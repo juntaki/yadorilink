@@ -434,7 +434,10 @@ pub enum SettlementEvidence {
     ExactObject {
         kind: RecordKind,
         version: VersionHash,
-        identity: Option<yadorilink_root_authority::fs_identity::FileIdentity>,
+        // Boxed to keep this variant's size close to the other arms'
+        // (clippy large_enum_variant): `FileIdentity` is comparatively
+        // large and only this arm carries it.
+        identity: Box<Option<yadorilink_root_authority::fs_identity::FileIdentity>>,
         mutation_generation: i64,
     },
     /// Disk holds the exact desired absence: a tombstone deletion
@@ -466,7 +469,7 @@ impl SettlementEvidence {
                     crate::ports::ExactActualState::Object {
                         kind: *kind,
                         version: *version,
-                        identity: *identity,
+                        identity: identity.clone(),
                     },
                     *mutation_generation,
                 ))
@@ -1707,7 +1710,9 @@ enum OrdinaryBatchItem<'a> {
     /// the unbatched `materialize_dag_content_head`'s single guard held
     /// across its whole call. Never inspected, only kept alive; dropped
     /// once this item is consumed (committed or dropped to retry).
-    Upsert(Box<dyn Send + 'a>, crate::ports::PreparedProjectedUpsert),
+    // `PreparedProjectedUpsert` boxed to keep this variant's size close to
+    // `Delete`'s (clippy large_enum_variant).
+    Upsert(Box<dyn Send + 'a>, Box<crate::ports::PreparedProjectedUpsert>),
     /// `(path, tombstone_author, derived_head)` -- mirrors the synthetic
     /// tombstone `FileRecord` reconcile_group_paths' own Absent branch
     /// builds for the unbatched case, minus the record itself (rebuilt
@@ -3750,11 +3755,8 @@ impl PeerSyncSession {
         fingerprint: Option<crate::ports::MaterializedFingerprint>,
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), PeerSessionError> {
-        let record = || {
-            self.state
-                .record_materialized_fingerprint(group_id, path, fingerprint, permit)
-                .map_err(PeerSessionError::from)
-        };
+        let record =
+            || self.state.record_materialized_fingerprint(group_id, path, fingerprint, permit);
         #[cfg(not(madsim))]
         {
             match tokio::runtime::Handle::try_current() {
@@ -5767,7 +5769,17 @@ impl PeerSyncSession {
             return None;
         }
         let signing_key_fingerprint: [u8; 32] = Sha256::digest(key_bytes).into();
-        if !auth.accepts_change_auth(
+        // `accepts_live_change_auth`, NOT `accepts_change_auth`: every
+        // Change reaching this function arrived fresh over this live wire
+        // session (see `handle_change_batch`, this function's only caller)
+        // -- the freshness floor closes the stale-pin replay gap plain
+        // `accepts_change_auth` alone leaves open (a device that captured a
+        // writer-granting `ChangeAuth` before a later downgrade/revoke
+        // could otherwise keep replaying it indefinitely). See
+        // `ChangeAuthenticator::accepts_live_change_auth`'s own doc comment
+        // for why retained-history re-validation must never use this
+        // variant, and why this live-admission call site always must.
+        if !auth.accepts_live_change_auth(
             change.device_id.as_str(),
             change.group_id.as_str(),
             signing_key_fingerprint,
@@ -5784,7 +5796,8 @@ impl PeerSyncSession {
                 auth_seq = change.auth_seq,
                 auth_epoch = change.auth_epoch,
                 "rejected a change whose author did not hold write authorization at the \
-                 policy state it pinned at creation time"
+                 policy state it pinned at creation time, or is no longer a current writer \
+                 now (live-admission freshness floor)"
             );
             return None;
         }
@@ -6229,6 +6242,9 @@ impl PeerSyncSession {
     /// exactly mirroring `materialize_dag_content_head`'s own CONV-7
     /// freshness re-resolution, just deferred to the batched commit step
     /// instead of running inline here.
+    // ~10 call sites across this module and its tests; grouping these into
+    // a params struct is out of scope for a lint cleanup.
+    #[allow(clippy::too_many_arguments)]
     async fn prepare_ordinary_projected_upsert<'a>(
         &self,
         group_id: &str,
@@ -6497,6 +6513,7 @@ impl PeerSyncSession {
         // `OrdinaryBatchItem` would need `OrdinaryBatchItem: Sync` to stay
         // `Send` across the `.await` below, and the `Box<dyn Send + '_>`
         // activity guard it carries is (correctly) not `Sync`.
+        #[allow(clippy::needless_range_loop)]
         for i in 0..sorted.len() {
             let path_lock = self.state.path_lock(group_id, sorted[i].path());
             // C4_DIAG (temporary, remove after investigation): aggregate
@@ -6542,7 +6559,7 @@ impl PeerSyncSession {
                     pending_provenance_hashes
                         .extend(prepared.newly_fetched_block_hashes.iter().cloned());
                     if self.revalidate_ordinary_upsert(group_id, &prepared, call_timer).await? {
-                        candidate_upserts.push(prepared);
+                        candidate_upserts.push(*prepared);
                     } else {
                         // Codex review (C4-6): a rejected candidate's
                         // already-assembled temp file is otherwise never
@@ -7351,7 +7368,10 @@ impl PeerSyncSession {
                     );
                     match c4_diag_prepare_result {
                         Ok(Some((write_activity, prepared))) => {
-                            pending_batch.push(OrdinaryBatchItem::Upsert(write_activity, prepared));
+                            pending_batch.push(OrdinaryBatchItem::Upsert(
+                                write_activity,
+                                Box::new(prepared),
+                            ));
                             continue;
                         }
                         Ok(None) => {}
@@ -7966,11 +7986,12 @@ impl PeerSyncSession {
                     return Ok(MaterializeResult::Settled(SettlementEvidence::ExactObject {
                         kind: RecordKind::File,
                         version: version_hash,
-                        identity:
+                        identity: Box::new(
                             yadorilink_root_authority::fs_identity::FileIdentity::observe_path(
                                 &out_path,
                             )
                             .ok(),
+                        ),
                         mutation_generation,
                     }));
                 }
@@ -8037,11 +8058,12 @@ impl PeerSyncSession {
                     return Ok(MaterializeResult::Settled(SettlementEvidence::ExactObject {
                         kind: version.meta.record_kind,
                         version: version_hash,
-                        identity:
+                        identity: Box::new(
                             yadorilink_root_authority::fs_identity::FileIdentity::observe_path(
                                 &out_path,
                             )
                             .ok(),
+                        ),
                         mutation_generation,
                     }));
                 }
@@ -9049,8 +9071,8 @@ impl PeerSyncSession {
     /// fingerprint_off_runtime`'s doc comment describes.
     ///
     /// Combined into one `block_in_place` hop rather than two, mirroring the
-    /// receive path's own twin combination (`record_group_block_provenance`
-    /// + `clear_block_fetch_refusal` behind one `spawn_blocking`, in
+    /// receive path's own twin combination (`record_group_block_provenance` +
+    /// `clear_block_fetch_refusal` behind one `spawn_blocking`, in
     /// `ensure_blocks_present`): the two checks run back to back against the
     /// same connection, and `group_has_block_provenance` only needs to run
     /// at all once `block_request_is_referenced` has already returned
@@ -10881,15 +10903,16 @@ impl PeerSyncSession {
         // whole `FuturesUnordered` (e.g. on this function's own early
         // `Err` return below) cleanly cancels every still-in-flight fetch
         // with no detached background work left behind.
-        let mut in_flight: FuturesUnordered<
-            std::pin::Pin<
-                Box<
-                    dyn std::future::Future<Output = Result<BlockFetchOutcome, PeerSessionError>>
-                        + Send
-                        + '_,
-                >,
+        // Factored out of the `FuturesUnordered` type below (clippy
+        // type_complexity): a pinned, boxed, borrowed block-fetch future.
+        type BlockFetchFuture<'a> = std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<BlockFetchOutcome, PeerSessionError>>
+                    + Send
+                    + 'a,
             >,
-        > = FuturesUnordered::new();
+        >;
+        let mut in_flight: FuturesUnordered<BlockFetchFuture<'_>> = FuturesUnordered::new();
         // Set once a block is confirmed missing after its own bounded
         // retries -- mirrors the old sequential loop's `break` (see
         // `fix/conflict-copy-convergence-obligation-20260723`): this peer
@@ -12592,8 +12615,9 @@ impl PeerSyncSession {
         Ok(SettlementEvidence::ExactObject {
             kind,
             version,
-            identity: yadorilink_root_authority::fs_identity::FileIdentity::observe_path(&out_path)
-                .ok(),
+            identity: Box::new(
+                yadorilink_root_authority::fs_identity::FileIdentity::observe_path(&out_path).ok(),
+            ),
             mutation_generation,
         })
     }
@@ -14378,6 +14402,44 @@ pub trait ChangeAuthenticator: Send + Sync {
         let _ = signing_key_fingerprint;
         let _ = auth;
         self.is_writer(device_id, group_id)
+    }
+    /// Whether a Change arriving FRESH over the wire, from a currently-
+    /// connected peer claiming to author it right now, is acceptable --
+    /// the LIVE-admission counterpart to `accepts_change_auth`.
+    ///
+    /// `accepts_change_auth` alone authorizes a Change against the
+    /// historical policy point the author's own `ChangeAuth` pin names,
+    /// which is real (it once WAS current) but is never re-checked for
+    /// staleness -- a device that captured a writer-granting pin before
+    /// being downgraded or revoked could otherwise keep replaying that
+    /// stale pin indefinitely. This method exists to additionally require
+    /// the author to still hold write authorization at the receiver's
+    /// CURRENT policy state, not merely at the pin's own point.
+    ///
+    /// Callers MUST use this only for genuinely live, freshly-received
+    /// admission (`PeerSyncSession::authenticate_incoming_change`) and MUST
+    /// NEVER use it for retained/historical Change re-validation (already-
+    /// admitted history being re-authenticated during rebootstrap,
+    /// compaction, or resync) -- a device's legitimately-authored past
+    /// history must remain valid forever even after that device is later
+    /// downgraded or revoked, and this freshness check would wrongly
+    /// quarantine it. `yadorilink_replica_engine::authenticated_history::
+    /// AuthenticatedHistoryTrust` (the retained-history trust interface)
+    /// deliberately has no equivalent method and can only ever reach
+    /// `accepts_change_auth` -- see that trait's own doc comment.
+    ///
+    /// Defaults to `accepts_change_auth` unchanged, so an implementation
+    /// with no freshness concern of its own (a test fixture, or any
+    /// implementor that hasn't been given a notion of "current" state)
+    /// behaves exactly as before.
+    fn accepts_live_change_auth(
+        &self,
+        device_id: &str,
+        group_id: &str,
+        signing_key_fingerprint: [u8; 32],
+        auth: yadorilink_replica_domain::change::ChangeAuth,
+    ) -> bool {
+        self.accepts_change_auth(device_id, group_id, signing_key_fingerprint, auth)
     }
 }
 
@@ -17210,7 +17272,9 @@ mod ordinary_batch_tests {
                 emitter,
             )
             .unwrap();
-            self.state.dag_admit_change_with_versions(&change, &[version.clone()], false).unwrap();
+            self.state
+                .dag_admit_change_with_versions(&change, std::slice::from_ref(version), false)
+                .unwrap();
             change
         }
 
@@ -17308,7 +17372,7 @@ mod ordinary_batch_tests {
             .session
             .try_commit_ordinary_batch(
                 GROUP,
-                vec![OrdinaryBatchItem::Upsert(guard, prepared)],
+                vec![OrdinaryBatchItem::Upsert(guard, Box::new(prepared))],
                 &crate::c4_attr::ReconcileCallTimer::new(),
             )
             .await
@@ -17389,7 +17453,7 @@ mod ordinary_batch_tests {
             .session
             .try_commit_ordinary_batch(
                 GROUP,
-                vec![OrdinaryBatchItem::Upsert(guard, prepared)],
+                vec![OrdinaryBatchItem::Upsert(guard, Box::new(prepared))],
                 &crate::c4_attr::ReconcileCallTimer::new(),
             )
             .await
@@ -17430,7 +17494,7 @@ mod ordinary_batch_tests {
             .session
             .try_commit_ordinary_batch(
                 GROUP,
-                vec![OrdinaryBatchItem::Upsert(guard, prepared)],
+                vec![OrdinaryBatchItem::Upsert(guard, Box::new(prepared))],
                 &crate::c4_attr::ReconcileCallTimer::new(),
             )
             .await
@@ -17633,7 +17697,7 @@ mod ordinary_batch_tests {
             .session
             .try_commit_ordinary_batch(
                 GROUP,
-                vec![OrdinaryBatchItem::Upsert(guard, prepared)],
+                vec![OrdinaryBatchItem::Upsert(guard, Box::new(prepared))],
                 &crate::c4_attr::ReconcileCallTimer::new(),
             )
             .await
@@ -17681,7 +17745,7 @@ mod ordinary_batch_tests {
             .session
             .try_commit_ordinary_batch(
                 GROUP,
-                vec![OrdinaryBatchItem::Upsert(guard, prepared)],
+                vec![OrdinaryBatchItem::Upsert(guard, Box::new(prepared))],
                 &crate::c4_attr::ReconcileCallTimer::new(),
             )
             .await
@@ -17714,7 +17778,7 @@ mod ordinary_batch_tests {
             let head = h.winner_head(&path);
             let (guard, prepared) =
                 h.prepare(&path, &head, activity_provider.as_ref()).await.unwrap();
-            items.push(OrdinaryBatchItem::Upsert(guard, prepared));
+            items.push(OrdinaryBatchItem::Upsert(guard, Box::new(prepared)));
             paths_and_contents.push((path, content));
         }
         let stale_path = "f3.txt".to_string();
@@ -17773,7 +17837,7 @@ mod ordinary_batch_tests {
             .session
             .try_commit_ordinary_batch(
                 GROUP,
-                vec![OrdinaryBatchItem::Upsert(guard, prepared)],
+                vec![OrdinaryBatchItem::Upsert(guard, Box::new(prepared))],
                 &crate::c4_attr::ReconcileCallTimer::new(),
             )
             .await;
@@ -18855,7 +18919,7 @@ mod block_provenance_batching_tests {
                 .expect(
                     "a fresh single-block ordinary content upsert must classify as batch-eligible",
                 );
-            items.push(OrdinaryBatchItem::Upsert(guard, prepared));
+            items.push(OrdinaryBatchItem::Upsert(guard, Box::new(prepared)));
         }
 
         let (settled, retry) = session_b
@@ -18928,7 +18992,7 @@ mod block_provenance_batching_tests {
                 .expect(
                     "a fresh single-block ordinary content upsert must classify as batch-eligible",
                 );
-            items.push(OrdinaryBatchItem::Upsert(guard, prepared));
+            items.push(OrdinaryBatchItem::Upsert(guard, Box::new(prepared)));
         }
         assert_eq!(items.len(), 9);
 
@@ -19022,7 +19086,7 @@ mod block_provenance_batching_tests {
                 .expect(
                     "a fresh single-block ordinary content upsert must classify as batch-eligible",
                 );
-            items.push(OrdinaryBatchItem::Upsert(guard, prepared));
+            items.push(OrdinaryBatchItem::Upsert(guard, Box::new(prepared)));
         }
 
         let (settled, retry) = session_b
@@ -19134,7 +19198,7 @@ mod block_provenance_batching_tests {
         let (settled, retry) = session_b
             .try_commit_ordinary_batch(
                 GROUP,
-                vec![OrdinaryBatchItem::Upsert(guard_a, prepared_a)],
+                vec![OrdinaryBatchItem::Upsert(guard_a, Box::new(prepared_a))],
                 &call_timer,
             )
             .await
@@ -19230,7 +19294,7 @@ mod block_provenance_batching_tests {
         let (settled, retry) = session_b
             .try_commit_ordinary_batch(
                 GROUP,
-                vec![OrdinaryBatchItem::Upsert(guard_good, prepared_good)],
+                vec![OrdinaryBatchItem::Upsert(guard_good, Box::new(prepared_good))],
                 &call_timer,
             )
             .await
@@ -19299,7 +19363,7 @@ mod block_provenance_batching_tests {
                 .expect(
                     "a fresh single-block ordinary content upsert must classify as batch-eligible",
                 );
-            items.push(OrdinaryBatchItem::Upsert(guard, prepared));
+            items.push(OrdinaryBatchItem::Upsert(guard, Box::new(prepared)));
         }
 
         // Force the SQL provenance transaction itself to fail, AFTER every

@@ -181,7 +181,7 @@ impl SqliteSyncStore {
         }
         self.database.read::<_, SyncSqliteError>(|conn| {
             let placeholders =
-                std::iter::repeat("?").take(block_hashes.len()).collect::<Vec<_>>().join(",");
+                std::iter::repeat_n("?", block_hashes.len()).collect::<Vec<_>>().join(",");
             let sql = format!(
                 "SELECT block_hash FROM group_block_provenance \
                  WHERE group_id = ? AND block_hash IN ({placeholders})"
@@ -441,6 +441,21 @@ impl SqliteSyncStore {
             .into_iter()
             .map(Into::into)
             .collect())
+    }
+
+    /// Folder Rewind's read-only preview for `group_id` at `at_unix_nanos`
+    /// -- see [`crate::rewind_plan::compute_rewind_plan`] for the full
+    /// semantics, including what an [`yadorilink_replica_domain::rewind::
+    /// RewindPathAction::Unavailable`] entry does and does not mean. Runs
+    /// on a pooled read connection; computes nothing and writes nothing.
+    pub fn compute_rewind_plan(
+        &self,
+        group_id: &str,
+        at_unix_nanos: i64,
+    ) -> Result<yadorilink_replica_domain::rewind::RewindPlan, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            crate::rewind_plan::compute_rewind_plan(conn, group_id, at_unix_nanos)
+        })
     }
 
     /// C4-12: the fail-closed read entry point for `(group_id, path)`'s

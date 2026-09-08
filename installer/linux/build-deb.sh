@@ -107,7 +107,29 @@ mkdir -p \
     "$STAGE_DIR/DEBIAN" \
     "$STAGE_DIR/usr/bin" \
     "$STAGE_DIR/usr/lib/systemd/user" \
-    "$STAGE_DIR/usr/share/doc/yadorilink"
+    "$STAGE_DIR/usr/share/doc/yadorilink" \
+    "$STAGE_DIR/usr/share/lintian/overrides"
+
+# `mkdir -p` inherits the *building* user's umask, not a fixed mode -- on
+# a machine/CI runner with a group-writable default umask (002), that
+# silently produces 0775 directories in the shipped payload instead of
+# the standard 0755 (lintian's non-standard-dir-perm check, caught by
+# actually running lintian against a real build, not just eyeballing this
+# script). Fixed explicitly here rather than relying on every build
+# environment's umask happening to be 022.
+chmod 755 \
+    "$STAGE_DIR" \
+    "$STAGE_DIR/DEBIAN" \
+    "$STAGE_DIR/usr" \
+    "$STAGE_DIR/usr/bin" \
+    "$STAGE_DIR/usr/lib" \
+    "$STAGE_DIR/usr/lib/systemd" \
+    "$STAGE_DIR/usr/lib/systemd/user" \
+    "$STAGE_DIR/usr/share" \
+    "$STAGE_DIR/usr/share/doc" \
+    "$STAGE_DIR/usr/share/doc/yadorilink" \
+    "$STAGE_DIR/usr/share/lintian" \
+    "$STAGE_DIR/usr/share/lintian/overrides"
 
 install -m 755 "$CLI_BIN" "$STAGE_DIR/usr/bin/yadorilink"
 install -m 755 "$DAEMON_BIN" "$STAGE_DIR/usr/bin/yadorilink-daemon"
@@ -125,6 +147,8 @@ install -m 644 "$SCRIPT_DIR/systemd/yadorilink-daemon.service" \
     "$STAGE_DIR/usr/lib/systemd/user/yadorilink-daemon.service"
 install -m 644 "$REPO_ROOT/LICENSE-MIT" "$STAGE_DIR/usr/share/doc/yadorilink/LICENSE-MIT"
 install -m 644 "$SCRIPT_DIR/debian/copyright" "$STAGE_DIR/usr/share/doc/yadorilink/copyright"
+install -m 644 "$SCRIPT_DIR/debian/yadorilink.lintian-overrides" \
+    "$STAGE_DIR/usr/share/lintian/overrides/yadorilink"
 
 # Debian policy requires a changelog for every package -- for a "native"
 # package (no separate upstream tarball, which is what a single-repo Rust
@@ -141,6 +165,9 @@ install -m 644 "$SCRIPT_DIR/debian/copyright" "$STAGE_DIR/usr/share/doc/yadorili
     echo
     echo " -- yadorilink project <juntaki@users.noreply.github.com>  $(date -R)"
 } | gzip -n -9 > "$STAGE_DIR/usr/share/doc/yadorilink/changelog.gz"
+# Same umask issue as the directories above: a `>` redirect creates the
+# file at the umask-default mode, not a fixed one.
+chmod 644 "$STAGE_DIR/usr/share/doc/yadorilink/changelog.gz"
 
 # control/postinst/postrm: substitute @VERSION@/@ARCH@ into control,
 # copy postinst/postrm as-is (must be executable, LF line endings).

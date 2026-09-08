@@ -78,6 +78,7 @@ pub mod replica_coordinator;
 pub mod reporting;
 pub mod reporting_ipc;
 pub mod reporting_retry;
+pub mod rewind;
 pub mod root_commit_authority;
 pub mod route;
 pub mod runtime_telemetry;
@@ -93,6 +94,7 @@ pub mod placeholder_dehydrate_windows;
 pub mod placeholder_inspect_windows;
 #[cfg(not(madsim))]
 pub mod resource_lock;
+pub mod send_transfer;
 pub mod shell_ipc;
 pub mod shell_status;
 pub mod supervise;

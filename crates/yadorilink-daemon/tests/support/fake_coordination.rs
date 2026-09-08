@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex};
 use base64::Engine as _;
 use ed25519_dalek::SigningKey;
 use futures_util::SinkExt;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -84,6 +85,49 @@ struct Inner {
     /// real endpoint -- restart tests specifically need a viewer's view of
     /// a peer to stay overridden across that peer's own reconnect.
     endpoint_view_overrides: HashMap<(String, String), Vec<String>>,
+    /// Track Send rendezvous grants -- see `serve_send_authorization_issue`'s
+    /// own doc comment. grant_id -> record.
+    send_authorizations: HashMap<String, FakeSendAuthorization>,
+    /// Per-group, append-only signed policy chain this fake has issued via
+    /// `grant_role`, in the exact `PolicyRecord` shape
+    /// `yadorilink_daemon::change_policy::verify_group_policy_log` accepts --
+    /// built with that same crate's own `change_policy::policy_signing::
+    /// grant_record` helper, so a record built here is byte-identical
+    /// (preimage, hash chain, signature) to one `coordination-worker`'s real
+    /// `recordGrantWithRole` (`src/policy/service.ts`) would produce, not a
+    /// hand-rolled approximation of the wire format. A group with no entry
+    /// here has never had `grant_role` called for it -- `signed_policy_logs`
+    /// then falls back to the historical all-zero, no-records frame every
+    /// non-role-aware test already depends on.
+    group_policy_chains: HashMap<String, Vec<yadorilink_daemon::change_policy::PolicyRecord>>,
+    /// Per-subscriber, per-group "already sent up to this seq" watermark --
+    /// mirrors `coordination-worker`'s own per-WebSocket `policyWatermarks`
+    /// (`durable-objects/netmap-device.ts`): a group's policy chain is never
+    /// resent in full to a subscriber that has already seen a prefix of it,
+    /// only the tail beyond what it was last sent, because the daemon's own
+    /// `verify_group_policy_log_with_base` only accepts a record tail that
+    /// starts exactly at its last verified seq + 1, not a redundant full
+    /// resend. Reset (removed) whenever a device (re)subscribes, exactly
+    /// like a fresh production WebSocket starts with a fresh (empty)
+    /// watermark map for that connection.
+    policy_send_watermarks: HashMap<String, HashMap<String, u64>>,
+}
+
+/// One in-flight (or already-consumed) Track Send grant this fake has
+/// issued. Mirrors coordination-worker's `send_authorizations` table just
+/// enough for real daemon-side E2E coverage: identity binding and atomic
+/// single-use consumption. Deliberately does not model account scoping
+/// (this fake has no account concept for anything else either -- every
+/// registered device is implicitly "the same account") or a real TTL sweep
+/// -- those properties are exhaustively covered by coordination-worker's
+/// own `test/send-authorization.test.ts` against the real Worker; this
+/// fake's job is only to exercise the DAEMON side end to end.
+#[derive(Clone)]
+struct FakeSendAuthorization {
+    nonce: String,
+    sender_device_id: String,
+    receiver_device_id: String,
+    consumed: bool,
 }
 
 /// A handle to the running fake. Cloneable; every clone shares one server.
@@ -130,6 +174,153 @@ impl FakeCoordination {
     /// going through that method's own candidate-search logic.
     pub fn policy_signing_key(&self) -> Option<SigningKey> {
         self.inner.lock().unwrap().policy_service_key.clone()
+    }
+
+    /// Grants `device_id` a specific writer role for `group_id` by appending
+    /// a real, signed `ACTION_GRANT_WITH_ROLE` record to that group's policy
+    /// chain and pushing a fresh netmap update -- the fake-coordination
+    /// counterpart to a real `share grant --role viewer|editor` request
+    /// landing on `coordination-worker`'s `recordGrantWithRole`
+    /// (`coordination-worker/src/policy/service.ts`). Built with
+    /// `yadorilink_daemon::change_policy::policy_signing::grant_record`, the
+    /// SAME helper this crate's own unit tests
+    /// (`daemon_state.rs`'s `local_change_auth_provider_withholds_a_viewers_
+    /// local_edit_but_allows_an_editor`, `change_auth.rs`'s
+    /// `accepts_change_auth_rejects_a_viewer_and_accepts_the_same_device_
+    /// as_an_editor`) use to construct a role-carrying Grant -- the record
+    /// this produces is therefore byte-identical in shape (preimage, hash
+    /// chain, signature) to what a real coordination plane would sign, not
+    /// an approximation of `GroupPolicyLogWire`/`WsPolicyRecord`'s wire
+    /// contract.
+    ///
+    /// `device_id` must already be registered (`register_device`) -- the
+    /// Grant binds the SHA-256 fingerprint of its currently-registered
+    /// signing key, exactly as a real Grant binds a device's registered
+    /// key. `enable_signed_policy` must have been called first; panics
+    /// otherwise, since there is no service signing key to issue a record
+    /// with. Multiple calls for the same group append further records to
+    /// that group's chain (seq keeps increasing), so a device's role can be
+    /// changed (e.g. Viewer then later Editor) the same way a real grant
+    /// chain evolves.
+    pub fn grant_role(
+        &self,
+        device_id: &str,
+        group_id: &str,
+        role: yadorilink_daemon::change_policy::WriterRole,
+    ) {
+        use yadorilink_daemon::change_policy::policy_signing::grant_record;
+        {
+            let mut inner = self.inner.lock().unwrap();
+            let signing_key = inner
+                .policy_service_key
+                .clone()
+                .expect("grant_role requires enable_signed_policy() to be called first");
+            let device = inner
+                .devices
+                .get(device_id)
+                .unwrap_or_else(|| panic!("grant_role: device {device_id} is not registered"))
+                .clone();
+            let b64 = base64::engine::general_purpose::STANDARD;
+            let signing_public_key: [u8; 32] = b64
+                .decode(&device.signing_public_key_b64)
+                .expect("registered signing key is valid base64")
+                .try_into()
+                .expect("registered signing key is 32 bytes");
+            let fingerprint: [u8; 32] = Sha256::digest(signing_public_key).into();
+
+            let chain = inner.group_policy_chains.entry(group_id.to_string()).or_default();
+            let prev: [u8; 32] = chain
+                .last()
+                .map(|record| {
+                    record.record_hash.as_slice().try_into().expect("record_hash is 32 bytes")
+                })
+                .unwrap_or([0u8; 32]);
+            let seq = chain.last().map(|record| record.seq + 1).unwrap_or(1);
+            let record =
+                grant_record(&signing_key, group_id, seq, prev, device_id, fingerprint, role);
+            chain.push(record);
+        }
+        self.push();
+    }
+
+    /// Changes `device_id`'s role for `group_id` the same way
+    /// `coordination-worker`'s live role-change endpoint (`changeDeviceRole`,
+    /// `src/shares/service.ts`) does for a DOWNGRADE: a plain `Revoke`
+    /// record (bumping the group's `auth_epoch`, exactly like an ordinary
+    /// revoke) immediately followed by a `GrantWithRole` record at
+    /// `new_role`, at the SAME newly-bumped epoch -- and then a fresh
+    /// netmap push, so every subscriber (including `device_id` itself)
+    /// re-derives write authorization from the updated chain on its very
+    /// next check.
+    ///
+    /// Unlike a real downgrade, this always appends the chained pair
+    /// regardless of whether `new_role` genuinely outranks the device's
+    /// current role -- callers that need to distinguish upgrade-vs-downgrade
+    /// behavior should call `grant_role` directly for a plain upgrade (no
+    /// epoch bump); this helper exists specifically to drive the
+    /// epoch-bumping downgrade path end to end. `device_id` must already be
+    /// registered and already have a prior `grant_role` call for
+    /// `group_id` (there must be a chain to revoke from); panics otherwise.
+    pub fn downgrade_role(
+        &self,
+        device_id: &str,
+        group_id: &str,
+        new_role: yadorilink_daemon::change_policy::WriterRole,
+    ) {
+        use yadorilink_daemon::change_policy::policy_signing::{
+            grant_record_at_epoch, revoke_record_at_epoch,
+        };
+        {
+            let mut inner = self.inner.lock().unwrap();
+            let signing_key = inner
+                .policy_service_key
+                .clone()
+                .expect("downgrade_role requires enable_signed_policy() to be called first");
+            let device = inner
+                .devices
+                .get(device_id)
+                .unwrap_or_else(|| panic!("downgrade_role: device {device_id} is not registered"))
+                .clone();
+            let b64 = base64::engine::general_purpose::STANDARD;
+            let signing_public_key: [u8; 32] = b64
+                .decode(&device.signing_public_key_b64)
+                .expect("registered signing key is valid base64")
+                .try_into()
+                .expect("registered signing key is 32 bytes");
+            let fingerprint: [u8; 32] = Sha256::digest(signing_public_key).into();
+
+            let chain = inner.group_policy_chains.get_mut(group_id).unwrap_or_else(|| {
+                panic!("downgrade_role: group {group_id} has no policy chain yet")
+            });
+            let head = chain.last().expect("downgrade_role: group's policy chain is empty");
+            let head_hash: [u8; 32] =
+                head.record_hash.as_slice().try_into().expect("record_hash is 32 bytes");
+            let new_epoch = head.epoch + 1;
+            let revoke_seq = head.seq + 1;
+            let revoke = revoke_record_at_epoch(
+                &signing_key,
+                group_id,
+                revoke_seq,
+                head_hash,
+                new_epoch,
+                device_id,
+            );
+            let revoke_hash: [u8; 32] =
+                revoke.record_hash.as_slice().try_into().expect("record_hash is 32 bytes");
+            let regrant = grant_record_at_epoch(
+                &signing_key,
+                group_id,
+                revoke_seq + 1,
+                revoke_hash,
+                new_epoch,
+                device_id,
+                fingerprint,
+                new_role,
+            );
+            chain.push(revoke);
+            chain.push(regrant);
+        }
+        self.push();
     }
 
     /// Takes the coordination plane down completely, as a chaos test needs:
@@ -451,15 +642,65 @@ fn netmap_frame_for(inner: &mut Inner, subscriber_id: &str) -> String {
             base64::engine::general_purpose::STANDARD
                 .encode(service_key.verifying_key().to_bytes()),
         );
-        frame["groupPolicyLogs"] = signed_policy_logs(inner, &self_groups, service_key);
+        frame["groupPolicyLogs"] = signed_policy_logs(inner, subscriber_id, &self_groups);
     }
     frame.to_string()
 }
 
+/// The literal `ACTION_GRANT_WITH_ROLE` wire discriminant (see
+/// `yadorilink_daemon::change_policy`'s own module doc comment for why this
+/// is a distinct shape from plain `ACTION_GRANT`) -- mirrored here rather
+/// than importing the crate's private constant, since it decides whether
+/// `policy_record_to_wire_json` includes a `role` field at all, exactly like
+/// `coordination-worker`'s own `recordToWire` (`src/policy/service.ts`)
+/// includes `role` only when `r.action.role !== undefined`.
+const WIRE_ACTION_GRANT_WITH_ROLE: u32 = 3;
+
+/// Renders one signed `PolicyRecord` (built by `grant_role` via
+/// `policy_signing::grant_record`) into the exact camelCase/base64 wire
+/// shape `peer_orchestrator.rs`'s `WsPolicyRecord` deserializes -- the
+/// mirror image of that struct's own field-by-field decoding, so a record
+/// built here and one built by a real coordination plane are
+/// indistinguishable on the wire.
+fn policy_record_to_wire_json(
+    record: &yadorilink_daemon::change_policy::PolicyRecord,
+) -> serde_json::Value {
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let mut json = serde_json::json!({
+        "groupId": record.group_id,
+        "seq": record.seq,
+        "prevRecordHashBase64": b64.encode(&record.prev_record_hash),
+        "recordHashBase64": b64.encode(&record.record_hash),
+        "epoch": record.epoch,
+        "actionType": record.action_type,
+        "deviceId": record.device_id,
+        "signingKeyFingerprintBase64": b64.encode(&record.signing_key_fingerprint),
+        "newAuthorityKeyBase64": b64.encode(&record.new_authority_key),
+        "signerKeyIdBase64": b64.encode(&record.signer_key_id),
+        "signatureBase64": b64.encode(&record.signature),
+    });
+    // Omitted entirely (not merely absent-as-null) for anything but a
+    // grant-with-role record -- matches the daemon-side `#[serde(default)]`
+    // `Option<u32>` field, which defaults to absent the same way.
+    if record.action_type == WIRE_ACTION_GRANT_WITH_ROLE {
+        json["role"] = serde_json::Value::from(record.role);
+    }
+    json
+}
+
+/// Builds the `groupPolicyLogs` array for one subscriber's netmap frame:
+/// every group it belongs to, each with the group's CURRENT head coordinates
+/// (`currentSeq`/`currentEpoch`/`policyHeadBase64`, always the group's real
+/// current state, matching `coordination-worker`'s own `toWirePolicyLog`) but
+/// only the record TAIL this specific subscriber has not already been sent
+/// (`policy_send_watermarks`, matching that same Worker's per-connection
+/// `policyWatermarks` filtering in `pushNetmapSerializedSafely`). A group
+/// `grant_role` has never touched keeps the historical all-zero, no-records
+/// shape every pre-existing (non-role-aware) test in this suite depends on.
 fn signed_policy_logs(
-    _inner: &Inner,
+    inner: &mut Inner,
+    subscriber_id: &str,
     groups: &HashSet<String>,
-    _service_key: &SigningKey,
 ) -> serde_json::Value {
     let b64 = base64::engine::general_purpose::STANDARD;
     let mut group_ids: Vec<_> = groups.iter().cloned().collect();
@@ -467,12 +708,34 @@ fn signed_policy_logs(
     let logs: Vec<_> = group_ids
         .into_iter()
         .map(|group_id| {
+            let chain = inner.group_policy_chains.get(&group_id).cloned().unwrap_or_default();
+            let Some(head) = chain.last() else {
+                return serde_json::json!({
+                    "groupId": group_id,
+                    "currentSeq": 0,
+                    "currentEpoch": 0,
+                    "policyHeadBase64": b64.encode([0u8; 32]),
+                    "records": [],
+                });
+            };
+            let current_seq = head.seq;
+            let current_epoch = head.epoch;
+            let policy_head_b64 = b64.encode(&head.record_hash);
+            let watermarks =
+                inner.policy_send_watermarks.entry(subscriber_id.to_string()).or_default();
+            let since = watermarks.get(&group_id).copied().unwrap_or(0);
+            let records: Vec<_> = chain
+                .iter()
+                .filter(|record| record.seq > since)
+                .map(policy_record_to_wire_json)
+                .collect();
+            watermarks.insert(group_id.clone(), current_seq);
             serde_json::json!({
                 "groupId": group_id,
-                "currentSeq": 0,
-                "currentEpoch": 0,
-                "policyHeadBase64": b64.encode([0u8; 32]),
-                "records": [],
+                "currentSeq": current_seq,
+                "currentEpoch": current_epoch,
+                "policyHeadBase64": policy_head_b64,
+                "records": records,
             })
         })
         .collect();
@@ -492,6 +755,10 @@ async fn handle_connection(mut stream: TcpStream, inner: Arc<Mutex<Inner>>) -> s
     } else if method == "POST" {
         if let Some(group_id) = parse_relay_grant_target(&target) {
             serve_relay_grant(stream, &head, leftover, group_id, inner).await
+        } else if target.split('?').next() == Some("/send/authorization") {
+            serve_send_authorization_issue(stream, &head, leftover, inner).await
+        } else if let Some(grant_id) = parse_send_authorization_consume_target(&target) {
+            serve_send_authorization_consume(stream, &head, leftover, grant_id, inner).await
         } else {
             // Every other endpoint the daemon calls (endpoint report,
             // rendezvous, signing-key backfill) is best-effort: a 204 is all
@@ -515,6 +782,219 @@ fn parse_relay_grant_target(target: &str) -> Option<String> {
     let path = target.split('?').next().unwrap_or(target);
     let group_id = path.strip_prefix("/shares/groups/")?.strip_suffix("/relay/grant")?;
     (!group_id.is_empty() && !group_id.contains('/')).then(|| group_id.to_string())
+}
+
+/// Matches `/send/authorization/{grantId}/consume` and extracts `grantId`.
+fn parse_send_authorization_consume_target(target: &str) -> Option<String> {
+    let path = target.split('?').next().unwrap_or(target);
+    let grant_id = path.strip_prefix("/send/authorization/")?.strip_suffix("/consume")?;
+    (!grant_id.is_empty() && !grant_id.contains('/')).then(|| grant_id.to_string())
+}
+
+/// Serves `POST /send/authorization` for real -- Track Send's rendezvous
+/// grant, `coordination-worker`'s `routes/send.ts` mirrored just enough to
+/// exercise `coordination_client::request_send_authorization` and the
+/// `send_authorization` netmap-subscription push end to end against real
+/// daemon code, not an in-process bypass. See `FakeSendAuthorization`'s own
+/// doc comment for what this deliberately does not model.
+async fn serve_send_authorization_issue(
+    mut stream: TcpStream,
+    head: &str,
+    leftover: Vec<u8>,
+    inner: Arc<Mutex<Inner>>,
+) -> std::io::Result<()> {
+    let body = read_body(&mut stream, head, leftover).await?;
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Req {
+        sender_device_id: String,
+        receiver_device_id: String,
+    }
+    let Ok(req) = serde_json::from_slice::<Req>(&body) else {
+        return respond_json(&mut stream, 400, "Bad Request", r#"{"error":"invalid body"}"#).await;
+    };
+    if req.sender_device_id == req.receiver_device_id {
+        return respond_json(
+            &mut stream,
+            400,
+            "Bad Request",
+            r#"{"error":"sender and receiver must differ"}"#,
+        )
+        .await;
+    }
+
+    let (sender, receiver) = {
+        let inner = inner.lock().unwrap();
+        (
+            inner.devices.get(&req.sender_device_id).cloned(),
+            inner.devices.get(&req.receiver_device_id).cloned(),
+        )
+    };
+    let (Some(_sender), Some(receiver)) = (sender.clone(), receiver) else {
+        return respond_json(&mut stream, 404, "Not Found", r#"{"error":"unknown device"}"#).await;
+    };
+
+    let grant_id = uuid_like("grant");
+    let nonce = uuid_like("nonce");
+    let now = unix_now();
+    let expires_at = now + 300;
+    {
+        let mut inner = inner.lock().unwrap();
+        inner.send_authorizations.insert(
+            grant_id.clone(),
+            FakeSendAuthorization {
+                nonce: nonce.clone(),
+                sender_device_id: req.sender_device_id.clone(),
+                receiver_device_id: req.receiver_device_id.clone(),
+                consumed: false,
+            },
+        );
+    }
+
+    // Delivered synchronously, before this responds -- matching
+    // coordination-worker's own "push happens inside the request handler"
+    // convention (see `routes/send.ts`'s own comment).
+    push_send_authorization(
+        &inner,
+        &req.receiver_device_id,
+        &grant_id,
+        &nonce,
+        &req.sender_device_id,
+        expires_at,
+    );
+
+    let body = serde_json::json!({
+        "grantId": grant_id,
+        "nonce": nonce,
+        "expiresAt": expires_at,
+        "receiver": {
+            "deviceId": req.receiver_device_id,
+            "signingPublicKeyBase64": receiver.signing_public_key_b64,
+            "endpoints": receiver.endpoints
+                .iter()
+                .map(|address| serde_json::json!({ "address": address, "priority": 0 }))
+                .collect::<Vec<_>>(),
+        },
+    })
+    .to_string();
+    respond_json(&mut stream, 200, "OK", &body).await
+}
+
+/// Serves `POST /send/authorization/:grantId/consume` for real -- the
+/// atomic single-use guard `handle_offer`/`DaemonDeviceDirectory::
+/// consume_grant` calls before ever recording an inbound offer. Same
+/// identity-binding shape as the real Worker's `consumeSendAuthorization`:
+/// grant id, nonce, sender, and receiver must all match a still-unconsumed
+/// record, checked and flipped to consumed under the SAME lock acquisition
+/// (no separate read-then-write), so two concurrent attempts for the same
+/// grant can never both succeed.
+async fn serve_send_authorization_consume(
+    mut stream: TcpStream,
+    head: &str,
+    leftover: Vec<u8>,
+    grant_id: String,
+    inner: Arc<Mutex<Inner>>,
+) -> std::io::Result<()> {
+    let body = read_body(&mut stream, head, leftover).await?;
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Req {
+        nonce: String,
+        sender_device_id: String,
+        receiver_device_id: String,
+    }
+    let Ok(req) = serde_json::from_slice::<Req>(&body) else {
+        return respond_json(&mut stream, 400, "Bad Request", r#"{"error":"invalid body"}"#).await;
+    };
+
+    let sender = {
+        let mut inner = inner.lock().unwrap();
+        let consumable = inner.send_authorizations.get(&grant_id).is_some_and(|g| {
+            !g.consumed
+                && g.nonce == req.nonce
+                && g.sender_device_id == req.sender_device_id
+                && g.receiver_device_id == req.receiver_device_id
+        }) && inner.devices.contains_key(&req.sender_device_id)
+            && inner.devices.contains_key(&req.receiver_device_id);
+        if consumable {
+            inner.send_authorizations.get_mut(&grant_id).unwrap().consumed = true;
+            inner.devices.get(&req.sender_device_id).cloned()
+        } else {
+            None
+        }
+    };
+    let Some(sender) = sender else {
+        return respond_json(
+            &mut stream,
+            403,
+            "Forbidden",
+            r#"{"error":"send authorization is invalid, expired, or already used"}"#,
+        )
+        .await;
+    };
+
+    let body = serde_json::json!({
+        "sender": {
+            "deviceId": req.sender_device_id,
+            "signingPublicKeyBase64": sender.signing_public_key_b64,
+            "endpoints": sender.endpoints
+                .iter()
+                .map(|address| serde_json::json!({ "address": address, "priority": 0 }))
+                .collect::<Vec<_>>(),
+        },
+    })
+    .to_string();
+    respond_json(&mut stream, 200, "OK", &body).await
+}
+
+/// Pushes a `{type:"send_authorization",...}` frame to `receiver_device_id`'s
+/// live subscription, if it has one -- a no-op wake otherwise, matching
+/// `coordination-worker`'s own "content-blind, never stored" delivery
+/// contract for this push.
+fn push_send_authorization(
+    inner: &Arc<Mutex<Inner>>,
+    receiver_device_id: &str,
+    grant_id: &str,
+    nonce: &str,
+    sender_device_id: &str,
+    expires_at: i64,
+) {
+    let inner = inner.lock().unwrap();
+    let Some(tx) = inner.subscribers.get(receiver_device_id) else { return };
+    let Some(sender) = inner.devices.get(sender_device_id) else { return };
+    let frame = serde_json::json!({
+        "type": "send_authorization",
+        "grantId": grant_id,
+        "nonce": nonce,
+        "from": sender_device_id,
+        "senderSigningPublicKeyBase64": sender.signing_public_key_b64,
+        "senderCandidates": sender.endpoints
+            .iter()
+            .map(|address| serde_json::json!({ "address": address, "priority": 0 }))
+            .collect::<Vec<_>>(),
+        "expiresAt": expires_at,
+    })
+    .to_string();
+    let _ = tx.send(frame);
+}
+
+/// A short, sufficiently-unique id for this fake's own grant/nonce values --
+/// not a real UUID library dependency, just enough entropy (a monotonic
+/// process-wide counter) that two concurrently-issued grants in the same
+/// test never collide. `label` distinguishes a grant id from a nonce in
+/// test failure output.
+fn uuid_like(label: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{label}-{n}-{}", unix_now())
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Serves `POST /shares/groups/:groupId/relay/grant` for real, over the same
@@ -780,6 +1260,15 @@ async fn serve_netmap_subscription(
     let initial = {
         let mut guard = inner.lock().unwrap();
         guard.subscribers.insert(device_id.clone(), tx);
+        // A brand-new subscription starts with a fresh (empty) per-group
+        // policy watermark -- mirrors a real coordination plane's per-
+        // WebSocket `policyWatermarks` map starting empty for a new socket
+        // (`durable-objects/netmap-device.ts`'s `WeakMap<WebSocket, ...>`),
+        // so this device's very first frame on a (re)connect always carries
+        // each shared group's policy chain from the beginning, exactly as
+        // `verify_group_policy_log_with_base` requires when this device has
+        // no retained base state for that group yet.
+        guard.policy_send_watermarks.remove(&device_id);
         netmap_frame_for(&mut guard, &device_id)
     };
     if ws.send(Message::Text(initial)).await.is_err() {

@@ -267,6 +267,67 @@ impl NetmapChangeAuthenticator {
     }
 }
 
+impl NetmapChangeAuthenticator {
+    /// Shared implementation for both `accepts_change_auth` (retained-
+    /// history re-validation; also the default trust an unresolved/
+    /// bootstrap/withheld group falls back to) and `accepts_live_change_auth`
+    /// (live per-Change admission) -- `require_current_writer` is the ONLY
+    /// difference between them, and it is threaded through exactly once,
+    /// here, so the two public trait methods below can never accidentally
+    /// diverge in anything BUT that one flag. See `ChangeAuthenticator::
+    /// accepts_live_change_auth`'s own doc comment for why the distinction
+    /// exists and why each of the two callers must get the right one.
+    fn accepts_change_auth_impl(
+        &self,
+        device_id: &str,
+        group_id: &str,
+        signing_key_fingerprint: [u8; 32],
+        auth: ChangeAuth,
+        require_current_writer: bool,
+    ) -> bool {
+        match self.state.resolve_group_policy(group_id) {
+            GroupPolicyResolution::Verified(policy) => {
+                // `auth == ChangeAuth::PLACEHOLDER` short-circuits the
+                // freshness half exactly like the Bootstrap arm below: a
+                // group whose policy chain `grant_role` has never touched
+                // verifies to a genuinely EMPTY `GroupPolicyState`
+                // (`current_seq: 0`, no records) -- `Verified`, not
+                // `Bootstrap`, but functionally the identical genesis state,
+                // and `author_was_writer_at`'s own PLACEHOLDER branch
+                // already treats it that way (`self.records.is_empty() && ...`).
+                // There is no "role" pinned for a PLACEHOLDER author to have
+                // gone stale FROM -- `author_is_writer_now` would otherwise
+                // always report `false` here (an empty chain has no grant
+                // record for anyone), wrongly rejecting every ordinary
+                // PLACEHOLDER-authorized write the instant this state is
+                // reached through `Verified` rather than `Bootstrap`. Safe to
+                // OR in unconditionally: `author_was_writer_at` already
+                // rejects a non-empty chain's PLACEHOLDER auth on its own, so
+                // this only ever matters when both agree the chain really is
+                // empty.
+                policy.author_was_writer_at(device_id, signing_key_fingerprint, auth)
+                    && (!require_current_writer
+                        || auth == ChangeAuth::PLACEHOLDER
+                        || policy.author_is_writer_now(device_id, signing_key_fingerprint))
+            }
+            GroupPolicyResolution::Bootstrap => {
+                // Match DaemonState's local-change auth provider exactly: in the
+                // genuine pre-policy bootstrap window this device's own local
+                // emission is stamped PLACEHOLDER without consulting the peer
+                // writer map. Remote authors still require the existing netmap
+                // writer authorization. There is no verified policy chain here
+                // at all yet, so `require_current_writer` has nothing further
+                // to check against -- "current" and "the pin" are the same
+                // undifferentiated bootstrap state either way.
+                auth == ChangeAuth::PLACEHOLDER
+                    && (device_id == self.state.device_id
+                        || self.state.peer_is_writer(device_id, group_id))
+            }
+            GroupPolicyResolution::Withhold => false,
+        }
+    }
+}
+
 impl ChangeAuthenticator for NetmapChangeAuthenticator {
     fn signing_key(&self, device_id: &str) -> Option<[u8; 32]> {
         // Store-and-forward can legitimately bring one of this device's own
@@ -291,6 +352,16 @@ impl ChangeAuthenticator for NetmapChangeAuthenticator {
         self.state.peer_is_writer(device_id, group_id)
     }
 
+    /// Retained-history re-validation's trust boundary (reached via
+    /// `ChangeAuthenticatorTrust`/`validate_retained_group`), and the
+    /// default every OTHER caller falls back to. Deliberately does NOT
+    /// require the author to be a CURRENT writer -- only that the pin it
+    /// presents names a real, correctly-bound historical grant. A device's
+    /// legitimately-authored past history must remain valid forever even
+    /// after that device is later downgraded, revoked, or leaves the group
+    /// -- see `GroupPolicyState::author_is_writer_now`'s own doc comment for
+    /// the full reasoning. Live per-Change admission from a connected peer
+    /// must use `accepts_live_change_auth` instead, never this method.
     fn accepts_change_auth(
         &self,
         device_id: &str,
@@ -298,27 +369,25 @@ impl ChangeAuthenticator for NetmapChangeAuthenticator {
         signing_key_fingerprint: [u8; 32],
         auth: ChangeAuth,
     ) -> bool {
-        // Resolve the group's policy state through the daemon's single
-        // group-policy resolver, so inbound admission and retained-history
-        // validation fail closed on the same conditions local emission
-        // withholds on: own-verification-stale, coordinator-flagged invalid,
-        // and an already-introduced group whose verified policy has not loaded.
-        match self.state.resolve_group_policy(group_id) {
-            GroupPolicyResolution::Verified(policy) => {
-                policy.author_was_writer_at(device_id, signing_key_fingerprint, auth)
-            }
-            GroupPolicyResolution::Bootstrap => {
-                // Match DaemonState's local-change auth provider exactly: in the
-                // genuine pre-policy bootstrap window this device's own local
-                // emission is stamped PLACEHOLDER without consulting the peer
-                // writer map. Remote authors still require the existing netmap
-                // writer authorization.
-                auth == ChangeAuth::PLACEHOLDER
-                    && (device_id == self.state.device_id
-                        || self.state.peer_is_writer(device_id, group_id))
-            }
-            GroupPolicyResolution::Withhold => false,
-        }
+        self.accepts_change_auth_impl(device_id, group_id, signing_key_fingerprint, auth, false)
+    }
+
+    /// Live per-Change admission's trust boundary (`PeerSyncSession::
+    /// authenticate_incoming_change`, the only real caller). Additionally
+    /// requires the author to be a writer at THIS device's CURRENT verified
+    /// policy state, not merely at the historical point its own `ChangeAuth`
+    /// pin names -- see `GroupPolicyState::author_is_writer_now`'s own doc
+    /// comment for the exploit this closes (a downgraded/revoked device
+    /// replaying a stale, once-legitimate pin forever) and why this must
+    /// never be used for retained-history re-validation instead.
+    fn accepts_live_change_auth(
+        &self,
+        device_id: &str,
+        group_id: &str,
+        signing_key_fingerprint: [u8; 32],
+        auth: ChangeAuth,
+    ) -> bool {
+        self.accepts_change_auth_impl(device_id, group_id, signing_key_fingerprint, auth, true)
     }
 }
 

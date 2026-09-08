@@ -42,9 +42,10 @@ jobs:
         run: cargo test -p yadorilink-daemon --lib -- --test-threads=1
       - name: Public boundary checks
         run: |
+          python3 scripts/check-architecture.py --self-test
+          python3 scripts/check-architecture.py
           python3 scripts/check-block-commit-boundary.py
           python3 scripts/check-block-deletion-boundary.py
-          python3 scripts/check-daemon-application-dependencies.py
           python3 scripts/check-daemon-composition-root.py
           python3 scripts/check-data-durability-model.py
           python3 scripts/check-index-read-fail-closed.py
@@ -54,17 +55,6 @@ jobs:
           python3 scripts/check-maintenance-ownership.py
           python3 scripts/check-materialization-journal.py
           python3 scripts/check-mutation-boundary.py
-          python3 scripts/check-phase1b-application-boundary.py
-          python3 scripts/check-phase7b-engine-boundary.py
-          python3 scripts/check-phase7c-complete-wire-boundary.py
-          python3 scripts/check-phase7c-inbound-boundary.py
-          python3 scripts/check-phase7d1-domain-boundary.py
-          python3 scripts/check-phase7d2-sync-wire-boundary.py
-          python3 scripts/check-phase7d3-replica-engine-boundary.py
-          python3 scripts/check-phase7d4-sqlite-runtime-boundary.py
-          python3 scripts/check-phase7d5-sync-sqlite-boundary.py
-          python3 scripts/check-phase7d6-peer-session-boundary.py
-          python3 scripts/check-phase7d8-local-capture-boundary.py
           python3 scripts/check-stored-blocklist-fail-closed.py
           python3 scripts/check-pre-release-compatibility-debt.py
           bash scripts/check_removed_features.sh

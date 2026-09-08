@@ -242,6 +242,10 @@ pub trait MaterializationStatePort: Send + Sync {
     /// `PolicyUnavailable` pre-check, then a `yadorilink-sync-sqlite`
     /// repository write -- both already fold losslessly into
     /// `SyncSqliteError` (see its own `PolicyUnavailable` variant).
+    // Port trait method with many call sites workspace-wide; grouping
+    // these into a params struct would be a call-site-touching refactor
+    // well beyond a toolchain-drift lint cleanup.
+    #[allow(clippy::too_many_arguments)]
     fn mark_deleted_emitting_change(
         &self,
         group_id: &str,

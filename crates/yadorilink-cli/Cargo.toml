@@ -54,6 +54,12 @@ base64 = { version = "0.22" }
 # which mishandled IPv6 literal addresses (`http://[::1]:8787`) in an
 # earlier version of this file. Same crate `oauth2`/`google_login.rs` use.
 url = { version = "2" }
+# Renders `share invite`'s one-use URL as a terminal QR code
+# (`commands::share`'s `render_invite_qr`). `default-features = false`
+# drops the `image`/`svg`/`pic` default features entirely -- only the core
+# module-matrix + built-in char-based string renderer is needed, so no
+# image-decoding dependency tree comes along for the ride.
+qrcode = { version = "0.14", default-features = false }
 
 [dev-dependencies]
 # Test-only: integration tests seed a `ReplicaCoordinator` fixture directly

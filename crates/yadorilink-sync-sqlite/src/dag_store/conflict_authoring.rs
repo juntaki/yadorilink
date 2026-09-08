@@ -281,7 +281,7 @@ impl FrontierWalkMemo {
         conn: &Connection,
         hash: &ChangeHash,
     ) -> Result<Option<&MemoizedChange>, SyncSqliteError> {
-        if !self.changes.contains_key(&hash.0) {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.changes.entry(hash.0) {
             let entry = match get_change(conn, hash)? {
                 Some(change) => {
                     let mut touched_path_fingerprints = HashSet::with_capacity(change.ops.len());
@@ -300,7 +300,7 @@ impl FrontierWalkMemo {
                 }
                 None => None,
             };
-            self.changes.insert(hash.0, entry);
+            e.insert(entry);
         }
         Ok(self.changes.get(&hash.0).and_then(|entry| entry.as_ref()))
     }

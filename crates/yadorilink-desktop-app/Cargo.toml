@@ -68,6 +68,19 @@ yadorilink-local-storage = { path = "../yadorilink-local-storage" }
 # replacing the macOS-only `osascript` path.
 eframe = "0.29"
 rfd = "0.15"
+# The share window's on-screen QR code. Same version and same
+# `default-features = false` as `yadorilink-cli`'s own dependency (which
+# renders the terminal QR for `share invite`) -- the dropped `image`/`svg`/
+# `pic` default features are file-format renderers, and this window paints
+# the core module matrix (`QrCode::to_colors`/`width`) straight into an
+# `egui` texture instead.
+qrcode = { version = "0.14", default-features = false }
+# Percent-encodes the share window's `mailto:` subject and body per RFC
+# 3986. Deliberately not `form_urlencoded` (already reachable via `url`
+# above): that encodes a space as `+`, which several mail clients place
+# literally in the message body. Already in this workspace's dependency
+# graph as `url`'s own dependency, so this adds no new crate to the build.
+percent-encoding = "2"
 
 [target.'cfg(unix)'.dependencies]
 # Advisory file locking (`flock` under the hood) to serialize the

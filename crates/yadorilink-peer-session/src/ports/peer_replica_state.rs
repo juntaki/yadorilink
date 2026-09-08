@@ -146,7 +146,10 @@ pub enum ExactActualState {
     Object {
         kind: RecordKind,
         version: yadorilink_replica_domain::ids::VersionHash,
-        identity: Option<yadorilink_root_authority::fs_identity::FileIdentity>,
+        // Boxed to keep this variant's size close to `Absent`'s (clippy
+        // large_enum_variant): `FileIdentity` is comparatively large and
+        // only this arm carries it.
+        identity: Box<Option<yadorilink_root_authority::fs_identity::FileIdentity>>,
     },
     /// Disk holds the exact desired absence.
     Absent,

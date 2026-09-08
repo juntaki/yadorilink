@@ -18,7 +18,8 @@ use crate::traits::{BlockStore, ContentHash, GcReport, LocallyHashedBlock, Stora
 /// One bulk-ingest block's outcome: its hash, the commit outcome, an
 /// optional dirty-path to fsync, and its byte length -- see
 /// `FsBlockStore::commit_batch`'s own `results` binding.
-type BulkIngestBlockResult = Result<(ContentHash, BlockCommitOutcome, Option<PathBuf>, u64), StorageError>;
+type BulkIngestBlockResult =
+    Result<(ContentHash, BlockCommitOutcome, Option<PathBuf>, u64), StorageError>;
 
 /// Single crate-wide boundary for removing a filesystem object. Block-store
 /// deletion and materialization cleanup both pass through here so audits see

@@ -121,6 +121,50 @@ pub struct ConnectionAttemptTrace {
     pub recorded_at_unix_nanos: i64,
 }
 
+/// One LAN-discovered address this device is currently holding as a dial
+/// candidate for a peer -- the diagnostics complement to
+/// `ConnectionAttemptTrace`.
+///
+/// The two answer different halves of "why isn't my LAN peer connecting".
+/// A trace exists only once an attempt has RESOLVED, so a candidate that
+/// has been announced and accepted but has not (yet, or ever) produced a
+/// connection is invisible in the trace history; this is that candidate.
+/// Purely an observation of `peer_orchestrator`'s existing candidate
+/// cache: being listed here is a dial target and nothing more -- never
+/// authorization, and never a statement that anything was or will be
+/// dialed.
+///
+/// Redacted on the same terms as every other field in this module: the
+/// coarse address class, never the announced address itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LanDiscoveredCandidate {
+    pub peer_device_id: String,
+    /// Coarse class of the announced address (`AddressClass::as_str`).
+    /// Usually `"lan"` by construction, but derived from the actual
+    /// address rather than assumed -- a misconfigured or spoofed
+    /// announcement can carry an off-LAN address, and that is exactly the
+    /// kind of thing someone reads this surface to find out.
+    pub address_class: &'static str,
+    /// How long ago this address was last announced, from the daemon's own
+    /// monotonic clock. Bounded by
+    /// `peer_orchestrator::LAN_DISCOVERED_CANDIDATE_TTL`: an entry older
+    /// than the TTL is not reported at all, matching exactly what the dial
+    /// path would still consider usable.
+    pub last_seen_ms_ago: u64,
+    /// Whether this peer currently has ANY live session -- not necessarily
+    /// one over this candidate, and not necessarily over a LAN candidate at
+    /// all (a peer connected on a coordination-supplied address reports
+    /// `true` here while every LAN candidate it announced went unused).
+    /// Named for what it measures rather than for the question it helps
+    /// answer, because it is repeated on every one of a peer's candidate
+    /// rows and a per-candidate reading of it would be wrong.
+    ///
+    /// `false` alongside a recent `last_seen_ms_ago` is the "the peer
+    /// announced itself but we never connected" case this surface exists
+    /// for.
+    pub peer_has_any_session: bool,
+}
+
 #[derive(Default)]
 pub struct ConnectionTraceLog {
     entries: Mutex<VecDeque<ConnectionAttemptTrace>>,

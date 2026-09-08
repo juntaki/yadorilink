@@ -118,7 +118,8 @@ each user who wants the daemon running persistently runs, once:
 systemctl --user enable --now yadorilink-daemon
 ```
 
-Then, same as macOS/Windows: `yadorilink login`, `yadorilink link ...`,
+Then, same as macOS/Windows: `yadorilink login`, `yadorilink device
+register ...`, `yadorilink share create <name> --path <folder>`,
 `yadorilink status`, etc. — see the top-level README for CLI usage.
 
 ## What the package does beyond copying files
@@ -191,35 +192,85 @@ Beyond that structural check, verify the real install end to end:
 
 ## What has and hasn't been verified (as of this change)
 
-This packaging was authored and structurally exercised from a **macOS**
-development machine, which cannot run `dpkg -i`, `systemctl`, or produce
-real Linux (`x86_64-unknown-linux-gnu`) binaries — no Linux Rust target
-or cross-linker was available in that environment. What *was* actually
-run there, using `dpkg-deb` installed via `brew install dpkg` (which
-works identically on any host since it only manipulates `ar`/`tar`
-archives, not ELF binaries) and placeholder stand-in files in place of
-real Linux binaries:
+This packaging was originally authored and structurally exercised from a
+**macOS** development machine (see git history), which could not run
+`dpkg -i`, `systemctl`, or produce real Linux binaries. A later
+verification pass re-ran this package for real on a real Linux (x86_64)
+machine, closing most of that original gap:
 
-- `build-deb.sh`'s staging logic end-to-end (directory layout,
-  `install` modes, `@VERSION@`/`@ARCH@` substitution into `control`,
-  `dpkg-deb --build --root-owner-group`) — produced a structurally valid
-  `.deb`.
-- `verify-deb.sh` against that output — confirmed `dpkg-deb --info`
-  parses the control file correctly and `dpkg-deb --contents` shows the
-  expected paths and file modes (binaries `0755`, unit file `0644`).
+- `cargo build --release --workspace --exclude yadorilink-desktop-app
+  --bin yadorilink --bin yadorilink-daemon` — **succeeds**, real
+  `x86_64-unknown-linux-gnu` binaries.
+- `./build-deb.sh` end to end, including `dpkg-deb --build
+  --root-owner-group` — **produces a real, valid `.deb`** (verified with
+  `verify-deb.sh`: checksum, control fields, payload paths and modes all
+  correct).
+- `lintian` against the built `.deb` — **clean** (run via a disposable
+  Ubuntu 24.04 container, since `lintian` wasn't installed on the build
+  host either: `docker run ... ubuntu:24.04 ... lintian
+  yadorilink_<version>_amd64.deb`).
+- A real `dpkg -i`/`apt install` — **succeeds**. Exercised as part of a
+  full APT-repository acceptance test (see `installer/linux/apt/`): a
+  clean Ubuntu 24.04 container ran the archive-keyring package, `apt-get
+  update` (verified the repository's GPG signature), `apt-get install
+  yadorilink`, and confirmed `postinst` ran (`Setting up yadorilink
+  (0.1.0) ...` plus its reminder text), both binaries execute
+  (`yadorilink --version`, `yadorilink-daemon --version`), and `dpkg -s
+  yadorilink` reports `Status: install ok installed`.
+- `systemd-analyze verify /usr/lib/systemd/user/yadorilink-daemon.service`
+  against the **installed** unit (so `ExecStart`'s path actually
+  resolves) — **zero errors or warnings**.
 
-What was **not** verified, and needs a real Linux machine/VM/CI runner:
+What is still **not** verified, and needs a real Linux machine/VM with a
+live user session (a plain container has no session bus):
 
-- That `cargo build --release --workspace --exclude yadorilink-desktop-app
-  --bin yadorilink --bin yadorilink-daemon` actually succeeds on Linux.
-- That the resulting real binaries run at all, that `dpkg -i`/`apt
-  install` actually installs them, or that `postinst`/`postrm` run
-  correctly under real `dpkg`/`apt`.
-- That the systemd unit is accepted by a real `systemd --user` instance
-  (`systemd-analyze verify` isn't available on macOS either), that
-  `Restart=on-failure` actually restarts the daemon after a crash, or
-  that `WantedBy=default.target` actually autostarts it at login.
-- `lintian` output (not installed in the authoring environment).
+- `systemctl --user enable --now yadorilink-daemon` actually starting the
+  daemon, `Restart=on-failure` actually restarting it after a crash, and
+  `WantedBy=default.target` actually autostarting it at login.
+- `./uninstall.sh`'s live `systemctl --user disable --now` path (its
+  `dpkg -r` half is implicitly covered by the apt test above removing the
+  package cleanly when the container exits, but the per-user unit
+  stop/disable step needs a real session to exercise).
+
+## ARM64 status
+
+`build-deb.sh` was already structurally arm64-aware before this
+verification pass (`uname -m`'s `aarch64|arm64` case, `PKG_ARCH`
+override) — that part of
+the earlier "untested and should be treated as experimental" caveat above
+was about the *build itself* having never been run for arm64, not about
+missing code. That later verification pass actually ran it:
+
+- `cargo build --release --workspace --exclude yadorilink-desktop-app
+  --bin yadorilink --bin yadorilink-daemon` under real arm64 execution
+  (QEMU user-mode emulation via `docker run --platform linux/arm64
+  rust:1.98-bookworm`, i.e. genuinely running as an arm64 process, not
+  just cross-compiled and left unexecuted).
+- `PKG_ARCH=arm64 YADORILINK_BIN_DIR=<arm64 binaries> ./build-deb.sh`
+  against those binaries, then `dpkg-deb --info`/`--contents` on the
+  result (structural check only — this build host cannot execute an
+  arm64 ELF outside of QEMU emulation).
+- `installer/docker/Dockerfile` had a real bug caught and fixed: the
+  builder stage was pinned to `--platform=$BUILDPLATFORM` for build
+  speed, which silently produced an **amd64** binary inside the arm64
+  runtime image (a wrong-architecture binary gives "no such file or
+  directory" at container start, not "exec format error", because the
+  copied glibc dynamic linker path doesn't exist in the target image —
+  easy to miss without actually running the image). Fixed by dropping
+  that pin; see the Dockerfile's own comment. The fix was re-verified
+  against real arm64 compilation mechanics (QEMU registered, workspace
+  crates compiling for `aarch64`), but the final confirming end-to-end
+  `docker run --platform linux/arm64 ... --version` has not been
+  completed to a clean pass — see `installer/docker/README.md` for the
+  exact status. Treat the arm64 image as unverified until that run
+  completes.
+
+Not yet run on real arm64 hardware (only QEMU emulation, which proves the
+build/packaging mechanics work but not real-hardware performance or any
+QEMU-masked instruction-level issue) — treat this as "arm64 packaging is
+now exercised and works" rather than "arm64 has been through the same
+depth of manual verification as amd64" (the live systemd-session gaps
+above apply here too, and were not re-checked separately for arm64).
 
 ## Files
 

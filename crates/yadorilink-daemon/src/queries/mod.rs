@@ -37,4 +37,10 @@ pub(crate) struct QueryServices {
     pub(crate) diagnostics_bundle: Arc<diagnostics_bundle::DiagnosticsBundleQueryService>,
     pub(crate) handoff_readiness: Arc<handoff_readiness::HandoffReadinessQueryService>,
     pub(crate) update_status: Arc<update_status::UpdateStatusQueryService>,
+    /// Track Send's `inbox` command -- see `crate::send_transfer`'s own
+    /// module doc comment.
+    pub(crate) inbox: Arc<crate::send_transfer::InboxQueries>,
+    /// Folder Rewind's read-only preview -- see `crate::rewind`'s own
+    /// module doc comment.
+    pub(crate) rewind: Arc<crate::rewind::RewindQueries>,
 }

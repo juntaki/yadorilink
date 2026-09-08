@@ -671,6 +671,41 @@ pub fn install_rebootstrap_snapshot(
     rebuild_change_file_version_relations(tx, group_id)?;
     rebuild_group_heads(tx, group_id)?;
 
+    // The time-index counterpart of the head-set rebuild just above, and
+    // deliberately right after it rather than earlier in this function.
+    //
+    // Reset first, with the same whole-group scoping as the `orphan_changes`
+    // /`device_frontier` deletes and for the same reason: an installed
+    // HistoryBase replaces this group's local history outright, so every
+    // frontier snapshot recorded against the old base describes a point this
+    // device can no longer reconstruct. Left behind, those rows would be
+    // unbounded stale state naming changes that no longer exist -- and
+    // `dag_store::frontier_heads_at_or_before` would hand one back as an
+    // answer.
+    //
+    // Then re-record exactly one snapshot, because the reset alone is not a
+    // finished job: `frontier_heads_at_or_before` returns `None` when it
+    // finds no row, and its contract reads that as "this group has no
+    // admission history at or before the target". After an install that is
+    // false -- the group has a frontier, it is simply not indexed -- and it
+    // would stay false until the group's next ordinary admission.
+    //
+    // The placement is what makes the recorded row correct.
+    // `record_admission_time_index` reads `group_heads` live, so a call
+    // before `rebuild_group_heads` would capture whatever head-set the
+    // install had not finished replacing yet. That is also why the offline-
+    // branch squash's own admissions (which run before the rebuild, and do
+    // record time-index rows) are cleared here rather than preserved: they
+    // describe a head-set the rebuild then supersedes. One correct snapshot
+    // of the frontier this install actually produced -- not zero, and not a
+    // stale one.
+    tx.execute("DELETE FROM change_time_index WHERE group_id = ?1", [group_id])?;
+    crate::dag_store::record_admission_time_index(
+        tx,
+        group_id,
+        crate::dag_store::now_unix_nanos(),
+    )?;
+
     // Reconcile serving authorization against the newly-installed
     // HistoryBase. The loop above only *adds* to `file_versions`/
     // `compacted_file_version_authorization` (`INSERT OR IGNORE`),
@@ -916,6 +951,43 @@ fn replace_group_files_from_snapshot(
     };
 
     conn.execute("DELETE FROM files WHERE group_id = ?1", [group_id])?;
+    // One clock read for the whole replace: every row this install writes
+    // was admitted by this device at the same instant, because that is
+    // literally what happened -- the snapshot arrived and was applied as a
+    // unit. See `file_index::upsert_file_in_tx`'s "stamping invariant"
+    // section for why this write site has to stamp at all, and why several
+    // rows of one path sharing a stamp is safe (the reader's `version_seq
+    // DESC` tie-break resolves them to the path's current row).
+    let admitted_at_unix_nanos = crate::file_index::now_unix_nanos_checked();
+    // The same instant, recorded once more as this group's local history
+    // floor -- the boundary below which this device's own `files` history
+    // for the group no longer exists, because the DELETE above just removed
+    // it. Written from the very same clock read as the row stamps, in the
+    // same transaction, so the floor and the rows it bounds can never
+    // describe two different instants.
+    //
+    // Not derivable from the reinstalled rows themselves, which is the whole
+    // reason it is stored: they carry the SOURCE device's `version_seq`
+    // numbering, so a file created long ago and never edited arrives with
+    // `version_seq = 1` and looks, to any reader of `files` alone, exactly
+    // like a path this device first indexed at the install. See
+    // `crate::rewind_plan::classify_without_history` for the inference this
+    // exists to keep honest.
+    //
+    // A clock that cannot be read at all (before the Unix epoch) writes no
+    // floor and leaves any earlier one in place: every row this install
+    // writes is then unstamped, which the reader already reports as
+    // unanswerable on its own, and an older floor can only make an answer
+    // more conservative, never more confident.
+    //
+    // The other writer of this table is a join's own link commit
+    // (`enrollment::EnrollmentRepository::add_link_with_pending_enrollment_
+    // and_begin_setup`); both go through the one statement in
+    // `rewind_plan::record_local_history_floor` so their conflict handling
+    // cannot drift apart.
+    if let Some(admitted_at_unix_nanos) = admitted_at_unix_nanos {
+        crate::rewind_plan::record_local_history_floor(conn, group_id, admitted_at_unix_nanos)?;
+    }
     for file in files {
         let blocks_json = serde_json::to_string(&file.record.blocks)?;
         let is_live_current = file.state == SnapshotVersionState::Current && !file.record.deleted;
@@ -938,8 +1010,9 @@ fn replace_group_files_from_snapshot(
              (group_id, path, size, mtime_unix_nanos, blocks_json, deleted, \
               version_seq, state, origin_device_id, materialization_state, pinned, \
               record_kind, symlink_target, unix_mode, symlink_out_of_root, \
-              held_reason, held_since_unix_nanos) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+              held_reason, held_since_unix_nanos, admitted_at_unix_nanos) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
+                     ?18)",
             params![
                 group_id,
                 &file.record.path,
@@ -958,6 +1031,7 @@ fn replace_group_files_from_snapshot(
                 file.symlink_out_of_root as i64,
                 held_reason,
                 held_since_unix_nanos,
+                admitted_at_unix_nanos,
             ],
         )?;
     }
@@ -1380,6 +1454,11 @@ fn rebuild_change_file_version_relations(
     Ok(())
 }
 
+/// Recomputes `group_heads` for `group_id` from whatever `changes` now
+/// holds. [`install_rebootstrap_snapshot`] resets and re-records the
+/// `change_time_index` counterpart immediately after calling this, because
+/// the snapshot it records is read live from the `group_heads` rows this
+/// function writes -- see the comment at that call.
 fn rebuild_group_heads(conn: &Connection, group_id: &str) -> Result<(), SyncSqliteError> {
     conn.execute("DELETE FROM group_heads WHERE group_id = ?1", [group_id])?;
     conn.execute(
@@ -1615,5 +1694,402 @@ mod replace_group_files_from_snapshot_tests {
              itself already believed was deleted, which is not the same claim as the resurrected \
              row"
         );
+    }
+}
+
+/// The reset half of a HistoryBase install, exercised through the real
+/// [`install_rebootstrap_snapshot`] entry point rather than through its
+/// individual helpers.
+#[cfg(test)]
+mod install_rebootstrap_snapshot_tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use yadorilink_replica_domain::file::{FileRecord, RecordKind};
+    use yadorilink_replica_domain::ids::{DeviceId, FolderGroupId};
+
+    /// Full production schema in the production order (`yadorilink_sqlite_
+    /// runtime::init_schema` assumes `changes`/`pruned_changes` already
+    /// exist, per its own doc comment).
+    pub(super) fn open() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::dag_store::init_dag_schema(&conn).unwrap();
+        yadorilink_sqlite_runtime::init_schema(&conn).unwrap();
+        conn
+    }
+
+    pub(super) fn snapshot_row(
+        path: &str,
+        version_seq: i64,
+        state: SnapshotVersionState,
+        deleted: bool,
+        size: u64,
+    ) -> SnapshotFile {
+        SnapshotFile {
+            record: FileRecord {
+                path: path.to_string(),
+                size,
+                mtime_unix_nanos: 0,
+                blocks: vec![],
+                deleted,
+            },
+            version_seq,
+            state,
+            origin_device_id: Some("device-a".to_string()),
+            record_kind: RecordKind::File,
+            symlink_target: None,
+            symlink_out_of_root: false,
+            unix_mode: None,
+            xattrs: Vec::new(),
+        }
+    }
+
+    /// A minimal but genuinely valid install: real `files` rows, and an
+    /// empty checkpoint frontier so no signed frontier change has to be
+    /// fabricated for a test that is not about frontier installation.
+    pub(super) fn install(conn: &mut Connection, group_id: &str, files: Vec<SnapshotFile>) {
+        let group = FolderGroupId(group_id.to_string());
+        let snapshot =
+            RebootstrapSnapshot::new(group.clone(), files, Vec::new(), Vec::new(), Vec::new())
+                .unwrap();
+        let checkpoint = Checkpoint::new(group, Vec::new(), snapshot.snapshot_hash());
+        let manifest = SnapshotManifest::new_signed(
+            checkpoint,
+            Vec::new(),
+            None,
+            DeviceId("device-a".to_string()),
+            &SigningKey::from_bytes(&[7u8; 32]),
+        )
+        .unwrap();
+        let tx = conn.transaction().unwrap();
+        install_rebootstrap_snapshot(&tx, &manifest, &snapshot.canonical_encoding(), None, None)
+            .unwrap();
+        tx.commit().unwrap();
+    }
+
+    /// An installed HistoryBase replaces this group's local history
+    /// outright, so every frontier snapshot recorded against the old base
+    /// describes a point that can no longer be reconstructed. Left behind,
+    /// those rows are unbounded stale state naming changes that no longer
+    /// exist -- and `dag_store::frontier_heads_at_or_before` would hand one
+    /// back as an answer.
+    ///
+    /// Clearing them is only half the job, so this also pins the other
+    /// half: the install must leave behind exactly one snapshot of its own,
+    /// or the group reads as having no admission history at all until its
+    /// next ordinary admission.
+    #[test]
+    fn installing_a_history_base_clears_the_groups_stale_frontier_time_index() {
+        let mut conn = open();
+        for (group_id, admission_seq) in [("group-1", 1i64), ("group-1", 2), ("other", 1)] {
+            conn.execute(
+                "INSERT INTO change_time_index \
+                 (group_id, admission_seq, observed_at_unix_nanos, heads_snapshot) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![group_id, admission_seq, admission_seq * 100, &[0xAAu8; 32][..]],
+            )
+            .unwrap();
+        }
+
+        install(
+            &mut conn,
+            "group-1",
+            vec![snapshot_row("kept.txt", 1, SnapshotVersionState::Current, false, 10)],
+        );
+
+        let count = |group_id: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM change_time_index WHERE group_id = ?1",
+                [group_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            count("group-1"),
+            1,
+            "the install must leave exactly its own snapshot behind -- neither the stale rows \
+             recorded against the replaced base, nor nothing at all"
+        );
+        let stale_snapshots: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM change_time_index \
+                 WHERE group_id = 'group-1' AND heads_snapshot = ?1",
+                [&[0xAAu8; 32][..]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stale_snapshots, 0,
+            "snapshots recorded against the replaced base must not survive the install"
+        );
+        assert_eq!(
+            count("other"),
+            1,
+            "an unrelated group's time index must not be touched by this group's install"
+        );
+    }
+
+    /// The half that a bare reset cannot cover: after an install the group
+    /// really does have a frontier, so
+    /// `dag_store::frontier_heads_at_or_before` must answer with it rather
+    /// than with `None` -- which its own contract reads as "no admission
+    /// history exists at all", a claim that would be false from the moment
+    /// the install commits until the group's next ordinary admission.
+    ///
+    /// Exercised with a NON-EMPTY frontier specifically: an empty one is
+    /// satisfied by an empty snapshot blob, which cannot tell a correctly
+    /// recorded frontier apart from a wrongly recorded one.
+    #[test]
+    fn an_install_leaves_the_time_index_answering_with_its_own_new_frontier() {
+        let mut conn = open();
+        let group = FolderGroupId("group-1".to_string());
+        let frontier_change = Change::create_signed(
+            Vec::new(),
+            0,
+            ChangeAuth::PLACEHOLDER,
+            DeviceId("device-a".to_string()),
+            group.clone(),
+            vec![Op::Delete { path: SyncPath("gone.txt".to_string()) }],
+            &SigningKey::from_bytes(&[9u8; 32]),
+        );
+        let frontier_hash = frontier_change.compute_hash();
+        let snapshot = RebootstrapSnapshot::new(
+            group.clone(),
+            vec![snapshot_row("kept.txt", 1, SnapshotVersionState::Current, false, 10)],
+            vec![frontier_change.to_wire_bytes()],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let checkpoint = Checkpoint::new(group, vec![frontier_hash], snapshot.snapshot_hash());
+        let manifest = SnapshotManifest::new_signed(
+            checkpoint,
+            Vec::new(),
+            None,
+            DeviceId("device-a".to_string()),
+            &SigningKey::from_bytes(&[7u8; 32]),
+        )
+        .unwrap();
+
+        let before_install = crate::dag_store::now_unix_nanos();
+        {
+            let tx = conn.transaction().unwrap();
+            install_rebootstrap_snapshot(
+                &tx,
+                &manifest,
+                &snapshot.canonical_encoding(),
+                None,
+                None,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        // What `group_heads` itself says, read independently of the index.
+        let real_heads: Vec<ChangeHash> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT change_hash FROM group_heads WHERE group_id = ?1 ORDER BY change_hash",
+                )
+                .unwrap();
+            let rows = stmt
+                .query_map(["group-1"], |row| {
+                    let bytes: Vec<u8> = row.get(0)?;
+                    Ok(ChangeHash(<[u8; 32]>::try_from(bytes.as_slice()).unwrap()))
+                })
+                .unwrap();
+            rows.collect::<Result<_, _>>().unwrap()
+        };
+        assert_eq!(
+            real_heads,
+            vec![frontier_hash],
+            "the install must actually produce a non-empty frontier for this to test anything"
+        );
+
+        assert_eq!(
+            crate::dag_store::frontier_heads_at_or_before(&conn, "group-1", i64::MAX).unwrap(),
+            Some(real_heads.clone()),
+            "the time index must answer with the frontier the install actually produced"
+        );
+        assert_eq!(
+            crate::dag_store::frontier_heads_at_or_before(&conn, "group-1", before_install - 1)
+                .unwrap(),
+            None,
+            "and must not claim to have observed that frontier before the install happened \
+             (one nanosecond back, so a clock too coarse to separate the two reads cannot \
+             make this pass or fail by accident)"
+        );
+    }
+
+    /// A rebootstrapped group's rewind plan must report real per-path
+    /// values. Before this install path stamped `admitted_at_unix_nanos`,
+    /// every path in the group came back `Unavailable` for every target
+    /// time until the next local write to that path -- a blanket "this
+    /// device cannot answer" about a folder whose contents it plainly
+    /// holds. This also exercises the reader's `version_seq DESC`
+    /// tie-break through the real write path: an install stamps a path's
+    /// whole retained history with one instant, so every multi-version path
+    /// here is a genuine tie.
+    #[test]
+    fn a_rebootstrapped_groups_rewind_plan_reports_real_values_not_unavailable() {
+        let mut conn = open();
+        let before_install = crate::file_index::now_unix_nanos_checked().unwrap();
+        install(
+            &mut conn,
+            "group-1",
+            vec![
+                // A compacted path: real history behind it, starting above
+                // version 1, and all three rows stamped with the install's
+                // single instant -- so every one of them is a tie.
+                snapshot_row("kept.txt", 4, SnapshotVersionState::Current, false, 40),
+                snapshot_row("kept.txt", 3, SnapshotVersionState::Superseded, false, 30),
+                snapshot_row("kept.txt", 2, SnapshotVersionState::Superseded, false, 20),
+                // A path whose whole history the snapshot carries.
+                snapshot_row("fresh.txt", 1, SnapshotVersionState::Current, false, 10),
+                // A path the snapshot itself carries as deleted.
+                snapshot_row("gone.txt", 1, SnapshotVersionState::Current, true, 0),
+            ],
+        );
+        let after_install = crate::file_index::now_unix_nanos_checked().unwrap();
+
+        let plan =
+            crate::rewind_plan::compute_rewind_plan(&conn, "group-1", after_install).unwrap();
+        let counts = plan.action_counts();
+        assert_eq!(
+            counts.unavailable, 0,
+            "a rebootstrapped group must be answerable, got {plan:?}"
+        );
+        assert_eq!(
+            counts.unchanged, 3,
+            "nothing happened between the install and the target, so nothing would change"
+        );
+        // Specifically: the multi-version path resolved to its CURRENT row,
+        // not to one of the superseded rows sharing the same stamp -- that
+        // would have reported a rollback that never happened.
+        assert!(
+            plan.entries.iter().all(|entry| matches!(
+                entry.action,
+                yadorilink_replica_domain::rewind::RewindPathAction::Unchanged
+            )),
+            "expected every path unchanged, got {plan:?}"
+        );
+
+        // The honest remaining limit, asserted so it stays honest. A target
+        // BEFORE the install is before this device's own history for the
+        // group exists at all: the install emptied `files` and reinstalled
+        // the SOURCE device's rows, complete with the source's `version_seq`
+        // numbering. So EVERY path is unanswerable that early, including the
+        // ones whose reinstalled history starts at version 1 -- for those,
+        // "version 1" means "never edited since the source device created
+        // it", which says nothing about when this device first saw the path
+        // and must not be read as "created after the target".
+        use yadorilink_replica_domain::rewind::RewindPathAction;
+        let earlier =
+            crate::rewind_plan::compute_rewind_plan(&conn, "group-1", before_install).unwrap();
+        let action = |path: &str| {
+            earlier.entries.iter().find(|entry| entry.path == path).unwrap().action.clone()
+        };
+        for path in ["kept.txt", "fresh.txt", "gone.txt"] {
+            match action(path) {
+                RewindPathAction::Unavailable { reason } => {
+                    assert!(
+                        reason.contains("re-bootstrap"),
+                        "the reason must name the real cause for {path}: {reason}"
+                    );
+                    assert!(
+                        !reason.contains("retention"),
+                        "retention cannot be the cause below the install instant, and naming it \
+                         for {path} would be a confident wrong explanation: {reason}"
+                    );
+                }
+                other => {
+                    panic!("expected Unavailable before the install for {path}, got {other:?}")
+                }
+            }
+        }
+        assert_eq!(earlier.action_counts().unavailable, 3);
+        assert_eq!(
+            earlier.action_counts().delete,
+            0,
+            "reporting a never-edited pre-install file as 'created after the target' would \
+             invent history this device never observed"
+        );
+    }
+
+    /// The exact inversion the group's local history floor exists to
+    /// prevent, and the boundary it must NOT over-apply, both through the
+    /// real install path.
+    ///
+    /// A file the source device created long ago and never edited since
+    /// arrives in the snapshot as `version_seq = 1`. Read from `files`
+    /// alone that is indistinguishable from a path this device itself first
+    /// indexed after the rewind target -- which would report `Delete`,
+    /// claiming the file was created recently, for the never-modified
+    /// majority of an ordinary folder. The install records its own instant
+    /// as the floor precisely so that reading is suspended below it.
+    #[test]
+    fn an_unmodified_file_from_before_an_install_is_unavailable_below_the_floor() {
+        let mut conn = open();
+        let before_install = crate::file_index::now_unix_nanos_checked().unwrap();
+        install(
+            &mut conn,
+            "group-1",
+            vec![snapshot_row("unmodified.txt", 1, SnapshotVersionState::Current, false, 10)],
+        );
+
+        let floor: i64 = conn
+            .query_row(
+                "SELECT floor_unix_nanos FROM group_local_history_floor WHERE group_id = ?1",
+                ["group-1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            floor >= before_install,
+            "the install must record its own instant as this group's local history floor"
+        );
+
+        // An ordinary local write after the install, at a chosen instant so
+        // the second target below can sit strictly between the two. Direct
+        // SQL for the same reason `rewind_plan`'s own tests use it: the
+        // production writer stamps the wall clock and offers no way to pick
+        // the instant (`stamps_the_local_admission_clock_at_the_write_
+        // chokepoint` covers that writer separately).
+        conn.execute(
+            "INSERT INTO files (group_id, path, version_seq, state, deleted, size, \
+                                mtime_unix_nanos, blocks_json, admitted_at_unix_nanos) \
+             VALUES ('group-1', 'typed-later.txt', 1, 'current', 0, 20, 0, '[]', ?1)",
+            params![floor + 2],
+        )
+        .unwrap();
+
+        let action = |at: i64, path: &str| {
+            crate::rewind_plan::compute_rewind_plan(&conn, "group-1", at)
+                .unwrap()
+                .entries
+                .iter()
+                .find(|entry| entry.path == path)
+                .unwrap()
+                .action
+                .clone()
+        };
+        use yadorilink_replica_domain::rewind::RewindPathAction;
+
+        // Below the floor: this device has no history of its own that early,
+        // so neither path can be classified -- least of all as `Delete`.
+        for path in ["unmodified.txt", "typed-later.txt"] {
+            assert!(
+                matches!(action(before_install, path), RewindPathAction::Unavailable { .. }),
+                "{path} must be unanswerable below the floor, got {:?}",
+                action(before_install, path)
+            );
+        }
+
+        // At or above it, the group's local history is this device's own
+        // unbroken record again and ordinary classification resumes --
+        // including the "first version admitted after the target" reading
+        // the floor suspends below itself.
+        assert_eq!(action(floor + 1, "unmodified.txt"), RewindPathAction::Unchanged);
+        assert_eq!(action(floor + 1, "typed-later.txt"), RewindPathAction::Delete);
     }
 }

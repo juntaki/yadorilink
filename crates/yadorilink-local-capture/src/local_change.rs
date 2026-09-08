@@ -84,9 +84,7 @@ fn fresh_actual_state_identity_if_unraced(
     path: &Path,
     fingerprint_before_read: Option<(u64, Option<std::time::SystemTime>, i64, i64)>,
 ) -> Option<FileIdentity> {
-    if fingerprint_before_read.is_none() {
-        return None;
-    }
+    fingerprint_before_read?;
     if disk_race_fingerprint(path) != fingerprint_before_read {
         return None;
     }
@@ -269,6 +267,15 @@ fn exact_leaf_exists_as_file_or_symlink(root: &Path, path: &str) -> bool {
 /// changed); the inner `Option<u32>` is `unix_mode_from_metadata`'s own
 /// value (itself `None` on a platform with no Unix permission-bits model).
 type PendingUnixModeUpdate = Option<Option<u32>>;
+
+/// A caller-supplied per-chunk-commit observer, threaded through a full
+/// disk scan's batched writes. Factored out (clippy type_complexity).
+type OnChunkCommitted<'a> = Option<&'a mut dyn FnMut(&[FileRecord])>;
+
+/// Per-path xattrs collected during a disk reconcile pass but not yet
+/// written: `(relative_path, xattrs)`, each xattr itself a `(name, value)`
+/// pair. Factored out (clippy type_complexity).
+type PendingXattrsBatch = Vec<(String, Vec<(String, Vec<u8>)>)>;
 
 /// What one filesystem event turned out to mean, once interpreted —
 /// `process_event`'s result.
@@ -601,7 +608,7 @@ impl LocalChangeProcessor {
     /// sufficient on its own.
     fn begin_operation(
         &self,
-    ) -> Result<yadorilink_root_authority::root_commit::LinkOperation, LocalCaptureError> {
+    ) -> Result<yadorilink_root_authority::root_commit::LinkOperation<'_>, LocalCaptureError> {
         Ok(self.root_lease.begin_operation()?)
     }
 
@@ -791,7 +798,7 @@ impl LocalChangeProcessor {
         root: &Path,
         ignore_set: &EffectiveIgnoreSet,
         emit_tombstones: bool,
-        on_chunk_committed: Option<&mut dyn FnMut(&[FileRecord])>,
+        on_chunk_committed: OnChunkCommitted<'_>,
     ) -> Result<Vec<FileRecord>, LocalCaptureError> {
         let root = self.verified_root_of_established_link(group_id, root)?;
         self.reconcile_disk_with_ignore(
@@ -1000,7 +1007,7 @@ impl LocalChangeProcessor {
         root: &VerifiedRoot,
         ignore_set: &EffectiveIgnoreSet,
         mode: ReconcileMode,
-        mut on_chunk_committed: Option<&mut dyn FnMut(&[FileRecord])>,
+        mut on_chunk_committed: OnChunkCommitted<'_>,
     ) -> Result<Vec<FileRecord>, LocalCaptureError> {
         let root = root.path();
 
@@ -1068,7 +1075,7 @@ impl LocalChangeProcessor {
         // metadata (the `build_record_for_created_or_modified` path
         // below), never dropped on the floor the way an earlier version
         // of this scan unconditionally did.
-        let mut pending_xattrs: Vec<(String, Vec<(String, Vec<u8>)>)> = Vec::new();
+        let mut pending_xattrs: PendingXattrsBatch = Vec::new();
         // `follow_links(false)` is walkdir's default, but stated
         // explicitly here — verified (not assumed) that this default is
         // what makes a symlinked directory get enumerated as a single
@@ -1585,8 +1592,8 @@ impl LocalChangeProcessor {
                 // `record.deleted` candidates ever reach a delete.
                 let mut kept_indices: Vec<usize> = Vec::with_capacity(end - start);
                 let mut kept_guards: Vec<tokio::sync::OwnedMutexGuard<()>> = Vec::new();
-                for i in start..end {
-                    if !records[i].deleted {
+                for (i, record) in records.iter().enumerate().take(end).skip(start) {
+                    if !record.deleted {
                         kept_indices.push(i);
                         continue;
                     }
@@ -1598,8 +1605,8 @@ impl LocalChangeProcessor {
                     // race the earlier one. Compiled out entirely in
                     // non-test builds.
                     #[cfg(test)]
-                    scan_test_hooks::fire_pre_chunk_commit_recheck(group_id, &records[i].path);
-                    match self.recheck_tombstone_candidate(group_id, root, &records[i].path)? {
+                    scan_test_hooks::fire_pre_chunk_commit_recheck(group_id, &record.path);
+                    match self.recheck_tombstone_candidate(group_id, root, &record.path)? {
                         Some(guard) => {
                             kept_indices.push(i);
                             kept_guards.push(guard);
@@ -1607,7 +1614,7 @@ impl LocalChangeProcessor {
                         None => {
                             tracing::info!(
                                 group_id,
-                                path = %records[i].path,
+                                path = %record.path,
                                 "live reconciliation scan's final pre-commit re-check found \
                                  this path no longer eligible for an offline-deletion \
                                  tombstone; withholding it from this chunk's commit"
@@ -3622,9 +3629,14 @@ fn is_source_path_vanished_error(e: &LocalCaptureError, path: &Path) -> bool {
 /// doc comment), but a future test targeting a different window could
 /// still want the hook to keep firing.
 #[cfg(test)]
-static RACE_AFTER_LSTAT_HOOKS: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<PathBuf, Box<dyn FnMut() -> bool + Send>>>,
-> = std::sync::OnceLock::new();
+static RACE_AFTER_LSTAT_HOOKS: std::sync::OnceLock<RaceAfterLstatHookMap> =
+    std::sync::OnceLock::new();
+
+/// Per-path armed test hooks for [`RACE_AFTER_LSTAT_HOOKS`]. Factored out
+/// (clippy type_complexity).
+#[cfg(test)]
+type RaceAfterLstatHookMap =
+    std::sync::Mutex<std::collections::HashMap<PathBuf, Box<dyn FnMut() -> bool + Send>>>;
 
 #[cfg(test)]
 fn arm_race_after_lstat_hook(path: PathBuf, f: impl FnMut() -> bool + Send + 'static) {
@@ -7065,7 +7077,7 @@ mod tests {
         // predecessor in the chain) — proving the batch's causal order
         // matches what committing each mutation sequentially would have
         // produced.
-        let mut hash = heads[0].clone();
+        let mut hash = heads[0];
         let mut seen = std::collections::HashSet::new();
         for step in 0..N {
             let change = state.sqlite().dag_get_change(&hash).unwrap().expect("change must exist");
@@ -7076,7 +7088,7 @@ mod tests {
                  into one multi-op Change"
             );
             assert!(
-                seen.insert(hash.clone()),
+                seen.insert(hash),
                 "every mutation in the batch must produce a distinct Change hash"
             );
             if step == N - 1 {
@@ -7093,7 +7105,7 @@ mod tests {
                 "each non-final Change in the chain must have exactly one parent, forming a \
                  linear chain"
             );
-            hash = change.parents[0].clone();
+            hash = change.parents[0];
         }
         assert_eq!(seen.len(), N);
     }

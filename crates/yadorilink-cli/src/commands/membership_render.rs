@@ -1,16 +1,72 @@
-//! Shared stdout/stderr rendering for `ReplicaMembershipCommandOutcome`
-//! (`device remove`, `share revoke`, `share revoke <edge-id>`) — every call
-//! site used to discard this outcome entirely (`Outcome(_) => {}`), so a
-//! `--force` removal's data-loss warning and an unknown-scope operation's
-//! "the affected scope could not be determined" warning never reached the
-//! user, even though the daemon side already computed them.
+//! Shared rendering for `ReplicaMembershipCommandOutcome` (`device remove`,
+//! `share revoke`, `share revoke <edge-id>`, and the desktop app's share
+//! window) — every call site used to discard this outcome entirely
+//! (`Outcome(_) => {}`), so a `--force` removal's data-loss warning and an
+//! unknown-scope operation's "the affected scope could not be determined"
+//! warning never reached the user, even though the daemon side already
+//! computed them.
+//!
+//! The wording lives in `membership_outcome_notices`/
+//! `membership_outcome_warnings`, which return the lines as data, so a
+//! surface with no stdout/stderr to write to (a window) shows the SAME
+//! sentences rather than paraphrasing a data-loss warning into something
+//! milder.
 
 use std::io::Write;
 
 use yadorilink_ipc_proto::daemonctl::ReplicaMembershipCommandOutcome;
 
-pub(crate) fn render_membership_outcome(action: &str, outcome: &ReplicaMembershipCommandOutcome) {
+pub fn render_membership_outcome(action: &str, outcome: &ReplicaMembershipCommandOutcome) {
     render_membership_outcome_to(action, outcome, &mut std::io::stdout(), &mut std::io::stderr());
+}
+
+/// The informational lines an outcome carries: one per completed durability
+/// handoff. Not warnings — these report work that succeeded.
+pub fn membership_outcome_notices(outcome: &ReplicaMembershipCommandOutcome) -> Vec<String> {
+    outcome
+        .handoffs
+        .iter()
+        .map(|handoff| {
+            format!(
+                "handoff completed: group={} target={} generation={} lease={}",
+                handoff.group_id,
+                handoff.target_device_id,
+                handoff.membership_generation,
+                handoff.lease_id,
+            )
+        })
+        .collect()
+}
+
+/// The warnings an outcome carries: a forced operation's data-loss warning,
+/// and the harder one for an operation forced before its affected folder
+/// groups could even be determined. Empty for an ordinary, non-forced
+/// outcome — which is the common case, and must stay silent.
+///
+/// `action` names the operation in the text ("remove", "revoke"), since the
+/// same outcome shape is produced by several commands.
+pub fn membership_outcome_warnings(
+    action: &str,
+    outcome: &ReplicaMembershipCommandOutcome,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if !outcome.forced_group_ids.is_empty() {
+        warnings.push(format!(
+            "warning: forced {action} without confirmed durability for: {}. This may \
+             permanently lose data.",
+            outcome.forced_group_ids.join(", ")
+        ));
+    }
+    if !outcome.unknown_scope_operation_id.is_empty() {
+        warnings.push(format!(
+            "warning: {action} was forced before the affected folder groups could be \
+             determined. The possible data-loss scope is unknown.\n\
+             Recovery operation: {}\n\
+             Sync status will remain degraded until reconciliation completes.",
+            outcome.unknown_scope_operation_id
+        ));
+    }
+    warnings
 }
 
 /// Testable core: writes to the given sinks instead of the real
@@ -21,33 +77,11 @@ fn render_membership_outcome_to(
     out: &mut impl Write,
     err: &mut impl Write,
 ) {
-    for handoff in &outcome.handoffs {
-        let _ = writeln!(
-            out,
-            "handoff completed: group={} target={} generation={} lease={}",
-            handoff.group_id,
-            handoff.target_device_id,
-            handoff.membership_generation,
-            handoff.lease_id,
-        );
+    for notice in membership_outcome_notices(outcome) {
+        let _ = writeln!(out, "{notice}");
     }
-    if !outcome.forced_group_ids.is_empty() {
-        let _ = writeln!(
-            err,
-            "warning: forced {action} without confirmed durability for: {}. This may \
-             permanently lose data.",
-            outcome.forced_group_ids.join(", ")
-        );
-    }
-    if !outcome.unknown_scope_operation_id.is_empty() {
-        let _ = writeln!(
-            err,
-            "warning: {action} was forced before the affected folder groups could be \
-             determined. The possible data-loss scope is unknown.\n\
-             Recovery operation: {}\n\
-             Sync status will remain degraded until reconciliation completes.",
-            outcome.unknown_scope_operation_id
-        );
+    for warning in membership_outcome_warnings(action, outcome) {
+        let _ = writeln!(err, "{warning}");
     }
 }
 

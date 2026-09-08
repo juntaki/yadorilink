@@ -435,6 +435,26 @@ pub(crate) struct DirectPeerRoute {
     channel: Arc<yadorilink_transport::QuicPeerChannel>,
 }
 
+/// One Track Send grant-derived peer -- see `DaemonState::send_grant_peers`'s
+/// own field doc comment. `grant_id`/`nonce` let a caller cross-check an
+/// inbound offer's OWN claimed grant against what this device was actually
+/// told (by its own `request_grant` response, or the coordination plane's
+/// push) to expect from `signing_key`, before ever spending a coordination-
+/// plane round trip on an obviously-wrong one -- defense in depth, not the
+/// load-bearing check: the Worker's own atomic `consumeSendAuthorization`
+/// guard is what actually decides, and `device_id` here (never anything an
+/// offer's payload claims) is what makes that call's `senderDeviceId`
+/// trustworthy in the first place.
+#[derive(Debug, Clone)]
+pub struct SendGrantPeer {
+    pub device_id: String,
+    pub signing_key: [u8; 32],
+    pub candidate_addresses: Vec<std::net::SocketAddr>,
+    pub grant_id: String,
+    pub nonce: String,
+    pub expires_at_unix: i64,
+}
+
 pub struct DaemonState {
     pub device_id: String,
     /// Phase 7D-10.9: this is now the ONLY replica/DAG/materialization
@@ -488,6 +508,89 @@ pub struct DaemonState {
     /// first use in production; the deterministic-simulation harness sets a
     /// pre-bound one via [`set_shared_socket`](DaemonState::set_shared_socket).
     pub shared_socket: tokio::sync::OnceCell<Arc<yadorilink_transport::TransportHub>>,
+    /// The device's one `QuicPeerEndpoint`, published here once
+    /// `peer_orchestrator::ensure_quic_endpoint` has built it -- mirrors
+    /// `shared_socket` immediately above in every respect (same `OnceCell`
+    /// shape, same "bound/built lazily, readable by anyone once it
+    /// exists" contract), but for the endpoint layered on that socket
+    /// rather than the socket itself.
+    ///
+    /// Track Send (see `crate::send_transfer`) is the reason this exists:
+    /// it is a wholly separate protocol on the SAME endpoint (distinguished
+    /// by ALPN, not by a second endpoint -- a transport hub accepts exactly
+    /// one registered QUIC socket, so there is no second one to build), and
+    /// it needs a handle to dial/accept on, but it is not
+    /// `peer_orchestrator`'s own code and must not reach into that
+    /// module's private `NetmapDiffState` to get one.
+    pub shared_quic_peer_endpoint:
+        tokio::sync::OnceCell<Arc<yadorilink_transport::quic_peer_endpoint::QuicPeerEndpoint>>,
+    /// device_id -> the coordination-plane-advertised candidate addresses
+    /// `peer_orchestrator` most recently learned for that peer, published
+    /// on every applied netmap push (see `record_peer_candidate_addresses`'s
+    /// call site) for any other daemon subsystem that needs a dial target
+    /// for an already-known device without re-deriving netmap-fed
+    /// connectivity itself. Track Send is the first such consumer: it
+    /// reuses this instead of racing its own candidate discovery, matching
+    /// this workspace's existing device-addressing rather than inventing a
+    /// second one.
+    ///
+    /// Deliberately just the netmap-advertised set, not LAN-discovered or
+    /// rendezvous-derived candidates layered on elsewhere in
+    /// `peer_orchestrator.rs` -- good enough for a one-shot transfer to an
+    /// already-paired account device, and simpler than threading every
+    /// candidate source out of a module that keeps most of them private on
+    /// purpose.
+    pub peer_candidate_addresses: Mutex<HashMap<String, Vec<std::net::SocketAddr>>>,
+    /// A read-only view of `peer_orchestrator`'s LAN-discovered candidate
+    /// cache, published by `peer_orchestrator::run` -- same `OnceCell`
+    /// shape and same reason as `shared_quic_peer_endpoint` above:
+    /// something outside that module needs to see one of its values, and
+    /// must not reach into its private `NetmapDiffState` to get it. Here
+    /// the consumer is the diagnostics read model
+    /// (`queries::diagnostics`), which reports candidates a peer has
+    /// announced but that have not produced a connection -- the half of
+    /// LAN troubleshooting `connection_trace`'s resolved-attempt history
+    /// structurally cannot show.
+    ///
+    /// Strictly observation: `LanCandidateObserver` exposes no mutation at
+    /// all, so nothing reached through this cell can change which
+    /// candidates exist or what is done with them.
+    ///
+    /// `Arc`-wrapped, unlike `shared_quic_peer_endpoint`'s bare
+    /// `OnceCell`, purely so the diagnostics query service can hold this
+    /// one cell as a narrow, cheap-clone dependency instead of the whole
+    /// `DaemonState` -- see `queries::diagnostics`'s own module doc.
+    ///
+    /// `pub(crate)`, unlike its neighbours, because the guarantee that this
+    /// view reports the same candidate set the dial path reads rests on
+    /// `peer_orchestrator::run` being the thing that publishes it. A `pub`
+    /// cell would let any holder of a `&DaemonState` win the `OnceCell`
+    /// race with a view over an unrelated map, and nothing about the type
+    /// would notice.
+    pub(crate) lan_candidate_observer:
+        Arc<tokio::sync::OnceCell<crate::peer_orchestrator::LanCandidateObserver>>,
+    /// Track Send's own service, published by `crate::send_transfer::run`
+    /// once `shared_quic_peer_endpoint` above exists -- mirrors that
+    /// field's own `OnceCell` shape/contract exactly. `None` until this
+    /// device's coordination-plane connectivity has been established at
+    /// least once; `crate::send_transfer::SendTransferService`/
+    /// `InboxQueries` report a clear "not ready yet" error for that
+    /// window rather than blocking a control-socket request on it.
+    pub send_service: tokio::sync::OnceCell<Arc<yadorilink_send::SendService>>,
+    /// Track Send grant-derived peers this device currently knows about
+    /// through the coordination plane's short-lived, sender+receiver-bound
+    /// rendezvous grant primitive -- never through ordinary netmap
+    /// membership (see `crate::send_transfer`'s own module doc comment for
+    /// the full design). Populated two ways: this device's own
+    /// `request_send_authorization` response names the RECEIVER it may now
+    /// reach, and a `"send_authorization"` push on the netmap WebSocket
+    /// subscription names a SENDER it should now expect. A plain `Vec`
+    /// rather than a `HashMap`, because the cardinality is tiny (minutes-
+    /// scale TTL, one entry per outstanding grant) and it needs to be
+    /// looked up by EITHER signing key or device id depending on the
+    /// caller -- see `record_send_grant_peer`/`send_grant_peer_by_key`/
+    /// `send_grant_peer_by_device_id`.
+    pub send_grant_peers: Mutex<Vec<SendGrantPeer>>,
     /// M3 Pass 5: the coordination plane's currently-pinned service
     /// signing key -- the SAME trust anchor `change_policy::
     /// verify_group_policy_log` uses for group policy logs, mirrored here
@@ -1342,6 +1445,11 @@ impl DaemonState {
             nat_candidates,
             nat_observations: yadorilink_transport::ObservationLog::new(),
             shared_socket: tokio::sync::OnceCell::new(),
+            shared_quic_peer_endpoint: tokio::sync::OnceCell::new(),
+            peer_candidate_addresses: Mutex::new(HashMap::new()),
+            lan_candidate_observer: Arc::new(tokio::sync::OnceCell::new()),
+            send_service: tokio::sync::OnceCell::new(),
+            send_grant_peers: Mutex::new(Vec::new()),
             pinned_coordination_service_key: Mutex::new(None),
             #[cfg(not(madsim))]
             relay_forwarder: Arc::new(crate::relay_forwarder::RelayForwarder::new()),
@@ -1436,7 +1544,47 @@ impl DaemonState {
                 // stays journaled dirty and re-emits with a real authorization
                 // context once the group's policy resolves.
                 match state.resolve_group_policy(group_id) {
-                    GroupPolicyResolution::Verified(policy) => Ok(policy.change_auth()),
+                    GroupPolicyResolution::Verified(policy) => {
+                        // A `Verified` policy alone is not enough: this
+                        // device must ITSELF currently hold Editor/Owner
+                        // role under that policy, exactly the same check
+                        // `NetmapChangeAuthenticator::accepts_change_auth`
+                        // runs for a REMOTE author (`change_auth.rs`'s
+                        // `Verified` arm). Without this, a Viewer's own
+                        // daemon would happily stamp its own local edits
+                        // with a valid-looking `ChangeAuth` and apply them
+                        // to its own local DAG head, while every remote
+                        // peer's `accepts_change_auth`/`author_was_writer_at`
+                        // correctly rejects the same Change -- silently and
+                        // permanently diverging the Viewer's local replica
+                        // from the rest of the group, with no error
+                        // surfaced anywhere. Withholding here is safe for
+                        // the identical reason the staleness cases above
+                        // are safe: the edit stays journaled dirty and
+                        // re-emits once this device is (re-)granted write
+                        // access, rather than minting a doomed-to-be-
+                        // globally-rejected local Change.
+                        //
+                        // What (if anything) surfaces this withholding to
+                        // the user -- e.g. a "not syncing, you have
+                        // view-only access" notification -- is a later
+                        // product-UX decision, not addressed here.
+                        let auth = policy.change_auth();
+                        let Some(signing_key) = state.device_signing_key() else {
+                            return Err(PolicyUnavailable);
+                        };
+                        let signing_key_fingerprint: [u8; 32] =
+                            sha2::Sha256::digest(signing_key.verifying_key().as_bytes()).into();
+                        if policy.author_was_writer_at(
+                            &state.device_id,
+                            signing_key_fingerprint,
+                            auth,
+                        ) {
+                            Ok(auth)
+                        } else {
+                            Err(PolicyUnavailable)
+                        }
+                    }
                     GroupPolicyResolution::Bootstrap => Ok(ChangeAuth::PLACEHOLDER),
                     GroupPolicyResolution::Withhold => Err(PolicyUnavailable),
                 }
@@ -1451,6 +1599,66 @@ impl DaemonState {
             // had no remaining production reader. See
             // phase7d10-exit-report.md's 7D-10.8/7D-10.9 addenda.
             state.replica_coordinator.set_local_change_auth_provider(local_change_auth_provider);
+        }
+        {
+            // The real, policy-backed orphan-promotion freshness check --
+            // see `yadorilink_sync_sqlite::ChangeHistoryRepository`'s own
+            // field doc comment for why this exists: without it, a change
+            // buffered as an orphan (its parent deliberately withheld) from
+            // a since-downgraded/revoked author could still get durably
+            // promoted later -- including after a restart, when
+            // `init_dag_schema`'s startup self-heal sweep runs with
+            // NO trust material at all and so always defers (never promotes
+            // via that path) -- on the strength of a check that was only
+            // ever run once, back when the row was originally buffered.
+            // Checked by device id alone (`is_writer_device_now`, not
+            // `author_is_writer_now`): promotion has no live wire session of
+            // its own to re-derive a signing-key fingerprint from, and the
+            // orphan's own signature/fingerprint binding was already fully
+            // verified once at original receipt time, through this exact
+            // same live-admission path (`NetmapChangeAuthenticator::
+            // accepts_live_change_auth`).
+            let weak_state = Arc::downgrade(&state);
+            let orphan_promotion_writer_check: std::sync::Arc<
+                yadorilink_sync_sqlite::dag_store::OrphanPromotionWriterCheck,
+            > = std::sync::Arc::new(move |group_id, device_id| {
+                let state = weak_state.upgrade()?;
+                match state.resolve_group_policy(group_id) {
+                    // A group `grant_role` has never touched verifies to a
+                    // genuinely empty policy chain (`Verified`, not
+                    // `Bootstrap`, but the identical genesis state -- see
+                    // `GroupPolicyState::has_no_policy_history`'s own doc
+                    // comment, and `NetmapChangeAuthenticator::
+                    // accepts_change_auth_impl`'s matching PLACEHOLDER
+                    // short-circuit for the live-admission half of this same
+                    // fix). `is_writer_device_now` would always answer
+                    // `false` here (an empty chain has no grant record for
+                    // anyone), wrongly deferring every ordinary orphan from
+                    // this group forever -- fall back to the SAME raw
+                    // netmap-membership check the Bootstrap arm below and
+                    // `local_change_auth_provider`'s own Bootstrap branch
+                    // use, rather than the role-aware chain replay, which has
+                    // nothing to replay yet.
+                    GroupPolicyResolution::Verified(policy) if policy.has_no_policy_history() => {
+                        Some(
+                            device_id == state.device_id
+                                || state.peer_is_writer(device_id, group_id),
+                        )
+                    }
+                    GroupPolicyResolution::Verified(policy) => {
+                        Some(policy.is_writer_device_now(device_id))
+                    }
+                    // No verified policy chain to check against yet (either
+                    // genuinely pre-policy, or a stale/withheld group) --
+                    // cannot positively confirm current writer status, so
+                    // defer rather than guess either way.
+                    GroupPolicyResolution::Bootstrap | GroupPolicyResolution::Withhold => None,
+                }
+            });
+            state
+                .replica_coordinator
+                .change_history_repository()
+                .set_orphan_promotion_writer_check(orphan_promotion_writer_check);
         }
         {
             let weak_state = Arc::downgrade(&state);
@@ -1490,6 +1698,26 @@ impl DaemonState {
                         GroupPolicyResolution::Verified(policy) => {
                             let writers = policy.current_writers();
                             if writers.is_empty() {
+                                // TODO(follow-up, not fixed here): this is one
+                                // of THREE inconsistent ways this codebase
+                                // currently handles "a verified policy chain
+                                // whose current writer set is empty" --
+                                // `local_change_auth_provider` above falls
+                                // through to `author_was_writer_at`'s own
+                                // empty-log special case (ALLOWS local
+                                // emission), `check_signer_authorized_for_group`
+                                // (`rebootstrap_handler.rs`) REJECTS every
+                                // signer unconditionally with no fallback at
+                                // all, and this provider instead falls back to
+                                // the netmap's role-blind member set below
+                                // (documented in place, since removing it here
+                                // would revive issue #24's group-wide failover
+                                // deadlock). Reconciling these three into one
+                                // deliberate answer is a real follow-up; this
+                                // comment exists so whoever picks it up next
+                                // does not have to rediscover the
+                                // inconsistency from scratch.
+                                //
                                 // A verified policy whose Grant chain names NO
                                 // writers is the bootstrap regime with a signed
                                 // (empty) log: the same regime in which ordinary
@@ -2080,6 +2308,79 @@ impl DaemonState {
         self.shared_socket.get().cloned()
     }
 
+    /// Publishes this device's `QuicPeerEndpoint` once
+    /// `peer_orchestrator::ensure_quic_endpoint` has built it. A no-op if
+    /// one is already published -- the endpoint is built at most once per
+    /// process (its own `OnceCell`), so every call after the first
+    /// publishes the identical `Arc`.
+    pub fn set_shared_quic_peer_endpoint(
+        &self,
+        endpoint: Arc<yadorilink_transport::quic_peer_endpoint::QuicPeerEndpoint>,
+    ) {
+        let _ = self.shared_quic_peer_endpoint.set(endpoint);
+    }
+
+    /// Publishes the diagnostics-only view of `peer_orchestrator`'s
+    /// LAN-discovered candidate cache. A no-op if one is already published
+    /// -- `peer_orchestrator::run` builds exactly one `NetmapDiffState`
+    /// per process, so every call after the first publishes the identical
+    /// view. See the field's own doc comment.
+    pub(crate) fn set_lan_candidate_observer(
+        &self,
+        observer: crate::peer_orchestrator::LanCandidateObserver,
+    ) {
+        let _ = self.lan_candidate_observer.set(observer);
+    }
+
+    /// This device's `QuicPeerEndpoint`, if `peer_orchestrator` has built
+    /// and published one yet.
+    pub fn shared_quic_peer_endpoint(
+        &self,
+    ) -> Option<Arc<yadorilink_transport::quic_peer_endpoint::QuicPeerEndpoint>> {
+        self.shared_quic_peer_endpoint.get().cloned()
+    }
+
+    /// Records the candidate addresses `peer_orchestrator` most recently
+    /// learned for `device_id` from an applied netmap push. Replaces any
+    /// prior entry outright -- the netmap push this came from is itself an
+    /// authoritative snapshot, not a delta, so a stale candidate must not
+    /// outlive the push that dropped it.
+    pub fn record_peer_candidate_addresses(
+        &self,
+        device_id: &str,
+        candidates: Vec<std::net::SocketAddr>,
+    ) {
+        self.peer_candidate_addresses
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(device_id.to_string(), candidates);
+    }
+
+    /// The candidate addresses currently on record for `device_id`, or
+    /// empty if this device has never seen a netmap entry naming one.
+    pub fn peer_candidate_addresses(&self, device_id: &str) -> Vec<std::net::SocketAddr> {
+        self.peer_candidate_addresses
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(device_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Publishes this device's Track Send service once
+    /// `crate::send_transfer::run` has built it. A no-op if one is already
+    /// published -- same one-time-per-process `OnceCell` contract as
+    /// `set_shared_quic_peer_endpoint`.
+    pub fn set_send_service(&self, service: Arc<yadorilink_send::SendService>) {
+        let _ = self.send_service.set(service);
+    }
+
+    /// This device's Track Send service, if `crate::send_transfer::run`
+    /// has built and published one yet.
+    pub fn send_service(&self) -> Option<Arc<yadorilink_send::SendService>> {
+        self.send_service.get().cloned()
+    }
+
     /// Marks `local_path` Degraded
     /// (disk-pressure), scheduling its next re-check via
     /// `BackoffConfig::DEGRADED_LINK_RECHECK` — a link already degraded has
@@ -2531,6 +2832,48 @@ impl DaemonState {
             .iter()
             .find(|(_, k)| *k == key)
             .map(|(device_id, _)| device_id.clone())
+    }
+
+    /// Removes every already-expired entry from `send_grant_peers` -- called
+    /// at the start of every read/write against it, matching
+    /// `handle_lan_announcement`'s own "TTL-pruned on every call" convention
+    /// rather than a separate sweep task. Cheap at this scale: one entry per
+    /// currently outstanding grant, minutes-scale TTL.
+    fn prune_expired_send_grant_peers(guard: &mut Vec<SendGrantPeer>) {
+        let now = now_unix();
+        guard.retain(|p| p.expires_at_unix > now);
+    }
+
+    /// Records (or, for the same signing key, replaces) a Track Send
+    /// grant-derived peer -- see `send_grant_peers`'s own field doc comment
+    /// for the two call sites this serves and why this is never a way to
+    /// reach ordinary netmap-authorized peer state.
+    pub fn record_send_grant_peer(&self, peer: SendGrantPeer) {
+        let mut guard = self.send_grant_peers.lock().unwrap_or_else(|p| p.into_inner());
+        Self::prune_expired_send_grant_peers(&mut guard);
+        guard.retain(|p| p.signing_key != peer.signing_key);
+        guard.push(peer);
+    }
+
+    /// The grant-derived peer currently on record for `signing_key`, if its
+    /// grant has not yet expired. `device_id_for_key`'s and `consume_grant`'s
+    /// own sender-identity derivation both rest on this: an authenticated
+    /// QUIC peer key is looked up here, never trusted from anything the
+    /// connection itself claims.
+    pub fn send_grant_peer_by_key(&self, signing_key: &[u8; 32]) -> Option<SendGrantPeer> {
+        let mut guard = self.send_grant_peers.lock().unwrap_or_else(|p| p.into_inner());
+        Self::prune_expired_send_grant_peers(&mut guard);
+        guard.iter().find(|p| &p.signing_key == signing_key).cloned()
+    }
+
+    /// The grant-derived peer currently on record for `device_id`, if its
+    /// grant has not yet expired -- `DaemonDeviceDirectory::resolve`'s
+    /// fallback for a `receive_transfer` pull-dial against a sender this
+    /// device has no ordinary netmap relationship with.
+    pub fn send_grant_peer_by_device_id(&self, device_id: &str) -> Option<SendGrantPeer> {
+        let mut guard = self.send_grant_peers.lock().unwrap_or_else(|p| p.into_inner());
+        Self::prune_expired_send_grant_peers(&mut guard);
+        guard.iter().find(|p| p.device_id == device_id).cloned()
     }
 
     /// Applies one peer's netmap entry as an authoritative snapshot. Every
@@ -4565,6 +4908,79 @@ impl DaemonState {
             .insert(group_id.to_string(), GroupPolicyState::placeholder_for_tests());
     }
 
+    /// Test-only seam: replaces this device's real `local_change_auth_provider`
+    /// (installed by `DaemonState::new`, see that closure's own doc comment)
+    /// with one that unconditionally stamps every local edit with the
+    /// group's current policy `ChangeAuth`, regardless of whether this
+    /// device itself currently holds Editor/Owner under that policy --
+    /// exactly the pre-fix behavior `local_change_auth_provider`'s own doc
+    /// comment describes as the bug it closes.
+    ///
+    /// Models a malicious or buggy client that bypasses ITS OWN local
+    /// emission check, for an end-to-end test that needs to prove the
+    /// SECOND, independent enforcement layer
+    /// (`NetmapChangeAuthenticator::accepts_change_auth`/
+    /// `author_was_writer_at`, on whichever peer receives the resulting
+    /// Change) also holds even when the sender's own gate is defeated.
+    /// Everything else in the pipeline this bypass sits in front of --
+    /// signing the Change with this device's real key, writing it to the
+    /// local DAG, and broadcasting it to peers over a real session --
+    /// remains genuine, unmodified production code; only this ONE device's
+    /// own local gate is swapped out, and only for a test that says so
+    /// explicitly.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn install_unconditional_local_change_auth_provider_for_test(self: &Arc<Self>) {
+        let weak_state = Arc::downgrade(self);
+        let provider: Arc<crate::replica_coordinator::LocalChangeAuthProvider> =
+            Arc::new(move |group_id| {
+                let Some(state) = weak_state.upgrade() else {
+                    return Err(PolicyUnavailable);
+                };
+                match state.resolve_group_policy(group_id) {
+                    GroupPolicyResolution::Verified(policy) => Ok(policy.change_auth()),
+                    GroupPolicyResolution::Bootstrap => Ok(ChangeAuth::PLACEHOLDER),
+                    GroupPolicyResolution::Withhold => Err(PolicyUnavailable),
+                }
+            });
+        self.replica_coordinator.set_local_change_auth_provider(provider);
+    }
+
+    /// Test-only seam: replaces this device's real `local_change_auth_
+    /// provider` with one that unconditionally stamps every local edit with
+    /// a FIXED, caller-supplied `ChangeAuth` -- regardless of the group's
+    /// actual current policy state.
+    ///
+    /// Models the REALISTIC attacker for the stale-`ChangeAuth`-replay
+    /// exploit: a still-connected device that legitimately captured a
+    /// writer-granting `ChangeAuth` stamp before it was downgraded or
+    /// revoked, and simply keeps replaying that cached, now-stale stamp on
+    /// every subsequent edit instead of fetching a fresh one -- there is no
+    /// client-side bug in doing this; nothing obligates a real client to
+    /// re-derive its `ChangeAuth` on every single local edit, and this is
+    /// exactly what a real client legitimately does today between edits.
+    ///
+    /// This is a STRONGER and more realistic attacker than
+    /// `install_unconditional_local_change_auth_provider_for_test`: that
+    /// seam still stamps with the group's CURRENT policy watermark (it only
+    /// skips this device's own local writer-role gate), which the
+    /// receiver's pre-existing `author_was_writer_at` check already rejects
+    /// on its own once this device is no longer a writer at that CURRENT
+    /// watermark -- it never actually exercises the stale-pin gap.  This
+    /// seam instead proves the receiver's LIVE-ADMISSION freshness floor
+    /// (`GroupPolicyState::author_is_writer_now`, via `NetmapChangeAuthenticator
+    /// ::accepts_live_change_auth`) is what actually closes it: a pin that
+    /// was genuinely, honestly valid at the moment it was captured, but has
+    /// since gone stale.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn install_stale_pin_local_change_auth_provider_for_test(
+        self: &Arc<Self>,
+        stale_auth: ChangeAuth,
+    ) {
+        let provider: Arc<crate::replica_coordinator::LocalChangeAuthProvider> =
+            Arc::new(move |_group_id| Ok(stale_auth));
+        self.replica_coordinator.set_local_change_auth_provider(provider);
+    }
+
     /// Whether `local_retirement_session` has ever been called for
     /// `group_id` in this process -- true the instant its one-shot,
     /// cached construction runs (see that method's own doc comment),
@@ -4998,6 +5414,272 @@ mod tests {
         let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
         let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
         DaemonState::new("device-a".into(), sync_state, store)
+    }
+
+    /// Bug 1 regression: `DaemonState::new`'s real production
+    /// `local_change_auth_provider` closure (wired via `replica_coordinator
+    /// .local_emission_auth`) must withhold a Viewer-role device's own
+    /// local edit rather than stamping it with a valid-looking `ChangeAuth`
+    /// -- the same live check `NetmapChangeAuthenticator::accepts_change_
+    /// auth` runs for a REMOTE author's Change (see `change_auth.rs`'s
+    /// `accepts_change_auth_rejects_a_viewer_and_accepts_the_same_device_
+    /// as_an_editor`, whose pattern this test mirrors from the local-
+    /// emission side). Before the fix, `local_change_auth_provider`
+    /// unconditionally returned `Ok(policy.change_auth())` for ANY
+    /// `Verified` policy regardless of the local device's own role, so a
+    /// Viewer's own daemon would happily stamp and apply its own edits
+    /// while every remote peer rejected them -- a silent, permanent local
+    /// divergence. The same device promoted to Editor at a later policy
+    /// seq must succeed.
+    #[tokio::test]
+    async fn local_change_auth_provider_withholds_a_viewers_local_edit_but_allows_an_editor() {
+        use crate::change_policy::policy_signing::grant_record;
+        use crate::change_policy::{
+            verify_group_policy_log, GroupPolicyLog, PolicyRecord, WriterRole,
+        };
+        use ed25519_dalek::SigningKey;
+
+        fn hash_of(record: &PolicyRecord) -> [u8; 32] {
+            record.record_hash.as_slice().try_into().unwrap()
+        }
+
+        let authority = SigningKey::from_bytes(&[7u8; 32]);
+        let group_id = "group-viewer";
+        // The LOCAL device's own signing key -- "device-a", matching
+        // `test_state()`'s device id, since this test is about the local
+        // emission path, not a remote peer's.
+        let device_key = SigningKey::from_bytes(&[11u8; 32]);
+        let device_fp: [u8; 32] =
+            sha2::Sha256::digest(device_key.verifying_key().to_bytes()).into();
+
+        let state = test_state();
+        state.set_device_signing_key(device_key.clone());
+
+        // device-a granted Viewer only.
+        let viewer_grant = grant_record(
+            &authority,
+            group_id,
+            1,
+            [0u8; 32],
+            "device-a",
+            device_fp,
+            WriterRole::Viewer,
+        );
+        let viewer_head = hash_of(&viewer_grant);
+        let viewer_log = GroupPolicyLog {
+            group_id: group_id.to_string(),
+            current_seq: 1,
+            current_epoch: 0,
+            policy_head: viewer_head.to_vec(),
+            records: vec![viewer_grant],
+        };
+        let viewer_policy =
+            verify_group_policy_log(&authority.verifying_key().to_bytes(), &viewer_log).unwrap();
+        state.replace_group_policy_states(HashMap::from([(group_id.to_string(), viewer_policy)]));
+
+        let viewer_result = state.replica_coordinator.local_emission_auth(group_id);
+        assert!(
+            viewer_result.is_err(),
+            "a Viewer's own local edit must be withheld, not stamped with a valid ChangeAuth; got {viewer_result:?}"
+        );
+
+        // The identical device, now granted Editor at seq 2 -- its local
+        // edit must succeed and carry the current policy watermark.
+        let editor_grant = grant_record(
+            &authority,
+            group_id,
+            2,
+            viewer_head,
+            "device-a",
+            device_fp,
+            WriterRole::Editor,
+        );
+        let editor_head = hash_of(&editor_grant);
+        let editor_log = GroupPolicyLog {
+            group_id: group_id.to_string(),
+            current_seq: 2,
+            current_epoch: 0,
+            policy_head: editor_head.to_vec(),
+            records: vec![
+                grant_record(
+                    &authority,
+                    group_id,
+                    1,
+                    [0u8; 32],
+                    "device-a",
+                    device_fp,
+                    WriterRole::Viewer,
+                ),
+                editor_grant,
+            ],
+        };
+        let editor_policy =
+            verify_group_policy_log(&authority.verifying_key().to_bytes(), &editor_log).unwrap();
+        state.replace_group_policy_states(HashMap::from([(group_id.to_string(), editor_policy)]));
+
+        let editor_result = state.replica_coordinator.local_emission_auth(group_id);
+        let auth = editor_result.expect("an Editor's own local edit must succeed");
+        assert_eq!(auth.auth_seq, 2);
+        assert_eq!(auth.policy_head_hash, editor_head);
+    }
+
+    /// Bug 2 regression: the initial-import/backfill path
+    /// (`dag_import::ensure_initial_import`/`backfill_missing_history`,
+    /// reached from `link_runtime::startup` and this type's own
+    /// `backfill_missing_change_history`) must withhold a Viewer-role
+    /// device's pre-existing local content exactly like the normal local-
+    /// edit path above -- it goes through the identical
+    /// `ReplicaCoordinator::local_emission_auth` gate
+    /// (`append_initial_import`/`append_history_backfill` both call it
+    /// before touching change history), so this is the same fix proven
+    /// against a second call site rather than a second mechanism. Before
+    /// this device's own `local_change_auth_provider` was hardened to check
+    /// `author_was_writer_at`, a Viewer's first-run disk scan (or a later
+    /// coverage-audit sweep picking up content that initial import missed)
+    /// would have been committed to this device's own signed DAG history
+    /// under a valid-looking `ChangeAuth`, even though no peer would ever
+    /// accept it -- silent, permanent local-only divergence with nothing to
+    /// reconcile it. The same content must import cleanly once the device
+    /// is promoted to Editor.
+    #[tokio::test]
+    async fn initial_import_and_backfill_withhold_a_viewers_pre_existing_content_but_allow_an_editor(
+    ) {
+        use crate::change_policy::policy_signing::grant_record;
+        use crate::change_policy::{
+            verify_group_policy_log, GroupPolicyLog, PolicyRecord, WriterRole,
+        };
+        use ed25519_dalek::SigningKey;
+        use yadorilink_replica_domain::file::BlockInfo;
+        use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
+
+        fn hash_of(record: &PolicyRecord) -> [u8; 32] {
+            record.record_hash.as_slice().try_into().unwrap()
+        }
+
+        let authority = SigningKey::from_bytes(&[7u8; 32]);
+        let group_id = "group-viewer-import";
+        let device_key = SigningKey::from_bytes(&[11u8; 32]);
+        let device_fp: [u8; 32] =
+            sha2::Sha256::digest(device_key.verifying_key().to_bytes()).into();
+
+        let state = test_state();
+        state.set_device_signing_key(device_key.clone());
+        let emitter = ChangeEmitter::new("device-a", device_key.clone());
+
+        // Pre-existing local content, indexed the way a first-run disk scan
+        // indexes it: a bare index row with no change-history behind it yet
+        // (see `dag_import`'s own module doc).
+        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .upsert_file(
+                group_id,
+                &FileRecord {
+                    path: "pre-existing.txt".into(),
+                    size: 3,
+                    mtime_unix_nanos: 1,
+                    blocks: vec![BlockInfo { hash: vec![1, 2, 3], offset: 0, size: 3 }],
+                    deleted: false,
+                },
+                &permit,
+            )
+            .unwrap();
+
+        // device-a granted Viewer only.
+        let viewer_grant = grant_record(
+            &authority,
+            group_id,
+            1,
+            [0u8; 32],
+            "device-a",
+            device_fp,
+            WriterRole::Viewer,
+        );
+        let viewer_head = hash_of(&viewer_grant);
+        let viewer_log = GroupPolicyLog {
+            group_id: group_id.to_string(),
+            current_seq: 1,
+            current_epoch: 0,
+            policy_head: viewer_head.to_vec(),
+            records: vec![viewer_grant],
+        };
+        let viewer_policy =
+            verify_group_policy_log(&authority.verifying_key().to_bytes(), &viewer_log).unwrap();
+        state.replace_group_policy_states(HashMap::from([(group_id.to_string(), viewer_policy)]));
+
+        let import_result = crate::dag_import::ensure_initial_import(
+            state.replica_coordinator.as_ref(),
+            group_id,
+            &emitter,
+        );
+        assert!(
+            matches!(import_result, Err(crate::sync_error::SyncError::PolicyUnavailable)),
+            "a Viewer's own initial import of pre-existing content must be withheld, not \
+             committed to signed history; got {import_result:?}"
+        );
+        assert!(
+            state.replica_coordinator.sqlite().dag_group_heads(group_id).unwrap().is_empty(),
+            "a Viewer's pre-existing content must never be committed to local signed DAG history"
+        );
+
+        // The mid-life coverage audit (the retry path for content initial
+        // import missed) must withhold identically, not just the one-shot
+        // path.
+        let backfill_result = crate::dag_import::backfill_missing_history(
+            state.replica_coordinator.as_ref(),
+            group_id,
+            &emitter,
+        )
+        .await;
+        assert!(
+            matches!(backfill_result, Err(crate::sync_error::SyncError::PolicyUnavailable)),
+            "a Viewer's own backfill of pre-existing content must be withheld, not committed to \
+             signed history; got {backfill_result:?}"
+        );
+        assert!(state.replica_coordinator.sqlite().dag_group_heads(group_id).unwrap().is_empty());
+
+        // The identical device, now granted Editor -- the same pre-existing
+        // content must import successfully.
+        let editor_grant = grant_record(
+            &authority,
+            group_id,
+            2,
+            viewer_head,
+            "device-a",
+            device_fp,
+            WriterRole::Editor,
+        );
+        let editor_log = GroupPolicyLog {
+            group_id: group_id.to_string(),
+            current_seq: 2,
+            current_epoch: 0,
+            policy_head: hash_of(&editor_grant).to_vec(),
+            records: vec![
+                grant_record(
+                    &authority,
+                    group_id,
+                    1,
+                    [0u8; 32],
+                    "device-a",
+                    device_fp,
+                    WriterRole::Viewer,
+                ),
+                editor_grant,
+            ],
+        };
+        let editor_policy =
+            verify_group_policy_log(&authority.verifying_key().to_bytes(), &editor_log).unwrap();
+        state.replace_group_policy_states(HashMap::from([(group_id.to_string(), editor_policy)]));
+
+        let outcome = crate::dag_import::ensure_initial_import(
+            state.replica_coordinator.as_ref(),
+            group_id,
+            &emitter,
+        )
+        .expect("an Editor's own initial import must succeed");
+        assert_eq!(outcome, crate::dag_import::ImportOutcome::Imported { changes: 1, ops: 1 });
+        assert_eq!(state.replica_coordinator.sqlite().dag_group_heads(group_id).unwrap().len(), 1);
     }
 
     /// `group_id`'s real current durability-root digest -- what a genuine

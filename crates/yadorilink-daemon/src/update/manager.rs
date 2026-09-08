@@ -16,7 +16,7 @@ use std::time::Duration;
 use super::manifest::{self, Applicability, LocalContext, ReleaseEntry};
 use super::policy::{AutoInstallMode, UpdatePolicy, UpdatePolicyStore, UpdateState};
 use super::verify::{self, CommandRunner, SystemCommandRunner};
-use super::{install_macos, install_windows};
+use super::{install_linux, install_macos, install_windows};
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum UpdateError {
@@ -91,10 +91,33 @@ impl PlatformInfo {
 #[cfg(windows)]
 fn detect_install_source() -> String {
     let exe = std::env::current_exe().unwrap_or_default();
-    install_windows::detect_install_source(&exe).as_str().to_string()
+    match install_windows::detect_install_source(&exe) {
+        install_windows::InstallSource::MicrosoftStore => {
+            install_windows::InstallSource::MicrosoftStore.as_str().to_string()
+        }
+        // The Store's MSIX path is a structural signal checked first and
+        // takes precedence; only a non-Store install can also be a WinGet
+        // one (see `install_windows::detect_package_manager_marker`'s doc
+        // comment on why WinGet needs its own installer-written marker).
+        install_windows::InstallSource::Standalone => {
+            install_windows::detect_package_manager_marker()
+                .unwrap_or_else(|| install_windows::InstallSource::Standalone.as_str().to_string())
+        }
+    }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn detect_install_source() -> String {
+    install_macos::detect_install_source()
+}
+
+#[cfg(target_os = "linux")]
+fn detect_install_source() -> String {
+    let exe = std::env::current_exe().unwrap_or_default();
+    install_linux::detect_install_source(&SystemCommandRunner, &exe)
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 fn detect_install_source() -> String {
     "standalone".to_string()
 }
@@ -557,9 +580,24 @@ impl UpdateManager {
         artifact_path: &Path,
     ) -> Result<InstallDispatchOutcome, UpdateError> {
         match self.platform_info.platform.as_str() {
-            "macos" => install_macos::install(runner, artifact_path)
-                .map(|_| InstallDispatchOutcome::HandoffLaunched)
-                .map_err(|e| UpdateError::Install(e.to_string())),
+            "macos" => {
+                // Package-manager ownership: a Homebrew Cask install (see
+                // `install_macos::HOMEBREW_MARKER_PATH`) must defer to
+                // `brew upgrade`, exactly like a Microsoft Store install
+                // defers below — launching Installer.app over a
+                // brew-tracked install would leave Homebrew's own Caskroom
+                // bookkeeping pointing at a version that no longer matches
+                // what's actually on disk.
+                if self.platform_info.install_source == "homebrew" {
+                    return Ok(InstallDispatchOutcome::StoreManaged {
+                        guidance: "this install is managed by Homebrew; run `brew upgrade --cask yadorilink` instead"
+                            .to_string(),
+                    });
+                }
+                install_macos::install(runner, artifact_path)
+                    .map(|_| InstallDispatchOutcome::HandoffLaunched)
+                    .map_err(|e| UpdateError::Install(e.to_string()))
+            }
             "windows" => {
                 let source = if self.platform_info.install_source == "microsoft_store" {
                     install_windows::InstallSource::MicrosoftStore
@@ -573,9 +611,33 @@ impl UpdateManager {
                                 .to_string(),
                     });
                 }
+                // Package-manager ownership, WinGet case: same principle as
+                // the Store branch above, gated on the installer-written
+                // registry marker (`install_windows::detect_package_manager_marker`)
+                // since a WinGet install runs this same standalone installer.
+                if self.platform_info.install_source == "winget" {
+                    return Ok(InstallDispatchOutcome::StoreManaged {
+                        guidance: "this install is managed by WinGet; run `winget upgrade yadorilink` instead"
+                            .to_string(),
+                    });
+                }
                 install_windows::install(runner, source, artifact_path)
                     .map(|_| InstallDispatchOutcome::Installed)
                     .map_err(|e| UpdateError::Install(e.to_string()))
+            }
+            "linux" => {
+                // No self-update installer exists for Linux at all yet
+                // (see `install_linux`'s module doc) -- an apt-managed
+                // install already can't be silently overwritten as a
+                // result, but this still reports the precise, actionable
+                // reason instead of a generic "unsupported platform".
+                if self.platform_info.install_source == "apt" {
+                    return Ok(InstallDispatchOutcome::StoreManaged {
+                        guidance: "this install is managed by apt; run `sudo apt update && sudo apt install --only-upgrade yadorilink` instead"
+                            .to_string(),
+                    });
+                }
+                Err(UpdateError::UnsupportedPlatform)
             }
             _ => Err(UpdateError::UnsupportedPlatform),
         }
@@ -1004,5 +1066,97 @@ mod tests {
         let outcome = manager.install_now(false).await.unwrap();
         assert_eq!(outcome, InstallDispatchOutcome::Deferred);
         assert_eq!(manager.policy.load().unwrap().state, UpdateState::Deferred);
+    }
+
+    /// Sets up a manager with a verified artifact ready to install, then
+    /// overrides its detected platform/install_source -- `dispatch_install`
+    /// is pure string matching on those two fields with no `cfg!` inside
+    /// it, so this exercises the real production dispatch path for every
+    /// platform's package-manager-deferral branch regardless of which OS
+    /// actually runs this test suite (unlike `install_linux`/`install_macos`/
+    /// `install_windows`'s own module tests, which test detection in
+    /// isolation, this proves `manager::dispatch_install` itself reacts
+    /// correctly once a source is detected).
+    fn manager_with_verified_artifact(
+        dir: &Path,
+        platform: &str,
+        install_source: &str,
+    ) -> UpdateManager {
+        let mut mgr = manager(dir);
+        mgr.platform_info.platform = platform.to_string();
+        mgr.platform_info.install_source = install_source.to_string();
+        let artifact = dir.join("update-artifact");
+        std::fs::write(&artifact, b"x").unwrap();
+        mgr.policy
+            .update(|p| {
+                p.state = UpdateState::Verified;
+                p.downloaded_artifact_path = Some(artifact.clone());
+                p.downloaded_artifact_verified = true;
+            })
+            .unwrap();
+        mgr
+    }
+
+    /// Package-manager ownership (docs/AUTOMATIC_UPDATES.md
+    /// "Package-manager-owned installs never self-update"): a Homebrew
+    /// Cask install must defer to `brew upgrade`, never launch
+    /// Installer.app itself.
+    #[tokio::test]
+    async fn dispatch_defers_to_brew_for_a_homebrew_managed_macos_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager_with_verified_artifact(dir.path(), "macos", "homebrew");
+
+        let outcome = manager.install_now(true).await.unwrap();
+        let InstallDispatchOutcome::StoreManaged { guidance } = outcome else {
+            panic!("expected StoreManaged, got {outcome:?}");
+        };
+        assert!(guidance.contains("brew upgrade --cask yadorilink"), "guidance was: {guidance}");
+    }
+
+    /// Same principle, WinGet case: a WinGet-managed Windows install must
+    /// defer to `winget upgrade`, never run its own standalone installer
+    /// (the registry-marker path `install_windows::detect_package_manager_marker`
+    /// feeds into `platform_info.install_source`).
+    #[tokio::test]
+    async fn dispatch_defers_to_winget_for_a_winget_managed_windows_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager_with_verified_artifact(dir.path(), "windows", "winget");
+
+        let outcome = manager.install_now(true).await.unwrap();
+        let InstallDispatchOutcome::StoreManaged { guidance } = outcome else {
+            panic!("expected StoreManaged, got {outcome:?}");
+        };
+        assert!(guidance.contains("winget upgrade yadorilink"), "guidance was: {guidance}");
+    }
+
+    /// Linux has no self-update installer handoff at all yet (see
+    /// `install_linux`'s module doc), so an apt-managed install must still
+    /// report the precise, actionable reason rather than a generic
+    /// "unsupported platform" error.
+    #[tokio::test]
+    async fn dispatch_defers_to_apt_for_an_apt_managed_linux_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager_with_verified_artifact(dir.path(), "linux", "apt");
+
+        let outcome = manager.install_now(true).await.unwrap();
+        let InstallDispatchOutcome::StoreManaged { guidance } = outcome else {
+            panic!("expected StoreManaged, got {outcome:?}");
+        };
+        assert!(
+            guidance.contains("apt install --only-upgrade yadorilink"),
+            "guidance was: {guidance}"
+        );
+    }
+
+    /// A non-package-manager (tarball) Linux install has no self-update
+    /// path at all -- this is pre-existing, still-correct behavior that
+    /// adding Linux `install_source` detection did not change.
+    #[tokio::test]
+    async fn dispatch_is_unsupported_for_a_standalone_linux_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager_with_verified_artifact(dir.path(), "linux", "standalone");
+
+        let result = manager.install_now(true).await;
+        assert!(matches!(result, Err(UpdateError::UnsupportedPlatform)));
     }
 }

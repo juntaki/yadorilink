@@ -223,7 +223,44 @@ use crate::error::DatabaseError;
 /// prior version bump that also documents refusing an old database as its
 /// own recovery story -- not something v25 introduces or worsens -- and is
 /// not otherwise fixed by anything in this commit.
-pub const SCHEMA_VERSION: i32 = 25;
+/// Version 26 adds `files.admitted_at_unix_nanos` -- see that column's own
+/// migration comment for what it records and why it must not be derived
+/// from `mtime_unix_nanos`. Purely additive and NULLable with no default,
+/// the same shape as v24's `xattrs_json`, so like that version it genuinely
+/// could have been read forward from a v25 database; this codebase's stated
+/// no-compat-path policy (see this function's own doc comment) applies
+/// uniformly to every version bump rather than case-by-case, so a v25
+/// database is still refused at open.
+/// Version 27 adds `group_local_history_floor` -- see that table's own
+/// comment for what it records. Purely additive, so a bare `CREATE TABLE IF
+/// NOT EXISTS` is the whole migration; the version is still bumped, not left
+/// implicit, for the reason version 11 gives and one more specific to this
+/// table. A v26 database can have crossed a re-bootstrap boundary already,
+/// and the row recording where that boundary was is exactly what was never
+/// written -- absence is indistinguishable from "this group's local history
+/// was never replaced", so the rewind planning layer would read an old
+/// database as continuous back to its first version and answer confidently
+/// about a stretch of time it never actually observed. There is no honest
+/// backfill for that (the evidence was deleted by the install itself), so
+/// the same refuse-at-open policy every version above relies on is what
+/// closes it here too.
+/// Version 28 changes no table shape at all -- `group_local_history_floor`
+/// keeps exactly the columns v27 gave it. What changed is WHEN a row gets
+/// written: v27 wrote one only for a re-bootstrap install, and v28 also
+/// writes one when this device links a group it did not originate, which is
+/// the far more common way a device ends up holding `files` rows whose
+/// `version_seq` numbering is not its own history (see that table's own
+/// comment). The version is bumped anyway, for exactly the reason v27 gives
+/// about a v26 database: a v27 database can already have joined a group, the
+/// row recording where that join was is precisely what was never written,
+/// and absence is indistinguishable from "this device originated the folder
+/// itself" -- so the rewind planning layer would read it as continuous back
+/// to each path's first version and answer confidently about a stretch of
+/// time it never observed. There is no honest backfill: `links` records no
+/// timestamp of its own, and the enrollment marker that carried the
+/// create-vs-join distinction is deleted once the enrollment settles. The
+/// same refuse-at-open policy closes it.
+pub const SCHEMA_VERSION: i32 = 28;
 
 /// Reads `PRAGMA user_version` and
 /// errors if it's newer than this binary's [`SCHEMA_VERSION`] — an older
@@ -620,6 +657,51 @@ pub fn init_schema(conn: &Connection) -> Result<(), DatabaseError> {
             refused_at_unix_nanos INTEGER NOT NULL,
             PRIMARY KEY (group_id, path, version_hash, peer_device_id)
         );
+
+        -- The instant this device's own *continuous* local file history for
+        -- a group begins, when that history started somewhere other than at
+        -- this device's own first sight of each path. Two events write it,
+        -- each at the moment it happens:
+        --
+        --   * LINKING a group this device did not originate and holds no
+        --     files for yet -- both link commits that can name such a group
+        --     (`add_link_with_pending_enrollment_and_begin_setup` with a
+        --     `Join` marker, and the marker-less `add_link` behind
+        --     `share accept`/`yadorilink link`). Every path the group
+        --     already holds arrives afterwards, and `upsert_file_in_tx`
+        --     numbers a path it is seeing for the first time from
+        --     `version_seq = 1` however much history that path already has
+        --     elsewhere.
+        --   * a re-bootstrap snapshot install
+        --     (`replace_group_files_from_snapshot`), which deletes every
+        --     `files` row for the group and reinstalls the snapshot's rows
+        --     carrying the SOURCE device's `version_seq` numbering.
+        --
+        -- After either, a row's `version_seq` says nothing about when THIS
+        -- device first saw the path.
+        --
+        -- Read only by the rewind planning layer, which needs it to tell the
+        -- two cases apart: below this instant its own `version_seq` evidence
+        -- describes someone else's history and cannot be reasoned from, so
+        -- the honest answer for a target that early is "no answer here"
+        -- rather than an inference. At or above it, the group's local
+        -- history is this device's own unbroken record and the inference is
+        -- sound. No row means this device originated the group locally and
+        -- has never re-bootstrapped it, so its history really does run back
+        -- to each path's own first version.
+        --
+        -- One row per group, overwritten (never accumulated) by each such
+        -- event, because only the most recent one bounds the history that
+        -- actually survives. Deliberately stores the instant alone and not
+        -- which event set it: the reader states both possible causes rather
+        -- than committing to one, and a stored cause would be one more thing
+        -- to keep true. A new additive table, so a bare `CREATE TABLE IF NOT
+        -- EXISTS` is the whole migration, like `group_policy_watermark`
+        -- above.
+        CREATE TABLE IF NOT EXISTS group_local_history_floor (
+            group_id         TEXT PRIMARY KEY,
+            floor_unix_nanos INTEGER NOT NULL
+        );
         "#,
     )?;
     // Lightweight migrations (on-demand-sync): `CREATE TABLE IF NOT
@@ -820,6 +902,61 @@ pub fn init_schema(conn: &Connection) -> Result<(), DatabaseError> {
         // for every pre-existing row, so this needs no no-compat-path
         // refusal of its own.
         "ALTER TABLE files ADD COLUMN xattrs_json TEXT NOT NULL DEFAULT '[]'",
+        // Version 26: when THIS device admitted this exact `files` row into
+        // its index, read from this device's OWN local clock at the moment
+        // of the write. This is the ordering column Folder Rewind's
+        // read-only planning layer scans to answer "which version of each
+        // path was current at wall-clock time T" in one pass, with no DAG
+        // walk.
+        //
+        // Every statement anywhere that inserts a `files` row stamps this
+        // column -- the ordinary version write path
+        // (`file_index::upsert_file_in_tx`, all three of its branches), the
+        // two `version_seq = 0` metadata-scaffold inserts beside it, and the
+        // rebootstrap snapshot replace in
+        // `rebootstrap_store::replace_group_files_from_snapshot`. That set
+        // is enumerated, with the invariant it upholds and what depends on
+        // it, in `upsert_file_in_tx`'s own doc comment; a NULL here means
+        // only "written before this column existed", never "this writer
+        // forgot".
+        //
+        // Deliberately NOT `mtime_unix_nanos`, which is already on this
+        // table and superficially looks like it would do: `mtime` is a
+        // filesystem timestamp that travels inside a replicated
+        // `FileVersion` and therefore originates on whichever device
+        // authored the version. A peer with a skewed (or deliberately
+        // manipulated) clock could place its own writes arbitrarily far in
+        // the past or future, moving what a rewind plan believes was true
+        // at T. An admission timestamp must be this device's own
+        // observation, never untrusted replicated input -- the same
+        // reasoning `change_time_index.observed_at_unix_nanos` is built on.
+        // The two columns also mean genuinely different things: `mtime` is
+        // part of version IDENTITY (a metadata-only touch is a distinct
+        // version), while this is purely local bookkeeping and is not
+        // hashed into anything.
+        //
+        // NULLable with no default, and read back as "admission time
+        // unknown" rather than being coerced to some stand-in value. Both
+        // halves of that are deliberate:
+        //
+        //   * The blanket refuse-old-database-at-open policy above does
+        //     apply to this version like every other, so this build never
+        //     actually reads a row written before the column existed --
+        //     except in the one stale shape that gate accepts, a
+        //     `user_version = 0` database whose first-ever schema init
+        //     crashed partway. This `ALTER` exists for that case.
+        //   * Even so, the read path treats NULL as unknown and reports the
+        //     affected path as unresolvable rather than guessing. Unlike
+        //     v25's `materialization_state` default, no value here can
+        //     manufacture a trusted claim about the filesystem; the only
+        //     hazard is a fabricated ANSWER. Coercing NULL to `0` would
+        //     make an un-stamped row read as infinitely old and therefore
+        //     "already present at T" for every possible T -- a confident
+        //     wrong answer. Coercing it to "now" would hide the row from
+        //     every historical query instead. Neither is honest, and the
+        //     planning layer has an explicit "cannot answer for this path"
+        //     outcome precisely so it never has to pick one.
+        "ALTER TABLE files ADD COLUMN admitted_at_unix_nanos INTEGER",
         // `restore_operations`'s own `CREATE TABLE IF NOT EXISTS` above
         // already lists `record_kind`/`symlink_target`/`unix_mode`/
         // `symlink_out_of_root`/`xattrs_json` -- correct for a genuinely
@@ -1161,6 +1298,36 @@ mod tests {
         stub_dag_tables(&conn).expect("stub dag tables");
         init_schema(&conn).expect("init_schema");
         assert!(table_exists(&conn, "changes").unwrap());
+    }
+
+    /// `files.admitted_at_unix_nanos` (v26) lands on a fresh database and
+    /// is NULLable with no default -- both halves matter. The column's
+    /// presence is what Folder Rewind's read-only planning layer reads;
+    /// its NULLability is what lets an unstamped row be reported as
+    /// unanswerable instead of being coerced to a value that would read as
+    /// a confident (and wrong) answer. See the column's own migration
+    /// comment.
+    #[test]
+    fn admitted_at_unix_nanos_is_present_and_nullable_with_no_default() {
+        let conn = Connection::open_in_memory().expect("open");
+        stub_dag_tables(&conn).expect("stub dag tables");
+        init_schema(&conn).expect("init_schema");
+
+        let mut stmt = conn.prepare("PRAGMA table_info(files)").unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        let mut found = false;
+        while let Some(row) = rows.next().unwrap() {
+            if row.get::<_, String>(1).unwrap() == "admitted_at_unix_nanos" {
+                found = true;
+                assert_eq!(row.get::<_, i64>(3).unwrap(), 0, "must not be NOT NULL");
+                assert_eq!(
+                    row.get::<_, Option<String>>(4).unwrap(),
+                    None,
+                    "must have no column default"
+                );
+            }
+        }
+        assert!(found, "the v26 migration must add files.admitted_at_unix_nanos");
     }
 
     /// Running `init_schema` twice in a row (schema already present) must

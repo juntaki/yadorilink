@@ -576,6 +576,56 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "axum"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90"
+dependencies = [
+ "axum-core",
+ "bytes",
+ "form_urlencoded",
+ "futures-util",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "itoa",
+ "matchit",
+ "memchr",
+ "mime",
+ "percent-encoding",
+ "pin-project-lite",
+ "serde_core",
+ "serde_json",
+ "serde_path_to_error",
+ "serde_urlencoded",
+ "sync_wrapper",
+ "tokio",
+ "tower",
+ "tower-layer",
+ "tower-service",
+]
+
+[[package]]
+name = "axum-core"
+version = "0.5.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08c78f31d7b1291f7ee735c1c6780ccde7785daae9a9206026862dab7d8792d1"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "http",
+ "http-body",
+ "http-body-util",
+ "mime",
+ "pin-project-lite",
+ "sync_wrapper",
+ "tower-layer",
+ "tower-service",
+]
+
+[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3295,6 +3345,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "matchit"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
+
+[[package]]
 name = "md-5"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3351,6 +3407,12 @@ dependencies = [
  "objc",
  "paste",
 ]
+
+[[package]]
+name = "mime"
+version = "0.3.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
 name = "miniz_oxide"
@@ -4751,6 +4813,12 @@ name = "pxfm"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quick-xml"
@@ -6171,8 +6239,10 @@ dependencies = [
  "pin-project-lite",
  "sync_wrapper",
  "tokio",
+ "tokio-util",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -6187,6 +6257,7 @@ dependencies = [
  "http",
  "http-body",
  "pin-project-lite",
+ "tokio",
  "tower",
  "tower-layer",
  "tower-service",
@@ -7677,6 +7748,7 @@ dependencies = [
  "hex",
  "keyring",
  "oauth2",
+ "qrcode",
  "reqwest",
  "serde",
  "serde_json",
@@ -7738,6 +7810,7 @@ dependencies = [
  "wiremock",
  "yadorilink-daemon",
  "yadorilink-filesystem-sync",
+ "yadorilink-http-api",
  "yadorilink-ipc-proto",
  "yadorilink-local-capture",
  "yadorilink-local-storage",
@@ -7746,6 +7819,7 @@ dependencies = [
  "yadorilink-replica-engine",
  "yadorilink-reporting",
  "yadorilink-root-authority",
+ "yadorilink-send",
  "yadorilink-sqlite-runtime",
  "yadorilink-sync-sqlite",
  "yadorilink-sync-wire",
@@ -7761,6 +7835,8 @@ dependencies = [
  "fs2",
  "libc",
  "opener",
+ "percent-encoding",
+ "qrcode",
  "rfd",
  "tao",
  "tempfile",
@@ -7802,6 +7878,33 @@ dependencies = [
  "yadorilink-replica-domain",
  "yadorilink-replica-engine",
  "yadorilink-root-authority",
+]
+
+[[package]]
+name = "yadorilink-http-api"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "futures-util",
+ "hex",
+ "rand 0.10.2",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+ "windows-sys 0.59.0",
+ "yadorilink-daemon",
+ "yadorilink-http-api",
+ "yadorilink-ipc-proto",
+ "yadorilink-local-storage",
+ "yadorilink-replica-domain",
+ "yadorilink-root-authority",
+ "yadorilink-sync-sqlite",
 ]
 
 [[package]]
@@ -7956,6 +8059,31 @@ dependencies = [
  "yadorilink-daemon",
  "yadorilink-replica-domain",
  "yadorilink-root-authority",
+]
+
+[[package]]
+name = "yadorilink-send"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "hex",
+ "madsim-tokio",
+ "prost",
+ "quinn",
+ "r2d2",
+ "rusqlite",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "uuid",
+ "walkdir",
+ "yadorilink-ipc-proto",
+ "yadorilink-local-storage",
+ "yadorilink-replica-domain",
+ "yadorilink-sqlite-runtime",
+ "yadorilink-transport",
 ]
 
 [[package]]

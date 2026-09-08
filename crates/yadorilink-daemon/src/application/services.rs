@@ -28,4 +28,8 @@ pub(crate) struct ApplicationServices {
     pub(crate) reporting: Arc<ReportingCommandService>,
     pub(crate) update: Arc<UpdateCommandService>,
     pub(crate) link_lifecycle: Arc<LinkLifecycleService>,
+    /// Track Send's `send`/`receive` commands -- see `crate::send_transfer`'s
+    /// own module doc comment for why this is a thin wrapper rather than a
+    /// full ports/adapters service like the fields above.
+    pub(crate) send_transfer: Arc<crate::send_transfer::SendTransferService>,
 }

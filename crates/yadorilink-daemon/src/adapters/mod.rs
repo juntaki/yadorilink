@@ -147,6 +147,8 @@ pub(crate) fn build_application_services(state: Arc<DaemonState>) -> Arc<Applica
         runtime::update::DaemonUpdateCommandAdapter::new(state.clone()),
     )));
 
+    let send_transfer = Arc::new(crate::send_transfer::SendTransferService::new(state.clone()));
+
     Arc::new(ApplicationServices {
         enrollment,
         enrollment_recovery,
@@ -163,6 +165,7 @@ pub(crate) fn build_application_services(state: Arc<DaemonState>) -> Arc<Applica
         reporting,
         update,
         link_lifecycle,
+        send_transfer,
     })
 }
 
@@ -175,6 +178,8 @@ pub(crate) fn build_query_services(state: Arc<DaemonState>) -> Arc<QueryServices
         state.telemetry.clone(),
         state.replica_coordinator.clone(),
         state.nat_observations.clone(),
+        state.lan_candidate_observer.clone(),
+        state.peers.clone(),
     ));
     let update_status = Arc::new(crate::queries::update_status::UpdateStatusQueryService::new(
         state.update_manager.clone(),
@@ -235,6 +240,10 @@ pub(crate) fn build_query_services(state: Arc<DaemonState>) -> Arc<QueryServices
             query::handoff_readiness::DaemonHandoffReadinessReader::new(state.clone()),
         )));
 
+    let inbox = Arc::new(crate::send_transfer::InboxQueries::new(state.clone()));
+
+    let rewind = Arc::new(crate::rewind::RewindQueries::new(state.clone()));
+
     Arc::new(QueryServices {
         link_status,
         health,
@@ -248,6 +257,8 @@ pub(crate) fn build_query_services(state: Arc<DaemonState>) -> Arc<QueryServices
         diagnostics_bundle,
         handoff_readiness,
         update_status,
+        inbox,
+        rewind,
     })
 }
 

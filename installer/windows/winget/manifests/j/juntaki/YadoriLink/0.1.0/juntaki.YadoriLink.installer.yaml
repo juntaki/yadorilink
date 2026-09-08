@@ -1,0 +1,50 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.28.0.schema.json
+PackageIdentifier: juntaki.YadoriLink
+PackageVersion: 0.1.0
+InstallerLocale: en-US
+Platform:
+  - Windows.Desktop
+MinimumOSVersion: 10.0.17763.0
+InstallerType: inno
+Scope: machine
+InstallModes:
+  - interactive
+  - silent
+  - silentWithProgress
+UpgradeBehavior: install
+# installer/windows/yadorilink.iss's [Setup] PrivilegesRequired=admin:
+# this installer always elevates, so WinGet must know to prompt/elevate
+# rather than assume a per-user install.
+ElevationRequirement: elevationRequired
+# installer/windows/yadorilink.iss's fixed AppId
+# ({6F2C6E0A-6E1D-4E62-9E9C-2F7B2C9D6A31}) is what makes upgrade detection
+# stable across versions; Inno Setup's uninstall registry key name is
+# always the AppId GUID with "_is1" appended.
+ProductCode: '{6F2C6E0A-6E1D-4E62-9E9C-2F7B2C9D6A31}_is1'
+InstallerSwitches:
+  # Both switches append /PACKAGEMANAGER=winget -- installer/windows/yadorilink.iss's
+  # GetPackageManagerParam reads this and records InstallSource=winget in
+  # the registry (HKLM\Software\yadorilink) so
+  # install_windows::detect_package_manager_marker can tell the daemon's
+  # built-in updater a WinGet-managed install exists and defer to
+  # `winget upgrade` instead of running its own installer over it -- see
+  # manager::dispatch_install in
+  # crates/yadorilink-daemon/src/update/manager.rs. Set explicitly (not
+  # left to the `inno` InstallerType's built-in defaults) specifically so
+  # this flag is always present regardless of which mode WinGet picks.
+  Silent: /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /PACKAGEMANAGER=winget
+  SilentWithProgress: /SILENT /SUPPRESSMSGBOXES /NORESTART /PACKAGEMANAGER=winget
+Installers:
+  - Architecture: x64
+    # PLACEHOLDER: juntaki/yadorilink has not cut its first tagged
+    # release yet, so there is no real yadorilink-setup.exe asset or
+    # SignatureSha256 (the signed installer's Authenticode certificate
+    # thumbprint hash) to point at. See installer/windows/winget/README.md
+    # "Status" for what has to happen before this manifest can actually be
+    # submitted: a real release with a WINDOWS_CODE_SIGN_PFX-signed
+    # yadorilink-setup.exe, which does not exist yet either (see that
+    # README for the exact gap).
+    InstallerUrl: https://github.com/juntaki/yadorilink/releases/download/v0.1.0/yadorilink-setup.exe
+    InstallerSha256: "0000000000000000000000000000000000000000000000000000000000000000"
+ManifestType: installer
+ManifestVersion: 1.28.0

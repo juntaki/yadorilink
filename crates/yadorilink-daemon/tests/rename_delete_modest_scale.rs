@@ -63,7 +63,7 @@ async fn bulk_rename_and_delete_converge_at_modest_scale() {
     let store_dir_a = tempfile::tempdir().unwrap();
     let store_a = Arc::new(FsBlockStore::new(store_dir_a.path()).unwrap());
     let sync_state_a =
-        Arc::new(ReplicaCoordinator::open(&db_dir_a.path().join("index.db")).unwrap());
+        Arc::new(ReplicaCoordinator::open(db_dir_a.path().join("index.db")).unwrap());
     let state_a = DaemonState::new("device-a".to_string(), sync_state_a, store_a);
     ensure_device_signing_key(&state_a);
     let root_a = tempfile::tempdir().unwrap();
@@ -72,7 +72,7 @@ async fn bulk_rename_and_delete_converge_at_modest_scale() {
     let store_dir_b = tempfile::tempdir().unwrap();
     let store_b = Arc::new(FsBlockStore::new(store_dir_b.path()).unwrap());
     let sync_state_b =
-        Arc::new(ReplicaCoordinator::open(&db_dir_b.path().join("index.db")).unwrap());
+        Arc::new(ReplicaCoordinator::open(db_dir_b.path().join("index.db")).unwrap());
     let state_b = DaemonState::new("device-b".to_string(), sync_state_b, store_b);
     ensure_device_signing_key(&state_b);
     let root_b = tempfile::tempdir().unwrap();

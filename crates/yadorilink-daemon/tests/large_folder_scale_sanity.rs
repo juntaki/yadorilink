@@ -127,7 +127,7 @@ fn build_large_tree(root: &Path) -> Vec<String> {
         for _ in 0..FILES_PER_DIR {
             let file_name = format!("f-{file_index:07}.txt");
             std::fs::write(dir_path.join(&file_name), format!("small file {file_index}")).unwrap();
-            if file_index % 7_000 == 0 {
+            if file_index.is_multiple_of(7_000) {
                 sampled.push(format!("{dir_name}/{file_name}"));
             }
             file_index += 1;

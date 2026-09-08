@@ -462,6 +462,10 @@ impl ReplicaCoordinator {
 
     /// Upserts a single file record and emits the corresponding change,
     /// after checking local-emission authorization for `group_id`.
+    // Forwards `file_index_repository`'s own identically-shaped, widely-
+    // called port method; grouping these into a params struct is out of
+    // scope for a lint cleanup.
+    #[allow(clippy::too_many_arguments)]
     pub fn upsert_file_emitting_change(
         &self,
         group_id: &str,
@@ -518,6 +522,10 @@ impl ReplicaCoordinator {
 
     /// Marks `path` deleted and emits the corresponding change, after
     /// checking local-emission authorization for `group_id`.
+    // Forwards `file_index_repository`'s own identically-shaped, widely-
+    // called port method; grouping these into a params struct is out of
+    // scope for a lint cleanup.
+    #[allow(clippy::too_many_arguments)]
     pub fn mark_deleted_emitting_change(
         &self,
         group_id: &str,

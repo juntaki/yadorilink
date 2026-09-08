@@ -658,7 +658,6 @@ async fn established_session_replies_to_a_fresh_unacked_cluster_config() {
                 max_inflight_requests: 64,
                 max_inflight_bytes: 64 * 1024 * 1024,
                 acked_peer_cluster_config,
-                ..Default::default()
             })),
         }
         .encode_to_vec()
@@ -2832,9 +2831,8 @@ async fn version_present_query_for_an_unauthorized_group_is_refused_not_answered
             spawn_session_with_groups(channel_b, &device_b, "device-a", vec![GROUP.to_string()]);
         wait_until(|| session_a.peer_handshake_received(), Duration::from_secs(10)).await;
 
-        let present = session_a
-            .request_version_present(GROUP, "a.bin", version_hash.clone(), &blocks, true)
-            .await;
+        let present =
+            session_a.request_version_present(GROUP, "a.bin", version_hash, &blocks, true).await;
         assert!(
             present,
             "sanity: an authorized peer querying the identical durably-held version must get \
@@ -15087,7 +15085,7 @@ mod dag_convergence_authority_tests {
                 yadorilink_peer_session::ports::ExactActualState::Object {
                     kind: RecordKind::File,
                     version: loser_version.version_hash,
-                    identity: None,
+                    identity: Box::new(None),
                 },
                 fence_before_retirement,
             )
@@ -15229,7 +15227,7 @@ mod dag_convergence_authority_tests {
                         yadorilink_peer_session::ports::ExactActualState::Object {
                             kind: RecordKind::File,
                             version: version_w.version_hash,
-                            identity: None,
+                            identity: Box::new(None),
                         },
                         fence_now,
                     )
@@ -15383,7 +15381,7 @@ mod dag_convergence_authority_tests {
                 version,
                 identity,
                 mutation_generation,
-            }) => (*kind, *version, *identity, *mutation_generation),
+            }) => (*kind, *version, identity.clone(), *mutation_generation),
             other => panic!("expected plain.txt to settle as ExactObject, got {other:?}"),
         };
 
@@ -15735,7 +15733,7 @@ mod dag_convergence_authority_tests {
                 yadorilink_peer_session::ports::ExactActualState::Object {
                     kind: RecordKind::File,
                     version: version_l.version_hash,
-                    identity: None,
+                    identity: Box::new(None),
                 },
                 stale_epoch,
             )
@@ -15786,7 +15784,7 @@ mod dag_convergence_authority_tests {
                 yadorilink_peer_session::ports::ExactActualState::Object {
                     kind: RecordKind::File,
                     version: recreated_version,
-                    identity: None,
+                    identity: Box::new(None),
                 },
                 mat_epoch,
             )
@@ -15916,7 +15914,7 @@ mod dag_convergence_authority_tests {
                 yadorilink_peer_session::ports::ExactActualState::Object {
                     kind: RecordKind::File,
                     version: version_w.version_hash,
-                    identity: None,
+                    identity: Box::new(None),
                 },
                 fence_a0,
             )

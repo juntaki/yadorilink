@@ -124,6 +124,33 @@ impl WriterRole {
     }
 }
 
+/// One device this group's signed policy currently grants ANY access to --
+/// Viewer, Editor, or Owner alike. Unlike [`AuthorizedWriter`] (which
+/// [`GroupPolicyState::current_writers`]/`writers_at` narrow to Editor/Owner
+/// only), this includes Viewer-role members: a Viewer is a real group member
+/// even though its changes are never admitted as writes. `role` carries no
+/// admission authority of its own here -- `author_was_writer_at` remains the
+/// sole write-authorization check; this type exists purely to report
+/// membership and role.
+///
+/// This type and [`GroupPolicyState::current_members`] have no production
+/// consumer in this daemon today, and that is deliberate rather than an
+/// oversight: the user-facing "people with access" listing is served by the
+/// coordination plane, which folds the same policy log itself. What this
+/// fold provides is a second, independent implementation to check that one
+/// against -- see
+/// `current_members_matches_the_ts_fold_currentroles_parity_fixture`, which
+/// pins the two against one identical grant/revoke fixture. A listing that
+/// disagreed with the verifier that actually admits or rejects a device's
+/// changes would misreport exactly the state an operator relies on, so the
+/// parity reference is the point; it is not dead code awaiting a caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupMember {
+    pub device_id: String,
+    pub role: WriterRole,
+    pub signing_key_fingerprint: [u8; HASH_LEN],
+}
+
 /// Whether a Grant's bound signing-key fingerprint admits a change whose
 /// verifying key hashes to `presented_fingerprint`. A Grant records the
 /// SHA-256 fingerprint of the device's signing key so admission can confirm
@@ -260,9 +287,94 @@ impl GroupPolicyState {
         if head.record_hash != auth.policy_head_hash || head.epoch != auth.auth_epoch {
             return false;
         }
+        self.is_writer_up_to(auth.auth_seq, author, signing_key_fingerprint)
+    }
 
+    /// Whether `author` (bound to `signing_key_fingerprint`) is a writer at
+    /// THIS state's current verified position -- i.e. right now, regardless
+    /// of whatever historical policy point a Change's own `ChangeAuth` pin
+    /// claims.
+    ///
+    /// This is the freshness floor for LIVE admission of a Change arriving
+    /// fresh over the wire from a currently-connected peer:
+    /// `author_was_writer_at` alone authorizes against the pin the author
+    /// itself chose, which is real (it names an actual, once-valid record in
+    /// this chain) but says nothing about whether that grant is still in
+    /// effect. Without this check, a device downgraded or revoked after
+    /// legitimately capturing a writer-granting `ChangeAuth` could keep
+    /// stamping every subsequent Change with that stale pin indefinitely --
+    /// this receiver would keep replaying grants/revokes only up to the
+    /// pinned seq, forever seeing the old grant and never the later
+    /// downgrade/revoke that actually governs right now.
+    ///
+    /// This method must NEVER be applied to retained/historical Change
+    /// re-validation (`yadorilink_replica_engine::authenticated_history::
+    /// validate_retained_group`, reached through `NetmapChangeAuthenticator::
+    /// accepts_change_auth`): a device's legitimately-authored past history
+    /// stays valid forever even after the device is downgraded, revoked, or
+    /// leaves the group entirely -- what was validly authored stays validly
+    /// authored, exactly as `author_was_writer_at` alone already guarantees.
+    /// Applying THIS check there would retroactively invalidate that
+    /// history the moment the device's role changes, which is wrong. See
+    /// `NetmapChangeAuthenticator::accepts_live_change_auth`/
+    /// `accepts_change_auth` (`change_auth.rs`) for how the two call sites
+    /// are kept genuinely distinct.
+    pub fn author_is_writer_now(
+        &self,
+        author: &str,
+        signing_key_fingerprint: [u8; HASH_LEN],
+    ) -> bool {
+        self.is_writer_up_to(self.current_seq, author, signing_key_fingerprint)
+    }
+
+    /// Whether `device_id` is a writer at THIS state's current verified
+    /// position, checked by device id alone -- no fingerprint binding.
+    ///
+    /// Used only where the caller has no fresh signing-key-fingerprint
+    /// context of its own to check against: specifically, `dag_store::
+    /// orphan_integrity::promote_orphans`'s writer-freshness re-check for a
+    /// BUFFERED orphan at PROMOTION time, which can run long after (and with
+    /// no wire session live for) the orphan's own signature and fingerprint
+    /// binding, both already fully verified once at original receipt time
+    /// via the live-admission path this state's `author_is_writer_now`
+    /// covers. See that method's own doc comment for the live-vs-retained
+    /// distinction this shares.
+    pub fn is_writer_device_now(&self, device_id: &str) -> bool {
+        self.current_writers().iter().any(|writer| writer.device_id == device_id)
+    }
+
+    /// Whether this state's policy chain has NEVER had a single record
+    /// appended to it -- a group `grant_role` has never touched verifies to
+    /// exactly this (`current_seq: 0`, no records at all), which is
+    /// `GroupPolicyResolution::Verified`, not `Bootstrap`, but functionally
+    /// the identical genesis/no-real-policy-yet state `author_was_writer_at`'s
+    /// own `ChangeAuth::PLACEHOLDER` branch already treats it as. `current_seq`
+    /// alone is a reliable proxy for this (never nonzero without at least one
+    /// appended record; policy log entries are never pruned/compacted the way
+    /// change/DAG history is), so callers outside this module that cannot see
+    /// the private `records` map can still ask this directly -- see
+    /// `NetmapChangeAuthenticator::accepts_change_auth_impl`'s own use for why
+    /// this matters: the live-admission freshness floor must not require a
+    /// "current writer" role to exist in a chain that has never had ANY role
+    /// recorded for anyone.
+    pub fn has_no_policy_history(&self) -> bool {
+        self.current_seq == 0
+    }
+
+    /// Replays every Grant/Revoke up to (and including) `up_to_seq` and
+    /// answers whether `author` -- bound to `signing_key_fingerprint` --
+    /// holds a writer role at that point. Shared by `author_was_writer_at`
+    /// (`up_to_seq` = the author's own pinned, PRE-VALIDATED `auth_seq`) and
+    /// `author_is_writer_now` (`up_to_seq` = `self.current_seq`, always
+    /// valid for this state by construction, no separate pin check needed).
+    fn is_writer_up_to(
+        &self,
+        up_to_seq: u64,
+        author: &str,
+        signing_key_fingerprint: [u8; HASH_LEN],
+    ) -> bool {
         let mut grants: HashMap<&str, ([u8; HASH_LEN], WriterRole)> = HashMap::new();
-        for record in self.records.range(..=auth.auth_seq).map(|(_, record)| record) {
+        for record in self.records.range(..=up_to_seq).map(|(_, record)| record) {
             match &record.action {
                 PolicyAction::Grant { device_id, signing_key_fingerprint, role, .. } => {
                     grants.insert(device_id.as_str(), (*signing_key_fingerprint, *role));
@@ -343,6 +455,42 @@ impl GroupPolicyState {
             .filter(|(_, (_, role))| role.is_writer())
             .map(|(device_id, (signing_key_fingerprint, _))| AuthorizedWriter {
                 device_id: device_id.to_string(),
+                signing_key_fingerprint,
+            })
+            .collect()
+    }
+
+    /// The full group membership as of `self.current_seq` -- Viewer, Editor,
+    /// and Owner grants alike; unlike [`Self::current_writers`], a
+    /// Viewer-role grant is included here, not excluded. Serves as the
+    /// parity reference the coordination plane's own membership fold is
+    /// checked against rather than as a caller in this daemon -- see
+    /// [`GroupMember`]'s own doc comment. This is a strict superset of
+    /// [`Self::writers_up_to`]'s own fold -- the identical grants map, the
+    /// identical Grant/Revoke replay, just without that method's
+    /// `is_writer()` filter -- so it inherits that fold's correctness
+    /// rather than re-deriving it. Sorted by `device_id` (the `BTreeMap`'s
+    /// own iteration order) for the same determinism reason `writers_at`'s
+    /// own doc comment gives: any two devices that replay the same verified
+    /// chain up to the same seq compute the identical `Vec`.
+    pub fn current_members(&self) -> Vec<GroupMember> {
+        let mut grants: BTreeMap<&str, ([u8; HASH_LEN], WriterRole)> = BTreeMap::new();
+        for record in self.records.range(..=self.current_seq).map(|(_, record)| record) {
+            match &record.action {
+                PolicyAction::Grant { device_id, signing_key_fingerprint, role, .. } => {
+                    grants.insert(device_id.as_str(), (*signing_key_fingerprint, *role));
+                }
+                PolicyAction::Revoke { device_id } => {
+                    grants.remove(device_id.as_str());
+                }
+                PolicyAction::RotateAuthority { .. } => {}
+            }
+        }
+        grants
+            .into_iter()
+            .map(|(device_id, (signing_key_fingerprint, role))| GroupMember {
+                device_id: device_id.to_string(),
+                role,
                 signing_key_fingerprint,
             })
             .collect()
@@ -752,8 +900,10 @@ fn fixed<const N: usize>(bytes: &[u8], field: &str) -> Result<[u8; N], String> {
 ///
 /// In production this half lives in the coordination plane's policy service,
 /// which is the only holder of a group's authority private key; a daemon only
-/// ever verifies. It is compiled here for this module's own tests and for the
-/// deterministic simulator (`--cfg madsim`), and never in a production build.
+/// ever verifies. It is compiled here for this module's own tests, for the
+/// deterministic simulator (`--cfg madsim`), and for another crate's
+/// `feature = "test-support"` dev-dependency on this one (`cfg(test)` alone
+/// is never active for such a caller) -- never in a production build.
 ///
 /// The simulator needs it because it runs no coordination plane at all, yet a
 /// simulated daemon must still reach its verified policy the way a shipped one
@@ -762,7 +912,14 @@ fn fixed<const N: usize>(bytes: &[u8], field: &str) -> Result<[u8; N], String> {
 /// authorization check on the daemon side intact; the alternative (installing
 /// a `GroupPolicyState` into `DaemonState` directly) would simulate a daemon
 /// that no user ever runs.
-#[cfg(any(test, madsim))]
+///
+/// The `test-support` path exists for this crate's OWN full-stack
+/// integration tests (`tests/support/fake_coordination.rs`): a fake
+/// coordination plane that wants to serve a genuinely role-carrying,
+/// correctly-signed policy log over the real netmap wire format needs to
+/// sign one exactly the way a real coordination plane would, rather than
+/// hand-rolling an approximation of the preimage/hash-chain shape.
+#[cfg(any(test, madsim, feature = "test-support"))]
 pub mod policy_signing {
     use ed25519_dalek::{Signer, SigningKey};
     use sha2::{Digest, Sha256};
@@ -821,6 +978,16 @@ pub mod policy_signing {
     /// part of the signed preimage. Use [`legacy_grant_record`] instead to
     /// build a pre-role, `ACTION_GRANT`-shaped record (e.g. to test
     /// backward compatibility with already-persisted historical data).
+    ///
+    /// Epoch-0 shorthand for [`grant_record_at_epoch`]: correct only when
+    /// this Grant is appended before the group's first-ever Revoke (a Grant
+    /// never changes the epoch itself, so its own signed epoch is whatever
+    /// is already in effect). Every existing caller of this function
+    /// appends grants before any revoke, so this has always been that
+    /// value; a caller building a chain where a Grant follows a Revoke
+    /// (e.g. a live role downgrade's own re-grant at the new, lower role)
+    /// must use [`grant_record_at_epoch`] instead and pass the real current
+    /// epoch explicitly.
     #[allow(clippy::too_many_arguments)]
     pub fn grant_record(
         key: &SigningKey,
@@ -831,12 +998,34 @@ pub mod policy_signing {
         signing_key_fingerprint: [u8; HASH_LEN],
         role: WriterRole,
     ) -> PolicyRecord {
+        grant_record_at_epoch(key, group_id, seq, prev, 0, device_id, signing_key_fingerprint, role)
+    }
+
+    /// Same as [`grant_record`], but for a Grant appended when the group's
+    /// current epoch is already non-zero -- `epoch` is the record's own
+    /// signed epoch field, i.e. whatever epoch is already in effect (a
+    /// Grant never changes it). Needed to build a chain where a Grant
+    /// follows a Revoke at the same or a later point, such as the
+    /// coordination plane's own live-role-downgrade sequence (a Revoke that
+    /// bumps the epoch, immediately followed by a Grant at the new, lower
+    /// role and the SAME bumped epoch).
+    #[allow(clippy::too_many_arguments)]
+    pub fn grant_record_at_epoch(
+        key: &SigningKey,
+        group_id: &str,
+        seq: u64,
+        prev: [u8; HASH_LEN],
+        epoch: u64,
+        device_id: &str,
+        signing_key_fingerprint: [u8; HASH_LEN],
+        role: WriterRole,
+    ) -> PolicyRecord {
         signed_record(
             key,
             group_id,
             seq,
             prev,
-            0,
+            epoch,
             PolicyAction::Grant {
                 device_id: device_id.to_string(),
                 signing_key_fingerprint,
@@ -874,6 +1063,20 @@ pub mod policy_signing {
         )
     }
 
+    /// Epoch-1 shorthand for [`revoke_record_at_epoch`]: correct only for a
+    /// group's first-ever revoke (from epoch 0). Every existing internal
+    /// caller of this function is exactly that case; a caller building a
+    /// chain with more than one revoke, or a revoke that follows an earlier
+    /// one, must use [`revoke_record_at_epoch`] instead and pass the real
+    /// resulting epoch explicitly.
+    //
+    // `#[allow(dead_code)]`: under the `test-support`-only compilation this
+    // module is also reachable from (see this module's own doc comment),
+    // `cfg(test)` is false, so this crate's own `#[cfg(test)] mod tests` --
+    // this shorthand's only caller -- is absent from that build; a
+    // consuming crate's integration tests reach `revoke_record_at_epoch`
+    // directly instead.
+    #[allow(dead_code)]
     pub(super) fn revoke_record(
         key: &SigningKey,
         group_id: &str,
@@ -881,16 +1084,35 @@ pub mod policy_signing {
         prev: [u8; HASH_LEN],
         device_id: &str,
     ) -> PolicyRecord {
+        revoke_record_at_epoch(key, group_id, seq, prev, 1, device_id)
+    }
+
+    /// Same as [`revoke_record`], but `epoch` is the record's own signed
+    /// epoch field explicitly -- the epoch value AFTER this revoke applies
+    /// (always `previous_epoch + 1`, since a Revoke always bumps it). Used
+    /// by `fake_coordination.rs`'s live-role-downgrade helper, which must
+    /// compute this from whatever the group's chain-so-far actually is
+    /// rather than assume it is always the group's first revoke.
+    pub fn revoke_record_at_epoch(
+        key: &SigningKey,
+        group_id: &str,
+        seq: u64,
+        prev: [u8; HASH_LEN],
+        epoch: u64,
+        device_id: &str,
+    ) -> PolicyRecord {
         signed_record(
             key,
             group_id,
             seq,
             prev,
-            1,
+            epoch,
             PolicyAction::Revoke { device_id: device_id.to_string() },
         )
     }
 
+    // See `revoke_record`'s own `#[allow(dead_code)]` comment just above.
+    #[allow(dead_code)]
     pub(super) fn rotate_record(
         key: &SigningKey,
         group_id: &str,
@@ -977,7 +1199,10 @@ pub mod policy_signing {
 mod tests {
     use ed25519_dalek::SigningKey;
 
-    use super::policy_signing::{grant_record, legacy_grant_record, revoke_record, rotate_record};
+    use super::policy_signing::{
+        grant_record, grant_record_at_epoch, legacy_grant_record, revoke_record,
+        revoke_record_at_epoch, rotate_record,
+    };
     use super::*;
 
     fn service_key() -> SigningKey {
@@ -1843,6 +2068,147 @@ mod tests {
         );
     }
 
+    /// The mirror image of the test above: a Viewer-role grant is excluded
+    /// from the WRITER set, but it IS a group MEMBER -- `current_members()`
+    /// must surface it with `role: Viewer`, distinct from
+    /// `current_writers()`'s own exclusion. Backs the "people with access"
+    /// listing, where a Viewer is a real, visible member even though its
+    /// changes are never admitted.
+    #[test]
+    fn a_viewer_role_grant_is_a_member_but_not_a_writer() {
+        let key = service_key();
+        let group_id = "group";
+        let viewer_fp = [9u8; HASH_LEN];
+        let grant = grant_record(
+            &key,
+            group_id,
+            1,
+            ZERO_HASH,
+            "device-viewer",
+            viewer_fp,
+            WriterRole::Viewer,
+        );
+        let hash = hash_of(&grant);
+        let log = GroupPolicyLog {
+            group_id: group_id.to_string(),
+            current_seq: 1,
+            current_epoch: 0,
+            policy_head: hash.to_vec(),
+            records: vec![grant],
+        };
+        let policy = verify_group_policy_log(&key.verifying_key().to_bytes(), &log).unwrap();
+
+        assert!(
+            policy.current_writers().is_empty(),
+            "a Viewer must still be excluded from the writer set"
+        );
+        assert_eq!(
+            policy.current_members(),
+            vec![GroupMember {
+                device_id: "device-viewer".to_string(),
+                role: WriterRole::Viewer,
+                signing_key_fingerprint: viewer_fp,
+            }],
+            "a Viewer-role grant is a group member -- current_members() must include it with \
+             role Viewer"
+        );
+    }
+
+    /// Cross-implementation parity fixture: this exact grant/revoke
+    /// sequence is reproduced in `coordination-worker/test/policy.test.ts`
+    /// (`foldCurrentRoles` describe block) against the TypeScript
+    /// `foldCurrentRoles` fold, asserting an IDENTICAL role result. Exercises
+    /// every case that fold must handle the same way this one does: a
+    /// Viewer that survives to the end, an implicit-Editor legacy grant (no
+    /// role byte at all), a device that is granted then revoked (must be
+    /// absent), and an Owner grant passed through honestly rather than
+    /// coerced into Viewer/Editor.
+    ///
+    /// The Owner case pins a property of the FOLD, not a claim about which
+    /// coordination-plane routes can currently mint such a grant. This
+    /// fold's whole contract is to report what the VERIFIED policy chain
+    /// actually says, and `WriterRole::Owner` is part of the signed wire
+    /// vocabulary (`to_wire`/`from_wire`), so a chain carrying one verifies
+    /// and replays like any other regardless of what the granting side
+    /// happens to accept. Quietly folding such a record down to
+    /// Viewer/Editor would make this state disagree with the chain it was
+    /// derived from, and disagree with the coordination plane's mirror fold
+    /// -- which is exactly the divergence this fixture exists to prevent,
+    /// and is why the fixture writes the Owner record directly rather than
+    /// routing it through whatever grant path is available at any given
+    /// moment. See `GroupMember`'s own doc comment.
+    #[test]
+    fn current_members_matches_the_ts_fold_currentroles_parity_fixture() {
+        let key = service_key();
+        let group_id = "group";
+        let viewer_fp = [1u8; HASH_LEN];
+        let revoked_fp = [2u8; HASH_LEN];
+        let legacy_fp = [3u8; HASH_LEN];
+        let owner_fp = [4u8; HASH_LEN];
+
+        // The revoke is deliberately the LAST record: this crate's own
+        // `revoke_record`/`grant_record` test helpers each hard-code the
+        // epoch they sign (0 for a grant, 1 for a revoke) rather than
+        // threading the running epoch through, so a real "grant after a
+        // revoke" chain (which would need epoch to STAY at 1, not reset to
+        // 0) is outside what these particular helpers can produce -- not a
+        // constraint of `current_members`/`foldCurrentRoles` themselves.
+        let a =
+            grant_record(&key, group_id, 1, ZERO_HASH, "device-a", viewer_fp, WriterRole::Viewer);
+        let a_hash = hash_of(&a);
+        let b = grant_record(&key, group_id, 2, a_hash, "device-b", revoked_fp, WriterRole::Editor);
+        let b_hash = hash_of(&b);
+        let c = legacy_grant_record(&key, group_id, 3, b_hash, "device-c", legacy_fp);
+        let c_hash = hash_of(&c);
+        let d = grant_record(&key, group_id, 4, c_hash, "device-d", owner_fp, WriterRole::Owner);
+        let d_hash = hash_of(&d);
+        let revoke_b = revoke_record(&key, group_id, 5, d_hash, "device-b");
+        let revoke_hash = hash_of(&revoke_b);
+
+        let log = GroupPolicyLog {
+            group_id: group_id.to_string(),
+            current_seq: 5,
+            current_epoch: 1,
+            policy_head: revoke_hash.to_vec(),
+            records: vec![a, b, c, d, revoke_b],
+        };
+        let policy = verify_group_policy_log(&key.verifying_key().to_bytes(), &log).unwrap();
+
+        // current_members() is sorted by device_id (BTreeMap iteration
+        // order), so this equality also pins that ordering.
+        assert_eq!(
+            policy.current_members(),
+            vec![
+                GroupMember {
+                    device_id: "device-a".to_string(),
+                    role: WriterRole::Viewer,
+                    signing_key_fingerprint: viewer_fp,
+                },
+                GroupMember {
+                    device_id: "device-c".to_string(),
+                    role: WriterRole::Editor,
+                    signing_key_fingerprint: legacy_fp,
+                },
+                GroupMember {
+                    device_id: "device-d".to_string(),
+                    role: WriterRole::Owner,
+                    signing_key_fingerprint: owner_fp,
+                },
+            ],
+            "device-b must be excluded (revoked); device-c's legacy no-role grant must resolve \
+             to Editor; device-d's Owner grant must pass through as Owner, not be coerced"
+        );
+
+        // current_writers() is the pre-existing strict subset: Viewer
+        // excluded, Editor/Owner included.
+        let mut writers = policy.current_writers();
+        writers.sort_by(|x, y| x.device_id.cmp(&y.device_id));
+        assert_eq!(
+            writers.iter().map(|w| w.device_id.as_str()).collect::<Vec<_>>(),
+            vec!["device-c", "device-d"],
+        );
+    }
+
     /// Editor and Owner grants are both writers -- this verifier makes no
     /// distinction between them (see `WriterRole`'s own doc comment for why
     /// Owner's extra authority, if any, belongs to the signing service, not
@@ -1936,6 +2302,117 @@ mod tests {
             editor_fp,
             ChangeAuth { auth_seq: 2, auth_epoch: 1, policy_head_hash: revoke_hash }
         ));
+    }
+
+    /// A live role CHANGE (the coordination plane's downgrade mechanism) is
+    /// expressed as a chained Revoke immediately followed by a Grant for
+    /// the SAME device, at the SAME bumped epoch -- this proves the replay
+    /// this crate performs (both `current_writers`/`writers_at`'s fold and
+    /// `author_was_writer_at`'s identical fold) correctly ends up with the
+    /// device holding the NEW granted role, not stuck "revoked" and not in
+    /// any other inconsistent state. This is the exact record shape
+    /// `coordination-worker`'s downgrade endpoint produces: it was not
+    /// obvious from reading the fold alone that a same-seq-adjacent
+    /// Revoke-then-Grant pair for one device converges correctly rather
+    /// than leaving some artifact of the intermediate revoked state.
+    #[test]
+    fn a_chained_revoke_then_grant_for_the_same_device_leaves_it_holding_the_new_role_not_revoked()
+    {
+        let key = service_key();
+        let group_id = "group";
+        let fp = [3u8; HASH_LEN];
+        let original_grant =
+            grant_record(&key, group_id, 1, ZERO_HASH, "device-a", fp, WriterRole::Editor);
+        let original_hash = hash_of(&original_grant);
+        let revoke = revoke_record_at_epoch(&key, group_id, 2, original_hash, 1, "device-a");
+        let revoke_hash = hash_of(&revoke);
+        let downgrade_grant = grant_record_at_epoch(
+            &key,
+            group_id,
+            3,
+            revoke_hash,
+            1,
+            "device-a",
+            fp,
+            WriterRole::Viewer,
+        );
+        let downgrade_hash = hash_of(&downgrade_grant);
+        let log = GroupPolicyLog {
+            group_id: group_id.to_string(),
+            current_seq: 3,
+            current_epoch: 1,
+            policy_head: downgrade_hash.to_vec(),
+            records: vec![original_grant, revoke, downgrade_grant],
+        };
+        let policy = verify_group_policy_log(&key.verifying_key().to_bytes(), &log).unwrap();
+
+        // Not revoked -- still a genuine group member with a real grant.
+        // `current_writers` intentionally excludes Viewers (see its own doc
+        // comment), so its emptiness alone is ambiguous between "revoked"
+        // and "downgraded to Viewer"; `author_was_writer_at` at the FINAL
+        // seq/epoch disambiguates it directly.
+        assert!(policy.current_writers().is_empty());
+        assert!(
+            !policy.author_was_writer_at(
+                "device-a",
+                fp,
+                ChangeAuth { auth_seq: 3, auth_epoch: 1, policy_head_hash: downgrade_hash }
+            ),
+            "a Viewer-downgraded device must not be treated as a writer"
+        );
+        // The device is a Viewer, not un-granted: presenting a DIFFERENT
+        // signing key at the same final auth point is still refused (the
+        // grant's own fingerprint binding still applies), proving this is
+        // a real, checked grant record rather than "no grant at all"
+        // (which `author_was_writer_at` would also report as `false`,
+        // indistinguishably, without this second check).
+        assert!(!policy.author_was_writer_at(
+            "device-a",
+            [9u8; HASH_LEN],
+            ChangeAuth { auth_seq: 3, auth_epoch: 1, policy_head_hash: downgrade_hash }
+        ));
+
+        // Upgrading the SAME device back to Editor in the same chain
+        // converges correctly too -- the fold is not somehow "poisoned" by
+        // having passed through a Revoke.
+        let reupgrade = grant_record_at_epoch(
+            &key,
+            group_id,
+            4,
+            downgrade_hash,
+            1,
+            "device-a",
+            fp,
+            WriterRole::Editor,
+        );
+        let reupgrade_hash = hash_of(&reupgrade);
+        let reupgraded_log = GroupPolicyLog {
+            group_id: group_id.to_string(),
+            current_seq: 4,
+            current_epoch: 1,
+            policy_head: reupgrade_hash.to_vec(),
+            records: vec![
+                log.records[0].clone(),
+                log.records[1].clone(),
+                log.records[2].clone(),
+                reupgrade,
+            ],
+        };
+        let reupgraded_policy =
+            verify_group_policy_log(&key.verifying_key().to_bytes(), &reupgraded_log).unwrap();
+        assert!(reupgraded_policy.author_was_writer_at(
+            "device-a",
+            fp,
+            ChangeAuth { auth_seq: 4, auth_epoch: 1, policy_head_hash: reupgrade_hash }
+        ));
+        assert_eq!(
+            reupgraded_policy
+                .current_writers()
+                .iter()
+                .map(|w| w.device_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["device-a"]
+        );
     }
 
     /// The role is part of what gets signed: a record with its `role` field

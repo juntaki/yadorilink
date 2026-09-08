@@ -11,5 +11,8 @@ pub mod google_login;
 pub mod ipc_client;
 pub mod login_item;
 pub mod onboarding;
+pub mod share_access;
+pub mod share_invite;
+pub mod share_window;
 pub mod status_model;
 pub mod window;

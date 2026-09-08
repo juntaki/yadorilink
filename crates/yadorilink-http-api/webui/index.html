@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>YadoriLink</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f5f6f8;
+    --panel: #ffffff;
+    --text: #1a1d23;
+    --muted: #6b7280;
+    --border: #e2e5ea;
+    --ok: #1b8a5a;
+    --warn: #b7791f;
+    --bad: #c0392b;
+    --accent: #2f6feb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1115;
+      --panel: #171a21;
+      --text: #e6e8ee;
+      --muted: #9aa1ad;
+      --border: #2a2e37;
+      --ok: #3fbf82;
+      --warn: #e0a83e;
+      --bad: #e5605a;
+      --accent: #6ea8fe;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .conn-state { font-size: 12px; color: var(--muted); }
+  main { max-width: 1000px; margin: 0 auto; padding: 20px; }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+    margin-bottom: 16px;
+  }
+  .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 12px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; }
+  tr:last-child td { border-bottom: none; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+  .pill.ok { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
+  .pill.warn { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
+  .pill.bad { background: color-mix(in srgb, var(--bad) 18%, transparent); color: var(--bad); }
+  .empty { color: var(--muted); font-size: 13px; padding: 4px 0; }
+  #gate {
+    position: fixed; inset: 0; background: var(--bg);
+    display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 10px;
+  }
+  #gate input { font-family: monospace; padding: 8px 10px; width: 320px; max-width: 80vw; border-radius: 6px; border: 1px solid var(--border); background: var(--panel); color: var(--text); }
+  #gate button { padding: 8px 14px; border-radius: 6px; border: 1px solid var(--accent); background: var(--accent); color: #fff; cursor: pointer; }
+  #gate p { color: var(--muted); font-size: 13px; max-width: 420px; text-align: center; }
+  #gate code { font-size: 12px; }
+  [hidden] { display: none !important; }
+  button.action {
+    font-size: 12px; padding: 3px 9px; border-radius: 6px; border: 1px solid var(--border);
+    background: transparent; color: var(--text); cursor: pointer;
+  }
+  button.action:hover { border-color: var(--accent); color: var(--accent); }
+</style>
+</head>
+<body>
+
+<div id="gate">
+  <h1 style="margin:0">YadoriLink</h1>
+  <p>
+    Paste the local API token to continue. It was written on this daemon's
+    last startup to a file only your own user account can read (see the
+    daemon's startup log for the exact path). Stored only in this browser's
+    local storage for this page's own origin.
+  </p>
+  <input id="token-input" type="password" placeholder="local API token" autocomplete="off" spellcheck="false">
+  <button id="token-submit">Connect</button>
+  <p id="token-error" style="color:var(--bad)" hidden></p>
+</div>
+
+<div id="app" hidden>
+  <header>
+    <h1>YadoriLink</h1>
+    <span class="conn-state" id="conn-state">connecting&hellip;</span>
+  </header>
+  <main>
+    <div class="card">
+      <h2>Status</h2>
+      <div id="overall-state" class="empty">loading&hellip;</div>
+    </div>
+
+    <div class="card">
+      <h2>Links</h2>
+      <div id="links-table"></div>
+    </div>
+
+    <div class="card">
+      <h2>Conflicts</h2>
+      <div id="conflicts-table"></div>
+    </div>
+
+    <div class="card">
+      <h2>Connections</h2>
+      <div id="connections-table"></div>
+    </div>
+  </main>
+</div>
+
+<script nonce="%%CSP_NONCE%%">
+(function () {
+  "use strict";
+
+  const TOKEN_KEY = "yadorilink-http-api-token";
+
+  function getToken() {
+    try { return localStorage.getItem(TOKEN_KEY) || ""; } catch (e) { return ""; }
+  }
+  function setToken(t) {
+    try { localStorage.setItem(TOKEN_KEY, t); } catch (e) { /* private-browsing etc.: token still works for this page load */ }
+  }
+
+  async function api(path, opts) {
+    opts = opts || {};
+    const headers = Object.assign({}, opts.headers, { "Authorization": "Bearer " + getToken() });
+    if (opts.body) headers["Content-Type"] = "application/json";
+    const res = await fetch(path, Object.assign({}, opts, { headers }));
+    if (res.status === 401) {
+      const err = new Error("unauthorized");
+      err.unauthorized = true;
+      throw err;
+    }
+    if (!res.ok) {
+      let body;
+      try { body = await res.json(); } catch (e) { body = {}; }
+      throw new Error(body.error || (res.status + " " + res.statusText));
+    }
+    return res.json();
+  }
+
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  function pill(text, kind) {
+    return '<span class="pill ' + kind + '">' + esc(text) + "</span>";
+  }
+
+  function renderOverall(status) {
+    const el = document.getElementById("overall-state");
+    const state = status.overall_state || "unknown";
+    const kind = state === "healthy" ? "ok" : state === "attention" ? "warn" : state === "degraded" ? "bad" : "warn";
+    let html = pill(state, kind);
+    if (status.attention_reasons && status.attention_reasons.length) {
+      html += '<div class="empty">' + status.attention_reasons.map(esc).join(", ") + "</div>";
+    }
+    el.innerHTML = html;
+  }
+
+  function renderLinks(links) {
+    const el = document.getElementById("links-table");
+    if (!links.length) { el.innerHTML = '<div class="empty">No linked folders.</div>'; return; }
+    let rows = links.map(function (l) {
+      const stateKind = l.degraded ? "bad" : l.paused ? "warn" : "ok";
+      const stateLabel = l.degraded ? "degraded" : l.paused ? "paused" : "syncing";
+      return "<tr>" +
+        "<td>" + esc(l.local_path) + "<div class=\"empty\">" + esc(l.group_id) + "</div></td>" +
+        "<td>" + pill(stateLabel, stateKind) + "</td>" +
+        "<td>" + esc(l.materialization_policy) + "</td>" +
+        "<td>" + l.hydrated_count + " hydrated / " + l.placeholder_count + " placeholder</td>" +
+        "<td>" + (l.conflict_count > 0 ? pill(l.conflict_count + " conflict(s)", "bad") : "&ndash;") + "</td>" +
+        "<td>" +
+          '<button class="action" data-action="' + (l.paused ? "resume" : "pause") + '" data-path="' + esc(l.local_path) + '">' +
+          (l.paused ? "Resume" : "Pause") + "</button>" +
+        "</td>" +
+      "</tr>";
+    }).join("");
+    el.innerHTML = "<table><thead><tr><th>Folder</th><th>State</th><th>Policy</th><th>Files</th><th>Conflicts</th><th></th></tr></thead><tbody>" + rows + "</tbody></table>";
+    el.querySelectorAll("button[data-action]").forEach(function (btn) {
+      btn.addEventListener("click", async function () {
+        btn.disabled = true;
+        try {
+          await api("/api/" + btn.getAttribute("data-action"), {
+            method: "POST",
+            body: JSON.stringify({ path: btn.getAttribute("data-path") }),
+          });
+          await refreshOnce();
+        } catch (e) {
+          alert(e.message);
+        } finally {
+          btn.disabled = false;
+        }
+      });
+    });
+  }
+
+  function renderConflicts(data) {
+    const el = document.getElementById("conflicts-table");
+    if (!data.conflicts.length) { el.innerHTML = '<div class="empty">No conflicts.</div>'; return; }
+    let rows = data.conflicts.map(function (c) {
+      return "<tr><td>" + esc(c.path) + "</td><td>" + esc(c.local_path) + "</td><td>" + c.size + "</td></tr>";
+    }).join("");
+    el.innerHTML = "<table><thead><tr><th>Conflicted copy</th><th>Folder</th><th>Size</th></tr></thead><tbody>" + rows + "</tbody></table>";
+  }
+
+  function renderConnections(peers) {
+    const el = document.getElementById("connections-table");
+    if (!peers.length) { el.innerHTML = '<div class="empty">No known peers.</div>'; return; }
+    let rows = peers.map(function (p) {
+      const reach = p.reachability.replace("PEER_REACHABILITY_", "").toLowerCase();
+      const kind = reach === "connected" ? "ok" : reach === "unreachable" ? "bad" : "warn";
+      return "<tr><td>" + esc(p.device_id) + "</td><td>" + pill(reach, kind) + "</td>" +
+        "<td>" + esc(p.route_kind.replace("ROUTE_KIND_", "").toLowerCase()) + "</td></tr>";
+    }).join("");
+    el.innerHTML = "<table><thead><tr><th>Device</th><th>Reachability</th><th>Route</th></tr></thead><tbody>" + rows + "</tbody></table>";
+  }
+
+  function renderStatus(status) {
+    renderOverall(status);
+    renderLinks(status.links || []);
+    renderConnections(status.peers || []);
+  }
+
+  async function refreshOnce() {
+    const status = await api("/api/status");
+    renderStatus(status);
+    const conflicts = await api("/api/conflicts");
+    renderConflicts(conflicts);
+  }
+
+  // Not the native `EventSource` API: it has no way to attach a header, and
+  // this API deliberately never accepts its bearer token from anywhere but
+  // the `Authorization` header (see the crate's top-level security notes --
+  // a query-string token would leak into browser history/server logs, a
+  // cookie would reopen the exact CSRF hole the header-only design closes).
+  // So this reads `/api/events` as a plain authenticated `fetch()` and
+  // parses the `text/event-stream` framing by hand.
+  function handleSseFrame(frame) {
+    let eventName = "message";
+    const dataLines = [];
+    frame.split("\n").forEach(function (line) {
+      if (line.startsWith("event:")) eventName = line.slice(6).trim();
+      else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+      // Lines starting with ":" are keep-alive comments; anything else is
+      // an SSE field this dashboard doesn't use (id/retry) -- ignored.
+    });
+    if (eventName !== "status" || !dataLines.length) return;
+    try { renderStatus(JSON.parse(dataLines.join("\n"))); } catch (e) { /* malformed frame: skip it */ }
+  }
+
+  async function connectEvents() {
+    const connState = document.getElementById("conn-state");
+    for (;;) {
+      try {
+        const res = await fetch("/api/events", { headers: { "Authorization": "Bearer " + getToken() } });
+        if (res.status === 401) { showGate("That token was rejected."); return; }
+        if (!res.ok || !res.body) throw new Error("stream connect failed: " + res.status);
+        connState.textContent = "live";
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = "";
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          let idx;
+          while ((idx = buf.indexOf("\n\n")) !== -1) {
+            handleSseFrame(buf.slice(0, idx));
+            buf = buf.slice(idx + 2);
+          }
+        }
+      } catch (e) {
+        // fall through to reconnect below
+      }
+      connState.textContent = "reconnecting…";
+      await new Promise(function (r) { setTimeout(r, 2000); });
+    }
+  }
+
+  async function boot() {
+    document.getElementById("gate").hidden = true;
+    document.getElementById("app").hidden = false;
+    try {
+      await refreshOnce();
+    } catch (e) {
+      if (e.unauthorized) { showGate("That token was rejected."); return; }
+      document.getElementById("overall-state").innerHTML = '<span class="pill bad">unreachable</span><div class="empty">' + esc(e.message) + "</div>";
+    }
+    connectEvents();
+  }
+
+  function showGate(message) {
+    document.getElementById("app").hidden = true;
+    document.getElementById("gate").hidden = false;
+    const err = document.getElementById("token-error");
+    if (message) { err.textContent = message; err.hidden = false; } else { err.hidden = true; }
+  }
+
+  document.getElementById("token-submit").addEventListener("click", function () {
+    const v = document.getElementById("token-input").value.trim();
+    if (!v) return;
+    setToken(v);
+    boot();
+  });
+  document.getElementById("token-input").addEventListener("keydown", function (e) {
+    if (e.key === "Enter") document.getElementById("token-submit").click();
+  });
+
+  if (getToken()) { boot(); } else { showGate(); }
+})();
+</script>
+</body>
+</html>

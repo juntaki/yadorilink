@@ -61,6 +61,26 @@ pub struct ChangeEmissionContext<'a> {
     pub auth: ChangeAuth,
 }
 
+/// Current wall-clock time in nanoseconds since the Unix epoch, or `None`
+/// when this device's clock reads before the epoch.
+///
+/// The `None` case exists because the `admitted_at_unix_nanos` stamp cannot
+/// tolerate the usual `unwrap_or(0)` fallback the sibling helpers below use.
+/// A `0` there is not a harmlessly-wrong number: it reads as "admitted at
+/// the epoch", which makes the row look present at every possible rewind
+/// target and turns an unreadable clock into a confident wrong answer about
+/// what a folder held at some past instant. NULL is the honest encoding of
+/// "this device does not know when it admitted this row", and the planning
+/// layer already has an explicit outcome for it -- see the column's own
+/// migration comment in `yadorilink-sqlite-runtime`'s schema, which spells
+/// out why neither `0` nor "now" is an acceptable substitute.
+pub(crate) fn now_unix_nanos_checked() -> Option<i64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_nanos() as i64)
+}
+
 /// Current wall-clock time in nanoseconds since the Unix epoch, clamped to
 /// `0` if the clock reads before the epoch. Deliberately duplicated here
 /// rather than depending on `yadorilink-sync-core`'s own `index.rs::
@@ -68,11 +88,11 @@ pub struct ChangeEmissionContext<'a> {
 /// sits strictly below sync-core in the dependency graph and must not reach
 /// back up to it. Same shape as this crate's other
 /// `dag_store`/`materialization_job_repository`/`retention_roots` copies.
+///
+/// Not for `admitted_at_unix_nanos`: use [`now_unix_nanos_checked`] there,
+/// for the reason given on it.
 fn now_unix_nanos() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0)
+    now_unix_nanos_checked().unwrap_or(0)
 }
 
 pub struct FileIndexRepository {
@@ -206,6 +226,10 @@ impl FileIndexRepository {
     /// before, publishing no proof -- the Convergence Engine's existing
     /// fail-closed ordinary reconcile path handles it exactly as it always
     /// has; this is never required for correctness, only an optimization.
+    // ~40 call sites workspace-wide (via this port's implementors);
+    // grouping these into a params struct is out of scope for a lint
+    // cleanup.
+    #[allow(clippy::too_many_arguments)]
     pub fn upsert_file_emitting_change(
         &self,
         group_id: &str,
@@ -594,6 +618,23 @@ impl FileIndexRepository {
         })
     }
 
+    /// Deletes every version row for one path -- not a tombstone, an
+    /// erasure of this device's local index entry. Its one production
+    /// caller is the ignore sweep, for a path that has just become
+    /// `.yadorilinkignore`d: sync must stop considering it, but nothing
+    /// about it is deleted for anyone else.
+    ///
+    /// Known limitation, recorded rather than silently left: un-ignoring
+    /// such a path later re-indexes it from `version_seq = 1`, so the rewind
+    /// planning layer reads it as a path this device first saw at the
+    /// re-index and answers `Delete` for targets before the ignore, when in
+    /// fact the path was indexed and answerable back then. This is the same
+    /// class of wrong reading `group_local_history_floor` closes for a link
+    /// or a re-bootstrap, but it is per-PATH rather than per-group, so that
+    /// group-scoped floor is the wrong instrument for it -- setting one here
+    /// would make every OTHER path in the group unanswerable before this
+    /// instant. Closing it needs a per-path boundary, or an ignored-but-
+    /// retained index row instead of a delete; neither is attempted here.
     pub fn remove_file(
         &self,
         group_id: &str,
@@ -1014,12 +1055,19 @@ impl FileIndexRepository {
         // observed under load, not a hypothetical) -- fixed the same way
         // `upsert_file_with_origin` already is, so a resync round's own
         // retried reconciles aren't undermined by this same gap.
+        //
+        // Stamped with `admitted_at_unix_nanos` like every other `files`
+        // insert -- see `upsert_file_in_tx`'s "stamping invariant" section.
+        // A scaffold row is short-lived (the next real upsert promotes it in
+        // place) but it is a genuine row this device held, and leaving it
+        // unstamped would make the path's whole history unreadable for
+        // rewind purposes rather than merely imprecise.
         self.database.write::<_, SyncSqliteError>(|conn| {
             conn.execute(
-                "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json, deleted, version_seq, state, origin_device_id)
-                 SELECT ?1, ?2, 0, 0, '[]', 0, 0, 'current', NULL
+                "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json, deleted, version_seq, state, origin_device_id, admitted_at_unix_nanos)
+                 SELECT ?1, ?2, 0, 0, '[]', 0, 0, 'current', NULL, ?3
                   WHERE NOT EXISTS (SELECT 1 FROM files WHERE group_id = ?1 AND path = ?2 AND state = 'current')",
-                rusqlite::params![group_id, path],
+                rusqlite::params![group_id, path, now_unix_nanos_checked()],
             )?;
             Ok(())
         })
@@ -1855,6 +1903,49 @@ impl FileIndexRepository {
 /// `superseded`/`trashed` per 's rule *and* returns everything
 /// needed to build the new current row, so no separate up-front `SELECT`
 /// is needed before it.
+///
+/// Every row this function writes -- all three branches -- is stamped with
+/// `admitted_at_unix_nanos`, this device's own local clock read at the
+/// moment of the write. Captured inside this function rather than passed
+/// in, so no caller can supply it and no caller site needed to change.
+/// Never `record.mtime_unix_nanos` -- see that column's own migration
+/// comment in `yadorilink-sqlite-runtime`'s schema for why a replicated
+/// filesystem timestamp is untrusted input here.
+///
+/// # The stamping invariant
+///
+/// This function is the ordinary per-path version write path, but it is
+/// deliberately NOT the only writer of `files` rows, and the correctness of
+/// everything reading `admitted_at_unix_nanos` rests on the whole set
+/// agreeing. The invariant, stated once here because it is easy to break by
+/// adding a fourth writer without noticing:
+///
+/// > **Every statement anywhere that inserts a `files` row stamps
+/// > `admitted_at_unix_nanos` from this device's own clock at the moment of
+/// > that write. A NULL means only "this row predates the column".**
+///
+/// The complete set of writers, all of which do:
+///
+/// * this function (three branches: new path, `version_seq = 0` scaffold
+///   promotion, and superseding version bump),
+/// * [`FileIndexRepository::ensure_bootstrap_row_for_metadata`] and
+///   [`ensure_bootstrap_row_for_metadata_in_tx`], which insert the
+///   `version_seq = 0` metadata scaffold, and
+/// * `rebootstrap_store::replace_group_files_from_snapshot`, which replaces
+///   a whole group's rows from an installed HistoryBase snapshot.
+///
+/// Two consequences follow, and both are load-bearing rather than
+/// incidental:
+///
+/// * Because every writer stamps, a NULL genuinely does mean "written
+///   before the column existed" -- so `crate::rewind_plan` is entitled to
+///   treat NULL rows as a prefix of a path's history and to report the
+///   affected path as unanswerable rather than guessing.
+/// * Several rows for one path can share a stamp, because the snapshot
+///   replace above writes a path's whole retained history in one pass. The
+///   reader's `version_seq DESC` tie-break is what resolves that to the
+///   path's current row, so a rebootstrapped group reports real per-path
+///   values rather than a blanket "unavailable".
 pub fn upsert_file_in_tx(
     tx: &rusqlite::Transaction,
     group_id: &str,
@@ -1866,6 +1957,12 @@ pub fn upsert_file_in_tx(
     let origin: Option<&str> =
         if origin_device_id.is_empty() { None } else { Some(origin_device_id) };
     let authoring_blob = authoring_change_hash.map(|hash| &hash.0[..]);
+    // Read once, before any branch, so all three branches stamp the exact
+    // same instant for one call -- a scaffold promotion in particular
+    // writes what is logically the same admission as the insert that
+    // preceded it, and two clock reads could otherwise straddle a rewind
+    // target and split them.
+    let admitted_at_unix_nanos = now_unix_nanos_checked();
 
     #[allow(clippy::type_complexity)]
     let flipped: Option<(
@@ -1914,8 +2011,8 @@ pub fn upsert_file_in_tx(
         None => {
             // Brand new path.
             tx.execute(
-                "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json, deleted, version_seq, state, origin_device_id, authoring_change_hash)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, 'current', ?7, ?8)",
+                "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json, deleted, version_seq, state, origin_device_id, authoring_change_hash, admitted_at_unix_nanos)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, 'current', ?7, ?8, ?9)",
                 rusqlite::params![
                     group_id,
                     record.path,
@@ -1925,6 +2022,7 @@ pub fn upsert_file_in_tx(
                     record.deleted as i64,
                     origin,
                     authoring_blob,
+                    admitted_at_unix_nanos,
                 ],
             )?;
         }
@@ -1942,8 +2040,8 @@ pub fn upsert_file_in_tx(
         // doesn't cost the common case anything.
         Some((0, ..)) => {
             tx.execute(
-                "UPDATE files SET size = ?1, mtime_unix_nanos = ?2, blocks_json = ?3, deleted = ?4, version_seq = 1, state = 'current', origin_device_id = ?5, authoring_change_hash = ?6
-                 WHERE group_id = ?7 AND path = ?8 AND version_seq = 0",
+                "UPDATE files SET size = ?1, mtime_unix_nanos = ?2, blocks_json = ?3, deleted = ?4, version_seq = 1, state = 'current', origin_device_id = ?5, authoring_change_hash = ?6, admitted_at_unix_nanos = ?7
+                 WHERE group_id = ?8 AND path = ?9 AND version_seq = 0",
                 rusqlite::params![
                     record.size,
                     record.mtime_unix_nanos,
@@ -1951,6 +2049,7 @@ pub fn upsert_file_in_tx(
                     record.deleted as i64,
                     origin,
                     authoring_blob,
+                    admitted_at_unix_nanos,
                     group_id,
                     record.path,
                 ],
@@ -2013,8 +2112,9 @@ pub fn upsert_file_in_tx(
                     version_seq, state, origin_device_id,
                     materialization_state, pinned, last_accessed_unix, record_kind,
                     symlink_target, unix_mode, held_reason, held_since_unix_nanos,
-                    symlink_out_of_root, authoring_change_hash, xattrs_json
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'current', ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                    symlink_out_of_root, authoring_change_hash, xattrs_json,
+                    admitted_at_unix_nanos
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'current', ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
                 rusqlite::params![
                     group_id,
                     record.path,
@@ -2035,6 +2135,10 @@ pub fn upsert_file_in_tx(
                     symlink_out_of_root,
                     authoring_blob.or(authoring_change_hash.as_deref()),
                     xattrs_json_carried,
+                    // NOT carried forward from the row just superseded --
+                    // this is a NEW admission of a NEW version, and its
+                    // admission time is now, not the previous version's.
+                    admitted_at_unix_nanos,
                 ],
             )?;
         }
@@ -2258,17 +2362,18 @@ fn adopt_local_capture_absent_state(
 /// row_for_metadata`], for a caller that already has a `tx` open (C4-7's
 /// `apply_incoming_metadata_atomic` and the C4-6 batch commit path) --
 /// same idempotent `INSERT ... WHERE NOT EXISTS`, no separate `writer_
-/// gate` acquisition of its own.
+/// gate` acquisition of its own, and the same `admitted_at_unix_nanos`
+/// stamp (see [`upsert_file_in_tx`]'s "stamping invariant" section).
 pub fn ensure_bootstrap_row_for_metadata_in_tx(
     tx: &rusqlite::Transaction,
     group_id: &str,
     path: &str,
 ) -> Result<(), SyncSqliteError> {
     tx.execute(
-        "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json, deleted, version_seq, state, origin_device_id)
-         SELECT ?1, ?2, 0, 0, '[]', 0, 0, 'current', NULL
+        "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json, deleted, version_seq, state, origin_device_id, admitted_at_unix_nanos)
+         SELECT ?1, ?2, 0, 0, '[]', 0, 0, 'current', NULL, ?3
           WHERE NOT EXISTS (SELECT 1 FROM files WHERE group_id = ?1 AND path = ?2 AND state = 'current')",
-        rusqlite::params![group_id, path],
+        rusqlite::params![group_id, path, now_unix_nanos_checked()],
     )?;
     Ok(())
 }
@@ -2412,6 +2517,9 @@ pub(crate) fn encode_xattrs_column(xattrs: &[(String, Vec<u8>)]) -> String {
     serde_json::to_string(xattrs).expect("xattr list is always representable as JSON")
 }
 
+// One parameter per SQLite row column this constructs from; grouping into
+// a params struct is out of scope for a lint cleanup.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn version_record(
     path: String,
     version_seq: i64,

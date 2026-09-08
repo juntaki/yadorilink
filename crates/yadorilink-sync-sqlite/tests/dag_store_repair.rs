@@ -5,8 +5,8 @@ use yadorilink_replica_domain::file::RecordKind;
 use yadorilink_replica_domain::file::{FileMeta, FileVersion};
 use yadorilink_replica_domain::ids::{DeviceId, FolderGroupId, SyncPath};
 use yadorilink_sync_sqlite::dag_store::{
-    admit_change, emit_local_change, get_file_version, init_dag_schema, promote_orphans,
-    put_file_version, AdmitOutcome, ChangeEmitter,
+    admit_change, always_current_writer, emit_local_change, get_file_version, init_dag_schema,
+    promote_orphans, put_file_version, AdmitOutcome, ChangeEmitter,
 };
 use yadorilink_sync_sqlite::SyncSqliteError as SyncError;
 
@@ -337,7 +337,8 @@ fn promoting_hash_mismatched_orphan_does_not_leave_ghost_parent_edges() {
     )
     .unwrap();
 
-    let promoted = promote_orphans(&conn, &[parent.compute_hash()]).unwrap();
+    let promoted =
+        promote_orphans(&conn, &[parent.compute_hash()], &always_current_writer).unwrap();
     assert_eq!(promoted, vec![orphan.compute_hash()]);
 
     let ghost_edge_count: i64 = conn

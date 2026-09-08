@@ -79,6 +79,11 @@ pub struct OrchestratorConfig {
 /// empty one (an empty "previous" would report zero removals no matter
 /// what changed, silently forgetting any revocation the diff hasn't
 /// already acted on).
+/// device_id -> (candidate address, last-announced-at), the shape
+/// `NetmapDiffState::lan_discovered` and `ttl_filtered_lan_candidates` both
+/// share. Factored out (clippy type_complexity).
+type LanDiscoveredMap = HashMap<String, Vec<(SocketAddr, Instant)>>;
+
 #[derive(Clone)]
 struct NetmapDiffState {
     previous: Arc<StdMutex<NetmapSnapshot>>,
@@ -201,7 +206,7 @@ struct NetmapDiffState {
     /// a dial target, never authorization, so the worst a successful
     /// poisoning achieves is denying a LAN-discovery *convenience* for the
     /// process lifetime, not a security bypass.
-    lan_discovered: Arc<StdMutex<HashMap<String, Vec<(SocketAddr, Instant)>>>>,
+    lan_discovered: Arc<StdMutex<LanDiscoveredMap>>,
 }
 
 /// How many peers this device may be mid-connection-attempt with at once
@@ -275,20 +280,113 @@ const LAN_DISCOVERED_CANDIDATE_TTL: Duration = Duration::from_secs(180);
 /// see `NetmapDiffState::lan_discovered`'s own doc comment for why BOTH
 /// sides need the TTL applied, not just the write side.
 fn ttl_filtered_lan_candidates(
-    lan_discovered: &HashMap<String, Vec<(SocketAddr, Instant)>>,
+    lan_discovered: &LanDiscoveredMap,
     peer_device_id: &str,
     now: Instant,
 ) -> Vec<SocketAddr> {
+    live_lan_entries(lan_discovered, peer_device_id, now).map(|(addr, _seen_at)| *addr).collect()
+}
+
+/// The single TTL rule both readers of `lan_discovered` share: the dial
+/// path (`ttl_filtered_lan_candidates`, immediately above) and the
+/// diagnostics snapshot (`LanCandidateObserver::snapshot_at`). Factored
+/// out rather than duplicated so the surface that reports which candidates
+/// are live cannot drift from the one that decides which are usable --
+/// a diagnostic that disagrees with the thing it describes is worse than
+/// none.
+fn live_lan_entries<'a>(
+    lan_discovered: &'a LanDiscoveredMap,
+    peer_device_id: &str,
+    now: Instant,
+) -> impl Iterator<Item = &'a (SocketAddr, Instant)> {
     lan_discovered
         .get(peer_device_id)
-        .map(|entries| {
-            entries
-                .iter()
-                .filter(|(_, seen_at)| now.duration_since(*seen_at) <= LAN_DISCOVERED_CANDIDATE_TTL)
-                .map(|(addr, _seen_at)| *addr)
-                .collect()
-        })
-        .unwrap_or_default()
+        .into_iter()
+        .flatten()
+        .filter(move |(_, seen_at)| now.duration_since(*seen_at) <= LAN_DISCOVERED_CANDIDATE_TTL)
+}
+
+/// A read-only view of one `NetmapDiffState`'s LAN-discovered candidate
+/// cache, published onto `DaemonState` by [`run`] so the diagnostics read
+/// model can report it without reaching into this module's private
+/// `NetmapDiffState` -- the same arrangement, and for the same reason, as
+/// `DaemonState::shared_quic_peer_endpoint`.
+///
+/// Observation only. It holds the very `Arc` the dial path reads, so it
+/// can never report a candidate set the dial path does not have, and it
+/// offers no way to add, remove, reorder, or otherwise influence one: no
+/// `&mut` accessor, and the inner map stays private to this module.
+///
+/// That "same `Arc`" guarantee is upheld by `run` being the only thing
+/// that constructs and publishes one, so both the constructor and
+/// `DaemonState`'s cell are crate-visible rather than `pub` -- see
+/// `DaemonState::lan_candidate_observer`.
+#[derive(Clone)]
+pub(crate) struct LanCandidateObserver {
+    lan_discovered: Arc<StdMutex<LanDiscoveredMap>>,
+}
+
+impl LanCandidateObserver {
+    pub(crate) fn new(lan_discovered: Arc<StdMutex<LanDiscoveredMap>>) -> Self {
+        Self { lan_discovered }
+    }
+
+    /// Every LAN-discovered candidate currently within
+    /// `LAN_DISCOVERED_CANDIDATE_TTL`, in the redacted shape
+    /// `connection_trace::LanDiscoveredCandidate` describes. `peer_device_id`
+    /// filters to one peer, mirroring `ConnectionTraceLog::recent`.
+    ///
+    /// `peer_has_any_session` is resolved through the caller's
+    /// `peer_has_session` predicate rather than read here, because this
+    /// module's cache knows nothing about live sessions -- see
+    /// `LanDiscoveredCandidate`'s own doc comment for what that flag does
+    /// and does not claim.
+    pub(crate) fn snapshot(
+        &self,
+        peer_device_id: Option<&str>,
+        peer_has_session: &dyn Fn(&str) -> bool,
+    ) -> Vec<crate::connection_trace::LanDiscoveredCandidate> {
+        self.snapshot_at(Instant::now(), peer_device_id, peer_has_session)
+    }
+
+    /// `snapshot` with an injected "now", so the TTL boundary is testable
+    /// by `Instant` arithmetic rather than by sleeping -- the same trick
+    /// `ttl_filtered_lan_candidates`'s own test uses.
+    fn snapshot_at(
+        &self,
+        now: Instant,
+        peer_device_id: Option<&str>,
+        peer_has_session: &dyn Fn(&str) -> bool,
+    ) -> Vec<crate::connection_trace::LanDiscoveredCandidate> {
+        let lan_discovered = self.lan_discovered.lock().unwrap_or_else(|p| p.into_inner());
+        let mut peers: Vec<&String> = lan_discovered
+            .keys()
+            .filter(|peer| peer_device_id.is_none_or(|wanted| wanted == peer.as_str()))
+            .collect();
+        // Sorted so the surface is stable across calls: a `HashMap`'s
+        // iteration order is not, and a diagnostic whose row order shuffles
+        // between two reads is hard to compare against itself.
+        peers.sort();
+        let mut out = Vec::new();
+        for peer in peers {
+            let has_session = peer_has_session(peer.as_str());
+            let mut entries: Vec<crate::connection_trace::LanDiscoveredCandidate> =
+                live_lan_entries(&lan_discovered, peer, now)
+                    .map(|(addr, seen_at)| crate::connection_trace::LanDiscoveredCandidate {
+                        peer_device_id: peer.clone(),
+                        address_class: candidate_class_to_address(classify_endpoint(*addr))
+                            .as_str(),
+                        last_seen_ms_ago: now.duration_since(*seen_at).as_millis() as u64,
+                        peer_has_any_session: has_session,
+                    })
+                    .collect();
+            // Most recently announced first, matching `ConnectionTraceLog::
+            // recent`'s own newest-first convention.
+            entries.sort_by_key(|entry| entry.last_seen_ms_ago);
+            out.append(&mut entries);
+        }
+        out
+    }
 }
 
 /// Folds one LAN discovery announcement into `diff_state.lan_discovered`.
@@ -394,6 +492,58 @@ fn handle_incoming_rendezvous(
         // `UdpBlocked` if no attempt ever confirms a direct path.
         state.nat_observations.record_punch_attempt(false);
     }
+}
+
+/// Reacts to an inbound Track Send rendezvous-grant push: records the
+/// sender as a grant-derived peer (`DaemonState::send_grant_peers` -- see
+/// its own doc comment) and admits its signing key at the QUIC transport
+/// layer for the duration of the grant, so the sender's later offer-dial
+/// can complete a handshake despite this device's ordinary netmap-derived
+/// authorized set never naming it. Never touches that ordinary set itself
+/// (`DaemonState::replace_peer_netmap_metadata`/`endpoint.replace_authorized`
+/// are untouched) -- see `QuicPeerEndpoint::authorize_send_peer`'s own doc
+/// comment for why this is a completely separate admission path that can
+/// never reach a real sync session.
+///
+/// Schedules the matching revoke at `expires_at_unix`, so a key admitted
+/// only through this path does not remain admitted indefinitely once its
+/// grant's short TTL has passed -- `DaemonState::send_grant_peers`'s own
+/// lazy TTL-pruning bounds the APPLICATION-layer record, but the transport
+/// layer's `AuthorizedPeerKeys` has no TTL notion of its own and must be
+/// told explicitly.
+fn handle_incoming_send_authorization(
+    grant_id: String,
+    nonce: String,
+    from_device_id: String,
+    signing_key: [u8; 32],
+    candidate_addresses: Vec<SocketAddr>,
+    expires_at_unix: i64,
+    state: &Arc<DaemonState>,
+) {
+    state.record_send_grant_peer(crate::daemon_state::SendGrantPeer {
+        device_id: from_device_id.clone(),
+        signing_key,
+        candidate_addresses,
+        grant_id,
+        nonce,
+        expires_at_unix,
+    });
+    let Some(endpoint) = state.shared_quic_peer_endpoint() else {
+        // Rare: a push arriving before this device's own QUIC endpoint has
+        // been built yet (before the first applied netmap push). The
+        // grant's own short TTL bounds how long the sender's dial would
+        // fail for even if nothing here recovers it; no retry is added
+        // deliberately, matching this whole primitive's "cheap to
+        // re-request" design rather than adding a second scheduling path.
+        tracing::debug!(
+            peer = %from_device_id,
+            "received a send-authorization push before this device's QUIC endpoint exists; the \
+             sender's dial may need to be retried"
+        );
+        return;
+    };
+    endpoint.authorize_send_peer(signing_key);
+    endpoint.schedule_send_peer_revoke(signing_key, expires_at_unix);
 }
 
 /// How many addresses this device will keep for one peer. Matches the cap
@@ -626,6 +776,26 @@ fn record_group_policy_states(
         state.clear_group_policy_stale(group_id);
     }
     state.replace_group_policy_states(states);
+    // Give every orphan `init_dag_schema`'s startup self-heal sweep
+    // deferred (it always defers -- it runs before any policy/trust could
+    // possibly be loaded, see that call site's own comment) a genuine
+    // second chance now that this frame just installed freshly-verified
+    // policy state: `resweep_deferred_orphan_promotions` re-attempts every
+    // orphan whose parent is already durably admitted, gated by the SAME
+    // real, policy-backed writer-freshness check live admission uses
+    // (wired in `DaemonState::new`). Non-fatal: a failure here must not
+    // break netmap-frame processing for every other group in this same
+    // push, and the next frame (or the next orphan-unblocking admission)
+    // gets another chance regardless.
+    if let Err(error) =
+        state.replica_coordinator.change_history_repository().resweep_deferred_orphan_promotions()
+    {
+        tracing::warn!(
+            %error,
+            "deferred orphan-promotion resweep failed; deferred rows remain buffered for a later \
+             attempt"
+        );
+    }
     Ok(())
 }
 
@@ -788,6 +958,10 @@ pub async fn run(config: OrchestratorConfig, state: Arc<DaemonState>) -> Result<
     // coordination-stream reconnect — see `NetmapDiffState`'s doc
     // comment.
     let diff_state = NetmapDiffState::new();
+    // Diagnostics only, and published before discovery starts so the very
+    // first announcement this process accepts is already observable -- see
+    // `LanCandidateObserver`'s own doc comment.
+    state.set_lan_candidate_observer(LanCandidateObserver::new(diff_state.lan_discovered.clone()));
 
     let _ = start_lan_discovery(&state, &diff_state, LAN_DISCOVERY_BROADCAST_PORT).await;
 
@@ -1033,6 +1207,28 @@ mod ws_netmap {
         candidates: Vec<WsEndpoint>,
     }
 
+    /// A Track Send rendezvous-grant notice, a THIRD distinct message type
+    /// on this same subscription (`{ type: "send_authorization", ... }`) --
+    /// see `coordination-worker`'s `NetmapDeviceObject.deliverSendAuthorization`
+    /// for the server side and `crate::send_transfer`'s own module doc
+    /// comment for the full design. Tells this device to expect an inbound
+    /// yadorilink-send/1 connection from `from` (a same-account device with
+    /// no shared folder group, so it is otherwise invisible in this
+    /// device's own netmap) presenting `grant_id`/`nonce`, and carries
+    /// exactly the connect material needed to also dial `from` BACK during
+    /// the pull phase.
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct WsSendAuthorization {
+        grant_id: String,
+        nonce: String,
+        from: String,
+        sender_signing_public_key_base64: String,
+        #[serde(default)]
+        sender_candidates: Vec<WsEndpoint>,
+        expires_at: i64,
+    }
+
     /// `config.coordination_addr` is the same http(s) base URL used for
     /// HTTP coordination service's unary routes; the netmap subscription is
     /// just a `wss://`/`ws://` upgrade of the same host at a fixed path,
@@ -1204,6 +1400,41 @@ mod ws_netmap {
                     let candidates =
                         rzv.candidates.iter().filter_map(|c| c.address.parse().ok()).collect();
                     handle_incoming_rendezvous(vec![(rzv.from, candidates)], state, diff_state);
+                }
+                continue;
+            }
+            if value.get("type").and_then(|t| t.as_str()) == Some("send_authorization") {
+                match serde_json::from_value::<WsSendAuthorization>(value) {
+                    Ok(grant) => {
+                        let signing_key = base64::engine::general_purpose::STANDARD
+                            .decode(&grant.sender_signing_public_key_base64)
+                            .ok()
+                            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok());
+                        let Some(signing_key) = signing_key else {
+                            tracing::warn!(
+                                "received a send-authorization push with an unparseable sender \
+                                 signing key; ignoring"
+                            );
+                            continue;
+                        };
+                        let candidates: Vec<SocketAddr> = grant
+                            .sender_candidates
+                            .iter()
+                            .filter_map(|c| c.address.parse().ok())
+                            .collect();
+                        handle_incoming_send_authorization(
+                            grant.grant_id,
+                            grant.nonce,
+                            grant.from,
+                            signing_key,
+                            candidates,
+                            grant.expires_at,
+                            state,
+                        );
+                    }
+                    Err(_) => {
+                        tracing::warn!("received malformed send-authorization push; ignoring");
+                    }
                 }
                 continue;
             }
@@ -1461,6 +1692,12 @@ mod ws_netmap {
                     .iter()
                     .filter_map(|e| e.address.parse().ok())
                     .collect();
+                // Published for any daemon subsystem outside this module
+                // that needs a dial target for an already-known device --
+                // see `DaemonState::peer_candidate_addresses`'s own doc
+                // comment. Purely additive: nothing below reads this back,
+                // so it changes no existing orchestrator behavior.
+                state.record_peer_candidate_addresses(&peer.device_id, candidates.clone());
                 let effective_authorized_groups = apply_authoritative_peer_metadata(
                     state,
                     &peer.device_id,
@@ -2001,6 +2238,21 @@ fn spawn_peer_session(
 /// signing key, which a device that is not yet fully registered does not
 /// have. Both are conditions a later attempt can find resolved.
 async fn ensure_quic_endpoint(
+    state: &Arc<DaemonState>,
+    diff_state: &NetmapDiffState,
+) -> Result<Arc<QuicPeerEndpoint>, DaemonError> {
+    let endpoint = ensure_quic_endpoint_inner(state, diff_state).await?;
+    // Idempotent: `set_shared_quic_peer_endpoint` is a no-op once already
+    // published, and the `OnceCell` above already guarantees `endpoint` is
+    // the same `Arc` on every call, so publishing it again on a cache hit
+    // costs one no-op `OnceCell::set` rather than anything unsafe. See
+    // `DaemonState::shared_quic_peer_endpoint`'s own doc comment for who
+    // reads this (Track Send, `crate::send_transfer`).
+    state.set_shared_quic_peer_endpoint(endpoint.clone());
+    Ok(endpoint)
+}
+
+async fn ensure_quic_endpoint_inner(
     state: &Arc<DaemonState>,
     diff_state: &NetmapDiffState,
 ) -> Result<Arc<QuicPeerEndpoint>, DaemonError> {
@@ -2737,7 +2989,7 @@ async fn try_better_path(
         // Still connected on an address the plane advertises: there is
         // nothing here that a new connection could improve on.
         let current = established.channel.remote_address();
-        if candidates.iter().any(|candidate| *candidate == current) {
+        if candidates.contains(&current) {
             return None;
         }
     }
@@ -4816,11 +5068,17 @@ mod tests {
         // actual `DiscoveryFilters::allows` check the bug lived in.
         let announced_port = 51820u16;
         let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // The discovery socket binds the wildcard address, so `bound_addr`
+        // is `0.0.0.0:port`. Linux delivers a datagram addressed to
+        // 0.0.0.0 to the local host; macOS answers EHOSTUNREACH. Aim at
+        // the loopback address explicitly and the announcement reaches the
+        // same socket on either platform.
+        let target = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, bound_addr.port()));
         let msg = yadorilink_ipc_proto::local_discovery::LocalAnnouncement {
             public_key: peer_key.to_vec(),
             wg_port: announced_port as u32,
         };
-        sender.send_to(&msg.encode_to_vec(), bound_addr).await.unwrap();
+        sender.send_to(&msg.encode_to_vec(), target).await.unwrap();
 
         let mut candidates = Vec::new();
         for _ in 0..100 {
@@ -4877,6 +5135,144 @@ mod tests {
             Vec::<StdSocketAddr>::new(),
             "an entry read past its TTL must be excluded from the candidate list even though \
              nothing ever re-wrote it -- read-path enforcement, not just write-path pruning"
+        );
+    }
+
+    /// The observability gap this surface closes: a candidate that has been
+    /// announced and accepted but has NOT led to a connection appears in no
+    /// connection trace at all, because a trace is only written once an
+    /// attempt has resolved -- so before this, "the peer announced itself
+    /// and we never connected" was indistinguishable from "the peer never
+    /// announced itself". Goes through the real announcement path
+    /// (`handle_lan_announcement`) and the real read model the control
+    /// socket answers `ListLanDiscoveredCandidates` from
+    /// (`build_query_services`), rather than reading the private map
+    /// directly, so this covers the wiring and not just the accessor.
+    #[tokio::test]
+    async fn a_held_lan_candidate_is_reported_with_whether_its_peer_has_a_session() {
+        let state = test_state();
+        let diff_state = NetmapDiffState::new();
+        // Exactly what `run` publishes, at the same point in its startup.
+        state.set_lan_candidate_observer(LanCandidateObserver::new(
+            diff_state.lan_discovered.clone(),
+        ));
+        let queries = crate::adapters::build_query_services(state.clone());
+
+        assert!(
+            queries.diagnostics.lan_discovered_candidates(None).is_empty(),
+            "nothing has been announced yet, so there is nothing to report"
+        );
+
+        let peer_key = DeviceSigningKeyPair::generate().public_bytes();
+        state.record_peer_signing_key("device-b", peer_key);
+        diff_state.desired_peers.lock().unwrap_or_else(|p| p.into_inner()).insert(
+            "device-b".to_string(),
+            PeerConnectSpec { candidates: vec![], effective_group_ids: vec![] },
+        );
+        // A private-range address nothing is listening on: announced and
+        // accepted, but no connection to it ever happens in this test --
+        // precisely the case the trace history cannot show.
+        let announced: StdSocketAddr = "192.168.7.42:51820".parse().unwrap();
+        handle_lan_announcement(
+            yadorilink_transport::PeerAnnouncement { public_key: peer_key, addr: announced },
+            &state,
+            &diff_state,
+        );
+
+        assert!(
+            state.telemetry.recent_connection_attempts(Some("device-b")).is_empty(),
+            "no attempt has resolved, so the trace history is empty -- this is the gap the \
+             assertion below covers"
+        );
+
+        let reported = queries.diagnostics.lan_discovered_candidates(None);
+        assert_eq!(reported.len(), 1, "expected exactly one held candidate, got {reported:?}");
+        assert_eq!(reported[0].peer_device_id, "device-b");
+        assert_eq!(
+            reported[0].address_class, "lan",
+            "a private-range announced address must be reported as LAN-class"
+        );
+        assert!(
+            reported[0].last_seen_ms_ago < LAN_DISCOVERED_CANDIDATE_TTL.as_millis() as u64,
+            "a just-announced candidate must be reported as recently seen, got {:?}",
+            reported[0]
+        );
+        assert!(
+            !reported[0].peer_has_any_session,
+            "no session was ever established with this peer, and that is exactly what makes \
+             this row worth reporting"
+        );
+
+        assert_eq!(
+            queries.diagnostics.lan_discovered_candidates(Some("device-b")),
+            reported,
+            "filtering to the one peer that has a candidate must return the same row"
+        );
+        assert!(
+            queries.diagnostics.lan_discovered_candidates(Some("device-c")).is_empty(),
+            "filtering to a peer with no candidates must return nothing"
+        );
+
+        // The other polarity, from the same setup, because the flag is this
+        // surface's whole answer: a peer that IS connected must not be
+        // reported as one that announced itself and never connected. Without
+        // this, a `peer_has_any_session` wired to a constant would satisfy
+        // every assertion above -- an operator would be told the exact
+        // opposite of the truth about a peer that is working fine, which is
+        // worse than the blind spot this feature was built to remove.
+        let channel = fake_channel().await;
+        state.peers.register_session("device-b".into(), fake_session(&state, channel));
+
+        let reported = queries.diagnostics.lan_discovered_candidates(None);
+        assert_eq!(reported.len(), 1, "the candidate itself is unchanged, got {reported:?}");
+        assert!(
+            reported[0].peer_has_any_session,
+            "a peer with a live session must be reported as having one, got {:?}",
+            reported[0]
+        );
+    }
+
+    /// The diagnostics snapshot must apply the SAME TTL as the dial path,
+    /// not a second copy of the rule that can drift from it: a candidate
+    /// the dialer would no longer use must not be reported as held. Both
+    /// sides share `live_lan_entries`; this pins that they agree at the
+    /// boundary. `Instant` arithmetic rather than sleeping, exactly as
+    /// `ttl_filtered_lan_candidates`'s own TTL test does.
+    #[test]
+    fn the_diagnostics_snapshot_excludes_a_candidate_past_its_ttl() {
+        let on_lan: StdSocketAddr = "192.168.7.42:51820".parse().unwrap();
+        let off_lan: StdSocketAddr = "203.0.113.9:51820".parse().unwrap();
+        let announced_at = Instant::now();
+        let mut lan_discovered = HashMap::new();
+        lan_discovered
+            .insert("device-b".to_string(), vec![(on_lan, announced_at), (off_lan, announced_at)]);
+        let observer = LanCandidateObserver::new(Arc::new(StdMutex::new(lan_discovered.clone())));
+        let no_session = |_: &str| false;
+
+        let still_within_ttl = announced_at + LAN_DISCOVERED_CANDIDATE_TTL - Duration::from_secs(1);
+        let held = observer.snapshot_at(still_within_ttl, None, &no_session);
+        assert_eq!(
+            held.iter().map(|c| c.address_class).collect::<Vec<_>>(),
+            vec!["lan", "server_reflexive"],
+            "both entries are still within the TTL, and the class is derived from the announced \
+             address rather than assumed to be LAN, got {held:?}"
+        );
+        assert_eq!(
+            held.iter().map(|c| c.last_seen_ms_ago).collect::<Vec<_>>(),
+            vec![(LAN_DISCOVERED_CANDIDATE_TTL - Duration::from_secs(1)).as_millis() as u64; 2],
+            "the reported age must be measured from the announcement, got {held:?}"
+        );
+
+        let past_ttl = announced_at + LAN_DISCOVERED_CANDIDATE_TTL + Duration::from_secs(1);
+        assert!(
+            observer.snapshot_at(past_ttl, None, &no_session).is_empty(),
+            "a candidate the dial path would no longer offer must not be reported as held"
+        );
+        assert_eq!(
+            ttl_filtered_lan_candidates(&lan_discovered, "device-b", past_ttl),
+            Vec::<StdSocketAddr>::new(),
+            "and the dial path itself must agree at the same boundary -- one TTL rule, two \
+             readers"
         );
     }
 

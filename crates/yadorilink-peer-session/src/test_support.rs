@@ -53,6 +53,12 @@ use yadorilink_root_authority::root_commit::RootCommitPermit;
 use crate::error::PeerSessionError;
 use crate::ports::{MaterializedFingerprint, OpenMaterializationIntent, PeerReplicaStatePort};
 
+/// Last-published materialized-generation evidence for one `(group_id,
+/// path)`: `(mutation_fence, causal_change_hashes, record_kind,
+/// version_hash)`. Factored out of `materialized_generations`'s field type
+/// below (clippy type_complexity).
+type MaterializedGenerationEntry = (i64, Vec<ChangeHash>, Option<RecordKind>, Option<VersionHash>);
+
 /// Per-`(group_id, path)` bookkeeping this fake tracks -- every column
 /// `PeerReplicaStatePort` exposes a getter/setter for, flattened into one
 /// row instead of `SyncState`'s several backing tables.
@@ -168,8 +174,7 @@ struct Inner {
     /// causal-frontier half of the real CAS (no DAG in this fake); only the
     /// mutation-fence half is enforced, matching what this file's tests
     /// actually need to exercise (the race the fence exists to catch).
-    materialized_generations:
-        HashMap<(String, String), (i64, Vec<ChangeHash>, Option<RecordKind>, Option<VersionHash>)>,
+    materialized_generations: HashMap<(String, String), MaterializedGenerationEntry>,
     /// M6PHASE provenance-write-amplification investigation: one entry per
     /// `record_group_block_provenance` CALL (not per hash), each holding
     /// the exact hash slice that call was given -- a "counting fake" for

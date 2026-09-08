@@ -696,6 +696,9 @@ pub async fn unreachable_channel() -> Arc<SilentPeerChannel> {
 /// whichever side the device-id ordering names as the dialer -- the same rule
 /// production uses, so a test pairing exercises the shipped one.
 #[allow(dead_code)]
+// Shared test-support helper; grouping these into a params struct is out
+// of scope for a lint cleanup.
+#[allow(clippy::too_many_arguments)]
 pub async fn connect_quic_pair(
     endpoint_a: &Arc<QuicPeerEndpoint>,
     device_a_id: &str,

@@ -15,26 +15,32 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
 use yadorilink_ipc_proto::daemonctl::{
-    create_and_link_command_response, join_and_link_command_response,
-    remove_device_command_response, revoke_device_command_response, revoke_edge_command_response,
+    accept_invite_command_response, create_and_link_command_response,
+    join_and_link_command_response, mint_invite_command_response, remove_device_command_response,
+    revoke_device_command_response, revoke_edge_command_response, AcceptInviteCommandResponse,
     ActiveTransferProgress, ApplicationCommandError, ApplicationErrorCode,
     CheckFullReplicaHandoffReadyExcludingResponse, CheckFullReplicaHandoffReadyResponse,
     ConflictedFileInfo, ConnectionAttemptTrace, ConnectivityDoctorCategory,
     ConnectivityDoctorResponse, CreateAndLinkCommandResponse, DaemonControlRequest,
     DaemonControlResponse, EnrollmentCommandOutcome, EvictResponse, FetchAvailability,
     FileVersionInfo, GcResponse, GroupDurabilityStatus, HandoffResult, HealthResponse, HeldFile,
-    HydrateResponse, JoinAndLinkCommandResponse, LatchGroupDurabilityUnknownResponse,
-    LimitsSetResponse, LimitsShowResponse, LinkRequest, LinkResponse, LinkStatus,
-    ListConflictsResponse, ListConnectionTracesResponse, ListLinksResponse, ListQueueItemsResponse,
-    ListRecoveryOperationsResponse, ListTrashResponse, ListVersionsResponse, LocalStorageState,
-    MaterializationState as WireMaterializationState, MaterializationStatusResponse,
-    MembershipHandoffResult, ObtainHandoffTicketResponse, PauseResponse, PeerStatus,
-    PendingEnrollmentKind, PinResponse, QueueItem, RecentSyncError, ReleaseHandoffTicketResponse,
-    RemoveDeviceCommandResponse, RemovePendingEnrollmentResponse, ReplicaMembershipCommandOutcome,
-    ReportingConsentState, ReportingStatusResponse, RequestHandoffLeaseResponse,
-    RestoreTrashResponse, RestoreVersionResponse, ResumeResponse, RevokeDeviceCommandResponse,
-    RevokeEdgeCommandResponse, SetStorageModeResponse, ShowQueueItemResponse, ShutdownResponse,
-    StatusResponse, TaskLiveness, TrashedFileInfo, UnlinkResponse, UnpinResponse, VolumeFreeSpace,
+    HydrateResponse, InboxFileSummary, InboxTransfer, JoinAndLinkCommandResponse,
+    LanDiscoveredCandidate, LatchGroupDurabilityUnknownResponse, LimitsSetResponse,
+    LimitsShowResponse, LinkRequest, LinkResponse, LinkStatus, ListConflictsResponse,
+    ListConnectionTracesResponse, ListInboxResponse, ListLanDiscoveredCandidatesResponse,
+    ListLinksResponse, ListQueueItemsResponse, ListRecoveryOperationsResponse, ListTrashResponse,
+    ListVersionsResponse, LocalStorageState, MaterializationState as WireMaterializationState,
+    MaterializationStatusResponse, MembershipHandoffResult, MintInviteCommandResponse,
+    MintedInviteInfo, ObtainHandoffTicketResponse, PauseResponse, PeerStatus,
+    PendingEnrollmentKind, PinResponse, QueueItem, ReceiveTransferResponse, RecentSyncError,
+    ReleaseHandoffTicketResponse, RemoveDeviceCommandResponse, RemovePendingEnrollmentResponse,
+    ReplicaMembershipCommandOutcome, ReportingConsentState, ReportingStatusResponse,
+    RequestHandoffLeaseResponse, RestoreTrashResponse, RestoreVersionResponse, ResumeResponse,
+    RevokeDeviceCommandResponse, RevokeEdgeCommandResponse,
+    RewindActionCounts as WireRewindActionCounts, RewindPathEntry as WireRewindPathEntry,
+    RewindPreviewResponse, RewindRenameCandidate as WireRewindRenameCandidate, SendFileResponse,
+    SetStorageModeResponse, ShowQueueItemResponse, ShutdownResponse, StatusResponse, TaskLiveness,
+    TrashedFileInfo, UnlinkResponse, UnpinResponse, VolumeFreeSpace,
 };
 use yadorilink_ipc_proto::framing::{read_message, write_message};
 #[cfg(windows)]
@@ -53,7 +59,26 @@ where
 {
     let Some(req) = read_message::<DaemonControlRequest>(&mut stream).await? else { return Ok(()) };
     let resp = handle_request(&context, req).await;
-    write_message(&mut stream, &resp).await
+    match write_message(&mut stream, &resp).await {
+        // A response too large to frame is refused by `write_message`
+        // before any byte reaches the stream, so the connection is still
+        // clean and the client can be told what happened instead of seeing
+        // the socket close on it. Every response that can grow with the
+        // size of a folder is expected to bound itself (see
+        // `crate::rewind::trim_for_wire` for the worked case); this is the
+        // backstop for one that does not.
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+            let fallback = DaemonControlResponse {
+                daemon_protocol_version: yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION,
+                payload: Some(RespPayload::Error(format!(
+                    "this daemon's answer is too large to send over the control socket \
+                     ({error}); narrow the request and try again"
+                ))),
+            };
+            write_message(&mut stream, &fallback).await
+        }
+        other => other,
+    }
 }
 
 #[cfg(unix)]
@@ -341,6 +366,54 @@ async fn handle_request(
             Err(e) => RespPayload::Error(e.to_string()),
         },
 
+        // Track Send: `yadorilink send <source_path> <target_device>`.
+        Some(ReqPayload::SendFile(r)) => {
+            match context.application.send_transfer.send(&r.source_path, &r.target_device).await {
+                Ok(outcome) => RespPayload::SendFile(SendFileResponse {
+                    transfer_id: outcome.transfer_id,
+                    files_offered: outcome.files_offered,
+                    total_size: outcome.total_size,
+                }),
+                Err(e) => RespPayload::Error(e),
+            }
+        }
+
+        // Track Send: `yadorilink inbox`.
+        Some(ReqPayload::ListInbox(_)) => match context.queries.inbox.list() {
+            Ok(transfers) => RespPayload::ListInbox(ListInboxResponse {
+                transfers: transfers
+                    .into_iter()
+                    .map(|t| InboxTransfer {
+                        transfer_id: t.transfer_id,
+                        sender_device_id: t.sender_device_id,
+                        files: t
+                            .files
+                            .into_iter()
+                            .map(|(relative_path, size)| InboxFileSummary { relative_path, size })
+                            .collect(),
+                        total_size: t.total_size,
+                        offered_at_unix_nanos: t.offered_at_unix_nanos,
+                        status: t.status.to_string(),
+                    })
+                    .collect(),
+            }),
+            Err(e) => RespPayload::Error(e),
+        },
+
+        // Track Send: `yadorilink receive <transfer_id> [--to <dir>]`.
+        Some(ReqPayload::ReceiveTransfer(r)) => {
+            let destination_dir =
+                if r.destination_dir.is_empty() { None } else { Some(r.destination_dir.as_str()) };
+            match context.application.send_transfer.receive(&r.transfer_id, destination_dir).await {
+                Ok(outcome) => RespPayload::ReceiveTransfer(ReceiveTransferResponse {
+                    destination_dir: outcome.destination_dir.to_string_lossy().into_owned(),
+                    files_received: outcome.files_received,
+                    bytes_received: outcome.bytes_received,
+                }),
+                Err(e) => RespPayload::Error(e),
+            }
+        }
+
         // `yadorilink trash restore <path>`.
         Some(ReqPayload::RestoreTrash(r)) => {
             match context.queries.linked_path.resolve(&r.absolute_path) {
@@ -598,6 +671,29 @@ async fn handle_request(
             RespPayload::ListConnectionTraces(ListConnectionTracesResponse { traces })
         }
 
+        // The other half of the same question: candidates a peer has
+        // announced on this network that are being held as dial targets,
+        // which have no trace entry until an attempt using one resolves.
+        Some(ReqPayload::ListLanDiscoveredCandidates(r)) => {
+            let peer_device_id =
+                (!r.peer_device_id.is_empty()).then_some(r.peer_device_id.as_str());
+            let candidates = context
+                .queries
+                .diagnostics
+                .lan_discovered_candidates(peer_device_id)
+                .into_iter()
+                .map(|candidate| LanDiscoveredCandidate {
+                    peer_device_id: candidate.peer_device_id,
+                    address_class: candidate.address_class.to_string(),
+                    last_seen_ms_ago: candidate.last_seen_ms_ago,
+                    peer_has_any_session: candidate.peer_has_any_session,
+                })
+                .collect();
+            RespPayload::ListLanDiscoveredCandidates(ListLanDiscoveredCandidatesResponse {
+                candidates,
+            })
+        }
+
         Some(ReqPayload::ConnectivityDoctor(_)) => {
             let categories = context
                 .queries
@@ -642,6 +738,22 @@ async fn handle_request(
             }),
             Err(e) => RespPayload::Error(e.to_string()),
         },
+
+        // `yadorilink rewind <group> --at <timestamp>`: Folder Rewind's
+        // read-only preview. Nothing here mutates anything -- no signed
+        // change, no filesystem write, no obligation -- so it goes through
+        // `queries`, not `application`, like every other read-only handler.
+        Some(ReqPayload::RewindPreview(r)) => {
+            match context
+                .queries
+                .rewind
+                .preview(&r.group_id, r.at_unix_nanos, r.include_unchanged)
+                .await
+            {
+                Ok(preview) => RespPayload::RewindPreview(rewind_preview_to_proto(preview)),
+                Err(e) => RespPayload::Error(e.to_string()),
+            }
+        }
 
         // Read-only pre-check for `yadorilink share set-storage-mode`: never
         // mutates anything, local or remote (see
@@ -869,6 +981,62 @@ async fn handle_request(
             })
         }
 
+        Some(ReqPayload::AcceptInviteCommand(r)) => {
+            let application = context.application.clone();
+            let result = application
+                .enrollment
+                .accept_invite_and_link(crate::application::AcceptInviteCommand {
+                    code: r.code,
+                    absolute_path: r.local_path.into(),
+                    on_demand: r.on_demand,
+                    acknowledge_risks: r.acknowledge_risks,
+                })
+                .await;
+            RespPayload::AcceptInviteCommand(AcceptInviteCommandResponse {
+                result: Some(match result {
+                    Ok(outcome) => accept_invite_command_response::Result::Outcome(
+                        enrollment_outcome_to_proto(outcome),
+                    ),
+                    Err(error) => accept_invite_command_response::Result::Error(
+                        enrollment_error_to_proto(error),
+                    ),
+                }),
+            })
+        }
+
+        Some(ReqPayload::MintInviteCommand(r)) => {
+            let application = context.application.clone();
+            let role = if r.role.is_empty() { None } else { Some(r.role.as_str()) };
+            let ttl_secs = if r.ttl_secs == 0 { None } else { Some(r.ttl_secs) };
+            let result = application
+                .enrollment
+                .mint_invite(&r.group_id, role, ttl_secs, r.requires_approval)
+                .await;
+            RespPayload::MintInviteCommand(MintInviteCommandResponse {
+                result: Some(match result {
+                    Ok(invite) => mint_invite_command_response::Result::Outcome(MintedInviteInfo {
+                        code: invite.code,
+                        invite_id: invite.invite_id,
+                        group_id: invite.group_id,
+                        role: invite.role,
+                        expires_at_unix: invite.expires_at_unix,
+                        // Echoed from the coordination plane's own response,
+                        // never from the request: what the caller renders must
+                        // describe the invite that exists.
+                        requires_approval: invite.requires_approval,
+                    }),
+                    Err(detail) => {
+                        mint_invite_command_response::Result::Error(ApplicationCommandError {
+                            code: ApplicationErrorCode::CoordinationRejected as i32,
+                            message: detail,
+                            group_ids: Vec::new(),
+                            operation_id: String::new(),
+                        })
+                    }
+                }),
+            })
+        }
+
         // Phase 2.1: `yadorilink recovery list`/`show`. Strictly read-only --
         // see yadorilink_sync_core::recovery's own doc comment -- so there is
         // no dedicated error variant on these responses; a genuine read
@@ -1015,6 +1183,7 @@ fn enrollment_outcome_to_proto(
         operation_id: outcome.operation_id,
         group_id: outcome.group_id,
         local_path: outcome.local_path.to_string_lossy().to_string(),
+        awaiting_approval: outcome.awaiting_approval,
     }
 }
 
@@ -1097,6 +1266,70 @@ fn decode_link_command(r: LinkRequest) -> crate::application::LinkCommand {
         max_local_size_bytes: r.max_local_size_bytes,
         acknowledge_risks: r.acknowledge_risks,
         pending_enrollment,
+    }
+}
+
+/// `RewindPreview` (daemon) -> `RewindPreviewResponse` (proto).
+///
+/// A by-field mapping only: the decisions about what the listing carries --
+/// the `unchanged` filter and the byte budgets that keep a response inside
+/// one frame -- are made in `crate::rewind::trim_for_wire`, which this is
+/// handed the result of.
+///
+/// `RewindPathAction::Unavailable` maps to a distinct `action` string with
+/// its own `unavailable_reason`, never to `"unchanged"`: the whole point of
+/// that variant is that "this device cannot answer" reaches the person
+/// reading the preview as itself.
+fn rewind_preview_to_proto(preview: crate::rewind::RewindPreview) -> RewindPreviewResponse {
+    use yadorilink_replica_domain::rewind::RewindPathAction;
+    RewindPreviewResponse {
+        group_id: preview.group_id,
+        target_unix_nanos: preview.target_unix_nanos,
+        counts: Some(WireRewindActionCounts {
+            create: preview.counts.create,
+            delete: preview.counts.delete,
+            replace: preview.counts.replace,
+            unchanged: preview.counts.unchanged,
+            unavailable: preview.counts.unavailable,
+        }),
+        total_entry_count: preview.total_entry_count,
+        total_rename_candidate_count: preview.total_rename_candidate_count,
+        listing_truncated: preview.listing_truncated,
+        entries: preview
+            .entries
+            .into_iter()
+            .map(|entry| {
+                let (action, to_version_seq, from_version_seq, unavailable_reason) =
+                    match entry.action {
+                        RewindPathAction::Create { version_seq, .. } => {
+                            ("create", Some(version_seq), None, None)
+                        }
+                        RewindPathAction::Delete => ("delete", None, None, None),
+                        RewindPathAction::Replace { from_version_seq, to_version_seq, .. } => {
+                            ("replace", Some(to_version_seq), Some(from_version_seq), None)
+                        }
+                        RewindPathAction::Unchanged => ("unchanged", None, None, None),
+                        RewindPathAction::Unavailable { reason } => {
+                            ("unavailable", None, None, Some(reason))
+                        }
+                    };
+                WireRewindPathEntry {
+                    path: entry.path,
+                    action: action.to_string(),
+                    to_version_seq,
+                    from_version_seq,
+                    unavailable_reason,
+                }
+            })
+            .collect(),
+        rename_candidates: preview
+            .rename_candidates
+            .into_iter()
+            .map(|candidate| WireRewindRenameCandidate {
+                from_path: candidate.from_path,
+                to_path: candidate.to_path,
+            })
+            .collect(),
     }
 }
 
@@ -1555,6 +1788,106 @@ fn overall_status(response: &StatusResponse) -> (OverallState, Vec<String>) {
         return (OverallState::Attention, attention_reasons);
     }
     (OverallState::Healthy, Vec::new())
+}
+
+#[cfg(test)]
+mod rewind_preview_wire_tests {
+    use super::*;
+    use prost::Message;
+    use yadorilink_ipc_proto::framing::MAX_FRAME_LEN;
+    use yadorilink_replica_domain::ids::VersionHash;
+    use yadorilink_replica_domain::rewind::{
+        RewindPathAction, RewindPathEntry, RewindPlan, RewindRenameCandidate,
+    };
+
+    /// A plan far past the scale the read-side benchmark measures, built to
+    /// be as expensive to encode as a real one can plausibly be: long
+    /// nested paths, and an `unavailable` reason on every path that can
+    /// carry one.
+    fn huge_plan(paths: usize) -> RewindPlan {
+        let entries = (0..paths)
+            .map(|i| {
+                let action = match i % 4 {
+                    0 => RewindPathAction::Unchanged,
+                    1 => RewindPathAction::Delete,
+                    2 => RewindPathAction::Replace {
+                        from_version_seq: 9,
+                        to_version_seq: 4,
+                        to_version_hash: VersionHash([1u8; 32]),
+                    },
+                    _ => RewindPathAction::Unavailable {
+                        reason: "this device holds no version of this path from at or before \
+                                 the target time (its earliest retained version is 7); earlier \
+                                 versions were either expired by version retention or never \
+                                 held by this device"
+                            .to_string(),
+                    },
+                };
+                RewindPathEntry {
+                    path: format!("some/reasonably/deep/project/directory/tree/file-{i:07}.bin"),
+                    action,
+                }
+            })
+            .collect();
+        RewindPlan {
+            group_id: "group-with-a-lot-in-it".to_string(),
+            target_unix_nanos: 1_750_000_000_000_000_000,
+            entries,
+            rename_candidates: (0..paths / 10)
+                .map(|i| RewindRenameCandidate {
+                    from_path: format!("some/reasonably/deep/moved/from-{i:07}.bin"),
+                    to_path: format!("some/reasonably/deep/moved/to-{i:07}.bin"),
+                    version_hash: VersionHash([2u8; 32]),
+                })
+                .collect(),
+        }
+    }
+
+    /// The response has to fit in one frame or the CLI cannot read it at
+    /// all -- the reader rejects an oversized frame outright, and now so
+    /// does the writer. Asserted at a scale well past the 50k the read-side
+    /// benchmark covers, in BOTH modes: the `unchanged` filter is the
+    /// ordinary saving, but the byte budget is what makes the guarantee
+    /// unconditional.
+    #[test]
+    fn a_huge_plan_still_produces_a_response_that_fits_in_one_frame() {
+        for include_unchanged in [false, true] {
+            let response = rewind_preview_to_proto(crate::rewind::trim_for_wire(
+                huge_plan(200_000),
+                include_unchanged,
+            ));
+            let encoded_len = response.encoded_len();
+            assert!(
+                encoded_len < MAX_FRAME_LEN as usize,
+                "include_unchanged={include_unchanged}: response of {encoded_len} bytes would \
+                 not fit in a {MAX_FRAME_LEN}-byte frame"
+            );
+            // The summary must still describe the WHOLE plan, or the
+            // trimming would have quietly changed the answer.
+            let counts = response.counts.as_ref().expect("counts are always sent");
+            assert_eq!(response.total_entry_count, 200_000);
+            assert_eq!(
+                counts.create
+                    + counts.delete
+                    + counts.replace
+                    + counts.unchanged
+                    + counts.unavailable,
+                200_000
+            );
+            assert!(response.listing_truncated, "a listing this big cannot have fit whole");
+        }
+    }
+
+    /// The ordinary case: a folder small enough to describe completely must
+    /// come back complete, with nothing flagged as cut.
+    #[test]
+    fn a_small_plan_is_delivered_whole() {
+        let response = rewind_preview_to_proto(crate::rewind::trim_for_wire(huge_plan(40), true));
+        assert_eq!(response.entries.len(), 40);
+        assert_eq!(response.rename_candidates.len(), 4);
+        assert!(!response.listing_truncated);
+        assert!(response.encoded_len() < MAX_FRAME_LEN as usize);
+    }
 }
 
 #[cfg(test)]

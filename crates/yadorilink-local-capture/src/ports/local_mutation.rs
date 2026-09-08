@@ -287,6 +287,10 @@ pub trait LocalMutationStore: Send + Sync {
     /// recognize this device's own locally-authored content as already
     /// correct). `None` is always correct/safe — it simply forgoes that
     /// optimization for this call.
+    // Port trait method with many call sites workspace-wide; grouping
+    // these into a params struct would be a call-site-touching refactor
+    // well beyond a toolchain-drift lint cleanup.
+    #[allow(clippy::too_many_arguments)]
     fn upsert_file_emitting_change(
         &self,
         group_id: &str,
@@ -374,6 +378,10 @@ pub trait LocalMutationStore: Send + Sync {
     /// exact `Absent` actual-state proof in the SAME transaction, same
     /// reasoning as `upsert_file_emitting_change`'s `filesystem_identity`
     /// parameter. `false` is always correct/safe.
+    // Port trait method with many call sites workspace-wide; grouping
+    // these into a params struct would be a call-site-touching refactor
+    // well beyond a toolchain-drift lint cleanup.
+    #[allow(clippy::too_many_arguments)]
     fn mark_deleted_emitting_change(
         &self,
         group_id: &str,

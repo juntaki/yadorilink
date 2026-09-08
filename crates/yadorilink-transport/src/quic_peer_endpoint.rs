@@ -38,8 +38,8 @@ use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use crate::error::TransportError;
 use crate::keys::DeviceSigningKeyPair;
 use crate::quic_identity::{
-    ed25519_key_from_spki, quic_client_config, quic_server_config, AuthorizedPeerKeys,
-    PEER_SERVER_NAME,
+    ed25519_key_from_spki, quic_client_config, quic_dual_server_config, quic_send_client_config,
+    AuthorizedPeerKeys, PEER_SERVER_NAME, YADORILINK_SEND_ALPN,
 };
 use crate::quic_socket::{HubQuinnRuntime, TransportHubQuicSocket};
 use crate::transport_hub::TransportHub;
@@ -78,10 +78,35 @@ const PEER_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// must not be able to make this device hold an unbounded number of them.
 const INBOUND_CONNECTION_QUEUE_DEPTH: usize = 4;
 
+/// How many not-yet-claimed Track Send connections this device holds at
+/// once, across every peer -- unlike `INBOUND_CONNECTION_QUEUE_DEPTH`
+/// above, this is one shared queue rather than one per peer (see
+/// `QuicPeerEndpoint::inbound_send`'s own doc comment for why), so it is
+/// sized for "several sends arrived before the daemon's dispatcher task
+/// got to them", not for one misbehaving peer alone. Still small and
+/// bounded for the identical reason: an authenticated connection sitting
+/// in this queue is live QUIC state, and an authorized peer that opens
+/// send connections in a loop must not be able to make this device hold
+/// an unbounded number of them.
+const INBOUND_SEND_QUEUE_DEPTH: usize = 8;
+
 /// QUIC application error code closing a connection this device has no
 /// intention of using. Named rather than a bare literal so every place that
 /// closes one agrees.
 const CONNECTION_NOT_WANTED: u32 = 1;
+
+/// A completed inbound handshake queued for Track Send: the live connection,
+/// paired with the peer's authenticated Ed25519 public key (see
+/// `QuicPeerEndpoint::inbound_send`'s own doc comment for the queue this
+/// feeds).
+type PendingInboundConnection = (quinn::Connection, [u8; 32]);
+
+/// The receiving half of Track Send's inbound-connection queue.
+type InboundConnectionReceiver = mpsc::Receiver<PendingInboundConnection>;
+
+/// The sending half of Track Send's inbound-connection queue, held by the
+/// accept loop that feeds [`InboundConnectionReceiver`].
+type InboundConnectionSender = mpsc::Sender<PendingInboundConnection>;
 
 /// Written by the dialler on the one connection it has selected, and
 /// required by the acceptor before it will hand a connection to a session.
@@ -303,9 +328,35 @@ pub struct QuicPeerEndpoint {
     /// is what stops any other authorized peer from taking the call.
     device: DeviceSigningKeyPair,
     authorized: AuthorizedPeerKeys,
+    /// A second, independent live set: keys admitted to a raw TLS handshake
+    /// for a reason OTHER than ordinary netmap membership -- today, Track
+    /// Send's own short-lived, sender+receiver-bound rendezvous grants (see
+    /// `crates/yadorilink-daemon`'s `send_transfer` module). Deliberately
+    /// never merged into `authorized`: `accept_loop` treats a completed
+    /// SYNC-ALPN handshake as a real peer connection only when the peer key
+    /// is ALSO in `authorized` specifically, so a key admitted only through
+    /// this set can complete a handshake (Track Send needs that) without
+    /// ever being able to reach a real sync session, a folder, or the
+    /// change DAG through it.
+    send_authorized: AuthorizedPeerKeys,
     /// Shared with the accept loop, which is why it is behind its own `Arc`
     /// rather than living in this struct directly.
     inbound: Arc<InboundConnections>,
+    /// Completed inbound handshakes that negotiated [`YADORILINK_SEND_ALPN`]
+    /// instead of the sync protocol's ALPN -- Track Send's own inbox,
+    /// entirely separate from `inbound` above.
+    ///
+    /// Not peer-keyed like `inbound`: the sync protocol has one long-lived
+    /// session per peer that is always the one waiting to claim a
+    /// connection, but Track Send has no standing per-peer session --
+    /// sends are sporadic and one-shot, from any authorized peer, at any
+    /// time. So this is a single queue of `(connection, peer_public_key)`
+    /// pairs, drained by one daemon-side task that dispatches each
+    /// connection by the peer key it carries. `Some` until whichever task
+    /// owns Track Send's inbound handling takes it (see
+    /// [`take_inbound_send`](Self::take_inbound_send)); `None` afterwards,
+    /// since a channel receiver has exactly one owner.
+    inbound_send: StdMutex<Option<InboundConnectionReceiver>>,
     transport: Arc<quinn::TransportConfig>,
     accept_loop: tokio::task::JoinHandle<()>,
 }
@@ -344,9 +395,16 @@ impl QuicPeerEndpoint {
         device: DeviceSigningKeyPair,
     ) -> Result<Arc<Self>, TransportError> {
         let authorized = AuthorizedPeerKeys::new();
+        let send_authorized = AuthorizedPeerKeys::new();
         let transport = Arc::new(peer_transport_config());
 
-        let mut server_config = quic_server_config(&device, &authorized)?;
+        // `quic_dual_server_config`, not `quic_server_config`: this is the
+        // one server configuration the device's one endpoint actually runs
+        // with, so it has to accept both the sync protocol's ALPN and
+        // Track Send's -- see that function's own doc comment for why this
+        // is a separate function rather than a change to
+        // `quic_server_config` itself.
+        let mut server_config = quic_dual_server_config(&device, &authorized, &send_authorized)?;
         server_config.transport_config(transport.clone());
 
         let socket = TransportHubQuicSocket::new(hub)?;
@@ -358,9 +416,65 @@ impl QuicPeerEndpoint {
         )?;
 
         let inbound = Arc::new(InboundConnections::default());
-        let accept_loop = tokio::spawn(accept_loop(endpoint.clone(), inbound.clone()));
+        let (inbound_send_tx, inbound_send_rx) = mpsc::channel(INBOUND_SEND_QUEUE_DEPTH);
+        let accept_loop = tokio::spawn(accept_loop(
+            endpoint.clone(),
+            authorized.clone(),
+            inbound.clone(),
+            inbound_send_tx,
+        ));
 
-        Ok(Arc::new(Self { endpoint, device, authorized, inbound, transport, accept_loop }))
+        Ok(Arc::new(Self {
+            endpoint,
+            device,
+            authorized,
+            send_authorized,
+            inbound,
+            inbound_send: StdMutex::new(Some(inbound_send_rx)),
+            transport,
+            accept_loop,
+        }))
+    }
+
+    /// Takes ownership of Track Send's inbound-connection stream: every
+    /// completed handshake that negotiated [`YADORILINK_SEND_ALPN`], paired
+    /// with the peer's authenticated public key, in arrival order.
+    ///
+    /// Returns `None` on every call after the first -- a channel receiver
+    /// has exactly one owner, and this endpoint has exactly one Track Send
+    /// inbound-handling task to hand it to. That task is expected to drain
+    /// this for the life of the endpoint; a connection queued here before
+    /// anyone takes the receiver simply waits (bounded by
+    /// [`INBOUND_SEND_QUEUE_DEPTH`], same backpressure shape as the sync
+    /// protocol's own per-peer inbox).
+    pub fn take_inbound_send(&self) -> Option<InboundConnectionReceiver> {
+        self.inbound_send.lock().unwrap_or_else(|p| p.into_inner()).take()
+    }
+
+    /// Dials `addr` for a Track Send connection, accepting an answer only
+    /// from `peer_public_key` -- the send-ALPN counterpart of
+    /// [`connect`](Self::connect)/[`dial`](Self::dial).
+    ///
+    /// Deliberately does not run the sync protocol's candidate-race/
+    /// selection-preface dance ([`connect_racing`](Self::connect_racing)):
+    /// Track Send is a one-shot request against a device this daemon
+    /// already has (or can already establish) ordinary connectivity to,
+    /// not a long-lived session worth racing multiple candidates for. A
+    /// caller with more than one candidate address tries them in whatever
+    /// order/bound fits its own retry policy; each attempt here is a plain
+    /// single dial.
+    pub async fn connect_send(
+        &self,
+        addr: SocketAddr,
+        peer_public_key: [u8; 32],
+    ) -> Result<quinn::Connection, TransportError> {
+        let mut client_config = quic_send_client_config(&self.device, peer_public_key)?;
+        client_config.transport_config(self.transport.clone());
+        self.endpoint
+            .connect_with(client_config, addr, PEER_SERVER_NAME)
+            .map_err(|err| TransportError::NoRoute(err.to_string()))?
+            .await
+            .map_err(|err| TransportError::NoRoute(err.to_string()))
     }
 
     /// The address peers should be told to dial. Identical to the hub's, by
@@ -436,6 +550,53 @@ impl QuicPeerEndpoint {
         for removed in self.authorized.replace(peer_public_keys) {
             self.inbound.discard(&removed);
         }
+    }
+
+    /// Admits `peer_public_key` to a raw TLS handshake for Track Send
+    /// purposes only -- see `send_authorized`'s own field doc comment for
+    /// why this is a completely separate set from ordinary netmap
+    /// authorization, never a way to reach a real sync session. Additive,
+    /// unlike [`replace_authorized`](Self::replace_authorized): Track
+    /// Send's own caller adds and removes exactly one key per grant, on its
+    /// own schedule, entirely independent of netmap pushes.
+    pub fn authorize_send_peer(&self, peer_public_key: [u8; 32]) -> bool {
+        self.send_authorized.authorize(peer_public_key)
+    }
+
+    /// Withdraws a key added by [`authorize_send_peer`](Self::authorize_send_peer)
+    /// -- called once its grant is consumed, expired, or the transfer it
+    /// was for is done. Does not touch any already-completed handshake or
+    /// live connection; same scope as [`replace_authorized`](Self::replace_authorized)'s
+    /// own "decides who may connect next" guarantee.
+    pub fn revoke_send_peer(&self, peer_public_key: &[u8; 32]) -> bool {
+        self.send_authorized.revoke(peer_public_key)
+    }
+
+    /// Schedules [`revoke_send_peer`](Self::revoke_send_peer) at
+    /// `expires_at_unix` (unix seconds) -- the one pattern both directions
+    /// of a Track Send grant need: an [`authorize_send_peer`](Self::authorize_send_peer)
+    /// admission that must not outlive the grant's own short TTL, since
+    /// `AuthorizedPeerKeys` itself has no TTL notion of its own. An
+    /// `expires_at_unix` already in the past schedules an effectively-
+    /// immediate revoke rather than erroring -- a grant this device only
+    /// just learned about but that is already stale needs to be revoked,
+    /// not rejected outright, since it may have been briefly authorized a
+    /// moment earlier by the very call this schedules after.
+    pub fn schedule_send_peer_revoke(
+        self: &Arc<Self>,
+        peer_public_key: [u8; 32],
+        expires_at_unix: i64,
+    ) {
+        let endpoint = self.clone();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let ttl = Duration::from_secs(expires_at_unix.saturating_sub(now).max(0) as u64);
+        tokio::spawn(async move {
+            tokio::time::sleep(ttl).await;
+            endpoint.revoke_send_peer(&peer_public_key);
+        });
     }
 
     /// Dials `addr`, accepting an answer only from `peer_public_key`.
@@ -729,15 +890,35 @@ fn peer_transport_config() -> quinn::TransportConfig {
     transport
 }
 
-/// Routes each completed inbound handshake to the peer it authenticated as.
+/// Routes each completed inbound handshake to the peer it authenticated as,
+/// and -- since `QuicPeerEndpoint::new` now builds its server configuration
+/// from `quic_dual_server_config` -- to the right one of the two
+/// completely separate protocols this endpoint accepts.
 ///
 /// Every connection reaching here has already been through mutual raw-
 /// public-key verification against the live authorized set -- the handshake
 /// is what admitted it -- so the identity read back off it is the verified
-/// one, not a claim.
-async fn accept_loop(endpoint: quinn::Endpoint, inbound: Arc<InboundConnections>) {
+/// one, not a claim. That set, however, is `authorized` UNION
+/// `send_authorized` (`quic_dual_server_config`'s two live sets) -- a
+/// completed handshake alone does not say which of the two admitted this
+/// key. For a SYNC-ALPN connection that distinction matters: `authorized`
+/// (passed in here, read fresh) is re-checked before `inbound.deliver()`,
+/// so a key admitted only through `send_authorized` gets its handshake
+/// (Track Send needs that to succeed) but never reaches a real sync
+/// session. A SEND-ALPN connection needs no such re-check here -- its own
+/// authorization is the application-layer grant check inside
+/// `yadorilink-send`'s `handle_offer`, not anything this transport layer
+/// decides.
+async fn accept_loop(
+    endpoint: quinn::Endpoint,
+    authorized: AuthorizedPeerKeys,
+    inbound: Arc<InboundConnections>,
+    inbound_send_tx: InboundConnectionSender,
+) {
     while let Some(incoming) = endpoint.accept().await {
+        let authorized = authorized.clone();
         let inbound = inbound.clone();
+        let inbound_send_tx = inbound_send_tx.clone();
         // One task per handshake: a peer that starts a handshake and then
         // goes quiet must not hold up every other peer's.
         tokio::spawn(async move {
@@ -761,9 +942,64 @@ async fn accept_loop(endpoint: quinn::Endpoint, inbound: Arc<InboundConnections>
                 tracing::warn!("an accepted QUIC connection carried no Ed25519 peer identity");
                 return;
             };
+            if negotiated_send_alpn(&connection) {
+                // Track Send's own inbox, never the sync protocol's --
+                // `try_send` rather than an unbounded await, so a dispatcher
+                // task that is momentarily behind cannot stall this
+                // connection's own handshake-acceptor task indefinitely; a
+                // full queue closes the connection exactly as the sync
+                // path's `InboundConnections::deliver` does.
+                if let Err(err) = inbound_send_tx.try_send((connection, peer)) {
+                    let connection = match err {
+                        mpsc::error::TrySendError::Full(pair) => pair.0,
+                        mpsc::error::TrySendError::Closed(pair) => pair.0,
+                    };
+                    connection
+                        .close(CONNECTION_NOT_WANTED.into(), b"send inbox queue full or closed");
+                    tracing::debug!(
+                        "dropping an inbound Track Send QUIC connection: the queue is full or \
+                         nobody has taken it yet"
+                    );
+                }
+                return;
+            }
+            if !authorized.contains(&peer) {
+                // Reachable only for a key admitted solely through
+                // `send_authorized` -- every key genuinely in `authorized`
+                // was already checked by the exact same read a moment
+                // earlier at the crypto layer, so this is never a false
+                // refusal of an ordinary netmap peer, only the closing half
+                // of the split this function's own doc comment describes:
+                // a Track Send grant's handshake succeeds, but it must
+                // never be mistaken for a sync-protocol connection.
+                connection.close(CONNECTION_NOT_WANTED.into(), b"not a sync-authorized peer");
+                tracing::debug!(
+                    "refusing a sync-ALPN connection from a key not in this device's netmap-\
+                     derived authorized set (admitted only for Track Send, if at all)"
+                );
+                return;
+            }
             inbound.deliver(peer, connection);
         });
     }
+}
+
+/// Whether `connection` negotiated [`YADORILINK_SEND_ALPN`] rather than the
+/// sync protocol's ALPN. `false` for anything else, including a connection
+/// whose handshake data quinn cannot report or downcast -- the sync
+/// protocol is this endpoint's original, still-default behavior, so an
+/// unrecognized case falls back to exactly what every connection did before
+/// Track Send's ALPN existed, rather than to a queue built for a protocol
+/// that connection never actually claimed to speak.
+fn negotiated_send_alpn(connection: &quinn::Connection) -> bool {
+    let Some(handshake_data) = connection.handshake_data() else {
+        return false;
+    };
+    let Ok(handshake_data) = handshake_data.downcast::<quinn::crypto::rustls::HandshakeData>()
+    else {
+        return false;
+    };
+    handshake_data.protocol.as_deref() == Some(YADORILINK_SEND_ALPN)
 }
 
 /// The Ed25519 public key the peer authenticated with.
@@ -872,5 +1108,152 @@ mod tests {
     #[test]
     fn a_device_paired_with_itself_does_not_dial() {
         assert_eq!(connect_role("device-a", "device-a"), ConnectRole::Accept);
+    }
+
+    /// Track Send's own inbox is genuinely separate from the sync
+    /// protocol's: a `connect_send` dial must be delivered through
+    /// `take_inbound_send`, and must NOT be claimable through the ordinary
+    /// peer-keyed `accept` -- proving the two protocols cannot be confused
+    /// for each other even though they share one endpoint, one socket, and
+    /// one authorized-peer set.
+    #[tokio::test]
+    async fn a_send_alpn_connection_is_delivered_to_the_send_inbox_not_the_sync_one() {
+        let (dialer, _dialer_addr, dialer_key) = endpoint().await;
+        let (acceptor, acceptor_addr, acceptor_key) = endpoint().await;
+        dialer.authorize(acceptor_key);
+        acceptor.authorize(dialer_key);
+
+        let mut inbound_send =
+            acceptor.take_inbound_send().expect("first take of the send inbox succeeds");
+
+        let dialed = dialer
+            .connect_send(acceptor_addr, acceptor_key)
+            .await
+            .expect("a send-ALPN dial completes");
+
+        let (accepted, peer) = tokio::time::timeout(Duration::from_secs(10), inbound_send.recv())
+            .await
+            .expect("the send inbox receives the connection")
+            .expect("the channel is still open");
+        assert_eq!(peer, dialer_key, "the send inbox reports the dialer's authenticated key");
+
+        // Prove it is genuinely the same connection, not a coincidence:
+        // traffic written on one side must arrive on the other.
+        let (mut send, _recv) = dialed.open_bi().await.expect("open a stream on the send dial");
+        send.write_all(b"track send").await.expect("write on the send dial");
+        let (_send, mut recv) = tokio::time::timeout(Duration::from_secs(10), accepted.accept_bi())
+            .await
+            .expect("the send inbox connection carries the dial's stream")
+            .expect("stream");
+        let mut carried = [0u8; 10];
+        recv.read_exact(&mut carried).await.expect("read the marker");
+        assert_eq!(&carried, b"track send");
+
+        // The ordinary sync-protocol `accept` must see nothing: a second
+        // take of the send inbox reports it already taken (proving the
+        // dispatch really used the send-specific path, not the sync one),
+        // and a bounded wait on the sync `accept` for the same peer key
+        // times out rather than handing back this connection.
+        assert!(acceptor.take_inbound_send().is_none(), "the send inbox has exactly one owner");
+        let sync_accept =
+            tokio::time::timeout(Duration::from_millis(200), acceptor.accept(dialer_key));
+        assert!(
+            sync_accept.await.is_err(),
+            "a send-ALPN connection must never reach sync `accept`"
+        );
+    }
+
+    /// The reverse direction of the test above: an ordinary sync-protocol
+    /// dial must still reach `accept` exactly as it always has, and must
+    /// never be delivered through Track Send's inbox -- proving the new
+    /// ALPN dispatch changed nothing about the connection every peer
+    /// session already depends on.
+    #[tokio::test]
+    async fn a_sync_alpn_connection_still_reaches_the_ordinary_accept() {
+        let (dialer, _dialer_addr, dialer_key) = endpoint().await;
+        let (acceptor, acceptor_addr, acceptor_key) = endpoint().await;
+        dialer.authorize(acceptor_key);
+        acceptor.authorize(dialer_key);
+
+        let mut inbound_send =
+            acceptor.take_inbound_send().expect("first take of the send inbox succeeds");
+
+        let _dialed =
+            dialer.connect(acceptor_addr, acceptor_key).await.expect("a sync-ALPN dial completes");
+
+        let claimed = tokio::time::timeout(Duration::from_secs(10), acceptor.accept(dialer_key))
+            .await
+            .expect("accept must resolve")
+            .expect("a sync connection must be handed to the ordinary accept path");
+        assert!(claimed.close_reason().is_none());
+
+        let send_side = tokio::time::timeout(Duration::from_millis(200), inbound_send.recv());
+        assert!(send_side.await.is_err(), "a sync-ALPN connection must never reach the send inbox");
+    }
+
+    /// The adversarial counterpart to the two tests above, and the one
+    /// Track Send's own grant primitive depends on: a key admitted ONLY
+    /// through `authorize_send_peer` -- never through the ordinary
+    /// `authorize`, i.e. never a genuine netmap-derived peer -- can still
+    /// complete a send-ALPN dial (Track Send needs exactly that for a
+    /// same-account sender with no shared folder group), but if the SAME
+    /// key is instead used to attempt the ordinary SYNC-protocol ALPN, the
+    /// resulting connection must never reach `accept`. A coordination-plane
+    /// rendezvous grant must never be usable to reach a real sync session,
+    /// a folder, or the change DAG -- see `send_authorized`'s own field
+    /// doc comment and `accept_loop`'s own post-handshake gate, which is
+    /// what this test is exercising end to end rather than merely reading
+    /// the source.
+    #[tokio::test]
+    async fn a_key_authorized_only_for_send_cannot_reach_the_ordinary_sync_accept() {
+        let (dialer, _dialer_addr, dialer_key) = endpoint().await;
+        let (acceptor, acceptor_addr, acceptor_key) = endpoint().await;
+        // Deliberately NOT `acceptor.authorize(dialer_key)` -- the dialer
+        // is never a genuine netmap peer of the acceptor's in this test,
+        // exactly Track Send's own groupless-sender scenario.
+        acceptor.authorize_send_peer(dialer_key);
+
+        // The send-ALPN path this admission exists for still works.
+        let mut inbound_send =
+            acceptor.take_inbound_send().expect("first take of the send inbox succeeds");
+        let dialed = dialer
+            .connect_send(acceptor_addr, acceptor_key)
+            .await
+            .expect("a send-ALPN dial completes for a send-authorized-only key");
+        let (accepted, peer) = tokio::time::timeout(Duration::from_secs(10), inbound_send.recv())
+            .await
+            .expect("the send inbox receives the connection")
+            .expect("the channel is still open");
+        assert_eq!(peer, dialer_key);
+        drop(dialed);
+        drop(accepted);
+
+        // The SAME key attempting the ordinary sync ALPN instead: the raw
+        // TLS handshake completes (`send_authorized` is unioned into the
+        // crypto layer's accept set -- see `PinnedPeerKeys::additional`'s
+        // own doc comment), but the connection must never be claimable
+        // through `accept` -- proving a Track Send grant can never be
+        // used to reach a real sync session.
+        let sync_dial = dialer.dial(acceptor_addr, acceptor_key).await;
+        match sync_dial {
+            Ok(_connection) => {
+                // The handshake succeeded, as expected -- now prove the
+                // acceptor never promotes it to a real sync connection.
+                let claimed =
+                    tokio::time::timeout(Duration::from_millis(300), acceptor.accept(dialer_key))
+                        .await;
+                assert!(
+                    claimed.is_err(),
+                    "a key authorized only for Track Send must never reach the sync-protocol \
+                     accept()"
+                );
+            }
+            Err(_) => {
+                // Also an acceptable outcome: if the transport-layer union
+                // were ever tightened further to refuse the handshake
+                // outright, that is a strictly stronger form of the same
+                // guarantee this test exists to prove.
+            }
+        }
     }
 }

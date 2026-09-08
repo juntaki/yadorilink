@@ -59,12 +59,22 @@ pub use frontier_index::{
     get_device_frontier, group_heads, max_parent_lamport, remove_device_frontier,
     set_device_frontier,
 };
-pub use orphan_integrity::{promote_orphans, ORPHAN_BOUND};
+pub use orphan_integrity::{
+    always_current_writer, defer_all_orphan_promotion, promote_orphans, OrphanPromotionWriterCheck,
+    ORPHAN_BOUND,
+};
 pub use rejected_changes::list_rejected_changes;
 pub(crate) use rejected_changes::{is_change_rejected, record_rejected_change};
+/// Crate-visible, unlike the reader just above: the one writer of
+/// `change_time_index` outside the admission path itself is
+/// `rebootstrap_store::install_rebootstrap_snapshot`, which replaces a
+/// group's history wholesale rather than extending it and so has to leave
+/// the group with one snapshot describing the frontier it actually
+/// produced. Nothing outside this crate has any business recording one.
+pub(crate) use retained_history_integrity::record_admission_time_index;
 pub use retained_history_integrity::{
-    get_encoded, group_history_paths, has_all_parents, has_change, has_change_or_pruned,
-    is_ancestor, lamport_of, list_unapplied, mark_applied, parents_of,
+    frontier_heads_at_or_before, get_encoded, group_history_paths, has_all_parents, has_change,
+    has_change_or_pruned, is_ancestor, lamport_of, list_unapplied, mark_applied, parents_of,
 };
 pub use retention_roots::{
     full_payload_retained_block_hashes, full_payload_retained_block_hashes_all_groups,
@@ -226,6 +236,62 @@ pub fn init_dag_schema(conn: &Connection) -> Result<(), SyncSqliteError> {
         CREATE INDEX IF NOT EXISTS change_parents_by_parent
             ON change_parents(parent_hash);
 
+        -- One row per admission EVENT on this device (not per change --
+        -- `admission_seq` is this device's own local per-group counter,
+        -- unrelated to `lamport`), storing the group's actual head-set
+        -- immediately after that admission completed, alongside this
+        -- device's own local clock at that moment (never a peer-reported
+        -- or change-embedded timestamp -- untrusted input, same reasoning
+        -- as `lamport` itself).
+        --
+        -- Ground truth captured at write time, not derived later: `lamport`
+        -- alone cannot represent "the frontier at time T", because it does
+        -- not form a meaningful total order across concurrent branches --
+        -- two causally-unrelated changes (neither an ancestor of the
+        -- other) can both be genuine live heads simultaneously with no
+        -- single "highest" one, and lamport values are not even guaranteed
+        -- distinct across devices that concurrently emit off the same
+        -- parent. `heads_snapshot` sidesteps this entirely by recording the
+        -- REAL head-set (as `group_heads` itself already computes it, right
+        -- after this same admission's own head-set mutations), not a
+        -- scalar approximation of it.
+        --
+        -- Answers "what was this group's frontier at wall-clock time T, as
+        -- observed on this device" with a single index seek (`ORDER BY
+        -- observed_at_unix_nanos DESC LIMIT 1` against the index below),
+        -- never a DAG walk and never a scan of the whole retained history.
+        --
+        -- Deliberately NOT the mechanism behind Folder Rewind's per-path
+        -- planning layer (`crate::rewind_plan`): a head-set says what the
+        -- group's DAG frontier was, and turning that into "what should
+        -- path X contain at T" would need a per-path ancestor walk against
+        -- a historical frontier -- exactly the call shape `is_ancestor`'s
+        -- own doc comment documents collapsing at 100k scale. This table
+        -- answers a group-level question and stays on that side.
+        CREATE TABLE IF NOT EXISTS change_time_index (
+            group_id               TEXT NOT NULL,
+            admission_seq          INTEGER NOT NULL,
+            observed_at_unix_nanos INTEGER NOT NULL,
+            -- Sorted concatenation of 32-byte `ChangeHash`es -- the group's
+            -- `group_heads` rows immediately after this admission. Sorted
+            -- so two snapshots covering the same actual head-set always
+            -- compare byte-equal, and so decoding never depends on
+            -- insertion order.
+            heads_snapshot         BLOB NOT NULL,
+            PRIMARY KEY (group_id, admission_seq)
+        );
+        -- `admission_seq` is the third column so `frontier_heads_at_or_
+        -- before`'s `ORDER BY observed_at_unix_nanos DESC, admission_seq
+        -- DESC LIMIT 1` is satisfied entirely by a reverse index scan that
+        -- stops at the first row. Without it the tie-break (needed because
+        -- two admissions can share a coarse-granularity timestamp -- see
+        -- that function's own doc comment) would force a temporary sort
+        -- over the whole `observed_at_unix_nanos <= ?` range, turning a
+        -- bounded seek into a cost proportional to the group's entire
+        -- admission history.
+        CREATE INDEX IF NOT EXISTS change_time_index_by_time
+            ON change_time_index(group_id, observed_at_unix_nanos, admission_seq);
+
         CREATE TABLE IF NOT EXISTS group_heads (
             group_id    TEXT NOT NULL,
             change_hash BLOB NOT NULL,
@@ -336,6 +402,22 @@ pub fn init_dag_schema(conn: &Connection) -> Result<(), SyncSqliteError> {
     // operation only seeds from the change that was just admitted. This is
     // the one place a full-buffer sweep is appropriate: it runs once at
     // startup, not once per admission.
+    //
+    // `defer_all_orphan_promotion` (not `always_current_writer`) is
+    // deliberate: this runs directly on a freshly-opened connection, before
+    // any daemon-level policy/trust material could possibly have loaded yet
+    // -- there is no one to ask "is this orphan's author still a writer
+    // right now" at this point in startup, and this is exactly the
+    // real-world window that matters: an already-buffered orphan from a
+    // since-downgraded/revoked author, sitting across a restart, must NOT
+    // get promoted here just because no trust material happens to be
+    // loaded yet. Every candidate this sweep would
+    // otherwise have promoted is deferred (left buffered, not dropped) and
+    // gets a genuine second chance, with REAL trust available, once
+    // `yadorilink_daemon::daemon_state::DaemonState::new` has wired the
+    // real check and the first netmap frame verifies a policy chain --
+    // see `ChangeHistoryRepository::resweep_deferred_orphan_promotions`'s
+    // own doc comment for that later call.
     let self_heal_seeds = orphan_integrity::already_satisfied_parents(conn)?;
     if !self_heal_seeds.is_empty() {
         // Unlike ordinary admission (whose caller always wraps `admit_change`
@@ -350,7 +432,11 @@ pub fn init_dag_schema(conn: &Connection) -> Result<(), SyncSqliteError> {
         // `admit_change`'s own promotion path never has, since it never runs
         // outside `write_immediate`.
         let tx = conn.unchecked_transaction()?;
-        let self_healed = orphan_integrity::promote_orphans(&tx, &self_heal_seeds)?;
+        let self_healed = orphan_integrity::promote_orphans(
+            &tx,
+            &self_heal_seeds,
+            &orphan_integrity::defer_all_orphan_promotion,
+        )?;
         // Each of these just moved from buffered to durably admitted, on
         // this very connection -- exactly what `admit_change`'s own
         // promotion step does, and it must be fenced the same way: a
@@ -455,6 +541,7 @@ pub fn commit_prune(
         ],
     )?;
     let rooted = retention_roots::full_payload_rooted(conn, group_id, pruned)?;
+    let mut removed: std::collections::HashSet<ChangeHash> = std::collections::HashSet::new();
     for hash in pruned {
         if rooted.contains(hash) {
             continue;
@@ -472,7 +559,14 @@ pub fn commit_prune(
             "DELETE FROM group_heads WHERE group_id = ?1 AND change_hash = ?2",
             rusqlite::params![group_id, &hash.0[..]],
         )?;
+        removed.insert(*hash);
     }
+    // The time index is derived from `group_heads`, so it has to be cut back
+    // alongside it: a recorded frontier snapshot naming a change this loop
+    // just deleted describes a point that can no longer be reconstructed.
+    // Skipped hashes (`rooted`) are deliberately not in `removed` -- their
+    // bodies are still live, so snapshots naming them stay answerable.
+    retained_history_integrity::drop_time_index_snapshots_naming(conn, group_id, &removed)?;
     // Pruning history can orphan file-version rows: a version referenced only
     // by a now-deleted change can never be materialized again, so it is dead
     // weight. Sweep the group's versions against what its retained changes
@@ -555,10 +649,37 @@ fn bump_execution_fence_for_promoted(
 /// enclosing transaction aborts. `ChangeHistoryRepository::dag_admit_change[
 /// _with_versions]` already does this correctly — call one of those instead
 /// of this function directly unless there is a specific reason not to.
+///
+/// Uses [`orphan_integrity::always_current_writer`] for any orphan this
+/// admission's own arrival happens to promote — the permissive default,
+/// correct for every caller that has no revocation-freshness concern of its
+/// own. `ChangeHistoryRepository`'s real remote-admission callers use
+/// [`admit_change_with_orphan_writer_check`] instead, with the real
+/// policy-backed check — see that function's own doc comment.
 pub fn admit_change(
     conn: &Connection,
     change: &Change,
     applied: bool,
+) -> Result<AdmitResult, SyncSqliteError> {
+    admit_change_with_orphan_writer_check(
+        conn,
+        change,
+        applied,
+        &orphan_integrity::always_current_writer,
+    )
+}
+
+/// Identical to [`admit_change`], except any orphan this admission's own
+/// arrival happens to promote is additionally gated by `orphan_writer_check`
+/// — see [`orphan_integrity::promote_orphans`]'s own doc comment for why
+/// promotion (not just an orphan's original receipt) must re-check writer
+/// freshness, and [`orphan_integrity::OrphanPromotionWriterCheck`] for what
+/// the callback contracts to answer.
+pub fn admit_change_with_orphan_writer_check(
+    conn: &Connection,
+    change: &Change,
+    applied: bool,
+    orphan_writer_check: &orphan_integrity::OrphanPromotionWriterCheck,
 ) -> Result<AdmitResult, SyncSqliteError> {
     if let Err(e) = serving_authorization_index::validate_no_reserved_paths(change) {
         // Unlike every other admission failure below (a missing referenced
@@ -619,7 +740,8 @@ pub fn admit_change(
                 change.group_id.as_str(),
                 change,
             )?;
-            let newly_appended = retained_history_integrity::append_change(conn, change, applied)?;
+            let newly_appended =
+                retained_history_integrity::append_change(conn, change, applied, now_unix_nanos())?;
             conflict_authoring::record_conflict_copy_ops_provenance(
                 conn,
                 change.group_id.as_str(),
@@ -656,7 +778,7 @@ pub fn admit_change(
             // must project and gate every one — return the full set in append
             // order (current change first).
             let hash = change.compute_hash();
-            let promoted = orphan_integrity::promote_orphans(conn, &[hash])?;
+            let promoted = orphan_integrity::promote_orphans(conn, &[hash], orphan_writer_check)?;
             // Every orphan `promote_orphans` just promoted also just moved the
             // desired state, exactly like the primary change above -- fence out
             // any plan built on the paths its own ops touch too.
@@ -718,6 +840,35 @@ pub fn admit_change(
             Ok(AdmitResult { outcome: AdmitOutcome::Orphaned, newly_admitted: Vec::new() })
         }
     }
+}
+
+/// Re-attempts promotion for every orphan whose parent is already durably
+/// admitted, gated by `writer_check` -- the deferred-promotion counterpart to
+/// `init_dag_schema`'s startup self-heal sweep, which unconditionally defers
+/// every candidate (`orphan_integrity::defer_all_orphan_promotion`) because it
+/// runs before any daemon-level trust material could possibly be loaded. A
+/// row that sweep deferred has no future admission event to re-seed a
+/// promotion pass for it — ordinary admission (`admit_change`) only ever
+/// seeds from the change it just admitted — so something must explicitly
+/// give deferred rows a second look once real trust becomes available. See
+/// `ChangeHistoryRepository::resweep_deferred_orphan_promotions`'s own doc
+/// comment for the daemon-side call that triggers this.
+///
+/// Bumps the execution fence for whatever gets promoted, exactly like
+/// `admit_change`'s own promotion step and `init_dag_schema`'s self-heal
+/// sweep — a change that just became durable must never leave a plan built
+/// against its paths unfenced.
+pub fn resweep_deferred_orphan_promotions(
+    conn: &Connection,
+    writer_check: &orphan_integrity::OrphanPromotionWriterCheck,
+) -> Result<Vec<ChangeHash>, SyncSqliteError> {
+    let seeds = orphan_integrity::already_satisfied_parents(conn)?;
+    if seeds.is_empty() {
+        return Ok(Vec::new());
+    }
+    let promoted = orphan_integrity::promote_orphans(conn, &seeds, writer_check)?;
+    bump_execution_fence_for_promoted(conn, &promoted)?;
+    Ok(promoted)
 }
 
 /// `orphan_integrity` is private to this module -- this is the public seam
@@ -1254,7 +1405,7 @@ pub fn admit_prepared_emission(
             )
         });
     }
-    retained_history_integrity::append_change(conn, &change, applied)?;
+    retained_history_integrity::append_change(conn, &change, applied, now_unix_nanos())?;
     conflict_authoring::record_conflict_copy_ops_provenance(conn, group_id, &change)?;
     // The local-emission seam of the projection-obligation bump. Covers every
     // path in `change.ops`, direct and derived alike -- this is what makes it
@@ -1372,7 +1523,7 @@ fn emit_change_with_derived_conflict_copies(
     admit_prepared_emission(conn, prepared, auth, emitter)
 }
 
-fn now_unix_nanos() -> i64 {
+pub(crate) fn now_unix_nanos() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as i64)
@@ -1671,6 +1822,270 @@ mod tests {
         assert!(group_file_version_references_block(&c, "group-a", &block_hash).unwrap());
         assert!(!group_file_version_references_block(&c, "group-b", &block_hash).unwrap());
         assert!(!group_file_version_references_block(&c, "group-a", &[0xcdu8; 32]).unwrap());
+    }
+
+    #[test]
+    fn frontier_heads_at_or_before_reflects_real_admission_including_concurrent_branches() {
+        let c = conn();
+        let group_id = "group-a";
+
+        // Nothing admitted yet: any query, even "at or before the far
+        // future", must find nothing to rewind to.
+        assert_eq!(
+            frontier_heads_at_or_before(&c, group_id, i64::MAX).unwrap(),
+            None,
+            "an empty group has no frontier at any time"
+        );
+
+        let root = emit_local_change(
+            &c,
+            group_id,
+            vec![Op::Put {
+                path: SyncPath("a.bin".into()),
+                version: yadorilink_replica_domain::ids::VersionHash([0x11u8; 32]),
+                origin: PutOrigin::Direct,
+            }],
+            ChangeAuth::PLACEHOLDER,
+            &emitter(),
+        )
+        .unwrap();
+        let root_hash = root.compute_hash();
+        // `now_unix_nanos()` is this same module's real wall-clock read --
+        // reused here (not a fixed sleep) so the boundary this test checks
+        // is exactly the one `append_change` itself would have recorded,
+        // whatever the actual clock granularity/monotonicity turns out to
+        // be on the machine running the test.
+        let after_root = now_unix_nanos();
+
+        // Two changes emitted onto the SAME parent (the root) are
+        // genuinely concurrent -- neither is an ancestor of the other, so
+        // both are real live heads simultaneously. This is exactly the
+        // case a single scalar (e.g. a max lamport) cannot represent, and
+        // the reason `change_time_index` stores the real head SET rather
+        // than deriving one number from it.
+        let branch_a = emit_local_change_onto(
+            &c,
+            group_id,
+            vec![root_hash],
+            vec![Op::Put {
+                path: SyncPath("b.bin".into()),
+                version: yadorilink_replica_domain::ids::VersionHash([0x22u8; 32]),
+                origin: PutOrigin::Direct,
+            }],
+            ChangeAuth::PLACEHOLDER,
+            &emitter(),
+        )
+        .unwrap();
+        let branch_b = emit_local_change_onto(
+            &c,
+            group_id,
+            vec![root_hash],
+            vec![Op::Put {
+                path: SyncPath("c.bin".into()),
+                version: yadorilink_replica_domain::ids::VersionHash([0x33u8; 32]),
+                origin: PutOrigin::Direct,
+            }],
+            ChangeAuth::PLACEHOLDER,
+            &emitter(),
+        )
+        .unwrap();
+        let after_fork = now_unix_nanos();
+
+        // A rewind target between root-admission and the fork must see
+        // ONLY the root as the frontier -- proving the real `emit_local_
+        // change` -> `append_change` path records a usable, correctly-
+        // ordered time index, not just the synthetic direct-SQL seeding
+        // the scale benchmark uses.
+        assert_eq!(
+            frontier_heads_at_or_before(&c, group_id, after_root).unwrap(),
+            Some(vec![root_hash]),
+            "a rewind target before the fork must resolve to the root alone"
+        );
+
+        // A rewind target after the fork must see BOTH concurrent
+        // branches, sorted -- a scalar frontier could only ever report one
+        // of these two.
+        let mut expected_fork_heads = vec![branch_a.compute_hash(), branch_b.compute_hash()];
+        expected_fork_heads.sort_by_key(|h| h.0);
+        assert_eq!(
+            frontier_heads_at_or_before(&c, group_id, after_fork).unwrap(),
+            Some(expected_fork_heads.clone()),
+            "a rewind target after the fork must include BOTH concurrent branches, not just one"
+        );
+        // Cross-check against the live `group_heads` table itself -- the
+        // recorded snapshot must always agree with what the ordinary
+        // frontier-index machinery reports at the same point, since it was
+        // read from that exact table.
+        let mut live_heads = frontier_index::group_heads(&c, group_id).unwrap();
+        live_heads.sort_by_key(|h| h.0);
+        assert_eq!(
+            live_heads, expected_fork_heads,
+            "sanity: the live group_heads table must agree with the recorded snapshot"
+        );
+
+        // An unrelated group must never see this group's frontier.
+        assert_eq!(
+            frontier_heads_at_or_before(&c, "group-b", now_unix_nanos()).unwrap(),
+            None,
+            "group scoping must hold: an unrelated, never-admitted-to group has no frontier"
+        );
+    }
+
+    /// Two admissions that landed on the same `observed_at_unix_nanos` --
+    /// routine whenever the local clock's granularity is coarser than the
+    /// gap between two writes -- must resolve to the LATER one. Seeded
+    /// directly so the collision is guaranteed rather than left to whatever
+    /// the host clock happens to do; the real-admission path is covered by
+    /// `frontier_heads_at_or_before_reflects_real_admission_including_
+    /// concurrent_branches` above.
+    #[test]
+    fn a_timestamp_tie_resolves_to_the_later_admission_not_an_arbitrary_one() {
+        let c = conn();
+        let earlier = [0xEEu8; 32];
+        let later = [0x11u8; 32];
+        for (admission_seq, head) in [(1i64, earlier), (2, later)] {
+            c.execute(
+                "INSERT INTO change_time_index \
+                 (group_id, admission_seq, observed_at_unix_nanos, heads_snapshot) \
+                 VALUES ('g', ?1, 5000, ?2)",
+                rusqlite::params![admission_seq, &head[..]],
+            )
+            .unwrap();
+        }
+        // Deliberately NOT distinguishable by the ordering column alone:
+        // both rows share `observed_at_unix_nanos`, and the earlier
+        // admission's head sorts HIGHER by raw bytes, so a query that fell
+        // back to any incidental order would be very likely to return it.
+        assert_eq!(
+            frontier_heads_at_or_before(&c, "g", 5000).unwrap(),
+            Some(vec![ChangeHash(later)]),
+            "a tie on the timestamp must resolve by admission_seq to the later admission"
+        );
+        assert_eq!(
+            frontier_heads_at_or_before(&c, "g", 4999).unwrap(),
+            None,
+            "sanity: the boundary is still inclusive-at-or-before, not fuzzy"
+        );
+    }
+
+    /// The tie-break above must not have cost the query its bounded shape:
+    /// `ORDER BY a DESC, b DESC LIMIT 1` over an index on `(group_id, a)`
+    /// alone would make SQLite sort the whole matching range in a temporary
+    /// b-tree -- cost proportional to the group's entire admission history,
+    /// which is precisely the collapse shape this table exists to avoid.
+    /// Asserted against the real statement, not a copy of it.
+    #[test]
+    fn frontier_query_is_answered_by_a_reverse_index_seek() {
+        let c = conn();
+        let plan: Vec<String> = {
+            let mut stmt = c
+                .prepare(&format!(
+                    "EXPLAIN QUERY PLAN {}",
+                    retained_history_integrity::FRONTIER_AT_OR_BEFORE_SQL
+                ))
+                .unwrap();
+            let rows = stmt.query_map(rusqlite::params!["g", 0i64], |row| row.get::<_, String>(3));
+            rows.unwrap().collect::<Result<_, _>>().unwrap()
+        };
+        let plan = plan.join("\n");
+        assert!(
+            plan.contains("change_time_index_by_time"),
+            "the frontier query must use its own index; plan was:\n{plan}"
+        );
+        assert!(
+            !plan.to_uppercase().contains("TEMP B-TREE"),
+            "the frontier query must never sort a range to satisfy its ORDER BY; plan was:\n{plan}"
+        );
+    }
+
+    fn time_index_snapshots(conn: &Connection, group_id: &str) -> Vec<(i64, Vec<u8>)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT admission_seq, heads_snapshot FROM change_time_index \
+                 WHERE group_id = ?1 ORDER BY admission_seq",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([group_id], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)))
+            .unwrap();
+        rows.collect::<Result<_, _>>().unwrap()
+    }
+
+    /// The time index is derived from `group_heads`, so compaction has to
+    /// cut it back too. Without this, a pruned group accumulates snapshots
+    /// naming changes whose bodies are gone -- unbounded stale rows that
+    /// `frontier_heads_at_or_before` would hand back as an answer.
+    #[test]
+    fn pruning_history_removes_the_time_index_snapshots_that_named_it() {
+        let c = conn();
+        let em = emitter();
+
+        let prior =
+            emit_local_change(&c, "g", vec![create_op("prior.txt")], ChangeAuth::PLACEHOLDER, &em)
+                .unwrap();
+        let prior_hash = prior.compute_hash();
+        let child =
+            emit_local_change(&c, "g", vec![create_op("child.txt")], ChangeAuth::PLACEHOLDER, &em)
+                .unwrap();
+        let child_hash = child.compute_hash();
+        // An unrelated group's own history must be untouched by all of this.
+        emit_local_change(&c, "other", vec![create_op("theirs.txt")], ChangeAuth::PLACEHOLDER, &em)
+            .unwrap();
+
+        let before = time_index_snapshots(&c, "g");
+        assert_eq!(before.len(), 2, "each admission records one snapshot");
+        assert_eq!(before[0].1, prior_hash.0.to_vec());
+        assert_eq!(before[1].1, child_hash.0.to_vec());
+
+        let checkpoint = yadorilink_replica_domain::rebootstrap::Checkpoint::new(
+            FolderGroupId("g".into()),
+            vec![child_hash],
+            [0u8; 32],
+        );
+        {
+            let tx = c.unchecked_transaction().unwrap();
+            commit_prune(&tx, &checkpoint, &[prior_hash]).unwrap();
+            tx.commit().unwrap();
+        }
+        assert!(!has_change(&c, &prior_hash).unwrap());
+
+        let after = time_index_snapshots(&c, "g");
+        assert_eq!(
+            after.len(),
+            1,
+            "the snapshot naming the pruned change must go with it, not linger"
+        );
+        assert_eq!(
+            after[0].1,
+            child_hash.0.to_vec(),
+            "the snapshot naming only retained history must survive"
+        );
+        assert_eq!(
+            frontier_heads_at_or_before(&c, "g", i64::MAX).unwrap(),
+            Some(vec![child_hash]),
+            "the surviving snapshot must still be readable"
+        );
+        assert_eq!(
+            time_index_snapshots(&c, "other").len(),
+            1,
+            "an unrelated group's time index must not be touched by this group's prune"
+        );
+
+        // `admission_seq` must keep increasing across a prune: the tie-break
+        // in `frontier_heads_at_or_before` treats a higher value as strictly
+        // later, so a post-prune admission may never reuse a surviving row's
+        // sequence number.
+        emit_local_change(&c, "g", vec![create_op("later.txt")], ChangeAuth::PLACEHOLDER, &em)
+            .unwrap();
+        let seqs: Vec<i64> = time_index_snapshots(&c, "g").iter().map(|(seq, _)| *seq).collect();
+        assert!(
+            seqs.windows(2).all(|w| w[0] < w[1]),
+            "admission_seq must stay strictly increasing after a prune, got {seqs:?}"
+        );
+        assert!(
+            seqs.last().copied() > Some(after[0].0),
+            "the post-prune admission must sort after every surviving row, got {seqs:?}"
+        );
     }
 
     #[test]
@@ -2020,7 +2435,7 @@ mod tests {
             emit_local_change(&c, "g", vec![create_op("a")], ChangeAuth::PLACEHOLDER, &emitter())
                 .unwrap();
         // Re-appending the identical change changes nothing.
-        assert!(!append_change(&c, &change, true).unwrap());
+        assert!(!append_change(&c, &change, true, now_unix_nanos()).unwrap());
         let count: i64 = c.query_row("SELECT COUNT(*) FROM changes", [], |r| r.get(0)).unwrap();
         assert_eq!(count, 1);
         assert_eq!(group_heads(&c, "g").unwrap().len(), 1);
@@ -2430,8 +2845,13 @@ mod tests {
 
         // Land the root directly and promote: c1 unblocks first (its parent is
         // the root), then c2 (its parent is c1).
-        assert!(append_change(&recv, &root, true).unwrap());
-        let promoted = promote_orphans(&recv, &[root.compute_hash()]).unwrap();
+        assert!(append_change(&recv, &root, true, now_unix_nanos()).unwrap());
+        let promoted = promote_orphans(
+            &recv,
+            &[root.compute_hash()],
+            &orphan_integrity::always_current_writer,
+        )
+        .unwrap();
         assert_eq!(promoted, vec![c1.compute_hash(), c2.compute_hash()]);
     }
 
@@ -2478,19 +2898,29 @@ mod tests {
         // the "crash between append_change and promote_orphans" gap
         // `already_satisfied_parents`'s own doc comment describes. Nothing
         // has promoted `child` yet.
-        assert!(append_change(&recv, &root, true).unwrap());
+        assert!(append_change(&recv, &root, true, now_unix_nanos()).unwrap());
         assert!(!has_change(&recv, &child.compute_hash()).unwrap());
 
         let seeds = orphan_integrity::already_satisfied_parents(&recv).unwrap();
         assert_eq!(seeds, vec![root.compute_hash()], "root must be a self-heal seed");
 
-        // Drive the exact sequence `init_dag_schema`'s self-heal block now
-        // uses, inside one transaction -- but corrupt `child`'s own `changes`
-        // row between the two steps, forcing `bump_execution_fence_for_
-        // promoted`'s `describe_hash` re-read to fail with `CorruptState`
-        // instead of finding it `Admitted`.
+        // Drive the same promotion+fence-bump sequence `init_dag_schema`'s
+        // self-heal block and `ChangeHistoryRepository::
+        // resweep_deferred_orphan_promotions` both use, inside one
+        // transaction -- but corrupt `child`'s own `changes` row between the
+        // two steps, forcing `bump_execution_fence_for_promoted`'s
+        // `describe_hash` re-read to fail with `CorruptState` instead of
+        // finding it `Admitted`. `always_current_writer` here: this test is
+        // about promotion/fence-bump atomicity, not the writer-freshness
+        // gate (`init_dag_schema`'s own self-heal call always defers now --
+        // see that call site's own comment).
         let tx = recv.unchecked_transaction().unwrap();
-        let promoted = orphan_integrity::promote_orphans(&tx, &seeds).unwrap();
+        let promoted = orphan_integrity::promote_orphans(
+            &tx,
+            &seeds,
+            &orphan_integrity::always_current_writer,
+        )
+        .unwrap();
         assert_eq!(promoted, vec![child.compute_hash()]);
         tx.execute("DELETE FROM changes WHERE change_hash = ?1", [&child.compute_hash().0[..]])
             .unwrap();
@@ -2530,7 +2960,7 @@ mod tests {
         let recv = conn();
         seed_test_version(&recv, "g");
         assert_eq!(admit_change(&recv, &child, true).unwrap().outcome, AdmitOutcome::Orphaned);
-        assert!(append_change(&recv, &root, true).unwrap());
+        assert!(append_change(&recv, &root, true, now_unix_nanos()).unwrap());
         assert!(!has_change(&recv, &child.compute_hash()).unwrap());
 
         // Re-running schema init on the SAME connection is what a restart
@@ -2685,7 +3115,7 @@ mod tests {
         let recv = conn();
         seed_test_version(&recv, "g");
         assert_eq!(admit_change(&recv, &child, true).unwrap().outcome, AdmitOutcome::Orphaned);
-        assert!(append_change(&recv, &root, true).unwrap());
+        assert!(append_change(&recv, &root, true, now_unix_nanos()).unwrap());
         assert!(
             crate::projection_obligations::lookup_projection_obligation(&recv, "g", "b")
                 .unwrap()

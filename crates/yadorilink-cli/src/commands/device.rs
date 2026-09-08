@@ -20,18 +20,24 @@ mod http {
     use crate::error::CliError;
     use crate::http_client::{get_json, post_json, require_access_token};
 
+    // The coordination plane reads/writes camelCase JSON keys, same contract
+    // as `commands::share`'s own request/response structs -- see that
+    // module's identical comment.
     #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
     struct RegisterDeviceRequest<'a> {
         device_name: &'a str,
         wireguard_public_key_base64: String,
         signing_public_key_base64: String,
     }
     #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
     struct RegisterDeviceResponse {
         device_id: String,
     }
 
     #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
     struct DeviceInfo {
         device_id: String,
         device_name: String,
@@ -141,6 +147,65 @@ mod http {
         }
         println!("Removed device: {device_id}");
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Regression test, same bug class as `commands::share`'s own
+        /// camelCase-deserialization fixes: `POST /devices/register`'s real
+        /// success response is `{"deviceId": ..., "serviceSigningPublicKeyBase64":
+        /// ...}` (coordination-worker's `POST /devices/register` handler) --
+        /// `RegisterDeviceResponse` was missing
+        /// `#[serde(rename_all = "camelCase")]`, so it failed to deserialize
+        /// a real response at all, breaking device registration -- a
+        /// fundamental onboarding operation -- against a real deployed
+        /// worker.
+        #[test]
+        fn register_device_response_deserializes_the_coordination_planes_camelcase_shape() {
+            let parsed: RegisterDeviceResponse = serde_json::from_str(
+                r#"{"deviceId":"device-1","serviceSigningPublicKeyBase64":"abc123"}"#,
+            )
+            .unwrap();
+            assert_eq!(parsed.device_id, "device-1");
+        }
+
+        /// Same bug, the request side: the coordination plane's `POST
+        /// /devices/register` route reads `deviceName`/
+        /// `wireguardPublicKeyBase64`/`signingPublicKeyBase64` -- a
+        /// snake_case body arrives with every field `undefined`
+        /// server-side (the handler rejects a missing
+        /// `signingPublicKeyBase64` outright).
+        #[test]
+        fn register_device_request_serializes_camelcase_for_the_coordination_plane() {
+            let body = serde_json::to_value(RegisterDeviceRequest {
+                device_name: "my-laptop",
+                wireguard_public_key_base64: "wg-key".to_string(),
+                signing_public_key_base64: "sign-key".to_string(),
+            })
+            .unwrap();
+            assert_eq!(body["deviceName"], "my-laptop");
+            assert_eq!(body["wireguardPublicKeyBase64"], "wg-key");
+            assert_eq!(body["signingPublicKeyBase64"], "sign-key");
+            assert!(body.get("device_name").is_none());
+        }
+
+        /// Regression test, same bug class: `GET /devices`'s real response
+        /// carries camelCase device keys (`listDevices`'s return shape) --
+        /// `DeviceInfo` was missing `#[serde(rename_all = "camelCase")]`,
+        /// so it silently failed to deserialize every field but `online`
+        /// against a real worker, breaking `device list`.
+        #[test]
+        fn device_info_deserializes_the_coordination_planes_camelcase_shape() {
+            let parsed: DeviceInfo = serde_json::from_str(
+                r#"{"deviceId":"device-1","deviceName":"my-laptop","online":true}"#,
+            )
+            .unwrap();
+            assert_eq!(parsed.device_id, "device-1");
+            assert_eq!(parsed.device_name, "my-laptop");
+            assert!(parsed.online);
+        }
     }
 }
 

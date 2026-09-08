@@ -302,21 +302,17 @@ mod tests {
         }
     }
 
-    /// Serializes access to the `YADORILINK_COORDINATION_HTTP_ADDR` env var
-    /// this test mutates -- process-global state that would otherwise race
-    /// against any other test in this same binary that touches it. A
-    /// `tokio::sync::Mutex`, not `std::sync::Mutex`: the guard is held
-    /// across this test's own multi-second `.await` (the whole point is to
-    /// keep the env var stable for that entire span), and
-    /// `std::sync::MutexGuard` held across an await point is exactly what
-    /// `clippy::await_holding_lock` flags as a real hazard (a blocked std
-    /// mutex can starve the async runtime); the tokio version is designed
-    /// to be held this way.
-    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     #[tokio::test]
     async fn poll_device_login_honors_pending_and_slow_down_backoff_from_the_worker() {
-        let _guard = ENV_LOCK.lock().await;
+        // `crate::http_client::COORDINATION_ADDR_ENV_LOCK` serializes every
+        // test in this crate that mutates `YADORILINK_COORDINATION_HTTP_ADDR`
+        // -- process-global state that would otherwise race against any
+        // other such test running concurrently in this same binary. Held
+        // across this test's own multi-second `.await` (the whole point is
+        // to keep the env var stable for that entire span) -- see that
+        // static's own doc comment for why it is a `tokio::sync::Mutex`,
+        // not `std::sync::Mutex`.
+        let _guard = crate::http_client::COORDINATION_ADDR_ENV_LOCK.lock().await;
         let server = MockServer::start().await;
 
         Mock::given(method("POST"))

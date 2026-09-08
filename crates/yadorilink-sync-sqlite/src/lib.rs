@@ -39,6 +39,7 @@ pub mod rebootstrap_store;
 mod replica_history;
 pub mod restore_operation;
 pub mod retroactive_conflict;
+pub mod rewind_plan;
 pub mod role_loss_operation;
 mod store;
 mod types;

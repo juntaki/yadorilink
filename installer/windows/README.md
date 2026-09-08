@@ -131,3 +131,19 @@ install, confirm the four binaries + two Scheduled Tasks (`YadoriLinkDaemon`,
 context menu shows the yadorilink submenu on a test file, then uninstall
 and confirm the binaries, Scheduled Tasks, and COM registration are all
 gone.
+
+## WinGet
+
+`winget/manifests/j/juntaki/YadoriLink/` holds a WinGet manifest for this
+installer — see `winget/README.md` for its build/validation/submission
+status. One detail that affects this directory: `yadorilink.iss`'s
+`[Code]` section accepts an undocumented `/PACKAGEMANAGER=<name>` command-
+line switch, which writes `InstallSource=<name>` to
+`HKLM\Software\yadorilink` (cleaned up on uninstall). The WinGet manifest's
+`InstallerSwitches` pass `/PACKAGEMANAGER=winget`; the running daemon's
+`install_windows::detect_package_manager_marker` reads that registry value
+so its built-in updater defers to `winget upgrade` instead of running its
+own installer over a WinGet-managed install (see `manager::dispatch_install`
+in `crates/yadorilink-daemon/src/update/manager.rs`). **This has not been
+verified against a real WinGet install** — no Windows machine was
+available for this verification pass; see `winget/README.md`.

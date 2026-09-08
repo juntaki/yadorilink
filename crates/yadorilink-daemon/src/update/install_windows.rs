@@ -52,6 +52,94 @@ pub fn detect_install_source(current_exe_path: &Path) -> InstallSource {
     }
 }
 
+/// Registry location the Inno Setup installer (`installer/windows/yadorilink.iss`)
+/// writes to when it is invoked with a `/PACKAGEMANAGER=<name>` command-line
+/// parameter. `HKEY_LOCAL_MACHINE` (not `HKCU`) because the installer itself
+/// always runs elevated (`PrivilegesRequired=admin`) and the value must be
+/// readable regardless of which user account the daemon later runs as.
+pub const PACKAGE_MANAGER_MARKER_KEY: &str = r"Software\yadorilink";
+pub const PACKAGE_MANAGER_MARKER_VALUE: &str = "InstallSource";
+
+/// Reads the package-manager marker this project's own installer writes
+/// under [`PACKAGE_MANAGER_MARKER_KEY`]/[`PACKAGE_MANAGER_MARKER_VALUE`]
+/// when driven by a `/PACKAGEMANAGER=<name>` switch — the mechanism a
+/// WinGet manifest's `InstallerSwitches.Silent` string uses to tell this
+/// installer it is being run by `winget` rather than by hand.
+///
+/// Unlike the Microsoft Store (whose MSIX layout is a structural,
+/// unforgeable signal — see [`detect_install_source`] above), WinGet runs
+/// this exact same Inno Setup installer a manual download would, into the
+/// exact same `%ProgramFiles%\yadorilink` layout: there is no path-based
+/// signal to key off. This explicit, installer-written marker is the only
+/// reliable way to tell the two apart. Returns `None` when the value is
+/// absent — a manual/standalone install, or a build predating this
+/// marker — and callers must treat that as "standalone", never as an
+/// error: a missing marker is the overwhelmingly common, fully-supported
+/// case.
+///
+/// **Not yet verified against a real Windows machine or a real WinGet
+/// install** — matching this module's own header comment about
+/// `detect_install_source`'s verification status. `installer/windows/README.md`
+/// tracks this as an open verification item.
+#[cfg(windows)]
+pub fn detect_package_manager_marker() -> Option<String> {
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY_LOCAL_MACHINE, KEY_READ, REG_SZ,
+    };
+
+    fn to_wide(s: &str) -> Vec<u16> {
+        use std::os::windows::ffi::OsStrExt;
+        std::ffi::OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    unsafe {
+        let subkey = to_wide(PACKAGE_MANAGER_MARKER_KEY);
+        let mut hkey = std::ptr::null_mut();
+        if RegOpenKeyExW(HKEY_LOCAL_MACHINE, subkey.as_ptr(), 0, KEY_READ, &mut hkey)
+            != ERROR_SUCCESS
+        {
+            return None;
+        }
+
+        let value_name = to_wide(PACKAGE_MANAGER_MARKER_VALUE);
+        // Generous fixed buffer: this value is always a short ASCII
+        // package-manager name ("winget"), never user-controlled free text.
+        let mut buf = [0u16; 256];
+        let mut buf_len = (buf.len() * std::mem::size_of::<u16>()) as u32;
+        let mut value_type = 0u32;
+        let status = RegQueryValueExW(
+            hkey,
+            value_name.as_ptr(),
+            std::ptr::null(),
+            &mut value_type,
+            buf.as_mut_ptr().cast::<u8>(),
+            &mut buf_len,
+        );
+        RegCloseKey(hkey);
+
+        if status != ERROR_SUCCESS || value_type != REG_SZ {
+            return None;
+        }
+        let chars = (buf_len as usize) / std::mem::size_of::<u16>();
+        let s = String::from_utf16_lossy(&buf[..chars]);
+        let s = s.trim_end_matches('\0').trim();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s.to_string())
+        }
+    }
+}
+
+/// Non-Windows stub so `install_windows` (declared unconditionally in
+/// `update/mod.rs`, mirroring `install_macos`) still compiles cross-platform;
+/// never called outside a `#[cfg(windows)]` call site in `manager.rs`.
+#[cfg(not(windows))]
+pub fn detect_package_manager_marker() -> Option<String> {
+    None
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum InstallError {
     #[error("standalone installer handoff is not applicable to a Microsoft Store install")]
