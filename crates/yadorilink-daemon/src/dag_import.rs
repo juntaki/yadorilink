@@ -35,6 +35,28 @@
 //! runs, so import always establishes the root of history ahead of the first
 //! live mutation or admitted peer change.
 //!
+//! Authorization: this module signs and commits every change it writes, so
+//! it is bound by the same local-authoring rule as a live watcher edit --
+//! this device must itself currently be a writer (Editor/Owner) under the
+//! group's current signed policy chain, or the import must be withheld
+//! rather than stamped. This module does not check that itself; both
+//! [`DagImportSource::append_initial_import`] and
+//! [`DagImportSource::append_history_backfill`] are required to route
+//! through the SAME gate a normal local edit uses (`ReplicaCoordinator::
+//! local_emission_auth`, which consults the daemon's `local_change_auth_
+//! provider`) before committing anything, exactly the way `Replica
+//! Coordinator`'s own implementation does. A device that is not currently a
+//! writer -- including the whole pre-policy Bootstrap window, where any
+//! device may stamp a PLACEHOLDER-authorized change, same as live emission
+//! -- must have its import/backfill withheld (an `Err` from this module's
+//! functions), not silently skipped as a no-op and not committed anyway:
+//! otherwise a Viewer's first-run disk scan (or a later coverage-audit
+//! sweep) would commit content to this device's own signed history that no
+//! peer will ever accept, permanently diverging this device's local state
+//! from the rest of the group for no benefit. See `daemon_state.rs`'s
+//! `initial_import_and_backfill_withhold_a_viewers_pre_existing_content_
+//! but_allow_an_editor` for the regression proof.
+//!
 //! Relocated here from `yadorilink-sync-core` (Phase 7D-10.5): every real
 //! production caller ([`crate::daemon_state::DaemonState::
 //! backfill_missing_change_history`], `crate::link_runtime::startup`) already

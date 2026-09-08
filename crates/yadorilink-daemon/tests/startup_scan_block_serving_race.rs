@@ -121,7 +121,7 @@ fn build_tree(root: &Path, dir_count: usize, medium_file_count: usize) -> Vec<St
         for _ in 0..FILES_PER_DIR {
             let file_name = format!("f-{file_index:07}.txt");
             std::fs::write(dir_path.join(&file_name), format!("small file {file_index}")).unwrap();
-            if file_index % 500 == 0 {
+            if file_index.is_multiple_of(500) {
                 sampled.push(format!("{dir_name}/{file_name}"));
             }
             file_index += 1;
@@ -249,6 +249,12 @@ fn new_device(device_id: &str) -> Device {
     Device { state, root: tempfile::tempdir().unwrap(), _store_dir: store_dir, _db_dir: db_dir }
 }
 
+// Every field is read, via the derived `Debug` impl, by the
+// `tracing::warn!(?arm_result, ...)` diagnostic calls below -- dead_code
+// analysis deliberately does not count Debug-only reads as real usage, but
+// that IS this struct's entire purpose (a diagnostic dump), so this is a
+// false positive.
+#[allow(dead_code)]
 #[derive(Debug)]
 struct ArmResult {
     arm_name: &'static str,

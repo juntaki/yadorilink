@@ -1,0 +1,694 @@
+# YadoriLink architecture manifest.
+#
+# This file is the single declarative statement of the workspace's intended
+# structure. `scripts/check-architecture.py` reads it, resolves the real
+# crate graph with `cargo metadata`, scans the sources named by each rule,
+# and fails CI on any divergence. There is one checker and one manifest: a
+# new boundary is a new entry here, never a new bespoke script.
+#
+# ## Model
+#
+# Crates are stratified into ordered layers. A crate may depend on crates in
+# its own layer or in any LOWER layer, never a higher one. Layer membership
+# is exhaustive: every workspace member must appear in exactly one layer, so
+# a newly added crate cannot silently sit outside the model.
+#
+# Layer order alone is coarse (it permits every edge inside a layer), so the
+# crates whose isolation actually carries weight additionally declare an
+# exact `workspace_dependencies` allowlist, and rules below forbid specific
+# third-party packages and source symbols per crate or per path.
+#
+# ## Rule kinds
+#
+# * `[layer.<name>]`            layer membership (order fixed by `layers.order`)
+# * `[crate."<name>"]`          exact allowed workspace dependencies
+# * `[[forbidden_dependency]]`  packages a crate must not name, by kind
+# * `[[forbidden_symbol]]`      substrings that must not appear in given sources
+# * `[[forbidden_pattern]]`     the same, as a regex, with optional line guards
+# * `[[confined_symbol]]`       symbols allowed only in named files of a scope
+# * `[[call_site]]`             a call allowed only from named files
+#
+# ## Scanning conventions, applied uniformly by the checker
+#
+# * Whole-line comments (`//`, `///`, `//!`) are never scanned. Only real
+#   code can violate a source rule; prose that names a forbidden path is a
+#   documentation choice, not a dependency.
+# * `test_spans = "exclude"` additionally drops `#[cfg(test)]` items, for the
+#   rules whose invariant is about the production graph rather than about
+#   what a unit-test fixture may construct in-process. The exempted region is
+#   the attributed item's own brace-matched span, so production code that
+#   merely sits after a test module in the same file is still scanned.
+# * Every path pattern -- each entry of a `paths` or `allowed_paths` list,
+#   individually, not the list as a whole -- must match at least one real
+#   file, and every crate named here must exist in the workspace. A rule that
+#   lists three files and still resolves two of them has stopped guarding the
+#   third, so that is a failure, not a silent pass: a guard that quietly stops
+#   guarding is the failure mode this manifest exists to prevent.
+#
+# These are checks on structure, not on behavior: they are substring and
+# regex matches over sources plus the resolved Cargo graph, not a Rust
+# parser. A deliberate `use tokio as t;` rename evades a symbol rule.
+# Reviewer judgment remains the backstop, as it does for every lint.
+
+[layers]
+# Bottom to top. Index in this list is the layer's rank.
+order = [
+  "contract",
+  "domain",
+  "platform",
+  "storage",
+  "engine",
+  "application",
+  "interface",
+]
+
+# Workspace members that are build tooling rather than product code and are
+# deliberately outside the layer model.
+exempt = ["xtask"]
+
+[layer.contract]
+purpose = """
+Serialization and reporting contracts. Generated protobuf types and shared
+report shapes, with no policy, no I/O, and no workspace dependencies.
+"""
+crates = [
+  "yadorilink-ipc-proto",
+  "yadorilink-reporting",
+]
+
+[layer.domain]
+purpose = """
+Pure, synchronous model and policy. Identities, file and version records,
+the signed canonical change, root authority, and the deterministic replica
+policy engine. Nothing beneath these but the standard library and
+cryptography: no async runtime, no database, no wire framing, no filesystem
+or network access.
+"""
+crates = [
+  "yadorilink-replica-domain",
+  "yadorilink-root-authority",
+  "yadorilink-replica-engine",
+]
+
+[layer.platform]
+purpose = """
+Process-level infrastructure that knows nothing about replica policy: the
+shared SQLite connection pool and writer gate, the QUIC peer transport, the
+peer wire codec, and the HTTP request/response surface. Each of these owns
+one mechanism and must stay ignorant of the domain concepts layered above
+it.
+"""
+crates = [
+  "yadorilink-sqlite-runtime",
+  "yadorilink-transport",
+  "yadorilink-sync-wire",
+  "yadorilink-http-api",
+]
+
+[layer.storage]
+purpose = """
+Content-addressed local block and file storage, expressed against the domain
+model.
+"""
+crates = [
+  "yadorilink-local-storage",
+]
+
+[layer.engine]
+purpose = """
+The synchronization engines: the peer session that speaks the wire protocol,
+the single-file send path, filesystem materialization, the SQLite
+persistence adapter, and local change capture. These compose the layers
+below into running behavior but own no process lifecycle of their own.
+"""
+crates = [
+  "yadorilink-peer-session",
+  "yadorilink-send",
+  "yadorilink-filesystem-sync",
+  "yadorilink-sync-sqlite",
+  "yadorilink-local-capture",
+]
+
+[layer.application]
+purpose = """
+The daemon: process lifecycle, the composition root, and the application
+services the interfaces drive.
+"""
+crates = [
+  "yadorilink-daemon",
+]
+
+[layer.interface]
+purpose = """
+User-facing entry points.
+"""
+crates = [
+  "yadorilink-cli",
+  "yadorilink-desktop-app",
+]
+
+
+# ---------------------------------------------------------------------------
+# Exact workspace-dependency allowlists.
+#
+# For the crates whose isolation is load-bearing, the layer rank is not
+# specific enough: it would permit any edge within a layer. These crates
+# declare their full set of workspace dependencies instead, so widening one
+# is a deliberate, reviewable edit here rather than an unnoticed line in a
+# manifest. Only normal (non-dev, non-build) dependencies count -- a test
+# fixture reaching for a higher layer is not a production cycle, and several
+# of these crates deliberately use such a dev-only back edge.
+#
+# That normal-only scope is why an empty list here does NOT by itself mean
+# "no workspace dependency of any kind". For the crates that must hold to
+# zero of any kind -- the domain model, the policy engine, the wire codec --
+# the forbidden-workspace-crate half of that invariant is stated in their
+# `forbidden_dependency` rules below, whose `kinds` covers dev and build too.
+# ---------------------------------------------------------------------------
+
+[crate."yadorilink-replica-domain"]
+reason = "The domain model sits at the bottom; it depends on no workspace crate."
+workspace_dependencies = []
+
+[crate."yadorilink-root-authority"]
+reason = "Root identity and leases, expressed only over the domain model."
+workspace_dependencies = ["yadorilink-replica-domain"]
+
+[crate."yadorilink-replica-engine"]
+reason = """
+Change admission, causal authorization, custody and durability evidence, and
+deterministic conflict repair election. Pure policy over the domain model
+and root authority, so it can be reasoned about and tested without a
+runtime.
+"""
+workspace_dependencies = [
+  "yadorilink-replica-domain",
+  "yadorilink-root-authority",
+]
+
+[crate."yadorilink-sqlite-runtime"]
+reason = """
+Owns exactly the connection pool, the in-process writer gate, connection
+PRAGMA setup, and the transaction helpers for the shared database file. It
+must know nothing about domain concepts, replica policy, or wire framing.
+"""
+workspace_dependencies = []
+
+[crate."yadorilink-sync-wire"]
+reason = """
+The standalone peer wire codec and frame layer. It depends on the generated
+protobuf contract and nothing else; a dependency on the domain model or on
+any engine crate would recreate the cycle this split exists to cut.
+"""
+workspace_dependencies = ["yadorilink-ipc-proto"]
+
+[crate."yadorilink-peer-session"]
+reason = """
+Owns the peer session and its supporting modules. It reaches persistence
+only through its own port traits, so it must not depend on the SQLite
+adapter or on any crate above it; its wire encoding comes exclusively from
+the wire codec crate.
+"""
+workspace_dependencies = [
+  "yadorilink-local-storage",
+  "yadorilink-replica-domain",
+  "yadorilink-replica-engine",
+  "yadorilink-root-authority",
+  "yadorilink-sqlite-runtime",
+  "yadorilink-sync-wire",
+  "yadorilink-transport",
+]
+
+[crate."yadorilink-sync-sqlite"]
+reason = """
+The single adapter owning YadoriLink-specific SQLite persistence. It must
+not reach back into the peer session, the daemon, the transport, or the wire
+codec: persistence is driven by those, never the reverse.
+"""
+workspace_dependencies = [
+  "yadorilink-filesystem-sync",
+  "yadorilink-local-storage",
+  "yadorilink-replica-domain",
+  "yadorilink-replica-engine",
+  "yadorilink-root-authority",
+  "yadorilink-sqlite-runtime",
+]
+
+[crate."yadorilink-local-capture"]
+reason = """
+Owns local change processing and the mutation-store port it consumes. All
+persistence goes through that port, and filesystem events arrive as
+already-built value types -- it runs no watcher and no SQL of its own.
+"""
+workspace_dependencies = [
+  "yadorilink-filesystem-sync",
+  "yadorilink-local-storage",
+  "yadorilink-replica-domain",
+  "yadorilink-root-authority",
+  "yadorilink-sync-sqlite",
+]
+
+
+# ---------------------------------------------------------------------------
+# Forbidden dependencies.
+#
+# `kinds` selects which Cargo dependency kinds the rule covers. A crate that
+# must stay pure in its own right is checked across every kind; a crate that
+# is only required to keep something out of its PRODUCTION graph (and whose
+# own tests legitimately use it) is checked on normal and build kinds only.
+#
+# `packages` names third-party crates and workspace crates alike -- the
+# checker matches by package name either way. The three crates whose
+# `workspace_dependencies` allowlist above is empty or near-empty name their
+# forbidden workspace crates HERE as well, and not only there, because that
+# allowlist deliberately reads normal-kind edges only. Without these entries
+# a dev- or build-kind back edge into a "pure" crate would pass unnoticed,
+# which is exactly what `domain_stays_pure`'s own reason forbids.
+# ---------------------------------------------------------------------------
+
+[[forbidden_dependency]]
+name = "domain_stays_pure"
+crates = ["yadorilink-replica-domain"]
+kinds = ["normal", "build", "dev"]
+packages = [
+  "tokio", "async-trait",
+  "rusqlite", "r2d2", "r2d2_sqlite",
+  "prost",
+  "notify", "fs2", "walkdir", "fastcdc",
+  # Workspace crates, named here and not left to the
+  # `workspace_dependencies = []` allowlist above, because that allowlist
+  # covers normal-kind edges only -- see the note above it. The domain model
+  # holds to zero workspace dependencies of ANY kind, so the crates it must
+  # never reach for are listed where `kinds` covers dev and build too.
+  "yadorilink-ipc-proto", "yadorilink-local-storage", "yadorilink-transport",
+]
+reason = """
+No async runtime, no database, no wire framing, no filesystem machinery
+beneath the domain model -- not even in its own tests, which must be
+runnable as plain synchronous unit tests.
+"""
+
+[[forbidden_dependency]]
+name = "policy_engine_stays_pure"
+crates = ["yadorilink-replica-engine"]
+kinds = ["normal", "build", "dev"]
+packages = [
+  "tokio", "async-trait",
+  "rusqlite", "r2d2", "r2d2_sqlite",
+  "prost",
+  "notify", "fs2", "walkdir", "fastcdc",
+  "tracing",
+  # Zero workspace dependencies of any kind beyond the two the allowlist
+  # above admits, its own tests included -- same reasoning as
+  # `domain_stays_pure`.
+  "yadorilink-ipc-proto", "yadorilink-local-storage", "yadorilink-transport",
+  "yadorilink-sync-wire",
+]
+reason = """
+The policy engine is deterministic and observable through its return values.
+`tracing` is forbidden alongside the runtime and storage crates on purpose:
+a policy decision must be a value the caller can assert on, not a log line.
+"""
+
+[[forbidden_dependency]]
+name = "wire_codec_stays_standalone"
+crates = ["yadorilink-sync-wire"]
+kinds = ["normal", "build", "dev"]
+packages = [
+  "tokio", "async-trait",
+  "rusqlite", "r2d2", "r2d2_sqlite",
+  "notify", "fs2", "walkdir", "fastcdc",
+  # A dev-kind edge onto the domain model would recreate exactly the cycle
+  # this split was made to cut, so the workspace crates are named here, where
+  # `kinds` covers dev, and not only in the normal-kind allowlist above.
+  "yadorilink-local-storage", "yadorilink-transport", "yadorilink-replica-domain",
+]
+reason = "Framing and codec only: no runtime, no storage, no filesystem."
+
+[[forbidden_dependency]]
+name = "peer_session_owns_no_storage"
+crates = ["yadorilink-peer-session"]
+kinds = ["normal", "build"]
+packages = ["rusqlite", "r2d2", "r2d2_sqlite", "notify", "walkdir"]
+reason = """
+The session reaches persistence through its port traits and never runs an OS
+file watcher. Its own unit tests do drive raw SQLite fixtures, so this
+covers the production graph only.
+"""
+
+[[forbidden_dependency]]
+name = "local_capture_owns_no_storage"
+crates = ["yadorilink-local-capture"]
+kinds = ["normal", "build", "dev"]
+packages = ["rusqlite", "r2d2", "r2d2_sqlite", "notify"]
+reason = """
+No SQL of its own -- all persistence goes through the mutation-store port --
+and no OS file watcher: filesystem events arrive as already-built value
+types.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Forbidden source symbols.
+# ---------------------------------------------------------------------------
+
+[[forbidden_symbol]]
+name = "domain_source_purity"
+paths = ["crates/yadorilink-replica-domain/src/**/*.rs"]
+symbols = [
+  "tokio::", "async_trait::",
+  "rusqlite::", "r2d2::", "r2d2_sqlite::",
+  "prost::", "yadorilink_ipc_proto::",
+  "yadorilink_local_storage::", "yadorilink_transport::",
+  "notify::", "fs2::", "walkdir::", "fastcdc::",
+  "std::fs", "std::net",
+]
+reason = "The domain model touches neither the filesystem nor the network."
+
+[[forbidden_symbol]]
+name = "policy_engine_source_purity"
+paths = ["crates/yadorilink-replica-engine/src/**/*.rs"]
+symbols = [
+  "tokio::", "async_trait::",
+  "rusqlite::", "r2d2::", "r2d2_sqlite::",
+  "prost::", "yadorilink_ipc_proto::",
+  "yadorilink_local_storage::", "yadorilink_transport::",
+  "yadorilink_sync_wire::",
+  "notify::", "fs2::", "walkdir::", "fastcdc::",
+  "tracing::",
+  "std::fs", "std::net",
+  "PeerMessageChannel",
+]
+reason = """
+The policy engine must stay callable from a plain synchronous test. The
+session's message-channel port is listed too: a reverse dependency on the
+session or protocol layer would put the engine back inside the thing it was
+extracted out of.
+"""
+
+[[forbidden_symbol]]
+name = "wire_codec_source_isolation"
+paths = ["crates/yadorilink-sync-wire/src/**/*.rs"]
+symbols = [
+  "tokio::", "async_trait::",
+  "rusqlite::", "r2d2::", "r2d2_sqlite::",
+  "yadorilink_local_storage::", "yadorilink_transport::",
+  "yadorilink_replica_domain::",
+  "notify::", "fs2::", "walkdir::", "fastcdc::",
+  "std::fs", "std::net",
+]
+reason = """
+The codec turns bytes into frames and back. It neither performs the I/O that
+carries those bytes nor interprets them as domain values.
+"""
+
+[[forbidden_symbol]]
+name = "sqlite_runtime_knows_no_domain"
+paths = ["crates/yadorilink-sqlite-runtime/src/**/*.rs"]
+symbols = [
+  "yadorilink_replica_domain::",
+  "yadorilink_replica_engine::",
+  "yadorilink_sync_wire::",
+]
+reason = "The connection pool and writer gate know nothing above themselves."
+
+[[forbidden_symbol]]
+name = "sqlite_runtime_names_no_schema"
+paths = ["crates/yadorilink-sqlite-runtime/src/**/*.rs"]
+symbols = [
+  "pre_dag_schema",
+  "post_dag_schema",
+  "dag_store",
+  "filesystem_transaction",
+  "materialization_jobs",
+]
+reason = """
+Database open takes exactly one opaque schema-initialization closure,
+sequenced entirely by its caller. If a domain-specific schema name appears
+in this crate's own source, the ordering knowledge it must not hold has
+leaked back in.
+"""
+
+[[forbidden_symbol]]
+name = "peer_session_reaches_storage_through_ports"
+paths = ["crates/yadorilink-peer-session/src/**/*.rs"]
+test_spans = "exclude"
+symbols = ["rusqlite::", "r2d2::", "r2d2_sqlite::", "notify::", "walkdir::"]
+reason = """
+Production session code never touches SQLite or an OS watcher directly. Its
+own unit-test fixtures do drive a raw connection to exercise a persistence
+failure path, which is why test items are out of scope here while the
+production-graph dependency rule above still forbids the crate from linking
+these at all.
+"""
+
+[[forbidden_symbol]]
+name = "peer_session_holds_no_wire_protobuf"
+paths = ["crates/yadorilink-peer-session/src/**/*.rs"]
+test_spans = "exclude"
+symbols = ["yadorilink_ipc_proto", "prost::", "proto::"]
+reason = """
+The session speaks in wire-codec frame types; the generated protobuf
+representation lives behind that codec and never surfaces here. This
+replaces an older per-handler signature table that named each inbound
+handler and the exact frame type it took: that table went stale the moment a
+handler was legitimately renamed or a message stopped being a session-level
+payload, while this states the actual invariant -- no generated protobuf
+type reaches production session code by any route.
+"""
+
+[[forbidden_symbol]]
+name = "local_capture_reaches_storage_through_ports"
+paths = ["crates/yadorilink-local-capture/src/**/*.rs"]
+symbols = ["rusqlite::", "r2d2::", "r2d2_sqlite::", "notify::"]
+reason = "No SQL and no OS watcher in local change capture."
+
+[[forbidden_symbol]]
+name = "sync_sqlite_is_driven_not_driving"
+paths = ["crates/yadorilink-sync-sqlite/src/**/*.rs"]
+test_spans = "exclude"
+symbols = [
+  "yadorilink_daemon::",
+  "yadorilink_peer_session::",
+  "yadorilink_transport::",
+  "yadorilink_sync_wire::",
+]
+reason = """
+The persistence adapter is called by the engines and the daemon; reaching
+back up to any of them would make the dependency direction circular. Test
+fixtures may use the daemon's own constructors, so test items are out of
+scope.
+"""
+
+[[forbidden_symbol]]
+name = "application_layer_depends_only_on_ports"
+paths = ["crates/yadorilink-daemon/src/application/**/*.rs"]
+symbols = [
+  # Concrete daemon-runtime state and its decomposed pieces. Matched with a
+  # trailing `::` so only a real path segment counts, never a local
+  # identifier that happens to share the name -- and so a grouped
+  # `use crate::{daemon_state::X, ...};` or a relative `use
+  # super::super::daemon_state::X;` is caught just as reliably as the plain
+  # single-item form.
+  "daemon_state::",
+  "coordination_client::",
+  "control_socket::",
+  "hydration::",
+  "link_manager::",
+  "peer_registry::",
+  "link_registry::",
+  "durability_service::",
+  "runtime_telemetry::",
+  "maintenance_coordinator::",
+  # Transport and IPC representations.
+  "yadorilink_ipc_proto",
+  "reqwest::",
+]
+reason = """
+The application layer is expressed against its own port traits and value
+types only. A concrete adapter, transport, or runtime-state type reaching it
+directly is the dependency inversion this boundary exists to hold.
+"""
+
+[[forbidden_symbol]]
+name = "membership_operations_go_through_the_daemon"
+paths = [
+  "crates/yadorilink-cli/src/commands/device.rs",
+  "crates/yadorilink-cli/src/commands/share.rs",
+  "crates/yadorilink-cli/src/commands/link.rs",
+]
+symbols = [
+  "guard_against_forced_replica_loss",
+  "obtain_handoff_ticket_from_device",
+  "release_handoff_ticket_from_device",
+  "LatchGroupDurabilityUnknown",
+  "activate_create(",
+  "activate_join(",
+  "cancel_create(",
+  "cancel_join(",
+  # Membership-coordination endpoints must only ever be reached through a
+  # daemon command. A raw HTTP call to any of these from the interface layer
+  # is exactly the bypass this rule exists to catch.
+  '"/shares/{edge_id}"',
+  "/shares/groups/{group_id}/revoke",
+  "/devices/{device_id}/handoff-remove",
+  'format!("/devices/{device_id}")',
+]
+reason = """
+The interface layer issues daemon commands. Replica-loss guards, handoff
+ticket lifecycle, group activation, and the membership endpoints are daemon
+responsibilities, and reaching them directly from a command would put a
+second, unguarded copy of that policy in the interface.
+"""
+
+[[forbidden_symbol]]
+name = "control_socket_delegates_role_loss"
+paths = ["crates/yadorilink-daemon/src/control_socket.rs"]
+symbols = [
+  "coordination_client::commit_handoff_role_loss(",
+  ".open_role_loss_operation(",
+]
+reason = """
+Role-loss commitment runs through the application layer, never straight from
+the control socket.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Forbidden source patterns (regex).
+# ---------------------------------------------------------------------------
+
+[[forbidden_pattern]]
+name = "one_pool_and_one_writer_gate"
+paths = [
+  "crates/yadorilink-sync-sqlite/src/**/*.rs",
+  "crates/yadorilink-peer-session/src/**/*.rs",
+]
+test_spans = "exclude"
+patterns = ["Pool<SqliteConnectionManager>", "writer_gate:"]
+reason = """
+The connection pool and the in-process writer gate are owned once, by the
+SQLite runtime crate, and handed to everyone else as a shared database
+handle. A second pool or a second writer gate would silently drop the
+serialization the single gate provides.
+"""
+
+[[forbidden_pattern]]
+name = "sync_sqlite_opens_no_database"
+paths = ["crates/yadorilink-sync-sqlite/src/**/*.rs"]
+test_spans = "exclude"
+patterns = ['fn open\s*\(']
+skip_lines_containing = ["SqliteConnectionManager"]
+reason = """
+The persistence adapter is handed an already-open shared database handle. An
+`open` entry point of its own would be a second construction path, and so a
+second pool.
+"""
+
+[[forbidden_pattern]]
+name = "sqlite_transaction_boundary_stays_internal"
+paths = ["crates/yadorilink-sync-sqlite/src/**/*.rs"]
+test_spans = "exclude"
+patterns = ['rusqlite::Transaction', '&Transaction\b']
+require_lines_containing = ["pub fn"]
+reason = """
+The physical SQLite transaction never appears in a public signature: callers
+ask for an operation, not for a transaction to run things inside.
+"""
+
+[[forbidden_pattern]]
+name = "peer_session_has_one_wire_codec"
+paths = ["crates/yadorilink-peer-session/src/**/*.rs"]
+patterns = ['prost::Message', 'impl Message for']
+reason = """
+Encoding and decoding happen in the wire codec crate. A protobuf message
+implementation here would be a second, divergent copy of the framing.
+"""
+
+[[forbidden_pattern]]
+name = "peer_session_frames_nothing_by_hand"
+paths = ["crates/yadorilink-peer-session/src/**/*.rs"]
+patterns = ['\bfn\s+(encode|decode)\s*\(']
+reason = """
+An `encode`/`decode` function declared here is the shape a hand-rolled byte
+framing takes. The session has no encoding of its own at all: every byte it
+puts on or takes off the wire goes through the codec crate, so any function
+by these names in this crate is a duplicated framing path.
+"""
+
+[[forbidden_pattern]]
+name = "dag_mutations_stay_engine_owned"
+paths = ["crates/yadorilink-peer-session/src/peer_session.rs"]
+test_spans = "exclude"
+patterns = [
+  '\.dag_admit_change_with_versions\(',
+  '\.record_acknowledged_frontier\(',
+]
+reason = """
+These two writes are owned by the replica engine's admission and frontier
+ports. The session's wire handlers delegate to the engine; calling either
+directly from a handler would put change-admission policy back inside the
+protocol layer. The port traits that DECLARE these methods live in this
+crate's own `ports/` module and are not affected -- this rule is scoped to
+the session implementation, which must only ever be a caller.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Confinement: a dependency that is legitimate, but only in one place.
+# ---------------------------------------------------------------------------
+
+[[confined_symbol]]
+name = "generated_protobuf_confined_to_the_codec"
+paths = ["crates/yadorilink-sync-wire/src/**/*.rs"]
+allowed_paths = ["crates/yadorilink-sync-wire/src/protobuf.rs"]
+symbols = ["yadorilink_ipc_proto", "prost::"]
+reason = """
+The generated protobuf types are an implementation detail of one encoder.
+The crate's public frame types and its re-export list must stay free of
+them, so a caller can hold a frame without linking the generated code.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Call-site allowlists.
+# ---------------------------------------------------------------------------
+
+[[call_site]]
+name = "sessions_are_constructed_by_the_composition_root"
+paths = ["crates/**/*.rs"]
+patterns = ['PeerSyncSession::(new|new_with_dependencies|new_with_forwarding)\s*\(']
+allowed_paths = [
+  "crates/yadorilink-daemon/src/**/*.rs",
+  "crates/yadorilink-peer-session/src/**/*.rs",
+]
+skip_test_paths = true
+test_spans = "exclude"
+reason = """
+A live peer session owns transport handles, credit windows, and replica
+state. Exactly one place in production decides when one exists: the daemon's
+composition root. Integration tests under `tests/` and in-crate test items
+build their own sessions and are out of scope.
+"""
+
+[[call_site]]
+name = "each_database_file_is_opened_once"
+paths = ["crates/**/*.rs"]
+patterns = ['SyncDatabase::open\s*\(']
+allowed_paths = [
+  "crates/yadorilink-daemon/src/replica_coordinator.rs",
+  "crates/yadorilink-send/src/store.rs",
+]
+skip_test_paths = true
+test_spans = "exclude"
+reason = """
+The connection pool and the in-process writer gate a `SyncDatabase` owns
+serialize writers within one process against one file, so a second open of
+the SAME file is a second gate and no serialization at all. Two database
+files exist and each has exactly one production opener: the replica database
+opened by `ReplicaCoordinator::open`, and the separate single-file send
+database opened by `SendStore::open`. A third caller opening either one is
+the bypass this rule catches. `open_in_memory` is a different constructor
+and deliberately not matched -- an in-memory database is per-handle by
+construction.
+"""

@@ -247,6 +247,65 @@ jobs:
           path: release/linux
           if-no-files-found: error
 
+  # Multi-arch (amd64+arm64) yadorilink-daemon image, published to GHCR --
+  # see installer/docker/Dockerfile's header for what it contains and why.
+  # Gated like windows-signed-artifacts/macos-signed-artifacts: this pushes
+  # to a registry (not just an unpublished build-health artifact), so fork
+  # PRs must never reach it. Unlike those two jobs this needs no protected
+  # Environment secret -- GITHUB_TOKEN's per-job `packages: write`
+  # permission is already scoped to this one run by GitHub, not a
+  # long-lived credential this workflow manages.
+  docker-artifacts:
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Nightly (rolling, main) gets a single floating `nightly` tag,
+      # matching the nightly-release job's rolling-tag/`--clobber` model.
+      # A version tag gets both an immutable `<version>` tag and a
+      # floating `latest`, matching beta-release's "immutable, never
+      # force-moved" GitHub Release model for the version tag itself --
+      # `latest` is the one floating exception, same as every other image
+      # registry's convention.
+      - name: Compute image tags
+        id: tags
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${{ github.repository_owner }}/yadorilink-daemon"
+          if [[ "$REF" == refs/tags/v* ]]; then
+            version="${REF#refs/tags/v}"
+            printf 'tags=%s:%s,%s:latest\n' "$image" "$version" "$image" >> "$GITHUB_OUTPUT"
+          else
+            printf 'tags=%s:nightly\n' "$image" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: installer/docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+
   windows-build-health:
     runs-on: windows-latest
     steps:
@@ -1041,4 +1100,137 @@ jobs:
             fi
           else
             echo "Cloudflare creds absent; beta manifest uploaded as release asset only."
+          fi
+
+      # --- Package-manager distribution wiring ----------------------------
+
+      - name: Require APT signing configuration
+        id: apt
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$APT_SIGNING_KEY" ]; then
+            echo "::warning::APT_SIGNING_KEY not configured in the release-signing Environment; skipping APT repository publish. See installer/linux/apt/README.md's 'Signing key custody' section."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # installer/linux/apt/README.md: this is the "stable" apt suite --
+      # only immutable, gated beta-release tags publish here, never the
+      # rolling nightly build (an apt repo's stable suite is not the place
+      # for unvetted dev builds).
+      - name: Build and publish the APT repository
+        if: steps.apt.outputs.enabled == 'true'
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          export GNUPGHOME="$RUNNER_TEMP/apt-gnupg"
+          mkdir -p "$GNUPGHOME"
+          chmod 700 "$GNUPGHOME"
+          printf '%s\n' "$APT_SIGNING_KEY" | gpg --batch --import
+          key_id="$(gpg --batch --with-colons --list-secret-keys | awk -F: '/^sec/{print $5; exit}')"
+
+          # arm64 packages join this invocation once ARM64 validation
+          # (installer/linux/README.md) lands a real arm64 linux-artifacts
+          # build; today only amd64 exists.
+          bash scripts/ci/build-apt-repo.sh --out-dir apt-repo --gpg-key-id "$key_id" -- dist/yadorilink_*_amd64.deb
+
+          gpg --batch --armor --export "$key_id" > apt-repo/yadorilink-archive-keyring.asc
+          cp installer/linux/apt/install.sh apt-repo/install.sh
+
+          ARMORED_PUBLIC_KEY_PATH="$(pwd)/apt-repo/yadorilink-archive-keyring.asc" \
+            bash installer/linux/apt/build-keyring-deb.sh
+          cp installer/linux/apt/dist/yadorilink-archive-keyring_*_all.deb apt-repo/
+
+          if [ -n "${CLOUDFLARE_API_TOKEN:-}" ] && [ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+            # Publish order matters and failures must not be silently
+            # swallowed (set -euo pipefail above already aborts this step
+            # on the first failed `r2 object put` -- no per-file ||
+            # fallback here, unlike an earlier version of this script,
+            # which only logged a ::warning:: and let the job report
+            # success with a partially-published repository).
+            #
+            # Order: pool/ + Packages(.gz) first, then Release +
+            # Release.gpg, and dists/stable/InRelease strictly last. apt
+            # fetches InRelease first and treats its presence as "this
+            # repository is ready"; publishing files in arbitrary
+            # filesystem order (as an earlier version of this script did,
+            # via a plain `find | while read`) could publish InRelease
+            # before the Packages.gz it hashes has finished uploading,
+            # opening a window where a concurrent `apt-get update` sees a
+            # hash mismatch against a real signed InRelease.
+            publish_file() {
+              local f="$1"
+              local key="${f#apt-repo/}"
+              npx --yes wrangler@3 r2 object put "yadorilink-apt/${key}" --file "$f" --remote
+            }
+            while IFS= read -r f; do
+              publish_file "$f"
+            done < <(find apt-repo -type f ! -name Release ! -name Release.gpg ! -name InRelease)
+            publish_file apt-repo/dists/stable/Release
+            publish_file apt-repo/dists/stable/Release.gpg
+            publish_file apt-repo/dists/stable/InRelease
+          else
+            echo "::warning::Cloudflare creds absent; APT repository built but not published to R2."
+          fi
+
+      - name: Tear down APT signing key
+        if: always()
+        run: rm -rf "${RUNNER_TEMP}/apt-gnupg" installer/linux/apt/dist
+
+      - name: Notify the Homebrew tap of a new release
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_DISPATCH_TOKEN }}
+          VERSION: ${{ steps.tag.outputs.version }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning::HOMEBREW_TAP_DISPATCH_TOKEN not configured; skipping the Homebrew tap bump. Run juntaki/homebrew-yadorilink's 'Bump tap on release' workflow by hand (see its README's 'Recovering a missed bump')."
+          elif [ ! -f dist/yadorilink-macos.pkg.sha256 ]; then
+            echo "::warning::No signed yadorilink-macos.pkg checksum found; skipping the Homebrew tap bump."
+          else
+            macos_pkg_sha256="$(awk '{print $1; exit}' dist/yadorilink-macos.pkg.sha256)"
+            source_sha256="$(curl -fsSL "https://github.com/juntaki/yadorilink/archive/refs/tags/${TAG}.tar.gz" | sha256sum | awk '{print $1}')"
+            gh workflow run bump-tap.yml \
+              --repo juntaki/homebrew-yadorilink \
+              -f version="$VERSION" \
+              -f macos_pkg_sha256="$macos_pkg_sha256" \
+              -f source_sha256="$source_sha256"
+          fi
+
+      # WinGet: deliberately does NOT commit installer/windows/winget/ here
+      # or run scripts/ci/update-winget-manifest.sh itself -- same
+      # human-gated-release-step reasoning as not auto-opening the
+      # winget-pkgs PR (installer/windows/winget/README.md's "Submission"
+      # section): an unattended workflow committing generated files back
+      # to this repo isn't something this project's release-signing
+      # discipline (required reviewers, no unattended production
+      # credentials) allows. This step only records the two real inputs
+      # that script needs so a maintainer doesn't have to re-derive them.
+      - name: Record WinGet manifest inputs (no auto-submission)
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -f dist/yadorilink-setup.exe.sha256 ]; then
+            exe_sha256="$(awk '{print $1; exit}' dist/yadorilink-setup.exe.sha256)"
+            {
+              echo "### WinGet manifest inputs for v${VERSION}"
+              echo
+              echo "Regenerate \`installer/windows/winget/manifests/j/juntaki/YadoriLink/${VERSION}/\` with:"
+              echo
+              echo '```'
+              echo "scripts/ci/update-winget-manifest.sh --version ${VERSION} --installer-sha256 ${exe_sha256}"
+              echo '```'
+              echo
+              echo "by hand (see \`installer/windows/winget/README.md\`'s Status section for why this workflow doesn't run it itself). Submission to microsoft/winget-pkgs stays a manual, human-gated step (same README's Submission section)."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::No signed yadorilink-setup.exe checksum found; skipping WinGet manifest input summary."
           fi

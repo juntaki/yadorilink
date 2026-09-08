@@ -96,6 +96,32 @@ use crate::keys::DeviceSigningKeyPair;
 /// still carrying block content inline on the control stream.
 pub const YADORILINK_P2P_ALPN: &[u8] = b"yadorilink-p2p/7";
 
+/// The application protocol Track Send speaks: a one-shot,
+/// Taildrop/Resilio-style file send/receive service layered on this
+/// device's exact same per-device QUIC endpoint -- same socket, same
+/// NAT-traversal, same Ed25519 raw-public-key mutual authentication as
+/// [`YADORILINK_P2P_ALPN`] above -- but a wholly separate application
+/// protocol, distinguished purely by ALPN. This is deliberately the same
+/// dispatch mechanism the module doc comment above describes for the sync
+/// generation number: ALPN is negotiated *inside* the TLS handshake, so a
+/// Track Send connection and a sync connection can never be confused for
+/// each other, and neither protocol's frames are ever read by the other's
+/// handler. See `quic_peer_endpoint.rs`'s `accept_loop` for where a
+/// completed handshake is routed by which of the two protocols it
+/// negotiated, and that module's own doc comment for why Track Send is a
+/// second, independent inbox/dial pair on the one shared endpoint rather
+/// than a second `quinn::Endpoint` (a hub's UDP socket accepts exactly one
+/// registered QUIC socket -- see `quic_socket.rs` -- so a second endpoint
+/// would mean a second port and re-deriving NAT traversal from scratch,
+/// which is exactly the duplication reusing this transport is meant to
+/// avoid).
+///
+/// Track Send's manifest/session/chunk-progress state is intentionally
+/// never admitted into the sync DAG (`change_parents`, `dag_group_heads`,
+/// `ProjectionObligation`, ...); this ALPN is the transport-level half of
+/// keeping the two lanes separate.
+pub const YADORILINK_SEND_ALPN: &[u8] = b"yadorilink-send/1";
+
 /// The name a dialer passes to `quinn::Endpoint::connect`.
 ///
 /// It is a placeholder and is deliberately never checked. Under RFC 7250 the
@@ -367,6 +393,18 @@ impl AuthorizedPeerKeys {
 /// construction-time snapshot.
 pub struct PinnedPeerKeys {
     expected: AuthorizedPeerKeys,
+    /// A second, independently-managed live set, checked in addition to
+    /// `expected` -- never folded into it. Exists for exactly one caller:
+    /// `quic_dual_server_config`'s Track Send grant-derived keys, which must
+    /// admit a raw TLS handshake from a device this endpoint's ordinary
+    /// netmap-derived `expected` set does not (and must not) name, without
+    /// that device ever being added to `expected` itself -- see this
+    /// endpoint's own `accept_loop`, which is what keeps a key admitted only
+    /// through THIS set from ever reaching a real sync session even though
+    /// its handshake succeeds here. `None` for every other caller
+    /// ([`quic_server_config`], [`quic_client_config`],
+    /// [`quic_send_client_config`]), which have exactly one set to check.
+    additional: Option<AuthorizedPeerKeys>,
     /// The signature algorithms of the provider this configuration is built
     /// on. Held rather than looked up per handshake so the verifier cannot
     /// end up validating against a different provider than the one doing the
@@ -411,7 +449,19 @@ impl PinnedPeerKeys {
         expected: AuthorizedPeerKeys,
         provider: &rustls::crypto::CryptoProvider,
     ) -> Self {
-        Self { expected, supported: provider.signature_verification_algorithms }
+        Self::with_live_sets(expected, None, provider)
+    }
+
+    /// As [`with_live_set`](Self::with_live_set), but a presented key is
+    /// accepted if it is in EITHER `expected` or `additional` -- see
+    /// `additional`'s own field doc comment for the one caller this exists
+    /// for and why the two sets stay separate rather than merged into one.
+    pub fn with_live_sets(
+        expected: AuthorizedPeerKeys,
+        additional: Option<AuthorizedPeerKeys>,
+        provider: &rustls::crypto::CryptoProvider,
+    ) -> Self {
+        Self { expected, additional, supported: provider.signature_verification_algorithms }
     }
 
     /// Decides whether a presented raw public key is one this endpoint
@@ -434,7 +484,9 @@ impl PinnedPeerKeys {
         let Some(presented) = ed25519_key_from_spki(end_entity.as_ref()) else {
             return Err(rustls::Error::InvalidCertificate(CertificateError::BadEncoding));
         };
-        if !self.expected.contains(&presented) {
+        let accepted = self.expected.contains(&presented)
+            || self.additional.as_ref().is_some_and(|extra| extra.contains(&presented));
+        if !accepted {
             // `UnknownIssuer` would be the closer analogue in an X.509 world,
             // but there is no issuer here. The key simply is not one this
             // device was told to talk to, which is an application-level
@@ -645,6 +697,91 @@ pub fn quic_server_config(
     crypto.session_storage = Arc::new(NoServerSessionStorage {});
     // 0-RTT data would arrive before this handshake's client authentication
     // has happened at all.
+    crypto.max_early_data_size = 0;
+    Ok(quinn::ServerConfig::with_crypto(Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(crypto).map_err(quic_config_error)?,
+    )))
+}
+
+/// Dials one specific peer for a Track Send connection.
+///
+/// Identical to [`quic_client_config`] in every respect except which
+/// protocol this connection identifies itself as: this device's own
+/// Ed25519 key authenticates it, and it accepts an answer only from
+/// `expected_peer`, exactly as a sync dial does. The only difference is
+/// [`YADORILINK_SEND_ALPN`] in place of [`YADORILINK_P2P_ALPN`], so the
+/// two kinds of connection can never be negotiated as each other. Kept as
+/// a fully separate function rather than a parameter on
+/// [`quic_client_config`] so that function's existing behavior (and the
+/// tests pinned to it) stays exactly as it was before Track Send existed.
+pub fn quic_send_client_config(
+    device: &DeviceSigningKeyPair,
+    expected_peer: [u8; 32],
+) -> Result<quinn::ClientConfig, TransportError> {
+    let provider = provider();
+    let verifier = Arc::new(PinnedPeerKeys::new([expected_peer], &provider));
+    let mut crypto = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(quic_config_error)?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_client_cert_resolver(Arc::new(AlwaysResolvesClientRawPublicKeys::new(
+            device_certified_key(device),
+        )));
+    crypto.alpn_protocols = vec![YADORILINK_SEND_ALPN.to_vec()];
+    crypto.resumption = rustls::client::Resumption::disabled();
+    Ok(quinn::ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(crypto).map_err(quic_config_error)?,
+    )))
+}
+
+/// The server configuration this device's one QUIC endpoint actually runs
+/// with: identical to [`quic_server_config`] -- same peer authentication,
+/// same live-revocation semantics, same resumption/ticket refusal -- except
+/// its ALPN list additionally accepts [`YADORILINK_SEND_ALPN`], so the one
+/// endpoint can complete a handshake for either protocol.
+///
+/// A separate function rather than a change to [`quic_server_config`]
+/// itself so that function's existing single-ALPN contract stays exactly
+/// as it was for every other caller (this crate's own handshake tests and
+/// benchmark example construct a server directly from it, asserting
+/// sync-only behavior) -- only `QuicPeerEndpoint::new`, which is what
+/// actually needs to accept both protocols, calls this one instead.
+///
+/// Which protocol a given accepted connection actually negotiated is read
+/// back after the handshake completes and used to route it; see
+/// `quic_peer_endpoint.rs`'s `accept_loop`.
+///
+/// `send_authorized_peers` is a SECOND, independent live set: a key
+/// admitted only through it (never through `authorized_peers`) completes a
+/// raw TLS handshake here exactly as if it were in `authorized_peers`, but
+/// is never treated as a genuine netmap peer beyond that -- see
+/// `PinnedPeerKeys::additional`'s own doc comment for why the two sets stay
+/// separate, and `quic_peer_endpoint.rs`'s `accept_loop` for the
+/// post-handshake check that is the other half of this: a completed
+/// handshake alone is not what makes a SYNC-ALPN connection real for a key
+/// that got in only through this set.
+pub fn quic_dual_server_config(
+    device: &DeviceSigningKeyPair,
+    authorized_peers: &AuthorizedPeerKeys,
+    send_authorized_peers: &AuthorizedPeerKeys,
+) -> Result<quinn::ServerConfig, TransportError> {
+    let provider = provider();
+    let verifier = Arc::new(PinnedPeerKeys::with_live_sets(
+        authorized_peers.clone(),
+        Some(send_authorized_peers.clone()),
+        &provider,
+    ));
+    let mut crypto = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(quic_config_error)?
+        .with_client_cert_verifier(verifier)
+        .with_cert_resolver(Arc::new(AlwaysResolvesServerRawPublicKeys::new(
+            device_certified_key(device),
+        )));
+    crypto.alpn_protocols = vec![YADORILINK_P2P_ALPN.to_vec(), YADORILINK_SEND_ALPN.to_vec()];
+    crypto.send_tls13_tickets = 0;
+    crypto.session_storage = Arc::new(NoServerSessionStorage {});
     crypto.max_early_data_size = 0;
     Ok(quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(crypto).map_err(quic_config_error)?,

@@ -28,6 +28,38 @@ pub struct EndpointCandidate {
     pub priority: i32,
 }
 
+/// A Track Send rendezvous grant from `POST /send/authorization` --
+/// coordination-worker's `routes/send.ts`, backed by the `send_authorizations`
+/// table (see that migration's own doc comment for what this primitive is
+/// and, deliberately, is not: never an extension of folder-group/ACL
+/// membership). Names the exact sender+receiver pair it authorizes and
+/// carries ONLY the receiver's own yadorilink-send/1 connect material --
+/// never any other same-account device's key or address.
+#[derive(Debug, Clone)]
+pub struct SendAuthorizationGrant {
+    pub grant_id: String,
+    /// Presented alongside `grant_id` at consume time, never alone -- see
+    /// `consume_send_authorization`'s own doc comment for why a leaked or
+    /// logged grant id must not be independently consumable.
+    pub nonce: String,
+    pub expires_at_unix: i64,
+    pub receiver_device_id: String,
+    pub receiver_signing_key: [u8; 32],
+    pub receiver_candidates: Vec<EndpointCandidate>,
+}
+
+/// The connect material `POST /send/authorization/:grantId/consume` returns
+/// on success -- the sender's own yadorilink-send/1 signing key and
+/// candidate addresses, released only once the grant is atomically and
+/// irreversibly consumed (never a second time -- see that function's own
+/// doc comment).
+#[derive(Debug, Clone)]
+pub struct SendGrantPeerMaterial {
+    pub device_id: String,
+    pub signing_key: [u8; 32],
+    pub candidates: Vec<EndpointCandidate>,
+}
+
 /// The result of an `activate_create`/`activate_join` call, distinguished by
 /// what the coordination plane's response actually communicates --
 /// `EnrollmentRecoveryService::reconcile_once` branches on this instead of a bare bool
@@ -42,6 +74,19 @@ pub enum ActivateOutcome {
     /// call already succeeded before a crash) lands here rather than
     /// erroring.
     AlreadyActive,
+    /// Cross-account invite acceptance only: the coordination plane
+    /// accepted this device's half, but the invite was minted requiring the
+    /// group owner's approval, so the membership is parked awaiting their
+    /// decision and grants nothing yet.
+    ///
+    /// A 2xx like `Success`, and deliberately NOT folded into it: the
+    /// security property does not depend on the caller believing this (with
+    /// no policy-log grant the device authorizes nothing whatever it
+    /// concludes), but the HONESTY of what the caller then tells the user
+    /// does. Folding it into `Success` is what made the CLI report "Joined
+    /// folder group ..." for a folder that will never sync until someone
+    /// else acts.
+    AwaitingApproval,
     /// The coordination-side row this operation id names is permanently
     /// gone (never prepared, or already cancelled/swept) -- a 404 from the
     /// coordination plane. There is nothing left to activate.
@@ -99,13 +144,21 @@ pub struct RoleLossCommitRequest<'a> {
 }
 
 pub use imp::{
-    activate_create, activate_join, cancel_create, cancel_create_classified, cancel_join,
-    cancel_join_classified, commit_handoff_role_loss, compensate_handoff_role_loss,
-    find_handoff_lease, prepare_create, prepare_join, query_enrollment_operation,
-    query_membership_operation, query_membership_operation_categorized, query_role_loss_operation,
-    release_handoff_lease, report_endpoint, request_handoff_lease, request_relay_grant,
-    resolve_edge, send_rendezvous, set_storage_mode, upload_signing_key,
+    activate_create, activate_invite_accept, activate_join, cancel_create,
+    cancel_create_classified, cancel_invite_accept_classified, cancel_join, cancel_join_classified,
+    commit_handoff_role_loss, compensate_handoff_role_loss, consume_send_authorization,
+    fetch_edge_state, find_handoff_lease, prepare_create, prepare_invite_accept, prepare_join,
+    query_enrollment_operation, query_membership_operation, query_membership_operation_categorized,
+    query_role_loss_operation, release_handoff_lease, report_endpoint, request_handoff_lease,
+    request_relay_grant, request_send_authorization, resolve_edge, send_rendezvous,
+    set_storage_mode, upload_signing_key,
 };
+// `MintedInvite` is `pub(crate)` (defined in `application::model`, a
+// crate-internal module) -- unlike every other re-export above, whose
+// return types are genuinely part of this module's own public surface, so
+// `mint_invite` can only ever be re-exported at `pub(crate)`, not widened
+// to `pub` alongside its siblings.
+pub(crate) use imp::mint_invite;
 
 /// Why a remote-evidence lookup could not be answered -- see
 /// `RemoteEvidence`'s own doc comment for the
@@ -227,6 +280,7 @@ pub(crate) use crate::application::model::membership::{
     MembershipRemoteRequest, MembershipRemoteRequestGroup, MembershipRemoteResult,
     MembershipRemoteStatus, RoleLossCommitOutcome,
 };
+pub(crate) use crate::application::model::MintedInvite;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoleLossCompensationOutcome {
@@ -316,8 +370,15 @@ mod imp {
         MembershipOperationRecord, MembershipRemoteRequest, MembershipRemoteRequestGroup,
         MembershipRemoteResult, MembershipRemoteStatus, RemoteEvidenceErrorCategory,
         RemoteQueryError, RoleLossCommitOutcome, RoleLossCommitRequest,
-        RoleLossCompensationOutcome, RoleLossOperationRecord,
+        RoleLossCompensationOutcome, RoleLossOperationRecord, SendAuthorizationGrant,
+        SendGrantPeerMaterial,
     };
+
+    /// `skip_serializing_if` predicate for an optional boolean request
+    /// field whose `false` means exactly what omitting it means.
+    fn is_false(value: &bool) -> bool {
+        !*value
+    }
 
     #[derive(Serialize)]
     struct WireCandidate {
@@ -330,6 +391,20 @@ mod imp {
             .iter()
             .map(|c| WireCandidate { address: c.address.clone(), priority: c.priority })
             .collect()
+    }
+
+    /// Extracts the coordination plane's own `{"error": "..."}` message
+    /// from a rejected response body, when the body actually has that
+    /// shape. Used by `prepare_invite_accept` to give its `DefinitelyRejected`
+    /// detail a clean, directly user-facing message (e.g. "invite is
+    /// invalid or already used") instead of a raw `HTTP 400:
+    /// {"error":"..."}` dump -- that raw form is what every enrollment
+    /// error detail in this file falls back to, and still does here too
+    /// (see the caller) whenever the body does not parse as this exact
+    /// shape.
+    fn coord_error_message(body_text: &str) -> Option<String> {
+        let value: serde_json::Value = serde_json::from_str(body_text).ok()?;
+        value.get("error")?.as_str().map(str::to_string)
     }
 
     async fn post_no_content<B: Serialize>(url: String, access_token: &str, body: &B, what: &str) {
@@ -368,23 +443,33 @@ mod imp {
         }
     }
 
-    /// The response body an activate call's 2xx response carries: which of
-    /// the two non-error outcomes (`ActivateCreateResult`/`ActivateJoinResult`
-    /// on the coordination-worker side) it landed on. A response that fails
-    /// to parse (an older coordination-worker build that still replies with
-    /// an empty 204, or any other unexpected body) is treated as a plain
-    /// `Success` -- the status code alone already confirms the row is
-    /// active, and "already active" vs. "freshly activated" makes no
-    /// difference to any caller of `activate_create`/`activate_join`.
+    /// The response body an activate call's 2xx response carries: which
+    /// non-error outcome (`ActivateCreateResult`/`ActivateJoinResult`/
+    /// `ActivateInviteAcceptResult` on the coordination-worker side) it
+    /// landed on. A response that fails to parse (an older
+    /// coordination-worker build that still replies with an empty 204, or
+    /// any other unexpected body) is treated as a plain `Success` -- the
+    /// status code alone already confirms the row is active, and "already
+    /// active" vs. "freshly activated" makes no difference to any caller of
+    /// `activate_create`/`activate_join`.
     #[derive(Deserialize)]
     struct ActivateResultBody {
         result: String,
     }
 
-    /// Shared by `activate_create`/`activate_join`: both coordination-worker
-    /// routes are 404 on a permanently-gone row and otherwise 2xx with a
-    /// `{"result": "activated" | "already_active"}` body -- see
-    /// `coordination-worker/src/routes/shares.ts`'s activate handlers.
+    /// The coordination plane's own result strings, matched POSITIVELY --
+    /// an unrecognized future outcome falls through to plain `Success`
+    /// (the status code already confirmed the mutation landed), never into
+    /// one of the specific branches.
+    const ACTIVATE_RESULT_ALREADY_ACTIVE: &str = "already_active";
+    const ACTIVATE_RESULT_AWAITING_APPROVAL: &str = "awaiting_approval";
+    const ACTIVATE_RESULT_ALREADY_AWAITING_APPROVAL: &str = "already_awaiting_approval";
+
+    /// Shared by `activate_create`/`activate_join`/`activate_invite_accept`:
+    /// every one of those coordination-worker routes is 404 on a
+    /// permanently-gone row and otherwise 2xx with a `{"result": ...}` body
+    /// -- see `coordination-worker/src/routes/shares.ts`'s activate
+    /// handlers.
     async fn post_activate<B: Serialize>(
         url: String,
         access_token: &str,
@@ -400,7 +485,20 @@ mod imp {
             }
             Ok(resp) if resp.status().is_success() => match resp.json::<ActivateResultBody>().await
             {
-                Ok(body) if body.result == "already_active" => ActivateOutcome::AlreadyActive,
+                Ok(body) if body.result == ACTIVATE_RESULT_ALREADY_ACTIVE => {
+                    ActivateOutcome::AlreadyActive
+                }
+                // Both awaiting-approval outcomes are the same answer to
+                // the only question a caller of this has: is this device a
+                // member yet? (No.) Which call parked it -- this one, or an
+                // earlier attempt -- changes nothing about what happens
+                // next or what the user is told.
+                Ok(body)
+                    if body.result == ACTIVATE_RESULT_AWAITING_APPROVAL
+                        || body.result == ACTIVATE_RESULT_ALREADY_AWAITING_APPROVAL =>
+                {
+                    ActivateOutcome::AwaitingApproval
+                }
                 _ => ActivateOutcome::Success,
             },
             Ok(resp) => {
@@ -524,6 +622,7 @@ mod imp {
             creating_device_id: &'a str,
         }
         #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
         struct Response {
             group_id: String,
         }
@@ -681,6 +780,200 @@ mod imp {
                 .await,
         )
         .await
+    }
+
+    /// Sends the cross-account invite-accept prepare request and classifies
+    /// the response -- see [`prepare_create`]'s own doc comment for why:
+    /// unlike join, the group id is not known ahead of time (only the
+    /// invite code names it), so a successful response's `groupId` is what
+    /// the caller learns the group actually is.
+    pub async fn prepare_invite_accept(
+        addr: &str,
+        access_token: &str,
+        operation_id: &str,
+        code: &str,
+        device_id: &str,
+        storage_mode: &str,
+    ) -> super::EnrollmentPrepareOutcome {
+        use super::EnrollmentPrepareOutcome;
+
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            operation_id: &'a str,
+            code: &'a str,
+            device_id: &'a str,
+            storage_mode: &'a str,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Response {
+            group_id: String,
+        }
+
+        let response = match reqwest::Client::new()
+            .post(format!("{addr}/shares/invites/accept/prepare"))
+            .bearer_auth(access_token)
+            .json(&Body { operation_id, code, device_id, storage_mode })
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => return EnrollmentPrepareOutcome::Ambiguous(error.to_string()),
+        };
+        let status = response.status();
+        if status == reqwest::StatusCode::CONFLICT {
+            return EnrollmentPrepareOutcome::Conflict(response.text().await.unwrap_or_default());
+        }
+        if status.is_client_error() {
+            let body_text = response.text().await.unwrap_or_default();
+            // Prefer the coordination plane's own clean `error` message
+            // (e.g. "invite is invalid or already used") over a raw
+            // HTTP-status-plus-JSON-body dump -- this is the detail an
+            // expired/already-used/cancelled invite surfaces all the way
+            // up to `yadorilink share accept`'s own error output, so it
+            // should read as a sentence, not a debug trace.
+            let detail = coord_error_message(&body_text).unwrap_or_else(|| {
+                format!("invite accept prepare returned HTTP {status}: {body_text}")
+            });
+            return EnrollmentPrepareOutcome::DefinitelyRejected(detail);
+        }
+        if !status.is_success() {
+            return EnrollmentPrepareOutcome::Ambiguous(format!(
+                "invite accept prepare returned HTTP {status}: {}",
+                response.text().await.unwrap_or_default()
+            ));
+        }
+        match response.json::<Response>().await {
+            Ok(body) if !body.group_id.is_empty() => {
+                EnrollmentPrepareOutcome::Prepared { group_id: body.group_id }
+            }
+            Ok(_) => EnrollmentPrepareOutcome::Ambiguous(
+                "invite accept prepare returned an empty group_id".to_string(),
+            ),
+            Err(error) => EnrollmentPrepareOutcome::Ambiguous(format!(
+                "invite accept prepare may have committed but its response was unparseable: \
+                 {error}"
+            )),
+        }
+    }
+
+    /// Confirms a previously-prepared cross-account invite acceptance
+    /// (`POST /shares/groups/:groupId/invites/accept/activate`), turning a
+    /// Pending membership into the real thing. No code in the body -- the
+    /// coordination plane re-derives the invite (and its role) from what
+    /// this (deviceId, operationId) pair already redeemed at prepare time.
+    pub async fn activate_invite_accept(
+        addr: &str,
+        access_token: &str,
+        group_id: &str,
+        operation_id: &str,
+        device_id: &str,
+    ) -> ActivateOutcome {
+        post_activate(
+            format!("{addr}/shares/groups/{group_id}/invites/accept/activate"),
+            access_token,
+            &JoinOperationBody { operation_id, device_id },
+            "invite accept activate",
+        )
+        .await
+    }
+
+    /// The compensating call for an invite acceptance that will never be
+    /// activated (`POST /shares/groups/:groupId/invites/accept/cancel`) --
+    /// deletes only the still-Pending membership; does NOT return the
+    /// invite itself to unused (see the coordination plane's own doc
+    /// comment on that route).
+    pub async fn cancel_invite_accept_classified(
+        addr: &str,
+        access_token: &str,
+        group_id: &str,
+        operation_id: &str,
+        device_id: &str,
+    ) -> super::EnrollmentCancelOutcome {
+        classify_cancel_response(
+            reqwest::Client::new()
+                .post(format!("{addr}/shares/groups/{group_id}/invites/accept/cancel"))
+                .bearer_auth(access_token)
+                .json(&JoinOperationBody { operation_id, device_id })
+                .send()
+                .await,
+        )
+        .await
+    }
+
+    /// Mints a one-use, expiring, device-scoped cross-account invite for
+    /// `group_id` (`POST /shares/groups/:groupId/invites`). Owner-only on
+    /// the coordination plane's side; `Err` carries the rejection detail
+    /// verbatim (e.g. "not the owner", "invalid role") -- there is no
+    /// crash-safety story to classify here (a single stateless request, no
+    /// local state to reconcile), so a plain `Result` is enough, unlike the
+    /// enrollment prepare/activate/cancel calls above.
+    pub(crate) async fn mint_invite(
+        addr: &str,
+        access_token: &str,
+        group_id: &str,
+        minting_device_id: &str,
+        role: Option<&str>,
+        ttl_secs: Option<u64>,
+        requires_approval: bool,
+    ) -> Result<super::MintedInvite, String> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            minting_device_id: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            role: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            ttl_secs: Option<u64>,
+            /// Omitted entirely when false, the way `role`/`ttl_secs` are
+            /// when unset: the coordination plane treats an absent key and
+            /// an explicit `false` identically, so skipping keeps a mint
+            /// that wants no approval step byte-identical on the wire to
+            /// one from a build that predates this option.
+            #[serde(skip_serializing_if = "is_false")]
+            requires_approval: bool,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Response {
+            code: String,
+            invite_id: String,
+            group_id: String,
+            role: String,
+            expires_at_unix: i64,
+            /// Absent from a coordination plane that predates this option,
+            /// which is exactly the same thing as "no approval step".
+            #[serde(default)]
+            requires_approval: bool,
+        }
+
+        let response = reqwest::Client::new()
+            .post(format!("{addr}/shares/groups/{group_id}/invites"))
+            .bearer_auth(access_token)
+            .json(&Body { minting_device_id, role, ttl_secs, requires_approval })
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!(
+                "invite mint returned HTTP {status}: {}",
+                response.text().await.unwrap_or_default()
+            ));
+        }
+        let body = response
+            .json::<Response>()
+            .await
+            .map_err(|e| format!("invite mint response was unparseable: {e}"))?;
+        Ok(super::MintedInvite {
+            code: body.code,
+            invite_id: body.invite_id,
+            group_id: body.group_id,
+            role: body.role,
+            expires_at_unix: body.expires_at_unix,
+            requires_approval: body.requires_approval,
+        })
     }
 
     pub async fn upload_signing_key(
@@ -1096,12 +1389,33 @@ mod imp {
         access_token: &str,
         edge_id: &str,
     ) -> Result<Option<(String, String)>, String> {
-        #[derive(Deserialize)]
-        struct EdgeInfo {
-            edge_id: String,
-            group_id: String,
-            device_id: String,
-        }
+        Ok(list_share_edges(addr, access_token)
+            .await?
+            .into_iter()
+            .find(|edge| edge.edge_id == edge_id)
+            .map(|edge| (edge.group_id, edge.device_id)))
+    }
+
+    /// One row of the `GET /shares` listing, as far as this daemon reads it.
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct EdgeInfo {
+        edge_id: String,
+        group_id: String,
+        device_id: String,
+        /// The edge's membership state (`"active"`, `"pending"`, or
+        /// `"pending_approval"`). Optional-with-default rather than
+        /// required: a coordination plane deployed before it reported edge
+        /// state must degrade to "state unknown" instead of failing the
+        /// whole listing and taking `resolve_edge` -- and with it every
+        /// `revoke <edge-id>` -- down with it. Every consumer of this field
+        /// treats `None` as "not known to be anything in particular" and
+        /// falls back to the conservative branch.
+        #[serde(default)]
+        state: Option<String>,
+    }
+
+    async fn list_share_edges(addr: &str, access_token: &str) -> Result<Vec<EdgeInfo>, String> {
         #[derive(Deserialize)]
         struct Resp {
             edges: Vec<EdgeInfo>,
@@ -1116,11 +1430,26 @@ mod imp {
             return Err(format!("listing shares returned HTTP {}", resp.status()));
         }
         let parsed: Resp = resp.json().await.map_err(|e| e.to_string())?;
-        Ok(parsed
-            .edges
+        Ok(parsed.edges)
+    }
+
+    /// The coordination plane's membership `state` for one (group, device)
+    /// edge, read from the same `/shares` listing `resolve_edge` uses.
+    /// `Ok(None)` means the account's listing carries no such edge at all,
+    /// or carries one whose state this coordination plane does not report
+    /// -- both of which callers must treat as "unknown", never as "not
+    /// active".
+    pub async fn fetch_edge_state(
+        addr: &str,
+        access_token: &str,
+        group_id: &str,
+        device_id: &str,
+    ) -> Result<Option<String>, String> {
+        Ok(list_share_edges(addr, access_token)
+            .await?
             .into_iter()
-            .find(|edge| edge.edge_id == edge_id)
-            .map(|edge| (edge.group_id, edge.device_id)))
+            .find(|edge| edge.group_id == group_id && edge.device_id == device_id)
+            .and_then(|edge| edge.state))
     }
 
     /// Confirms whether a daemon-driven membership mutation actually landed,
@@ -1714,5 +2043,455 @@ mod imp {
             "rendezvous send",
         )
         .await;
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct WireEndpoint {
+        address: String,
+        priority: i32,
+    }
+
+    fn decoded_endpoints(endpoints: Vec<WireEndpoint>) -> Vec<EndpointCandidate> {
+        endpoints
+            .into_iter()
+            .map(|e| EndpointCandidate { address: e.address, priority: e.priority })
+            .collect()
+    }
+
+    /// Decodes a base64 Ed25519 public key into the fixed-size form every
+    /// signing-key field in this daemon uses. `None` for anything that
+    /// isn't valid base64 or doesn't decode to exactly 32 bytes -- the
+    /// coordination plane's own signing-key column is exactly 32 bytes or
+    /// absent (see `sendConnectMaterialFor`'s own `null` case), so a
+    /// present-but-wrong-length value here means a build mismatch between
+    /// this daemon and the coordination plane, not a real key to try to use
+    /// anyway.
+    fn decode_signing_key(base64_key: &str) -> Option<[u8; 32]> {
+        let bytes = base64::engine::general_purpose::STANDARD.decode(base64_key).ok()?;
+        bytes.try_into().ok()
+    }
+
+    /// Requests a Track Send rendezvous grant naming `receiver_device_id` as
+    /// the exact (and only) device this call authorizes `sender_device_id`
+    /// to reach -- `POST /send/authorization`. Unlike most calls in this
+    /// module, this surfaces its failure to the caller: `SendTransferService`
+    /// needs to tell a user-initiated `yadorilink send` apart a real
+    /// rejection (receiver removed, not on this account, budget exceeded)
+    /// from a transient outage, and a silently-swallowed `None` cannot do
+    /// that.
+    pub async fn request_send_authorization(
+        addr: &str,
+        access_token: &str,
+        sender_device_id: &str,
+        receiver_device_id: &str,
+    ) -> Result<SendAuthorizationGrant, String> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            sender_device_id: &'a str,
+            receiver_device_id: &'a str,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct ReceiverBody {
+            device_id: String,
+            signing_public_key_base64: String,
+            endpoints: Vec<WireEndpoint>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Resp {
+            grant_id: String,
+            nonce: String,
+            expires_at: i64,
+            receiver: ReceiverBody,
+        }
+        let url = format!("{addr}/send/authorization");
+        let body = Body { sender_device_id, receiver_device_id };
+        let resp = reqwest::Client::new()
+            .post(&url)
+            .bearer_auth(access_token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("could not reach the coordination plane: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!(
+                "coordination plane refused the send-authorization request ({status}): {text}"
+            ));
+        }
+        let parsed: Resp = resp
+            .json()
+            .await
+            .map_err(|e| format!("unparseable send-authorization response: {e}"))?;
+        let receiver_signing_key = decode_signing_key(&parsed.receiver.signing_public_key_base64)
+            .ok_or_else(|| {
+            "send-authorization response carried an unparseable receiver signing key".to_string()
+        })?;
+        Ok(SendAuthorizationGrant {
+            grant_id: parsed.grant_id,
+            nonce: parsed.nonce,
+            expires_at_unix: parsed.expires_at,
+            receiver_device_id: parsed.receiver.device_id,
+            receiver_signing_key,
+            receiver_candidates: decoded_endpoints(parsed.receiver.endpoints),
+        })
+    }
+
+    /// Atomically consumes a grant -- `POST /send/authorization/:grantId/consume`
+    /// -- naming the exact sender identity this device's own QUIC handshake
+    /// just authenticated (never a value merely claimed in the application-
+    /// layer offer that presented `grant_id`/`nonce`; see
+    /// `yadorilink-send`'s `handle_offer`, which is what calls this). On
+    /// success, returns the sender's own connect material, released by the
+    /// coordination plane for the first and only time this grant is ever
+    /// consumed -- see `consumeSendAuthorization`'s own doc comment on the
+    /// Worker side for why a SECOND call with the exact same arguments
+    /// (a replay, or an honest retry after this device never saw the first
+    /// response) reliably fails rather than reliably succeeding twice: only
+    /// the first to actually commit gets a receiver's `Ok`, and a caller
+    /// that legitimately needs to retry a transient failure does so by
+    /// requesting a fresh grant, not by re-presenting a consumed one.
+    pub async fn consume_send_authorization(
+        addr: &str,
+        access_token: &str,
+        grant_id: &str,
+        nonce: &str,
+        sender_device_id: &str,
+        receiver_device_id: &str,
+    ) -> Result<SendGrantPeerMaterial, String> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            nonce: &'a str,
+            sender_device_id: &'a str,
+            receiver_device_id: &'a str,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct SenderBody {
+            device_id: String,
+            signing_public_key_base64: String,
+            endpoints: Vec<WireEndpoint>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Resp {
+            sender: SenderBody,
+        }
+        let url = format!("{addr}/send/authorization/{grant_id}/consume");
+        let body = Body { nonce, sender_device_id, receiver_device_id };
+        let resp = reqwest::Client::new()
+            .post(&url)
+            .bearer_auth(access_token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("could not reach the coordination plane: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!(
+                "send authorization is invalid, expired, or already used ({status}): {text}"
+            ));
+        }
+        let parsed: Resp = resp
+            .json()
+            .await
+            .map_err(|e| format!("unparseable send-authorization-consume response: {e}"))?;
+        let signing_key =
+            decode_signing_key(&parsed.sender.signing_public_key_base64).ok_or_else(|| {
+                "send-authorization-consume response carried an unparseable sender signing key"
+                    .to_string()
+            })?;
+        Ok(SendGrantPeerMaterial {
+            device_id: parsed.sender.device_id,
+            signing_key,
+            candidates: decoded_endpoints(parsed.sender.endpoints),
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{
+            activate_invite_accept, coord_error_message, fetch_edge_state, prepare_create,
+            prepare_invite_accept, resolve_edge,
+        };
+        use crate::coordination_client::{ActivateOutcome, EnrollmentPrepareOutcome};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        #[test]
+        fn coord_error_message_extracts_the_coordination_planes_error_field() {
+            let body = r#"{"error":"invite is invalid or already used"}"#;
+            assert_eq!(
+                coord_error_message(body).as_deref(),
+                Some("invite is invalid or already used"),
+            );
+        }
+
+        #[test]
+        fn coord_error_message_returns_none_for_a_body_with_no_error_field() {
+            assert_eq!(coord_error_message(r#"{"other":"x"}"#), None);
+        }
+
+        #[test]
+        fn coord_error_message_returns_none_for_unparseable_bodies() {
+            assert_eq!(coord_error_message(""), None);
+            assert_eq!(coord_error_message("not json"), None);
+            assert_eq!(coord_error_message(r#"{"error":123}"#), None);
+        }
+
+        /// Regression test: `POST /shares/groups/prepare`'s real success
+        /// body is `{"groupId": ..., "state": ...}` (coordination-worker's
+        /// `prepareCreateFolderGroup`/`PendingEnrollmentResult`) --
+        /// `prepare_create`'s inner `Response` struct was missing
+        /// `#[serde(rename_all = "camelCase")]`, so it failed to parse a
+        /// real 2xx response at all. That parse failure was silently
+        /// swallowed into `EnrollmentPrepareOutcome::Ambiguous` (the worst
+        /// outcome class -- "may have committed, response merely lost"),
+        /// even though the create had genuinely succeeded, driving every
+        /// `share create` against a real deployed worker into the
+        /// reconciliation path instead of completing normally. This proves
+        /// the full round trip -- request sent, realistic response parsed --
+        /// lands on `Prepared`, not `Ambiguous`.
+        #[tokio::test]
+        async fn prepare_create_a_realistic_camelcase_response_is_prepared_not_ambiguous() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/shares/groups/prepare"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(
+                        serde_json::json!({ "groupId": "group-1", "state": "pending" }),
+                    ),
+                )
+                .mount(&server)
+                .await;
+
+            let outcome =
+                prepare_create(&server.uri(), "test-token", "op-1", "photos", "device-a").await;
+            assert_eq!(
+                outcome,
+                EnrollmentPrepareOutcome::Prepared { group_id: "group-1".to_string() }
+            );
+        }
+
+        /// Same bug, same fix, on the cross-account invite-accept path:
+        /// `POST /shares/invites/accept/prepare` returns the identical
+        /// `{"groupId": ..., "state": ...}` shape (`prepareInviteAccept`'s
+        /// own return type). Before this fix, EVERY `share accept` against
+        /// a real worker landed on `Ambiguous` even on a genuine success --
+        /// and because the invite is atomically consumed server-side before
+        /// this response is even built, the invite was already burned while
+        /// the daemon reported "don't know if this committed", never
+        /// completing the local link.
+        #[tokio::test]
+        async fn prepare_invite_accept_a_realistic_camelcase_response_is_prepared_not_ambiguous() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/shares/invites/accept/prepare"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(
+                        serde_json::json!({ "groupId": "group-2", "state": "active" }),
+                    ),
+                )
+                .mount(&server)
+                .await;
+
+            let outcome = prepare_invite_accept(
+                &server.uri(),
+                "test-token",
+                "op-2",
+                "invite-code-1",
+                "device-b",
+                "on-demand",
+            )
+            .await;
+            assert_eq!(
+                outcome,
+                EnrollmentPrepareOutcome::Prepared { group_id: "group-2".to_string() }
+            );
+        }
+
+        /// Regression test, same bug class: `GET /shares`' real response
+        /// carries camelCase edge keys (`listShares`'s `ShareEdgeInfo`) --
+        /// `resolve_edge`'s inner `EdgeInfo` struct was missing
+        /// `#[serde(rename_all = "camelCase")]`, so it silently resolved
+        /// every edge id to `None` against a real worker (every field but
+        /// none matched, so `serde_json` filled in nothing and the id
+        /// comparison in `.find(...)` never matched), which is what backs
+        /// `share revoke <edge-id>`.
+        #[tokio::test]
+        async fn resolve_edge_deserializes_the_coordination_planes_camelcase_shares_shape() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/shares"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "edges": [{
+                        "edgeId": "edge-1",
+                        "groupId": "group-1",
+                        "groupName": "photos",
+                        "deviceId": "device-1",
+                    }]
+                })))
+                .mount(&server)
+                .await;
+
+            let resolved = resolve_edge(&server.uri(), "test-token", "edge-1").await.unwrap();
+            assert_eq!(resolved, Some(("group-1".to_string(), "device-1".to_string())));
+        }
+
+        /// Same fixture, a different edge id: must resolve to `None` rather
+        /// than panicking or misreporting a different edge as a match.
+        #[tokio::test]
+        async fn resolve_edge_returns_none_for_an_edge_id_not_in_the_account_edge_list() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/shares"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "edges": [{
+                        "edgeId": "edge-1",
+                        "groupId": "group-1",
+                        "groupName": "photos",
+                        "deviceId": "device-1",
+                    }]
+                })))
+                .mount(&server)
+                .await;
+
+            let resolved =
+                resolve_edge(&server.uri(), "test-token", "edge-does-not-exist").await.unwrap();
+            assert_eq!(resolved, None);
+        }
+
+        /// The state a targeted revoke reads before deciding whether it
+        /// needs a ticket-bound full-replica handoff at all -- see
+        /// `ReplicaMembershipService::target_edge_is_provably_not_active`.
+        /// Same camelCase listing, matched on the (group, device) pair
+        /// rather than the edge id.
+        #[tokio::test]
+        async fn fetch_edge_state_reads_the_pairs_state_from_the_shares_listing() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/shares"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "edges": [
+                        {
+                            "edgeId": "edge-1",
+                            "groupId": "group-1",
+                            "groupName": "photos",
+                            "deviceId": "device-1",
+                            "state": "active",
+                        },
+                        {
+                            "edgeId": "edge-2",
+                            "groupId": "group-1",
+                            "groupName": "photos",
+                            "deviceId": "device-2",
+                            "state": "pending_approval",
+                        },
+                    ]
+                })))
+                .mount(&server)
+                .await;
+
+            let uri = server.uri();
+            assert_eq!(
+                fetch_edge_state(&uri, "test-token", "group-1", "device-2").await.unwrap(),
+                Some("pending_approval".to_string())
+            );
+            assert_eq!(
+                fetch_edge_state(&uri, "test-token", "group-1", "device-1").await.unwrap(),
+                Some("active".to_string())
+            );
+            // An edge the listing does not carry is "unknown", never "not
+            // active" -- the caller must keep failing closed on it.
+            assert_eq!(
+                fetch_edge_state(&uri, "test-token", "group-1", "device-9").await.unwrap(),
+                None
+            );
+        }
+
+        /// A coordination plane that predates edge-state reporting must
+        /// degrade to "unknown" rather than failing the whole listing --
+        /// which would also take `resolve_edge`, and with it every
+        /// `share revoke <edge-id>`, down with it.
+        #[tokio::test]
+        async fn fetch_edge_state_is_unknown_when_the_listing_reports_no_state() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/shares"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "edges": [{
+                        "edgeId": "edge-1",
+                        "groupId": "group-1",
+                        "groupName": "photos",
+                        "deviceId": "device-1",
+                    }]
+                })))
+                .mount(&server)
+                .await;
+
+            assert_eq!(
+                fetch_edge_state(&server.uri(), "test-token", "group-1", "device-1").await.unwrap(),
+                None
+            );
+        }
+
+        /// The activate outcome that must NOT be folded into a plain
+        /// success: the coordination plane accepted this device's half of a
+        /// cross-account acceptance, but the invite required the group
+        /// owner's approval, so no membership exists yet. Both spellings
+        /// (fresh, and a retry that finds it already parked) are the same
+        /// answer to the only question the caller has.
+        #[tokio::test]
+        async fn activate_invite_accept_distinguishes_awaiting_approval_from_success() {
+            for result in ["awaiting_approval", "already_awaiting_approval"] {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .and(path("/shares/groups/group-1/invites/accept/activate"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_json(serde_json::json!({ "result": result })),
+                    )
+                    .mount(&server)
+                    .await;
+
+                let outcome =
+                    activate_invite_accept(&server.uri(), "test-token", "group-1", "op-1", "dev-1")
+                        .await;
+                assert_eq!(outcome, ActivateOutcome::AwaitingApproval, "for result {result:?}");
+            }
+        }
+
+        /// ... while the ordinary outcomes on the same route are unchanged,
+        /// including an unrecognized future one, which stays a plain
+        /// success (the status code already confirmed the mutation landed).
+        #[tokio::test]
+        async fn activate_invite_accept_keeps_its_other_outcomes() {
+            for (result, expected) in [
+                ("activated", ActivateOutcome::Success),
+                ("already_active", ActivateOutcome::AlreadyActive),
+                ("some_future_outcome", ActivateOutcome::Success),
+            ] {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .and(path("/shares/groups/group-1/invites/accept/activate"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_json(serde_json::json!({ "result": result })),
+                    )
+                    .mount(&server)
+                    .await;
+
+                let outcome =
+                    activate_invite_accept(&server.uri(), "test-token", "group-1", "op-1", "dev-1")
+                        .await;
+                assert_eq!(outcome, expected, "for result {result:?}");
+            }
+        }
     }
 }

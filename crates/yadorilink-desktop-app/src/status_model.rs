@@ -36,16 +36,25 @@ pub fn reason_lines(status: &StatusResponse) -> Vec<String> {
     status.attention_reasons.clone()
 }
 
+/// A linked folder's short display name: its last path segment, so a long
+/// path doesn't blow out a menu's width or a window's heading. Falls back
+/// to the whole path when there is no final segment (a filesystem root).
+/// Shared by every surface that titles a folder — the tray submenu below,
+/// and the folder-detail and share windows.
+pub fn folder_display_name(local_path: &str) -> String {
+    std::path::Path::new(local_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| local_path.to_string())
+}
+
 /// One label per linked folder for the tray's "Linked Folders" submenu —
 /// the folder's last path segment (so long paths don't blow out the menu
 /// width) plus a short state suffix, non-empty exactly when there's
 /// something to say beyond "syncing" (same "empty unless applicable"
 /// discipline `yadorilink-cli`'s `status.rs` already uses).
 pub fn folder_menu_label(link: &LinkStatus) -> String {
-    let name = std::path::Path::new(&link.local_path)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| link.local_path.clone());
+    let name = folder_display_name(&link.local_path);
     let mut suffix = String::new();
     // FIRST in the chain, ahead of `paused`/`degraded`: this is not a
     // degradation but a full stop — the group syncs nothing until the user
@@ -89,6 +98,16 @@ mod tests {
 
     fn base_link() -> LinkStatus {
         LinkStatus { local_path: "/Users/alice/Photos".into(), ..Default::default() }
+    }
+
+    #[test]
+    fn folder_display_name_uses_the_last_path_segment() {
+        assert_eq!(folder_display_name("/Users/alice/Photos"), "Photos");
+    }
+
+    #[test]
+    fn folder_display_name_falls_back_to_the_whole_path_when_it_has_no_segment() {
+        assert_eq!(folder_display_name("/"), "/");
     }
 
     #[test]

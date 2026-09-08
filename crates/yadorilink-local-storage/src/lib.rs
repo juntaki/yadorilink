@@ -50,4 +50,6 @@ pub use materialize_write::{
     xattrs_already_match_disk, PlaceholderDiskIdentity, PlaceholderIdentityToRecord,
     INTERNAL_INODE_PROVIDER_KIND, WINDOWS_CFAPI_GENERATION_PROVIDER_KIND,
 };
-pub use traits::{BlockStore, ContentHash, GcReport, LocallyHashedBlock, StorageUsage};
+pub use traits::{
+    hash_block_bytes, BlockStore, ContentHash, GcReport, LocallyHashedBlock, StorageUsage,
+};

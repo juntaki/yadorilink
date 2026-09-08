@@ -142,6 +142,12 @@ fn force_unprotected_groups(
 /// request that created the row it is looking at.
 const MEMBERSHIP_OPERATION_RECONCILE_MIN_AGE_SECS: i64 = 30;
 
+/// The coordination plane's `acl.state` value for a live member. Every
+/// membership read on that side admits a row by testing this value
+/// POSITIVELY rather than by excluding known-inactive ones, so a state
+/// this daemon has never heard of is correctly not a member here either.
+const ACTIVE_EDGE_STATE: &str = "active";
+
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -235,7 +241,13 @@ impl ReplicaMembershipService {
             return Err(ReplicaMembershipError::LocalIdentityUnavailable);
         }
         let (groups_at_risk, unverified) = match &scoped_group_id {
-            Some(group_id) => (vec![group_id.clone()], false),
+            Some(group_id) => {
+                if self.target_edge_is_provably_not_active(group_id, &target_device_id).await {
+                    (Vec::new(), false)
+                } else {
+                    (vec![group_id.clone()], false)
+                }
+            }
             None => match self.coordination.fetch_eager_groups(&target_device_id).await {
                 Ok(groups) => (groups, false),
                 Err(error) => {
@@ -245,8 +257,7 @@ impl ReplicaMembershipService {
             },
         };
 
-        let forced_group_ids;
-        if target_device_id != self.device_id {
+        let forced_group_ids = if target_device_id != self.device_id {
             if !unverified {
                 if groups_at_risk.is_empty() {
                     match self
@@ -292,7 +303,7 @@ impl ReplicaMembershipService {
                     });
                 }
             }
-            forced_group_ids = force_unprotected_groups(force, unverified, groups_at_risk.clone())?;
+            force_unprotected_groups(force, unverified, groups_at_risk.clone())?
         } else {
             let linked_group_ids: Vec<String> =
                 self.repository.list_links()?.into_iter().map(|link| link.group_id).collect();
@@ -307,8 +318,8 @@ impl ReplicaMembershipService {
                     not_ready.push(group_id.clone());
                 }
             }
-            forced_group_ids = force_unprotected_groups(force, unverified, not_ready)?;
-        }
+            force_unprotected_groups(force, unverified, not_ready)?
+        };
 
         // `forced_group_ids` is only ever non-empty when `unverified` is
         // false (see `force_unprotected_groups`) -- `durability_scope`
@@ -362,6 +373,53 @@ impl ReplicaMembershipService {
             }
             (operation_id, MembershipCommitOutcome::Conflict(detail)) => {
                 Err(ReplicaMembershipError::OperationConflict { operation_id, detail })
+            }
+        }
+    }
+
+    /// Whether the coordination plane POSITIVELY reports the target's edge
+    /// on this group as something other than `active` -- the one case in
+    /// which a targeted revoke needs no ticket-bound full-replica handoff.
+    ///
+    /// A targeted revoke otherwise treats its one group as at risk
+    /// unconditionally, which is right for a live member: removing it may
+    /// be removing the group's last full replica, so the removal must be
+    /// bound to a lease handing those duties to a confirmed-ready peer. An
+    /// edge that has never been `active` holds none of that. It has no
+    /// grant, so it is in no netmap, so no peer session with it can exist
+    /// and `obtain_ticket` can never succeed -- and demanding a ticket
+    /// anyway made turning down an approval request (which is this same
+    /// revoke) fail with "another full replica is not ready", pointing at a
+    /// device holding zero data, with `--force` and its data-loss warning
+    /// as the only way through. Nothing is at risk, so nothing is protected
+    /// by refusing.
+    ///
+    /// This does not soften the guard, it only declines to apply it where
+    /// it cannot bite: the coordination plane's own last-full-replica check
+    /// counts eager edges `WHERE state = 'active'`, so an edge this returns
+    /// `true` for was never counted there either, and that check remains
+    /// the independent final word regardless of what this decides.
+    ///
+    /// Fails closed in every uncertain case -- an unreadable listing, an
+    /// edge the listing does not carry, or a coordination plane that does
+    /// not report edge state -- so the ticket requirement is relaxed only
+    /// on a positive, current answer.
+    async fn target_edge_is_provably_not_active(
+        &self,
+        group_id: &str,
+        target_device_id: &str,
+    ) -> bool {
+        match self.coordination.fetch_edge_state(group_id, target_device_id).await {
+            Ok(Some(state)) => state != ACTIVE_EDGE_STATE,
+            Ok(None) => false,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    group_id,
+                    target_device_id,
+                    "could not read the target's share-edge state; requiring a handoff ticket"
+                );
+                false
             }
         }
     }
@@ -1281,7 +1339,6 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
     struct FakeCoordination {
         configured: AtomicBool,
         eager_groups: Mutex<VecDeque<Result<Vec<String>, String>>>,
@@ -1289,16 +1346,43 @@ mod tests {
         dispatch_calls: Mutex<u32>,
         query: Mutex<VecDeque<Result<MembershipOperationLookup, String>>>,
         resolve_edge_result: Mutex<ResolveEdgeResults>,
+        /// What `fetch_edge_state` answers. `None` (the default) stands for
+        /// the coordination plane that does not report edge state at all,
+        /// which every pre-existing test here is exercising -- so those keep
+        /// taking the conservative, ticket-requiring branch unchanged.
+        edge_state: Mutex<Result<Option<String>, String>>,
+        edge_state_calls: Mutex<u32>,
         audit_calls: Mutex<u32>,
     }
 
     type ResolveEdgeResults = VecDeque<Result<Option<(String, String)>, String>>;
+
+    impl Default for FakeCoordination {
+        fn default() -> Self {
+            Self {
+                configured: AtomicBool::default(),
+                eager_groups: Mutex::default(),
+                dispatch: Mutex::default(),
+                dispatch_calls: Mutex::default(),
+                query: Mutex::default(),
+                resolve_edge_result: Mutex::default(),
+                edge_state: Mutex::new(Ok(None)),
+                edge_state_calls: Mutex::default(),
+                audit_calls: Mutex::default(),
+            }
+        }
+    }
 
     impl FakeCoordination {
         fn configured() -> Self {
             let this = Self::default();
             this.configured.store(true, Ordering::SeqCst);
             this
+        }
+
+        fn with_edge_state(self, state: &str) -> Self {
+            *self.edge_state.lock().unwrap() = Ok(Some(state.to_string()));
+            self
         }
     }
 
@@ -1346,6 +1430,17 @@ mod tests {
                     .unwrap()
                     .pop_front()
                     .expect("missing fake resolve result")
+            })
+        }
+
+        fn fetch_edge_state<'a>(
+            &'a self,
+            _group_id: &'a str,
+            _device_id: &'a str,
+        ) -> BoxFuture<'a, Result<Option<String>, String>> {
+            Box::pin(async move {
+                *self.edge_state_calls.lock().unwrap() += 1;
+                self.edge_state.lock().unwrap().clone()
             })
         }
 
@@ -1551,6 +1646,81 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(ReplicaMembershipError::ReplicaNotReady { .. })));
+    }
+
+    /// Turning down a device that is waiting for the group owner's approval
+    /// is this same targeted revoke, and it must simply work.
+    ///
+    /// Such a device has never been granted anything, so it is in no
+    /// netmap, so no peer session with it can exist and no handoff ticket
+    /// for it can ever be obtained. Treating its group as at risk anyway
+    /// made every deny fail with "another full replica is not ready" for a
+    /// device holding zero bytes, leaving `--force` -- and its data-loss
+    /// warning, describing data that does not exist -- as the only way
+    /// through. Note what this test withholds: the tickets port yields
+    /// nothing at all, and `force` is false.
+    #[tokio::test]
+    async fn revoking_a_device_awaiting_approval_needs_no_ticket_and_no_force() {
+        let repository = Arc::new(FakeRepository::default());
+        let coordination =
+            Arc::new(FakeCoordination::configured().with_edge_state("pending_approval"));
+        coordination
+            .dispatch
+            .lock()
+            .unwrap()
+            .push_back(MembershipCommitOutcome::Committed(MembershipCommitResult::NONE));
+        let tickets = Arc::new(FakeTickets::default());
+        let readiness = Arc::new(FakeReadiness::default());
+
+        let outcome = service(repository.clone(), coordination.clone(), tickets.clone(), readiness)
+            .revoke_device(RevokeDeviceCommand {
+                group_id: "group-1".to_string(),
+                device_id: "device-b".to_string(),
+                force: false,
+            })
+            .await
+            .expect("denying an approval request must not need a full-replica handoff");
+
+        // The plain fast path: no handoff, nothing forced, no ticket asked
+        // for, and no `--force` audit record (there was no override).
+        assert!(outcome.handoffs.is_empty());
+        assert!(outcome.forced_group_ids.is_empty());
+        assert!(outcome.unknown_scope_operation_id.is_none());
+        assert_eq!(*coordination.audit_calls.lock().unwrap(), 0);
+        assert!(!repository
+            .calls
+            .lock()
+            .unwrap()
+            .contains(&RepoCall::Latch("group-1".to_string())));
+    }
+
+    /// The relaxation above is decided on the target's CURRENT state, and
+    /// only ever on a positive non-active answer: an active member still
+    /// takes the ticket-bound path and is still refused without one, exactly
+    /// as before. Anything less than a positive answer (an unreadable
+    /// listing, an edge the listing does not carry, a coordination plane
+    /// that reports no state at all -- what `FakeCoordination::default`
+    /// stands for, and what every other test in this file uses) is covered
+    /// by `unavailable_ticket_without_force_refuses_with_replica_not_ready`
+    /// above.
+    #[tokio::test]
+    async fn revoking_an_active_member_still_requires_a_ticket() {
+        let repository = Arc::new(FakeRepository::default());
+        let coordination = Arc::new(FakeCoordination::configured().with_edge_state("active"));
+        let tickets = Arc::new(FakeTickets::default());
+        tickets.grants.lock().unwrap().push_back(None);
+        let readiness = Arc::new(FakeReadiness::default());
+
+        let result = service(repository, coordination.clone(), tickets, readiness)
+            .revoke_device(RevokeDeviceCommand {
+                group_id: "group-1".to_string(),
+                device_id: "device-b".to_string(),
+                force: false,
+            })
+            .await;
+
+        assert!(matches!(result, Err(ReplicaMembershipError::ReplicaNotReady { .. })));
+        assert_eq!(*coordination.edge_state_calls.lock().unwrap(), 1);
     }
 
     #[tokio::test]

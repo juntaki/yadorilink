@@ -512,13 +512,22 @@ pub struct BeforeHeadsAfterHook {
 }
 
 impl BeforeHeadsAfterHook {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self { parked: tokio::sync::Notify::new(), proceed: tokio::sync::Notify::new() })
-    }
-
     async fn pause(&self) {
         self.parked.notify_one();
         self.proceed.notified().await;
+    }
+}
+
+// Construction and the test-side drive (`wait_parked`/`resume`) are only
+// ever reached from this module's own `#[cfg(test)] mod tests` -- unlike
+// `BeforeCompletionHook`, this hook has no `test-support`-feature re-export
+// for an external test crate to construct one, so (unlike `pause` above,
+// which every non-hooked production caller reaches unconditionally) these
+// are genuinely dead outside a `cfg(test)` build.
+#[cfg(test)]
+impl BeforeHeadsAfterHook {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self { parked: tokio::sync::Notify::new(), proceed: tokio::sync::Notify::new() })
     }
 
     pub async fn wait_parked(&self) {
@@ -531,16 +540,31 @@ impl BeforeHeadsAfterHook {
 }
 
 impl BeforeCompletionHook {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self { parked: tokio::sync::Notify::new(), proceed: tokio::sync::Notify::new() })
-    }
-
     /// Called from inside the worker, immediately before it issues its
     /// completion CAS: announces that it has parked, then waits for the
     /// test to call [`Self::resume`].
+    ///
+    /// Ungated, unlike the rest of this type's methods, because the worker
+    /// reaches it through a plain `Option<&Arc<BeforeCompletionHook>>`
+    /// parameter that is `None` in production -- the call site is ordinary
+    /// production code, so removing this method outside test builds would
+    /// stop the crate compiling.
     async fn pause(&self) {
         self.parked.notify_one();
         self.proceed.notified().await;
+    }
+}
+
+// The driving half. Only a test ever constructs a hook or steps it, so
+// outside a build that can construct one these are dead -- gated to match
+// `engine_wrapper`'s re-export of the type exactly, rather than the plain
+// `cfg(test)` that fits `BeforeHeadsAfterHook` above: this hook IS
+// re-exported under the `test-support` feature for tests living outside
+// this crate, and gating on `test` alone would break them.
+#[cfg(any(test, feature = "test-support"))]
+impl BeforeCompletionHook {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self { parked: tokio::sync::Notify::new(), proceed: tokio::sync::Notify::new() })
     }
 
     /// Called from the test: blocks until the worker has actually reached
@@ -568,6 +592,9 @@ impl BeforeCompletionHook {
 /// leaves the obligation outstanding for a later claim to re-resolve from
 /// scratch — never treated as this path's final word: a rejected
 /// publication must not close its obligation.
+// Each parameter is independently meaningful obligation-completion context;
+// grouping into a params struct is out of scope for a lint cleanup.
+#[allow(clippy::too_many_arguments)]
 async fn complete_one_obligation(
     state: &Arc<DaemonState>,
     group_id: &str,
@@ -1358,7 +1385,14 @@ pub async fn drive_obligations_once_for_test_with_hooks(
 /// deterministic-interleaving test admit an independent change in between
 /// and observe whether the heads-stability fence discards this attempt's
 /// settlements as a result.
-#[cfg(any(test, feature = "test-support"))]
+///
+/// `#[cfg(test)]` only (unlike its siblings above, which are also `feature =
+/// "test-support"`-gated): nothing outside this module's own `mod tests`
+/// calls it -- no `engine_wrapper` re-export makes it reachable from an
+/// external test-support consumer, so gating it in only for `cfg(test)`
+/// keeps it out of (and therefore not dead code in) a plain `test-support`
+/// build.
+#[cfg(test)]
 pub async fn drive_obligations_once_for_test_with_heads_hook(
     state: &Arc<DaemonState>,
     per_group_limit: u32,
@@ -2172,7 +2206,7 @@ mod process_group_publication_tests {
                 yadorilink_peer_session::ports::ExactActualState::Object {
                     kind: RecordKind::Symlink,
                     version: version.version_hash,
-                    identity: Some(identity),
+                    identity: Box::new(Some(identity)),
                 },
                 fence,
             )
@@ -2251,7 +2285,7 @@ mod process_group_publication_tests {
                     version: version.version_hash,
                     // No identity recorded -- revalidation can never
                     // confirm this record, by design.
-                    identity: None,
+                    identity: Box::new(None),
                 },
                 fence,
             )
@@ -2483,7 +2517,7 @@ mod process_group_publication_tests {
                 yadorilink_peer_session::ports::ExactActualState::Object {
                     kind: RecordKind::Symlink,
                     version: version.version_hash,
-                    identity: Some(identity_at_seed.clone()),
+                    identity: Box::new(Some(identity_at_seed)),
                 },
                 fence,
             )
@@ -3047,6 +3081,13 @@ mod process_group_publication_tests {
     /// zero-work check for AT MOST `MAX_PATHS_PER_RECONCILE_ATTEMPT` of
     /// them, and that repeated ticks eventually rotate through every one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    // Deliberately held across this whole async test's `.await` points: the
+    // point of this std `Mutex` is to serialize this test against its
+    // siblings for its ENTIRE body, not just a synchronous prelude (see
+    // `c4_diag_test_guard`'s own doc comment). Attribute is on the function,
+    // not the `let`, because clippy attributes this lint to each await
+    // point the guard is live across, not to the guard's own binding site.
+    #[allow(clippy::await_holding_lock)]
     async fn zero_work_precheck_examines_at_most_the_path_budget_window_per_tick() {
         let _guard = c4_diag_test_guard();
         let (state, _root_dir, _root) = build_state_with_adopted_group().await;
@@ -3279,8 +3320,8 @@ mod process_group_publication_tests {
         let key = SigningKey::from_bytes(&[93u8; 32]);
         admit_change(&state, "device-a", &key, "wakes-siblings.txt", &empty_version(1_700_007_000));
 
-        assert!(state.replica_coordinator.retirement_wake().pending().get(GROUP).is_none());
-        assert!(state.replica_coordinator.hazard_recheck_wake().pending().get(GROUP).is_none());
+        assert!(!state.replica_coordinator.retirement_wake().pending().contains_key(GROUP));
+        assert!(!state.replica_coordinator.hazard_recheck_wake().pending().contains_key(GROUP));
 
         let healthy = drive_obligations_once_for_test(&state, 128, 256).await;
         assert!(healthy);
@@ -3295,11 +3336,11 @@ mod process_group_publication_tests {
         );
 
         assert!(
-            state.replica_coordinator.retirement_wake().pending().get(GROUP).is_some(),
+            state.replica_coordinator.retirement_wake().pending().contains_key(GROUP),
             "a real completion must mark the retirement loop dirty for this group"
         );
         assert!(
-            state.replica_coordinator.hazard_recheck_wake().pending().get(GROUP).is_some(),
+            state.replica_coordinator.hazard_recheck_wake().pending().contains_key(GROUP),
             "a real completion must mark the hazard-recheck loop dirty for this group"
         );
     }

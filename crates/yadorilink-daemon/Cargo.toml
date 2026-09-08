@@ -115,7 +115,21 @@ yadorilink-replica-engine = { path = "../yadorilink-replica-engine" }
 yadorilink-transport = { path = "../yadorilink-transport" }
 yadorilink-local-storage = { path = "../yadorilink-local-storage" }
 yadorilink-ipc-proto = { path = "../yadorilink-ipc-proto" }
+# Track Send: `crate::send_transfer` builds and holds this device's
+# `yadorilink_send::SendService`. This crate never gains a reverse
+# dependency the other way -- `yadorilink-send` does not, and must not,
+# depend on `yadorilink-daemon`.
+yadorilink-send = { path = "../yadorilink-send" }
 yadorilink-reporting = { path = "../yadorilink-reporting" }
+# Localhost HTTP/REST + SSE adapter in front of this crate's own control
+# socket -- spawned as a non-essential background task by `app.rs`, the same
+# way NAT-traversal/signing-key-backfill are (`supervise::spawn_logged`), so
+# a failure to bind never takes down folder sync itself. Deliberately talks
+# to this daemon only by dialing `control_socket_path`/`control_pipe_name`
+# like any other control-socket client (see that crate's own module docs) --
+# not given an `Arc<DaemonState>`/`ControlContext`, so it can add no daemon
+# capability this crate doesn't already expose over that socket.
+yadorilink-http-api = { workspace = true }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
@@ -220,6 +234,10 @@ yadorilink-filesystem-sync = { path = "../yadorilink-filesystem-sync", features 
 # Windows-only handling on any host. Same override shape as the two
 # entries above.
 yadorilink-local-storage = { path = "../yadorilink-local-storage", features = ["test-support"] }
+# Track Send's real crash-recovery test needs the deterministic
+# mid-transfer abort seam (`SendService::test_abort_after_n_chunks`), same
+# override shape as the two entries above.
+yadorilink-send = { path = "../yadorilink-send", features = ["test-support"] }
 tempfile = "3"
 rand = "0.10.2"
 # The in-process fake coordination service the full-stack E2E tests point the
@@ -251,5 +269,6 @@ windows-sys = { version = "0.59", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_CorrelationVector",
     "Win32_System_IO",
+    "Win32_System_Registry",
     "Win32_System_Threading",
 ] }

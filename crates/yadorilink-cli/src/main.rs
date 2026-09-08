@@ -103,6 +103,21 @@ enum Command {
         #[command(subcommand)]
         action: ConflictsAction,
     },
+    /// Send a file or directory to another device on this account --
+    /// one-shot, not linked/synced. Resolves `target_device` against this
+    /// account's already-known device list.
+    Send { source_path: String, target_device: String },
+    /// List transfers other devices have sent to this device, whether or
+    /// not `receive` has been run for them yet.
+    Inbox,
+    /// Accept an inbound transfer, materializing it into `--to` (or this
+    /// daemon's default inbox directory). Resumable: re-running this for a
+    /// transfer already partially received continues where it left off.
+    Receive {
+        transfer_id: String,
+        #[arg(long)]
+        to: Option<String>,
+    },
     /// Force-hydrate a placeholder file and keep it hydrated (on-demand-sync).
     Pin { local_path: String },
     /// Allow a pinned file to become a placeholder again (on-demand-sync).
@@ -132,6 +147,21 @@ enum Command {
         /// deleting anything.
         #[arg(long)]
         dry_run: bool,
+    },
+
+    /// Preview what restoring a folder to an earlier point in time would
+    /// change. Read-only: this shows the plan and changes nothing.
+    Rewind {
+        /// The folder group to preview a rewind for.
+        group: String,
+        /// The point in time to rewind to: unix nanoseconds
+        /// (e.g. 1750000000000000000), or an offset back from now
+        /// (e.g. 90s, 30m, 2h, 7d).
+        #[arg(long)]
+        at: String,
+        /// List every path and its action, not just the per-action counts.
+        #[arg(long)]
+        verbose: bool,
     },
     /// Manage global transfer rate limits.
     Limits {
@@ -182,7 +212,8 @@ enum Command {
     /// (daemon/listener/discovery/coordination-plane/authorization/
     /// clock/policy categories).
     Doctor,
-    /// Recent connection-attempt history, optionally filtered to one peer
+    /// Recent connection-attempt history plus the LAN-discovered addresses
+    /// currently held as dial candidates, optionally filtered to one peer
     /// device id.
     Connections {
         #[arg(long)]
@@ -468,9 +499,40 @@ enum ShareAction {
         #[arg(long)]
         yes: bool,
     },
+    /// Grant another of your own already-registered devices access to a
+    /// folder group. Same-account only -- for a different account's device,
+    /// use `share invite`/`share accept` instead.
     Grant {
         group_name: String,
         device_id: String,
+        /// The granted device's role: `viewer` or `editor`. Defaults to
+        /// `editor` if omitted -- deliberately DIFFERENT from `share
+        /// invite`'s own default (`viewer`): this preserves `grant`'s
+        /// pre-existing, always-full-writer behavior for every caller that
+        /// never adopts this flag. `owner` is not available via this
+        /// command yet.
+        #[arg(long)]
+        role: Option<String>,
+    },
+    /// Move a device that ALREADY has access to a folder group to a
+    /// different role, in place — no revoke-and-re-invite round trip, and
+    /// the device is never dropped from the group while the change is
+    /// applied. A downgrade takes effect promptly for a currently-connected
+    /// peer rather than only on its next poll.
+    ///
+    /// Use `grant`/`invite` to give a device access it does not have yet;
+    /// this command only changes an existing member's role.
+    ChangeRole {
+        group_name: String,
+        /// A device id from `share members`.
+        device_id: String,
+        /// The role to move the device to: `viewer` or `editor`. Required
+        /// and never defaulted — unlike `grant`'s own `--role`, since
+        /// silently picking a role for an EXISTING collaborator is not a
+        /// safe default to have. `owner` is not available via this command:
+        /// there is no management-authority model yet to back it.
+        #[arg(long)]
+        role: String,
     },
     /// Revoke a device's access to one folder group, or (given a single
     /// argument) revoke one edge listed by `share list` by its edge id —
@@ -499,6 +561,15 @@ enum ShareAction {
     /// List every ACL edge visible to this account — folder groups it
     /// owns, and its own devices' shares.
     List,
+    /// "People with access": list every device authorized for a folder
+    /// group and its role. Read-only -- this never grants, revokes, or
+    /// changes a role; use `grant`/`invite` to give access, `change-role`
+    /// to move an existing member, and `revoke` to take it away. Visible to
+    /// the group's owning account and to any account with a member device
+    /// in the group, matching `share list`'s own policy-log visibility.
+    /// Identity shown is group-scoped and minimal: device name and a
+    /// shortened device id only, never another account's email address.
+    Members { group_name: String },
     /// Same-account onboarding: list the folder groups this account owns and
     /// can join on this device, by name. A newly-registered device lists
     /// these, then joins the ones it wants with `share join`.
@@ -535,6 +606,92 @@ enum ShareAction {
         /// files, fetched on first access).
         #[arg(long)]
         mode: String,
+    },
+    /// Cross-account onboarding: mint a one-use, expiring invite for a
+    /// folder group this account owns, printing its code, a
+    /// `yadorilink://` URL, and a terminal QR code. Share the code/URL/QR
+    /// with exactly one recipient -- accepting it is `share accept`.
+    Invite {
+        group_name: String,
+        /// The accepting device's role: `viewer` or `editor`. Defaults to
+        /// `viewer` if omitted -- least privilege for a stranger-facing
+        /// invite, deliberately DIFFERENT from `share grant`'s own default
+        /// (`editor`). Affects whether the daemon-side verifier accepts the
+        /// device's own changes (`viewer` is read-only; `editor` may
+        /// write). `owner` is not available via this command yet: there is
+        /// no management-authority model yet to back it (re-inviting,
+        /// revoking other members, transferring ownership).
+        #[arg(long)]
+        role: Option<String>,
+        /// Override the invite's expiry, in seconds. Defaults to the
+        /// coordination plane's own default (7 days) if omitted.
+        #[arg(long)]
+        ttl_secs: Option<u64>,
+        /// Make accepting this invite a REQUEST rather than a completed
+        /// join: the recipient redeems the code as usual, but gains no
+        /// access at all until you approve them with `share approve`.
+        /// Review waiting requests with `share pending`; turn one down
+        /// with `share deny`. Off by default, and an independent choice
+        /// from `--role` -- either role can be approval-gated or not.
+        #[arg(long)]
+        require_approval: bool,
+    },
+    /// Cross-account onboarding: redeem a one-use invite minted by another
+    /// account's `share invite` (accepts either the bare code or the full
+    /// `yadorilink://invite/<code>` URL/QR payload) and link it locally at
+    /// `--path` with the chosen `--storage-mode`.
+    Accept {
+        code_or_url: String,
+        /// Local directory to link the group into.
+        #[arg(long)]
+        path: String,
+        /// `eager` (store everything) or `on-demand` (store only needed
+        /// files, fetched on first access). Defaults to `eager`.
+        #[arg(long, default_value = "eager")]
+        storage_mode: String,
+        /// Acknowledge a risky link preflight (non-empty folder, low disk
+        /// space, a nested-link conflict, or a risky location)
+        /// non-interactively, matching `join --yes`.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Cross-account onboarding: list every invite this account has minted
+    /// (via a group it owns) that nobody has redeemed yet, with its
+    /// remaining TTL -- `pending`, `expired`, or `cancelled`. An invite
+    /// someone HAS already accepted does not appear here; see it as an
+    /// ordinary grant via `share list` instead.
+    Invites,
+    /// Cross-account onboarding: withdraw a not-yet-redeemed invite (an id
+    /// from `share invites`) before it is ever used or expires. For an
+    /// invite that has already been accepted, use `share revoke` instead.
+    CancelInvite {
+        /// An invite id from `share invites`.
+        invite_id: String,
+    },
+    /// List the devices waiting for your approval to join a folder group
+    /// you own -- someone redeemed an invite you minted with
+    /// `--require-approval` and cannot see anything until you decide. Admit
+    /// one with `share approve`, turn it down with `share deny`.
+    Pending,
+    /// Admit a device that is waiting for your approval (from `share
+    /// pending`) into a folder group you own. It is granted exactly the
+    /// role the invite it redeemed named -- this command takes no role of
+    /// its own. Repeating it on an already-admitted device is a no-op, not
+    /// an error.
+    Approve {
+        group_name: String,
+        /// A device id from `share pending`.
+        device_id: String,
+    },
+    /// Turn down a device waiting for your approval (from `share
+    /// pending`), so it never gains access and its invite cannot be
+    /// redeemed again. This is the same operation as `share revoke` -- a
+    /// device already admitted (including one admitted by a concurrent
+    /// `share approve`) loses the access it has.
+    Deny {
+        group_name: String,
+        /// A device id from `share pending`.
+        device_id: String,
     },
 }
 
@@ -630,8 +787,11 @@ async fn run(command: Command) -> Result<(), CliError> {
             ShareAction::Create { group_name, path, yes } => {
                 commands::share::create(group_name, path, yes).await
             }
-            ShareAction::Grant { group_name, device_id } => {
-                commands::share::grant(group_name, device_id).await
+            ShareAction::Grant { group_name, device_id, role } => {
+                commands::share::grant(group_name, device_id, role).await
+            }
+            ShareAction::ChangeRole { group_name, device_id, role } => {
+                commands::share::change_role(group_name, device_id, role).await
             }
             ShareAction::Revoke { group_name_or_edge, device_id, force } => match device_id {
                 Some(device_id) => {
@@ -640,12 +800,30 @@ async fn run(command: Command) -> Result<(), CliError> {
                 None => commands::share::revoke_edge(group_name_or_edge, force).await,
             },
             ShareAction::List => commands::share::list_shares().await,
+            ShareAction::Members { group_name } => commands::share::members(group_name).await,
             ShareAction::Joinable => commands::share::list_joinable().await,
             ShareAction::Join { group_name, path, storage_mode, yes } => {
                 commands::share::join(group_name, path, storage_mode, yes).await
             }
             ShareAction::SetStorageMode { group_name, mode } => {
                 commands::share::set_storage_mode(group_name, mode).await
+            }
+            ShareAction::Invite { group_name, role, ttl_secs, require_approval } => {
+                commands::share::invite(group_name, role, ttl_secs, require_approval).await
+            }
+            ShareAction::Accept { code_or_url, path, storage_mode, yes } => {
+                commands::share::accept(code_or_url, path, storage_mode, yes).await
+            }
+            ShareAction::Invites => commands::share::list_invites().await,
+            ShareAction::Pending => commands::share::list_pending_approvals().await,
+            ShareAction::Approve { group_name, device_id } => {
+                commands::share::approve(group_name, device_id).await
+            }
+            ShareAction::Deny { group_name, device_id } => {
+                commands::share::deny(group_name, device_id).await
+            }
+            ShareAction::CancelInvite { invite_id } => {
+                commands::share::cancel_invite(invite_id).await
             }
         },
         Command::Link { local_path, group_name, on_demand, max_local_size, dry_run, yes } => {
@@ -667,6 +845,11 @@ async fn run(command: Command) -> Result<(), CliError> {
         Command::Conflicts { action } => match action {
             ConflictsAction::List => commands::version_history::conflicts_list().await,
         },
+        Command::Send { source_path, target_device } => {
+            commands::send::send(source_path, target_device).await
+        }
+        Command::Inbox => commands::send::inbox().await,
+        Command::Receive { transfer_id, to } => commands::send::receive(transfer_id, to).await,
         Command::Pin { local_path } => commands::materialization::pin(local_path).await,
         Command::Unpin { local_path } => commands::materialization::unpin(local_path).await,
         Command::Evict { local_path } => commands::materialization::evict(local_path).await,
@@ -685,6 +868,7 @@ async fn run(command: Command) -> Result<(), CliError> {
         Command::Status { watch } => commands::status::status(watch).await,
         Command::Feedback => commands::feedback::run(),
         Command::Gc { dry_run } => commands::gc::run(dry_run).await,
+        Command::Rewind { group, at, verbose } => commands::rewind::run(group, at, verbose).await,
         Command::Limits { action } => match action {
             LimitsAction::Set { up, down } => commands::limits::set(up, down).await,
             LimitsAction::Show => commands::limits::show().await,

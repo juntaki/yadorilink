@@ -222,7 +222,19 @@ impl EnrollmentRecoveryService {
                     };
                     match outcome {
                         EnrollmentActivationResult::Activated
-                        | EnrollmentActivationResult::AlreadyActive => {
+                        | EnrollmentActivationResult::AlreadyActive
+                        // Unreachable from here: this sweep only ever
+                        // activates the CREATE and JOIN markers the match
+                        // above produces, and neither has an approval step
+                        // (only cross-account invite acceptance does, and
+                        // that path writes no marker for this sweep to
+                        // find -- see `accept_invite_and_link`'s own doc
+                        // comment). Grouped with the settled outcomes
+                        // anyway rather than left to a catch-all: the
+                        // remote side committed a state transition, so the
+                        // one thing that must never happen is treating it
+                        // as a rollback trigger.
+                        | EnrollmentActivationResult::AwaitingApproval => {
                             self.attempts.clear_transient_attempts(&marker.operation_id);
                             // Deletes the marker AND the `ActivationPending`
                             // journal row atomically.
@@ -911,6 +923,55 @@ mod tests {
                 self.cancel.lock().unwrap().pop_front().expect("missing fake cancel")
             })
         }
+
+        fn prepare_invite_accept<'a>(
+            &'a self,
+            _operation_id: &'a str,
+            _code: &'a str,
+            _device_id: &'a str,
+            _storage_mode: &'a str,
+        ) -> crate::application::ports::BoxFuture<'a, EnrollmentPrepareResult> {
+            Box::pin(async move {
+                self.prepare.lock().unwrap().pop_front().expect("missing fake prepare")
+            })
+        }
+
+        fn activate_invite_accept<'a>(
+            &'a self,
+            _group_id: &'a str,
+            _operation_id: &'a str,
+            _device_id: &'a str,
+        ) -> crate::application::ports::BoxFuture<'a, EnrollmentActivationResult> {
+            Box::pin(async move {
+                *self.activate_calls.lock().unwrap() += 1;
+                self.activate.lock().unwrap().pop_front().expect("missing fake activate")
+            })
+        }
+
+        fn cancel_invite_accept<'a>(
+            &'a self,
+            _group_id: &'a str,
+            _operation_id: &'a str,
+            _device_id: &'a str,
+        ) -> crate::application::ports::BoxFuture<'a, EnrollmentCancellationResult> {
+            Box::pin(async move {
+                *self.cancel_calls.lock().unwrap() += 1;
+                self.cancel.lock().unwrap().pop_front().expect("missing fake cancel")
+            })
+        }
+
+        fn mint_invite<'a>(
+            &'a self,
+            _group_id: &'a str,
+            _role: Option<&'a str>,
+            _ttl_secs: Option<u64>,
+            _requires_approval: bool,
+        ) -> crate::application::ports::BoxFuture<
+            'a,
+            Result<crate::application::model::MintedInvite, String>,
+        > {
+            Box::pin(async move { unimplemented!("recovery never mints an invite") })
+        }
     }
 
     #[derive(Default)]
@@ -943,6 +1004,16 @@ mod tests {
                     .pop_front()
                     .expect("missing fake rollback result")
             })
+        }
+
+        fn commit_plain<'a>(
+            &'a self,
+            _group_id: &'a str,
+            _absolute_path: &'a std::path::Path,
+            _on_demand: bool,
+            _acknowledge_risks: bool,
+        ) -> crate::application::ports::BoxFuture<'a, Result<(), EnrollmentLinkError>> {
+            Box::pin(async move { unimplemented!("recovery never commits a plain link") })
         }
     }
 

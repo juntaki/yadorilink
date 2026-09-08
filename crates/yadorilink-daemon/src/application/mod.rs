@@ -18,8 +18,8 @@ mod version_restore_service;
 pub(crate) use enrollment_recovery_service::EnrollmentRecoveryService;
 #[allow(unused_imports)]
 pub(crate) use enrollment_service::{
-    CreateAndLinkCommand, EnrollmentError, EnrollmentKind, EnrollmentLinkError, EnrollmentOutcome,
-    EnrollmentService, JoinAndLinkCommand,
+    AcceptInviteCommand, CreateAndLinkCommand, EnrollmentError, EnrollmentKind,
+    EnrollmentLinkError, EnrollmentOutcome, EnrollmentService, JoinAndLinkCommand,
 };
 #[allow(unused_imports)]
 pub(crate) use governance_service::GovernanceCommandService;

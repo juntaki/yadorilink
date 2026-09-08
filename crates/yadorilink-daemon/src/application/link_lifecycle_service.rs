@@ -29,6 +29,23 @@ impl LinkLifecycleService {
         Self { repository, watcher }
     }
 
+    /// Whether `local_path` is CURRENTLY a live link for `group_id`, read
+    /// directly from local state rather than inferred from a `link()`
+    /// call's own return value. `link()`'s `Err` does not always mean
+    /// nothing was committed (see its own doc comment on the rollback-
+    /// failure path); callers with no independent state of their own to
+    /// classify against (no `enrollment_operations` journal row -- e.g. a
+    /// plain, non-enrollment-tracked link commit) use this instead to tell
+    /// "genuinely never committed" apart from "may still be committed"
+    /// after a failure.
+    pub(crate) fn is_linked(
+        &self,
+        group_id: &str,
+        local_path: &str,
+    ) -> Result<bool, crate::sync_error::SyncError> {
+        Ok(self.repository.live_link_paths_for_group(group_id)?.iter().any(|p| p == local_path))
+    }
+
     pub(crate) async fn link(&self, command: LinkCommand) -> Result<(), DaemonError> {
         // Deliberately NOT gated by `!command.acknowledge_risks` the way the
         // nested-path preflight below is: a second live root on one group is

@@ -1,0 +1,27 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.28.0.schema.json
+PackageIdentifier: juntaki.YadoriLink
+PackageVersion: 0.1.0
+PackageLocale: en-US
+Publisher: juntaki
+PublisherUrl: https://github.com/juntaki
+PublisherSupportUrl: https://github.com/juntaki/yadorilink/issues
+PackageName: YadoriLink
+PackageUrl: https://github.com/juntaki/yadorilink
+License: MIT OR Apache-2.0
+LicenseUrl: https://github.com/juntaki/yadorilink/blob/main/LICENSE-MIT
+Copyright: Copyright (c) Jumpei Takiyasu
+ShortDescription: Local-first peer-to-peer folder sync
+Description: >-
+  YadoriLink synchronizes folders directly between your own devices over a
+  peer-to-peer connection, with no server ever holding your file data. This
+  installer includes the yadorilink CLI, the sync daemon, the menu-bar
+  status app, and Windows Explorer shell integration (Cloud Filter API
+  placeholder/on-demand files, right-click sharing).
+Moniker: yadorilink
+Tags:
+  - file-sync
+  - peer-to-peer
+  - sync
+  - backup
+ManifestType: defaultLocale
+ManifestVersion: 1.28.0

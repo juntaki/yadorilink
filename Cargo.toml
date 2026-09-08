@@ -13,10 +13,12 @@ members = [
     "crates/yadorilink-local-capture",
     "crates/yadorilink-filesystem-sync",
     "crates/yadorilink-daemon",
+    "crates/yadorilink-send",
     "crates/yadorilink-cli",
     "crates/yadorilink-ipc-proto",
     "crates/yadorilink-reporting",
     "crates/yadorilink-desktop-app",
+    "crates/yadorilink-http-api",
     # DST replay + lane runner.
     "xtask",
 ]
@@ -41,6 +43,8 @@ yadorilink-sync-wire = { path = "crates/yadorilink-sync-wire" }
 yadorilink-local-capture = { path = "crates/yadorilink-local-capture" }
 yadorilink-filesystem-sync = { path = "crates/yadorilink-filesystem-sync" }
 yadorilink-reporting = { path = "crates/yadorilink-reporting" }
+yadorilink-send = { path = "crates/yadorilink-send" }
+yadorilink-http-api = { path = "crates/yadorilink-http-api" }
 tokio = { version = "1", features = ["full"] }
 bytes = "1"
 serde = { version = "1", features = ["derive"] }

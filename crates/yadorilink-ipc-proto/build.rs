@@ -10,6 +10,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "proto/shellipc.proto",
             "proto/local_discovery.proto",
             "proto/daemon_control.proto",
+            "proto/send.proto",
         ],
         &["proto"],
     )?;

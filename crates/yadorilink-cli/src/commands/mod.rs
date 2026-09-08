@@ -16,9 +16,15 @@ pub mod limits;
 #[allow(unused_imports)]
 pub mod link;
 pub mod materialization;
-pub(crate) mod membership_render;
+// Public rather than crate-private since the desktop app's share window
+// reuses this module's warning wording verbatim for its own forced-revoke
+// reporting -- a data-loss warning paraphrased a second time is a data-loss
+// warning that can be softened by accident.
+pub mod membership_render;
 pub mod recovery;
 pub mod report;
+pub mod rewind;
+pub mod send;
 pub mod share;
 pub mod status;
 pub mod update;

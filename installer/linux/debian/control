@@ -5,7 +5,7 @@ Priority: optional
 Architecture: @ARCH@
 Maintainer: yadorilink project <juntaki@users.noreply.github.com>
 Homepage: https://github.com/juntaki/yadorilink
-Depends: libc6
+Depends: libc6, libgcc-s1
 Description: Peer-to-peer file sync -- CLI and daemon
  yadorilink is a peer-to-peer file synchronization tool. This package
  installs the yadorilink CLI (`yadorilink`) and the yadorilink-daemon sync

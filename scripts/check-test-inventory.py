@@ -52,6 +52,11 @@ WORKSPACE_MULTITHREAD_ALLOWLIST: dict[str, str] = {
     # CLI end-to-end tests each drive at most one in-process daemon over a
     # per-test unix control socket in its own tempdir (or exercise pure CLI
     # parsing); deterministic, with no cross-test loopback/disk contention.
+    # Wire-contract round trips against a locally started coordination
+    # service. Every test returns immediately unless
+    # YADORILINK_WIRE_CONTRACT_ADDR names one, so the workspace run compiles
+    # this file and executes nothing.
+    "yadorilink-cli/tests/coordination_wire_contract.rs": "inert without YADORILINK_WIRE_CONTRACT_ADDR; its own lane runs it alone and single-threaded",
     "yadorilink-cli/tests/desktop_status_parity.rs": "single in-process daemon over a per-test unix socket; no cross-test contention",
     "yadorilink-cli/tests/diagnose.rs": "single in-process daemon over a per-test unix socket; no cross-test contention",
     "yadorilink-cli/tests/gc.rs": "single in-process daemon over a per-test unix socket; no cross-test contention",

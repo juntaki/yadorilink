@@ -291,6 +291,25 @@ impl MembershipCoordination for HttpMembershipCoordination {
         })
     }
 
+    fn fetch_edge_state<'a>(
+        &'a self,
+        group_id: &'a str,
+        device_id: &'a str,
+    ) -> BoxFuture<'a, Result<Option<String>, String>> {
+        Box::pin(async move {
+            let Some(config) = self.config() else {
+                return Err(NOT_CONFIGURED_DETAIL.to_string());
+            };
+            crate::coordination_client::fetch_edge_state(
+                &config.addr,
+                &config.access_token,
+                group_id,
+                device_id,
+            )
+            .await
+        })
+    }
+
     fn record_force_override_audit<'a>(
         &'a self,
         local_device_id: &'a str,

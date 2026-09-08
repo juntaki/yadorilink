@@ -167,12 +167,59 @@ begin
   Result := not FileExists(ExpandConstant('{userappdata}\yadorilink\device.json'));
 end;
 
+// Package-manager ownership (see docs/AUTOMATIC_UPDATES.md's
+// "Package-manager-owned installs never self-update"): a WinGet manifest
+// invokes this exact installer -- the same one a manual download would
+// run, into the same %ProgramFiles%\yadorilink layout -- so there is no
+// structural signal (unlike the Microsoft Store's WindowsApps path) this
+// installer's own layout can offer. The WinGet manifest's
+// InstallerSwitches.Silent therefore appends `/PACKAGEMANAGER=winget` to
+// the normal silent-install flags; this scans for that switch (Inno Setup
+// has no built-in support for arbitrary custom /switches, only ParamStr)
+// and, if present, records it so the running daemon's
+// `install_windows::detect_package_manager_marker` can defer self-update
+// to `winget upgrade` instead of running its own installer over an
+// install WinGet believes it owns.
+function GetPackageManagerParam: String;
+var
+  i: Integer;
+  p: String;
+  prefix: String;
+begin
+  Result := '';
+  prefix := '/PACKAGEMANAGER=';
+  for i := 1 to ParamCount do
+  begin
+    p := ParamStr(i);
+    if Copy(p, 1, Length(prefix)) = prefix then
+    begin
+      Result := Copy(p, Length(prefix) + 1, MaxInt);
+      Exit;
+    end;
+  end;
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   ShellExtOk, DaemonTaskOk, StatusAppTaskOk: Boolean;
+  PackageManager: String;
 begin
   if CurStep = ssPostInstall then
   begin
+    PackageManager := GetPackageManagerParam;
+    if PackageManager <> '' then
+    begin
+      // HKLM (not HKCU): this installer always runs elevated
+      // (PrivilegesRequired=admin above), and the daemon must be able to
+      // read this value regardless of which user account it later runs
+      // as. {#MyAppName}'s AppId-scoped uninstall key already lives under
+      // HKLM for the same reason; this is a small, separate key
+      // (`Software\yadorilink`) rather than reusing that uninstall entry
+      // so `install_windows::detect_package_manager_marker` doesn't need
+      // to know Inno Setup's uninstall-key layout.
+      RegWriteStringValue(HKLM, 'Software\yadorilink', 'InstallSource', PackageManager);
+    end;
+
     if not WizardSilent() then
     begin
       WizardForm.StatusLabel.Caption := 'Registering the yadorilink shell extension...';
@@ -238,5 +285,9 @@ begin
     ExecPowerShellScript(ExpandConstant('{app}\daemon-task.ps1'), '-Uninstall', 'daemon-task.ps1 -Uninstall');
     ExecPowerShellScript(ExpandConstant('{app}\status-app-task.ps1'), '-Uninstall', 'status-app-task.ps1 -Uninstall');
     ExecPowerShellScript(ExpandConstant('{app}\_stage\install.ps1'), '-Uninstall', 'shell-ext install.ps1 -Uninstall');
+    // Clean up the package-manager marker `CurStepChanged` above may have
+    // written; RegDeleteKeyIncludingSubkeys is a no-op (returns True) if
+    // it was never created (a manual/standalone install).
+    RegDeleteKeyIncludingSubkeys(HKLM, 'Software\yadorilink');
   end;
 end;

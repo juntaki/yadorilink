@@ -585,87 +585,357 @@ async fn late_small_requests_from_another_peer_and_group_cut_ahead_of_a_large_ba
     drain(&mut tasks, Duration::from_secs(20)).await;
 }
 
+/// A `.proto` read as a structure rather than as a string.
+///
+/// The previous version of the schema test called `contains()` on the raw
+/// source text, which cannot tell a live field from the record of a deleted
+/// one. `reserved "redirect";` contains `redirect`, so asserting that
+/// `redirect` was still part of the wire passed against the very line that
+/// documents its removal. Three of the four "required" serve-credit fields
+/// were in the same position: `available_worker_slots` and
+/// `estimated_queue_delay_ms` are reserved, not present, and the test was
+/// green on both.
+///
+/// The parser below is deliberately small -- it understands only the subset
+/// this repository's `.proto` files use -- but it distinguishes the three
+/// things a substring search cannot: which message a name belongs to,
+/// whether it is a declaration or a reservation, and what its number and
+/// `oneof` membership are.
+mod proto_model {
+    use std::collections::{HashMap, HashSet};
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Field {
+        pub name: String,
+        pub ty: String,
+        pub number: u32,
+        /// The `oneof` this field is declared inside, if any.
+        pub oneof: Option<String>,
+    }
+
+    #[derive(Debug, Default, Clone)]
+    pub struct Message {
+        pub fields: Vec<Field>,
+        pub reserved_names: HashSet<String>,
+        pub reserved_numbers: HashSet<u32>,
+    }
+
+    impl Message {
+        pub fn field(&self, name: &str) -> Option<&Field> {
+            self.fields.iter().find(|f| f.name == name)
+        }
+
+        /// Field names declared inside `oneof`, in declaration order.
+        pub fn oneof_fields(&self, oneof: &str) -> Vec<&Field> {
+            self.fields.iter().filter(|f| f.oneof.as_deref() == Some(oneof)).collect()
+        }
+    }
+
+    /// Everything after `//` on a line is a comment, and a comment naming a
+    /// removed field is exactly what a substring search mistakes for the
+    /// field itself.
+    fn strip_comments(src: &str) -> String {
+        // Line comments only. A `/* */` block would be left in place, and a
+        // field declaration inside one would be read as a declaration -- or,
+        // worse, a `//` inside a block comment would truncate a real line and
+        // make a field vanish, which turns every `field(x).is_none()` check
+        // into a pass for the wrong reason. No schema in this repository uses
+        // block comments; this refuses to keep parsing if one appears.
+        assert!(
+            !src.contains("/*"),
+            "this parser handles only `//` comments; a block comment appeared and would be \
+             misread -- teach it `/* */` before relying on the result"
+        );
+        src.lines()
+            .map(|line| match line.find("//") {
+                Some(at) => &line[..at],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn parse_reserved(body: &str, message: &mut Message) {
+        for item in body.split(',') {
+            let item = item.trim();
+            if let Some(quoted) = item.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+                message.reserved_names.insert(quoted.to_string());
+            } else if let Ok(number) = item.parse::<u32>() {
+                message.reserved_numbers.insert(number);
+            } else if let Some((lo, hi)) = item.split_once(" to ") {
+                // `reserved 3 to 7;`
+                if let (Ok(lo), Ok(hi)) = (lo.trim().parse::<u32>(), hi.trim().parse::<u32>()) {
+                    for n in lo..=hi {
+                        message.reserved_numbers.insert(n);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Parses `Type name = N;`, tolerating the `repeated`/`optional` label.
+    fn parse_field(statement: &str, oneof: Option<&str>) -> Option<Field> {
+        let (decl, number) = statement.rsplit_once('=')?;
+        let number = number.trim().parse::<u32>().ok()?;
+        let mut words: Vec<&str> = decl.split_whitespace().collect();
+        let name = words.pop()?;
+        // Drop the cardinality label so `repeated bytes x` reports `bytes`.
+        while matches!(words.first().copied(), Some("repeated" | "optional" | "required")) {
+            words.remove(0);
+        }
+        let ty = words.pop()?;
+        if !words.is_empty() {
+            return None;
+        }
+        Some(Field {
+            name: name.to_string(),
+            ty: ty.to_string(),
+            number,
+            oneof: oneof.map(str::to_string),
+        })
+    }
+
+    /// Messages by name. Nested messages are not used by these schemas and
+    /// are not handled; a `oneof` block is, since that is what carries the
+    /// block-response outcomes.
+    ///
+    /// Statements are accumulated until their terminating `;` rather than
+    /// read a line at a time: a `reserved` list wraps across lines in this
+    /// schema, and treating each line as a statement drops everything after
+    /// the first.
+    pub fn parse(src: &str) -> HashMap<String, Message> {
+        let src = strip_comments(src);
+        let mut out: HashMap<String, Message> = HashMap::new();
+        let mut current: Option<(String, Message)> = None;
+        let mut oneof: Option<String> = None;
+        let mut pending = String::new();
+
+        for raw in src.lines() {
+            let line = raw.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if current.is_none() {
+                if let Some(rest) = line.strip_prefix("message ") {
+                    if let Some(name) = rest.split_whitespace().next() {
+                        current = Some((name.to_string(), Message::default()));
+                    }
+                }
+                continue;
+            }
+            if pending.is_empty() {
+                if let Some(rest) = line.strip_prefix("oneof ") {
+                    oneof = rest.split_whitespace().next().map(str::to_string);
+                    continue;
+                }
+                if line == "}" {
+                    if oneof.take().is_some() {
+                        continue;
+                    }
+                    let (name, message) = current.take().expect("inside a message");
+                    out.insert(name, message);
+                    continue;
+                }
+            }
+            if !pending.is_empty() {
+                pending.push(' ');
+            }
+            pending.push_str(line);
+            let Some(statement) = pending.strip_suffix(';').map(str::to_string) else {
+                continue;
+            };
+            pending.clear();
+            let (_, message) = current.as_mut().expect("inside a message");
+            let statement = statement.trim();
+            if let Some(body) = statement.strip_prefix("reserved ") {
+                parse_reserved(body, message);
+            } else if let Some(field) = parse_field(statement, oneof.as_deref()) {
+                message.fields.push(field);
+            }
+        }
+        out
+    }
+}
+
+/// The wire contract for block serving, asserted against the parsed schema.
+///
+/// Every check names one message, so a field moving between messages is a
+/// failure rather than something a whole-file search would still find.
 #[test]
 fn wire_schema_exposes_serve_credit_and_explicit_congestion_outcomes() {
     let schema = include_str!("../../yadorilink-ipc-proto/proto/sync.proto");
-    let lower = schema.to_ascii_lowercase();
+    let messages = proto_model::parse(schema);
 
-    let cluster_start = lower.find("message clusterconfig").unwrap();
-    let cluster_end = lower.find("message blockrequestheader").unwrap();
-    let cluster = &lower[cluster_start..cluster_end];
-    for required in [
-        "max_inflight_requests",
-        "max_inflight_bytes",
-        "available_worker_slots",
-        "estimated_queue_delay_ms",
+    let cluster = messages.get("ClusterConfig").expect("ClusterConfig must exist");
+    // What serve credit actually consists of on the wire today. The pair of
+    // per-connection ceilings, and nothing else: the worker-slot and
+    // queue-delay hints were removed, and asserting them as required is what
+    // the substring version of this test was silently doing.
+    assert_eq!(
+        cluster.field("max_inflight_requests").map(|f| (f.ty.as_str(), f.number)),
+        Some(("uint32", 11)),
+        "the in-flight request ceiling is the requester's admission-control input"
+    );
+    assert_eq!(
+        cluster.field("max_inflight_bytes").map(|f| (f.ty.as_str(), f.number)),
+        Some(("uint64", 12)),
+        "the in-flight byte ceiling is what makes credit independent of block size"
+    );
+
+    // Every capability bit and hint this generation dropped must stay
+    // reserved BY NAME, not merely be absent: a later generation reusing the
+    // name for something else would silently change what an old peer's field
+    // means. Checking the reservation directly is the point -- the previous
+    // test could not distinguish this from the field still being live.
+    // Paired deliberately. The NAME reservation stops source-level reuse; the
+    // NUMBER reservation is what stops wire-level reuse, and it is the one
+    // that matters more: drop `reserved 13, 14;` while keeping the names and
+    // protoc will happily accept a later `uint32 shard_hint = 13;`, which an
+    // older peer decodes as `available_worker_slots`. Asserting only the name
+    // guards the weaker half.
+    for (retired, number) in [
+        ("supported_compression", 3),
+        ("supports_change_dag", 7),
+        ("supports_version_present", 8),
+        ("supports_version_hash_exact", 9),
+        ("supports_block_serve_credit", 10),
+        ("available_worker_slots", 13),
+        ("estimated_queue_delay_ms", 14),
+        ("protocol_version", 15),
     ] {
         assert!(
-            cluster.contains(required),
-            "serve-credit advertisement is missing required field {required:?}"
+            cluster.reserved_names.contains(retired),
+            "{retired:?} must stay reserved on ClusterConfig"
+        );
+        assert!(
+            cluster.reserved_numbers.contains(&number),
+            "field number {number} ({retired:?}) must stay reserved -- a later generation \
+             reusing it would be decoded as {retired:?} by an older peer"
+        );
+        assert!(
+            cluster.field(retired).is_none(),
+            "{retired:?} is reserved and must not also be declared"
         );
     }
-    assert!(
-        cluster.contains("reserved \"supports_block_serve_credit\""),
-        "the removed capability bit must stay reserved so no fallback serving path can return"
-    );
+
     // The protocol generation lives in exactly one place, and it is not
     // here: it rides the ALPN, where a mismatch is refused inside the TLS
-    // handshake rather than after it. A `protocol_version` field reappearing
-    // on this message would be a second definition of the same number.
-    assert!(
-        cluster.contains("reserved \"protocol_version\""),
-        "the protocol generation must stay reserved on ClusterConfig -- the ALPN defines it"
-    );
-    for gone in [
-        "supported_compression",
-        "supports_change_dag",
-        "supports_version_present",
-        "supports_version_hash_exact",
-    ] {
-        assert!(
-            !cluster.lines().any(|line| {
-                let line = line.trim_start();
-                !line.starts_with("//")
-                    && !line.starts_with("reserved")
-                    && line.contains(&format!("{gone} ="))
-            }),
-            "the removed capability bit {gone:?} must not be declared on ClusterConfig"
-        );
-    }
+    // handshake rather than after it. Its name and number are both covered
+    // by the loop above.
 
     // One block request is one bidirectional stream, so the request and
     // response headers are their own messages rather than `SyncMessage`
     // payload variants, and neither carries a correlation id.
-    let request_start = lower.find("message blockrequestheader").unwrap();
-    let request_end = lower.find("message blockfound").unwrap();
-    let request = &lower[request_start..request_end];
+    let request = messages.get("BlockRequestHeader").expect("BlockRequestHeader must exist");
     assert!(
-        !request.contains("request_id"),
+        request.field("request_id").is_none(),
         "a block request header must carry no correlation id -- the stream is the correlation"
     );
+    assert_eq!(
+        request.fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+        ["folder_group_id", "file_path", "block_hash"],
+        "a block request names exactly the block it wants and nothing else"
+    );
 
-    let response_start = lower.find("message blockfound").unwrap();
-    let response_end = lower.find("// change-history dag exchange").unwrap();
-    let response = &lower[response_start..response_end];
-    for required in [
-        "busy",
-        "retry_after_ms",
-        "queue_depth",
-        "redirect",
-        "candidate_device_ids",
-        "rejected",
-        "reason",
-        "dont_have",
-    ] {
-        assert!(
-            response.contains(required),
-            "the block response header is missing outcome field/variant {required:?}"
-        );
-    }
+    // The response's admission-control outcomes are a closed set: a
+    // same-generation peer sets exactly one, and an absent outcome is
+    // malformed rather than a forward-compatible unknown.
+    let response = messages.get("BlockResponseHeader").expect("BlockResponseHeader must exist");
+    assert_eq!(
+        response
+            .oneof_fields("outcome")
+            .iter()
+            .map(|f| (f.name.as_str(), f.ty.as_str(), f.number))
+            .collect::<Vec<_>>(),
+        [
+            ("found", "BlockFound", 1),
+            ("dont_have", "bool", 2),
+            ("busy", "BlockBusy", 3),
+            ("rejected", "BlockRejected", 5),
+        ],
+        "the outcome set is closed; adding a case is a wire generation change"
+    );
+    // The removed redirect case. This is the assertion the substring version
+    // got backwards: it asserted `redirect` was PRESENT, and passed because
+    // `reserved \"redirect\";` contains the word.
+    assert!(
+        response.field("redirect").is_none(),
+        "the redirect outcome was removed and must not come back without a new generation"
+    );
+    assert!(
+        response.reserved_names.contains("redirect") && response.reserved_numbers.contains(&4),
+        "the removed redirect case must stay reserved by both name and number"
+    );
+
+    // Congestion is carried in its own message with its own fields, so a
+    // busy answer is distinguishable from "does not have it".
+    let busy = messages.get("BlockBusy").expect("BlockBusy must exist");
+    assert_eq!(busy.field("retry_after_ms").map(|f| f.number), Some(1));
+    assert_eq!(busy.field("queue_depth").map(|f| f.number), Some(2));
+    let rejected = messages.get("BlockRejected").expect("BlockRejected must exist");
+    assert_eq!(rejected.field("reason").map(|f| f.ty.as_str()), Some("string"));
+
+    // Inline chunking is gone: a block is one body on one stream.
+    let found = messages.get("BlockFound").expect("BlockFound must exist");
     for gone in ["chunk_offset", "total_size"] {
         assert!(
-            !response.contains(gone),
+            found.field(gone).is_none(),
             "inline block-reply chunking is gone; {gone:?} must not reappear"
         );
     }
+    assert_eq!(
+        found.fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+        ["size", "hash", "compression"],
+        "a found block carries its length, its identity and its encoding"
+    );
+}
+
+/// The parser has to make the distinction the old test could not, so that
+/// distinction is itself tested rather than assumed.
+#[test]
+fn the_schema_parser_tells_a_declared_field_from_a_reserved_or_commented_one() {
+    let messages = proto_model::parse(
+        r#"
+        // A comment naming ghost = 9 must not create a field.
+        message Sample {
+          reserved 4;
+          reserved "redirect";
+          // A reserved list that wraps, which a line-at-a-time reader
+          // truncates after the first line.
+          reserved "wrapped_one", "wrapped_two",
+                   "wrapped_three";
+          uint32 live = 1;
+          oneof outcome {
+            bool picked = 2;
+          }
+        }
+        "#,
+    );
+    let sample = messages.get("Sample").expect("the sample message parses");
+
+    // The exact failure that made the previous test green on a removed field.
+    assert!(sample.field("redirect").is_none(), "a reserved name is not a field");
+    assert!(sample.reserved_names.contains("redirect"));
+    assert!(sample.reserved_numbers.contains(&4));
+
+    for wrapped in ["wrapped_one", "wrapped_two", "wrapped_three"] {
+        assert!(
+            sample.reserved_names.contains(wrapped),
+            "a wrapped reserved list must be read to its end, not to its first line"
+        );
+    }
+
+    // The exact failure a comment would have caused.
+    assert!(sample.field("ghost").is_none(), "a name in a comment is not a field");
+
+    assert_eq!(sample.field("live").map(|f| (f.ty.as_str(), f.number)), Some(("uint32", 1)));
+    assert_eq!(
+        sample.oneof_fields("outcome").iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+        ["picked"],
+        "oneof membership is recorded, so a field cannot drift out of its oneof unnoticed"
+    );
+    assert!(
+        sample.field("live").expect("live is a field").oneof.is_none(),
+        "a top-level field must not be reported as part of the oneof"
+    );
 }

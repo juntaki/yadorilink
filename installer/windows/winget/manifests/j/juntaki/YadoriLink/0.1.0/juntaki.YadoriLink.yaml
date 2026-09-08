@@ -1,0 +1,9 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.version.1.28.0.schema.json
+# Created with a schema validated against manifest.version.1.28.0.json
+# (github.com/microsoft/winget-cli) -- see installer/windows/winget/README.md
+# for how this manifest set is built, validated, and (eventually) submitted.
+PackageIdentifier: juntaki.YadoriLink
+PackageVersion: 0.1.0
+DefaultLocale: en-US
+ManifestType: version
+ManifestVersion: 1.28.0

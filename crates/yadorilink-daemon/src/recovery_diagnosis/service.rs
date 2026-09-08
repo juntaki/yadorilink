@@ -932,13 +932,16 @@ mod tests {
         }
 
         #[test]
-        fn control_protocol_version_is_7() {
-            // C5: bumped from 6 -- the `ListConflicts` request/response
-            // oneof variants are new wire fields; a version mismatch must
-            // fail clearly rather than let an old daemon silently decode
-            // the new request as an empty/unknown payload -- see this
-            // constant's own doc comment.
-            assert_eq!(yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION, 7);
+        fn control_protocol_version_is_10() {
+            // Bumped from 9 -- LAN discovery's read-only
+            // `list_lan_discovered_candidates` request/response oneof
+            // variants are new wire fields; a version mismatch must fail
+            // clearly rather than let an old daemon silently decode the new
+            // request as an empty/unknown payload -- see this constant's own
+            // doc comment. (9 was Folder Rewind's `rewind_preview` variants
+            // over 8, and 8 the one-shot transfer `send_file`/`list_inbox`/
+            // `receive_transfer` variants over 7, for the identical reason.)
+            assert_eq!(yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION, 10);
         }
     }
 }

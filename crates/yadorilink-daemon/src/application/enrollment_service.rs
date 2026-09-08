@@ -5,7 +5,7 @@ use uuid::Uuid;
 use yadorilink_replica_domain::session_state::{EnrollmentOperation, EnrollmentOperationState};
 
 use super::model::{
-    EnrollmentActivationResult, EnrollmentCancellationResult, EnrollmentPrepareResult,
+    EnrollmentActivationResult, EnrollmentCancellationResult, EnrollmentPrepareResult, MintedInvite,
 };
 use super::ports::{
     EnrollmentCoordination, EnrollmentLinkPort, EnrollmentLinkRequest, EnrollmentRepository,
@@ -18,10 +18,13 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-/// Owns the create/join pending-enrollment sagas. Every dependency is a
-/// port -- no `DaemonState`, no `reqwest`, no IPC proto -- see
-/// the composition root for what backs each one
-/// in production.
+/// Owns the create/join pending-enrollment sagas, cross-account invite
+/// acceptance (a related but deliberately simpler saga -- see
+/// `accept_invite_and_link`'s own doc comment for how and why it differs),
+/// and invite minting (no saga at all -- see `mint_invite`'s own doc
+/// comment). Every dependency is a port -- no `DaemonState`, no `reqwest`,
+/// no IPC proto -- see the composition root for what backs each one in
+/// production.
 pub(crate) struct EnrollmentService {
     device_id: String,
     repository: Arc<dyn EnrollmentRepository>,
@@ -49,11 +52,50 @@ pub(crate) struct JoinAndLinkCommand {
     pub(crate) acknowledge_risks: bool,
 }
 
+/// High-level cross-account invite-accept command. `code` is the plaintext
+/// invite credential; the group it names is learned from the coordination
+/// plane's accept/prepare response, not supplied here.
+pub(crate) struct AcceptInviteCommand {
+    pub(crate) code: String,
+    pub(crate) absolute_path: PathBuf,
+    pub(crate) on_demand: bool,
+    pub(crate) acknowledge_risks: bool,
+}
+
+/// A stable operation id derived from `(code, device_id)` rather than a
+/// fresh random UUID -- see `EnrollmentService::accept_invite_and_link`'s
+/// own doc comment for why: without a durable cross-restart journal for
+/// this saga, retry-safety depends on a repeated command (same code, same
+/// device) presenting the SAME operation_id, so the coordination plane's
+/// own idempotent-redemption check recognizes it. Not a secret and not
+/// sent anywhere the code itself isn't already going, so a plain SHA-256
+/// hex digest (not a MAC) is enough -- collision resistance is the only
+/// property this needs.
+fn invite_accept_operation_id(code: &str, device_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(code.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(device_id.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EnrollmentOutcome {
     pub(crate) operation_id: String,
     pub(crate) group_id: String,
     pub(crate) local_path: PathBuf,
+    /// Set only by `accept_invite_and_link`, and only when the redeemed
+    /// invite required the group owner's approval: this device finished its
+    /// own half, but the membership is parked awaiting that decision and
+    /// grants nothing until it is made. Always false for create/join,
+    /// neither of which has an approval step.
+    ///
+    /// Carried on the outcome rather than being flattened into "success"
+    /// because the two are materially different for the person who ran the
+    /// command: one means the folder is syncing, the other means it will
+    /// not sync until someone else acts.
+    pub(crate) awaiting_approval: bool,
 }
 
 #[allow(dead_code)]
@@ -127,9 +169,17 @@ enum ActivationDisposition {
 
 fn activation_disposition(outcome: &EnrollmentActivationResult) -> ActivationDisposition {
     match outcome {
-        EnrollmentActivationResult::Activated | EnrollmentActivationResult::AlreadyActive => {
-            ActivationDisposition::Finalize
-        }
+        EnrollmentActivationResult::Activated
+        | EnrollmentActivationResult::AlreadyActive
+        // Only the CROSS-ACCOUNT invite path can produce this, and that
+        // path does not go through `finish_activation` at all -- neither
+        // create nor join has an approval step, so this arm is
+        // unreachable from the two callers of this function. Finalize
+        // anyway rather than roll back: the remote side did commit a
+        // state transition, and treating a committed transition as
+        // "never happened" is the one answer that could destroy local
+        // state. Never `RollBack`, never left dangling.
+        | EnrollmentActivationResult::AwaitingApproval => ActivationDisposition::Finalize,
         EnrollmentActivationResult::Deleted => ActivationDisposition::RollBack,
         EnrollmentActivationResult::TransientFailure { .. } => {
             ActivationDisposition::LeaveForReconciliation
@@ -330,6 +380,196 @@ impl EnrollmentService {
         .await
     }
 
+    /// Cross-account invite acceptance: redeems an invite credential and
+    /// links it locally in one crash-safe enrollment, mirroring
+    /// `join_and_link`'s Pending -> Active shape at the coordination-plane
+    /// level.
+    ///
+    /// Deliberately does NOT use `open_enrollment_operation`/the durable
+    /// `enrollment_operations` journal `create_and_link`/`join_and_link`
+    /// use for cross-*daemon-restart* crash recovery -- doing so would mean
+    /// giving `EnrollmentKind` (and every exhaustive match over it in the
+    /// recovery/diagnosis subsystem) a third variant, a change with a much
+    /// larger blast radius than this feature needs yet. Instead:
+    ///
+    /// - `operation_id` is DERIVED deterministically from `(code,
+    ///   device_id)` (a SHA-256 hex digest), not a random UUID. Re-running
+    ///   this exact command (same invite code, same device) after a crash
+    ///   or a transient/ambiguous error therefore always presents the SAME
+    ///   operation_id, which is what makes it a safe retry rather than a
+    ///   rejected "invite already used": the coordination plane's own
+    ///   accept/prepare recognizes a repeated (device, operation_id) pair
+    ///   as this device's own earlier redemption (see that route's own
+    ///   doc comment), and `commit_plain`'s underlying `LinkLifecycleService`
+    ///   allows re-linking the identical (group_id, path) pair as an
+    ///   idempotent no-op.
+    /// - The local link commits via `commit_plain` (the plain `yadorilink
+    ///   link` shape, no `pending_enrollment` marker) rather than `commit`.
+    ///   There is therefore no local crash-recovery marker for a daemon
+    ///   restart to reconcile: if this process dies between a successful
+    ///   local link and the matching activate call, the coordination-plane
+    ///   edge is left Pending, and this device's own next restart does
+    ///   NOT automatically retry it -- either the user re-runs `share
+    ///   accept <code>` (safe, per the retry story above), or the
+    ///   coordination plane's own pending-enrollment TTL sweep eventually
+    ///   deletes the abandoned Pending row, leaving a local link that no
+    ///   longer syncs rather than a silently-orphaned coordination-plane
+    ///   authorization. This is a real, bounded gap relative to
+    ///   create/join's full cross-restart recovery, accepted for now
+    ///   rather than silently pretended away.
+    /// - `commit_plain`'s failure still gets classified (`NotCommitted` vs
+    ///   `CommitUncertain`), same two-variant shape `commit` uses for
+    ///   create/join -- a local link that may still be live must never be
+    ///   silently cancelled on the coordination plane just because this
+    ///   call is reporting failure. There is no `enrollment_operations`
+    ///   journal row to classify against here, so the classification reads
+    ///   current local link state back directly instead (see
+    ///   `commit_plain`'s own doc comment).
+    pub(crate) async fn accept_invite_and_link(
+        &self,
+        command: AcceptInviteCommand,
+    ) -> Result<EnrollmentOutcome, EnrollmentError> {
+        if !self.coordination.is_configured() {
+            return Err(EnrollmentError::LocalIdentityUnavailable);
+        }
+        let storage_mode = if command.on_demand { "on-demand" } else { "eager" };
+        let operation_id = invite_accept_operation_id(&command.code, &self.device_id);
+
+        let group_id = match self
+            .coordination
+            .prepare_invite_accept(&operation_id, &command.code, &self.device_id, storage_mode)
+            .await
+        {
+            EnrollmentPrepareResult::Prepared { group_id } => group_id,
+            EnrollmentPrepareResult::DefinitelyRejected { detail } => {
+                return Err(EnrollmentError::PreparationRejected { detail });
+            }
+            EnrollmentPrepareResult::Conflict { detail } => {
+                return Err(EnrollmentError::OperationConflict { operation_id, detail });
+            }
+            EnrollmentPrepareResult::Ambiguous { detail } => {
+                return Err(EnrollmentError::PreparationAmbiguous { operation_id, detail });
+            }
+        };
+
+        let local_path = command.absolute_path.clone();
+        match self
+            .links
+            .commit_plain(
+                &group_id,
+                &command.absolute_path,
+                command.on_demand,
+                command.acknowledge_risks,
+            )
+            .await
+        {
+            Ok(()) => {}
+            Err(EnrollmentLinkError::NotCommitted { detail }) => {
+                // Confirmed nothing was committed locally -- safe to
+                // compensate. Best-effort: if the cancel call also fails,
+                // the coordination plane's own pending-enrollment TTL sweep
+                // is the eventual backstop, same as every other best-effort
+                // cancel call in this file.
+                let _ = self
+                    .coordination
+                    .cancel_invite_accept(&group_id, &operation_id, &self.device_id)
+                    .await;
+                return Err(EnrollmentError::LocalLinkFailed { detail });
+            }
+            Err(EnrollmentLinkError::CommitUncertain { detail }) => {
+                // The local link may still be live even though this call
+                // is reporting failure -- cancelling here would delete the
+                // coordination-plane authorization for a group this device
+                // may actually be actively linked to (see `commit_plain`'s
+                // own doc comment, and `classify_link_failure`'s identical
+                // reasoning for the same-account `commit` path this
+                // mirrors). Leave the Pending edge in place instead: a
+                // retry of this exact command is always safe (same
+                // deterministic operation id), and re-commits idempotently
+                // once local state is confirmed one way or the other.
+                return Err(EnrollmentError::LocalLinkAmbiguous {
+                    operation_id,
+                    detail: format!(
+                        "{detail}; the local link may still be committed, so remote \
+                         cancellation was not attempted"
+                    ),
+                });
+            }
+        }
+
+        match self
+            .coordination
+            .activate_invite_accept(&group_id, &operation_id, &self.device_id)
+            .await
+        {
+            EnrollmentActivationResult::Activated | EnrollmentActivationResult::AlreadyActive => {
+                Ok(EnrollmentOutcome {
+                    operation_id,
+                    group_id,
+                    local_path,
+                    awaiting_approval: false,
+                })
+            }
+            // The invite required the group owner's approval, so this
+            // device's own half is complete and correct but the membership
+            // is not live yet. Reported as a success, not an error: nothing
+            // failed and there is nothing here to retry -- the local link
+            // committed above stays, and the coordination plane's edge
+            // stays, both waiting on a human. The local runtime this
+            // enrollment started is running but idle; with no policy-log
+            // grant it withholds every local change rather than syncing or
+            // losing one, and it starts working the moment the owner
+            // approves, with no further action here. The FLAG is what
+            // keeps this from being reported as a completed join.
+            EnrollmentActivationResult::AwaitingApproval => Ok(EnrollmentOutcome {
+                operation_id,
+                group_id,
+                local_path,
+                awaiting_approval: true,
+            }),
+            EnrollmentActivationResult::Deleted => {
+                // Confirmed terminal: the Pending row this operation_id
+                // named is permanently gone (most likely the TTL sweep won
+                // a race against a very slow local link commit). Unlike
+                // `finish_activation`'s marker-based rollback, the local
+                // link just committed above has no marker to remove -- it
+                // is left in place, orphaned from this now-gone
+                // authorization, for the user to `yadorilink unlink` if
+                // they don't retry with a fresh invite.
+                Err(EnrollmentError::ActivationRejected {
+                    detail: format!(
+                        "invite-accept authorization for operation {operation_id} is gone \
+                         (expired or already superseded); the local folder was linked but is \
+                         not authorized -- unlink it, or request a new invite and retry"
+                    ),
+                })
+            }
+            EnrollmentActivationResult::TransientFailure { detail } => {
+                Err(EnrollmentError::ActivationAmbiguous { operation_id, detail })
+            }
+        }
+    }
+
+    /// Mints a one-use, expiring cross-account invite for `group_id`,
+    /// naming this device as the minting device -- the CLI never needs to
+    /// know or supply its own device id (unlike `grant`, which names some
+    /// OTHER device explicitly). No local state, no journal row: a single
+    /// stateless coordination-plane call.
+    pub(crate) async fn mint_invite(
+        &self,
+        group_id: &str,
+        role: Option<&str>,
+        ttl_secs: Option<u64>,
+        requires_approval: bool,
+    ) -> Result<MintedInvite, String> {
+        if !self.coordination.is_configured() {
+            return Err(
+                "coordination-plane address/access token not configured on this device".to_string()
+            );
+        }
+        self.coordination.mint_invite(group_id, role, ttl_secs, requires_approval).await
+    }
+
     /// Opens a fresh `enrollment_operations` journal row, retrying under a
     /// NEW `operation_id` on a (should be astronomically rare) UUID
     /// collision -- mirrors `replica_membership_service.rs`'s
@@ -511,6 +751,8 @@ impl EnrollmentService {
                     operation_id: operation_id.to_string(),
                     group_id: group_id.to_string(),
                     local_path,
+                    // Create and join have no approval step at all.
+                    awaiting_approval: false,
                 })
             }
             ActivationDisposition::RollBack => {
@@ -560,6 +802,7 @@ mod tests {
             operation_id: "operation-1".to_string(),
             group_id: "group-1".to_string(),
             local_path: PathBuf::from("/tmp/group-1"),
+            awaiting_approval: false,
         };
 
         assert_eq!(outcome.operation_id, "operation-1");
@@ -745,12 +988,26 @@ mod tests {
     enum EnrollmentCall {
         PrepareCreate,
         PrepareJoin,
+        PrepareInviteAccept,
         ActivateCreate,
         ActivateJoin,
+        ActivateInviteAccept,
         CancelCreate,
         CancelJoin,
+        CancelInviteAccept,
+        MintInvite,
         LinkCommit,
         LinkRollback,
+        LinkCommitPlain,
+    }
+
+    /// The arguments one `mint_invite` port call carried.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct MintInviteArgs {
+        group_id: String,
+        role: Option<String>,
+        ttl_secs: Option<u64>,
+        requires_approval: bool,
     }
 
     #[derive(Default)]
@@ -759,6 +1016,11 @@ mod tests {
         prepare: Mutex<std::collections::VecDeque<EnrollmentPrepareResult>>,
         activate: Mutex<std::collections::VecDeque<EnrollmentActivationResult>>,
         cancel: Mutex<std::collections::VecDeque<EnrollmentCancellationResult>>,
+        mint: Mutex<std::collections::VecDeque<Result<MintedInvite, String>>>,
+        /// One entry per mint call -- the approval flag is the whole point of
+        /// the option, so a test must be able to prove it survived the trip
+        /// through this port rather than merely that a mint happened.
+        mint_args: Mutex<Vec<MintInviteArgs>>,
         configured: std::sync::atomic::AtomicBool,
     }
 
@@ -845,6 +1107,62 @@ mod tests {
                 self.cancel.lock().unwrap().pop_front().expect("missing fake cancel result")
             })
         }
+
+        fn prepare_invite_accept<'a>(
+            &'a self,
+            _operation_id: &'a str,
+            _code: &'a str,
+            _device_id: &'a str,
+            _storage_mode: &'a str,
+        ) -> super::super::ports::BoxFuture<'a, EnrollmentPrepareResult> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push(EnrollmentCall::PrepareInviteAccept);
+                self.prepare.lock().unwrap().pop_front().expect("missing fake prepare result")
+            })
+        }
+
+        fn activate_invite_accept<'a>(
+            &'a self,
+            _group_id: &'a str,
+            _operation_id: &'a str,
+            _device_id: &'a str,
+        ) -> super::super::ports::BoxFuture<'a, EnrollmentActivationResult> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push(EnrollmentCall::ActivateInviteAccept);
+                self.activate.lock().unwrap().pop_front().expect("missing fake activate result")
+            })
+        }
+
+        fn cancel_invite_accept<'a>(
+            &'a self,
+            _group_id: &'a str,
+            _operation_id: &'a str,
+            _device_id: &'a str,
+        ) -> super::super::ports::BoxFuture<'a, EnrollmentCancellationResult> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push(EnrollmentCall::CancelInviteAccept);
+                self.cancel.lock().unwrap().pop_front().expect("missing fake cancel result")
+            })
+        }
+
+        fn mint_invite<'a>(
+            &'a self,
+            group_id: &'a str,
+            role: Option<&'a str>,
+            ttl_secs: Option<u64>,
+            requires_approval: bool,
+        ) -> super::super::ports::BoxFuture<'a, Result<MintedInvite, String>> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push(EnrollmentCall::MintInvite);
+                self.mint_args.lock().unwrap().push(MintInviteArgs {
+                    group_id: group_id.to_string(),
+                    role: role.map(str::to_string),
+                    ttl_secs,
+                    requires_approval,
+                });
+                self.mint.lock().unwrap().pop_front().expect("missing fake mint result")
+            })
+        }
     }
 
     #[derive(Default)]
@@ -852,6 +1170,7 @@ mod tests {
         calls: Mutex<Vec<EnrollmentCall>>,
         commit: Mutex<std::collections::VecDeque<Result<(), EnrollmentLinkError>>>,
         rollback: Mutex<std::collections::VecDeque<Result<(), String>>>,
+        commit_plain: Mutex<std::collections::VecDeque<Result<(), EnrollmentLinkError>>>,
     }
 
     impl EnrollmentLinkPort for FakeLinkPort {
@@ -873,6 +1192,23 @@ mod tests {
             Box::pin(async move {
                 self.calls.lock().unwrap().push(EnrollmentCall::LinkRollback);
                 self.rollback.lock().unwrap().pop_front().expect("missing fake rollback result")
+            })
+        }
+
+        fn commit_plain<'a>(
+            &'a self,
+            _group_id: &'a str,
+            _absolute_path: &'a std::path::Path,
+            _on_demand: bool,
+            _acknowledge_risks: bool,
+        ) -> super::super::ports::BoxFuture<'a, Result<(), EnrollmentLinkError>> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push(EnrollmentCall::LinkCommitPlain);
+                self.commit_plain
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("missing fake commit_plain result")
             })
         }
     }
@@ -1145,5 +1481,327 @@ mod tests {
             operations.get(&operation_id).unwrap().state,
             EnrollmentOperationState::RecoveryBlocked
         );
+    }
+
+    fn accept_invite_command() -> AcceptInviteCommand {
+        AcceptInviteCommand {
+            code: "invite-code-abc".to_string(),
+            absolute_path: PathBuf::from("/home/bob/Shared"),
+            on_demand: false,
+            acknowledge_risks: false,
+        }
+    }
+
+    #[test]
+    fn invite_accept_operation_id_is_deterministic_and_scoped_to_both_inputs() {
+        let a = invite_accept_operation_id("code-1", "device-a");
+        let b = invite_accept_operation_id("code-1", "device-a");
+        assert_eq!(a, b, "same (code, device) must always produce the same operation id");
+
+        let different_device = invite_accept_operation_id("code-1", "device-b");
+        assert_ne!(a, different_device, "a different device must produce a different id");
+
+        let different_code = invite_accept_operation_id("code-2", "device-a");
+        assert_ne!(a, different_code, "a different code must produce a different id");
+    }
+
+    #[tokio::test]
+    async fn accept_invite_happy_path_activates_and_returns_outcome() {
+        let repository = Arc::new(FakeEnrollmentRepository::default());
+        let coordination = Arc::new(FakeCoordination::configured());
+        coordination
+            .prepare
+            .lock()
+            .unwrap()
+            .push_back(EnrollmentPrepareResult::Prepared { group_id: "group-9".to_string() });
+        coordination.activate.lock().unwrap().push_back(EnrollmentActivationResult::Activated);
+        let links = Arc::new(FakeLinkPort::default());
+        links.commit_plain.lock().unwrap().push_back(Ok(()));
+
+        let result = service(repository, coordination.clone(), links.clone())
+            .accept_invite_and_link(accept_invite_command())
+            .await;
+
+        let outcome = result.expect("expected a successful enrollment outcome");
+        assert_eq!(outcome.group_id, "group-9");
+        assert_eq!(outcome.local_path, PathBuf::from("/home/bob/Shared"));
+        assert_eq!(
+            *coordination.calls.lock().unwrap(),
+            vec![EnrollmentCall::PrepareInviteAccept, EnrollmentCall::ActivateInviteAccept]
+        );
+        assert!(
+            !outcome.awaiting_approval,
+            "an ordinary invite acceptance is a completed membership, not a request"
+        );
+        assert_eq!(*links.calls.lock().unwrap(), vec![EnrollmentCall::LinkCommitPlain]);
+    }
+
+    /// An invite minted requiring the owner's approval parks the membership
+    /// instead of granting it. That is a success for this device -- nothing
+    /// failed, nothing is left to retry, and the local link stays -- but it
+    /// is NOT a membership, and the outcome has to say so or the command
+    /// that ran it reports a folder as joined when it will not sync until
+    /// someone else acts.
+    #[tokio::test]
+    async fn accept_invite_awaiting_approval_succeeds_but_is_not_reported_as_a_membership() {
+        let repository = Arc::new(FakeEnrollmentRepository::default());
+        let coordination = Arc::new(FakeCoordination::configured());
+        coordination
+            .prepare
+            .lock()
+            .unwrap()
+            .push_back(EnrollmentPrepareResult::Prepared { group_id: "group-9".to_string() });
+        coordination
+            .activate
+            .lock()
+            .unwrap()
+            .push_back(EnrollmentActivationResult::AwaitingApproval);
+        let links = Arc::new(FakeLinkPort::default());
+        links.commit_plain.lock().unwrap().push_back(Ok(()));
+
+        let outcome = service(repository, coordination.clone(), links.clone())
+            .accept_invite_and_link(accept_invite_command())
+            .await
+            .expect("awaiting approval is a success, not an error: nothing failed here");
+
+        assert!(outcome.awaiting_approval);
+        assert_eq!(outcome.group_id, "group-9");
+        assert_eq!(outcome.local_path, PathBuf::from("/home/bob/Shared"));
+        // The local link is NOT rolled back and no cancel is sent: the
+        // coordination-plane edge is legitimately parked, waiting on a
+        // human, and both sides must survive until they decide.
+        assert_eq!(
+            *coordination.calls.lock().unwrap(),
+            vec![EnrollmentCall::PrepareInviteAccept, EnrollmentCall::ActivateInviteAccept]
+        );
+        assert_eq!(*links.calls.lock().unwrap(), vec![EnrollmentCall::LinkCommitPlain]);
+    }
+
+    /// A definitely-rejected prepare (e.g. the invite is invalid/expired/
+    /// already used) must never attempt a local link commit at all --
+    /// unlike the same-account create/join paths, there is no durable
+    /// journal row to open or clean up here either.
+    #[tokio::test]
+    async fn accept_invite_rejected_prepare_never_touches_the_link_port() {
+        let repository = Arc::new(FakeEnrollmentRepository::default());
+        let coordination = Arc::new(FakeCoordination::configured());
+        coordination.prepare.lock().unwrap().push_back(
+            EnrollmentPrepareResult::DefinitelyRejected {
+                detail: "invite is invalid or already used".to_string(),
+            },
+        );
+        let links = Arc::new(FakeLinkPort::default());
+
+        let result = service(repository, coordination, links.clone())
+            .accept_invite_and_link(accept_invite_command())
+            .await;
+
+        assert!(matches!(result, Err(EnrollmentError::PreparationRejected { .. })));
+        assert!(links.calls.lock().unwrap().is_empty());
+    }
+
+    /// A local link failure compensates by cancelling the invite-accept
+    /// Pending edge -- best-effort, but always attempted (mirrors
+    /// `compensate_failed_join_link`'s reasoning, simplified since there is
+    /// no local partial-state classification to make: see
+    /// `accept_invite_and_link`'s own doc comment).
+    #[tokio::test]
+    async fn accept_invite_not_committed_link_failure_triggers_a_cancel() {
+        let repository = Arc::new(FakeEnrollmentRepository::default());
+        let coordination = Arc::new(FakeCoordination::configured());
+        coordination
+            .prepare
+            .lock()
+            .unwrap()
+            .push_back(EnrollmentPrepareResult::Prepared { group_id: "group-9".to_string() });
+        coordination.cancel.lock().unwrap().push_back(EnrollmentCancellationResult::Confirmed);
+        let links = Arc::new(FakeLinkPort::default());
+        links
+            .commit_plain
+            .lock()
+            .unwrap()
+            .push_back(Err(EnrollmentLinkError::NotCommitted { detail: "disk full".to_string() }));
+
+        let result = service(repository, coordination.clone(), links.clone())
+            .accept_invite_and_link(accept_invite_command())
+            .await;
+
+        assert!(matches!(result, Err(EnrollmentError::LocalLinkFailed { .. })));
+        assert_eq!(
+            *coordination.calls.lock().unwrap(),
+            vec![EnrollmentCall::PrepareInviteAccept, EnrollmentCall::CancelInviteAccept]
+        );
+    }
+
+    /// A `CommitUncertain` classification (the local link may still be
+    /// live even though `commit_plain` is reporting failure) must NEVER
+    /// trigger the compensating cancel -- doing so would delete the
+    /// coordination-plane authorization for a group this device may
+    /// actually be actively linked to. Mirrors `commit`'s identical
+    /// same-account guarantee (see `classify_link_failure`'s own doc
+    /// comment and its 3 dedicated tests in enrollment_link.rs).
+    #[tokio::test]
+    async fn accept_invite_commit_uncertain_never_triggers_a_cancel() {
+        let repository = Arc::new(FakeEnrollmentRepository::default());
+        let coordination = Arc::new(FakeCoordination::configured());
+        coordination
+            .prepare
+            .lock()
+            .unwrap()
+            .push_back(EnrollmentPrepareResult::Prepared { group_id: "group-9".to_string() });
+        let links = Arc::new(FakeLinkPort::default());
+        links.commit_plain.lock().unwrap().push_back(Err(EnrollmentLinkError::CommitUncertain {
+            detail: "watcher start failed and the rollback itself also failed".to_string(),
+        }));
+
+        let result = service(repository, coordination.clone(), links.clone())
+            .accept_invite_and_link(accept_invite_command())
+            .await;
+
+        assert!(matches!(result, Err(EnrollmentError::LocalLinkAmbiguous { .. })));
+        // Only PrepareInviteAccept ran -- no CancelInviteAccept, and no
+        // ActivateInviteAccept either (this call returns before reaching
+        // activate).
+        assert_eq!(*coordination.calls.lock().unwrap(), vec![EnrollmentCall::PrepareInviteAccept]);
+    }
+
+    /// A confirmed-gone activation (the Pending row's TTL swept it before
+    /// activate ran) reports an error but does NOT roll back the local
+    /// link -- there is no marker for `commit_plain` to have written, so
+    /// there is nothing for a rollback to remove; the link is left in
+    /// place for the user to `unlink` or retry with a fresh invite (see
+    /// `accept_invite_and_link`'s own doc comment).
+    #[tokio::test]
+    async fn accept_invite_deleted_activation_leaves_the_link_in_place() {
+        let repository = Arc::new(FakeEnrollmentRepository::default());
+        let coordination = Arc::new(FakeCoordination::configured());
+        coordination
+            .prepare
+            .lock()
+            .unwrap()
+            .push_back(EnrollmentPrepareResult::Prepared { group_id: "group-9".to_string() });
+        coordination.activate.lock().unwrap().push_back(EnrollmentActivationResult::Deleted);
+        let links = Arc::new(FakeLinkPort::default());
+        links.commit_plain.lock().unwrap().push_back(Ok(()));
+
+        let result = service(repository, coordination, links.clone())
+            .accept_invite_and_link(accept_invite_command())
+            .await;
+
+        assert!(matches!(result, Err(EnrollmentError::ActivationRejected { .. })));
+        // Only the plain commit ran -- no rollback call exists on this path
+        // at all (unlike `commit`'s `EnrollmentLinkPort::rollback`).
+        assert_eq!(*links.calls.lock().unwrap(), vec![EnrollmentCall::LinkCommitPlain]);
+    }
+
+    #[tokio::test]
+    async fn accept_invite_missing_coordination_config_never_attempts_a_link() {
+        let repository = Arc::new(FakeEnrollmentRepository::default());
+        let coordination = Arc::new(FakeCoordination::default()); // not configured
+        let links = Arc::new(FakeLinkPort::default());
+
+        let result = service(repository, coordination, links.clone())
+            .accept_invite_and_link(accept_invite_command())
+            .await;
+
+        assert!(matches!(result, Err(EnrollmentError::LocalIdentityUnavailable)));
+        assert!(links.calls.lock().unwrap().is_empty());
+    }
+
+    fn minted(role: &str, requires_approval: bool) -> MintedInvite {
+        MintedInvite {
+            code: "abc123".to_string(),
+            invite_id: "invite-1".to_string(),
+            group_id: "group-9".to_string(),
+            role: role.to_string(),
+            expires_at_unix: 1_800_000_000,
+            requires_approval,
+        }
+    }
+
+    #[tokio::test]
+    async fn mint_invite_happy_path_returns_the_coordination_plane_result() {
+        let repository = Arc::new(FakeEnrollmentRepository::default());
+        let coordination = Arc::new(FakeCoordination::configured());
+        coordination.mint.lock().unwrap().push_back(Ok(minted("viewer", false)));
+        let links = Arc::new(FakeLinkPort::default());
+
+        let result = service(repository, coordination.clone(), links)
+            .mint_invite("group-9", Some("viewer"), None, false)
+            .await;
+
+        let invite = result.expect("expected a minted invite");
+        assert_eq!(invite.code, "abc123");
+        assert_eq!(invite.group_id, "group-9");
+        assert!(!invite.requires_approval);
+        assert_eq!(*coordination.calls.lock().unwrap(), vec![EnrollmentCall::MintInvite]);
+        assert_eq!(
+            *coordination.mint_args.lock().unwrap(),
+            vec![MintInviteArgs {
+                group_id: "group-9".to_string(),
+                role: Some("viewer".to_string()),
+                ttl_secs: None,
+                requires_approval: false,
+            }],
+        );
+    }
+
+    /// The approval flag must reach the coordination plane unchanged and
+    /// independently of the role -- an owner asking for an approval-gated
+    /// Editor invite must not silently get an ungated one.
+    #[tokio::test]
+    async fn mint_invite_forwards_the_approval_requirement_independently_of_the_role() {
+        let repository = Arc::new(FakeEnrollmentRepository::default());
+        let coordination = Arc::new(FakeCoordination::configured());
+        coordination.mint.lock().unwrap().push_back(Ok(minted("editor", true)));
+        let links = Arc::new(FakeLinkPort::default());
+
+        let invite = service(repository, coordination.clone(), links)
+            .mint_invite("group-9", Some("editor"), None, true)
+            .await
+            .expect("expected a minted invite");
+
+        assert!(invite.requires_approval);
+        assert_eq!(
+            *coordination.mint_args.lock().unwrap(),
+            vec![MintInviteArgs {
+                group_id: "group-9".to_string(),
+                role: Some("editor".to_string()),
+                ttl_secs: None,
+                requires_approval: true,
+            }],
+        );
+    }
+
+    /// What the caller reports is what the coordination plane recorded, not
+    /// what was requested: a plane that ignored the flag must not be
+    /// described as having honored it.
+    #[tokio::test]
+    async fn mint_invite_reports_the_coordination_planes_own_approval_answer() {
+        let repository = Arc::new(FakeEnrollmentRepository::default());
+        let coordination = Arc::new(FakeCoordination::configured());
+        coordination.mint.lock().unwrap().push_back(Ok(minted("editor", false)));
+        let links = Arc::new(FakeLinkPort::default());
+
+        let invite = service(repository, coordination.clone(), links)
+            .mint_invite("group-9", Some("editor"), None, true)
+            .await
+            .expect("expected a minted invite");
+
+        assert!(!invite.requires_approval);
+    }
+
+    #[tokio::test]
+    async fn mint_invite_missing_coordination_config_fails_closed() {
+        let repository = Arc::new(FakeEnrollmentRepository::default());
+        let coordination = Arc::new(FakeCoordination::default()); // not configured
+        let links = Arc::new(FakeLinkPort::default());
+
+        let result = service(repository, coordination.clone(), links)
+            .mint_invite("group-9", None, None, true)
+            .await;
+
+        assert!(result.is_err());
+        assert!(coordination.calls.lock().unwrap().is_empty());
     }
 }

@@ -16,6 +16,45 @@ use yadorilink_replica_domain::ids::ChangeHash;
 /// oldest are evicted (and would be re-requested by a later heads exchange).
 pub const ORPHAN_BOUND: usize = 4096;
 
+/// Confirms whether `device_id` still holds writer authorization for
+/// `group_id` RIGHT NOW, at the moment an orphan is about to be promoted --
+/// independent of whatever historical `ChangeAuth` pin the orphan's own
+/// signed bytes carry. Injected so this storage-layer crate never has to
+/// depend on policy/trust types: `yadorilink_daemon`'s `DaemonState` wires
+/// the real, policy-backed answer (see `promote_orphans`'s own doc comment
+/// for why this exists and where it is actually consulted).
+///
+/// `None` means the check cannot currently be answered -- no trust/policy
+/// material is available yet -- and callers must fail closed: defer
+/// promotion (leave the row buffered) rather than treat unavailable trust as
+/// authorization. `Some(false)` (a definite "no longer a writer") is treated
+/// identically to `None` by `promote_orphans`: both defer rather than drop,
+/// since a later re-grant could make the row legitimately promotable again,
+/// and `ORPHAN_BOUND` eviction already bounds how long a permanently-stuck
+/// row can linger.
+pub type OrphanPromotionWriterCheck = dyn Fn(&str, &str) -> Option<bool> + Send + Sync;
+
+/// The permissive default: every author is treated as still a current
+/// writer. Used by every call site that has no revocation-freshness concern
+/// of its own -- tests, and any internal `dag_store` caller that isn't part
+/// of live remote-peer admission. Real production remote admission gets the
+/// REAL check, wired by `yadorilink_daemon::daemon_state::DaemonState::new`
+/// onto `yadorilink_sync_sqlite::ChangeHistoryRepository` the same way that
+/// module wires `local_change_auth_provider`.
+pub fn always_current_writer(_group_id: &str, _device_id: &str) -> Option<bool> {
+    Some(true)
+}
+
+/// Fails closed: no trust material is available to answer this at all. Used
+/// by `init_dag_schema`'s startup self-heal sweep, which runs directly on a
+/// freshly opened connection before any daemon-level policy/trust has even
+/// begun loading -- see that call site's own comment, and `resweep_deferred_
+/// orphan_promotions`'s own doc comment for how a row deferred here later
+/// gets a genuine second chance once real trust is available.
+pub fn defer_all_orphan_promotion(_group_id: &str, _device_id: &str) -> Option<bool> {
+    None
+}
+
 /// Buffers a change whose ancestry is not yet complete. Evicts the oldest
 /// orphans once the bound is exceeded (see `ORPHAN_BOUND`).
 pub(crate) fn insert_orphan(
@@ -87,9 +126,28 @@ pub(crate) fn insert_orphan(
 /// Returns the hashes of the changes that were promoted, oldest-first — the
 /// caller projects each promoted orphan's paths, so it needs the identities,
 /// not just a count.
+///
+/// `writer_check` is consulted for every promotion candidate, right after
+/// its ancestry is confirmed complete: this is a SEPARATE, freshness-gated
+/// re-check, distinct from whatever authorization decision let the row
+/// buffer as an orphan in the first place. An orphan's own signature and
+/// `ChangeAuth` pin were only checked against policy state AS OF THE MOMENT
+/// IT WAS RECEIVED (or, for a startup self-heal candidate, not checked
+/// against live policy at all -- see `defer_all_orphan_promotion`) --
+/// arbitrary time can pass between that receipt and this promotion, during
+/// which the author can be downgraded or revoked. Re-checking only at
+/// receipt time closes that window at the moment the change first arrives,
+/// but a still-buffered orphan sitting on a withheld parent (deliberately,
+/// by an attacker, or incidentally, across a restart) would otherwise get
+/// promoted later on the strength of a check that has since gone stale --
+/// exactly the live-admission replay gap `GroupPolicyState::
+/// author_is_writer_now` closes for the ordinary per-Change path, extended
+/// here to the promotion path a fix confined to that ordinary path cannot
+/// reach.
 pub fn promote_orphans(
     conn: &Connection,
     seeds: &[ChangeHash],
+    writer_check: &OrphanPromotionWriterCheck,
 ) -> Result<Vec<ChangeHash>, SyncSqliteError> {
     let mut promoted: Vec<ChangeHash> = Vec::new();
     let mut queue: std::collections::VecDeque<ChangeHash> = seeds.iter().copied().collect();
@@ -128,6 +186,20 @@ pub fn promote_orphans(
                 }
             };
             if !super::retained_history_integrity::has_all_parents(conn, &change)? {
+                continue;
+            }
+            // The freshness re-check this function's own doc comment
+            // describes: is this orphan's author STILL a writer for its
+            // group RIGHT NOW, at promotion time -- not merely whatever was
+            // true when the row was originally buffered. `None` (trust
+            // unavailable) and `Some(false)` (confirmed no longer a writer)
+            // both defer identically: leave the row buffered rather than
+            // drop it outright, matching `CausalAuthCheck::Unresolvable`'s
+            // own fail-closed-by-deferral treatment just below, not
+            // `Violated`'s permanent drop -- a later re-grant (or a later
+            // call with real trust material loaded) can still legitimately
+            // promote this exact row.
+            if writer_check(change.group_id.as_str(), change.device_id.as_str()) != Some(true) {
                 continue;
             }
             // Re-verifies `4175e8cd`'s causal-auth-monotonicity invariant
@@ -251,7 +323,12 @@ pub fn promote_orphans(
                     [&child_hash_blob[..]],
                 )?;
             }
-            if super::retained_history_integrity::append_change(conn, &change, applied)? {
+            if super::retained_history_integrity::append_change(
+                conn,
+                &change,
+                applied,
+                super::now_unix_nanos(),
+            )? {
                 super::conflict_authoring::record_conflict_copy_ops_provenance(
                     conn,
                     change.group_id.as_str(),

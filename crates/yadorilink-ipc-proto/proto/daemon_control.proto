@@ -544,6 +544,57 @@ message ListConflictsResponse {
   repeated ConflictedFileInfo files = 1;
 }
 
+// Track Send: `yadorilink send <file-or-dir> <target-device>`. Never
+// touches a linked folder or the sync DAG -- `source_path` is chunked and
+// offered directly, independent of whether it sits inside any linked
+// folder at all. `target_device` is resolved against this device's
+// already-known same-account device list, the same one `StatusResponse
+// .peers` below reports on -- not a new discovery mechanism.
+message SendFileRequest {
+  string source_path = 1;
+  string target_device = 2;
+}
+message SendFileResponse {
+  string transfer_id = 1;
+  repeated string files_offered = 2;
+  uint64 total_size = 3;
+}
+
+// `yadorilink inbox`: every inbound Track Send transfer this device has
+// been offered, whether or not `receive` has been run for it yet.
+message ListInboxRequest {}
+message InboxFileSummary {
+  string relative_path = 1;
+  uint64 size = 2;
+}
+message InboxTransfer {
+  string transfer_id = 1;
+  string sender_device_id = 2;
+  repeated InboxFileSummary files = 3;
+  uint64 total_size = 4;
+  int64 offered_at_unix_nanos = 5;
+  // "pending" | "in_progress" | "completed" | "failed".
+  string status = 6;
+}
+message ListInboxResponse {
+  repeated InboxTransfer transfers = 1;
+}
+
+// Track Send: `yadorilink receive <transfer-id> [--to <dir>]` -- the
+// explicit accept step. Resumable: re-running this for a transfer already
+// partially received continues from this device's own durable per-file
+// progress rather than re-fetching confirmed bytes.
+message ReceiveTransferRequest {
+  string transfer_id = 1;
+  // Empty means the daemon's default inbox directory.
+  string destination_dir = 2;
+}
+message ReceiveTransferResponse {
+  string destination_dir = 1;
+  repeated string files_received = 2;
+  uint64 bytes_received = 3;
+}
+
 message StatusRequest {}
 message StatusResponse {
   repeated LinkStatus links = 1;
@@ -1221,6 +1272,36 @@ message ListConnectionTracesResponse {
   repeated ConnectionAttemptTrace traces = 1;
 }
 
+// One LAN-discovered address currently held as a dial candidate — the
+// announced-but-not-necessarily-connected counterpart to
+// `ConnectionAttemptTrace`, which only ever describes an attempt that has
+// already resolved. Diagnostics only: being listed here is a dial target
+// and nothing more, never authorization. Redacted on the same terms as
+// `ConnectionAttemptTrace` — the coarse address class, never the
+// announced address itself. See
+// `yadorilink-daemon::connection_trace::LanDiscoveredCandidate`.
+message LanDiscoveredCandidate {
+  string peer_device_id = 1;
+  // "lan" | "port_mapped" | "ipv6" | "server_reflexive" | "wan" |
+  // "unknown", derived from the announced address rather than assumed.
+  string address_class = 2;
+  // Daemon-side monotonic age of the last announcement. Entries past the
+  // daemon's candidate TTL are not reported at all.
+  uint64 last_seen_ms_ago = 3;
+  // Whether the peer has any live session — not necessarily over this
+  // candidate, and not necessarily over a LAN candidate at all. Repeated
+  // on every one of a peer's candidate rows, so it must not be read as
+  // "connected over this address"; named for what it measures.
+  bool peer_has_any_session = 4;
+}
+// Empty `peer_device_id` lists every peer's held candidates.
+message ListLanDiscoveredCandidatesRequest {
+  string peer_device_id = 1;
+}
+message ListLanDiscoveredCandidatesResponse {
+  repeated LanDiscoveredCandidate candidates = 1;
+}
+
 message ConnectivityDoctorRequest {}
 message ConnectivityDoctorCategory {
   string name = 1;
@@ -1370,6 +1451,19 @@ message EnrollmentCommandOutcome {
   string operation_id = 1;
   string group_id = 2;
   string local_path = 3;
+  // Set only by AcceptInviteCommand, and only when the redeemed invite was
+  // minted with `requires_approval`: the coordination plane accepted this
+  // device's own half of the acceptance, but the resulting membership is
+  // parked awaiting the group owner's decision and grants NOTHING until
+  // they make it. False on every create/join outcome (neither has an
+  // approval step) and on an ordinary invite acceptance.
+  //
+  // Carried as its own field rather than folded into the plain success it
+  // shares a status code with, because the two are materially different
+  // outcomes for the user: one means the folder is syncing, the other
+  // means it will not sync until someone else acts. A caller that renders
+  // both the same way tells people their folder is live when it is not.
+  bool awaiting_approval = 4;
 }
 
 message CreateAndLinkCommandResponse {
@@ -1382,6 +1476,65 @@ message CreateAndLinkCommandResponse {
 message JoinAndLinkCommandResponse {
   oneof result {
     EnrollmentCommandOutcome outcome = 1;
+    ApplicationCommandError error = 2;
+  }
+}
+
+// Cross-account invite acceptance: same crash-safe Pending -> Active shape
+// as JoinAndLinkCommand, but authorized by a validated, one-use invite
+// credential instead of the account already being able to see the group.
+// `code` is the plaintext invite code the recipient received out of band
+// (a URL or a QR code decodes to it); the coordination plane never sees it
+// twice -- see coordination_client's accept_invite_prepare doc comment.
+message AcceptInviteCommandRequest {
+  string code = 1;
+  string local_path = 2;
+  bool on_demand = 3;
+  bool acknowledge_risks = 4;
+}
+
+message AcceptInviteCommandResponse {
+  oneof result {
+    EnrollmentCommandOutcome outcome = 1;
+    ApplicationCommandError error = 2;
+  }
+}
+
+// Mints a one-use, expiring, device-scoped cross-account invite for
+// group_id, naming the local daemon's own device as the minting device --
+// the CLI never supplies or needs to know its own device id for this.
+// `role` is optional ("viewer"/"editor" -- "owner" is not available via
+// this route yet; empty defaults to Viewer on the coordination plane);
+// `ttl_secs` is optional (0 means "use the coordination plane's own
+// default"). `requires_approval` makes acceptance a REQUEST: the
+// recipient's own accept still runs, but the resulting membership waits
+// for this owner to approve it before it grants anything. It is an
+// explicit per-invite choice, independent of `role`; false is the
+// pre-existing straight-to-member behavior.
+message MintInviteCommandRequest {
+  string group_id = 1;
+  string role = 2;
+  uint64 ttl_secs = 3;
+  bool requires_approval = 4;
+}
+
+// The plaintext `code` is returned exactly once, here -- only its hash is
+// ever persisted (by the coordination plane; this daemon never stores it
+// at all). `requires_approval` echoes what the coordination plane actually
+// recorded, so a caller renders the recipient-facing wording that matches
+// the invite that exists rather than the one it asked for.
+message MintedInviteInfo {
+  string code = 1;
+  string invite_id = 2;
+  string group_id = 3;
+  string role = 4;
+  int64 expires_at_unix = 5;
+  bool requires_approval = 6;
+}
+
+message MintInviteCommandResponse {
+  oneof result {
+    MintedInviteInfo outcome = 1;
     ApplicationCommandError error = 2;
   }
 }
@@ -1531,6 +1684,91 @@ message ShowRecoveryOperationResponse {
   }
 }
 
+// `yadorilink rewind <group> --at <timestamp>`: Folder Rewind's read-only
+// preview. Computes what WOULD have to change, per path, to bring a group's
+// desired state back to what this device held at `at_unix_nanos`. Purely a
+// preview -- answering it emits no signed change, writes nothing to disk,
+// and creates no obligation of any kind.
+//
+// `at_unix_nanos` is on the DAEMON device's own clock, matching the
+// admission timestamps the plan is computed from. Those are deliberately
+// local observations rather than replicated values, so a plan is only
+// meaningful against the device that produced it.
+message RewindPreviewRequest {
+  string group_id = 1;
+  int64 at_unix_nanos = 2;
+  // Whether `entries` should list the paths a rewind would leave alone.
+  //
+  // Off by default, and that default is a delivery constraint rather than
+  // a display preference: a whole-folder plan carries one entry per path
+  // the device has ever indexed, and for a large folder the `unchanged`
+  // majority alone is far more than one frame can hold. The action counts
+  // below are computed over the WHOLE plan either way, so a summary is
+  // never made wrong by what was left out of the listing.
+  bool include_unchanged = 3;
+}
+
+// One path's verdict. `action` is one of `create`, `delete`, `replace`,
+// `unchanged`, `unavailable`. `unavailable` means this device genuinely
+// cannot say what the path held at the target time -- three things produce
+// it: its history there was expired by retention, this device never held
+// any history reaching back that far (it joined the group late, or its
+// local history was replaced wholesale by a re-bootstrap more recently than
+// the target), or a retained row carries no admission timestamp at all. It
+// is a real answer and must never be rendered as "nothing to do".
+message RewindPathEntry {
+  string path = 1;
+  string action = 2;
+  // Set only for `create` and `replace`: the version the path would be
+  // restored to.
+  optional int64 to_version_seq = 3;
+  // Set only for `replace`: the version it would be rolled back from.
+  optional int64 from_version_seq = 4;
+  // Set only for `unavailable`: why no answer exists.
+  optional string unavailable_reason = 5;
+}
+
+// A heuristic content match between a would-be-deleted and a would-be-
+// created path. Advisory annotation only: the per-path entries above stay
+// authoritative whether or not a pairing was found, so a coincidental
+// identical-content match here can never change per-path correctness.
+message RewindRenameCandidate {
+  string from_path = 1;
+  string to_path = 2;
+}
+
+// How many paths of the whole plan fall into each action. Always computed
+// over every path, never over whatever subset `entries` ended up carrying,
+// so a summary stays correct no matter how the listing was trimmed.
+message RewindActionCounts {
+  uint64 create = 1;
+  uint64 delete = 2;
+  uint64 replace = 3;
+  uint64 unchanged = 4;
+  uint64 unavailable = 5;
+}
+
+message RewindPreviewResponse {
+  string group_id = 1;
+  int64 target_unix_nanos = 2;
+  // The per-path listing, which is a SUBSET of the plan: `unchanged`
+  // entries are omitted unless the request asked for them, and the listing
+  // is additionally capped at a byte budget so a response always fits in
+  // one frame regardless of folder size. `counts` and the two totals below
+  // describe the whole plan; these two lists describe what fit.
+  repeated RewindPathEntry entries = 3;
+  repeated RewindRenameCandidate rename_candidates = 4;
+  RewindActionCounts counts = 5;
+  // Paths in the whole plan, and rename candidates in the whole plan --
+  // both independent of what the two lists above actually carry.
+  uint64 total_entry_count = 6;
+  uint64 total_rename_candidate_count = 7;
+  // Set when the byte budget cut either listing short, so a reader can say
+  // so instead of silently presenting a partial list as complete. Not set
+  // merely because `unchanged` entries were filtered out as requested.
+  bool listing_truncated = 8;
+}
+
 message DaemonControlRequest {
   oneof payload {
     LinkRequest link = 1;
@@ -1607,6 +1845,22 @@ message DaemonControlRequest {
     MaterializationStatusRequest materialization_status = 64;
     // C5: `yadorilink conflicts list`.
     ListConflictsRequest list_conflicts = 65;
+    // Cross-account invite acceptance: redeems an invite credential and
+    // links it locally in one crash-safe enrollment, mirroring
+    // join_and_link_command's Pending -> Active shape.
+    AcceptInviteCommandRequest accept_invite_command = 66;
+    MintInviteCommandRequest mint_invite_command = 67;
+    // Track Send: one-shot P2P file send/receive, entirely separate from
+    // the sync DAG -- see `send.proto`.
+    SendFileRequest send_file = 68;
+    ListInboxRequest list_inbox = 69;
+    ReceiveTransferRequest receive_transfer = 70;
+
+    // Folder Rewind's read-only preview.
+    RewindPreviewRequest rewind_preview = 71;
+
+    // LAN-discovery diagnostics: candidates held but not (yet) connected.
+    ListLanDiscoveredCandidatesRequest list_lan_discovered_candidates = 72;
   }
   // Field numbers 24-26 were the directional-mode requests (set_mode,
   // override, revert); 40-43 were the directional folder-operation requests
@@ -1705,6 +1959,19 @@ message DaemonControlResponse {
     MaterializationStatusResponse materialization_status = 64;
     // C5: `yadorilink conflicts list`.
     ListConflictsResponse list_conflicts = 65;
+    AcceptInviteCommandResponse accept_invite_command = 66;
+    MintInviteCommandResponse mint_invite_command = 67;
+    // Track Send: one-shot P2P file send/receive, entirely separate from
+    // the sync DAG -- see `send.proto`.
+    SendFileResponse send_file = 68;
+    ListInboxResponse list_inbox = 69;
+    ReceiveTransferResponse receive_transfer = 70;
+
+    // Folder Rewind's read-only preview.
+    RewindPreviewResponse rewind_preview = 71;
+
+    // LAN-discovery diagnostics: candidates held but not (yet) connected.
+    ListLanDiscoveredCandidatesResponse list_lan_discovered_candidates = 72;
   }
   // Field numbers 25-27 were the directional-mode responses (set_mode,
   // override, revert); 40-43 were the directional folder-operation responses

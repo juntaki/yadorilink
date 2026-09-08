@@ -385,7 +385,19 @@ impl eframe::App for FolderStatusApp {
 impl FolderStatusApp {
     fn render_body(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
-        ui.heading(folder_display_name(&self.local_path));
+        ui.horizontal(|ui| {
+            ui.heading(crate::status_model::folder_display_name(&self.local_path));
+            // This window's own mutating actions are per-file (trash
+            // restore, version restore, pin/unpin, hydrate/evict); nothing
+            // here touches sharing. The button opens the sharing window as
+            // its own process (exactly what the tray's own "Share…" item
+            // does) and never mints or changes anything itself.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Share…").clicked() {
+                    crate::actions::spawn_window_with_path("share", &self.local_path);
+                }
+            });
+        });
         ui.label(egui::RichText::new(&self.local_path).weak().small());
         ui.add_space(10.0);
         ui.separator();
@@ -766,16 +778,6 @@ fn version_line(v: &FileVersionInfo) -> String {
     )
 }
 
-/// The folder's last path segment, mirroring `status_model::
-/// folder_menu_label`'s own "don't blow out the window with a long path"
-/// choice.
-fn folder_display_name(local_path: &str) -> String {
-    std::path::Path::new(local_path)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| local_path.to_string())
-}
-
 fn field_row(ui: &mut egui::Ui, label: &str, value: &str, stale: bool) {
     ui.horizontal(|ui| {
         ui.label(dim(egui::RichText::new(label).strong(), stale));
@@ -798,16 +800,6 @@ fn dim(text: egui::RichText, stale: bool) -> egui::RichText {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn folder_display_name_uses_the_last_path_segment() {
-        assert_eq!(folder_display_name("/Users/alice/Photos"), "Photos");
-    }
-
-    #[test]
-    fn folder_display_name_falls_back_to_the_whole_path_when_it_has_no_segment() {
-        assert_eq!(folder_display_name("/"), "/");
-    }
 
     #[test]
     fn materialization_state_label_covers_every_state() {

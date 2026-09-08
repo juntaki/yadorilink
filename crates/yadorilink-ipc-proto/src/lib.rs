@@ -12,6 +12,13 @@ pub mod local_discovery {
     include!(concat!(env!("OUT_DIR"), "/yadorilink.local_discovery.v1.rs"));
 }
 
+// Track Send's own peer-to-peer wire protocol -- see `proto/send.proto`'s
+// own doc comment for why this is a wholly separate message family from
+// `sync` above, never exchanged over the sync protocol's ALPN/stream.
+pub mod send {
+    include!(concat!(env!("OUT_DIR"), "/yadorilink.send.v1.rs"));
+}
+
 pub mod daemonctl {
     include!(concat!(env!("OUT_DIR"), "/yadorilink.daemonctl.v1.rs"));
 
@@ -20,7 +27,14 @@ pub mod daemonctl {
     /// development builds are not required to interoperate across protocol
     /// generations. A version mismatch should fail clearly rather than select a
     /// backward-compatibility path.
-    pub const CONTROL_PROTOCOL_VERSION: u32 = 7;
+    ///
+    /// `8`: adds Track Send's `send_file`/`list_inbox`/`receive_transfer`
+    /// request and response variants.
+    /// `9`: adds Folder Rewind's read-only `rewind_preview` request and
+    /// response variants.
+    /// `10`: adds LAN discovery's read-only
+    /// `list_lan_discovered_candidates` request and response variants.
+    pub const CONTROL_PROTOCOL_VERSION: u32 = 10;
 }
 
 #[cfg(test)]
@@ -112,6 +126,9 @@ mod tests {
                             operation_id: "operation-1".into(),
                             group_id: "group-1".into(),
                             local_path: "/tmp/documents".into(),
+                            // Create has no approval step; only a
+                            // cross-account invite acceptance ever sets it.
+                            awaiting_approval: false,
                         },
                     )),
                 },

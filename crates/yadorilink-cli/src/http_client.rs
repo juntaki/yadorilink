@@ -13,6 +13,22 @@ pub fn coordination_http_addr() -> String {
         .unwrap_or_else(|_| "http://127.0.0.1:8787".into())
 }
 
+/// Serializes test-only mutation of `YADORILINK_COORDINATION_HTTP_ADDR`, the
+/// process-global env var [`coordination_http_addr`] reads -- shared by
+/// every test in this crate that points the coordination HTTP client at a
+/// local mock server (this module's own tests, plus `google_auth`'s and
+/// `commands::auth`'s), so two such tests can never race on the same global
+/// env var when `cargo test` runs them concurrently in one process. A
+/// `tokio::sync::Mutex`, not `std::sync::Mutex`: some of these tests hold
+/// the guard across a multi-request `.await` span, and a
+/// `std::sync::MutexGuard` held across an await point is exactly what
+/// `clippy::await_holding_lock` flags as a real hazard (a blocked std mutex
+/// can starve the async runtime); the tokio version is designed to be held
+/// this way.
+#[cfg(test)]
+pub(crate) static COORDINATION_ADDR_ENV_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
 /// The coordination endpoint recorded in this device's `device.json` at
 /// registration time, read from
 /// `YADORILINK_COORDINATION_ADDR`. Kept distinct from

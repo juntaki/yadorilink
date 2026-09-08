@@ -31,7 +31,7 @@ Phase 2's:
 
 This is a substring/brace-matching scan, not a real Rust parser -- same
 class of tool, and the same false-positive/evasion tradeoffs, as
-`check-daemon-application-dependencies.py`/`check-daemon-composition-root.py`.
+`check-architecture.py`/`check-daemon-composition-root.py`.
 Check 2's "real code, not a comment" distinction is a plain per-line
 `.strip().startswith("//")` heuristic (this repo's own style never puts
 a real `use`/type reference on the same line as a `//` comment opener),

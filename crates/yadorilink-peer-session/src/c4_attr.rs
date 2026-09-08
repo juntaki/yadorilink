@@ -354,7 +354,7 @@ pub fn report_requester_rtt(group_id: &str, block_hash: &[u8], rtt: Duration) {
 /// request line for the common, fast case.
 pub fn responder_and_requester_summary() -> String {
     let fmt = |name: &str, (count, total_ms, max_ms): (u64, u64, u64)| {
-        let avg_ms = if count > 0 { total_ms / count } else { 0 };
+        let avg_ms = total_ms.checked_div(count).unwrap_or(0);
         format!("{name}(n={count},avg_ms={avg_ms},max_ms={max_ms})")
     };
     format!(

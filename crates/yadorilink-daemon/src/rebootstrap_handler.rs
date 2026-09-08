@@ -65,12 +65,49 @@ impl DaemonRebootstrapHandler {
     /// key produced these exact bytes), a re-bootstrap manifest must also be
     /// authorized to introduce a NEW baseline for its specific group right
     /// now: the signer must be a device this policy currently recognizes as
-    /// a writer, and — since a compaction snapshot materializes the group's
-    /// *entire* retained history — a full replica of it. Neither of these is
-    /// implied by a valid signature alone; `RebootstrapTrust::signing_key`
-    /// has no group context to check them itself, so this runs as a second,
-    /// explicit gate after signature verification, before either
-    /// `verify_rebootstrap` or `install_rebootstrap` accepts the message.
+    /// a writer, the manifest's actual signing key must be the exact key the
+    /// signed policy chain bound to that writer, and — since a compaction
+    /// snapshot materializes the group's *entire* retained history — the
+    /// signer must be a full replica of it. None of these is implied by a
+    /// valid signature alone; `RebootstrapTrust::signing_key` has no group
+    /// context to check them itself, so this runs as a second, explicit gate
+    /// after signature verification, before either `verify_rebootstrap` or
+    /// `install_rebootstrap` accepts the message.
+    ///
+    /// The writer-role-and-key-binding check (first two conditions above)
+    /// now fully mirrors the pattern `NetmapChangeAuthenticator::
+    /// accepts_change_auth` (`change_auth.rs`) uses for ordinary Change
+    /// admission, via `GroupPolicyState::author_was_writer_at`: resolve the
+    /// group's signed policy chain, check the signer's role against it (real,
+    /// role-aware writer authorization -- NOT `state.peer_is_writer`, which
+    /// is populated from plain netmap membership, every authorized group
+    /// member including Viewer; see `replace_peer_netmap_metadata`), AND
+    /// require the manifest's actual signer key (`self.trust_key(signer)`,
+    /// the SAME key already used to verify the manifest's own signature) to
+    /// hash to the exact `AuthorizedWriter::signing_key_fingerprint` the
+    /// policy chain bound to that writer -- the same two-part test
+    /// `author_was_writer_at` ends on (`role.is_writer() &&
+    /// fingerprint_admits(...)`, `change_policy.rs`). Without this second
+    /// half, the writer-role check would pass on `device_id` alone while
+    /// still trusting whatever key the NETMAP currently has pinned for that
+    /// device to have produced the signature actually verified above --
+    /// exactly the weak trust root this whole check exists to stop relying
+    /// on for write-authorization decisions. Unlike ordinary Change
+    /// admission, this call site has no `ChangeAuth` policy-watermark stamp
+    /// to check the signer against a specific historical seq -- it only has
+    /// the bare signer device id -- so this checks `current_writers()`,
+    /// `GroupPolicyState`'s existing "writer set as of the policy's own
+    /// current/latest verified position" accessor, rather than a historical
+    /// one.
+    ///
+    /// The full-replica check (the THIRD condition, `peer_group_is_full_
+    /// replica` below) is intentionally and unavoidably netmap-derived only,
+    /// with no signed-policy equivalent to bind against: `WriterRole`/the
+    /// signed policy chain has no storage-mode/full-replica concept at all,
+    /// so there is nothing in the policy chain for this to check the netmap
+    /// claim against. Do not assume the fingerprint-binding fix above
+    /// extends to this check too -- it does not, and cannot with the policy
+    /// chain's current shape.
     fn check_signer_authorized_for_group(
         &self,
         required: &RebootstrapRequired,
@@ -80,16 +117,82 @@ impl DaemonRebootstrapHandler {
         if signer == self.state.device_id {
             return Ok(());
         }
-        if matches!(self.state.resolve_group_policy(group_id), GroupPolicyResolution::Withhold) {
-            return Err(SyncError::CorruptState(format!(
-                "cannot accept re-bootstrap manifest for group {group_id}: group policy is \
-                 currently withheld"
-            )));
-        }
-        if !self.state.peer_is_writer(signer, group_id) {
+        let is_writer = match self.state.resolve_group_policy(group_id) {
+            GroupPolicyResolution::Verified(policy) => {
+                // A verified policy whose `current_writers()` is empty -- a
+                // genuinely empty signed log, or a chain where every past
+                // writer has since been revoked or downgraded to Viewer --
+                // is treated as "no authorized writer for this group, full
+                // stop": `find` below returns `None` and `is_writer` resolves
+                // to `false` unconditionally, with no netmap-derived
+                // fallback of any kind. This is a deliberate, fail-closed
+                // choice, and it differs on purpose from how the SAME
+                // scenario is handled elsewhere in this codebase:
+                //   - `local_change_auth_provider` (daemon_state.rs) falls
+                //     through to `author_was_writer_at`'s own empty-log
+                //     special case, which ALLOWS local emission (treats an
+                //     empty verified log the same as the pre-policy
+                //     Bootstrap window);
+                //   - `repair_election_provider` (daemon_state.rs) falls
+                //     back to the netmap's role-blind member set (see the
+                //     TODO on that function for the follow-up needed to
+                //     reconcile this).
+                // Re-bootstrap is different in kind from both: it installs a
+                // BRAND NEW HistoryBase for the group, wholesale replacing
+                // retained history, on the strength of a single signer claim
+                // with no group-wide quorum or merge to fall back on if that
+                // signer turns out to be wrong. An empty verified writer set
+                // gives this function no signed authority to point to at
+                // all, so rejecting outright -- rather than guessing via
+                // netmap membership, or treating "empty" as "still
+                // bootstrapping" -- is the only answer that cannot be
+                // exploited by a compromised or spoofed netmap entry. This
+                // is a real behavior change from the pre-fix
+                // membership-based version (which relied on
+                // `peer_is_writer` and so would have allowed this); see
+                // `check_signer_authorized_for_group_rejects_every_signer_when_the_verified_policy_names_no_writers`
+                // below for regression coverage.
+                policy
+                    .current_writers()
+                    .into_iter()
+                    .find(|writer| writer.device_id == signer)
+                    .is_some_and(|writer| {
+                        // Fail closed if there is no LIVE netmap-pinned key
+                        // to compare against (matches `trust_key`'s own
+                        // fail-closed behavior for signature verification).
+                        self.trust_key(signer)
+                            .map(|signer_key| {
+                                let presented_fingerprint: [u8; 32] =
+                                    Sha256::digest(signer_key).into();
+                                presented_fingerprint == writer.signing_key_fingerprint
+                            })
+                            .unwrap_or(false)
+                    })
+            }
+            GroupPolicyResolution::Bootstrap => {
+                // Genuine pre-policy bootstrap window: no signed policy
+                // chain has ever existed for this group, so there is no
+                // role data -- and so no signing-key binding either -- to
+                // check against. Fall back to netmap membership, exactly
+                // matching `local_change_auth_provider`'s and
+                // `accepts_change_auth`'s own Bootstrap-arm behavior (both
+                // documented as legitimate on this narrow pre-role window;
+                // see their own comments).
+                self.state.peer_is_writer(signer, group_id)
+            }
+            GroupPolicyResolution::Withhold => {
+                return Err(SyncError::CorruptState(format!(
+                    "cannot accept re-bootstrap manifest for group {group_id}: group policy is \
+                     currently withheld"
+                )));
+            }
+        };
+        if !is_writer {
             return Err(SyncError::CorruptState(format!(
                 "re-bootstrap manifest signer {signer} is not a current writer for group \
-                 {group_id}; refusing to install a HistoryBase it is not authorized to introduce"
+                 {group_id}, or its signing key does not match the key the signed policy chain \
+                 bound to that writer; refusing to install a HistoryBase it is not authorized to \
+                 introduce"
             )));
         }
         if !self.state.peer_group_is_full_replica(signer, group_id) {
@@ -376,6 +479,278 @@ mod tests {
         let handler = DaemonRebootstrapHandler { state };
         let required = required_signed_by("g", "device-a", &key);
         handler.check_signer_authorized_for_group(&required).unwrap();
+    }
+
+    /// Bug 2 regression: this function's own doc comment says the signer
+    /// must be "a device this policy currently recognizes as a writer" --
+    /// but the pre-fix code checked `state.peer_is_writer`, which is
+    /// populated from plain netmap membership (every authorized group
+    /// member, Viewer included; see `DaemonState::replace_peer_netmap_
+    /// metadata`), not from the signed policy chain's Editor/Owner role
+    /// data. That let a Viewer-role device's re-bootstrap manifest --
+    /// installing a brand-new HistoryBase/compaction snapshot for the
+    /// group -- be accepted as though it came from a real writer. This
+    /// proves a Viewer-signed manifest is now rejected, and the identical
+    /// manifest signed by the same device once re-granted Editor (and
+    /// marked a full replica, the separate, unchanged full-replica check)
+    /// is accepted.
+    #[tokio::test]
+    async fn check_signer_authorized_for_group_rejects_a_viewer_and_accepts_the_same_device_as_an_editor(
+    ) {
+        use crate::change_policy::policy_signing::grant_record;
+        use crate::change_policy::{verify_group_policy_log, GroupPolicyLog, WriterRole};
+
+        let authority = SigningKey::from_bytes(&[7u8; 32]);
+        let group_id = "group-rebootstrap";
+        let signer_key = SigningKey::from_bytes(&[13u8; 32]);
+        let signer_fp: [u8; 32] = Sha256::digest(signer_key.verifying_key().to_bytes()).into();
+
+        let viewer_grant = grant_record(
+            &authority,
+            group_id,
+            1,
+            [0u8; 32],
+            "device-b",
+            signer_fp,
+            WriterRole::Viewer,
+        );
+        let viewer_head: [u8; 32] = viewer_grant.record_hash.as_slice().try_into().unwrap();
+        let viewer_log = GroupPolicyLog {
+            group_id: group_id.to_string(),
+            current_seq: 1,
+            current_epoch: 0,
+            policy_head: viewer_head.to_vec(),
+            records: vec![viewer_grant],
+        };
+        let viewer_policy =
+            verify_group_policy_log(&authority.verifying_key().to_bytes(), &viewer_log).unwrap();
+
+        let state = test_state();
+        // device-b is a real netmap-authorized group member -- exactly what
+        // a Viewer legitimately is (membership and write-role are separate
+        // axes; see `WriterRole`'s own doc comment). This is what makes the
+        // pre-fix check dangerous: `peer_is_writer` returns true here
+        // (membership alone), which is precisely why this test needs the
+        // real signed-policy role check instead.
+        state.set_peer_group_writer("device-b", group_id, true);
+        // Also already a full replica for the whole test, so the ONLY thing
+        // that changes between the Viewer and Editor phases below is the
+        // signed policy role -- isolating the writer-role check this test
+        // targets from the separate, unchanged full-replica check.
+        state.set_peer_group_full_replica("device-b", group_id, true);
+        // The netmap-pinned key matches the policy-bound fingerprint for the
+        // whole test (both derived from the same `signer_key`) -- fix 1's
+        // added fingerprint-binding check is exercised elsewhere
+        // (`..._rejects_a_manifest_signed_with_a_key_the_policy_never_bound_to_the_writer`);
+        // this test isolates the writer-ROLE check only, so the fingerprint
+        // half must trivially agree throughout.
+        state.record_peer_signing_key("device-b", signer_key.verifying_key().to_bytes());
+        state.replace_group_policy_states(std::collections::HashMap::from([(
+            group_id.to_string(),
+            viewer_policy,
+        )]));
+        let handler = DaemonRebootstrapHandler { state: state.clone() };
+        let required = required_signed_by(group_id, "device-b", &signer_key);
+
+        let error = handler.check_signer_authorized_for_group(&required).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SyncError::CorruptState(ref message) if message.contains("is not a current writer")
+            ),
+            "expected a Viewer-signed re-bootstrap manifest to be rejected as not-a-writer, got \
+             {error:?}"
+        );
+
+        // Promote device-b to Editor at seq 2 -- membership and full-replica
+        // status are unchanged from above, so this isolates the writer-role
+        // check. The identical manifest must now be accepted.
+        let editor_grant = grant_record(
+            &authority,
+            group_id,
+            2,
+            viewer_head,
+            "device-b",
+            signer_fp,
+            WriterRole::Editor,
+        );
+        let editor_head: [u8; 32] = editor_grant.record_hash.as_slice().try_into().unwrap();
+        let editor_log = GroupPolicyLog {
+            group_id: group_id.to_string(),
+            current_seq: 2,
+            current_epoch: 0,
+            policy_head: editor_head.to_vec(),
+            records: vec![
+                grant_record(
+                    &authority,
+                    group_id,
+                    1,
+                    [0u8; 32],
+                    "device-b",
+                    signer_fp,
+                    WriterRole::Viewer,
+                ),
+                editor_grant,
+            ],
+        };
+        let editor_policy =
+            verify_group_policy_log(&authority.verifying_key().to_bytes(), &editor_log).unwrap();
+        state.replace_group_policy_states(std::collections::HashMap::from([(
+            group_id.to_string(),
+            editor_policy,
+        )]));
+
+        handler.check_signer_authorized_for_group(&required).unwrap();
+    }
+
+    /// Signing-key fingerprint binding regression test: the writer-role
+    /// check alone is not enough -- the manifest's ACTUAL signing key must
+    /// also match the key the SIGNED POLICY CHAIN bound to that writer, not
+    /// merely whatever key the
+    /// (netmap-derived, weak) `trust_key` resolver currently has pinned for
+    /// that device id. The policy binds device-b's Editor grant to key A's
+    /// fingerprint; the netmap separately has a DIFFERENT key B pinned for
+    /// device-b; the manifest is signed with key B. Before this fix,
+    /// `check_signer_authorized_for_group` only checked `writer.device_id
+    /// == signer` against `current_writers()` and never consulted
+    /// `AuthorizedWriter::signing_key_fingerprint` at all, so this was
+    /// wrongly accepted -- a manifest signed by a key the signed policy
+    /// chain never actually authorized for that writer. The existing
+    /// `check_signer_authorized_for_group_rejects_a_viewer_and_accepts_the_same_device_as_an_editor`
+    /// test above can't catch this: it uses ONE key for both the Viewer and
+    /// Editor phases, so `writer.device_id == signer` and a hypothetical
+    /// fingerprint check would always agree there too. This test needs two
+    /// DISTINCT keys to isolate the gap.
+    #[tokio::test]
+    async fn check_signer_authorized_for_group_rejects_a_manifest_signed_with_a_key_the_policy_never_bound_to_the_writer(
+    ) {
+        use crate::change_policy::policy_signing::grant_record;
+        use crate::change_policy::{verify_group_policy_log, GroupPolicyLog, WriterRole};
+
+        let authority = SigningKey::from_bytes(&[7u8; 32]);
+        let group_id = "group-rebootstrap-fp-binding";
+        // Key A: the key the signed policy chain binds device-b's Editor
+        // grant to.
+        let policy_bound_key = SigningKey::from_bytes(&[21u8; 32]);
+        let policy_bound_fp: [u8; 32] =
+            Sha256::digest(policy_bound_key.verifying_key().to_bytes()).into();
+        // Key B: a DIFFERENT key, netmap-pinned for the SAME device id, and
+        // the one the manifest is actually signed with -- the forged/wrong
+        // key an attacker who controls the netmap pin (but not device-b's
+        // real key A) would use.
+        let netmap_pinned_key = SigningKey::from_bytes(&[22u8; 32]);
+        assert_ne!(
+            policy_bound_key.verifying_key().to_bytes(),
+            netmap_pinned_key.verifying_key().to_bytes(),
+            "test setup bug: the two keys must be distinct for this probe to mean anything"
+        );
+
+        let editor_grant = grant_record(
+            &authority,
+            group_id,
+            1,
+            [0u8; 32],
+            "device-b",
+            policy_bound_fp,
+            WriterRole::Editor,
+        );
+        let editor_head: [u8; 32] = editor_grant.record_hash.as_slice().try_into().unwrap();
+        let editor_log = GroupPolicyLog {
+            group_id: group_id.to_string(),
+            current_seq: 1,
+            current_epoch: 0,
+            policy_head: editor_head.to_vec(),
+            records: vec![editor_grant],
+        };
+        let editor_policy =
+            verify_group_policy_log(&authority.verifying_key().to_bytes(), &editor_log).unwrap();
+
+        let state = test_state();
+        state.set_peer_group_writer("device-b", group_id, true);
+        state.set_peer_group_full_replica("device-b", group_id, true);
+        // The attack: the netmap has key B pinned for device-b, NOT key A
+        // the signed policy chain actually bound.
+        state.record_peer_signing_key("device-b", netmap_pinned_key.verifying_key().to_bytes());
+        state.replace_group_policy_states(std::collections::HashMap::from([(
+            group_id.to_string(),
+            editor_policy,
+        )]));
+        let handler = DaemonRebootstrapHandler { state: state.clone() };
+        // Manifest claims signer "device-b" (a real Editor per the policy
+        // chain) but is signed with key B, which the policy chain never
+        // bound to device-b.
+        let required = required_signed_by(group_id, "device-b", &netmap_pinned_key);
+
+        let error = handler.check_signer_authorized_for_group(&required).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SyncError::CorruptState(ref message) if message.contains("is not a current writer")
+            ),
+            "expected a manifest signed with a key the signed policy chain never bound to this \
+             writer to be rejected even though the same device id is a real Editor under a \
+             DIFFERENT key, got {error:?}"
+        );
+    }
+
+    /// Empty-verified-writer-set regression test: a signed policy
+    /// chain that has been verified but currently names ZERO writers (a
+    /// genuinely empty log here; a chain where every writer has since been
+    /// revoked reaches the identical `current_writers().is_empty()` state)
+    /// must reject every signer unconditionally -- no netmap-membership
+    /// fallback of any kind, even for a device the netmap otherwise
+    /// considers both a group member and a full replica. See this
+    /// function's own doc comment (the paragraph on `current_writers()`
+    /// being empty) for why this differs, on purpose, from how
+    /// `local_change_auth_provider` and `repair_election_provider`
+    /// (`daemon_state.rs`) each handle the identical scenario.
+    #[tokio::test]
+    async fn check_signer_authorized_for_group_rejects_every_signer_when_the_verified_policy_names_no_writers(
+    ) {
+        use crate::change_policy::{verify_group_policy_log, GroupPolicyLog};
+
+        let authority = SigningKey::from_bytes(&[7u8; 32]);
+        let group_id = "group-empty-writer-set";
+        let empty_log = GroupPolicyLog {
+            group_id: group_id.to_string(),
+            current_seq: 0,
+            current_epoch: 0,
+            policy_head: vec![0u8; 32],
+            records: vec![],
+        };
+        let empty_policy =
+            verify_group_policy_log(&authority.verifying_key().to_bytes(), &empty_log).unwrap();
+        assert!(
+            empty_policy.current_writers().is_empty(),
+            "test setup bug: this policy must have an empty writer set for the probe to mean \
+             anything"
+        );
+
+        let state = test_state();
+        let signer_key = SigningKey::from_bytes(&[31u8; 32]);
+        // device-b looks like a fully legitimate signer by every
+        // netmap-derived signal -- a real member, a real full replica, and
+        // its real live key is pinned -- so the ONLY reason this must be
+        // rejected is the empty verified writer set itself.
+        state.set_peer_group_writer("device-b", group_id, true);
+        state.set_peer_group_full_replica("device-b", group_id, true);
+        state.record_peer_signing_key("device-b", signer_key.verifying_key().to_bytes());
+        state.replace_group_policy_states(std::collections::HashMap::from([(
+            group_id.to_string(),
+            empty_policy,
+        )]));
+        let handler = DaemonRebootstrapHandler { state: state.clone() };
+        let required = required_signed_by(group_id, "device-b", &signer_key);
+
+        let error = handler.check_signer_authorized_for_group(&required).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SyncError::CorruptState(ref message) if message.contains("is not a current writer")
+            ),
+            "expected a verified-but-empty writer set to reject every signer unconditionally, \
+             got {error:?}"
+        );
     }
 
     /// Issue D2: trusting the outer `SnapshotManifest` signer (verified

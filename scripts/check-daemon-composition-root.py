@@ -12,19 +12,23 @@ and the external integration-test binaries under `tests/`, so never
 `#[cfg(test)]`-gated itself), and `#[cfg(test)]`-gated call sites in
 `control_socket.rs`/`diagnostics_ipc.rs`.
 
-This is a substring/brace-matching scan, not a real Rust parser -- same
-class of tool as `check-daemon-application-dependencies.py`, with the
-same false-positive/evasion tradeoffs documented there. `#[cfg(test)]`
-span detection reuses `gen-daemon-production-graph.py`'s own brace-
-matching approach (see that script's `strip_cfg_test_blocks` for the
-same technique, doc comment included).
+This stays a separate script rather than an `architecture.toml` rule
+because what it enforces is not a boundary between crates or paths but a
+three-tier per-file call allowlist with `#[cfg(test)]` span awareness,
+specific to one crate's startup sequence.
 
-Phase 2E: this gate exists specifically to keep "build the whole
-application/query layer fresh on every single request/tick" (the
-pattern every one of Phase 2's slices worked to eliminate) from quietly
-reappearing at a new call site once this check is in place -- new
-violations must be treated as real regressions, not adjusted into the
-allowlist without a documented reason.
+This is a substring/brace-matching scan, not a real Rust parser -- same
+class of tool as `scripts/check-architecture.py`, with the same
+false-positive/evasion tradeoffs documented there. `#[cfg(test)]` span
+detection reuses `gen-daemon-production-graph.py`'s own brace-matching
+approach (see that script's `strip_cfg_test_blocks` for the same
+technique, doc comment included).
+
+This gate exists specifically to keep "build the whole application/query
+layer fresh on every single request/tick" from quietly reappearing at a
+new call site: constructing those services is expensive and is meant to
+happen once, at startup. New violations must be treated as real
+regressions, not adjusted into the allowlist without a documented reason.
 """
 
 from __future__ import annotations
@@ -47,16 +51,15 @@ DEFINITION_FILE = "adapters/mod.rs"
 
 # Files allowed to call the composition-root builders, relative to
 # DAEMON_SRC. `daemon_state.rs` is allowed twice over: `DaemonState::new`
-# (the Section B compatibility wrapper every existing test call site still
-# uses) and `run_membership_recovery_sweep` (the periodic sweep
+# (the compatibility wrapper every existing test call site still uses) and
+# `run_membership_recovery_sweep` (the periodic sweep
 # `maintenance_coordinator` schedules) -- the latter rebuilds
 # `ApplicationServices` on every tick rather than reusing a shared
-# instance, a known, documented gap (see this repo's Phase 2 exit report),
-# not a silent oversight; narrowing it requires reordering `app.rs`'s
-# startup sequence (building `ApplicationServices` before starting
-# `MaintenanceCoordinator`, which currently starts first -- Section B's own
-# ordering guarantee) and is deliberately left for a later pass rather than
-# risking that ordering here.
+# instance, a known gap rather than a silent oversight. Narrowing it
+# requires reordering `app.rs`'s startup sequence (building
+# `ApplicationServices` before starting `MaintenanceCoordinator`, which
+# currently starts first) and is deliberately left for a later pass rather
+# than risking that ordering here.
 ALLOWED_BUILD_CALLERS = {
     "app.rs",
     "control_context.rs",
@@ -71,7 +74,7 @@ TEST_GATED_ONLY_CALLERS = {
 }
 
 # `maintenance_coordinator::start` -- production's `app.rs` and the
-# `DaemonState::new` compatibility wrapper (Section B) are the only two
+# `DaemonState::new` compatibility wrapper are the only two
 # legitimate callers; nothing else should ever start the maintenance
 # background-task set a second time.
 ALLOWED_MAINTENANCE_START_CALLERS = {

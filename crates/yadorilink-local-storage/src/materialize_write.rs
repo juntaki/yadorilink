@@ -1549,10 +1549,8 @@ mod tests {
 
         apply_xattrs(&path, &[("user.a".to_string(), b"old".to_vec())]).unwrap();
 
-        assert!(
-            !verify_replicated_xattrs_exact(&path, &[("user.a".to_string(), b"new".to_vec())])
-                .unwrap()
-        );
+        assert!(!verify_replicated_xattrs_exact(&path, &[("user.a".to_string(), b"new".to_vec())])
+            .unwrap());
     }
 
     // The non-Linux `verify_replicated_xattrs_exact` arm (always

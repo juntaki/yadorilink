@@ -148,6 +148,45 @@ pub(crate) trait EnrollmentCoordination: Send + Sync {
         operation_id: &'a str,
         device_id: &'a str,
     ) -> BoxFuture<'a, EnrollmentCancellationResult>;
+
+    /// Cross-account invite-accept PREPARE. Unlike `prepare_join`, the
+    /// group id is not supplied -- only the invite `code` names it -- and a
+    /// successful `EnrollmentPrepareResult::Prepared` carries whatever
+    /// group id the coordination plane resolved the code to.
+    fn prepare_invite_accept<'a>(
+        &'a self,
+        operation_id: &'a str,
+        code: &'a str,
+        device_id: &'a str,
+        storage_mode: &'a str,
+    ) -> BoxFuture<'a, EnrollmentPrepareResult>;
+
+    fn activate_invite_accept<'a>(
+        &'a self,
+        group_id: &'a str,
+        operation_id: &'a str,
+        device_id: &'a str,
+    ) -> BoxFuture<'a, EnrollmentActivationResult>;
+
+    fn cancel_invite_accept<'a>(
+        &'a self,
+        group_id: &'a str,
+        operation_id: &'a str,
+        device_id: &'a str,
+    ) -> BoxFuture<'a, EnrollmentCancellationResult>;
+
+    /// Mints a one-use, expiring cross-account invite for `group_id`.
+    /// Stateless on this device -- no journal row, no local link -- so a
+    /// plain `Result` is enough; see `coordination_client::mint_invite`'s
+    /// own doc comment for why this doesn't need the same classified-
+    /// outcome treatment as prepare/activate/cancel.
+    fn mint_invite<'a>(
+        &'a self,
+        group_id: &'a str,
+        role: Option<&'a str>,
+        ttl_secs: Option<u64>,
+        requires_approval: bool,
+    ) -> BoxFuture<'a, Result<crate::application::model::MintedInvite, String>>;
 }
 
 /// A local link/marker/watcher commit request -- what the current `LinkFn`
@@ -181,4 +220,28 @@ pub(crate) trait EnrollmentLinkPort: Send + Sync {
         local_path: &'a str,
         operation_id: &'a str,
     ) -> BoxFuture<'a, Result<(), String>>;
+
+    /// The same underlying local-link commit as `commit`, but with no
+    /// `pending_enrollment` marker -- the plain `yadorilink link` shape,
+    /// used by the invite-accept saga instead of `commit`. Returns the SAME
+    /// two-variant `EnrollmentLinkError` `commit` does: `link()`'s `Err`
+    /// does NOT always mean nothing was committed (its own doc comment
+    /// documents a rollback-failure path where the link may still be live)
+    /// -- there is no `enrollment_operations` journal row to classify
+    /// against here (unlike `commit`'s `classify_link_failure`), so an
+    /// implementation must classify some other way (e.g. reading back
+    /// current local link state directly). Re-committing the SAME
+    /// (group_id, path) this already linked is an idempotent no-op, which
+    /// is what makes a retried invite-accept command (same code, same
+    /// deterministic operation id) safe to run again after a crash between
+    /// this call and the matching activate call -- see
+    /// `EnrollmentService::accept_invite_and_link`'s own doc comment for
+    /// the full retry story this depends on.
+    fn commit_plain<'a>(
+        &'a self,
+        group_id: &'a str,
+        absolute_path: &'a std::path::Path,
+        on_demand: bool,
+        acknowledge_risks: bool,
+    ) -> BoxFuture<'a, Result<(), crate::application::EnrollmentLinkError>>;
 }

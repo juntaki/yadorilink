@@ -77,11 +77,65 @@ pub struct PendingAdmission<'a> {
 
 pub struct ChangeHistoryRepository {
     database: Arc<SyncDatabase>,
+    /// Consulted by every remote-admission call this repository makes for
+    /// any orphan that admission's own arrival happens to promote -- see
+    /// `dag_store::orphan_integrity::promote_orphans`'s own doc comment for
+    /// why promotion needs a freshness re-check distinct from whatever
+    /// authorization decision let the row buffer as an orphan in the first
+    /// place. Defaults to `dag_store::always_current_writer` (permissive,
+    /// matching this repository's pre-fix behavior) until `yadorilink_
+    /// daemon::daemon_state::DaemonState::new` wires the real, policy-backed
+    /// check via `set_orphan_promotion_writer_check` -- the same late-bound-
+    /// provider pattern that module uses for `local_change_auth_provider`.
+    orphan_promotion_writer_check: std::sync::Mutex<Arc<dag_store::OrphanPromotionWriterCheck>>,
 }
 
 impl ChangeHistoryRepository {
     pub fn new(database: Arc<SyncDatabase>) -> Self {
-        Self { database }
+        Self {
+            database,
+            orphan_promotion_writer_check: std::sync::Mutex::new(Arc::new(
+                dag_store::always_current_writer,
+            )),
+        }
+    }
+
+    /// Installs the real, policy-backed orphan-promotion freshness check --
+    /// see this struct's own field doc comment.
+    pub fn set_orphan_promotion_writer_check(
+        &self,
+        check: Arc<dag_store::OrphanPromotionWriterCheck>,
+    ) {
+        *self.orphan_promotion_writer_check.lock().unwrap_or_else(|p| p.into_inner()) = check;
+    }
+
+    fn orphan_promotion_writer_check(&self) -> Arc<dag_store::OrphanPromotionWriterCheck> {
+        self.orphan_promotion_writer_check.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Re-attempts promotion for every orphan whose parent is already
+    /// durably admitted, using the currently-installed writer-freshness
+    /// check -- the deferred-promotion counterpart to `init_dag_schema`'s
+    /// startup self-heal sweep, which always defers every candidate (see
+    /// that call site's own comment: it runs before any trust material
+    /// could possibly be loaded, so it cannot answer the freshness check at
+    /// all). Once real trust IS available, a row that sweep deferred needs
+    /// something to give it a second chance -- ordinary admission only ever
+    /// seeds a promotion pass from the change it just admitted, never from
+    /// an orphan whose parent arrived by some other means (a crash between
+    /// `append_change` and `promote_orphans`, or a row deferred here for
+    /// lack of trust). `yadorilink_daemon::peer_orchestrator::
+    /// record_group_policy_states` calls this once per netmap frame that
+    /// verifies at least one group's policy, right after installing the
+    /// freshly-verified state -- the same moment retained-history
+    /// re-validation (`NetmapChangeAuthenticator::
+    /// validate_linked_history_best_effort`) treats as "trust just became
+    /// fresh enough to check."
+    pub fn resweep_deferred_orphan_promotions(&self) -> Result<Vec<ChangeHash>, SyncSqliteError> {
+        let writer_check = self.orphan_promotion_writer_check();
+        self.database.write_immediate::<_, SyncSqliteError>(|tx| {
+            dag_store::resweep_deferred_orphan_promotions(tx, writer_check.as_ref())
+        })
     }
 
     /// Appends a group's initial-import changes in a single transaction, but
@@ -462,11 +516,17 @@ impl ChangeHistoryRepository {
         versions: &[FileVersion],
         applied: bool,
     ) -> Result<dag_store::AdmitResult, SyncSqliteError> {
+        let writer_check = self.orphan_promotion_writer_check();
         let result = self.database.write_immediate::<_, SyncSqliteError>(|tx| {
             for version in versions {
                 dag_store::put_file_version(tx, change.group_id.as_str(), version)?;
             }
-            dag_store::admit_change(tx, change, applied)
+            dag_store::admit_change_with_orphan_writer_check(
+                tx,
+                change,
+                applied,
+                writer_check.as_ref(),
+            )
         });
         if matches!(result, Err(SyncSqliteError::CausalAuthViolation)) {
             self.database.write_immediate::<_, SyncSqliteError>(|tx| {
@@ -554,6 +614,7 @@ impl ChangeHistoryRepository {
         // below tell "one of our items failed" (safe, deterministic to
         // replay) apart from "the transaction itself failed" (not).
         let item_failure = std::cell::Cell::new(false);
+        let writer_check = self.orphan_promotion_writer_check();
         let fast_path = self.database.write_immediate::<_, SyncSqliteError>(|tx| {
             let mut chunk_results = Vec::with_capacity(chunk.len());
             for item in chunk {
@@ -565,7 +626,12 @@ impl ChangeHistoryRepository {
                         return Err(e);
                     }
                 }
-                match dag_store::admit_change(tx, item.change, item.applied) {
+                match dag_store::admit_change_with_orphan_writer_check(
+                    tx,
+                    item.change,
+                    item.applied,
+                    writer_check.as_ref(),
+                ) {
                     Ok(admitted) => chunk_results.push(admitted),
                     Err(e) => {
                         item_failure.set(true);

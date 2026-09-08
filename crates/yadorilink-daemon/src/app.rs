@@ -244,6 +244,57 @@ fn enforce_trust_root_gate_at_startup() -> anyhow::Result<()> {
     })
 }
 
+/// A boolean-flag-shaped env var is "set" (the flag is on) for any value
+/// other than `0`/`false` (case-insensitive), including an empty string --
+/// merely setting `YADORILINK_HTTP_API_DISABLE=` is treated as intent to
+/// disable, not as an accidental no-op. Unset is always "not set". A pure
+/// function over `std::env::var`'s own `Result` (rather than reading the
+/// env var itself) so this convention is unit-testable without mutating
+/// process-global env state.
+#[cfg_attr(madsim, allow(dead_code))]
+fn env_disable_flag_is_set(value: Result<String, std::env::VarError>) -> bool {
+    match value {
+        Ok(v) => {
+            let v = v.trim();
+            !(v == "0" || v.eq_ignore_ascii_case("false"))
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(all(test, not(madsim)))]
+mod env_disable_flag_tests {
+    use super::env_disable_flag_is_set;
+
+    fn set(v: &str) -> Result<String, std::env::VarError> {
+        Ok(v.to_string())
+    }
+    fn unset() -> Result<String, std::env::VarError> {
+        Err(std::env::VarError::NotPresent)
+    }
+
+    #[test]
+    fn unset_is_not_disabled() {
+        assert!(!env_disable_flag_is_set(unset()));
+    }
+
+    #[test]
+    fn merely_setting_it_including_empty_disables() {
+        assert!(env_disable_flag_is_set(set("")));
+        assert!(env_disable_flag_is_set(set("1")));
+        assert!(env_disable_flag_is_set(set("yes")));
+    }
+
+    #[test]
+    fn explicit_falsy_values_do_not_disable() {
+        assert!(!env_disable_flag_is_set(set("0")));
+        assert!(!env_disable_flag_is_set(set("false")));
+        assert!(!env_disable_flag_is_set(set("False")));
+        assert!(!env_disable_flag_is_set(set("FALSE")));
+        assert!(!env_disable_flag_is_set(set(" 0 ")));
+    }
+}
+
 pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     #[cfg(feature = "enforce-release-trust-root")]
     enforce_trust_root_gate_at_startup()?;
@@ -702,6 +753,79 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
         });
     }
 
+    // Localhost HTTP/REST + SSE dashboard, a thin translation layer over
+    // this same control socket/pipe (see `yadorilink-http-api`'s own crate
+    // doc comment; also documented for operators in README.md's "HTTP API
+    // and web dashboard" section) -- not started under the deterministic
+    // simulator, same reasoning as the control-socket/shell-IPC essential
+    // tasks above (no in-sim equivalent of a real TCP listener or this
+    // crate's own control-socket dialer). Non-essential/best-effort, like
+    // NAT-traversal below: a failure to bind (most likely the configured
+    // port already in use) must not take down folder sync. Opt-out only,
+    // never opt-in, so the dashboard is available by default for a headless
+    // Linux box or NAS with no desktop, where the only other way to see
+    // sync status is SSH plus the CLI -- `YADORILINK_HTTP_API_DISABLE` is
+    // the accidental-opt-out escape hatch (tests that don't want a second
+    // listener bound per daemon instance use it). This does shift part of
+    // this daemon's trust boundary: the existing control socket is gated by
+    // Unix filesystem permissions (owning-uid only), while this dashboard is
+    // gated by a bearer token readable by that uid but reachable, as a raw
+    // TCP connection, by every local uid -- see README.md for that trade-off
+    // written out.
+    #[cfg(not(madsim))]
+    if !env_disable_flag_is_set(std::env::var("YADORILINK_HTTP_API_DISABLE")) {
+        #[cfg(unix)]
+        let control_socket_path = control_socket_path.clone();
+        #[cfg(windows)]
+        let control_pipe_name = device_config::control_pipe_name();
+
+        const DEFAULT_HTTP_API_PORT: u16 = 8484;
+        let port: u16 = match std::env::var("YADORILINK_HTTP_API_PORT") {
+            Ok(v) => v.parse().unwrap_or_else(|_| {
+                tracing::warn!(
+                    value = %v,
+                    default = DEFAULT_HTTP_API_PORT,
+                    "YADORILINK_HTTP_API_PORT is set but not a valid port number; using the default"
+                );
+                DEFAULT_HTTP_API_PORT
+            }),
+            Err(_) => DEFAULT_HTTP_API_PORT,
+        };
+        // A single explicit dev-server origin, never a wildcard -- see
+        // `yadorilink-http-api`'s own security module doc comment.
+        let extra_allowed_origins =
+            std::env::var("YADORILINK_HTTP_API_DEV_ORIGIN").into_iter().collect();
+
+        let http_api_config = yadorilink_http_api::HttpApiConfig {
+            #[cfg(unix)]
+            control_socket_path,
+            #[cfg(windows)]
+            control_pipe_name,
+            token_path: dir.join("http-api-token"),
+            port,
+            extra_allowed_origins,
+        };
+        match yadorilink_http_api::bind(&http_api_config).await {
+            Ok(handle) => {
+                tracing::info!(
+                    port = handle.port,
+                    token_path = %http_api_config.token_path.display(),
+                    "http api listening on 127.0.0.1 (and [::1] where available); bearer token \
+                     written to token_path, readable only by this OS user"
+                );
+                crate::supervise::spawn_logged("http-api", async move {
+                    yadorilink_http_api::run(handle).await
+                });
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "failed to start the localhost HTTP API dashboard; folder sync is unaffected"
+                );
+            }
+        }
+    }
+
     match (device_config, token_store::load_access_token()) {
         (Some(cfg), Some(access_token)) => {
             tracing::info!(device_id = %cfg.device_id, "connecting to coordination plane");
@@ -797,6 +921,23 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
                 crate::supervise::spawn_logged("nat-traversal", async move {
                     crate::nat_traversal::run(nat_config, addr, token, device_id, nat_state).await;
                     Ok(())
+                });
+            }
+
+            // Track Send: waits for the peer orchestrator spawned below to
+            // publish this device's `QuicPeerEndpoint`, then builds and
+            // serves this device's Track Send service -- a wholly separate
+            // protocol on the same endpoint, never the sync DAG/
+            // materialization machinery the rest of this daemon serves. Not
+            // an `essential.spawn` task: a device that cannot yet (or ever)
+            // establish coordination-plane connectivity should not bring
+            // the whole daemon down over a feature that itself has no
+            // effect on linked-folder sync.
+            {
+                let state = state.clone();
+                let config_dir = dir.clone();
+                crate::supervise::spawn_logged("send-transfer-inbound", async move {
+                    crate::send_transfer::run(state, config_dir).await
                 });
             }
 

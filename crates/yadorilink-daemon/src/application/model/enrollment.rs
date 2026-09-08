@@ -27,6 +27,14 @@ pub(crate) enum EnrollmentPrepareResult {
 pub(crate) enum EnrollmentActivationResult {
     Activated,
     AlreadyActive,
+    /// Cross-account invite acceptance only: the coordination plane
+    /// accepted this device's half, but the invite required the group
+    /// owner's approval, so the membership is parked awaiting their
+    /// decision and grants nothing yet. A success as far as this device's
+    /// own protocol obligations go -- there is nothing left for it to
+    /// retry, compensate, or reconcile -- but NOT a membership, and callers
+    /// must not describe it as one.
+    AwaitingApproval,
     /// A CONFIRMED terminal answer: the coordination plane has nothing left
     /// to activate for this operation.
     Deleted,
@@ -46,4 +54,21 @@ pub(crate) enum EnrollmentCancellationResult {
     Ambiguous {
         detail: String,
     },
+}
+
+/// A freshly-minted, one-use cross-account invite -- the plaintext `code`
+/// is returned exactly once, here, and never persisted by this device (the
+/// coordination plane stores only its hash).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MintedInvite {
+    pub(crate) code: String,
+    pub(crate) invite_id: String,
+    pub(crate) group_id: String,
+    pub(crate) role: String,
+    pub(crate) expires_at_unix: i64,
+    /// Whether accepting this invite still needs the group owner's
+    /// explicit approval before it grants anything. Echoed back by the
+    /// coordination plane rather than assumed from what was requested, so
+    /// a caller describes the invite that actually exists.
+    pub(crate) requires_approval: bool,
 }

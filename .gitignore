@@ -64,6 +64,12 @@ installer/windows/Output/
 installer/linux/.stage/
 installer/linux/dist/
 
+# installer/linux/apt/build-keyring-deb.sh's scratch/output dirs — same
+# rebuilt-from-scratch, not-checked-in shape as installer/linux/.stage/
+# and installer/linux/dist/ above.
+installer/linux/apt/.stage/
+installer/linux/apt/dist/
+
 # Generated per-release artifacts (scripts/generate-release-sbom.py,
 # scripts/generate-release-evidence.py,
 # scripts/ci/generate-release-checksums.py --out) — regenerated for each

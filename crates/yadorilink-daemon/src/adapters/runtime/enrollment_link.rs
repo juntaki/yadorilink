@@ -66,6 +66,66 @@ impl EnrollmentLinkPort for DaemonEnrollmentLinkAdapter {
             Ok(())
         })
     }
+
+    fn commit_plain<'a>(
+        &'a self,
+        group_id: &'a str,
+        absolute_path: &'a std::path::Path,
+        on_demand: bool,
+        acknowledge_risks: bool,
+    ) -> BoxFuture<'a, Result<(), EnrollmentLinkError>> {
+        Box::pin(async move {
+            let local_path = absolute_path.to_string_lossy().to_string();
+            let Err(link_error) = self
+                .link_lifecycle
+                .link(LinkCommand {
+                    local_path: local_path.clone(),
+                    group_id: group_id.to_string(),
+                    on_demand,
+                    max_local_size_bytes: None,
+                    acknowledge_risks,
+                    pending_enrollment: None,
+                })
+                .await
+            else {
+                return Ok(());
+            };
+            let detail = link_error.to_string();
+            // No `enrollment_operations` journal row exists for a plain
+            // link -- classify by reading CURRENT local link state back
+            // directly instead (`LinkLifecycleService::is_linked`), the
+            // same authoritative source `link()`'s own duplicate-group
+            // check reads. See `commit_plain`'s own doc comment (port
+            // trait) for why `link()`'s `Err` alone is not enough here.
+            match self.link_lifecycle.is_linked(group_id, &local_path) {
+                Ok(true) => Err(EnrollmentLinkError::CommitUncertain {
+                    detail: format!(
+                        "{detail}; the local link may still be committed even though this call \
+                         is reporting failure, so remote cancellation was not attempted"
+                    ),
+                }),
+                Ok(false) => Err(EnrollmentLinkError::NotCommitted { detail }),
+                Err(read_err) => {
+                    // Can't even confirm which -- fail closed the same way
+                    // `classify_link_failure`'s own unreachable/unknown-
+                    // state branch does: assume it may still be committed.
+                    tracing::error!(
+                        error = %read_err,
+                        group_id,
+                        local_path = %local_path,
+                        "commit_plain: link() failed and the local link state re-check ALSO \
+                         failed -- cannot confirm whether the link is actually committed"
+                    );
+                    Err(EnrollmentLinkError::CommitUncertain {
+                        detail: format!(
+                            "{detail}; could not confirm local link state after the failure \
+                             ({read_err}), so remote cancellation was not attempted"
+                        ),
+                    })
+                }
+            }
+        })
+    }
 }
 
 fn enrollment_link_to_command(link: EnrollmentLinkRequest) -> LinkCommand {
@@ -133,6 +193,7 @@ async fn classify_link_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::ports::{LinkRepositoryPort, LinkWatcherPort};
     use crate::application::EnrollmentKind;
 
     fn test_state() -> Arc<DaemonState> {
@@ -297,6 +358,164 @@ mod tests {
         assert!(
             matches!(result, Err(EnrollmentLinkError::CommitUncertain { .. })),
             "expected CommitUncertain (fail closed), got {result:?}"
+        );
+    }
+
+    /// `LinkLifecycleService::is_linked` -- the primitive `commit_plain`'s
+    /// own classification is built on, since a plain link has no
+    /// `enrollment_operations` journal row to read back the way
+    /// `classify_link_failure` does above.
+    #[tokio::test]
+    async fn is_linked_reports_true_only_for_a_genuinely_live_matching_path() {
+        let state = test_state();
+        let lifecycle = test_link_lifecycle(&state);
+        let linked = tempfile::tempdir().unwrap();
+        let linked_path = linked.path().to_string_lossy().to_string();
+        state.replica_coordinator.link_repository().add_link(&linked_path, "group-1").unwrap();
+
+        assert!(
+            lifecycle.is_linked("group-1", &linked_path).unwrap(),
+            "the exact (group, path) that was just linked must report true"
+        );
+
+        let elsewhere = tempfile::tempdir().unwrap();
+        assert!(
+            !lifecycle.is_linked("group-1", &elsewhere.path().to_string_lossy()).unwrap(),
+            "a different path for the SAME group must report false"
+        );
+        assert!(
+            !lifecycle.is_linked("group-2", &linked_path).unwrap(),
+            "the same path under a DIFFERENT group must report false"
+        );
+    }
+
+    /// Forwards every `LinkRepositoryPort` call to a real, working adapter
+    /// EXCEPT `remove_link`, which always fails -- the one piece
+    /// `classify_link_failure`'s own tests above never needed to fake
+    /// (they vary journal-row state instead), but `commit_plain` has no
+    /// journal to read, so proving its classification right requires
+    /// actually reaching "commit landed, watcher failed, rollback ALSO
+    /// failed" for real, not asserting it from a stub.
+    struct RemoveLinkAlwaysFails {
+        inner: super::super::link_lifecycle::DaemonLinkRepositoryAdapter,
+    }
+
+    impl LinkRepositoryPort for RemoveLinkAlwaysFails {
+        fn live_link_paths_for_group(
+            &self,
+            group_id: &str,
+        ) -> Result<Vec<String>, crate::sync_error::SyncError> {
+            self.inner.live_link_paths_for_group(group_id)
+        }
+        fn list_link_paths(&self) -> Result<Vec<String>, crate::sync_error::SyncError> {
+            self.inner.list_link_paths()
+        }
+        fn commit_plain_link(
+            &self,
+            local_path: &str,
+            group_id: &str,
+        ) -> Result<(), crate::sync_error::SyncError> {
+            self.inner.commit_plain_link(local_path, group_id)
+        }
+        fn commit_link_with_pending_enrollment(
+            &self,
+            local_path: &str,
+            group_id: &str,
+            marker: &PendingEnrollmentLinkCommand,
+        ) -> Result<(), crate::sync_error::SyncError> {
+            self.inner.commit_link_with_pending_enrollment(local_path, group_id, marker)
+        }
+        fn remove_link(&self, _local_path: &str) -> Result<(), crate::sync_error::SyncError> {
+            Err(std::io::Error::other("simulated remove_link failure").into())
+        }
+        fn rollback_local_setup_to_cancel_pending(
+            &self,
+            local_path: &str,
+            operation_id: &str,
+            detail: &str,
+        ) -> Result<(), crate::sync_error::SyncError> {
+            self.inner.rollback_local_setup_to_cancel_pending(local_path, operation_id, detail)
+        }
+        fn mark_enrollment_activation_pending(
+            &self,
+            operation_id: &str,
+        ) -> Result<bool, crate::sync_error::SyncError> {
+            self.inner.mark_enrollment_activation_pending(operation_id)
+        }
+    }
+
+    /// A `LinkWatcherPort` whose `start` always fails -- forces `link()`
+    /// past the commit and into its post-commit rollback path.
+    struct WatcherStartAlwaysFails;
+
+    impl LinkWatcherPort for WatcherStartAlwaysFails {
+        fn is_ready(&self, _local_path: &str) -> bool {
+            false
+        }
+        fn start<'a>(
+            &'a self,
+            _local_path: &'a str,
+            _group_id: &'a str,
+            _on_demand: bool,
+            _max_local_size_bytes: Option<i64>,
+        ) -> BoxFuture<'a, Result<(), crate::error::DaemonError>> {
+            Box::pin(async move {
+                Err(crate::error::DaemonError::Config(
+                    "simulated watcher start failure".to_string(),
+                ))
+            })
+        }
+        fn stop<'a>(&'a self, _local_path: &'a str) -> BoxFuture<'a, ()> {
+            Box::pin(async move {})
+        }
+    }
+
+    /// Exercises `commit_plain`'s REAL classification logic end to end,
+    /// through the actual `LinkLifecycleService::link()` call chain --
+    /// commit succeeds, the watcher fails, the rollback ALSO fails -- the
+    /// exact failure shape `commit_plain`'s own doc comment describes.
+    /// `link()` itself returns only a plain `Err` with no structure a
+    /// caller could classify from; this proves `commit_plain`'s `is_linked`
+    /// re-check correctly sees the link row still genuinely present and
+    /// classifies it `CommitUncertain`, never `NotCommitted` (which would
+    /// let the caller safely cancel the coordination-plane authorization
+    /// for a link that is actually still live).
+    #[tokio::test]
+    async fn commit_plain_classifies_a_genuinely_uncommittable_rollback_failure_as_commit_uncertain(
+    ) {
+        let state = test_state();
+        let repository = RemoveLinkAlwaysFails {
+            inner: super::super::link_lifecycle::DaemonLinkRepositoryAdapter::new(state.clone()),
+        };
+        let lifecycle = Arc::new(LinkLifecycleService::new(
+            Arc::new(repository),
+            Arc::new(WatcherStartAlwaysFails),
+        ));
+        let controller = Arc::new(LinkRuntimeController::new(state.clone()));
+        let adapter = DaemonEnrollmentLinkAdapter::new(state.clone(), lifecycle, controller);
+
+        let dir = tempfile::tempdir().unwrap();
+        let local_path = dir.path().to_path_buf();
+        let local_path_str = local_path.to_string_lossy().to_string();
+
+        let result = adapter.commit_plain("group-1", &local_path, false, true).await;
+
+        assert!(
+            matches!(result, Err(EnrollmentLinkError::CommitUncertain { .. })),
+            "expected CommitUncertain (the commit landed, only post-commit setup and its own \
+             rollback failed), got {result:?}"
+        );
+        // The proof this test actually exercises the real classification,
+        // not a stub: the link row genuinely IS still present.
+        assert!(
+            state
+                .replica_coordinator
+                .link_repository()
+                .live_link_paths_for_group("group-1")
+                .unwrap()
+                .iter()
+                .any(|p| p == &local_path_str),
+            "the link row must genuinely still exist -- this is what makes CommitUncertain correct"
         );
     }
 }

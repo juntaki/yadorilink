@@ -759,10 +759,18 @@ pub fn has_all_parents(conn: &Connection, change: &Change) -> Result<bool, SyncS
 /// Idempotent for an already-retained change. A hash that this replica already
 /// compacted is deliberately rejected rather than reinserted: a stale peer may
 /// replay old history after reconnecting, but pruning must be monotonic.
+///
+/// `now_unix_nanos` is this device's own local clock at admission time --
+/// never a peer-reported or change-embedded timestamp, which would be
+/// untrusted input a peer could skew. Recorded into `change_time_index` in
+/// this SAME transaction as the change insert itself, so the two can never
+/// diverge across a crash (no committed change with a missing time-index
+/// row, and no time-index row for a change that didn't actually commit).
 pub(crate) fn append_change(
     conn: &Connection,
     change: &Change,
     applied: bool,
+    now_unix_nanos: i64,
 ) -> Result<bool, SyncSqliteError> {
     let hash = change.compute_hash();
     if is_pruned_change(conn, change.group_id.as_str(), &hash)? {
@@ -803,7 +811,204 @@ pub(crate) fn append_change(
         "INSERT OR IGNORE INTO group_heads (group_id, change_hash) VALUES (?1, ?2)",
         rusqlite::params![change.group_id.as_str(), &hash.0[..]],
     )?;
+    record_admission_time_index(conn, change.group_id.as_str(), now_unix_nanos)?;
     Ok(true)
+}
+
+/// Records the group's REAL head-set as of right now into
+/// `change_time_index`, stamped with `now_unix_nanos`.
+///
+/// Split out of [`append_change`] rather than inlined so the write-side
+/// cost this adds to every admission can be measured on its own -- see
+/// `change_time_index_scale_benchmark.rs`, which times this function
+/// against a full admission at several history depths.
+///
+/// The head-set is read straight back from `group_heads`, the same table
+/// (and therefore the same computation) every other caller of
+/// `dag_group_heads`/`group_heads` already trusts, so this never diverges
+/// from what "the group's current heads" means anywhere else in this
+/// codebase -- deliberately not a scalar approximation of it.
+/// `admission_seq` is this device's own local per-group counter (same
+/// `MAX(seq)+1` shape as `change_checkpoints.seq`), unrelated to `lamport`
+/// -- see `change_time_index`'s own table comment for why `lamport` cannot
+/// serve this role.
+///
+/// All three statements go through `prepare_cached`, matching the
+/// head-set read that was already cached here: this runs on the admission
+/// hot path, once per admitted change, so re-parsing three fixed
+/// statements per call would be pure overhead. The `MAX(admission_seq)`
+/// lookup is a bounded index probe (the `(group_id, admission_seq)`
+/// primary key's own right edge), not a scan of the group's history.
+pub(crate) fn record_admission_time_index(
+    conn: &Connection,
+    group_id: &str,
+    now_unix_nanos: i64,
+) -> Result<(), SyncSqliteError> {
+    let mut heads_snapshot = Vec::new();
+    {
+        let mut heads_stmt = conn.prepare_cached(
+            "SELECT change_hash FROM group_heads WHERE group_id = ?1 ORDER BY change_hash",
+        )?;
+        let mut rows = heads_stmt.query(rusqlite::params![group_id])?;
+        while let Some(row) = rows.next()? {
+            let head_hash: Vec<u8> = row.get(0)?;
+            heads_snapshot.extend_from_slice(&head_hash);
+        }
+    }
+    let next_admission_seq: i64 = conn
+        .prepare_cached(
+            "SELECT COALESCE(MAX(admission_seq), 0) + 1 FROM change_time_index \
+             WHERE group_id = ?1",
+        )?
+        .query_row(rusqlite::params![group_id], |row| row.get(0))?;
+    conn.prepare_cached(
+        "INSERT INTO change_time_index \
+         (group_id, admission_seq, observed_at_unix_nanos, heads_snapshot) \
+         VALUES (?1, ?2, ?3, ?4)",
+    )?
+    .execute(rusqlite::params![
+        group_id,
+        next_admission_seq,
+        now_unix_nanos,
+        heads_snapshot
+    ])?;
+    Ok(())
+}
+
+/// Drops every `change_time_index` snapshot for `group_id` that names any
+/// change in `removed` -- the time-index half of removing history, called
+/// from [`crate::dag_store::commit_prune`] with exactly the set of change
+/// bodies that prune actually deleted.
+///
+/// Without this, pruned groups accumulate snapshots naming changes that no
+/// longer exist: rows that grow without bound and that
+/// [`frontier_heads_at_or_before`] would hand back as a frontier whose
+/// members cannot be resolved. Deleting them is also the semantically
+/// right answer rather than merely tidy: a frontier that included a pruned
+/// change is precisely a point this device can no longer reconstruct, so
+/// the honest response to a target that early is the newest surviving
+/// snapshot at or before it -- which is what compaction means.
+///
+/// Scoped per removed hash, mirroring how the same loop clears
+/// `group_heads`; the membership test is done in memory over the group's
+/// own rows because a snapshot stores its heads as one concatenated blob
+/// with no per-hash column to join on. One group-scoped scan, on the
+/// compaction path, never on admission.
+pub(crate) fn drop_time_index_snapshots_naming(
+    conn: &Connection,
+    group_id: &str,
+    removed: &std::collections::HashSet<ChangeHash>,
+) -> Result<(), SyncSqliteError> {
+    if removed.is_empty() {
+        return Ok(());
+    }
+    let mut stale: Vec<i64> = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT admission_seq, heads_snapshot FROM change_time_index WHERE group_id = ?1",
+        )?;
+        let mut rows = stmt.query([group_id])?;
+        while let Some(row) = rows.next()? {
+            let admission_seq: i64 = row.get(0)?;
+            let snapshot: Vec<u8> = row.get(1)?;
+            // A blob whose length is not a multiple of 32 is corrupt;
+            // `as_chunks`'s remainder is ignored here deliberately, since
+            // this is a cleanup path and `frontier_heads_at_or_before` is
+            // the reader that fails closed on that shape.
+            if snapshot.as_chunks::<32>().0.iter().any(|h| removed.contains(&ChangeHash(*h))) {
+                stale.push(admission_seq);
+            }
+        }
+    }
+    for admission_seq in stale {
+        conn.execute(
+            "DELETE FROM change_time_index WHERE group_id = ?1 AND admission_seq = ?2",
+            rusqlite::params![group_id, admission_seq],
+        )?;
+    }
+    Ok(())
+}
+
+/// The group's actual head-set (as `group_heads` itself would have reported
+/// it) as of the most recent admission event this device durably recorded
+/// at or before `at_unix_nanos`. `None` means either the group has no
+/// admission history at all, or every admission for it happened strictly
+/// AFTER `at_unix_nanos` (nothing to rewind to; the caller should treat
+/// this as "no prior state exists that early", not as an error).
+///
+/// This is ground truth captured at write time inside [`append_change`],
+/// not derived here -- there is no ancestor walk, generation math, or
+/// frontier reconstruction happening in this function at all, only a
+/// single-row index lookup. See `change_time_index`'s own table comment
+/// for why a derived scalar (e.g. a max lamport) cannot correctly stand in
+/// for this across concurrent branches.
+///
+/// Answered via `ORDER BY observed_at_unix_nanos DESC, admission_seq DESC
+/// LIMIT 1` against `change_time_index`'s own `(group_id,
+/// observed_at_unix_nanos, admission_seq)` index -- a reverse index seek to
+/// the boundary plus one row, never a scan of the group's full admission
+/// history and never a temporary sort (see [`is_ancestor`]'s own doc
+/// comment for why an unbounded per-call walk here would be the same class
+/// of mistake at scale). `frontier_query_is_answered_by_a_reverse_index_
+/// seek` in `dag_store`'s own tests asserts that plan rather than assuming
+/// it.
+///
+/// `admission_seq DESC` is a tie-break, not decoration, and the index
+/// carries the column for exactly that reason. Two admissions can share an
+/// `observed_at_unix_nanos` whenever the local clock's granularity is
+/// coarser than the gap between them -- routine for two changes admitted in
+/// one batch -- and with no secondary key the winner between them would be
+/// arbitrary, so a tie could resolve to the EARLIER admission and report a
+/// stale frontier. `admission_seq` is this device's own strictly increasing
+/// per-group admission counter, assigned `MAX(admission_seq) + 1` over
+/// whatever rows the group still has at that moment ([`append_change`]).
+/// That assignment alone is what makes it a correct total order on "which
+/// admission happened later", and it holds however rows are removed --
+/// which matters, because they are not removed in any tidy shape:
+/// [`drop_time_index_snapshots_naming`] deletes exactly the snapshots
+/// naming a pruned change, wherever in the sequence they sit, and a
+/// re-bootstrap install clears the group's rows outright before recording
+/// its own. `MAX(surviving) + 1` is above every survivor in every one of
+/// those cases, so a later admission always outranks every row already
+/// there. The identical
+/// hazard, and the identical fix, appear in `crate::rewind_plan`'s own
+/// per-path query as its `version_seq DESC` tie-break.
+///
+/// This answers a GROUP-level question ("what was the DAG frontier") and
+/// nothing about any individual path's content. Folder Rewind's per-path
+/// planning layer (`crate::rewind_plan`) deliberately does not call this:
+/// going from a head-set to "what should path X contain at T" requires a
+/// per-path ancestor walk against a historical frontier, which is the
+/// exact shape [`is_ancestor`]'s doc comment records collapsing at 100k
+/// scale.
+/// Shared so the query-plan assertion in `dag_store`'s own tests checks the
+/// exact statement this function issues rather than a copy of it that could
+/// drift.
+pub(crate) const FRONTIER_AT_OR_BEFORE_SQL: &str = "SELECT heads_snapshot FROM change_time_index \
+     WHERE group_id = ?1 AND observed_at_unix_nanos <= ?2 \
+     ORDER BY observed_at_unix_nanos DESC, admission_seq DESC LIMIT 1";
+
+pub fn frontier_heads_at_or_before(
+    conn: &Connection,
+    group_id: &str,
+    at_unix_nanos: i64,
+) -> Result<Option<Vec<ChangeHash>>, SyncSqliteError> {
+    let snapshot: Option<Vec<u8>> = conn
+        .query_row(FRONTIER_AT_OR_BEFORE_SQL, rusqlite::params![group_id, at_unix_nanos], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    let Some(snapshot) = snapshot else { return Ok(None) };
+    if snapshot.len() % 32 != 0 {
+        return Err(SyncSqliteError::CorruptState(format!(
+            "change_time_index heads_snapshot for group {group_id} has a length ({}) that \
+             is not a multiple of 32 -- corrupt row",
+            snapshot.len()
+        )));
+    }
+    // The length check above already rejected a non-multiple-of-32 blob, so
+    // `as_chunks`'s remainder is always empty here.
+    Ok(Some(snapshot.as_chunks::<32>().0.iter().copied().map(ChangeHash).collect()))
 }
 
 /// Confirms a retained row's storage key and denormalized SQL columns agree

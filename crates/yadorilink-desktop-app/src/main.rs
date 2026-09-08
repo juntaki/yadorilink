@@ -22,8 +22,10 @@ use tao::event::Event;
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use yadorilink_desktop_app::actions::{spawn_window, spawn_window_with_path};
 use yadorilink_desktop_app::{
-    account, actions, folder_status_window, ipc_client, login_item, status_model, window,
+    account, actions, folder_status_window, ipc_client, login_item, share_window, status_model,
+    window,
 };
 use yadorilink_ipc_proto::daemonctl::StatusResponse;
 
@@ -60,6 +62,12 @@ fn main() {
         Some(WindowKind::FolderStatus(local_path)) => {
             if let Err(e) = folder_status_window::run_folder_status(local_path) {
                 tracing::error!(error = %e, "folder status window exited with an error");
+            }
+            return;
+        }
+        Some(WindowKind::Share(local_path)) => {
+            if let Err(e) = share_window::run_share(local_path) {
+                tracing::error!(error = %e, "share window exited with an error");
             }
             return;
         }
@@ -134,13 +142,16 @@ enum WindowKind {
     /// `local_path`, since (unlike every other window kind) it needs to
     /// know WHICH folder to show.
     FolderStatus(String),
+    /// The per-folder sharing window -- carries the folder's `local_path`
+    /// for the same reason `FolderStatus` does.
+    Share(String),
 }
 
 /// Parses `--window <kind>` (/— the tray items and installer first-run
-/// hook launch these windows this way). `folder-status` additionally
-/// requires a `--path <local_path>` argument, parsed regardless of
-/// argument order (matching `--window`'s own position-independent
-/// parsing below).
+/// hook launch these windows this way). `folder-status` and `share`
+/// additionally require a `--path <local_path>` argument, parsed
+/// regardless of argument order (matching `--window`'s own
+/// position-independent parsing below).
 fn requested_window() -> Option<WindowKind> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut kind = None;
@@ -153,36 +164,15 @@ fn requested_window() -> Option<WindowKind> {
             i += 1;
         }
     }
+    let path = || -> Option<String> {
+        args.iter().position(|a| a == "--path").and_then(|i| args.get(i + 1)).cloned()
+    };
     match kind.as_deref() {
         Some("onboarding") => Some(WindowKind::Onboarding),
         Some("account") => Some(WindowKind::Account),
-        Some("folder-status") => {
-            let path =
-                args.iter().position(|a| a == "--path").and_then(|i| args.get(i + 1)).cloned()?;
-            Some(WindowKind::FolderStatus(path))
-        }
+        Some("folder-status") => Some(WindowKind::FolderStatus(path()?)),
+        Some("share") => Some(WindowKind::Share(path()?)),
         _ => None,
-    }
-}
-
-/// Launch one of this binary's GUI windows as a separate process — the
-/// tray never runs an eframe loop in its own process.
-fn spawn_window(kind: &str) {
-    if let Ok(exe) = std::env::current_exe() {
-        let _ = std::process::Command::new(exe).arg("--window").arg(kind).spawn();
-    }
-}
-
-/// Same as `spawn_window`, for a window kind that also needs a
-/// `--path <local_path>` argument (currently only `folder-status`).
-fn spawn_window_with_path(kind: &str, local_path: &str) {
-    if let Ok(exe) = std::env::current_exe() {
-        let _ = std::process::Command::new(exe)
-            .arg("--window")
-            .arg(kind)
-            .arg("--path")
-            .arg(local_path)
-            .spawn();
     }
 }
 
@@ -268,6 +258,15 @@ fn build_menu(status: Option<&StatusResponse>) -> Menu {
                 let _ = per_folder.append(&MenuItem::with_id(
                     format!("folder_status:{}", link.local_path),
                     "Details…",
+                    true,
+                    None,
+                ));
+                // Opens the per-folder sharing window (permission, expiry,
+                // invite link/QR) as its own process, the same way
+                // "Details…" above opens the detail window.
+                let _ = per_folder.append(&MenuItem::with_id(
+                    format!("share:{}", link.local_path),
+                    "Share…",
                     true,
                     None,
                 ));
@@ -369,6 +368,10 @@ fn handle_menu_event(id: &str) {
     }
     if let Some(path) = id.strip_prefix("folder_status:") {
         spawn_window_with_path("folder-status", path);
+        return;
+    }
+    if let Some(path) = id.strip_prefix("share:") {
+        spawn_window_with_path("share", path);
         return;
     }
     // Guarded folder removal. The CLI's

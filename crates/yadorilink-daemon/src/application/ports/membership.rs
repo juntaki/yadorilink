@@ -96,6 +96,22 @@ pub(crate) trait MembershipCoordination: Send + Sync {
         edge_id: &'a str,
     ) -> BoxFuture<'a, Result<Option<(String, String)>, String>>;
 
+    /// The coordination plane's membership state for one (group, device)
+    /// edge -- `"active"` for a live member, or one of the not-yet-admitted
+    /// states for an edge that has never been granted anything.
+    ///
+    /// `Ok(None)` means the answer is genuinely unknown (no such edge in
+    /// this account's listing, or a coordination plane that does not report
+    /// edge state at all), NOT "not active"; `Err` means the question could
+    /// not be asked. Callers must treat both as "assume active" -- this
+    /// exists to let a targeted revoke skip a guard that provably cannot
+    /// apply, so only a POSITIVE non-active answer may relax anything.
+    fn fetch_edge_state<'a>(
+        &'a self,
+        group_id: &'a str,
+        device_id: &'a str,
+    ) -> BoxFuture<'a, Result<Option<String>, String>>;
+
     /// Best-effort audit record for a `--force` override. Never fails the
     /// caller -- a timeout/error here is logged by the adapter, not
     /// propagated.

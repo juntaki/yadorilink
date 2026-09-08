@@ -986,6 +986,11 @@ fn repair_interrupted_materializations_inner(
 /// but not matching the recorded target, with no repair intent, is left
 /// untouched rather than silently overwritten -- a real, scoped
 /// limitation, not an oversight.
+// Each parameter is an independently-meaningful piece of repair context
+// (state handle, path identity, emitter, mode, permit, snapshot, report
+// sink); grouping them into a params struct here would not reduce the
+// call site's own argument list and is out of scope for a lint cleanup.
+#[allow(clippy::too_many_arguments)]
 fn repair_one_interrupted_symlink(
     state: &dyn MaterializationExecutionPort,
     root: &Path,

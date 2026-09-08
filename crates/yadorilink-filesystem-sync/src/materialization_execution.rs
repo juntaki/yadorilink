@@ -366,6 +366,10 @@ pub trait MaterializationExecutionPort: Send + Sync {
     /// it, in one transaction. Returns `Err(PolicyUnavailable)` when the
     /// group's policy has not loaded this run, in which case the emission
     /// was withheld, not attempted-and-failed.
+    // Port trait method with ~40 call sites workspace-wide; grouping these
+    // into a params struct would be a call-site-touching refactor well
+    // beyond a toolchain-drift lint cleanup.
+    #[allow(clippy::too_many_arguments)]
     fn mark_deleted_emitting_change(
         &self,
         group_id: &str,

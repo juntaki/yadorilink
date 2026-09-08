@@ -315,6 +315,15 @@ pub fn spawn_orchestrator(
     let device_id = node.device_id.clone();
     let log_device_id = device_id.clone();
     let state = node.state.clone();
+    // Mirrors `app.rs`'s real startup path: production calls this once,
+    // early, whenever both the address and token are available -- a test
+    // node needs the exact same thing so `DaemonState::coordination_client_config`
+    // is populated for anything that reads it directly rather than through
+    // `OrchestratorConfig` (Track Send's `request_send_authorization`/
+    // `consume_send_authorization`, and the role-loss-compensation path).
+    // A no-op if already set, matching `OnceLock::set`'s own semantics, so
+    // this is safe for every other existing test that never reads it.
+    state.set_coordination_client_config(coordination_addr.clone(), "test".to_string());
     let config = peer_orchestrator::OrchestratorConfig {
         coordination_addr,
         access_token: "test".to_string(),

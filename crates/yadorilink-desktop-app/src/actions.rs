@@ -69,6 +69,41 @@ pub fn open_folder(local_path: &str) -> Result<(), opener::OpenError> {
     opener::open(local_path)
 }
 
+/// Launch one of this binary's GUI windows as a separate process. Every
+/// GUI surface is this same binary re-invoked as `--window <kind>`,
+/// running its own eframe/winit event loop, so none of them has to coexist
+/// with the tray's own tao loop (see `main.rs`'s doc comment for the full
+/// reasoning).
+///
+/// Lives here rather than in `main.rs` because one window can also open
+/// another (the folder-detail window's "Share…" button), and only this
+/// crate's library half is reachable from a window module.
+pub fn spawn_window(kind: &str) {
+    spawn_window_process(kind, None);
+}
+
+/// Same as `spawn_window`, for a window kind that also needs a
+/// `--path <local_path>` argument (the per-folder detail and share
+/// windows, which have to know WHICH folder they are about).
+pub fn spawn_window_with_path(kind: &str, local_path: &str) {
+    spawn_window_process(kind, Some(local_path));
+}
+
+fn spawn_window_process(kind: &str, local_path: Option<&str>) {
+    let Ok(exe) = std::env::current_exe() else {
+        tracing::warn!(kind, "cannot locate this executable to open a window");
+        return;
+    };
+    let mut command = std::process::Command::new(exe);
+    command.arg("--window").arg(kind);
+    if let Some(local_path) = local_path {
+        command.arg("--path").arg(local_path);
+    }
+    if let Err(e) = command.spawn() {
+        tracing::warn!(error = %e, kind, "could not open a window");
+    }
+}
+
 /// Remove a linked folder — the same
 /// daemon `Unlink` request `yadorilink unlink` sends (`commands::link::
 /// unlink`). The daemon only forgets the link; it never touches the local

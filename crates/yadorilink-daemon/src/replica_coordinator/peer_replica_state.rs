@@ -757,7 +757,7 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
                         yadorilink_sync_sqlite::materialized_generation::MaterializedObjectKind::Symlink
                     }
                 };
-                (sync_kind, Some(version), identity)
+                (sync_kind, Some(version), *identity)
             }
             yadorilink_peer_session::ports::ExactActualState::Absent => (
                 yadorilink_sync_sqlite::materialized_generation::MaterializedObjectKind::Absent,
@@ -858,7 +858,7 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
                             "a non-Absent materialized generation must carry a version".into(),
                         )))
                     })?,
-                    identity: basis.filesystem_identity,
+                    identity: Box::new(basis.filesystem_identity),
                 }
             }
             yadorilink_sync_sqlite::materialized_generation::MaterializedObjectKind::Directory => {
@@ -869,7 +869,7 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
                             "a non-Absent materialized generation must carry a version".into(),
                         )))
                     })?,
-                    identity: basis.filesystem_identity,
+                    identity: Box::new(basis.filesystem_identity),
                 }
             }
             yadorilink_sync_sqlite::materialized_generation::MaterializedObjectKind::Symlink => {
@@ -880,7 +880,7 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
                             "a non-Absent materialized generation must carry a version".into(),
                         )))
                     })?,
-                    identity: basis.filesystem_identity,
+                    identity: Box::new(basis.filesystem_identity),
                 }
             }
         };

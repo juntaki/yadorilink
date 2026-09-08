@@ -7,8 +7,8 @@ license.workspace = true
 # Deliberately no tokio, no async, no filesystem/network -- this crate is
 # the pure, synchronous domain model (identities, the signed canonical
 # Change, file/version records, conflict policy) with nothing beneath it
-# but the standard library and cryptography. See
-# `scripts/check-phase7d1-domain-boundary.py` for the enforced boundary.
+# but the standard library and cryptography. The boundary is declared in
+# `architecture.toml` and enforced by `scripts/check-architecture.py`.
 [dependencies]
 serde.workspace = true
 sha2.workspace = true
