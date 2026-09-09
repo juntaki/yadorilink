@@ -19,7 +19,11 @@ env:
 jobs:
   linux-full:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Once "Full workspace" (below) is fully green, later steps in this
+    # job (Daemon E2E, Wire integration, DST lanes, installer
+    # build-health) will actually run for real for the first time --
+    # give real headroom for that, matching platform-e2e's own bump.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -70,7 +74,12 @@ jobs:
       matrix:
         os: [windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    # --no-fail-fast (below) makes the full daemon integration suite run to
+    # completion even after an early failure, instead of aborting fast --
+    # more complete failure information per run, but real wall-clock cost:
+    # the previous 60-minute budget was hit and the job cancelled before
+    # finishing on both windows-latest and macos-latest.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
