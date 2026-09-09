@@ -100,21 +100,28 @@ pub trait LocalMutationStore: Send + Sync {
         path: &str,
     ) -> Result<bool, SyncSqliteError>;
 
-    /// Whether `(group_id, path)` still has an unsettled `projection_
-    /// obligations` row -- distinct from `has_materialization_intent`
-    /// above, which only covers the narrower window a
-    /// `MaterializationIntentGuard` protects (a `materialize()` call
-    /// already in flight). A path can have a durably-committed, non-deleted
-    /// index row with an obligation that has not yet settled at all -- no
-    /// intent has ever been opened for it, but it is just as much "we know
-    /// about this file and are still placing it locally" as an in-flight
-    /// intent is. An M5-A finding: the startup reconciliation scan's own
+    /// Whether `(group_id, path)` still has an unsettled, REMOTE-origin
+    /// `projection_obligations` row -- distinct from
+    /// `has_materialization_intent` above, which only covers the narrower
+    /// window a `MaterializationIntentGuard` protects (a `materialize()`
+    /// call already in flight). A path can have a durably-committed,
+    /// non-deleted index row with an obligation that has not yet settled at
+    /// all -- no intent has ever been opened for it, but it is just as much
+    /// "we know about this file and are still placing it locally" as an
+    /// in-flight intent is: the startup reconciliation scan's own
     /// `has_materialization_intent` check alone is not enough to protect
     /// this state; a newly-arrived DAG record whose obligation is still
     /// unsettled when a restart's scan runs was silently tombstoned before
-    /// this check existed. While an obligation exists for a path, an
-    /// absent local file must not yet be interpreted as an offline user
-    /// deletion.
+    /// this check existed. While a REMOTE-origin obligation exists for a
+    /// path, an absent local file must not yet be interpreted as an
+    /// offline user deletion.
+    ///
+    /// Deliberately excludes a LOCAL-origin obligation: one can only be
+    /// produced by this device's own local emission, whose bytes were
+    /// already observed on this device's own disk before the change was
+    /// ever admitted (that observation IS what produced the change) -- so
+    /// it never represents content not yet placed, and its presence must
+    /// never withhold a genuine, later offline deletion of that same path.
     fn has_unsettled_projection_obligation(
         &self,
         group_id: &str,

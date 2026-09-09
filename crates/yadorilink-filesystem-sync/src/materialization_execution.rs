@@ -293,18 +293,21 @@ pub trait MaterializationExecutionPort: Send + Sync {
         path: &str,
     ) -> Result<bool, MaterializationExecutionError>;
 
-    /// Whether `path` currently has ANY row at all in the projection-
+    /// Whether `path` currently has a REMOTE-origin row in the projection-
     /// obligation worklist (any state, including the parked
     /// `ignore_blocked` state) -- a live, per-path, always-authoritative
-    /// read; never cached or snapshotted.
+    /// read; never cached or snapshotted. A LOCAL-origin row (this
+    /// device's own local emission, whose bytes were already observed on
+    /// this device's own disk before the change was admitted) is
+    /// deliberately excluded: it never represents content not yet placed.
     ///
-    /// While a projection obligation exists for a path, an absent local
-    /// file must not yet be interpreted as an offline user deletion: the
-    /// Convergence Engine still considers this path's desired state
-    /// unsettled (freshly admitted, mid-materialize-retry, or otherwise
-    /// not yet placed -- see this method's own callers for the "not yet
-    /// settled, not settled-but-wrong" scope this signal covers, and does
-    /// not). This is a SEPARATE signal from `has_materialization_intent`/
+    /// While a REMOTE-origin projection obligation exists for a path, an
+    /// absent local file must not yet be interpreted as an offline user
+    /// deletion: the Convergence Engine still considers this path's
+    /// desired state unsettled (freshly admitted, mid-materialize-retry,
+    /// or otherwise not yet placed -- see this method's own callers for
+    /// the "not yet settled, not settled-but-wrong" scope this signal
+    /// covers, and does not). This is a SEPARATE signal from `has_materialization_intent`/
     /// `list_materialization_intent_paths`: an intent exists only for the
     /// narrow window of one in-flight physical write, while an obligation
     /// can be outstanding long before any write is ever attempted (or

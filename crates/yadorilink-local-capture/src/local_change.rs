@@ -1381,10 +1381,10 @@ impl LocalChangeProcessor {
                 if self.state.has_materialization_intent(group_id, path)? {
                     continue;
                 }
-                // M5-A finding: an open intent alone is not enough. A
-                // path can have a durably-committed, non-deleted index
-                // row whose projection obligation is still unsettled
-                // (right after the DAG record was admitted, before
+                // An open intent alone is not enough. A path can have a
+                // durably-committed, non-deleted index row whose REMOTE-
+                // origin projection obligation is still unsettled (right
+                // after the DAG record was admitted from a peer, before
                 // `materialize()` itself has ever run) -- no intent has
                 // ever been opened for it, but it is exactly as "not yet
                 // known to be deleted" as an in-flight intent is. Without
@@ -1394,6 +1394,19 @@ impl LocalChangeProcessor {
                 // tombstones a file the device never even finished
                 // receiving once. Same fail-closed contract as the intent
                 // check above: an errored lookup propagates via `?`.
+                //
+                // Deliberately does NOT veto on a LOCAL-origin obligation:
+                // one exists only after this device's own local emission,
+                // whose bytes were already on this device's own disk
+                // before the change was admitted (that observation is what
+                // produced the change) -- it can never represent content
+                // this device is still waiting to receive, so its presence
+                // must never block a genuine, later offline deletion of
+                // that same path. See `yadorilink_sync_sqlite::
+                // projection_obligations::ObligationOrigin`'s own doc
+                // comment for why the obligation table now distinguishes
+                // this, and `has_unsettled_projection_obligation`'s own
+                // contract for how the distinction is applied.
                 if self.state.has_unsettled_projection_obligation(group_id, path)? {
                     continue;
                 }
