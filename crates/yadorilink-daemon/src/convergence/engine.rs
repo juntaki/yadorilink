@@ -1662,6 +1662,21 @@ mod process_group_publication_tests {
         let block_store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
 
         replica_coordinator.link_repository().add_link(&root.to_string_lossy(), GROUP).unwrap();
+        // Real symlink materialization on Windows is per-link opt-in
+        // (`materialize_symlink_windows`'s own doc comment) -- without this,
+        // `materialize_symlink_at` takes the default skip-with-visible-status
+        // policy and every symlink candidate in this module's tests would
+        // settle as `SymlinkMaterializeOutcome::PolicySkipped` ->
+        // `MaterializeResult::RetryRequired` on a real Windows host, never
+        // closing its obligation, regardless of how many ticks run. Opting
+        // in here (mirroring `hydration.rs`'s own `#[cfg(windows)]` call
+        // sites) makes this fixture's real materialize path exercise the
+        // same real on-disk write on every platform.
+        #[cfg(windows)]
+        replica_coordinator
+            .link_repository()
+            .set_windows_symlink_opt_in(&root.to_string_lossy(), true)
+            .unwrap();
         VerifiedRoot::open(&root, GROUP, replica_coordinator.as_ref()).unwrap();
         let generation = replica_coordinator.startup_readiness().begin_group_startup(GROUP);
         replica_coordinator.startup_readiness().mark_group_ready(GROUP, generation);
@@ -1908,6 +1923,25 @@ mod process_group_publication_tests {
     /// generation check -- equally conclusive proof this test is not
     /// vacuous, and a stronger failure mode than a silently-wrong
     /// classification would be.
+    ///
+    /// The obligation-closes-synchronously half of this is genuinely
+    /// platform-specific, not a portability oversight: on a real Windows
+    /// host `create_or_defer_placeholder` unconditionally defers the actual
+    /// on-disk write to `cfapi-host.exe`'s own poll (see that function's
+    /// own doc comment) -- nothing in this crate's `test-support` seam can
+    /// force the opposite (synchronous) outcome on real Windows the way it
+    /// can force the deferred one on every OTHER platform, because the
+    /// synchronous outcome this test's non-Windows half exercises simply
+    /// does not exist on Windows. So the one tick here settles as
+    /// `MaterializeResult::RetryRequired` on Windows instead of
+    /// `Settled(PolicyPlaceholder)`, and the obligation is left outstanding
+    /// (mirroring `materialization_execution.rs`'s own
+    /// `repair_leaves_the_intent_open_when_the_windows_placeholder_write_
+    /// is_deferred`, the sibling regression for the repair-sweep side of
+    /// this exact platform split) rather than closed. Confirmed against
+    /// real windows-latest CI (not merely reasoned from the doc comment):
+    /// this test failed there with the obligation still present after the
+    /// single tick, precisely this branch's own expectation.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn on_demand_placeholder_settlement_does_not_publish_an_exact_generation() {
         let (state, _root_dir, root) = build_state_with_adopted_group().await;
@@ -1926,6 +1960,19 @@ mod process_group_publication_tests {
         let healthy = drive_obligations_once_for_test(&state, 128, 256).await;
         assert!(healthy, "the one, unraced candidate attempt must be trustworthy");
 
+        #[cfg(windows)]
+        assert!(
+            state
+                .replica_coordinator
+                .sqlite()
+                .dag_lookup_projection_obligation(GROUP, "deferred.txt")
+                .unwrap()
+                .is_some(),
+            "on Windows the real placeholder write is deferred to cfapi-host.exe -- one tick \
+             must leave the obligation outstanding, not close it via a settlement that never \
+             happened"
+        );
+        #[cfg(not(windows))]
         assert!(
             state
                 .replica_coordinator

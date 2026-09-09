@@ -808,8 +808,24 @@ mod tests {
 
         // Trigger the destination to learn the relay's ephemeral source
         // address, then reply with an oversized datagram.
+        //
+        // `forward_from_source` wraps the "hi" payload in
+        // `yadorilink_transport::wrap_relay_envelope` before it ever hits
+        // the wire (see that call site's own doc comment), so what
+        // actually arrives here is the envelope header plus payload, not
+        // 2 bare bytes -- a 2048-byte buffer, matching every other probe
+        // buffer this file uses (`echo_server`'s own, `run_relay_socket_
+        // reader`'s), rather than one sized to the unwrapped payload
+        // alone. An 8-byte buffer used to "work" here only because POSIX
+        // `recvfrom` truncates-and-succeeds on an undersized buffer,
+        // silently discarding the excess and still returning the sender's
+        // address; Winsock's `WSARecvFrom` does not share that leniency --
+        // an undersized buffer makes the call itself fail with
+        // `WSAEMSGSIZE`, so the `.unwrap()` below would panic on the very
+        // first probe on a real Windows host, before this test ever
+        // reaches what it actually means to exercise.
         forwarder.forward_from_source(session_id, OWNER, b"hi", now_unix_millis()).await.unwrap();
-        let mut probe = [0u8; 8];
+        let mut probe = [0u8; 2048];
         let (_, relay_addr) =
             tokio::time::timeout(Duration::from_secs(2), echo.recv_from(&mut probe))
                 .await

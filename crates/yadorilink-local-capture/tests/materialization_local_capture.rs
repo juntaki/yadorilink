@@ -53,6 +53,7 @@ use yadorilink_filesystem_sync::materialization_repair::{
 };
 use yadorilink_local_storage::{BlockStore, FsBlockStore};
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
+use yadorilink_replica_domain::session_state::MaterializationState;
 use yadorilink_root_authority::root_commit::{RootCommitPermit, RootLease};
 use yadorilink_root_authority::root_identity::VerifiedRoot;
 
@@ -92,6 +93,23 @@ fn crashed_executable(
     state
         .file_index_repository()
         .set_unix_mode("group-1", path, Some(0o755), &RootCommitPermit::for_tests())
+        .unwrap();
+    // A fresh `upsert_file` row defaults to `Placeholder` (schema v25's
+    // fail-closed default -- see `upsert_file_in_tx`'s own doc comment), not
+    // `Hydrated`. This fixture simulates a device that had already
+    // materialized the file before crashing mid-rewrite, so it must stamp
+    // `Hydrated` explicitly; without this, `repair_interrupted_
+    // materializations_inner`'s candidate loop skips the row entirely
+    // (it only considers rows snapshotted as `Hydrated`) and repair never
+    // sees "tool.sh" at all.
+    state
+        .materialization_state_repository()
+        .set_materialization_state(
+            "group-1",
+            path,
+            MaterializationState::Hydrated,
+            &RootCommitPermit::for_tests(),
+        )
         .unwrap();
     state
         .materialization_intent_repository()

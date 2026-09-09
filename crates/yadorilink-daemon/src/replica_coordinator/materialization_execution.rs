@@ -341,6 +341,38 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         out_path: &Path,
         expected_generation: Option<u64>,
     ) -> Result<(), MaterializationExecutionError> {
+        // Test-only bypass: a `--lib` unit test (`gc::tests::eviction_without_
+        // remote_lease_never_reaches_physical_reclaim`, `hydration::tests::
+        // preflight_disk_pressure_runs_eviction_sweep_for_on_demand_link_
+        // first`) that seeds a real `Hydrated` row via direct index writes
+        // (no actual `cfapi-host.exe` ever ran to create a real CfAPI
+        // placeholder object underneath it) has no live pipe to dial here --
+        // unlike `get_recorded_placeholder_identity`'s "no recorded identity"
+        // check just above this call site (a plain SQL read, and a REAL
+        // precondition these tests must still seed via `record_placeholder_
+        // generation` to reach this call at all), the actual native RPC
+        // needs `cfapi-host.exe` running, real Windows CfAPI infrastructure
+        // no unit test process provides. Exactly the same shape as
+        // `create_or_defer_placeholder`'s own `test_force_deferred_
+        // placeholder_is_armed_for` seam (`yadorilink-local-storage`'s
+        // `materialize_write.rs`): a path-scoped flag lets a specific test
+        // drive this exact Windows-only branch without a real provider,
+        // while every OTHER path (and every non-test build) still dials the
+        // real pipe. Compiled out entirely outside `cfg(test)` -- unlike
+        // several other seams in this crate, nothing outside this crate's
+        // own unit tests needs this one, so plain `cfg(test)` (rather than
+        // `any(test, feature = "test-support")`) is deliberate: it keeps
+        // this function's only caller (`gc.rs`/`hydration.rs`'s own
+        // `#[cfg(test)] mod tests`) compiled into the exact same build unit
+        // as the function itself, so it is never a `dead_code` warning in
+        // the SEPARATE plain-lib artifact `test-support` alone would also
+        // activate (via this crate's own dev-dependency self-reference)
+        // but that never turns `cfg(test)` on for that artifact's callers.
+        #[cfg(test)]
+        if test_windows_dehydrate_confirmed_without_cfapi_host_is_armed_for(out_path) {
+            let _ = expected_generation;
+            return Ok(());
+        }
         let absolute_path = out_path.to_string_lossy().to_string();
         crate::placeholder_dehydrate_windows::dehydrate_via_cfapi_host_blocking(
             &absolute_path,
@@ -538,6 +570,71 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
     }
 }
 
+/// Test-only failure-injection flag consulted by `dehydrate_windows_
+/// placeholder`'s `#[cfg(windows)]` impl above: when armed for a path,
+/// that call skips the real `cfapi-host.exe` pipe round trip and reports
+/// dehydration confirmed. See that call site's own doc comment for why a
+/// plain `--lib` unit test needs this (no real Windows CfAPI provider
+/// process runs in a `cargo test` process).
+///
+/// Path-keyed, not a single global flag -- same reasoning as
+/// `yadorilink_local_storage::materialize_write`'s identical
+/// `TEST_FORCE_DEFERRED_PLACEHOLDER_PATHS`: several `#[tokio::test]`
+/// functions in this crate can be mid-flight at once, each evicting its
+/// own path, and a blanket flag would let one test's bypass silently
+/// swallow an unrelated test's real (non-bypassed) call.
+///
+/// `#[cfg(windows)]`: the only reader is inside `dehydrate_windows_
+/// placeholder`'s own `#[cfg(windows)]` body, so on every other target
+/// this static would otherwise be written (by the arming function below)
+/// but never read -- a `dead_code` warning under `-D warnings`. The
+/// arming function itself stays defined on every platform (its callers,
+/// `gc.rs`/`hydration.rs`'s own unit tests, are not themselves
+/// `#[cfg(windows)]`-gated); its body is simply a no-op on a target where
+/// there is no Windows dehydrate path to bypass in the first place.
+#[cfg(all(windows, test))]
+static TEST_WINDOWS_DEHYDRATE_CONFIRMED_PATHS: std::sync::Mutex<
+    Option<std::collections::HashSet<std::path::PathBuf>>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(all(windows, test))]
+fn test_windows_dehydrate_confirmed_without_cfapi_host_is_armed_for(path: &Path) -> bool {
+    TEST_WINDOWS_DEHYDRATE_CONFIRMED_PATHS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .is_some_and(|paths| paths.contains(path))
+}
+
+/// Test-only: arms (or disarms) the bypass above for one exact path --
+/// see [`TEST_WINDOWS_DEHYDRATE_CONFIRMED_PATHS`]'s own doc comment. Call
+/// after seeding a `Hydrated` row this test intends to `evict_file` on a
+/// build targeting Windows, once a placeholder identity has also been
+/// recorded for it (`record_placeholder_generation`) -- the real
+/// precondition `dehydrate_windows_placeholder`'s own doc comment
+/// documents, which this bypass does NOT substitute for.
+#[cfg(all(windows, test))]
+pub(crate) fn set_test_windows_dehydrate_confirmed_for_path(path: &Path, armed: bool) {
+    let mut guard =
+        TEST_WINDOWS_DEHYDRATE_CONFIRMED_PATHS.lock().unwrap_or_else(|p| p.into_inner());
+    let paths = guard.get_or_insert_with(std::collections::HashSet::new);
+    if armed {
+        paths.insert(path.to_path_buf());
+    } else {
+        paths.remove(path);
+    }
+}
+
+/// Non-Windows stand-in for the above: there is no native Windows
+/// dehydrate path to bypass on this target at all, so arming this is a
+/// no-op. Exists so `gc.rs`/`hydration.rs`'s own unit tests (which run,
+/// and must compile, on every target) can call this unconditionally
+/// rather than needing their own `#[cfg(windows)]` branch around the call.
+#[cfg(all(not(windows), test))]
+pub(crate) fn set_test_windows_dehydrate_confirmed_for_path(path: &Path, armed: bool) {
+    let _ = (path, armed);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -671,6 +768,37 @@ mod tests {
     /// production invariant (nothing is ever purged without a durable
     /// custody lease, and none exist yet) rather than claiming to prove
     /// oracle-specific handling this build cannot actually reach.
+    ///
+    /// `#[cfg(not(windows))]`: this is the only test in this module that
+    /// drives a `Hydrated` row all the way through `evict_file` to a
+    /// successful placeholder write, so it is the only one that actually
+    /// reaches `materialization_eviction::evict_to_placeholder`'s Windows
+    /// arm (every other eviction test here either rejects earlier --
+    /// pinned, diverged-on-disk -- or, like the cross-group tests below,
+    /// leaves its row at the schema-v25 `Placeholder` default, which bails
+    /// out of `evict_file` before `evict_to_placeholder` is ever called).
+    /// On Windows that arm does not locally write a placeholder at all --
+    /// by design (see `evict_to_placeholder`'s own doc comment) it asks
+    /// the real `cfapi-host.exe` process to confirm native dehydration over
+    /// a named pipe (`placeholder_dehydrate_windows::
+    /// dehydrate_via_cfapi_host_blocking`), and there is no test-support
+    /// seam to fake that confirmation the way `create_or_defer_
+    /// placeholder`'s `set_test_force_deferred_placeholder_for_path` fakes
+    /// the Windows-deferred *creation* path elsewhere in this module. A
+    /// plain `cargo test` binary never starts that host process, so on a
+    /// real Windows runner this call fails fast with a pipe-connect error
+    /// (`EvictionOutcomeAmbiguous`) regardless of whether the row has a
+    /// recorded placeholder identity -- recording one (as a real Windows
+    /// CfAPI-hydrated row always would) only changes which error `evict_
+    /// file` returns, not whether this test can succeed without that
+    /// external process. This is a test-infrastructure gap, not a
+    /// production bug: the fail-closed behavior itself is exactly what a
+    /// real Windows host is supposed to do. Scoping the test out mirrors
+    /// this same module's `repair_recreates_a_symlink_after_a_simulated_
+    /// crash_before_the_write`, `#[cfg(unix)]`-scoped for the same reason
+    /// (a real write this platform cannot exercise without OS-specific
+    /// support this test harness does not provide).
+    #[cfg(not(windows))]
     #[test]
     fn evict_on_an_on_demand_device_frees_the_file_but_never_purges_its_blocks_today() {
         let state = ReplicaCoordinator::open_in_memory().unwrap();
@@ -1358,6 +1486,24 @@ mod tests {
         let state = ReplicaCoordinator::open_in_memory().unwrap();
         let root = tempfile::tempdir().unwrap();
         adopt_root(&state, "group-1", root.path());
+        // `repair_one_interrupted_symlink`'s Windows arm gates its ENTIRE
+        // body -- including this test's own offline-delete classification
+        // -- on the link's `windows_symlink_opt_in` policy flag, which a
+        // fresh `add_link` (inside `adopt_root` above) defaults to `false`
+        // (see `windows_symlink_opt_in_for_group`'s own `unwrap_or(0)`).
+        // Without opting in here, `policy_permits_write` is `false` on
+        // Windows and the function returns `Ok(())` before ever reaching
+        // the on-disk/intent checks this test means to exercise, so
+        // `report.offline_deleted` stays empty regardless of what is (or
+        // is not) on disk. Mirrors the same opt-in every other symlink-
+        // materialization test that must actually reach that logic on
+        // Windows already performs (see e.g. `yadorilink-daemon::
+        // hydration`'s own `set_windows_symlink_opt_in(..., true)` calls).
+        #[cfg(windows)]
+        state
+            .link_repository()
+            .set_windows_symlink_opt_in(&root.path().to_string_lossy(), true)
+            .unwrap();
         let permit = RootCommitPermit::for_tests();
         let record = FileRecord {
             path: "gone-link.txt".to_string(),
@@ -1701,7 +1847,24 @@ mod tests {
             .begin_materialization_intent("group-1", "missing-deferred.bin", &[0; 32], &permit)
             .unwrap();
 
-        let out_path = root.path().join("missing-deferred.bin");
+        // `repair_interrupted_materializations` canonicalizes `root` itself
+        // (via `MaterializationExecutionPort::open_root` ->
+        // `VerifiedRoot::open`, which calls `root.canonicalize()`) before
+        // ever joining a path onto it -- see that type's own doc comment
+        // ("Callers relativize walked entries against this, so it must be
+        // the same resolution the caller's own scan performs internally").
+        // The failure-injection seam below matches on exact `PathBuf`
+        // equality, not on-disk identity, so this test must arm the SAME
+        // canonicalized path repair will actually build internally, not
+        // the raw `tempdir()` path -- on a host where the temp directory
+        // itself sits behind a symlink (e.g. macOS's `/var` ->
+        // `/private/var`, under which `TMPDIR` lives), those two differ:
+        // arming the raw path would silently never match, and the real
+        // (non-deferred) `write_placeholder` would run instead, leaving an
+        // actual placeholder file this test's own sanity assertion below
+        // expects to be absent.
+        let canonical_root = root.path().canonicalize().unwrap();
+        let out_path = canonical_root.join("missing-deferred.bin");
         yadorilink_local_storage::materialize_write::set_test_force_deferred_placeholder_for_path(
             &out_path, true,
         );
