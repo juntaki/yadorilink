@@ -153,11 +153,20 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         group_id: &str,
         path: &str,
     ) -> Result<bool, MaterializationExecutionError> {
+        // Excludes a LOCAL-origin obligation: it can only be produced by
+        // this device's own local emission, whose bytes were already
+        // observed on this device's own disk before the change was ever
+        // admitted, so it never represents content not yet placed -- see
+        // `yadorilink_sync_sqlite::projection_obligations::
+        // ObligationOrigin`'s own doc comment.
         Ok(self
             .sqlite()
             .dag_lookup_projection_obligation(group_id, path)
             .map_err(SyncError::from)?
-            .is_some())
+            .is_some_and(|obligation| {
+                obligation.origin
+                    == yadorilink_sync_sqlite::projection_obligations::ObligationOrigin::Remote
+            }))
     }
 
     fn clear_materialization_intent(

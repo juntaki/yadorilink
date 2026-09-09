@@ -79,10 +79,18 @@ pub fn init_projection_obligations_schema(conn: &Connection) -> Result<(), SyncS
     // runs (nothing holds an in-memory `ClaimedObligation` across a process
     // restart, which a schema migration requires), so it needs no more than
     // this one shared, permanently-unique sentinel.
+    // `origin` migrates the same idempotent way, defaulting existing rows to
+    // `'remote'` -- the fail-closed choice: a pre-migration row carries no
+    // record of which of the four bump seams last touched it, and `'remote'`
+    // is exactly the veto-preserving default (see `ObligationOrigin`'s own
+    // doc comment) -- treating an unknown-origin row as if it might still
+    // need content placed from elsewhere, never as self-evidently safe to
+    // wave through.
     for stmt in [
         "ALTER TABLE projection_obligations ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE projection_obligations ADD COLUMN next_attempt_at INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE projection_obligations ADD COLUMN obligation_incarnation INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE projection_obligations ADD COLUMN origin TEXT NOT NULL DEFAULT 'remote'",
     ] {
         match conn.execute(stmt, []) {
             Ok(_) => {}
@@ -168,17 +176,33 @@ pub fn bump_projection_obligations_for_touched_paths(
             "DELETE FROM projection_obligation_incarnations WHERE id = ?1",
             rusqlite::params![fresh_incarnation],
         )?;
+        // `origin` is always written as `'remote'` here, on BOTH the fresh
+        // `INSERT` and the `ON CONFLICT` bump-in-place arm -- this is the
+        // universal, conservative default every one of this function's
+        // three call sites gets for free. `admit_prepared_emission` (the
+        // sole local-authoring seam) additionally calls
+        // [`mark_projection_obligations_local_origin`] immediately
+        // afterward, in the SAME transaction, to overwrite it to `'local'`
+        // for the paths it just touched. Writing `'remote'` unconditionally
+        // in the `ON CONFLICT` arm too (not just on first insert) is
+        // deliberate: a later REMOTE-authored admission bumping a path an
+        // earlier LOCAL emission had marked must reset origin back to
+        // `'remote'`, since the row now again describes desired content
+        // this device has not necessarily placed -- see `ObligationOrigin`'s
+        // own doc comment for why leaving a stale `'local'` tag in place
+        // across a subsequent remote bump would be unsound.
         conn.execute(
             "INSERT INTO projection_obligations
                 (group_id, path, invalidation_generation, state, attempt_count,
-                 next_attempt_at, created_at, updated_at, obligation_incarnation)
-             VALUES (?1, ?2, 1, 'pending', 0, ?3, ?3, ?3, ?4)
+                 next_attempt_at, created_at, updated_at, obligation_incarnation, origin)
+             VALUES (?1, ?2, 1, 'pending', 0, ?3, ?3, ?3, ?4, 'remote')
              ON CONFLICT (group_id, path) DO UPDATE SET
                 invalidation_generation = invalidation_generation + 1,
                 state = 'pending',
                 attempt_count = 0,
                 next_attempt_at = ?3,
-                updated_at = ?3",
+                updated_at = ?3,
+                origin = 'remote'",
             rusqlite::params![group_id, path, now_unix_nanos, fresh_incarnation],
         )?;
     }
@@ -195,7 +219,7 @@ pub fn lookup_projection_obligation(
 ) -> Result<Option<ProjectionObligation>, SyncSqliteError> {
     conn.query_row(
         "SELECT invalidation_generation, state, attempt_count, next_attempt_at, created_at,
-                updated_at, obligation_incarnation
+                updated_at, obligation_incarnation, origin
            FROM projection_obligations WHERE group_id = ?1 AND path = ?2",
         rusqlite::params![group_id, path],
         |r| {
@@ -207,6 +231,7 @@ pub fn lookup_projection_obligation(
                 created_at: r.get(4)?,
                 updated_at: r.get(5)?,
                 obligation_incarnation: r.get(6)?,
+                origin: ObligationOrigin::from_db_str(&r.get::<_, String>(7)?),
             })
         },
     )
@@ -225,6 +250,97 @@ pub struct ProjectionObligation {
     /// See [`bump_projection_obligations_for_touched_paths`]'s own doc
     /// comment (Phase E finding: obligation row-incarnation ABA).
     pub obligation_incarnation: i64,
+    /// Which of the four admission seams' bump most recently touched this
+    /// row. See [`ObligationOrigin`]'s own doc comment for what this
+    /// distinguishes and why it exists.
+    pub origin: ObligationOrigin,
+}
+
+/// Which kind of DAG admission most recently bumped a `projection_
+/// obligations` row -- the distinction the offline-delete-vs-not-yet-placed
+/// tombstone veto was missing.
+///
+/// `bump_projection_obligations_for_touched_paths` bumps identically for
+/// EVERY admission -- a primary change, a promoted orphan, a startup
+/// self-heal promotion, or a local emission -- because all four are
+/// equally genuine "desired state changed" events from the Convergence
+/// Engine's scheduling point of view. But they are NOT equally ambiguous
+/// for the *offline-delete-vs-not-yet-placed* question the tombstone veto
+/// (`has_unsettled_projection_obligation`, in both
+/// `yadorilink-local-capture`'s restart scan and
+/// `yadorilink-filesystem-sync`'s interrupted-materialization repair pass)
+/// exists to answer: a primary change/promoted orphan/self-heal promotion
+/// all describe content that arrived (or was buffered) from a PEER -- this
+/// device may not yet have written those bytes anywhere, so the path's
+/// absence from disk is genuinely ambiguous between "never materialized
+/// yet" and "deleted after materializing." A LOCAL emission is different by
+/// construction: `admit_prepared_emission`'s caller already observed the
+/// bytes on this device's own disk (that observation IS the local capture
+/// that produced the change) before the change was ever admitted -- there
+/// is no fetch/materialize step for content this device authored itself,
+/// so an obligation whose most recent bump was a local emission can never
+/// represent "not yet placed." Its path's absence from disk at scan/repair
+/// time can only mean a genuine subsequent deletion.
+///
+/// `Remote` is the fail-closed default (see the schema migration's own doc
+/// comment and `bump_projection_obligations_for_touched_paths`'s own doc
+/// comment on why the `ON CONFLICT` arm always resets to `Remote`): only
+/// `admit_prepared_emission`'s own immediate follow-up call to
+/// [`mark_projection_obligations_local_origin`] ever produces `Local`, and
+/// any later bump from ANY of the other three seams overwrites it back to
+/// `Remote` -- so a path that ever again needs content from elsewhere loses
+/// its `Local` tag the instant that need is recorded, never leaving a stale
+/// `Local` tag protecting the wrong generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObligationOrigin {
+    /// This device authored the change itself; the desired bytes were
+    /// already on this device's own disk (observed directly by local
+    /// capture) before the obligation was ever created. Never a "not yet
+    /// placed" veto reason.
+    Local,
+    /// The change came from (or through) a peer -- a primary admission, a
+    /// promoted orphan, or a startup self-heal promotion. This device may
+    /// not have the desired bytes on disk yet. The veto-preserving default.
+    Remote,
+}
+
+impl ObligationOrigin {
+    /// Any value other than the literal `"local"` this crate itself ever
+    /// writes -- including a value from some future, not-yet-understood
+    /// migration path -- reads as `Remote`, matching the column's own
+    /// fail-closed `DEFAULT 'remote'`.
+    fn from_db_str(s: &str) -> Self {
+        match s {
+            "local" => ObligationOrigin::Local,
+            _ => ObligationOrigin::Remote,
+        }
+    }
+}
+
+/// Overwrites the `origin` of the just-bumped obligation row for each of
+/// `touched_paths` to [`ObligationOrigin::Local`]. Must be called in the
+/// SAME transaction as, and strictly after,
+/// [`bump_projection_obligations_for_touched_paths`] for the same
+/// `touched_paths` -- it updates whatever row currently exists for
+/// `(group_id, path)`, which that preceding call is what guarantees is the
+/// row this bump just touched, not a stale one from an earlier admission.
+///
+/// The sole production call site is `admit_prepared_emission` (the local-
+/// authoring emission seam) -- see [`ObligationOrigin`]'s own doc comment
+/// for why only that seam ever produces `Local`.
+pub fn mark_projection_obligations_local_origin(
+    conn: &Connection,
+    group_id: &str,
+    touched_paths: &[&str],
+) -> Result<(), SyncSqliteError> {
+    for path in touched_paths {
+        conn.execute(
+            "UPDATE projection_obligations SET origin = 'local'
+              WHERE group_id = ?1 AND path = ?2",
+            rusqlite::params![group_id, path],
+        )?;
+    }
+    Ok(())
 }
 
 /// One obligation a claim call handed to a worker: enough to drive an

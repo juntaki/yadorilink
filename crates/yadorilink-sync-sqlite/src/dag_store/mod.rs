@@ -1426,6 +1426,19 @@ pub fn admit_prepared_emission(
                 &touched,
                 now_unix_nanos(),
             )?;
+            // This is the sole local-authoring emission seam: the bytes this
+            // change describes were already observed on this device's own
+            // disk (that observation is what produced the change), so the
+            // obligation this bump just created/advanced can never
+            // represent content not yet placed locally. Tag it `Local`
+            // (overwriting the bump's own conservative `Remote` default)
+            // so the offline-delete-vs-not-yet-placed tombstone veto never
+            // treats this device's own already-authored write as a reason
+            // to withhold a later, genuine offline deletion. See
+            // `ObligationOrigin`'s own doc comment for the full reasoning.
+            crate::projection_obligations::mark_projection_obligations_local_origin(
+                conn, group_id, &touched,
+            )?;
         }
     }
     Ok(change)

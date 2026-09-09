@@ -153,11 +153,22 @@ impl LocalMutationStore for ReplicaCoordinator {
         group_id: &str,
         path: &str,
     ) -> Result<bool, SyncSqliteError> {
-        // While a projection obligation exists for this path, an absent
-        // local file must not yet be interpreted as an offline user
-        // deletion -- any row at all (pending or the parked
+        // While a REMOTE-origin projection obligation exists for this path,
+        // an absent local file must not yet be interpreted as an offline
+        // user deletion -- any row at all (pending or the parked
         // `ignore_blocked`) means the path is still being placed locally.
-        Ok(self.sqlite().dag_lookup_projection_obligation(group_id, path)?.is_some())
+        // A `Local`-origin row is excluded from this veto: it can only be
+        // produced by this device's own local emission, whose bytes were
+        // already observed on this device's own disk before the change was
+        // ever admitted, so it never represents content not yet placed --
+        // see `yadorilink_sync_sqlite::projection_obligations::
+        // ObligationOrigin`'s own doc comment.
+        Ok(self.sqlite().dag_lookup_projection_obligation(group_id, path)?.is_some_and(
+            |obligation| {
+                obligation.origin
+                    == yadorilink_sync_sqlite::projection_obligations::ObligationOrigin::Remote
+            },
+        ))
     }
 
     fn is_held(&self, group_id: &str, path: &str) -> Result<bool, SyncSqliteError> {

@@ -120,7 +120,8 @@ xcrun swiftc \
     -target "$SWIFT_TARGET" \
     -framework Cocoa \
     -o "$APP_BUNDLE/Contents/MacOS/$HOST_APP_NAME" \
-    "$HOST_DIR/main.swift"
+    "$HOST_DIR/main.swift" \
+    "$HOST_DIR/DomainRegistration.swift"
 
 cp "$HOST_DIR/Info.plist" "$APP_BUNDLE/Contents/Info.plist"
 

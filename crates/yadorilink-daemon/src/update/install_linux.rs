@@ -104,6 +104,11 @@ mod tests {
         use std::os::unix::process::ExitStatusExt;
         ExitStatus::from_raw(if succeed { 0 } else { 1 << 8 })
     }
+    #[cfg(windows)]
+    fn mock_exit_status(succeed: bool) -> ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+        ExitStatus::from_raw(if succeed { 0 } else { 1 })
+    }
 
     impl CommandRunner for MockRunner {
         fn run(&self, program: &str, args: &[&str]) -> std::io::Result<Output> {

@@ -222,7 +222,12 @@ impl LocalMutationStore for TestReplica {
         path: &str,
     ) -> Result<bool, SyncSqliteError> {
         // Kept a verbatim copy of `ReplicaCoordinator`'s own impl.
-        Ok(self.sqlite().dag_lookup_projection_obligation(group_id, path)?.is_some())
+        Ok(self.sqlite().dag_lookup_projection_obligation(group_id, path)?.is_some_and(
+            |obligation| {
+                obligation.origin
+                    == yadorilink_sync_sqlite::projection_obligations::ObligationOrigin::Remote
+            },
+        ))
     }
 
     fn is_held(&self, group_id: &str, path: &str) -> Result<bool, SyncSqliteError> {
