@@ -1122,6 +1122,31 @@ mod unix_socket_tests {
                 &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
+        // `upsert_file` alone leaves `materialization_state` at the
+        // schema's own default, `Placeholder` -- not `Hydrated` -- since it
+        // is the generic index-write primitive every kind of row (including
+        // a not-yet-fetched on-demand placeholder) goes through. This test
+        // is specifically about evicting an already-*hydrated* file (see
+        // its own doc comment), so that has to be set explicitly here,
+        // exactly like the real materialize path would have left it after
+        // actually writing `report.pdf`'s bytes to disk. Without this,
+        // `evict_file`'s own revalidation snapshot reads `materialization_
+        // state != Some(Hydrated)` and silently, correctly, takes its
+        // "leave the file materialized" bail-out path -- `dehydrated:
+        // false`, `blocks_retained: true` -- which the control socket
+        // still reports back as an ordinary `RespPayload::Evict` (a
+        // legitimate no-op response, not an error), so eviction appeared
+        // to "succeed" while never actually touching the file at all.
+        state
+            .replica_coordinator
+            .materialization_state_repository()
+            .set_materialization_state(
+                "group-7",
+                "report.pdf",
+                yadorilink_replica_domain::session_state::MaterializationState::Hydrated,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
 
         let resp = send(
             &socket_path,
