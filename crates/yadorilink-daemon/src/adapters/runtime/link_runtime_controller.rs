@@ -1287,12 +1287,27 @@ mod tests {
     /// Discriminating by construction: the runtime has exactly one worker
     /// thread and the sweep runs in a spawned task (not in the test's own
     /// `block_on` thread, which is not a worker and would therefore never have
-    /// held a core to begin with). A second spawned task tries to tick every
-    /// millisecond throughout. Run inline, the sweep's task owns the only core
-    /// from the moment it starts until it returns, and the ticker records zero
-    /// ticks for that whole window; offloaded, `block_in_place` hands the core
-    /// -- and the ticker queued on it -- to a replacement thread before the
-    /// walk begins, and the ticks keep coming.
+    /// held a core to begin with). A second spawned task loops on
+    /// `tokio::task::yield_now` throughout, counting how many times it gets
+    /// rescheduled. Run inline, the sweep's task owns the only core from the
+    /// moment it starts until it returns, and the counter advances zero
+    /// times for that whole window; offloaded, `block_in_place` hands the
+    /// core -- and the counter task queued on it -- to a replacement thread
+    /// before the walk begins, and the count keeps climbing.
+    ///
+    /// Cooperative rescheduling, not a real-time ticker: an earlier version
+    /// of this test used a `tokio::time::sleep(1ms)` loop and compared its
+    /// tick rate against wall-clock elapsed time, which measured this
+    /// fixture correctly on Linux and macOS but failed on real
+    /// windows-latest CI runners even when the worker genuinely was freed --
+    /// confirmed via that failure's own numbers (63 ticks across 675ms,
+    /// ~10.7ms/tick) that Windows's own timer resolution is coarser than the
+    /// 1ms this test's old tolerance assumed, not that the offload stopped
+    /// happening. `yield_now` has no such platform-dependent floor: it is
+    /// rescheduled the instant the runtime's ready queue reaches it again,
+    /// bounded only by scheduler overhead, so the offloaded/inline gap stays
+    /// enormous (thousands of reschedules vs. essentially none) regardless
+    /// of host OS, CPU speed, or machine load.
     ///
     /// The fixture is directories, not files, deliberately. A directory entry
     /// is skipped outright by the reconcile loop, so the whole tree walk is
@@ -1323,45 +1338,46 @@ mod tests {
             .unwrap();
         start_watch_and_await_scan(&state, root.path(), group).await;
 
-        let ticks = Arc::new(AtomicU64::new(0));
-        let ticker = {
-            let ticks = ticks.clone();
+        let reschedules = Arc::new(AtomicU64::new(0));
+        let counter_started = Arc::new(tokio::sync::Notify::new());
+        let counter = {
+            let reschedules = reschedules.clone();
+            let counter_started = counter_started.clone();
             tokio::spawn(async move {
+                counter_started.notify_one();
                 loop {
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                    ticks.fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                    reschedules.fetch_add(1, Ordering::Relaxed);
                 }
             })
         };
-        // Let the ticker reach its first `sleep` before the sweep starts, so
-        // "no ticks" can only mean the worker was held, never that the ticker
-        // had not been polled even once yet.
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // An explicit signal that the counter task has actually started
+        // (rather than a fixed delay guessed to be "surely enough"), so "no
+        // reschedules" during the sweep can only mean the worker was held,
+        // never that the counter task had not begun running yet.
+        counter_started.notified().await;
 
         let controller = LinkRuntimeController::new(state.clone());
-        let before = ticks.load(Ordering::Relaxed);
-        let started = std::time::Instant::now();
+        let before = reschedules.load(Ordering::Relaxed);
         tokio::spawn(async move { controller.run_disk_reconcile_backstop_sweep().await })
             .await
             .expect("the sweep task must not panic");
-        let elapsed = started.elapsed();
-        let during = ticks.load(Ordering::Relaxed) - before;
-        ticker.abort();
+        let during = reschedules.load(Ordering::Relaxed) - before;
+        counter.abort();
 
-        // Proportional, not `> 0`: a ticker that never gets its worker back
-        // still records the odd tick from the slop either side of the spawn, so
-        // an absolute floor of one does not discriminate. A ticker that keeps
-        // its worker ticks about once per millisecond. An eighth of the elapsed
-        // milliseconds sits far below that and far above the slop, with room
-        // for a loaded machine to stretch the ticker's real period several-fold
-        // -- measured on this fixture: 85 ticks across 183ms offloaded, 1 tick
-        // across 166ms inline.
-        let expected = elapsed.as_millis() as u64 / 8;
+        // A generous but still highly discriminating floor: run inline, the
+        // counter task cannot be scheduled even once while the sweep holds
+        // the only worker (0, plus at most a handful from unavoidable
+        // scheduling slop around the spawn boundaries); offloaded, a
+        // `yield_now` loop sharing a free worker for the whole multi-
+        // hundred-directory walk manages many thousands. 100 sits far above
+        // any plausible slop and far below any genuinely offloaded run, with
+        // no dependency on wall-clock time at all.
         assert!(
-            during >= expected,
+            during > 100,
             "the disk-reconcile backstop's whole-folder walk ran on the worker that polls the \
-             sweep: a 1ms ticker sharing the runtime's only worker managed only {during} ticks \
-             (expected at least {expected}) across the sweep's {elapsed:?}"
+             sweep: a yield-now loop sharing the runtime's only worker was rescheduled only \
+             {during} times while the sweep ran (expected at least 100)"
         );
     }
 }

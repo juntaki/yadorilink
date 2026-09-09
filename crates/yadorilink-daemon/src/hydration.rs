@@ -3879,6 +3879,33 @@ mod tests {
             .file_index_repository()
             .touch_last_accessed(GROUP, PATH, 100)
             .unwrap();
+        // On a Windows build, `evict_to_placeholder`'s Windows arm requires
+        // a recorded CfAPI placeholder identity for this row (see that
+        // function's own doc comment) -- a real precondition this test must
+        // seed, same as `dst_eviction_crash_recovery.rs` does, since this
+        // row was indexed directly rather than through a real create/hydrate
+        // lifecycle. Harmless on non-Windows: `evict_to_placeholder`'s
+        // non-Windows arm never reads it.
+        state
+            .replica_coordinator
+            .materialization_state_repository()
+            .record_placeholder_generation(
+                GROUP,
+                PATH,
+                yadorilink_local_storage::PlaceholderDiskIdentity { dev: 0, ino: 1 },
+                yadorilink_local_storage::WINDOWS_CFAPI_GENERATION_PROVIDER_KIND,
+                &permit,
+            )
+            .unwrap();
+        // Bypasses the real `cfapi-host.exe` pipe round trip on a Windows
+        // build -- this test asserts on the custody/lease gate, not on the
+        // native dehydrate mechanism, and no live CfAPI provider process
+        // runs in this unit test. No-op on non-Windows. See
+        // `set_test_windows_dehydrate_confirmed_for_path`'s own doc comment.
+        crate::replica_coordinator::set_test_windows_dehydrate_confirmed_for_path(
+            &root.path().join(PATH),
+            true,
+        );
         // An instantaneous peer confirmation is deliberately insufficient for
         // physical CAS deletion until durable remote custody leases exist.
         state.set_custody_confirmer(std::sync::Arc::new(

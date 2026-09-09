@@ -29,6 +29,17 @@ mod materialization_execution;
 mod materialization_state;
 mod peer_replica_state;
 
+// Test-only: lets `gc.rs`/`hydration.rs`'s own unit tests reach
+// `materialization_execution`'s Windows-native-dehydrate bypass without
+// that private submodule itself becoming `pub(crate)` -- see that
+// function's own doc comment. Plain `cfg(test)`, not `any(test, feature =
+// "test-support"))]`: the function it re-exports is itself `cfg(test)`-only
+// (no caller outside this crate's own unit tests needs it), so gating the
+// re-export any wider would just be an unused `pub(crate) use` in a build
+// that has `test-support` on but `cfg(test)` off.
+#[cfg(test)]
+pub(crate) use materialization_execution::set_test_windows_dehydrate_confirmed_for_path;
+
 use std::sync::{Arc, Mutex};
 
 use rusqlite::Connection;
