@@ -2955,9 +2955,20 @@ mod tests {
         );
     }
 
-    /// Happy-path companion to the atomicity test above: confirms the
-    /// transaction wrap did not break ordinary self-heal. `init_dag_schema`
-    /// is genuinely re-run on the same connection (a restart, not a fresh
+    /// Happy-path companion to the atomicity test above, updated for the
+    /// writer-freshness fix (`a329b9d4`, "Close a stale-ChangeAuth replay
+    /// hole in live admission; cover orphan promotion"): `init_dag_schema`'s
+    /// own self-heal sweep now runs with `orphan_integrity::
+    /// defer_all_orphan_promotion` (see that call site's own comment), so it
+    /// must NOT promote `child` itself -- no trust material can possibly be
+    /// loaded this early in startup. What this test actually proves is the
+    /// full two-step production sequence: `init_dag_schema` defers at
+    /// startup, then `resweep_deferred_orphan_promotions` (driven here with
+    /// `always_current_writer`, standing in for the real policy-backed check
+    /// `yadorilink_daemon::peer_orchestrator::record_group_policy_states`
+    /// installs once trust is available) gives the deferred child its
+    /// genuine second chance and actually promotes it. `init_dag_schema` is
+    /// genuinely re-run on the same connection (a restart, not a fresh
     /// database), matching production's own re-open-on-every-startup shape.
     #[test]
     fn startup_self_heal_promotes_a_child_whose_parent_landed_via_append_change_alone() {
@@ -2981,9 +2992,30 @@ mod tests {
         // call, on every open, not just the first).
         init_dag_schema(&recv).unwrap();
 
+        // `init_dag_schema`'s own self-heal sweep always defers now -- no
+        // trust material is available this early in startup, so the child
+        // must still be a buffered orphan, not promoted.
+        assert!(
+            !has_change(&recv, &child.compute_hash()).unwrap(),
+            "init_dag_schema's self-heal sweep must defer (not promote) with no trust material \
+             available"
+        );
+        assert!(
+            has_change_or_buffered_orphan(&recv, &child.compute_hash()).unwrap(),
+            "the deferred child must still be recoverable as a buffered orphan"
+        );
+
+        // The second half of production's real sequence: once real trust is
+        // available, `resweep_deferred_orphan_promotions` gives the
+        // deferred candidate its genuine second chance.
+        let resweeped =
+            resweep_deferred_orphan_promotions(&recv, &orphan_integrity::always_current_writer)
+                .unwrap();
+        assert_eq!(resweeped, vec![child.compute_hash()]);
         assert!(
             has_change(&recv, &child.compute_hash()).unwrap(),
-            "startup self-heal must promote a child whose parent only ever landed via append_change"
+            "resweep_deferred_orphan_promotions must promote a child whose parent only ever \
+             landed via append_change"
         );
         assert_eq!(group_heads(&recv, "g").unwrap(), vec![child.compute_hash()]);
     }
@@ -3107,13 +3139,16 @@ mod tests {
         assert_eq!(ob.invalidation_generation, 1);
     }
 
-    /// Startup self-heal bumps the obligation for a child promoted only
-    /// because `init_dag_schema` re-ran (the parent
-    /// landed via bare `append_change`, never through `admit_change`).
+    /// Startup self-heal bumps the obligation for a child promoted once
+    /// real trust becomes available and `resweep_deferred_orphan_
+    /// promotions` actually runs -- `init_dag_schema`'s own self-heal sweep
+    /// always defers now (writer-freshness fix `a329b9d4`; see that call
+    /// site's own comment and the happy-path promotion test above), so it
+    /// must not touch the obligation at all; only the later resweep may.
     /// Confirmed genuinely RED by temporarily removing the bump call this
     /// seam shares with `bump_execution_fence_for_promoted` and re-running:
-    /// the child is promoted (proven by the existing happy-path test above)
-    /// but never obligated.
+    /// the child is promoted (proven by the happy-path test above) but
+    /// never obligated.
     #[test]
     fn startup_self_heal_bumps_the_projection_obligation_for_the_promoted_child() {
         let sender = conn();
@@ -3137,6 +3172,18 @@ mod tests {
         );
 
         init_dag_schema(&recv).unwrap();
+
+        // `init_dag_schema`'s self-heal sweep defers -- the child is still
+        // unpromoted, so it must still have no obligation either.
+        assert!(
+            crate::projection_obligations::lookup_projection_obligation(&recv, "g", "b")
+                .unwrap()
+                .is_none(),
+            "a deferred (not yet promoted) child must still have no obligation"
+        );
+
+        resweep_deferred_orphan_promotions(&recv, &orphan_integrity::always_current_writer)
+            .unwrap();
 
         let ob = crate::projection_obligations::lookup_projection_obligation(&recv, "g", "b")
             .unwrap()

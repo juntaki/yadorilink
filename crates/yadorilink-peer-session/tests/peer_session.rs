@@ -8790,14 +8790,21 @@ mod promoted_orphan_projection_tests {
     /// `REMOTE_ADMISSION_BATCH_SIZE` (8) independent Changes must still
     /// admit every one of them, AND the underlying storage-layer fast-path
     /// call site (`ChangeHistoryRepository::admit_one_bounded_chunk`'s own
-    /// `write_immediate`, `change_history.rs:557`) must be invoked
-    /// approximately `ceil(N / 8)` times, not once per Change -- proving
-    /// `handle_change_batch`'s Stage 1/Stage 2 restructuring actually
-    /// reaches the bounded batch API in production, not just in the
-    /// storage-layer's own unit tests. Filters `call_site_stats()` to this
-    /// one specific internal call site (rather than a global reset) so
+    /// `write_immediate`, `change_history.rs:618` as of the writer-freshness
+    /// fix `a329b9d4` -- `#[track_caller]` bakes in the exact source line,
+    /// so this literal MUST be re-synced whenever an edit to
+    /// `change_history.rs` above that call site shifts it again) must be
+    /// invoked approximately `ceil(N / 8)` times, not once per Change --
+    /// proving `handle_change_batch`'s Stage 1/Stage 2 restructuring
+    /// actually reaches the bounded batch API in production, not just in
+    /// the storage-layer's own unit tests. Filters `call_site_stats()` to
+    /// this one specific internal call site (rather than a global reset) so
     /// this assertion is robust to unrelated writer-gate traffic from any
-    /// other test running concurrently in this same binary.
+    /// other test running concurrently in this same binary -- and
+    /// deliberately NOT to every `write_immediate` call in
+    /// `change_history.rs`, which would also match the sequential
+    /// exceptional-fallback path (`dag_admit_change_with_versions`'s own
+    /// call site) this test needs to distinguish from.
     #[tokio::test]
     async fn a_wire_batch_larger_than_the_admission_chunk_size_is_admitted_in_bounded_db_groups() {
         let signing_key = SigningKey::from_bytes(&[19u8; 32]);
@@ -8856,7 +8863,7 @@ mod promoted_orphan_projection_tests {
 
         let before: u64 = yadorilink_sqlite_runtime::c4_diag::call_site_stats()
             .into_iter()
-            .filter(|(site, _)| site.contains("change_history.rs:557"))
+            .filter(|(site, _)| site.contains("change_history.rs:618"))
             .map(|(_, count)| count)
             .sum();
 
@@ -8880,7 +8887,7 @@ mod promoted_orphan_projection_tests {
 
         let after: u64 = yadorilink_sqlite_runtime::c4_diag::call_site_stats()
             .into_iter()
-            .filter(|(site, _)| site.contains("change_history.rs:557"))
+            .filter(|(site, _)| site.contains("change_history.rs:618"))
             .map(|(_, count)| count)
             .sum();
         let delta = after - before;
