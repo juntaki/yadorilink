@@ -35,7 +35,7 @@ tracing.workspace = true
 hex = "0.4"
 # Content-defined chunking for `chunker::chunk_file_content_defined`
 # (Phase 7D-8.1, moved from `yadorilink-sync-core`).
-fastcdc = "4.0.1"
+fastcdc = "5.0.0"
 # Portable free-space queries
 # (`available_space`/`total_space`) for the disk-headroom preflight check —
 # no existing dependency in this crate (or anywhere else in the workspace,
