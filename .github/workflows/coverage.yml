@@ -41,10 +41,14 @@ jobs:
         run: cargo install --locked --version 0.8.7 cargo-llvm-cov
       - run: cargo llvm-cov clean --workspace
       - name: Workspace coverage
-        run: cargo llvm-cov --workspace --exclude yadorilink-daemon --exclude yadorilink-desktop-app --no-report
+        # --no-fail-fast: surface every failing crate's tests in one run
+        # rather than stopping at the first one, so a fix doesn't have to
+        # be discovered and landed one crate at a time across repeated CI
+        # round-trips.
+        run: cargo llvm-cov --no-fail-fast --workspace --exclude yadorilink-daemon --exclude yadorilink-desktop-app --no-report
       - name: Daemon coverage (serial)
         run: |
-          cargo llvm-cov -p yadorilink-daemon --tests --no-report -- \
+          cargo llvm-cov --no-fail-fast -p yadorilink-daemon --tests --no-report -- \
             --test-threads=1 \
             --skip random_concurrent_operations_converge_to_an_identical_file_set \
             --skip replay_known_failing_seeds
