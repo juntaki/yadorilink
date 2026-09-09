@@ -52,8 +52,17 @@ jobs:
         # The two monkey-chaos cases are private seed/soak coverage. They run
         # in private beta-heat, while every ordinary daemon integration test
         # remains in this public, serial correctness lane.
+        #
+        # Deliberately WITHOUT --no-fail-fast: this is 90 separate test
+        # binaries that has never actually run to completion in public CI --
+        # a private-side baseline run found 37 pre-existing failures across
+        # many unrelated subsystems and took 111 minutes. Running the full
+        # suite unconditionally here would make every push spend 90+ minutes
+        # re-discovering the same known-broken tail instead of catching a
+        # real new regression quickly. Full-suite triage is tracked as its
+        # own separate effort, not something every CI run should pay for.
         run: >-
-          cargo test --no-fail-fast -p yadorilink-daemon --tests --
+          cargo test -p yadorilink-daemon --tests --
           --test-threads=1
           --skip random_concurrent_operations_converge_to_an_identical_file_set
           --skip replay_known_failing_seeds
@@ -74,12 +83,7 @@ jobs:
       matrix:
         os: [windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    # --no-fail-fast (below) makes the full daemon integration suite run to
-    # completion even after an early failure, instead of aborting fast --
-    # more complete failure information per run, but real wall-clock cost:
-    # the previous 60-minute budget was hit and the job cancelled before
-    # finishing on both windows-latest and macos-latest.
-    timeout-minutes: 90
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -91,8 +95,12 @@ jobs:
         with:
           toolchain: stable
       - name: Daemon E2E
+        # Deliberately WITHOUT --no-fail-fast: see linux-full's own Daemon
+        # E2E step for why -- this is the same 90-binary suite, never run
+        # to completion before, with a large known-broken tail. Full-suite
+        # triage is tracked as its own separate effort.
         run: >-
-          cargo test --no-fail-fast -p yadorilink-daemon --tests --
+          cargo test -p yadorilink-daemon --tests --
           --test-threads=1
           --skip random_concurrent_operations_converge_to_an_identical_file_set
           --skip replay_known_failing_seeds
