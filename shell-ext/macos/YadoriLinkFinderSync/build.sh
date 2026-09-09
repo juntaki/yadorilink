@@ -38,12 +38,20 @@ export DEVELOPER_DIR
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$SCRIPT_DIR"
 CORE_DIR="$ROOT_DIR/../core"
+FP_CORE_DIR="$ROOT_DIR/../fileprovider-core"
 EXT_DIR="$ROOT_DIR/Extension"
 HOST_DIR="$ROOT_DIR/HostApp"
 BUILD_DIR="$ROOT_DIR/build"
 
 RUST_TARGET="aarch64-apple-darwin"
 SWIFT_TARGET="arm64-apple-macos11"
+# Host app only, not the extension: DomainRegistration.swift's domain-
+# removal reconciliation calls NSFileProviderManager.remove(_:mode:
+# completionHandler:), API_AVAILABLE(macos(12.0)) per FileProvider.
+# framework's own NSFileProviderDefines.h -- matches project.yml's own
+# YadoriLinkFinderSyncHost target override (MACOSX_DEPLOYMENT_TARGET
+# "12.0" against the project-wide 11.0 base).
+HOST_SWIFT_TARGET="arm64-apple-macos12"
 
 HOST_APP_ID="com.juntaki.yadorilink"
 HOST_APP_NAME="YadoriLinkFinderSyncHost"
@@ -109,16 +117,42 @@ xcrun swiftc \
 cp "$EXT_DIR/Info.plist" "$APPEX_BUNDLE/Contents/Info.plist"
 
 # --- 3. Host app binary ------------------------------------
+# HostApp/DomainRegistration.swift needs the fileprovider-core FFI
+# (yadorilink_fp_list_on_demand_folders/yadorilink_fp_free_string) to
+# discover which OnDemand folder groups to register as File Provider
+# domains, and FileProvider.framework itself for NSFileProviderManager/
+# NSFileProviderDomain -- see project.yml's own YadoriLinkFinderSyncHost
+# target for the reference build these flags mirror.
+echo "-- building yadorilink-fileprovider-core (release, $RUST_TARGET) --"
+( cd "$FP_CORE_DIR" && cargo build --release --target "$RUST_TARGET" )
+FP_CORE_LIB_DIR="$FP_CORE_DIR/target/$RUST_TARGET/release"
+FP_CORE_LIB="$FP_CORE_LIB_DIR/libyadorilink_fileprovider_core.a"
+test -f "$FP_CORE_LIB" || { echo "missing $FP_CORE_LIB"; exit 1; }
+
+echo "-- discovering native-static-libs for fileprovider-core's link step --"
+FP_NATIVE_LIBS="$(cd "$FP_CORE_DIR" && cargo rustc --release --target "$RUST_TARGET" --crate-type staticlib -- --print native-static-libs 2>&1 | grep 'native-static-libs:' | sed -E 's/.*native-static-libs: *//')"
+FP_NATIVE_LIBS="$(printf '%s' "$FP_NATIVE_LIBS" | sed -E $'s/\x1b\\[[0-9;]*[a-zA-Z]//g')"
+FP_NATIVE_LIBS="$(echo "$FP_NATIVE_LIBS" | sed -E 's/(^| )-lm( |$)/\1/g')"
+echo "fileprovider-core native-static-libs: $FP_NATIVE_LIBS"
+
 echo "-- compiling host app --"
 APP_BUNDLE="$BUILD_DIR/$HOST_APP_NAME.app"
 mkdir -p "$APP_BUNDLE/Contents/MacOS"
 mkdir -p "$APP_BUNDLE/Contents/Resources"
 mkdir -p "$APP_BUNDLE/Contents/PlugIns"
 
+# shellcheck disable=SC2086
 xcrun swiftc \
     -sdk "$SDK" \
-    -target "$SWIFT_TARGET" \
+    -target "$HOST_SWIFT_TARGET" \
+    -import-objc-header "$HOST_DIR/YadoriLinkFinderSyncHost-Bridging-Header.h" \
+    -I "$FP_CORE_DIR/include" \
+    -L "$FP_CORE_LIB_DIR" \
+    -lyadorilink_fileprovider_core \
+    -liconv \
+    $FP_NATIVE_LIBS \
     -framework Cocoa \
+    -framework FileProvider \
     -o "$APP_BUNDLE/Contents/MacOS/$HOST_APP_NAME" \
     "$HOST_DIR/main.swift" \
     "$HOST_DIR/DomainRegistration.swift"
