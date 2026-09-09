@@ -82,7 +82,12 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo build --workspace --all-targets
       - name: Windows tests
-        run: cargo test --no-fail-fast --workspace --exclude yadorilink-daemon -- --test-threads=4
+        # Deliberately WITHOUT --no-fail-fast: this job's 20-minute budget
+        # doesn't have room for a full non-fail-fast run on Windows's
+        # slower CI hardware (confirmed: exceeded 20 minutes and got
+        # cancelled with it). Linux/macOS keep --no-fail-fast since their
+        # runs stayed well within budget.
+        run: cargo test --workspace --exclude yadorilink-daemon -- --test-threads=4
       - name: Windows shell extension
         working-directory: shell-ext/windows
         run: cargo build --release
