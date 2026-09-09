@@ -16191,6 +16191,29 @@ mod handoff_lease_wire_tests {
             None,
             session_b_deps,
         );
+        // `wait_for_and_process_peer_first_frame`'s own serve-budget gate
+        // (2026-09-02 handshake consolidation) now fails closed on a
+        // `ClusterConfig` advertising `max_inflight_requests`/`max_inflight_
+        // bytes` of zero -- which is exactly what `cluster_config_message`
+        // sends when no `BlockServeEngine` is installed. Every real
+        // (facade-constructed) session always has one before `run()` can be
+        // called (`PeerSyncSessionDeps::block_serve_engine` is mandatory),
+        // so both sides need one here too, or neither side's handshake ever
+        // completes and the whole pair's `run()` loops exit before this
+        // test's real request is ever seen. Generous limits: block-serving
+        // budget itself is not under test in this module.
+        session_a.set_block_serve_engine(crate::block_serve::BlockServeEngine::new(
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            16,
+        ));
+        session_b.set_block_serve_engine(crate::block_serve::BlockServeEngine::new(
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            16,
+        ));
 
         tokio::spawn({
             let session = session_a.clone();
@@ -16455,6 +16478,24 @@ mod handoff_ticket_wire_tests {
             None,
             session_b_deps,
         );
+        // See the matching comment in `handoff_lease_wire_tests::connected_
+        // pair_with_session_b_deps`: without a `BlockServeEngine` installed
+        // on both sides, `cluster_config_message` advertises a zero serve
+        // budget and `wait_for_and_process_peer_first_frame`'s fail-closed
+        // gate refuses the handshake outright, so neither `run()` loop ever
+        // reaches ordinary dispatch.
+        session_a.set_block_serve_engine(crate::block_serve::BlockServeEngine::new(
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            16,
+        ));
+        session_b.set_block_serve_engine(crate::block_serve::BlockServeEngine::new(
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            16,
+        ));
 
         tokio::spawn({
             let session = session_a.clone();
@@ -16722,6 +16763,24 @@ mod rebootstrap_wire_tests {
             None,
             session_b_deps,
         );
+        // See the matching comment in `handoff_lease_wire_tests::connected_
+        // pair_with_session_b_deps`: without a `BlockServeEngine` installed
+        // on both sides, `cluster_config_message` advertises a zero serve
+        // budget and `wait_for_and_process_peer_first_frame`'s fail-closed
+        // gate refuses the handshake outright, so neither `run()` loop ever
+        // reaches ordinary dispatch.
+        session_a.set_block_serve_engine(crate::block_serve::BlockServeEngine::new(
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            16,
+        ));
+        session_b.set_block_serve_engine(crate::block_serve::BlockServeEngine::new(
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            16,
+        ));
 
         tokio::spawn({
             let session = session_a.clone();
@@ -18276,6 +18335,25 @@ mod dag_paging_termination_tests {
                 ..PeerSyncSessionOneTimeDeps::test_permissive()
             },
         );
+        // Without a `BlockServeEngine` installed on both sides,
+        // `cluster_config_message` advertises a zero serve budget and
+        // `wait_for_and_process_peer_first_frame`'s fail-closed gate (2026-
+        // 09-02 handshake consolidation) refuses the handshake outright --
+        // see the matching comment in `handoff_lease_wire_tests::connected_
+        // pair_with_session_b_deps`. Neither `run()` loop would ever reach
+        // ordinary dispatch, so no anti-entropy traffic could occur at all.
+        session_a.set_block_serve_engine(crate::block_serve::BlockServeEngine::new(
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            16,
+        ));
+        session_b.set_block_serve_engine(crate::block_serve::BlockServeEngine::new(
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            16,
+        ));
         tokio::spawn({
             let session = session_a.clone();
             async move {
@@ -18526,6 +18604,21 @@ mod block_provenance_batching_tests {
             vec![GROUP.to_string()],
             HashMap::from([(GROUP.to_string(), root_b)]),
         );
+        // B also needs one, not because this module ever asks B to serve a
+        // block, but because `wait_for_and_process_peer_first_frame`'s
+        // fail-closed serve-budget gate (2026-09-02 handshake consolidation)
+        // rejects EITHER side's `ClusterConfig` if it advertises a zero
+        // budget -- which is exactly what `cluster_config_message` sends
+        // with no `BlockServeEngine` installed. Without this, A's own
+        // handshake with B is refused, A's `run()` returns before ever
+        // reaching ordinary dispatch, and A can never serve the very
+        // `BlockRequest`s this module's tests depend on B sending it.
+        session_b.set_block_serve_engine(crate::block_serve::BlockServeEngine::new(
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            16,
+        ));
         tokio::spawn({
             let session = session_a.clone();
             async move {
