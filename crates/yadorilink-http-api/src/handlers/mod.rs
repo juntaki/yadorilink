@@ -64,7 +64,6 @@ pub fn peer_status_json(p: &PeerStatus) -> Value {
         "reachability": p.reachability().as_str_name(),
         "unreachable_category": p.unreachable_category().as_str_name(),
         "route_kind": p.route_kind().as_str_name(),
-        "relay_capability": p.relay_capability().as_str_name(),
     })
 }
 

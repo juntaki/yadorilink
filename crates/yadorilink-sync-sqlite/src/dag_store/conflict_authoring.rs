@@ -81,6 +81,7 @@ use yadorilink_replica_domain::ids::{ChangeHash, VersionHash};
 use yadorilink_replica_engine::conflict::{change_touches_path, path_head_from_change, PathHead};
 use yadorilink_replica_engine::conflict_authoring as decision;
 
+use super::path_frontier;
 use super::retained_history_integrity;
 
 /// Creates the `conflict_copy_provenance` table if it does not exist. New
@@ -216,10 +217,57 @@ pub fn record_conflict_copy_ops_provenance(
 /// of only "what does it look like right now".
 pub fn path_heads_at_frontier(
     conn: &Connection,
+    group_id: &str,
     path: &str,
     frontier: &[ChangeHash],
 ) -> Result<Vec<PathHead>, SyncSqliteError> {
-    path_heads_at_frontier_memoized(conn, path, frontier, &mut FrontierWalkMemo::default())
+    path_heads_at_frontier_memoized(
+        conn,
+        group_id,
+        path,
+        frontier,
+        &mut FrontierWalkMemo::default(),
+    )
+}
+
+/// Whether `frontier` is exactly the group's current head set.
+///
+/// Set equality, not sequence equality: `group_heads` returns its rows in
+/// hash order and a change's parents are canonically sorted, but a caller
+/// may hand either one over in any order, and answering "no" to a
+/// frontier that is in fact the current one would silently reinstate a
+/// walk rather than produce a wrong result -- a performance cliff is
+/// harder to notice than a failure.
+///
+/// Both sides are frontiers, so both are small; this is one indexed query
+/// and a comparison of a handful of hashes.
+fn frontier_is_current_group_heads(
+    conn: &Connection,
+    group_id: &str,
+    frontier: &[ChangeHash],
+) -> Result<bool, SyncSqliteError> {
+    let current = super::frontier_index::group_heads(conn, group_id)?;
+    if current.len() != frontier.len() {
+        return Ok(false);
+    }
+    let current: HashSet<[u8; 32]> = current.iter().map(|h| h.0).collect();
+    Ok(frontier.iter().all(|h| current.contains(&h.0)))
+}
+
+/// Whether any retained change in this group touches `path`, as one
+/// indexed lookup against the normalized path effects.
+///
+/// `change_path_effects`'s primary key leads with `(group_id, path)`, so
+/// this is a range probe that stops at the first row.
+fn group_has_touched_path(
+    conn: &Connection,
+    group_id: &str,
+    path: &str,
+) -> Result<bool, SyncSqliteError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT 1 FROM change_path_effects WHERE group_id = ?1 AND path = ?2 LIMIT 1",
+    )?;
+    Ok(stmt.exists(rusqlite::params![group_id, path])?)
 }
 
 /// A cheap, order-insensitive fingerprint of one path, used only as a negative
@@ -312,33 +360,241 @@ impl FrontierWalkMemo {
 /// visits and returns exactly what it returns.
 fn path_heads_at_frontier_memoized(
     conn: &Connection,
+    group_id: &str,
     path: &str,
     frontier: &[ChangeHash],
-    memo: &mut FrontierWalkMemo,
+    _memo: &mut FrontierWalkMemo,
 ) -> Result<Vec<PathHead>, SyncSqliteError> {
-    let fingerprint = path_fingerprint(path);
+    // Start from what is known to touch this path, not from the frontier.
+    //
+    // This used to descend the DAG from `frontier`, decoding every change
+    // it passed and stopping a lineage at the first one that touched
+    // `path`. That is proportional to how much history the frontier
+    // reaches, not to how often the path was written -- and it is at its
+    // worst for a path the walk will not find, because nothing lets it
+    // stop early.
+    //
+    // The cost lands on the case peer-to-peer sync exists for. A device
+    // returning from offline brings changes whose parents are its own, so
+    // every admission resolves against a frontier that is not the current
+    // one and the current-frontier read never applies. Two measurements,
+    // both on a returning branch:
+    //
+    // - Carrying paths this device had never seen, the walk had no toucher
+    //   to stop at and descended everything reachable: the last hundred
+    //   admissions cost 8.1x the first hundred, growing with position,
+    //   making the catch-up quadratic in the branch's own length.
+    // - Carrying edits to files that already existed -- the ordinary case
+    //   -- it cost a flat 3,780us per admission over 1,000 files, ~29x the
+    //   first case. Flat, because editing files in creation order happens
+    //   to keep the walk a constant length; flat and expensive is not
+    //   better than growing, it is just harder to notice.
+    //
+    // `change_path_effects` already records every retained change that
+    // touches a path, so the candidate set is bounded by how often the
+    // path was written. Empty settles the question outright. Otherwise
+    // what remains is a question about a handful of changes: which of
+    // them this frontier can see, and which of those the others supersede
+    // -- both answered by the bounded ancestry decision the admission
+    // path uses, and neither requiring a change to be decoded at all.
+    let candidates = path_frontier::effects_touching_path(conn, group_id, path)?;
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut reachable: Vec<PathHead> = Vec::new();
+    for candidate in candidates {
+        let hash = ChangeHash(candidate.change_hash);
+        let visible = frontier.contains(&hash)
+            || frontier.iter().try_fold(false, |seen, head| {
+                if seen {
+                    return Ok::<bool, SyncSqliteError>(true);
+                }
+                path_frontier::is_ancestor_bounded(conn, &hash, head)
+            })?;
+        if visible {
+            reachable.push(candidate);
+        }
+    }
+
+    let mut live = Vec::new();
+    for candidate in &reachable {
+        let hash = ChangeHash(candidate.change_hash);
+        let mut superseded = false;
+        for other in &reachable {
+            if other.change_hash == candidate.change_hash {
+                continue;
+            }
+            if path_frontier::is_ancestor_bounded(conn, &hash, &ChangeHash(other.change_hash))? {
+                superseded = true;
+                break;
+            }
+        }
+        if !superseded {
+            live.push(candidate.clone());
+        }
+    }
+    Ok(live)
+}
+
+/// Like [`path_heads_at_frontier_memoized`], but additionally recovers a
+/// "buried root": a genesis-shaped content touch for `path` (one with no
+/// ancestor, among the changes reachable from `frontier` that also touch
+/// `path`, that itself touches `path`) that a later, SINGLE-PARENT
+/// descendant already supersedes -- WITHOUT that descendant's own authorship
+/// ever having incorporated a genuinely concurrent SIBLING genesis touch.
+///
+/// Confirmed, reproduced defect this recovers: four (or more) devices each
+/// independently author the group's very first `Put` to a brand-new shared
+/// path (four concurrent roots, exactly `two_independent_roots_with_no_
+/// common_ancestor_are_still_detected_as_a_fork`'s own shape, generalized
+/// past two). If one device's own local write happens to race behind a
+/// PEER's already-synced root for the SAME path -- a real, confirmed
+/// possibility once propagation latency is comparable to the devices'
+/// own write-timing stagger, not a hypothetical -- that device's change is
+/// authored with the peer's root as its sole DAG parent, and ordinary DAG
+/// ancestry then reads as "this change legitimately supersedes its parent."
+/// `path_heads_at_frontier_memoized`'s cheap is-ancestor supersession check
+/// cannot distinguish that from a genuine sequential edit (a device reading
+/// and replacing content it actually observed) because the two are
+/// causally IDENTICAL in DAG-ancestry terms -- the only difference is
+/// whether a THIRD, unrelated root ALSO existed concurrently with the
+/// buried one at the moment it was superseded, information the plain
+/// ancestor check never looks for. The buried root's content is then
+/// permanently unrecoverable: it is not the group's live winner, it has no
+/// live head of its own, and nothing else ever re-examines it, so
+/// `multiway_conflict_matrix.rs`'s `four/five/six_devices_staggered` rows
+/// stall forever at N-1 preserved contents.
+///
+/// The fix generalizes `two_independent_roots_with_no_common_ancestor_are_
+/// still_detected_as_a_fork`'s own insight (independently-authored roots
+/// with no common ancestor are concurrent, full stop) from "currently live"
+/// to "ever existed, anywhere in retained history reachable from the
+/// frontier": a genesis touch is only safely dropped once EVERY OTHER
+/// genesis touch for the same path is reachable from the candidate
+/// descendant -- it genuinely incorporated that sibling, exactly what an
+/// honest multi-way resolution's own multi-parent carrier naturally
+/// provides once it exists (its own parents name every branch it
+/// reconciles, so anything descending from IT has every genesis touch as
+/// an ordinary transitive ancestor). A non-genesis (continuation) touch --
+/// one whose own parent already touches `path`, e.g. a plain sequential
+/// edit of content this device's own author causally could have observed
+/// -- is dropped exactly as before, with no extra scrutiny:
+/// `late_loser_is_preserved_by_one_elected_merge_resolution`'s own root
+/// (root -> device-a -> device-d, an ordinary edit chain, with an unrelated
+/// sibling B concurrent only with ROOT, not with A) must keep resolving to
+/// exactly one preserved loser (B), not three -- A's intermediate content is
+/// legitimately superseded by D regardless of B's existence, since A's own
+/// authorship already had root's prior state to build on.
+///
+/// Deliberately NOT used by ordinary local-edit authoring
+/// (`derive_required_conflict_copy_ops`'s own default, `ChangePurpose::
+/// Ordinary`): a fresh local edit's own emission genuinely cannot detect a
+/// sibling root it has not synced yet -- the walk below cannot recover
+/// information the emitting replica does not have -- and unconditionally
+/// widening every ordinary edit's frontier walk to full, unbounded history
+/// (rather than the cheap early-stopping walk) would reproduce exactly the
+/// writer-gate-hold regression `paths_that_can_have_concurrent_heads`'s own
+/// doc comment measured (46 planning passes holding the gate for 366 of a
+/// 348-second window) on every single local edit instead of only the rare
+/// retroactive-repair pass. Used only by [`plan_retroactive_merge`]-driven
+/// planning and by admission validation of a `ChangePurpose::
+/// RetroactiveRepair` carrier specifically (see
+/// `validate_carrier_conflict_copy_ops_parts`), both already-rare,
+/// already-expensive code paths that pay a full reachable-history decode
+/// regardless (`paths_that_can_have_concurrent_heads`'s own unconditional
+/// walk), so the additional pairwise ancestry comparisons here (bounded by
+/// the number of changes that ever concurrently touched ONE path, not the
+/// group's whole history) add no new order-of-magnitude cost.
+pub fn path_heads_at_frontier_including_buried_roots(
+    conn: &Connection,
+    path: &str,
+    frontier: &[ChangeHash],
+) -> Result<Vec<PathHead>, SyncSqliteError> {
+    // Unlike the early-stopping walk above, this visits EVERY change
+    // touching `path` reachable from `frontier`, not just the first one
+    // found along each lineage -- required to find a genesis touch a later,
+    // unaware single-parent descendant has already superseded.
     let mut candidates: Vec<Change> = Vec::new();
     let mut visited: HashSet<[u8; 32]> = HashSet::new();
     let mut stack: Vec<ChangeHash> = frontier.to_vec();
-    while let Some(h) = stack.pop() {
-        if !visited.insert(h.0) {
+    while let Some(hash) = stack.pop() {
+        if !visited.insert(hash.0) {
             continue;
         }
-        let Some(entry) = memo.get(conn, &h)? else { continue };
-        if entry.touched_path_fingerprints.contains(&fingerprint)
-            && change_touches_path(&entry.change, path)
-        {
-            candidates.push(entry.change.clone());
-        } else {
-            stack.extend(entry.change.parents.iter().copied());
+        let Some(change) = get_change(conn, &hash)? else { continue };
+        if change_touches_path(&change, path) {
+            candidates.push(change.clone());
+        }
+        stack.extend(change.parents.iter().copied());
+    }
+
+    let hashes: Vec<ChangeHash> = candidates.iter().map(Change::compute_hash).collect();
+    let n = candidates.len();
+
+    // `ancestor[i][j]` == is candidate `i` an ancestor of candidate `j`.
+    // Computed once, up front, so the genesis classification and the
+    // supersession pass below share it rather than re-issuing the same
+    // `is_ancestor` query from two different angles.
+    let mut ancestor = vec![vec![false; n]; n];
+    for i in 0..n {
+        for j in 0..n {
+            if i != j {
+                ancestor[i][j] =
+                    retained_history_integrity::is_ancestor(conn, &hashes[i], &hashes[j])?;
+            }
         }
     }
-    let hashes: Vec<ChangeHash> = candidates.iter().map(|c| c.change_hash()).collect();
+
+    // A candidate is "genesis" for this path if no OTHER candidate touching
+    // the same path is its ancestor -- the start of its own lineage here,
+    // never itself a sequential edit of some other candidate's content.
+    let is_genesis: Vec<bool> = (0..n).map(|i| !(0..n).any(|j| ancestor[j][i])).collect();
+
     let mut live = Vec::new();
-    for i in 0..candidates.len() {
+    for i in 0..n {
         let mut superseded = false;
-        for j in 0..candidates.len() {
-            if i != j && retained_history_integrity::is_ancestor(conn, &hashes[i], &hashes[j])? {
+        for (j, &i_ancestor_of_j) in ancestor[i].iter().enumerate() {
+            if i == j || !i_ancestor_of_j {
+                continue;
+            }
+            if !is_genesis[i] {
+                // A continuation is dropped by any of its own descendants,
+                // exactly like the cheap early-stopping walk already does --
+                // its own author had this path's prior state to build on,
+                // so nothing further needs checking.
+                superseded = true;
+                break;
+            }
+            // `i` is a genesis touch: `j` (its descendant) only properly
+            // closes it if every OTHER genesis touch is something `j`
+            // itself incorporated (reachable as `j`'s own ancestor).
+            //
+            // Deliberately NOT also treating a sibling `k` already
+            // recorded in `conflict_copy_provenance` as "safe to ignore"
+            // here: `conflict_copy_already_provisioned` is a group-wide
+            // EXISTENCE check, not scoped to what `j` itself can prove --
+            // using it here would let this candidate's own live-ness (and
+            // therefore whether THIS SAME op is required) depend on
+            // whether some UNRELATED, already-admitted carrier happens to
+            // have recorded `k`'s provenance, which can differ between
+            // authoring time (before this very carrier's own admission)
+            // and a later validator re-examining it (after admission,
+            // once this carrier's own provenance rows already exist) --
+            // exactly the authoring-vs-validation inconsistency
+            // `derive_required_conflict_copy_ops_with`'s own doc comment
+            // warns `already_provisioned` must never be conflated across
+            // (confirmed: reproduced live as a false rejection on a
+            // carrier re-validating its own output). A genuine multi-way
+            // resolution already satisfies "reachable from `j`" without
+            // any such escape once it exists: the resolving carrier's own
+            // parents name every branch it reconciles, so a later
+            // superseding descendant naturally has every genesis touch as
+            // an ordinary transitive ancestor -- see this function's own
+            // doc comment.
+            let properly_closes =
+                (0..n).filter(|&k| k != i && k != j && is_genesis[k]).all(|k| ancestor[k][j]);
+            if properly_closes {
                 superseded = true;
                 break;
             }
@@ -379,8 +635,80 @@ pub fn derive_required_conflict_copy_ops(
         group_id,
         parents,
         direct_ops,
+        false,
         &|conn, source_path, losing_change| {
             conflict_copy_already_provisioned(conn, group_id, source_path, losing_change)
+        },
+    )
+}
+
+/// Like [`derive_required_conflict_copy_ops`], but resolves each touched
+/// path's heads via [`path_heads_at_frontier_including_buried_roots`]
+/// instead of the cheap early-stopping walk, so a genesis-shaped root
+/// buried by an unaware single-parent descendant is recovered as its own
+/// obligation -- see that function's own doc comment for the confirmed
+/// defect this exists to close. Used only by retroactive-repair planning
+/// (`plan_retroactive_merge`) and by admission validation of a
+/// `ChangePurpose::RetroactiveRepair` carrier specifically; never by
+/// ordinary local-edit authoring, which cannot detect a sibling root it has
+/// not synced yet and would otherwise pay this walk's full-history cost on
+/// every edit for no benefit.
+pub fn derive_required_conflict_copy_ops_including_buried_roots(
+    conn: &Connection,
+    group_id: &str,
+    parents: &[ChangeHash],
+    direct_ops: &[Op],
+) -> Result<Vec<Op>, SyncSqliteError> {
+    derive_required_conflict_copy_ops_with(
+        conn,
+        group_id,
+        parents,
+        direct_ops,
+        true,
+        &|conn, source_path, losing_change| {
+            conflict_copy_already_provisioned(conn, group_id, source_path, losing_change)
+        },
+    )
+}
+
+/// The obligations a change emitted at `parents` must carry, asked the way
+/// ADMISSION will ask it.
+///
+/// [`derive_required_conflict_copy_ops`] asks the group-wide, existence-only
+/// question -- "has any carrier, anywhere in this group's history, ever
+/// recorded this obligation?" -- which is the right question for
+/// idempotency and the wrong one for deciding what to emit. Admission asks
+/// the causally-scoped one: was it satisfied by something reachable from
+/// THIS carrier's parents. Where the two differ, an author that used the
+/// existence-only answer emits a change that its OWN emission-time
+/// validation then rejects as deficient, and re-driving derives the same
+/// deficient set again. Observed on a six-device mesh as
+/// `carrier change is missing a required conflict-copy put` repeating for
+/// one losing change until the group stopped converging.
+///
+/// `include_buried_roots` mirrors the walk the same carrier's validation
+/// will use -- see [`derive_required_conflict_copy_ops_including_buried_roots`].
+pub fn derive_required_conflict_copy_ops_as_admission_will(
+    conn: &Connection,
+    group_id: &str,
+    parents: &[ChangeHash],
+    direct_ops: &[Op],
+    include_buried_roots: bool,
+) -> Result<Vec<Op>, SyncSqliteError> {
+    derive_required_conflict_copy_ops_with(
+        conn,
+        group_id,
+        parents,
+        direct_ops,
+        include_buried_roots,
+        &|conn, source_path, losing_change| {
+            conflict_copy_provisioned_and_reachable(
+                conn,
+                group_id,
+                source_path,
+                losing_change,
+                parents,
+            )
         },
     )
 }
@@ -408,6 +736,7 @@ fn derive_required_conflict_copy_ops_with(
     group_id: &str,
     parents: &[ChangeHash],
     direct_ops: &[Op],
+    include_buried_roots: bool,
     already_provisioned: &dyn Fn(&Connection, &str, &ChangeHash) -> Result<bool, SyncSqliteError>,
 ) -> Result<Vec<Op>, SyncSqliteError> {
     let touched_paths = decision::collect_touched_paths(direct_ops);
@@ -415,11 +744,56 @@ fn derive_required_conflict_copy_ops_with(
     // One memo for the whole derivation: every path below resolves against the
     // same `parents` frontier, so each change the walk passes is decoded once
     // here instead of once per touched path (see `FrontierWalkMemo`).
+    // Unused (and never populated) when `include_buried_roots` selects the
+    // unmemoized, buried-root-aware walk instead -- see that walk's own doc
+    // comment for why it deliberately does not share this memo.
     let mut memo = FrontierWalkMemo::default();
+
+    // Resolved once for the whole derivation, not once per path.
+    //
+    // The walk below answers "what were this path's live heads at
+    // `parents`". When `parents` is the group's current head set, that is
+    // the question `path_live_heads` already holds the answer to -- it is
+    // maintained as changes are admitted for exactly this question -- so
+    // the walk has nothing to add and is skipped entirely.
+    //
+    // This matters because the derivation runs on every admission, once
+    // per path the change touches, and each walk visits the whole
+    // frontier-reachable DAG. Measured on a single-headed chain: admitting
+    // into a group of 9,500 changes cost ~37x what admitting into an empty
+    // one did, all of it here. Reading the index instead makes that cost
+    // flat, which is what stops the supersession decision from simply
+    // having moved from read time to write time.
+    //
+    // A structural test on the frontier, not on where the change came
+    // from. Ordinary local emission always signs onto the current
+    // frontier, so it always takes this route; a remote change takes it
+    // whenever its parents happen to cover exactly what this device
+    // currently holds, which is the ordinary steady state for a device
+    // that is merely behind. Anything else -- a genuinely historical
+    // frontier, a buried-root derivation -- still walks, because no index
+    // answers for a frontier other than the current one, and this is
+    // deliberately not the place to start pretending otherwise.
+    let frontier_is_current =
+        !include_buried_roots && frontier_is_current_group_heads(conn, group_id, parents)?;
+
+    let heads_at = |conn: &Connection, path: &str, memo: &mut FrontierWalkMemo| {
+        if frontier_is_current {
+            return super::path_frontier::live_path_heads(conn, group_id, path);
+        }
+        if include_buried_roots {
+            path_heads_at_frontier_including_buried_roots(conn, path, parents)
+        } else {
+            path_heads_at_frontier_memoized(conn, group_id, path, parents, memo)
+        }
+    };
     let mut derived_ops = Vec::new();
     for path in touched_paths {
-        let heads = path_heads_at_frontier_memoized(conn, &path, parents, &mut memo)?;
-        for candidate in decision::conflict_copy_candidates(&path, &heads) {
+        let heads = heads_at(conn, &path, &mut memo)?;
+        let directories = directory_head_changes(conn, group_id, &path, &heads)?;
+        for candidate in decision::conflict_copy_candidates(&path, &heads, |head| {
+            directories.contains(&head.change_hash)
+        }) {
             let losing_change = candidate.losing_change;
             if already_provisioned(conn, &path, &losing_change)? {
                 tracing::debug!(
@@ -449,14 +823,38 @@ fn derive_required_conflict_copy_ops_with(
             // predates or is unrelated to this specific conflict, not a
             // resolution of it -- suppressing derivation there would
             // silently drop the loser's content instead of preserving it.
-            // Only an existing head that is `losing_change` itself, or
-            // descends from it, is evidence of an actual later action ON
+            // Only an existing head that STRICTLY descends from
+            // `losing_change` is evidence of an actual later action ON
             // this conflict's own resolution (the ordinary case: a device
             // edits/deletes/renames the conflict-copy path only after it
             // exists, so any such action necessarily has `losing_change` as
             // an ancestor).
-            let target_heads =
-                path_heads_at_frontier_memoized(conn, &candidate.target_path, parents, &mut memo)?;
+            //
+            // The losing change ITSELF is deliberately not such evidence,
+            // and treating it as evidence lost content outright
+            // (reproduced as a unit test, see
+            // `derive_provisions_a_loser_that_itself_touches_its_own_
+            // conflict_target`). Whatever the loser did at the target
+            // path, it did before -- in fact instead of -- preserving the
+            // content it was about to lose at the source path, so it is
+            // not a later action on a resolution that had not happened
+            // yet. This is reachable from an ordinary user action, not a
+            // contrivance: the deterministic target name embeds the losing
+            // content's own hash, so a change can only land on it by
+            // putting or removing exactly the content it is about to lose
+            // -- which is precisely "resolve a conflict by keeping the
+            // conflicted copy" (copy its bytes over the real file, delete
+            // the copy), and local capture commits one debounce batch as
+            // ONE signed change. If a peer edited the same file
+            // concurrently, that change is the loser and the content the
+            // user deliberately chose to keep is what would be dropped.
+            //
+            // The one shape where the loser touching its own target IS
+            // benign -- the loser having put that very content there
+            // itself -- stays suppressed, by the identical-content check
+            // below, which is the check that actually establishes the
+            // content is preserved.
+            let target_heads = heads_at(conn, &candidate.target_path, &mut memo)?;
             // Fallible loop, not `.any(...).unwrap_or(false)`: a DB error or
             // corrupted ancestry index here must fail closed, not silently
             // read as "not already acted on" -- that would let this
@@ -466,13 +864,11 @@ fn derive_required_conflict_copy_ops_with(
             // or signing a new change against corrupted history.
             let mut already_acted_on = false;
             for h in &target_heads {
-                if h.change_hash == losing_change.0
-                    || retained_history_integrity::is_ancestor(
-                        conn,
-                        &losing_change,
-                        &ChangeHash(h.change_hash),
-                    )?
-                {
+                if retained_history_integrity::is_ancestor(
+                    conn,
+                    &losing_change,
+                    &ChangeHash(h.change_hash),
+                )? {
                     already_acted_on = true;
                     break;
                 }
@@ -538,6 +934,53 @@ fn derive_required_conflict_copy_ops_with(
     Ok(derived_ops)
 }
 
+/// The change hashes of `path`'s content heads whose version is a
+/// Directory, for [`decision::conflict_copy_candidates`] and the claim
+/// validators, which resolve a fork under DIR-1: an explicit Directory
+/// keeps its path whoever wins the rank, every File or Symlink there (the
+/// ranked winner included) is owed its copy, and a Directory is owed none
+/// (an empty directory beside `path` carries nothing). See
+/// `yadorilink_replica_engine::conflict::resolve_path_heads_keeping_directory`.
+///
+/// Fails closed with [`SyncSqliteError::NotFound`] when a forked head's
+/// version is not held: every change admitted here had its versions checked in,
+/// so a missing one is local damage, and guessing its kind would let two
+/// validators disagree on the same carrier.
+pub(crate) fn directory_head_changes(
+    conn: &Connection,
+    group_id: &str,
+    path: &str,
+    heads: &[PathHead],
+) -> Result<HashSet<[u8; 32]>, SyncSqliteError> {
+    let mut directories = HashSet::new();
+    // Kind only decides between distinct contents: with one content class
+    // (or none) there is no fork to resolve, and nothing is read, so a
+    // replica that does not hold an unforked version is not asked for it.
+    if !matches!(
+        yadorilink_replica_engine::conflict::resolve_path_heads(path, heads),
+        yadorilink_replica_engine::conflict::PathResolution::Present { ref conflict_copies, .. }
+            if !conflict_copies.is_empty()
+    ) {
+        return Ok(directories);
+    }
+    for head in heads {
+        let Some(content) = head.content.as_ref() else {
+            continue;
+        };
+        let version_hash = VersionHash(content.version_hash);
+        let version = super::get_file_version(conn, group_id, &version_hash)?.ok_or_else(|| {
+            SyncSqliteError::NotFound(format!(
+                "live version {} at {path} is not locally resolvable",
+                version_hash.to_hex()
+            ))
+        })?;
+        if version.meta.record_kind == yadorilink_replica_domain::file::RecordKind::Directory {
+            directories.insert(head.change_hash);
+        }
+    }
+    Ok(directories)
+}
+
 /// Store-dependent structural validation for one `Put { origin: ConflictCopy
 /// { source_path, losing_change }, .. }` op inside `carrier`. Re-derives and
 /// requires exact agreement with what an honest author would have computed
@@ -564,11 +1007,13 @@ fn derive_required_conflict_copy_ops_with(
 /// [`validate_carrier_conflict_copy_ops_parts`].
 pub(crate) fn validate_conflict_copy_origin(
     conn: &Connection,
+    group_id: &str,
     carrier_parents: &[ChangeHash],
     path: &str,
     version: &VersionHash,
     source_path: &str,
     losing_change: &ChangeHash,
+    include_buried_roots: bool,
 ) -> Result<(), SyncSqliteError> {
     // Fallible loop, not `.any(...).unwrap_or(false)`: a DB error or
     // corrupted ancestry index here must fail closed (reject this carrier
@@ -593,9 +1038,21 @@ pub(crate) fn validate_conflict_copy_origin(
         )));
     }
 
-    let heads = path_heads_at_frontier(conn, source_path, carrier_parents)?;
-    decision::validate_conflict_copy_claim(&heads, path, version, source_path, losing_change)
-        .map_err(|e| SyncSqliteError::InvalidInput(e.to_string()))
+    let heads = if include_buried_roots {
+        path_heads_at_frontier_including_buried_roots(conn, source_path, carrier_parents)?
+    } else {
+        path_heads_at_frontier(conn, group_id, source_path, carrier_parents)?
+    };
+    let directories = directory_head_changes(conn, group_id, source_path, &heads)?;
+    decision::validate_conflict_copy_claim(
+        &heads,
+        path,
+        version,
+        source_path,
+        losing_change,
+        |head| directories.contains(&head.change_hash),
+    )
+    .map_err(|e| SyncSqliteError::InvalidInput(e.to_string()))
 }
 
 /// Re-derives and validates every `ConflictCopy` `Put` op `carrier` claims,
@@ -633,6 +1090,16 @@ pub(crate) fn validate_carrier_conflict_copy_ops_parts(
     carrier_ops: &[Op],
     carrier_purpose: &ChangePurpose,
 ) -> Result<(), SyncSqliteError> {
+    // A `RetroactiveRepair` carrier is validated with the SAME buried-root-
+    // aware walk `plan_retroactive_merge`/`prepare_emission` used to compute
+    // its obligations in the first place -- see
+    // `derive_required_conflict_copy_ops_including_buried_roots`'s own doc
+    // comment. `ChangePurpose::Ordinary` (an ordinary local edit's own
+    // self-derived `ConflictCopy` ops, folded in at authoring time) keeps
+    // the cheap early-stopping walk: it never claims a buried-root-style op,
+    // so it never needs the expensive one to validate.
+    let include_buried_roots = matches!(carrier_purpose, ChangePurpose::RetroactiveRepair { .. });
+
     let mut claimed: BTreeSet<(String, ChangeHash)> = BTreeSet::new();
     for op in carrier_ops {
         if let Op::Put {
@@ -643,13 +1110,49 @@ pub(crate) fn validate_carrier_conflict_copy_ops_parts(
         {
             validate_conflict_copy_origin(
                 conn,
+                group_id,
                 carrier_parents,
                 path.as_str(),
                 version,
                 source_path.as_str(),
                 losing_change,
+                include_buried_roots,
             )?;
             claimed.insert((source_path.as_str().to_string(), *losing_change));
+        }
+        // A re-assertion's provenance is re-derived from the carrier's own
+        // parents, never trusted: `naming_device_id` decides how this
+        // content is named if it ever loses a later conflict, so an
+        // unchecked claim would let a carrier attribute another device's
+        // content to itself (or to nobody).
+        if let Op::Put {
+            path,
+            version,
+            origin: PutOrigin::Reasserted { original_change, naming_device_id },
+        } = op
+        {
+            // Still a walk, deliberately. Unlike the derivation above,
+            // this runs only for a carrier that actually carries a
+            // re-assertion, which ordinary editing never produces -- so
+            // it is not on the path every admission takes, and routing it
+            // through the current-frontier index would buy nothing while
+            // widening what depends on that index. The same goes for
+            // `validate_conflict_copy_origin`'s own walk.
+            let heads = if include_buried_roots {
+                path_heads_at_frontier_including_buried_roots(conn, path.as_str(), carrier_parents)?
+            } else {
+                path_heads_at_frontier(conn, group_id, path.as_str(), carrier_parents)?
+            };
+            let directories = directory_head_changes(conn, group_id, path.as_str(), &heads)?;
+            decision::validate_reassertion_claim(
+                &heads,
+                path.as_str(),
+                version,
+                original_change,
+                naming_device_id.as_str(),
+                |head| directories.contains(&head.change_hash),
+            )
+            .map_err(|e| SyncSqliteError::InvalidInput(e.to_string()))?;
         }
     }
 
@@ -673,6 +1176,7 @@ pub(crate) fn validate_carrier_conflict_copy_ops_parts(
         group_id,
         carrier_parents,
         &direct_ops,
+        include_buried_roots,
         &|conn, source_path, losing_change| {
             conflict_copy_provisioned_and_reachable(
                 conn,
@@ -707,436 +1211,4 @@ pub(crate) fn validate_carrier_conflict_copy_ops_parts(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::dag_store::{group_heads, init_dag_schema, max_parent_lamport, put_file_version};
-    use ed25519_dalek::SigningKey;
-    use yadorilink_replica_domain::change::ChangeAuth;
-    use yadorilink_replica_domain::file::FileMeta;
-    use yadorilink_replica_domain::file::RecordKind;
-    use yadorilink_replica_domain::ids::{DeviceId, FolderGroupId, SyncPath};
-
-    fn conn() -> Connection {
-        let c = Connection::open_in_memory().unwrap();
-        init_dag_schema(&c).unwrap();
-        init_conflict_copy_provenance_schema(&c).unwrap();
-        c
-    }
-
-    fn key(byte: u8) -> SigningKey {
-        SigningKey::from_bytes(&[byte; 32])
-    }
-
-    /// Distinct `mtime_unix_nanos` is enough to give each call a genuinely
-    /// different `version_hash` (a `FileVersion`'s hash covers its full
-    /// canonical encoding, including `meta`) without needing real block
-    /// content.
-    fn version(mtime: i64) -> yadorilink_replica_domain::file::FileVersion {
-        yadorilink_replica_domain::file::FileVersion::new(
-            vec![],
-            0,
-            FileMeta {
-                mtime_unix_nanos: mtime,
-                unix_mode: None,
-                symlink_target: None,
-                record_kind: RecordKind::File,
-                xattrs: Vec::new(),
-            },
-        )
-    }
-
-    fn put_op(path: &str, v: &yadorilink_replica_domain::file::FileVersion) -> Op {
-        Op::Put { path: SyncPath(path.into()), version: v.version_hash, origin: PutOrigin::Direct }
-    }
-
-    /// Signs and admits a change directly (bypassing `emit_local_change`,
-    /// which only ever knows one device's own current heads), so a test can
-    /// construct genuinely concurrent changes from independent devices
-    /// sharing one connection -- concurrency is a pure DAG-structural
-    /// property (shared parents, neither an ancestor of the other), not
-    /// something that requires two physical connections to model.
-    fn admit(
-        conn: &Connection,
-        group_id: &str,
-        parents: Vec<ChangeHash>,
-        device_id: &str,
-        signing_key: &SigningKey,
-        ops: Vec<Op>,
-    ) -> Change {
-        let max_parent_lamport = max_parent_lamport(conn, group_id, &parents).unwrap();
-        let change = Change::create_signed(
-            parents,
-            max_parent_lamport,
-            ChangeAuth::PLACEHOLDER,
-            DeviceId(device_id.to_string()),
-            FolderGroupId(group_id.to_string()),
-            ops,
-            signing_key,
-        );
-        let result = super::super::admit_change(conn, &change, true).unwrap();
-        assert_eq!(result.outcome, super::super::AdmitOutcome::Applied, "admission must succeed");
-        change
-    }
-
-    /// Admits two concurrent edits to `path` from two distinct devices, both
-    /// parented on `root`, and returns `(loser_change, loser_version,
-    /// deterministic_target_path)` -- computed the same way
-    /// `derive_required_conflict_copy_ops` itself would, so tests can predict
-    /// and directly manipulate the exact literal path a real conflict would
-    /// derive.
-    fn seed_conflict(
-        conn: &Connection,
-        group_id: &str,
-        root: ChangeHash,
-        path: &str,
-    ) -> (Change, yadorilink_replica_domain::file::FileVersion, String) {
-        let version_a = version(100);
-        let version_b = version(200);
-        put_file_version(conn, group_id, &version_a).unwrap();
-        put_file_version(conn, group_id, &version_b).unwrap();
-        let change_a =
-            admit(conn, group_id, vec![root], "device-a", &key(1), vec![put_op(path, &version_a)]);
-        let change_b =
-            admit(conn, group_id, vec![root], "device-b", &key(2), vec![put_op(path, &version_b)]);
-
-        let a_hash = change_a.compute_hash();
-        let b_hash = change_b.compute_hash();
-        let (loser_change, loser_version, loser_device) =
-            if yadorilink_replica_engine::conflict::dag_conflict_loser_is_a(
-                change_a.lamport,
-                &a_hash.0,
-                change_b.lamport,
-                &b_hash.0,
-            ) {
-                (change_a, version_a, "device-a")
-            } else {
-                (change_b, version_b, "device-b")
-            };
-        let target_path = yadorilink_replica_engine::conflict::conflict_copy_path_for_losing_change(
-            path,
-            loser_device,
-            0,
-            &loser_version.version_hash.0,
-        );
-        (loser_change, loser_version, target_path)
-    }
-
-    /// Regression for the retroactive-carrier storm observed live on a
-    /// contended host: after a carrier has already preserved a loser's
-    /// content at its deterministic target, a *straggler* change that
-    /// reasserts that same stale content (a concurrent carrier signed
-    /// against an older frontier is the real-world author of exactly this
-    /// shape) becomes a fresh loser with a brand-new change hash. The
-    /// per-losing_change dedup checks cannot see that its content is
-    /// already preserved — no provenance row exists for the new hash, and
-    /// the existing target write does not descend from it — so derivation
-    /// used to re-require the identical copy, every straggler's carrier
-    /// could itself become the next straggler, and under delivery lag the
-    /// repair loop minted carriers faster than the mesh could converge
-    /// (four devices, disjoint per-author head sets, the same copy name
-    /// carried repeatedly at successive lamports). The identical-content
-    /// suppression must make re-derivation come up empty here, while the
-    /// positive control (the FIRST derivation, before any carrier exists)
-    /// must still require the copy.
-    #[test]
-    fn a_stale_reassertion_loser_is_not_recarried_once_its_content_is_already_at_the_target() {
-        let c = conn();
-        let group = "g";
-        let version_a = version(100);
-        let version_b = version(200);
-        put_file_version(&c, group, &version_a).unwrap();
-        put_file_version(&c, group, &version_b).unwrap();
-        let change_a =
-            admit(&c, group, vec![], "device-a", &key(1), vec![put_op("shared.bin", &version_a)]);
-        let change_b =
-            admit(&c, group, vec![], "device-b", &key(2), vec![put_op("shared.bin", &version_b)]);
-        let a_hash = change_a.compute_hash();
-        let b_hash = change_b.compute_hash();
-        let a_loses = yadorilink_replica_engine::conflict::dag_conflict_loser_is_a(
-            change_a.lamport,
-            &a_hash.0,
-            change_b.lamport,
-            &b_hash.0,
-        );
-        let (winner_version, loser_version, loser_device, loser_key, loser_hash) = if a_loses {
-            (version_b, version_a, "device-a", key(1), a_hash)
-        } else {
-            (version_a, version_b, "device-b", key(2), b_hash)
-        };
-
-        // A filler change gives the carrier a strictly higher lamport than
-        // the straggler below, so the round-2 resolution deterministically
-        // keeps the carrier's winner: this test pins the "same stale
-        // content re-carried" blind spot, not the (legitimate) case where
-        // a resolution flip makes the old winner a genuinely new loser.
-        let filler_version = version(300);
-        put_file_version(&c, group, &filler_version).unwrap();
-        let filler = admit(
-            &c,
-            group,
-            vec![a_hash, b_hash],
-            "device-carrier",
-            &key(7),
-            vec![put_op("filler.txt", &filler_version)],
-        );
-        let carrier_parents = vec![filler.compute_hash()];
-
-        let winner_reassert = put_op("shared.bin", &winner_version);
-        let required = derive_required_conflict_copy_ops(
-            &c,
-            group,
-            &carrier_parents,
-            std::slice::from_ref(&winner_reassert),
-        )
-        .unwrap();
-        assert_eq!(
-            required.len(),
-            1,
-            "positive control: the genuine loser must require its copy before any carrier exists"
-        );
-
-        // The carrier, exactly as authoring would sign it: winner
-        // reassertion plus the derived copy, on its own frontier.
-        let mut carrier_ops = vec![winner_reassert.clone()];
-        carrier_ops.extend(required);
-        let carrier = admit(&c, group, carrier_parents, "device-carrier", &key(7), carrier_ops);
-
-        // The straggler: the loser device reasserts its own stale content,
-        // signed against its own LAGGED frontier (only its previous change
-        // — it has not yet seen the winner or the carrier, so from its view
-        // there is no concurrent loser and honest authoring derives no copy
-        // ops). Once admitted here it is concurrent with the carrier: a
-        // fresh change hash carrying already-preserved content.
-        let straggler = admit(
-            &c,
-            group,
-            vec![loser_hash],
-            loser_device,
-            &loser_key,
-            vec![put_op("shared.bin", &loser_version)],
-        );
-
-        let new_frontier = vec![carrier.compute_hash(), straggler.compute_hash()];
-        let rederived = derive_required_conflict_copy_ops(
-            &c,
-            group,
-            &new_frontier,
-            std::slice::from_ref(&winner_reassert),
-        )
-        .unwrap();
-        assert!(
-            rederived.is_empty(),
-            "a loser whose exact content the target already preserves at this frontier must not \
-             be re-carried; got {rederived:?}"
-        );
-    }
-
-    /// RED regression (Phase 1 carry-over): a coincidental pre-existing file
-    /// at the EXACT deterministic conflict-copy path, created and deleted
-    /// entirely independently of this conflict (a sibling branch off the
-    /// same root, never touching the source path or descending from either
-    /// concurrent edit), must not suppress deriving the loser's real
-    /// conflict copy. The original (over-broad) guard treated ANY existing
-    /// history at the target path as "already handled" and silently dropped
-    /// the loser instead.
-    #[test]
-    fn derive_still_provisions_a_loser_whose_target_path_has_unrelated_earlier_history() {
-        let c = conn();
-        let group = "g";
-        let root_version = version(0);
-        put_file_version(&c, group, &root_version).unwrap();
-        let root = admit(
-            &c,
-            group,
-            vec![],
-            "device-root",
-            &key(9),
-            vec![put_op("shared.bin", &root_version)],
-        );
-        let root_hash = root.compute_hash();
-
-        let (loser_change, loser_version, target_path) =
-            seed_conflict(&c, group, root_hash, "shared.bin");
-
-        // Unrelated history at the exact target path, on a sibling branch
-        // off the SAME root -- created, then deleted, never touching
-        // "shared.bin" and not descending from either concurrent edit.
-        let unrelated_version = version(50);
-        put_file_version(&c, group, &unrelated_version).unwrap();
-        let unrelated_create = admit(
-            &c,
-            group,
-            vec![root_hash],
-            "device-unrelated",
-            &key(3),
-            vec![put_op(&target_path, &unrelated_version)],
-        );
-        admit(
-            &c,
-            group,
-            vec![unrelated_create.compute_hash()],
-            "device-unrelated",
-            &key(3),
-            vec![Op::Delete { path: SyncPath(target_path.clone()) }],
-        );
-
-        let closing_version = version(300);
-        put_file_version(&c, group, &closing_version).unwrap();
-        let parents = group_heads(&c, group).unwrap();
-
-        let derived = derive_required_conflict_copy_ops(
-            &c,
-            group,
-            &parents,
-            &[put_op("shared.bin", &closing_version)],
-        )
-        .unwrap();
-
-        assert_eq!(derived.len(), 1, "the loser must still be provisioned: {derived:?}");
-        let Op::Put {
-            path,
-            version: derived_version,
-            origin: PutOrigin::ConflictCopy { losing_change, .. },
-        } = &derived[0]
-        else {
-            panic!("expected a ConflictCopy put, got {:?}", derived[0]);
-        };
-        assert_eq!(path.as_str(), target_path);
-        assert_eq!(derived_version.0, loser_version.version_hash.0);
-        assert_eq!(*losing_change, loser_change.compute_hash());
-    }
-
-    /// RED regression (Phase 1 carry-over): an unrelated file still LIVE
-    /// (never deleted) at the target path -- not a tombstone -- must also
-    /// not block the loser's own provisioning, and the loser's content must
-    /// not be silently dropped (only the derivation is checked here; the
-    /// resulting head-to-head resolution at the target path, once the
-    /// derived Put actually lands, is ordinary same-path DAG dominance, not
-    /// a special case this function needs to invent).
-    #[test]
-    fn derive_still_provisions_a_loser_whose_target_path_has_an_unrelated_live_file() {
-        let c = conn();
-        let group = "g";
-        let root_version = version(0);
-        put_file_version(&c, group, &root_version).unwrap();
-        let root = admit(
-            &c,
-            group,
-            vec![],
-            "device-root",
-            &key(9),
-            vec![put_op("shared.bin", &root_version)],
-        );
-        let root_hash = root.compute_hash();
-
-        let (loser_change, loser_version, target_path) =
-            seed_conflict(&c, group, root_hash, "shared.bin");
-
-        let unrelated_version = version(50);
-        put_file_version(&c, group, &unrelated_version).unwrap();
-        admit(
-            &c,
-            group,
-            vec![root_hash],
-            "device-unrelated",
-            &key(3),
-            vec![put_op(&target_path, &unrelated_version)],
-        );
-
-        let closing_version = version(300);
-        put_file_version(&c, group, &closing_version).unwrap();
-        let parents = group_heads(&c, group).unwrap();
-
-        let derived = derive_required_conflict_copy_ops(
-            &c,
-            group,
-            &parents,
-            &[put_op("shared.bin", &closing_version)],
-        )
-        .unwrap();
-
-        assert_eq!(derived.len(), 1, "the loser must still be provisioned: {derived:?}");
-        let Op::Put {
-            path,
-            version: derived_version,
-            origin: PutOrigin::ConflictCopy { losing_change, .. },
-        } = &derived[0]
-        else {
-            panic!("expected a ConflictCopy put, got {:?}", derived[0]);
-        };
-        assert_eq!(path.as_str(), target_path);
-        assert_eq!(derived_version.0, loser_version.version_hash.0);
-        assert_eq!(*losing_change, loser_change.compute_hash());
-    }
-
-    /// Regression: once a conflict copy has been legitimately provisioned and
-    /// a LATER change (descending from the loser) directly edits, renames
-    /// away from, or deletes that target path, a subsequent derivation for
-    /// the same source-path conflict must not re-add (resurrect) it.
-    #[test]
-    fn derive_does_not_resurrect_a_conflict_copy_deleted_after_provisioning() {
-        let c = conn();
-        let group = "g";
-        let root_version = version(0);
-        put_file_version(&c, group, &root_version).unwrap();
-        let root = admit(
-            &c,
-            group,
-            vec![],
-            "device-root",
-            &key(9),
-            vec![put_op("shared.bin", &root_version)],
-        );
-        let root_hash = root.compute_hash();
-
-        let (loser_change, _loser_version, target_path) =
-            seed_conflict(&c, group, root_hash, "shared.bin");
-
-        // First closing edit legitimately provisions the conflict copy.
-        let first_closing_version = version(300);
-        put_file_version(&c, group, &first_closing_version).unwrap();
-        let parents_before = group_heads(&c, group).unwrap();
-        let first_derived = derive_required_conflict_copy_ops(
-            &c,
-            group,
-            &parents_before,
-            &[put_op("shared.bin", &first_closing_version)],
-        )
-        .unwrap();
-        assert_eq!(first_derived.len(), 1, "sanity: the loser is provisioned the first time");
-        let mut first_ops = vec![put_op("shared.bin", &first_closing_version)];
-        first_ops.extend(first_derived.clone());
-        let first_closing = admit(&c, group, parents_before, "device-a", &key(1), first_ops);
-        record_conflict_copy_ops_provenance(&c, group, &first_closing).unwrap();
-
-        // The user deletes the now-provisioned conflict copy directly.
-        let after_provision_heads = group_heads(&c, group).unwrap();
-        admit(
-            &c,
-            group,
-            after_provision_heads,
-            "device-a",
-            &key(1),
-            vec![Op::Delete { path: SyncPath(target_path.clone()) }],
-        );
-
-        // A SECOND closing-style edit to "shared.bin" must not resurrect it.
-        let second_closing_version = version(400);
-        put_file_version(&c, group, &second_closing_version).unwrap();
-        let parents_after_delete = group_heads(&c, group).unwrap();
-        let second_derived = derive_required_conflict_copy_ops(
-            &c,
-            group,
-            &parents_after_delete,
-            &[put_op("shared.bin", &second_closing_version)],
-        )
-        .unwrap();
-
-        assert!(
-            second_derived.is_empty(),
-            "the deleted conflict copy for {} (loser {}) must not be re-derived: {second_derived:?}",
-            target_path,
-            hex::encode(loser_change.compute_hash().0),
-        );
-    }
-}
+mod tests;

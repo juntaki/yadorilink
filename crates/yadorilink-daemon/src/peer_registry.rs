@@ -1,8 +1,12 @@
-//! Owns this device's live peer state: the running sync sessions
-//! (`device_id -> Arc<PeerSyncSession>`) and each peer's last-known
-//! reachability. Both maps are private -- every caller reaches them
-//! through this type's own methods, never a raw `MutexGuard`/`HashMap`
-//! crossing the module boundary. `peer_orchestrator.rs`'s own doc comments
+//! Owns this device's running sync sessions
+//! (`device_id -> Arc<PeerSyncSession>`). The map is private -- every caller
+//! reaches it through this type's own methods, never a raw
+//! `MutexGuard`/`HashMap` crossing the module boundary.
+//!
+//! A peer's reachability is not kept here. It is the vocabulary below
+//! ([`PeerReachability`]), and its only producer is the iroh connectivity
+//! runtime (`PeerConnectivityRuntime::reachability`): whether a session is
+//! registered here says nothing about whether the peer can be reached. `peer_orchestrator.rs`'s own doc comments
 //! encode exact ordering guarantees around session teardown/revocation
 //! against this same data; the methods here preserve those guarantees
 //! exactly (same lock scopes, same removal semantics) rather than
@@ -43,13 +47,10 @@ impl UnreachableCategory {
     }
 }
 
-/// A peer's live connectivity as tracked by the daemon and reported to the
-/// CLI and desktop app. There is no operator-run RELAY -- a peer is
-/// either being connected, connected (directly, or -- from M3 Pass 4
-/// onward -- via another peer that is relaying for it), or cannot be
-/// connected at all (with the reason it can't). See `crate::route`'s own
-/// doc comment for the `Durability != Connectivity` invariant this extends
-/// without weakening.
+/// A peer's live connectivity as reported to the CLI and desktop app: being
+/// connected, connected (directly, or through a relay server), or not
+/// reachable (with the reason). See `crate::route`'s own doc comment for the
+/// `Durability != Connectivity` invariant this extends without weakening.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerReachability {
     /// Candidate paths are still being raced; not yet connected, but not
@@ -58,24 +59,13 @@ pub enum PeerReachability {
     /// A path to the peer is confirmed and in use -- see `RouteKind` for
     /// which kind.
     Connected(crate::route::RouteKind),
-    /// The peer speaks a different protocol generation.
-    ///
-    /// No longer produced from a connected session, and cannot be: the
-    /// generation rides the ALPN, so a peer of another generation is
-    /// refused inside the TLS handshake and never reaches `Connected` at
-    /// all -- it is reported `Unreachable` instead. The variant is retained
-    /// because it is part of the status vocabulary the CLI and desktop app
-    /// render, and because that is where the signal belongs once the
-    /// connection layer distinguishes an ALPN refusal from an ordinary
-    /// failure to reach the peer.
-    ProtocolIncompatible,
     /// The peer cannot currently be reached; carries why.
     Unreachable(UnreachableCategory),
 }
 
 impl PeerReachability {
     pub fn is_connected(self) -> bool {
-        matches!(self, PeerReachability::Connected(_))
+        matches!(self, Self::Connected(_))
     }
 
     /// Stable wire/status slug: "connecting" | "connected" | "unreachable".
@@ -84,17 +74,16 @@ impl PeerReachability {
     /// see `route_str` for that.
     pub fn as_str(self) -> &'static str {
         match self {
-            PeerReachability::Connecting => "connecting",
-            PeerReachability::Connected(_) => "connected",
-            PeerReachability::ProtocolIncompatible => "protocol_incompatible",
-            PeerReachability::Unreachable(_) => "unreachable",
+            Self::Connecting => "connecting",
+            Self::Connected(_) => "connected",
+            Self::Unreachable(_) => "unreachable",
         }
     }
 
     /// The route slug ("direct" | "relay") when connected, otherwise empty.
     pub fn route_str(self) -> &'static str {
         match self {
-            PeerReachability::Connected(route) => route.as_str(),
+            Self::Connected(route) => route.as_str(),
             _ => "",
         }
     }
@@ -102,52 +91,68 @@ impl PeerReachability {
     /// The failure-category slug when unreachable, otherwise empty.
     pub fn unreachable_category_str(self) -> &'static str {
         match self {
-            PeerReachability::Unreachable(category) => category.as_str(),
-            PeerReachability::ProtocolIncompatible => "",
+            Self::Unreachable(category) => category.as_str(),
             _ => "",
         }
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct PeerStatusInfo {
-    pub reachability: PeerReachability,
-}
-
-/// One peer's session presence plus its last-known reachability, as
-/// returned by [`PeerRegistry::snapshot`] for status/health rendering.
-pub struct PeerSnapshot {
-    pub device_id: String,
-    pub reachability: PeerReachability,
-    /// Whether a session is currently registered for this device (distinct
-    /// from `reachability`, since a status entry can outlive/precede an
-    /// actual session -- e.g. `Connecting` before the session is inserted).
-    pub has_session: bool,
+/// One peer's live runtime: the session, and the convergence executor
+/// that runs the local half of its work.
+///
+/// One entry, not two parallel maps. Two maps make "a session with no
+/// executor" and "an executor outlived its session" representable, and
+/// registration and teardown can interleave into exactly those states --
+/// a cleanup for the session it is replacing removing the executor a
+/// newly registered session just installed. Keeping them in one value
+/// under one mutex makes both states unconstructible.
+#[derive(Clone)]
+pub struct PeerRuntime {
+    pub session: Arc<PeerSyncSession>,
+    /// The executor's work is local, and it lives in this crate, so it is
+    /// held beside the session rather than inside it. One per session,
+    /// which is exactly what each session used to construct for itself.
+    pub convergence: Arc<crate::local_convergence::LocalConvergenceExecutor>,
 }
 
 pub struct PeerRegistry {
-    /// device_id -> the running sync session, so local changes can be
-    /// broadcast and sessions torn down on ACL revocation.
-    sessions: Mutex<HashMap<String, Arc<PeerSyncSession>>>,
-    statuses: Mutex<HashMap<String, PeerStatusInfo>>,
+    /// device_id -> the running sync session and its executor, so local
+    /// changes can be broadcast and sessions torn down on ACL revocation.
+    sessions: Mutex<HashMap<String, PeerRuntime>>,
+    /// Marked each time a session leaves the registry, so a caller waiting
+    /// for a slot to free up can wait for that instead of polling.
+    removals: tokio::sync::watch::Sender<()>,
 }
 
 impl PeerRegistry {
     pub(crate) fn new() -> Self {
-        Self { sessions: Mutex::new(HashMap::new()), statuses: Mutex::new(HashMap::new()) }
+        Self { sessions: Mutex::new(HashMap::new()), removals: tokio::sync::watch::channel(()).0 }
     }
 
-    fn lock_sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<PeerSyncSession>>> {
+    /// Wakes after any session is removed from here from now on. Subscribe
+    /// before looking at the registry, so a removal between the look and
+    /// the wait is not missed.
+    pub(crate) fn subscribe_to_removals(&self) -> tokio::sync::watch::Receiver<()> {
+        self.removals.subscribe()
+    }
+
+    fn lock_sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, PeerRuntime>> {
         self.sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    fn lock_statuses(&self) -> std::sync::MutexGuard<'_, HashMap<String, PeerStatusInfo>> {
-        self.statuses.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// The live session for `device_id`, if any.
     pub fn session(&self, device_id: &str) -> Option<Arc<PeerSyncSession>> {
-        self.lock_sessions().get(device_id).cloned()
+        self.lock_sessions().get(device_id).map(|runtime| runtime.session.clone())
+    }
+
+    /// The local-convergence executor registered beside `device_id`'s
+    /// session, for a caller that needs the local half rather than the wire
+    /// half of that peer's runtime.
+    pub fn convergence(
+        &self,
+        device_id: &str,
+    ) -> Option<Arc<crate::local_convergence::LocalConvergenceExecutor>> {
+        self.lock_sessions().get(device_id).map(|runtime| runtime.convergence.clone())
     }
 
     /// Whether a session is currently registered for `device_id`.
@@ -162,8 +167,8 @@ impl PeerRegistry {
         let sessions = self.lock_sessions();
         let mut candidates: Vec<_> = sessions
             .iter()
-            .filter(|(_, session)| session.shares_group(group_id))
-            .map(|(peer_id, session)| (peer_id.clone(), session.clone()))
+            .filter(|(_, runtime)| runtime.session.shares_group(group_id))
+            .map(|(peer_id, runtime)| (peer_id.clone(), runtime.session.clone()))
             .collect();
         candidates.sort_by(|a, b| a.0.cmp(&b.0));
         candidates
@@ -171,7 +176,10 @@ impl PeerRegistry {
 
     /// Every live session, device id paired with its `Arc`.
     pub fn all_sessions(&self) -> Vec<(String, Arc<PeerSyncSession>)> {
-        self.lock_sessions().iter().map(|(id, session)| (id.clone(), session.clone())).collect()
+        self.lock_sessions()
+            .iter()
+            .map(|(id, runtime)| (id.clone(), runtime.session.clone()))
+            .collect()
     }
 
     /// Count of currently live sessions.
@@ -185,15 +193,70 @@ impl PeerRegistry {
         &self,
         device_id: String,
         session: Arc<PeerSyncSession>,
+        convergence: Arc<crate::local_convergence::LocalConvergenceExecutor>,
     ) -> Option<Arc<PeerSyncSession>> {
-        self.lock_sessions().insert(device_id, session)
+        self.lock_sessions()
+            .insert(device_id, PeerRuntime { session, convergence })
+            .map(|previous| previous.session)
+    }
+
+    /// Installs `session` for `device_id` only if no session is registered
+    /// for it, returning whether it was installed.
+    pub fn register_session_if_absent(
+        &self,
+        device_id: &str,
+        session: Arc<PeerSyncSession>,
+        convergence: Arc<crate::local_convergence::LocalConvergenceExecutor>,
+    ) -> bool {
+        match self.lock_sessions().entry(device_id.to_string()) {
+            std::collections::hash_map::Entry::Occupied(_) => false,
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(PeerRuntime { session, convergence });
+                true
+            }
+        }
+    }
+
+    /// `device_id`'s convergence executor, if a session is registered.
+    pub fn local_convergence(
+        &self,
+        device_id: &str,
+    ) -> Option<Arc<crate::local_convergence::LocalConvergenceExecutor>> {
+        self.lock_sessions().get(device_id).map(|runtime| runtime.convergence.clone())
+    }
+
+    /// Every live session that shares `group_id`, paired with its
+    /// executor, in the same deterministic order as
+    /// [`Self::sessions_for_group`].
+    pub fn convergence_for_group(
+        &self,
+        group_id: &str,
+    ) -> Vec<(String, Arc<PeerSyncSession>, Arc<crate::local_convergence::LocalConvergenceExecutor>)>
+    {
+        // Built from the same locked snapshot as `sessions_for_group`,
+        // in the same deterministic order, so a session and its executor
+        // can never be observed apart.
+        let sessions = self.lock_sessions();
+        let mut candidates: Vec<_> = sessions
+            .iter()
+            .filter(|(_, runtime)| runtime.session.shares_group(group_id))
+            .map(|(peer_id, runtime)| {
+                (peer_id.clone(), runtime.session.clone(), runtime.convergence.clone())
+            })
+            .collect();
+        candidates.sort_by(|a, b| a.0.cmp(&b.0));
+        candidates
     }
 
     /// Removes `device_id`'s session unconditionally, whatever it is --
     /// used for forced teardown/revocation paths that must clear the slot
     /// regardless of which session (if any) currently occupies it.
     pub fn remove(&self, device_id: &str) -> Option<Arc<PeerSyncSession>> {
-        self.lock_sessions().remove(device_id)
+        let removed = self.lock_sessions().remove(device_id).map(|runtime| runtime.session);
+        if removed.is_some() {
+            self.removals.send_replace(());
+        }
+        removed
     }
 
     /// Removes `device_id`'s session only if it is still exactly `expected`
@@ -202,74 +265,13 @@ impl PeerRegistry {
     /// installed. Returns whether a removal happened.
     pub fn remove_if_current(&self, device_id: &str, expected: &Arc<PeerSyncSession>) -> bool {
         let mut sessions = self.lock_sessions();
-        let matches = sessions.get(device_id).is_some_and(|current| Arc::ptr_eq(current, expected));
+        let matches =
+            sessions.get(device_id).is_some_and(|current| Arc::ptr_eq(&current.session, expected));
         if matches {
             sessions.remove(device_id);
+            drop(sessions);
+            self.removals.send_replace(());
         }
         matches
-    }
-
-    /// Records `device_id`'s current reachability, overwriting any
-    /// previous value.
-    pub fn set_reachability(&self, device_id: String, reachability: PeerReachability) {
-        self.lock_statuses().insert(device_id, PeerStatusInfo { reachability });
-    }
-
-    /// `device_id`'s last-recorded reachability, if any status has ever
-    /// been set for it.
-    pub fn reachability(&self, device_id: &str) -> Option<PeerReachability> {
-        self.lock_statuses().get(device_id).map(|info| info.reachability)
-    }
-
-    /// Updates `device_id`'s reachability only if a status entry already
-    /// exists for it (as opposed to [`set_reachability`], which creates
-    /// one). Returns whether an entry was found and updated -- callers use
-    /// this to detect "the status entry is already gone" (the session
-    /// ended) and stop polling, rather than resurrecting a removed entry.
-    ///
-    /// [`set_reachability`]: PeerRegistry::set_reachability
-    pub fn update_reachability_if_present(
-        &self,
-        device_id: &str,
-        reachability: PeerReachability,
-    ) -> bool {
-        let mut statuses = self.lock_statuses();
-        match statuses.get_mut(device_id) {
-            Some(info) => {
-                info.reachability = reachability;
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Removes `device_id`'s status entry -- used alongside `remove`/
-    /// `remove_if_current` when a session ends, so a stale status can never
-    /// linger and be reported after the session it described is gone.
-    pub fn clear_status(&self, device_id: &str) {
-        self.lock_statuses().remove(device_id);
-    }
-
-    /// Count of peers whose last-recorded reachability is `Connected`.
-    pub fn connected_peer_count(&self) -> u32 {
-        self.lock_statuses().values().filter(|info| info.reachability.is_connected()).count() as u32
-    }
-
-    /// A snapshot of every peer with a recorded status, each combined with
-    /// whether a session currently exists for it. Order is unspecified.
-    pub fn snapshot(&self) -> Vec<PeerSnapshot> {
-        let statuses = self.lock_statuses();
-        let sessions = self.lock_sessions();
-        statuses
-            .iter()
-            .map(|(device_id, info)| {
-                let session = sessions.get(device_id);
-                PeerSnapshot {
-                    device_id: device_id.clone(),
-                    reachability: info.reachability,
-                    has_session: session.is_some(),
-                }
-            })
-            .collect()
     }
 }

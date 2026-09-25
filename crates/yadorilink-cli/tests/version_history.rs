@@ -7,7 +7,7 @@
 //! against the coordination plane via `require_access_token`/
 //! `resolve_group_id`) and out of scope for this daemon-only fixture,
 //! exactly like `materialization.rs` never calls it either — tests here
-//! that need a link seed it directly over `control_client::send`
+//! that need a link seed it directly over `control::send`
 //! (`ReqPayload::Link`), the same wire message `commands::link::link`
 //! itself ultimately sends, so `--keep-versions`/`--keep-days` persistence
 //! is exercised through the identical control-socket path a real `link`
@@ -16,32 +16,28 @@
 
 use std::sync::Arc;
 
-use yadorilink_cli::control_client;
 use yadorilink_cli::error::CliError;
+use yadorilink_client_core::daemon::control;
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
 use yadorilink_ipc_proto::daemonctl::{ListTrashRequest, ListVersionsRequest};
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
 
 async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>) {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsBlockStore::new(dir.path().join("blocks")).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(dir.path().join("blocks")).unwrap());
     let sync_state = Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
     let state = DaemonState::new("device-under-test".into(), sync_state, store);
     state.set_device_signing_key(ed25519_dalek::SigningKey::from_bytes(&[29u8; 32]));
-    state.replica_coordinator.set_local_change_auth_provider(Arc::new(|_| {
-        Ok(yadorilink_replica_domain::change::ChangeAuth::PLACEHOLDER)
-    }));
+    state.replica_coordinator.set_local_policy_head_provider(Arc::new(|_| Ok([0u8; 32])));
     // Local edits now route through `replica_coordinator`, not `sync_state`
     // (7D-10.7) -- mirror the override there too, or `DaemonState::new`'s
     // real provider fires instead and withholds for lack of a verified
     // group policy.
-    state.replica_coordinator.set_local_change_auth_provider(Arc::new(|_| {
-        Ok(yadorilink_replica_domain::change::ChangeAuth::PLACEHOLDER)
-    }));
+    state.replica_coordinator.set_local_policy_head_provider(Arc::new(|_| Ok([0u8; 32])));
 
     let socket_path = dir.path().join("daemon.sock");
     std::env::set_var("YADORILINK_CONTROL_SOCKET", &socket_path);
@@ -133,10 +129,9 @@ async fn versions_command_lists_all_retained_versions_newest_first_including_cur
     let path = folder.join("notes.txt").to_string_lossy().to_string();
     yadorilink_cli::commands::version_history::versions(path.clone()).await.unwrap();
 
-    let resp =
-        control_client::send(ReqPayload::ListVersions(ListVersionsRequest { absolute_path: path }))
-            .await
-            .unwrap();
+    let resp = control::send(ReqPayload::ListVersions(ListVersionsRequest { absolute_path: path }))
+        .await
+        .unwrap();
     let Some(RespPayload::ListVersions(list)) = resp.payload else { panic!("wrong response") };
     assert_eq!(list.versions.len(), 2);
     assert_eq!(list.versions[0].version_seq, 2, "newest first");
@@ -159,6 +154,11 @@ async fn restore_command_restores_a_specific_version_as_a_new_current_version() 
         .link_repository()
         .add_link(&folder.to_string_lossy(), "group-1")
         .unwrap();
+    // A restore runs as one root-authorized operation (D10): it takes this
+    // group's live `RootLease` before anything else, and a direct
+    // `add_link` (never a real `start_link_watch`) installs none -- so
+    // install the test lease `yadorilink-daemon`'s own restore tests use.
+    state.install_test_root_commit_authority("group-1");
     // Writing a restored version back to disk verifies the root's adopted
     // identity first -- a direct `add_link` (never a real
     // `start_link_watch`) leaves no adopted root token behind, so this
@@ -218,7 +218,8 @@ async fn restore_command_without_version_defaults_to_most_recent_superseded() {
         .add_link(&folder.to_string_lossy(), "group-1")
         .unwrap();
     // See `restore_command_restores_a_specific_version_as_a_new_current_version`'s
-    // identical comment.
+    // identical comments.
+    state.install_test_root_commit_authority("group-1");
     yadorilink_root_authority::root_identity::VerifiedRoot::open(
         &folder,
         "group-1",
@@ -270,6 +271,11 @@ async fn restore_command_fails_clearly_and_exits_non_zero_on_missing_blocks() {
         .link_repository()
         .add_link(&folder.to_string_lossy(), "group-1")
         .unwrap();
+    // The restore's root lease is taken before the content lookup (D10);
+    // without one this fails on the missing authority, not on the missing
+    // blocks this test is about. See
+    // `restore_command_restores_a_specific_version_as_a_new_current_version`.
+    state.install_test_root_commit_authority("group-1");
 
     // A version referencing a block never actually written to this
     // device's block store.
@@ -314,7 +320,9 @@ async fn trash_list_then_trash_restore_recovers_a_deleted_file() {
     let local_path = folder.to_string_lossy().to_string();
     state.replica_coordinator.link_repository().add_link(&local_path, "group-1").unwrap();
     // See `restore_command_restores_a_specific_version_as_a_new_current_version`'s
-    // identical comment -- `trash restore` writes back to disk the same way.
+    // identical comments -- `trash restore` is the same root-authorized
+    // restore and writes back to disk the same way.
+    state.install_test_root_commit_authority("group-1");
     yadorilink_root_authority::root_identity::VerifiedRoot::open(
         &folder,
         "group-1",
@@ -347,7 +355,7 @@ async fn trash_list_then_trash_restore_recovers_a_deleted_file() {
 
     yadorilink_cli::commands::version_history::trash_list().await.unwrap();
 
-    let resp = control_client::send(ReqPayload::ListTrash(ListTrashRequest {})).await.unwrap();
+    let resp = control::send(ReqPayload::ListTrash(ListTrashRequest {})).await.unwrap();
     let Some(RespPayload::ListTrash(list)) = resp.payload else { panic!("wrong response") };
     assert_eq!(list.files.len(), 1);
     assert_eq!(list.files[0].path, "gone.txt");

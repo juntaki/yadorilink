@@ -6,14 +6,19 @@
 //! the `domain` layer) and enforced by `scripts/check-architecture.py`.
 
 pub mod admission;
+pub mod authorization_checkpoint;
+pub mod base_negotiation;
 pub mod change;
 pub mod codec;
 pub mod conflict;
 pub mod file;
 pub mod ids;
 pub mod limits;
+pub mod proof_carrying;
 pub mod rebootstrap;
 pub mod recovery;
+pub mod recursive_operation;
 pub mod reserved_paths;
 pub mod rewind;
 pub mod session_state;
+pub mod test_authoring;

@@ -6,10 +6,10 @@
 //! The whole daemon lifecycle lives here in the library, behind
 //! [`run`], rather than inline in `main.rs`. `main.rs` is now only a thin
 //! entry point that builds the real (production) tokio runtime and calls
-//! [`run`]; keeping the lifecycle in the library is what lets a
-//! deterministic-simulation node drive an in-process daemon instance by
-//! calling [`run`] with a simulated [`DaemonConfig`] directly, instead of
-//! going through the real process entry point.
+//! [`run`]; keeping the lifecycle in the library is what lets a test drive
+//! an in-process daemon instance by calling [`run`] with its own
+//! [`DaemonConfig`] directly, instead of going through the real process
+//! entry point.
 //!
 //! Every essential task (control socket, shell-integration IPC,
 //! peer orchestrator) is supervised together in one [`EssentialTasks`] set
@@ -26,54 +26,33 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use yadorilink_local_storage::FsBlockStore;
-// The `BlockStore` trait itself is only named in the simulator-only
-// pre-built-store seam (see `DaemonConfig::block_store_override` and its use
-// in `run`); production builds only ever construct the concrete
-// `FsBlockStore`, so importing the trait there would be an unused import.
 use crate::replica_coordinator::ReplicaCoordinator;
-#[cfg(madsim)]
-use yadorilink_local_storage::BlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 
 use crate::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use crate::daemon_state::DaemonState;
 use crate::device_config::config_dir;
 use crate::supervise::EssentialTasks;
-use crate::{device_config, peer_orchestrator, token_store};
-
-// The control-socket and shell-IPC transports are not started under the
-// deterministic simulator (their essential tasks are `cfg(not(madsim))` —
-// see `run`), so their modules go unused there.
-#[cfg(not(madsim))]
 use crate::{control_socket, shell_ipc};
+use crate::{credential_store, device_config, peer_orchestrator};
 
 /// Names used both for the essential-task logging and for
 /// `DaemonState::task_liveness` (health surface) — kept as
 /// constants so the two always agree.
-// Under the deterministic simulator the control-socket and shell-IPC
-// essential tasks are not started (their Unix-domain-socket transports
-// have no in-sim equivalent — see `run`), so these two names go unused
-// there; the `allow(dead_code)` keeps that intentional gap warning-free
-// without changing the production build in any way.
-#[cfg_attr(madsim, allow(dead_code))]
 const TASK_CONTROL_SOCKET: &str = "control-socket";
-#[cfg_attr(madsim, allow(dead_code))]
 const TASK_SHELL_IPC: &str = "shell-ipc-server";
 const TASK_PEER_ORCHESTRATOR: &str = "peer-orchestrator";
-#[cfg(not(madsim))]
 const DAEMON_INSTANCE_LOCK_FILE: &str = ".daemon.lock";
 
 /// Process-lifetime ownership of one config directory. The OS releases the
 /// advisory lock when the process exits, including SIGKILL/crash paths; the
 /// file itself deliberately remains so restart never relies on PID parsing or
 /// stale-file deletion.
-#[cfg(not(madsim))]
 #[derive(Debug)]
 struct DaemonInstanceLock {
     _file: std::fs::File,
 }
 
-#[cfg(not(madsim))]
 impl DaemonInstanceLock {
     fn acquire(config_dir: &std::path::Path) -> anyhow::Result<Self> {
         use std::fs::OpenOptions;
@@ -120,30 +99,14 @@ impl DaemonInstanceLock {
 /// materialization-repair/disk-reconcile cadences (this is a crash-recovery
 /// backstop for a killed CLI process, not a live sync path racing user-visible
 /// staleness).
-#[cfg_attr(madsim, allow(dead_code))]
 const PENDING_ENROLLMENT_RECONCILE_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
-
-/// A slot a deterministic-simulation smoke test passes into
-/// [`DaemonConfig::state_probe`] so it can obtain the in-process
-/// [`DaemonState`](crate::daemon_state::DaemonState) that [`run`] builds —
-/// `run` never returns its state (it owns the whole lifecycle), so this is
-/// how an in-sim driver reaches in to link folders and request shutdown.
-/// Exists only under `--cfg madsim`; production has no such seam.
-#[cfg(madsim)]
-pub type StateProbe =
-    std::sync::Arc<std::sync::Mutex<Option<Arc<crate::daemon_state::DaemonState>>>>;
 
 /// Filesystem locations the daemon operates over. Extracted from the
 /// process environment for the real binary ([`DaemonConfig::from_env`]),
-/// but passed in explicitly so a single OS process running many simulated
-/// daemon instances can give each its own isolated paths rather than
-/// sharing one set of process-global environment variables / socket paths.
-// `Debug` and `Clone` are derived only in production. Under the simulator
-// the added `state_probe` slot holds an `Arc<DaemonState>` (not `Debug`),
-// and the `sim_discovery` slot holds a pre-bound `UdpSocket` (not `Clone`);
-// deriving either there would fail, and nothing in-sim clones or debugs a
-// `DaemonConfig` (it is always moved by value into `run`).
-#[cfg_attr(not(madsim), derive(Debug, Clone))]
+/// but passed in explicitly so a single OS process running many daemon
+/// instances can give each its own isolated paths rather than sharing one
+/// set of process-global environment variables / socket paths.
+#[derive(Debug, Clone)]
 pub struct DaemonConfig {
     /// Base configuration directory; also where per-daemon config files
     /// (device config, metrics config, ...) are read from.
@@ -154,31 +117,6 @@ pub struct DaemonConfig {
     pub control_socket_path: PathBuf,
     #[cfg(unix)]
     pub shell_ipc_socket_path: PathBuf,
-    /// (simulator only) When `Some`, [`run`] publishes the `DaemonState` it
-    /// builds into this slot so an in-sim smoke test can drive it. Always
-    /// `None`/absent in production ([`DaemonConfig::from_env`] never sets it).
-    #[cfg(madsim)]
-    pub state_probe: Option<StateProbe>,
-    /// (simulator only) When `Some`, [`run`] starts the peer orchestrator's
-    /// static-netmap seam ([`peer_orchestrator::run_sim`]) with this
-    /// harness-supplied discovery input instead of the real coordination
-    /// netmap stream, and uses its `local_device_id` for the `DaemonState`
-    /// device identity. This is how two in-sim daemons pair up and sync
-    /// without the (not-in-simulation) coordination server. Always `None` in
-    /// production ([`DaemonConfig::from_env`] never sets it).
-    #[cfg(madsim)]
-    pub sim_discovery: Option<peer_orchestrator::SimDiscovery>,
-    /// (simulator only) When `Some`, [`run`] uses this pre-built block store
-    /// verbatim instead of constructing a plain [`FsBlockStore`] over
-    /// [`block_store_root`](Self::block_store_root). This is the fault-injection
-    /// seam: a deterministic-simulation test can hand the daemon a
-    /// `FaultingBlockStore` wrapping the real `FsBlockStore` so the
-    /// materialization/hydration error paths (ENOSPC / EIO / torn writes)
-    /// are exercised through the real daemon end to end. Always `None` in
-    /// production ([`DaemonConfig::from_env`] never sets it), so the real
-    /// binary's storage behavior is unchanged.
-    #[cfg(madsim)]
-    pub block_store_override: Option<Arc<dyn BlockStore + Send + Sync>>,
 }
 
 impl DaemonConfig {
@@ -210,17 +148,6 @@ impl DaemonConfig {
             control_socket_path,
             #[cfg(unix)]
             shell_ipc_socket_path,
-            // The real binary is never driven by an in-sim probe.
-            #[cfg(madsim)]
-            state_probe: None,
-            // The real binary always discovers peers over the coordination
-            // netmap stream, never a harness-supplied static netmap.
-            #[cfg(madsim)]
-            sim_discovery: None,
-            // The real binary always builds its own `FsBlockStore`; only an
-            // in-sim fault-injection test supplies a decorated store.
-            #[cfg(madsim)]
-            block_store_override: None,
         }
     }
 }
@@ -251,7 +178,6 @@ fn enforce_trust_root_gate_at_startup() -> anyhow::Result<()> {
 /// function over `std::env::var`'s own `Result` (rather than reading the
 /// env var itself) so this convention is unit-testable without mutating
 /// process-global env state.
-#[cfg_attr(madsim, allow(dead_code))]
 fn env_disable_flag_is_set(value: Result<String, std::env::VarError>) -> bool {
     match value {
         Ok(v) => {
@@ -262,7 +188,7 @@ fn env_disable_flag_is_set(value: Result<String, std::env::VarError>) -> bool {
     }
 }
 
-#[cfg(all(test, not(madsim)))]
+#[cfg(test)]
 mod env_disable_flag_tests {
     use super::env_disable_flag_is_set;
 
@@ -295,9 +221,25 @@ mod env_disable_flag_tests {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "daemon startup sequence, and the sequence itself is the invariant: \
+              instance lock -> device-config preflight -> signing-key validation -> \
+              data-resource locks -> block store/DB open -> state wiring -> link \
+              resumption -> essential-task spawn. Every step depends on the previous \
+              one having already succeeded or already failed closed, so extracting \
+              phases into helpers would hide the ordering that makes an aborted \
+              startup leave nothing on disk mutated."
+)]
 pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     #[cfg(feature = "enforce-release-trust-root")]
     enforce_trust_root_gate_at_startup()?;
+
+    // Before anything else observable: if this daemon was asked to record
+    // which carriers its transfers use, the request has to be complete. A
+    // half-configured instrument would start cleanly and then write a file
+    // that reads like evidence, which is worse than not measuring at all.
+    crate::path_witness_sink::configure_from_env()?;
 
     // `YADORILINK_DIAGNOSTIC_IO_COUNTERS=1` arms `yadorilink_local_storage
     // ::io_diag`'s process-global durability/pipeline counters for this
@@ -312,13 +254,16 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     if std::env::var("YADORILINK_DIAGNOSTIC_IO_COUNTERS").as_deref() == Ok("1") {
         yadorilink_local_storage::io_diag::set_enabled(true);
     }
+    // Reads those same totals on demand rather than only at shutdown; see
+    // the function's own doc comment. No-op unless the line above armed
+    // them, so a production daemon installs nothing.
+    spawn_io_diag_mark_listener();
 
     let dir = config.config_dir;
     std::fs::create_dir_all(&dir)?;
     // Acquire before opening the block store/SQLite or touching either Unix
     // socket. In particular, a losing process must never unlink the live
     // daemon's socket before discovering that it does not own this config.
-    #[cfg(not(madsim))]
     let _instance_lock = DaemonInstanceLock::acquire(&dir)?;
 
     // Validate this device's identity config before any data-plane startup
@@ -382,9 +327,7 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     // them together before acquiring data-resource locks, opening the block
     // store/SQLite, running migrations, or repairing linked files. Keep this
     // exact loaded value for later wiring so no second read can observe a
-    // different file after persistent startup work has begun. Not cfg-gated:
-    // `load_existing` is plain synchronous file I/O with no tokio/madsim
-    // dependency.
+    // different file after persistent startup work has begun.
     //
     // One key, not two. It signs this device's change history and it
     // authenticates its transport, and a registered device that cannot load
@@ -394,24 +337,16 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     } else {
         None
     };
-    // Under the simulator the harness installs this device's key itself
-    // (`peer_orchestrator::run_sim`), so the load above is purely the
-    // validation that a registered device HAS one -- which still has to
-    // happen, and still has to happen here, before any persistent startup
-    // work begins.
-    #[cfg(madsim)]
-    let _ = &registered_identity;
 
     // Additive to the config-dir lock above: take exclusive OS locks on the
     // block-store root and the sync-state database *before* opening either
-    // (`FsBlockStore::new`/`SyncState::open` below), so a losing daemon never
+    // (`SegmentBlockStore::new`/`SyncState::open` below), so a losing daemon never
     // mutates them. The config-dir lock alone does not cover this: the store
     // root and database paths are independently overridable, so two daemons
     // with distinct config dirs could otherwise be aimed at the same store/DB
     // and corrupt them. Deterministic acquisition order (config dir → block
     // store → DB) prevents cross-instance deadlock; on conflict the
     // already-acquired lock is released (RAII) as `run` returns the error.
-    #[cfg(not(madsim))]
     let _data_resource_locks =
         crate::resource_lock::DataResourceLocks::acquire(&block_store_root, &sync_db_path)?;
 
@@ -419,12 +354,6 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     let control_socket_path = config.control_socket_path;
     #[cfg(unix)]
     let shell_ipc_socket_path = config.shell_ipc_socket_path;
-    #[cfg(madsim)]
-    let state_probe = config.state_probe;
-    #[cfg(madsim)]
-    let sim_discovery = config.sim_discovery;
-    #[cfg(madsim)]
-    let block_store_override = config.block_store_override;
 
     // A severe-error hook for the
     // two fallible startup calls that would otherwise abort startup before
@@ -432,63 +361,45 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     // throwaway `ReportingStorage` over the same config directory rather
     // than waiting for `DaemonState::new`, since a failure here is exactly
     // the kind of thing a maintainer would want a local candidate for.
-    #[cfg(not(madsim))]
-    let block_store = Arc::new(FsBlockStore::new(&block_store_root).inspect_err(|e| {
+    let block_store = Arc::new(SegmentBlockStore::new(&block_store_root).inspect_err(|e| {
         record_startup_error_best_effort("daemon_startup", "block-store", e.to_string());
     })?);
-    // (simulator only) Prefer a harness-supplied, pre-built block store (a
-    // fault-injecting decorator over the real `FsBlockStore`) when present, so
-    // storage-layer faults are exercised through the identical production
-    // materialization/hydration code path. Absent an override this builds the
-    // exact same `FsBlockStore` production does. The `Arc<dyn BlockStore>`
-    // annotation matches `DaemonState`'s own field type, into which this is
-    // handed unchanged below.
-    #[cfg(madsim)]
-    let block_store: Arc<dyn BlockStore + Send + Sync> = match block_store_override {
-        Some(store) => store,
-        None => Arc::new(FsBlockStore::new(&block_store_root).inspect_err(|e| {
-            record_startup_error_best_effort("daemon_startup", "block-store", e.to_string());
-        })?),
-    };
-    // Phase 7D-10.9: builds the daemon's one replica/DAG/materialization
-    // composition-root handle directly -- `DaemonState` no longer holds a
-    // separate `yadorilink_sync_core::index::SyncState` this used to open
-    // first and forward from. `ReplicaCoordinator::open` mirrors
-    // `SyncState::open`'s own field construction (same `SyncDatabase::open`
-    // + schema-bootstrap sequence), just without the `sync-core`-owned
-    // wrapper type.
     let replica_coordinator =
         Arc::new(ReplicaCoordinator::open(&sync_db_path).inspect_err(|e| {
             record_startup_error_best_effort("daemon_startup", "sync-state", e.to_string());
         })?);
 
-    // Recover any file left permanently stuck `Hydrating` by a
-    // previous crash before anything else runs — see
-    // `yadorilink_sync_core::index::SyncState::reset_stale_hydrating_to_placeholder`'s
-    // doc comment (verbatim same behavior, now read through
-    // `replica_coordinator`).
-    match replica_coordinator
-        .materialization_state_repository()
-        .reset_stale_hydrating_to_placeholder()
-    {
+    // Both resets run (each its own transaction) before either result is
+    // looked at, and fail independently.
+    let (stale_hydrating, stale_evicting) = replica_coordinator.reset_stale_transient_states();
+    match stale_hydrating {
         Ok(0) => {}
         Ok(n) => tracing::info!(count = n, "reset stale Hydrating rows to Placeholder on startup"),
         Err(e) => tracing::warn!(error = %e, "failed to reset stale Hydrating rows on startup"),
     }
 
-    // Recover any file left permanently stuck `Evicting` by a crash mid-eviction
-    // (before its placeholder commit) — otherwise nothing ever reconciles it and
-    // the file is wedged. Reset to `Placeholder` (blocks are always still
-    // retained at this point), the state safe for both interrupted-eviction disk
-    // cases — see `yadorilink_sync_core::index::SyncState::reset_stale_evicting_to_placeholder`'s
-    // doc comment.
-    match replica_coordinator
-        .materialization_state_repository()
-        .reset_stale_evicting_to_placeholder()
-    {
+    // Recover any file left permanently stuck `Evicting` by a crash
+    // mid-eviction (before its placeholder commit) — otherwise nothing
+    // ever reconciles it and the file is wedged.
+    match stale_evicting {
         Ok(0) => {}
         Ok(n) => tracing::info!(count = n, "reset stale Evicting rows to Placeholder on startup"),
         Err(e) => tracing::warn!(error = %e, "failed to reset stale Evicting rows on startup"),
+    }
+
+    // A structural `mkdir` interrupted between its intent and its
+    // completion: at startup nothing is in flight, so every pending intent
+    // is dropped (never completed). The directory it may have created is
+    // kept and is of unknown origin -- never removed, never authored.
+    match replica_coordinator.drop_interrupted_structural_intents_at_startup() {
+        Ok(dropped) if dropped.is_empty() => {}
+        Ok(dropped) => tracing::info!(
+            count = dropped.len(),
+            "dropped interrupted structural-directory intents on startup"
+        ),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to drop interrupted structural-directory intents")
+        }
     }
 
     // Run before any link watcher starts or any new write happens, so
@@ -519,18 +430,7 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     // pretend it has no work.
     let links = replica_coordinator.link_repository().list_links()?;
 
-    #[cfg(not(madsim))]
     let device_id = device_config.as_ref().map(|c| c.device_id.clone()).unwrap_or_default();
-    // Under the simulator a harness-supplied static netmap carries this
-    // device's identity directly (an in-sim daemon is not "logged in", so
-    // `device_config` is absent and every daemon would otherwise share the
-    // same empty device id -- which version vectors and peer-session
-    // identity depend on being distinct).
-    #[cfg(madsim)]
-    let device_id = match &sim_discovery {
-        Some(sim) => sim.local_device_id.clone(),
-        None => device_config.as_ref().map(|c| c.device_id.clone()).unwrap_or_default(),
-    };
 
     // Construction (`DaemonState::build`) and starting `MaintenanceCoordinator`
     // are two explicit steps here, not the single `DaemonState::new` every
@@ -543,7 +443,7 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     // change, just the same two steps made explicit and separately owned.
     let build =
         DaemonState::build(device_id.clone(), replica_coordinator.clone(), block_store.clone());
-    crate::maintenance_coordinator::start(&build.state, build.forward_rx);
+    let recovery_job = crate::maintenance_coordinator::start(&build.state, build.forward_rx);
     let state = build.state;
     // Only the real `yadorilink-daemon`
     // binary itself opts into disk-headroom enforcement — see
@@ -552,48 +452,17 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     // crate also goes through).
     state.enable_disk_headroom_enforcement();
 
-    // `set_local_relay_capable` had no production entry point at all before
-    // this -- every existing call site was a test's own direct call on a
-    // `DaemonState` it built itself. This is this device's LOCAL half of
-    // "may I relay for others" (`route.rs`'s own doc comment: `Durability
-    // != Connectivity`, a device a user already trusts -- a home NAS, an
-    // always-on desktop -- can opt into this independently of full-replica
-    // status); the coordination plane's own netmap is the other half, and
-    // grants nothing on its own without this device also consenting
-    // locally. Env-var-gated rather than a config-file field for now,
-    // matching this function's own existing `YADORILINK_*` operator knobs
-    // (`YADORILINK_BLOCK_STORE`, `YADORILINK_DAEMON_METRICS_ADDR`, ...);
-    // promoting it to a real CLI/config surface is separate follow-up work,
-    // not something this one-line activation needs to wait for.
-    if std::env::var("YADORILINK_RELAY_CAPABLE").as_deref() == Ok("1") {
-        state.set_local_relay_capable(true);
-    }
-
     // Wire the generation-stamped peer custody confirmer. Physical cache
     // reclamation remains disabled until the responder can persist a custody
     // lease as a GC root; the real daemon keeps the exact-version protocol
     // available for diagnostics and that future lease flow.
-    #[cfg(not(madsim))]
     state.install_p2p_custody_confirmer();
 
     // Wire this device's change-history signing key once, so linked folders
     // emit signed changes. Only for a registered device (an unregistered one
-    // has no identity to attribute changes to), and not under the simulator,
-    // whose in-process daemons drive emission through their own seams.
-    #[cfg(not(madsim))]
+    // has no identity to attribute changes to).
     if let Some(signing) = registered_identity.as_ref() {
         state.set_device_signing_key(signing.signing.clone());
-    }
-
-    // Deterministic-simulation seam: hand the just-built `DaemonState` to an
-    // in-sim smoke-test driver (if one supplied a probe) so it can link
-    // folders and request shutdown against this exact instance. Published
-    // here — after `DaemonState::new` but before the essential-task set and
-    // the top-level `select!` — so the driver observes the daemon at steady
-    // state. A no-op in production (`state_probe` is always `None` there).
-    #[cfg(madsim)]
-    if let Some(probe) = state_probe {
-        *probe.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(state.clone());
     }
 
     // Opt-in `/metrics`
@@ -603,7 +472,8 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     // override takes precedence, with the persisted config as this
     // binary's own additional, CLI-settable fallback.
     let metrics_addr = std::env::var("YADORILINK_DAEMON_METRICS_ADDR").ok().or_else(|| {
-        let config = crate::metrics_config::MetricsConfigStore::new(&dir).load_or_default();
+        let config =
+            yadorilink_reporting::metrics_config::MetricsConfigStore::new(&dir).load_or_default();
         config.enabled.then_some(config.bind_addr)
     });
     if let Some(metrics_addr) = metrics_addr {
@@ -670,11 +540,6 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     // it.
     let mut essential = EssentialTasks::new();
 
-    // Not started under the deterministic simulator: the control socket's
-    // Unix-domain-socket transport has no in-sim equivalent, and a smoke
-    // test drives the daemon through `DaemonState`/`shutdown_tx` directly
-    // (see the `state_probe` seam above) rather than over this socket.
-    // Production (`not(madsim)`) is byte-for-byte unchanged.
     // `app.rs` is the sole composition root: `application`/`queries` are
     // built exactly once here, after `state`'s own setup above (headroom
     // enforcement, custody confirmer, signing key) is complete, and handed
@@ -685,7 +550,7 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
         crate::adapters::build_query_services(state.clone()),
     ));
 
-    #[cfg(all(unix, not(madsim)))]
+    #[cfg(unix)]
     {
         let state = state.clone();
         let control_context = control_context.clone();
@@ -720,15 +585,20 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
         });
     }
 
-    // Not started under the simulator, same rationale as the control
-    // socket above (no in-sim Unix-domain-socket transport).
-    #[cfg(all(unix, not(madsim)))]
+    // The shell extension's hydrate/pin/evict share the control socket's
+    // `ApplicationServices` instance rather than reaching `DaemonState`.
+    #[cfg(any(windows, unix))]
+    let shell_context =
+        std::sync::Arc::new(crate::shell_context::ShellContext::new(&control_context, &state));
+
+    #[cfg(unix)]
     {
         let state = state.clone();
+        let shell_context = shell_context.clone();
         let path = shell_ipc_socket_path.clone();
         state.set_task_alive(TASK_SHELL_IPC, true);
         essential.spawn(async move {
-            if let Err(e) = shell_ipc::unix_transport::serve(&path, state.clone()).await {
+            if let Err(e) = shell_ipc::unix_transport::serve(&path, shell_context).await {
                 tracing::error!(error = %e, task = TASK_SHELL_IPC, "essential task failed");
             } else {
                 tracing::warn!(task = TASK_SHELL_IPC, "essential task exited");
@@ -740,10 +610,11 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     #[cfg(windows)]
     {
         let state = state.clone();
+        let shell_context = shell_context.clone();
         let pipe_name = device_config::shell_ipc_pipe_name();
         state.set_task_alive(TASK_SHELL_IPC, true);
         essential.spawn(async move {
-            if let Err(e) = shell_ipc::windows_transport::serve(&pipe_name, state.clone()).await {
+            if let Err(e) = shell_ipc::windows_transport::serve(&pipe_name, shell_context).await {
                 tracing::error!(error = %e, task = TASK_SHELL_IPC, "essential task failed");
             } else {
                 tracing::warn!(task = TASK_SHELL_IPC, "essential task exited");
@@ -756,10 +627,7 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     // Localhost HTTP/REST + SSE dashboard, a thin translation layer over
     // this same control socket/pipe (see `yadorilink-http-api`'s own crate
     // doc comment; also documented for operators in README.md's "HTTP API
-    // and web dashboard" section) -- not started under the deterministic
-    // simulator, same reasoning as the control-socket/shell-IPC essential
-    // tasks above (no in-sim equivalent of a real TCP listener or this
-    // crate's own control-socket dialer). Non-essential/best-effort, like
+    // and web dashboard" section). Non-essential/best-effort, like
     // NAT-traversal below: a failure to bind (most likely the configured
     // port already in use) must not take down folder sync. Opt-out only,
     // never opt-in, so the dashboard is available by default for a headless
@@ -772,7 +640,6 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     // gated by a bearer token readable by that uid but reachable, as a raw
     // TCP connection, by every local uid -- see README.md for that trade-off
     // written out.
-    #[cfg(not(madsim))]
     if !env_disable_flag_is_set(std::env::var("YADORILINK_HTTP_API_DISABLE")) {
         #[cfg(unix)]
         let control_socket_path = control_socket_path.clone();
@@ -826,73 +693,57 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
         }
     }
 
-    match (device_config, token_store::load_access_token()) {
-        (Some(cfg), Some(access_token)) => {
+    // `?`, not a fallback. A credential store this process cannot read is not
+    // the same as a machine nobody has signed in on: the second is an
+    // unconnected daemon, which is a supported state, and the first is a
+    // daemon that would run as if nobody had signed in while a credential sits
+    // there unreadable. Refusing is what keeps a misconfigured store from
+    // looking like an ordinary logged-out machine.
+    //
+    // ONE credential for the whole process, built once here. It is not a
+    // token: on the Authorization Server's plane it is a handle on the shared
+    // credential manager, so every clone below refreshes through one cache and
+    // one cross-process rotation lock instead of holding a five-minute
+    // snapshot that dies while the daemon is idle.
+    let coordination_auth = credential_store::coordination_auth().await?;
+
+    // Before the orchestrator can start, and whether or not it can reach
+    // anything: rebuild the verified group policy state from the signed
+    // chains this device stored, re-checking each one against its pinned
+    // coordination service key and its rollback watermark. Without it a
+    // restart taken while the plane is unreachable rediscovers its peers and
+    // then withholds every group anyway, because an introduced group with no
+    // verified policy fails closed -- a connection that cannot carry data.
+    // The first live netmap of the run replaces all of it.
+    if let Some(cfg) = device_config.as_ref() {
+        peer_orchestrator::restore_offline_group_policy_states(&state, &cfg.coordination_addr);
+    }
+
+    match (device_config, coordination_auth) {
+        (Some(cfg), Some(auth)) => {
             tracing::info!(device_id = %cfg.device_id, "connecting to coordination plane");
 
             // Best-effort, production-only coordination-plane wiring, spawned
             // before the orchestrator moves `cfg`/`access_token` into its
-            // config. Not run under the deterministic simulator (no real
-            // coordination plane, network, or gateway):
-            //  - a one-time, idempotent signing-key backfill so a device
-            //    registered before change-history signing keys existed still
-            //    gets its key recorded and distributed to peers (set-once on
-            //    the server, so re-running it every startup is a no-op);
-            //  - NAT-traversal candidate gathering (STUN + router port
-            //    mapping) that keeps the coordination plane's view of this
-            //    device's direct-connection candidates current.
-            #[cfg(not(madsim))]
+            // config: keeps the coordination plane's view of this device's iroh
+            // address current.
             {
                 let addr = cfg.coordination_addr.clone();
-                let token = access_token.clone();
+                let token = auth.clone();
                 let device_id = cfg.device_id.clone();
-                let nat_config = cfg.nat.clone();
-                let nat_state = state.clone();
+                let own_address = state.peer_connectivity.local_substrate_reachability.clone();
 
                 // Recorded once, up front, so any control-socket request the
                 // CLI issues from this point on (currently only the
                 // full-replica-handoff lease request) can make its own
                 // coordination-plane calls without needing `coordination_addr`/
-                // `access_token` threaded through as extra parameters -- see
+                // the credential threaded through as extra parameters -- see
                 // `DaemonState::coordination_client_config`'s doc comment.
                 state.set_coordination_client_config(addr.clone(), token.clone());
 
-                // P0-A: the production RelayGrantSource -- see that
-                // struct's own doc comment. Installed unconditionally,
-                // exactly like every other coordination-plane-backed
-                // capability wired in this same block: whether a grant is
-                // ever actually usable still depends entirely on this
-                // device's own relay_candidates() finding a live,
-                // relay-capable, directly-reachable peer to ask (see
-                // relay_carrier.rs::open_relay_path), same as before this
-                // existed.
-                state.set_relay_grant_source(std::sync::Arc::new(
-                    crate::relay_carrier::ProductionRelayGrantSource::new(
-                        addr.clone(),
-                        token.clone(),
-                        device_id.clone(),
-                    ),
-                ));
-
-                if let Some(signing) = registered_identity.as_ref() {
-                    let addr = addr.clone();
-                    let token = token.clone();
-                    let device_id = device_id.clone();
-                    let signing_public_key = signing.public_bytes().to_vec();
-                    crate::supervise::spawn_logged("signing-key-backfill", async move {
-                        crate::coordination_client::upload_signing_key(
-                            &addr,
-                            &token,
-                            device_id,
-                            signing_public_key,
-                        )
-                        .await;
-                        Ok(())
-                    });
-                }
-
                 // Crash-safe create/join enrollment (see
-                // `EnrollmentRecoveryService`'s own module doc): finish
+                // `EnrollmentRecoveryService`'s own module doc), run through
+                // the daemon's one `RecoveryJob`: finish
                 // confirming (or, failing that, cancel) any local link this
                 // device committed whose matching coordination-plane
                 // activation never got confirmed -- the CLI process that
@@ -901,34 +752,40 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
                 // immediately (covering a marker left over from before this
                 // startup) and then on a fixed interval, so a marker left
                 // behind by a killed CLI process is retried without needing a
-                // daemon restart to notice it. Best-effort and self-healing
-                // like the signing-key backfill above: a sweep that can't reach
-                // the coordination plane leaves its marker in place for the
-                // next one.
+                // daemon restart to notice it. Best-effort and self-healing: a
+                // sweep that can't reach the coordination plane leaves its
+                // marker in place for the next one.
                 {
-                    let application = control_context.application.clone();
+                    let recovery_job = recovery_job.clone();
                     crate::supervise::spawn_logged("pending-enrollment-reconcile", async move {
                         let mut interval =
                             tokio::time::interval(PENDING_ENROLLMENT_RECONCILE_SWEEP_INTERVAL);
                         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                         loop {
                             interval.tick().await;
-                            application.enrollment_recovery.reconcile_once().await;
+                            recovery_job.run_enrollment_recovery_once().await;
                         }
                     });
                 }
 
-                crate::supervise::spawn_logged("nat-traversal", async move {
-                    crate::nat_traversal::run(nat_config, addr, token, device_id, nat_state).await;
+                crate::supervise::spawn_logged("address-report", async move {
+                    crate::peer_connectivity_runtime::report_own_address(
+                        addr,
+                        token,
+                        device_id,
+                        own_address,
+                    )
+                    .await;
                     Ok(())
                 });
             }
 
-            // Track Send: waits for the peer orchestrator spawned below to
-            // publish this device's `QuicPeerEndpoint`, then builds and
-            // serves this device's Track Send service -- a wholly separate
-            // protocol on the same endpoint, never the sync DAG/
-            // materialization machinery the rest of this daemon serves. Not
+            // Track Send: waits for the reconciliation stack to bind this
+            // device's iroh endpoint, then builds and serves this device's
+            // Track Send service on its own ALPN (`yadorilink/send/v1`) --
+            // a wholly separate protocol on the same endpoint, never the
+            // sync DAG/materialization machinery the rest of this daemon
+            // serves. Not
             // an `essential.spawn` task: a device that cannot yet (or ever)
             // establish coordination-plane connectivity should not bring
             // the whole daemon down over a feature that itself has no
@@ -943,7 +800,7 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
 
             let orchestrator_config = peer_orchestrator::OrchestratorConfig {
                 coordination_addr: cfg.coordination_addr,
-                access_token,
+                auth,
                 device_id: cfg.device_id,
             };
             let state = state.clone();
@@ -963,28 +820,15 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
             tracing::warn!(
                 "not logged in or no device registered yet — running with local link management only; run `yadorilink login` and `yadorilink device register` to enable P2P sync"
             );
+            // Signed out, or not a registered device: there is no account
+            // relationship left for a last-known-good peer authorization to
+            // continue, so the snapshot is deleted rather than left on disk
+            // for a later restart to act on. This is also what makes
+            // `yadorilink logout` (which clears the credential store from
+            // another process) reach the snapshot: the next daemon start
+            // finds no credential and drops it.
+            state.forget_offline_peer_authorization();
         }
-    }
-
-    // Deterministic-simulation discovery seam: when the harness supplies a
-    // static netmap, run the peer orchestrator's `run_sim` variant (peer
-    // channels over madsim's simulated UDP) as the same supervised
-    // essential task the real `peer_orchestrator::run` would occupy.
-    // Production never takes this path (`sim_discovery` is always `None`
-    // there).
-    #[cfg(madsim)]
-    if let Some(sim) = sim_discovery {
-        let state = state.clone();
-        state.set_task_alive(TASK_PEER_ORCHESTRATOR, true);
-        essential.spawn(async move {
-            if let Err(e) = peer_orchestrator::run_sim(sim, state.clone()).await {
-                tracing::error!(error = %e, task = TASK_PEER_ORCHESTRATOR, "essential task failed");
-            } else {
-                tracing::warn!(task = TASK_PEER_ORCHESTRATOR, "essential task exited");
-            }
-            state.set_task_alive(TASK_PEER_ORCHESTRATOR, false);
-            TASK_PEER_ORCHESTRATOR
-        });
     }
 
     #[cfg(unix)]
@@ -1041,7 +885,7 @@ async fn wait_for_shutdown_request(
     }
 }
 
-#[cfg(all(unix, not(madsim)))]
+#[cfg(unix)]
 async fn wait_for_os_signal() -> &'static str {
     use tokio::signal::unix::{signal, SignalKind};
     // `signal()` only fails if the underlying OS signal registration
@@ -1072,22 +916,121 @@ fn record_startup_error_best_effort(category: &str, subsystem: &str, message: St
 /// already covers cross-platform — no Windows-specific signal API needed
 /// for this MVP — cfg-split only where the platforms genuinely differ,
 /// e.g. named pipes vs Unix sockets.
-#[cfg(all(windows, not(madsim)))]
+#[cfg(windows)]
 async fn wait_for_os_signal() -> &'static str {
     let _ = tokio::signal::ctrl_c().await;
     "Ctrl-C"
 }
 
-/// Under the deterministic simulator there are no OS signals — madsim's
-/// tokio shim has no `signal` module at all. A simulated daemon is shut
-/// down exclusively through `DaemonState::shutdown_tx` (the same channel
-/// the control socket's `Shutdown` request uses), so this side of the
-/// `select!` simply never fires and the watch-channel branch drives every
-/// in-sim shutdown.
-#[cfg(madsim)]
-async fn wait_for_os_signal() -> &'static str {
-    std::future::pending().await
+/// Writes every armed `io_diag` counter out as one line per operation
+/// class, tagged with `occasion`.
+///
+/// Shared by the shutdown dump and the SIGUSR1 mark below so the two can
+/// never report different counter sets. That is the whole reason this is a
+/// function rather than two loops: a benchmark that subtracts a mark from
+/// a later mark is subtracting two readings of the same instrument, and a
+/// counter present in one dump but not the other would silently turn into
+/// a wrong delta rather than a visible error.
+///
+/// Reads only — `snapshot()` is a row of relaxed loads. Nothing here
+/// resets a counter or touches any product state.
+fn emit_io_diag_counters(occasion: &str) {
+    for op in yadorilink_local_storage::io_diag::snapshot() {
+        if op.calls > 0 {
+            tracing::info!(
+                op = op.name,
+                calls = op.calls,
+                nanos = op.nanos,
+                bytes = op.bytes,
+                "io_diag counter at {occasion}"
+            );
+        }
+    }
+    emit_custody_counters(occasion);
 }
+
+/// The custody-query counters, written in the same shape and on the same
+/// occasions as the block-store ones.
+///
+/// Same shape deliberately: a reader already subtracts one reading of
+/// those from another to get a phase's value, and these have to be
+/// subtracted the same way to be compared with them. The question they
+/// exist to answer -- whether custody read volume grows because more
+/// queries arrive or because each answer verifies more -- is only
+/// answerable if both sides of the ratio come from the same two instants.
+fn emit_custody_counters(occasion: &str) {
+    let s = yadorilink_peer_session::custody_diag::stats();
+    if s.requests == 0 {
+        return;
+    }
+    for (name, value) in [
+        ("custody_requests", s.requests),
+        ("custody_requests_for_handoff", s.requests_for_handoff),
+        ("custody_unique_versions", s.unique_versions),
+        ("custody_blocks_verified", s.blocks_verified),
+    ] {
+        tracing::info!(
+            op = name,
+            calls = value,
+            nanos = 0,
+            bytes = 0,
+            "io_diag counter at {occasion}"
+        );
+    }
+}
+
+/// Monotonic sequence number for SIGUSR1 marks, so a reader can tell
+/// "mark 3 then mark 4" from "mark 4 arrived, mark 3's lines were lost".
+/// Diagnostic-only and never read by the daemon itself.
+#[cfg(unix)]
+static IO_DIAG_MARK_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Installs a SIGUSR1 listener that dumps `io_diag`'s counters on demand.
+///
+/// Exists because those counters are process-global totals with exactly
+/// one reader — the shutdown dump — which forces a measurement wanting
+/// per-phase numbers to stop the daemon between phases. Stopping it is not
+/// a neutral act: it drops the page cache and the SQLite cache, and on
+/// restart re-scans every file already synced, so the next phase's numbers
+/// describe a cold daemon rather than the steady state being measured.
+/// A mark lets a benchmark take the difference between two readings of a
+/// daemon that never stopped.
+///
+/// Installed only when the counters are already armed, i.e. only under
+/// `YADORILINK_DIAGNOSTIC_IO_COUNTERS=1`. A production daemon installs no
+/// handler and keeps SIGUSR1's default disposition, exactly as before.
+#[cfg(unix)]
+fn spawn_io_diag_mark_listener() {
+    use std::sync::atomic::Ordering;
+    use tokio::signal::unix::{signal, SignalKind};
+
+    if !yadorilink_local_storage::io_diag::enabled() {
+        return;
+    }
+    tokio::spawn(async move {
+        // Unlike the shutdown handler this does not panic on a failed
+        // registration: losing the ability to mark costs a measurement,
+        // which is not a reason to take down a running daemon.
+        let mut sigusr1 = match signal(SignalKind::user_defined1()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to install SIGUSR1 io_diag mark handler");
+                return;
+            }
+        };
+        while sigusr1.recv().await.is_some() {
+            let seq = IO_DIAG_MARK_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+            // Emitted before the counters, so a truncated or interleaved
+            // read is detectable rather than silently short.
+            tracing::info!(seq, "io_diag mark begin");
+            emit_io_diag_counters("mark");
+            tracing::info!(seq, "io_diag mark end");
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_io_diag_mark_listener() {}
 
 /// The one graceful-shutdown path both SIGTERM/SIGINT and the
 /// control socket's `Shutdown` request (via `DaemonState::shutdown_tx`)
@@ -1104,6 +1047,14 @@ async fn graceful_shutdown(
     // matching the old control-socket-only code's 200ms grace period,
     // now applied uniformly to every shutdown path.
     tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Before anything is torn down: the watchers read from live connections,
+    // and a verdict taken after the links are closed would be reporting on
+    // whatever survived rather than on the transfer. Inert unless this daemon
+    // was started with the path-evidence variable set.
+    if let Some(sink) = crate::path_witness_sink::sink() {
+        sink.flush().await;
+    }
 
     // Stop generating new local changes first: shut down every link's
     // runtime (watcher/executor/repair/dirty-journal tasks, then the
@@ -1161,16 +1112,6 @@ async fn graceful_shutdown(
     // tearing down the sessions that would otherwise cut them off.
     state.wait_for_broadcasts_to_drain(Duration::from_secs(3)).await;
 
-    // SQLite checkpoint/flush: `yadorilink_sync_core::index::SyncState`
-    // currently exposes no explicit checkpoint/close method (its
-    // `rusqlite::Connection` is a private field with no `Drop` impl
-    // beyond the default) — there is nothing in this crate's scope to
-    // call here. Every write already goes through normal SQLite commits
-    // (see `SyncState`'s per-call `Connection` usage), so this is a
-    // WAL-checkpoint-on-clean-exit gap, not a durability gap; flagged as
-    // a follow-up rather than inventing new `yadorilink-sync-core` API
-    // from here.
-
     // Remove the socket files last, once nothing should be listening
     // through them anymore — a stale socket left behind after an
     // ungraceful kill is already handled by `unix_transport::serve`'s
@@ -1185,17 +1126,75 @@ async fn graceful_shutdown(
     // regardless, so this is unconditionally cheap to call and skip when
     // nothing was ever recorded (every `calls == 0`).
     if yadorilink_local_storage::io_diag::enabled() {
-        for op in yadorilink_local_storage::io_diag::snapshot() {
-            if op.calls > 0 {
+        use yadorilink_local_storage::io_diag::Op;
+        emit_io_diag_counters("shutdown");
+        // Distribution, not just the total. "Did more queue depth make
+        // each fsync slower, or just overlap more of them?" is a question
+        // about the shape of the latency, and a mean cannot answer it: the
+        // same total is produced by every call getting slower and by a few
+        // getting much slower, which have different causes and different
+        // fixes.
+        for op in
+            [Op::SegmentFsync, Op::GroupCommit, Op::IndexCommit, Op::CommitBatch, Op::SegmentAppend]
+        {
+            let stat = yadorilink_local_storage::io_diag::stat(op);
+            if stat.calls == 0 {
+                continue;
+            }
+            let p = yadorilink_local_storage::io_diag::percentiles(op, &[0.5, 0.95, 0.99]);
+            tracing::info!(
+                op = stat.name,
+                calls = stat.calls,
+                p50_us = p[0] / 1000,
+                p95_us = p[1] / 1000,
+                p99_us = p[2] / 1000,
+                "io_diag latency at shutdown"
+            );
+        }
+
+        // The other half of the same question. `io_diag` instruments the
+        // BLOCK store exhaustively and the SQLite write path not at all, so
+        // a run whose wall clock exceeds its block work leaves the
+        // remainder unattributable -- which is exactly what happened
+        // comparing a batched import against an interleaved one: block
+        // fsync latency was measurably LOWER in the slower run, while
+        // ~283s of a 100k run's wall clock had no instrument pointing at
+        // it. `writer_gate_stats` records per-call-site write-transaction
+        // counts and gate hold times (see its own doc comment); this is
+        // where a daemon reads them out. One `locked_write` is one
+        // fsync-backed commit, so `held_micros` per site is the SQLite-side
+        // cost that `commit_batch` is to the block side.
+        let (gate_acquisitions, gate_wait) = yadorilink_sqlite_runtime::writer_gate_stats::stats();
+        tracing::info!(
+            write_transactions = gate_acquisitions,
+            gate_wait_ms = gate_wait.as_millis() as u64,
+            "sqlite_diag totals at shutdown"
+        );
+        for (site, count, held_micros) in
+            yadorilink_sqlite_runtime::writer_gate_stats::hold_site_stats()
+        {
+            if count > 0 {
                 tracing::info!(
-                    op = op.name,
-                    calls = op.calls,
-                    nanos = op.nanos,
-                    bytes = op.bytes,
-                    "io_diag counter at shutdown"
+                    site = %site,
+                    calls = count,
+                    held_ms = (held_micros / 1000) as u64,
+                    "sqlite_diag write-transaction hold at shutdown"
                 );
             }
         }
+    }
+
+    // Close the substrate endpoint while the tasks that serve it are still
+    // running, so peers are TOLD this device is going away instead of being
+    // left to discover it. A peer that is not told keeps its connection, and
+    // iroh sends every datagram for a remote down that connection's selected
+    // path -- including the handshake of a new dial -- so until that dead
+    // connection times out on its own the peer cannot reach this device
+    // again, not even after it comes back. `SubstrateNode::shutdown`'s own
+    // doc comment says this lifecycle is owned explicitly for exactly that
+    // reason; nothing was calling it.
+    if let Some(driver) = state.reconciliation_driver() {
+        driver.stack().shutdown().await;
     }
 
     // Finally, stop the essential tasks themselves (control socket,
@@ -1269,7 +1268,7 @@ mod trust_root_startup_tests {
     }
 }
 
-#[cfg(all(test, not(madsim)))]
+#[cfg(test)]
 mod instance_lock_tests {
     use super::*;
 
@@ -1313,7 +1312,7 @@ mod instance_lock_tests {
     }
 }
 
-#[cfg(all(test, not(madsim)))]
+#[cfg(test)]
 mod startup_config_validation_tests {
     use super::*;
     use crate::test_support::CONFIG_ENV_MUTEX;
@@ -1334,7 +1333,7 @@ mod startup_config_validation_tests {
     /// build supports — the "unsupported downgrade" case.
     fn too_new_device_json() -> String {
         format!(
-            r#"{{"device_id":"device-a","coordination_addr":"http://127.0.0.1:1","nat":{{}},"wireguard_public_key":"wg-pub","signing_public_key":"signing-pub","config_version":{}}}"#,
+            r#"{{"device_id":"device-a","coordination_addr":"http://127.0.0.1:1","signing_public_key":"signing-pub","config_version":{}}}"#,
             device_config::CONFIG_VERSION + 1
         )
     }
@@ -1393,7 +1392,7 @@ mod startup_config_validation_tests {
 
     fn current_device_json() -> String {
         format!(
-            r#"{{"device_id":"device-a","coordination_addr":"http://127.0.0.1:1","nat":{{}},"wireguard_public_key":"wg-pub","signing_public_key":"signing-pub","config_version":{}}}"#,
+            r#"{{"device_id":"device-a","coordination_addr":"http://127.0.0.1:1","signing_public_key":"signing-pub","config_version":{}}}"#,
             device_config::CONFIG_VERSION
         )
     }

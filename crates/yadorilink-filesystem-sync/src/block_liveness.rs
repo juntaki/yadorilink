@@ -1,11 +1,3 @@
-//! Process-wide exclusion between block-reference commits and physical
-//! deletion -- a real filesystem/execution-coordination primitive with zero
-//! index/SQL/state dependency, moved out of `yadorilink-sync-core` in Phase
-//! 7D-9C alongside the eviction/materialization logic it serializes (see
-//! `docs/design/phase7d9-dependency-plan.md`'s 7D-9C routing rules; this
-//! gate is one of the named "behavior to preserve exactly" invariants,
-//! "block liveness").
-
 use std::sync::{Condvar, Mutex};
 
 #[derive(Default)]

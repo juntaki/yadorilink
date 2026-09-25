@@ -1,13 +1,12 @@
 //! First-divergence
 //! localization as a **standalone reducer**.
 //!
-//! The design has the incremental-oracle observer ride harden's triage-replay
-//! standard-profile leg (one automatic same-seed replay, no cost on passing
-//! runs). That replay leg does not exist on this branch, so the localization
+//! The incremental-oracle observer is meant to ride a triage-replay leg (one
+//! automatic same-seed replay, no cost on passing runs). The localization
 //! logic is factored out here as a pure reducer that a replay hook feeds one
 //! boolean sample per event boundary: "does the terminal violation's predicate
 //! hold *now*?". Keeping it standalone means it is fully unit-testable without
-//! a running simulation, and harden's replay leg later just calls `observe`.
+//! a running simulation; a replay leg only has to call `observe`.
 //!
 //! It records the earliest simulated time at which the predicate first holds
 //! and never subsequently clears (design's `first_observable`) — deliberately

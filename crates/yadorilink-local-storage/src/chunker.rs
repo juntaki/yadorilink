@@ -4,27 +4,13 @@
 //! edited internally rather than appended to or replaced wholesale (VM
 //! images, databases, large project files), where fixed-size blocks
 //! re-transfer everything after an edit point due to boundary shift.
-//! Blocks are content-addressed and stored via [`crate::BlockContentStore`],
-//! giving free local dedup: an identical block from any other file/version
-//! is only ever stored once, regardless of which chunking method produced
-//! it.
-//!
-//! Moved here from `yadorilink-sync-core::chunker` in Phase 7D-8.1 --
-//! `chunk_file`/`chunk_file_content_defined`'s only production dependencies
-//! were already [`crate::BlockContentStore`] and
-//! `yadorilink_replica_domain::file::BlockInfo`, both already at or below
-//! this crate in the dependency graph (`yadorilink-sync-core::chunker`'s
-//! other functions -- `reconstruct_file`, `write_placeholder`,
-//! `materialize_symlink*`, `apply_unix_mode`, the `verify_*_target_within_*`
-//! guards -- were already thin `SyncError`-converting wrappers over this
-//! crate's `materialize_write` module as of Phase 7D-6, and stay in
-//! `yadorilink-sync-core` unchanged, since `yadorilink-sync-core` callers
-//! still need a `SyncError`-returning entry point for them).
-//!
-//! `unix_mode_from_metadata` (a 6-line `std::fs::Metadata` read, zero
-//! dependencies of its own) moved alongside for the same reason: it feeds
-//! exactly the same file-capture call sites `chunk_file`/
-//! `chunk_file_content_defined` do.
+//! Blocks are content-addressed and stored via
+//! [`crate::BlockContentStore`], giving free local dedup: an identical
+//! block from any other file/version is only ever stored once, regardless
+//! of which chunking method produced it. `unix_mode_from_metadata` (a
+//! 6-line `std::fs::Metadata` read, zero dependencies of its own) moved
+//! alongside for the same reason: it feeds exactly the same file-capture
+//! call sites `chunk_file`/ `chunk_file_content_defined` do.
 
 use std::fs;
 use std::io::Read;
@@ -81,10 +67,20 @@ pub fn chunk_file(
     store: &dyn BlockContentStore,
     path: &Path,
 ) -> Result<Vec<BlockInfo>, StorageError> {
-    let metadata = fs::metadata(path)?;
-    let block_size = block_size_for(metadata.len());
+    chunk_open_file(store, &fs::File::open(path)?)
+}
 
-    let mut file = fs::File::open(path)?;
+/// [`chunk_file`] over a handle the caller already opened, sized from that
+/// handle's own `fstat`. A caller that needs to know whether the file
+/// changed while it was read brackets this call with `fstat`s of the same
+/// handle -- see [`chunk_file`]'s callers in local capture.
+pub fn chunk_open_file(
+    store: &dyn BlockContentStore,
+    file: &fs::File,
+) -> Result<Vec<BlockInfo>, StorageError> {
+    let block_size = block_size_for(file.metadata()?.len());
+
+    let mut file = file;
     let mut blocks = Vec::new();
     let mut offset: u64 = 0;
     let mut buf = vec![0u8; block_size];
@@ -157,10 +153,10 @@ pub fn chunk_file_content_defined(
 /// `Arc` clone gets ownership just as cheaply, without also constraining
 /// this function to hand out its *only* copy of the bytes before it can
 /// commit them.
-/// M6-2B3: total bytes (summed across every batch currently queued but not
+/// Total bytes (summed across every batch currently queued but not
 /// yet durably committed) the chunk producer is allowed to run ahead of the
 /// single background durability worker before `submit` blocks it. A
-/// COUNT-based bound (e.g. "3 batches") was tried first and rejected: CDC
+/// COUNT-based bound (e.g. "3 batches") would not work: CDC
 /// blocks scale up to `CDC_MAX_SIZE` (8 MiB) each, so a 32-block batch can
 /// legitimately be anywhere from a few KiB to ~256 MiB -- a fixed batch
 /// COUNT gives no real memory bound. This is a budget, not a hard cap: a
@@ -192,35 +188,32 @@ fn durability_queue_byte_budget() -> usize {
     })
 }
 
-/// M6-2B3: a bounded, single-producer-single-consumer queue plus ONE
-/// background worker thread that calls `store.put_prepared_batch`, so a
+/// A bounded, single-producer-single-consumer queue plus ONE background
+/// worker thread that calls `store.put_prepared_batch`, so a
 /// chunk-producing loop (CDC or fixed-size) can keep producing the NEXT
 /// batch's blocks while the CURRENT (and up to `DURABILITY_QUEUE_BYTE_
-/// BUDGET` bytes of further queued) batch's real durability I/O (write +
-/// fsync + shard-directory-sync) is still in flight, instead of blocking on
-/// it inline. This is the fix for a real, measured serialization: a fair
-/// FastCDC-vs-fixed-chunking A/B this session found `capture -> chunk EOF`
-/// statistically identical between the two boundary algorithms (~13.4s
-/// mean, both), and a direct CPU-cost check confirmed SHA-256/allocation
-/// cost was under 5% of that -- the dominant cost was `put_prepared_batch`
-/// itself, called synchronously inline inside the SAME loop that produces
-/// chunks, blocking chunk production on every batch's fsync. `BulkIngest`
-/// (M6-2B2) had already reduced how many TIMES that blocking happened (one
-/// call per ~32 blocks instead of per block) but never actually decoupled
-/// production from commit -- this closes that gap one layer up.
+/// BUDGET` bytes of further queued) batch's durability I/O is still in
+/// flight, instead of blocking on it inline. This is the fix for a real,
+/// measured serialization: a fair FastCDC-vs-fixed-chunking A/B found
+/// `capture -> chunk EOF` statistically identical between the two boundary
+/// algorithms (~13.4s mean, both), and a direct CPU-cost check confirmed
+/// SHA-256/allocation cost was under 5% of that -- the dominant cost was
+/// `put_prepared_batch` itself, called synchronously inline inside the SAME
+/// loop that produces chunks, blocking chunk production on every batch's
+/// barrier.
 ///
-/// Deliberately ONE worker thread, not several: `put_prepared_batch`/
-/// `commit_batch` isn't validated for concurrent invocation from multiple
-/// callers against the SAME file's blocks, and a single worker already
-/// closes the actual gap this exists for. `BulkIngest::commit_batch` (one
-/// layer down, in `fs_backend.rs`) already runs its OWN bounded-concurrency
-/// writes (`BULK_INGEST_CONCURRENCY`) inside one `put_prepared_batch` call
-/// -- this queue's job is only to overlap batch N's durability I/O with
-/// batch N+1 (and beyond)'s CHUNKING, not to parallelize durability I/O
-/// itself further.
+/// Deliberately ONE worker thread, not several. This queue's job is to
+/// overlap batch N's durability I/O with batch N+1's CHUNKING, and nothing
+/// else: the store's own durability coordinator is already the single
+/// writer for every caller in the process, so adding threads here would
+/// only queue more callers behind the same barrier, not issue more of them
+/// in parallel. What extra concurrent callers DO buy is a wider group --
+/// the store batches whatever is waiting when a commit finishes -- and
+/// that benefit is available to genuinely independent producers, not to
+/// one file's chunk loop split across threads.
 ///
-/// Extends `BulkIngest`'s own `staged -> durable -> authoritative` contract
-/// to the whole file, not just one batch: `submit` only means "queued for
+/// Extends the store's `staged -> durable -> authoritative` contract to
+/// the whole file, not just one batch: `submit` only means "queued for
 /// commit," never "durable" -- nothing about a successful `submit` call
 /// tells a caller anything about whether that batch's blocks have actually
 /// hit disk yet. Only `finish()` returning `Ok(())` means EVERY submitted
@@ -367,15 +360,24 @@ impl<'scope> BackgroundBatchCommitter<'scope> {
 pub fn chunk_file_content_defined_with_callback(
     store: &dyn BlockContentStore,
     path: &Path,
+    on_block: impl FnMut(&BlockInfo, Arc<[u8]>),
+) -> Result<Vec<BlockInfo>, StorageError> {
+    chunk_open_file_content_defined_with_callback(store, &fs::File::open(path)?, on_block)
+}
+
+/// [`chunk_file_content_defined_with_callback`] over a handle the caller
+/// already opened.
+pub fn chunk_open_file_content_defined_with_callback(
+    store: &dyn BlockContentStore,
+    file: &fs::File,
     mut on_block: impl FnMut(&BlockInfo, Arc<[u8]>),
 ) -> Result<Vec<BlockInfo>, StorageError> {
-    let file = fs::File::open(path)?;
     let chunker = fastcdc::v2020::StreamCDC::new(file, CDC_MIN_SIZE, CDC_AVG_SIZE, CDC_MAX_SIZE);
 
     let mut blocks = Vec::new();
-    // M6-2B2: blocks accumulate here instead of each being durably
+    // Blocks accumulate here instead of each being durably
     // committed (`put_prepared`) the instant it's chunked -- that
-    // per-block commit (write+fsync+directory-fsync) was the worst-case
+    // per-block commit (write plus its own durability barrier) was the worst-case
     // serialization on this loop: CDC scan, callback and durable commit
     // could never overlap because the loop wouldn't even START chunking
     // the next block until the current one's full durability barrier had
@@ -383,16 +385,17 @@ pub fn chunk_file_content_defined_with_callback(
     // -- only the DURABLE commit is deferred to a
     // batch boundary via `put_prepared_batch`. See `BlockStore::
     // put_prepared_batch`'s own doc comment for what a real
-    // (`FsBlockStore`) override does with the batch, and `BulkIngest`'s
-    // doc comment for the `staged -> durable -> authoritative` contract
+    // (`SegmentBlockStore`) override does with the batch, and the
+    // `segment_store` module doc for the `staged -> durable ->
+    // authoritative` contract
     // this composes with (a block callback firing here says nothing
     // about durability -- only this function's own successful return,
     // via `BackgroundBatchCommitter::finish` below, meaning every
     // accumulated batch flushed, does).
     let mut pending: Vec<LocallyHashedBlock> = Vec::with_capacity(CDC_BULK_INGEST_BATCH_SIZE);
-    // M6-2 phase-timing diagnostic (temporary): narrows down which phase
-    // of source capture actually dominates T_detect, since a packed-vs-
-    // loose storage-backend comparison alone can't distinguish "storage
+    // Phase-timing diagnostic: narrows down which phase
+    // of source capture actually dominates T_detect, since a storage-
+    // backend comparison alone can't distinguish "storage
     // durability is the bottleneck" from "the CDC/hash/stage pipeline
     // itself is the bottleneck and changing storage wouldn't move the
     // number either way". Remove once the phase breakdown this produces
@@ -425,12 +428,12 @@ pub fn chunk_file_content_defined_with_callback(
             }
             let chunk = result.map_err(|e| StorageError::Chunking(e.to_string()))?;
             if !first_chunk_logged {
-                tracing::warn!("M6PHASE T_cdc_first: first CDC block boundary produced");
+                tracing::debug!("phase T_cdc_first: first CDC block boundary produced");
                 first_chunk_logged = true;
             }
             let prepared = LocallyHashedBlock::from_bytes(chunk.data);
             if blocks.is_empty() {
-                tracing::warn!("M6PHASE T_hash_first: first PreparedBlock hash complete");
+                tracing::debug!("phase T_hash_first: first PreparedBlock hash complete");
             }
             let block = BlockInfo {
                 hash: hex::decode(prepared.hash())?,
@@ -448,8 +451,8 @@ pub fn chunk_file_content_defined_with_callback(
             pending.push(prepared);
             if pending.len() >= CDC_BULK_INGEST_BATCH_SIZE {
                 if !first_batch_logged {
-                    tracing::warn!(
-                        "M6PHASE T_store_first: first bulk batch submitted for background commit"
+                    tracing::debug!(
+                        "phase T_store_first: first bulk batch submitted for background commit"
                     );
                     first_batch_logged = true;
                 }
@@ -459,11 +462,11 @@ pub fn chunk_file_content_defined_with_callback(
                 ));
             }
         }
-        tracing::warn!("M6PHASE T_chunking_eof: chunk producer reached EOF");
+        tracing::debug!("phase T_chunking_eof: chunk producer reached EOF");
         if !pending.is_empty() {
             if !first_batch_logged {
-                tracing::warn!(
-                    "M6PHASE T_store_first: first bulk batch submitted for background commit"
+                tracing::debug!(
+                    "phase T_store_first: first bulk batch submitted for background commit"
                 );
             }
             committer.submit(pending);
@@ -471,22 +474,28 @@ pub fn chunk_file_content_defined_with_callback(
         committer.finish()
     });
     commit_result?;
-    tracing::warn!("M6PHASE T_all_staged: all source blocks staged/durably committed");
+    tracing::debug!("phase T_all_staged: all source blocks staged/durably committed");
 
     Ok(blocks)
 }
 
-/// M6-2B2: how many CDC-chunked blocks `chunk_file_content_defined_with_
-/// callback` accumulates before committing them as one durable
+/// How many CDC-chunked blocks `chunk_file_content_defined_with_callback`
+/// accumulates before handing them to the store as one
 /// `put_prepared_batch` call, instead of one `put_prepared` per block.
 /// Matches `PREWARM_PROVENANCE_BATCH_SIZE` (`peer_session.rs`) so the
 /// source-side commit batch and the receiver-side provenance batch land
 /// on the same natural cadence -- not a hard requirement, just avoids an
 /// arbitrary mismatch between two batch sizes that both exist for the
 /// same reason on opposite ends of the same transfer.
+///
+/// This is a *handoff* size, not a durability-group size: the store
+/// decides how many blocks share a barrier, and a caller's batch is only
+/// one of the inputs to that decision. Blocks of this size are large
+/// enough that a barrier is never paid per block, which is all this
+/// constant has to achieve.
 const CDC_BULK_INGEST_BATCH_SIZE: usize = 32;
 
-/// M6-2C diagnostic: `chunk_file`, generalized the exact same way `chunk_
+/// Diagnostic: `chunk_file`, generalized the exact same way `chunk_
 /// file_content_defined` was generalized into `chunk_file_content_defined_
 /// with_callback` -- same callback-before-durable-commit ordering,
 /// same `LocallyHashedBlock`/hash-once, same `put_prepared_batch` bulk
@@ -517,12 +526,21 @@ const CDC_BULK_INGEST_BATCH_SIZE: usize = 32;
 pub fn chunk_file_fixed_with_callback(
     store: &dyn BlockContentStore,
     path: &Path,
+    on_block: impl FnMut(&BlockInfo, Arc<[u8]>),
+) -> Result<Vec<BlockInfo>, StorageError> {
+    chunk_open_file_fixed_with_callback(store, &fs::File::open(path)?, on_block)
+}
+
+/// [`chunk_file_fixed_with_callback`] over a handle the caller already
+/// opened, sized from that handle's own `fstat`.
+pub fn chunk_open_file_fixed_with_callback(
+    store: &dyn BlockContentStore,
+    file: &fs::File,
     mut on_block: impl FnMut(&BlockInfo, Arc<[u8]>),
 ) -> Result<Vec<BlockInfo>, StorageError> {
-    let metadata = fs::metadata(path)?;
-    let block_size = block_size_for(metadata.len());
+    let block_size = block_size_for(file.metadata()?.len());
 
-    let mut file = fs::File::open(path)?;
+    let mut file = file;
     let mut blocks = Vec::new();
     let mut offset: u64 = 0;
     let mut buf = vec![0u8; block_size];
@@ -559,7 +577,7 @@ pub fn chunk_file_fixed_with_callback(
                 break;
             }
             if !first_chunk_logged {
-                tracing::warn!("M6PHASE T_cdc_first: first CDC block boundary produced");
+                tracing::debug!("phase T_cdc_first: first CDC block boundary produced");
                 first_chunk_logged = true;
             }
             // `buf[..n]` is reused across iterations (unlike `fastcdc`'s
@@ -577,7 +595,7 @@ pub fn chunk_file_fixed_with_callback(
             // whole file.
             let prepared = LocallyHashedBlock::from_arc_bytes(Arc::from(&buf[..n]));
             if blocks.is_empty() {
-                tracing::warn!("M6PHASE T_hash_first: first PreparedBlock hash complete");
+                tracing::debug!("phase T_hash_first: first PreparedBlock hash complete");
             }
             let block = BlockInfo { hash: hex::decode(prepared.hash())?, offset, size: n as u32 };
             on_block(&block, prepared.bytes_arc());
@@ -585,8 +603,8 @@ pub fn chunk_file_fixed_with_callback(
             pending.push(prepared);
             if pending.len() >= CDC_BULK_INGEST_BATCH_SIZE {
                 if !first_batch_logged {
-                    tracing::warn!(
-                        "M6PHASE T_store_first: first bulk batch submitted for background commit"
+                    tracing::debug!(
+                        "phase T_store_first: first bulk batch submitted for background commit"
                     );
                     first_batch_logged = true;
                 }
@@ -600,11 +618,11 @@ pub fn chunk_file_fixed_with_callback(
                 break; // short read = end of file
             }
         }
-        tracing::warn!("M6PHASE T_chunking_eof: chunk producer reached EOF");
+        tracing::debug!("phase T_chunking_eof: chunk producer reached EOF");
         if !pending.is_empty() {
             if !first_batch_logged {
-                tracing::warn!(
-                    "M6PHASE T_store_first: first bulk batch submitted for background commit"
+                tracing::debug!(
+                    "phase T_store_first: first bulk batch submitted for background commit"
                 );
             }
             committer.submit(pending);
@@ -612,20 +630,163 @@ pub fn chunk_file_fixed_with_callback(
         committer.finish()
     });
     commit_result?;
-    tracing::warn!("M6PHASE T_all_staged: all source blocks staged/durably committed");
+    tracing::debug!("phase T_all_staged: all source blocks staged/durably committed");
 
     Ok(blocks)
 }
 
-/// Reads the replicated permission bits (`yadorilink_replica_domain::file::
-/// REPLICATED_MODE_MASK`, owner/group/other read-write-execute) `chunker`'s
-/// own callers capture alongside a file's content — the read-side
-/// counterpart to `materialize_write::apply_unix_mode`. `None` on any
-/// platform with no Unix permission-bits model (Windows); real content on
-/// Unix always has some mode, so this is always `Some` there, never a stand-
-/// in for "not yet known". Moved here from `yadorilink-sync-core::types` in
-/// Phase 7D-8.1 as the single owner-exec bit; widened to the full
-/// permission-bits word for Competitive Hardening C1.1.
+/// Produces every block of `path` — each as its `BlockInfo` plus the
+/// `LocallyHashedBlock` carrying the bytes and the hash this pass just
+/// computed from them — and hands each to `on_block`, WITHOUT committing
+/// any of them to a block store.
+///
+/// The one thing this does that no other function here can: it lets a
+/// caller batch block durability across FILE boundaries. Every other
+/// producer in this module owns the commit itself and therefore cannot
+/// batch wider than the single file it was called on — `chunk_file` commits
+/// per block, and the two `_with_callback` producers commit per
+/// `CDC_BULK_INGEST_BATCH_SIZE` blocks *within one file*, which for a folder
+/// of small files degenerates to exactly one one-block batch per file.
+/// Pooling blocks across files is what lets a folder of small files reach
+/// the store as groups of thousands rather than as thousands of groups of
+/// one -- and since the group is the durability unit, that difference is
+/// the whole cost of a small-file import.
+///
+/// Handing the block out instead of committing it moves that decision to
+/// the caller, who is the only one that knows where the file boundary is
+/// and whether crossing it is safe. It also moves a real obligation there:
+/// **a block handed to `on_block` is not durable**, and nothing derived
+/// from it may be treated as authoritative until the caller has itself
+/// committed it (`BlockStore::put_prepared_batch`) and that call has
+/// returned `Ok`. `chunk_file`'s own contract — every returned block is
+/// already durably stored — does NOT hold for this function, deliberately.
+///
+/// Block boundaries, sizes, offsets and hashes are identical to what
+/// `chunk_file` (`content_defined == false`) and
+/// `chunk_file_content_defined` (`true`) produce for the same file, so a
+/// record built from this function's output is byte-for-byte the record
+/// those produce — see `hash_file_blocks_matches_chunk_file*` in this
+/// module's tests, which pin exactly that.
+///
+/// Generic over the sink's error so the caller's own error type (which is
+/// what a commit failure inside `on_block` will produce) propagates
+/// unwrapped; this function's own I/O errors arrive through
+/// `E: From<StorageError>`.
+pub fn hash_file_blocks<E>(
+    path: &Path,
+    content_defined: bool,
+    on_block: impl FnMut(&BlockInfo, LocallyHashedBlock) -> Result<(), E>,
+) -> Result<Vec<BlockInfo>, E>
+where
+    E: From<StorageError>,
+{
+    let file = fs::File::open(path).map_err(storage_err::<E>)?;
+    hash_open_file_blocks(&file, content_defined, on_block)
+}
+
+/// [`hash_file_blocks`] over a handle the caller already opened, sized
+/// from that handle's own `fstat`.
+pub fn hash_open_file_blocks<E>(
+    file: &fs::File,
+    content_defined: bool,
+    on_block: impl FnMut(&BlockInfo, LocallyHashedBlock) -> Result<(), E>,
+) -> Result<Vec<BlockInfo>, E>
+where
+    E: From<StorageError>,
+{
+    if content_defined {
+        hash_file_content_defined(file, on_block)
+    } else {
+        hash_file_fixed(file, on_block)
+    }
+}
+
+/// `hash_file_blocks`' fixed-size half — the same read loop, block sizing
+/// and boundary placement as `chunk_file`, with `store.put` replaced by the
+/// caller's sink.
+fn hash_file_fixed<E>(
+    file: &fs::File,
+    mut on_block: impl FnMut(&BlockInfo, LocallyHashedBlock) -> Result<(), E>,
+) -> Result<Vec<BlockInfo>, E>
+where
+    E: From<StorageError>,
+{
+    let block_size = block_size_for(file.metadata().map_err(storage_err::<E>)?.len());
+
+    let mut file = file;
+    let mut blocks = Vec::new();
+    let mut offset: u64 = 0;
+    let mut buf = vec![0u8; block_size];
+
+    loop {
+        let n = read_up_to(&mut file, &mut buf).map_err(storage_err::<E>)?;
+        if n == 0 {
+            break;
+        }
+        // One copy out of the reused read buffer, hashed in place — the
+        // same single-copy shape `chunk_file_fixed_with_callback` settled
+        // on, and for the same reason (`from_bytes(buf[..n].to_vec())`
+        // copies twice).
+        let prepared = LocallyHashedBlock::from_arc_bytes(Arc::from(&buf[..n]));
+        let block = BlockInfo {
+            hash: hex::decode(prepared.hash()).map_err(storage_err::<E>)?,
+            offset,
+            size: n as u32,
+        };
+        on_block(&block, prepared)?;
+        blocks.push(block);
+        offset += n as u64;
+        if n < block_size {
+            break; // short read = end of file
+        }
+    }
+
+    Ok(blocks)
+}
+
+/// `hash_file_blocks`' content-defined half — the same `StreamCDC`
+/// configuration and boundary placement as
+/// `chunk_file_content_defined`, with the durable commit replaced by the
+/// caller's sink.
+fn hash_file_content_defined<E>(
+    file: &fs::File,
+    mut on_block: impl FnMut(&BlockInfo, LocallyHashedBlock) -> Result<(), E>,
+) -> Result<Vec<BlockInfo>, E>
+where
+    E: From<StorageError>,
+{
+    let chunker = fastcdc::v2020::StreamCDC::new(file, CDC_MIN_SIZE, CDC_AVG_SIZE, CDC_MAX_SIZE);
+
+    let mut blocks = Vec::new();
+    for result in chunker {
+        let chunk = result.map_err(|e| E::from(StorageError::Chunking(e.to_string())))?;
+        let prepared = LocallyHashedBlock::from_bytes(chunk.data);
+        let block = BlockInfo {
+            hash: hex::decode(prepared.hash()).map_err(storage_err::<E>)?,
+            offset: chunk.offset,
+            size: chunk.length as u32,
+        };
+        on_block(&block, prepared)?;
+        blocks.push(block);
+    }
+
+    Ok(blocks)
+}
+
+/// Lifts one of this module's own I/O/decode failures into the sink's error
+/// type, for the two `hash_file_*` loops above.
+fn storage_err<E: From<StorageError>>(e: impl Into<StorageError>) -> E {
+    E::from(e.into())
+}
+
+/// Reads the replicated permission bits
+/// (`yadorilink_replica_domain::file:: REPLICATED_MODE_MASK`,
+/// owner/group/other read-write-execute) `chunker`'s own callers capture
+/// alongside a file's content — the read-side counterpart to
+/// `materialize_write::apply_unix_mode`. `None` on any platform with no
+/// Unix permission-bits model (Windows); real content on Unix always has
+/// some mode, so this is always `Some` there, never a stand- in for "not
+/// yet known".
 #[cfg(unix)]
 pub fn unix_mode_from_metadata(metadata: &std::fs::Metadata) -> Option<u32> {
     use std::os::unix::fs::PermissionsExt;
@@ -637,9 +798,9 @@ pub fn unix_mode_from_metadata(_metadata: &std::fs::Metadata) -> Option<u32> {
     None
 }
 
-/// Reads this regular file's ALLOW-LISTED extended attributes (Competitive
-/// Hardening C1.2a), sorted by name -- the read-side counterpart to a
-/// future `materialize_write::apply_xattrs`. Takes an open file (via its
+/// Reads this regular file's ALLOW-LISTED extended attributes, sorted by
+/// name -- the read-side counterpart to `materialize_write::apply_xattrs`. Takes an open file (via
+/// its
 /// raw fd, `flistxattr`/`fgetxattr`), not a path: this crate's own capture
 /// paths already read `unix_mode_from_metadata` from an already-open
 /// handle rather than a fresh path lookup specifically to avoid a TOCTOU
@@ -735,6 +896,9 @@ pub(crate) fn read_replicated_xattrs_strict(
 /// every probe and read (a local actor continuously rewriting xattrs)
 /// must eventually surface as a real `Err`, not spin this exactness-proof
 /// gate forever.
+// Both readers that consult this bound are `#[cfg(target_os = "linux")]`, so the
+// constant has to carry the same gate to stay used on every other target.
+#[cfg(target_os = "linux")]
 const MAX_ERANGE_RETRIES: u32 = 3;
 
 /// The one decision both strict readers make about a fresh size an
@@ -949,15 +1113,7 @@ pub(crate) fn list_xattr_names_for_apply(fd: std::os::unix::io::RawFd) -> Vec<St
     list_xattr_names(fd).unwrap_or_default()
 }
 
-/// Short-read-retry loop shared by `chunk_file`'s fixed-size block read and
-/// (a duplicate copy, per this branch's established "duplicate small leaf
-/// helpers rather than force an awkward shared dependency" precedent --
-/// see `unique_tmp_path`'s own split between `materialize_write.rs` and
-/// `fs_backend.rs`) `yadorilink-sync-core::single_pass_capture`'s own
-/// fixed-size block read, which must fill a block buffer exactly the same
-/// way (retrying on a short read instead of treating it as EOF) to agree
-/// byte-for-byte with this function's output.
-fn read_up_to(file: &mut fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
+fn read_up_to(file: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
     let mut total = 0;
     while total < buf.len() {
         let n = file.read(&mut buf[total..])?;
@@ -970,419 +1126,4 @@ fn read_up_to(file: &mut fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::FsBlockStore;
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn resolve_erange_reprobe_treats_a_positive_size_as_retry() {
-        assert_eq!(resolve_erange_reprobe(42).unwrap(), Some(42));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn resolve_erange_reprobe_treats_a_zero_size_as_genuinely_empty() {
-        assert_eq!(resolve_erange_reprobe(0).unwrap(), None);
-    }
-
-    /// The exact bug an independent review caught: a prior version of
-    /// both `list_xattr_names_strict`/`get_xattr_value_strict` treated
-    /// ANY re-probe outcome `<= 0` (not just a genuine `0`) as "no
-    /// attributes," silently folding a real re-probe failure (`-1`,
-    /// e.g. an `EIO`/`EACCES` on the second call) into an empty result --
-    /// exactly the "could not check" read as "matches" this strict
-    /// reader's whole contract exists to rule out. Confirmed genuinely
-    /// RED against a version of this function using `if size <= 0 {
-    /// return Ok(None) }` in place of the separate `< 0`/`== 0` checks:
-    /// this exact case returned `Ok(None)` (treated as empty) instead of
-    /// `Err`.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn resolve_erange_reprobe_treats_a_negative_size_as_a_real_error() {
-        assert!(resolve_erange_reprobe(-1).is_err());
-    }
-
-    #[test]
-    fn chunk_and_reconstruct_roundtrip() {
-        let store_dir = tempfile::tempdir().unwrap();
-        let store = FsBlockStore::new(store_dir.path()).unwrap();
-
-        let src_dir = tempfile::tempdir().unwrap();
-        let src_path = src_dir.path().join("file.bin");
-        let content: Vec<u8> = (0..DEFAULT_BLOCK_SIZE * 3 + 777).map(|i| (i % 251) as u8).collect();
-        fs::write(&src_path, &content).unwrap();
-
-        let blocks = chunk_file(&store, &src_path).unwrap();
-        assert_eq!(blocks.len(), 4); // 3 full blocks + 1 partial
-
-        let out_path = src_dir.path().join("reconstructed.bin");
-        crate::reconstruct_file(&store, &out_path, &blocks, -1).unwrap();
-
-        let reconstructed = fs::read(&out_path).unwrap();
-        assert_eq!(reconstructed, content);
-    }
-
-    /// `chunk_file_fixed_with_callback` differs from `chunk_file` only in
-    /// pipeline shape (hash-once, block callback, bulk commit) -- never in
-    /// what it produces. Its own doc comment rests on that: it exists to be
-    /// compared against the CDC path with every stage but boundary
-    /// selection held identical, which is only a valid comparison while its
-    /// boundaries and hashes still agree with the original fixed chunker's,
-    /// block for block. Pinned here because the buffer handling on its hot
-    /// loop is exactly the kind of thing that gets tuned.
-    #[test]
-    fn the_fixed_callback_chunker_agrees_block_for_block_with_chunk_file() {
-        let store_dir = tempfile::tempdir().unwrap();
-        let store = FsBlockStore::new(store_dir.path()).unwrap();
-        let src_dir = tempfile::tempdir().unwrap();
-        let src_path = src_dir.path().join("file.bin");
-        // Deliberately not a whole number of blocks: the short final read
-        // is the case where a reused buffer is easiest to get wrong.
-        let content: Vec<u8> =
-            (0..DEFAULT_BLOCK_SIZE * 2 + 1234).map(|i| (i % 251) as u8).collect();
-        fs::write(&src_path, &content).unwrap();
-
-        let expected = chunk_file(&store, &src_path).unwrap();
-
-        let mut seen: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        let actual = chunk_file_fixed_with_callback(&store, &src_path, |block, data| {
-            seen.push((block.hash.clone(), data.to_vec()));
-        })
-        .unwrap();
-
-        assert_eq!(actual, expected, "boundaries and hashes must match `chunk_file` exactly");
-
-        // The callback must see every block, with the bytes that actually
-        // hash to the hash it is handed alongside them -- a consumer
-        // sends these to a peer, which verifies by hash on arrival.
-        assert_eq!(seen.len(), expected.len());
-        for ((hash, data), block) in seen.iter().zip(&expected) {
-            assert_eq!(hash, &block.hash);
-            assert_eq!(data.len(), block.size as usize);
-            assert_eq!(
-                data.as_slice(),
-                &content[block.offset as usize..block.offset as usize + block.size as usize]
-            );
-        }
-    }
-
-    #[test]
-    fn identical_blocks_across_files_are_deduped_in_storage() {
-        let store_dir = tempfile::tempdir().unwrap();
-        let store = FsBlockStore::new(store_dir.path()).unwrap();
-        let src_dir = tempfile::tempdir().unwrap();
-
-        let content = vec![9u8; DEFAULT_BLOCK_SIZE];
-        let path_a = src_dir.path().join("a.bin");
-        let path_b = src_dir.path().join("b.bin");
-        fs::write(&path_a, &content).unwrap();
-        fs::write(&path_b, &content).unwrap();
-
-        let blocks_a = chunk_file(&store, &path_a).unwrap();
-        let blocks_b = chunk_file(&store, &path_b).unwrap();
-        assert_eq!(blocks_a[0].hash, blocks_b[0].hash);
-    }
-
-    #[test]
-    fn block_size_scales_up_for_very_large_files() {
-        assert_eq!(block_size_for(1024), DEFAULT_BLOCK_SIZE);
-        let huge = (TARGET_MAX_BLOCKS + 1) * DEFAULT_BLOCK_SIZE as u64;
-        assert!(block_size_for(huge) > DEFAULT_BLOCK_SIZE);
-    }
-
-    /// Deterministic pseudo-random content — real CDC boundary-finding
-    /// behavior depends on actual byte entropy, so a trivially repetitive
-    /// pattern (unlike the fixed-size tests above, which don't care)
-    /// isn't representative here.
-    fn pseudo_random_content(size: usize, seed: u64) -> Vec<u8> {
-        use rand::{RngExt, SeedableRng};
-        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-        (0..size).map(|_| rng.random()).collect()
-    }
-
-    /// A large file chunked with CDC round-trips correctly through
-    /// `reconstruct_file`.
-    #[test]
-    fn cdc_chunk_and_reconstruct_roundtrip() {
-        let store_dir = tempfile::tempdir().unwrap();
-        let store = FsBlockStore::new(store_dir.path()).unwrap();
-        let src_dir = tempfile::tempdir().unwrap();
-        let src_path = src_dir.path().join("file.bin");
-
-        let content = pseudo_random_content(10 * 1024 * 1024, 42);
-        fs::write(&src_path, &content).unwrap();
-
-        let blocks = chunk_file_content_defined(&store, &src_path).unwrap();
-        assert!(blocks.len() > 1, "a 10MB file should produce multiple CDC chunks");
-
-        let out_path = src_dir.path().join("reconstructed.bin");
-        crate::reconstruct_file(&store, &out_path, &blocks, -1).unwrap();
-        assert_eq!(fs::read(&out_path).unwrap(), content);
-    }
-
-    /// Inserting bytes partway through a large file and re-chunking with
-    /// CDC leaves most block hashes unchanged for the untouched regions,
-    /// while the same edit under fixed-size chunking changes every block
-    /// hash from the edit point onward.
-    #[test]
-    fn cdc_resists_boundary_shift_unlike_fixed_size_chunking() {
-        let store_dir = tempfile::tempdir().unwrap();
-        let store = FsBlockStore::new(store_dir.path()).unwrap();
-        let src_dir = tempfile::tempdir().unwrap();
-
-        let original = pseudo_random_content(10 * 1024 * 1024, 7);
-        let original_path = src_dir.path().join("original.bin");
-        fs::write(&original_path, &original).unwrap();
-
-        // Insert 37 bytes (not aligned to any block boundary) near the
-        // start of the file — everything from there on shifts by 37 bytes
-        // relative to fixed byte offsets.
-        let insertion_point = 1024;
-        let mut edited = original[..insertion_point].to_vec();
-        edited.extend_from_slice(&pseudo_random_content(37, 999));
-        edited.extend_from_slice(&original[insertion_point..]);
-        let edited_path = src_dir.path().join("edited.bin");
-        fs::write(&edited_path, &edited).unwrap();
-
-        let fixed_before = chunk_file(&store, &original_path).unwrap();
-        let fixed_after = chunk_file(&store, &edited_path).unwrap();
-        let fixed_unchanged = count_shared_hashes(&fixed_before, &fixed_after);
-
-        let cdc_before = chunk_file_content_defined(&store, &original_path).unwrap();
-        let cdc_after = chunk_file_content_defined(&store, &edited_path).unwrap();
-        let cdc_unchanged = count_shared_hashes(&cdc_before, &cdc_after);
-
-        // Fixed-size: only the one block containing the insertion point
-        // can coincidentally still match (it won't, since content shifted
-        // within it) — expect (close to) nothing shared after the edit.
-        assert!(
-            fixed_unchanged <= 1,
-            "fixed-size chunking should share almost no blocks after a mid-file insertion, shared {fixed_unchanged}"
-        );
-        // CDC: the vast majority of blocks after the (small, localized)
-        // edit region should be found at the same content-relative
-        // boundary and therefore hash identically to before the edit.
-        assert!(
-            cdc_unchanged as f64 / cdc_before.len() as f64 > 0.7,
-            "CDC should preserve most block hashes after a small localized edit: {cdc_unchanged}/{} shared",
-            cdc_before.len()
-        );
-        assert!(
-            cdc_unchanged > fixed_unchanged,
-            "CDC must share strictly more unchanged blocks than fixed-size chunking for the same edit"
-        );
-    }
-
-    fn count_shared_hashes(before: &[BlockInfo], after: &[BlockInfo]) -> usize {
-        let before_hashes: std::collections::HashSet<&Vec<u8>> =
-            before.iter().map(|b| &b.hash).collect();
-        after.iter().filter(|b| before_hashes.contains(&b.hash)).count()
-    }
-
-    /// Content below `CDC_SIZE_THRESHOLD` is a caller-side decision (this
-    /// function itself doesn't enforce the threshold) — confirm it still
-    /// functions correctly for a small file, since nothing here should
-    /// assume a minimum input size beyond `fastcdc`'s own `CDC_MIN_SIZE`.
-    #[test]
-    fn cdc_chunking_handles_small_input_correctly() {
-        let store_dir = tempfile::tempdir().unwrap();
-        let store = FsBlockStore::new(store_dir.path()).unwrap();
-        let src_dir = tempfile::tempdir().unwrap();
-        let src_path = src_dir.path().join("small.bin");
-
-        let content = pseudo_random_content(1000, 3);
-        fs::write(&src_path, &content).unwrap();
-
-        let blocks = chunk_file_content_defined(&store, &src_path).unwrap();
-        let out_path = src_dir.path().join("out.bin");
-        crate::reconstruct_file(&store, &out_path, &blocks, -1).unwrap();
-        assert_eq!(fs::read(&out_path).unwrap(), content);
-    }
-
-    /// `chunk_file_content_defined_with_callback` must be
-    /// behavior-identical to the plain (no-op-callback) form for its
-    /// return value -- callers that don't need per-block notification
-    /// (i.e. every existing caller/test) must see zero change. Separately,
-    /// the callback itself must fire exactly once per block, IN ORDER,
-    /// with the exact same `(hash, offset, size)` the returned `Vec`
-    /// carries for that position, and with the exact same content bytes
-    /// that were just durably `store.put()` -- a caller acting on those
-    /// bytes depends on this matching precisely, not approximately.
-    #[test]
-    fn content_defined_callback_matches_plain_form_and_fires_once_per_block_in_order() {
-        let store_dir = tempfile::tempdir().unwrap();
-        let store = FsBlockStore::new(store_dir.path()).unwrap();
-        let src_dir = tempfile::tempdir().unwrap();
-        let src_path = src_dir.path().join("large.bin");
-
-        // Large enough to produce several real CDC blocks, not just one --
-        // a single-block file wouldn't exercise "in order" or "exactly
-        // once per block" at all.
-        let content = pseudo_random_content(CDC_AVG_SIZE * 8, 42);
-        fs::write(&src_path, &content).unwrap();
-
-        let plain_blocks = chunk_file_content_defined(&store, &src_path).unwrap();
-        assert!(plain_blocks.len() > 1, "test needs multiple blocks to be meaningful");
-
-        let mut observed: Vec<(BlockInfo, Arc<[u8]>)> = Vec::new();
-        let callback_blocks =
-            chunk_file_content_defined_with_callback(&store, &src_path, |block, data| {
-                observed.push((block.clone(), data));
-            })
-            .unwrap();
-
-        assert_eq!(
-            callback_blocks, plain_blocks,
-            "the callback form's return value must be identical to the plain form's"
-        );
-        assert_eq!(
-            observed.len(),
-            plain_blocks.len(),
-            "callback must fire exactly once per block, no more, no fewer"
-        );
-        for (i, (observed_block, observed_data)) in observed.iter().enumerate() {
-            assert_eq!(
-                observed_block, &plain_blocks[i],
-                "callback's block info at position {i} must match the returned Vec's, in order"
-            );
-            assert_eq!(
-                observed_data.len(),
-                observed_block.size as usize,
-                "callback's data length must match its own block's declared size"
-            );
-            let expected_content = &content[observed_block.offset as usize
-                ..observed_block.offset as usize + observed_data.len()];
-            assert_eq!(
-                observed_data.as_ref(),
-                expected_content,
-                "callback's data at position {i} must be the exact source bytes for that block's \
-                 offset/size, not some other block's"
-            );
-        }
-    }
-
-    /// Changing a file's permission bits actually changes what
-    /// `unix_mode_from_metadata` reads back.
-    #[cfg(unix)]
-    #[test]
-    fn reads_owner_unix_mode() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("maybe-script");
-        fs::write(&path, b"echo hi").unwrap();
-
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(unix_mode_from_metadata(&fs::metadata(&path).unwrap()), Some(0o644));
-
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o744)).unwrap();
-        assert_eq!(unix_mode_from_metadata(&fs::metadata(&path).unwrap()), Some(0o744));
-    }
-
-    #[test]
-    fn owner_exec_reader_accepts_ordinary_metadata() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("plain.txt");
-        fs::write(&path, b"hello").unwrap();
-        let _ = unix_mode_from_metadata(&fs::metadata(&path).unwrap());
-    }
-
-    /// M6-2B2 crash-safety property 4: a source's `FileRecord`/DAG
-    /// publication can only ever reference blocks this function actually
-    /// returned as `Ok(Vec<BlockInfo>)` -- there is no other way for a
-    /// caller to get a block list to publish with. If a batch's durable
-    /// commit fails partway through capture, this function must propagate
-    /// that failure as `Err`, never hand back a partial or best-effort
-    /// block list a caller could mistake for something safe to publish.
-    /// Forces every durable commit to fail (the same headroom-preflight
-    /// injection `fs_backend.rs`'s own crash-safety tests and
-    /// a batch-commit-failure test uses) rather than
-    /// exhausting real disk space.
-    #[test]
-    fn a_failed_batch_flush_never_returns_a_partial_block_list() {
-        use crate::BlockStore;
-
-        let store_dir = tempfile::tempdir().unwrap();
-        let store = FsBlockStore::new(store_dir.path()).unwrap();
-        store.set_headroom_enforced(true);
-        store.set_headroom_override_bytes(Some(u64::MAX));
-
-        let src_dir = tempfile::tempdir().unwrap();
-        let src_path = src_dir.path().join("file.bin");
-        let content = pseudo_random_content(2 * 1024 * 1024, 99);
-        fs::write(&src_path, &content).unwrap();
-
-        let result = chunk_file_content_defined_with_callback(&store, &src_path, |_, _| {});
-        assert!(
-            result.is_err(),
-            "a batch commit failure must surface as an error, never a partial block list a \
-             caller could go on to publish a FileRecord from"
-        );
-    }
-
-    /// C1.2a round trip: attributes set in reverse-alphabetical order on
-    /// disk must come back sorted ascending by name -- the canonical
-    /// encoding invariant `FileMeta::xattrs` requires of every capture
-    /// path, not just an accident of `listxattr`'s own (unspecified)
-    /// ordering.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn read_replicated_xattrs_captures_user_namespace_attributes_sorted_by_name() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("file.bin");
-        fs::write(&path, b"content").unwrap();
-
-        set_xattr_for_test(&path, "user.zzz", b"last");
-        set_xattr_for_test(&path, "user.aaa", b"first");
-
-        let file = fs::File::open(&path).unwrap();
-        let xattrs = read_replicated_xattrs(&file);
-        assert_eq!(
-            xattrs,
-            vec![
-                ("user.aaa".to_string(), b"first".to_vec()),
-                ("user.zzz".to_string(), b"last".to_vec()),
-            ]
-        );
-    }
-
-    /// The allow-list is the whole point of `read_replicated_xattrs`
-    /// (never every xattr a file happens to carry, see its own doc
-    /// comment) -- exercised directly against `read_xattrs_filtered`'s
-    /// predicate parameter rather than a real disallowed namespace, since
-    /// setting `security.*`/`trusted.*` requires privileges this test
-    /// process does not have; the predicate is the exact mechanism
-    /// `read_replicated_xattrs`'s own `LINUX_ALLOWED_PREFIX` check
-    /// delegates to, so this proves the same logic without needing root.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn read_xattrs_filtered_excludes_names_the_allow_predicate_rejects() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("file.bin");
-        fs::write(&path, b"content").unwrap();
-
-        set_xattr_for_test(&path, "user.allowed", b"yes");
-        set_xattr_for_test(&path, "user.rejected", b"no");
-
-        let file = fs::File::open(&path).unwrap();
-        let xattrs = read_xattrs_filtered(&file, |name| name == "user.allowed");
-        assert_eq!(xattrs, vec![("user.allowed".to_string(), b"yes".to_vec())]);
-    }
-
-    #[cfg(target_os = "linux")]
-    fn set_xattr_for_test(path: &std::path::Path, name: &str, value: &[u8]) {
-        let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        let c_name = std::ffi::CString::new(name).unwrap();
-        let ret = unsafe {
-            libc::setxattr(
-                c_path.as_ptr(),
-                c_name.as_ptr(),
-                value.as_ptr() as *const libc::c_void,
-                value.len(),
-                0,
-            )
-        };
-        assert_eq!(ret, 0, "setxattr({name}) failed: {}", std::io::Error::last_os_error());
-    }
-}
+mod tests;

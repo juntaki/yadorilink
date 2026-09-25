@@ -9,7 +9,6 @@
 //! [`ports::FrontierStorePort`], [`ports::DurabilityEvidencePort`]) as thin
 //! adapters over its own storage.
 
-pub mod authenticated_history;
 pub mod change_ops;
 pub mod compaction;
 pub mod conflict;
@@ -18,6 +17,7 @@ pub mod custody;
 mod engine;
 pub mod error;
 pub mod handoff_lease;
+pub mod namespace;
 pub mod outcomes;
 pub mod ports;
 pub mod rebootstrap;

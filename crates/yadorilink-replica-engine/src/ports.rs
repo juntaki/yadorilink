@@ -1,14 +1,11 @@
-//! The 4 narrow ports `PeerReplicaEngine` depends on. Each port owns only
-//! the operations its own use case needs -- not a wholesale trait-ification
-//! of `yadorilink-sync-core`'s own storage API. `yadorilink-sync-core`
-//! implements every one of these for its own `SyncState`/`dag_store`/
-//! `index` machinery; this crate never depends back on any of that.
+//! The 4 narrow ports `PeerReplicaEngine` depends on.
 
 use yadorilink_replica_domain::change::Change;
 use yadorilink_replica_domain::file::FileVersion;
 use yadorilink_replica_domain::ids::{
     BlockHash, ChangeHash, DeviceId, FolderGroupId, SyncPath, VersionHash,
 };
+use yadorilink_replica_domain::session_state::RootSetSummary;
 
 use crate::error::{AdmissionStoreError, ReplicaEngineError};
 
@@ -17,8 +14,6 @@ use crate::error::{AdmissionStoreError, ReplicaEngineError};
 /// computation every hold/orphan path needs.
 pub trait ReplicaHistoryPort: Send + Sync {
     fn parents_of(&self, hash: &ChangeHash) -> Result<Vec<ChangeHash>, ReplicaEngineError>;
-
-    fn encoded_change(&self, hash: &ChangeHash) -> Result<Option<Vec<u8>>, ReplicaEngineError>;
 
     fn change(&self, hash: &ChangeHash) -> Result<Option<Change>, ReplicaEngineError>;
 
@@ -46,11 +41,29 @@ pub trait ReplicaHistoryPort: Send + Sync {
 /// as durable-but-not-yet-projected. `false` (never project inline) is not
 /// a caller-chosen parameter here -- `PeerReplicaEngine`'s own use case
 /// always admits unprojected, so the port API never exposes that choice.
+/// One remotely-received Change's already-verified `AuthorizationCheckpoint`
+/// evidence, storage-agnostic (this crate never depends on
+/// `yadorilink-sync-sqlite`) -- converted to
+/// `yadorilink_sync_sqlite::dag_store::published_view::PublishedEvidence`
+/// only at the daemon's own port-implementation layer. Admission must write the
+/// Change and its evidence atomically, in ONE transaction, so a crash
+/// never strands a remote Change as an accidental Pending row.
+#[derive(Debug, Clone)]
+pub struct ChangeEvidence {
+    pub checkpoint_hash: [u8; 32],
+    pub checkpoint_seq: u64,
+    pub checkpoint_encoded: Vec<u8>,
+    pub checkpoint_signature: Vec<u8>,
+    pub author_signing_public_key: [u8; 32],
+    pub merkle_proof_encoded: Vec<u8>,
+}
+
 pub trait ChangeAdmissionPort: Send + Sync {
     fn admit_unprojected_change(
         &self,
         change: &Change,
         versions: &[FileVersion],
+        evidence: &ChangeEvidence,
     ) -> Result<AdmissionStoreResult, AdmissionStoreError>;
 
     /// Bounded micro-batch sibling of [`Self::admit_unprojected_change`]:
@@ -67,11 +80,13 @@ pub trait ChangeAdmissionPort: Send + Sync {
     /// benefit; the port's own contract does not require it.
     fn admit_unprojected_change_batch(
         &self,
-        items: &[(&Change, &[FileVersion])],
+        items: &[(&Change, &[FileVersion], &ChangeEvidence)],
     ) -> Vec<Result<AdmissionStoreResult, AdmissionStoreError>> {
         items
             .iter()
-            .map(|(change, versions)| self.admit_unprojected_change(change, versions))
+            .map(|(change, versions, evidence)| {
+                self.admit_unprojected_change(change, versions, evidence)
+            })
             .collect()
     }
 }
@@ -84,6 +99,24 @@ pub struct AdmissionStoreResult {
 pub enum AdmissionStoreOutcome {
     Applied,
     Orphaned,
+    /// The store refused the Change because its own author's chain cannot
+    /// accommodate it. Final: nothing was stored and nothing is held, so
+    /// there is no ancestry to request and no retry to schedule.
+    RefusedAuthorChain {
+        reason: String,
+    },
+    /// The store refused the Change because it was written on a different
+    /// history than this replica's. Final for the same reason, and
+    /// distinct because the remedy is a re-bootstrap, not a resend.
+    RefusedForeignHistoryBase {
+        reason: String,
+    },
+    /// The store refused the Change because one of its DAG parents is
+    /// itself permanently refused, so its ancestry can never be complete.
+    /// Final: there is no ancestry worth requesting.
+    RefusedBehindRejectedParent {
+        reason: String,
+    },
 }
 
 /// Records a peer's (or this device's own) acknowledged frontier for a
@@ -100,10 +133,6 @@ pub trait FrontierStorePort: Send + Sync {
     ) -> Result<(), ReplicaEngineError>;
 }
 
-/// This device's retention policy for a group -- the durability-evidence
-/// equivalent of `yadorilink_replica_domain::session_state::MaterializationPolicy`,
-/// deliberately a distinct type (not re-exported) so this crate never
-/// depends on `yadorilink-sync-core`'s own storage-representation enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplicaRetentionPolicy {
     Eager,
@@ -155,4 +184,16 @@ pub trait DurabilityEvidencePort: Send + Sync {
     /// holds_version_durably`'s own doc comment on why a corrupt/truncated
     /// block must answer "not held").
     fn verify_block(&self, block: &BlockHash) -> Result<(), ReplicaEngineError>;
+
+    /// This device's whole durability-root set for a group, reduced to two
+    /// digests and two counts.
+    ///
+    /// Derived from the index alone. Implementations must not read or hash
+    /// a single block to answer it -- that is the distinction between this
+    /// and every other method on this port, and the reason a caller may
+    /// treat the answer as a health signal and never as custody. A peer
+    /// comparing digests learns that two indexes agree; only
+    /// `verify_block` above learns that the bytes are there.
+    fn root_set_summary(&self, group: &FolderGroupId)
+        -> Result<RootSetSummary, ReplicaEngineError>;
 }

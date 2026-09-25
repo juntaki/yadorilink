@@ -72,12 +72,73 @@ use crate::keys::DeviceSigningKeyPair;
 /// generation while the protocol has no released baseline to be compatible
 /// with.
 ///
+/// This ALPN, and the generation history below it, now belong to this
+/// crate's test-only QUIC channel: no shipped code path speaks it, and the
+/// types it names -- `ClusterConfig` among them -- are retained only for
+/// tests pending a replacement control plane. Production peer connectivity
+/// negotiates its own ALPN on the iroh endpoint in
+/// `yadorilink-sync-substrate`. The history is kept because the tests still
+/// pin this number, and because it records why each break was a break.
+///
 /// This is now the *only* place the peer protocol generation is defined. It
 /// used to be one of two: a `protocol_version` field on the first
 /// application message claimed the same authority, and two definitions of one
 /// number eventually disagree. Being the only one carries an obligation --
 /// **this number moves whenever the peer wire changes**, because nothing else
-/// is left that can refuse a peer speaking the previous shape. Generation `7`
+/// is left that can refuse a peer speaking the previous shape.
+///
+/// Generation `9` adds one service-lane RPC: a peer can be asked to describe
+/// its own durable state for a folder group — two digests over its index and
+/// the counts behind them — in a single message.
+///
+/// The background custody check used to ask the same question by issuing one
+/// `VersionPresent(for_handoff = true)` per durability root, each of which
+/// made the responder read every block of that version back off disk and
+/// re-hash it. On a two-device group that was eight thousand round-trips and
+/// eight thousand whole-file re-reads every ninety seconds, to refresh a
+/// health indicator.
+///
+/// This is an ALPN bump rather than an optional message for the same reason
+/// `8` was a hard break from `7`. The alternative — letting `9` talk to `8`
+/// and treating "peer does not answer this RPC" as "old peer, fall back to
+/// the per-root scan" — would look like compatibility and be the defect: a
+/// peer that cannot answer is indistinguishable from one that will not, so
+/// the expensive path would come back for anything able to present itself as
+/// generation `8`. With the bump, an `8` peer is refused inside the TLS
+/// handshake, never becomes a candidate, and the fallback has nowhere to
+/// live.
+///
+/// The operational cost of that, stated plainly because "the group reports
+/// unknown durability" understates it: **an `8` and a `9` cannot establish a
+/// session at all**, so during a rolling upgrade mixed-version peers stop
+/// synchronising entirely, not just stop corroborating each other. A fleet
+/// upgrades as a unit or splits into two halves that do not talk until it
+/// does. That is what every generation bump in this list has meant, and it
+/// is the price of the number being able to refuse anything.
+///
+/// Generation `8` adds the serving device's own verified policy coordinate
+/// to `ChangeBatch` (`relay_policy_seq`/`relay_policy_epoch`/
+/// `relay_policy_head`). A receiver may admit a Change whose author is no
+/// longer a current writer when the SENDER is a current writer honestly
+/// relaying that author's already-signed history -- without which a
+/// downgraded device's legitimate pre-downgrade history could never reach a
+/// peer that does not already hold it. Those fields are what let the
+/// receiver refuse that exemption to a relay whose own policy view is behind
+/// its own.
+///
+/// This generation is a HARD incompatibility with `7`, deliberately, and
+/// that is the whole reason it is an ALPN bump rather than an optional
+/// field. ALPN is negotiated inside the TLS handshake, so a `7` peer is
+/// refused before it can send a single frame. The alternative -- letting `8`
+/// talk to `7` and treating a missing attestation as "old peer, skip the
+/// check" -- would look fixed and not be: a missing attestation is exactly
+/// what a stale relay's traffic looks like, so every `7` peer (and anything
+/// able to present itself as one) would get the exemption unconditionally,
+/// reopening the hole this generation exists to close. With the bump, a
+/// missing attestation has exactly one meaning -- the sender itself has no
+/// verified policy state for the group -- and is safely fail-closed.
+///
+/// Generation `7`
 /// removes every dead/future-only wire field this build never sent or never
 /// read: `ChangeBatch.compression`/`compressed_changes` (no sender ever
 /// compressed), `HeadsAnnounce.frontier_hint` (no receiver ever read it),
@@ -94,33 +155,7 @@ use crate::keys::DeviceSigningKeyPair;
 /// requester's full ancestor closure; `5` was the block protocol in which
 /// one request is one bidirectional stream; `4` was the same transport
 /// still carrying block content inline on the control stream.
-pub const YADORILINK_P2P_ALPN: &[u8] = b"yadorilink-p2p/7";
-
-/// The application protocol Track Send speaks: a one-shot,
-/// Taildrop/Resilio-style file send/receive service layered on this
-/// device's exact same per-device QUIC endpoint -- same socket, same
-/// NAT-traversal, same Ed25519 raw-public-key mutual authentication as
-/// [`YADORILINK_P2P_ALPN`] above -- but a wholly separate application
-/// protocol, distinguished purely by ALPN. This is deliberately the same
-/// dispatch mechanism the module doc comment above describes for the sync
-/// generation number: ALPN is negotiated *inside* the TLS handshake, so a
-/// Track Send connection and a sync connection can never be confused for
-/// each other, and neither protocol's frames are ever read by the other's
-/// handler. See `quic_peer_endpoint.rs`'s `accept_loop` for where a
-/// completed handshake is routed by which of the two protocols it
-/// negotiated, and that module's own doc comment for why Track Send is a
-/// second, independent inbox/dial pair on the one shared endpoint rather
-/// than a second `quinn::Endpoint` (a hub's UDP socket accepts exactly one
-/// registered QUIC socket -- see `quic_socket.rs` -- so a second endpoint
-/// would mean a second port and re-deriving NAT traversal from scratch,
-/// which is exactly the duplication reusing this transport is meant to
-/// avoid).
-///
-/// Track Send's manifest/session/chunk-progress state is intentionally
-/// never admitted into the sync DAG (`change_parents`, `dag_group_heads`,
-/// `ProjectionObligation`, ...); this ALPN is the transport-level half of
-/// keeping the two lanes separate.
-pub const YADORILINK_SEND_ALPN: &[u8] = b"yadorilink-send/1";
+pub const YADORILINK_P2P_ALPN: &[u8] = b"yadorilink-p2p/9";
 
 /// The name a dialer passes to `quinn::Endpoint::connect`.
 ///
@@ -393,18 +428,6 @@ impl AuthorizedPeerKeys {
 /// construction-time snapshot.
 pub struct PinnedPeerKeys {
     expected: AuthorizedPeerKeys,
-    /// A second, independently-managed live set, checked in addition to
-    /// `expected` -- never folded into it. Exists for exactly one caller:
-    /// `quic_dual_server_config`'s Track Send grant-derived keys, which must
-    /// admit a raw TLS handshake from a device this endpoint's ordinary
-    /// netmap-derived `expected` set does not (and must not) name, without
-    /// that device ever being added to `expected` itself -- see this
-    /// endpoint's own `accept_loop`, which is what keeps a key admitted only
-    /// through THIS set from ever reaching a real sync session even though
-    /// its handshake succeeds here. `None` for every other caller
-    /// ([`quic_server_config`], [`quic_client_config`],
-    /// [`quic_send_client_config`]), which have exactly one set to check.
-    additional: Option<AuthorizedPeerKeys>,
     /// The signature algorithms of the provider this configuration is built
     /// on. Held rather than looked up per handshake so the verifier cannot
     /// end up validating against a different provider than the one doing the
@@ -449,19 +472,7 @@ impl PinnedPeerKeys {
         expected: AuthorizedPeerKeys,
         provider: &rustls::crypto::CryptoProvider,
     ) -> Self {
-        Self::with_live_sets(expected, None, provider)
-    }
-
-    /// As [`with_live_set`](Self::with_live_set), but a presented key is
-    /// accepted if it is in EITHER `expected` or `additional` -- see
-    /// `additional`'s own field doc comment for the one caller this exists
-    /// for and why the two sets stay separate rather than merged into one.
-    pub fn with_live_sets(
-        expected: AuthorizedPeerKeys,
-        additional: Option<AuthorizedPeerKeys>,
-        provider: &rustls::crypto::CryptoProvider,
-    ) -> Self {
-        Self { expected, additional, supported: provider.signature_verification_algorithms }
+        Self { expected, supported: provider.signature_verification_algorithms }
     }
 
     /// Decides whether a presented raw public key is one this endpoint
@@ -484,9 +495,7 @@ impl PinnedPeerKeys {
         let Some(presented) = ed25519_key_from_spki(end_entity.as_ref()) else {
             return Err(rustls::Error::InvalidCertificate(CertificateError::BadEncoding));
         };
-        let accepted = self.expected.contains(&presented)
-            || self.additional.as_ref().is_some_and(|extra| extra.contains(&presented));
-        if !accepted {
+        if !self.expected.contains(&presented) {
             // `UnknownIssuer` would be the closer analogue in an X.509 world,
             // but there is no issuer here. The key simply is not one this
             // device was told to talk to, which is an application-level
@@ -703,91 +712,6 @@ pub fn quic_server_config(
     )))
 }
 
-/// Dials one specific peer for a Track Send connection.
-///
-/// Identical to [`quic_client_config`] in every respect except which
-/// protocol this connection identifies itself as: this device's own
-/// Ed25519 key authenticates it, and it accepts an answer only from
-/// `expected_peer`, exactly as a sync dial does. The only difference is
-/// [`YADORILINK_SEND_ALPN`] in place of [`YADORILINK_P2P_ALPN`], so the
-/// two kinds of connection can never be negotiated as each other. Kept as
-/// a fully separate function rather than a parameter on
-/// [`quic_client_config`] so that function's existing behavior (and the
-/// tests pinned to it) stays exactly as it was before Track Send existed.
-pub fn quic_send_client_config(
-    device: &DeviceSigningKeyPair,
-    expected_peer: [u8; 32],
-) -> Result<quinn::ClientConfig, TransportError> {
-    let provider = provider();
-    let verifier = Arc::new(PinnedPeerKeys::new([expected_peer], &provider));
-    let mut crypto = rustls::ClientConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(quic_config_error)?
-        .dangerous()
-        .with_custom_certificate_verifier(verifier)
-        .with_client_cert_resolver(Arc::new(AlwaysResolvesClientRawPublicKeys::new(
-            device_certified_key(device),
-        )));
-    crypto.alpn_protocols = vec![YADORILINK_SEND_ALPN.to_vec()];
-    crypto.resumption = rustls::client::Resumption::disabled();
-    Ok(quinn::ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(crypto).map_err(quic_config_error)?,
-    )))
-}
-
-/// The server configuration this device's one QUIC endpoint actually runs
-/// with: identical to [`quic_server_config`] -- same peer authentication,
-/// same live-revocation semantics, same resumption/ticket refusal -- except
-/// its ALPN list additionally accepts [`YADORILINK_SEND_ALPN`], so the one
-/// endpoint can complete a handshake for either protocol.
-///
-/// A separate function rather than a change to [`quic_server_config`]
-/// itself so that function's existing single-ALPN contract stays exactly
-/// as it was for every other caller (this crate's own handshake tests and
-/// benchmark example construct a server directly from it, asserting
-/// sync-only behavior) -- only `QuicPeerEndpoint::new`, which is what
-/// actually needs to accept both protocols, calls this one instead.
-///
-/// Which protocol a given accepted connection actually negotiated is read
-/// back after the handshake completes and used to route it; see
-/// `quic_peer_endpoint.rs`'s `accept_loop`.
-///
-/// `send_authorized_peers` is a SECOND, independent live set: a key
-/// admitted only through it (never through `authorized_peers`) completes a
-/// raw TLS handshake here exactly as if it were in `authorized_peers`, but
-/// is never treated as a genuine netmap peer beyond that -- see
-/// `PinnedPeerKeys::additional`'s own doc comment for why the two sets stay
-/// separate, and `quic_peer_endpoint.rs`'s `accept_loop` for the
-/// post-handshake check that is the other half of this: a completed
-/// handshake alone is not what makes a SYNC-ALPN connection real for a key
-/// that got in only through this set.
-pub fn quic_dual_server_config(
-    device: &DeviceSigningKeyPair,
-    authorized_peers: &AuthorizedPeerKeys,
-    send_authorized_peers: &AuthorizedPeerKeys,
-) -> Result<quinn::ServerConfig, TransportError> {
-    let provider = provider();
-    let verifier = Arc::new(PinnedPeerKeys::with_live_sets(
-        authorized_peers.clone(),
-        Some(send_authorized_peers.clone()),
-        &provider,
-    ));
-    let mut crypto = rustls::ServerConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(quic_config_error)?
-        .with_client_cert_verifier(verifier)
-        .with_cert_resolver(Arc::new(AlwaysResolvesServerRawPublicKeys::new(
-            device_certified_key(device),
-        )));
-    crypto.alpn_protocols = vec![YADORILINK_P2P_ALPN.to_vec(), YADORILINK_SEND_ALPN.to_vec()];
-    crypto.send_tls13_tickets = 0;
-    crypto.session_storage = Arc::new(NoServerSessionStorage {});
-    crypto.max_early_data_size = 0;
-    Ok(quinn::ServerConfig::with_crypto(Arc::new(
-        quinn::crypto::rustls::QuicServerConfig::try_from(crypto).map_err(quic_config_error)?,
-    )))
-}
-
 /// Both failures these constructors can report are "the crypto provider does
 /// not offer what TLS 1.3 over QUIC needs", which is a build-time property of
 /// the pinned `ring` provider rather than anything a caller or a peer
@@ -798,158 +722,4 @@ fn quic_config_error(err: impl fmt::Display) -> TransportError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The encode and decode halves have to be exact inverses, because one
-    /// runs on what this device presents and the other on what it accepts.
-    #[test]
-    fn an_spki_this_device_emits_decodes_back_to_the_same_key() {
-        let device = DeviceSigningKeyPair::generate();
-        let spki = ed25519_spki(&device.public_bytes());
-        assert_eq!(spki.len(), ED25519_SPKI_LEN);
-        assert_eq!(ed25519_key_from_spki(&spki), Some(device.public_bytes()));
-    }
-
-    /// Every one of these arrives from an unauthenticated peer, so the
-    /// requirement is `None` rather than a panic -- a truncated prefix in
-    /// particular is what a naive fixed-offset slice would fault on.
-    #[test]
-    fn malformed_subject_public_key_info_is_rejected_without_panicking() {
-        let good = ed25519_spki(&[7u8; 32]);
-
-        assert_eq!(ed25519_key_from_spki(&[]), None, "empty");
-        assert_eq!(ed25519_key_from_spki(&good[..5]), None, "truncated inside the prefix");
-        assert_eq!(ed25519_key_from_spki(&good[..ED25519_SPKI_LEN - 1]), None, "short key");
-
-        let mut long = good.clone();
-        long.push(0);
-        assert_eq!(ed25519_key_from_spki(&long), None, "trailing bytes");
-
-        let mut wrong_oid = good.clone();
-        wrong_oid[8] = 0x71;
-        assert_eq!(ed25519_key_from_spki(&wrong_oid), None, "a different algorithm identifier");
-    }
-
-    /// The identity a peer receives and the key that signs the transcript
-    /// have to be the same key. Disagreement between them would fail only at
-    /// the peer, during a handshake, for a reason nothing local reports.
-    ///
-    /// `CertifiedKey::keys_match` is deliberately not used: it parses the
-    /// first entry as an X.509 certificate, which under RFC 7250 it is not.
-    #[test]
-    fn the_presented_public_key_matches_the_key_that_signs() {
-        let device = DeviceSigningKeyPair::generate();
-        let certified = device_certified_key(&device);
-
-        let presented = certified.end_entity_cert().expect("an identity is present");
-        assert_eq!(
-            ed25519_key_from_spki(presented.as_ref()),
-            Some(device.public_bytes()),
-            "the key a peer is shown"
-        );
-        let advertised = certified.key.public_key().expect("the signing key exposes its SPKI");
-        assert_eq!(advertised.as_ref(), presented.as_ref(), "the key that signs");
-    }
-
-    /// Only Ed25519, and specifically not "the first thing offered".
-    #[test]
-    fn no_scheme_other_than_ed25519_is_accepted() {
-        let device = DeviceSigningKeyPair::generate();
-        let key = DeviceSigningIdentity {
-            signing: device.signing.clone(),
-            spki: ed25519_spki(&device.public_bytes()),
-        };
-
-        assert!(key.choose_scheme(&[SignatureScheme::RSA_PSS_SHA256]).is_none());
-        assert!(key.choose_scheme(&[]).is_none());
-        let chosen = key
-            .choose_scheme(&[SignatureScheme::RSA_PSS_SHA256, SignatureScheme::ED25519])
-            .expect("Ed25519 was on offer");
-        assert_eq!(chosen.scheme(), SignatureScheme::ED25519);
-    }
-
-    /// The signature the TLS layer will hand to a peer must verify under the
-    /// public key this device advertises.
-    #[test]
-    fn a_produced_signature_verifies_under_the_advertised_key() {
-        use ed25519_dalek::Verifier as _;
-
-        let device = DeviceSigningKeyPair::generate();
-        let key = DeviceSigningIdentity {
-            signing: device.signing.clone(),
-            spki: ed25519_spki(&device.public_bytes()),
-        };
-        let signer = key.choose_scheme(&[SignatureScheme::ED25519]).expect("Ed25519 signer");
-
-        let signature = signer.sign(b"a transcript stand-in").expect("sign");
-        let signature =
-            ed25519_dalek::Signature::from_slice(&signature).expect("64-byte signature");
-        assert!(device.verifying.verify(b"a transcript stand-in", &signature).is_ok());
-    }
-
-    /// The membership test itself, in both directions and with the empty set
-    /// included, without needing a handshake to reach it.
-    #[test]
-    fn only_pinned_keys_are_accepted_by_either_verifier() {
-        let provider = provider();
-        let pinned = DeviceSigningKeyPair::generate();
-        let stranger = DeviceSigningKeyPair::generate();
-
-        let verifier = PinnedPeerKeys::new([pinned.public_bytes()], &provider);
-        let good = CertificateDer::from(ed25519_spki(&pinned.public_bytes()));
-        let bad = CertificateDer::from(ed25519_spki(&stranger.public_bytes()));
-
-        assert!(verifier.accept(&good, &[]).is_ok());
-        assert!(verifier.accept(&bad, &[]).is_err());
-        // A pinned key with anything appended to it is still a refusal: the
-        // profile is one key, alone.
-        assert!(verifier.accept(&good, std::slice::from_ref(&bad)).is_err());
-
-        let refuses_everyone = PinnedPeerKeys::new([], &provider);
-        assert!(refuses_everyone.accept(&good, &[]).is_err(), "an empty set must fail closed");
-    }
-
-    /// The membership test reads the live set, not a copy taken when the
-    /// verifier was built. Without this the whole point of the shared set is
-    /// lost: `quic_server_config` would still be answering with whatever the
-    /// netmap said at endpoint-construction time.
-    ///
-    /// The handshake-level counterpart -- a key removed from a *running*
-    /// endpoint's set being refused on the next connection -- is in
-    /// `tests/quic_peer_identity.rs`; this one pins the decision itself.
-    #[test]
-    fn the_verifier_reads_the_live_set_rather_than_a_snapshot() {
-        let provider = provider();
-        let peer = DeviceSigningKeyPair::generate();
-        let presented = CertificateDer::from(ed25519_spki(&peer.public_bytes()));
-
-        let authorized = AuthorizedPeerKeys::new();
-        let verifier = PinnedPeerKeys::with_live_set(authorized.clone(), &provider);
-        assert!(verifier.accept(&presented, &[]).is_err(), "nobody authorized yet");
-
-        assert!(authorized.authorize(peer.public_bytes()), "newly added");
-        assert!(verifier.accept(&presented, &[]).is_ok(), "authorized after construction");
-
-        assert!(authorized.revoke(&peer.public_bytes()), "was authorized");
-        assert!(verifier.accept(&presented, &[]).is_err(), "refused once revoked");
-
-        // A whole-set replacement is how a netmap push lands, and it has to
-        // move membership in both directions at once.
-        let other = DeviceSigningKeyPair::generate();
-        let _ = authorized.replace([peer.public_bytes(), other.public_bytes()]);
-        assert!(verifier.accept(&presented, &[]).is_ok(), "restored by a replacement");
-        // The replacement must also REPORT what it dropped: a caller that
-        // only learned the new membership could not finish revoking the
-        // peers this removed.
-        let removed = authorized.replace([other.public_bytes()]);
-        assert_eq!(removed, vec![peer.public_bytes()], "a replacement must report what it drops");
-        assert!(verifier.accept(&presented, &[]).is_err(), "dropped by a replacement");
-
-        // And an emptying replacement still fails closed, which is the state
-        // a device with no peers left should be in.
-        assert_eq!(authorized.replace([]), vec![other.public_bytes()]);
-        assert!(authorized.is_empty());
-        assert!(verifier.accept(&presented, &[]).is_err(), "an emptied set must fail closed");
-    }
-}
+mod tests;

@@ -29,3 +29,144 @@
 //! (`device_config.rs`) use `blocking_lock` instead.
 #[cfg(test)]
 pub(crate) static CONFIG_ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// A connected pair of real, substrate-backed `SessionTransports`, for this
+/// crate's own unit tests that build a `PeerSyncSession` directly (rather
+/// than through `SyncStack`, which every real session goes through in
+/// production).
+///
+/// `SessionTransports` is a required constructor parameter now (A3/A4) --
+/// there is no `Option`/null/deny-by-default shape for it (see that type's
+/// own doc comment for why), so every test that constructs a session needs
+/// a real one. This crate is not the one that would hit the dev-dependency
+/// cycle `yadorilink-peer-session`'s own unit tests have to work around
+/// (`yadorilink-lane-ports` depends on this crate too, but this crate is
+/// never itself a dependency of `yadorilink-lane-ports`), so it uses the
+/// same real fixture (`yadorilink_lane_ports::testing::TestPeerNode`)
+/// production's own `SyncStack` is built on, rather than a second,
+/// in-memory-only implementation.
+#[cfg(test)]
+pub(crate) async fn session_transports_pair(
+    device_a_id: &str,
+    device_b_id: &str,
+) -> (
+    yadorilink_peer_session::ports::SessionTransports,
+    yadorilink_peer_session::ports::SessionTransports,
+) {
+    use yadorilink_lane_ports::testing::{TestAddressBook, TestPeerNode};
+
+    let book = TestAddressBook::new();
+    let node_a = TestPeerNode::start(device_a_id, book.clone()).await;
+    let node_b = TestPeerNode::start(device_b_id, book).await;
+
+    let transports_a = node_a.transports_for(device_b_id);
+    let transports_b = node_b.transports_for(device_a_id);
+    (
+        yadorilink_peer_session::ports::SessionTransports {
+            blocks: transports_a.clone(),
+            service: transports_a.clone(),
+            prepared_snapshots: std::sync::Arc::new(yadorilink_lane_ports::PreparedSnapshots::new()),
+            snapshot_fetch: transports_a,
+        },
+        yadorilink_peer_session::ports::SessionTransports {
+            blocks: transports_b.clone(),
+            service: transports_b.clone(),
+            prepared_snapshots: std::sync::Arc::new(yadorilink_lane_ports::PreparedSnapshots::new()),
+            snapshot_fetch: transports_b,
+        },
+    )
+}
+
+/// Seeds the proof a prior materialization cycle left behind for `path`:
+/// the fence that cycle bumped before its write, and the one commit that
+/// publishes the proof, stamps `Hydrated`, and clears the intent. Returns
+/// the version it proved, which is the version the row names right now.
+///
+/// Fixtures need this because `Hydrated` is a claim about two things at
+/// once -- the stamp, and a usable actual-state proof naming the version
+/// the row derives -- and every reader that trusts the claim checks both.
+/// Seeding only the stamp produces a combination production can no longer
+/// reach, so the code under test takes a path it would never take.
+///
+/// It goes through the internal-mutator lane, the one a device that
+/// performed its own write must use, for the reason that lane's own doc
+/// comment gives: the external-adoption lane mints a fresh epoch, which is
+/// only correct for a change this device is discovering after the fact.
+/// A fixture standing in for this device's own earlier write must not mint
+/// an epoch no cycle ever minted. Publishing the proof and stamping the
+/// claim through two separate calls would be the same problem from the
+/// other side: one transaction produces the pair, so a row holding one
+/// without the other is a state no writer can leave behind.
+pub fn seed_prior_cycle_proof(
+    coordinator: &crate::replica_coordinator::ReplicaCoordinator,
+    group_id: &str,
+    path: &str,
+    on_disk: &std::path::Path,
+    permit: &yadorilink_root_authority::root_commit::RootCommitPermit,
+) -> yadorilink_replica_domain::ids::VersionHash {
+    use yadorilink_sync_sqlite::exact_materialized_commit::{
+        ExactMaterializedState, InternalMaterializedCommit,
+    };
+
+    // The version the row itself derives -- a present object's proof has
+    // to carry it, or it names no desired resolution and closes nothing.
+    let version = coordinator
+        .file_index_repository()
+        .canonical_current_row(group_id, path)
+        .expect("canonical current row")
+        .expect("a seeded row to prove")
+        .version_hash();
+    let identity =
+        yadorilink_root_authority::fs_identity::FileIdentity::observe_path(on_disk).unwrap();
+    let mutation_generation = coordinator
+        .dag_bump_mutation_fence(group_id, path, "hydration_write")
+        .expect("bump the fence this seeded cycle publishes under");
+    let committed = coordinator
+        .materialization_state_repository()
+        .commit_internal_materialized_state_if_fence_current(
+            group_id,
+            path,
+            None,
+            &ExactMaterializedState::Object {
+                kind: yadorilink_replica_domain::file::RecordKind::File,
+                version,
+                identity: Box::new(Some(identity)),
+            },
+            mutation_generation,
+            None,
+            permit,
+        )
+        .expect("seed the prior cycle's commit");
+    assert!(
+        matches!(committed, InternalMaterializedCommit::Published(_)),
+        "the seeded cycle commits under the fence it just bumped, so this must land -- a \
+         silent refusal would leave the test running against an unseeded row"
+    );
+    version
+}
+
+/// The two-device assembly stack-level scenarios start from: real devices,
+/// a netmap pin, and honestly signed bundles. Lives here rather than beside
+/// the tests that first needed it because `#[cfg(test)]` is crate-local, and
+/// a scenario under `tests/` compiles against this crate as a library.
+#[cfg(any(test, feature = "test-support"))]
+pub mod sync_stack_fixture;
+
+/// Where a Change got to on one device, layer by layer, and whether its
+/// stopping point is something the test is about. Read its header before
+/// asserting on layers 4-6.
+#[cfg(any(test, feature = "test-support"))]
+pub mod layer_probe;
+
+/// A second network between simulated devices, so a partition scenario can
+/// tell "sync stopped" from "the devices are isolated". Shared by this
+/// crate's own turmoil tests and its integration binaries, which is why it is
+/// here rather than beside either.
+#[cfg(any(test, feature = "test-support"))]
+pub mod sim_control_plane;
+
+/// The `ReplicaCoordinator`-backed peer-session integration fixture, shared
+/// with `yadorilink-peer-session`'s own integration binaries while the tests
+/// whose subject is materialization, hydration and convergence move to this
+/// crate. See that module's own header for why it is here and what retires it.
+pub mod peer_session_fixture;

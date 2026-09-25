@@ -2,10 +2,12 @@
 
 use std::sync::Arc;
 
-use yadorilink_replica_domain::session_state::RoleLossAction;
+use yadorilink_replica_domain::session_state::{
+    RoleLossAction, RoleLossOperation, RoleLossOperationState,
+};
 
-use crate::application::ports::{BoxFuture, RoleLossJournal};
-use crate::daemon_state::DaemonState;
+use crate::application::ports::RoleLossJournal;
+use crate::daemon_state::{now_unix, DaemonState};
 
 pub(crate) struct DaemonRoleLossJournal {
     state: Arc<DaemonState>,
@@ -47,7 +49,51 @@ impl RoleLossJournal for DaemonRoleLossJournal {
         self.state.settle_role_loss_operation_success(operation_id);
     }
 
-    fn compensate<'a>(&'a self, operation_id: &'a str) -> BoxFuture<'a, Result<(), String>> {
-        Box::pin(async move { self.state.compensate_role_loss_operation(operation_id).await })
+    fn get_operation(&self, operation_id: &str) -> Result<Option<RoleLossOperation>, String> {
+        self.state
+            .replica_coordinator
+            .role_loss_operation_repository()
+            .get_role_loss_operation(operation_id)
+            .map_err(|e| e.to_string())
+    }
+
+    fn list_operations_in_states(
+        &self,
+        states: &[RoleLossOperationState],
+    ) -> Result<Vec<RoleLossOperation>, String> {
+        self.state
+            .replica_coordinator
+            .role_loss_operation_repository()
+            .list_role_loss_operations_in_states(states)
+            .map_err(|e| e.to_string())
+    }
+
+    fn advance_operation(
+        &self,
+        operation_id: &str,
+        state: RoleLossOperationState,
+    ) -> Result<(), String> {
+        self.state
+            .replica_coordinator
+            .role_loss_operation_repository()
+            .advance_role_loss_operation(operation_id, state, now_unix())
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    fn increment_attempts(&self, operation_id: &str) -> Result<i64, String> {
+        self.state
+            .replica_coordinator
+            .role_loss_operation_repository()
+            .increment_role_loss_operation_attempts(operation_id, now_unix())
+            .map_err(|e| e.to_string())
+    }
+
+    fn delete_operation(&self, operation_id: &str) -> Result<(), String> {
+        self.state
+            .replica_coordinator
+            .role_loss_operation_repository()
+            .delete_role_loss_operation(operation_id)
+            .map_err(|e| e.to_string())
     }
 }

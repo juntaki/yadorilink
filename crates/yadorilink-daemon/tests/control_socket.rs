@@ -22,7 +22,7 @@ mod unix_socket_tests {
         UnlinkRequest, UnpinRequest,
     };
     use yadorilink_ipc_proto::framing::{read_message, write_message};
-    use yadorilink_local_storage::FsBlockStore;
+    use yadorilink_local_storage::SegmentBlockStore;
 
     async fn start_daemon() -> (std::path::PathBuf, tempfile::TempDir) {
         let (socket_path, dir, _state) = start_daemon_with_state().await;
@@ -35,7 +35,7 @@ mod unix_socket_tests {
     async fn start_daemon_with_state() -> (std::path::PathBuf, tempfile::TempDir, Arc<DaemonState>)
     {
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(FsBlockStore::new(dir.path().join("blocks")).unwrap());
+        let store = Arc::new(SegmentBlockStore::new(dir.path().join("blocks")).unwrap());
         let state_db = Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
         let state = DaemonState::new("device-under-test".into(), state_db, store);
         // A registered (non-empty device_id) device with no change-signing
@@ -44,16 +44,12 @@ mod unix_socket_tests {
         // emission silently off. Wire one before any test here links.
         state
             .set_device_signing_key(yadorilink_transport::DeviceSigningKeyPair::generate().signing);
-        state.replica_coordinator.set_local_change_auth_provider(Arc::new(|_| {
-            Ok(yadorilink_replica_domain::change::ChangeAuth::PLACEHOLDER)
-        }));
+        state.replica_coordinator.set_local_policy_head_provider(Arc::new(|_| Ok([0u8; 32])));
         // Local edits now route through `replica_coordinator`, not
         // `sync_state` (7D-10.7) -- mirror the override there too, or
         // `DaemonState::new`'s real provider fires instead and withholds
         // for lack of a verified group policy.
-        state.replica_coordinator.set_local_change_auth_provider(Arc::new(|_| {
-            Ok(yadorilink_replica_domain::change::ChangeAuth::PLACEHOLDER)
-        }));
+        state.replica_coordinator.set_local_policy_head_provider(Arc::new(|_| Ok([0u8; 32])));
         let socket_path = dir.path().join("daemon.sock");
 
         let serve_path = socket_path.clone();
@@ -292,7 +288,7 @@ mod unix_socket_tests {
         // the linked folder is empty -- nothing to hand off, so the
         // durability gate (`ensure_unlink_keeps_a_full_replica`) is
         // vacuously satisfied regardless of any other recorded peer.
-        state.set_peer_group_full_replica("device-b", "group-3", true);
+        state.authority.set_peer_group_full_replica("device-b", "group-3", true);
 
         let resp =
             send(&socket_path, ReqPayload::Unlink(UnlinkRequest { local_path, force: false }))
@@ -413,7 +409,7 @@ mod unix_socket_tests {
             .link_repository()
             .force_second_live_link_for_test(&folder_b.to_string_lossy(), "group-amb")
             .unwrap();
-        state.set_peer_group_full_replica("device-b", "group-amb", true);
+        state.authority.set_peer_group_full_replica("device-b", "group-amb", true);
 
         // The window starts closed (the column defaults to 0) and nothing in
         // this test opens it, so a pass below means the unlink handler did. It
@@ -466,7 +462,7 @@ mod unix_socket_tests {
             .link_repository()
             .add_link(&folder_b.to_string_lossy(), "group-y")
             .unwrap();
-        state.set_peer_group_full_replica("device-b", "group-y", true);
+        state.authority.set_peer_group_full_replica("device-b", "group-y", true);
 
         send(
             &socket_path,
@@ -517,6 +513,91 @@ mod unix_socket_tests {
         assert_eq!(status.links[0].conflict_count, 0);
     }
 
+    /// Seeds a conflict copy the way a real one always arrives: with DAG
+    /// history behind it.
+    ///
+    /// A bare `upsert_file` cannot be used for this. `Link` above starts the
+    /// real link runtime, and with it the convergence engine's
+    /// `retire_unjustified_ephemeral_conflict_copies` loop, which deletes
+    /// any conflict copy the group's history does not account for -- exactly
+    /// what an index row with no change behind it is. The row was being
+    /// seeded and then correctly swept away before the request was served,
+    /// so the test raced the retirement loop and lost.
+    ///
+    /// Returns nothing: callers assert through the control socket, which is
+    /// the surface under test.
+    fn seed_dag_backed_conflict_copy(
+        state: &std::sync::Arc<DaemonState>,
+        group_id: &str,
+        path: &str,
+        content: &[u8],
+        mtime_unix_nanos: i64,
+    ) {
+        use yadorilink_replica_domain::file::{
+            BlockInfo, FileMeta, FileRecord, FileVersion, RecordKind, VersionBlock,
+        };
+
+        // Real content, not an empty block list: a regular file's version is
+        // required to have blocks iff it is non-empty, and its hash is
+        // re-derived from its own encoding before it is stored. A version
+        // claiming a size with nothing to back it is refused, which is the
+        // right answer -- it does not describe anything.
+        let hash_hex = state.block_store.put(content).unwrap();
+        let hash = hex::decode(&hash_hex).unwrap();
+        let size = content.len() as u64;
+
+        let signing_key = state
+            .device_signing_key()
+            .expect("start_daemon_with_state installs one before anything links");
+        let emitter = yadorilink_sync_sqlite::dag_store::ChangeEmitter::new(
+            state.device_id.clone(),
+            signing_key,
+        );
+        let version = FileVersion::new(
+            vec![VersionBlock {
+                hash: yadorilink_replica_domain::ids::BlockHash(hash.clone()),
+                size: content.len() as u32,
+            }],
+            size,
+            FileMeta {
+                mtime_unix_nanos,
+                unix_mode: None,
+                symlink_target: None,
+                record_kind: RecordKind::File,
+                xattrs: Vec::new(),
+            },
+        );
+        let record = FileRecord {
+            path: path.to_string(),
+            size,
+            mtime_unix_nanos,
+            blocks: vec![BlockInfo { hash, offset: 0, size: content.len() as u32 }],
+            deleted: false,
+        };
+        state
+            .replica_coordinator
+            .upsert_file_emitting_change(
+                group_id,
+                &record,
+                &state.device_id,
+                yadorilink_replica_domain::session_state::ChangeContent {
+                    ops: vec![yadorilink_replica_domain::change::Op::Put {
+                        path: yadorilink_replica_domain::ids::SyncPath(record.path.clone()),
+                        version: version.version_hash,
+                        origin: yadorilink_replica_domain::change::PutOrigin::Direct,
+                    }],
+                    versions: std::slice::from_ref(&version),
+                },
+                None,
+                None,
+                yadorilink_daemon::replica_coordinator::ReplicaChangeEmission {
+                    emitter: &emitter,
+                    permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+                },
+            )
+            .unwrap();
+    }
+
     /// `yadorilink conflicts list` -- a live file whose path already
     /// carries the "(conflicted copy" marker `conflict_count` above counts
     /// by is individually listed, tagged with its link's `local_path`; a
@@ -559,21 +640,13 @@ mod unix_socket_tests {
                 &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
-        state
-            .replica_coordinator
-            .file_index_repository()
-            .upsert_file(
-                "group-conflicts",
-                &FileRecord {
-                    path: "photo (conflicted copy, 2026-01-01-000000, device-b).jpg".into(),
-                    size: 7,
-                    mtime_unix_nanos: 42,
-                    blocks: vec![],
-                    deleted: false,
-                },
-                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-            )
-            .unwrap();
+        seed_dag_backed_conflict_copy(
+            &state,
+            "group-conflicts",
+            "photo (conflicted copy, 2026-01-01-000000, device-b).jpg",
+            b"7 bytes",
+            42,
+        );
 
         let resp = send(&socket_path, ReqPayload::ListConflicts(ListConflictsRequest {})).await;
         let Some(RespPayload::ListConflicts(list)) = resp.payload else {
@@ -596,8 +669,6 @@ mod unix_socket_tests {
     /// filter tombstones and the other not to.
     #[tokio::test]
     async fn a_deleted_conflict_copy_disappears_from_both_list_conflicts_and_conflict_count() {
-        use yadorilink_replica_domain::file::FileRecord;
-
         let (socket_path, dir, state) = start_daemon_with_state().await;
         let folder = dir.path().join("shared");
         std::fs::create_dir_all(&folder).unwrap();
@@ -619,21 +690,7 @@ mod unix_socket_tests {
 
         let conflict_path = "note (conflicted copy, 2026-01-01-000000, device-b).txt";
         let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
-        state
-            .replica_coordinator
-            .file_index_repository()
-            .upsert_file(
-                "group-retired-conflict",
-                &FileRecord {
-                    path: conflict_path.into(),
-                    size: 4,
-                    mtime_unix_nanos: 0,
-                    blocks: vec![],
-                    deleted: false,
-                },
-                &permit,
-            )
-            .unwrap();
+        seed_dag_backed_conflict_copy(&state, "group-retired-conflict", conflict_path, b"note", 0);
 
         // Still live: both surfaces agree it exists.
         let resp = send(&socket_path, ReqPayload::ListConflicts(ListConflictsRequest {})).await;
@@ -649,18 +706,27 @@ mod unix_socket_tests {
 
         // The retirement sweep deletes it, same as it would once no unresolved
         // divergence justifies keeping the copy around.
+        // Emitted, not a bare tombstone upsert. Once the group has DAG
+        // history, a `deleted: true` row written straight through the index
+        // has a NULL authoring hash with `version_seq > 0`, which the
+        // `files_require_authoring_identity_on_insert` trigger aborts
+        // outright -- the delete has to come from a change like any other.
+        let signing_key = state
+            .device_signing_key()
+            .expect("start_daemon_with_state installs one before anything links");
+        let emitter = yadorilink_sync_sqlite::dag_store::ChangeEmitter::new(
+            state.device_id.clone(),
+            signing_key,
+        );
         state
             .replica_coordinator
-            .file_index_repository()
-            .upsert_file(
+            .mark_deleted_emitting_change(
                 "group-retired-conflict",
-                &FileRecord {
-                    path: conflict_path.into(),
-                    size: 4,
-                    mtime_unix_nanos: 0,
-                    blocks: vec![],
-                    deleted: true,
-                },
+                conflict_path,
+                &state.device_id,
+                0,
+                false,
+                &emitter,
                 &permit,
             )
             .unwrap();
@@ -1174,7 +1240,7 @@ mod unix_socket_tests {
         assert_ne!(std::fs::read(folder.join("report.pdf")).unwrap(), content);
     }
 
-    /// P0-B: a path the daemon has never indexed reports `known: false`
+    /// A path the daemon has never indexed reports `known: false`
     /// over the control socket, never a guessed default state.
     #[tokio::test]
     async fn materialization_status_via_control_socket_reports_unknown_for_an_unindexed_path() {
@@ -1211,7 +1277,7 @@ mod unix_socket_tests {
         }
     }
 
-    /// P0-B: an indexed file's real materialization state and pin flag
+    /// An indexed file's real materialization state and pin flag
     /// round-trip through the control socket exactly, end to end.
     #[tokio::test]
     async fn materialization_status_via_control_socket_reports_the_real_state_and_pin_flag() {
@@ -1777,7 +1843,7 @@ mod windows_pipe_tests {
         PendingEnrollmentKind, ResumeRequest, StatusRequest,
     };
     use yadorilink_ipc_proto::framing::{read_message, write_message};
-    use yadorilink_local_storage::FsBlockStore;
+    use yadorilink_local_storage::SegmentBlockStore;
 
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -1788,22 +1854,18 @@ mod windows_pipe_tests {
 
     async fn start_daemon() -> (String, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(FsBlockStore::new(dir.path().join("blocks")).unwrap());
+        let store = Arc::new(SegmentBlockStore::new(dir.path().join("blocks")).unwrap());
         let state_db = Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
         let state = DaemonState::new("device-under-test".into(), state_db, store);
         // See the identical comment in the Unix `start_daemon_with_state` above.
         state
             .set_device_signing_key(yadorilink_transport::DeviceSigningKeyPair::generate().signing);
-        state.replica_coordinator.set_local_change_auth_provider(Arc::new(|_| {
-            Ok(yadorilink_replica_domain::change::ChangeAuth::PLACEHOLDER)
-        }));
+        state.replica_coordinator.set_local_policy_head_provider(Arc::new(|_| Ok([0u8; 32])));
         // Local edits now route through `replica_coordinator`, not
         // `sync_state` (7D-10.7) -- mirror the override there too, or
         // `DaemonState::new`'s real provider fires instead and withholds
         // for lack of a verified group policy.
-        state.replica_coordinator.set_local_change_auth_provider(Arc::new(|_| {
-            Ok(yadorilink_replica_domain::change::ChangeAuth::PLACEHOLDER)
-        }));
+        state.replica_coordinator.set_local_policy_head_provider(Arc::new(|_| Ok([0u8; 32])));
         let pipe_name = unique_pipe_name();
 
         let serve_name = pipe_name.clone();

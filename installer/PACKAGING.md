@@ -72,10 +72,7 @@ floating `latest`).
   created.
 - **WinGet PR submission**: intentionally not automated at all — see
   `installer/windows/winget/README.md`'s "Submission".
-- **`release-signing` Environment protection**: verified via `gh api` that
-  this Environment currently has **no required-reviewers rule**, despite
-  `docs/UPDATE_SIGNING.md` mandating one. This is a pre-existing gap, not
-  something introduced here, and choosing reviewers is a maintainer/org
-  decision this repository's tooling shouldn't make unilaterally — fixing
-  it just needs a maintainer to add a required-reviewers rule to that
-  Environment in repository Settings.
+- **`release-signing` Environment protection**: the update-signing policy
+  requires a required-reviewers rule on this Environment. Choosing reviewers
+  is a maintainer/org decision this repository's tooling does not make; it
+  is set on that Environment in repository Settings.

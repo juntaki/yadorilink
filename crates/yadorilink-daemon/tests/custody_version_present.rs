@@ -12,7 +12,7 @@ use support::{
     connect_two_daemons, ensure_device_signing_key, open_file_backed_replica_coordinator,
 };
 use yadorilink_daemon::daemon_state::DaemonState;
-use yadorilink_local_storage::{BlockStore, FsBlockStore};
+use yadorilink_local_storage::{BlockStore, SegmentBlockStore};
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord, RecordKind};
 use yadorilink_replica_domain::file::{FileMeta, FileVersion, VersionBlock};
 use yadorilink_replica_domain::ids::{BlockHash, VersionHash};
@@ -28,7 +28,7 @@ struct Daemon {
 
 fn new_daemon(device_id: &str) -> Daemon {
     let store_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let (sync_state, index_dir) = open_file_backed_replica_coordinator();
     let state = DaemonState::new(device_id.to_string(), Arc::new(sync_state), store);
     ensure_device_signing_key(&state);
@@ -42,7 +42,7 @@ fn new_daemon(device_id: &str) -> Daemon {
 }
 
 /// Like [`new_daemon`], but this device's block store wraps its real
-/// `FsBlockStore` in [`support::DelayedGetBlockStore`], so a
+/// `SegmentBlockStore` in [`support::DelayedGetBlockStore`], so a
 /// `VersionPresentQuery` answered by this device fires an "entered get()"
 /// signal and then stalls for `delay` inside `holds_version_durably`'s
 /// checksum-verifying `get` call — used to open a deterministic in-flight
@@ -53,7 +53,7 @@ fn new_daemon_with_slow_get(
     delay: Duration,
 ) -> (Daemon, Arc<support::DelayedGetBlockStore>) {
     let store_dir = tempfile::tempdir().unwrap();
-    let inner = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+    let inner = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let slow = Arc::new(support::DelayedGetBlockStore::new(inner, delay));
     let store: Arc<dyn BlockStore + Send + Sync> = slow.clone();
     let (sync_state, index_dir) = open_file_backed_replica_coordinator();
@@ -172,7 +172,7 @@ async fn custody_is_confirmed_only_when_a_full_replica_holds_the_blocks() {
     connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
     // B knows A is a full replica of the group; use the real peer-to-peer
     // confirmer, which issues a VersionPresentQuery over the live session.
-    b.state.set_peer_group_full_replica("device-a", GROUP, true);
+    b.state.authority.set_peer_group_full_replica("device-a", GROUP, true);
     b.state.install_p2p_custody_confirmer();
     tokio::time::sleep(Duration::from_millis(500)).await; // let the session establish
 
@@ -259,7 +259,7 @@ async fn eviction_custody_does_not_confirm_from_a_retained_only_peer() {
         .unwrap();
 
     connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
-    b.state.set_peer_group_full_replica("device-a", GROUP, true);
+    b.state.authority.set_peer_group_full_replica("device-a", GROUP, true);
     b.state.install_p2p_custody_confirmer();
     tokio::time::sleep(Duration::from_millis(500)).await; // let the session establish
 
@@ -295,24 +295,24 @@ async fn membership_generation_bumps_only_on_real_authorization_changes() {
     support::ensure_isolated_config_dir();
     let d = new_daemon("device-x");
 
-    let g0 = d.state.membership_generation();
-    d.state.set_peer_group_full_replica("peer-1", GROUP, true);
-    let g1 = d.state.membership_generation();
+    let g0 = d.state.authority.membership_generation();
+    d.state.authority.set_peer_group_full_replica("peer-1", GROUP, true);
+    let g1 = d.state.authority.membership_generation();
     assert!(g1 > g0, "adding a full-replica edge must bump the generation");
 
-    d.state.set_peer_group_full_replica("peer-1", GROUP, true);
-    assert_eq!(d.state.membership_generation(), g1, "a no-op set must not bump");
+    d.state.authority.set_peer_group_full_replica("peer-1", GROUP, true);
+    assert_eq!(d.state.authority.membership_generation(), g1, "a no-op set must not bump");
 
     d.state.set_peer_group_writer("peer-1", GROUP, true);
-    let g2 = d.state.membership_generation();
+    let g2 = d.state.authority.membership_generation();
     assert!(g2 > g1, "adding a writer edge must bump the generation");
 
-    d.state.set_peer_group_full_replica("peer-1", GROUP, false);
-    let g3 = d.state.membership_generation();
+    d.state.authority.set_peer_group_full_replica("peer-1", GROUP, false);
+    let g3 = d.state.authority.membership_generation();
     assert!(g3 > g2, "revoking a full-replica edge must bump the generation");
-    d.state.set_peer_group_full_replica("peer-1", GROUP, false);
+    d.state.authority.set_peer_group_full_replica("peer-1", GROUP, false);
     assert_eq!(
-        d.state.membership_generation(),
+        d.state.authority.membership_generation(),
         g3,
         "removing an already-absent edge must not bump"
     );
@@ -371,7 +371,7 @@ async fn no_reclaim_after_membership_epoch_change() {
         .unwrap();
 
     connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
-    b.state.set_peer_group_full_replica("device-a", GROUP, true);
+    b.state.authority.set_peer_group_full_replica("device-a", GROUP, true);
     tokio::time::sleep(Duration::from_millis(500)).await; // let the session establish
 
     let (epoch_vh, epoch_blocks) = version_and_blocks(hash_bytes.clone(), content.len() as u64);
@@ -389,17 +389,17 @@ async fn no_reclaim_after_membership_epoch_change() {
     // get calls would have consumed it), then revoke exactly when device-a
     // begins answering.
     let mut entered_get = a_slow_store.arm_entered_get_signal();
-    let epoch_before = b.state.membership_generation();
+    let epoch_before = b.state.authority.membership_generation();
     let confirm =
         b.state.confirm_version_present_via_peer(GROUP, "epoch.bin", epoch_vh, &epoch_blocks);
     let revoke_mid_flight = async {
         entered_get.recv().await.expect("device-a must enter get() to answer the query");
-        b.state.set_peer_group_full_replica("device-a", GROUP, false);
+        b.state.authority.set_peer_group_full_replica("device-a", GROUP, false);
     };
     let (confirmed, ()) = tokio::join!(confirm, revoke_mid_flight);
 
     assert!(
-        b.state.membership_generation() > epoch_before,
+        b.state.authority.membership_generation() > epoch_before,
         "the revoke must actually have bumped the generation for this test to mean anything"
     );
     assert!(
@@ -455,7 +455,7 @@ async fn no_reclaim_from_corrupt_replica_block() {
         .unwrap();
 
     connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
-    b.state.set_peer_group_full_replica("device-a", GROUP, true);
+    b.state.authority.set_peer_group_full_replica("device-a", GROUP, true);
     b.state.install_p2p_custody_confirmer();
     tokio::time::sleep(Duration::from_millis(500)).await; // let the session establish
 
@@ -531,7 +531,7 @@ async fn no_confirm_after_block_store_wipe() {
     assert!(a.state.block_store.exists(&hash_hex).unwrap(), "block genuinely held before the wipe");
 
     connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
-    b.state.set_peer_group_full_replica("device-a", GROUP, true);
+    b.state.authority.set_peer_group_full_replica("device-a", GROUP, true);
     b.state.install_p2p_custody_confirmer();
     tokio::time::sleep(Duration::from_millis(500)).await; // let the session establish
 
@@ -615,7 +615,7 @@ async fn custody_rejects_a_query_whose_version_hash_differs_despite_matching_blo
         .unwrap();
 
     connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
-    b.state.set_peer_group_full_replica("device-a", GROUP, true);
+    b.state.authority.set_peer_group_full_replica("device-a", GROUP, true);
     tokio::time::sleep(Duration::from_millis(500)).await; // let the session establish
 
     // Sanity/positive baseline: the real version_hash, matching device-a's
@@ -698,7 +698,7 @@ async fn custody_binds_the_unix_mode_from_the_atomic_current_row() {
         .unwrap();
 
     connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
-    b.state.set_peer_group_full_replica("device-a", GROUP, true);
+    b.state.authority.set_peer_group_full_replica("device-a", GROUP, true);
     tokio::time::sleep(Duration::from_millis(500)).await; // let the session establish
 
     let blocks =

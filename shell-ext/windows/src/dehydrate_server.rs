@@ -1,4 +1,4 @@
-//! M2-3b: a second named-pipe server, hosted by `yadorilink-cfapi-host.exe`
+//! A second named-pipe server, hosted by `yadorilink-cfapi-host.exe`
 //! itself (unlike every other shell-IPC message pair, which flows shell
 //! extension/cfapi-host -> daemon over the daemon's OWN pipe -- see
 //! `crates/yadorilink-daemon/src/shell_ipc.rs`), so the daemon can dial IN

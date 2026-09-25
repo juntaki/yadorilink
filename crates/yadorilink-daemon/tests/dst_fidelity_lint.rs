@@ -7,17 +7,17 @@
 //! the migration removed -- a local `stamp_deterministic_mtime`, a fixed
 //! settle sleep, or an `outbound_partitioned` boolean. This lint greps the
 //! *migrated* files (only) for those banned patterns and fails if any
-//! reappears, mirroring the existing inline `PF`-tag discipline: a blunt
+//! reappears: a blunt
 //! textual check that only guards files whose migration flag is set and
 //! only bans a pattern that has a designated shared replacement.
 //!
 //! A false positive is a one-line allowlist: put
 //! `// fidelity-lint: allow <pattern>` on the same line, with a
-//! justification, exactly as the `PF` tags justify their own exceptions.
+//! justification.
 //!
-//! Not `#![cfg(madsim)]`-gated: it reads source text off disk, so it runs
-//! in the ordinary `cargo test` legs (and harmlessly under the madsim
-//! sweep too).
+//! Not gated on the simulation cfg: it reads source text off disk, so it
+//! runs in the ordinary `cargo test` legs (and harmlessly under the turmoil
+//! build too).
 
 use std::path::PathBuf;
 

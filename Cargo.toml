@@ -10,18 +10,37 @@ members = [
     "crates/yadorilink-sqlite-runtime",
     "crates/yadorilink-sync-sqlite",
     "crates/yadorilink-sync-wire",
+    "crates/yadorilink-sync-substrate",
+    "crates/yadorilink-rbsr",
+    "crates/yadorilink-sync-protocol",
+    "crates/yadorilink-sync-runtime",
+    "crates/yadorilink-lane-ports",
     "crates/yadorilink-local-capture",
     "crates/yadorilink-filesystem-sync",
     "crates/yadorilink-daemon",
     "crates/yadorilink-send",
+    "crates/yadorilink-client-core",
+    "crates/yadorilink-apple-ffi",
     "crates/yadorilink-cli",
     "crates/yadorilink-ipc-proto",
     "crates/yadorilink-reporting",
     "crates/yadorilink-desktop-app",
     "crates/yadorilink-http-api",
+    "crates/yadorilink-product-view",
+    "crates/yadorilink-fapi-client",
     # DST replay + lane runner.
     "xtask",
 ]
+
+[workspace.lints.rust]
+# Hoisted verbatim from the member crates, which all carried this same block.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(turmoil)"] }
+
+[workspace.lints.clippy]
+# `excessive_nesting` is warn-by-default already; it only starts firing once
+# `excessive-nesting-threshold` is set in clippy.toml. `too_many_lines` is
+# pedantic, so it has to be enabled explicitly here.
+too_many_lines = "warn"
 
 [workspace.package]
 version = "0.1.0"
@@ -45,6 +64,7 @@ yadorilink-filesystem-sync = { path = "crates/yadorilink-filesystem-sync" }
 yadorilink-reporting = { path = "crates/yadorilink-reporting" }
 yadorilink-send = { path = "crates/yadorilink-send" }
 yadorilink-http-api = { path = "crates/yadorilink-http-api" }
+yadorilink-fapi-client = { path = "crates/yadorilink-fapi-client" }
 tokio = { version = "1", features = ["full"] }
 bytes = "1"
 serde = { version = "1", features = ["derive"] }
@@ -57,3 +77,24 @@ sha2 = "0.11"
 # scoped to `yadorilink-peer-session` only, not a dependency of any other
 # crate.
 zstd = "0.13"
+# The Swift binding for the macOS app. One exact version: the generated Swift
+# checks the library's API checksums at load time, so the bindgen and the
+# scaffolding must come from the same release.
+uniffi = "=0.32.1"
+
+# Profiling build: release-level optimization with debug symbols/line info
+# retained, so `perf`/`samply`/Instruments can resolve stacks to source
+# lines instead of raw addresses. Not used by any normal build/test/CI
+# invocation — only `--profile profiling`.
+[profile.profiling]
+inherits = "release"
+debug = 1
+
+# Line tables only: backtraces keep file:line, but test binaries shrink from
+# ~600 MB to ~165 MB each. With ~100 integration-test binaries in the daemon
+# crate alone, relinking all of them after a daemon change drops from about
+# 11-12 minutes to about 4, and a target dir from ~63 GB to ~22 GB.
+# For a debugger session with local variables, build with
+# CARGO_PROFILE_DEV_DEBUG=full.
+[profile.dev]
+debug = "line-tables-only"

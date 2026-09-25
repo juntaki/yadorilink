@@ -145,18 +145,6 @@ impl CheckpointStore for MockStore {
         self.deleted.borrow_mut().extend_from_slice(pruned);
         Ok(())
     }
-
-    fn history_base_previous_checkpoint_hash(
-        &self,
-        _group: &FolderGroupId,
-    ) -> Result<Option<[u8; 32]>, ReplicaEngineError> {
-        let checkpoints = self.checkpoints.borrow();
-        Ok(checkpoints
-            .len()
-            .checked_sub(2)
-            .and_then(|i| checkpoints.get(i))
-            .map(|checkpoint| checkpoint.checkpoint_hash().0))
-    }
 }
 
 fn group() -> FolderGroupId {

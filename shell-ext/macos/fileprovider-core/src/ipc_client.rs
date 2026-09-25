@@ -17,7 +17,7 @@ use tokio::runtime::Runtime;
 use yadorilink_ipc_proto::framing::{read_message, write_message};
 use yadorilink_ipc_proto::shellipc::shell_ipc_message::Payload;
 use yadorilink_ipc_proto::shellipc::{
-    HydrateRequest, ListFolderFilesRequest, ListOnDemandFoldersRequest,
+    EntryKind, HydrateRequest, ListFolderFilesRequest, ListOnDemandFoldersRequest,
     LocalWriteKind as ProtoLocalWriteKind, LocalWriteRequest, MaterializationState,
     ShellIpcMessage, StatusQuery, SyncState,
 };
@@ -45,7 +45,7 @@ const ENUMERATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// is still a bounded wait, just a much longer tier than status/action —
 /// a multi-second timeout vs. ~200ms for status.
 const HYDRATION_TIMEOUT: Duration = Duration::from_secs(35);
-/// M1-3: a local-write notification (`createItem`/`modifyItem`/
+/// A local-write notification (`createItem`/`modifyItem`/
 /// `deleteItem`) makes the daemon read the live file from disk, chunk/hash
 /// it, and commit an index+DAG write -- real local I/O, no network round
 /// trip (peer broadcast afterward is fire-and-forget from this call's
@@ -293,10 +293,9 @@ mod tests {
 
     fn hydrate_response(ok: bool, error: &str) -> ShellIpcMessage {
         ShellIpcMessage {
-            payload: Some(Payload::HydrateResponse(yadorilink_ipc_proto::shellipc::HydrateResponse {
-                ok,
-                error: error.to_string(),
-            })),
+            payload: Some(Payload::HydrateResponse(
+                yadorilink_ipc_proto::shellipc::HydrateResponse { ok, error: error.to_string() },
+            )),
         }
     }
 
@@ -312,9 +311,11 @@ mod tests {
     /// discarded before this change.
     #[tokio::test]
     async fn hydrate_failure_response_preserves_the_daemons_own_error_detail() {
-        let result =
-            respond_to_hydrate(Some(hydrate_response(false, "no peer currently holds this content")))
-                .await;
+        let result = respond_to_hydrate(Some(hydrate_response(
+            false,
+            "no peer currently holds this content",
+        )))
+        .await;
         assert_eq!(result, Err("no peer currently holds this content".to_string()));
     }
 
@@ -350,6 +351,20 @@ pub struct FileEntryInfo {
     /// `core::lib::YadoriLinkBadgeStatus`'s stated rationale for keeping the
     /// FFI/JSON contract independent of `prost`'s numbering).
     pub materialization_state: String,
+    /// `"file" | "directory" | "symlink"`, as a plain string for the same
+    /// reason as `materialization_state`. An explicit directory is listed as
+    /// its own entry; the Swift side must not also make a file of it.
+    pub kind: String,
+}
+
+fn entry_kind_str(kind: EntryKind) -> &'static str {
+    match kind {
+        // An unset kind is a sender that never classified the entry, which
+        // only ever meant a file.
+        EntryKind::Unspecified | EntryKind::File => "file",
+        EntryKind::Directory => "directory",
+        EntryKind::Symlink => "symlink",
+    }
 }
 
 fn materialization_state_str(s: MaterializationState) -> &'static str {
@@ -367,41 +382,159 @@ fn materialization_state_str(s: MaterializationState) -> &'static str {
 /// `ListFolderFilesResponse` is a flat list (shellipc.proto: "not
 /// paginated, not directory-scoped"), so the Swift enumerator buckets
 /// these into directory levels itself; this function just relays the
-/// daemon's answer, empty on any failure.
-pub fn list_folder_files(local_path: &str) -> Vec<FileEntryInfo> {
+/// daemon's answer.
+///
+/// `None` on any failure to confirm the listing (unreachable daemon,
+/// timeout, malformed response, or an explicit `snapshot_available: false`
+/// from the daemon), deliberately distinct from `Some(vec![])`, a
+/// *confirmed* empty folder — same contract as `list_on_demand_folders`.
+/// The File Provider treats a successful enumeration as authoritative, so
+/// the Swift caller must end the enumeration with an error on `None`,
+/// never report an empty folder.
+pub fn list_folder_files(local_path: &str) -> Option<Vec<FileEntryInfo>> {
     runtime().block_on(async {
-        tokio::time::timeout(ENUMERATION_TIMEOUT, list_folder_files_inner(local_path))
-            .await
-            .unwrap_or_default()
+        tokio::time::timeout(ENUMERATION_TIMEOUT, list_folder_files_inner(local_path)).await.ok()?
     })
 }
 
-async fn list_folder_files_inner(local_path: &str) -> Vec<FileEntryInfo> {
-    let Ok(mut stream) = connect().await else { return Vec::new() };
+async fn list_folder_files_inner(local_path: &str) -> Option<Vec<FileEntryInfo>> {
+    let mut stream = connect().await.ok()?;
+    list_folder_files_over(&mut stream, local_path).await
+}
+
+/// The stream-generic core of `list_folder_files_inner`, split out (like
+/// `list_on_demand_folders_over`) so the `None`-vs-`Some(vec![])`
+/// distinction is testable against an in-memory duplex stream.
+async fn list_folder_files_over<S>(stream: &mut S, local_path: &str) -> Option<Vec<FileEntryInfo>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let msg = ShellIpcMessage {
         payload: Some(Payload::ListFolderFilesRequest(ListFolderFilesRequest {
             local_path: local_path.to_string(),
         })),
     };
-    if write_message(&mut stream, &msg).await.is_err() {
-        return Vec::new();
+    write_message(stream, &msg).await.ok()?;
+    match read_message::<ShellIpcMessage>(stream).await {
+        Ok(Some(ShellIpcMessage { payload: Some(Payload::ListFolderFilesResponse(r)) }))
+            if r.snapshot_available =>
+        {
+            Some(
+                r.entries
+                    .into_iter()
+                    .map(|e| FileEntryInfo {
+                        kind: entry_kind_str(e.kind()).to_string(),
+                        relative_path: e.relative_path,
+                        size: e.size,
+                        mtime_unix_nanos: e.mtime_unix_nanos,
+                        materialization_state: materialization_state_str(
+                            MaterializationState::try_from(e.materialization_state)
+                                .unwrap_or(MaterializationState::Unspecified),
+                        )
+                        .to_string(),
+                    })
+                    .collect(),
+            )
+        }
+        _ => None,
     }
-    match read_message::<ShellIpcMessage>(&mut stream).await {
-        Ok(Some(ShellIpcMessage { payload: Some(Payload::ListFolderFilesResponse(r)) })) => r
-            .entries
-            .into_iter()
-            .map(|e| FileEntryInfo {
-                relative_path: e.relative_path,
-                size: e.size,
-                mtime_unix_nanos: e.mtime_unix_nanos,
-                materialization_state: materialization_state_str(
-                    MaterializationState::try_from(e.materialization_state)
-                        .unwrap_or(MaterializationState::Unspecified),
-                )
-                .to_string(),
-            })
-            .collect(),
-        _ => Vec::new(),
+}
+
+#[cfg(test)]
+mod list_folder_files_tests {
+    use super::*;
+
+    async fn respond_with(response: Option<ShellIpcMessage>) -> Option<Vec<FileEntryInfo>> {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            let _ = read_message::<ShellIpcMessage>(&mut server).await;
+            if let Some(response) = response {
+                let _ = write_message(&mut server, &response).await;
+            }
+        });
+        let result = list_folder_files_over(&mut client, "/Users/x/A").await;
+        server_task.await.unwrap();
+        result
+    }
+
+    fn response(relative_paths: &[&str], snapshot_available: bool) -> ShellIpcMessage {
+        ShellIpcMessage {
+            payload: Some(Payload::ListFolderFilesResponse(
+                yadorilink_ipc_proto::shellipc::ListFolderFilesResponse {
+                    entries: relative_paths
+                        .iter()
+                        .map(|p| yadorilink_ipc_proto::shellipc::FolderFileEntry {
+                            relative_path: p.to_string(),
+                            size: 1,
+                            mtime_unix_nanos: 2,
+                            materialization_state: MaterializationState::Placeholder as i32,
+                            placeholder_generation: None,
+                            kind: EntryKind::File as i32,
+                        })
+                        .collect(),
+                    snapshot_available,
+                },
+            )),
+        }
+    }
+
+    fn paths(entries: Option<Vec<FileEntryInfo>>) -> Option<Vec<String>> {
+        entries.map(|e| e.into_iter().map(|e| e.relative_path).collect())
+    }
+
+    #[tokio::test]
+    async fn confirmed_listing_is_some() {
+        let result = respond_with(Some(response(&["a.txt"], true))).await;
+        assert_eq!(paths(result), Some(vec!["a.txt".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn confirmed_empty_listing_is_some_empty() {
+        assert_eq!(paths(respond_with(Some(response(&[], true))).await), Some(vec![]));
+    }
+
+    /// The daemon could not confirm the listing (e.g. a DB read
+    /// failure) — never "the folder is empty".
+    #[tokio::test]
+    async fn unconfirmed_listing_is_none() {
+        assert!(respond_with(Some(response(&[], false))).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn connection_closed_without_a_response_is_none() {
+        assert!(respond_with(None).await.is_none());
+    }
+
+    /// The Swift catalog builds its directory tree from this string, so an
+    /// explicit directory must arrive as `"directory"`, and an unset kind
+    /// as `"file"`.
+    #[tokio::test]
+    async fn every_entry_carries_its_kind() {
+        let mut message = response(&["album", "album/a.txt", "album/latest", "old.txt"], true);
+        let Some(Payload::ListFolderFilesResponse(r)) = &mut message.payload else {
+            unreachable!()
+        };
+        for (entry, kind) in r.entries.iter_mut().zip([
+            EntryKind::Directory,
+            EntryKind::File,
+            EntryKind::Symlink,
+            EntryKind::Unspecified,
+        ]) {
+            entry.kind = kind as i32;
+        }
+        let kinds: Vec<String> =
+            respond_with(Some(message)).await.unwrap().into_iter().map(|e| e.kind).collect();
+        assert_eq!(kinds, ["directory", "file", "symlink", "file"]);
+    }
+
+    #[tokio::test]
+    async fn wrong_payload_type_is_none() {
+        let wrong = ShellIpcMessage {
+            payload: Some(Payload::HydrateResponse(
+                yadorilink_ipc_proto::shellipc::HydrateResponse { ok: false, error: String::new() },
+            )),
+        };
+        assert!(respond_with(Some(wrong)).await.is_none());
     }
 }
 
@@ -509,8 +642,7 @@ pub fn hydrate(path: &str) -> bool {
 }
 
 async fn hydrate_inner(path: &str) -> Result<(), String> {
-    let mut stream =
-        connect().await.map_err(|e| format!("could not reach the daemon: {e}"))?;
+    let mut stream = connect().await.map_err(|e| format!("could not reach the daemon: {e}"))?;
     hydrate_over(&mut stream, path).await
 }
 

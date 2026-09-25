@@ -8,10 +8,15 @@ private signing key:
   1. Ed25519 signature over the exact `manifest_json` bytes verifies under the
      pinned trust-root public key for the envelope's `key_id`.
   2. The body parses and passes field/consistency validation.
+  3. With --artifacts-dir, every entry's artifact exists there under the file
+     name in its artifact_url, and its byte count and SHA-256 equal the
+     entry's artifact_size and artifact_sha256.
 
-The trust root mirrors `crates/yadorilink-daemon/src/update/manifest.rs`
-(`TRUSTED_KEYS`). Pass --public-key-hex/--key-id to check against a specific key
-(e.g. a freshly generated test key); otherwise the pinned key(s) below are used.
+The key to verify against is always explicit: --key-id with --public-key-hex
+(the release key for a release manifest), or --dev-trust-root for the
+development key compiled into non-release builds. There is no default, so a
+release manifest can never be checked against the development key by
+omission.
 
 Requires the `cryptography` package for Ed25519 verification.
 """
@@ -20,14 +25,15 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import importlib.util
 import json
 import sys
 from pathlib import Path
 
-# Mirror of manifest.rs TRUSTED_KEYS (public halves only). Keep in sync with the
-# shipped client; a manifest signed under an unlisted key id is rejected.
-PINNED_TRUSTED_KEYS = {
+# Mirror of the development TRUSTED_KEYS in manifest.rs (public half only),
+# used only with --dev-trust-root.
+DEV_TRUSTED_KEYS = {
     "yadorilink-beta-dev-2026": "00e033f866c263139ff4afd165e75bae3cfca67eb32399dddd6e33a3251af1e3",
 }
 
@@ -81,22 +87,55 @@ def verify(envelope_json: str, trusted: dict[str, str]) -> list[str]:
     return problems
 
 
+def check_artifacts(envelope_json: str, artifacts_dir: Path) -> list[str]:
+    """Compare each entry's artifact_size and artifact_sha256 with the file of
+    the same name in artifacts_dir (the bytes that are about to be published)."""
+    manifest = json.loads(json.loads(envelope_json)["manifest_json"])
+    problems: list[str] = []
+    for i, e in enumerate(manifest.get("releases", [])):
+        where = f"releases[{i}]"
+        name = str(e.get("artifact_url", "")).rsplit("/", 1)[-1]
+        path = artifacts_dir / name
+        if not name or not path.is_file():
+            problems.append(f"{where}: artifact {name!r} not found in {artifacts_dir}")
+            continue
+        data = path.read_bytes()
+        if e.get("artifact_size") != len(data):
+            problems.append(
+                f"{where}.artifact_size {e.get('artifact_size')!r} != {len(data)} bytes in {path}"
+            )
+        digest = hashlib.sha256(data).hexdigest()
+        if e.get("artifact_sha256") != digest:
+            problems.append(f"{where}.artifact_sha256 does not match {path} ({digest})")
+    return problems
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("envelope", help="path to the signed manifest envelope JSON")
-    ap.add_argument("--public-key-hex", default=None, help="override trust root with this public key")
+    ap.add_argument("--public-key-hex", default=None, help="hex Ed25519 public key to verify against")
     ap.add_argument("--key-id", default=None, help="key id for --public-key-hex")
+    ap.add_argument("--dev-trust-root", action="store_true",
+                    help="verify against the development key instead (never for a release manifest)")
+    ap.add_argument("--artifacts-dir", default=None,
+                    help="directory holding the artifacts; check their size and SHA-256 against the manifest")
     args = ap.parse_args(argv)
 
-    if args.public_key_hex:
-        if not args.key_id:
-            print("error: --key-id is required with --public-key-hex", file=sys.stderr)
+    if args.dev_trust_root:
+        if args.public_key_hex or args.key_id:
+            print("error: --dev-trust-root cannot be combined with --key-id/--public-key-hex", file=sys.stderr)
             return 2
+        trusted = DEV_TRUSTED_KEYS
+    elif args.public_key_hex and args.key_id:
         trusted = {args.key_id: args.public_key_hex}
     else:
-        trusted = PINNED_TRUSTED_KEYS
+        print("error: pass --key-id and --public-key-hex (or --dev-trust-root)", file=sys.stderr)
+        return 2
 
-    problems = verify(Path(args.envelope).read_text(encoding="utf-8"), trusted)
+    envelope_json = Path(args.envelope).read_text(encoding="utf-8")
+    problems = verify(envelope_json, trusted)
+    if not problems and args.artifacts_dir:
+        problems = check_artifacts(envelope_json, Path(args.artifacts_dir))
     if problems:
         print(f"manifest verification FAILED for {args.envelope}:", file=sys.stderr)
         for p in problems:

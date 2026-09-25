@@ -1,33 +1,21 @@
-//! `MembershipOperationRepository` owns the `membership_operations` table --
-//! the per-attempt journal for a device-membership mutation (revoke/replace)
-//! that may commit at the coordination worker before this device's local
-//! recovery-scope bookkeeping is confirmed.
-//!
+//! `MembershipOperationRepository` owns the `membership_operations` table
+//! -- the per-attempt journal for a device-membership mutation
+//! (revoke/replace) that may commit at the coordination worker before this
+//! device's local recovery-scope bookkeeping is confirmed.
 //! `recovery_local_snapshot` stays on `SyncState`, untouched: it reads a
 //! SINGLE snapshot across whichever of `links`, `pending_enrollments`,
-//! `enrollment_operations`, `membership_operations`, `role_loss_operations`,
-//! and `durability_unknown_latches` its `RecoveryDomain` needs, all inside
-//! one `Deferred` SQLite transaction -- genuinely cross-cluster (Enrollment/
-//! Membership/RoleLoss/Link, depending on the key's domain), not a single
-//! table this repository (or any other single repository) owns. Moving it
-//! here would mean either reaching into every sibling repository's own
-//! `pool()`/table internals from outside, or duplicating its three
-//! domain-dispatch helpers (`snapshot_enrollment_in_tx`/
-//! `snapshot_membership_in_tx`/`snapshot_role_loss_in_tx`) across repository
-//! boundaries -- out of scope for this commit, and a better fit for a future
-//! cross-repository read/commit-store pass.
-//!
-//! Moved here from `yadorilink-sync-core::repository::membership_operation`
-//! (Phase 7D-9F): its own value types already lived in
-//! `yadorilink_replica_domain::session_state`; the only real blocker was
-//! `scan_all_membership_operations`'s own use of
-//! `crate::recovery::{InvalidRecoveryOperation, RecoveryDomain}`, resolved
-//! by this same pass's relocation of those two types to
-//! `yadorilink_replica_domain::recovery`. `recovery_local_snapshot` stays
-//! behind on `yadorilink_sync_core::index::SyncState` exactly as this
-//! module's own original doc comment above describes -- unaffected by this
-//! move, still genuinely cross-repository/cross-crate now that this
-//! repository itself has relocated.
+//! `enrollment_operations`, `membership_operations`,
+//! `role_loss_operations`, and `durability_unknown_latches` its
+//! `RecoveryDomain` needs, all inside one `Deferred` SQLite transaction --
+//! genuinely cross-cluster (Enrollment/ Membership/RoleLoss/Link,
+//! depending on the key's domain), not a single table this repository (or
+//! any other single repository) owns. Moving it here would mean either
+//! reaching into every sibling repository's own `pool()`/table internals
+//! from outside, or duplicating its three domain-dispatch helpers
+//! (`snapshot_enrollment_in_tx`/
+//! `snapshot_membership_in_tx`/`snapshot_role_loss_in_tx`) across
+//! repository boundaries -- out of scope for this commit, and a better fit
+//! for a future cross-repository read/commit-store pass.
 
 use std::sync::Arc;
 

@@ -1,4 +1,4 @@
-//! M5-A review follow-up: `topology_n_m_w.rs`, `topology_storage_mode_
+//! `topology_n_m_w.rs`, `topology_storage_mode_
 //! safety.rs`, and `topology_pass3_protected_availability.rs` each opened
 //! a real control-socket connection to query/drive a node's own daemon
 //! over the actual wire boundary (the CLI/desktop-facing surface, not

@@ -8,3 +8,6 @@ license.workspace = true
 yadorilink-ipc-proto = { path = "../yadorilink-ipc-proto" }
 prost = "0.14.4"
 thiserror.workspace = true
+
+[lints]
+workspace = true

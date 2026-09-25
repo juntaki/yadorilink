@@ -35,8 +35,8 @@
 # `systemctl --user` units also require "lingering" (`loginctl enable-linger
 # <user>`) if the daemon should keep running after the user logs out of
 # their graphical/terminal session entirely — not enabled by default here,
-# since most users run this while logged in; document as a follow-up for
-# headless/server use if that need comes up.
+# since most users run this while logged in. Enable it for headless/server
+# use.
 
 [Unit]
 Description=YadoriLink sync daemon

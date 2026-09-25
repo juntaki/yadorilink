@@ -12,7 +12,7 @@ use support::{real_entry_names, wait_until_with_context};
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 
 const FILE_COUNT: usize = 200;
 
@@ -45,7 +45,7 @@ async fn many_small_files_survive_initial_sync_and_incremental_update() {
     support::grant_access(&account, &group_id, &device_b_id).await;
 
     let store_dir_a = tempfile::tempdir().unwrap();
-    let store_a = Arc::new(FsBlockStore::new(store_dir_a.path()).unwrap());
+    let store_a = Arc::new(SegmentBlockStore::new(store_dir_a.path()).unwrap());
     let sync_state_a = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
     let state_a = DaemonState::new(device_a_id.clone(), sync_state_a, store_a);
     // Give the device a change-signing key before its link watch starts, so
@@ -54,7 +54,7 @@ async fn many_small_files_survive_initial_sync_and_incremental_update() {
     let root_a = tempfile::tempdir().unwrap();
 
     let store_dir_b = tempfile::tempdir().unwrap();
-    let store_b = Arc::new(FsBlockStore::new(store_dir_b.path()).unwrap());
+    let store_b = Arc::new(SegmentBlockStore::new(store_dir_b.path()).unwrap());
     let sync_state_b = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
     let state_b = DaemonState::new(device_b_id.clone(), sync_state_b, store_b);
     support::ensure_device_signing_key(&state_b);

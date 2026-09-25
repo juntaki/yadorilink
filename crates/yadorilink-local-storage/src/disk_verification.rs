@@ -1,11 +1,6 @@
 //! Pure disk-content verification and headroom-preflight helpers: no SQL,
 //! no port dependency, just filesystem reads/hashing and the free-space
-//! classification this crate already owns. Moved out of
-//! `yadorilink-sync-core`'s `materialization.rs` in Phase 7D-6: needed
-//! directly by `yadorilink-peer-session` production code
-//! (`disk_content_comparison`/`disk_bytes_match_indexed_blocks`/
-//! `intent_target_hash`/`check_disk_headroom`), and by
-//! `materialization.rs`/`root_identity.rs` (staying in sync-core) alike.
+//! classification this crate already owns.
 
 use std::path::Path;
 
@@ -138,3 +133,98 @@ pub fn disk_bytes_match_indexed_blocks(
 ) -> Result<bool, StorageError> {
     Ok(matches!(disk_content_comparison(path, blocks)?, DiskContentComparison::Matched))
 }
+
+/// What one exact object is supposed to be, chosen by the kind its own
+/// version declares -- the input to [`disk_matches_expected_object`].
+#[derive(Debug, Clone, Copy)]
+pub enum ExpectedObject<'a> {
+    /// A regular file holding exactly these blocks, in order, with
+    /// nothing past the last one.
+    File { blocks: &'a [BlockInfo] },
+    /// A symlink whose raw target bytes are exactly these.
+    Symlink { target: Option<&'a [u8]> },
+    /// A directory. Nothing below it is this check's business: the paths
+    /// inside are their own index rows with their own proofs.
+    Directory,
+}
+
+/// Verifies that `path` holds exactly the object `expected` describes,
+/// with the comparison chosen by kind rather than assumed.
+///
+/// [`disk_content_comparison`] answers one question -- "does this regular
+/// file hold these bytes" -- and answers it by `File::open`, which follows
+/// symlinks and cannot read a directory at all. Asking it about a symlink
+/// compares the TARGET's bytes against the link's (empty) block list, so a
+/// correctly restored link to a non-empty file reads as different and a
+/// correctly restored dangling link reads as absent. Asking it about a
+/// directory returns an I/O error from the read. Every one of those is a
+/// wrong answer about a path that is exactly right, and a caller that
+/// treats "not verified" as "must redo the work" acts on it.
+///
+/// Fail-closed throughout: anything that cannot be positively confirmed is
+/// [`DiskContentComparison::PresentButDifferent`], and only a genuine
+/// "nothing is there" is [`DiskContentComparison::Absent`]. The kind check
+/// is `symlink_metadata`, never `metadata`, so a symlink is never mistaken
+/// for whatever it points at.
+pub fn disk_matches_expected_object(
+    path: &Path,
+    expected: ExpectedObject<'_>,
+) -> Result<DiskContentComparison, StorageError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(DiskContentComparison::Absent);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    match expected {
+        ExpectedObject::File { blocks } => {
+            if !metadata.is_file() {
+                return Ok(DiskContentComparison::PresentButDifferent);
+            }
+            disk_content_comparison(path, blocks)
+        }
+        ExpectedObject::Symlink { target } => {
+            if !metadata.is_symlink() {
+                return Ok(DiskContentComparison::PresentButDifferent);
+            }
+            // A version with no recorded target says nothing about what
+            // the link should point at, so nothing on disk can confirm
+            // it -- not even a link that happens to exist.
+            let Some(target) = target else {
+                return Ok(DiskContentComparison::PresentButDifferent);
+            };
+            let actual = match std::fs::read_link(path) {
+                Ok(actual) => actual,
+                // The link is there (`symlink_metadata` succeeded) but its
+                // target cannot be read: unconfirmed, not absent.
+                Err(_) => return Ok(DiskContentComparison::PresentButDifferent),
+            };
+            // `target_to_bytes` is this workspace's one definition of what
+            // a symlink target's captured bytes ARE -- the same conversion
+            // local capture used to record the value being compared
+            // against, and the same one `bytes_to_target` inverts to write
+            // the link. Comparing through anything else here would be a
+            // second, independently-lossy encoding of one thing.
+            Ok(if yadorilink_root_authority::fs_identity::target_to_bytes(&actual) == target {
+                DiskContentComparison::Matched
+            } else {
+                DiskContentComparison::PresentButDifferent
+            })
+        }
+        ExpectedObject::Directory => Ok(if metadata.is_dir() {
+            DiskContentComparison::Matched
+        } else {
+            DiskContentComparison::PresentButDifferent
+        }),
+    }
+}
+
+/// The blind spot [`disk_matches_expected_object`] exists to close: exact
+/// verification used to be `disk_content_comparison` everywhere, which is a
+/// regular-file question wearing a general name. Restore recovery asked it
+/// about symlinks and directories, and got a wrong answer for a path that
+/// was exactly right -- then quarantined the user's correctly restored file
+/// on the strength of it.
+#[cfg(test)]
+mod expected_object_tests;

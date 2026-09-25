@@ -1,9 +1,8 @@
-//! The decisive attribution test for the 2026-09-02 100k acceptance-run
-//! failure: does `is_ancestor`'s cost for a FIXED-size target group's own
-//! history grow as a completely UNRELATED group's history grows? If yes,
-//! that directly proves the un-scoped edge-set query is the mechanism (a
-//! correctly group-scoped query would be indifferent to unrelated-group
-//! size entirely). `#[ignore]`d (prints, not a pass/fail gate) -- run
+//! Group-isolation measurement for `is_ancestor`: does `is_ancestor`'s cost for a FIXED-size target
+//! group's own
+//! history grow as a completely UNRELATED group's history grows? A
+//! correctly group-scoped query is indifferent to unrelated-group size
+//! entirely; an un-scoped edge-set query is not. `#[ignore]`d (prints, not a pass/fail gate) -- run
 //! explicitly with `--ignored --nocapture --test-threads=1`.
 
 use rusqlite::Connection;
@@ -20,8 +19,9 @@ fn seed_linear_chain(conn: &Connection, group_id: &str, seed: u64, n: u64) -> Ve
         h[8..16].copy_from_slice(&i.to_le_bytes());
         let hash = ChangeHash(h);
         tx.execute(
-            "INSERT INTO changes (group_id, change_hash, device_id, lamport, applied, encoded) \
-             VALUES (?1, ?2, 'bench-device', ?3, 1, x'')",
+            "INSERT INTO changes \
+             (group_id, change_hash, device_id, author_seq, lamport, encoded) \
+             VALUES (?1, ?2, 'bench-device', ?3, ?3, x'')",
             rusqlite::params![group_id, &hash.0[..], i as i64 + 1],
         )
         .unwrap();
@@ -38,11 +38,11 @@ fn seed_linear_chain(conn: &Connection, group_id: &str, seed: u64, n: u64) -> Ve
     hashes
 }
 
-/// The pre-fix query shape verbatim (the original `edges(child_hash,
-/// parent_hash) AS (... UNION ...)` CTE, unioning the FULL `change_parents`
+/// The un-scoped query shape (an `edges(child_hash, parent_hash) AS (...
+/// UNION ...)` CTE, unioning the FULL `change_parents`
 /// and `pruned_change_parents` tables up front regardless of group), kept
-/// here only as the RED baseline for this measurement -- `is_ancestor`
-/// itself no longer has this shape.
+/// here only as the baseline for this measurement -- `is_ancestor` itself
+/// does not have this shape.
 fn is_ancestor_old_shape(
     conn: &Connection,
     ancestor: &ChangeHash,
@@ -79,7 +79,7 @@ fn is_ancestor_old_shape_for_a_fixed_target_group_as_an_unrelated_group_grows_re
     let target_immediate_parent = target[(TARGET_SIZE - 2) as usize];
 
     println!(
-        "RED baseline (pre-fix query shape): target group fixed at {TARGET_SIZE} changes; \
+        "Baseline (un-scoped query shape): target group fixed at {TARGET_SIZE} changes; \
          measuring is_ancestor(immediate_parent, newest) for the TARGET group as an UNRELATED \
          group grows"
     );

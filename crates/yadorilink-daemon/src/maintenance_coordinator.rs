@@ -5,12 +5,10 @@
 //! membership recovery, the disk-reconcile backstop, and the idle-triggered
 //! GC scheduler.
 //!
-//! Phase 2B Step 5 (daemon runtime decomposition): this is a relocation of
-//! the SPAWNING CODE out of `DaemonState::new`'s own body into its own
-//! named module -- `DaemonState::new` now calls `start` as a single line
-//! instead of inlining ~200 lines of spawn setup. It is deliberately NOT
-//! yet a relocation of the CALL SITE itself (still invoked from inside
-//! `new`, not from `app.rs`/`DaemonContext` after construction returns):
+//! This module holds the SPAWNING CODE, kept out of `DaemonState::new`'s
+//! own body -- `DaemonState::new` calls `start` as a single line. The
+//! CALL SITE itself stays inside `new` (not in `app.rs`/`DaemonContext`
+//! after construction returns):
 //! `forward_rx` (the local `mpsc::Receiver` half of the change-forwarding
 //! channel `new` constructs) is consumed directly by one of these tasks
 //! and isn't stored anywhere on `DaemonState`, so moving the call site out
@@ -18,21 +16,16 @@
 //! type or storing `forward_rx` behind an `Option`/`Mutex` purely to hand
 //! it back out again -- a real signature change touching every one of
 //! `DaemonState::new`'s call sites (production and every test in this
-//! crate) for no behavioral gain in this step. Left for a later pass, once
-//! `DaemonContext` threading itself (the deferred remainder of Step 1)
-//! is worth doing.
+//! crate) for no behavioral gain.
 //!
-//! Phase 4: 7 of these 10 tasks (#1-3, #6-10 in
-//! `docs/design/phase4-maintenance-inventory.md`'s own table) are now
-//! named job types under `crate::maintenance`, each with a `run_once`
-//! method holding the sweep/check logic that used to be inlined directly
-//! in this file's spawned closures. This module's own remaining job is
+//! Most of these tasks are named job types under `crate::maintenance`,
+//! each with a `run_once` method holding the sweep/check logic. This module's own remaining job is
 //! exactly what its name says: construct each job (deriving its narrow
 //! dependencies from `state`), then spawn a small loop per job that calls
 //! `run_once` -- every loop-shape/interval/supervision-strategy choice
 //! below (`spawn_logged` vs `spawn_restarting`, which jobs run once
-//! immediately at startup, which don't) is unchanged from before this
-//! reorganization; only the sweep bodies moved out to their own files.
+//! immediately at startup, which don't) lives here; the sweep bodies live
+//! in their own files.
 //! `#4` (`convergence-engine-scheduler`) and `#5` (`forward-rebroadcast`)
 //! are untouched -- see each one's own comment below for why.
 //!
@@ -54,21 +47,29 @@ use crate::maintenance::degraded_link_recheck::DegradedLinkRecheckJob;
 use crate::maintenance::disk_reconcile_backstop::DiskReconcileBackstopJob;
 use crate::maintenance::durability_confirmation::DurabilityConfirmationJob;
 use crate::maintenance::gc_idle::GcIdleJob;
-use crate::maintenance::membership_recovery::MembershipRecoveryJob;
+use crate::maintenance::recovery::RecoveryJob;
 use crate::maintenance::retention_expiry::RetentionExpiryJob;
-#[cfg(not(any(madsim, test)))]
+#[cfg(not(test))]
 use crate::maintenance::update_check::UpdateCheckJob;
-use crate::maintenance::MaintenanceTrigger;
 use crate::supervise;
 
 /// Spawns every periodic background maintenance task this daemon runs for
 /// the rest of its life. Called once, synchronously, from
 /// `DaemonState::new` right after `state` itself is fully constructed.
+///
+/// Returns the daemon's single [`RecoveryJob`], so the caller can schedule
+/// the enrollment sweep (which must wait for the coordination-plane config)
+/// through the same owner instead of building a second one.
 pub(crate) fn start(
     state: &Arc<DaemonState>,
     mut forward_rx: mpsc::UnboundedReceiver<(String, FileRecord)>,
-) {
+) -> Arc<RecoveryJob> {
     let controller = Arc::new(LinkRuntimeController::new(state.clone()));
+    // Built once here rather than per sweep: the recovery workflows live in
+    // the application services, which read the daemon's state lazily
+    // through their adapters, so one instance serves the process lifetime.
+    let recovery_job =
+        Arc::new(RecoveryJob::new(&crate::adapters::build_application_services(state.clone())));
     // Periodic background update
     // checks with jitter, honoring `automatic_checks_enabled` (a
     // disabled policy just means this loop's iteration is a no-op,
@@ -79,31 +80,26 @@ pub(crate) fn start(
     // steady-state success interval (`UPDATE_CHECK_INTERVAL`).
     // The periodic update-check scheduler is the daemon's only startup
     // path that performs a real outbound HTTP request (`reqwest`, via
-    // `UpdateManager::check_now`). The deterministic simulator does not
-    // virtualize `reqwest`, and there is no update endpoint to reach
-    // in-sim, so this loop is not spawned there — its absence is inert
-    // (an operator-facing background maintenance task, not part of the
-    // sync data path). Production (`not(madsim)`) is unchanged; the
-    // `UpdateManager` itself is still constructed regardless so
+    // `UpdateManager::check_now`). The `UpdateManager` itself is
+    // constructed regardless of whether this loop runs, so
     // `yadorilink update check` and control-socket requests work.
     // Unit tests construct many short-lived states in one process. Starting
     // a real, immediate HTTP check for each one both leaks work past the
     // test body and can overwrite the update-policy fixture another test
     // is asserting. Integration tests still compile this crate normally,
     // so production-like scheduler coverage remains available there.
-    #[cfg(not(any(madsim, test)))]
+    #[cfg(not(test))]
     {
         let update_check_job = UpdateCheckJob::new(state.update_manager.clone());
         supervise::spawn_logged("daemon-state-update-check-scheduler", async move {
             let mut consecutive_failures: u32 = 0;
-            let mut trigger = MaintenanceTrigger::Startup;
             loop {
                 // Periodic update checks at daemon startup
                 // and on an interval — the startup check runs first
                 // (immediately, no delay), and every subsequent iteration
                 // waits out the jittered steady-state interval, or a
                 // shorter jittered backoff after a failure.
-                match update_check_job.run_once(trigger).await {
+                match update_check_job.run_once().await {
                     None => {}
                     Some(Ok(_)) => consecutive_failures = 0,
                     Some(Err(e)) => {
@@ -111,7 +107,6 @@ pub(crate) fn start(
                         tracing::warn!(error = %e, consecutive_failures, "update check failed");
                     }
                 }
-                trigger = MaintenanceTrigger::Interval;
                 let delay = if consecutive_failures == 0 {
                     supervise::BackoffConfig::UPDATE_CHECK_INTERVAL.next(0)
                 } else {
@@ -160,19 +155,24 @@ pub(crate) fn start(
     // exact wiring (the panic recovers, not just "spawn_restarting works
     // in general") is directly testable -- see that function's own test.
     crate::maintenance::materialization_repair::spawn_materialization_repair_task(state.clone());
-    // M4: durability confirmation sweep -- interval-only, same
-    // fresh-read-each-tick shape as materialization repair above, so
-    // `set_custody_confirmation_sweep_interval` takes effect on the very
+    // Durability confirmation sweep -- interval-only, same
+    // fresh-read-each-tick shape as materialization repair above, so a
+    // changed `DurabilityService` sweep interval takes effect on the very
     // next sleep. This is what turns `group_durability_status`'s `Protected`
     // into real peer-confirmed evidence instead of a local-only heuristic
     // -- see `durability_confirmation::DurabilityConfirmationJob`'s own
     // doc comment.
     {
-        let durability_confirmation_job = DurabilityConfirmationJob::new(state.clone());
+        let durability_confirmation_job = DurabilityConfirmationJob::new(
+            state.durability().clone(),
+            state.authority.clone(),
+            state.peers.clone(),
+            state.replica_coordinator.clone(),
+        );
         supervise::spawn_logged("daemon-state-durability-confirmation", async move {
             loop {
                 tokio::time::sleep(durability_confirmation_job.sweep_interval()).await;
-                durability_confirmation_job.run_once(MaintenanceTrigger::Interval).await;
+                durability_confirmation_job.run_once().await;
             }
         });
     }
@@ -184,15 +184,18 @@ pub(crate) fn start(
     // stop of this one loop halts all materialization for every group
     // for the rest of the daemon's life — `spawn_restarting` is used
     // deliberately so a panic/error here recovers instead of silently
-    // wedging the daemon. Out of Phase 4's own scope (the inventory's
-    // own #4 row): already isolated via `spawn_restarting`, with no
-    // `run_once`/interval shape to extract it into -- left exactly as-is.
+    // wedging the daemon. Already isolated via `spawn_restarting`, with no
+    // `run_once`/interval shape to extract it into.
     {
-        let convergence_state = state.clone();
+        // Built once, outside the restart factory, so the engine's own
+        // rotation cursors survive a panic-restart and reset only with a
+        // new `DaemonState` -- see `ConvergenceEngine`'s own doc comment.
+        let convergence_engine =
+            Arc::new(crate::convergence::engine::ConvergenceEngine::new(state.clone()));
         crate::supervise::spawn_restarting(
             "convergence-engine-scheduler",
             crate::supervise::BackoffConfig::CONVERGENCE_ENGINE,
-            move || crate::convergence::engine::run(convergence_state.clone()),
+            move || crate::convergence::engine::run(convergence_engine.clone()),
         );
     }
     // Every one of `DaemonState`'s own background tasks
@@ -238,7 +241,7 @@ pub(crate) fn start(
         supervise::spawn_logged("daemon-state-degraded-link-recheck", async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                degraded_link_recheck_job.run_once(MaintenanceTrigger::Interval);
+                degraded_link_recheck_job.run_once();
             }
         });
     }
@@ -258,13 +261,13 @@ pub(crate) fn start(
     // spawned loop's own periodic call now go through the same
     // `RetentionExpiryJob::run_once`.
     let retention_expiry_job = RetentionExpiryJob::new(controller.clone());
-    retention_expiry_job.run_once(MaintenanceTrigger::Startup);
+    retention_expiry_job.run_once();
     {
         let retention_expiry_job = retention_expiry_job.clone();
         supervise::spawn_logged("daemon-state-retention-expiry-sweep", async move {
             loop {
                 tokio::time::sleep(RETENTION_EXPIRY_SWEEP_INTERVAL).await;
-                retention_expiry_job.run_once(MaintenanceTrigger::Interval);
+                retention_expiry_job.run_once();
             }
         });
     }
@@ -281,14 +284,25 @@ pub(crate) fn start(
     // the top before its first sleep, rather than a separate blocking
     // call ahead of the spawn -- both that first, immediate sweep and
     // every later periodic one now go through the same
-    // `MembershipRecoveryJob::run_once`.
+    // `RecoveryJob::run_membership_recovery_once`.
     {
-        let membership_recovery_job = MembershipRecoveryJob::new(state.clone());
+        let recovery_job = recovery_job.clone();
+        // Unit tests that plant a journal row and read it back switch this
+        // sweep off (`DaemonState::disable_membership_recovery_sweep_for_test`)
+        // so it cannot race the read.
+        #[cfg(test)]
+        let sweep_state = state.clone();
         supervise::spawn_logged("daemon-state-membership-recovery-sweep", async move {
-            let mut trigger = MaintenanceTrigger::Startup;
             loop {
-                membership_recovery_job.run_once(trigger).await;
-                trigger = MaintenanceTrigger::Interval;
+                #[cfg(test)]
+                let disabled = sweep_state
+                    .membership_recovery_sweep_disabled_for_test
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                #[cfg(not(test))]
+                let disabled = false;
+                if !disabled {
+                    recovery_job.run_membership_recovery_once().await;
+                }
                 tokio::time::sleep(ROLE_LOSS_RECONCILIATION_SWEEP_INTERVAL).await;
             }
         });
@@ -310,7 +324,7 @@ pub(crate) fn start(
                     yadorilink_peer_session::peer_session::DEFAULT_MAINTENANCE_RECONCILE_INTERVAL,
                 )
                 .await;
-                disk_reconcile_backstop_job.run_once(MaintenanceTrigger::Interval).await;
+                disk_reconcile_backstop_job.run_once().await;
             }
         });
     }
@@ -326,8 +340,17 @@ pub(crate) fn start(
         supervise::spawn_logged("daemon-state-gc-idle-scheduler", async move {
             loop {
                 tokio::time::sleep(crate::gc::GC_IDLE_POLL_INTERVAL).await;
-                gc_idle_job.run_once(MaintenanceTrigger::Interval).await;
+                gc_idle_job.run_once().await;
             }
         });
     }
+    recovery_job
+}
+
+/// Runs one role-loss reconciliation pass through the same service the
+/// periodic recovery sweep uses -- for integration tests that need the real
+/// production workflow deterministically, without racing that sweep's own
+/// interval.
+pub async fn run_role_loss_reconciliation_sweep(context: &crate::control_context::ControlContext) {
+    context.application.replica_role.reconcile_role_loss().await;
 }

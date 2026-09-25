@@ -54,12 +54,11 @@ pub(crate) fn init_retention_roots_schema(conn: &Connection) -> Result<(), SyncS
             -- `register_retention_root` itself -- see that function's doc).
             -- `INSERT OR IGNORE` never updates it on a re-registration, so it
             -- is the true first-registration instant for the row's whole
-            -- life. Consumed by an owner's own orphan sweep (e.g.
-            -- `yadorilink-sync-core::retained_obligation::sweep_orphaned_captured_authoring_roots`)
-            -- to bound the window between a root being registered and its
-            -- owning record being created, when the two happen as separate
-            -- steps -- see that function's doc for why age, not just
-            -- presence, is required.
+            -- life. An owner's orphan sweep uses it to bound the window
+            -- between a root being registered and its owning record being
+            -- created, when the two happen as separate steps: age, not mere
+            -- presence, is what distinguishes an in-flight pair from a
+            -- stranded root.
             registered_at_unix_nanos INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (owner_kind, owner_id, group_id, change_hash, retention_class)
         );
@@ -79,19 +78,11 @@ fn now_unix_nanos() -> i64 {
         .unwrap_or(0)
 }
 
-/// Registers that `owner_kind`/`owner_id` requires `change_hash` retained at
-/// `class` in `group_id`. Idempotent: registering the same root twice (the
-/// ordinary case for a long-lived owner re-asserting its roots) is a no-op
-/// past the first call -- including leaving `registered_at_unix_nanos` at
-/// whatever the first call stamped.
-///
-/// Stamps `registered_at_unix_nanos` from the real wall clock rather than
-/// accepting it as a parameter: every existing caller of this function
-/// (`captured_authoring`, `index`) predates the orphan-sweep need for this
-/// column and calls it without a timestamp, and none of them are owned by
-/// this module -- threading a `now_unix_nanos` parameter through their call
-/// sites is out of scope for the table this function owns. This matches the
-/// same non-caller-supplied-clock shape `captured_authoring_receipts.
+/// Registers that `owner_kind`/`owner_id` requires `change_hash` retained
+/// at `class` in `group_id`. Idempotent: registering the same root twice
+/// (the ordinary case for a long-lived owner re-asserting its roots) is a
+/// no-op past the first call -- including leaving
+/// `registered_at_unix_nanos` at whatever the first call stamped.
 /// created_at_unix_nanos` already uses for its own "when was this durable
 /// row first written" column.
 pub fn register_retention_root(
@@ -159,22 +150,17 @@ fn full_payload_root_change_hashes(
     Ok(out)
 }
 
-/// The block-level live set implied by every `full_payload` root registered
-/// for `group_id`: every block hash referenced by a `FileVersion` that a
-/// `full_payload`-rooted change's ops name, resolved through
-/// `change_file_versions`/`file_versions` -- the same tables
+/// The block-level live set implied by every `full_payload` root
+/// registered for `group_id`: every block hash referenced by a
+/// `FileVersion` that a `full_payload`-rooted change's ops name, resolved
+/// through `change_file_versions`/`file_versions` -- the same tables
 /// `serving_authorization_index` already owns and decodes, not a
-/// subsystem-private payload. Meant to be passed as (part of) the
-/// `extra_roots` argument to
-/// `yadorilink-sync-core::index::IndexDb::live_block_hashes_with_extra_roots`, per that
-/// function's own doc comment naming `extra_roots` as the extension point
-/// for exactly this.
-///
-/// A registered root whose change no longer decodes, or whose referenced
-/// version has no retained encoding, is a corrupt-state error, not a silent
-/// skip: a hash was promised full-payload retention, so its content must
-/// still be resolvable, and an unresolvable root would otherwise let GC
-/// silently reclaim blocks something explicitly declared it still needs.
+/// subsystem-private payload. A registered root whose change no longer
+/// decodes, or whose referenced version has no retained encoding, is a
+/// corrupt-state error, not a silent skip: a hash was promised
+/// full-payload retention, so its content must still be resolvable, and an
+/// unresolvable root would otherwise let GC silently reclaim blocks
+/// something explicitly declared it still needs.
 pub fn full_payload_retained_block_hashes(
     conn: &Connection,
     group_id: &str,
@@ -312,353 +298,4 @@ fn block_hashes_of(version: &FileVersion) -> impl Iterator<Item = String> + '_ {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use ed25519_dalek::SigningKey;
-    use yadorilink_replica_domain::change::{Change, ChangeAuth, Op, PutOrigin};
-    use yadorilink_replica_domain::file::RecordKind;
-    use yadorilink_replica_domain::file::{FileMeta, VersionBlock};
-    use yadorilink_replica_domain::ids::{BlockHash, DeviceId, FolderGroupId, SyncPath};
-
-    fn open() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        init_retention_roots_schema(&conn).unwrap();
-        crate::dag_store::init_conflict_copy_provenance_schema(&conn).unwrap();
-        crate::dag_store::init_dag_schema(&conn).unwrap();
-        conn
-    }
-
-    fn signing_key() -> SigningKey {
-        SigningKey::from_bytes(&[7u8; 32])
-    }
-
-    fn make_version(byte: u8) -> FileVersion {
-        let blocks = vec![VersionBlock { hash: BlockHash(vec![byte; 32]), size: 4 }];
-        let meta = FileMeta {
-            mtime_unix_nanos: 1,
-            unix_mode: None,
-            symlink_target: None,
-            record_kind: RecordKind::File,
-            xattrs: Vec::new(),
-        };
-        FileVersion::new(blocks, 4, meta)
-    }
-
-    #[test]
-    fn register_and_release_round_trip() {
-        let conn = open();
-        let hash = ChangeHash([9u8; 32]);
-        register_retention_root(
-            &conn,
-            "materialized_generation",
-            "gen-1",
-            "g",
-            &hash,
-            RetentionClass::FullPayload,
-        )
-        .unwrap();
-        let count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM dag_retention_roots", [], |r| r.get(0)).unwrap();
-        assert_eq!(count, 1);
-        release_retention_root(
-            &conn,
-            "materialized_generation",
-            "gen-1",
-            "g",
-            &hash,
-            RetentionClass::FullPayload,
-        )
-        .unwrap();
-        let count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM dag_retention_roots", [], |r| r.get(0)).unwrap();
-        assert_eq!(count, 0);
-    }
-
-    #[test]
-    fn registering_the_same_root_twice_is_idempotent() {
-        let conn = open();
-        let hash = ChangeHash([9u8; 32]);
-        for _ in 0..3 {
-            register_retention_root(&conn, "k", "id", "g", &hash, RetentionClass::CausalStub)
-                .unwrap();
-        }
-        let count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM dag_retention_roots", [], |r| r.get(0)).unwrap();
-        assert_eq!(count, 1);
-    }
-
-    #[test]
-    fn full_payload_root_resolves_to_its_referenced_block_hashes() {
-        let conn = open();
-        let version = make_version(0xAB);
-        crate::dag_store::put_file_version(&conn, "g", &version).unwrap();
-        let change = Change::create_signed(
-            vec![],
-            0,
-            ChangeAuth::PLACEHOLDER,
-            DeviceId("d1".into()),
-            FolderGroupId("g".into()),
-            vec![Op::Put {
-                path: SyncPath("a.txt".into()),
-                version: version.version_hash,
-                origin: PutOrigin::Direct,
-            }],
-            &signing_key(),
-        );
-        crate::dag_store::admit_change(&conn, &change, false).unwrap();
-        register_retention_root(
-            &conn,
-            "materialized_generation",
-            "gen-1",
-            "g",
-            &change.compute_hash(),
-            RetentionClass::FullPayload,
-        )
-        .unwrap();
-
-        let live = full_payload_retained_block_hashes(&conn, "g").unwrap();
-        assert_eq!(live, HashSet::from([hex::encode([0xABu8; 32])]));
-    }
-
-    #[test]
-    fn a_group_with_no_registered_roots_yields_no_extra_live_blocks() {
-        let conn = open();
-        assert!(full_payload_retained_block_hashes(&conn, "g").unwrap().is_empty());
-    }
-
-    fn emitter(seed: u8) -> crate::dag_store::ChangeEmitter {
-        crate::dag_store::ChangeEmitter::new(
-            format!("device-{seed}"),
-            SigningKey::from_bytes(&[seed; 32]),
-        )
-    }
-
-    fn is_pruned(conn: &Connection, group_id: &str, hash: &ChangeHash) -> bool {
-        conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pruned_changes WHERE group_id = ?1 AND change_hash = ?2)",
-            rusqlite::params![group_id, &hash.0[..]],
-            |r| r.get(0),
-        )
-        .unwrap()
-    }
-
-    /// A two-change chain (`a` parented on nothing, `b` parented on `a`) with
-    /// `a` registered `full_payload` -- a stand-in for `captured_authoring`'s
-    /// own hand-off. A checkpoint whose plan would prune `a` (a real prune
-    /// plan: `b` is the surviving frontier, `a` is strictly below it) must
-    /// leave `a` fully intact -- present in `changes`, absent from
-    /// `pruned_changes` -- proving `commit_prune` honors the root rather than
-    /// deleting `a`'s body regardless. See [`commit_prune`]'s own doc for why
-    /// this is a per-hash skip, not a whole-checkpoint refusal: `b`
-    /// (unrooted, and not even in this checkpoint's `pruned` list to begin
-    /// with) is untouched either way, confirming the checkpoint still
-    /// commits normally around the held root.
-    #[test]
-    fn a_full_payload_rooted_change_survives_a_checkpoint_that_would_prune_it() {
-        let conn = open();
-        let em = emitter(1);
-        let a = crate::dag_store::emit_local_change(
-            &conn,
-            "g",
-            vec![Op::Put {
-                path: SyncPath("a.txt".into()),
-                version: yadorilink_replica_domain::ids::VersionHash([1u8; 32]),
-                origin: PutOrigin::Direct,
-            }],
-            ChangeAuth::PLACEHOLDER,
-            &em,
-        )
-        .unwrap();
-        let a_hash = a.compute_hash();
-        let b = crate::dag_store::emit_local_change(
-            &conn,
-            "g",
-            vec![Op::Put {
-                path: SyncPath("b.txt".into()),
-                version: yadorilink_replica_domain::ids::VersionHash([2u8; 32]),
-                origin: PutOrigin::Direct,
-            }],
-            ChangeAuth::PLACEHOLDER,
-            &em,
-        )
-        .unwrap();
-        let b_hash = b.compute_hash();
-
-        register_retention_root(
-            &conn,
-            "captured_authoring",
-            "retained-1",
-            "g",
-            &a_hash,
-            RetentionClass::FullPayload,
-        )
-        .unwrap();
-
-        // The real plan a compactor would compute: `b` is the maximal
-        // (surviving) frontier, `a` sits strictly below it and would
-        // ordinarily be pruned.
-        let checkpoint = yadorilink_replica_domain::rebootstrap::Checkpoint::new(
-            FolderGroupId("g".into()),
-            vec![b_hash],
-            [0u8; 32],
-        );
-        crate::dag_store::commit_prune(&conn, &checkpoint, &[a_hash]).unwrap();
-
-        assert!(
-            crate::dag_store::has_change(&conn, &a_hash).unwrap(),
-            "rooted change must survive"
-        );
-        assert!(
-            !is_pruned(&conn, "g", &a_hash),
-            "rooted change must not gain a pruned-stub tombstone"
-        );
-        assert!(
-            crate::dag_store::has_change(&conn, &b_hash).unwrap(),
-            "unrelated change is unaffected"
-        );
-    }
-
-    /// The mirror case: once the same root is released, a later checkpoint
-    /// naming the same hash actually prunes it -- proving the skip in
-    /// `commit_prune` is scoped to a live root, not a permanent exemption.
-    #[test]
-    fn a_released_root_no_longer_blocks_pruning_the_same_change() {
-        let conn = open();
-        let em = emitter(2);
-        let a = crate::dag_store::emit_local_change(
-            &conn,
-            "g",
-            vec![Op::Put {
-                path: SyncPath("a.txt".into()),
-                version: yadorilink_replica_domain::ids::VersionHash([3u8; 32]),
-                origin: PutOrigin::Direct,
-            }],
-            ChangeAuth::PLACEHOLDER,
-            &em,
-        )
-        .unwrap();
-        let a_hash = a.compute_hash();
-        let b = crate::dag_store::emit_local_change(
-            &conn,
-            "g",
-            vec![Op::Put {
-                path: SyncPath("b.txt".into()),
-                version: yadorilink_replica_domain::ids::VersionHash([4u8; 32]),
-                origin: PutOrigin::Direct,
-            }],
-            ChangeAuth::PLACEHOLDER,
-            &em,
-        )
-        .unwrap();
-        let b_hash = b.compute_hash();
-
-        register_retention_root(
-            &conn,
-            "captured_authoring",
-            "retained-2",
-            "g",
-            &a_hash,
-            RetentionClass::FullPayload,
-        )
-        .unwrap();
-        let checkpoint_1 = yadorilink_replica_domain::rebootstrap::Checkpoint::new(
-            FolderGroupId("g".into()),
-            vec![b_hash],
-            [0u8; 32],
-        );
-        crate::dag_store::commit_prune(&conn, &checkpoint_1, &[a_hash]).unwrap();
-        assert!(
-            crate::dag_store::has_change(&conn, &a_hash).unwrap(),
-            "still held by the live root"
-        );
-
-        release_retention_root(
-            &conn,
-            "captured_authoring",
-            "retained-2",
-            "g",
-            &a_hash,
-            RetentionClass::FullPayload,
-        )
-        .unwrap();
-        let checkpoint_2 = yadorilink_replica_domain::rebootstrap::Checkpoint::new(
-            FolderGroupId("g".into()),
-            vec![b_hash],
-            [1u8; 32],
-        );
-        crate::dag_store::commit_prune(&conn, &checkpoint_2, &[a_hash]).unwrap();
-
-        assert!(!crate::dag_store::has_change(&conn, &a_hash).unwrap(), "must now prune");
-        assert!(is_pruned(&conn, "g", &a_hash), "must now carry a pruned-stub tombstone");
-    }
-
-    /// [`full_payload_retained_block_hashes_all_groups`] unions roots across
-    /// every group in one pass -- the shape `yadorilink-daemon`'s
-    /// daemon-wide GC sweep needs (one block store shared by every group).
-    /// Two distinct groups each with their own rooted change and distinct
-    /// block content prove neither the union nor the per-group resolution
-    /// (`group_id` threaded correctly into `get_file_version`) is lost.
-    #[test]
-    fn all_groups_block_hashes_unions_roots_across_every_group() {
-        let conn = open();
-        crate::dag_store::init_dag_schema(&conn).unwrap(); // second group's schema is the same tables; idempotent
-        let version_g1 = make_version(0x11);
-        let version_g2 = make_version(0x22);
-        crate::dag_store::put_file_version(&conn, "g1", &version_g1).unwrap();
-        crate::dag_store::put_file_version(&conn, "g2", &version_g2).unwrap();
-
-        let change_g1 = Change::create_signed(
-            vec![],
-            0,
-            ChangeAuth::PLACEHOLDER,
-            DeviceId("d1".into()),
-            FolderGroupId("g1".into()),
-            vec![Op::Put {
-                path: SyncPath("a.txt".into()),
-                version: version_g1.version_hash,
-                origin: PutOrigin::Direct,
-            }],
-            &signing_key(),
-        );
-        let change_g2 = Change::create_signed(
-            vec![],
-            0,
-            ChangeAuth::PLACEHOLDER,
-            DeviceId("d2".into()),
-            FolderGroupId("g2".into()),
-            vec![Op::Put {
-                path: SyncPath("b.txt".into()),
-                version: version_g2.version_hash,
-                origin: PutOrigin::Direct,
-            }],
-            &signing_key(),
-        );
-        crate::dag_store::admit_change(&conn, &change_g1, false).unwrap();
-        crate::dag_store::admit_change(&conn, &change_g2, false).unwrap();
-        register_retention_root(
-            &conn,
-            "captured_authoring",
-            "retained-g1",
-            "g1",
-            &change_g1.compute_hash(),
-            RetentionClass::FullPayload,
-        )
-        .unwrap();
-        register_retention_root(
-            &conn,
-            "captured_authoring",
-            "retained-g2",
-            "g2",
-            &change_g2.compute_hash(),
-            RetentionClass::FullPayload,
-        )
-        .unwrap();
-
-        let live = full_payload_retained_block_hashes_all_groups(&conn).unwrap();
-        assert_eq!(
-            live,
-            HashSet::from([hex::encode([0x11u8; 32]), hex::encode([0x22u8; 32])]),
-            "must include both groups' rooted blocks in one union"
-        );
-    }
-}
+mod tests;

@@ -1,50 +1,33 @@
 //! Canonical writer-set snapshot and deterministic, leaderless election
 //! ranking for background maintenance operations (currently: retroactive
-//! conflict-copy repair) that must be safe to run without ever depending on
-//! one specific device remaining available.
-//!
-//! # Why this needs to be its own module
-//!
-//! The retroactive conflict-copy repair mechanism's planner today elects
-//! only the current winning path head's own author to repair a
-//! late-arriving conflict-copy obligation. If that device is ever
-//! permanently unavailable (removed, revoked, crashed, or simply never
-//! reconnects), nothing else steps in, and the obligation is never resolved
-//! — a real, silent, permanent correctness gap, not just a delay (tracked in
-//! issue #24).
-//!
-//! The fix is not to pick a single deterministic *fallback* device (that
-//! still depends on one device's availability, just a different one, and
-//! still can't tell a genuinely-departed device from one that is merely
-//! slow). It is to make maintenance operations something *any* currently
-//! authorized writer may publish — a cryptographically verifiable, idempotent
-//! fact any replica can check independently — with election reduced to an
-//! optimization that only cuts down on duplicate work, never a correctness
-//! or liveness dependency.
-//!
-//! That requires every replica to compute the *same* writer set from the
-//! *same* signed policy state, and the *same* deterministic ranking over it,
-//! given only public, already-verified inputs (the policy head and the
-//! obligation being repaired) — this module is exactly that shared
-//! computation, kept dependency-light so both `yadorilink-sync-core`
-//! (validates and plans repairs) and `yadorilink-daemon` (owns
-//! `GroupPolicyState`, the signed source of truth for a group's writer set)
-//! can use it without a crate-dependency cycle.
-//!
+//! conflict-copy repair) that must be safe to run without ever depending
+//! on one specific device remaining available. # Why this needs to be its
+//! own module If only the current winning path head's own author could
+//! repair a late-arriving conflict-copy obligation, then once that device
+//! became permanently unavailable (removed, revoked, crashed, or simply
+//! never reconnecting), nothing else would step in and the obligation
+//! would never resolve — a silent, permanent correctness gap, not just a
+//! delay. The answer is not to pick a single deterministic
+//! *fallback* device (that still depends on one device's availability,
+//! just a different one, and still can't tell a genuinely-departed device
+//! from one that is merely slow). It is to make maintenance operations
+//! something *any* currently authorized writer may publish — a
+//! cryptographically verifiable, idempotent fact any replica can check
+//! independently — with election reduced to an optimization that only cuts
+//! down on duplicate work, never a correctness or liveness dependency.
 //! Repair carriers use this ranking only to stagger duplicate work. Every
 //! authorized writer eventually becomes eligible while an obligation's DAG
 //! frontier remains unchanged, so election is never a liveness dependency.
 
 use sha2::{Digest, Sha256};
 
-use yadorilink_replica_domain::change::{ChangeAuth, RepairObligation};
+use yadorilink_replica_domain::change::RepairObligation;
 use yadorilink_replica_domain::ids::{ChangeHash, FolderGroupId, SyncPath};
 
 /// One device this group's signed policy currently (or, for
 /// `GroupPolicyState::writers_at`-style historical queries, as of a given
 /// sequence) grants write access to, together with the signing-key
-/// fingerprint its Grant bound — the same binding `author_was_writer_at`
-/// checks a change's signer against.
+/// fingerprint its Grant bound.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AuthorizedWriter {
     pub device_id: String,
@@ -211,34 +194,38 @@ impl std::fmt::Display for RepairElectionError {
 impl std::error::Error for RepairElectionError {}
 
 /// Bundles one device's view of a single obligation's election: the ranking
-/// it computed (see [`rank_writers_for_obligation`]), the `ChangeAuth` a
-/// repair carrier must be stamped with to be valid against the policy head
-/// that ranking was computed from, and this device's own identity.
+/// it computed (see [`rank_writers_for_obligation`]), the policy head that
+/// ranking was computed from, and this device's own identity.
+///
+/// `expected_policy_head` is NOT an authorization pin -- writer
+/// authorization for the repair carrier itself happens only at checkpoint
+/// issuance, same as any
+/// other Change. It exists purely so the repair transaction can re-check,
+/// immediately before it commits, that the policy this device elected
+/// itself under is still the current one -- a liveness/consistency
+/// re-check for the election, not a security boundary.
 ///
 /// Fields are private and the ranking is always derived internally from
-/// `expected_auth`'s own `policy_head_hash` — never taken as a separate
-/// caller-supplied argument — so it is impossible to construct a context
-/// whose `ranked_writers` was computed against a different policy head than
-/// `expected_auth` names. Carried end-to-end from election through signing
-/// so the repair transaction can re-check, immediately before it commits,
-/// that the policy this device elected itself under is still the current
-/// one.
+/// `expected_policy_head` — never taken as a separate caller-supplied
+/// argument — so it is impossible to construct a context whose
+/// `ranked_writers` was computed against a different policy head than
+/// `expected_policy_head` names.
 #[derive(Debug, Clone)]
 pub struct RepairElectionContext {
-    expected_auth: ChangeAuth,
+    expected_policy_head: [u8; 32],
     local_device_id: String,
     local_key_fingerprint: [u8; 32],
     ranked_writers: Vec<AuthorizedWriter>,
 }
 
 impl RepairElectionContext {
-    /// Ranks `writers` for `obligation` under `expected_auth.policy_head_hash`
-    /// and bundles the result with this device's own identity. Rejects a
+    /// Ranks `writers` for `obligation` under `expected_policy_head` and
+    /// bundles the result with this device's own identity. Rejects a
     /// `writers` set containing a duplicate `device_id` rather than silently
     /// deduplicating it, since a duplicate can only mean the caller passed
     /// something other than a genuine `GroupPolicyState` writer snapshot.
     pub fn new(
-        expected_auth: ChangeAuth,
+        expected_policy_head: [u8; 32],
         obligation: RepairObligationId,
         writers: Vec<AuthorizedWriter>,
         local_device_id: String,
@@ -253,12 +240,12 @@ impl RepairElectionContext {
             }
         }
         let ranked_writers =
-            rank_writers_for_obligation(&expected_auth.policy_head_hash, obligation, &writers);
-        Ok(Self { expected_auth, local_device_id, local_key_fingerprint, ranked_writers })
+            rank_writers_for_obligation(&expected_policy_head, obligation, &writers);
+        Ok(Self { expected_policy_head, local_device_id, local_key_fingerprint, ranked_writers })
     }
 
-    pub fn expected_auth(&self) -> ChangeAuth {
-        self.expected_auth
+    pub fn expected_policy_head(&self) -> [u8; 32] {
+        self.expected_policy_head
     }
 
     pub fn local_device_id(&self) -> &str {
@@ -281,10 +268,11 @@ impl RepairElectionContext {
     /// `device_id` alone: a process presenting the right device_id but a
     /// different signing key than the one the group's policy actually
     /// granted is not the authorized writer, regardless of what it calls
-    /// itself — the same binding `author_was_writer_at` enforces for
-    /// ordinary changes. Final signing still re-checks authorization, but
-    /// this keeps an unauthorized process from even believing it holds
-    /// rank 0 and repeatedly attempting (and failing) the primary's work.
+    /// itself. Checkpoint issuance still re-checks writer status
+    /// independently before the repair carrier's Change can ever become
+    /// externally observable, but this keeps an unauthorized process from
+    /// even believing it holds rank 0 and repeatedly attempting (and
+    /// failing) the primary's work.
     pub fn local_rank(&self) -> Option<usize> {
         self.ranked_writers.iter().position(|writer| {
             writer.device_id == self.local_device_id
@@ -294,217 +282,4 @@ impl RepairElectionContext {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn writer(device_id: &str, fingerprint_byte: u8) -> AuthorizedWriter {
-        AuthorizedWriter {
-            device_id: device_id.to_string(),
-            signing_key_fingerprint: [fingerprint_byte; 32],
-        }
-    }
-
-    fn group(name: &str) -> FolderGroupId {
-        FolderGroupId(name.to_string())
-    }
-
-    fn path(name: &str) -> SyncPath {
-        SyncPath(name.to_string())
-    }
-
-    #[test]
-    fn obligation_id_is_stable_and_distinguishes_its_inputs() {
-        let losing_a = ChangeHash([1u8; 32]);
-        let losing_b = ChangeHash([2u8; 32]);
-        let id = RepairObligationId::compute(&group("group"), &path("path.bin"), &losing_a);
-        assert_eq!(id, RepairObligationId::compute(&group("group"), &path("path.bin"), &losing_a));
-        assert_ne!(
-            id,
-            RepairObligationId::compute(&group("other-group"), &path("path.bin"), &losing_a)
-        );
-        assert_ne!(id, RepairObligationId::compute(&group("group"), &path("other.bin"), &losing_a));
-        assert_ne!(id, RepairObligationId::compute(&group("group"), &path("path.bin"), &losing_b));
-    }
-
-    #[test]
-    fn ranking_is_a_permutation_of_the_input_writers() {
-        let policy_head = [7u8; 32];
-        let obligation =
-            RepairObligationId::compute(&group("group"), &path("path.bin"), &ChangeHash([9u8; 32]));
-        let writers = vec![writer("device-a", 1), writer("device-b", 2), writer("device-c", 3)];
-        let ranked = rank_writers_for_obligation(&policy_head, obligation, &writers);
-        assert_eq!(ranked.len(), writers.len());
-        for w in &writers {
-            assert!(ranked.contains(w));
-        }
-    }
-
-    #[test]
-    fn ranking_is_deterministic_across_independent_calls_and_input_order() {
-        let policy_head = [7u8; 32];
-        let obligation =
-            RepairObligationId::compute(&group("group"), &path("path.bin"), &ChangeHash([9u8; 32]));
-        let writers = vec![writer("device-a", 1), writer("device-b", 2), writer("device-c", 3)];
-        let mut shuffled = writers.clone();
-        shuffled.reverse();
-
-        let ranked_1 = rank_writers_for_obligation(&policy_head, obligation, &writers);
-        let ranked_2 = rank_writers_for_obligation(&policy_head, obligation, &shuffled);
-        assert_eq!(ranked_1, ranked_2, "ranking must not depend on the caller's input order");
-    }
-
-    /// Pins the actual ranking `rank_writers_for_obligation` produces for a
-    /// fixed set of inputs, rather than asserting a property (like "changes
-    /// with policy_head") rendezvous hashing does not actually guarantee for
-    /// an arbitrary pair of inputs. If this ever fails after a genuinely
-    /// intended algorithm change, recompute and update the expected order
-    /// deliberately -- do not "fix" it by loosening the assertion.
-    #[test]
-    fn ranking_matches_a_fixed_reference_vector() {
-        let policy_head = [0x11u8; 32];
-        let obligation = RepairObligationId::compute(
-            &group("group-ref"),
-            &path("ref/path.bin"),
-            &ChangeHash([0x22u8; 32]),
-        );
-        let writers =
-            vec![writer("device-a", 0xAA), writer("device-b", 0xBB), writer("device-c", 0xCC)];
-        let ranked = rank_writers_for_obligation(&policy_head, obligation, &writers);
-        let ranked_ids: Vec<&str> = ranked.iter().map(|w| w.device_id.as_str()).collect();
-        assert_eq!(ranked_ids, vec!["device-b", "device-a", "device-c"]);
-    }
-
-    #[test]
-    fn score_is_bound_to_policy_head() {
-        let obligation =
-            RepairObligationId::compute(&group("group"), &path("path.bin"), &ChangeHash([9u8; 32]));
-        let w = writer("device-a", 1);
-        assert_ne!(
-            election_score(&[1u8; 32], obligation, &w),
-            election_score(&[2u8; 32], obligation, &w)
-        );
-    }
-
-    #[test]
-    fn score_is_bound_to_obligation() {
-        let policy_head = [7u8; 32];
-        let obligation_1 = RepairObligationId::compute(
-            &group("group"),
-            &path("path-1.bin"),
-            &ChangeHash([9u8; 32]),
-        );
-        let obligation_2 = RepairObligationId::compute(
-            &group("group"),
-            &path("path-2.bin"),
-            &ChangeHash([9u8; 32]),
-        );
-        let w = writer("device-a", 1);
-        assert_ne!(
-            election_score(&policy_head, obligation_1, &w),
-            election_score(&policy_head, obligation_2, &w)
-        );
-    }
-
-    #[test]
-    fn score_is_bound_to_writer_identity_and_fingerprint() {
-        let policy_head = [7u8; 32];
-        let obligation =
-            RepairObligationId::compute(&group("group"), &path("path.bin"), &ChangeHash([9u8; 32]));
-        let a = writer("device-a", 1);
-        let b = writer("device-b", 1);
-        let a_other_key = writer("device-a", 2);
-        assert_ne!(
-            election_score(&policy_head, obligation, &a),
-            election_score(&policy_head, obligation, &b),
-            "score must depend on device_id"
-        );
-        assert_ne!(
-            election_score(&policy_head, obligation, &a),
-            election_score(&policy_head, obligation, &a_other_key),
-            "score must depend on the bound signing-key fingerprint, not just device_id"
-        );
-    }
-
-    fn obligation_fixture() -> RepairObligationId {
-        RepairObligationId::compute(&group("group"), &path("path.bin"), &ChangeHash([9u8; 32]))
-    }
-
-    #[test]
-    fn context_new_rejects_a_duplicate_device_id() {
-        let writers = vec![writer("device-a", 1), writer("device-a", 2)];
-        let result = RepairElectionContext::new(
-            ChangeAuth::PLACEHOLDER,
-            obligation_fixture(),
-            writers,
-            "device-a".to_string(),
-            [1u8; 32],
-        );
-        assert_eq!(
-            result.unwrap_err(),
-            RepairElectionError::DuplicateWriter { device_id: "device-a".to_string() }
-        );
-    }
-
-    #[test]
-    fn context_ranks_writers_against_expected_auths_own_policy_head() {
-        let auth = ChangeAuth { auth_seq: 1, auth_epoch: 0, policy_head_hash: [7u8; 32] };
-        let writers = vec![writer("device-a", 1), writer("device-b", 2), writer("device-c", 3)];
-        let context = RepairElectionContext::new(
-            auth,
-            obligation_fixture(),
-            writers.clone(),
-            "device-a".to_string(),
-            [1u8; 32],
-        )
-        .unwrap();
-        assert_eq!(
-            context.ranked_writers(),
-            rank_writers_for_obligation(&auth.policy_head_hash, obligation_fixture(), &writers)
-        );
-        assert_eq!(context.expected_auth(), auth);
-    }
-
-    #[test]
-    fn local_rank_finds_self_among_ranked_writers() {
-        let writers = vec![writer("device-b", 2), writer("device-a", 1), writer("device-c", 3)];
-        let context = RepairElectionContext::new(
-            ChangeAuth::PLACEHOLDER,
-            obligation_fixture(),
-            writers,
-            "device-a".to_string(),
-            [1u8; 32],
-        )
-        .unwrap();
-        assert_eq!(context.ranked_writers()[context.local_rank().unwrap()].device_id, "device-a");
-    }
-
-    #[test]
-    fn local_rank_is_none_when_not_an_authorized_writer() {
-        let context = RepairElectionContext::new(
-            ChangeAuth::PLACEHOLDER,
-            obligation_fixture(),
-            vec![writer("device-a", 1)],
-            "device-z".to_string(),
-            [1u8; 32],
-        )
-        .unwrap();
-        assert_eq!(context.local_rank(), None);
-    }
-
-    /// The liveness gap this whole module exists to close would reopen if a
-    /// process presenting the right device_id but the WRONG signing key
-    /// could still see itself as rank 0 and keep re-attempting a repair it
-    /// isn't actually authorized for.
-    #[test]
-    fn local_rank_is_none_when_device_id_matches_but_fingerprint_differs() {
-        let context = RepairElectionContext::new(
-            ChangeAuth::PLACEHOLDER,
-            obligation_fixture(),
-            vec![writer("device-a", 1)],
-            "device-a".to_string(),
-            [0xFFu8; 32],
-        )
-        .unwrap();
-        assert_eq!(context.local_rank(), None);
-    }
-}
+mod tests;

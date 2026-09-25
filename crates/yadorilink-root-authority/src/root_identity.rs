@@ -1,54 +1,45 @@
-//! Sync-root identity: proving that the directory a scan is about to treat as
-//! authoritative really is the folder this link was established against.
-//!
-//! The failure this exists to prevent: a sync root that lives on a removable or
-//! network volume, unmounted. On every mainstream platform the mountpoint is an
-//! ordinary directory that *survives* the unmount, so every existence check
-//! (`Path::exists`, `fs::metadata`, even `canonicalize`) still succeeds and the
-//! scanner walks a bare, empty directory. A full scan is authoritative by
-//! design, so every indexed file then looks deleted and those deletions
-//! propagate as tombstones to every other device. Unplugging a drive silently
-//! destroys the folder everywhere. An existence check cannot see this, because
-//! the thing that vanished is the *filesystem*, not the path.
-//!
-//! The guard is a marker file ([`ROOT_MARKER_FILE_NAME`]) written inside the
-//! root, naming the group and an opaque per-link `root_token` that is also
-//! persisted in the local `links` table. The marker rides on the same
-//! filesystem as the content, so it disappears exactly when the content does: a
-//! bare mountpoint has no marker, the token cannot be corroborated, and the
-//! check fails closed.
-//!
-//! THE MARKER IS THE AUTHORITY — deliberately, in preference to a filesystem
-//! identity such as `st_dev`. A device number is neither portable across
-//! platforms nor stable across remounts: a USB volume routinely gets a
-//! different `st_dev` on each plug, so an `st_dev` check would reject the very
-//! folder it is meant to protect, on the ordinary happy path. It is recorded in
-//! the marker as a human diagnostic for bug reports and is never compared —
-//! see [`RootMarker::st_dev_hint`].
-//!
-//! `root_token` is an opaque identity nonce, never a digest of the folder's
-//! contents or paths. It answers "is this the same folder I adopted?", a
-//! question whose answer must stay `true` across every legitimate edit to that
-//! folder — so binding it to content would make it self-invalidating. It is
-//! orthogonal to exact-version binding (a change's content hash), which is the
-//! construct for "are these the same bytes".
-//!
-//! # The `RootVerificationStatePort` split (Phase 7D-9B)
-//!
-//! Every constructor below needs two things from the durable index that this
+//! Sync-root identity: proving that the directory a scan is about to treat
+//! as authoritative really is the folder this link was established
+//! against. The failure this exists to prevent: a sync root that lives on
+//! a removable or network volume, unmounted. On every mainstream platform
+//! the mountpoint is an ordinary directory that *survives* the unmount, so
+//! every existence check (`Path::exists`, `fs::metadata`, even
+//! `canonicalize`) still succeeds and the scanner walks a bare, empty
+//! directory. A full scan is authoritative by design, so every indexed
+//! file then looks deleted and those deletions propagate as tombstones to
+//! every other device. Unplugging a drive silently destroys the folder
+//! everywhere. An existence check cannot see this, because the thing that
+//! vanished is the *filesystem*, not the path. The guard is a marker file
+//! ([`ROOT_MARKER_FILE_NAME`]) written inside the root, naming the group
+//! and an opaque per-link `root_token` that is also persisted in the local
+//! `links` table. The marker rides on the same filesystem as the content,
+//! so it disappears exactly when the content does: a bare mountpoint has
+//! no marker, the token cannot be corroborated, and the check fails
+//! closed. THE MARKER IS THE AUTHORITY — deliberately, in preference to a
+//! filesystem identity such as `st_dev`. A device number is neither
+//! portable across platforms nor stable across remounts: a USB volume
+//! routinely gets a different `st_dev` on each plug, so an `st_dev` check
+//! would reject the very folder it is meant to protect, on the ordinary
+//! happy path. It is recorded in the marker as a human diagnostic for bug
+//! reports and is never compared — see [`RootMarker::st_dev_hint`].
+//! `root_token` is an opaque identity nonce, never a digest of the
+//! folder's contents or paths. It answers "is this the same folder I
+//! adopted?", a question whose answer must stay `true` across every
+//! legitimate edit to that folder — so binding it to content would make it
+//! self-invalidating. It is orthogonal to exact-version binding (a
+//! change's content hash), which is the construct for "are these the same
+//! bytes". # The `RootVerificationStatePort` split Every
+//! constructor below needs two things from the durable index that this
 //! crate itself cannot see: "does this group currently have more than one
-//! live link" and "what root token, if any, did this device already persist
-//! for this link" (plus, on the unmarked-adoption path, "does every live
-//! indexed row still corroborate on disk"). [`RootVerificationStatePort`] is
-//! the narrow, semantic port that answers exactly those questions —
-//! deliberately not a generic CRUD surface, and deliberately not folded into
-//! [`VerifiedRoot`] itself: `VerifiedRoot` stays a plain, private-field proof
-//! value with no borrowed state and no trait-object indirection, per this
-//! phase's own non-negotiable constraint (see its own doc below). The
-//! production implementation, `impl RootVerificationStatePort for SyncState`,
-//! stays in `yadorilink-sync-core` for now (moved here as a moved leaf
-//! consumer, not a moved implementation) — `SyncState` itself doesn't leave
-//! that crate until Phase 7D-9F.
+//! live link" and "what root token, if any, did this device already
+//! persist for this link" (plus, on the unmarked-adoption path, "does
+//! every live indexed row still corroborate on disk").
+//! [`RootVerificationStatePort`] is the narrow, semantic port that answers
+//! exactly those questions — deliberately not a generic CRUD surface, and
+//! deliberately not folded into [`VerifiedRoot`] itself: `VerifiedRoot`
+//! stays a plain, private-field proof value with no borrowed state and no
+//! trait-object indirection, per this phase's own non-negotiable
+//! constraint (see its own doc below).
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
@@ -184,11 +175,10 @@ pub trait RootVerificationStatePort: Send + Sync {
 /// forget it: there is no way to name a root to those functions without
 /// producing one of these first.
 ///
-/// **A plain value type, never a trait object or callback** (Phase 7D-9B's own
-/// explicit constraint): the state query this type's constructors need is
+/// **A plain value type, never a trait object or callback**: the state query this type's
+/// constructors need is
 /// factored out to [`RootVerificationStatePort`] instead, so this type itself
-/// stays exactly as narrow as it was before that split — a canonicalized path
-/// and nothing else.
+/// stays exactly as narrow as a canonicalized path and nothing else.
 ///
 /// The guarantee every constructor must uphold, and which any constructor added
 /// later inherits as a requirement rather than an option:
@@ -623,20 +613,4 @@ fn root_identity_mismatch(root: &Path, group_id: &str, why: &str) -> RootAuthori
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The marker is top-level-only, exactly like `.yadorilinkignore`: a
-    /// same-named file a user keeps inside a subdirectory is their content and
-    /// must keep syncing. Zero state dependency, so this one test stays here
-    /// rather than moving to sync-core's integration test alongside the rest
-    /// of this module's (real-`SyncState`-needing) coverage.
-    #[test]
-    fn only_the_top_level_marker_is_recognized() {
-        assert!(is_root_marker_relative_path(".yadorilink-root"));
-        assert!(is_root_marker_relative_path("./.yadorilink-root"));
-        assert!(!is_root_marker_relative_path("nested/.yadorilink-root"));
-        assert!(!is_root_marker_relative_path(".yadorilink-root/inner.txt"));
-        assert!(!is_root_marker_relative_path("notes.txt"));
-    }
-}
+mod tests;

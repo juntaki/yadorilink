@@ -1,6 +1,6 @@
 #![cfg(windows)]
 
-//! M2-3b: the daemon-process side of `dehydrate_server`'s pipe --
+//! The daemon-process side of `dehydrate_server`'s pipe --
 //! `materialization_eviction.rs`'s ONLY way to get a confirmed answer
 //! that a Windows placeholder's local content was actually dehydrated
 //! before it commits the row to `Placeholder` and reclaims blocks. See
@@ -64,7 +64,7 @@ fn runtime() -> &'static Runtime {
 /// implementation actually calls.
 pub fn dehydrate_via_cfapi_host_blocking(
     absolute_path: &str,
-    expected_generation: Option<u64>,
+    expected_generation: u64,
 ) -> Result<(), DehydrateError> {
     runtime().block_on(dehydrate_via_cfapi_host(absolute_path, expected_generation))
 }
@@ -78,9 +78,8 @@ pub fn dehydrate_via_cfapi_host_blocking(
 /// that error (NOT an unconditional rollback to `Hydrated`).
 const DEHYDRATE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// A Codex-review finding caught an earlier version of this doc comment
-/// claiming every variant here means "dehydration did NOT happen" -- false
-/// as written: `dehydrate_server` performs the real
+/// Not every variant here means "dehydration did NOT happen":
+/// `dehydrate_server` performs the real
 /// `CfDehydratePlaceholder` call BEFORE writing its response, so `Io`/
 /// `Timeout` can both occur AFTER that call already succeeded server-side
 /// (a dropped connection, a lost response, a slow driver call racing the
@@ -143,12 +142,11 @@ fn pipe_name() -> String {
 /// process's index has recorded for the file (see
 /// `MaterializationExecutionPort::get_recorded_placeholder_identity`),
 /// passed through unchanged as `DehydrateRequest`'s own defense-in-depth
-/// identity guard -- `None` if this row never had one recorded (a
-/// pre-M2-3a row, or a mismatched provider_kind), in which case
-/// cfapi-host dehydrates unconditionally.
+/// identity guard. cfapi-host always verifies it; there is no
+/// unconditional-dehydrate path.
 pub async fn dehydrate_via_cfapi_host(
     absolute_path: &str,
-    expected_generation: Option<u64>,
+    expected_generation: u64,
 ) -> Result<(), DehydrateError> {
     tokio::time::timeout(DEHYDRATE_TIMEOUT, dehydrate_inner(absolute_path, expected_generation))
         .await
@@ -157,7 +155,7 @@ pub async fn dehydrate_via_cfapi_host(
 
 async fn dehydrate_inner(
     absolute_path: &str,
-    expected_generation: Option<u64>,
+    expected_generation: u64,
 ) -> Result<(), DehydrateError> {
     let mut stream = connect().await.map_err(DehydrateError::Io)?;
     write_message(

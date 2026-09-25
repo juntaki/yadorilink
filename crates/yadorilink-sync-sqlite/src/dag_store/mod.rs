@@ -38,11 +38,15 @@
 //! one of those structures in a single atomic step
 //! ([`admit_change`]/[`emit_local_change`]/[`commit_prune`]).
 
+pub(crate) mod author_chain;
 mod causal_basis;
 mod checkpoint_store;
 mod conflict_authoring;
 mod frontier_index;
 mod orphan_integrity;
+pub(crate) mod path_frontier;
+pub mod published_view;
+mod recursive_operations;
 mod rejected_changes;
 mod retained_history_integrity;
 mod retention_roots;
@@ -50,31 +54,45 @@ mod serving_authorization_index;
 
 pub use causal_basis::{intern_causal_basis, lookup_causal_basis_members};
 pub use checkpoint_store::latest_checkpoint;
+pub(crate) use conflict_authoring::directory_head_changes;
 pub use conflict_authoring::record_conflict_copy_ops_provenance;
 pub use conflict_authoring::{
-    derive_required_conflict_copy_ops, init_conflict_copy_provenance_schema,
-    path_heads_at_frontier, validate_carrier_conflict_copy_ops,
+    derive_required_conflict_copy_ops, derive_required_conflict_copy_ops_including_buried_roots,
+    init_conflict_copy_provenance_schema, path_heads_at_frontier,
+    path_heads_at_frontier_including_buried_roots, validate_carrier_conflict_copy_ops,
 };
 pub use frontier_index::{
     get_device_frontier, group_heads, max_parent_lamport, remove_device_frontier,
     set_device_frontier,
 };
-pub use orphan_integrity::{
-    always_current_writer, defer_all_orphan_promotion, promote_orphans, OrphanPromotionWriterCheck,
-    ORPHAN_BOUND,
+pub use orphan_integrity::{promote_orphans, ORPHAN_BOUND};
+pub(crate) use path_frontier::record_admission as record_path_frontier_admission;
+/// `live_path_heads`/`rebuild_group_path_frontier` are public so the
+/// differential suite can hold the derived index against an independent
+/// re-derivation of the same question -- see
+/// `tests/path_frontier_differential.rs`. `record_path_frontier_admission`
+/// stays crate-visible: it is only correct called from inside an
+/// admission transaction, after that transaction has updated
+/// `group_heads`.
+pub use path_frontier::{
+    has_live_descendant, live_descendant_paths, live_heads_at_level, live_heads_by_path,
+    live_path_heads, rebuild_group as rebuild_group_path_frontier,
+};
+pub use recursive_operations::{
+    check_recursive_operation_part, init_recursive_operations_schema,
+    record_recursive_operation_part, recursive_operation, recursive_operation_of_change,
+    RecordedRecursiveOperation, RecordedRecursivePart, RecursiveOperationCompleteness,
 };
 pub use rejected_changes::list_rejected_changes;
-pub(crate) use rejected_changes::{is_change_rejected, record_rejected_change};
-/// Crate-visible, unlike the reader just above: the one writer of
-/// `change_time_index` outside the admission path itself is
-/// `rebootstrap_store::install_rebootstrap_snapshot`, which replaces a
-/// group's history wholesale rather than extending it and so has to leave
-/// the group with one snapshot describing the frontier it actually
-/// produced. Nothing outside this crate has any business recording one.
-pub(crate) use retained_history_integrity::record_admission_time_index;
+#[cfg(test)]
+pub(crate) use rejected_changes::record_rejected_change;
+pub(crate) use rejected_changes::{
+    current_rejection_domain, current_rules_stamps, is_change_rejected,
+    record_rejected_change_resting_on, RejectionDomain,
+};
 pub use retained_history_integrity::{
     frontier_heads_at_or_before, get_encoded, group_history_paths, has_all_parents, has_change,
-    has_change_or_pruned, is_ancestor, lamport_of, list_unapplied, mark_applied, parents_of,
+    has_change_or_pruned, is_ancestor, lamport_of, parents_of,
 };
 pub use retention_roots::{
     full_payload_retained_block_hashes, full_payload_retained_block_hashes_all_groups,
@@ -83,8 +101,8 @@ pub use retention_roots::{
 pub use serving_authorization_index::sweep_unreferenced_file_versions;
 pub use serving_authorization_index::{
     get_file_version, group_file_version_references_block, group_has_block_provenance,
-    has_file_version, put_file_version, record_compacted_file_version_authorization,
-    record_group_block_provenance,
+    has_file_version, put_file_version, record_group_block_provenance,
+    record_pruned_published_change_version,
 };
 
 use rusqlite::{Connection, OptionalExtension};
@@ -98,19 +116,19 @@ use yadorilink_replica_domain::file::FileVersion;
 
 use crate::error::SyncSqliteError;
 use yadorilink_replica_domain::change::{
-    encoded_op_len, Change, ChangeAuth, ChangePurpose, Op, RepairObligation, MAX_CHANGE_OP_BYTES,
+    encoded_op_len, Change, ChangePurpose, Op, RepairObligation, MAX_CHANGE_OP_BYTES,
 };
-use yadorilink_replica_domain::ids::{ChangeHash, DeviceId, FolderGroupId};
+use yadorilink_replica_domain::ids::{AuthorSeq, ChangeHash, DeviceId, FolderGroupId};
+use yadorilink_replica_domain::recursive_operation::RecursiveOperation;
 
 pub use yadorilink_replica_domain::admission::{
-    AdmitOutcome, AdmitResult, ChangeEmitter, ChangeOrdering,
+    AdmissionRefusal, AdmitOutcome, AdmitResult, AuthorChainRefusal, ChangeEmitter, ChangeOrdering,
+    PathRefusal,
 };
+pub use yadorilink_replica_domain::rebootstrap::HistoryEpoch;
 
-/// The `change_checkpoints` table schema. Duplicated from
-/// `yadorilink-sync-core::compaction::CHECKPOINT_TABLE_MIGRATION` rather than
-/// reached back up for -- this crate sits below sync-core in the dependency
-/// graph (see this crate's own lib.rs doc comment), so it cannot depend on
-/// it. If that schema ever changes, this copy must change with it.
+/// The `change_checkpoints` table schema. If that schema ever changes,
+/// this copy must change with it.
 pub(crate) const CHECKPOINT_TABLE_MIGRATION: &str = "\
 CREATE TABLE IF NOT EXISTS change_checkpoints (
     checkpoint_hash BLOB PRIMARY KEY,
@@ -123,10 +141,6 @@ CREATE INDEX IF NOT EXISTS idx_change_checkpoints_group
     ON change_checkpoints(group_id, seq);
 ";
 
-/// DST-only targeted trace, duplicated from `yadorilink-sync-core::dst_trace`
-/// for the same "this crate sits below sync-core" reason as
-/// [`CHECKPOINT_TABLE_MIGRATION`] above -- see that function's own doc
-/// comment for the full rationale (set `DST_TRACE_PATH=<exact sync path>`).
 fn dst_trace(path: &str, msg: impl FnOnce() -> String) {
     if dst_trace_enabled(path) {
         eprintln!("[DSTTRACE {path}] {}", msg());
@@ -143,81 +157,32 @@ fn dst_trace_enabled(path: &str) -> bool {
     }
 }
 
-/// Creates the DAG tables if they do not exist. New tables only, so — like
-/// the index's own `group_policy_watermark` — a
-/// bare `CREATE TABLE IF NOT EXISTS` is the whole migration.
+/// Creates the DAG tables. There are no migrations here: a database stamped
+/// with an older `SCHEMA_VERSION` is refused at open, so every table this
+/// creates is created in its current shape, once.
+#[allow(clippy::too_many_lines, reason = "one DAG schema-creation sequence, kept in one place")]
 pub fn init_dag_schema(conn: &Connection) -> Result<(), SyncSqliteError> {
-    // v2 keyed versions by hash alone and attached one first-writer group.
-    // Rebuild it with group ownership in the primary key before the regular
-    // idempotent DDL runs. This preserves every existing row while allowing
-    // identical content to be referenced independently by multiple groups.
-    let legacy_file_versions =
-        conn.prepare("PRAGMA table_info(file_versions)").and_then(|mut stmt| {
-            let rows =
-                stmt.query_map([], |row| Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?)))?;
-            rows.collect::<Result<Vec<_>, _>>()
-        })?;
-    if legacy_file_versions.iter().any(|(name, pk)| name == "version_hash" && *pk == 1)
-        && !legacy_file_versions.iter().any(|(name, pk)| name == "group_id" && *pk > 0)
-    {
-        let tx = conn.unchecked_transaction()?;
-        tx.execute_batch(
-            r#"
-            ALTER TABLE file_versions RENAME TO file_versions_v2;
-            CREATE TABLE file_versions (
-                version_hash BLOB NOT NULL,
-                group_id     TEXT NOT NULL,
-                encoded      BLOB NOT NULL,
-                PRIMARY KEY (group_id, version_hash)
-            );
-            INSERT INTO file_versions (version_hash, group_id, encoded)
-                SELECT version_hash, group_id, encoded FROM file_versions_v2;
-            DROP TABLE file_versions_v2;
-            CREATE TABLE IF NOT EXISTS change_file_versions (
-                group_id     TEXT NOT NULL,
-                change_hash  BLOB NOT NULL,
-                version_hash BLOB NOT NULL,
-                PRIMARY KEY (group_id, change_hash, version_hash)
-            );
-            "#,
-        )?;
-
-        // A v2 row recorded only the first group that stored a global
-        // version, even though retained Changes in other groups could
-        // legally reference the same hash. Reconstruct cross-group ownership
-        // from the authoritative retained history in the same transaction as
-        // the shape change itself: missing or corrupt history rolls back the
-        // whole conversion rather than committing a partially-converted,
-        // unusable table shape. (A database that already carries this shape
-        // from an earlier, incomplete conversion — or that lost ownership
-        // some other way, e.g. a promote-then-crash race — never enters this
-        // `if`; it is instead repaired by the unconditional
-        // `retained_history_integrity::repair`/`orphan_integrity::repair` pass
-        // below, which also covers `orphan_changes`.)
-        let admitted_changes: Vec<Vec<u8>> = {
-            let mut stmt = tx.prepare("SELECT encoded FROM changes")?;
-            let rows = stmt.query_map([], |row| row.get(0))?;
-            rows.collect::<Result<_, _>>()?
-        };
-        for encoded in admitted_changes {
-            let change = Change::from_wire_bytes(&encoded).map_err(|error| {
-                SyncSqliteError::CorruptState(format!(
-                    "cannot migrate v2 file versions: retained change is corrupt: {error}"
-                ))
-            })?;
-            serving_authorization_index::repair_change_file_versions(&tx, &change, true)?;
-        }
-        tx.commit()?;
-    }
+    // Admission runs more distinct statements than rusqlite caches by
+    // default; see `STATEMENT_CACHE_CAPACITY`. Pooled connections get this
+    // from the pool, and this covers a connection the store is opened on
+    // directly.
+    conn.set_prepared_statement_cache_capacity(yadorilink_sqlite_runtime::STATEMENT_CACHE_CAPACITY);
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS changes (
             change_hash          BLOB PRIMARY KEY,
             group_id             TEXT NOT NULL,
             device_id            TEXT NOT NULL,
+            -- This change's position in its own author's chain within
+            -- `group_id`: the third component of its causal dot,
+            -- `(group_id, device_id, author_seq)`. A plain column copy of
+            -- the signed field, exactly like `device_id` and `lamport`,
+            -- so an author's next position can be read without decoding
+            -- `encoded`. It counts only this author's own writes, is
+            -- consecutive from 1, and never restarts.
+            author_seq           INTEGER NOT NULL,
             lamport              INTEGER NOT NULL,
             encoded              BLOB NOT NULL,
-            applied              INTEGER NOT NULL DEFAULT 0,
             -- `Change::authenticated_header_encoding()` for this row,
             -- computed once at append time. Retained so a future prune can
             -- hand it straight to `pruned_changes.authenticated_header`
@@ -227,6 +192,17 @@ pub fn init_dag_schema(conn: &Connection) -> Result<(), SyncSqliteError> {
             authenticated_header BLOB NOT NULL DEFAULT X''
         );
         CREATE INDEX IF NOT EXISTS changes_by_group ON changes(group_id);
+        -- Unique, not merely an index. Two different changes at one dot is
+        -- equivocation: the same author claiming two histories at the same
+        -- position, which no merge rule can reconcile and which makes a
+        -- per-author watermark stop deciding what a replica holds.
+        -- Admission refuses it on its own, and this constraint is the last
+        -- place it can be refused -- it holds for every writer of this
+        -- table, including one that has not yet been written. It also
+        -- serves the lookup the emission funnel does before every single
+        -- local edit, which must not cost a scan of the whole group.
+        CREATE UNIQUE INDEX IF NOT EXISTS changes_by_author
+            ON changes(group_id, device_id, author_seq);
 
         CREATE TABLE IF NOT EXISTS change_parents (
             child_hash  BLOB NOT NULL,
@@ -235,6 +211,70 @@ pub fn init_dag_schema(conn: &Connection) -> Result<(), SyncSqliteError> {
         );
         CREATE INDEX IF NOT EXISTS change_parents_by_parent
             ON change_parents(parent_hash);
+
+        CREATE TABLE IF NOT EXISTS authorization_checkpoints (
+            checkpoint_hash BLOB PRIMARY KEY,
+            group_id        TEXT NOT NULL,
+            device_id       TEXT NOT NULL,
+            checkpoint_seq  INTEGER NOT NULL,
+            encoded         BLOB NOT NULL,
+            signature       BLOB NOT NULL,
+            -- The device's raw 32-byte Ed25519 verifying key, carried
+            -- alongside the checkpoint so a fresh device (or one that
+            -- never pinned this author's key locally) can verify history
+            -- from a since-revoked/forgotten author. The daemon
+            -- verifies `SHA256(author_signing_public_key) ==
+            -- signing_key_fingerprint` (implied by `encoded`'s own signed
+            -- content) before ever storing this, so a stored row's key is
+            -- always the one the authority actually vouched for.
+            author_signing_public_key BLOB NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS authorization_checkpoints_by_device
+            ON authorization_checkpoints(group_id, device_id);
+
+        CREATE TABLE IF NOT EXISTS change_authorization (
+            change_hash     BLOB PRIMARY KEY,
+            checkpoint_hash BLOB NOT NULL,
+            merkle_proof    BLOB NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS change_authorization_by_checkpoint
+            ON change_authorization(checkpoint_hash);
+
+        -- Enforced by triggers, not a `REFERENCES` + `PRAGMA foreign_keys`
+        -- pair: `foreign_keys` is a per-CONNECTION setting that, once
+        -- turned on, stays on for that connection's entire remaining
+        -- lifetime (including after the transaction that set it commits)
+        -- -- it is not scoped to one transaction the way an earlier
+        -- revision of this schema assumed. That also means it backstops
+        -- nothing against a DIFFERENT connection (e.g. a pooled one)
+        -- whose own `foreign_keys` setting is still off. A trigger fires
+        -- unconditionally, on every connection, regardless of any pragma
+        -- -- the correct mechanism for an invariant these two tables must
+        -- hold no matter which connection or future writer touches them.
+        CREATE TRIGGER IF NOT EXISTS change_authorization_requires_checkpoint
+        BEFORE INSERT ON change_authorization
+        WHEN NOT EXISTS (
+            SELECT 1 FROM authorization_checkpoints
+            WHERE checkpoint_hash = NEW.checkpoint_hash
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'change_authorization.checkpoint_hash references a checkpoint that does not exist');
+        END;
+
+        -- The reverse direction: a checkpoint must not be deleted while
+        -- any change_authorization row still cites it.
+        -- `authorization_witness_gc` deletes a checkpoint only after the
+        -- last evidence citing it is gone; this trigger holds that order
+        -- for any other deletion path too.
+        CREATE TRIGGER IF NOT EXISTS authorization_checkpoints_protect_referenced
+        BEFORE DELETE ON authorization_checkpoints
+        WHEN EXISTS (
+            SELECT 1 FROM change_authorization
+            WHERE checkpoint_hash = OLD.checkpoint_hash
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'authorization_checkpoints row is still referenced by change_authorization');
+        END;
 
         -- One row per admission EVENT on this device (not per change --
         -- `admission_seq` is this device's own local per-group counter,
@@ -266,7 +306,7 @@ pub fn init_dag_schema(conn: &Connection) -> Result<(), SyncSqliteError> {
         -- group's DAG frontier was, and turning that into "what should
         -- path X contain at T" would need a per-path ancestor walk against
         -- a historical frontier -- exactly the call shape `is_ancestor`'s
-        -- own doc comment documents collapsing at 100k scale. This table
+        -- own doc comment documents as expensive at 100k-file scale. This table
         -- answers a group-level question and stays on that side.
         CREATE TABLE IF NOT EXISTS change_time_index (
             group_id               TEXT NOT NULL,
@@ -311,9 +351,57 @@ pub fn init_dag_schema(conn: &Connection) -> Result<(), SyncSqliteError> {
             device_id    TEXT NOT NULL,
             lamport      INTEGER NOT NULL,
             encoded      BLOB NOT NULL,
-            applied      INTEGER NOT NULL,
-            received_seq INTEGER NOT NULL
+            received_seq INTEGER NOT NULL,
+            -- Whether live admission accepted this Change on the DELIVERING
+            -- PEER's authority (a current writer relaying somebody else's
+            -- already-signed work) rather than on its own author's. A row
+            -- with this set was never subject to an author-freshness
+            -- requirement at receipt, so `orphan_integrity::promote_orphans`
+            -- must not impose one on it at promotion time. Added to an
+            -- `DEFAULT 0` so a row reads as the conservative
+            -- (non-exempt) value it was actually admitted under, and so a
+            -- downgrade to a build that never writes the column still
+            -- inserts a valid row.
+            relay_admitted INTEGER NOT NULL DEFAULT 0,
+            -- WHICH peer's authority that was: the authenticated transport
+            -- identity of the session the Change arrived on. Empty string
+            -- for a row that was not relay-admitted.
+            --
+            -- This column buys nothing at admission time -- the decision is
+            -- already made and recorded in `relay_admitted` -- and exists
+            -- purely so the decision stays auditable afterwards. Promotion
+            -- deliberately does NOT re-check the relay's current role (see
+            -- `promote_orphans`), `ORPHAN_BOUND` bounds this table by ROW
+            -- COUNT globally with no TTL, and eviction only runs on insert
+            -- -- so on a quiet device a vouched row can sit indefinitely and
+            -- promote long after both its author and its voucher were
+            -- revoked. That is a defensible decision (the relay's
+            -- authorization AT RECEIPT is what vouched for the row, and
+            -- re-checking would reintroduce the convergence failure the
+            -- exemption closes) but it is only defensible while an operator
+            -- can still answer "who vouched for this?". Without this column
+            -- that question has no answer at all, which is the part that
+            -- is not defensible.
+            relay_vouched_by TEXT NOT NULL DEFAULT '',
+            -- The previous change of this change's own author, when that is
+            -- what the row is waiting for. NULL when the row is waiting
+            -- only on DAG ancestry (or when the change names no
+            -- predecessor at all, which only a first change may do).
+            --
+            -- Deliberately NOT a `change_parents` edge. That table is DAG
+            -- ancestry and `frontier_index::repair` reads it to decide
+            -- which changes still have children; an author link recorded
+            -- there would drop the author's own tip out of the group heads.
+            -- Author ordering and causality are two relations, and each
+            -- gets its own column.
+            author_prev_hash BLOB
         );
+        -- `promote_orphans` wakes a row whose named author predecessor has
+        -- just been admitted, and `missing_ancestor_frontier` asks the same
+        -- question in reverse; both look a row up by this name, once per
+        -- admitted change.
+        CREATE INDEX IF NOT EXISTS orphan_changes_by_author_prev
+            ON orphan_changes(author_prev_hash);
         -- `insert_orphan`'s own eviction check (`ORDER BY received_seq DESC
         -- LIMIT -1 OFFSET ORPHAN_BOUND`, run on every single insert) has no
         -- other way to avoid a full-table sort every time without this --
@@ -351,18 +439,34 @@ pub fn init_dag_schema(conn: &Connection) -> Result<(), SyncSqliteError> {
             PRIMARY KEY (group_id, block_hash)
         );
 
-        -- A version's `change_file_versions` justification is lost the moment
-        -- its only referencing change is compacted away, even when the
-        -- version itself is still a live (current or retained superseded)
-        -- row in the group's materialized file index. This table is that
-        -- justification's compaction-surviving analog: the re-bootstrap
-        -- snapshot layer records one row per version it re-persisted from
-        -- live index state, so `group_file_version_references_block` never
-        -- has to treat "the admitting change was pruned" as "this device is
-        -- no longer authorized to serve it".
-        CREATE TABLE IF NOT EXISTS compacted_file_version_authorization (
-            group_id     TEXT NOT NULL,
-            version_hash BLOB NOT NULL,
+        -- A version's `change_file_versions` justification is lost the
+        -- moment its only referencing (authoring) change is compacted away
+        -- (`commit_prune` deletes that change's `change_file_versions`
+        -- rows), even when the version itself is still a live (current or
+        -- retained superseded) row in the group's materialized file index,
+        -- AND even though that change's own `change_authorization` row
+        -- (its checkpoint evidence) is deliberately left untouched by
+        -- `commit_prune` (until `authorization_witness_gc` collects it once
+        -- nothing retained names the change) -- the witness model: this table is exactly that lost
+        -- link, version_hash to its
+        -- authoring change_hash, so `published_group_file_version_
+        -- references_block` can still reach the SAME, already-verified
+        -- `change_authorization`/`authorization_checkpoints` rows a live
+        -- change's version would -- replacing the former evidence-FREE
+        -- `compacted_file_version_authorization` (removed), which granted
+        -- block-serving with no evidence at all. A cross-device rebootstrap
+        -- install populates this only after the daemon layer independently
+        -- re-verifies the wire-carried witness evidence
+        -- (`authorization_checkpoint::verify_change_admission`) and
+        -- installs it into `change_authorization`/`authorization_
+        -- checkpoints` via the ordinary `attach_authorization_evidence`
+        -- path first -- this table's mere existence is not itself proof of
+        -- anything, exactly like `change_authorization`'s own trust
+        -- boundary; it is a link, not an evidence store.
+        CREATE TABLE IF NOT EXISTS pruned_published_change_versions (
+            group_id              TEXT NOT NULL,
+            version_hash          BLOB NOT NULL,
+            authoring_change_hash BLOB NOT NULL,
             PRIMARY KEY (group_id, version_hash)
         );
 
@@ -371,30 +475,82 @@ pub fn init_dag_schema(conn: &Connection) -> Result<(), SyncSqliteError> {
         -- `change_hash` alone is the key, matching `changes`'s own PK
         -- shape: a change is content-addressed, so the same hash always
         -- means the same bytes and the same rejection everywhere.
-        -- `rules_version` is `reserved_namespace::RULES_VERSION` at the time
-        -- this row was recorded — see `rejected_changes`'s module doc
+        -- `rejection_domain` names which body of rules produced the
+        -- verdict, and `rules_version` is THAT domain's version at the time
+        -- the row was recorded — see `rejected_changes`'s module doc
         -- comment on why a row is only trusted as a settled verdict while
-        -- its stamped version still matches the rules running right now.
+        -- its stamp still matches its own domain's rules, and why one
+        -- version number for every domain would both strand and needlessly
+        -- re-open verdicts.
         CREATE TABLE IF NOT EXISTS rejected_changes (
-            change_hash   BLOB PRIMARY KEY,
-            group_id      TEXT NOT NULL,
-            reason        TEXT NOT NULL,
-            rejected_at   INTEGER NOT NULL,
-            rules_version INTEGER NOT NULL
+            change_hash      BLOB PRIMARY KEY,
+            group_id         TEXT NOT NULL,
+            reason           TEXT NOT NULL,
+            rejected_at      INTEGER NOT NULL,
+            rejection_domain TEXT NOT NULL,
+            rules_version    INTEGER NOT NULL,
+            -- The refused change this verdict follows from, when it is not
+            -- a verdict on this change's own content: a DAG parent or
+            -- author predecessor that can never be held here. NULL for a
+            -- verdict of its own. The row stands only while that change's
+            -- refusal does -- see `rejected_changes`'s module doc comment.
+            rests_on         BLOB,
+            -- The history this replica was on when it refused the change,
+            -- for a verdict measured against that history (a change written
+            -- on another one): empty for genesis, the base's bytes above
+            -- one. The row stands only while the group is still on it. NULL
+            -- for a verdict that does not depend on the local history.
+            refused_on_epoch BLOB
         );
         CREATE INDEX IF NOT EXISTS rejected_changes_by_group ON rejected_changes(group_id);
         "#,
     )?;
+    author_chain::init_author_chain_schema(conn)?;
     causal_basis::init_causal_basis_schema(conn)?;
+    path_frontier::init_path_frontier_schema(conn)?;
     retention_roots::init_retention_roots_schema(conn)?;
-    // C4-12 Stage 2: this function's own self-heal promotion below (via
-    // `bump_execution_fence_for_promoted`) also bumps the projection-
-    // obligation fence, so that table must exist before it runs too --
-    // same reasoning as `init_filesystem_transaction_schema` immediately
-    // above, and the same harmless-no-op-on-repeat-call shape.
+    recursive_operations::init_recursive_operations_schema(conn)?;
     crate::projection_obligations::init_projection_obligations_schema(conn)?;
-    retained_history_integrity::repair(conn)?;
+    // A path's materialized generation names a causal basis interned in
+    // this schema, and the writers that change what that basis may mean --
+    // local emission, prune, a base install -- live here too and must be
+    // able to retire it in their own transaction. So the table has to
+    // exist wherever the DAG does. Pure `CREATE ... IF NOT EXISTS`.
+    crate::materialized_generation::init_materialized_generation_schema(conn)?;
+    // Written by local capture in the transaction that emits its change, so
+    // it has to exist wherever the DAG does, like the table above.
+    crate::local_capture_provenance::init_local_capture_provenance_schema(conn)?;
+    // Bumps the same per-path mutation fence the table above keeps, in the
+    // same transaction, so it has to exist wherever that one does.
+    crate::structural_origin::init_structural_origin_schema(conn)?;
+    // Also reports any group whose stored path effects no longer match
+    // the changes they were derived from -- checked inside that pass
+    // because it is already decoding every retained change, so the extra
+    // cost is one indexed lookup and one op scan per change rather than a
+    // second decode of the whole history.
+    let effect_mismatches = retained_history_integrity::repair(conn)?;
     orphan_integrity::repair(conn)?;
+    // Before the orphan promotion sweep below, and not after it. Promotion
+    // applies the author-chain rules, and a refusal there is destructive:
+    // the orphan is recorded as permanently rejected and its subtree is
+    // dropped. This rebuild exists precisely for the case where
+    // `author_chain_state` is missing or behind, which is exactly the case
+    // in which a sweep run first would measure every buffered orphan against
+    // a position its author has in fact already passed, refuse each one as a
+    // sequence gap, and destroy it moments before the rebuild that would
+    // have made it admissible.
+    //
+    // One transaction for the whole pass: it only ever raises watermarks, so
+    // a crash part-way through costs nothing but a repeat at the next start,
+    // but there is no reason to leave the window open. Running it first
+    // changes nothing when the state is already current, because
+    // `advance_author_state` never lowers anything and `append_change`
+    // advances the state on every promotion anyway.
+    {
+        let tx = conn.unchecked_transaction()?;
+        author_chain::rebuild_author_chain_state(&tx)?;
+        tx.commit()?;
+    }
     // Self-heal: an orphan whose parent is already durably admitted but that
     // was never promoted (a crash between `append_change` and
     // `promote_orphans`, or an orphan buffered directly out of band) has no
@@ -403,21 +559,10 @@ pub fn init_dag_schema(conn: &Connection) -> Result<(), SyncSqliteError> {
     // the one place a full-buffer sweep is appropriate: it runs once at
     // startup, not once per admission.
     //
-    // `defer_all_orphan_promotion` (not `always_current_writer`) is
-    // deliberate: this runs directly on a freshly-opened connection, before
-    // any daemon-level policy/trust material could possibly have loaded yet
-    // -- there is no one to ask "is this orphan's author still a writer
-    // right now" at this point in startup, and this is exactly the
-    // real-world window that matters: an already-buffered orphan from a
-    // since-downgraded/revoked author, sitting across a restart, must NOT
-    // get promoted here just because no trust material happens to be
-    // loaded yet. Every candidate this sweep would
-    // otherwise have promoted is deferred (left buffered, not dropped) and
-    // gets a genuine second chance, with REAL trust available, once
-    // `yadorilink_daemon::daemon_state::DaemonState::new` has wired the
-    // real check and the first netmap frame verifies a policy chain --
-    // see `ChangeHistoryRepository::resweep_deferred_orphan_promotions`'s
-    // own doc comment for that later call.
+    // Under `AuthorizationCheckpoint` admission, a change's authorization is a static,
+    // content-addressed fact that never goes stale between original
+    // admission and this sweep -- there is no live-trust dependency left
+    // to defer on, so this can promote directly, immediately, at startup.
     let self_heal_seeds = orphan_integrity::already_satisfied_parents(conn)?;
     if !self_heal_seeds.is_empty() {
         // Unlike ordinary admission (whose caller always wraps `admit_change`
@@ -432,11 +577,7 @@ pub fn init_dag_schema(conn: &Connection) -> Result<(), SyncSqliteError> {
         // `admit_change`'s own promotion path never has, since it never runs
         // outside `write_immediate`.
         let tx = conn.unchecked_transaction()?;
-        let self_healed = orphan_integrity::promote_orphans(
-            &tx,
-            &self_heal_seeds,
-            &orphan_integrity::defer_all_orphan_promotion,
-        )?;
+        let self_healed = orphan_integrity::promote_orphans(&tx, &self_heal_seeds)?;
         // Each of these just moved from buffered to durably admitted, on
         // this very connection -- exactly what `admit_change`'s own
         // promotion step does, and it must be fenced the same way: a
@@ -447,75 +588,81 @@ pub fn init_dag_schema(conn: &Connection) -> Result<(), SyncSqliteError> {
         tx.commit()?;
     }
     frontier_index::repair(conn)?;
+    // The normalized path effects and the live path frontier are derived
+    // from retained history, so any group whose derived rows do not hold
+    // up against it is rebuilt from canonical changes -- see
+    // `path_frontier::groups_needing_rebuild` for what "hold up" means
+    // and why a rebuild is the answer to both an absent index and a
+    // damaged one. That rebuild is also the entire migration for a
+    // database that predates these tables: there is no version ladder to
+    // walk, because a replacement never has to reconcile with what it
+    // replaces.
+    //
+    // This runs after `frontier_index::repair` above deliberately: the
+    // rebuild replays admission, and a replay whose starting frontier
+    // disagreed with the repaired one would produce a frontier that
+    // disagrees with `group_heads`. When nothing is wrong -- every
+    // startup after the first -- it costs two indexed queries and no
+    // writes.
+    //
+    // Fails closed. A group whose history cannot be replayed has no safe
+    // reduced service to fall back to: resolving its paths against an
+    // index known to be incomplete would silently report content as
+    // absent, which materialization would then act on.
+    let mut needs_rebuild = path_frontier::groups_needing_rebuild(conn)?;
+    for group_id in effect_mismatches {
+        if !needs_rebuild.contains(&group_id) {
+            needs_rebuild.push(group_id);
+        }
+    }
+    for group_id in needs_rebuild {
+        let tx = conn.unchecked_transaction()?;
+        path_frontier::rebuild_group(&tx, &group_id)?;
+        tx.commit()?;
+    }
     // The checkpoint table is created in the same step as the other DAG
     // tables so the whole change-history schema is provisioned by one call and
     // in one order; the DDL itself is owned by the compaction module, which
     // reads and writes it. Pure `CREATE TABLE/INDEX IF NOT EXISTS`, so this is
     // idempotent on both a fresh and an already-upgraded database.
     conn.execute_batch(crate::dag_store::CHECKPOINT_TABLE_MIGRATION)?;
-    // One-time upgrade migration -- see `bootstrap_obligations_from_
-    // legacy_unapplied_changes`'s own doc comment. Runs after the
-    // self-heal promotion above
-    // so it observes the post-self-heal `applied = 0` set, not stale
-    // pre-self-heal state; gated by its own marker, so this is a cheap
-    // no-op on every startup after the first. Explicit transaction here
-    // (not left to run on the plain autocommit `conn`, same reasoning as
-    // the self-heal block above) so the marker and every backfilled
-    // obligation this pass produces commit atomically or not at all,
-    // matching what that function's own doc comment already claims.
-    let tx = conn.unchecked_transaction()?;
-    crate::projection_obligations::bootstrap_obligations_from_legacy_unapplied_changes(
-        &tx,
-        now_unix_nanos(),
-    )?;
-    tx.commit()?;
+    // The history-base tables belong to the same call, for the same
+    // reason. Admission now measures every incoming change against the
+    // base this group holds, so the row that says which base that is has
+    // to exist wherever the DAG exists -- and reading it must not have to
+    // create it first, which on the admission path would turn a read into
+    // a write. Pure `CREATE ... IF NOT EXISTS`, idempotent with the
+    // re-bootstrap module's own calls.
+    crate::rebootstrap_store::init_rebootstrap_schema(conn)?;
     Ok(())
 }
 
-/// Installs a checkpoint and deletes the pruned prefix, all on the supplied
-/// connection — pass an open transaction so the checkpoint insert and every
-/// delete commit together and a crash can never leave history half-pruned with
-/// no checkpoint to answer ancestry against.
-///
-/// Each pruned hash is removed from `changes`, from `change_parents` as both a
-/// child and a parent (so the retained cut changes become clean roots and an
-/// ancestry walk terminates at the boundary with no dangling edge into deleted
-/// history), and from `group_heads`. The checkpoint frontier changes are *not*
-/// in `pruned`, so they and the live history above them are retained intact.
-///
-/// A hash in `pruned` that currently carries a `full_payload`
-/// [`RetentionClass`] root ([`register_retention_root`]) is skipped entirely
-/// — not deleted, not reduced to a `pruned_changes` stub — per that class's
-/// own contract ("compaction must not even reduce this change to a causal
-/// stub"; see `retention_roots`'s module doc and
-/// `yadorilink-sync-core::captured_authoring`, its first registering owner). This is a
-/// per-hash skip, not a whole-checkpoint refusal: the checkpoint still
-/// commits and every other planned hash still prunes, so one held root can
-/// delay compaction of *its own* change indefinitely without blocking the
-/// rest of the group's history from compacting on schedule. The skipped hash
-/// simply remains an ordinary live row in `changes` — not part of
-/// `checkpoint.frontier`, but no different in shape from any other retained
-/// change; its own already-live parents/children need no adjustment, and
+/// Installs a checkpoint and deletes the pruned prefix, all on the
+/// supplied connection — pass an open transaction so the checkpoint insert
+/// and every delete commit together and a crash can never leave history
+/// half-pruned with no checkpoint to answer ancestry against. Each pruned
+/// hash is removed from `changes`, from `change_parents` as both a child
+/// and a parent (so the retained cut changes become clean roots and an
+/// ancestry walk terminates at the boundary with no dangling edge into
+/// deleted history), and from `group_heads`. The checkpoint frontier
+/// changes are *not* in `pruned`, so they and the live history above them
+/// are retained intact. This is a per-hash skip, not a whole-checkpoint
+/// refusal: the checkpoint still commits and every other planned hash
+/// still prunes, so one held root can delay compaction of *its own* change
+/// indefinitely without blocking the rest of the group's history from
+/// compacting on schedule. The skipped hash simply remains an ordinary
+/// live row in `changes` — not part of `checkpoint.frontier`, but no
+/// different in shape from any other retained change; its own already-live
+/// parents/children need no adjustment, and
 /// `sweep_unreferenced_file_versions` below still observes (and keeps) the
-/// file versions it references, since it re-scans `changes` after this loop
-/// runs, not the `pruned` list this function was given.
-///
-/// This root check is a caller-independent safety net at the one place that
-/// actually deletes change bodies, not merely a planner-side filter: the
-/// planner (`compaction::plan_prune`) has no visibility into
-/// `dag_retention_roots`, so any future or direct caller of this function
-/// gets the same protection `plan_prune` (`yadorilink-sync-core::compaction::plan_prune`)'s
-/// own callers do.
-///
-/// Releasing an orphaned root (one whose registering owner never follows up
-/// to release it — see [`register_retention_root`]'s own idempotency note)
-/// is out of scope here: this function enforces the contract a live root
-/// states, it does not judge whether that root is still wanted. A root that
-/// is never released holds its one change indefinitely; that owner's own
-/// lifecycle (e.g. `yadorilink-sync-core::retained_obligation::delete_if_eligible` for
-/// `captured_authoring`'s roots) is what is expected to call
-/// [`release_retention_root`] once the content it protects is durable
-/// through some other path.
+/// file versions it references, since it re-scans `changes` after this
+/// loop runs, not the `pruned` list this function was given. Releasing an
+/// orphaned root (one whose registering owner never follows up to release
+/// it — see [`register_retention_root`]'s own idempotency note) is out of
+/// scope here: this function enforces the contract a live root states, it
+/// does not judge whether that root is still wanted. A root that is never
+/// released holds its one change indefinitely; that owner's own lifecycle
+/// (e.g.
 pub fn commit_prune(
     conn: &Connection,
     checkpoint: &yadorilink_replica_domain::rebootstrap::Checkpoint,
@@ -559,6 +706,14 @@ pub fn commit_prune(
             "DELETE FROM group_heads WHERE group_id = ?1 AND change_hash = ?2",
             rusqlite::params![group_id, &hash.0[..]],
         )?;
+        // Everything derived for this change goes with it. A path whose
+        // last live head is pruned resolves as untouched -- the same
+        // answer the ancestry walk this index replaced already gave for a
+        // pruned change, which was unreachable from the group's heads and
+        // so never became a candidate. Keeping compaction from pruning
+        // content that is still wanted is `build_compaction_snapshot`'s
+        // job, unchanged by this.
+        path_frontier::forget_change(conn, hash)?;
         removed.insert(*hash);
     }
     // The time index is derived from `group_heads`, so it has to be cut back
@@ -567,6 +722,18 @@ pub fn commit_prune(
     // Skipped hashes (`rooted`) are deliberately not in `removed` -- their
     // bodies are still live, so snapshots naming them stay answerable.
     retained_history_integrity::drop_time_index_snapshots_naming(conn, group_id, &removed)?;
+    // Materialized bases are derived from `group_heads` too, at the moment
+    // each was published, so they can name what this loop just removed. A
+    // local edit is parented on its path's basis, and one parented below
+    // the checkpoint would name history peers starting from it do not hold.
+    if !removed.is_empty() {
+        crate::materialized_generation::forget_group_materialized_generations(
+            conn,
+            group_id,
+            "history-pruned",
+            now_unix_nanos(),
+        )?;
+    }
     // Pruning history can orphan file-version rows: a version referenced only
     // by a now-deleted change can never be materialized again, so it is dead
     // weight. Sweep the group's versions against what its retained changes
@@ -599,7 +766,7 @@ pub(crate) fn op_touched_paths(op: &Op) -> Vec<&str> {
 /// this runs) rather than trusting the caller to have kept the decoded
 /// `Change` around.
 ///
-/// C4-12 Stage 2: bumps `crate::projection_obligations::bump_projection_
+/// Bumps `crate::projection_obligations::bump_projection_
 /// obligations_for_touched_paths` for the touched paths of each promoted
 /// hash's decoded `Change`.
 fn bump_execution_fence_for_promoted(
@@ -609,8 +776,7 @@ fn bump_execution_fence_for_promoted(
     for hash in promoted {
         match describe_hash(conn, hash)? {
             DagHashDisposition::Admitted { change, .. } => {
-                // C4-12 Stage 2 (PROJ-1/2/4): the promoted-orphan seam of the
-                // projection-obligation bump.
+                // The promoted-orphan seam of the projection-obligation bump.
                 let touched: Vec<&str> = change.ops.iter().flat_map(op_touched_paths).collect();
                 if !touched.is_empty() {
                     crate::projection_obligations::bump_projection_obligations_for_touched_paths(
@@ -637,148 +803,527 @@ fn bump_execution_fence_for_promoted(
 /// caller MUST have already run `change::verify_change` — this function
 /// assumes the change is authentic and authorized.
 ///
-/// On `Err(SyncSqliteError::CausalAuthViolation)`, the caller MUST call
-/// [`drop_orphan_subtree_for_rejected_change`] for `change.compute_hash()`
-/// in a SEPARATE, already-committed transaction (i.e. after — not inside —
-/// whatever transaction this call itself ran in), or a buffered descendant
-/// of the rejected change (if any) is left stuck forever, reappearing in
-/// every future `missing_ancestor_frontier` walk. Deliberately not done
-/// inside this function: it takes a plain `&Connection` precisely so a
-/// caller can compose it into a larger transaction, and any mutation made
-/// here would roll back right along with an `Err` return the moment that
-/// enclosing transaction aborts. `ChangeHistoryRepository::dag_admit_change[
-/// _with_versions]` already does this correctly — call one of those instead
-/// of this function directly unless there is a specific reason not to.
+/// Under `AuthorizationCheckpoint` admission, authorization is a static, content-addressed
+/// fact checked once before this function is ever called, never re-checked
+/// here or at promotion time -- so there is no orphan-promotion writer
+/// check and no causal-auth-monotonicity check left in this path; whether a
+/// change applies directly or buffers as an orphan depends purely on
+/// whether its ancestry is structurally complete.
+/// Installs exactly one Change into the canonical DAG and does nothing else.
 ///
-/// Uses [`orphan_integrity::always_current_writer`] for any orphan this
-/// admission's own arrival happens to promote — the permissive default,
-/// correct for every caller that has no revocation-freshness concern of its
-/// own. `ChangeHistoryRepository`'s real remote-admission callers use
-/// [`admit_change_with_orphan_writer_check`] instead, with the real
-/// policy-backed check — see that function's own doc comment.
-pub fn admit_change(
-    conn: &Connection,
-    change: &Change,
-    applied: bool,
-) -> Result<AdmitResult, SyncSqliteError> {
-    admit_change_with_orphan_writer_check(
-        conn,
-        change,
-        applied,
-        &orphan_integrity::always_current_writer,
-    )
+/// This is [`admit_change`] without its orphan promotion. It appends the
+/// Change, updates the indexes and raises the projection obligation for the
+/// paths it touches — and stops. Whatever this Change may have unblocked is
+/// left for its own promotion to handle.
+///
+/// # Why remote admission needs this
+///
+/// `admit_change` finishes by recursively promoting every buffered
+/// `orphan_changes` row the new Change completes. For the old receive path
+/// that is correct: an orphan there was already fully verified on arrival and
+/// only ever lacked ancestry.
+///
+/// It is not correct for promotion out of the verified-change store. A Change
+/// promoted through [`crate::remote_admission`] passes a plan/revalidate
+/// sequence — the local capture fences of every path it touches are read
+/// during planning and required to be unchanged at commit — and a child
+/// swept in by recursive orphan promotion would bypass all of it, being
+/// installed inside someone else's transaction against fences nobody checked.
+/// Every Change must earn its own promotion, so remote admission installs one
+/// Change and wakes the coordinator for the rest.
+///
+/// What [`install_canonical_change_only`] did.
+///
+/// Missing parents are a distinct outcome rather than an error. They mean the
+/// caller's plan went stale — a parent it saw as canonical no longer is — which
+/// is an ordinary re-drive. Returning it as an error would force the caller to
+/// tell "your plan is stale" apart from "the database is inconsistent" by
+/// inspecting an error variant that the append path can also legitimately
+/// produce, and a genuine corruption would then be retried forever as though
+/// it were a race.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum InstallCanonicalOutcome {
+    /// The Change is now canonical, and was not before.
+    Installed,
+    /// The Change was already canonical. Idempotent: a redelivery costs a
+    /// lookup.
+    AlreadyPresent,
+    /// Something the Change names is not canonical yet — one of its DAG
+    /// parents, or the previous change of its own author — so it cannot be
+    /// installed. Nothing was written, and the caller should re-plan rather
+    /// than stop asking.
+    ParentsNotPresent,
+    /// Every parent is canonical and the Change's own author chain refuses
+    /// it. Unlike `ParentsNotPresent` this is not a stale plan: no later
+    /// arrival makes it installable, so the caller must stop asking rather
+    /// than re-plan. Nothing was written.
+    RefusedAuthorChain(AuthorChainRefusal),
+    /// Every parent is canonical and the Change was written on a different
+    /// history than this replica's. Final for the same reason as
+    /// `RefusedAuthorChain`, and separate from it because the remedy is a
+    /// re-bootstrap onto this replica's base rather than anything the
+    /// author's chain could supply.
+    RefusedForeignHistoryBase { local: HistoryEpoch, incoming: HistoryEpoch },
+    /// The Change names a path no replica may store. Final, like the two
+    /// refusals above, and decided before any of them. Nothing was written
+    /// for the Change itself; its durable refusal was.
+    RefusedPath(PathRefusal),
+    /// One of the Change's DAG parents is permanently refused here, so it
+    /// can never be installed. Final, and recorded durably under the rules
+    /// that refused the parent. Distinct from `ParentsNotPresent`, which
+    /// is a stale plan to re-drive.
+    RefusedBehindRejectedParent { parent: ChangeHash },
 }
 
-/// Identical to [`admit_change`], except any orphan this admission's own
-/// arrival happens to promote is additionally gated by `orphan_writer_check`
-/// — see [`orphan_integrity::promote_orphans`]'s own doc comment for why
-/// promotion (not just an orphan's original receipt) must re-check writer
-/// freshness, and [`orphan_integrity::OrphanPromotionWriterCheck`] for what
-/// the callback contracts to answer.
-pub fn admit_change_with_orphan_writer_check(
+impl From<AdmissionRefusal> for InstallCanonicalOutcome {
+    fn from(refusal: AdmissionRefusal) -> Self {
+        match refusal {
+            AdmissionRefusal::AuthorChain(refusal) => Self::RefusedAuthorChain(refusal),
+            AdmissionRefusal::ForeignHistoryBase { local, incoming } => {
+                Self::RefusedForeignHistoryBase { local, incoming }
+            }
+            AdmissionRefusal::BehindRejectedParent { parent } => {
+                Self::RefusedBehindRejectedParent { parent }
+            }
+        }
+    }
+}
+
+pub fn install_canonical_change_only(
     conn: &Connection,
     change: &Change,
-    applied: bool,
-    orphan_writer_check: &orphan_integrity::OrphanPromotionWriterCheck,
-) -> Result<AdmitResult, SyncSqliteError> {
-    if let Err(e) = serving_authorization_index::validate_no_reserved_paths(change) {
-        // Unlike every other admission failure below (a missing referenced
-        // version, an incomplete parent shape — all properties of what this
-        // device has received SO FAR, which change as more of the DAG
-        // arrives), a reserved-namespace collision or a non-portable path
-        // is a fixed property of the change's own signed bytes:
-        // re-admitting the identical change can never produce a different
-        // verdict. Record it durably so
-        // `missing_ancestor_frontier`/`has_change_or_buffered_orphan` stop
-        // treating this hash as merely not-yet-received and a peer stops
-        // being asked for it forever — see `rejected_changes`'s module doc
-        // comment for the retry loop this closes.
-        match &e {
-            SyncSqliteError::ReservedNamespaceCollision(path) => {
-                record_rejected_change(
-                    conn,
-                    &change.compute_hash(),
-                    change.group_id.as_str(),
-                    &format!("reserved namespace collision: {path:?}"),
-                    now_unix_nanos(),
-                )?;
-            }
-            SyncSqliteError::NonPortablePath(path) => {
-                record_rejected_change(
-                    conn,
-                    &change.compute_hash(),
-                    change.group_id.as_str(),
-                    &format!("non-portable path: {path:?}"),
-                    now_unix_nanos(),
-                )?;
-            }
-            _ => {}
+) -> Result<InstallCanonicalOutcome, SyncSqliteError> {
+    if let Some(refusal) = reject_permanently_inadmissible_paths(conn, change)? {
+        return Ok(InstallCanonicalOutcome::RefusedPath(refusal));
+    }
+    // Before the parent shape, as in `admit_change`: a change from another
+    // history is not a change with missing parents, and reporting it as a
+    // stale plan would have it re-planned for as long as it stays staged.
+    if let Some(refusal) = refuse_foreign_history_base(conn, change)? {
+        return Ok(refusal.into());
+    }
+    serving_authorization_index::validate_referenced_versions(conn, change)?;
+
+    if !retained_history_integrity::validate_present_parent_shape(conn, change)? {
+        if let Some(refusal) = refuse_behind_rejected_parent(conn, change)? {
+            return Ok(refusal.into());
         }
-        return Err(e);
+        return Ok(InstallCanonicalOutcome::ParentsNotPresent);
+    }
+    match admission_verdict(conn, change)? {
+        AdmissionVerdict::Admit => {}
+        // Not installable yet for the same reason as a missing parent, and
+        // reported the same way: the change names a previous change of its
+        // own author that is not here. Author ordering is not DAG
+        // causality, so a complete parent set does not imply a complete
+        // author chain, and this is a stale plan rather than a verdict —
+        // re-plan once that change is canonical.
+        AdmissionVerdict::AwaitAuthorPredecessor { .. } => {
+            return Ok(InstallCanonicalOutcome::ParentsNotPresent)
+        }
+        AdmissionVerdict::Refuse(refusal) => return Ok(refusal.into()),
+    }
+
+    match append_structurally_complete_change(conn, change)? {
+        true => Ok(InstallCanonicalOutcome::Installed),
+        false => Ok(InstallCanonicalOutcome::AlreadyPresent),
+    }
+}
+
+/// Records a final admission refusal durably and hands it back unchanged.
+///
+/// Every refusal that reaches here is final by construction: it is a
+/// property of the Change's own signed bytes measured against history this
+/// replica already holds, and no later delivery of anything changes the
+/// answer. Recording it is what makes "final" true in practice rather than
+/// only in the comment. `has_change_or_buffered_orphan` and
+/// `missing_ancestor_frontier` treat a hash as still-missing unless it is
+/// in `changes`, `orphan_changes` or `rejected_changes`, so a refusal that
+/// wrote nothing would be re-requested from a peer at the next heads
+/// exchange, forever, while being refused again each time.
+///
+/// It lives at the verdict itself rather than in each caller because the
+/// callers are the thing that drifted: the staged-bundle path and orphan
+/// promotion each recorded their own refusals while the main remote path
+/// returned one as an ordinary `Ok` and wrote nothing. One place decides
+/// and one place records.
+fn record_final_refusal(
+    conn: &Connection,
+    change: &Change,
+    refusal: AdmissionRefusal,
+    decided_by: RejectionDomain,
+    rests_on: Option<&ChangeHash>,
+) -> Result<AdmissionRefusal, SyncSqliteError> {
+    // A change from another history is foreign only relative to the history
+    // this replica is on now, so that verdict is scoped to it.
+    let refused_on = match &refusal {
+        AdmissionRefusal::ForeignHistoryBase { local, .. } => Some(*local),
+        _ => None,
+    };
+    record_permanent_rejection(
+        conn,
+        change,
+        decided_by,
+        rests_on,
+        refused_on,
+        &format!("admission: {refusal}"),
+    )?;
+    Ok(refusal)
+}
+
+/// The one place a permanent rejection of `change` is persisted, whichever
+/// rule domain decided it: records the verdict under `domain`'s current
+/// rules and releases everything buffered against the rejected hash.
+///
+/// A rejection is also a release. The rejected hash will never enter
+/// retained history, so anything still buffered against it -- a change
+/// that named it as a DAG parent, or one that named it as its own author's
+/// previous change -- is waiting on something that cannot arrive. Left in
+/// the buffer such a row is not merely stale: a buffered hash counts as
+/// known, so no peer is ever asked for it again, and the one name it waits
+/// on is now recorded as rejected and so counted as resolved by
+/// `missing_ancestor_frontier` -- it would sit there with an empty missing
+/// frontier, never promoted, never re-requested and never dropped. That
+/// holds for a change rejected for its paths exactly as for one the author
+/// chain refuses, so the two are not recorded separately.
+///
+/// `rests_on` names the refused change this verdict follows from, when it
+/// is not a verdict on the change's own content: a DAG parent or author
+/// predecessor that can never be held here. The record then stands only
+/// while that change's own refusal does (see `rejected_changes`).
+/// `refused_on` names the local history a verdict was measured against, when
+/// it was; the record then stands only while the group stays on it.
+fn record_permanent_rejection(
+    conn: &Connection,
+    change: &Change,
+    domain: RejectionDomain,
+    rests_on: Option<&ChangeHash>,
+    refused_on: Option<HistoryEpoch>,
+    reason: &str,
+) -> Result<(), SyncSqliteError> {
+    let hash = change.compute_hash();
+    record_rejected_change_resting_on(
+        conn,
+        &hash,
+        change.group_id.as_str(),
+        domain,
+        rests_on,
+        refused_on,
+        reason,
+        now_unix_nanos(),
+    )?;
+    orphan_integrity::drop_orphan_subtree(conn, &hash.0[..])
+}
+
+/// The admission verdict for a Change whose DAG parents are all present:
+/// `None` to admit, `Some` to refuse finally.
+///
+/// A refusal is recorded durably here, by [`record_final_refusal`], before
+/// it is returned. Callers report it; they do not also have to remember to
+/// persist it.
+///
+/// The one place the fixed admission order is expressed, so that every entry
+/// point applying it applies the same one -- ordinary admission, the staged
+/// canonical install, and the promotion of a buffered orphan alike. A Change this replica already
+/// knows short-circuits to `None` before the author chain is consulted at
+/// all: a re-delivery necessarily sits at or below its author's watermark,
+/// so validating it as though it were new would turn ordinary repetition
+/// into a forked-history verdict.
+///
+/// "Already knows" includes a Change this replica admitted and has since
+/// compacted away. It is not new history either, and its own tombstone —
+/// not the author chain — is what has the right answer for it: a replayed
+/// pruned Change must be refused as pruned, which says that this replica
+/// decided about it and moved on, rather than as a forked author history,
+/// which would accuse the author of something it did not do.
+pub(crate) fn admission_verdict(
+    conn: &Connection,
+    change: &Change,
+) -> Result<AdmissionVerdict, SyncSqliteError> {
+    if retained_history_integrity::has_change_or_pruned(
+        conn,
+        change.group_id.as_str(),
+        &change.compute_hash(),
+    )? {
+        return Ok(AdmissionVerdict::Admit);
+    }
+    // The history the change was written on, before anything about its
+    // author is consulted. A change from another history has no position
+    // in THIS history's author chains, so measuring it against them would
+    // answer a question that was never asked -- and would answer it with
+    // an accusation, since a self-consistent old history looks exactly
+    // like an author that forked.
+    //
+    // The change is already known not to be held here, which is the only
+    // thing `foreign_history_base_verdict` asks before comparing epochs, so
+    // only the comparison is repeated.
+    if let Some(refusal) = history_epoch_mismatch(conn, change)? {
+        return Ok(AdmissionVerdict::Refuse(record_foreign_history_base_refusal(
+            conn, change, refusal,
+        )?));
+    }
+    Ok(match author_chain::check_admission(conn, change)? {
+        // The author's chain takes the change; a part of a recursive
+        // operation must also agree with the parts of it this author
+        // already wrote. Asked only now, so the parts it is measured
+        // against are exactly the author's earlier changes.
+        author_chain::AuthorChainVerdict::Admit => {
+            match recursive_operations::recursive_operation_part_refusal(conn, change)? {
+                None => AdmissionVerdict::Admit,
+                Some(refusal) => AdmissionVerdict::Refuse(record_final_refusal(
+                    conn,
+                    change,
+                    AdmissionRefusal::AuthorChain(refusal),
+                    RejectionDomain::AuthorChain,
+                    None,
+                )?),
+            }
+        }
+        author_chain::AuthorChainVerdict::AwaitAuthorPredecessor { named } => {
+            AdmissionVerdict::AwaitAuthorPredecessor { named }
+        }
+        author_chain::AuthorChainVerdict::Refuse(refusal) => {
+            AdmissionVerdict::Refuse(record_final_refusal(
+                conn,
+                change,
+                AdmissionRefusal::AuthorChain(refusal),
+                RejectionDomain::AuthorChain,
+                None,
+            )?)
+        }
+        author_chain::AuthorChainVerdict::RefuseBehindRejectedPredecessor {
+            refusal,
+            decided_by,
+            rests_on,
+        } => AdmissionVerdict::Refuse(record_final_refusal(
+            conn,
+            change,
+            AdmissionRefusal::AuthorChain(refusal),
+            decided_by,
+            Some(&rests_on),
+        )?),
+    })
+}
+
+/// What the full admission rules say about a change whose DAG parents are
+/// all present: store it, hold it, or refuse it finally.
+///
+/// The middle answer exists because author ordering is not DAG causality.
+/// A change names the previous change of its own author, and that change is
+/// routinely not one of its DAG parents — an ordinary local edit is
+/// parented on the basis of the bytes it edited, while its author's latest
+/// write went to some unrelated path. So "every parent is present" does not
+/// imply "this author's previous change is present", and a change that is
+/// merely early must be held rather than refused. See
+/// [`author_chain::check_admission`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AdmissionVerdict {
+    /// Admissible now.
+    Admit,
+    /// The change names a previous change of its own author that this
+    /// replica does not hold. Nothing is decided and nothing is recorded:
+    /// it is buffered against that name, exactly as a change with a missing
+    /// DAG parent is, and the verdict is taken again in full once the named
+    /// change is admitted.
+    AwaitAuthorPredecessor { named: ChangeHash },
+    /// Refused, finally and durably: the refusal is already recorded.
+    Refuse(AdmissionRefusal),
+}
+
+/// Whether this Change was written on a history other than the one this
+/// replica is on.
+///
+/// Decidable from the Change's own signed bytes and this group's installed
+/// base alone — like a reserved-namespace path, and unlike a missing
+/// parent, no later delivery can change the answer. That is why
+/// [`admit_change`] asks it before the ancestry question rather than after:
+/// a whole self-consistent foreign history would otherwise arrive
+/// child-first, fill the bounded orphan buffer on its way to this same
+/// verdict, and evict orphans that were merely early.
+///
+/// A Change this replica already holds is not measured at all. Retained
+/// history spans the base switch that produced it — the frontier bodies an
+/// install writes were authored on the history the base replaced — so
+/// asking this of a re-delivery would report history this device itself
+/// installed as foreign.
+fn foreign_history_base_verdict(
+    conn: &Connection,
+    change: &Change,
+) -> Result<Option<AdmissionRefusal>, SyncSqliteError> {
+    if retained_history_integrity::has_change_or_pruned(
+        conn,
+        change.group_id.as_str(),
+        &change.compute_hash(),
+    )? {
+        return Ok(None);
+    }
+    history_epoch_mismatch(conn, change)
+}
+
+/// The comparison half of [`foreign_history_base_verdict`], for a caller
+/// that has just established the change is not held here.
+fn history_epoch_mismatch(
+    conn: &Connection,
+    change: &Change,
+) -> Result<Option<AdmissionRefusal>, SyncSqliteError> {
+    let local = crate::rebootstrap_store::current_history_epoch(conn, change.group_id.as_str())?;
+    if change.history_epoch == local {
+        return Ok(None);
+    }
+    Ok(Some(AdmissionRefusal::ForeignHistoryBase { local, incoming: change.history_epoch }))
+}
+
+/// Refuses `change`, finally and durably, when it was written on a history
+/// other than the one this replica is on. See
+/// [`foreign_history_base_verdict`] for why every entry point asks this
+/// before it asks anything about the change's ancestry: [`admit_change`],
+/// [`install_canonical_change_only`] and the staged promotion alike.
+pub(crate) fn refuse_foreign_history_base(
+    conn: &Connection,
+    change: &Change,
+) -> Result<Option<AdmissionRefusal>, SyncSqliteError> {
+    let Some(refusal) = foreign_history_base_verdict(conn, change)? else {
+        return Ok(None);
+    };
+    record_foreign_history_base_refusal(conn, change, refusal).map(Some)
+}
+
+fn record_foreign_history_base_refusal(
+    conn: &Connection,
+    change: &Change,
+    refusal: AdmissionRefusal,
+) -> Result<AdmissionRefusal, SyncSqliteError> {
+    // A change from another history is refused for what its author chains
+    // are, not for what paths it names.
+    record_final_refusal(conn, change, refusal, RejectionDomain::AuthorChain, None)
+}
+
+/// The shared body of [`admit_change`]'s structurally-complete arm and
+/// [`install_canonical_change_only`]: everything that installs exactly this
+/// one Change, and nothing that touches any other.
+fn append_structurally_complete_change(
+    conn: &Connection,
+    change: &Change,
+) -> Result<bool, SyncSqliteError> {
+    // A change's `ConflictCopy` puts claim things about its OWN parent
+    // frontier (see `conflict_authoring::validate_carrier_conflict_copy_ops`'s
+    // doc comment) -- only checkable once its parents are confirmed
+    // present, which the caller has just done.
+    conflict_authoring::validate_carrier_conflict_copy_ops(conn, change.group_id.as_str(), change)?;
+    let newly_appended = retained_history_integrity::append_change(conn, change, now_unix_nanos())?;
+    conflict_authoring::record_conflict_copy_ops_provenance(
+        conn,
+        change.group_id.as_str(),
+        change,
+    )?;
+    // Every caller has had `admission_verdict` admit the change, which
+    // refuses a part that contradicts its operation, so this only records.
+    recursive_operations::record_recursive_operation_part(conn, change)?;
+
+    // `append_change` is idempotent -- `false` means this exact hash
+    // was already durably admitted, so this call is a redelivery.
+    // "A Change receipt is not a projection event" must hold
+    // here too, so the bump below is gated on genuine, first-time
+    // appendment.
+    if newly_appended {
+        let touched: Vec<&str> = change.ops.iter().flat_map(op_touched_paths).collect();
+        if !touched.is_empty() {
+            crate::projection_obligations::bump_projection_obligations_for_touched_paths(
+                conn,
+                change.group_id.as_str(),
+                &touched,
+                now_unix_nanos(),
+            )?;
+        }
+    }
+
+    Ok(newly_appended)
+}
+
+/// Refuses a change for a path it names, when it names one no replica may
+/// store: records the refusal durably, so a peer stops being asked for a
+/// Change that can never be admitted, and releases what was buffered
+/// against it (see [`record_permanent_rejection`]). Shared by
+/// [`admit_change`] and [`install_canonical_change_only`].
+///
+/// The refusal comes back as a value, never as an error. Every production
+/// caller runs admission inside a transaction it commits only on `Ok`, so
+/// an error here would roll back the very record and release this function
+/// exists to write, and the refused hash would be re-requested at every
+/// heads exchange while the changes waiting on it stayed held.
+fn reject_permanently_inadmissible_paths(
+    conn: &Connection,
+    change: &Change,
+) -> Result<Option<PathRefusal>, SyncSqliteError> {
+    // Unlike every other admission failure (a missing referenced version,
+    // an incomplete parent shape — all properties of what this device has
+    // received SO FAR, which change as more of the DAG arrives), a
+    // reserved-namespace collision or a non-portable path is a fixed
+    // property of the change's own signed bytes: re-admitting the identical
+    // change can never produce a different verdict. Record it durably so
+    // `missing_ancestor_frontier`/`has_change_or_buffered_orphan` stop
+    // treating this hash as merely not-yet-received — see
+    // `rejected_changes`'s module doc comment for the retry loop this
+    // closes.
+    let refusal = match serving_authorization_index::validate_no_reserved_paths(change) {
+        Ok(()) => return Ok(None),
+        Err(SyncSqliteError::ReservedNamespaceCollision(path)) => {
+            PathRefusal::ReservedNamespaceCollision { path }
+        }
+        Err(SyncSqliteError::NonPortablePath(path)) => PathRefusal::NonPortablePath { path },
+        Err(other) => return Err(other),
+    };
+    record_permanent_rejection(
+        conn,
+        change,
+        RejectionDomain::Path,
+        None,
+        None,
+        &refusal.to_string(),
+    )?;
+    Ok(Some(refusal))
+}
+
+pub fn admit_change(conn: &Connection, change: &Change) -> Result<AdmitResult, SyncSqliteError> {
+    if let Some(refusal) = reject_permanently_inadmissible_paths(conn, change)? {
+        return Ok(AdmitResult {
+            outcome: AdmitOutcome::RefusedPath(refusal),
+            newly_admitted: Vec::new(),
+        });
+    }
+    // Before the ancestry question, for the reason given on
+    // `foreign_history_base_verdict`. `admission_verdict` asks it again
+    // below, so the rule stays expressed in one place for the entry points
+    // that reach it only there.
+    if let Some(refusal) = refuse_foreign_history_base(conn, change)? {
+        return Ok(AdmitResult { outcome: refusal.into(), newly_admitted: Vec::new() });
     }
     serving_authorization_index::validate_referenced_versions(conn, change)?;
     let structurally_complete =
         retained_history_integrity::validate_present_parent_shape(conn, change)?;
-    // Only worth checking once every parent is structurally present --
-    // `check_causal_auth_monotonicity_at_promotion` needs each parent's own
-    // coordinate, which is meaningless to look up for a parent that isn't
-    // even there yet (that case already routes to the orphan branch below
-    // regardless of what this returns).
-    let causal_check = if structurally_complete {
-        retained_history_integrity::check_causal_auth_monotonicity_at_promotion(conn, change)?
-    } else {
-        retained_history_integrity::CausalAuthCheck::Unresolvable
-    };
-    match (structurally_complete, causal_check) {
-        (true, retained_history_integrity::CausalAuthCheck::Verified) => {
-            // A change's `ConflictCopy` puts claim things about its OWN parent
-            // frontier (see `conflict_authoring::validate_carrier_conflict_copy_ops`'s
-            // doc comment) -- only checkable once its parents are confirmed
-            // present, which `validate_present_parent_shape` above just did.
-            conflict_authoring::validate_carrier_conflict_copy_ops(
-                conn,
-                change.group_id.as_str(),
-                change,
-            )?;
-            let newly_appended =
-                retained_history_integrity::append_change(conn, change, applied, now_unix_nanos())?;
-            conflict_authoring::record_conflict_copy_ops_provenance(
-                conn,
-                change.group_id.as_str(),
-                change,
-            )?;
-            // `append_change` is idempotent -- `false` means this exact hash
-            // was already durably admitted (its `changes` row already
-            // existed), so this call is itself a redelivery reaching
-            // `admit_change` directly rather than being filtered upstream
-            // (the ordinary production path: `handle_change_batch`'s own
-            // `dag_has_change` fast-path never calls this far for a hash it
-            // already has). PROJ-1 ("a Change receipt is not a projection
-            // event") must hold here too, not only at the upstream filter --
-            // the bump below is therefore gated on genuine, first-time
-            // appendment, not merely on reaching this arm.
-            if newly_appended {
-                // C4-12 Stage 2 (PROJ-1/2/4): the primary-admission seam of the
-                // projection-obligation bump. Runs inside this call's own
-                // transaction (the caller's `write_immediate` for remote
-                // admission), so a crash here leaves neither the change nor
-                // its obligation bump committed.
-                let touched: Vec<&str> = change.ops.iter().flat_map(op_touched_paths).collect();
-                if !touched.is_empty() {
-                    crate::projection_obligations::bump_projection_obligations_for_touched_paths(
-                        conn,
-                        change.group_id.as_str(),
-                        &touched,
-                        now_unix_nanos(),
-                    )?;
+    match structurally_complete {
+        true => {
+            match admission_verdict(conn, change)? {
+                AdmissionVerdict::Admit => {}
+                // Complete ancestry, but the author's own previous change
+                // is not here. Held, not refused: author ordering is not
+                // DAG causality, so an author's previous change need not be
+                // an ancestor of this one and can still be in flight. See
+                // `buffer_as_orphan`.
+                AdmissionVerdict::AwaitAuthorPredecessor { .. } => {
+                    buffer_as_orphan(conn, change)?;
+                    return Ok(AdmitResult {
+                        outcome: AdmitOutcome::Orphaned,
+                        newly_admitted: Vec::new(),
+                    });
+                }
+                AdmissionVerdict::Refuse(refusal) => {
+                    return Ok(AdmitResult { outcome: refusal.into(), newly_admitted: Vec::new() })
                 }
             }
-            // The current change lands first, then any orphans its arrival
-            // unblocked. All of them became durable in this call, so the caller
-            // must project and gate every one — return the full set in append
-            // order (current change first).
+            append_structurally_complete_change(conn, change)?;
             let hash = change.compute_hash();
-            let promoted = orphan_integrity::promote_orphans(conn, &[hash], orphan_writer_check)?;
+            let promoted = orphan_integrity::promote_orphans(conn, &[hash])?;
             // Every orphan `promote_orphans` just promoted also just moved the
             // desired state, exactly like the primary change above -- fence out
             // any plan built on the paths its own ops touch too.
@@ -790,101 +1335,77 @@ pub fn admit_change_with_orphan_writer_check(
             newly_admitted.extend(promoted);
             Ok(AdmitResult { outcome: AdmitOutcome::Applied, newly_admitted })
         }
-        (true, retained_history_integrity::CausalAuthCheck::Violated) => {
-            // Permanent and provable -- this change pins an authorization
-            // coordinate older than one of its own causal parents', the
-            // revoked-writer-replay attack `4175e8cd` closed. Deliberately
-            // NOT recorded into `rejected_changes`: that table's permanence
-            // is scoped to `reserved_namespace::RULES_VERSION` (see
-            // `is_change_rejected`'s own doc comment) and re-opens for
-            // re-evaluation whenever those unrelated rules change --
-            // reusing it here would tie an unrelated invariant's
-            // permanence to this one. Matches `check_causal_auth_
-            // monotonicity`'s pre-existing `Rejected` outcome, which never
-            // recorded rejection durably either: re-delivery re-evaluates
-            // the same pure function of the change's own bytes and its
-            // (now-resolvable) parent coordinate, and rejects it again
-            // identically every time.
-            //
-            // Deliberately does NOT clean up any buffered descendant of
-            // this hash here (Codex-caught follow-up to the P1 this
-            // function's own cascade-drop already fixes for `promote_
-            // orphans`): `admit_change` runs inside its caller's own
-            // `write_immediate` transaction, which commits only on `Ok` --
-            // any mutation made here would be rolled back right along with
-            // this `Err`, silently undone. `CausalAuthViolation` is a
-            // distinct error variant specifically so `ChangeHistoryRepository
-            // ::dag_admit_change[_with_versions]` can recognize this exact
-            // case and re-run that cleanup in its OWN, separate, already-
-            // committed transaction afterward -- see those methods' own doc
-            // comments.
-            Err(SyncSqliteError::CausalAuthViolation)
-        }
-        _ => {
-            // Covers two cases: the parent is genuinely, structurally
-            // missing (the ordinary orphan case), or it is structurally
-            // present (live or pruned) but its own causal-auth coordinate
-            // isn't resolvable yet (a pruned parent with no retained
-            // checkpoint-boundary record) -- fail closed for the latter
-            // exactly as `4175e8cd` intended for "missing or unreadable,"
-            // rather than admit on trust. Either way, buffer and retry once
-            // more of the DAG arrives.
-            let hash = change.compute_hash();
-            for parent in &change.parents {
-                conn.execute(
-                    "INSERT OR IGNORE INTO change_parents (child_hash, parent_hash) VALUES (?1, ?2)",
-                    rusqlite::params![&hash.0[..], &parent.0[..]],
-                )?;
+        false => {
+            if let Some(refusal) = refuse_behind_rejected_parent(conn, change)? {
+                return Ok(AdmitResult { outcome: refusal.into(), newly_admitted: Vec::new() });
             }
-            orphan_integrity::insert_orphan(conn, change, applied)?;
+            // The parent is structurally missing -- buffer and retry once
+            // more of the DAG arrives.
+            buffer_as_orphan(conn, change)?;
             Ok(AdmitResult { outcome: AdmitOutcome::Orphaned, newly_admitted: Vec::new() })
         }
     }
 }
 
-/// Re-attempts promotion for every orphan whose parent is already durably
-/// admitted, gated by `writer_check` -- the deferred-promotion counterpart to
-/// `init_dag_schema`'s startup self-heal sweep, which unconditionally defers
-/// every candidate (`orphan_integrity::defer_all_orphan_promotion`) because it
-/// runs before any daemon-level trust material could possibly be loaded. A
-/// row that sweep deferred has no future admission event to re-seed a
-/// promotion pass for it — ordinary admission (`admit_change`) only ever
-/// seeds from the change it just admitted — so something must explicitly
-/// give deferred rows a second look once real trust becomes available. See
-/// `ChangeHistoryRepository::resweep_deferred_orphan_promotions`'s own doc
-/// comment for the daemon-side call that triggers this.
+/// Refuses a change one of whose DAG parents is permanently refused here,
+/// recording the refusal under the rule domain that refused that parent.
 ///
-/// Bumps the execution fence for whatever gets promoted, exactly like
-/// `admit_change`'s own promotion step and `init_dag_schema`'s self-heal
-/// sweep — a change that just became durable must never leave a plan built
-/// against its paths unfenced.
-pub fn resweep_deferred_orphan_promotions(
+/// Asked before the change would be buffered for a missing parent, and by
+/// staged promotion before it would report a stale plan. Buffering would
+/// wait on a name that can never arrive, and one nothing would ask for
+/// either: a refused hash counts as resolved in `missing_ancestor_frontier`
+/// and a buffered one as known in `has_change_or_buffered_orphan`. The row
+/// would sit in the bounded buffer until evicted. A staged copy is worse
+/// off still: it stays possessed, and so is never asked for again, while
+/// never becoming canonical. Refusing the parent released such a change
+/// once, but a peer still holding it sends it again, and a child can also
+/// arrive for the first time after its parent was refused.
+///
+/// The DAG-parent counterpart of refusing a sequence gap behind a refused
+/// author predecessor, and recorded the same way: it stands exactly as long
+/// as the parent's refusal does. It is stamped with that refusal's domain,
+/// so it is re-opened when those rules move, and it names the parent, so it
+/// also lapses if the parent's own verdict stops standing for any other
+/// reason. A parent this replica holds is never a reason to refuse, whatever
+/// a stale row says about it.
+pub(crate) fn refuse_behind_rejected_parent(
     conn: &Connection,
-    writer_check: &orphan_integrity::OrphanPromotionWriterCheck,
-) -> Result<Vec<ChangeHash>, SyncSqliteError> {
-    let seeds = orphan_integrity::already_satisfied_parents(conn)?;
-    if seeds.is_empty() {
-        return Ok(Vec::new());
+    change: &Change,
+) -> Result<Option<AdmissionRefusal>, SyncSqliteError> {
+    for parent in &change.parents {
+        if retained_history_integrity::has_change_or_pruned(conn, change.group_id.as_str(), parent)?
+        {
+            continue;
+        }
+        if let Some(decided_by) = current_rejection_domain(conn, parent)? {
+            let refusal = AdmissionRefusal::BehindRejectedParent { parent: *parent };
+            return record_final_refusal(conn, change, refusal, decided_by, Some(parent)).map(Some);
+        }
     }
-    let promoted = orphan_integrity::promote_orphans(conn, &seeds, writer_check)?;
-    bump_execution_fence_for_promoted(conn, &promoted)?;
-    Ok(promoted)
+    Ok(None)
 }
 
-/// `orphan_integrity` is private to this module -- this is the public seam
-/// onto its `drop_orphan_subtree`, for a caller's own follow-up cleanup
-/// after `admit_change` returns `Err(SyncSqliteError::CausalAuthViolation)`
-/// (see that function's own doc comment for why this can't just happen
-/// inside `admit_change` itself, and why it must be called, in a separate
-/// transaction, by every direct caller of `admit_change` -- not just
-/// `ChangeHistoryRepository::dag_admit_change[_with_versions]`, which is
-/// the only one that exists in this codebase today but not the only one
-/// `admit_change`'s own `pub` visibility permits).
-pub fn drop_orphan_subtree_for_rejected_change(
-    conn: &Connection,
-    change_hash: &ChangeHash,
-) -> Result<(), SyncSqliteError> {
-    orphan_integrity::drop_orphan_subtree(conn, &change_hash.0)
+/// Holds a change that names something this replica does not have yet — a
+/// DAG parent, or its own author's previous change — and records the names
+/// it is waiting on so a later admission can wake it.
+///
+/// The author link is recorded on the orphan row itself (`author_prev_hash`)
+/// rather than as a `change_parents` edge, and that placement is the point:
+/// `change_parents` is DAG ancestry, and `frontier_index::repair` reads it
+/// to decide which changes still have children. An author link written
+/// there would make the author's own tip look like it had a child and drop
+/// it out of the group heads, which is exactly the conflation this
+/// separation exists to prevent.
+fn buffer_as_orphan(conn: &Connection, change: &Change) -> Result<(), SyncSqliteError> {
+    let hash = change.compute_hash();
+    for parent in &change.parents {
+        conn.execute(
+            "INSERT OR IGNORE INTO change_parents (child_hash, parent_hash) VALUES (?1, ?2)",
+            rusqlite::params![&hash.0[..], &parent.0[..]],
+        )?;
+    }
+    orphan_integrity::insert_orphan(conn, change)?;
+    Ok(())
 }
 
 /// Whether a change is already known locally — either durably admitted,
@@ -989,14 +1510,29 @@ pub fn missing_ancestor_frontier(
         if is_change_rejected(conn, &hash)? {
             continue;
         }
-        let is_buffered: Option<i64> = conn
-            .query_row("SELECT 1 FROM orphan_changes WHERE change_hash = ?1", [&hash.0[..]], |r| {
-                r.get(0)
-            })
+        let buffered: Option<Option<Vec<u8>>> = conn
+            .query_row(
+                "SELECT author_prev_hash FROM orphan_changes WHERE change_hash = ?1",
+                [&hash.0[..]],
+                |r| r.get(0),
+            )
             .optional()?;
-        if is_buffered.is_none() {
+        let Some(author_prev) = buffered else {
             missing.push(hash);
             continue;
+        };
+        // A buffered row may be waiting on its author's previous change
+        // rather than on any DAG parent, and that change is a hash no
+        // parent walk would ever reach: author ordering is not ancestry.
+        // Without this the row would sit in the buffer forever — counted as
+        // "already known" by `has_change_or_buffered_orphan`, so never
+        // re-sent — while the one change that could release it was never
+        // asked for.
+        if let Some(author_prev) = author_prev {
+            let author_prev = retained_history_integrity::hash_from_blob(author_prev)?;
+            if visited.insert(author_prev) {
+                queue.push_back(author_prev);
+            }
         }
         let parents: Vec<Vec<u8>> = {
             let mut stmt =
@@ -1020,10 +1556,8 @@ pub fn missing_ancestor_frontier(
 /// dumping raw tables. Never consulted by any production sync path.
 #[derive(Debug, Clone, Default)]
 pub struct GroupDagDiagnostics {
-    /// Rows in `changes` for this group (durably admitted, applied or not).
+    /// Rows in `changes` for this group.
     pub admitted_total: u64,
-    /// Admitted changes whose path projection has not succeeded yet.
-    pub admitted_unapplied: u64,
     /// Admitted-change count per authoring device — lets a caller see
     /// whether one device keeps emitting *new local* changes after its
     /// nominal input stopped (a projection → filesystem-watcher echo
@@ -1046,11 +1580,6 @@ pub fn group_dag_diagnostics(
         conn.query_row("SELECT COUNT(*) FROM changes WHERE group_id = ?1", [group_id], |r| {
             r.get(0)
         })?;
-    let admitted_unapplied: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM changes WHERE group_id = ?1 AND applied = 0",
-        [group_id],
-        |r| r.get(0),
-    )?;
     let mut admitted_by_author = std::collections::BTreeMap::new();
     {
         let mut stmt = conn.prepare(
@@ -1076,7 +1605,6 @@ pub fn group_dag_diagnostics(
     let orphan_missing_frontier = missing_ancestor_frontier(conn, orphan_roots)?;
     Ok(GroupDagDiagnostics {
         admitted_total: admitted_total as u64,
-        admitted_unapplied: admitted_unapplied as u64,
         admitted_by_author,
         orphan_total,
         orphan_missing_frontier,
@@ -1112,7 +1640,7 @@ pub fn list_group_changes(
 /// two states and cannot express the third.
 #[derive(Debug, Clone)]
 pub enum DagHashDisposition {
-    Admitted { applied: bool, change: Change },
+    Admitted { change: Change },
     Orphaned { received_seq: i64, change: Change },
     Missing,
 }
@@ -1124,21 +1652,19 @@ pub fn describe_hash(
     conn: &Connection,
     hash: &ChangeHash,
 ) -> Result<DagHashDisposition, SyncSqliteError> {
-    let admitted: Option<(Vec<u8>, i64)> = conn
-        .query_row(
-            "SELECT encoded, applied FROM changes WHERE change_hash = ?1",
-            [&hash.0[..]],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
+    let admitted: Option<Vec<u8>> = conn
+        .query_row("SELECT encoded FROM changes WHERE change_hash = ?1", [&hash.0[..]], |r| {
+            r.get(0)
+        })
         .optional()?;
-    if let Some((encoded, applied)) = admitted {
+    if let Some(encoded) = admitted {
         let change = Change::from_wire_bytes(&encoded).map_err(|error| {
             SyncSqliteError::CorruptState(format!(
                 "admitted change {} no longer decodes: {error}",
                 hash.to_hex()
             ))
         })?;
-        return Ok(DagHashDisposition::Admitted { applied: applied != 0, change });
+        return Ok(DagHashDisposition::Admitted { change });
     }
     let orphaned: Option<(Vec<u8>, i64)> = conn
         .query_row(
@@ -1172,7 +1698,6 @@ pub fn emit_local_change(
     conn: &Connection,
     group_id: &str,
     ops: Vec<Op>,
-    auth: ChangeAuth,
     emitter: &ChangeEmitter,
 ) -> Result<Change, SyncSqliteError> {
     let parents = frontier_index::group_heads(conn, group_id)?;
@@ -1200,10 +1725,9 @@ pub fn emit_local_change(
         group_id,
         parents,
         ops,
-        auth,
         emitter,
         ChangePurpose::Ordinary,
-        true,
+        None,
     )
 }
 
@@ -1227,8 +1751,35 @@ pub struct PreparedEmission {
     parents: Vec<ChangeHash>,
     all_ops: Vec<Op>,
     purpose: ChangePurpose,
-    max_parent_lamport: u64,
-    applied: bool,
+    /// The Lamport value this change is clocked one above: the greatest of
+    /// its parents' values and the floor of the history it is written on.
+    clocked_from: u64,
+    author_seq: AuthorSeq,
+    /// The change this author wrote at the position before `author_seq`,
+    /// read in the same breath as the sequence and signed with it. `None`
+    /// for this author's first change in the group, and for its first
+    /// change above the history base that carried its position.
+    ///
+    /// Author ordering, not causality: `parents` above is the causal basis
+    /// this emission is authored onto, and it is untouched by this field.
+    /// An ordinary local edit is parented on the basis its bytes came from,
+    /// which this author may have written past — that is exactly why the
+    /// author link is named rather than derived from ancestry.
+    author_prev: Option<ChangeHash>,
+    /// The history this emission will be written on, read from the group's
+    /// installed base at preparation time and signed unchanged. A local
+    /// change is only ever authored onto the history this device is
+    /// actually on: signing one onto any other would produce a change its
+    /// own store refuses on the next open.
+    history_epoch: HistoryEpoch,
+    /// Set when this emission is one part of a recursive delete or
+    /// directory rename, signed into the change unchanged.
+    recursive_operation: Option<RecursiveOperation>,
+    /// The author the sequence above was minted for. Kept so signing can
+    /// refuse to stamp one author's position onto another author's
+    /// signature: the two halves of an emission are separate calls, and a
+    /// mismatched pair would put the same dot on two different changes.
+    device_id: String,
 }
 
 /// Derives, validates and freezes everything about an emission that depends on
@@ -1237,14 +1788,42 @@ pub struct PreparedEmission {
 pub fn prepare_emission(
     conn: &Connection,
     group_id: &str,
+    device_id: &str,
     parents: Vec<ChangeHash>,
     ops: Vec<Op>,
     purpose: ChangePurpose,
-    default_applied: bool,
+    recursive_operation: Option<RecursiveOperation>,
 ) -> Result<PreparedEmission, SyncSqliteError> {
-    let derived_ops =
-        conflict_authoring::derive_required_conflict_copy_ops(conn, group_id, &parents, &ops)?;
-    let applied = default_applied && derived_ops.is_empty();
+    if recursive_operation.is_some() && !matches!(purpose, ChangePurpose::Ordinary) {
+        return Err(SyncSqliteError::InvalidInput(format!(
+            "cannot emit local change for group {group_id}: a retroactive-repair change cannot \
+             be part of a recursive operation"
+        )));
+    }
+    // A `RetroactiveRepair` carrier's own conflict-copy ops are derived with
+    // the buried-root-aware walk (see `derive_required_conflict_copy_ops_
+    // including_buried_roots`'s own doc comment), so this re-derivation
+    // agrees with `plan_retroactive_merge`'s own obligation computation --
+    // `validate_retroactive_repair_claims` requires the two to match
+    // exactly, or this carrier would fail its own local emission-time
+    // validation below. `ChangePurpose::Ordinary` (every other caller: the
+    // live watcher, rebootstrap's squash, restore) keeps the cheap
+    // early-stopping walk unconditionally -- see that function's own doc
+    // comment for why widening it here would regress the measured
+    // writer-gate-hold cost of every ordinary local edit.
+    //
+    // Asked the way this change's own validation below will ask it, too: the
+    // group-wide existence check answers a different question (see
+    // `derive_required_conflict_copy_ops_as_admission_will`), and where the
+    // two differ this function would sign a change that its own
+    // `validate_carrier_conflict_copy_ops_parts` call then rejects.
+    let derived_ops = conflict_authoring::derive_required_conflict_copy_ops_as_admission_will(
+        conn,
+        group_id,
+        &parents,
+        &ops,
+        matches!(purpose, ChangePurpose::RetroactiveRepair { .. }),
+    )?;
     let mut all_ops = ops;
     all_ops.extend(derived_ops.iter().cloned());
 
@@ -1256,6 +1835,19 @@ pub fn prepare_emission(
     parents.dedup();
 
     let max_parent_lamport = frontier_index::max_parent_lamport(conn, group_id, &parents)?;
+    // Clocked from the history this change is written on as well as from
+    // its parents: above an installed base, a change descends everything
+    // the base absorbed, and restarting the clock there would rank it below
+    // that history. The installed base always carries its ceiling.
+    let history_epoch = crate::rebootstrap_store::current_history_epoch(conn, group_id)?;
+    let lamport_floor = crate::rebootstrap_store::lamport_floor(conn, group_id, history_epoch)?
+        .ok_or_else(|| {
+            SyncSqliteError::CorruptState(format!(
+                "cannot emit local change for group {group_id}: no Lamport floor is known for \
+                 {history_epoch}, the history it is on"
+            ))
+        })?;
+    let clocked_from = max_parent_lamport.max(lamport_floor);
 
     // `group_heads`/caller-specified `parents` are trusted as this group's
     // frontier, but that trust is itself just a derived index; re-validate
@@ -1267,7 +1859,8 @@ pub fn prepare_emission(
         conn,
         group_id,
         &parents,
-        max_parent_lamport.saturating_add(1),
+        clocked_from.saturating_add(1),
+        Some(lamport_floor),
     )? {
         return Err(SyncSqliteError::CorruptState(format!(
             "cannot emit local change for group {group_id}: a recorded parent is not actually \
@@ -1278,50 +1871,102 @@ pub fn prepare_emission(
         conn, group_id, &parents, &all_ops, &purpose,
     )?;
 
+    // The author's own position in its chain is settled here, with every
+    // other database-derived field, and consumed unchanged by
+    // `admit_prepared_emission`'s signature. Deciding it anywhere else
+    // would mean two callers could mint the same position for two
+    // different changes, which is precisely the state an author chain
+    // exists to make impossible.
+    //
+    // The sequence and the predecessor link come from one read, because
+    // admission checks them as one fact. There is no policy knob here and
+    // no caller exempt from the rule: a local edit authored onto an older
+    // basis still names its author's previous change, so it satisfies the
+    // author chain on every replica while its parents stay the causal
+    // basis its bytes actually came from. Those were two conflicting
+    // demands only while author ordering was expressed as DAG ancestry.
+    let (author_seq, author_prev) = author_chain::next_author_position(conn, group_id, device_id)?;
+
     Ok(PreparedEmission {
         group_id: group_id.to_string(),
         parents,
         all_ops,
         purpose,
-        max_parent_lamport,
-        applied,
+        clocked_from,
+        author_seq,
+        author_prev,
+        history_epoch,
+        recursive_operation,
+        device_id: device_id.to_string(),
     })
 }
 
-/// Signs `prepared` under `auth` and appends it with its companion rows.
+/// Signs `prepared` and appends it with its companion rows.
 ///
-/// Consumes the preparation by value. Between the caller acquiring `auth` and
-/// this function's append there is no filesystem read, no block-store I/O, no
-/// parent lookup, no conflict derivation and no unrelated SQL: only the
-/// in-memory assembly of already-validated fields, the signature, the hash,
-/// the purely in-memory structural/size checks over those same fields, and the
-/// admission writes themselves.
+/// Consumes the preparation by value. Between the caller preparing the fields
+/// and this function's append there is no filesystem read, no block-store
+/// I/O, no parent lookup, no conflict derivation and no unrelated SQL: only
+/// the in-memory assembly of already-validated fields, the signature, the
+/// hash, the purely in-memory structural/size checks over those same fields,
+/// and the admission writes themselves.
 pub fn admit_prepared_emission(
     conn: &Connection,
     prepared: PreparedEmission,
-    auth: ChangeAuth,
     emitter: &ChangeEmitter,
 ) -> Result<Change, SyncSqliteError> {
-    let PreparedEmission { group_id, parents, all_ops, purpose, max_parent_lamport, applied } =
-        prepared;
+    let PreparedEmission {
+        group_id,
+        parents,
+        all_ops,
+        purpose,
+        clocked_from,
+        author_seq,
+        author_prev,
+        history_epoch,
+        recursive_operation,
+        device_id,
+    } = prepared;
     let group_id = group_id.as_str();
+    if device_id != emitter.device_id() {
+        return Err(SyncSqliteError::InvalidInput(format!(
+            "cannot emit local change for group {group_id}: author sequence {author_seq} was \
+             read for device {device_id} but the change would be signed by {}",
+            emitter.device_id()
+        )));
+    }
 
-    let change = match purpose {
-        ChangePurpose::Ordinary => Change::create_signed(
+    let change = match (purpose, recursive_operation) {
+        (ChangePurpose::Ordinary, Some(part)) => Change::create_recursive_part_signed(
             parents,
-            max_parent_lamport,
-            auth,
+            clocked_from,
             DeviceId(emitter.device_id().to_string()),
+            author_seq,
+            author_prev,
             FolderGroupId(group_id.to_string()),
+            history_epoch,
+            part,
             all_ops,
             emitter.signing_key(),
         ),
-        ChangePurpose::RetroactiveRepair { obligations } => Change::create_repair_signed(
+        (ChangePurpose::Ordinary, None) => Change::create_signed(
             parents,
-            max_parent_lamport,
-            auth,
+            clocked_from,
             DeviceId(emitter.device_id().to_string()),
+            author_seq,
+            author_prev,
             FolderGroupId(group_id.to_string()),
+            history_epoch,
+            all_ops,
+            emitter.signing_key(),
+        ),
+        (ChangePurpose::RetroactiveRepair { obligations }, _) => Change::create_repair_signed(
+            parents,
+            clocked_from,
+            DeviceId(emitter.device_id().to_string()),
+            author_seq,
+            author_prev,
+            FolderGroupId(group_id.to_string()),
+            history_epoch,
             obligations,
             all_ops,
             emitter.signing_key(),
@@ -1350,23 +1995,22 @@ pub fn admit_prepared_emission(
              conflict-copy ops are structurally invalid: {error}"
         ))
     })?;
-    // An independent review's finding: `admit_change` (the RECEIVING
-    // side, for a peer's incoming change) already calls this same
-    // `validate_no_reserved_paths` before ever admitting a change into
-    // this device's own history -- but this LOCAL-authoring emission
-    // path never did, for any of its callers (`emit_local_change`, the
+    // `admit_change` (the RECEIVING side, for a peer's incoming change)
+    // calls this same `validate_no_reserved_paths` before ever admitting a
+    // change into this device's own history, and this LOCAL-authoring
+    // emission path must match it for every one of its callers (`emit_local_change`, the
     // live watcher's own path; `emit_local_change_onto`, rebootstrap's
     // squash; `emit_retroactive_repair`, conflict-copy/retroactive
     // repair; and `SyncState::append_history_backfill`, which itself
     // calls `emit_local_change`). A path this device's own filesystem
     // happens to produce (e.g. a POSIX peer's user creating `"report."`,
-    // legal on Linux/macOS, silently normalized away on Windows) would
-    // sign and append successfully HERE, become this device's own head,
+    // legal on Linux/macOS, silently normalized away on Windows) could
+    // otherwise sign and append successfully HERE, become this device's own head,
     // and only then be discovered unacceptable -- by every OTHER peer's
     // `admit_change`, which permanently records the hash as rejected and
     // never re-requests it, orphaning every descendant change forever.
-    // Checking before `append_change` below closes the asymmetry at its
-    // root: the identical predicate now runs on both sides, so a
+    // Checking before `append_change` below keeps the two sides
+    // symmetric: the identical predicate runs on both sides, so a
     // non-portable path is refused before it can ever become local
     // history to propagate in the first place, not just refused by
     // peers after the fact.
@@ -1405,8 +2049,10 @@ pub fn admit_prepared_emission(
             )
         });
     }
-    retained_history_integrity::append_change(conn, &change, applied, now_unix_nanos())?;
+    recursive_operations::check_recursive_operation_part(conn, &change)?;
+    retained_history_integrity::append_change(conn, &change, now_unix_nanos())?;
     conflict_authoring::record_conflict_copy_ops_provenance(conn, group_id, &change)?;
+    recursive_operations::record_recursive_operation_part(conn, &change)?;
     // The local-emission seam of the projection-obligation bump. Covers every
     // path in `change.ops`, direct and derived alike -- this is what makes it
     // safe for this function to no longer also enqueue a separate
@@ -1439,30 +2085,37 @@ pub fn admit_prepared_emission(
             crate::projection_obligations::mark_projection_obligations_local_origin(
                 conn, group_id, &touched,
             )?;
+            // Every path this change writes has just moved past whatever
+            // materialized basis it held. That covers the paths no caller
+            // named (derived conflict copies), a restore whose write comes
+            // later and may never come, and a repair carrier -- so the
+            // bases are retired here, in the emission's own transaction,
+            // rather than by each caller.
+            crate::materialized_generation::retire_bases_after_local_emission(
+                conn,
+                group_id,
+                &touched,
+                now_unix_nanos(),
+            )?;
         }
     }
     Ok(change)
 }
 
 /// Builds, signs, and appends a new local change onto caller-specified
-/// `parents` rather than the group's current heads. Used by re-bootstrap to
-/// squash an offline-diverged local branch (one whose head does not descend
-/// from an incoming checkpoint frontier) into a single new change re-parented
-/// onto the just-installed frontier -- at that point in the atomic installer
-/// `group_heads` does not yet reflect the new frontier, so `emit_local_change`'s
-/// own current-heads resolution cannot be reused as-is. The signed content is
-/// otherwise identical: same signature/authorization shape, same structural
-/// re-validation before appending. Always leaves the appended change
-/// unapplied (`applied = false`), matching this call site's own convention
-/// (a squashed offline branch is deliberately left for the ordinary
-/// reprojection backstop), independent of whether any conflict-copy op was
-/// derived.
+/// `parents` rather than the group's current heads. Used for a local edit
+/// whose bytes came from a basis this device has since written past: the
+/// change is authored onto that basis, so the edit means what the user's
+/// bytes meant. The signed content is otherwise identical: same
+/// signature/authorization shape, same structural re-validation before
+/// appending. Always leaves the appended change unapplied
+/// (`applied = false`), matching this call site's own convention,
+/// independent of whether any conflict-copy op was derived.
 pub fn emit_local_change_onto(
     conn: &Connection,
     group_id: &str,
     parents: Vec<ChangeHash>,
     ops: Vec<Op>,
-    auth: ChangeAuth,
     emitter: &ChangeEmitter,
 ) -> Result<Change, SyncSqliteError> {
     emit_change_with_derived_conflict_copies(
@@ -1470,10 +2123,33 @@ pub fn emit_local_change_onto(
         group_id,
         parents,
         ops,
-        auth,
         emitter,
         ChangePurpose::Ordinary,
-        false,
+        None,
+    )
+}
+
+/// [`emit_local_change_onto`] for one part of a recursive delete or
+/// directory rename: the same emission, with `part` signed into it. The
+/// part's effect ops are `ops`; a conflict copy the emission derives rides
+/// along outside the operation's effect set (see
+/// [`yadorilink_replica_domain::recursive_operation::is_recursive_effect`]).
+pub fn emit_recursive_part_onto(
+    conn: &Connection,
+    group_id: &str,
+    parents: Vec<ChangeHash>,
+    ops: Vec<Op>,
+    part: RecursiveOperation,
+    emitter: &ChangeEmitter,
+) -> Result<Change, SyncSqliteError> {
+    emit_change_with_derived_conflict_copies(
+        conn,
+        group_id,
+        parents,
+        ops,
+        emitter,
+        ChangePurpose::Ordinary,
+        Some(part),
     )
 }
 
@@ -1486,7 +2162,6 @@ pub fn emit_retroactive_repair(
     group_id: &str,
     direct_ops: Vec<Op>,
     obligations: Vec<RepairObligation>,
-    auth: ChangeAuth,
     emitter: &ChangeEmitter,
 ) -> Result<Change, SyncSqliteError> {
     let parents = group_heads(conn, group_id)?;
@@ -1495,10 +2170,9 @@ pub fn emit_retroactive_repair(
         group_id,
         parents,
         direct_ops,
-        auth,
         emitter,
         ChangePurpose::RetroactiveRepair { obligations },
-        false,
+        None,
     )
 }
 
@@ -1527,13 +2201,20 @@ fn emit_change_with_derived_conflict_copies(
     group_id: &str,
     parents: Vec<ChangeHash>,
     ops: Vec<Op>,
-    auth: ChangeAuth,
     emitter: &ChangeEmitter,
     purpose: ChangePurpose,
-    default_applied: bool,
+    recursive_operation: Option<RecursiveOperation>,
 ) -> Result<Change, SyncSqliteError> {
-    let prepared = prepare_emission(conn, group_id, parents, ops, purpose, default_applied)?;
-    admit_prepared_emission(conn, prepared, auth, emitter)
+    let prepared = prepare_emission(
+        conn,
+        group_id,
+        emitter.device_id(),
+        parents,
+        ops,
+        purpose,
+        recursive_operation,
+    )?;
+    admit_prepared_emission(conn, prepared, emitter)
 }
 
 pub(crate) fn now_unix_nanos() -> i64 {
@@ -1544,2329 +2225,4 @@ pub(crate) fn now_unix_nanos() -> i64 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use ed25519_dalek::SigningKey;
-    use yadorilink_replica_domain::change::PutOrigin;
-    use yadorilink_replica_domain::file::RecordKind;
-    use yadorilink_replica_domain::file::{FileMeta, VersionBlock};
-    use yadorilink_replica_domain::ids::{BlockHash, SyncPath};
-    use yadorilink_replica_domain::session_state::ChangeContent;
-
-    fn conn() -> Connection {
-        let c = Connection::open_in_memory().unwrap();
-        init_dag_schema(&c).unwrap();
-        c
-    }
-
-    fn key() -> SigningKey {
-        SigningKey::from_bytes(&[42u8; 32])
-    }
-
-    fn test_version() -> FileVersion {
-        FileVersion::new(
-            vec![],
-            0,
-            FileMeta {
-                mtime_unix_nanos: 0,
-                unix_mode: None,
-                symlink_target: None,
-                record_kind: RecordKind::File,
-                xattrs: Vec::new(),
-            },
-        )
-    }
-
-    fn seed_test_version(conn: &Connection, group_id: &str) {
-        put_file_version(conn, group_id, &test_version()).unwrap();
-    }
-
-    fn collapse_file_versions_to_v2(conn: &Connection, retained_group: &str) {
-        conn.execute_batch(
-            "ALTER TABLE file_versions RENAME TO file_versions_v3; \
-             CREATE TABLE file_versions ( \
-                 version_hash BLOB PRIMARY KEY, \
-                 group_id TEXT NOT NULL, \
-                 encoded BLOB NOT NULL);",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO file_versions (version_hash, group_id, encoded) \
-             SELECT version_hash, group_id, encoded FROM file_versions_v3 WHERE group_id = ?1",
-            [retained_group],
-        )
-        .unwrap();
-        conn.execute_batch("DROP TABLE file_versions_v3; DELETE FROM change_file_versions;")
-            .unwrap();
-    }
-
-    #[test]
-    fn v2_migration_reconstructs_cross_group_version_ownership_from_changes() {
-        let c = conn();
-        let version = test_version();
-        put_file_version(&c, "group-a", &version).unwrap();
-        emit_local_change(
-            &c,
-            "group-a",
-            vec![Op::Put {
-                path: SyncPath("a".into()),
-                version: version.version_hash,
-                origin: PutOrigin::Direct,
-            }],
-            ChangeAuth::PLACEHOLDER,
-            &emitter(),
-        )
-        .unwrap();
-        put_file_version(&c, "group-b", &version).unwrap();
-        emit_local_change(
-            &c,
-            "group-b",
-            vec![Op::Put {
-                path: SyncPath("b".into()),
-                version: version.version_hash,
-                origin: PutOrigin::Direct,
-            }],
-            ChangeAuth::PLACEHOLDER,
-            &emitter(),
-        )
-        .unwrap();
-        collapse_file_versions_to_v2(&c, "group-a");
-
-        init_dag_schema(&c).unwrap();
-
-        assert!(get_file_version(&c, "group-a", &version.version_hash).unwrap().is_some());
-        assert!(get_file_version(&c, "group-b", &version.version_hash).unwrap().is_some());
-        let relations: i64 =
-            c.query_row("SELECT COUNT(*) FROM change_file_versions", [], |row| row.get(0)).unwrap();
-        assert_eq!(relations, 2);
-    }
-
-    #[test]
-    fn v2_migration_rolls_back_when_a_retained_change_has_no_global_version() {
-        let c = conn();
-        let version = test_version();
-        put_file_version(&c, "group-a", &version).unwrap();
-        emit_local_change(
-            &c,
-            "group-a",
-            vec![Op::Put {
-                path: SyncPath("a".into()),
-                version: version.version_hash,
-                origin: PutOrigin::Direct,
-            }],
-            ChangeAuth::PLACEHOLDER,
-            &emitter(),
-        )
-        .unwrap();
-        collapse_file_versions_to_v2(&c, "missing-group");
-
-        let error = init_dag_schema(&c).expect_err("missing v2 metadata must fail closed");
-        assert!(matches!(error, SyncSqliteError::CorruptState(_)));
-        let columns: Vec<String> = c
-            .prepare("PRAGMA table_info(file_versions)")
-            .unwrap()
-            .query_map([], |row| row.get(1))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        assert_eq!(columns, vec!["version_hash", "group_id", "encoded"]);
-        assert!(!c
-            .prepare("PRAGMA table_info(file_versions)")
-            .unwrap()
-            .query_map([], |row| row.get::<_, i64>(5))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap()
-            .contains(&2));
-    }
-
-    #[test]
-    fn already_group_scoped_database_missing_cross_group_ownership_is_repaired() {
-        // Reproduces a database that already carries the group-scoped
-        // `file_versions` shape from an earlier, incomplete conversion (the
-        // historical bug in `3edca8f0`, which copied each v2 row under only
-        // its first-writer group): the `if legacy_file_versions...` branch
-        // above never fires for it, since the shape is already current, so
-        // only the unconditional `repair_missing_file_version_ownership`
-        // pass can close this gap.
-        let c = conn();
-        let version = test_version();
-        put_file_version(&c, "group-a", &version).unwrap();
-        emit_local_change(
-            &c,
-            "group-a",
-            vec![Op::Put {
-                path: SyncPath("a".into()),
-                version: version.version_hash,
-                origin: PutOrigin::Direct,
-            }],
-            ChangeAuth::PLACEHOLDER,
-            &emitter(),
-        )
-        .unwrap();
-        put_file_version(&c, "group-b", &version).unwrap();
-        emit_local_change(
-            &c,
-            "group-b",
-            vec![Op::Put {
-                path: SyncPath("b".into()),
-                version: version.version_hash,
-                origin: PutOrigin::Direct,
-            }],
-            ChangeAuth::PLACEHOLDER,
-            &emitter(),
-        )
-        .unwrap();
-        // Simulate the prior migration's bug directly: drop group-b's row
-        // while leaving the table itself in the (already current)
-        // group-scoped shape.
-        c.execute(
-            "DELETE FROM file_versions WHERE group_id = 'group-b' AND version_hash = ?1",
-            [&version.version_hash.0[..]],
-        )
-        .unwrap();
-        assert!(get_file_version(&c, "group-b", &version.version_hash).unwrap().is_none());
-
-        init_dag_schema(&c).unwrap();
-
-        assert!(get_file_version(&c, "group-a", &version.version_hash).unwrap().is_some());
-        assert!(
-            get_file_version(&c, "group-b", &version.version_hash).unwrap().is_some(),
-            "a database already in the group-scoped shape must still have \
-             cross-group ownership repaired from retained Changes"
-        );
-    }
-
-    #[test]
-    fn schema_init_repairs_file_version_ownership_referenced_only_by_a_buffered_orphan() {
-        // The plain `changes`-table backfill cannot see a version referenced
-        // only by a change still buffered in `orphan_changes` (arrived
-        // before its parent). Left unrepaired, that group's later
-        // `promote_orphans` would fail `validate_referenced_versions`
-        // forever once the parent does arrive.
-        let sender = conn();
-        let version = test_version();
-        put_file_version(&sender, "group-b", &version).unwrap();
-        let orphan = emit_local_change(
-            &sender,
-            "group-b",
-            vec![Op::Put {
-                path: SyncPath("b".into()),
-                version: version.version_hash,
-                origin: PutOrigin::Direct,
-            }],
-            ChangeAuth::PLACEHOLDER,
-            &emitter(),
-        )
-        .unwrap();
-
-        let c = conn();
-        put_file_version(&c, "group-a", &version).unwrap();
-        insert_orphan(&c, &orphan, false).unwrap();
-        assert!(get_file_version(&c, "group-b", &version.version_hash).unwrap().is_none());
-
-        init_dag_schema(&c).unwrap();
-
-        assert!(
-            get_file_version(&c, "group-b", &version.version_hash).unwrap().is_some(),
-            "a version referenced only by a buffered orphan must still be \
-             repaired into that orphan's group"
-        );
-        // An orphan is not yet admitted, so repairing its group's version
-        // ownership must not also grant it block-serving authorization.
-        let relations: i64 = c
-            .query_row(
-                "SELECT COUNT(*) FROM change_file_versions WHERE group_id = 'group-b'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(relations, 0);
-    }
-
-    #[test]
-    fn list_unapplied_fails_closed_on_corrupt_retained_change() {
-        let c = conn();
-        c.execute(
-            "INSERT INTO changes \
-             (change_hash, group_id, device_id, lamport, encoded, applied) \
-             VALUES (?1, 'g', 'device-a', 1, ?2, 0)",
-            rusqlite::params![vec![0x72u8; 32], b"not-a-change".as_slice()],
-        )
-        .unwrap();
-
-        let error = list_unapplied(&c, "g").expect_err("corrupt retry state must be visible");
-        assert!(matches!(error, SyncSqliteError::CorruptState(_)));
-    }
-
-    #[test]
-    fn block_reference_authorization_is_group_scoped() {
-        let c = conn();
-        let block_hash = vec![0xabu8; 32];
-        let version = FileVersion::new(
-            vec![VersionBlock { hash: BlockHash(block_hash.clone()), size: 7 }],
-            7,
-            FileMeta {
-                mtime_unix_nanos: 0,
-                unix_mode: None,
-                symlink_target: None,
-                record_kind: RecordKind::File,
-                xattrs: Vec::new(),
-            },
-        );
-        put_file_version(&c, "group-a", &version).unwrap();
-
-        assert!(
-            !group_file_version_references_block(&c, "group-a", &block_hash).unwrap(),
-            "an unreferenced version must not authorize block service"
-        );
-        emit_local_change(
-            &c,
-            "group-a",
-            vec![Op::Put {
-                path: SyncPath("a.bin".into()),
-                version: version.version_hash,
-                origin: PutOrigin::Direct,
-            }],
-            ChangeAuth::PLACEHOLDER,
-            &emitter(),
-        )
-        .unwrap();
-        assert!(group_file_version_references_block(&c, "group-a", &block_hash).unwrap());
-        assert!(!group_file_version_references_block(&c, "group-b", &block_hash).unwrap());
-        assert!(!group_file_version_references_block(&c, "group-a", &[0xcdu8; 32]).unwrap());
-    }
-
-    #[test]
-    fn frontier_heads_at_or_before_reflects_real_admission_including_concurrent_branches() {
-        let c = conn();
-        let group_id = "group-a";
-
-        // Nothing admitted yet: any query, even "at or before the far
-        // future", must find nothing to rewind to.
-        assert_eq!(
-            frontier_heads_at_or_before(&c, group_id, i64::MAX).unwrap(),
-            None,
-            "an empty group has no frontier at any time"
-        );
-
-        let root = emit_local_change(
-            &c,
-            group_id,
-            vec![Op::Put {
-                path: SyncPath("a.bin".into()),
-                version: yadorilink_replica_domain::ids::VersionHash([0x11u8; 32]),
-                origin: PutOrigin::Direct,
-            }],
-            ChangeAuth::PLACEHOLDER,
-            &emitter(),
-        )
-        .unwrap();
-        let root_hash = root.compute_hash();
-        // `now_unix_nanos()` is this same module's real wall-clock read --
-        // reused here (not a fixed sleep) so the boundary this test checks
-        // is exactly the one `append_change` itself would have recorded,
-        // whatever the actual clock granularity/monotonicity turns out to
-        // be on the machine running the test.
-        let after_root = now_unix_nanos();
-
-        // Two changes emitted onto the SAME parent (the root) are
-        // genuinely concurrent -- neither is an ancestor of the other, so
-        // both are real live heads simultaneously. This is exactly the
-        // case a single scalar (e.g. a max lamport) cannot represent, and
-        // the reason `change_time_index` stores the real head SET rather
-        // than deriving one number from it.
-        let branch_a = emit_local_change_onto(
-            &c,
-            group_id,
-            vec![root_hash],
-            vec![Op::Put {
-                path: SyncPath("b.bin".into()),
-                version: yadorilink_replica_domain::ids::VersionHash([0x22u8; 32]),
-                origin: PutOrigin::Direct,
-            }],
-            ChangeAuth::PLACEHOLDER,
-            &emitter(),
-        )
-        .unwrap();
-        let branch_b = emit_local_change_onto(
-            &c,
-            group_id,
-            vec![root_hash],
-            vec![Op::Put {
-                path: SyncPath("c.bin".into()),
-                version: yadorilink_replica_domain::ids::VersionHash([0x33u8; 32]),
-                origin: PutOrigin::Direct,
-            }],
-            ChangeAuth::PLACEHOLDER,
-            &emitter(),
-        )
-        .unwrap();
-        let after_fork = now_unix_nanos();
-
-        // A rewind target between root-admission and the fork must see
-        // ONLY the root as the frontier -- proving the real `emit_local_
-        // change` -> `append_change` path records a usable, correctly-
-        // ordered time index, not just the synthetic direct-SQL seeding
-        // the scale benchmark uses.
-        assert_eq!(
-            frontier_heads_at_or_before(&c, group_id, after_root).unwrap(),
-            Some(vec![root_hash]),
-            "a rewind target before the fork must resolve to the root alone"
-        );
-
-        // A rewind target after the fork must see BOTH concurrent
-        // branches, sorted -- a scalar frontier could only ever report one
-        // of these two.
-        let mut expected_fork_heads = vec![branch_a.compute_hash(), branch_b.compute_hash()];
-        expected_fork_heads.sort_by_key(|h| h.0);
-        assert_eq!(
-            frontier_heads_at_or_before(&c, group_id, after_fork).unwrap(),
-            Some(expected_fork_heads.clone()),
-            "a rewind target after the fork must include BOTH concurrent branches, not just one"
-        );
-        // Cross-check against the live `group_heads` table itself -- the
-        // recorded snapshot must always agree with what the ordinary
-        // frontier-index machinery reports at the same point, since it was
-        // read from that exact table.
-        let mut live_heads = frontier_index::group_heads(&c, group_id).unwrap();
-        live_heads.sort_by_key(|h| h.0);
-        assert_eq!(
-            live_heads, expected_fork_heads,
-            "sanity: the live group_heads table must agree with the recorded snapshot"
-        );
-
-        // An unrelated group must never see this group's frontier.
-        assert_eq!(
-            frontier_heads_at_or_before(&c, "group-b", now_unix_nanos()).unwrap(),
-            None,
-            "group scoping must hold: an unrelated, never-admitted-to group has no frontier"
-        );
-    }
-
-    /// Two admissions that landed on the same `observed_at_unix_nanos` --
-    /// routine whenever the local clock's granularity is coarser than the
-    /// gap between two writes -- must resolve to the LATER one. Seeded
-    /// directly so the collision is guaranteed rather than left to whatever
-    /// the host clock happens to do; the real-admission path is covered by
-    /// `frontier_heads_at_or_before_reflects_real_admission_including_
-    /// concurrent_branches` above.
-    #[test]
-    fn a_timestamp_tie_resolves_to_the_later_admission_not_an_arbitrary_one() {
-        let c = conn();
-        let earlier = [0xEEu8; 32];
-        let later = [0x11u8; 32];
-        for (admission_seq, head) in [(1i64, earlier), (2, later)] {
-            c.execute(
-                "INSERT INTO change_time_index \
-                 (group_id, admission_seq, observed_at_unix_nanos, heads_snapshot) \
-                 VALUES ('g', ?1, 5000, ?2)",
-                rusqlite::params![admission_seq, &head[..]],
-            )
-            .unwrap();
-        }
-        // Deliberately NOT distinguishable by the ordering column alone:
-        // both rows share `observed_at_unix_nanos`, and the earlier
-        // admission's head sorts HIGHER by raw bytes, so a query that fell
-        // back to any incidental order would be very likely to return it.
-        assert_eq!(
-            frontier_heads_at_or_before(&c, "g", 5000).unwrap(),
-            Some(vec![ChangeHash(later)]),
-            "a tie on the timestamp must resolve by admission_seq to the later admission"
-        );
-        assert_eq!(
-            frontier_heads_at_or_before(&c, "g", 4999).unwrap(),
-            None,
-            "sanity: the boundary is still inclusive-at-or-before, not fuzzy"
-        );
-    }
-
-    /// The tie-break above must not have cost the query its bounded shape:
-    /// `ORDER BY a DESC, b DESC LIMIT 1` over an index on `(group_id, a)`
-    /// alone would make SQLite sort the whole matching range in a temporary
-    /// b-tree -- cost proportional to the group's entire admission history,
-    /// which is precisely the collapse shape this table exists to avoid.
-    /// Asserted against the real statement, not a copy of it.
-    #[test]
-    fn frontier_query_is_answered_by_a_reverse_index_seek() {
-        let c = conn();
-        let plan: Vec<String> = {
-            let mut stmt = c
-                .prepare(&format!(
-                    "EXPLAIN QUERY PLAN {}",
-                    retained_history_integrity::FRONTIER_AT_OR_BEFORE_SQL
-                ))
-                .unwrap();
-            let rows = stmt.query_map(rusqlite::params!["g", 0i64], |row| row.get::<_, String>(3));
-            rows.unwrap().collect::<Result<_, _>>().unwrap()
-        };
-        let plan = plan.join("\n");
-        assert!(
-            plan.contains("change_time_index_by_time"),
-            "the frontier query must use its own index; plan was:\n{plan}"
-        );
-        assert!(
-            !plan.to_uppercase().contains("TEMP B-TREE"),
-            "the frontier query must never sort a range to satisfy its ORDER BY; plan was:\n{plan}"
-        );
-    }
-
-    fn time_index_snapshots(conn: &Connection, group_id: &str) -> Vec<(i64, Vec<u8>)> {
-        let mut stmt = conn
-            .prepare(
-                "SELECT admission_seq, heads_snapshot FROM change_time_index \
-                 WHERE group_id = ?1 ORDER BY admission_seq",
-            )
-            .unwrap();
-        let rows = stmt
-            .query_map([group_id], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)))
-            .unwrap();
-        rows.collect::<Result<_, _>>().unwrap()
-    }
-
-    /// The time index is derived from `group_heads`, so compaction has to
-    /// cut it back too. Without this, a pruned group accumulates snapshots
-    /// naming changes whose bodies are gone -- unbounded stale rows that
-    /// `frontier_heads_at_or_before` would hand back as an answer.
-    #[test]
-    fn pruning_history_removes_the_time_index_snapshots_that_named_it() {
-        let c = conn();
-        let em = emitter();
-
-        let prior =
-            emit_local_change(&c, "g", vec![create_op("prior.txt")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
-        let prior_hash = prior.compute_hash();
-        let child =
-            emit_local_change(&c, "g", vec![create_op("child.txt")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
-        let child_hash = child.compute_hash();
-        // An unrelated group's own history must be untouched by all of this.
-        emit_local_change(&c, "other", vec![create_op("theirs.txt")], ChangeAuth::PLACEHOLDER, &em)
-            .unwrap();
-
-        let before = time_index_snapshots(&c, "g");
-        assert_eq!(before.len(), 2, "each admission records one snapshot");
-        assert_eq!(before[0].1, prior_hash.0.to_vec());
-        assert_eq!(before[1].1, child_hash.0.to_vec());
-
-        let checkpoint = yadorilink_replica_domain::rebootstrap::Checkpoint::new(
-            FolderGroupId("g".into()),
-            vec![child_hash],
-            [0u8; 32],
-        );
-        {
-            let tx = c.unchecked_transaction().unwrap();
-            commit_prune(&tx, &checkpoint, &[prior_hash]).unwrap();
-            tx.commit().unwrap();
-        }
-        assert!(!has_change(&c, &prior_hash).unwrap());
-
-        let after = time_index_snapshots(&c, "g");
-        assert_eq!(
-            after.len(),
-            1,
-            "the snapshot naming the pruned change must go with it, not linger"
-        );
-        assert_eq!(
-            after[0].1,
-            child_hash.0.to_vec(),
-            "the snapshot naming only retained history must survive"
-        );
-        assert_eq!(
-            frontier_heads_at_or_before(&c, "g", i64::MAX).unwrap(),
-            Some(vec![child_hash]),
-            "the surviving snapshot must still be readable"
-        );
-        assert_eq!(
-            time_index_snapshots(&c, "other").len(),
-            1,
-            "an unrelated group's time index must not be touched by this group's prune"
-        );
-
-        // `admission_seq` must keep increasing across a prune: the tie-break
-        // in `frontier_heads_at_or_before` treats a higher value as strictly
-        // later, so a post-prune admission may never reuse a surviving row's
-        // sequence number.
-        emit_local_change(&c, "g", vec![create_op("later.txt")], ChangeAuth::PLACEHOLDER, &em)
-            .unwrap();
-        let seqs: Vec<i64> = time_index_snapshots(&c, "g").iter().map(|(seq, _)| *seq).collect();
-        assert!(
-            seqs.windows(2).all(|w| w[0] < w[1]),
-            "admission_seq must stay strictly increasing after a prune, got {seqs:?}"
-        );
-        assert!(
-            seqs.last().copied() > Some(after[0].0),
-            "the post-prune admission must sort after every surviving row, got {seqs:?}"
-        );
-    }
-
-    #[test]
-    fn admitted_metadata_does_not_forge_block_provenance() {
-        let c = conn();
-        let block_hash = vec![0xabu8; 32];
-        let version = FileVersion::new(
-            vec![VersionBlock { hash: BlockHash(block_hash.clone()), size: 7 }],
-            7,
-            FileMeta {
-                mtime_unix_nanos: 0,
-                unix_mode: None,
-                symlink_target: None,
-                record_kind: RecordKind::File,
-                xattrs: Vec::new(),
-            },
-        );
-        put_file_version(&c, "group-a", &version).unwrap();
-        emit_local_change(
-            &c,
-            "group-a",
-            vec![Op::Put {
-                path: SyncPath("attacker-controlled.bin".into()),
-                version: version.version_hash,
-                origin: PutOrigin::Direct,
-            }],
-            ChangeAuth::PLACEHOLDER,
-            &emitter(),
-        )
-        .unwrap();
-
-        assert!(group_file_version_references_block(&c, "group-a", &block_hash).unwrap());
-        assert!(
-            !group_has_block_provenance(&c, "group-a", &block_hash).unwrap(),
-            "even admitted, correctly signed metadata must not prove byte ownership"
-        );
-
-        record_group_block_provenance(&c, "group-b", std::slice::from_ref(&block_hash)).unwrap();
-        assert!(group_has_block_provenance(&c, "group-b", &block_hash).unwrap());
-        assert!(
-            !group_has_block_provenance(&c, "group-a", &block_hash).unwrap(),
-            "physical dedup must not leak provenance across groups"
-        );
-
-        record_group_block_provenance(&c, "group-a", std::slice::from_ref(&block_hash)).unwrap();
-        assert!(group_has_block_provenance(&c, "group-a", &block_hash).unwrap());
-    }
-
-    #[test]
-    fn rejected_change_rolls_back_its_versions_and_grants_no_block_capability() {
-        let state =
-            yadorilink_daemon::replica_coordinator::ReplicaCoordinator::open_in_memory().unwrap();
-        let block_hash = vec![0x42; 32];
-        let version = FileVersion::new(
-            vec![VersionBlock { hash: BlockHash(block_hash.clone()), size: 7 }],
-            7,
-            FileMeta {
-                mtime_unix_nanos: 0,
-                unix_mode: None,
-                symlink_target: None,
-                record_kind: RecordKind::File,
-                xattrs: Vec::new(),
-            },
-        );
-        let signing = key();
-        let mut change = Change::create_signed(
-            vec![],
-            0,
-            ChangeAuth::PLACEHOLDER,
-            DeviceId("device-A".into()),
-            FolderGroupId("group-a".into()),
-            vec![Op::Put {
-                path: SyncPath("poison.bin".into()),
-                version: version.version_hash,
-                origin: PutOrigin::Direct,
-            }],
-            &signing,
-        );
-        change.lamport = 99;
-        change.sign(&signing);
-
-        assert!(state
-            .change_history_repository()
-            .dag_admit_change_with_versions(&change, std::slice::from_ref(&version), false)
-            .is_err());
-        assert!(!state.sqlite().dag_has_file_version("group-a", &version.version_hash).unwrap());
-        assert!(!state
-            .change_history_repository()
-            .dag_group_file_version_references_block("group-a", &block_hash)
-            .unwrap());
-    }
-
-    #[test]
-    fn orphan_version_grants_no_block_capability_until_promotion() {
-        let c = conn();
-        let block_hash = vec![0x24; 32];
-        let version = FileVersion::new(
-            vec![VersionBlock { hash: BlockHash(block_hash.clone()), size: 7 }],
-            7,
-            FileMeta {
-                mtime_unix_nanos: 0,
-                unix_mode: None,
-                symlink_target: None,
-                record_kind: RecordKind::File,
-                xattrs: Vec::new(),
-            },
-        );
-        put_file_version(&c, "g", &version).unwrap();
-        let signing = key();
-        let parent = Change::create_signed(
-            vec![],
-            0,
-            ChangeAuth::PLACEHOLDER,
-            DeviceId("device-A".into()),
-            FolderGroupId("g".into()),
-            vec![Op::Delete { path: SyncPath("old.bin".into()) }],
-            &signing,
-        );
-        let child = Change::create_signed(
-            vec![parent.compute_hash()],
-            parent.lamport,
-            ChangeAuth::PLACEHOLDER,
-            DeviceId("device-A".into()),
-            FolderGroupId("g".into()),
-            vec![Op::Put {
-                path: SyncPath("new.bin".into()),
-                version: version.version_hash,
-                origin: PutOrigin::Direct,
-            }],
-            &signing,
-        );
-
-        assert_eq!(admit_change(&c, &child, false).unwrap().outcome, AdmitOutcome::Orphaned);
-        assert!(!group_file_version_references_block(&c, "g", &block_hash).unwrap());
-        assert_eq!(admit_change(&c, &parent, false).unwrap().outcome, AdmitOutcome::Applied);
-        assert!(group_file_version_references_block(&c, "g", &block_hash).unwrap());
-    }
-
-    #[test]
-    fn schema_init_backfills_admitted_change_version_relations() {
-        let c = conn();
-        let block_hash = vec![0x66; 32];
-        let version = FileVersion::new(
-            vec![VersionBlock { hash: BlockHash(block_hash.clone()), size: 7 }],
-            7,
-            FileMeta {
-                mtime_unix_nanos: 0,
-                unix_mode: None,
-                symlink_target: None,
-                record_kind: RecordKind::File,
-                xattrs: Vec::new(),
-            },
-        );
-        put_file_version(&c, "g", &version).unwrap();
-        emit_local_change(
-            &c,
-            "g",
-            vec![Op::Put {
-                path: SyncPath("a".into()),
-                version: version.version_hash,
-                origin: PutOrigin::Direct,
-            }],
-            ChangeAuth::PLACEHOLDER,
-            &emitter(),
-        )
-        .unwrap();
-        c.execute("DELETE FROM change_file_versions", []).unwrap();
-        assert!(!group_file_version_references_block(&c, "g", &block_hash).unwrap());
-
-        init_dag_schema(&c).unwrap();
-        assert!(group_file_version_references_block(&c, "g", &block_hash).unwrap());
-    }
-
-    #[test]
-    fn version_sweep_fails_closed_on_a_corrupt_retained_change() {
-        let c = conn();
-        let version = test_version();
-        put_file_version(&c, "g", &version).unwrap();
-        c.execute(
-            "INSERT INTO changes \
-             (change_hash, group_id, device_id, lamport, encoded, applied) \
-             VALUES (?1, 'g', 'device-A', 1, ?2, 1)",
-            rusqlite::params![vec![0x91u8; 32], b"not-a-change".as_slice()],
-        )
-        .unwrap();
-
-        let error = sweep_unreferenced_file_versions(&c, "g")
-            .expect_err("corrupt retained history must abort version GC");
-        assert!(matches!(error, SyncSqliteError::CorruptState(_)));
-        assert!(get_file_version(&c, "g", &version.version_hash).unwrap().is_some());
-    }
-
-    fn create_op(path: &str) -> Op {
-        Op::Put {
-            path: SyncPath(path.into()),
-            version: test_version().version_hash,
-            origin: PutOrigin::Direct,
-        }
-    }
-
-    /// Builds a validly-signed root change directly via `Change::
-    /// create_signed`, bypassing `emit_local_change` entirely -- used by
-    /// the `admit_change_rejects_*` tests below, which construct a
-    /// deliberately reserved/non-portable-path change specifically to
-    /// drive the RECEIVING side's own rejection (`admit_change`), not the
-    /// local-emission-side check `emit_local_change` now also applies
-    /// (added for an independent review's CRITICAL-3 finding -- see that
-    /// change's own doc comment). Using `emit_local_change` to build these
-    /// fixtures would now refuse the change before it could ever reach
-    /// the `admit_change` call these tests actually exercise.
-    fn hand_signed_change(group_id: &str, ops: Vec<Op>) -> Change {
-        Change::create_signed(
-            vec![],
-            0,
-            ChangeAuth::PLACEHOLDER,
-            DeviceId("device-A".into()),
-            FolderGroupId(group_id.into()),
-            ops,
-            &key(),
-        )
-    }
-
-    fn emitter() -> ChangeEmitter {
-        ChangeEmitter::new("device-A", key())
-    }
-
-    #[test]
-    fn local_emission_chains_heads() {
-        let c = conn();
-        let em = emitter();
-
-        let c1 =
-            emit_local_change(&c, "g", vec![create_op("a")], ChangeAuth::PLACEHOLDER, &em).unwrap();
-        assert_eq!(c1.parents, vec![]);
-        assert_eq!(c1.lamport, 1);
-        assert_eq!(group_heads(&c, "g").unwrap(), vec![c1.compute_hash()]);
-
-        let c2 =
-            emit_local_change(&c, "g", vec![create_op("b")], ChangeAuth::PLACEHOLDER, &em).unwrap();
-        // c2 descends from c1, so c1 is no longer a head.
-        assert_eq!(c2.parents, vec![c1.compute_hash()]);
-        assert_eq!(c2.lamport, 2);
-        assert_eq!(group_heads(&c, "g").unwrap(), vec![c2.compute_hash()]);
-
-        assert!(is_ancestor(&c, &c1.compute_hash(), &c2.compute_hash()).unwrap());
-        assert!(!is_ancestor(&c, &c2.compute_hash(), &c1.compute_hash()).unwrap());
-    }
-
-    /// An independent review's finding: `admit_change` (the RECEIVING side)
-    /// already refuses a change containing a non-portable path component
-    /// (a trailing `.`/` `, which a POSIX filesystem accepts but Windows
-    /// silently normalizes away) via `validate_no_reserved_paths` -- but
-    /// LOCAL authoring (`emit_local_change`, reachable directly here, and
-    /// by extension every one of its own callers: the live watcher,
-    /// `append_history_backfill`, `emit_local_change_onto`'s rebootstrap
-    /// squash, `emit_retroactive_repair`) never applied the identical
-    /// check before signing. A POSIX device could therefore sign and
-    /// append a change no other peer could ever admit, becoming this
-    /// device's own head with nothing left to build on for every peer
-    /// that permanently rejects it.
-    #[test]
-    fn emit_local_change_refuses_a_non_portable_path() {
-        let c = conn();
-        let em = emitter();
-
-        let err = emit_local_change(
-            &c,
-            "g",
-            vec![create_op("report.")], // trailing dot: invalid on Windows
-            ChangeAuth::PLACEHOLDER,
-            &em,
-        )
-        .expect_err("a non-portable path must be refused before it is ever signed and appended");
-        assert!(
-            matches!(err, SyncSqliteError::NonPortablePath(_)),
-            "unexpected error variant: {err:?}"
-        );
-        assert!(
-            group_heads(&c, "g").unwrap().is_empty(),
-            "the refused change must never become this group's head"
-        );
-    }
-
-    /// Same local-authoring-side coverage as
-    /// `emit_local_change_refuses_a_non_portable_path`, for the reserved
-    /// Windows device-basename branch of `path_has_non_portable_wire_
-    /// component` instead of the trailing-dot/space branch. Mirrors
-    /// `admit_change_rejects_a_reserved_windows_device_name_path` (the
-    /// RECEIVING-side test for this same predicate, above), so both call
-    /// sites of `validate_no_reserved_paths` are directly, independently
-    /// covered for this hazard shape rather than only the receiving side.
-    #[test]
-    fn emit_local_change_refuses_a_reserved_windows_device_name() {
-        for name in ["CON", "com1", "LPT9.log"] {
-            let c = conn();
-            let em = emitter();
-            let err =
-                emit_local_change(&c, "g", vec![create_op(name)], ChangeAuth::PLACEHOLDER, &em)
-                    .expect_err(
-                        "a reserved Windows device name must be refused before it is ever signed \
-                     and appended",
-                    );
-            assert!(
-                matches!(err, SyncSqliteError::NonPortablePath(ref p) if p == name),
-                "{name:?}: expected NonPortablePath, got {err:?}"
-            );
-            assert!(
-                group_heads(&c, "g").unwrap().is_empty(),
-                "{name:?}: the refused change must never become this group's head"
-            );
-        }
-    }
-
-    /// Same local-authoring-side coverage as
-    /// `emit_local_change_refuses_a_non_portable_path`, for the Win32
-    /// reserved-filename-character branch instead of the trailing-dot/space
-    /// branch. Mirrors `admit_change_rejects_a_path_with_a_win32_reserved_
-    /// filename_character` (the RECEIVING-side test for this same
-    /// predicate, above).
-    #[test]
-    fn emit_local_change_refuses_a_win32_reserved_filename_character() {
-        for ch in ['<', '>', '"', '|', '?', '*'] {
-            let path = format!("notes{ch}draft.txt");
-            let c = conn();
-            let em = emitter();
-            let err =
-                emit_local_change(&c, "g", vec![create_op(&path)], ChangeAuth::PLACEHOLDER, &em)
-                    .expect_err(
-                        "a Win32-reserved filename character must be refused before it is ever \
-                         signed and appended",
-                    );
-            assert!(
-                matches!(err, SyncSqliteError::NonPortablePath(ref p) if p == &path),
-                "{ch:?}: expected NonPortablePath, got {err:?}"
-            );
-            assert!(
-                group_heads(&c, "g").unwrap().is_empty(),
-                "{ch:?}: the refused change must never become this group's head"
-            );
-        }
-    }
-
-    #[test]
-    fn append_is_idempotent_under_duplicate_delivery() {
-        let c = conn();
-        let change =
-            emit_local_change(&c, "g", vec![create_op("a")], ChangeAuth::PLACEHOLDER, &emitter())
-                .unwrap();
-        // Re-appending the identical change changes nothing.
-        assert!(!append_change(&c, &change, true, now_unix_nanos()).unwrap());
-        let count: i64 = c.query_row("SELECT COUNT(*) FROM changes", [], |r| r.get(0)).unwrap();
-        assert_eq!(count, 1);
-        assert_eq!(group_heads(&c, "g").unwrap().len(), 1);
-    }
-
-    #[test]
-    fn concurrent_changes_are_both_heads() {
-        // Two devices edit from the same (empty) frontier without seeing
-        // each other: both become heads.
-        let c = conn();
-        let a = ChangeEmitter::new("device-A", SigningKey::from_bytes(&[1u8; 32]));
-        let b = ChangeEmitter::new("device-B", SigningKey::from_bytes(&[2u8; 32]));
-        let ca =
-            emit_local_change(&c, "g", vec![create_op("a")], ChangeAuth::PLACEHOLDER, &a).unwrap();
-        seed_test_version(&c, "g");
-        // Force B's change to also root at the empty frontier by admitting it
-        // as if it arrived from a peer (its parents = []).
-        let cb = Change::create_signed(
-            vec![],
-            0,
-            ChangeAuth::PLACEHOLDER,
-            DeviceId("device-B".into()),
-            FolderGroupId("g".into()),
-            vec![create_op("b")],
-            &SigningKey::from_bytes(&[2u8; 32]),
-        );
-        let _ = b;
-        assert_eq!(admit_change(&c, &cb, true).unwrap().outcome, AdmitOutcome::Applied);
-        let mut heads = group_heads(&c, "g").unwrap();
-        heads.sort();
-        let mut expected = vec![ca.compute_hash(), cb.compute_hash()];
-        expected.sort();
-        assert_eq!(heads, expected);
-    }
-
-    #[test]
-    fn out_of_order_arrival_is_orphaned_then_promoted() {
-        // Build a chain root -> child on a "sender", then deliver child
-        // first to a fresh receiver.
-        let sender = conn();
-        let em = emitter();
-        let root =
-            emit_local_change(&sender, "g", vec![create_op("a")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
-        let child =
-            emit_local_change(&sender, "g", vec![create_op("b")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
-
-        let recv = conn();
-        seed_test_version(&recv, "g");
-        // Child arrives before its parent: held, not applied.
-        assert_eq!(admit_change(&recv, &child, true).unwrap().outcome, AdmitOutcome::Orphaned);
-        assert!(!has_change(&recv, &child.compute_hash()).unwrap());
-        assert!(group_heads(&recv, "g").unwrap().is_empty());
-
-        // Parent arrives: it applies and promotes the buffered child.
-        assert_eq!(admit_change(&recv, &root, true).unwrap().outcome, AdmitOutcome::Applied);
-        assert!(has_change(&recv, &root.compute_hash()).unwrap());
-        assert!(has_change(&recv, &child.compute_hash()).unwrap());
-        // The frontier converged to the single child head, just like the sender.
-        assert_eq!(group_heads(&recv, "g").unwrap(), vec![child.compute_hash()]);
-        assert_eq!(group_heads(&recv, "g").unwrap(), group_heads(&sender, "g").unwrap());
-    }
-
-    #[test]
-    fn missing_ancestor_frontier_walks_through_a_stuck_buffered_orphan() {
-        // A 3-generation chain root -> mid -> leaf built on a sender.
-        // Deliver `leaf` and `mid` to a fresh receiver, but never `root` --
-        // both `leaf` and `mid` buffer as orphans, `root` never arrives.
-        let sender = conn();
-        let em = emitter();
-        let root =
-            emit_local_change(&sender, "g", vec![create_op("a")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
-        let mid =
-            emit_local_change(&sender, "g", vec![create_op("b")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
-        let leaf =
-            emit_local_change(&sender, "g", vec![create_op("c")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
-
-        let recv = conn();
-        seed_test_version(&recv, "g");
-        assert_eq!(admit_change(&recv, &leaf, true).unwrap().outcome, AdmitOutcome::Orphaned);
-        assert_eq!(admit_change(&recv, &mid, true).unwrap().outcome, AdmitOutcome::Orphaned);
-
-        // The one-level check treats `leaf` as fully known (it's buffered),
-        // exactly the gap this fn exists to close: a caller relying on it
-        // alone would never discover that `root` is genuinely missing.
-        assert!(has_change_or_buffered_orphan(&recv, &leaf.compute_hash()).unwrap());
-
-        let missing = missing_ancestor_frontier(&recv, [leaf.compute_hash()]).unwrap();
-        assert_eq!(missing, vec![root.compute_hash()]);
-
-        // Once `root` lands, the whole buffered chain promotes.
-        assert_eq!(admit_change(&recv, &root, true).unwrap().outcome, AdmitOutcome::Applied);
-        assert!(has_change(&recv, &leaf.compute_hash()).unwrap());
-        assert_eq!(group_heads(&recv, "g").unwrap(), vec![leaf.compute_hash()]);
-        assert!(missing_ancestor_frontier(&recv, [leaf.compute_hash()]).unwrap().is_empty());
-    }
-
-    /// A non-PLACEHOLDER pin, for tests that need to trigger the real
-    /// causal-auth-monotonicity check rather than its PLACEHOLDER exemption.
-    fn real_auth(seq: u64, epoch: u64) -> ChangeAuth {
-        ChangeAuth { auth_seq: seq, auth_epoch: epoch, policy_head_hash: [seq as u8 ^ 0x5A; 32] }
-    }
-
-    /// Codex-caught regression (C4-10 review, first pass): dropping a
-    /// buffered orphan for violating causal-auth monotonicity must also
-    /// drop every OTHER buffered orphan that names it as a (transitive)
-    /// parent -- otherwise those descendants can never promote (their own
-    /// parent will never become durable) and stay in the buffer,
-    /// permanently re-appearing in every future `missing_ancestor_frontier`
-    /// walk, forever.
-    ///
-    /// Exercises `drop_orphan_subtree` directly (mirroring exactly what
-    /// `ChangeHistoryRepository::dag_admit_change_with_versions` now does
-    /// after a bare `admit_change` call rejects with `CausalAuthViolation`
-    /// -- see that method's own doc comment for why `admit_change` itself
-    /// cannot do this cleanup: it runs inside its caller's own
-    /// `write_immediate` transaction, which rolls back on `Err`, taking any
-    /// mutation `admit_change` made with it). `change_history::tests::
-    /// dropping_a_causal_auth_violation_persists_its_descendant_cleanup`
-    /// (Codex review, second pass) is the one that proves this actually
-    /// persists through a real transaction end-to-end; this one is the
-    /// fast, transaction-free check of `drop_orphan_subtree`'s own
-    /// recursive-BFS correctness.
-    #[test]
-    fn dropping_a_causal_auth_violation_also_drops_its_buffered_descendants() {
-        let sender = conn();
-        let em = emitter();
-        // root: a legitimate post-revoke commit under the new grant.
-        let root =
-            emit_local_change(&sender, "g", vec![create_op("a")], real_auth(10, 2), &em).unwrap();
-        // mid: the revoked writer's replay -- pins the OLD, pre-revoke grant
-        // (seq 3 < root's seq 10) despite descending from `root`.
-        let mid =
-            emit_local_change(&sender, "g", vec![create_op("b")], real_auth(3, 1), &em).unwrap();
-        // leaf: an innocent further commit built on top of the replay --
-        // its OWN pin is internally consistent with `mid`'s (3 !< 3), so
-        // nothing about leaf's own bytes is invalid; it only becomes
-        // unpromotable because its parent (`mid`) is.
-        let leaf =
-            emit_local_change(&sender, "g", vec![create_op("c")], real_auth(3, 1), &em).unwrap();
-
-        let recv = conn();
-        seed_test_version(&recv, "g");
-        // Deliver root first (admitted immediately), then leaf and mid out
-        // of order, so both `leaf` and `mid` are genuinely buffered orphans
-        // (not merely held) by the time `mid`'s violation is discovered.
-        assert_eq!(admit_change(&recv, &root, true).unwrap().outcome, AdmitOutcome::Applied);
-        assert_eq!(admit_change(&recv, &leaf, true).unwrap().outcome, AdmitOutcome::Orphaned);
-        assert!(
-            has_change_or_buffered_orphan(&recv, &leaf.compute_hash()).unwrap(),
-            "leaf must be genuinely buffered, not merely held, before mid arrives"
-        );
-
-        // mid arrives: root (its parent) is present, so its causal-auth
-        // coordinate is finally checkable -- and violates monotonicity.
-        // `admit_change` must reject it, not admit or re-buffer it. It no
-        // longer does descendant cleanup itself (see this test's own doc
-        // comment) -- that is now the caller's job, done here directly to
-        // isolate `drop_orphan_subtree`'s own behavior from transaction
-        // semantics.
-        assert!(admit_change(&recv, &mid, true).is_err());
-        assert!(!has_change(&recv, &mid.compute_hash()).unwrap());
-        orphan_integrity::drop_orphan_subtree(&recv, &mid.compute_hash().0).unwrap();
-
-        // The regression: leaf must be dropped too, not left stuck forever
-        // in the buffer waiting on a parent that will never become durable
-        // (leaf itself, correctly, remains genuinely absent -- it descends
-        // from a permanently-invalid change and can never legitimately
-        // sync; what must NOT happen is it wastefully occupying the orphan
-        // buffer, unpromotable, until `ORPHAN_BOUND` eviction happens to
-        // reach it).
-        assert!(
-            !has_change_or_buffered_orphan(&recv, &leaf.compute_hash()).unwrap(),
-            "leaf must not remain buffered once its parent is permanently rejected"
-        );
-    }
-
-    #[test]
-    fn missing_ancestor_frontier_is_empty_for_a_change_only_waiting_on_an_in_flight_parent() {
-        // A single-generation chain: `leaf`'s direct parent `root` simply
-        // hasn't arrived yet (not itself stuck behind anything). The old
-        // one-level check already handled this correctly -- confirms the
-        // new fn doesn't regress the ordinary in-flight case into treating
-        // an about-to-be-satisfied orphan as if its own immediate parent
-        // were missing when it's genuinely just still in transit.
-        let sender = conn();
-        let em = emitter();
-        let root =
-            emit_local_change(&sender, "g", vec![create_op("a")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
-        let leaf =
-            emit_local_change(&sender, "g", vec![create_op("b")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
-
-        let recv = conn();
-        seed_test_version(&recv, "g");
-        assert_eq!(admit_change(&recv, &leaf, true).unwrap().outcome, AdmitOutcome::Orphaned);
-
-        let missing = missing_ancestor_frontier(&recv, [leaf.compute_hash()]).unwrap();
-        assert_eq!(missing, vec![root.compute_hash()]);
-    }
-
-    #[test]
-    fn missing_ancestor_frontier_dedups_a_missing_ancestor_shared_by_two_roots() {
-        // Two independent chains, `root -> a` and `root -> b`, sharing the
-        // same never-delivered `root`. Both `a` and `b` buffer as orphans;
-        // querying both as roots together must report the shared missing
-        // ancestor exactly once, not twice -- this is the whole point of
-        // taking every root of one logical request in a single call instead
-        // of one call per root. Built via two sibling connections both
-        // seeded with the already-admitted `root` (so each independently
-        // emits a local change parented on it), rather than hand-building
-        // `Change` values directly.
-        let origin = conn();
-        let em_root = emitter();
-        let root = emit_local_change(
-            &origin,
-            "g",
-            vec![create_op("root")],
-            ChangeAuth::PLACEHOLDER,
-            &em_root,
-        )
-        .unwrap();
-
-        let sender_a = conn();
-        seed_test_version(&sender_a, "g");
-        assert_eq!(admit_change(&sender_a, &root, true).unwrap().outcome, AdmitOutcome::Applied);
-        let em_a = ChangeEmitter::new("device-a", key());
-        let a =
-            emit_local_change(&sender_a, "g", vec![create_op("a")], ChangeAuth::PLACEHOLDER, &em_a)
-                .unwrap();
-        assert_eq!(a.parents, vec![root.compute_hash()]);
-
-        let sender_b = conn();
-        seed_test_version(&sender_b, "g");
-        assert_eq!(admit_change(&sender_b, &root, true).unwrap().outcome, AdmitOutcome::Applied);
-        let em_b = ChangeEmitter::new("device-b", key());
-        let b =
-            emit_local_change(&sender_b, "g", vec![create_op("b")], ChangeAuth::PLACEHOLDER, &em_b)
-                .unwrap();
-        assert_eq!(b.parents, vec![root.compute_hash()]);
-
-        let recv = conn();
-        seed_test_version(&recv, "g");
-        assert_eq!(admit_change(&recv, &a, true).unwrap().outcome, AdmitOutcome::Orphaned);
-        assert_eq!(admit_change(&recv, &b, true).unwrap().outcome, AdmitOutcome::Orphaned);
-
-        let missing =
-            missing_ancestor_frontier(&recv, [a.compute_hash(), b.compute_hash()]).unwrap();
-        assert_eq!(missing, vec![root.compute_hash()]);
-    }
-
-    #[test]
-    fn missing_ancestor_frontier_reports_only_the_genuinely_missing_branch() {
-        // Two independent single-parent chains: one whose parent is already
-        // durably admitted (fully resolved, contributes nothing), one whose
-        // parent never arrived (genuinely missing). Confirms the walk
-        // doesn't conflate an admitted branch with a missing one when both
-        // are queried together.
-        let admitted_origin = conn();
-        let em_p1 = emitter();
-        let admitted_parent = emit_local_change(
-            &admitted_origin,
-            "g",
-            vec![create_op("p1")],
-            ChangeAuth::PLACEHOLDER,
-            &em_p1,
-        )
-        .unwrap();
-
-        let missing_origin = conn();
-        let em_p2 = ChangeEmitter::new("device-missing", key());
-        let missing_parent = emit_local_change(
-            &missing_origin,
-            "g",
-            vec![create_op("p2")],
-            ChangeAuth::PLACEHOLDER,
-            &em_p2,
-        )
-        .unwrap();
-
-        let recv = conn();
-        seed_test_version(&recv, "g");
-        // `admitted_parent` lands normally (its own parent set is empty --
-        // the first change in this group's history on `recv` -- so it
-        // applies immediately).
-        assert_eq!(
-            admit_change(&recv, &admitted_parent, true).unwrap().outcome,
-            AdmitOutcome::Applied
-        );
-
-        let resolved_sender = conn();
-        seed_test_version(&resolved_sender, "g");
-        assert_eq!(
-            admit_change(&resolved_sender, &admitted_parent, true).unwrap().outcome,
-            AdmitOutcome::Applied
-        );
-        let em_resolved = ChangeEmitter::new("device-a", key());
-        let resolved_child = emit_local_change(
-            &resolved_sender,
-            "g",
-            vec![create_op("resolved-child")],
-            ChangeAuth::PLACEHOLDER,
-            &em_resolved,
-        )
-        .unwrap();
-        assert_eq!(
-            admit_change(&recv, &resolved_child, true).unwrap().outcome,
-            AdmitOutcome::Applied
-        );
-
-        let orphaned_sender = conn();
-        seed_test_version(&orphaned_sender, "g");
-        assert_eq!(
-            admit_change(&orphaned_sender, &missing_parent, true).unwrap().outcome,
-            AdmitOutcome::Applied
-        );
-        let em_orphaned = ChangeEmitter::new("device-b", key());
-        let orphaned_child = emit_local_change(
-            &orphaned_sender,
-            "g",
-            vec![create_op("orphaned-child")],
-            ChangeAuth::PLACEHOLDER,
-            &em_orphaned,
-        )
-        .unwrap();
-        assert_eq!(
-            admit_change(&recv, &orphaned_child, true).unwrap().outcome,
-            AdmitOutcome::Orphaned
-        );
-
-        let missing = missing_ancestor_frontier(
-            &recv,
-            [resolved_child.compute_hash(), orphaned_child.compute_hash()],
-        )
-        .unwrap();
-        assert_eq!(missing, vec![missing_parent.compute_hash()]);
-    }
-
-    #[test]
-    fn missing_ancestor_frontier_propagates_a_corrupt_parent_hash_rather_than_calling_it_missing() {
-        // A malformed (non-32-byte) `change_parents.parent_hash` column must
-        // surface as an error from the walk, not be silently treated as
-        // "the peer doesn't have this either" -- folding a local data/DB
-        // problem into "missing" would trigger needless re-fetch storms
-        // instead of surfacing the real defect.
-        let sender = conn();
-        let em = emitter();
-        // `leaf` needs a genuinely missing parent to orphan at all -- a
-        // change with no parents (the group's very first) applies
-        // immediately instead.
-        let _root =
-            emit_local_change(&sender, "g", vec![create_op("root")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
-        let leaf =
-            emit_local_change(&sender, "g", vec![create_op("a")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
-
-        let recv = conn();
-        seed_test_version(&recv, "g");
-        assert_eq!(admit_change(&recv, &leaf, true).unwrap().outcome, AdmitOutcome::Orphaned);
-        recv.execute(
-            "DELETE FROM change_parents WHERE child_hash = ?1",
-            [&leaf.compute_hash().0[..]],
-        )
-        .unwrap();
-        recv.execute(
-            "INSERT INTO change_parents (child_hash, parent_hash) VALUES (?1, ?2)",
-            rusqlite::params![&leaf.compute_hash().0[..], vec![0xffu8; 4]],
-        )
-        .unwrap();
-
-        let error = missing_ancestor_frontier(&recv, [leaf.compute_hash()])
-            .expect_err("a malformed parent-hash column must be a hard error");
-        assert!(matches!(error, SyncSqliteError::NotFound(_)));
-    }
-
-    #[test]
-    fn promote_orphans_returns_promoted_hashes_in_append_order() {
-        // A chain root -> c1 -> c2 built on a sender, with the two descendants
-        // delivered to a fresh receiver before their common ancestor. When the
-        // ancestor lands, promotion must return the promoted changes' hashes in
-        // the order they were appended (oldest-first): the admission caller
-        // projects each promoted orphan's paths, so it needs their identities,
-        // not just a count.
-        let sender = conn();
-        let em = emitter();
-        let root =
-            emit_local_change(&sender, "g", vec![create_op("a")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
-        let c1 =
-            emit_local_change(&sender, "g", vec![create_op("b")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
-        let c2 =
-            emit_local_change(&sender, "g", vec![create_op("c")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
-
-        let recv = conn();
-        seed_test_version(&recv, "g");
-        // Both descendants arrive before the root: buffered, nothing promoted.
-        assert_eq!(admit_change(&recv, &c1, true).unwrap().outcome, AdmitOutcome::Orphaned);
-        assert_eq!(admit_change(&recv, &c2, true).unwrap().outcome, AdmitOutcome::Orphaned);
-
-        // Land the root directly and promote: c1 unblocks first (its parent is
-        // the root), then c2 (its parent is c1).
-        assert!(append_change(&recv, &root, true, now_unix_nanos()).unwrap());
-        let promoted = promote_orphans(
-            &recv,
-            &[root.compute_hash()],
-            &orphan_integrity::always_current_writer,
-        )
-        .unwrap();
-        assert_eq!(promoted, vec![c1.compute_hash(), c2.compute_hash()]);
-    }
-
-    /// C4-12 Stage 0.5.2/0.5.3: `init_dag_schema`'s startup self-heal sweep
-    /// (`already_satisfied_parents` -> `promote_orphans` ->
-    /// `bump_execution_fence_for_promoted`) now runs inside one explicit
-    /// transaction, closing a real, pre-existing atomicity gap: unlike
-    /// ordinary admission (always wrapped in `write_immediate` by its
-    /// caller), this startup sweep used to run its two mutating steps as
-    /// independent statements on a bare autocommit connection. A failure
-    /// between them (or a process crash) could leave a change durably
-    /// promoted with no corresponding execution-fence bump for its paths --
-    /// exactly the "DAG holds a change, no fence exists for its touched
-    /// paths" window `admit_change`'s own promotion path never has.
-    ///
-    /// This test proves the fix at the mechanism level (mirroring
-    /// `dropping_a_causal_auth_violation_also_drops_its_buffered_
-    /// descendants`'s own "isolate the transaction-free mechanism" style
-    /// above it): build the exact scenario `already_satisfied_parents`
-    /// exists for (a parent landed via bare `append_change`, never through
-    /// `admit_change`, so its buffered child was never promoted), then
-    /// force `bump_execution_fence_for_promoted` to fail immediately after
-    /// `promote_orphans` succeeds, inside the same transaction shape
-    /// `init_dag_schema` now uses. Confirmed genuinely RED against the
-    /// pre-fix (unwrapped, sequential) shape: reverting the `tx`/`commit`
-    /// wrap in `init_dag_schema` and driving the same two calls directly on
-    /// `recv` leaves the promotion committed despite the fence-bump error.
-    #[test]
-    fn startup_self_heal_promotion_and_fence_bump_are_atomic() {
-        let sender = conn();
-        let em = emitter();
-        let root =
-            emit_local_change(&sender, "g", vec![create_op("a")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
-        let child =
-            emit_local_change(&sender, "g", vec![create_op("b")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
-
-        let recv = conn();
-        seed_test_version(&recv, "g");
-        // child arrives first: buffered as an orphan (root unseen yet).
-        assert_eq!(admit_change(&recv, &child, true).unwrap().outcome, AdmitOutcome::Orphaned);
-        // root lands via bare `append_change`, not `admit_change` -- exactly
-        // the "crash between append_change and promote_orphans" gap
-        // `already_satisfied_parents`'s own doc comment describes. Nothing
-        // has promoted `child` yet.
-        assert!(append_change(&recv, &root, true, now_unix_nanos()).unwrap());
-        assert!(!has_change(&recv, &child.compute_hash()).unwrap());
-
-        let seeds = orphan_integrity::already_satisfied_parents(&recv).unwrap();
-        assert_eq!(seeds, vec![root.compute_hash()], "root must be a self-heal seed");
-
-        // Drive the same promotion+fence-bump sequence `init_dag_schema`'s
-        // self-heal block and `ChangeHistoryRepository::
-        // resweep_deferred_orphan_promotions` both use, inside one
-        // transaction -- but corrupt `child`'s own `changes` row between the
-        // two steps, forcing `bump_execution_fence_for_promoted`'s
-        // `describe_hash` re-read to fail with `CorruptState` instead of
-        // finding it `Admitted`. `always_current_writer` here: this test is
-        // about promotion/fence-bump atomicity, not the writer-freshness
-        // gate (`init_dag_schema`'s own self-heal call always defers now --
-        // see that call site's own comment).
-        let tx = recv.unchecked_transaction().unwrap();
-        let promoted = orphan_integrity::promote_orphans(
-            &tx,
-            &seeds,
-            &orphan_integrity::always_current_writer,
-        )
-        .unwrap();
-        assert_eq!(promoted, vec![child.compute_hash()]);
-        tx.execute("DELETE FROM changes WHERE change_hash = ?1", [&child.compute_hash().0[..]])
-            .unwrap();
-        let bump_result = bump_execution_fence_for_promoted(&tx, &promoted);
-        assert!(bump_result.is_err(), "the corrupted row must make the fence bump fail");
-        drop(tx); // never committed -- an uncommitted transaction rolls back on drop, exactly like a crash before `commit()`.
-
-        // GREEN: because promotion and the fence bump shared one
-        // transaction, the promotion rolled back along with the failed
-        // bump -- `child` is still a buffered orphan, never left durably
-        // promoted with a missing fence.
-        assert!(
-            !has_change(&recv, &child.compute_hash()).unwrap(),
-            "a failed fence bump must roll back its own promotion, not leave a promoted-but-unfenced change"
-        );
-        assert!(
-            has_change_or_buffered_orphan(&recv, &child.compute_hash()).unwrap(),
-            "the child must still be recoverable as a buffered orphan after the rollback"
-        );
-    }
-
-    /// Happy-path companion to the atomicity test above, updated for the
-    /// writer-freshness fix (`a329b9d4`, "Close a stale-ChangeAuth replay
-    /// hole in live admission; cover orphan promotion"): `init_dag_schema`'s
-    /// own self-heal sweep now runs with `orphan_integrity::
-    /// defer_all_orphan_promotion` (see that call site's own comment), so it
-    /// must NOT promote `child` itself -- no trust material can possibly be
-    /// loaded this early in startup. What this test actually proves is the
-    /// full two-step production sequence: `init_dag_schema` defers at
-    /// startup, then `resweep_deferred_orphan_promotions` (driven here with
-    /// `always_current_writer`, standing in for the real policy-backed check
-    /// `yadorilink_daemon::peer_orchestrator::record_group_policy_states`
-    /// installs once trust is available) gives the deferred child its
-    /// genuine second chance and actually promotes it. `init_dag_schema` is
-    /// genuinely re-run on the same connection (a restart, not a fresh
-    /// database), matching production's own re-open-on-every-startup shape.
-    #[test]
-    fn startup_self_heal_promotes_a_child_whose_parent_landed_via_append_change_alone() {
-        let sender = conn();
-        let em = emitter();
-        let root =
-            emit_local_change(&sender, "g", vec![create_op("a")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
-        let child =
-            emit_local_change(&sender, "g", vec![create_op("b")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
-
-        let recv = conn();
-        seed_test_version(&recv, "g");
-        assert_eq!(admit_change(&recv, &child, true).unwrap().outcome, AdmitOutcome::Orphaned);
-        assert!(append_change(&recv, &root, true, now_unix_nanos()).unwrap());
-        assert!(!has_change(&recv, &child.compute_hash()).unwrap());
-
-        // Re-running schema init on the SAME connection is what a restart
-        // does in production (`SyncDatabase::open`'s `schema_init(&conn)`
-        // call, on every open, not just the first).
-        init_dag_schema(&recv).unwrap();
-
-        // `init_dag_schema`'s own self-heal sweep always defers now -- no
-        // trust material is available this early in startup, so the child
-        // must still be a buffered orphan, not promoted.
-        assert!(
-            !has_change(&recv, &child.compute_hash()).unwrap(),
-            "init_dag_schema's self-heal sweep must defer (not promote) with no trust material \
-             available"
-        );
-        assert!(
-            has_change_or_buffered_orphan(&recv, &child.compute_hash()).unwrap(),
-            "the deferred child must still be recoverable as a buffered orphan"
-        );
-
-        // The second half of production's real sequence: once real trust is
-        // available, `resweep_deferred_orphan_promotions` gives the
-        // deferred candidate its genuine second chance.
-        let resweeped =
-            resweep_deferred_orphan_promotions(&recv, &orphan_integrity::always_current_writer)
-                .unwrap();
-        assert_eq!(resweeped, vec![child.compute_hash()]);
-        assert!(
-            has_change(&recv, &child.compute_hash()).unwrap(),
-            "resweep_deferred_orphan_promotions must promote a child whose parent only ever \
-             landed via append_change"
-        );
-        assert_eq!(group_heads(&recv, "g").unwrap(), vec![child.compute_hash()]);
-    }
-
-    /// The primary-admission seam bumps `projection_obligations` for
-    /// exactly the admitted change's touched
-    /// paths, no others. Confirmed genuinely RED by temporarily commenting
-    /// out this seam's own bump call (in `admit_change`'s `(true, Verified)`
-    /// arm) and re-running: the obligation row for "a" is never created.
-    #[test]
-    fn primary_admission_bumps_the_projection_obligation_for_exactly_its_touched_paths() {
-        let sender = conn();
-        let em = emitter();
-        let root = emit_local_change(
-            &sender,
-            "g",
-            vec![create_op("a"), create_op("b")],
-            ChangeAuth::PLACEHOLDER,
-            &em,
-        )
-        .unwrap();
-
-        let recv = conn();
-        seed_test_version(&recv, "g");
-        assert_eq!(admit_change(&recv, &root, true).unwrap().outcome, AdmitOutcome::Applied);
-
-        let a = crate::projection_obligations::lookup_projection_obligation(&recv, "g", "a")
-            .unwrap()
-            .unwrap();
-        assert_eq!(a.invalidation_generation, 1);
-        let b = crate::projection_obligations::lookup_projection_obligation(&recv, "g", "b")
-            .unwrap()
-            .unwrap();
-        assert_eq!(b.invalidation_generation, 1);
-        assert!(
-            crate::projection_obligations::lookup_projection_obligation(&recv, "g", "unrelated")
-                .unwrap()
-                .is_none(),
-            "an untouched path must have no obligation at all"
-        );
-    }
-
-    /// The promoted-orphan seam bumps the obligation for a change that
-    /// becomes durable only as a side effect of
-    /// its parent's own admission, not just for the parent itself. Confirmed
-    /// genuinely RED by temporarily removing the bump call from
-    /// `bump_execution_fence_for_promoted`'s loop body and re-running: the
-    /// orphan's own path ("child-path") is admitted but never obligated.
-    #[test]
-    fn promoted_orphan_admission_bumps_the_projection_obligation_for_its_own_touched_paths() {
-        let sender = conn();
-        let em = emitter();
-        let root = emit_local_change(
-            &sender,
-            "g",
-            vec![create_op("root-path")],
-            ChangeAuth::PLACEHOLDER,
-            &em,
-        )
-        .unwrap();
-        let child = emit_local_change(
-            &sender,
-            "g",
-            vec![create_op("child-path")],
-            ChangeAuth::PLACEHOLDER,
-            &em,
-        )
-        .unwrap();
-
-        let recv = conn();
-        seed_test_version(&recv, "g");
-        // child arrives first: buffered as an orphan, root unseen.
-        assert_eq!(admit_change(&recv, &child, true).unwrap().outcome, AdmitOutcome::Orphaned);
-        assert!(
-            crate::projection_obligations::lookup_projection_obligation(&recv, "g", "child-path")
-                .unwrap()
-                .is_none(),
-            "a buffered orphan must not bump any obligation until it is actually promoted"
-        );
-        // root lands via the normal admission path -- promotes child too.
-        assert_eq!(admit_change(&recv, &root, true).unwrap().outcome, AdmitOutcome::Applied);
-
-        let root_ob =
-            crate::projection_obligations::lookup_projection_obligation(&recv, "g", "root-path")
-                .unwrap()
-                .unwrap();
-        assert_eq!(root_ob.invalidation_generation, 1);
-        let child_ob =
-            crate::projection_obligations::lookup_projection_obligation(&recv, "g", "child-path")
-                .unwrap()
-                .unwrap();
-        assert_eq!(
-            child_ob.invalidation_generation, 1,
-            "the promoted orphan's own touched path must be obligated too, not just the parent's"
-        );
-    }
-
-    /// Local emission bumps the obligation for a change this device
-    /// authored itself, not only for remotely-admitted
-    /// changes. Confirmed genuinely RED by temporarily removing the bump
-    /// call from `admit_prepared_emission` and re-running.
-    #[test]
-    fn local_emission_bumps_the_projection_obligation_for_its_touched_paths() {
-        let conn = conn();
-        let em = emitter();
-        seed_test_version(&conn, "g");
-        let change = emit_local_change(
-            &conn,
-            "g",
-            vec![create_op("local-path")],
-            ChangeAuth::PLACEHOLDER,
-            &em,
-        )
-        .unwrap();
-        assert!(has_change(&conn, &change.compute_hash()).unwrap());
-
-        let ob =
-            crate::projection_obligations::lookup_projection_obligation(&conn, "g", "local-path")
-                .unwrap()
-                .unwrap();
-        assert_eq!(ob.invalidation_generation, 1);
-    }
-
-    /// Startup self-heal bumps the obligation for a child promoted once
-    /// real trust becomes available and `resweep_deferred_orphan_
-    /// promotions` actually runs -- `init_dag_schema`'s own self-heal sweep
-    /// always defers now (writer-freshness fix `a329b9d4`; see that call
-    /// site's own comment and the happy-path promotion test above), so it
-    /// must not touch the obligation at all; only the later resweep may.
-    /// Confirmed genuinely RED by temporarily removing the bump call this
-    /// seam shares with `bump_execution_fence_for_promoted` and re-running:
-    /// the child is promoted (proven by the happy-path test above) but
-    /// never obligated.
-    #[test]
-    fn startup_self_heal_bumps_the_projection_obligation_for_the_promoted_child() {
-        let sender = conn();
-        let em = emitter();
-        let root =
-            emit_local_change(&sender, "g", vec![create_op("a")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
-        let child =
-            emit_local_change(&sender, "g", vec![create_op("b")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
-
-        let recv = conn();
-        seed_test_version(&recv, "g");
-        assert_eq!(admit_change(&recv, &child, true).unwrap().outcome, AdmitOutcome::Orphaned);
-        assert!(append_change(&recv, &root, true, now_unix_nanos()).unwrap());
-        assert!(
-            crate::projection_obligations::lookup_projection_obligation(&recv, "g", "b")
-                .unwrap()
-                .is_none(),
-            "a buffered orphan must not be obligated before it is actually promoted"
-        );
-
-        init_dag_schema(&recv).unwrap();
-
-        // `init_dag_schema`'s self-heal sweep defers -- the child is still
-        // unpromoted, so it must still have no obligation either.
-        assert!(
-            crate::projection_obligations::lookup_projection_obligation(&recv, "g", "b")
-                .unwrap()
-                .is_none(),
-            "a deferred (not yet promoted) child must still have no obligation"
-        );
-
-        resweep_deferred_orphan_promotions(&recv, &orphan_integrity::always_current_writer)
-            .unwrap();
-
-        let ob = crate::projection_obligations::lookup_projection_obligation(&recv, "g", "b")
-            .unwrap()
-            .unwrap();
-        assert_eq!(ob.invalidation_generation, 1);
-    }
-
-    /// Re-admitting an already-admitted change (the "already known,
-    /// no-op" path inside `admit_change`) must not bump any generation
-    /// and must not create a new obligation row -- this is what makes
-    /// network redelivery a pure no-op on the desired side, independent
-    /// of anything a later batch handler does to `handle_change_batch`
-    /// itself.
-    #[test]
-    fn redelivering_an_already_admitted_change_bumps_no_obligation() {
-        let sender = conn();
-        let em = emitter();
-        let root =
-            emit_local_change(&sender, "g", vec![create_op("a")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
-
-        let recv = conn();
-        seed_test_version(&recv, "g");
-        assert_eq!(admit_change(&recv, &root, true).unwrap().outcome, AdmitOutcome::Applied);
-        let first = crate::projection_obligations::lookup_projection_obligation(&recv, "g", "a")
-            .unwrap()
-            .unwrap();
-        assert_eq!(first.invalidation_generation, 1);
-
-        // Re-admit the exact same, already-admitted change -- the "already
-        // known" path `admit_change` takes for a hash it has already seen.
-        // `AdmitResult.newly_admitted` always reports the primary hash when
-        // the outcome is `Applied` (pre-existing behavior, unrelated to
-        // this fix) -- what PROJ-1 actually requires is that no durable
-        // side effect happens a second time, checked below via the
-        // obligation's own generation, not via this return value's shape.
-        let second = admit_change(&recv, &root, true).unwrap();
-        assert_eq!(
-            second.outcome,
-            AdmitOutcome::Applied,
-            "re-admitting an already-known change is a no-op success, not an error"
-        );
-
-        let after = crate::projection_obligations::lookup_projection_obligation(&recv, "g", "a")
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            after.invalidation_generation, 1,
-            "redelivering an already-admitted change must not bump its generation"
-        );
-    }
-
-    #[test]
-    fn admit_change_reports_the_current_change_and_promoted_orphans() {
-        // The other half of the same guarantee, but through `admit_change`:
-        // admitting the root that unblocks a buffered child must report BOTH
-        // the root and the promoted child in `newly_admitted`, root first.
-        let sender = conn();
-        let em = emitter();
-        let root =
-            emit_local_change(&sender, "g", vec![create_op("a")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
-        let child =
-            emit_local_change(&sender, "g", vec![create_op("b")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
-
-        let recv = conn();
-        seed_test_version(&recv, "g");
-        let orphaned = admit_change(&recv, &child, true).unwrap();
-        assert_eq!(orphaned.outcome, AdmitOutcome::Orphaned);
-        assert!(orphaned.newly_admitted.is_empty(), "an orphaned change admits nothing yet");
-
-        let applied = admit_change(&recv, &root, true).unwrap();
-        assert_eq!(applied.outcome, AdmitOutcome::Applied);
-        assert_eq!(applied.newly_admitted, vec![root.compute_hash(), child.compute_hash()]);
-    }
-
-    /// A change naming a versioned reserved-namespace artefact must be
-    /// rejected before admission, so a peer can never route an artefact
-    /// path into another device's index.
-    #[test]
-    fn admit_change_rejects_a_versioned_artefact_path() {
-        let artefact_path = yadorilink_root_authority::reserved_namespace::artefact_component_name(
-            yadorilink_root_authority::reserved_namespace::ArtefactKind::Preimage,
-            "deadbeef",
-        )
-        .unwrap();
-        let change = hand_signed_change("g", vec![create_op(&artefact_path)]);
-
-        let recv = conn();
-        seed_test_version(&recv, "g");
-        let err = admit_change(&recv, &change, true).unwrap_err();
-        assert!(
-            matches!(err, SyncSqliteError::ReservedNamespaceCollision(ref p) if p == &artefact_path),
-            "expected ReservedNamespaceCollision naming the artefact path, got {err:?}"
-        );
-    }
-
-    /// THE remote-admission hole this pins closed: a peer's signed change
-    /// naming this device's own sync-root lock file
-    /// (`yadorilink_root_authority::sync_root_lock::SYNC_ROOT_LOCK_FILE_NAME`) must be refused
-    /// at admission -- driven through the real `admit_change` entry point a
-    /// peer's change actually arrives through, not a bare predicate call.
-    /// Without this, the change would later materialize and replace the
-    /// on-disk lock file out from under this device's own live OS lock,
-    /// letting a second daemon acquire a fresh lock at the same path and
-    /// believe it owns the root exclusively too.
-    #[test]
-    fn admit_change_rejects_a_sync_root_lock_path() {
-        let lock_path =
-            yadorilink_root_authority::sync_root_lock::SYNC_ROOT_LOCK_FILE_NAME.to_string();
-        let change = hand_signed_change("g", vec![create_op(&lock_path)]);
-
-        let recv = conn();
-        seed_test_version(&recv, "g");
-        let err = admit_change(&recv, &change, true).unwrap_err();
-        assert!(
-            matches!(err, SyncSqliteError::ReservedNamespaceCollision(ref p) if p == &lock_path),
-            "expected ReservedNamespaceCollision naming the sync-root lock path, got {err:?}"
-        );
-    }
-
-    /// The fix for a real defect: rejecting a change at admission used to
-    /// write nothing durable, so the hash was indistinguishable from one
-    /// this device simply never received — `has_change_or_buffered_orphan`
-    /// and `missing_ancestor_frontier` would treat it as still-missing
-    /// forever, and a peer would be asked for the identical, permanently
-    /// unadmittable change on every future heads announce. A
-    /// reserved-namespace rejection is a fixed property of the change's own
-    /// bytes (re-admitting the identical change can never produce a
-    /// different verdict), so it must be durably recorded and both
-    /// "is this hash known" functions must recognize it — proven directly
-    /// here rather than only through `admit_change`'s own return value.
-    #[test]
-    fn a_rejected_change_stops_being_reported_missing_and_is_not_re_requested() {
-        let artefact_path = yadorilink_root_authority::reserved_namespace::artefact_component_name(
-            yadorilink_root_authority::reserved_namespace::ArtefactKind::Backup,
-            "cafef00d",
-        )
-        .unwrap();
-        let change = hand_signed_change("g", vec![create_op(&artefact_path)]);
-        let hash = change.compute_hash();
-
-        let recv = conn();
-        seed_test_version(&recv, "g");
-        assert!(!has_change_or_buffered_orphan(&recv, &hash).unwrap(), "not seen yet");
-        let missing_before = missing_ancestor_frontier(&recv, [hash]).unwrap();
-        assert_eq!(missing_before, vec![hash], "genuinely unseen, so genuinely missing");
-
-        admit_change(&recv, &change, true).unwrap_err();
-
-        assert!(
-            has_change_or_buffered_orphan(&recv, &hash).unwrap(),
-            "a permanently-rejected hash must count as known — nothing about \
-             re-requesting it can ever change the outcome"
-        );
-        let missing_after = missing_ancestor_frontier(&recv, [hash]).unwrap();
-        assert!(
-            missing_after.is_empty(),
-            "a permanently-rejected hash must never be reported as missing again, or a peer \
-             re-request loop never terminates: {missing_after:?}"
-        );
-
-        let rejected = list_rejected_changes(&recv, "g").unwrap();
-        assert_eq!(rejected.len(), 1);
-        assert_eq!(rejected[0].0, hash);
-        assert!(rejected[0].1.contains(&artefact_path), "reason must name the exact path");
-    }
-
-    /// The converse guardrail, and the fix for a real defect: a change
-    /// naming a path that merely *contains* the LEGACY `.yadorilink-tmp.`
-    /// substring must still be admitted normally. Rejecting it here would
-    /// (a) permanently block a genuine user file that happens to look like
-    /// the marker (the marker is a substring match precisely because
-    /// arbitrary user content can precede it — see
-    /// `materialization::cleanup_stale_temp_files`'s own refusal to delete
-    /// such a look-alike), and (b) make any already-signed history
-    /// containing a legacy-marked path (admitted before this namespace
-    /// excluded it from indexing) permanently unadmittable by an upgraded
-    /// peer, stalling the whole group. `admit_change` must key its
-    /// rejection on the artefact-only predicate, not the broader exclusion
-    /// predicate; this test fails if it is pointed at the latter.
-    #[test]
-    fn admit_change_admits_a_legacy_marker_look_alike_path() {
-        let sender = conn();
-        let em = emitter();
-        let legacy_path = "report.yadorilink-tmp.old";
-        let change = emit_local_change(
-            &sender,
-            "g",
-            vec![create_op(legacy_path)],
-            ChangeAuth::PLACEHOLDER,
-            &em,
-        )
-        .unwrap();
-
-        let recv = conn();
-        seed_test_version(&recv, "g");
-        let result = admit_change(&recv, &change, true).unwrap();
-        assert_eq!(result.outcome, AdmitOutcome::Applied);
-    }
-
-    /// Windows drops trailing `.`/` ` in most Win32 path APIs, so a peer
-    /// that spells a reserved name with a trailing dot or space types a
-    /// path that is not literally the reserved name, but would land on
-    /// disk — on a Windows device — as exactly the reserved name. This
-    /// check is a wire-facing boundary between arbitrary peers, so it must
-    /// catch both forms regardless of which platform is running admission.
-    #[test]
-    fn admit_change_rejects_a_versioned_artefact_path_with_windows_trailing_normalization() {
-        for suffix in [" ", "."] {
-            let artefact_path = format!(
-                "{}{suffix}",
-                yadorilink_root_authority::reserved_namespace::artefact_component_name(
-                    yadorilink_root_authority::reserved_namespace::ArtefactKind::Preimage,
-                    "deadbeef",
-                )
-                .unwrap()
-            );
-            let change = hand_signed_change("g", vec![create_op(&artefact_path)]);
-
-            let recv = conn();
-            seed_test_version(&recv, "g");
-            let err = admit_change(&recv, &change, true).unwrap_err();
-            assert!(
-                matches!(err, SyncSqliteError::ReservedNamespaceCollision(ref p) if p == &artefact_path),
-                "suffix {suffix:?}: expected ReservedNamespaceCollision, got {err:?}"
-            );
-        }
-    }
-
-    /// A trailing space makes this path non-portable (Windows silently
-    /// drops it), independently of whether the path also happens to look
-    /// like a legacy marker: two distinct wire paths differing only in a
-    /// trailing '.'/' ' must never both be admitted as independent index
-    /// rows, since they'd silently collide onto one on-disk name the
-    /// moment either materializes on a Windows device. See
-    /// `admit_change_admits_a_legacy_marker_look_alike_path` for the
-    /// sibling case (same look-alike name, no trailing space) that
-    /// confirms the legacy-marker substring match alone must not block an
-    /// ordinary user file, and
-    /// `reserved_namespace::tests::wire_predicate_still_excludes_the_legacy_marker_with_a_trailing_space`
-    /// for where the narrower "trailing-space stripping must not widen the
-    /// artefact predicate" property this test used to pin now lives — it
-    /// can no longer be exercised through this full admission pipeline,
-    /// since the non-portability check below refuses the path before the
-    /// artefact-vs-legacy classification is ever reached.
-    #[test]
-    fn admit_change_rejects_a_non_portable_path_even_when_it_also_looks_like_a_legacy_marker() {
-        let legacy_path = "report.yadorilink-tmp.old ";
-        let change = hand_signed_change("g", vec![create_op(legacy_path)]);
-
-        let recv = conn();
-        seed_test_version(&recv, "g");
-        let err = admit_change(&recv, &change, true).unwrap_err();
-        assert!(
-            matches!(err, SyncSqliteError::NonPortablePath(ref p) if p == legacy_path),
-            "expected NonPortablePath naming the trailing-space path, got {err:?}"
-        );
-    }
-
-    /// NTFS `filename::$DATA` addresses `filename`'s own default stream,
-    /// so a change naming an ADS-suffixed alias for a versioned artefact
-    /// must be rejected at admission exactly like the un-suffixed name —
-    /// otherwise a remote peer can get history admitted that later
-    /// materializes as a write through the artefact's own default stream.
-    #[test]
-    fn admit_change_rejects_an_alternate_data_stream_alias_for_a_versioned_artefact() {
-        let artefact_path = format!(
-            "{}::$DATA",
-            yadorilink_root_authority::reserved_namespace::artefact_component_name(
-                yadorilink_root_authority::reserved_namespace::ArtefactKind::Stage,
-                "deadbeef",
-            )
-            .unwrap()
-        );
-        let change = hand_signed_change("g", vec![create_op(&artefact_path)]);
-
-        let recv = conn();
-        seed_test_version(&recv, "g");
-        let err = admit_change(&recv, &change, true).unwrap_err();
-        assert!(
-            matches!(err, SyncSqliteError::ReservedNamespaceCollision(ref p) if p == &artefact_path),
-            "expected ReservedNamespaceCollision naming the ADS-aliased path, got {err:?}"
-        );
-    }
-
-    /// `change::validate_path` accepts both `/` and `\` as separators, so
-    /// a change naming a backslash-delimited artefact component must be
-    /// rejected the same on every host running admission — resolving the
-    /// path through the local `std::path::Path` type instead would make a
-    /// Unix receiver admit exactly the history a Windows receiver refuses
-    /// forever, permanently splitting the group along platform lines.
-    #[test]
-    fn admit_change_rejects_a_backslash_delimited_artefact_path_on_every_host() {
-        let artefact_path = format!(
-            "safe\\{}",
-            yadorilink_root_authority::reserved_namespace::artefact_component_name(
-                yadorilink_root_authority::reserved_namespace::ArtefactKind::Preimage,
-                "cafef00d",
-            )
-            .unwrap()
-        );
-        let change = hand_signed_change("g", vec![create_op(&artefact_path)]);
-
-        let recv = conn();
-        seed_test_version(&recv, "g");
-        let err = admit_change(&recv, &change, true).unwrap_err();
-        assert!(
-            matches!(err, SyncSqliteError::ReservedNamespaceCollision(ref p) if p == &artefact_path),
-            "expected ReservedNamespaceCollision naming the backslash-delimited path, got {err:?}"
-        );
-    }
-
-    /// A literal backslash anywhere in a wire path is refused outright, on
-    /// every platform — not just converted or reinterpreted on Windows. A
-    /// Unix-authored path containing a literal backslash byte would
-    /// otherwise be ambiguous the moment it reaches a Windows receiver,
-    /// where `\` is the path separator: the same wire string would name two
-    /// different filesystem shapes depending on which OS materializes it.
-    /// Refusing it at the source is the only choice that is unambiguous
-    /// everywhere.
-    #[test]
-    fn admit_change_refuses_an_ordinary_backslash_containing_path() {
-        let sender = conn();
-        let em = emitter();
-        let err = emit_local_change(
-            &sender,
-            "g",
-            vec![create_op("safe\\ordinary-file.txt")],
-            ChangeAuth::PLACEHOLDER,
-            &em,
-        )
-        .unwrap_err();
-        assert!(
-            matches!(err, SyncSqliteError::InvalidInput(ref msg) if msg.contains("backslash")),
-            "expected a backslash-rejection InvalidInput, got {err:?}"
-        );
-    }
-
-    /// A literal `:` anywhere in an ordinary (non-artefact) path component
-    /// is refused the same way as trailing-dot/space: on a POSIX host it's
-    /// just a character, but on Windows it's the alternate-data-stream
-    /// separator, so `"notes"` and `"notes:draft"` would alias the same
-    /// on-disk object there — see
-    /// `reserved_namespace::path_has_non_portable_wire_component`'s doc
-    /// comment.
-    #[test]
-    fn admit_change_rejects_a_path_with_a_literal_colon() {
-        let path = "notes:draft.txt";
-        let change = hand_signed_change("g", vec![create_op(path)]);
-
-        let recv = conn();
-        seed_test_version(&recv, "g");
-        let err = admit_change(&recv, &change, true).unwrap_err();
-        assert!(
-            matches!(err, SyncSqliteError::NonPortablePath(ref p) if p == path),
-            "expected NonPortablePath naming the colon-containing path, got {err:?}"
-        );
-    }
-
-    /// Windows reserves `CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9` and
-    /// `LPT1`-`LPT9` (matched against a component's stem, case-
-    /// insensitively) as device names: a Windows peer can never create a
-    /// file under one of these names, while the identical path is a
-    /// perfectly ordinary file on Linux/macOS. Refused at admission for
-    /// the same host-independence reason as every other check in this
-    /// module — a change every non-Windows member accepts must not be one
-    /// a Windows member can never materialize.
-    #[test]
-    fn admit_change_rejects_a_reserved_windows_device_name_path() {
-        for name in ["CON", "com1", "LPT9.log"] {
-            let change = hand_signed_change("g", vec![create_op(name)]);
-
-            let recv = conn();
-            seed_test_version(&recv, "g");
-            let err = admit_change(&recv, &change, true).unwrap_err();
-            assert!(
-                matches!(err, SyncSqliteError::NonPortablePath(ref p) if p == name),
-                "{name:?}: expected NonPortablePath, got {err:?}"
-            );
-        }
-    }
-
-    /// Win32's `CreateFile` family refuses `<`, `>`, `"`, `|`, `?` and `*`
-    /// in a filename outright, on every Windows version, every time — each
-    /// is a perfectly ordinary character in a Linux/macOS filename. Same
-    /// host-independence reasoning as every other check in this module: a
-    /// change every non-Windows member accepts must not be one a Windows
-    /// member can never materialize.
-    #[test]
-    fn admit_change_rejects_a_path_with_a_win32_reserved_filename_character() {
-        for ch in ['<', '>', '"', '|', '?', '*'] {
-            let path = format!("notes{ch}draft.txt");
-            let change = hand_signed_change("g", vec![create_op(&path)]);
-
-            let recv = conn();
-            seed_test_version(&recv, "g");
-            let err = admit_change(&recv, &change, true).unwrap_err();
-            assert!(
-                matches!(err, SyncSqliteError::NonPortablePath(ref p) if p == &path),
-                "{ch:?}: expected NonPortablePath, got {err:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn delivery_order_does_not_change_final_heads() {
-        // Same three-change set delivered in two different orders converges
-        // to the same head set (commutativity at the store level).
-        let sender = conn();
-        let em = emitter();
-        let r = emit_local_change(&sender, "g", vec![create_op("a")], ChangeAuth::PLACEHOLDER, &em)
-            .unwrap();
-        let m = emit_local_change(&sender, "g", vec![create_op("b")], ChangeAuth::PLACEHOLDER, &em)
-            .unwrap();
-        let t = emit_local_change(&sender, "g", vec![create_op("c")], ChangeAuth::PLACEHOLDER, &em)
-            .unwrap();
-
-        let forward = conn();
-        seed_test_version(&forward, "g");
-        for ch in [&r, &m, &t] {
-            admit_change(&forward, ch, true).unwrap();
-        }
-        let reverse = conn();
-        seed_test_version(&reverse, "g");
-        for ch in [&t, &r, &m] {
-            admit_change(&reverse, ch, true).unwrap();
-        }
-        assert_eq!(group_heads(&forward, "g").unwrap(), group_heads(&reverse, "g").unwrap());
-        assert_eq!(group_heads(&forward, "g").unwrap(), vec![t.compute_hash()]);
-    }
-
-    #[test]
-    fn admission_rejects_malformed_lamport() {
-        let c = conn();
-        let em = emitter();
-        let root =
-            emit_local_change(&c, "g", vec![create_op("a")], ChangeAuth::PLACEHOLDER, &em).unwrap();
-        seed_test_version(&c, "g");
-        let bad = Change::create_signed(
-            vec![root.compute_hash()],
-            99,
-            ChangeAuth::PLACEHOLDER,
-            DeviceId("device-B".into()),
-            FolderGroupId("g".into()),
-            vec![create_op("b")],
-            &SigningKey::from_bytes(&[2u8; 32]),
-        );
-        assert!(admit_change(&c, &bad, true).is_err());
-    }
-
-    #[test]
-    fn admission_rejects_file_version_from_another_group() {
-        let c = conn();
-        put_file_version(&c, "other-group", &test_version()).unwrap();
-        let bad = Change::create_signed(
-            vec![],
-            0,
-            ChangeAuth::PLACEHOLDER,
-            DeviceId("device-B".into()),
-            FolderGroupId("g".into()),
-            vec![create_op("b")],
-            &SigningKey::from_bytes(&[2u8; 32]),
-        );
-        assert!(admit_change(&c, &bad, true).is_err());
-    }
-
-    #[test]
-    fn identical_file_version_is_independently_owned_by_each_group() {
-        let c = conn();
-        let version = test_version();
-        assert!(put_file_version(&c, "group-a", &version).unwrap());
-        assert!(put_file_version(&c, "group-b", &version).unwrap());
-        assert!(has_file_version(&c, "group-a", &version.version_hash).unwrap());
-        assert!(has_file_version(&c, "group-b", &version.version_hash).unwrap());
-        assert_eq!(
-            get_file_version(&c, "group-b", &version.version_hash).unwrap().unwrap(),
-            version
-        );
-    }
-
-    #[test]
-    fn device_frontier_replaces_and_removes() {
-        let c = conn();
-        let h1 = ChangeHash([1u8; 32]);
-        let h2 = ChangeHash([2u8; 32]);
-        let h3 = ChangeHash([3u8; 32]);
-
-        // A frontier can carry several concurrent heads.
-        set_device_frontier(&c, "g", "dev", &[h2, h1]).unwrap();
-        assert_eq!(get_device_frontier(&c, "g", "dev").unwrap(), vec![h1, h2]);
-
-        // Setting replaces the whole frontier rather than accumulating.
-        set_device_frontier(&c, "g", "dev", &[h3]).unwrap();
-        assert_eq!(get_device_frontier(&c, "g", "dev").unwrap(), vec![h3]);
-
-        // Removal clears it entirely.
-        remove_device_frontier(&c, "g", "dev").unwrap();
-        assert!(get_device_frontier(&c, "g", "dev").unwrap().is_empty());
-    }
-
-    #[test]
-    fn encoded_bytes_are_served_verbatim() {
-        let c = conn();
-        let change =
-            emit_local_change(&c, "g", vec![create_op("a")], ChangeAuth::PLACEHOLDER, &emitter())
-                .unwrap();
-        let served = get_encoded(&c, &change.compute_hash()).unwrap().unwrap();
-        assert_eq!(served, change.to_wire_bytes());
-        // A relayed change round-trips to the identical change.
-        assert_eq!(Change::from_wire_bytes(&served).unwrap(), change);
-    }
-
-    /// The dual-write path: `upsert_file_emitting_change` must land the index
-    /// row and the signed change in one commit, with the change becoming the
-    /// group's sole head.
-    #[test]
-    fn dual_write_commits_index_row_and_change_together() {
-        use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-        use yadorilink_replica_domain::file::FileRecord;
-
-        let state = ReplicaCoordinator::open_in_memory().unwrap();
-        state.set_local_change_auth_provider(std::sync::Arc::new(|_| {
-            Ok(ChangeAuth { auth_seq: 7, auth_epoch: 3, policy_head_hash: [9u8; 32] })
-        }));
-        let em = ChangeEmitter::new("device-A", SigningKey::from_bytes(&[7u8; 32]));
-        let record = FileRecord {
-            path: "a.txt".into(),
-            size: 3,
-            mtime_unix_nanos: 1,
-            blocks: vec![],
-            deleted: false,
-        };
-        let hash = state
-            .upsert_file_emitting_change(
-                "g",
-                &record,
-                "device-A",
-                ChangeContent { ops: vec![create_op("a.txt")], versions: &[] },
-                None,
-                None,
-                yadorilink_daemon::replica_coordinator::ReplicaChangeEmission {
-                    emitter: &em,
-                    permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-                },
-            )
-            .unwrap();
-
-        assert!(state.file_index_repository().get_file("g", "a.txt").unwrap().is_some());
-        assert!(state.change_history_repository().dag_has_change(&hash).unwrap());
-        assert_eq!(state.sqlite().dag_group_heads("g").unwrap(), vec![hash]);
-        let decoded = state.sqlite().dag_get_change(&hash).unwrap().unwrap();
-        assert_eq!(decoded.compute_hash(), hash);
-        assert_eq!(decoded.auth_seq, 7);
-        assert_eq!(decoded.auth_epoch, 3);
-        assert_eq!(decoded.policy_head_hash, [9u8; 32]);
-
-        // A subsequent tombstone chains from the first change and becomes the
-        // new sole head.
-        let del = state
-            .mark_deleted_emitting_change(
-                "g",
-                "a.txt",
-                "device-A",
-                2,
-                false,
-                &em,
-                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-            )
-            .unwrap();
-        assert_eq!(state.sqlite().dag_group_heads("g").unwrap(), vec![del]);
-        assert!(state.change_history_repository().dag_is_ancestor(&hash, &del).unwrap());
-        assert!(state.file_index_repository().get_file("g", "a.txt").unwrap().unwrap().deleted);
-    }
-
-    /// Regression test for the defect described on `frontier_index::
-    /// max_parent_lamport`'s own doc comment: signing must agree with
-    /// `validate_present_parent_shape`'s pruned-aware Lamport computation
-    /// even when a resolved basis is composed *entirely* of pruned parents
-    /// (the shape a delayed capture can resolve against after a checkpoint
-    /// prunes the frontier it was materialized on). Before the fix,
-    /// `max_parent_lamport` read only live `changes` rows, signed this
-    /// change with Lamport 1, and the very next validation step inside this
-    /// same call then rejected it against `prior`'s real (pruned) Lamport --
-    /// permanently, since every retry resolves the identical all-pruned
-    /// basis.
-    #[test]
-    fn emission_onto_a_wholly_pruned_basis_agrees_with_the_pruned_aware_validator() {
-        let c = conn();
-        let em = emitter();
-
-        let prior =
-            emit_local_change(&c, "g", vec![create_op("prior.txt")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
-        let prior_hash = prior.compute_hash();
-        assert_eq!(prior.lamport, 1);
-
-        let child =
-            emit_local_change(&c, "g", vec![create_op("child.txt")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
-        let child_hash = child.compute_hash();
-        assert_eq!(child.lamport, 2);
-
-        // Checkpoint at `child` prunes `prior`: the frontier moves past the
-        // point a delayed capture's basis was resolved against.
-        let checkpoint = yadorilink_replica_domain::rebootstrap::Checkpoint::new(
-            FolderGroupId("g".into()),
-            vec![child_hash],
-            [0u8; 32],
-        );
-        {
-            let tx = c.unchecked_transaction().unwrap();
-            commit_prune(&tx, &checkpoint, &[prior_hash]).unwrap();
-            tx.commit().unwrap();
-        }
-        assert!(!has_change(&c, &prior_hash).unwrap());
-
-        // A delayed capture resolves its displaced basis to `[prior]` alone
-        // -- wholly pruned -- and signs onto it directly, the same shape
-        // `captured_authoring`'s `an_all_pruned_basis_is_currently_refused`
-        // exercises through the higher-level capture path.
-        let delayed = emit_local_change_onto(
-            &c,
-            "g",
-            vec![prior_hash],
-            vec![create_op("delayed.txt")],
-            ChangeAuth::PLACEHOLDER,
-            &em,
-        )
-        .unwrap();
-        // `prior`'s recorded (pruned) Lamport is 1, so the correct, agreed
-        // clock is 1 + 1 = 2 -- not the pruned-blind 0 + 1 = 1 that used to
-        // be signed and then rejected one line later.
-        assert_eq!(delayed.lamport, 2);
-        assert_eq!(delayed.parents, vec![prior_hash]);
-    }
-
-    /// The common, already-working shape: a basis with at least one live
-    /// member alongside a pruned one. Guards against a fix that only checks
-    /// `pruned_lamport` and stops consulting live `changes` rows.
-    #[test]
-    fn emission_onto_a_mixed_live_and_pruned_basis_still_agrees() {
-        let c = conn();
-        let em = emitter();
-
-        let prior =
-            emit_local_change(&c, "g", vec![create_op("prior.txt")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
-        let prior_hash = prior.compute_hash();
-        assert_eq!(prior.lamport, 1);
-
-        let child =
-            emit_local_change(&c, "g", vec![create_op("child.txt")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
-        let child_hash = child.compute_hash();
-        assert_eq!(child.lamport, 2);
-
-        let checkpoint = yadorilink_replica_domain::rebootstrap::Checkpoint::new(
-            FolderGroupId("g".into()),
-            vec![child_hash],
-            [0u8; 32],
-        );
-        {
-            let tx = c.unchecked_transaction().unwrap();
-            commit_prune(&tx, &checkpoint, &[prior_hash]).unwrap();
-            tx.commit().unwrap();
-        }
-        assert!(!has_change(&c, &prior_hash).unwrap());
-        assert!(has_change(&c, &child_hash).unwrap());
-
-        // Basis names both the now-pruned `prior` and the still-live `child`;
-        // the live parent's Lamport (2) dominates, so the expected clock is
-        // 2 + 1 = 3.
-        let mixed = emit_local_change_onto(
-            &c,
-            "g",
-            vec![prior_hash, child_hash],
-            vec![create_op("mixed.txt")],
-            ChangeAuth::PLACEHOLDER,
-            &em,
-        )
-        .unwrap();
-        assert_eq!(mixed.lamport, 3);
-    }
-}
+mod tests;

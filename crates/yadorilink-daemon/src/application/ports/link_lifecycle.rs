@@ -13,6 +13,7 @@
 //! independent way to create a link row in this daemon.
 
 use crate::sync_error::SyncError;
+use yadorilink_replica_domain::session_state::LinkRowWrite;
 
 use super::common::BoxFuture;
 use crate::application::EnrollmentKind;
@@ -24,6 +25,18 @@ pub(crate) struct PendingEnrollmentLinkCommand {
     pub(crate) device_id: String,
 }
 
+/// What a successful [`LinkLifecycleService::link`] did.
+///
+/// [`LinkLifecycleService::link`]: crate::application::LinkLifecycleService::link
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinkOutcome {
+    /// The link was committed and its runtime started.
+    Linked,
+    /// The folder was already linked to this group with a running runtime;
+    /// nothing was written, and no pending-enrollment marker was recorded.
+    AlreadyLinked,
+}
+
 pub(crate) struct LinkCommand {
     pub(crate) local_path: String,
     pub(crate) group_id: String,
@@ -31,8 +44,7 @@ pub(crate) struct LinkCommand {
     pub(crate) max_local_size_bytes: Option<i64>,
     pub(crate) acknowledge_risks: bool,
     /// `None` for a plain `yadorilink link` -- no pending-enrollment
-    /// marker is written, and any failure is a plain rollback-free `Err`
-    /// (nothing was ever committed). `Some` for a `share create`/`share
+    /// marker is written. `Some` for a `share create`/`share
     /// join` link, coupling the link row and the marker in one
     /// transaction.
     pub(crate) pending_enrollment: Option<PendingEnrollmentLinkCommand>,
@@ -48,29 +60,48 @@ pub(crate) trait LinkRepositoryPort: Send + Sync {
     /// nested-path preflight (ancestor/descendant/exact-match conflicts).
     fn list_link_paths(&self) -> Result<Vec<String>, SyncError>;
 
-    fn commit_plain_link(&self, local_path: &str, group_id: &str) -> Result<(), SyncError>;
+    /// Commits the link row. Reports what that did to the row (inserted, or
+    /// updated a row that already existed for the same path and group) so a
+    /// failed setup can undo exactly that.
+    fn commit_plain_link(
+        &self,
+        local_path: &str,
+        group_id: &str,
+    ) -> Result<LinkRowWrite, SyncError>;
 
     /// Atomically inserts the link row AND the pending-enrollment marker,
     /// advancing the matching `enrollment_operations` row from `Prepared`
-    /// to `LocalSetupPending` in the same transaction.
+    /// to `LocalSetupPending` in the same transaction. Reports what it did
+    /// to the link row, like [`Self::commit_plain_link`].
     fn commit_link_with_pending_enrollment(
         &self,
         local_path: &str,
         group_id: &str,
         marker: &PendingEnrollmentLinkCommand,
-    ) -> Result<(), SyncError>;
+    ) -> Result<LinkRowWrite, SyncError>;
 
-    fn remove_link(&self, local_path: &str) -> Result<(), SyncError>;
+    /// Undoes a [`Self::commit_plain_link`] whose setup failed: deletes a row
+    /// it inserted, or restores a row it updated. Never deletes a row the
+    /// commit did not create. Returns what it did, for the caller's log.
+    fn undo_plain_link(
+        &self,
+        local_path: &str,
+        group_id: &str,
+        write: &LinkRowWrite,
+    ) -> Result<&'static str, SyncError>;
 
-    /// Atomically removes the link row AND rolls the matching
+    /// Atomically undoes the link-row write (as [`Self::undo_plain_link`]),
+    /// drops the pending marker, and rolls the matching
     /// `enrollment_operations` row back from `LocalSetupPending` to
     /// `CancelPending`, recording `detail` as the failure reason.
     fn rollback_local_setup_to_cancel_pending(
         &self,
         local_path: &str,
+        group_id: &str,
+        write: &LinkRowWrite,
         operation_id: &str,
         detail: &str,
-    ) -> Result<(), SyncError>;
+    ) -> Result<&'static str, SyncError>;
 
     /// Advances the `enrollment_operations` row from `LocalSetupPending`
     /// to `ActivationPending` -- `Ok(false)` means the row was no longer
@@ -84,6 +115,12 @@ pub(crate) trait LinkWatcherPort: Send + Sync {
     /// A `Starting` reservation is deliberately false so a concurrent retry
     /// cannot report success before the first attempt's fallible work lands.
     fn is_ready(&self, local_path: &str) -> bool;
+
+    /// True while ANY runtime holds the path, `Starting` or `Ready`. A
+    /// second start for such a path is refused, so a link call must not
+    /// commit anything for it: its own failure rollback would then be
+    /// undoing state the running (or starting) link depends on.
+    fn is_registered(&self, local_path: &str) -> bool;
 
     /// The fallible steps that run after the link (and marker) row(s) are
     /// already committed: on-demand materialization policy/size-cap

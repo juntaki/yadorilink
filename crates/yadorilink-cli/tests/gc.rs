@@ -13,7 +13,6 @@
 //! exists specifically to protect a block that recently landed on disk.
 #![cfg(unix)]
 
-use std::fs::File;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -22,14 +21,14 @@ use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
 use yadorilink_ipc_proto::daemonctl::{GcRequest, StatusRequest};
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 
 async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>, std::path::PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     std::env::set_var("YADORILINK_CONFIG_DIR", dir.path());
 
     let blocks_root = dir.path().join("blocks");
-    let store = Arc::new(FsBlockStore::new(&blocks_root).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(&blocks_root).unwrap());
     let sync_state = Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
     let state = DaemonState::new("device-under-test".into(), sync_state, store);
 
@@ -56,16 +55,19 @@ async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>, std::path::Path
 /// tests *within this file* do.
 static TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// git-object-style sharding, mirroring `FsBlockStore`'s own private
-/// `path_for_hash` (not exposed publicly) — this test needs the real
-/// on-disk path to backdate a block's mtime directly.
-fn block_path(blocks_root: &std::path::Path, hash: &str) -> std::path::PathBuf {
-    blocks_root.join(&hash[0..2]).join(&hash[2..4]).join(hash)
-}
-
-fn backdate_past_grace_window(path: &std::path::Path) {
-    let file = File::options().write(true).open(path).unwrap();
-    file.set_modified(SystemTime::now() - yadorilink_daemon::gc::GC_GRACE_WINDOW * 2).unwrap();
+/// Ages a block past the GC grace window.
+///
+/// The store records each block's ingest time in its own index rather than
+/// inferring it from a file mtime, so this reaches that row directly. It
+/// goes through the store *directory* rather than a second store object
+/// because the daemon under test owns the store's only handle.
+fn backdate_past_grace_window(blocks_root: &std::path::Path, hash: &str) {
+    yadorilink_local_storage::segment_store::testing::backdate_block(
+        blocks_root,
+        hash,
+        SystemTime::now() - yadorilink_daemon::gc::GC_GRACE_WINDOW * 2,
+    )
+    .unwrap();
 }
 
 /// A real `gc` reclaims an orphaned block and reports
@@ -75,12 +77,13 @@ async fn gc_reclaims_an_orphaned_block_and_reports_matching_counts() {
     let _guard = TEST_MUTEX.lock().await;
     let (_dir, state, blocks_root) = start_daemon().await;
     let hash = state.block_store.put(b"orphaned, never referenced by any file record").unwrap();
-    backdate_past_grace_window(&block_path(&blocks_root, &hash));
+    backdate_past_grace_window(&blocks_root, &hash);
     assert!(state.block_store.exists(&hash).unwrap(), "sanity: block exists before gc");
 
-    let resp = yadorilink_cli::control_client::send(ReqPayload::Gc(GcRequest { dry_run: false }))
-        .await
-        .unwrap();
+    let resp =
+        yadorilink_client_core::daemon::control::send(ReqPayload::Gc(GcRequest { dry_run: false }))
+            .await
+            .unwrap();
     let Some(RespPayload::Gc(report)) = resp.payload else {
         panic!("expected a Gc response, got {:?}", resp.payload);
     };
@@ -100,10 +103,10 @@ async fn gc_dry_run_matches_a_real_runs_estimate_without_deleting() {
     let _guard = TEST_MUTEX.lock().await;
     let (_dir, state, blocks_root) = start_daemon().await;
     let hash = state.block_store.put(b"orphaned block for dry-run test").unwrap();
-    backdate_past_grace_window(&block_path(&blocks_root, &hash));
+    backdate_past_grace_window(&blocks_root, &hash);
 
     let dry_run_resp =
-        yadorilink_cli::control_client::send(ReqPayload::Gc(GcRequest { dry_run: true }))
+        yadorilink_client_core::daemon::control::send(ReqPayload::Gc(GcRequest { dry_run: true }))
             .await
             .unwrap();
     let Some(RespPayload::Gc(dry_run_report)) = dry_run_resp.payload else {
@@ -114,7 +117,7 @@ async fn gc_dry_run_matches_a_real_runs_estimate_without_deleting() {
 
     // An immediate real run reclaims exactly what the dry run reported.
     let real_resp =
-        yadorilink_cli::control_client::send(ReqPayload::Gc(GcRequest { dry_run: false }))
+        yadorilink_client_core::daemon::control::send(ReqPayload::Gc(GcRequest { dry_run: false }))
             .await
             .unwrap();
     let Some(RespPayload::Gc(real_report)) = real_resp.payload else {
@@ -137,10 +140,12 @@ async fn status_reports_usage_and_lower_usage_after_gc() {
     let _guard = TEST_MUTEX.lock().await;
     let (_dir, state, blocks_root) = start_daemon().await;
     let hash = state.block_store.put(b"some content that counts toward usage").unwrap();
-    backdate_past_grace_window(&block_path(&blocks_root, &hash));
+    backdate_past_grace_window(&blocks_root, &hash);
 
     let before =
-        yadorilink_cli::control_client::send(ReqPayload::Status(StatusRequest {})).await.unwrap();
+        yadorilink_client_core::daemon::control::send(ReqPayload::Status(StatusRequest {}))
+            .await
+            .unwrap();
     let Some(RespPayload::Status(before)) = before.payload else {
         panic!("expected a Status response");
     };
@@ -148,12 +153,13 @@ async fn status_reports_usage_and_lower_usage_after_gc() {
     assert!(before.block_store_total_bytes > 0);
     assert_eq!(before.last_gc_unix, 0, "no real sweep has run yet");
 
-    yadorilink_cli::control_client::send(ReqPayload::Gc(GcRequest { dry_run: false }))
+    yadorilink_client_core::daemon::control::send(ReqPayload::Gc(GcRequest { dry_run: false }))
         .await
         .unwrap();
 
-    let after =
-        yadorilink_cli::control_client::send(ReqPayload::Status(StatusRequest {})).await.unwrap();
+    let after = yadorilink_client_core::daemon::control::send(ReqPayload::Status(StatusRequest {}))
+        .await
+        .unwrap();
     let Some(RespPayload::Status(after)) = after.payload else {
         panic!("expected a Status response");
     };
@@ -172,9 +178,10 @@ async fn gc_request_is_rejected_while_a_write_is_in_progress() {
     let (_dir, state, _blocks_root) = start_daemon().await;
     let _write_guard = state.begin_write_activity();
 
-    let err = yadorilink_cli::control_client::send(ReqPayload::Gc(GcRequest { dry_run: false }))
-        .await
-        .unwrap_err();
+    let err =
+        yadorilink_client_core::daemon::control::send(ReqPayload::Gc(GcRequest { dry_run: false }))
+            .await
+            .unwrap_err();
 
     let message = err.to_string();
     assert!(

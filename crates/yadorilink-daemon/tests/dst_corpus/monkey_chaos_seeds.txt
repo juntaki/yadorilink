@@ -1,8 +1,8 @@
 # Seeds for crates/yadorilink-daemon/tests/monkey_chaos.rs that
 # previously produced a failing run, one per line. Automatically appended
 # to by that test on failure (see `record_failing_seed`); always replayed
-# by the `replay_known_failing_seeds` test in the same file, in CI and in
-# scripts/heat-run.sh, regardless of whether the underlying bug has since
+# by the `replay_known_failing_seeds` test in the same file, regardless
+# of whether the underlying bug has since
 # been fixed -- once fixed, the entry becomes a permanent regression
 # check rather than being deleted.
 #
@@ -13,3 +13,13 @@
 18036069142062588829
 7130163079425790866
 11628226161925181928
+5320844737226071939
+1254137095109609298
+1254137095109609298
+1079752644454605084
+13961652510686304188
+13961652510686304188
+4768114271623059329
+12788561176311549428
+1079752644454605084
+12788561176311549428

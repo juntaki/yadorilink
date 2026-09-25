@@ -16,21 +16,21 @@
 
 use std::sync::Arc;
 
-use yadorilink_cli::control_client;
+use yadorilink_client_core::daemon::control;
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::peer_registry::{PeerReachability, UnreachableCategory};
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
 use yadorilink_ipc_proto::daemonctl::{LinkRequest, PendingEnrollmentKind, StatusRequest};
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 
 async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>) {
     let dir = tempfile::tempdir().unwrap();
     std::env::set_var("YADORILINK_CONFIG_DIR", dir.path());
     std::env::set_var("YADORILINK_UPDATE_MANIFEST_URL", "http://127.0.0.1:1/manifest.json");
 
-    let store = Arc::new(FsBlockStore::new(dir.path().join("blocks")).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(dir.path().join("blocks")).unwrap());
     let sync_state = Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
     let state = DaemonState::new("device-under-test".into(), sync_state, store);
     // A registered (non-empty device_id) device with no change-signing key is
@@ -112,7 +112,7 @@ fn attention_reasons_excluding_startup_update_check_race(
 }
 
 async fn fetch_status() -> yadorilink_ipc_proto::daemonctl::StatusResponse {
-    let resp = yadorilink_cli::control_client::send(ReqPayload::Status(StatusRequest {}))
+    let resp = yadorilink_client_core::daemon::control::send(ReqPayload::Status(StatusRequest {}))
         .await
         .expect("status request should succeed against a running daemon");
     match resp.payload {
@@ -168,8 +168,9 @@ async fn unreachable_peer_reports_attention_over_the_real_socket() {
     let _guard = TEST_MUTEX.lock().await;
     let (_dir, state) = start_daemon().await;
 
-    state.peers.set_reachability(
-        "device-b".to_string(),
+    yadorilink_daemon::peer_connectivity_runtime::reachability_source_for_tests::reach(
+        &state,
+        "device-b",
         PeerReachability::Unreachable(UnreachableCategory::NoResponse),
     );
 
@@ -218,7 +219,7 @@ async fn paused_link_still_reports_healthy_over_the_real_socket() {
 
     let folder = dir.path().join("synced");
     std::fs::create_dir_all(&folder).unwrap();
-    control_client::send(ReqPayload::Link(LinkRequest {
+    control::send(ReqPayload::Link(LinkRequest {
         local_path: folder.to_string_lossy().to_string(),
         group_id: "group-1".into(),
         on_demand: false,

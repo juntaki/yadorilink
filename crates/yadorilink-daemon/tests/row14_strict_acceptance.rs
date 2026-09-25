@@ -1,5 +1,6 @@
 //! Strict release-candidate acceptance harness for the `taguchi_row_14`
-//! permanent-stall fix (`fix/conflict-copy-convergence-obligation-20260723`).
+//! scenario (`taguchi_collision_matrix.rs`): conflict-copy convergence must
+//! never permanently stall.
 //! `TestDevice`/`setup_device`/etc. are intentionally duplicated from
 //! `taguchi_collision_matrix.rs` rather than shared -- matches this
 //! codebase's existing convention of self-contained daemon integration test
@@ -44,7 +45,7 @@ use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeCo
 use yadorilink_daemon::daemon_state::{
     set_default_materialization_repair_sweep_interval_for_tests, DaemonState,
 };
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 use yadorilink_replica_domain::ids::ChangeHash;
 use yadorilink_replica_engine::conflict::{resolve_path_heads, PathResolution};
 
@@ -66,7 +67,7 @@ struct TestDevice {
 async fn setup_device(account: &TestAccount, name: &str) -> TestDevice {
     let device_id = support::register_device(account, name, [0u8; 32]).await;
     let store_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let (sync_state, index_dir) = open_file_backed_replica_coordinator();
     let sync_state = Arc::new(sync_state);
     let state = DaemonState::new(device_id.clone(), sync_state, store);
@@ -131,7 +132,7 @@ const PAIR_RECONNECT_BACKOFF: yadorilink_daemon::supervise::BackoffConfig =
 /// over a 6-minute run, not merely the odd straggler. Serialized to 1
 /// (fully sequential handshakes, never more than one in flight at a time)
 /// rather than extending timeouts, since initial-connection speed is not
-/// what row14 is evaluating.
+/// what this test is evaluating.
 const MAX_CONCURRENT_HANDSHAKES: usize = 1;
 
 /// Connects one pair and blocks until it is genuinely ready
@@ -139,6 +140,7 @@ const MAX_CONCURRENT_HANDSHAKES: usize = 1;
 /// duration -- see [`MAX_CONCURRENT_HANDSHAKES`]'s own doc comment for
 /// why the permit must span the wait, not just the initial connect call.
 async fn connect_pair_with_bounded_concurrency(
+    mesh: &support::TestPeerMesh,
     handshake_semaphore: &tokio::sync::Semaphore,
     state_i: &Arc<DaemonState>,
     device_i: &str,
@@ -147,9 +149,16 @@ async fn connect_pair_with_bounded_concurrency(
     group_ids: &[String],
 ) -> [tokio::task::JoinHandle<()>; 2] {
     let _permit = handshake_semaphore.acquire().await.unwrap();
-    let handles =
-        support::connect_two_daemons_with_handles(state_i, device_i, state_j, device_j, group_ids)
-            .await;
+    // This 6-device mesh pairs every device more than once (15 pairings over
+    // a 1-factorization, plus every later reconnect) -- the free-function
+    // `connect_two_daemons*`/`checkpoint_fake_for` path can permanently
+    // split such a mesh into several separate coordination-authority
+    // islands once a bridging pairing arrives after both sides have already
+    // committed (see `checkpoint_fake_for`'s doc comment; this is exactly
+    // the root cause behind this test's historical "winner change ...
+    // UNKNOWN (never received at all)" failures). `TestPeerMesh` shares one
+    // authority across every pairing this whole run makes, by construction.
+    let handles = mesh.connect_with_handles(state_i, device_i, state_j, device_j, group_ids).await;
     wait_pair_ready(state_i, device_i, state_j, device_j).await;
     handles
 }
@@ -170,6 +179,7 @@ async fn connect_pair_with_bounded_concurrency(
 /// reasoning), so the
 /// supervision lives here instead.
 fn spawn_pair_reconnect_supervisor(
+    mesh: Arc<support::TestPeerMesh>,
     state_i: Arc<DaemonState>,
     device_i: String,
     state_j: Arc<DaemonState>,
@@ -201,6 +211,7 @@ fn spawn_pair_reconnect_supervisor(
             }
             tokio::time::sleep(PAIR_RECONNECT_BACKOFF.next(attempt)).await;
             let handles = connect_pair_with_bounded_concurrency(
+                &mesh,
                 &handshake_semaphore,
                 &state_i,
                 &device_i,
@@ -220,12 +231,12 @@ fn spawn_pair_reconnect_supervisor(
 /// "circle method"): `n-1` rounds, each a set of `n/2` vertex-disjoint pairs
 /// -- every vertex appears in exactly one pair per round. `n` must be even.
 ///
-/// This is what bounds row14's initial full-mesh connection burst to a
+/// This is what bounds this test's initial full-mesh connection burst to a
 /// production-plausible per-device concurrency: a real device's `netmap`
 /// growing to `n-1` peers arrives incrementally over real time (netmap
 /// pushes, existing sessions already up), never as an instantaneous
 /// simultaneous handshake against every peer at once. Connecting all
-/// `n*(n-1)/2` pairs together -- 15 for row14's 6 devices -- means every
+/// `n*(n-1)/2` pairs together -- 15 for this test's 6 devices -- means every
 /// device races `n-1` (5) concurrent QUIC handshakes from the first
 /// instant, all competing for the same process's CPU. Under a debug build
 /// on a resource-constrained CI runner, that CPU contention alone can push
@@ -233,7 +244,7 @@ fn spawn_pair_reconnect_supervisor(
 /// this exact shape, 26 consecutive handshake failures over a 321s CI run,
 /// independent of anything about reconnect-supervisor behavior (which
 /// only governs what happens once a *connected* pair later drops).
-/// Bounding round concurrency to `n/2` (3 for row14) caps every device at
+/// Bounding round concurrency to `n/2` (3 for this test) caps every device at
 /// exactly one concurrent handshake at a time.
 fn one_factorization(n: usize) -> Vec<Vec<(usize, usize)>> {
     assert!(
@@ -261,7 +272,7 @@ fn one_factorization(n: usize) -> Vec<Vec<(usize, usize)>> {
 /// [`wait_pair_ready`] gives up. Generous relative to the exact-generation
 /// handshake's own bounded retry budget (~11s worst case) since this is a
 /// hard failure (test setup itself is broken), not a tuning knob to shave
-/// close -- initial connection speed is not what row14 exists to evaluate.
+/// close -- initial connection speed is not what this test exists to evaluate.
 const TEST_PAIR_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Blocks until both sides of a pair report a genuinely established
@@ -288,10 +299,8 @@ async fn wait_pair_ready(
         loop {
             let a_session = state_a.peers.session(device_b_id);
             let b_session = state_b.peers.session(device_a_id);
-            if let (Some(a_session), Some(b_session)) = (&a_session, &b_session) {
-                if a_session.peer_handshake_received() && b_session.peer_handshake_received() {
-                    return;
-                }
+            if a_session.is_some() && b_session.is_some() {
+                return;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -316,12 +325,20 @@ async fn wait_pair_ready(
 /// semantics changes -- only the connection concurrency shape, uniformly
 /// across the whole run's lifetime.
 async fn connect_all_pairs(devices: &[TestDevice], group_ids: &[String]) {
+    // One shared coordination authority for this whole 6-device mesh's
+    // entire lifetime (initial connection AND every later reconnect) -- see
+    // `connect_pair_with_bounded_concurrency`'s doc comment for why the
+    // free-function `connect_two_daemons` path cannot safely serve a mesh
+    // shaped like this one.
+    let mesh = Arc::new(support::TestPeerMesh::new().await);
     let handshake_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
     for round in one_factorization(devices.len()) {
         futures_util::future::join_all(round.into_iter().map(|(i, j)| {
+            let mesh = mesh.clone();
             let handshake_semaphore = handshake_semaphore.clone();
             async move {
                 let handles = connect_pair_with_bounded_concurrency(
+                    &mesh,
                     &handshake_semaphore,
                     &devices[i].state,
                     &devices[i].device_id,
@@ -331,6 +348,7 @@ async fn connect_all_pairs(devices: &[TestDevice], group_ids: &[String]) {
                 )
                 .await;
                 spawn_pair_reconnect_supervisor(
+                    mesh.clone(),
                     devices[i].state.clone(),
                     devices[i].device_id.clone(),
                     devices[j].state.clone(),
@@ -361,9 +379,32 @@ async fn n_synced_devices(n: usize, test_name: &str) -> (Vec<TestDevice>, String
     for device in &devices {
         start_watching(device, &group_id).await;
     }
+    // Reconciliation counters are process-global; reset before the run so
+    // what is reported at the end describes this run only.
+    yadorilink_daemon::sync_adapter::metrics::reset();
+
     connect_all_pairs(&devices, std::slice::from_ref(&group_id)).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     (devices, group_id)
+}
+
+/// What reconciliation actually cost, against the numbers the old path
+/// produced on this same scenario (Run3/4: 560-676 verification attempts per
+/// unique Change; retroactive planner 74s max, 1200-2180s cumulative under
+/// the writer gate).
+fn report_reconciliation_cost(devices: &[TestDevice]) {
+    let stats = yadorilink_daemon::sync_adapter::metrics::stats();
+    let peak = devices
+        .iter()
+        .filter_map(|d| d.state.reconciliation_driver())
+        .map(|driver| driver.stack().store_metrics().peak_in_flight)
+        .max()
+        .unwrap_or(0);
+    eprintln!(
+        "row14_strict_acceptance: reconciliation {stats:?};          verification amplification = {:?}; staging amplification = {:?};          store peak in flight = {peak}",
+        stats.verification_amplification(),
+        stats.staging_amplification(),
+    );
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -411,9 +452,7 @@ fn snapshot(root: &std::path::Path) -> std::collections::HashMap<String, String>
         .collect()
 }
 
-/// Diagnostic-only three-layer snapshot for the
-/// `fix/conflict-copy-convergence-obligation-20260723` investigation --
-/// classifies a stall on a specific conflict-copy path into one of:
+/// Diagnostic-only three-layer snapshot that classifies a stall on a specific conflict-copy path into one of:
 ///
 /// A. The winner or loser Change itself is genuinely UNKNOWN to a device
 ///    (never received) -- a real DAG-propagation gap.
@@ -431,9 +470,17 @@ fn snapshot(root: &std::path::Path) -> std::collections::HashMap<String, String>
 /// Identifies the winner/loser `ChangeHash` values by finding a device
 /// whose own `resolve_path_heads(source_path)` call already produces a
 /// `ConflictCopy` matching `target_conflict_copy_path` by name -- avoids
-/// having to reverse-parse the conflict-copy filename (its embedded hash8
+/// having to reverse-parse the conflict-copy filename (its embedded hash
 /// is a losing FILE VERSION hash prefix, not a `ChangeHash`, so it cannot
 /// be used to look up the change directly).
+#[allow(
+    clippy::excessive_nesting,
+    reason = "failure-path diagnostic dump: the nested loops walk device -> peer session -> \
+              path-head resolution -> DAG parent closure in one pass, and each inner level \
+              appends to the same ordered report buffer; hoisting a level into a helper would \
+              split the report's layer-by-layer ordering across functions for output that only \
+              ever runs once, immediately before a panic"
+)]
 fn dump_conflict_diagnostic_snapshot(
     devices: &[TestDevice],
     group_id: &str,
@@ -445,13 +492,20 @@ fn dump_conflict_diagnostic_snapshot(
     let mut resolution_by_device: Vec<String> = Vec::new();
 
     for (i, device) in devices.iter().enumerate() {
-        let session =
-            device.state.peers.all_sessions().into_iter().next().map(|(_, session)| session);
-        let Some(session) = session else {
+        // The combined-heads read is the executor's, not the session's:
+        // it is a local index query with no wire involved.
+        let convergence = device
+            .state
+            .peers
+            .all_sessions()
+            .into_iter()
+            .next()
+            .and_then(|(peer_device_id, _)| device.state.peers.convergence(&peer_device_id));
+        let Some(convergence) = convergence else {
             resolution_by_device.push(format!("device-{i}: no peer session available"));
             continue;
         };
-        match session.diagnostic_path_heads(group_id, source_path) {
+        match convergence.combined_heads(group_id, source_path, None) {
             Ok(heads) => match resolve_path_heads(source_path, &heads) {
                 PathResolution::Present { winner, conflict_copies } => {
                     resolution_by_device.push(format!(
@@ -566,6 +620,15 @@ fn dump_conflict_diagnostic_snapshot(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(
+    clippy::excessive_nesting,
+    reason = "stall-detection wait loop: the deeply nested blocks are the diagnostic branch \
+              taken only when no-progress exceeds STALL_TIMEOUT, and it must inspect the same \
+              live `devices`/`current` snapshots the loop is already holding to pick the \
+              asymmetric (or content-mismatched) name to dump before panicking; extracting it \
+              would mean threading that whole loop state out just to keep the panic path \
+              shallower"
+)]
 async fn row14_strict_acceptance() {
     static TRACING_INIT: std::sync::Once = std::sync::Once::new();
     TRACING_INIT.call_once(|| {
@@ -582,8 +645,7 @@ async fn row14_strict_acceptance() {
     set_default_materialization_repair_sweep_interval_for_tests(Duration::from_secs(3600));
 
     // Diagnostic-only: a runtime heartbeat, independent of any device's own
-    // work, for the `fix/conflict-copy-convergence-obligation-20260723`
-    // investigation. If this keeps ticking every ~1s throughout a run that
+    // work. If this keeps ticking every ~1s throughout a run that
     // otherwise shows a long silent gap, the gap is a genuine (if slow)
     // async wait somewhere in the engine's own call chain, not worker-
     // thread starvation; if the heartbeat ALSO goes silent, something is
@@ -599,7 +661,7 @@ async fn row14_strict_acceptance() {
     });
 
     let device_count = 6;
-    let (devices, group_id) = n_synced_devices(device_count, "row14-strict").await;
+    let (devices, group_id) = n_synced_devices(device_count, "strict-repair").await;
     let round_count = 10u32;
     let stagger = Duration::from_millis(100);
 
@@ -737,6 +799,7 @@ async fn row14_strict_acceptance() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     eprintln!("row14_strict_acceptance: max no-progress gap observed = {max_gap:?}");
+    report_reconciliation_cost(&devices);
     assert!(
         max_gap <= MAX_ACCEPTABLE_PROGRESS_GAP,
         "row14_strict_acceptance: max no-progress gap {max_gap:?} exceeded the strict \

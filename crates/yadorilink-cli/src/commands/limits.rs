@@ -5,11 +5,8 @@
 //! clap itself, with a clear error and a non-zero exit, before this
 //! module's code ever runs.
 
-use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
-use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
-use yadorilink_ipc_proto::daemonctl::{LimitsSetRequest, LimitsShowRequest};
+use yadorilink_client_core::ops::storage;
 
-use crate::control_client;
 use crate::error::CliError;
 
 /// `0` reads as "unlimited" — mirrors `commands::status::format_rate_bytes_per_sec`'s
@@ -26,14 +23,7 @@ fn format_limit(bytes_per_sec: u64) -> String {
 }
 
 pub async fn set(up: u64, down: u64) -> Result<(), CliError> {
-    let resp = control_client::send(ReqPayload::LimitsSet(LimitsSetRequest {
-        upload_bytes_per_sec: up,
-        download_bytes_per_sec: down,
-    }))
-    .await?;
-    let Some(RespPayload::LimitsSet(applied)) = resp.payload else {
-        return Err(CliError::Other("unexpected daemon response".into()));
-    };
+    let applied = storage::set_bandwidth_limits(up, down).await?;
     println!(
         "Limits updated: up={}  down={}",
         format_limit(applied.upload_bytes_per_sec),
@@ -43,10 +33,7 @@ pub async fn set(up: u64, down: u64) -> Result<(), CliError> {
 }
 
 pub async fn show() -> Result<(), CliError> {
-    let resp = control_client::send(ReqPayload::LimitsShow(LimitsShowRequest {})).await?;
-    let Some(RespPayload::LimitsShow(current)) = resp.payload else {
-        return Err(CliError::Other("unexpected daemon response".into()));
-    };
+    let current = storage::bandwidth_limits().await?;
     println!(
         "up={}  down={}",
         format_limit(current.upload_bytes_per_sec),
@@ -56,16 +43,4 @@ pub async fn show() -> Result<(), CliError> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn format_limit_zero_is_unlimited() {
-        assert_eq!(format_limit(0), "unlimited");
-    }
-
-    #[test]
-    fn format_limit_nonzero_reports_exact_bytes() {
-        assert_eq!(format_limit(1_048_576), "1048576 bytes/sec");
-    }
-}
+mod tests;

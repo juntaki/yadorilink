@@ -25,11 +25,12 @@ use support::{ensure_device_signing_key, open_file_backed_replica_coordinator};
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::convergence::retirement_service::ConvergenceRetirementService;
 use yadorilink_daemon::daemon_state::DaemonState;
-use yadorilink_local_storage::FsBlockStore;
-use yadorilink_peer_session::peer_session::RetirementAttempt;
-use yadorilink_replica_domain::change::{Change, ChangeAuth, Op, PutOrigin};
+use yadorilink_daemon::local_convergence::types::RetirementAttempt;
+use yadorilink_local_storage::SegmentBlockStore;
+use yadorilink_replica_domain::change::{Change, Op, PutOrigin};
 use yadorilink_replica_domain::file::{FileMeta, FileRecord, FileVersion, RecordKind};
 use yadorilink_replica_domain::ids::{DeviceId, FolderGroupId, SyncPath};
+use yadorilink_replica_domain::test_authoring::create_signed_for_tests;
 
 const GROUP: &str = "retirement-no-peer";
 
@@ -42,7 +43,7 @@ struct Device {
 
 fn setup_device(device_id: &str) -> Device {
     let store_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let (sync_state, index_dir) = open_file_backed_replica_coordinator();
     let state = DaemonState::new(device_id.to_string(), Arc::new(sync_state), store);
     ensure_device_signing_key(&state);
@@ -84,10 +85,9 @@ fn admit(
     path: &str,
     version: &FileVersion,
 ) -> Change {
-    let change = Change::create_signed(
+    let change = create_signed_for_tests(
         vec![],
         0,
-        ChangeAuth::PLACEHOLDER,
         DeviceId(device_id.into()),
         FolderGroupId(GROUP.into()),
         vec![Op::Put {
@@ -101,7 +101,7 @@ fn admit(
         .state
         .replica_coordinator
         .change_history_repository()
-        .dag_admit_change_with_versions(&change, std::slice::from_ref(version), true)
+        .dag_admit_change_with_versions(&change, std::slice::from_ref(version))
         .unwrap();
     change
 }

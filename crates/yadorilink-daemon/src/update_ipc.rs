@@ -1,8 +1,8 @@
 //! IPC encode/decode for the update surface added to
 //! `daemon_control.proto` -- protobuf request -> application command, and
 //! application outcome -> protobuf response. All actual update-manager/
-//! policy mutation lives in `UpdateCommandService`
-//! (`crate::application::update_command_service`); status reads go
+//! policy mutation lives behind `UpdateCommandPort`
+//! (`crate::application::ports::update`); status reads go
 //! through `UpdateStatusQueryService` (`context.queries.update_status`).
 
 use yadorilink_ipc_proto::daemonctl::{

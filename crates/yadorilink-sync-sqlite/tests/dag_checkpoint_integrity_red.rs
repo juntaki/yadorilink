@@ -9,7 +9,7 @@ fn conn() -> Connection {
     conn
 }
 
-/// RED: the checkpoint primary key is content-addressed identity. A valid
+/// Pins: the checkpoint primary key is content-addressed identity. A valid
 /// encoded checkpoint stored under a different key must not be accepted.
 #[test]
 fn latest_checkpoint_rejects_storage_key_mismatch() {
@@ -33,7 +33,7 @@ fn latest_checkpoint_rejects_storage_key_mismatch() {
         .expect_err("checkpoint content must hash back to its storage key");
 }
 
-/// RED: the SQL group scope must agree with the canonical checkpoint body. A
+/// Pins: the SQL group scope must agree with the canonical checkpoint body. A
 /// row must not become another group's checkpoint by changing only `group_id`.
 #[test]
 fn latest_checkpoint_rejects_group_metadata_mismatch() {
@@ -56,7 +56,7 @@ fn latest_checkpoint_rejects_group_metadata_mismatch() {
         .expect_err("checkpoint row group_id must match the canonical checkpoint body");
 }
 
-/// RED: `snapshot_hash` is duplicated in the row and canonical body. Those two
+/// Pins: `snapshot_hash` is duplicated in the row and canonical body. Those two
 /// representations must not be allowed to drift, because re-bootstrap logic
 /// must have one authoritative snapshot identity.
 #[test]
@@ -77,7 +77,7 @@ fn latest_checkpoint_rejects_snapshot_metadata_mismatch() {
         .expect_err("checkpoint row snapshot_hash must match the canonical checkpoint body");
 }
 
-/// RED: unlike `Change`/`FileVersion`, the checkpoint decoder reads the
+/// Pins: unlike `Change`/`FileVersion`, the checkpoint decoder reads the
 /// frontier's `u32` entry count and feeds it straight to
 /// `Vec::with_capacity` with no bound check first. A corrupt or hostile
 /// count should be a clean decode error, not a multi-gigabyte allocation
@@ -97,7 +97,7 @@ fn checkpoint_decode_rejects_a_hostile_frontier_count_before_allocating() {
     );
 }
 
-/// RED: `new` always normalizes the frontier to ascending, deduped order
+/// Pins: `new` always normalizes the frontier to ascending, deduped order
 /// before encoding, but `decode` never checks that the order it read back
 /// actually is that. Decode/re-encode is order-preserving, so a checkpoint
 /// whose frontier was corrupted or hand-crafted out of order still hashes

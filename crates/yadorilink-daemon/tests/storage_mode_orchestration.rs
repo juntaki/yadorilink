@@ -39,7 +39,7 @@ use yadorilink_ipc_proto::daemonctl::{
     DaemonControlRequest, DaemonControlResponse, SetStorageModeRequest,
 };
 use yadorilink_ipc_proto::framing::{read_message, write_message};
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
 use yadorilink_replica_domain::session_state::MaterializationPolicy;
 
@@ -54,7 +54,7 @@ struct Daemon {
 
 fn new_daemon(device_id: &str) -> Daemon {
     let store_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let (sync_state, index_dir) = open_file_backed_replica_coordinator();
     let state = DaemonState::new(device_id.to_string(), Arc::new(sync_state), store);
     ensure_device_signing_key(&state);
@@ -210,15 +210,27 @@ async fn demoting_setup(
         )
         .unwrap();
 
-    connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
-    b.state.set_peer_group_full_replica("device-a", GROUP, true);
-    a.state.set_peer_group_full_replica("device-b", GROUP, true);
-    tokio::time::sleep(Duration::from_millis(500)).await; // let the session establish
-
-    b.state.set_coordination_client_config(server.uri(), "test-access-token".to_string());
+    // Must win the race against `connect_two_daemons`'s own coordination-
+    // plane wiring below: `coordination_client_config` is a set-once
+    // `OnceLock` (production semantics), so whichever caller sets it FIRST
+    // wins for the rest of the process -- this test needs its devices
+    // pointed at THIS `server`, not `connect_two_daemons`'s own in-process
+    // checkpoint-issuance fake.
+    b.state.set_coordination_client_config(
+        server.uri(),
+        yadorilink_fapi_client::test_support::offline_auth(),
+    );
     if configure_target_coordination {
-        a.state.set_coordination_client_config(server.uri(), "test-access-token-a".to_string());
+        a.state.set_coordination_client_config(
+            server.uri(),
+            yadorilink_fapi_client::test_support::offline_auth(),
+        );
     }
+
+    connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
+    b.state.authority.set_peer_group_full_replica("device-a", GROUP, true);
+    a.state.authority.set_peer_group_full_replica("device-b", GROUP, true);
+    tokio::time::sleep(Duration::from_millis(500)).await; // let the session establish
 
     let socket_path = serve(b.state.clone(), b.root.path()).await;
     (a, b, socket_path)
@@ -492,7 +504,7 @@ async fn demotion_refused_when_a_target_is_confirmed_but_this_device_has_no_conf
         )
         .unwrap();
     connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
-    b.state.set_peer_group_full_replica("device-a", GROUP, true);
+    b.state.authority.set_peer_group_full_replica("device-a", GROUP, true);
     tokio::time::sleep(Duration::from_millis(500)).await;
     let socket_path = serve(b.state.clone(), b.root.path()).await;
 
@@ -544,7 +556,10 @@ async fn demotion_of_an_empty_group_needs_no_lease() {
 
     let b = new_daemon("device-b"); // starts Eager, with zero files in GROUP
     b.state.set_test_placeholder_pipeline_connected(true);
-    b.state.set_coordination_client_config(server.uri(), "test-access-token".to_string());
+    b.state.set_coordination_client_config(
+        server.uri(),
+        yadorilink_fapi_client::test_support::offline_auth(),
+    );
     let socket_path = serve(b.state.clone(), b.root.path()).await;
 
     let resp = send_over_socket(
@@ -581,7 +596,10 @@ fn promoting_setup(server: &MockServer) -> Daemon {
             MaterializationPolicy::OnDemand,
         )
         .unwrap();
-    b.state.set_coordination_client_config(server.uri(), "test-access-token".to_string());
+    b.state.set_coordination_client_config(
+        server.uri(),
+        yadorilink_fapi_client::test_support::offline_auth(),
+    );
     b
 }
 
@@ -633,8 +651,8 @@ async fn promotion_writes_the_worker_storage_mode_route_itself() {
 /// flip local policy to eager while the coordination plane stays on-demand --
 /// a split that would NOT self-heal, since a re-run no-ops once the local
 /// mode already matches the target. (This test runs against a real control
-/// socket, not under madsim, so config is genuinely absent unless set; here
-/// it is never set.) Unlike a demotion, a promotion has no ready-peer gate to
+/// socket, so config is genuinely absent unless set; here it is never set.)
+/// Unlike a demotion, a promotion has no ready-peer gate to
 /// fail closed on its own, which is exactly why this direction needs the
 /// explicit guard.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

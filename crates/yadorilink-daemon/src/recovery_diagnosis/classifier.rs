@@ -1,7 +1,7 @@
-//! Phase 2.1-C2-B2: a pure classifier that combines a local recovery
-//! journal row's own state with Phase 2.1-C2-B1's evidence-identity
+//! A pure classifier that combines a local recovery
+//! journal row's own state with the evidence-identity
 //! qualification into a [`RecoveryDiagnosis`] -- a
-//! [`RecoveryRecommendation`] an operator, or a later phase's automatic
+//! [`RecoveryRecommendation`] an operator, or an automatic
 //! reconciler, can act on. No database, no HTTP client, no mutation: every
 //! function here is a pure `local + remote -> diagnosis` mapping over
 //! values already produced by earlier phases.
@@ -98,8 +98,8 @@ impl RecoveryRecommendation {
 }
 
 /// A recovery journal row's own domain-specific state, kept as its real
-/// typed enum -- never stringified early. Display/wire formatting is a
-/// later phase's (2.1-C2-C's) concern.
+/// typed enum -- never stringified early. Display/wire formatting is
+/// `super::ipc`'s concern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryLocalState {
     Enrollment(EnrollmentOperationState),

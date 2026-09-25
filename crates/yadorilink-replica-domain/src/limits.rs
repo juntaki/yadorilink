@@ -6,10 +6,6 @@
 //! this crate owns them.
 
 /// The largest single block a `VersionBlock`/`BlockInfo` may declare.
-/// `yadorilink-sync-core`'s local chunker never produces a block larger
-/// than this, but the bound itself belongs here: it is what
-/// `Change::validate`'s untrusted-input check enforces against a peer's
-/// encoded bytes, not merely a local chunking policy.
 pub const MAX_BLOCK_SIZE_BYTES: u32 = 16 * 1024 * 1024;
 
 /// The largest number of parent change-hashes a single `Change` may name.
@@ -28,7 +24,7 @@ pub const MAX_PATH_BYTES: usize = 4096;
 pub const MAX_PATH_SEGMENTS: usize = 255;
 
 /// The largest number of extended attributes a single `FileMeta` may
-/// carry (C1.2a). Real allow-listed xattr sets are always small (a
+/// carry. Real allow-listed xattr sets are always small (a
 /// handful of app-set attributes at most); this is an untrusted-input
 /// bound on a peer's encoded bytes, matching `MAX_BLOCKS`'s own
 /// reasoning, not a real-world capacity estimate.

@@ -21,9 +21,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_http_api::HttpApiConfig;
-use yadorilink_local_storage::FsBlockStore;
-use yadorilink_replica_domain::file::FileRecord;
-use yadorilink_replica_domain::session_state::MaterializationState;
+use yadorilink_local_storage::SegmentBlockStore;
+use yadorilink_replica_domain::file::{FileRecord, RecordKind};
 
 /// Tests in this file share `YADORILINK_CONTROL_SOCKET` (a process-global
 /// env var `start()` sets, same as `materialization.rs`'s identical
@@ -59,7 +58,7 @@ impl TestServer {
 
 async fn start() -> TestServer {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsBlockStore::new(dir.path().join("blocks")).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(dir.path().join("blocks")).unwrap());
     let sync_state = Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
     let state = DaemonState::new("device-under-test".into(), sync_state, store);
 
@@ -105,24 +104,21 @@ async fn start() -> TestServer {
 /// Adds a link and indexes one hydrated file under it, the same fixture
 /// shape `materialization.rs`'s own tests use.
 /// Mirrors `materialization.rs`'s own `pin_command_succeeds_for_an_already_hydrated_file`
-/// fixture (empty `blocks` list, real content written straight to disk),
-/// plus one explicit step that fixture leaves implicit: setting
-/// `materialization_state` to `Hydrated` directly, rather than relying on
-/// the `files` table's own schema-level `DEFAULT 'hydrated'` for a
-/// freshly-inserted row. `pin`'s real implementation (`hydration::pin`)
-/// only short-circuits to `Ok(())` without contacting any peer when the
-/// file already reads `MaterializationState::Hydrated`; anything else
-/// falls through to a real `hydrate()` call, which unconditionally needs a
-/// live root-commit authority (`hydrate_inner`'s `state.root_lease_for`)
-/// that a plain `add_link` (never a real `start_link_watch`) never
-/// installs -- this crate's tests don't install
-/// `state.install_test_root_commit_authority` either, since `pin`/
-/// `unpin`/`materialization`/`versions` should only ever need a path that
-/// resolves and has *some* indexed content, never a live peer/session.
-/// Setting the state explicitly makes that fast path deterministic instead
-/// of depending on the schema default surviving whatever this daemon's own
-/// background reconciliation passes do to a freshly-linked folder before
-/// this fixture's caller gets to make its first request.
+/// fixture (empty `blocks` list, real content written straight to disk).
+/// `pin`'s real implementation (`hydration::pin`) only short-circuits to
+/// `Ok(())` without contacting any peer when the file reads
+/// `MaterializationState::Hydrated` AND a usable actual-state proof names
+/// the version the row derives; anything else falls through to a real
+/// `hydrate()` call, which unconditionally needs a live root-commit
+/// authority (`hydrate_inner`'s `state.root_lease_for`) that a plain
+/// `add_link` (never a real `start_link_watch`) never installs. This
+/// crate's tests don't install `state.install_test_root_commit_authority`
+/// either, since `pin`/`unpin`/`materialization`/`versions` should only
+/// ever need a path that resolves and has *some* materialized content,
+/// never a live peer/session. A `Hydrated` stamp on its own is a
+/// combination production can no longer produce, so the fixture seeds the
+/// pair the one way a writer produces it: `seed_prior_cycle_proof`, the
+/// single commit that publishes the proof and stamps the claim together.
 fn seed_linked_file(state: &DaemonState, folder: &std::path::Path, content: &[u8]) {
     std::fs::create_dir_all(folder).unwrap();
     state
@@ -146,16 +142,13 @@ fn seed_linked_file(state: &DaemonState, folder: &std::path::Path, content: &[u8
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
-    state
-        .replica_coordinator
-        .materialization_state_repository()
-        .set_materialization_state(
-            "group-1",
-            "notes.txt",
-            MaterializationState::Hydrated,
-            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-        )
-        .unwrap();
+    yadorilink_daemon::test_support::seed_prior_cycle_proof(
+        &state.replica_coordinator,
+        "group-1",
+        "notes.txt",
+        &folder.join("notes.txt"),
+        &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -474,6 +467,7 @@ async fn materialization_and_versions_and_pin_round_trip() {
     let versions = versions["versions"].as_array().unwrap();
     assert_eq!(versions.len(), 1);
     assert_eq!(versions[0]["size"], 11);
+    assert_eq!(versions[0]["kind"], "ENTRY_KIND_FILE");
 }
 
 #[tokio::test]
@@ -576,6 +570,79 @@ async fn conflicts_endpoint_returns_real_per_file_detail() {
     assert_eq!(rows[0]["path"], conflict_path);
     assert_eq!(rows[0]["local_path"], folder.to_string_lossy().to_string());
     assert_eq!(rows[0]["size"], conflict_content.len());
+    assert_eq!(rows[0]["kind"], "ENTRY_KIND_FILE");
+    // Why the copy is kept, the same reason the CLI and apps show.
+    assert_eq!(rows[0]["reason"], "CONFLICT_REASON_CONCURRENT_EDIT");
+}
+
+/// Seeds a live explicit-directory row at `path`: a canonical `size=0`,
+/// `mtime=0`, block-less row whose `record_kind` is `Directory`.
+fn seed_directory_row(state: &DaemonState, path: &str) {
+    let files = state.replica_coordinator.file_index_repository();
+    let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+    files
+        .upsert_file(
+            "group-1",
+            &FileRecord {
+                path: path.into(),
+                size: 0,
+                mtime_unix_nanos: 0,
+                blocks: vec![],
+                deleted: false,
+            },
+            &permit,
+        )
+        .unwrap();
+    files.set_record_kind("group-1", path, RecordKind::Directory, &permit).unwrap();
+}
+
+/// `/api/versions` and `/api/conflicts` name each row's entry kind, so a
+/// client can show an explicit directory as a folder instead of a zero-byte
+/// file. Reads only -- no pin step, which needs a live root-commit
+/// authority this fixture does not run.
+#[tokio::test]
+async fn versions_and_conflicts_report_each_entry_kind() {
+    let _guard = TEST_MUTEX.lock().await;
+    let ts = start().await;
+    let folder = ts._dir.path().join("shared");
+    seed_linked_file(&ts.state, &folder, b"hello world");
+    seed_directory_row(&ts.state, "album");
+    let conflict_dir = "album (conflicted copy, 2026-01-01-000000, device-b)";
+    seed_directory_row(&ts.state, conflict_dir);
+
+    let versions_of = |rel: &str| {
+        let url = ts.url(&format!(
+            "/api/versions?path={}",
+            urlencoding_lite(&folder.join(rel).to_string_lossy())
+        ));
+        let req = ts.client.get(url).bearer_auth(&ts.token);
+        async move { req.send().await.unwrap().json::<serde_json::Value>().await.unwrap() }
+    };
+
+    let file_versions = versions_of("notes.txt").await;
+    let file_versions = file_versions["versions"].as_array().unwrap();
+    assert_eq!(file_versions.len(), 1, "{file_versions:?}");
+    assert_eq!(file_versions[0]["kind"], "ENTRY_KIND_FILE");
+
+    let dir_versions = versions_of("album").await;
+    let dir_versions = dir_versions["versions"].as_array().unwrap();
+    assert_eq!(dir_versions.len(), 1, "{dir_versions:?}");
+    assert_eq!(dir_versions[0]["kind"], "ENTRY_KIND_DIRECTORY");
+
+    let conflicts: serde_json::Value = ts
+        .client
+        .get(ts.url("/api/conflicts"))
+        .bearer_auth(&ts.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rows = conflicts["conflicts"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "expected only the seeded conflict-copy directory: {conflicts}");
+    assert_eq!(rows[0]["path"], conflict_dir);
+    assert_eq!(rows[0]["kind"], "ENTRY_KIND_DIRECTORY");
 }
 
 #[tokio::test]

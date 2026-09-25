@@ -7,7 +7,7 @@ IDs are the stable source of truth; file line numbers are intentionally omitted.
 
 - Target state: every current `Hydrated` or `Pinned` regular file at a stable repair boundary.
 - Destructive operations: cache eviction, GC, interrupted reconstruction, and block corruption.
-- Enforcement symbol: `repair_interrupted_materializations` and `BlockDeletionCoordinator::reclaim_cached_blocks`.
+- Enforcement symbol: `repair_interrupted_materializations` and `ReplicaCoordinator::reclaim_cached_blocks`.
 - Test IDs: `repair_demotes_to_placeholder_when_blocks_are_also_missing_locally`, `eviction_must_not_delete_block_used_by_pinned_file_in_another_group`.
 - Runtime diagnosis: link materialization state, repair warning logs, and recent `block_integrity` errors.
 
@@ -23,7 +23,7 @@ IDs are the stable source of truth; file line numbers are intentionally omitted.
 
 - Target state: every retained version in every group sharing a content hash.
 - Destructive operations: GC sweep and on-demand cache reclaim.
-- Enforcement symbol: `BlockDeletionCoordinator` and `SyncState::blocks_referenced_outside_current_file`.
+- Enforcement symbol: `BlockPhysicalDeletionGuard`, `ReplicaCoordinator::reclaim_cached_blocks`, `sweep_globally_unreferenced_blocks`, and `MaterializationStateRepository::blocks_referenced_outside_current_file`.
 - Test IDs: `eviction_must_not_delete_block_used_by_hydrated_file_in_another_group`, `eviction_must_not_delete_block_retained_for_uncustodied_placeholder_in_another_group`, `concurrent_evictions_across_groups_must_preserve_shared_block`.
 - Runtime diagnosis: GC report, eviction outcome, and `check-block-deletion-boundary.py` CI result.
 
@@ -32,7 +32,7 @@ IDs are the stable source of truth; file line numbers are intentionally omitted.
 - Target state: the device-global block store and all index commits that add block references.
 - Destructive operations: GC from live-set snapshot through final physical deletion.
 - Enforcement symbol: `BlockLivenessGate`, `DaemonState::begin_write_activity`, and `BlockWriteActivityProvider`.
-- Test IDs: `gc_must_not_delete_old_deduplicated_block_adopted_after_live_snapshot`, `eager_peer_adoption_waits_for_block_deletion_gate_before_index_commit`.
+- Test IDs: `gc_must_not_delete_old_deduplicated_block_adopted_after_live_snapshot`, `eager_adoption_waits_for_the_block_deletion_gate_before_committing_a_reference`.
 - Runtime diagnosis: GC `SyncBurstInProgress`, task liveness, and GC completion counters.
 
 ## DL-5: Crash Leaves A Recoverable State
@@ -55,7 +55,7 @@ IDs are the stable source of truth; file line numbers are intentionally omitted.
 
 - Target state: every group whose last-holder safety gate was bypassed with force.
 - Destructive operations: daemon restart or a status recomputation that would otherwise report `Healthy`.
-- Enforcement symbol: `SyncState::latch_group_durability_unknown`, `DaemonState::group_durability_status`, and `DaemonState::clear_group_durability_latch`.
+- Enforcement symbol: `RoleLossOperationRepository::latch_group_durability_unknown`, `DaemonState::group_durability_status`, and `DaemonState::clear_group_durability_latch`.
 - Test IDs: `forced_durability_unknown_latch_survives_daemon_restart`, `forced_unlink_latches_group_durability_unknown`.
 - Runtime diagnosis: `yadorilink status` displays `durability unknown`; persistent table `durability_unknown_latches` records the group until positive whole-group re-confirmation.
 

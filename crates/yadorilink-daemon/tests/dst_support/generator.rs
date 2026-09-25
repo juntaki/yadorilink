@@ -17,7 +17,7 @@
 //!
 //! Reads the shared `Case` IR only; it never mutates that type's shape.
 
-#![cfg(madsim)]
+#![cfg(turmoil)]
 #![allow(dead_code)] // exposed as a library surface; not every scenario drives every helper
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -47,8 +47,13 @@ pub enum OpKind {
     Rmdir,
     Chmod,
     ConflictingConcurrent,
+    RmTree,
+    RenameTree,
 }
 
+/// The default alphabet: what `generate_case` and `generate_pairwise` draw
+/// from. Deliberately excludes [`DIRECTORY_TREE_OP_KINDS`] so a seed keeps
+/// generating the `Case` it generated before those existed.
 pub const OP_KINDS: [OpKind; 9] = [
     OpKind::Write,
     OpKind::Edit,
@@ -60,6 +65,10 @@ pub const OP_KINDS: [OpKind; 9] = [
     OpKind::Chmod,
     OpKind::ConflictingConcurrent,
 ];
+
+/// Whole-tree directory ops: `rm -rf` of a possibly non-empty directory and a
+/// directory rename. Opt-in through [`generate_directory_case`].
+pub const DIRECTORY_TREE_OP_KINDS: [OpKind; 2] = [OpKind::RmTree, OpKind::RenameTree];
 
 impl OpKind {
     pub fn of(op: &Op) -> OpKind {
@@ -73,6 +82,8 @@ impl OpKind {
             Op::Rmdir { .. } => OpKind::Rmdir,
             Op::Chmod { .. } => OpKind::Chmod,
             Op::ConflictingConcurrent { .. } => OpKind::ConflictingConcurrent,
+            Op::RmTree { .. } => OpKind::RmTree,
+            Op::RenameTree { .. } => OpKind::RenameTree,
         }
     }
 }
@@ -181,6 +192,23 @@ impl PathPool {
         }
     }
 
+    /// The default pool plus one level of nesting under every top-level
+    /// directory, for the whole-tree directory workloads: an `rm -rf` or a
+    /// directory rename then removes or carries a subdirectory, not just
+    /// files (the staging `rm -rf linux/` left `linux/arch` behind). Every
+    /// top-level directory gets the same child name, so renaming one onto
+    /// another keeps the carried child inside the pool. Only
+    /// [`generate_directory_case`] draws from it; the default generators
+    /// keep [`PathPool::new`] so their recorded seeds stay unchanged.
+    fn nested() -> PathPool {
+        let mut pool = PathPool::new();
+        for top in ["dir_a", "dir_b", "dir_c", "dir_d"] {
+            pool.creatable_dirs.push(format!("{top}/sub"));
+            pool.files.push(format!("{top}/sub/s0.txt"));
+        }
+        pool
+    }
+
     fn is_file(&self, path: &str) -> bool {
         self.files.iter().any(|f| f == path)
     }
@@ -284,6 +312,38 @@ impl FsModel {
                     return Err(format!("rmdir of non-empty directory `{path}`"));
                 }
                 self.dirs.remove(path);
+            }
+            Op::RmTree { path } => {
+                if !self.dirs.contains(path) {
+                    return Err(format!("rm -rf of missing directory `{path}`"));
+                }
+                self.dirs.retain(|d| d != path && !is_under(d, path));
+                self.files.retain(|f| !is_under(f, path));
+            }
+            Op::RenameTree { from, to } => {
+                if !self.dirs.contains(from) {
+                    return Err(format!("directory rename of missing directory `{from}`"));
+                }
+                if self.dirs.contains(to) || self.files.contains(to) {
+                    return Err(format!("directory rename onto existing `{to}`"));
+                }
+                if to == from || is_under(to, from) {
+                    return Err(format!("directory rename of `{from}` into itself"));
+                }
+                if !self.parent_exists(to) {
+                    return Err(format!("directory rename to `{to}` under a missing directory"));
+                }
+                let moved = |p: &String| -> String {
+                    if p == from {
+                        to.clone()
+                    } else if is_under(p, from) {
+                        format!("{to}{}", &p[from.len()..])
+                    } else {
+                        p.clone()
+                    }
+                };
+                self.dirs = self.dirs.iter().map(moved).collect();
+                self.files = self.files.iter().map(moved).collect();
             }
             Op::Chmod { path, .. } => {
                 if !self.files.contains(path) {
@@ -403,6 +463,30 @@ fn construct(
             let path = pick(rng, &removable)?.clone();
             Some(Op::Rmdir { path })
         }
+        OpKind::RmTree => {
+            // Unlike `Rmdir`, any existing directory qualifies, empty or not.
+            let dirs: Vec<String> = model.dirs.iter().cloned().collect();
+            let path = pick(rng, &dirs)?.clone();
+            Some(Op::RmTree { path })
+        }
+        OpKind::RenameTree => {
+            let dirs: Vec<String> = model.dirs.iter().cloned().collect();
+            let from = pick(rng, &dirs)?.clone();
+            let targets: Vec<String> = pool
+                .initial_dirs
+                .iter()
+                .chain(&pool.creatable_dirs)
+                .filter(|t| {
+                    !model.dirs.contains(*t)
+                        && !model.files.contains(*t)
+                        && model.parent_exists(t)
+                        && !is_under(t, &from)
+                })
+                .cloned()
+                .collect();
+            let to = pick(rng, &targets)?.clone();
+            Some(Op::RenameTree { from, to })
+        }
         OpKind::Chmod => {
             let path = pick(rng, &live)?.clone();
             Some(Op::Chmod { path, exec_bit: rng.random_bool(0.5) })
@@ -464,7 +548,10 @@ struct Builder {
 
 impl Builder {
     fn new(device_count: usize) -> Builder {
-        let pool = PathPool::new();
+        Builder::with_pool(device_count, PathPool::new())
+    }
+
+    fn with_pool(device_count: usize, pool: PathPool) -> Builder {
         let model = FsModel::initial(&pool);
         Builder {
             pool,
@@ -614,6 +701,60 @@ pub fn generate_case(seed: u64) -> Case {
         topology,
         workload,
         fault_schedule,
+        content_table,
+        fault_plan: FaultPlan::default(),
+    }
+}
+
+/// Deterministically produces a well-formed, fault-free `Case` from `seed`
+/// that exercises the whole-tree directory ops: every round, each active
+/// device draws its desired op from the default alphabet plus
+/// [`DIRECTORY_TREE_OP_KINDS`] (falling back to any valid op when the draw's
+/// preconditions do not hold), after a prelude that leaves both initial
+/// directories non-empty, so an early `RmTree` removes real content.
+///
+/// Separate from [`generate_case`] so the default alphabet, and with it every
+/// recorded fresh seed, is untouched.
+pub fn generate_directory_case(seed: u64) -> Case {
+    let mut rng = StdRng::seed_from_u64(seed);
+
+    let topo_kind = TOPOLOGY_KINDS[rng.random_range(0..TOPOLOGY_KINDS.len())];
+    let device_count = topo_kind.device_count();
+    let topology = build_topology(topo_kind, &mut rng);
+
+    let mut builder = Builder::with_pool(device_count, PathPool::nested());
+    let mut ts = 0;
+    emit_prelude(&mut builder, &mut rng, &mut ts);
+    // A populated subdirectory from the start, so the first tree op already
+    // has a nested directory to remove or carry.
+    for op in [
+        Op::Mkdir { path: "dir_a/sub".into() },
+        Op::Write {
+            path: "dir_a/sub/s0.txt".into(),
+            content_id: builder.alloc.alloc(&mut builder.table, &mut rng),
+        },
+    ] {
+        builder.model.apply(&op).expect("nested prelude targets existing dirs");
+        builder.timelines[0].push((ts, op));
+        ts += 1;
+    }
+    let alphabet: Vec<OpKind> = OP_KINDS.iter().chain(&DIRECTORY_TREE_OP_KINDS).copied().collect();
+    let rounds = rng.random_range(6..14);
+    for round in 0..rounds {
+        for dev in 0..device_count {
+            if rng.random_bool(0.75) {
+                let desired = alphabet[rng.random_range(0..alphabet.len())];
+                builder.step(ts + round, dev, Some(desired), &mut rng);
+            }
+        }
+    }
+    let (workload, content_table) = builder.into_workload();
+
+    Case {
+        seed,
+        topology,
+        workload,
+        fault_schedule: Vec::new(),
         content_table,
         fault_plan: FaultPlan::default(),
     }
@@ -802,8 +943,11 @@ fn op_paths(op: &Op) -> Vec<&str> {
         | Op::Delete { path }
         | Op::Mkdir { path }
         | Op::Rmdir { path }
+        | Op::RmTree { path }
         | Op::Chmod { path, .. } => vec![path.as_str()],
-        Op::Rename { from, to } | Op::Move { from, to } => vec![from.as_str(), to.as_str()],
+        Op::Rename { from, to } | Op::Move { from, to } | Op::RenameTree { from, to } => {
+            vec![from.as_str(), to.as_str()]
+        }
         Op::ConflictingConcurrent { paths } => paths.iter().map(|p| p.as_str()).collect(),
     }
 }
@@ -815,7 +959,9 @@ fn op_paths(op: &Op) -> Vec<&str> {
 /// rmdir of a non-empty dir, no chmod/delete/rename of a missing file, ...)
 /// holds. Independent of the generator, so it genuinely cross-checks it.
 pub fn validate_case(case: &Case) -> Vec<Violation> {
-    let pool = PathPool::new();
+    // The nested pool is a superset of the default one, so it validates
+    // cases from every generator.
+    let pool = PathPool::nested();
     let mut model = FsModel::initial(&pool);
     let mut violations = Vec::new();
 
@@ -831,8 +977,15 @@ pub fn validate_case(case: &Case) -> Vec<Violation> {
     for (ts, dev, op) in ordered {
         let at = format!("ts={ts} dev={dev} {}", debug_kind(op));
 
+        // A directory rename carries its files to paths outside the pool
+        // (`dir_a/a0.txt` → `dir_c/a0.txt`); a later op on such a file is
+        // well-formed exactly when the model holds it.
+        let known_file = |p: &str| pool.is_file(p) || model.files.contains(p);
+        // Likewise a directory carried by a directory rename (`dir_a/sub`
+        // → `dir_b/sub/sub`) may be removed or renamed where it now is.
+        let known_dir = |p: &str| pool.is_dir(p) || model.dirs.contains(p);
         for p in op_paths(op) {
-            if !pool.known(p) {
+            if !pool.known(p) && !known_file(p) && !known_dir(p) {
                 violations.push(Violation {
                     at: at.clone(),
                     detail: format!("references path `{p}` outside the pool"),
@@ -841,7 +994,7 @@ pub fn validate_case(case: &Case) -> Vec<Violation> {
         }
         // Directory ops must name a directory; file ops must name a file.
         match op {
-            Op::Mkdir { path } | Op::Rmdir { path } => {
+            Op::Mkdir { path } => {
                 if !pool.is_dir(path) {
                     violations.push(Violation {
                         at: at.clone(),
@@ -849,9 +1002,27 @@ pub fn validate_case(case: &Case) -> Vec<Violation> {
                     });
                 }
             }
+            Op::Rmdir { path } | Op::RmTree { path } => {
+                if !known_dir(path) {
+                    violations.push(Violation {
+                        at: at.clone(),
+                        detail: format!("directory op on non-directory path `{path}`"),
+                    });
+                }
+            }
+            Op::RenameTree { from, to } => {
+                for (p, ok) in [(from, known_dir(from)), (to, pool.is_dir(to))] {
+                    if !ok {
+                        violations.push(Violation {
+                            at: at.clone(),
+                            detail: format!("directory op on non-directory path `{p}`"),
+                        });
+                    }
+                }
+            }
             _ => {
                 for p in op_paths(op) {
-                    if !pool.is_file(p) {
+                    if !known_file(p) {
                         violations.push(Violation {
                             at: at.clone(),
                             detail: format!("file op on non-file path `{p}`"),
@@ -1046,6 +1217,129 @@ mod tests {
             "seed={}|topo={:?}|workload={:?}|faults={:?}|content={:?}",
             case.seed, case.topology, case.workload, case.fault_schedule, content
         )
+    }
+
+    /// The default alphabet's output is pinned: a seed recorded before the
+    /// directory-tree ops existed must still generate the same `Case`, or
+    /// every fresh-seed reproduction note in the corpus silently changes
+    /// meaning.
+    #[test]
+    fn default_generation_is_unchanged_by_the_directory_tree_alphabet() {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        for seed in [0u64, 1, 42, 7777, u64::MAX] {
+            hasher.update(fingerprint(&generate_case(seed)).as_bytes());
+        }
+        for case in generate_pairwise() {
+            hasher.update(fingerprint(&case).as_bytes());
+        }
+        let digest: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(digest, "3be3b88dec705829a63f3d625575c2939cda437be7a97a7692b3bce7587805dc");
+    }
+
+    #[test]
+    fn directory_cases_are_well_formed_deterministic_and_exercise_tree_ops() {
+        let mut seen: BTreeSet<OpKind> = BTreeSet::new();
+        let mut removed_non_empty = false;
+        for seed in 0..200u64 {
+            let case = generate_directory_case(seed);
+            assert_eq!(fingerprint(&case), fingerprint(&generate_directory_case(seed)));
+            let violations = validate_case(&case);
+            assert!(violations.is_empty(), "seed {seed}: {violations:?}");
+
+            let mut ordered: Vec<(u64, usize, &Op)> = case
+                .workload
+                .iter()
+                .flat_map(|tl| tl.ops.iter().map(move |(ts, op)| (*ts, tl.device_index, op)))
+                .collect();
+            ordered.sort_by_key(|(ts, dev, _)| (*ts, *dev));
+            let mut model = FsModel::initial(&PathPool::new());
+            for (_, _, op) in ordered {
+                seen.insert(OpKind::of(op));
+                if let Op::RmTree { path } = op {
+                    removed_non_empty |= !model.is_dir_empty(path);
+                }
+                model.apply(op).unwrap();
+            }
+        }
+        for kind in DIRECTORY_TREE_OP_KINDS {
+            assert!(seen.contains(&kind), "{kind:?} never generated in 200 seeds");
+        }
+        assert!(removed_non_empty, "no RmTree ever removed a non-empty directory");
+    }
+
+    /// The staging `rm -rf linux/` left `linux/arch` behind: generated tree
+    /// ops must remove and move directories that hold a subdirectory, and
+    /// move a subdirectory on its own.
+    #[test]
+    fn directory_cases_remove_and_move_nested_directories() {
+        let (mut removed_nested, mut carried_nested, mut moved_a_subdir) = (false, false, false);
+        for seed in 0..200u64 {
+            let case = generate_directory_case(seed);
+            let mut ordered: Vec<(u64, usize, &Op)> = case
+                .workload
+                .iter()
+                .flat_map(|tl| tl.ops.iter().map(move |(ts, op)| (*ts, tl.device_index, op)))
+                .collect();
+            ordered.sort_by_key(|(ts, dev, _)| (*ts, *dev));
+            let mut model = FsModel::initial(&PathPool::nested());
+            for (_, _, op) in ordered {
+                let has_subdir = |dir: &str| model.dirs.iter().any(|d| is_under(d, dir));
+                match op {
+                    Op::RmTree { path } => removed_nested |= has_subdir(path),
+                    Op::RenameTree { from, .. } => {
+                        carried_nested |= has_subdir(from);
+                        moved_a_subdir |= from.contains('/');
+                    }
+                    _ => {}
+                }
+                model.apply(op).unwrap();
+            }
+        }
+        assert!(removed_nested, "no RmTree ever removed a directory holding a subdirectory");
+        assert!(carried_nested, "no RenameTree ever carried a subdirectory");
+        assert!(moved_a_subdir, "no RenameTree ever moved a nested directory itself");
+    }
+
+    #[test]
+    fn validate_rejects_malformed_directory_tree_ops() {
+        let case_of = |ops: Vec<Op>| {
+            let mut content_table = ContentTable::default();
+            content_table.insert(1, b"x".to_vec());
+            Case {
+                seed: 0,
+                topology: Topology { device_count: 1, links: vec![] },
+                workload: vec![DeviceTimeline {
+                    device_index: 0,
+                    ops: ops.into_iter().enumerate().map(|(i, op)| (i as u64, op)).collect(),
+                }],
+                fault_schedule: vec![],
+                content_table,
+                fault_plan: FaultPlan::default(),
+            }
+        };
+        let rejected = |ops: Vec<Op>| !validate_case(&case_of(ops)).is_empty();
+        assert!(rejected(vec![Op::RmTree { path: "dir_c".into() }]), "rm -rf of a missing dir");
+        assert!(rejected(vec![Op::RenameTree { from: "dir_a".into(), to: "dir_b".into() }]));
+        assert!(rejected(vec![Op::RenameTree { from: "dir_c".into(), to: "dir_d".into() }]));
+        // A file carried by a directory rename is addressable afterwards...
+        let carried = case_of(vec![
+            Op::Write { path: "dir_a/a0.txt".into(), content_id: 1 },
+            Op::RenameTree { from: "dir_a".into(), to: "dir_c".into() },
+            Op::Delete { path: "dir_c/a0.txt".into() },
+        ]);
+        assert!(validate_case(&carried).is_empty(), "{:?}", validate_case(&carried));
+        // ...and gone from where it was, as is everything an rm -rf removed.
+        assert!(rejected(vec![
+            Op::Write { path: "dir_a/a0.txt".into(), content_id: 1 },
+            Op::RenameTree { from: "dir_a".into(), to: "dir_c".into() },
+            Op::Delete { path: "dir_a/a0.txt".into() },
+        ]));
+        assert!(rejected(vec![
+            Op::Write { path: "dir_a/a0.txt".into(), content_id: 1 },
+            Op::RmTree { path: "dir_a".into() },
+            Op::Edit { path: "dir_a/a0.txt".into(), content_id: 1 },
+        ]));
     }
 
     #[test]

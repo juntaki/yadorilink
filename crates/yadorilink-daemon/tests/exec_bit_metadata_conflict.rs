@@ -1,41 +1,29 @@
-//! Deterministic two-device collision scenarios for a dimension the broader
-//! collision-matrix coverage doesn't touch: the Unix owner-executable bit and
-//! metadata-only (no content change) touches, as distinct from ordinary
-//! content-edit conflicts. Same full-daemon-stack, hand-picked-scenario
-//! convention as the rest of this suite.
-//!
+//! Deterministic two-device collision scenarios for a dimension the
+//! broader collision-matrix coverage doesn't touch: the Unix
+//! owner-executable bit and metadata-only (no content change) touches, as
+//! distinct from ordinary content-edit conflicts. Same full-daemon-stack,
+//! hand-picked-scenario convention as the rest of this suite.
 //! `TestDevice`/`setup_device`/`start_watching`/`two_synced_devices` are
-//! self-contained here rather than shared, matching this codebase's existing
-//! convention of self-contained daemon integration test binaries.
-//!
-//! **Load-bearing context this file's assertions were written against**
-//! (see `yadorilink-sync-core::types::unix_mode_from_metadata`'s doc
-//! comment, and `chunker::apply_unix_mode`/`peer_session`'s
-//! `try_apply_metadata_only_update`/`apply_incoming_wire_metadata`):
-//! `unix_mode_from_metadata` — the capture-side primitive that reads a
-//! locally-observed file's real owner-exec bit off its `std::fs::Metadata`
-//! — is now wired into `LocalChangeProcessor`'s record-building path: the
-//! size+mtime fast path compares the on-disk owner-exec bit against the
-//! indexed one and advances the file's version when they differ, so a real
-//! `chmod` on a synced file is captured, broadcast, and reconciled like any
-//! other change. The wire schema (`proto::FileInfo::unix_mode`) and the
-//! materialization-side apply (`apply_unix_mode`, `SyncState::get_unix_mode`/
-//! `set_unix_mode`) exist and are exercised end to end. The scenarios below
-//! assert against that wired behavior: a brand-new executable file
-//! propagates its exec bit to peers (scenario 4); an exec-bit-only chmod
-//! advances the version, so toggling it while a peer concurrently edits
-//! content is a genuine two-version conflict that surfaces a conflict copy
-//! (scenario 1); opposite exec-bit-only chmods with identical content still
-//! converge to an agreed exec-bit state on both devices, and the two-sided
-//! conflict is proved via explicit pre-connect index reads and a post-
-//! convergence exec-bit-multiset assertion, not just structural "a winner
-//! and a conflict copy exist" (scenario 2); a no-op identical-bytes touch
-//! still never produces a version-bumping record, so it cannot race a real
-//! edit (scenario 3); and a genuinely shared-history exec-bit-only
-//! divergence -- both devices starting from a real common ancestor, then
-//! diverging purely in metadata while disconnected -- converges the same
-//! way, closing the create/create-collision gap scenario 2 alone left open
-//! per a code reviewer's second review pass (scenario 5).
+//! self-contained here rather than shared, matching this codebase's
+//! existing convention of self-contained daemon integration test binaries.
+//! The wire schema (`proto::FileInfo::unix_mode`) and the
+//! materialization-side apply (`apply_unix_mode`,
+//! `SyncState::get_unix_mode`/ `set_unix_mode`) exist and are exercised
+//! end to end. The scenarios below assert against that wired behavior: a
+//! brand-new executable file propagates its exec bit to peers (scenario
+//! 4); an exec-bit-only chmod advances the version, so toggling it while a
+//! peer concurrently edits content is a genuine two-version conflict that
+//! surfaces a conflict copy (scenario 1); opposite exec-bit-only chmods
+//! with identical content still converge to an agreed exec-bit state on
+//! both devices, and the two-sided conflict is proved via explicit
+//! pre-connect index reads and a post- convergence exec-bit-multiset
+//! assertion, not just structural "a winner and a conflict copy exist"
+//! (scenario 2); a no-op identical-bytes touch still never produces a
+//! version-bumping record, so it cannot race a real edit (scenario 3); and
+//! a genuinely shared-history exec-bit-only divergence -- both devices
+//! starting from a real common ancestor, then diverging purely in metadata
+//! while disconnected -- converges the same way, covering the shared-history
+//! case scenario 2's create/create collision does not (scenario 5).
 
 mod support;
 
@@ -49,7 +37,7 @@ use support::{
 };
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 use yadorilink_replica_domain::ids::ChangeHash;
 use yadorilink_transport::QuicPeerChannel;
 
@@ -88,7 +76,7 @@ struct TestDevice {
 async fn setup_device(account: &TestAccount, name: &str) -> TestDevice {
     let device_id = support::register_device(account, name, [0u8; 32]).await;
     let store_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let (sync_state, index_dir) = open_file_backed_replica_coordinator();
     let sync_state = Arc::new(sync_state);
     let state = DaemonState::new(device_id.clone(), sync_state, store);
@@ -186,13 +174,11 @@ async fn two_synced_devices_with_channels(
 /// once it is ready to. See
 /// `concurrent_unix_mode_true_vs_false_no_content_change`'s doc comment for
 /// why this matters: two devices that are already connected while each
-/// makes an independent local write race the wire, and — confirmed,
-/// reproduced, 5/5 runs — that race in this environment resolves in favor
-/// of wire delivery beating the OTHER device's own local debounce/capture
-/// almost every time, which (per that same investigation) silently
-/// swallows a losing side's exec-bit divergence through a real, separate,
-/// pre-existing gap in `yadorilink-local-capture`'s self-echo content-hash
-/// suppression. Simply not connecting the two devices until both already
+/// makes an independent local write race the wire, and that race usually
+/// resolves in favour of wire delivery beating the OTHER device's own local
+/// debounce/capture; `yadorilink-local-capture`'s self-echo content-hash
+/// suppression then treats the losing side's exec-bit-only difference as no
+/// change. Simply not connecting the two devices until both already
 /// hold their own independent, captured local `Change` sidesteps needing to
 /// depend on winning that race at all -- no session exists yet, so there is
 /// nothing for a local write to race against.
@@ -265,9 +251,8 @@ fn is_executable(path: &std::path::Path) -> bool {
     std::fs::metadata(path).map(|m| m.permissions().mode() & 0o100 != 0).unwrap_or(false)
 }
 
-/// A conflict-copy artifact carries the `conflicted copy` marker in its name
-/// (see `yadorilink-sync-core::conflict`). Only exercised by the exec-bit
-/// conflict scenario below, which is itself `#[cfg(unix)]`.
+/// Only exercised by the exec-bit conflict scenario below, which is itself
+/// `#[cfg(unix)]`.
 #[cfg(unix)]
 fn is_conflict_copy(name: &str) -> bool {
     name.contains("conflicted copy")
@@ -403,8 +388,7 @@ async fn concurrent_unix_mode_toggle_true_vs_content_edit() {
 /// each other) the SAME filename with byte-identical content but opposite
 /// exec bits — a pure metadata conflict with no content divergence.
 ///
-/// **Corrected construction** (a code reviewer's finding on this file's
-/// first version): starting both devices from the SAME synced boolean and
+/// **Construction.** Starting both devices from the SAME synced boolean and
 /// setting one to `true` and the other to `false` cannot generate two
 /// genuinely concurrent, conflicting DAG branches — a boolean has only two
 /// states, so whichever device's target already equalled the shared starting
@@ -422,30 +406,20 @@ async fn concurrent_unix_mode_toggle_true_vs_content_edit() {
 ///    afterward, once both already hold their own independently-captured
 ///    local `Change`.
 ///
-/// Both corrections turned out to be load-bearing, not just belt-and-
-/// suspenders, per two real, separate, pre-existing gaps this rewrite's own
-/// investigation found and confirmed (reproduced multiple times each) in
-/// `yadorilink-local-capture`'s local-change capture pipeline, orthogonal to
-/// what this test is pinning down:
+/// Both are load-bearing: this test pins conflict resolution, not local
+/// capture, so it must not depend on two capture paths in
+/// `yadorilink-local-capture`:
 ///   - A chmod-only metadata edit to a path this device only knows about
-///     because it *received* it from a peer is never captured at all (its
-///     size+mtime fast path never fires because the receiving side's
-///     indexed `mtime` does not match the materialized file's real on-disk
-///     mtime, so the edit silently falls through to the pure block-hash
-///     self-echo check below it, waited up to 60 real seconds with no
-///     capture).
-///   - More generally, that same self-echo check (`existing.blocks ==
-///     blocks => no-op`) never compares the exec bit at all, so ANY local
-///     write whose content happens to already match what's indexed --
-///     including two devices concurrently creating the same path with the
-///     same content while already connected, where one side's write lands
-///     just after the other's matching content has already arrived over
-///     the wire -- silently drops that side's exec-bit divergence with no
-///     error and no conflict artifact. Confirmed 5/5 runs with the two
-///     devices connected throughout.
-/// Both are documented as findings rather than routed around silently; see
-/// this arc's exit report addendum. Connecting only after both independent
-/// creates are already captured avoids depending on either gap at all: with
+///     because it *received* it from a peer (its size+mtime fast path does
+///     not fire, because the receiving side's indexed `mtime` does not match
+///     the materialized file's real on-disk mtime).
+///   - The self-echo check (`existing.blocks == blocks => no-op`) compares
+///     blocks, not the exec bit, so a local write whose content already
+///     matches what's indexed -- e.g. two connected devices creating the
+///     same path with the same content, one landing just after the other's
+///     matching content arrived -- is treated as no change.
+/// Connecting only after both independent
+/// creates are already captured avoids depending on either path at all: with
 /// no session yet, there is nothing for either device's local write to race
 /// against, so [`dag_heads`] genuinely proves two distinct, independent DAG
 /// branches exist before any wire delivery could have happened, not merely
@@ -594,8 +568,8 @@ async fn concurrent_unix_mode_true_vs_false_no_content_change() {
         // value. `snapshot_a == snapshot_b` above already proves agreement,
         // but agreement alone would also hold if a bug (e.g. `apply_unix_mode`
         // always clearing the bit) collapsed BOTH devices to the same wrong
-        // value -- that is exactly the failure mode a code reviewer reported
-        // is reachable without this multiset check. Assert the winner and
+        // value -- a failure mode that is reachable without this multiset
+        // check. Assert the winner and
         // conflict-copy TOGETHER carry exactly one `true` and one `false`,
         // proving both original values genuinely survived resolution rather
         // than one being lost.
@@ -753,9 +727,8 @@ async fn unix_mode_set_on_brand_new_file_propagates_to_peer() {
 /// closed here for the first time at this file's daemon-integration level.
 ///
 /// Scenario 2 above is deliberately a create/create collision (two
-/// independent DAG roots, never sharing history) -- a code reviewer's
-/// second review pass on this file pointed out that this sidesteps, rather
-/// than closes, the originally-intended question: a concurrent metadata-
+/// independent DAG roots, never sharing history), which sidesteps rather
+/// than answers the originally-intended question: a concurrent metadata-
 /// only conflict on ONE file BOTH devices already share history on. This
 /// scenario builds exactly that:
 ///
@@ -854,6 +827,12 @@ async fn shared_history_unix_mode_only_divergence_converges_after_reconnect() {
         for channel in &channels {
             channel.close_revoked();
         }
+        // Changes converge over reconciliation now, on its own connection, so
+        // closing these channels partitions only the block/service plane.
+        // Without this the two devices keep converging right through the
+        // "partition" and the divergence this test exists to create never
+        // happens.
+        support::sever_reconciliation(&device_a.state, &device_b.state).await;
         wait_until_with_context(
             || channels.iter().all(|channel| !channel.is_open()),
             Duration::from_secs(10),
@@ -893,10 +872,78 @@ async fn shared_history_unix_mode_only_divergence_converges_after_reconnect() {
             },
         )
         .await;
-        assert!(
-            indexed_unix_mode(&device_b, &group_id, "shared.txt"),
-            "device-b's own file index must show shared.txt as executable after its first chmod"
-        );
+        // Separates the four things that can be wrong here in one shot,
+        // rather than asserting on the last of them and guessing backwards:
+        // did the DAGs diverge as intended, do the two devices resolve the
+        // path to the same version, and does each device's own index agree
+        // with its own disk.
+        let stage_dump = || {
+            let idx = |d: &TestDevice| {
+                d.state
+                    .replica_coordinator
+                    .file_index_repository()
+                    .get_file(&group_id, "shared.txt")
+                    .ok()
+                    .flatten()
+                    .map(|r| {
+                        format!(
+                            "present deleted={} mode={:?}",
+                            r.deleted,
+                            d.state
+                                .replica_coordinator
+                                .file_index_repository()
+                                .get_unix_mode(&group_id, "shared.txt")
+                                .ok()
+                                .flatten()
+                                .map(|m| format!("{m:o}"))
+                        )
+                    })
+                    .unwrap_or_else(|| "<absent>".to_string())
+            };
+            let disk_mode = |d: &TestDevice| {
+                std::fs::metadata(d.root.path().join("shared.txt"))
+                    .map(|m| format!("{:o}", m.permissions().mode() & 0o777))
+                    .unwrap_or_else(|e| format!("<{e}>"))
+            };
+            format!(
+                "\n  common head        a={:?} b={:?}\
+                 \n  heads now          a={:?} b={:?}\
+                 \n  index              a=[{}] b=[{}]\
+                 \n  disk mode          a={} b={}\
+                 \n  entries            a={:?} b={:?}",
+                common_heads_a.iter().map(|h| hex::encode(&h.0[..4])).collect::<Vec<_>>(),
+                common_heads_b.iter().map(|h| hex::encode(&h.0[..4])).collect::<Vec<_>>(),
+                dag_heads(&device_a, &group_id)
+                    .iter()
+                    .map(|h| hex::encode(&h.0[..4]))
+                    .collect::<Vec<_>>(),
+                dag_heads(&device_b, &group_id)
+                    .iter()
+                    .map(|h| hex::encode(&h.0[..4]))
+                    .collect::<Vec<_>>(),
+                idx(&device_a),
+                idx(&device_b),
+                disk_mode(&device_a),
+                disk_mode(&device_b),
+                real_entry_names(device_a.root.path()),
+                real_entry_names(device_b.root.path()),
+            )
+        };
+        // A head moving and the file index reflecting it are two separate
+        // writes, so this waits rather than reading the instant the head
+        // changed.
+        wait_until_with_context(
+            || indexed_unix_mode(&device_b, &group_id, "shared.txt"),
+            Duration::from_secs(20),
+            || {
+                format!(
+                    "device-b's own file index must show shared.txt as executable after its \
+                     first chmod{}",
+                    stage_dump()
+                )
+            },
+        )
+        .await;
         let heads_b_after_first = dag_heads(&device_b, &group_id);
 
         std::fs::set_permissions(&path_b, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -949,8 +996,7 @@ async fn shared_history_unix_mode_only_divergence_converges_after_reconnect() {
         )
         .await;
 
-        // Empirically confirmed (this test's own repeated verification
-        // runs; see this arc's exit report addendum): even though both
+        // Even though both
         // branches' CONTENT is byte-identical, this DAG conflict-resolution
         // engine treats two non-ancestor-related `FileVersion`s of the same
         // path as a genuine conflict requiring a winner-plus-conflict-copy
@@ -958,11 +1004,48 @@ async fn shared_history_unix_mode_only_divergence_converges_after_reconnect() {
         // uses, just reached via shared history instead of a create/create
         // collision. Both devices must agree on this.
         let names_a = real_entry_names(device_a.root.path());
+        // Which of the four stages this is, if it is any of them: did the
+        // DAGs converge, did both sides keep two live content heads for the
+        // path, and did the repair engine derive a conflict copy from them.
+        let converged_dump = format!(
+            "\n  heads              a={:?} b={:?}\
+             \n  pre-merge tips     a={:?} b={:?}\
+             \n  index mode         a={:?} b={:?}\
+             \n  entries            a={:?} b={:?}",
+            dag_heads(&device_a, &group_id)
+                .iter()
+                .map(|h| hex::encode(&h.0[..4]))
+                .collect::<Vec<_>>(),
+            dag_heads(&device_b, &group_id)
+                .iter()
+                .map(|h| hex::encode(&h.0[..4]))
+                .collect::<Vec<_>>(),
+            heads_a_after.iter().map(|h| hex::encode(&h.0[..4])).collect::<Vec<_>>(),
+            heads_b_after.iter().map(|h| hex::encode(&h.0[..4])).collect::<Vec<_>>(),
+            device_a
+                .state
+                .replica_coordinator
+                .file_index_repository()
+                .get_unix_mode(&group_id, "shared.txt")
+                .ok()
+                .flatten()
+                .map(|m| format!("{m:o}")),
+            device_b
+                .state
+                .replica_coordinator
+                .file_index_repository()
+                .get_unix_mode(&group_id, "shared.txt")
+                .ok()
+                .flatten()
+                .map(|m| format!("{m:o}")),
+            names_a,
+            real_entry_names(device_b.root.path()),
+        );
         assert_eq!(
             names_a.iter().filter(|n| is_conflict_copy(n)).count(),
             1,
             "a genuine metadata-only conflict on shared history must surface exactly one \
-             conflict-copy artifact alongside the winner: {names_a:?}"
+             conflict-copy artifact alongside the winner: {names_a:?}{converged_dump}"
         );
         assert!(names_a.contains(&"shared.txt".to_string()), "{names_a:?}");
         assert_eq!(names_a.len(), 2, "{names_a:?}");

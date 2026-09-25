@@ -27,7 +27,7 @@ use yadorilink_ipc_proto::daemonctl::{
     DaemonControlRequest, DaemonControlResponse, ListLinksRequest, UnlinkRequest,
 };
 use yadorilink_ipc_proto::framing::{read_message, write_message};
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
 use yadorilink_replica_domain::session_state::RoleLossOperationState;
 
@@ -42,7 +42,7 @@ struct Daemon {
 
 fn new_daemon(device_id: &str) -> Daemon {
     let store_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let (sync_state, index_dir) = open_file_backed_replica_coordinator();
     let state = DaemonState::new(device_id.to_string(), Arc::new(sync_state), store);
     ensure_device_signing_key(&state);
@@ -225,7 +225,7 @@ async fn exclude_target_readiness_false_when_only_ready_replica_is_the_excluded_
         .unwrap();
 
     connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
-    b.state.set_peer_group_full_replica("device-a", GROUP, true);
+    b.state.authority.set_peer_group_full_replica("device-a", GROUP, true);
     tokio::time::sleep(Duration::from_millis(500)).await; // let the session establish
 
     assert!(
@@ -281,8 +281,8 @@ async fn exclude_target_readiness_true_when_a_different_replica_is_ready() {
 
     connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
     connect_two_daemons(&c.state, "device-c", &b.state, "device-b", &[GROUP.to_string()]).await;
-    b.state.set_peer_group_full_replica("device-a", GROUP, true);
-    b.state.set_peer_group_full_replica("device-c", GROUP, true);
+    b.state.authority.set_peer_group_full_replica("device-a", GROUP, true);
+    b.state.authority.set_peer_group_full_replica("device-c", GROUP, true);
     tokio::time::sleep(Duration::from_millis(500)).await; // let the sessions establish
 
     assert!(
@@ -340,36 +340,64 @@ async fn unlink_setup(
         .record_group_block_provenance(GROUP, std::slice::from_ref(&bytes))
         .unwrap();
     let record = record_referencing("only.bin", bytes, content.len() as u64);
-    a.state
-        .replica_coordinator
-        .file_index_repository()
-        .upsert_file(
-            GROUP,
-            &record,
-            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-        )
-        .unwrap();
-    b.state
-        .replica_coordinator
-        .file_index_repository()
-        .upsert_file(
-            GROUP,
-            &record,
-            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-        )
-        .unwrap();
+    for daemon in [&a, &b] {
+        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+        daemon
+            .state
+            .replica_coordinator
+            .file_index_repository()
+            .upsert_file(GROUP, &record, &permit)
+            .unwrap();
+        // `upsert_file` leaves a row `Placeholder`, which is what a row
+        // looks like between its change being projected and its content
+        // being fetched. Both devices here are meant to be holding the
+        // content -- they have the blocks and the group provenance a few
+        // lines up -- so they have to say so.
+        //
+        // This used not to matter: the background custody check ran the
+        // action-time proof, which asks the peer's BLOCK STORE. The
+        // background check now asks the peer's index instead, and treats a
+        // peer with the changes and unmaterialized rows as a peer that has
+        // not taken custody yet -- deliberately, because that is exactly
+        // what a device still doing its first sync looks like. The fixture
+        // has to be specific about which of the two it is modelling.
+        daemon
+            .state
+            .replica_coordinator
+            .materialization_state_repository()
+            .set_materialization_state(
+                GROUP,
+                &record.path,
+                yadorilink_replica_domain::session_state::MaterializationState::Hydrated,
+                &permit,
+            )
+            .unwrap();
+    }
 
-    connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
-    b.state.set_peer_group_full_replica("device-a", GROUP, true);
-    a.state.set_peer_group_full_replica("device-b", GROUP, true);
-    tokio::time::sleep(Duration::from_millis(500)).await; // let the session establish
-
+    // Must win the race against `connect_two_daemons`'s own coordination-
+    // plane wiring below: `coordination_client_config` is a set-once
+    // `OnceLock` (production semantics), so whichever caller sets it FIRST
+    // wins for the rest of the process. This also matters for a `false`
+    // flag here: `connect_two_daemons` would otherwise unconditionally wire
+    // BOTH devices to its own fake regardless of what this test asked for,
+    // silently defeating a deliberate no-config scenario too.
     if configure_source_coordination {
-        b.state.set_coordination_client_config(server.uri(), "test-access-token".to_string());
+        b.state.set_coordination_client_config(
+            server.uri(),
+            yadorilink_fapi_client::test_support::offline_auth(),
+        );
     }
     if configure_target_coordination {
-        a.state.set_coordination_client_config(server.uri(), "test-access-token-a".to_string());
+        a.state.set_coordination_client_config(
+            server.uri(),
+            yadorilink_fapi_client::test_support::offline_auth(),
+        );
     }
+
+    connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
+    b.state.authority.set_peer_group_full_replica("device-a", GROUP, true);
+    a.state.authority.set_peer_group_full_replica("device-b", GROUP, true);
+    tokio::time::sleep(Duration::from_millis(500)).await; // let the session establish
 
     let socket_path = b.root.path().join("daemon.sock");
     let serve_path = socket_path.clone();
@@ -559,7 +587,7 @@ async fn unlink_force_proceeds_without_a_lease_and_latches_durability_unknown() 
         .await;
 
     let (_a, b, socket_path) = unlink_setup(&server, true, false).await;
-    // M4: `Protected` now requires a fresh peer-confirmed custody check
+    // `Protected` requires a fresh peer-confirmed custody check
     // (`DurabilityConfirmationJob`'s sweep, normally run periodically in
     // the background) rather than this device's own local materialization
     // state alone -- force one round synchronously so the sanity check
@@ -666,7 +694,7 @@ async fn unlink_force_proceeds_without_config_and_latches_durability_unknown() {
         .await;
 
     let (_a, b, socket_path) = unlink_setup(&server, false, false).await;
-    // M4: see the identical comment in
+    // See the identical comment in
     // `unlink_force_proceeds_without_a_lease_and_latches_durability_unknown`.
     b.state.refresh_custody_confirmation(GROUP).await;
     assert_eq!(

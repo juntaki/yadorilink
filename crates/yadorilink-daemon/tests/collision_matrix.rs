@@ -30,7 +30,7 @@ use support::{
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::sync_error::SyncError;
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 
 struct TestDevice {
     device_id: String,
@@ -47,7 +47,7 @@ struct TestDevice {
 async fn setup_device(account: &TestAccount, name: &str) -> TestDevice {
     let device_id = support::register_device(account, name, [0u8; 32]).await;
     let store_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let (sync_state, index_dir) = open_file_backed_replica_coordinator();
     let sync_state = Arc::new(sync_state);
     let state = DaemonState::new(device_id.clone(), sync_state, store);
@@ -469,8 +469,8 @@ async fn rename_then_immediate_delete_leaves_nothing_on_either_device() {
 /// (macOS default, Windows), this is a genuine hazard: one
 /// device's sync root can only ever hold one of the two names on disk.
 /// Skipped outright on a case-sensitive filesystem (Linux ext4), where
-/// this isn't a collision at all -- matching this session's earlier
-/// case-fold test fixes (`hazard_reason_for_policy`'s own gating logic).
+/// this isn't a collision at all -- matching `hazard_reason_for_policy`'s
+/// own case-fold gating logic.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_differently_cased_create_is_a_hazard_on_case_insensitive_filesystems() {
     let (device_a, device_b, group_id) = two_synced_devices("collision-case-fold").await;
@@ -548,5 +548,129 @@ async fn delete_then_immediate_recreate_converges_on_new_content() {
     assert_eq!(
         std::fs::read(device_a.root.path().join("shared.txt")).unwrap(),
         b"recreated content, different and longer"
+    );
+}
+
+// --- Scenario: a peer's create lands while a local create debounces --------
+
+/// A peer's create of a path is admitted while this device's own create of
+/// the same, brand-new path is still waiting out the watcher's debounce.
+///
+/// The local create's bytes were written against no version of the path,
+/// so it must land concurrent with the peer's: both stay live heads of the
+/// path, which is what lets conflict resolution keep both contents. Signed
+/// onto the frontier as it stood at emission, it would instead claim the
+/// peer's create as its causal past, the peer's version would be
+/// superseded, no conflict copy would ever be derived for it, and its
+/// content would exist nowhere.
+///
+/// One device and a directly admitted peer change make the ordering
+/// certain: the admission completes long before the debounce releases the
+/// local event. The assertion is on the signed DAG, which is where the
+/// loss is decided; the peer here is not a policy member, so its content
+/// is never placed on this device's disk either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_create_admitted_while_a_local_create_debounces_stays_concurrent() {
+    use ed25519_dalek::SigningKey;
+    use yadorilink_replica_domain::change::{Op, PutOrigin};
+    use yadorilink_replica_domain::file::{FileMeta, FileVersion, RecordKind};
+    use yadorilink_replica_domain::ids::{DeviceId, FolderGroupId, SyncPath};
+    use yadorilink_replica_domain::test_authoring::create_signed_for_tests;
+
+    support::ensure_isolated_config_dir();
+    let group_id = "create-race-group";
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
+    let (sync_state, _index_dir) = open_file_backed_replica_coordinator();
+    let state = DaemonState::new("device-a".to_string(), Arc::new(sync_state), store);
+    support::ensure_device_signing_key(&state);
+    let device = TestDevice {
+        device_id: "device-a".to_string(),
+        state,
+        root: tempfile::tempdir().unwrap(),
+        _store_dir: store_dir,
+        _index_dir,
+    };
+    // Local emission is withheld until the group has a verified policy.
+    support::install_bootstrap_policy(&device.state, &[group_id.to_string()]);
+    start_watching(&device, group_id).await;
+    // Past the link's initial scan, so the file below reaches capture
+    // through the live watcher rather than the scan.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    std::fs::write(device.root.path().join("new.txt"), b"created locally").unwrap();
+
+    let peer_version = FileVersion::new(
+        vec![],
+        0,
+        FileMeta {
+            mtime_unix_nanos: 1,
+            unix_mode: None,
+            symlink_target: None,
+            record_kind: RecordKind::File,
+            xattrs: Vec::new(),
+        },
+    );
+    let peer_create = create_signed_for_tests(
+        vec![],
+        0,
+        DeviceId("device-b".into()),
+        FolderGroupId(group_id.into()),
+        vec![Op::Put {
+            path: SyncPath("new.txt".into()),
+            version: peer_version.version_hash,
+            origin: PutOrigin::Direct,
+        }],
+        &SigningKey::from_bytes(&[9u8; 32]),
+    );
+    let peer_hash = peer_create.compute_hash();
+    let history = device.state.replica_coordinator.change_history_repository();
+    history
+        .dag_admit_change_with_versions(&peer_create, std::slice::from_ref(&peer_version))
+        .unwrap();
+
+    let local_create = || {
+        history
+            .dag_path_live_heads(group_id, "new.txt")
+            .unwrap()
+            .into_iter()
+            .find(|head| head.device_id == device.device_id)
+    };
+    wait_until_with_context(
+        || {
+            local_create().is_some()
+                || !history
+                    .dag_path_live_heads(group_id, "new.txt")
+                    .unwrap()
+                    .iter()
+                    .any(|head| head.change_hash == peer_hash.0)
+        },
+        Duration::from_secs(30),
+        || {
+            format!(
+                "disk={:?} {}",
+                snapshot(device.root.path()),
+                index_summary(&device, group_id, "new.txt")
+            )
+        },
+    )
+    .await;
+
+    let live: Vec<String> = history
+        .dag_path_live_heads(group_id, "new.txt")
+        .unwrap()
+        .into_iter()
+        .map(|head| head.device_id)
+        .collect();
+    assert!(
+        live.contains(&"device-b".to_string()) && live.contains(&device.device_id),
+        "the peer's create and the local create must both stay live heads of the path, \
+         got {live:?}"
+    );
+    let local_hash =
+        yadorilink_replica_domain::ids::ChangeHash(local_create().unwrap().change_hash);
+    assert!(
+        !history.dag_is_ancestor(&peer_hash, &local_hash).unwrap(),
+        "the local create claimed a peer's create its author never saw"
     );
 }

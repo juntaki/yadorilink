@@ -121,7 +121,7 @@ impl EnrollmentRepository for SyncStateEnrollmentRepository {
         operation_id: &str,
         detail: &str,
         now_unix: i64,
-    ) -> Result<(), SyncError> {
+    ) -> Result<bool, SyncError> {
         self.state
             .enrollment_repository()
             .rollback_local_setup_to_cancel_pending(local_path, operation_id, detail, now_unix)

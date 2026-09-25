@@ -1,0 +1,4 @@
+[bindings.swift]
+# Every generated Swift file compiles into this one module, so the product
+# types and the objects that use them see each other without imports.
+module_name = "YadoriLinkFFI"

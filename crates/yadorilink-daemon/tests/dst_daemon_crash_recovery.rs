@@ -1,56 +1,52 @@
 //! Deterministic-simulation crash/restart recovery test: boots the *real*
-//! daemon lifecycle (`app::run(DaemonConfig)`) inside a `madsim` simulation
-//! node, drives one local-change indexing cycle, then simulates an
-//! **ungraceful crash** (the running daemon task is aborted outright, with
-//! no `shutdown_tx` graceful path) leaving persistent state — the on-disk
-//! block store and the sqlite `SyncState` — behind on temp paths, plus a
-//! deliberately interrupted-materialization footprint (a stuck `Hydrating`
-//! index row and an orphaned `.yadorilink-tmp` file in the linked folder).
-//! A fresh `app::run` is then booted over the *same* paths and the same
-//! device identity; the assertions prove the daemon comes back up cleanly,
-//! its real startup recovery ran, and the previously-indexed file survives
-//! the crash consistent with disk.
-//!
-//! This is the whole-daemon analogue of `yadorilink-sync-core`'s
-//! `dst_disk_crash_chaos.rs`, which crash-restarts a bare `SyncState`. Here
+//! daemon lifecycle (`app::run(DaemonConfig)`) inside a `madsim`
+//! simulation node, drives one local-change indexing cycle, then simulates
+//! an **ungraceful crash** (the running daemon task is aborted outright,
+//! with no `shutdown_tx` graceful path) leaving persistent state — the
+//! on-disk block store and the sqlite `SyncState` — behind on temp paths,
+//! plus a deliberately interrupted-materialization footprint (a stuck
+//! `Hydrating` index row and an orphaned `.yadorilink-tmp` file in the
+//! linked folder). A fresh `app::run` is then booted over the *same* paths
+//! and the same device identity; the assertions prove the daemon comes
+//! back up cleanly, its real startup recovery ran, and the
+//! previously-indexed file survives the crash consistent with disk. Here
 //! the production `app::run` entry point runs the real startup recovery
 //! sequence itself. The passes this test exercises both run
 //! *unconditionally* at every boot — before `DaemonState` is published, so
 //! by the time the restart's state probe fires the recovery has already
-//! completed:
-//!   - `SyncState::reset_stale_hydrating_to_placeholder` (resets rows a
-//!     crash left stuck mid-hydration), and
-//!   - `materialization::cleanup_stale_temp_files` over the block-store root
-//!     (removes orphaned `.yadorilink-tmp` files a crash left behind).
-//!
-//! What is stubbed away so no real network/socket is touched in-sim (all
-//! seams are `#[cfg(madsim)]`-gated, so production behavior is unchanged) —
-//! identical to `dst_daemon_smoke.rs`:
-//!   - Peer orchestrator / update-check scheduler / control + shell-IPC
-//!     sockets are not started under `--cfg madsim`; the daemon is driven
-//!     through `DaemonState`/`shutdown_tx` via the `state_probe` seam.
-//!   - The initial linked-folder watch is fed by
-//!     `SimulatedFolderWatchSource` in place of the real OS watcher.
-//!
-//! Why the link is NOT persisted across the crash: `app::run`'s own startup
+//! completed: - `SyncState::reset_stale_hydrating_to_placeholder` (resets
+//! rows a crash left stuck mid-hydration), and -
+//! `materialization::cleanup_stale_temp_files` over the block-store root
+//! (removes orphaned `.yadorilink-tmp` files a crash left behind). What is
+//! stubbed away so no real network/socket is touched in-sim (all seams are
+//! `#[cfg(madsim)]`-gated, so production behavior is unchanged) —
+//! identical to `dst_daemon_smoke.rs`: - Peer orchestrator / update-check
+//! scheduler / control + shell-IPC sockets are not started under `--cfg
+//! madsim`; the daemon is driven through `DaemonState`/`shutdown_tx` via
+//! the `state_probe` seam. - The initial linked-folder watch is fed by
+//! `SimulatedFolderWatchSource` in place of the real OS watcher. Why the
+//! link is NOT persisted across the crash: `app::run`'s own startup
 //! resumes watching every *persisted* link (`sync_state.list_links()`) via
 //! the production `RealFolderWatchSource`, which builds a real `notify` OS
 //! watcher — and `notify` spawns a system thread, which madsim forbids
 //! (`attempt to spawn a system thread in simulation`). So this test links
-//! the folder for the pre-crash indexing pass with a *simulated* source but
-//! without `add_link`, exactly as `dst_daemon_smoke.rs` does; the indexed
-//! `FileRecord`s persist in sqlite independent of the links table, so the
-//! crash/restart of the *index* is fully exercised while the restart boots
-//! with no link to auto-resume. The per-link startup passes
+//! the folder for the pre-crash indexing pass with a *simulated* source
+//! but without `add_link`, exactly as `dst_daemon_smoke.rs` does; the
+//! indexed `FileRecord`s persist in sqlite independent of the links table,
+//! so the crash/restart of the *index* is fully exercised while the
+//! restart boots with no link to auto-resume. The per-link startup passes
 //! (`repair_interrupted_materializations` and the per-folder
 //! `cleanup_stale_temp_files`) therefore aren't reached in-sim; covering
 //! them would need a `#[cfg(madsim)]` seam on the link-resume path so the
-//! restart can re-attach a simulated watch source (a production change, out
-//! of scope for this first cut).
-//!
-//! Only compiled/run under `RUSTFLAGS="--cfg madsim"`.
+//! restart can re-attach a simulated watch source (a production change,
+//! out of scope for this first cut). Only compiled/run under
+//! `RUSTFLAGS="--cfg madsim"`.
 
-#![cfg(madsim)]
+// Retired. This scenario was written for a simulator this project no longer
+// builds against, and it names APIs that have since been removed. It is kept,
+// never compiled, as the specification its turmoil re-expression has to meet;
+// delete it in the change that lands that replacement.
+#![cfg(any())]
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -255,7 +251,7 @@ async fn scenario_body(seed: u64) -> Result<(), String> {
         )
         .map_err(|e| format!("set Hydrating: {e}"))?;
     // (b) An orphaned temp file in the block-store root — as if the crash
-    //     hit between an `FsBlockStore::put` writing its temp and the final
+    //     hit between an `SegmentBlockStore::put` writing its temp and the final
     //     rename. The block-store-root `cleanup_stale_temp_files` pass runs
     //     unconditionally at startup (it does not depend on any persisted
     //     link) and must remove it. Naming matches `unique_tmp_path`:

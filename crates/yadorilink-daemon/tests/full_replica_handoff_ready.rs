@@ -14,7 +14,7 @@ use support::{
     connect_two_daemons, ensure_device_signing_key, open_file_backed_replica_coordinator,
 };
 use yadorilink_daemon::daemon_state::DaemonState;
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
 use yadorilink_replica_domain::session_state::MaterializationPolicy;
 
@@ -29,7 +29,7 @@ struct Daemon {
 
 fn new_daemon(device_id: &str) -> Daemon {
     let store_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let (sync_state, index_dir) = open_file_backed_replica_coordinator();
     let state = DaemonState::new(device_id.to_string(), Arc::new(sync_state), store);
     ensure_device_signing_key(&state);
@@ -161,7 +161,7 @@ async fn ready_when_another_replica_holds_every_file() {
         .unwrap();
 
     connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
-    b.state.set_peer_group_full_replica("device-a", GROUP, true);
+    b.state.authority.set_peer_group_full_replica("device-a", GROUP, true);
     tokio::time::sleep(Duration::from_millis(500)).await; // let the session establish
 
     assert!(
@@ -255,8 +255,8 @@ async fn not_ready_when_no_single_peer_holds_every_file() {
 
     connect_two_daemons(&b.state, "device-b", &c.state, "device-c", &[GROUP.to_string()]).await;
     connect_two_daemons(&b.state, "device-b", &d.state, "device-d", &[GROUP.to_string()]).await;
-    b.state.set_peer_group_full_replica("device-c", GROUP, true);
-    b.state.set_peer_group_full_replica("device-d", GROUP, true);
+    b.state.authority.set_peer_group_full_replica("device-c", GROUP, true);
+    b.state.authority.set_peer_group_full_replica("device-d", GROUP, true);
     tokio::time::sleep(Duration::from_millis(500)).await; // let the sessions establish
 
     assert!(
@@ -320,7 +320,7 @@ async fn not_ready_when_another_replica_is_missing_one_files_blocks() {
         .unwrap();
 
     connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
-    b.state.set_peer_group_full_replica("device-a", GROUP, true);
+    b.state.authority.set_peer_group_full_replica("device-a", GROUP, true);
     tokio::time::sleep(Duration::from_millis(500)).await; // let the session establish
 
     assert!(
@@ -390,7 +390,7 @@ async fn not_ready_when_peer_holds_current_but_not_a_retained_version() {
         .unwrap();
 
     connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
-    b.state.set_peer_group_full_replica("device-a", GROUP, true);
+    b.state.authority.set_peer_group_full_replica("device-a", GROUP, true);
     tokio::time::sleep(Duration::from_millis(500)).await; // let the session establish
 
     assert!(
@@ -443,7 +443,7 @@ async fn ready_when_another_replica_holds_current_and_retained_history() {
     }
 
     connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
-    b.state.set_peer_group_full_replica("device-a", GROUP, true);
+    b.state.authority.set_peer_group_full_replica("device-a", GROUP, true);
     tokio::time::sleep(Duration::from_millis(500)).await; // let the session establish
 
     assert!(
@@ -493,7 +493,7 @@ async fn full_replica_handoff_ready_digest_detects_a_root_set_change_before_comm
         .unwrap();
 
     connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
-    b.state.set_peer_group_full_replica("device-a", GROUP, true);
+    b.state.authority.set_peer_group_full_replica("device-a", GROUP, true);
     tokio::time::sleep(Duration::from_millis(500)).await; // let the session establish
 
     // The check: device-a is confirmed to durably hold everything, and the
@@ -575,7 +575,7 @@ async fn handoff_confirms_a_peer_that_durably_holds_the_group() {
         .unwrap();
 
     connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
-    b.state.set_peer_group_full_replica("device-a", GROUP, true);
+    b.state.authority.set_peer_group_full_replica("device-a", GROUP, true);
     tokio::time::sleep(Duration::from_millis(500)).await; // let the session establish
 
     assert!(

@@ -7,9 +7,8 @@
 //! back through a channel this window drains each frame. No flow-control logic
 //! lives here (spec's "rendering SHALL contain no flow-control decisions").
 //!
-//! There is no display server in this environment, so this file is
-//! `cargo check`/`clippy`-gated only — the same honesty discipline `main.rs`'s
-//! tray wiring already documents. All testable behaviour is in the machine and
+//! This file's rendering is covered by `cargo check`/`clippy`, not by
+//! automated UI tests; all testable behaviour is in the machine and
 //! executor, which are headless-tested.
 
 use std::sync::mpsc::{self, Receiver};
@@ -338,6 +337,7 @@ pub fn run_onboarding() -> Result<(), eframe::Error> {
         "YadoriLink Setup",
         options,
         Box::new(move |cc| {
+            crate::fonts::install(&cc.egui_ctx);
             apply_theme(&cc.egui_ctx);
             let ctx = cc.egui_ctx.clone();
             if let Some(guard) = guard {

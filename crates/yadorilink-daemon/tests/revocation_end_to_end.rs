@@ -21,7 +21,7 @@ use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeCo
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::peer_orchestrator;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 
 static TEST_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -33,7 +33,7 @@ fn new_test_daemon(device_id: &str) -> TestDaemon {
     let store_dir = tempfile::tempdir().unwrap();
     // Leaked deliberately: the block store must outlive the test; the process
     // tears the temp dir down on exit.
-    let store = Arc::new(FsBlockStore::new(Box::leak(Box::new(store_dir)).path()).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(Box::leak(Box::new(store_dir)).path()).unwrap());
     let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
     let state = DaemonState::new(device_id.to_string(), sync_state, store);
     TestDaemon { state }
@@ -48,7 +48,7 @@ fn link(state: &Arc<DaemonState>, root: &std::path::Path, group_id: &str) {
 fn spawn_orchestrator(coordination_addr: String, device_id: String, state: Arc<DaemonState>) {
     let config = peer_orchestrator::OrchestratorConfig {
         coordination_addr,
-        access_token: "test".to_string(),
+        auth: yadorilink_fapi_client::test_support::offline_auth(),
         device_id,
     };
     tokio::spawn(async move {
@@ -94,17 +94,15 @@ async fn share_revoke_mid_session_stops_serving_the_revoked_group_but_not_others
     spawn_orchestrator(fake.addr(), device_a_id.to_string(), daemon_a.state.clone());
     spawn_orchestrator(fake.addr(), device_b_id.to_string(), daemon_b.state.clone());
 
-    wait_until(
-        || {
-            daemon_a
-                .state
-                .peers
-                .session(device_b_id)
-                .is_some_and(|session| session.peer_handshake_received())
-        },
-        Duration::from_secs(40),
-    )
-    .await;
+    // The peer-session handshake waited on below does NOT imply the
+    // reconciliation substrate is reachable -- different socket, different
+    // ALPN, and these fixtures carry only the former. Without this, the
+    // control group never converges either, so the test cannot tell "revoked
+    // group stopped being served" from "nothing was ever served".
+    support::advertise_substrate_between(&[&daemon_a.state, &daemon_b.state]).await;
+
+    wait_until(|| daemon_a.state.peers.session(device_b_id).is_some(), Duration::from_secs(40))
+        .await;
 
     // Sanity: both groups sync normally before any revocation.
     std::fs::write(root_b_revoked.path().join("before-revoke.txt"), b"synced pre-revoke").unwrap();
@@ -153,11 +151,21 @@ async fn share_revoke_mid_session_stops_serving_the_revoked_group_but_not_others
     wait_until(|| root_a_control.path().join("after-revoke.txt").exists(), Duration::from_secs(40))
         .await;
     assert!(
-        daemon_a.state.peers.reachability(device_b_id).map(|r| r.is_connected()).unwrap_or(false),
+        daemon_a
+            .state
+            .peer_connectivity
+            .reachability(device_b_id)
+            .map(|r| r.is_connected())
+            .unwrap_or(false),
         "the tunnel must stay up for a group-edge-only revocation"
     );
     assert!(
-        daemon_b.state.peers.reachability(device_a_id).map(|r| r.is_connected()).unwrap_or(false),
+        daemon_b
+            .state
+            .peer_connectivity
+            .reachability(device_a_id)
+            .map(|r| r.is_connected())
+            .unwrap_or(false),
         "the tunnel must stay up for a group-edge-only revocation"
     );
 }
@@ -187,7 +195,7 @@ async fn device_remove_while_peer_offline_is_reflected_on_its_next_subscribe() {
     register_with_fake(&fake, &daemon_a.state, device_a_id, &[group_id]).await;
     register_with_fake(&fake, &daemon_c.state, device_c_id, &[group_id]).await;
     // B is a member, then removed entirely before A's daemon ever subscribes.
-    fake.register_device(device_b_id, [9u8; 32], [9u8; 32], "127.0.0.1:1".to_string(), &[group_id]);
+    fake.register_device(device_b_id, [9u8; 32], "127.0.0.1:1".to_string(), &[group_id]);
     fake.remove_device(device_b_id);
 
     link(&daemon_a.state, root_a.path(), group_id);
@@ -207,83 +215,17 @@ async fn device_remove_while_peer_offline_is_reflected_on_its_next_subscribe() {
          session to the removed device"
     );
     assert!(
-        daemon_a.state.peers.reachability(device_b_id).is_none(),
+        daemon_a.state.peer_connectivity.reachability(device_b_id).is_none(),
         "a removed device must never even appear as connecting/connected in peer status"
     );
 }
 
-/// The "Coordination Plane Availability Independence" invariant: two devices
-/// confirm sync works, the coordination plane is then made completely
-/// unreachable, and sync in both directions must keep working uninterrupted —
-/// the netmap-diff re-validation wiring must never be on the peer-to-peer sync
-/// path.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn already_authorized_devices_keep_syncing_while_coordination_plane_is_unreachable() {
-    let _test_guard = TEST_GUARD.lock().await;
-    support::ensure_isolated_config_dir();
-    let fake = FakeCoordination::start().await;
-    fake.enable_signed_policy();
-    let fake_host = fake.addr().trim_start_matches("http://").to_string();
-    let device_a_id = "device-a-outage";
-    let device_b_id = "device-b-outage";
-    let group_id = "shared";
-
-    let daemon_a = new_test_daemon(device_a_id);
-    let daemon_b = new_test_daemon(device_b_id);
-    let root_a = tempfile::tempdir().unwrap();
-    let root_b = tempfile::tempdir().unwrap();
-
-    register_with_fake(&fake, &daemon_a.state, device_a_id, &[group_id]).await;
-    register_with_fake(&fake, &daemon_b.state, device_b_id, &[group_id]).await;
-
-    link(&daemon_a.state, root_a.path(), group_id);
-    link(&daemon_b.state, root_b.path(), group_id);
-
-    spawn_orchestrator(fake.addr(), device_a_id.to_string(), daemon_a.state.clone());
-    spawn_orchestrator(fake.addr(), device_b_id.to_string(), daemon_b.state.clone());
-
-    wait_until(
-        || {
-            daemon_a
-                .state
-                .peers
-                .session(device_b_id)
-                .is_some_and(|session| session.peer_handshake_received())
-        },
-        Duration::from_secs(40),
-    )
-    .await;
-
-    std::fs::write(root_a.path().join("before-outage.txt"), b"synced while healthy").unwrap();
-    wait_until(|| root_b.path().join("before-outage.txt").exists(), Duration::from_secs(40)).await;
-
-    // Take the coordination plane down completely.
-    fake.shutdown();
-    wait_until(
-        || {
-            std::net::TcpStream::connect_timeout(
-                &fake_host.parse().unwrap(),
-                Duration::from_millis(200),
-            )
-            .is_err()
-        },
-        Duration::from_secs(5),
-    )
-    .await;
-
-    // Already-authorized, already-connected devices keep syncing both ways.
-    std::fs::write(root_a.path().join("after-outage-from-a.txt"), b"a keeps syncing").unwrap();
-    std::fs::write(root_b.path().join("after-outage-from-b.txt"), b"b keeps syncing").unwrap();
-    wait_until(|| root_b.path().join("after-outage-from-a.txt").exists(), Duration::from_secs(40))
-        .await;
-    wait_until(|| root_a.path().join("after-outage-from-b.txt").exists(), Duration::from_secs(40))
-        .await;
-    assert_eq!(
-        std::fs::read(root_b.path().join("after-outage-from-a.txt")).unwrap(),
-        b"a keeps syncing"
-    );
-    assert_eq!(
-        std::fs::read(root_a.path().join("after-outage-from-b.txt")).unwrap(),
-        b"b keeps syncing"
-    );
-}
+// A coordination-plane-outage sync test used to live here too, testing the
+// broader "Coordination Plane Availability Independence" invariant this
+// file's revocation scenarios don't actually exercise. That invariant is
+// not achievable for NEW content under checkpoint admission (checkpoint
+// issuance requires a live coordination-plane round trip); the narrower, correct property
+// ("Published Data Plane Survives Coordination Outage") now has its own
+// dedicated, more thorough test in `chaos_coordination_unreachable.rs`
+// (which also covers the outage-recovery half this one never did), so this
+// file no longer duplicates it.

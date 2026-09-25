@@ -2,15 +2,16 @@
 """Enforce that `yadorilink-daemon`'s composition-root functions
 (`adapters::build_application_services`, `adapters::build_query_services`,
 `maintenance_coordinator::start`) are only ever CALLED from an allowed set
-of files -- the production composition root (`app.rs`), the one
-compatibility wrapper that still owns its own construction
-(`daemon_state.rs`'s `DaemonState::new`, and the periodic membership-
-recovery sweep it schedules -- see `ALLOWED_BUILD_CALLERS` below), the
+of files -- the production composition root (`app.rs`),
+`maintenance_coordinator.rs` (which builds the services its recovery job
+holds, once -- see `ALLOWED_BUILD_CALLERS` below), the
 test-construction helper (`control_context.rs`'s `ControlContext::
 from_state`, a normal `pub fn` used by both this crate's own unit tests
 and the external integration-test binaries under `tests/`, so never
 `#[cfg(test)]`-gated itself), and `#[cfg(test)]`-gated call sites in
-`control_socket.rs`/`diagnostics_ipc.rs`.
+`control_socket.rs`/`diagnostics_ipc.rs` -- including their test-only child
+module files (e.g. `control_socket/migration_safety_tests.rs`), which the
+parent declares `#[cfg(test)] mod name;` or which open with `#![cfg(test)]`.
 
 This stays a separate script rather than an `architecture.toml` rule
 because what it enforces is not a boundary between crates or paths but a
@@ -50,20 +51,16 @@ MAINTENANCE_START_TOKEN = "maintenance_coordinator::start("
 DEFINITION_FILE = "adapters/mod.rs"
 
 # Files allowed to call the composition-root builders, relative to
-# DAEMON_SRC. `daemon_state.rs` is allowed twice over: `DaemonState::new`
-# (the compatibility wrapper every existing test call site still uses) and
-# `run_membership_recovery_sweep` (the periodic sweep
-# `maintenance_coordinator` schedules) -- the latter rebuilds
-# `ApplicationServices` on every tick rather than reusing a shared
-# instance, a known gap rather than a silent oversight. Narrowing it
-# requires reordering `app.rs`'s startup sequence (building
-# `ApplicationServices` before starting `MaintenanceCoordinator`, which
-# currently starts first) and is deliberately left for a later pass rather
-# than risking that ordering here.
+# DAEMON_SRC. `maintenance_coordinator.rs` builds the one `ApplicationServices`
+# instance its `RecoveryJob` holds, once at start (maintenance starts before
+# `app.rs` builds the control socket's instance; the services are stateless
+# over `DaemonState`, so the two instances are interchangeable).
+# `daemon_state.rs` is deliberately NOT allowed: the state owner must never
+# drive an application workflow itself.
 ALLOWED_BUILD_CALLERS = {
     "app.rs",
     "control_context.rs",
-    "daemon_state.rs",
+    "maintenance_coordinator.rs",
 }
 
 # `control_socket.rs`/`diagnostics_ipc.rs` may call the builders ONLY from
@@ -72,6 +69,32 @@ TEST_GATED_ONLY_CALLERS = {
     "control_socket.rs",
     "diagnostics_ipc.rs",
 }
+
+# A file-level cfg(test): `#![cfg(test)]` as the first attribute of the file.
+INNER_CFG_TEST = re.compile(r"\A(?:\s*//[^\n]*\n)*\s*#!\[cfg\(\s*test\s*\)\]")
+
+
+def is_test_only_child(src_dir: Path, path: Path) -> bool:
+    """True when `path` is a child module of a TEST_GATED_ONLY_CALLERS file
+    (`control_socket/x.rs` under `control_socket.rs`) and is compiled only
+    under `cfg(test)`: the file opens with `#![cfg(test)]`, or its parent
+    declares it `#[cfg(test)] mod x;`. Such a file is one whole test span.
+    """
+    parent_dir = path.parent
+    parent = parent_dir.with_suffix(".rs")
+    if parent.name not in TEST_GATED_ONLY_CALLERS or parent.parent != src_dir:
+        return False
+    if INNER_CFG_TEST.match(path.read_text(encoding="utf-8")):
+        return True
+    if not parent.is_file():
+        return False
+    declaration = re.compile(
+        r"#\[cfg\(\s*test\s*\)\]\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+"
+        + re.escape(path.stem)
+        + r"\s*;"
+    )
+    return bool(declaration.search(parent.read_text(encoding="utf-8")))
+
 
 # `maintenance_coordinator::start` -- production's `app.rs` and the
 # `DaemonState::new` compatibility wrapper are the only two
@@ -140,6 +163,8 @@ def violations(src_dir: Path) -> list[str]:
         text = path.read_text(encoding="utf-8")
         lines = text.splitlines()
         test_ranges = cfg_test_line_ranges(text)
+        if is_test_only_child(src_dir, path):
+            test_ranges = [(1, len(lines))]
 
         def in_test_span(line_no: int) -> bool:
             return any(start <= line_no <= end for start, end in test_ranges)
@@ -147,6 +172,10 @@ def violations(src_dir: Path) -> list[str]:
         for i, line in enumerate(lines, start=1):
             for token, label in CALL_TOKENS.items():
                 if token not in line:
+                    continue
+                if in_test_span(i) and (
+                    rel_name in TEST_GATED_ONLY_CALLERS or is_test_only_child(src_dir, path)
+                ):
                     continue
                 if rel_name in TEST_GATED_ONLY_CALLERS:
                     if not in_test_span(i):
@@ -218,6 +247,32 @@ def self_test() -> None:
         assert any(
             "control_socket.rs" in f for f in found
         ), "an UN-gated call in control_socket.rs must be flagged"
+        test_gated_ok.unlink()
+
+        child_dir = src_dir / "control_socket"
+        child_dir.mkdir()
+        (src_dir / "control_socket.rs").write_text(
+            "#[cfg(test)]\nmod declared_tests;\nmod production_child;\n", encoding="utf-8"
+        )
+        call = "crate::adapters::build_application_services(state.clone());\n"
+        (child_dir / "declared_tests.rs").write_text(call, encoding="utf-8")
+        (child_dir / "inner_gated_tests.rs").write_text("#![cfg(test)]\n" + call, encoding="utf-8")
+        assert not violations(src_dir), "a cfg(test) child module of control_socket.rs must pass"
+
+        (child_dir / "production_child.rs").write_text(call, encoding="utf-8")
+        found = violations(src_dir)
+        assert any(
+            "production_child.rs" in f for f in found
+        ), "a production child module of control_socket.rs must be flagged"
+        (child_dir / "production_child.rs").unlink()
+
+        other_dir = src_dir / "some_handler"
+        other_dir.mkdir()
+        (other_dir / "tests.rs").write_text("#![cfg(test)]\n" + call, encoding="utf-8")
+        found = violations(src_dir)
+        assert any(
+            "some_handler/tests.rs" in f for f in found
+        ), "a test file outside the test-gated callers must still be flagged"
 
 
 def main() -> int:

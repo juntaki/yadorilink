@@ -210,8 +210,7 @@ def main(argv: list[str]) -> int:
 
     if not TARGET.exists():
         # `yadorilink-sync-core` (and its `index.rs`, this guard's sole
-        # subject) was deleted outright in Phase 7D-10's final elimination
-        # pass. The hazard this guard protects against (a rusqlite
+        # subject) was deleted outright. The hazard this guard protects against (a rusqlite
         # `query_row`/`.optional()` read masked with `.ok()`/`.unwrap_or*`,
         # or a boundary panic) has by now mostly relocated to
         # `yadorilink-sync-sqlite`'s own repository files -- but that crate

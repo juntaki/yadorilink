@@ -57,7 +57,7 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
         return ext.isEmpty ? .data : (UTType(filenameExtension: ext) ?? .data)
     }
 
-    // M1-3: write support (createItem/modifyItem/deleteItem) is now wired
+    // Write support (createItem/modifyItem/deleteItem) is wired
     // through to the daemon's local-change/DAG admission path -- see
     // FileProviderExtension.swift's own doc comment. Deliberately NOT
     // `.allowsRenaming`/`.allowsReparenting`/`.allowsTrashing`: none of

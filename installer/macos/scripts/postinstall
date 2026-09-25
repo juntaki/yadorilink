@@ -6,14 +6,12 @@
 # places these payloads:
 #   /usr/local/bin/yadorilink
 #   /usr/local/bin/yadorilink-daemon
-#   /usr/local/bin/yadorilink-status-app
-#   /Applications/YadoriLinkFinderSyncHost.app
+#   /Applications/YadoriLink.app
 #
 # Two things a plain file-copy pkg cannot do on its own, handled here:
 #
 #   1. Register + load a per-user launchd LaunchAgent so yadorilink-daemon
-#      (and yadorilink-status-app too — see section 2b below) starts
-#      automatically at login. This MUST be a
+#      starts automatically at login. This MUST be a
 #      LaunchAgent (runs in
 #      the logged-in user's session), not a LaunchDaemon (runs as root
 #      with no user session) — the daemon needs the interactive user's
@@ -24,9 +22,12 @@
 #      fail every credentialed operation.
 #
 #   2. Give PlugInKit a chance to discover the FinderSync + File Provider
-#      extensions embedded in the just-installed .app, and launch the
-#      host app once so it can self-register any already-known OnDemand
-#      File Provider domains (HostApp/DomainRegistration.swift).
+#      extensions embedded in the just-installed .app, and launch
+#      YadoriLink.app once so it can self-register any already-known
+#      OnDemand File Provider domains (HostApp/DomainRegistration.swift)
+#      and, on its first launch, register itself to open at login.
+#      YadoriLink.app manages its own login item (SMAppService), so this
+#      script writes no LaunchAgent for it.
 #
 # CLASSIC GOTCHA this script exists to avoid: postinstall scripts run as
 # root even during a normal GUI-driven install — `$HOME` here is root's
@@ -89,14 +90,12 @@ install_user_file() {
     /bin/rm -f "$tmp"
 }
 
-APP_PATH="/Applications/YadoriLinkFinderSyncHost.app"
+APP_PATH="/Applications/YadoriLink.app"
 DAEMON_PATH="/usr/local/bin/yadorilink-daemon"
 AGENT_LABEL="com.yadorilink.daemon"
-# The menu-bar status app's own
-# LaunchAgent, installed and loaded the same way as the daemon's just
-# above (see this script's header comment point 1 for why a LaunchAgent,
-# not a LaunchDaemon).
-STATUS_APP_PATH="/usr/local/bin/yadorilink-status-app"
+# The earlier menu bar app's LaunchAgent. YadoriLink.app replaced it and
+# preinstall booted it out; its plist under the user's home is removed
+# below so it does not start again at login.
 STATUS_APP_AGENT_LABEL="com.yadorilink.status-app"
 FINDER_SYNC_EXT_ID="com.juntaki.yadorilink.FinderSync"
 FILE_PROVIDER_EXT_ID="com.juntaki.yadorilink.FileProvider"
@@ -194,56 +193,23 @@ else
     log "It will still start automatically at the next login (RunAtLoad)."
 fi
 
-# --- 2b. Status app LaunchAgent ---------
-# Unlike the daemon's plist above, this one has no `KeepAlive` — the
-# status app is a user-facing tray icon, not an essential background
-# service; if the user deliberately quits it from its own "Quit" menu item
-# it should stay quit until the next login, not have launchd immediately
-# relaunch it.
+# --- 2b. Remove the earlier status app LaunchAgent ------------------------
+# YadoriLink.app is the menu bar app now and opens at login through
+# SMAppService, so the old eframe status app's agent must not come back
+# at the next login next to it.
 STATUS_PLIST_PATH="$LAUNCH_AGENTS_DIR/${STATUS_APP_AGENT_LABEL}.plist"
-
-if [ -x "$STATUS_APP_PATH" ]; then
-    install_user_file "$STATUS_PLIST_PATH" 644 <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-	<key>Label</key>
-	<string>${STATUS_APP_AGENT_LABEL}</string>
-	<key>ProgramArguments</key>
-	<array>
-		<string>${STATUS_APP_PATH}</string>
-	</array>
-	<key>RunAtLoad</key>
-	<true/>
-	<key>ProcessType</key>
-	<string>Background</string>
-	<key>StandardOutPath</key>
-	<string>${LOG_DIR}/status-app.out.log</string>
-	<key>StandardErrorPath</key>
-	<string>${LOG_DIR}/status-app.err.log</string>
-</dict>
-</plist>
-PLIST
-
-    log "Wrote $STATUS_PLIST_PATH"
-
-    /bin/launchctl asuser "$CONSOLE_UID" /bin/launchctl bootout "gui/${CONSOLE_UID}/${STATUS_APP_AGENT_LABEL}" >/dev/null 2>&1 || true
-    if /bin/launchctl asuser "$CONSOLE_UID" /bin/launchctl bootstrap "gui/${CONSOLE_UID}" "$STATUS_PLIST_PATH" 2>&1; then
-        /bin/launchctl asuser "$CONSOLE_UID" /bin/launchctl enable "gui/${CONSOLE_UID}/${STATUS_APP_AGENT_LABEL}" >/dev/null 2>&1 || true
-        log "Loaded LaunchAgent $STATUS_APP_AGENT_LABEL into gui/$CONSOLE_UID"
-    else
-        log "WARNING: launchctl bootstrap failed for the status app; it will still start at next login (RunAtLoad)."
-    fi
-else
-    log "WARNING: $STATUS_APP_PATH not found or not executable; skipping status app LaunchAgent."
+/bin/launchctl asuser "$CONSOLE_UID" /bin/launchctl bootout "gui/${CONSOLE_UID}/${STATUS_APP_AGENT_LABEL}" >/dev/null 2>&1 || true
+assert_user_home_path_has_no_symlink_component "$STATUS_PLIST_PATH"
+if [ -f "$STATUS_PLIST_PATH" ]; then
+    /bin/rm -f "$STATUS_PLIST_PATH"
+    log "Removed $STATUS_PLIST_PATH"
 fi
 
-# --- 3. Extension discovery + first launch --------------------------------
+# --- 3. Extension discovery -----------------------------------------------
 # Apple provides no supported, programmatic "enable my extension" API —
 # the user still has to flip the toggle in System Settings > General >
-# Login Items & Extensions themselves (see HostApp/main.swift's own
-# in-app instructions). What this installer *can* do is make sure
+# Login Items & Extensions themselves (YadoriLink.app's setup window and
+# Settings point them there). What this installer *can* do is make sure
 # PlugInKit knows the extensions exist right away, rather than waiting on
 # a Launch Services / Spotlight rescan of /Applications to notice them:
 if [ -d "$APP_PATH" ]; then
@@ -260,33 +226,31 @@ if [ -d "$APP_PATH" ]; then
     fi
     log "Registered extensions with pluginkit (best-effort; user must still enable them in System Settings)."
 
-    # Launch the host app once, hidden/backgrounded, so
-    # applicationDidFinishLaunching -> DomainRegistration.registerOnDemandDomains()
-    # runs (it needs a running host app process — an extension can't
-    # register its own File Provider domain, see DomainRegistration.swift).
-    /usr/bin/sudo -u "$CONSOLE_USER" /usr/bin/open -g -j -a "$APP_PATH" >/dev/null 2>&1 || true
-    log "Launched $APP_PATH once (hidden) to trigger extension/domain discovery."
 else
     log "WARNING: $APP_PATH not found; skipping extension registration."
 fi
 
-# --- 4. First-run onboarding window --
-# On a FRESH install only — i.e. this machine has never registered a device,
-# so `~/.yadorilink/device.json` does not yet exist — open the GUI onboarding
-# wizard for the console user. On an upgrade (device.json already
-# present) this is skipped, so re-installing never re-pops the wizard.
-# `launchctl asuser` runs it in the console user's GUI session (the same
-# mechanism the LaunchAgents above use); it is backgrounded so this root
-# postinstall doesn't block on the window, and reparents to launchd when
-# postinstall exits. Honors YADORILINK_CONFIG_DIR by falling back to the
-# default `~/.yadorilink` only (an installer can't know a per-user override).
+# --- 4. Launch YadoriLink.app once ------------------------------------------
+# It has to run once so it can register File Provider domains (an
+# extension can't register its own, see DomainRegistration.swift) and,
+# on its first launch, turn on open-at-login. On a FRESH install only —
+# this machine has never registered a device, so `~/.yadorilink/device.json`
+# does not exist yet — it opens with `--onboarding` so the setup window
+# shows; an upgrade launches it in the background instead. `launchctl
+# asuser` runs it in the console user's GUI session. Honors
+# YADORILINK_CONFIG_DIR by falling back to the default `~/.yadorilink` only
+# (an installer can't know a per-user override).
 DEVICE_JSON="$USER_HOME/.yadorilink/device.json"
-if [ -x "$STATUS_APP_PATH" ] && [ ! -f "$DEVICE_JSON" ]; then
-    ( /bin/launchctl asuser "$CONSOLE_UID" /usr/bin/sudo -u "$CONSOLE_USER" \
-        "$STATUS_APP_PATH" --window onboarding >/dev/null 2>&1 & ) || true
-    log "Fresh install: opened the onboarding window for $CONSOLE_USER."
-else
-    log "device.json present (upgrade) or status app missing; skipping first-run onboarding."
+if [ -d "$APP_PATH" ]; then
+    if [ ! -f "$DEVICE_JSON" ]; then
+        /bin/launchctl asuser "$CONSOLE_UID" /usr/bin/sudo -u "$CONSOLE_USER" \
+            /usr/bin/open -a "$APP_PATH" --args --onboarding >/dev/null 2>&1 || true
+        log "Fresh install: opened $APP_PATH with the setup window for $CONSOLE_USER."
+    else
+        /bin/launchctl asuser "$CONSOLE_UID" /usr/bin/sudo -u "$CONSOLE_USER" \
+            /usr/bin/open -g -j -a "$APP_PATH" >/dev/null 2>&1 || true
+        log "Upgrade: launched $APP_PATH in the background."
+    fi
 fi
 
 log "Postinstall complete."

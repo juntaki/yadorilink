@@ -26,9 +26,9 @@
 //! its own copy, predating that shared seam — now unified so a single clock
 //! stamps every harness mutation and drives every session-visible `now`).
 //!
-//! `#![cfg(madsim)]`-gated like every DST support module.
+//! `#![cfg(turmoil)]`-gated like every DST support module.
 
-#![cfg(madsim)]
+#![cfg(turmoil)]
 #![allow(dead_code)] // the generator that drives this lands separately
 
 use std::io;
@@ -72,6 +72,16 @@ pub enum AppliedEffect {
     DirCreated { path: String },
     /// `Rmdir`: the empty directory at `path` was removed.
     DirRemoved { path: String },
+    /// `RmTree`: `path` and everything under it are gone. `observed` is
+    /// every object the removal saw (the directory itself included), root-
+    /// relative and sorted: the observed-remove set a recursive delete may
+    /// replicate deletes for, and nothing more. An already-absent `path` (a
+    /// racing op removed it first) is tolerated with an empty set.
+    TreeRemoved { path: String, observed: Vec<String> },
+    /// `RenameTree`: the directory `from` now lives at `to`. `observed` is
+    /// every object that moved (the directory itself included), as its
+    /// root-relative path *before* the rename, sorted.
+    TreeRenamed { from: String, to: String, observed: Vec<String> },
     /// `Chmod` on unix: `path`'s mode was set so its owner-exec bit equals
     /// `exec_bit`; `mode` is the resulting full mode (`0o755`/`0o644`).
     ChmodApplied { path: String, exec_bit: bool, mode: u32 },
@@ -136,6 +146,23 @@ pub fn apply_op(
         Op::Rmdir { path } => {
             std::fs::remove_dir(root.join(path))?;
             Ok(AppliedEffect::DirRemoved { path: path.clone() })
+        }
+
+        Op::RmTree { path } => {
+            let full = root.join(path);
+            let observed = observed_subtree(root, &full)?;
+            match std::fs::remove_dir_all(&full) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            Ok(AppliedEffect::TreeRemoved { path: path.clone(), observed })
+        }
+
+        Op::RenameTree { from, to } => {
+            let observed = observed_subtree(root, &root.join(from))?;
+            rename(root, from, to)?;
+            Ok(AppliedEffect::TreeRenamed { from: from.clone(), to: to.clone(), observed })
         }
 
         Op::Chmod { path, exec_bit } => chmod(root, path, *exec_bit),
@@ -209,6 +236,31 @@ fn rename(root: &Path, from: &str, to: &str) -> io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::rename(root.join(from), to_full)
+}
+
+/// Every object at or under `top` (never following a symlink), as sorted
+/// forward-slash paths relative to `root`. An absent `top` observes nothing.
+fn observed_subtree(root: &Path, top: &Path) -> io::Result<Vec<String>> {
+    fn visit(root: &Path, at: &Path, out: &mut Vec<String>) -> io::Result<()> {
+        let meta = match std::fs::symlink_metadata(at) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        if let Ok(rel) = at.strip_prefix(root) {
+            out.push(rel.to_string_lossy().replace('\\', "/"));
+        }
+        if meta.is_dir() {
+            for entry in std::fs::read_dir(at)? {
+                visit(root, &entry?.path(), out)?;
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    visit(root, top, &mut out)?;
+    out.sort();
+    Ok(out)
 }
 
 /// Set `path`'s owner-exec bit to `exec_bit` by writing the canonical
@@ -388,6 +440,71 @@ mod tests {
         .unwrap();
         assert!(!root.path().join("d").exists());
         assert_eq!(rm, AppliedEffect::DirRemoved { path: "d".to_string() });
+    }
+
+    #[test]
+    fn rm_tree_removes_a_non_empty_directory_and_reports_what_it_saw() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("t/sub/empty")).unwrap();
+        std::fs::write(root.path().join("t/a.txt"), b"a").unwrap();
+        std::fs::write(root.path().join("t/sub/b.txt"), b"b").unwrap();
+        std::fs::write(root.path().join("t-sibling.txt"), b"keep").unwrap();
+
+        let effect = apply_op(
+            &clock(),
+            root.path(),
+            &Op::RmTree { path: "t".to_string() },
+            &ContentTable::default(),
+        )
+        .unwrap();
+
+        assert!(!root.path().join("t").exists());
+        assert!(root.path().join("t-sibling.txt").exists());
+        assert_eq!(
+            effect,
+            AppliedEffect::TreeRemoved {
+                path: "t".to_string(),
+                observed: ["t", "t/a.txt", "t/sub", "t/sub/b.txt", "t/sub/empty"]
+                    .map(String::from)
+                    .to_vec(),
+            }
+        );
+
+        let again = apply_op(
+            &clock(),
+            root.path(),
+            &Op::RmTree { path: "t".to_string() },
+            &ContentTable::default(),
+        )
+        .unwrap();
+        assert_eq!(again, AppliedEffect::TreeRemoved { path: "t".to_string(), observed: vec![] });
+    }
+
+    #[test]
+    fn rename_tree_moves_every_descendant_under_a_new_parent() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("from/empty")).unwrap();
+        std::fs::write(root.path().join("from/f.txt"), b"f").unwrap();
+
+        let effect = apply_op(
+            &clock(),
+            root.path(),
+            &Op::RenameTree { from: "from".to_string(), to: "new/to".to_string() },
+            &ContentTable::default(),
+        )
+        .unwrap();
+
+        assert!(!root.path().join("from").exists());
+        assert!(root.path().join("new/to/empty").is_dir());
+        assert_eq!(std::fs::read(root.path().join("new/to/f.txt")).unwrap(), b"f");
+        assert_eq!(
+            effect,
+            AppliedEffect::TreeRenamed {
+                from: "from".to_string(),
+                to: "new/to".to_string(),
+                observed: ["from", "from/empty", "from/f.txt"].map(String::from).to_vec(),
+            }
+        );
     }
 
     #[cfg(unix)]

@@ -23,6 +23,16 @@ pub struct HandoffCommitResult {
     pub lease_id: Option<String>,
 }
 
+/// Terminal outcome of reverting a role loss on the coordination plane:
+/// the source device's full-replica role was restored, or the coordination
+/// plane reports the operation superseded. Both settle the local journal
+/// row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoleLossCompensationOutcome {
+    Restored,
+    Superseded,
+}
+
 /// Outcome of a role-loss commit, preserving whether it is safe to discard
 /// the source-side Prepared journal row. Only an explicit 4xx response is a
 /// protocol-level guarantee that the Worker rejected the transaction before

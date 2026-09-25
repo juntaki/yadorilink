@@ -1,5 +1,5 @@
-//! Entry point for `--window folder-status --path <local_path>` -- the M4
-//! Pass 3 per-folder detail window presenting "Data protection / This
+//! Entry point for `--window folder-status --path <local_path>` -- the
+//! per-folder detail window presenting "Data protection / This
 //! device / Availability / Complete copies / Connection" for one linked
 //! folder, per `folder_detail.rs`'s pure formatters. Same threading/state
 //! shape as `account.rs`'s window (own `mpsc` channel + `EventSink` from
@@ -8,11 +8,9 @@
 //! wizard's `Effect`/`step` machine since this window has exactly one
 //! operation (fetch status) and no user-driven transitions to model.
 //!
-//! IMPORTANT / honesty note for reviewers (matching `main.rs`'s own): the
-//! pure logic in `folder_detail.rs` is unit-tested; this file's actual
-//! `eframe`/`egui` rendering can only be verified by `cargo build`/`cargo
-//! check` in this sandboxed environment -- there is no display server here
-//! to click a real window against.
+//! Test coverage: the pure logic in `folder_detail.rs` is unit-tested; this
+//! file's `eframe`/`egui` rendering is covered by compilation, not by
+//! automated UI tests.
 
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
@@ -21,7 +19,8 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use yadorilink_ipc_proto::daemonctl::{
     ConflictedFileInfo, FileVersionInfo, LinkStatus, MaterializationState,
-    MaterializationStatusResponse, PeerStatus, StatusResponse, TrashedFileInfo,
+    MaterializationStatusResponse, PeerStatus, RestoreTrashOperationResponse, StatusResponse,
+    TrashedFileInfo,
 };
 
 use crate::onboarding::executor::EventSink;
@@ -57,6 +56,11 @@ enum Event {
     /// own state with a stale result (checked in the event handler below).
     FileToolsFetched(String, Result<(Vec<FileVersionInfo>, MaterializationStatusResponse), String>),
     ActionDone(ActionKind, Result<String, String>),
+    /// Other devices with access to this folder's group --
+    /// `crate::devices::peer_count`, a coordination-plane call
+    /// separate from the daemon-control `StatusFetched` above (see that
+    /// function's own doc comment for why it's split out).
+    PeerCountFetched(Result<usize, String>),
 }
 
 /// Entry point for `--window folder-status`. Must run on the process main
@@ -74,6 +78,7 @@ pub fn run_folder_status(local_path: String) -> Result<(), eframe::Error> {
         "YadoriLink Folder Details",
         options,
         Box::new(move |cc| {
+            crate::fonts::install(&cc.egui_ctx);
             let ctx = cc.egui_ctx.clone();
             let sink = EventSink::new(tx, Arc::new(move || ctx.request_repaint()));
             Ok(Box::new(FolderStatusApp::new(local_path, rx, sink)))
@@ -164,6 +169,14 @@ fn spawn_file_tools_fetch(sink: EventSink<Event>, absolute_path: String) {
     );
 }
 
+fn spawn_peer_count_fetch(sink: EventSink<Event>, group_id: String) {
+    spawn_task(
+        sink,
+        async move { crate::devices::peer_count(&group_id).await.map_err(|e| e.to_string()) },
+        Event::PeerCountFetched,
+    );
+}
+
 fn spawn_action(
     sink: EventSink<Event>,
     kind: ActionKind,
@@ -219,6 +232,9 @@ struct FolderStatusApp {
     /// panel in this window already follows for a failed fetch.
     last_action_message: Option<Result<String, String>>,
     action_in_flight: bool,
+    peer_count: Option<usize>,
+    peer_count_error: Option<String>,
+    peer_count_fetch_in_flight: bool,
 }
 
 impl FolderStatusApp {
@@ -241,6 +257,9 @@ impl FolderStatusApp {
             file_tools: FileTools::default(),
             last_action_message: None,
             action_in_flight: false,
+            peer_count: None,
+            peer_count_error: None,
+            peer_count_fetch_in_flight: false,
         }
     }
 
@@ -256,9 +275,17 @@ impl FolderStatusApp {
     fn peers(&self) -> &[PeerStatus] {
         self.status.as_ref().map(|s| s.peers.as_slice()).unwrap_or_default()
     }
+
+    fn volumes(&self) -> &[yadorilink_ipc_proto::daemonctl::VolumeFreeSpace] {
+        self.status.as_ref().map(|s| s.volumes.as_slice()).unwrap_or_default()
+    }
 }
 
 impl eframe::App for FolderStatusApp {
+    #[allow(
+        clippy::excessive_nesting,
+        reason = "the event-drain loop is one match over every `Event` variant, and the post-action re-fetch arm nests match-on-`ActionKind` inside it so the exhaustiveness check keeps each action wired to the fetch that reconfirms it against the daemon; lifting the arms out would split that correspondence across items"
+    )]
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         while let Ok(event) = self.rx.try_recv() {
             match event {
@@ -270,6 +297,15 @@ impl eframe::App for FolderStatusApp {
                 Event::StatusFetched(Err(e)) => {
                     self.error = Some(e);
                     self.fetch_in_flight = false;
+                }
+                Event::PeerCountFetched(Ok(count)) => {
+                    self.peer_count = Some(count);
+                    self.peer_count_error = None;
+                    self.peer_count_fetch_in_flight = false;
+                }
+                Event::PeerCountFetched(Err(e)) => {
+                    self.peer_count_error = Some(e);
+                    self.peer_count_fetch_in_flight = false;
                 }
                 Event::ConflictsFetched(Ok(files)) => {
                     // Only the transition into "has conflicts" (not every
@@ -325,7 +361,10 @@ impl eframe::App for FolderStatusApp {
                     // a client-side guess -- the daemon is the sole
                     // authority on whether e.g. an evict actually happened
                     // (see `EvictResponse.dehydrated`'s own doc comment).
-                    if ok {
+                    // A folder restore that failed for some of its entries
+                    // still restored the rest, so the trash is re-read
+                    // whatever the outcome.
+                    if ok || kind == ActionKind::TrashRestore {
                         match kind {
                             ActionKind::TrashRestore => {
                                 self.trash_fetch_in_flight = true;
@@ -361,6 +400,18 @@ impl eframe::App for FolderStatusApp {
             if !self.fetch_in_flight {
                 self.fetch_in_flight = true;
                 spawn_fetch(self.sink.clone());
+            }
+            // The peer count needs this folder's `group_id`, which is only
+            // known once the first status fetch has resolved -- gated on
+            // `self.link()` rather than the shared `due` timer alone, and
+            // re-fetched (not just fetched once) so a later readiness/access
+            // change is eventually reflected without requiring the user to
+            // reopen the window.
+            if !self.peer_count_fetch_in_flight {
+                if let Some(group_id) = self.link().map(|l| l.group_id.clone()) {
+                    self.peer_count_fetch_in_flight = true;
+                    spawn_peer_count_fetch(self.sink.clone(), group_id);
+                }
             }
             if !self.conflicts_fetch_in_flight {
                 self.conflicts_fetch_in_flight = true;
@@ -409,7 +460,7 @@ impl FolderStatusApp {
             // failure means everything from here down is a STALE
             // last-known snapshot, not a live confirmation, and must
             // never render identically to a fresh one -- the same
-            // "never flash/retain a stale Protected state" principle M4's
+            // "never flash/retain a stale Protected state" principle the
             // durability model applies everywhere else (see
             // `crate::folder_detail`'s own doc comment on `Durability !=
             // Connectivity`/fail-closed defaults). Showing the last-known
@@ -446,10 +497,34 @@ impl FolderStatusApp {
         if let Some(detail) = crate::folder_detail::data_protection_detail(link) {
             ui.label(dim(egui::RichText::new(detail).weak(), stale));
         }
+        // What the claim above is standing on. Shown here rather than folded
+        // into the label because "confirmed" and "verified" are genuinely
+        // different assurances and this is the one screen where a user is
+        // asking about assurance.
+        if let Some(evidence) = crate::folder_detail::data_protection_evidence(link) {
+            ui.label(dim(egui::RichText::new(evidence).weak().small(), stale));
+        }
         ui.add_space(6.0);
         field_row(ui, "This device", crate::folder_detail::this_device_label(link), stale);
         ui.add_space(6.0);
         field_row(ui, "Availability", crate::folder_detail::availability_label(link), stale);
+        ui.add_space(6.0);
+
+        // Peers -- a coordination-plane count, not a `StatusResponse`
+        // field, so it has its own loading/error state independent of the
+        // `stale` flag above (see `PeerCountFetched`'s doc comment).
+        match (&self.peer_count, &self.peer_count_error) {
+            (Some(count), _) => field_row(ui, "Peers", &format!("{count}"), stale),
+            (None, Some(e)) => field_row(ui, "Peers", &format!("unavailable ({e})"), true),
+            (None, None) => field_row(ui, "Peers", "…", true),
+        }
+
+        // Disk usage -- this folder's own volume, matched by exact local
+        // path (see `disk_usage_for`'s own doc comment on why exact, not
+        // prefix, matching is correct here).
+        if let Some(volume) = crate::folder_detail::disk_usage_for(link, self.volumes()) {
+            field_row(ui, "Disk usage", &crate::folder_detail::disk_usage_label(volume), stale);
+        }
         ui.add_space(10.0);
 
         let copies = crate::folder_detail::complete_copies(link, peers);
@@ -461,8 +536,7 @@ impl FolderStatusApp {
             // content custody `Data protection` above actually verifies.
             // Dropping this qualifier (an earlier version of this row did)
             // would let "available" read as a verified-complete-copy claim
-            // stronger than this daemon can back up (M4 Pass 3 Codex
-            // review #3 follow-up) -- mirrors `yadorilink-cli`'s own
+            // stronger than this daemon can back up -- mirrors `yadorilink-cli`'s own
             // already-reviewed "configured full copy" wording exactly.
             ui.label(dim(
                 egui::RichText::new("Devices configured to keep a full copy:").weak().small(),
@@ -496,6 +570,10 @@ impl FolderStatusApp {
         self.render_file_tools(ui);
     }
 
+    #[allow(
+        clippy::excessive_nesting,
+        reason = "egui is immediate-mode: the conflict rows only exist inside the CollapsingHeader/match/for/horizontal closure chain that draws them, so the nesting is the widget tree itself and cannot be flattened without passing `ui` back out"
+    )]
     fn render_conflicts(&mut self, ui: &mut egui::Ui) {
         // A one-shot signal, not `default_open`: the label above changes
         // with the conflict count, so it's also `id_salt`-pinned to a
@@ -527,19 +605,47 @@ impl FolderStatusApp {
                 }
                 Some(files) => {
                     for file in files {
+                        let detail = yadorilink_product_view::conflict_detail(file);
+                        ui.add_space(4.0);
                         ui.horizontal(|ui| {
                             ui.label(&file.path);
-                            if ui.button("Reveal").clicked() {
+                            if ui.button("Reveal this copy").clicked() {
                                 let full = std::path::Path::new(&self.local_path).join(&file.path);
                                 let _ = opener::reveal(&full);
                             }
                         });
+                        ui.label(egui::RichText::new(conflict_origin_line(&detail)).weak().small());
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Current version kept at: {}",
+                                    detail.current_path
+                                ))
+                                .weak()
+                                .small(),
+                            );
+                            if ui.small_button("Reveal current").clicked() {
+                                let full = std::path::Path::new(&self.local_path)
+                                    .join(&detail.current_path);
+                                let _ = opener::reveal(&full);
+                            }
+                        });
+                        ui.label(
+                            egui::RichText::new(format!("Why: {}", detail.reason.explanation()))
+                                .weak()
+                                .small(),
+                        );
+                        ui.add_space(4.0);
                     }
                 }
             }
         });
     }
 
+    #[allow(
+        clippy::excessive_nesting,
+        reason = "the deferred `restore_clicked` handoff has to sit in the same scope as the row loop that sets it -- egui forbids mutating window state from inside the row closure -- so the collect-then-apply pattern keeps the click and its action in one readable block"
+    )]
     fn render_trash(&mut self, ui: &mut egui::Ui) {
         egui::CollapsingHeader::new(format!(
             "Trash{}",
@@ -562,30 +668,94 @@ impl FolderStatusApp {
                     ui.label("Trash is empty.");
                 }
                 Some(files) => {
-                    let mut restore_clicked: Option<String> = None;
-                    for file in files {
-                        ui.horizontal(|ui| {
-                            ui.label(&file.path);
-                            if ui
-                                .add_enabled(!self.action_in_flight, egui::Button::new("Restore"))
-                                .clicked()
-                            {
-                                restore_clicked = Some(file.path.clone());
-                            }
-                        });
+                    let mut restore_clicked: Option<TrashRestoreClick> = None;
+                    for group in trash_groups(files) {
+                        ui.add_space(4.0);
+                        let indent = if group.operation.is_some() {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(folder_group_title(&group)).strong());
+                                if ui
+                                    .add_enabled(
+                                        !self.action_in_flight,
+                                        egui::Button::new("Restore folder"),
+                                    )
+                                    .on_hover_text(
+                                        "Restores everything this delete or rename removed, \
+                                         together.",
+                                    )
+                                    .clicked()
+                                {
+                                    restore_clicked = Some(TrashRestoreClick::Folder(
+                                        group.root_path().to_string(),
+                                    ));
+                                }
+                            });
+                            12.0
+                        } else {
+                            0.0
+                        };
+                        for file in &group.entries {
+                            ui.horizontal(|ui| {
+                                ui.add_space(indent);
+                                ui.label(&file.path);
+                                if ui
+                                    .add_enabled(
+                                        !self.action_in_flight,
+                                        egui::Button::new("Restore"),
+                                    )
+                                    .clicked()
+                                {
+                                    restore_clicked =
+                                        Some(TrashRestoreClick::Entry(file.path.clone()));
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.add_space(indent);
+                                ui.label(
+                                    egui::RichText::new(trashed_file_provenance_line(file))
+                                        .weak()
+                                        .small(),
+                                );
+                            });
+                        }
                     }
-                    if let Some(path) = restore_clicked {
-                        let absolute_path = std::path::Path::new(&self.local_path)
-                            .join(&path)
-                            .to_string_lossy()
-                            .to_string();
+                    if let Some(click) = restore_clicked {
                         self.action_in_flight = true;
-                        spawn_action(self.sink.clone(), ActionKind::TrashRestore, async move {
-                            crate::actions::restore_trash(absolute_path)
-                                .await
-                                .map(|()| "Restored from trash.".to_string())
-                                .map_err(|e| e.to_string())
-                        });
+                        let local_path = self.local_path.clone();
+                        let absolute = move |path: &str| {
+                            std::path::Path::new(&local_path)
+                                .join(path)
+                                .to_string_lossy()
+                                .to_string()
+                        };
+                        match click {
+                            TrashRestoreClick::Entry(path) => {
+                                let absolute_path = absolute(&path);
+                                spawn_action(
+                                    self.sink.clone(),
+                                    ActionKind::TrashRestore,
+                                    async move {
+                                        crate::actions::restore_trash(absolute_path)
+                                            .await
+                                            .map(|()| "Restored from trash.".to_string())
+                                            .map_err(|e| e.to_string())
+                                    },
+                                );
+                            }
+                            TrashRestoreClick::Folder(path) => {
+                                let absolute_path = absolute(&path);
+                                spawn_action(
+                                    self.sink.clone(),
+                                    ActionKind::TrashRestore,
+                                    async move {
+                                        crate::actions::restore_trash_operation(absolute_path)
+                                            .await
+                                            .map_err(|e| e.to_string())
+                                            .and_then(|outcome| folder_restore_message(&outcome))
+                                    },
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -593,25 +763,42 @@ impl FolderStatusApp {
     }
 
     /// Version history + selective sync (on-demand pin/unpin/hydrate/
-    /// evict) for one file the user explicitly picks -- there is no
-    /// daemon request to list every indexed path in a folder (see
+    /// evict) for one file or folder the user explicitly picks -- there is
+    /// no daemon request to list every indexed path in a folder (see
     /// `actions::pick_file_in`'s own doc comment), so this panel operates
-    /// on exactly one chosen file rather than a full in-app file browser.
+    /// on exactly one chosen entry rather than a full in-app file browser.
+    /// A folder's selective sync acts on everything below it.
+    #[allow(
+        clippy::excessive_nesting,
+        reason = "one panel whose pin/unpin/hydrate/evict buttons and version-restore rows all close over the same `absolute_path` and `action_in_flight` guard; the depth is egui's nested-closure widget tree, and splitting per button would duplicate that shared borrow state"
+    )]
     fn render_file_tools(&mut self, ui: &mut egui::Ui) {
         egui::CollapsingHeader::new("Version history & selective sync").default_open(false).show(
             ui,
             |ui| {
                 ui.horizontal(|ui| {
-                    if ui.button("Choose a file…").clicked() {
-                        if let Some(path) = crate::actions::pick_file_in(&self.local_path) {
-                            let absolute_path = path.to_string_lossy().to_string();
-                            self.file_tools = FileTools {
-                                absolute_path: Some(absolute_path.clone()),
-                                loading: true,
-                                ..FileTools::default()
-                            };
-                            spawn_file_tools_fetch(self.sink.clone(), absolute_path);
-                        }
+                    let picked = if ui.button("Choose a file…").clicked() {
+                        crate::actions::pick_file_in(&self.local_path)
+                    } else if ui
+                        .button("Choose a folder…")
+                        .on_hover_text(
+                            "Pin, download or evict a folder as a whole. A pinned folder keeps \
+                             what is added to it later on this device too.",
+                        )
+                        .clicked()
+                    {
+                        crate::actions::pick_folder_in(&self.local_path)
+                    } else {
+                        None
+                    };
+                    if let Some(path) = picked {
+                        let absolute_path = path.to_string_lossy().to_string();
+                        self.file_tools = FileTools {
+                            absolute_path: Some(absolute_path.clone()),
+                            loading: true,
+                            ..FileTools::default()
+                        };
+                        spawn_file_tools_fetch(self.sink.clone(), absolute_path);
                     }
                     if let Some(path) = &self.file_tools.absolute_path {
                         ui.label(egui::RichText::new(path).weak().small());
@@ -748,6 +935,99 @@ impl FolderStatusApp {
     }
 }
 
+/// Which trash row's restore button was clicked this frame -- applied after
+/// the row loop, since egui forbids mutating window state inside it.
+enum TrashRestoreClick {
+    /// One trashed entry, on its own.
+    Entry(String),
+    /// Every entry one recursive delete or directory rename removed, named
+    /// by any of them; the daemon finds the rest by the operation.
+    Folder(String),
+}
+
+/// Trashed entries as the Trash panel shows them: the entries one recursive
+/// delete or directory rename removed together form one group (restorable
+/// as a folder), and every entry deleted on its own is a group of one.
+/// Groups keep the order their first entry has in the daemon's listing.
+#[derive(Debug, PartialEq)]
+struct TrashGroup<'a> {
+    /// `TrashedFileInfo.deleted_by_operation`; `None` for an entry deleted
+    /// on its own.
+    operation: Option<String>,
+    entries: Vec<&'a TrashedFileInfo>,
+}
+
+impl TrashGroup<'_> {
+    /// The group's outermost entry: the one with the fewest path
+    /// components, the first such in path order on a tie. A delete of a
+    /// folder names the folder; a rename names its source.
+    fn root_path(&self) -> &str {
+        self.entries
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .min_by(|a, b| a.split('/').count().cmp(&b.split('/').count()).then(a.cmp(b)))
+            .unwrap_or_default()
+    }
+}
+
+fn trash_groups(files: &[TrashedFileInfo]) -> Vec<TrashGroup<'_>> {
+    let mut groups: Vec<TrashGroup<'_>> = Vec::new();
+    for file in files {
+        if file.deleted_by_operation.is_empty() {
+            groups.push(TrashGroup { operation: None, entries: vec![file] });
+            continue;
+        }
+        match groups
+            .iter_mut()
+            .find(|group| group.operation.as_deref() == Some(file.deleted_by_operation.as_str()))
+        {
+            Some(group) => group.entries.push(file),
+            None => groups.push(TrashGroup {
+                operation: Some(file.deleted_by_operation.clone()),
+                entries: vec![file],
+            }),
+        }
+    }
+    groups
+}
+
+/// "Removed together with Photos/2024 (3 items)". The trash does not say
+/// whether the operation was a delete or a rename, so the title names only
+/// what both do to these entries: remove them from where they were.
+fn folder_group_title(group: &TrashGroup<'_>) -> String {
+    let count = group.entries.len();
+    format!(
+        "Removed together with {} ({count} item{})",
+        group.root_path(),
+        if count == 1 { "" } else { "s" }
+    )
+}
+
+/// A folder restore's outcome as one line. Any entry that could not be
+/// restored makes it a failure naming each one, even though the rest were
+/// restored; an operation only part of which has reached this device says
+/// so, since entries it removed elsewhere in the folder are not back.
+fn folder_restore_message(outcome: &RestoreTrashOperationResponse) -> Result<String, String> {
+    let restored = outcome.restored_paths.len();
+    let mut text =
+        format!("Restored {restored} item{} of the folder.", if restored == 1 { "" } else { "s" });
+    if outcome.partial {
+        text.push_str(
+            " Part of that delete has not reached this device yet, so what it removed elsewhere \
+             in the folder is not restored.",
+        );
+    }
+    if outcome.failed.is_empty() {
+        return Ok(text);
+    }
+    let failures: Vec<String> = outcome
+        .failed
+        .iter()
+        .map(|failure| format!("{}: {}", failure.path, failure.error))
+        .collect();
+    Err(format!("{text} Could not restore {}.", failures.join("; ")))
+}
+
 /// `MaterializationState` proto enum -> the same wording
 /// `commands::materialization::status` already prints for each state,
 /// kept consistent between CLI and desktop app.
@@ -761,15 +1041,99 @@ fn materialization_state_label(state: MaterializationState) -> &'static str {
     }
 }
 
+/// "Deleted 3h ago by device-a  ·  v4  ·  1.2 MiB" -- a trashed file's
+/// causal provenance: which device's edit produced the version that got
+/// deleted, when, and its last known size/version, straight from
+/// `TrashedFileInfo`'s own fields (no re-derivation) -- this window
+/// previously rendered only the bare path here, dropping all of this.
+fn trashed_file_provenance_line(f: &TrashedFileInfo) -> String {
+    format!(
+        "Deleted {} by {}  ·  v{}  ·  {}",
+        relative_time_from_unix_nanos(f.deleted_at_unix_nanos),
+        if f.origin_device_id.is_empty() { "unknown device" } else { &f.origin_device_id },
+        f.version_seq,
+        // A directory has no size of its own.
+        if f.kind() == yadorilink_ipc_proto::daemonctl::EntryKind::Directory {
+            "folder".to_string()
+        } else {
+            format_bytes_short(f.last_known_size.max(0) as u64)
+        },
+    )
+}
+
+/// "3m ago"/"2h ago"/"5d ago"/"just now"/"unknown time" -- same relative-
+/// bucket shape `home_window.rs`'s `last_seen_label` and `yadorilink-cli`'s
+/// `commands::status::last_gc_summary` already use (kept as its own copy,
+/// matching this crate's established duplication precedent -- see
+/// `ipc_client.rs`'s doc comment); this one takes nanoseconds since
+/// `TrashedFileInfo.deleted_at_unix_nanos`/`FileVersionInfo.mtime_unix_nanos`
+/// are nanosecond-scaled, unlike `DeviceSummary.last_seen_unix`.
+fn relative_time_from_unix_nanos(nanos: i64) -> String {
+    if nanos <= 0 {
+        return "unknown time".to_string();
+    }
+    let secs = nanos / 1_000_000_000;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let elapsed = (now - secs).max(0);
+    if elapsed < 10 {
+        "just now".to_string()
+    } else if elapsed < 60 {
+        format!("{elapsed}s ago")
+    } else if elapsed < 3600 {
+        format!("{}m ago", elapsed / 60)
+    } else if elapsed < 86400 {
+        format!("{}h ago", elapsed / 3600)
+    } else {
+        format!("{}d ago", elapsed / 86400)
+    }
+}
+
+/// Same binary-unit byte formatter as `folder_detail::format_bytes`
+/// (private to that module -- kept as its own copy here rather than
+/// exposing it, matching this crate's established duplication precedent).
+fn format_bytes_short(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[0])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// "From <device>, saved <timestamp>" -- the losing side's origin, parsed
+/// from the conflicted-copy filename itself (see `yadorilink_product_view::
+/// conflict_detail`'s own doc comment for why that's where this data
+/// actually lives on the wire today). Degrades to a plain statement when
+/// either field didn't parse, rather than printing a raw `None`.
+fn conflict_origin_line(detail: &yadorilink_product_view::ConflictDetail) -> String {
+    match (&detail.loser_device_id, &detail.timestamp) {
+        (Some(device), Some(ts)) => format!("From {device}, saved {ts}"),
+        (Some(device), None) => format!("From {device}"),
+        (None, _) => "Origin device unknown".to_string(),
+    }
+}
+
 /// One version's summary line -- same fields/order as
 /// `commands::version_history::version_line`, this window's own rendering
 /// of the identical `FileVersionInfo`.
 fn version_line(v: &FileVersionInfo) -> String {
+    let content = if v.kind() == yadorilink_ipc_proto::daemonctl::EntryKind::Directory {
+        "directory".to_string()
+    } else {
+        format!("{}  size={}", v.mtime_unix_nanos, v.size)
+    };
     format!(
-        "v{}  {}  size={}  origin={}  state={}  mode={}",
+        "v{}  {content}  origin={}  state={}  mode={}",
         v.version_seq,
-        v.mtime_unix_nanos,
-        v.size,
         if v.origin_device_id.is_empty() { "unknown" } else { &v.origin_device_id },
         v.state,
         // `-` for "no Unix permission info" (e.g. authored on Windows) --
@@ -798,60 +1162,4 @@ fn dim(text: egui::RichText, stale: bool) -> egui::RichText {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn materialization_state_label_covers_every_state() {
-        assert_eq!(materialization_state_label(MaterializationState::Hydrated), "hydrated");
-        assert_eq!(materialization_state_label(MaterializationState::Placeholder), "placeholder");
-        assert_eq!(materialization_state_label(MaterializationState::Hydrating), "hydrating");
-        assert_eq!(materialization_state_label(MaterializationState::Evicting), "evicting");
-        assert_eq!(materialization_state_label(MaterializationState::Unspecified), "unknown");
-    }
-
-    #[test]
-    fn version_line_renders_every_field() {
-        let v = FileVersionInfo {
-            version_seq: 3,
-            size: 42,
-            mtime_unix_nanos: 12345,
-            state: "superseded".into(),
-            origin_device_id: "device-a".into(),
-            unix_mode: Some(0o755),
-        };
-        assert_eq!(
-            version_line(&v),
-            "v3  12345  size=42  origin=device-a  state=superseded  mode=0o755"
-        );
-    }
-
-    #[test]
-    fn version_line_renders_unknown_origin() {
-        let v = FileVersionInfo {
-            version_seq: 1,
-            size: 0,
-            mtime_unix_nanos: 0,
-            state: "current".into(),
-            origin_device_id: String::new(),
-            unix_mode: None,
-        };
-        assert!(version_line(&v).contains("origin=unknown"));
-    }
-
-    /// No Unix permission info (a version authored on Windows) renders as
-    /// `-`, never a fabricated octal value -- same rule as the CLI's own
-    /// `version_history::version_line`.
-    #[test]
-    fn version_line_renders_absent_unix_mode() {
-        let v = FileVersionInfo {
-            version_seq: 1,
-            size: 0,
-            mtime_unix_nanos: 0,
-            state: "current".into(),
-            origin_device_id: "device-a".into(),
-            unix_mode: None,
-        };
-        assert!(version_line(&v).contains("mode=-"));
-    }
-}
+mod tests;

@@ -6,15 +6,23 @@
 //! hand-written rather than derived from serde or protobuf, whose output is
 //! not canonical across implementations.
 
-/// Rejection reasons for the pure model/crypto layer. Deliberately separate
-/// from `yadorilink-sync-core`'s `SyncError`: verification runs before
-/// anything is admitted to persistent storage, so it never needs to compose
-/// with the database-error taxonomy. Callers that admit changes (the peer
-/// session) decide how a rejection surfaces and log it.
+/// Rejection reasons for the pure model/crypto layer. Callers that admit
+/// changes (the peer session) decide how a rejection surfaces and log it.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ChangeError {
     #[error("change encoding is malformed: {0}")]
     Encoding(String),
+    /// The domain tag's identifying prefix matched but its trailing
+    /// generation byte did not: these are well-formed bytes from a
+    /// different encoding generation, not damage. Kept distinct from
+    /// [`ChangeError::Encoding`] precisely because the two call for
+    /// opposite responses — a generation mismatch points at a peer or a
+    /// stored row this build does not speak, while an encoding error points
+    /// at corruption. There is no compatibility path: a mismatched
+    /// generation is refused outright, never reinterpreted, because every
+    /// field after the tag would be read at the wrong offset.
+    #[error("change encoding generation {theirs} is not this build's generation {ours}")]
+    UnsupportedGeneration { theirs: u8, ours: u8 },
     #[error("change hash does not match its encoded bytes")]
     HashMismatch,
     #[error("file version block sizes do not sum to the declared total size")]

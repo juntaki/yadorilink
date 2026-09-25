@@ -11,10 +11,6 @@
 //! unauthorized client would notice. Since nothing above this transport
 //! re-encrypts, that omission would be handing plaintext file content to an
 //! unauthenticated caller.
-//!
-//! Two entry points per test body, as in `quic_socket_bridge.rs`: the
-//! deterministic simulator runs the same real quinn/rustls stack as the
-//! native build, never a substitute.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -38,7 +34,8 @@ const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A hub bound on loopback, plus the QUIC socket sharing it.
 async fn hub_socket() -> (Arc<TransportHub>, Arc<TransportHubQuicSocket>, SocketAddr) {
-    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("bind loopback");
+    let socket =
+        yadorilink_transport::sim_net::UdpSocket::bind("127.0.0.1:0").await.expect("bind loopback");
     let hub = TransportHub::from_socket(socket);
     let addr = hub.local_addr();
     let quic = TransportHubQuicSocket::new(hub.clone()).expect("one QUIC endpoint per hub");
@@ -172,17 +169,9 @@ async fn mutual_raw_public_keys_authenticate_both_directions() {
     assert_eq!(server, Outcome::Exchanged, "server side of the exchange");
 }
 
-#[cfg(not(madsim))]
 #[tokio::test]
 async fn a_mutual_raw_public_key_handshake_carries_a_bidirectional_stream() {
     mutual_raw_public_keys_authenticate_both_directions().await;
-}
-
-#[cfg(madsim)]
-#[test]
-fn a_mutual_raw_public_key_handshake_carries_a_bidirectional_stream() {
-    let rt = madsim::runtime::Runtime::with_seed_and_config(1, madsim::Config::default());
-    rt.block_on(mutual_raw_public_keys_authenticate_both_directions());
 }
 
 /// The dialer's half: a device that answers with a key other than the one
@@ -210,17 +199,9 @@ async fn a_server_presenting_another_devices_key_is_refused() {
     client.refused("the dialing client");
 }
 
-#[cfg(not(madsim))]
 #[tokio::test]
 async fn a_server_key_the_client_did_not_expect_fails_the_handshake() {
     a_server_presenting_another_devices_key_is_refused().await;
-}
-
-#[cfg(madsim)]
-#[test]
-fn a_server_key_the_client_did_not_expect_fails_the_handshake() {
-    let rt = madsim::runtime::Runtime::with_seed_and_config(1, madsim::Config::default());
-    rt.block_on(a_server_presenting_another_devices_key_is_refused());
 }
 
 /// The accepting half, and the one that is easy to leave unwired: a client
@@ -250,17 +231,9 @@ async fn a_client_outside_the_authorized_set_is_refused() {
     client.refused("the client whose key was not authorized");
 }
 
-#[cfg(not(madsim))]
 #[tokio::test]
 async fn a_client_key_the_server_did_not_expect_fails_the_handshake() {
     a_client_outside_the_authorized_set_is_refused().await;
-}
-
-#[cfg(madsim)]
-#[test]
-fn a_client_key_the_server_did_not_expect_fails_the_handshake() {
-    let rt = madsim::runtime::Runtime::with_seed_and_config(1, madsim::Config::default());
-    rt.block_on(a_client_outside_the_authorized_set_is_refused());
 }
 
 /// A server that authorizes nobody accepts nobody -- including a client
@@ -284,17 +257,9 @@ async fn an_empty_authorized_set_accepts_nobody() {
     client.refused("a client dialing a server that authorizes nobody");
 }
 
-#[cfg(not(madsim))]
 #[tokio::test]
 async fn a_server_with_no_authorized_peers_fails_closed() {
     an_empty_authorized_set_accepts_nobody().await;
-}
-
-#[cfg(madsim)]
-#[test]
-fn a_server_with_no_authorized_peers_fails_closed() {
-    let rt = madsim::runtime::Runtime::with_seed_and_config(1, madsim::Config::default());
-    rt.block_on(an_empty_authorized_set_accepts_nobody());
 }
 
 /// A peer of another protocol generation is refused during the handshake,
@@ -352,17 +317,61 @@ async fn a_peer_of_another_generation_is_refused() {
     server.refused("a server offered another generation");
 }
 
-#[cfg(not(madsim))]
 #[tokio::test]
 async fn a_mismatched_alpn_fails_the_handshake() {
     a_peer_of_another_generation_is_refused().await;
 }
 
-#[cfg(madsim)]
-#[test]
-fn a_mismatched_alpn_fails_the_handshake() {
-    let rt = madsim::runtime::Runtime::with_seed_and_config(1, madsim::Config::default());
-    rt.block_on(a_peer_of_another_generation_is_refused());
+/// The compatibility decision for the generation that added the group
+/// durability-summary RPC, stated as an executable fact rather than a
+/// comment: a peer speaking the PREVIOUS generation is refused outright, not
+/// accepted with the new RPC quietly unavailable.
+///
+/// This is deliberate and load-bearing, and it is the same shape the
+/// generation before it relied on. The summary RPC is what lets the
+/// background custody check cost one round-trip per group instead of one
+/// whole-file re-read per durability root. If a previous-generation peer
+/// were admitted and its inability to answer treated as "old build, fall
+/// back to the per-root scan", the expensive path would return for anything
+/// able to present itself as a previous-generation peer, and the cost the
+/// new RPC exists to remove would come back wearing a compatibility label.
+/// Refusing at the handshake leaves "this peer cannot answer" no way to
+/// happen: such a peer never connects, never becomes a candidate, and the
+/// group simply reports its durability as unknown.
+///
+/// Pins the previous generation by literal, not by arithmetic on the current
+/// one: the point is that THAT wire shape specifically is now refused.
+async fn the_previous_generation_is_refused() {
+    let server_device = DeviceSigningKeyPair::generate();
+    let client_device = DeviceSigningKeyPair::generate();
+
+    const PREVIOUS_GENERATION: &[u8] = b"yadorilink-p2p/8";
+    assert_ne!(
+        PREVIOUS_GENERATION, YADORILINK_P2P_ALPN,
+        "this test is meaningless unless the current generation has actually moved past the one          it pins"
+    );
+
+    let (client, server) = attempt(
+        quic_server_config(
+            &server_device,
+            &AuthorizedPeerKeys::with([client_device.public_bytes()]),
+        )
+        .expect("server config"),
+        client_config_of_another_generation(
+            &client_device,
+            server_device.public_bytes(),
+            PREVIOUS_GENERATION,
+        ),
+    )
+    .await;
+
+    client.refused("a client speaking the previous generation");
+    server.refused("a server offered the previous generation");
+}
+
+#[tokio::test]
+async fn a_previous_generation_peer_is_refused_rather_than_silently_downgraded() {
+    the_previous_generation_is_refused().await;
 }
 
 /// Revocation, on an endpoint that is never rebuilt.
@@ -488,15 +497,7 @@ async fn a_key_revoked_from_the_live_set_is_refused_next_time() {
     assert_eq!(served, 1, "only the pre-revocation client was served");
 }
 
-#[cfg(not(madsim))]
 #[tokio::test]
 async fn revoking_a_key_refuses_the_next_connection_without_rebuilding_the_endpoint() {
     a_key_revoked_from_the_live_set_is_refused_next_time().await;
-}
-
-#[cfg(madsim)]
-#[test]
-fn revoking_a_key_refuses_the_next_connection_without_rebuilding_the_endpoint() {
-    let rt = madsim::runtime::Runtime::with_seed_and_config(1, madsim::Config::default());
-    rt.block_on(a_key_revoked_from_the_live_set_is_refused_next_time());
 }

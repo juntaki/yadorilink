@@ -1,13 +1,7 @@
 //! Filesystem write primitives for materializing content from block
-//! storage: write-target/delete-target symlink-escape verification,
-//! atomic temp-then-rename file reconstruction, sparse placeholder
-//! writes, and the owner-exec bit. Moved out of `yadorilink-sync-core`'s
-//! `chunker.rs` in Phase 7D-6: needed directly by `yadorilink-peer-session`
-//! production code, and already parameterized entirely over
-//! `BlockContentStore` (already in this crate) rather than any SQL/port
-//! type -- `local_change.rs`/`materialization.rs`/`single_pass_capture.rs`
-//! (staying in sync-core) use this crate's *chunking* functions, a
-//! different concern from the write-target machinery here.
+//! storage: write-target/delete-target symlink-escape verification, atomic
+//! temp-then-rename file reconstruction, sparse placeholder writes, and
+//! the owner-exec bit.
 
 use std::ffi::OsString;
 use std::fs;
@@ -16,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::content_ports::BlockContentStore;
 use crate::error::StorageError;
-use crate::fs_backend::{remove_path, rename_path};
+use crate::fs_ops::{link_if_absent, remove_path, rename_path};
 use yadorilink_replica_domain::file::BlockInfo;
 
 fn unique_tmp_path(path: &Path) -> PathBuf {
@@ -50,10 +44,66 @@ fn unique_tmp_path(path: &Path) -> PathBuf {
 pub fn verify_write_target_within_root(
     out_path: &Path,
     sync_root: &Path,
+    ledger: &dyn StructuralDirectoryLedger,
 ) -> Result<(), StorageError> {
+    // The root itself, not a directory inside it: the one creation this
+    // module makes outside [`create_dir_all_never_through_a_symlink`].
     fs::create_dir_all(sync_root)?;
     let canonical_root = fs::canonicalize(sync_root)?;
-    verify_write_target_within_canonical_root(out_path, &canonical_root)
+    verify_write_target_within_canonical_root(out_path, &canonical_root, ledger)
+}
+
+/// Resolves a root-relative path for *reading*, refusing if any component of
+/// it is a symlink.
+///
+/// The read-side counterpart of [`verify_write_target_within_root`], and it
+/// exists because the two directions disagreed. A write was already refused
+/// when a component resolved outside the root; a read was not, so a directory
+/// symlink planted inside a sync root let the capture path read a file that
+/// lives outside it — and, being a capture, replicate those bytes to every
+/// peer in the group. Measured, not theorised.
+///
+/// The rule is deliberately about *traversal*, not about where the target
+/// lands:
+///
+/// ```text
+///   root/real-dir/...     resolved
+///   root/link             resolved, as the symlink itself
+///   root/link/anything    never
+/// ```
+///
+/// A link whose target is inside the root is refused too. Following it would
+/// give the same bytes two logical paths — `real/file` and `alias/file` —
+/// and this replica model uses a path as a semantic identity: duplicate
+/// Changes, ambiguous renames and deletes, ambiguous conflict copies, and
+/// cycles all follow from allowing one object two names.
+///
+/// A symlink is a synchronised filesystem object, not an edge the tree walk
+/// may cross.
+pub fn resolve_read_path_without_traversal(
+    root: &Path,
+    relative: &Path,
+) -> Result<PathBuf, StorageError> {
+    let mut resolved = root.to_path_buf();
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        resolved.push(component);
+        // The final component may itself be a symlink: that is a file this
+        // folder legitimately contains, and it is synchronised as a symlink.
+        // What it must never be is walked *through*, which is what having a
+        // further component after it would mean.
+        let is_intermediate = components.peek().is_some();
+        match fs::symlink_metadata(&resolved) {
+            Ok(metadata) if metadata.file_type().is_symlink() && is_intermediate => {
+                return Err(StorageError::PathEscapesRoot(resolved.display().to_string()));
+            }
+            // A component that does not exist cannot be a symlink being
+            // traversed, and its absence is the caller's business, not this
+            // function's.
+            _ => {}
+        }
+    }
+    Ok(resolved)
 }
 
 /// Like `verify_write_target_within_root`, but takes an already-canonical
@@ -63,14 +113,102 @@ pub fn verify_write_target_within_root(
 pub fn verify_write_target_within_canonical_root(
     out_path: &Path,
     canonical_root: &Path,
+    ledger: &dyn StructuralDirectoryLedger,
 ) -> Result<(), StorageError> {
     let parent = out_path.parent().unwrap_or(out_path);
-    create_dir_all_never_through_a_symlink(parent, canonical_root, out_path)?;
+    create_dir_all_never_through_a_symlink(parent, canonical_root, out_path, ledger)?;
     let canonical_parent = fs::canonicalize(parent)?;
     if !canonical_parent.starts_with(canonical_root) {
         return Err(StorageError::PathEscapesRoot(out_path.display().to_string()));
     }
     Ok(())
+}
+
+/// Where the materializer records the directories it creates only to hold
+/// descendants (structural directories), so that nothing later mistakes
+/// one for a directory a user made.
+///
+/// A directory's filesystem identity exists only after it is created, but
+/// the claim that this device created it has to be durable before, or a
+/// crash in between leaves a directory nothing says this device made --
+/// which capture would read as a user's `mkdir`. So each creation in
+/// [`create_dir_all_never_through_a_symlink`] is bracketed:
+///
+/// 1. [`Self::record_intent`] before the `mkdir` (durable before the
+///    syscall);
+/// 2. [`Self::complete`] after a `mkdir` that created the directory, with
+///    the identity observed on it;
+/// 3. [`Self::abandon`] when the `mkdir` found the name taken (`EEXIST`,
+///    a user or another writer got there first) or failed: nothing is
+///    claimed for what is there.
+///
+/// `rel_path` is the directory's path relative to the sync root, with `/`
+/// separators -- the same form every replicated path has. An
+/// implementation is bound to one group; it is the owner of the
+/// structural-origin ledger for that group's root.
+pub trait StructuralDirectoryLedger {
+    fn record_intent(&self, rel_path: &str) -> Result<(), StorageError>;
+    fn complete(
+        &self,
+        rel_path: &str,
+        identity: &yadorilink_root_authority::fs_identity::FileIdentity,
+    ) -> Result<(), StorageError>;
+    fn abandon(&self, rel_path: &str) -> Result<(), StorageError>;
+}
+
+/// What [`create_explicit_directory`] found or did at its path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExplicitDirectoryCreation {
+    /// This call created the directory.
+    Created,
+    /// A directory was already there; it is left as it is.
+    AlreadyDirectory,
+}
+
+/// Creates `out_path` as a directory that is itself a replicated entry (an
+/// explicit Directory version), inside `canonical_root`.
+///
+/// Its missing ancestors are structural -- they exist only to hold it --
+/// and are created through [`create_dir_all_never_through_a_symlink`],
+/// which records them in `ledger`. `out_path` itself is not structural and
+/// is not recorded there: what records it is the materialized proof its
+/// caller publishes for the version.
+///
+/// A directory already at `out_path` is kept (its mode is the caller's to
+/// apply). Anything else there -- a file, a symlink -- is refused with
+/// [`std::io::ErrorKind::AlreadyExists`] and left untouched.
+pub fn create_explicit_directory(
+    out_path: &Path,
+    canonical_root: &Path,
+    ledger: &dyn StructuralDirectoryLedger,
+) -> Result<ExplicitDirectoryCreation, StorageError> {
+    verify_write_target_within_canonical_root(out_path, canonical_root, ledger)?;
+    match fs::create_dir(out_path) {
+        Ok(()) => {
+            if let Err(error) = sync_parent_directory(out_path) {
+                tracing::warn!(
+                    path = %out_path.display(),
+                    error = %error,
+                    "directory was created but its parent directory could not be synced"
+                );
+            }
+            Ok(ExplicitDirectoryCreation::Created)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            match fs::symlink_metadata(out_path) {
+                Ok(meta) if meta.is_dir() => Ok(ExplicitDirectoryCreation::AlreadyDirectory),
+                Ok(_) => Err(StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!(
+                        "{} is occupied by an object that is not a directory",
+                        out_path.display()
+                    ),
+                ))),
+                Err(e) => Err(e.into()),
+            }
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Creates every missing directory component of `target` (`out_path`'s
@@ -93,10 +231,11 @@ pub fn verify_write_target_within_canonical_root(
 /// window remains between the existing-ancestor check and the first
 /// `create_dir` -- the same documented "Low / TOCTOU" class of residual
 /// `verify_write_target_within_root`'s own doc comment already accepts.
-fn create_dir_all_never_through_a_symlink(
+pub fn create_dir_all_never_through_a_symlink(
     target: &Path,
     canonical_root: &Path,
     out_path_for_errors: &Path,
+    ledger: &dyn StructuralDirectoryLedger,
 ) -> Result<(), StorageError> {
     let mut existing_ancestor = target;
     let mut to_create = Vec::new();
@@ -134,13 +273,120 @@ fn create_dir_all_never_through_a_symlink(
     if !canonical_existing_ancestor.starts_with(canonical_root) {
         return Err(StorageError::PathEscapesRoot(out_path_for_errors.display().to_string()));
     }
+    // Every directory below the existing ancestor is created here, so its
+    // root-relative name is the ancestor's plus the components walked.
+    let ancestor_rel = canonical_existing_ancestor
+        .strip_prefix(canonical_root)
+        .map_err(|_| StorageError::PathEscapesRoot(out_path_for_errors.display().to_string()))?
+        .to_path_buf();
     // `to_create` was pushed shallowest-last (closest to `target` first);
     // create shallowest-first so each `create_dir` call's own parent
     // already exists.
     for dir in to_create.into_iter().rev() {
-        fs::create_dir(dir)?;
+        let tail = dir.strip_prefix(existing_ancestor).map_err(|_| {
+            StorageError::PathEscapesRoot(out_path_for_errors.display().to_string())
+        })?;
+        let rel_path = wire_relative_path(&ancestor_rel.join(tail))?;
+        create_structural_directory(dir, &rel_path, ledger)?;
     }
     Ok(())
+}
+
+/// One structural `mkdir`, bracketed by `ledger`: the intent is durable
+/// before the syscall, the identity recorded after it. A name found taken
+/// (`EEXIST`: a user, or another writer, created it since the walk above
+/// looked) is abandoned without a claim, and is then accepted only if it
+/// is a real directory. Any other failure abandons the intent too, so a
+/// failed `mkdir` leaves nothing pending; a failure to abandon is left to
+/// recovery, which drops the intent.
+///
+/// The identity is observed by name right after the `mkdir`: neither macOS
+/// nor Linux has a `mkdir` that returns a descriptor of the directory it
+/// made. A directory another process swaps in at the same name within that
+/// gap (removing the new one and making its own) is recorded as structural
+/// in its place. What that can cost is bounded: a structural directory is
+/// only ever pruned with a non-recursive `rmdir`, so at most that
+/// replacement is removed later, and only while it is empty -- never a file
+/// or anything inside a directory. Making the directory under a private
+/// name and renaming it into place is no better: a plain directory rename
+/// replaces an empty directory already at the target, and a crash between
+/// the two leaves the privately named directory in the sync root.
+fn create_structural_directory(
+    dir: &Path,
+    rel_path: &str,
+    ledger: &dyn StructuralDirectoryLedger,
+) -> Result<(), StorageError> {
+    ledger.record_intent(rel_path)?;
+    match fs::create_dir(dir) {
+        Ok(()) => {
+            let identity =
+                match yadorilink_root_authority::fs_identity::FileIdentity::observe_path(dir) {
+                    Ok(identity) => identity,
+                    Err(e) => {
+                        // Created, but its identity cannot be read: nothing to
+                        // bind the claim to, so none is made.
+                        let _ = ledger.abandon(rel_path);
+                        return Err(e.into());
+                    }
+                };
+            ledger.complete(rel_path, &identity)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            ledger.abandon(rel_path)?;
+            match fs::symlink_metadata(dir) {
+                Ok(meta) if meta.is_dir() => Ok(()),
+                _ => Err(StorageError::PathEscapesRoot(dir.display().to_string())),
+            }
+        }
+        Err(e) => {
+            let _ = ledger.abandon(rel_path);
+            Err(e.into())
+        }
+    }
+}
+
+/// `relative` as a replicated path: its normal components joined with `/`.
+fn wire_relative_path(relative: &Path) -> Result<String, StorageError> {
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(part) => parts.push(part.to_str().ok_or_else(|| {
+                StorageError::InvalidPath(format!("{} is not valid UTF-8", relative.display()))
+            })?),
+            std::path::Component::CurDir => {}
+            _ => {
+                return Err(StorageError::InvalidPath(format!(
+                    "{} is not a plain relative path",
+                    relative.display()
+                )))
+            }
+        }
+    }
+    Ok(parts.join("/"))
+}
+
+/// The write primitives below never create a directory: inside a sync
+/// root every directory is created by
+/// [`create_dir_all_never_through_a_symlink`], which records the ones it
+/// makes for descendants, and their callers run it first (through
+/// [`verify_write_target_within_root`] or its canonical-root form). A
+/// missing parent here means the caller skipped that step, or something
+/// removed the directory since; either way it fails rather than creating an
+/// unrecorded directory.
+fn require_parent_directory(out_path: &Path) -> Result<(), StorageError> {
+    let Some(parent) = out_path.parent().filter(|parent| !parent.as_os_str().is_empty()) else {
+        return Ok(());
+    };
+    if fs::metadata(parent).is_ok_and(|meta| meta.is_dir()) {
+        return Ok(());
+    }
+    Err(StorageError::Io(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!(
+            "{} has no parent directory; verify the write target (which creates it) first",
+            out_path.display()
+        ),
+    )))
 }
 
 /// Like `verify_write_target_within_root`, but for a caller about to
@@ -303,7 +549,7 @@ pub fn reconstruct_file(
 /// same filesystem) -- WITHOUT touching `out_path` itself at all. Returns
 /// the temp file's path.
 ///
-/// Split out (C4-6: receiver-side materialization batching) so a caller
+/// Split out (receiver-side materialization batching) so a caller
 /// that needs to defer the final publish -- e.g. to batch several paths'
 /// SQLite commits together before any of them become visible on disk --
 /// can do the slow part (this function: network-fetch-bound block reads)
@@ -322,25 +568,26 @@ pub fn reconstruct_file_to_temp(
     blocks: &[BlockInfo],
     mtime_unix_nanos: i64,
 ) -> Result<PathBuf, StorageError> {
-    if let Some(parent) = out_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    require_parent_directory(out_path)?;
     let tmp_path = unique_tmp_path(out_path);
     let assemble = || -> Result<(), StorageError> {
+        // Straight-line and synchronous, so the guard covers exactly these
+        // reads and nothing else.
+        let _reads = crate::io_diag::attribute_reads(crate::io_diag::ReadReason::Reconstruct);
         let mut out = fs::File::create(&tmp_path)?;
         for block in blocks {
             let hash_hex = hex::encode(&block.hash);
             let data = store.get(&hash_hex)?;
             std::io::Write::write_all(&mut out, &data)?;
         }
-        // M6-2: receiver-side phase timing (see hydration.rs's own M6PHASE
-        // lines for the daemon-level points either side of this function).
+        // Receiver-side phase markers (see hydration.rs's own `phase T_recv_*`
+        // markers for the daemon-level points either side of this function).
         // This function is shared with the version-restore materialization
         // path, not only on-demand hydration -- a phase-log reader
         // interested specifically in a bulk-transfer receiver run should
         // anchor these against `T_recv_materialize_start`, which only the
         // hydration path emits.
-        tracing::warn!("M6PHASE T_recv_write_done: final-file write complete (all blocks written to the temp file)");
+        tracing::debug!("phase T_recv_write_done: final-file write complete (all blocks written to the temp file)");
         // Stamp the mtime before the final `sync_all`/rename below, so a
         // reader that observes the renamed-into-place file always also
         // observes its final mtime — no window where the file is visible
@@ -350,7 +597,7 @@ pub fn reconstruct_file_to_temp(
         // durable across power loss. Persist the complete temp before the
         // rename can publish it under the user-visible path.
         out.sync_all()?;
-        tracing::warn!("M6PHASE T_recv_fsync_done: final-file fsync complete");
+        tracing::debug!("phase T_recv_fsync_done: final-file fsync complete");
         Ok(())
         // `out` is dropped (closed) here, before the rename below.
     };
@@ -374,15 +621,15 @@ pub fn reconstruct_file_to_temp(
 pub fn persist_reconstructed_file(tmp_path: &Path, out_path: &Path) -> Result<(), StorageError> {
     let publish = || -> Result<(), StorageError> {
         rename_path(tmp_path, out_path)?;
-        tracing::warn!("M6PHASE T_recv_rename_done: temp-file-to-final-path rename complete");
+        tracing::debug!("phase T_recv_rename_done: temp-file-to-final-path rename complete");
         sync_parent_directory(out_path)?;
         // On Unix this is a real parent-directory fsync (see `sync_parent_
         // directory`'s own doc comment); on non-Unix it is a documented
         // no-op, so this line still fires there but measures nothing real
         // -- a phase-log reader on a non-Unix capture should read this
         // span as "step skipped," not "step free."
-        tracing::warn!(
-            "M6PHASE T_recv_dir_fsync_done: parent-directory fsync complete (or skipped, non-Unix)"
+        tracing::debug!(
+            "phase T_recv_dir_fsync_done: parent-directory fsync complete (or skipped, non-Unix)"
         );
         Ok(())
     };
@@ -443,7 +690,7 @@ pub struct PlaceholderDiskIdentity {
 /// grep-able under one name.
 pub const INTERNAL_INODE_PROVIDER_KIND: &str = "internal-inode";
 
-/// The `provider_kind` string M2-2's Windows CfAPI generation-identity
+/// The `provider_kind` string the Windows CfAPI generation-identity
 /// scheme persists alongside a `PlaceholderDiskIdentity` -- reusing this
 /// same two-`u64`-column shape even though the real value is a single
 /// opaque `u64` generation token, not a `(dev, ino)` pair: `dev` is always
@@ -501,25 +748,54 @@ pub fn write_placeholder(
     size: u64,
     mtime_unix_nanos: i64,
 ) -> Result<Option<PlaceholderDiskIdentity>, StorageError> {
-    if let Some(parent) = out_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    write_placeholder_publishing(out_path, size, mtime_unix_nanos, Publish::Replacing)
+}
+
+/// [`write_placeholder`], except that it never replaces an object already
+/// at `out_path`: when one is there it fails with
+/// [`std::io::ErrorKind::AlreadyExists`] and leaves it untouched. For a
+/// caller that decided `out_path` was empty without being able to stop a
+/// user from creating something there since.
+pub fn write_placeholder_if_absent(
+    out_path: &Path,
+    size: u64,
+    mtime_unix_nanos: i64,
+) -> Result<Option<PlaceholderDiskIdentity>, StorageError> {
+    write_placeholder_publishing(out_path, size, mtime_unix_nanos, Publish::IfAbsent)
+}
+
+#[derive(Clone, Copy)]
+enum Publish {
+    Replacing,
+    IfAbsent,
+}
+
+fn write_placeholder_publishing(
+    out_path: &Path,
+    size: u64,
+    mtime_unix_nanos: i64,
+    publish: Publish,
+) -> Result<Option<PlaceholderDiskIdentity>, StorageError> {
+    require_parent_directory(out_path)?;
     let tmp_path = unique_tmp_path(out_path);
     let mut identity: Option<PlaceholderDiskIdentity> = None;
     let mut prepare = || -> Result<(), StorageError> {
         let file = fs::File::create(&tmp_path)?;
-        file.set_len(size)?;
-        stamp_mtime(&file, mtime_unix_nanos);
-        // A sparse length and its metadata are not durable merely because
-        // the handle is closed. Persist the complete placeholder before its
-        // name becomes visible, matching `reconstruct_file`'s ordering.
-        file.sync_all()?;
+        write_placeholder_contents(&file, size, mtime_unix_nanos)?;
         identity = disk_identity_of(&file);
         Ok(())
     };
-    if let Err(error) =
-        prepare().and_then(|()| rename_path(&tmp_path, out_path).map_err(Into::into))
-    {
+    let published = prepare().and_then(|()| match publish {
+        Publish::Replacing => rename_path(&tmp_path, out_path).map_err(Into::into),
+        Publish::IfAbsent => publish_if_absent(&tmp_path, out_path, size, mtime_unix_nanos).map(
+            |fallback_identity| {
+                if fallback_identity.is_some() {
+                    identity = fallback_identity;
+                }
+            },
+        ),
+    });
+    if let Err(error) = published {
         let _ = remove_path(&tmp_path);
         return Err(error);
     }
@@ -536,6 +812,49 @@ pub fn write_placeholder(
         );
     }
     Ok(identity)
+}
+
+/// Sizes and stamps a freshly created placeholder file, then persists it.
+fn write_placeholder_contents(
+    file: &fs::File,
+    size: u64,
+    mtime_unix_nanos: i64,
+) -> Result<(), StorageError> {
+    file.set_len(size)?;
+    stamp_mtime(file, mtime_unix_nanos);
+    // A sparse length and its metadata are not durable merely because
+    // the handle is closed. Persist the complete placeholder before its
+    // name becomes visible, matching `reconstruct_file`'s ordering.
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Gives the prepared placeholder at `tmp_path` the name `out_path` only if
+/// nothing has that name. A hard link is the one portable primitive that is
+/// both atomic and refuses an existing destination; the temp name is
+/// removed afterwards, whatever happened. On a volume without hard links
+/// the placeholder is instead created at `out_path` directly and
+/// exclusively, which is equally unable to replace anything but can leave a
+/// partly written placeholder behind on a crash -- something a later pass
+/// reads as an object it does not recognise and keeps, never loses. Returns
+/// the identity of that directly created file when it took that route.
+fn publish_if_absent(
+    tmp_path: &Path,
+    out_path: &Path,
+    size: u64,
+    mtime_unix_nanos: i64,
+) -> Result<Option<PlaceholderDiskIdentity>, StorageError> {
+    let linked = link_if_absent(tmp_path, out_path);
+    let _ = remove_path(tmp_path);
+    match linked {
+        Ok(()) => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(error.into()),
+        Err(_) => {
+            let file = fs::OpenOptions::new().write(true).create_new(true).open(out_path)?;
+            write_placeholder_contents(&file, size, mtime_unix_nanos)?;
+            Ok(disk_identity_of(&file))
+        }
+    }
 }
 
 /// What a placeholder-creation call site must persist once
@@ -588,24 +907,20 @@ impl PlaceholderIdentityToRecord {
 
 /// The one sanctioned entry point every production placeholder-creation
 /// call site (repair, eviction, peer materialize) must use INSTEAD OF
-/// calling [`write_placeholder`] directly (M2-3a).
+/// calling [`write_placeholder`] directly.
 ///
 /// On every platform except Windows this is exactly `write_placeholder`,
 /// unchanged: writes a real sparse file and returns its on-disk identity
 /// under [`INTERNAL_INODE_PROVIDER_KIND`].
 ///
-/// On Windows this writes NOTHING to disk. Before M2-3a, every caller here
-/// called `write_placeholder` unconditionally, which on Windows still wrote
-/// a real sparse file (identity capture is the only part that's a no-op on
-/// non-Unix) and returned `None` -- so the caller then called
-/// `clear_placeholder_generation`, silently discarding any Windows CfAPI
-/// generation. Two bugs followed: (1) `cfapi-host.exe`'s `sync_placeholders`
-/// skips any path that already `exists()` on disk, so that real sparse file
-/// permanently pre-empted the native `CfCreatePlaceholders` call -- these
-/// paths never became real CfAPI placeholders at all; (2) even had it not
-/// pre-empted native creation, the cleared generation meant M2-2's dirty
-/// detection could never do better than fail-closed `Unknown` for a path
-/// created through one of these three call sites.
+/// On Windows this writes NOTHING to disk. Calling `write_placeholder`
+/// unconditionally would still write a real sparse file there (identity
+/// capture is the only part that's a no-op on non-Unix) and return `None`,
+/// with two consequences: (1) `cfapi-host.exe`'s `sync_placeholders` skips
+/// any path that already `exists()` on disk, so that sparse file would
+/// permanently pre-empt the native `CfCreatePlaceholders` call; (2) the
+/// caller would clear the generation, so Windows dirty detection could
+/// never do better than fail-closed `Unknown` for that path.
 ///
 /// Here, instead, no sparse file is written at all: a fresh generation is
 /// minted and returned tagged [`WINDOWS_CFAPI_GENERATION_PROVIDER_KIND`] for
@@ -616,9 +931,10 @@ impl PlaceholderIdentityToRecord {
 /// is created afterward by `cfapi-host.exe`'s existing poll
 /// (`sync_placeholders` -> `create_placeholder`), which is unaffected by
 /// this change and already reads the generation this call persists via
-/// `ListFolderFilesRequest`. Not creating the parent directory here either
-/// is deliberate for the same reason: `cfapi-host.exe`'s own
-/// `create_placeholder` already creates it.
+/// `ListFolderFilesRequest`. No parent directory is created here, and
+/// `cfapi-host.exe` creates none either: the caller must already have
+/// created (and recorded) the parents through the structural `mkdir`
+/// helper before recording the placeholder.
 pub fn create_or_defer_placeholder(
     out_path: &Path,
     size: u64,
@@ -656,6 +972,35 @@ pub fn create_or_defer_placeholder(
             None => PlaceholderIdentityToRecord::Clear,
         })
     }
+}
+
+/// [`create_or_defer_placeholder`], except that where it writes the
+/// placeholder itself it never replaces an object already at `out_path`
+/// (see [`write_placeholder_if_absent`]). Where creation is deferred to a
+/// separate process nothing is written here, and that process already
+/// skips a path something occupies.
+pub fn create_or_defer_placeholder_if_absent(
+    out_path: &Path,
+    size: u64,
+    mtime_unix_nanos: i64,
+) -> Result<PlaceholderIdentityToRecord, StorageError> {
+    #[cfg(not(windows))]
+    {
+        #[cfg(any(test, feature = "test-support"))]
+        let deferred = test_force_deferred_placeholder_is_armed_for(out_path);
+        #[cfg(not(any(test, feature = "test-support")))]
+        let deferred = false;
+        if !deferred {
+            return Ok(match write_placeholder_if_absent(out_path, size, mtime_unix_nanos)? {
+                Some(identity) => PlaceholderIdentityToRecord::RecordOverwrite {
+                    identity,
+                    provider_kind: INTERNAL_INODE_PROVIDER_KIND,
+                },
+                None => PlaceholderIdentityToRecord::Clear,
+            });
+        }
+    }
+    create_or_defer_placeholder(out_path, size, mtime_unix_nanos)
 }
 
 /// Test-only failure-injection flag, consumed by `create_or_defer_
@@ -804,7 +1149,15 @@ pub fn xattrs_already_match_disk(
     path: &Path,
     xattrs: &[(String, Vec<u8>)],
 ) -> Result<bool, StorageError> {
-    let file = fs::File::open(path)?;
+    // A file whose mode denies its owner read access cannot be compared.
+    // "Not known to match" sends the caller down its mutating path, which is
+    // always safe here; failing hard would stop every later step for a
+    // file that is merely unreadable.
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
     let mut current = crate::chunker::read_replicated_xattrs(&file);
     let mut desired = xattrs.to_vec();
     current.sort();
@@ -865,7 +1218,20 @@ pub fn verify_replicated_xattrs_exact(
     desired: &[(String, Vec<u8>)],
 ) -> Result<bool, StorageError> {
     let file = fs::File::open(path)?;
-    let mut current = crate::chunker::read_replicated_xattrs_strict(&file)?;
+    replicated_xattrs_exactly_match(&file, desired)
+}
+
+/// The comparison `verify_replicated_xattrs_exact` makes once it holds
+/// the file open, split out so a test can hand it a descriptor whose
+/// attribute listing succeeds but whose attribute read is refused -- a
+/// state the path-based entry point cannot reach, since it opens the
+/// file read-only and a file its caller cannot read never gets that far.
+#[cfg(target_os = "linux")]
+fn replicated_xattrs_exactly_match(
+    file: &fs::File,
+    desired: &[(String, Vec<u8>)],
+) -> Result<bool, StorageError> {
+    let mut current = crate::chunker::read_replicated_xattrs_strict(file)?;
     let mut desired = desired.to_vec();
     current.sort();
     desired.sort();
@@ -911,6 +1277,178 @@ pub fn verify_replicated_xattrs_exact(
 /// disk are preserved untouched. A no-op on any non-Unix platform (Windows
 /// has no equivalent permission-bits model, so this must be silent there,
 /// not an error).
+/// Applies a materialized regular file's replicated metadata: extended
+/// attributes first, permission bits second. The order is the contract.
+/// Setting or listing attributes needs access the target mode may not
+/// grant (`apply_xattrs` opens the file for reading, and a `user.*`
+/// attribute can only be written by someone who may write the file), so a
+/// replicated mode such as `0o200` or `0o444` applied first would make the
+/// attribute step fail with a permission error. The freshly written file
+/// still carries the mode it was created with until the last step here.
+pub fn apply_file_metadata(
+    path: &Path,
+    unix_mode: Option<u32>,
+    xattrs: &[(String, Vec<u8>)],
+) -> Result<(), StorageError> {
+    apply_xattrs(path, xattrs)?;
+    apply_unix_mode(path, unix_mode)
+}
+
+/// Evidence from one write attempt that a path's replicated extended
+/// attributes were set and then strictly re-read as exactly the desired set
+/// ([`verify_replicated_xattrs_exact`]) BEFORE that attempt applied the
+/// final mode. Only [`apply_file_metadata_verified`] constructs it.
+///
+/// It exists for the case a later re-read cannot cover: a replicated mode
+/// that revokes the owner's read permission (`0o200`) makes the attributes
+/// unreadable once the mode lands, although changing the mode does not
+/// change them. A caller that just wrote the file may use this in place of
+/// a re-read. A caller proving disk state it did not just write must still
+/// re-read with [`verify_replicated_xattrs_exact`], and an unreadable file
+/// is then correctly "not provable".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XattrsConfirmedInAttempt {
+    path: PathBuf,
+    xattrs: Vec<(String, Vec<u8>)>,
+}
+
+impl XattrsConfirmedInAttempt {
+    fn new(path: &Path, xattrs: &[(String, Vec<u8>)]) -> Self {
+        let mut xattrs = xattrs.to_vec();
+        xattrs.sort();
+        Self { path: path.to_path_buf(), xattrs }
+    }
+
+    /// Whether this confirmation is about `path` holding exactly `xattrs`.
+    /// A caller must check this before relying on it, so a confirmation
+    /// can never be spent on a different path or a different version.
+    pub fn covers(&self, path: &Path, xattrs: &[(String, Vec<u8>)]) -> bool {
+        let mut desired = xattrs.to_vec();
+        desired.sort();
+        self.path == path && self.xattrs == desired
+    }
+}
+
+/// Why [`apply_file_metadata_verified`] could not confirm the attributes.
+#[derive(Debug)]
+pub enum XattrsNotConfirmed {
+    /// Read back, and not the desired set.
+    Mismatch,
+    /// Could not be set or read back, e.g. a file whose current mode already
+    /// denies the owner read access.
+    Unreadable(StorageError),
+}
+
+/// What [`apply_file_metadata_verified`] established about one attempt.
+#[derive(Debug)]
+#[must_use = "the attribute confirmation is the ExactObject evidence; dropping it loses the proof"]
+pub struct AppliedFileMetadata {
+    xattrs: Result<XattrsConfirmedInAttempt, XattrsNotConfirmed>,
+}
+
+impl AppliedFileMetadata {
+    pub fn into_xattrs(self) -> Result<XattrsConfirmedInAttempt, XattrsNotConfirmed> {
+        self.xattrs
+    }
+}
+
+/// Where the replicated-xattr half of an exact-object proof comes from, for
+/// every writer that publishes one (local convergence, access hydration,
+/// materialization repair), so they all accept exactly the same evidence.
+///
+/// A path this attempt just wrote carries the attempt's own strict check,
+/// taken before the final mode was applied ([`apply_file_metadata_verified`]).
+/// A path whose disk state this attempt did not write is re-proved from disk,
+/// and on Linux an unreadable file then cannot be proved -- which is the
+/// correct answer, not something to accept as exact.
+#[derive(Debug)]
+pub enum XattrEvidence {
+    /// This attempt set the attributes and strictly re-read them.
+    ConfirmedInAttempt(XattrsConfirmedInAttempt),
+    /// This attempt set the attributes but could not confirm them.
+    NotConfirmedInAttempt(XattrsNotConfirmed),
+    /// Nothing was written in this attempt; prove what disk holds now.
+    ReproveFromDisk,
+}
+
+impl From<AppliedFileMetadata> for XattrEvidence {
+    fn from(applied: AppliedFileMetadata) -> Self {
+        match applied.into_xattrs() {
+            Ok(confirmed) => Self::ConfirmedInAttempt(confirmed),
+            Err(reason) => Self::NotConfirmedInAttempt(reason),
+        }
+    }
+}
+
+/// Why [`XattrEvidence::prove`] refused to back an exact claim.
+#[derive(Debug)]
+pub enum XattrProofRefused {
+    /// An in-attempt confirmation for a different path or attribute set.
+    ConfirmationDoesNotCover,
+    /// This attempt set the attributes but could not confirm them.
+    NotConfirmedInAttempt,
+    /// Re-read from disk, and not the desired set.
+    DiskMismatch,
+    /// Re-read from disk failed (e.g. an owner-unreadable file).
+    DiskUnreadable(StorageError),
+}
+
+impl XattrEvidence {
+    /// Whether this evidence proves `out_path` holds exactly `desired`. An
+    /// in-attempt confirmation counts only for the path and set it was taken
+    /// for; `ReproveFromDisk` re-reads strictly and never treats a failed
+    /// read as a match.
+    pub fn prove(
+        &self,
+        out_path: &Path,
+        desired: &[(String, Vec<u8>)],
+    ) -> Result<(), XattrProofRefused> {
+        match self {
+            Self::ConfirmedInAttempt(confirmed) if confirmed.covers(out_path, desired) => Ok(()),
+            Self::ConfirmedInAttempt(_) => Err(XattrProofRefused::ConfirmationDoesNotCover),
+            Self::NotConfirmedInAttempt(_) => Err(XattrProofRefused::NotConfirmedInAttempt),
+            Self::ReproveFromDisk => match verify_replicated_xattrs_exact(out_path, desired) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(XattrProofRefused::DiskMismatch),
+                Err(error) => Err(XattrProofRefused::DiskUnreadable(error)),
+            },
+        }
+    }
+}
+
+/// [`apply_file_metadata`] for a caller that will claim the result as an
+/// exact object: sets the attributes, strictly re-reads them while the file
+/// still has the mode it was written with, applies the final mode, and
+/// returns what the re-read established. Order:
+///
+/// 1. apply the replicated extended attributes
+/// 2. strictly verify them
+/// 3. apply the final permission bits
+///
+/// A permission error setting the attributes (a file already carrying an
+/// owner-unreadable mode) is reported as [`XattrsNotConfirmed::Unreadable`],
+/// not as a hard error, so the caller leaves the path unproven instead of
+/// failing everything around it. Any other error is returned as is.
+pub fn apply_file_metadata_verified(
+    path: &Path,
+    unix_mode: Option<u32>,
+    xattrs: &[(String, Vec<u8>)],
+) -> Result<AppliedFileMetadata, StorageError> {
+    let confirmation = match apply_xattrs(path, xattrs) {
+        Ok(()) => match verify_replicated_xattrs_exact(path, xattrs) {
+            Ok(true) => Ok(XattrsConfirmedInAttempt::new(path, xattrs)),
+            Ok(false) => Err(XattrsNotConfirmed::Mismatch),
+            Err(error) => Err(XattrsNotConfirmed::Unreadable(error)),
+        },
+        Err(StorageError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            Err(XattrsNotConfirmed::Unreadable(StorageError::Io(error)))
+        }
+        Err(error) => return Err(error),
+    };
+    apply_unix_mode(path, unix_mode)?;
+    Ok(AppliedFileMetadata { xattrs: confirmation })
+}
+
 #[cfg(unix)]
 pub fn apply_unix_mode(path: &Path, unix_mode: Option<u32>) -> Result<(), StorageError> {
     use std::os::unix::fs::PermissionsExt;
@@ -940,7 +1478,7 @@ pub fn apply_unix_mode(_path: &Path, _unix_mode: Option<u32>) -> Result<(), Stor
 }
 
 /// Sets an already-materialized regular file's replicated extended
-/// attributes (Competitive Hardening C1.2a) to exactly `xattrs` — the
+/// attributes to exactly `xattrs` — the
 /// write-side counterpart to `chunker::read_replicated_xattrs`. Scoped to
 /// the same `user.*` allow-list the read side captures under: only names
 /// in that namespace are ever set or removed here, so an attribute this
@@ -1029,16 +1567,12 @@ pub fn apply_xattrs(_path: &Path, _xattrs: &[(String, Vec<u8>)]) -> Result<(), S
 /// temp-path-then-rename pattern `reconstruct_file`/`write_placeholder`
 /// already use: `unique_tmp_path`'s existing collision-free naming scheme
 /// picks a temp path, `std::os::unix::fs::symlink` creates the link there,
-/// and `fs::rename` atomically swaps it into place — a torn/partial symlink
-/// is never observable at `out_path`, matching the guarantee regular-file
-/// materialization already gives. Moved out of `yadorilink-sync-core`'s
-/// `chunker.rs` in Phase 7D-6: needed directly by `yadorilink-peer-session`
-/// production code (`materialize_symlink_at`).
+/// and `fs::rename` atomically swaps it into place — a torn/partial
+/// symlink is never observable at `out_path`, matching the guarantee
+/// regular-file materialization already gives.
 #[cfg(unix)]
 pub fn materialize_symlink(out_path: &Path, target: &[u8]) -> Result<(), StorageError> {
-    if let Some(parent) = out_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    require_parent_directory(out_path)?;
     let tmp_path = unique_tmp_path(out_path);
     std::os::unix::fs::symlink(
         yadorilink_root_authority::fs_identity::bytes_to_target(target),
@@ -1088,9 +1622,7 @@ pub fn materialize_symlink_windows(out_path: &Path, target: &[u8]) -> Result<(),
             ),
         )));
     };
-    if let Some(parent) = out_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    require_parent_directory(out_path)?;
     let tmp_path = unique_tmp_path(out_path);
     let target_hint = out_path.parent().unwrap_or(out_path).join(&target);
     let is_dir = fs::metadata(&target_hint).map(|m| m.is_dir()).unwrap_or(false);
@@ -1115,450 +1647,108 @@ pub fn materialize_symlink_windows(out_path: &Path, target: &[u8]) -> Result<(),
 }
 
 #[cfg(test)]
-mod tests {
+mod tests;
+
+#[cfg(all(test, unix))]
+mod read_traversal_tests {
     use super::*;
-    use std::ffi::OsString;
 
-    /// C4-6: `reconstruct_file_to_temp` + `persist_reconstructed_file` must
-    /// together produce exactly what the composed `reconstruct_file` always
-    /// did -- and, critically, the temp-write half alone must never touch
-    /// `out_path` at all, since a caller batching several paths' SQLite
-    /// commits relies on being able to run this half for many paths without
-    /// any of them becoming visible until the (separate, later) publish
-    /// half runs.
-    #[test]
-    fn reconstruct_file_to_temp_then_persist_matches_reconstruct_file() {
-        let store_dir = tempfile::tempdir().unwrap();
-        let store = crate::FsBlockStore::new(store_dir.path()).unwrap();
-        let src_dir = tempfile::tempdir().unwrap();
-        let src_path = src_dir.path().join("file.bin");
-        let content: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
-        fs::write(&src_path, &content).unwrap();
-        let blocks = crate::chunker::chunk_file(&store, &src_path).unwrap();
-
-        let out_path = src_dir.path().join("reconstructed.bin");
-        let tmp_path = reconstruct_file_to_temp(&store, &out_path, &blocks, -1).unwrap();
-
-        assert!(!out_path.exists(), "the temp-write half must not touch out_path at all");
-        assert!(tmp_path.exists());
-        assert_eq!(fs::read(&tmp_path).unwrap(), content);
-
-        persist_reconstructed_file(&tmp_path, &out_path).unwrap();
-
-        assert!(!tmp_path.exists(), "the temp path must be gone after a successful publish");
-        assert_eq!(fs::read(&out_path).unwrap(), content);
+    fn root_with_link() -> (tempfile::TempDir, tempfile::TempDir) {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("victim.txt"), b"outside").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("link")).unwrap();
+        (root, outside)
     }
 
-    /// A placeholder reports the file's correct size via `stat`
-    /// without its content actually occupying disk space or being fetched.
     #[test]
-    fn write_placeholder_reports_correct_size_with_no_content() {
-        let dir = tempfile::tempdir().unwrap();
-        let out_path = dir.path().join("placeholder.bin");
-
-        write_placeholder(&out_path, 5_000_000, 1_700_000_000_000_000_000).unwrap();
-
-        let metadata = fs::metadata(&out_path).unwrap();
-        assert_eq!(metadata.len(), 5_000_000);
-        // No real bytes were written — reading it back is all zeros, not
-        // whatever content a real 5MB file might have had.
-        let content = fs::read(&out_path).unwrap();
-        assert!(content.iter().all(|&b| b == 0));
-    }
-
-    /// The identity `write_placeholder` returns for a freshly-written
-    /// placeholder must actually match the placeholder's real on-disk
-    /// identity, not merely be present -- a caller comparing against it
-    /// later relies on this being the truth, not a synthetic value.
-    #[test]
-    #[cfg(unix)]
-    fn write_placeholder_returns_the_real_on_disk_identity() {
-        use std::os::unix::fs::MetadataExt;
-
-        let dir = tempfile::tempdir().unwrap();
-        let out_path = dir.path().join("placeholder.bin");
-
-        let identity = write_placeholder(&out_path, 4096, 0).unwrap().unwrap();
-
-        let metadata = fs::metadata(&out_path).unwrap();
-        assert_eq!(identity.dev, metadata.dev());
-        assert_eq!(identity.ino, metadata.ino());
-    }
-
-    /// Two placeholders written to the SAME path in sequence (mirroring a
-    /// peer sending an updated version, or a repeated eviction) must mint
-    /// DIFFERENT identities -- each `write_placeholder` call creates a
-    /// fresh temp file and renames it in, so the second call's inode can
-    /// never equal the first's. This is the exact property M1-2's
-    /// generation-staleness invariant depends on: an old identity must
-    /// stop matching once its placeholder is superseded.
-    #[test]
-    #[cfg(unix)]
-    fn successive_placeholder_writes_to_the_same_path_mint_different_identities() {
-        let dir = tempfile::tempdir().unwrap();
-        let out_path = dir.path().join("placeholder.bin");
-
-        let first = write_placeholder(&out_path, 100, 0).unwrap().unwrap();
-        let second = write_placeholder(&out_path, 100, 0).unwrap().unwrap();
-
-        assert_ne!(first, second, "a re-written placeholder must mint a fresh identity");
-    }
-
-    /// M2-3a: on Windows, `create_or_defer_placeholder` must write NOTHING
-    /// to disk -- the real reparse-point placeholder is created later by
-    /// `cfapi-host.exe`'s own poll, which `write_placeholder`'s prior
-    /// unconditional sparse-file write would have pre-empted (that write
-    /// made `full_path.exists()` true, and `sync_placeholders` skips any
-    /// path that already exists).
-    #[test]
-    #[cfg(windows)]
-    fn windows_create_or_defer_placeholder_writes_nothing_to_disk() {
-        let dir = tempfile::tempdir().unwrap();
-        let out_path = dir.path().join("placeholder.bin");
-
-        let outcome = create_or_defer_placeholder(&out_path, 5_000_000, 0).unwrap();
-
-        assert!(!out_path.exists(), "Windows must defer creation to cfapi-host, not pre-empt it");
+    fn a_path_through_a_symlinked_component_is_refused() {
+        let (root, _outside) = root_with_link();
         assert!(matches!(
-            outcome,
-            PlaceholderIdentityToRecord::RecordIfAbsent {
-                provider_kind: WINDOWS_CFAPI_GENERATION_PROVIDER_KIND,
-                ..
-            }
+            resolve_read_path_without_traversal(root.path(), Path::new("link/victim.txt")),
+            Err(StorageError::PathEscapesRoot(_))
         ));
     }
 
-    /// The old bug this closes: `write_placeholder` returning `None` on
-    /// Windows made every caller call `clear_placeholder_generation`,
-    /// discarding any generation. `create_or_defer_placeholder` must always
-    /// return `RecordIfAbsent`, never `Clear`, on Windows. It must also
-    /// never return `RecordOverwrite` -- an unconditional overwrite would
-    /// reintroduce the exact race this shape exists to prevent (see
-    /// `PlaceholderIdentityToRecord`'s own doc comment).
+    /// The symlink itself is an ordinary member of the folder — it is
+    /// synchronised, as a symlink. Only walking *through* it is refused.
     #[test]
-    #[cfg(windows)]
-    fn windows_create_or_defer_placeholder_never_clears() {
-        let dir = tempfile::tempdir().unwrap();
-        let out_path = dir.path().join("placeholder.bin");
-
-        let outcome = create_or_defer_placeholder(&out_path, 100, 0).unwrap();
-
-        assert!(matches!(outcome, PlaceholderIdentityToRecord::RecordIfAbsent { .. }));
+    fn the_symlink_itself_resolves() {
+        let (root, _outside) = root_with_link();
+        assert_eq!(
+            resolve_read_path_without_traversal(root.path(), Path::new("link")).unwrap(),
+            root.path().join("link")
+        );
     }
 
-    /// Mirrors `successive_placeholder_writes_to_the_same_path_mint_
-    /// different_identities` for the Windows path: a re-create at the same
-    /// path (an evict immediately followed by a re-materialize) must not
-    /// reuse a stale generation a live CfAPI comparison could mistake for
-    /// the OLD placeholder still being untouched.
+    /// A link pointing back inside the root is refused too. Following it
+    /// would give one object two logical paths, and a path is a semantic
+    /// identity here.
     #[test]
-    #[cfg(windows)]
-    fn windows_successive_defers_at_the_same_path_mint_different_generations() {
-        let dir = tempfile::tempdir().unwrap();
-        let out_path = dir.path().join("placeholder.bin");
-
-        let first = create_or_defer_placeholder(&out_path, 100, 0).unwrap();
-        let second = create_or_defer_placeholder(&out_path, 100, 0).unwrap();
-
-        assert_ne!(first, second, "a re-deferred placeholder must mint a fresh generation");
-    }
-
-    #[test]
-    fn failed_placeholder_rename_removes_its_temp_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let out_path = dir.path().join("occupied");
-        fs::create_dir(&out_path).unwrap();
-
-        assert!(write_placeholder(&out_path, 1024, 0).is_err());
-
-        let entries: Vec<_> =
-            fs::read_dir(dir.path()).unwrap().map(|entry| entry.unwrap().file_name()).collect();
-        assert_eq!(entries, vec![OsString::from("occupied")]);
-        assert!(out_path.is_dir());
-    }
-
-    /// `materialize_symlink` creates a real, correctly-targeted symlink at
-    /// `out_path`, atomically (via `unique_tmp_path` + rename — no
-    /// partial/temp artifact left behind at the final path).
-    #[cfg(unix)]
-    #[test]
-    fn materialize_symlink_creates_a_real_symlink_atomically() {
-        let dir = tempfile::tempdir().unwrap();
-        let out_path = dir.path().join("link.txt");
-
-        materialize_symlink(&out_path, b"../outside/target.txt").unwrap();
-
-        let link_meta = fs::symlink_metadata(&out_path).unwrap();
-        assert!(link_meta.file_type().is_symlink(), "must be a real symlink, not a regular file");
-        assert_eq!(fs::read_link(&out_path).unwrap(), Path::new("../outside/target.txt"));
-    }
-
-    /// Re-materializing the same path (e.g. a re-sent index
-    /// update for an unchanged symlink record) must cleanly replace the
-    /// old link via the same atomic rename, not error on "already exists".
-    #[cfg(unix)]
-    #[test]
-    fn materialize_symlink_can_replace_an_existing_link_atomically() {
-        let dir = tempfile::tempdir().unwrap();
-        let out_path = dir.path().join("link.txt");
-
-        materialize_symlink(&out_path, b"old-target.txt").unwrap();
-        materialize_symlink(&out_path, b"new-target.txt").unwrap();
-
-        assert_eq!(fs::read_link(&out_path).unwrap(), Path::new("new-target.txt"));
-    }
-
-    #[test]
-    fn stamp_mtime_at_path_actually_changes_disk_mtime() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("f.txt");
-        fs::write(&path, b"content").unwrap();
-        let desired = 1_700_000_123_456_789i64;
-
-        assert!(!mtime_already_matches_disk(&path, desired).unwrap());
-        stamp_mtime_at_path(&path, desired).unwrap();
-        assert!(mtime_already_matches_disk(&path, desired).unwrap());
-    }
-
-    /// A negative `desired_mtime_unix_nanos` (the "no authoritative
-    /// mtime to stamp" sentinel) is trivially satisfied regardless of
-    /// whatever the disk actually holds -- there is nothing to compare
-    /// against, mirroring `unix_mode_already_matches_disk`'s own
-    /// `unix_mode: None` treatment.
-    #[test]
-    fn mtime_already_matches_disk_is_trivially_true_for_a_negative_sentinel() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("f.txt");
-        fs::write(&path, b"content").unwrap();
-        assert!(mtime_already_matches_disk(&path, -1).unwrap());
-    }
-
-    /// Changing the requested mode actually changes the on-disk permission
-    /// bits, and is idempotent (calling it again with the same value
-    /// doesn't error or otherwise misbehave). `None` is a deliberate no-op
-    /// — never fabricates a mode for a version that carries none.
-    #[cfg(unix)]
-    #[test]
-    fn apply_unix_mode_sets_and_clears_permission_bits() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("script.sh");
-        fs::write(&path, b"#!/bin/sh\necho hi\n").unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-
-        apply_unix_mode(&path, Some(0o744)).unwrap();
-        let mode_after_set = fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode_after_set & 0o777, 0o744, "owner-exec bit must be set");
-
-        // Idempotent: setting it again when already set is a harmless no-op.
-        apply_unix_mode(&path, Some(0o744)).unwrap();
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o744);
-
-        apply_unix_mode(&path, Some(0o644)).unwrap();
-        let mode_after_clear = fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode_after_clear & 0o777, 0o644, "owner-exec bit must be cleared");
-
-        // `None` is a no-op — the mode from the last real apply survives.
-        apply_unix_mode(&path, None).unwrap();
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o644);
-    }
-
-    /// `apply_unix_mode` must never error on a plain file — this
-    /// runs unconditionally (not `#[cfg(unix)]`-gated) so the non-Unix
-    /// no-op arm is at least compiled and exercised on every platform this
-    /// crate builds for; on this dev machine it's the `#[cfg(unix)]`-arm's
-    /// real permission-changing behavior above that's exercised.
-    #[test]
-    fn apply_unix_mode_never_errors_on_a_plain_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("plain.txt");
-        fs::write(&path, b"hello").unwrap();
-        apply_unix_mode(&path, Some(0o755)).unwrap();
-        apply_unix_mode(&path, None).unwrap();
-    }
-
-    /// An independent review's finding: `create_dir_all(parent)` follows
-    /// symlinks like any other `mkdir` chain, so a symlink planted at an
-    /// intermediate component (`escape -> outside`) let the OLD directory-
-    /// creation step create real directories on the far side of it,
-    /// entirely outside the sync root, before the `canonicalize`+
-    /// `starts_with` check that runs after it could ever refuse the
-    /// write. The `Err` result alone (already covered by
-    /// `materialize_symlink_at_refuses_a_root_whose_marker_no_longer_
-    /// matches`-style tests elsewhere) is not enough to prove this fix --
-    /// the whole point is that side effects outside the root must never
-    /// happen at all, error or not.
-    #[cfg(unix)]
-    #[test]
-    fn verify_write_target_within_root_creates_no_directories_through_an_escape_symlink() {
-        let sync_root = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink(outside.path(), sync_root.path().join("escape")).unwrap();
-
-        let out_path = sync_root.path().join("escape").join("a").join("b").join("pwned.txt");
-        let result = verify_write_target_within_root(&out_path, sync_root.path());
-
-        assert!(result.is_err(), "a write target reached only through a symlink must be refused");
+    fn a_link_whose_target_is_inside_the_root_is_refused_as_well() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("real")).unwrap();
+        std::fs::write(root.path().join("real/file.txt"), b"x").unwrap();
+        std::os::unix::fs::symlink(root.path().join("real"), root.path().join("alias")).unwrap();
         assert!(
-            !outside.path().join("a").exists(),
-            "no directory must ever be created on the far side of the escape symlink, \
-             regardless of whether the write itself is correctly refused"
+            resolve_read_path_without_traversal(root.path(), Path::new("real/file.txt")).is_ok()
         );
+        assert!(matches!(
+            resolve_read_path_without_traversal(root.path(), Path::new("alias/file.txt")),
+            Err(StorageError::PathEscapesRoot(_))
+        ));
     }
 
-    /// The non-escaping case must keep working exactly as before: nested
-    /// directories that genuinely need creating under the real root are
-    /// still created, component by component, with no regression from
-    /// the old single `create_dir_all` call.
     #[test]
-    fn verify_write_target_within_root_still_creates_genuine_nested_directories() {
-        let sync_root = tempfile::tempdir().unwrap();
-        let out_path = sync_root.path().join("a").join("b").join("c").join("file.txt");
-
-        verify_write_target_within_root(&out_path, sync_root.path()).unwrap();
-
-        assert!(sync_root.path().join("a").join("b").join("c").is_dir());
-    }
-
-    /// `apply_xattrs` must both set every attribute in the supplied list
-    /// AND remove any `user.*` attribute already on disk that the list no
-    /// longer carries -- the same "set exactly what's replicated, nothing
-    /// left over from a prior version" contract `apply_unix_mode` gives
-    /// for permission bits.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn apply_xattrs_sets_new_attributes_and_removes_stale_ones() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("file.bin");
-        fs::write(&path, b"content").unwrap();
-
-        apply_xattrs(&path, &[("user.keep".to_string(), b"v1".to_vec())]).unwrap();
+    fn an_ordinary_nested_path_resolves() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("a/b")).unwrap();
+        std::fs::write(root.path().join("a/b/c.txt"), b"x").unwrap();
         assert_eq!(
-            crate::read_replicated_xattrs(&fs::File::open(&path).unwrap()),
-            vec![("user.keep".to_string(), b"v1".to_vec())]
-        );
-
-        // A later version drops "user.keep" and adds "user.new" -- the
-        // stale attribute must not survive the second call.
-        apply_xattrs(&path, &[("user.new".to_string(), b"v2".to_vec())]).unwrap();
-        assert_eq!(
-            crate::read_replicated_xattrs(&fs::File::open(&path).unwrap()),
-            vec![("user.new".to_string(), b"v2".to_vec())]
+            resolve_read_path_without_traversal(root.path(), Path::new("a/b/c.txt")).unwrap(),
+            root.path().join("a/b/c.txt")
         );
     }
 
-    /// An empty attribute list is a real, meaningful target state (this
-    /// version genuinely carries no extended attributes) -- confirms it
-    /// clears whatever was already on disk rather than being silently
-    /// treated as "nothing to do."
-    #[cfg(target_os = "linux")]
+    /// A delete must not reach through a symlinked component either.
+    ///
+    /// This is the twin of the write-side check, and it was already correct —
+    /// it canonicalises the target's parent and refuses when that lands
+    /// outside the root. It had no test. Stated here rather than as a
+    /// two-device scenario because that scenario cannot isolate it: the two
+    /// devices legitimately disagree about whether the component is a
+    /// directory or a symlink, and the delete stalls on that rather than on
+    /// the defence.
     #[test]
-    fn apply_xattrs_with_an_empty_list_clears_existing_attributes() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("file.bin");
-        fs::write(&path, b"content").unwrap();
-
-        apply_xattrs(&path, &[("user.gone".to_string(), b"v".to_vec())]).unwrap();
-        apply_xattrs(&path, &[]).unwrap();
-
-        assert_eq!(crate::read_replicated_xattrs(&fs::File::open(&path).unwrap()), Vec::new());
+    fn a_delete_through_a_symlinked_component_is_refused() {
+        let (root, outside) = root_with_link();
+        let victim = outside.path().join("victim.txt");
+        assert!(matches!(
+            verify_delete_target_within_root(&root.path().join("link/victim.txt"), root.path()),
+            Err(StorageError::PathEscapesRoot(_))
+        ));
+        assert!(victim.exists(), "the check itself must not touch the target");
     }
 
-    /// Regression for an independent review's finding: `apply_xattrs`'s
-    /// own removal side already restricted itself to `user.*`, but its
-    /// set side handed every incoming name straight to `fsetxattr`
-    /// unconditionally -- defense-in-depth for the same allow-list
-    /// `FileMeta::decode` now rejects a violation of at the wire-decode
-    /// boundary (a second, independent layer, in case some future caller
-    /// ever builds an `xattrs` list some other way). Confirmed genuinely
-    /// RED by temporarily hardcoding this to `true` for every name: it no
-    /// longer distinguished the allow-listed namespace from any other.
-    #[cfg(target_os = "linux")]
+    /// And a delete inside the root is still allowed, so the rule above
+    /// cannot have been implemented as "refuse every delete".
     #[test]
-    fn is_replicated_xattr_name_only_accepts_the_user_namespace() {
-        assert!(is_replicated_xattr_name("user.foo"));
-        assert!(!is_replicated_xattr_name("security.selinux"));
-        assert!(!is_replicated_xattr_name("trusted.overlay"));
-        assert!(!is_replicated_xattr_name("system.posix_acl_access"));
-        assert!(!is_replicated_xattr_name("com.apple.quarantine"));
+    fn an_ordinary_delete_inside_the_root_is_allowed() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("a")).unwrap();
+        std::fs::write(root.path().join("a/file.txt"), b"x").unwrap();
+        assert!(
+            verify_delete_target_within_root(&root.path().join("a/file.txt"), root.path()).is_ok()
+        );
     }
 
-    /// The `ExactObject` proof gate's positive case: an attribute set
-    /// genuinely applied end to end verifies as an exact match.
-    #[cfg(target_os = "linux")]
+    /// A path whose components do not exist yet is not a traversal; whether
+    /// it is there is the caller's question.
     #[test]
-    fn verify_replicated_xattrs_exact_confirms_a_genuine_match() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("file.bin");
-        fs::write(&path, b"content").unwrap();
-        let desired = vec![("user.a".to_string(), b"1".to_vec())];
-
-        apply_xattrs(&path, &desired).unwrap();
-
-        assert!(verify_replicated_xattrs_exact(&path, &desired).unwrap());
+    fn a_missing_path_is_not_a_traversal() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(
+            resolve_read_path_without_traversal(root.path(), Path::new("nope/none.txt")).is_ok()
+        );
     }
-
-    /// Regression for the exact gap an independent review caught: a
-    /// desired attribute that never actually landed on disk (standing in
-    /// for `apply_xattrs`'s own `fsetxattr` silently failing, which it
-    /// never surfaces as an `Err`) must never verify as an exact match.
-    /// Confirmed genuinely RED by temporarily hardcoding this function's
-    /// comparison to `true`: the mismatch below went undetected.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn verify_replicated_xattrs_exact_detects_an_attribute_that_never_landed() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("file.bin");
-        fs::write(&path, b"content").unwrap();
-        let desired = vec![("user.missing".to_string(), b"1".to_vec())];
-
-        // No `apply_xattrs` call at all -- disk carries none of what is
-        // desired, exactly what a silently-swallowed `fsetxattr` failure
-        // would also leave behind.
-
-        assert!(!verify_replicated_xattrs_exact(&path, &desired).unwrap());
-    }
-
-    /// The mirror case: a stale attribute still on disk that the desired
-    /// version no longer carries (standing in for `apply_xattrs`'s
-    /// `fremovexattr` silently failing) must also never verify as exact.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn verify_replicated_xattrs_exact_detects_a_stale_attribute_that_should_be_gone() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("file.bin");
-        fs::write(&path, b"content").unwrap();
-
-        apply_xattrs(&path, &[("user.stale".to_string(), b"v".to_vec())]).unwrap();
-        // The version this file is meant to now exactly hold desires no
-        // attributes at all -- as if `apply_xattrs(&path, &[])`'s own
-        // `fremovexattr` call for "user.stale" had silently failed.
-
-        assert!(!verify_replicated_xattrs_exact(&path, &[]).unwrap());
-    }
-
-    /// A same-name attribute whose VALUE differs must also fail exactness
-    /// -- name-only comparison would wrongly accept this.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn verify_replicated_xattrs_exact_detects_a_value_mismatch() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("file.bin");
-        fs::write(&path, b"content").unwrap();
-
-        apply_xattrs(&path, &[("user.a".to_string(), b"old".to_vec())]).unwrap();
-
-        assert!(!verify_replicated_xattrs_exact(&path, &[("user.a".to_string(), b"new".to_vec())])
-            .unwrap());
-    }
-
-    // The non-Linux `verify_replicated_xattrs_exact` arm (always
-    // `Ok(true)`, unconditionally treating xattrs as retained-only on a
-    // backend with no replicated-xattr support -- see its own doc
-    // comment for the target-projection-contract reasoning) is `#[cfg(not(
-    // target_os = "linux"))]`, so it never compiles on the Linux machines
-    // this workspace is actually developed/tested on and has no dedicated
-    // test here; it is now a single unconditional return with no branch
-    // left to exercise.
 }

@@ -221,16 +221,46 @@ machine, closing most of that original gap:
   against the **installed** unit (so `ExecStart`'s path actually
   resolves) — **zero errors or warnings**.
 
-What is still **not** verified, and needs a real Linux machine/VM with a
-live user session (a plain container has no session bus):
+A later pass closed the remaining session-dependent gaps. They needed a
+machine with a real per-user systemd manager, which a plain
+`docker run ubuntu bash` does not have; running Ubuntu 24.04 with systemd
+as PID 1 and enabling lingering for the installing user provides one.
+Against a real installation on such a machine, all of the following were
+observed rather than inferred:
 
-- `systemctl --user enable --now yadorilink-daemon` actually starting the
-  daemon, `Restart=on-failure` actually restarting it after a crash, and
-  `WantedBy=default.target` actually autostarting it at login.
-- `./uninstall.sh`'s live `systemctl --user disable --now` path (its
-  `dpkg -r` half is implicitly covered by the apt test above removing the
-  package cleanly when the container exits, but the per-user unit
-  stop/disable step needs a real session to exercise).
+- `systemctl --user enable --now yadorilink-daemon` starts the daemon and
+  it reaches `active (running)`, and `yadorilink status` then reaches it
+  over the control socket.
+- The daemon under the unit reads the account session stored by the CLI, so
+  it authenticates to the coordination plane rather than merely running.
+  Worth stating separately: the daemon's process session is not the shell's,
+  and a daemon that cannot read the session would look healthy locally while
+  never reaching the coordination plane at all.
+- `Restart=on-failure` brings the daemon back after `kill -9`, within a
+  few seconds.
+- `WantedBy=default.target` starts the daemon by itself after the machine
+  restarts, with no user action, and previously linked folders are still
+  linked.
+- `./uninstall.sh`, run as the normal user, takes its live
+  `systemctl --user disable --now` path: afterwards the unit is no longer
+  known to systemd, both binaries and the unit file are gone, and
+  `~/.local/share/yadorilink` is left in place until `--purge-data` is
+  passed.
+
+Also confirmed on that machine: `lintian` is clean when run against the
+`.deb` on the machine that installs it, and `systemd-analyze verify` on the
+**installed** unit reports nothing.
+
+Every claim in that list is about *packaging and the unit file*. None of
+them is a claim about sync behaviour between devices, which is covered by the
+project's test suites rather than by this packaging pass.
+
+What is still **not** verified here:
+
+- Anything about a **signed** package. Nothing in this directory signs the
+  `.deb`, and the verification above ran against an unsigned one.
+- Upgrading from a previously released version, as opposed to a fresh
+  install. There is no earlier release to upgrade from yet.
 
 ## ARM64 status
 

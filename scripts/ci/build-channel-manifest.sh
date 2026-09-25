@@ -56,10 +56,12 @@ artifacts_json="$(mktemp)"
     [ -f "$path" ] || return 0
     [ -f "$path.sha256" ] || { echo "missing checksum sidecar for $file" >&2; exit 1; }
     local sha; sha="$(sha_of "$path.sha256")"
+    # Byte count of the published file; the client requires it.
+    local size; size="$(wc -c < "$path" | tr -d '[:space:]')"
     [ "$first" -eq 1 ] || echo ","
     first=0
-    printf '  {"platform":"%s","arch":"%s","install_source":"standalone","artifact_url":"%s","artifact_sha256":"%s","artifact_publisher_identity":""}' \
-      "$platform" "$arch" "${BASE_URL}/${file}" "$sha"
+    printf '  {"platform":"%s","arch":"%s","install_source":"standalone","artifact_url":"%s","artifact_sha256":"%s","artifact_size":%s,"artifact_publisher_identity":""}' \
+      "$platform" "$arch" "${BASE_URL}/${file}" "$sha" "$size"
   }
   emit macos   aarch64 yadorilink-macos.pkg
   emit windows x86_64  yadorilink-setup.exe

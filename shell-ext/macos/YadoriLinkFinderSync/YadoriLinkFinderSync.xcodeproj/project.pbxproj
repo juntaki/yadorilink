@@ -7,66 +7,160 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		0633E2A91E6E9143C947F625 /* YadoriLinkFinderSync.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = CF875B1FD41021C7A8472594 /* YadoriLinkFinderSync.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		13AB2F04B7C96CCF89E1CD73 /* YadoriLinkModel in Frameworks */ = {isa = PBXBuildFile; productRef = B018135DEC6FFF0E7229DF84 /* YadoriLinkModel */; };
+		289B3CDFF3E124220B4D2888 /* YadoriLinkModel in Frameworks */ = {isa = PBXBuildFile; productRef = 74E7474B32C3FF311526DE6A /* YadoriLinkModel */; };
+		319CC1EFD74BEE754A3A68A0 /* YadoriLinkCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1FFBB5F2E3A8E9F5DA8AE6A5 /* YadoriLinkCore.swift */; };
+		397BAB43A325A0DA6D39C932 /* YadoriLinkFinderSync.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = CF875B1FD41021C7A8472594 /* YadoriLinkFinderSync.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		3C2F14227963ACA5677A8963 /* YadoriLinkFFI.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3C4FAA49F59793402265CF4A /* YadoriLinkFFI.framework */; };
+		3DF3417D2C9B85C79A9435DF /* FileProviderCatalogTreeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7221F2A2C8F1B50290DFB9D2 /* FileProviderCatalogTreeTests.swift */; };
+		412E0E31985D5D6743EB75FC /* YadoriLinkFixtures in Frameworks */ = {isa = PBXBuildFile; productRef = A31CE2E090FC7F18F928FB27 /* YadoriLinkFixtures */; };
+		51A4227622E1099713CB33EE /* YadoriLinkFFI.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = 3C4FAA49F59793402265CF4A /* YadoriLinkFFI.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		5E2B195A277198A7222A6174 /* LiveClientTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B81C7FEF033EEB6733BF09C9 /* LiveClientTests.swift */; };
+		60B9FA0FD9879B0B634052AC /* ClientFactory.swift in Sources */ = {isa = PBXBuildFile; fileRef = 927716FB5075DC6EB3A19031 /* ClientFactory.swift */; };
 		61AEB212D82B731FC9CB04C0 /* FileProviderItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D88BD2C6C8A3DACDAF17E22 /* FileProviderItem.swift */; };
+		65730C41BE48C9DCAF5DC43E /* YadoriLinkFixtures in Frameworks */ = {isa = PBXBuildFile; productRef = 274970BD01D68F608E915878 /* YadoriLinkFixtures */; };
+		7DA3A059C9F33D7CC5F6BC5C /* FFIMapping.swift in Sources */ = {isa = PBXBuildFile; fileRef = B7B989B7AF2D72BF4DC1442D /* FFIMapping.swift */; };
 		85F8DC6E1AA2DF3F2DD8B54A /* FileProviderModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 70104ADC9B15018C319CD43D /* FileProviderModel.swift */; };
-		89B92D41B796CE185C7BDFBF /* DomainRegistration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 352EBBC9C4D1263ADBC5A3FD /* DomainRegistration.swift */; };
+		8747137B9B359619B2397E63 /* LiveYadoriLinkClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC4DD06C309E4145F9D733BB /* LiveYadoriLinkClient.swift */; };
 		8BCBDD3DAE8D5CF1B359CF38 /* FileProviderExtension.swift in Sources */ = {isa = PBXBuildFile; fileRef = 46E3E507F0A862932B7FB16D /* FileProviderExtension.swift */; };
-		95C14C39D926A8CC403DF332 /* YadoriLinkFileProvider.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = F47B539D9A20D96672049D5E /* YadoriLinkFileProvider.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		90158EE5BB8CDDB64B316698 /* SystemServices.swift in Sources */ = {isa = PBXBuildFile; fileRef = 83615BE5D5B7707298BD6470 /* SystemServices.swift */; };
+		91575FF3AD7D1884CEC6D60D /* YadoriLinkFFI.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3C4FAA49F59793402265CF4A /* YadoriLinkFFI.framework */; };
+		A22937C09598590CB5C8B9FD /* FileProviderCatalogTree.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4F6EA37DE48DD29C622E3BEA /* FileProviderCatalogTree.swift */; };
+		AC0AC527F16507CF23830097 /* FFIMapping.swift in Sources */ = {isa = PBXBuildFile; fileRef = B7B989B7AF2D72BF4DC1442D /* FFIMapping.swift */; };
+		B555DFF3ED0A4BA61F3D9EF7 /* LiveYadoriLinkClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC4DD06C309E4145F9D733BB /* LiveYadoriLinkClient.swift */; };
+		C7A59E0C3EA682059ECC3569 /* DomainRegistration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 352EBBC9C4D1263ADBC5A3FD /* DomainRegistration.swift */; };
+		CABD04380B9B2A49F7471862 /* FileProviderCatalogTree.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4F6EA37DE48DD29C622E3BEA /* FileProviderCatalogTree.swift */; };
+		D4E145DA87F0A78634B9B3C3 /* YadoriLinkUI in Frameworks */ = {isa = PBXBuildFile; productRef = F681DA7E988AE655151874DF /* YadoriLinkUI */; };
 		DAB7BBE65F3FB060FB9452C6 /* FileProviderEnumerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 943EF0F010F0BA6E951619DD /* FileProviderEnumerator.swift */; };
+		E1A75649BFA0F83ED427CD63 /* YadoriLinkFFI.swift in Sources */ = {isa = PBXBuildFile; fileRef = A72F3B5BE141698C02DEA6B9 /* YadoriLinkFFI.swift */; };
+		E530B322AB283420E629CD9E /* YadoriLinkApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA7C0855FB53B2E94F4B608D /* YadoriLinkApp.swift */; };
+		E655CBBD7A123973BB119A7B /* YadoriLinkFFI.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = 3C4FAA49F59793402265CF4A /* YadoriLinkFFI.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		ED0C89E264106398323C16E6 /* FinderSync.swift in Sources */ = {isa = PBXBuildFile; fileRef = 03C18D6B33051972D27DFB91 /* FinderSync.swift */; };
-		F9C6AA92D8255767422D0301 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = EAE0C369E749366C4D4789AC /* main.swift */; };
+		F0F1E9B7C22451A458B7EB5F /* YadoriLinkFileProvider.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = F47B539D9A20D96672049D5E /* YadoriLinkFileProvider.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
-		25D2211D1E76D195F7156339 /* PBXContainerItemProxy */ = {
+		02633FA1813D6CF94A27A85E /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
 			containerPortal = 2F68F241DC42D3E233EC0DEE /* Project object */;
 			proxyType = 1;
 			remoteGlobalIDString = 5BE358EB3FE3BD4E68908FB4;
 			remoteInfo = YadoriLinkFinderSync;
 		};
-		A1C0FE3CAE439C864DB81FAD /* PBXContainerItemProxy */ = {
+		0E78BCB9B1140A7E4B2C066F /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
 			containerPortal = 2F68F241DC42D3E233EC0DEE /* Project object */;
 			proxyType = 1;
 			remoteGlobalIDString = AEF3F210AC22BB30E078D314;
 			remoteInfo = YadoriLinkFileProvider;
 		};
+		E2A64C4B22297BF8C5494E0A /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 2F68F241DC42D3E233EC0DEE /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = F694DECF7EF7F7F9379745A9;
+			remoteInfo = YadoriLinkFFI;
+		};
+		ECA88C708BE264FA6AFEA323 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 2F68F241DC42D3E233EC0DEE /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = F694DECF7EF7F7F9379745A9;
+			remoteInfo = YadoriLinkFFI;
+		};
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXCopyFilesBuildPhase section */
-		78F67D86F2F507B39A419227 /* Embed Foundation Extensions */ = {
+		6C653639190BD5898D814362 /* Embed Frameworks */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 10;
+			files = (
+				E655CBBD7A123973BB119A7B /* YadoriLinkFFI.framework in Embed Frameworks */,
+			);
+			name = "Embed Frameworks";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		776CE49DD31031B1F0E4CDCB /* Embed Foundation Extensions */ = {
 			isa = PBXCopyFilesBuildPhase;
 			buildActionMask = 2147483647;
 			dstPath = "";
 			dstSubfolderSpec = 13;
 			files = (
-				0633E2A91E6E9143C947F625 /* YadoriLinkFinderSync.appex in Embed Foundation Extensions */,
-				95C14C39D926A8CC403DF332 /* YadoriLinkFileProvider.appex in Embed Foundation Extensions */,
+				397BAB43A325A0DA6D39C932 /* YadoriLinkFinderSync.appex in Embed Foundation Extensions */,
+				F0F1E9B7C22451A458B7EB5F /* YadoriLinkFileProvider.appex in Embed Foundation Extensions */,
 			);
 			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		E5AAC9D644E08E5893678E40 /* Embed Frameworks */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 10;
+			files = (
+				51A4227622E1099713CB33EE /* YadoriLinkFFI.framework in Embed Frameworks */,
+			);
+			name = "Embed Frameworks";
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
 		03C18D6B33051972D27DFB91 /* FinderSync.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FinderSync.swift; sourceTree = "<group>"; };
+		1FFBB5F2E3A8E9F5DA8AE6A5 /* YadoriLinkCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = YadoriLinkCore.swift; sourceTree = "<group>"; };
 		352EBBC9C4D1263ADBC5A3FD /* DomainRegistration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DomainRegistration.swift; sourceTree = "<group>"; };
+		3C4FAA49F59793402265CF4A /* YadoriLinkFFI.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = YadoriLinkFFI.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		46E3E507F0A862932B7FB16D /* FileProviderExtension.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileProviderExtension.swift; sourceTree = "<group>"; };
+		4F6EA37DE48DD29C622E3BEA /* FileProviderCatalogTree.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileProviderCatalogTree.swift; sourceTree = "<group>"; };
 		70104ADC9B15018C319CD43D /* FileProviderModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileProviderModel.swift; sourceTree = "<group>"; };
+		7221F2A2C8F1B50290DFB9D2 /* FileProviderCatalogTreeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileProviderCatalogTreeTests.swift; sourceTree = "<group>"; };
 		7D88BD2C6C8A3DACDAF17E22 /* FileProviderItem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileProviderItem.swift; sourceTree = "<group>"; };
-		8A566DC49C0A8C28312DBBDC /* YadoriLinkFinderSyncHost.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = YadoriLinkFinderSyncHost.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		83615BE5D5B7707298BD6470 /* SystemServices.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemServices.swift; sourceTree = "<group>"; };
+		927716FB5075DC6EB3A19031 /* ClientFactory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClientFactory.swift; sourceTree = "<group>"; };
 		943EF0F010F0BA6E951619DD /* FileProviderEnumerator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileProviderEnumerator.swift; sourceTree = "<group>"; };
+		A2D87F286F6C03C308DFBD79 /* YadoriLinkUI */ = {isa = PBXFileReference; lastKnownFileType = folder; name = YadoriLinkUI; path = ../YadoriLinkApp/Packages/YadoriLinkUI; sourceTree = SOURCE_ROOT; };
+		A72F3B5BE141698C02DEA6B9 /* YadoriLinkFFI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = YadoriLinkFFI.swift; sourceTree = "<group>"; };
+		B7B989B7AF2D72BF4DC1442D /* FFIMapping.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FFIMapping.swift; sourceTree = "<group>"; };
+		B81C7FEF033EEB6733BF09C9 /* LiveClientTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveClientTests.swift; sourceTree = "<group>"; };
+		B87FC8331B35282BA4546DD6 /* YadoriLinkAppTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = YadoriLinkAppTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		BA7C0855FB53B2E94F4B608D /* YadoriLinkApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = YadoriLinkApp.swift; sourceTree = "<group>"; };
+		C12ACE39418DEC9A34C81018 /* YadoriLink.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = YadoriLink.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		CC4DD06C309E4145F9D733BB /* LiveYadoriLinkClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveYadoriLinkClient.swift; sourceTree = "<group>"; };
 		CF875B1FD41021C7A8472594 /* YadoriLinkFinderSync.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = YadoriLinkFinderSync.appex; sourceTree = BUILT_PRODUCTS_DIR; };
-		EAE0C369E749366C4D4789AC /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
 		F47B539D9A20D96672049D5E /* YadoriLinkFileProvider.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = YadoriLinkFileProvider.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		0A421E6476678324D6FE042B /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				91575FF3AD7D1884CEC6D60D /* YadoriLinkFFI.framework in Frameworks */,
+				D4E145DA87F0A78634B9B3C3 /* YadoriLinkUI in Frameworks */,
+				13AB2F04B7C96CCF89E1CD73 /* YadoriLinkModel in Frameworks */,
+				412E0E31985D5D6743EB75FC /* YadoriLinkFixtures in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		0CA7FE7124936DE306B2FBCF /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				3C2F14227963ACA5677A8963 /* YadoriLinkFFI.framework in Frameworks */,
+				289B3CDFF3E124220B4D2888 /* YadoriLinkModel in Frameworks */,
+				65730C41BE48C9DCAF5DC43E /* YadoriLinkFixtures in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
 		069E5D4EC305F5151304E8F3 /* Extension */ = {
 			isa = PBXGroup;
 			children = (
+				4F6EA37DE48DD29C622E3BEA /* FileProviderCatalogTree.swift */,
 				943EF0F010F0BA6E951619DD /* FileProviderEnumerator.swift */,
 				46E3E507F0A862932B7FB16D /* FileProviderExtension.swift */,
 				7D88BD2C6C8A3DACDAF17E22 /* FileProviderItem.swift */,
@@ -74,6 +168,28 @@
 			);
 			name = Extension;
 			path = ../YadoriLinkFileProvider/Extension;
+			sourceTree = "<group>";
+		};
+		087D84EBF43386B39DF24451 /* App */ = {
+			isa = PBXGroup;
+			children = (
+				927716FB5075DC6EB3A19031 /* ClientFactory.swift */,
+				83615BE5D5B7707298BD6470 /* SystemServices.swift */,
+				BA7C0855FB53B2E94F4B608D /* YadoriLinkApp.swift */,
+				8F729FE4531FDEA1585CAC32 /* Live */,
+			);
+			name = App;
+			path = ../YadoriLinkApp/App;
+			sourceTree = "<group>";
+		};
+		1125AC2C23312985A6BE7C6A /* YadoriLinkAppTests */ = {
+			isa = PBXGroup;
+			children = (
+				7221F2A2C8F1B50290DFB9D2 /* FileProviderCatalogTreeTests.swift */,
+				B81C7FEF033EEB6733BF09C9 /* LiveClientTests.swift */,
+			);
+			name = YadoriLinkAppTests;
+			path = ../YadoriLinkApp/Tests/YadoriLinkAppTests;
 			sourceTree = "<group>";
 		};
 		2957D0F95A4D1D104451326C /* Extension */ = {
@@ -84,31 +200,63 @@
 			path = Extension;
 			sourceTree = "<group>";
 		};
+		4A7F16FE29785AFA49DAC64B /* Packages */ = {
+			isa = PBXGroup;
+			children = (
+				A2D87F286F6C03C308DFBD79 /* YadoriLinkUI */,
+			);
+			name = Packages;
+			sourceTree = "<group>";
+		};
 		6A6537B5611B2EE85F0D666B /* HostApp */ = {
 			isa = PBXGroup;
 			children = (
 				352EBBC9C4D1263ADBC5A3FD /* DomainRegistration.swift */,
-				EAE0C369E749366C4D4789AC /* main.swift */,
 			);
 			path = HostApp;
+			sourceTree = "<group>";
+		};
+		8F729FE4531FDEA1585CAC32 /* Live */ = {
+			isa = PBXGroup;
+			children = (
+				B7B989B7AF2D72BF4DC1442D /* FFIMapping.swift */,
+				CC4DD06C309E4145F9D733BB /* LiveYadoriLinkClient.swift */,
+			);
+			path = Live;
 			sourceTree = "<group>";
 		};
 		AC7B11FDEB8E79FAF2BB5B6F /* Products */ = {
 			isa = PBXGroup;
 			children = (
+				C12ACE39418DEC9A34C81018 /* YadoriLink.app */,
+				B87FC8331B35282BA4546DD6 /* YadoriLinkAppTests.xctest */,
+				3C4FAA49F59793402265CF4A /* YadoriLinkFFI.framework */,
 				F47B539D9A20D96672049D5E /* YadoriLinkFileProvider.appex */,
 				CF875B1FD41021C7A8472594 /* YadoriLinkFinderSync.appex */,
-				8A566DC49C0A8C28312DBBDC /* YadoriLinkFinderSyncHost.app */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		BFF91F66722FA743E0C409E8 /* Generated */ = {
+			isa = PBXGroup;
+			children = (
+				1FFBB5F2E3A8E9F5DA8AE6A5 /* YadoriLinkCore.swift */,
+				A72F3B5BE141698C02DEA6B9 /* YadoriLinkFFI.swift */,
+			);
+			name = Generated;
+			path = ../YadoriLinkApp/FFI/Generated;
 			sourceTree = "<group>";
 		};
 		F4BC46116C195C6D7CE8FC67 = {
 			isa = PBXGroup;
 			children = (
+				087D84EBF43386B39DF24451 /* App */,
 				2957D0F95A4D1D104451326C /* Extension */,
 				069E5D4EC305F5151304E8F3 /* Extension */,
+				BFF91F66722FA743E0C409E8 /* Generated */,
 				6A6537B5611B2EE85F0D666B /* HostApp */,
+				4A7F16FE29785AFA49DAC64B /* Packages */,
+				1125AC2C23312985A6BE7C6A /* YadoriLinkAppTests */,
 				AC7B11FDEB8E79FAF2BB5B6F /* Products */,
 			);
 			sourceTree = "<group>";
@@ -134,27 +282,6 @@
 			productReference = CF875B1FD41021C7A8472594 /* YadoriLinkFinderSync.appex */;
 			productType = "com.apple.product-type.app-extension";
 		};
-		6BC4ACF7703B417A1EC86D0D /* YadoriLinkFinderSyncHost */ = {
-			isa = PBXNativeTarget;
-			buildConfigurationList = 5EFC9688062BA07B026347EE /* Build configuration list for PBXNativeTarget "YadoriLinkFinderSyncHost" */;
-			buildPhases = (
-				F48F3196D6498B69E2224E2A /* Build Rust FFI core (fileprovider-core) */,
-				47755D2C08ED363576155AEE /* Sources */,
-				78F67D86F2F507B39A419227 /* Embed Foundation Extensions */,
-			);
-			buildRules = (
-			);
-			dependencies = (
-				B58ACD97483D585C56FA5678 /* PBXTargetDependency */,
-				540A29A0A2E0420381942E68 /* PBXTargetDependency */,
-			);
-			name = YadoriLinkFinderSyncHost;
-			packageProductDependencies = (
-			);
-			productName = YadoriLinkFinderSyncHost;
-			productReference = 8A566DC49C0A8C28312DBBDC /* YadoriLinkFinderSyncHost.app */;
-			productType = "com.apple.product-type.application";
-		};
 		AEF3F210AC22BB30E078D314 /* YadoriLinkFileProvider */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = 31A822B1931E7A59692DEF98 /* Build configuration list for PBXNativeTarget "YadoriLinkFileProvider" */;
@@ -173,6 +300,73 @@
 			productReference = F47B539D9A20D96672049D5E /* YadoriLinkFileProvider.appex */;
 			productType = "com.apple.product-type.app-extension";
 		};
+		D806708E0097A49D885AD015 /* YadoriLink */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 31041FC7DB5DFDF2FB83248D /* Build configuration list for PBXNativeTarget "YadoriLink" */;
+			buildPhases = (
+				8AB1644EDE03C79961BDC29F /* Build Rust FFI core (fileprovider-core) */,
+				A07FE2506F8166838A987B38 /* Sources */,
+				0A421E6476678324D6FE042B /* Frameworks */,
+				776CE49DD31031B1F0E4CDCB /* Embed Foundation Extensions */,
+				E5AAC9D644E08E5893678E40 /* Embed Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				2E876F5E688B38430D195A62 /* PBXTargetDependency */,
+				50B78B8D054E7104C2D5CE32 /* PBXTargetDependency */,
+				18626C2BE489A8A757281BD8 /* PBXTargetDependency */,
+			);
+			name = YadoriLink;
+			packageProductDependencies = (
+				F681DA7E988AE655151874DF /* YadoriLinkUI */,
+				B018135DEC6FFF0E7229DF84 /* YadoriLinkModel */,
+				A31CE2E090FC7F18F928FB27 /* YadoriLinkFixtures */,
+			);
+			productName = YadoriLink;
+			productReference = C12ACE39418DEC9A34C81018 /* YadoriLink.app */;
+			productType = "com.apple.product-type.application";
+		};
+		E9FD50F48B59EBC53F518A56 /* YadoriLinkAppTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 7164F1F3BED7C4613EC1B09E /* Build configuration list for PBXNativeTarget "YadoriLinkAppTests" */;
+			buildPhases = (
+				ECB7EB5FB73429DD3D15E00B /* Sources */,
+				0CA7FE7124936DE306B2FBCF /* Frameworks */,
+				6C653639190BD5898D814362 /* Embed Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				E251DD4092E2CEE4CE0ABE0B /* PBXTargetDependency */,
+			);
+			name = YadoriLinkAppTests;
+			packageProductDependencies = (
+				74E7474B32C3FF311526DE6A /* YadoriLinkModel */,
+				274970BD01D68F608E915878 /* YadoriLinkFixtures */,
+			);
+			productName = YadoriLinkAppTests;
+			productReference = B87FC8331B35282BA4546DD6 /* YadoriLinkAppTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+		F694DECF7EF7F7F9379745A9 /* YadoriLinkFFI */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 8861FFC45C1D173C611F30AE /* Build configuration list for PBXNativeTarget "YadoriLinkFFI" */;
+			buildPhases = (
+				189EDFACAA2C971228E5D1E9 /* Build the Rust client core and its Swift binding */,
+				ED9D2CC0E81686232C6BF890 /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = YadoriLinkFFI;
+			packageProductDependencies = (
+			);
+			productName = YadoriLinkFFI;
+			productReference = 3C4FAA49F59793402265CF4A /* YadoriLinkFFI.framework */;
+			productType = "com.apple.product-type.framework";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -186,11 +380,19 @@
 						DevelopmentTeam = 594UQF7QX3;
 						ProvisioningStyle = Automatic;
 					};
-					6BC4ACF7703B417A1EC86D0D = {
+					AEF3F210AC22BB30E078D314 = {
 						DevelopmentTeam = 594UQF7QX3;
 						ProvisioningStyle = Automatic;
 					};
-					AEF3F210AC22BB30E078D314 = {
+					D806708E0097A49D885AD015 = {
+						DevelopmentTeam = 594UQF7QX3;
+						ProvisioningStyle = Automatic;
+					};
+					E9FD50F48B59EBC53F518A56 = {
+						DevelopmentTeam = 594UQF7QX3;
+						ProvisioningStyle = Automatic;
+					};
+					F694DECF7EF7F7F9379745A9 = {
 						DevelopmentTeam = 594UQF7QX3;
 						ProvisioningStyle = Automatic;
 					};
@@ -205,19 +407,62 @@
 			);
 			mainGroup = F4BC46116C195C6D7CE8FC67;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				DB988C1240911E16AA042E93 /* XCLocalSwiftPackageReference "../YadoriLinkApp/Packages/YadoriLinkUI" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = AC7B11FDEB8E79FAF2BB5B6F /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				AEF3F210AC22BB30E078D314 /* YadoriLinkFileProvider */,
+				D806708E0097A49D885AD015 /* YadoriLink */,
+				F694DECF7EF7F7F9379745A9 /* YadoriLinkFFI */,
+				E9FD50F48B59EBC53F518A56 /* YadoriLinkAppTests */,
 				5BE358EB3FE3BD4E68908FB4 /* YadoriLinkFinderSync */,
-				6BC4ACF7703B417A1EC86D0D /* YadoriLinkFinderSyncHost */,
+				AEF3F210AC22BB30E078D314 /* YadoriLinkFileProvider */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXShellScriptBuildPhase section */
+		189EDFACAA2C971228E5D1E9 /* Build the Rust client core and its Swift binding */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build the Rust client core and its Swift binding";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -euo pipefail\n\"$SRCROOT/../../../scripts/generate-swift-bindings.sh\"\n";
+		};
+		8AB1644EDE03C79961BDC29F /* Build Rust FFI core (fileprovider-core) */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build Rust FFI core (fileprovider-core)";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -euo pipefail\ncd \"$SRCROOT/../fileprovider-core\"\n# See the matching comment on YadoriLinkFinderSync's own\n# prebuild script above: explicit --target-dir keeps this\n# build immune to a machine-local cargo target-dir override.\n# A clean environment: Xcode's exported linker settings (for\n# example LD_DEPENDENCY_INFO_FILE) leak into cargo's own links and\n# produce proc-macro libraries dyld refuses to load. A terminal's\n# PATH, so `cc` is the xcrun shim that finds the SDK on its own.\n# protoc is resolved from the caller's PATH first: ipc-proto's build\n# script needs it, and CI installs it outside that fixed PATH.\nPROTOC_BIN=\"${PROTOC:-$(command -v protoc || true)}\"\nenv -i HOME=\"$HOME\" TMPDIR=\"${TMPDIR:-/tmp}\" \\\n  PATH=\"$HOME/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin\" \\\n  ${PROTOC_BIN:+PROTOC=\"$PROTOC_BIN\"} \\\n  ${CARGO_HOME:+CARGO_HOME=\"$CARGO_HOME\"} \\\n  ${RUSTUP_HOME:+RUSTUP_HOME=\"$RUSTUP_HOME\"} \\\n  cargo build --release --target aarch64-apple-darwin --target-dir target\n";
+		};
 		8E1DDF5D46E2B9284F0379C8 /* Build Rust FFI core */ = {
 			isa = PBXShellScriptBuildPhase;
 			alwaysOutOfDate = 1;
@@ -235,7 +480,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -euo pipefail\ncd \"$SRCROOT/../core\"\ncargo build --release --target aarch64-apple-darwin --target-dir target\n";
+			shellScript = "set -euo pipefail\ncd \"$SRCROOT/../core\"\n# Explicit --target-dir: a machine-local `.cargo/config.toml`\n# `[build] target-dir` override (e.g. redirecting builds to an\n# external disk) would otherwise silently move this crate's\n# output away from the relative `target/` path\n# LIBRARY_SEARCH_PATHS below expects, breaking the link step\n# with a \"library not found\" error that gives no hint the\n# cause is a target-dir mismatch rather than a missing build.\n# A clean environment: Xcode's exported linker settings (for\n# example LD_DEPENDENCY_INFO_FILE) leak into cargo's own links and\n# produce proc-macro libraries dyld refuses to load. A terminal's\n# PATH, so `cc` is the xcrun shim that finds the SDK on its own.\n# protoc is resolved from the caller's PATH first: ipc-proto's build\n# script needs it, and CI installs it outside that fixed PATH.\nPROTOC_BIN=\"${PROTOC:-$(command -v protoc || true)}\"\nenv -i HOME=\"$HOME\" TMPDIR=\"${TMPDIR:-/tmp}\" \\\n  PATH=\"$HOME/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin\" \\\n  ${PROTOC_BIN:+PROTOC=\"$PROTOC_BIN\"} \\\n  ${CARGO_HOME:+CARGO_HOME=\"$CARGO_HOME\"} \\\n  ${RUSTUP_HOME:+RUSTUP_HOME=\"$RUSTUP_HOME\"} \\\n  cargo build --release --target aarch64-apple-darwin --target-dir target\n";
 		};
 		F0C2896918ACFE193248F77B /* Build Rust FFI core (fileprovider-core) */ = {
 			isa = PBXShellScriptBuildPhase;
@@ -254,47 +499,33 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -euo pipefail\ncd \"$SRCROOT/../fileprovider-core\"\ncargo build --release --target aarch64-apple-darwin --target-dir target\n";
-		};
-		F48F3196D6498B69E2224E2A /* Build Rust FFI core (fileprovider-core) */ = {
-			isa = PBXShellScriptBuildPhase;
-			alwaysOutOfDate = 1;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			inputFileListPaths = (
-			);
-			inputPaths = (
-			);
-			name = "Build Rust FFI core (fileprovider-core)";
-			outputFileListPaths = (
-			);
-			outputPaths = (
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-			shellPath = /bin/sh;
-			shellScript = "set -euo pipefail\ncd \"$SRCROOT/../fileprovider-core\"\ncargo build --release --target aarch64-apple-darwin --target-dir target\n";
+			shellScript = "set -euo pipefail\ncd \"$SRCROOT/../fileprovider-core\"\n# See the matching comment on YadoriLinkFinderSync's own\n# prebuild script above: explicit --target-dir keeps this\n# build immune to a machine-local cargo target-dir override.\n# A clean environment: Xcode's exported linker settings (for\n# example LD_DEPENDENCY_INFO_FILE) leak into cargo's own links and\n# produce proc-macro libraries dyld refuses to load. A terminal's\n# PATH, so `cc` is the xcrun shim that finds the SDK on its own.\n# protoc is resolved from the caller's PATH first: ipc-proto's build\n# script needs it, and CI installs it outside that fixed PATH.\nPROTOC_BIN=\"${PROTOC:-$(command -v protoc || true)}\"\nenv -i HOME=\"$HOME\" TMPDIR=\"${TMPDIR:-/tmp}\" \\\n  PATH=\"$HOME/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin\" \\\n  ${PROTOC_BIN:+PROTOC=\"$PROTOC_BIN\"} \\\n  ${CARGO_HOME:+CARGO_HOME=\"$CARGO_HOME\"} \\\n  ${RUSTUP_HOME:+RUSTUP_HOME=\"$RUSTUP_HOME\"} \\\n  cargo build --release --target aarch64-apple-darwin --target-dir target\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
-		47755D2C08ED363576155AEE /* Sources */ = {
-			isa = PBXSourcesBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-				89B92D41B796CE185C7BDFBF /* DomainRegistration.swift in Sources */,
-				F9C6AA92D8255767422D0301 /* main.swift in Sources */,
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
 		9A970039C534B07B69C2AE1B /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A22937C09598590CB5C8B9FD /* FileProviderCatalogTree.swift in Sources */,
 				DAB7BBE65F3FB060FB9452C6 /* FileProviderEnumerator.swift in Sources */,
 				8BCBDD3DAE8D5CF1B359CF38 /* FileProviderExtension.swift in Sources */,
 				61AEB212D82B731FC9CB04C0 /* FileProviderItem.swift in Sources */,
 				85F8DC6E1AA2DF3F2DD8B54A /* FileProviderModel.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A07FE2506F8166838A987B38 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				60B9FA0FD9879B0B634052AC /* ClientFactory.swift in Sources */,
+				C7A59E0C3EA682059ECC3569 /* DomainRegistration.swift in Sources */,
+				AC0AC527F16507CF23830097 /* FFIMapping.swift in Sources */,
+				8747137B9B359619B2397E63 /* LiveYadoriLinkClient.swift in Sources */,
+				90158EE5BB8CDDB64B316698 /* SystemServices.swift in Sources */,
+				E530B322AB283420E629CD9E /* YadoriLinkApp.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -306,18 +537,49 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		ECB7EB5FB73429DD3D15E00B /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				7DA3A059C9F33D7CC5F6BC5C /* FFIMapping.swift in Sources */,
+				CABD04380B9B2A49F7471862 /* FileProviderCatalogTree.swift in Sources */,
+				3DF3417D2C9B85C79A9435DF /* FileProviderCatalogTreeTests.swift in Sources */,
+				5E2B195A277198A7222A6174 /* LiveClientTests.swift in Sources */,
+				B555DFF3ED0A4BA61F3D9EF7 /* LiveYadoriLinkClient.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		ED9D2CC0E81686232C6BF890 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				319CC1EFD74BEE754A3A68A0 /* YadoriLinkCore.swift in Sources */,
+				E1A75649BFA0F83ED427CD63 /* YadoriLinkFFI.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
-		540A29A0A2E0420381942E68 /* PBXTargetDependency */ = {
+		18626C2BE489A8A757281BD8 /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
 			target = AEF3F210AC22BB30E078D314 /* YadoriLinkFileProvider */;
-			targetProxy = A1C0FE3CAE439C864DB81FAD /* PBXContainerItemProxy */;
+			targetProxy = 0E78BCB9B1140A7E4B2C066F /* PBXContainerItemProxy */;
 		};
-		B58ACD97483D585C56FA5678 /* PBXTargetDependency */ = {
+		2E876F5E688B38430D195A62 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = F694DECF7EF7F7F9379745A9 /* YadoriLinkFFI */;
+			targetProxy = E2A64C4B22297BF8C5494E0A /* PBXContainerItemProxy */;
+		};
+		50B78B8D054E7104C2D5CE32 /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
 			target = 5BE358EB3FE3BD4E68908FB4 /* YadoriLinkFinderSync */;
-			targetProxy = 25D2211D1E76D195F7156339 /* PBXContainerItemProxy */;
+			targetProxy = 02633FA1813D6CF94A27A85E /* PBXContainerItemProxy */;
+		};
+		E251DD4092E2CEE4CE0ABE0B /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = F694DECF7EF7F7F9379745A9 /* YadoriLinkFFI */;
+			targetProxy = ECA88C708BE264FA6AFEA323 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -326,6 +588,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
+				ARCHS = arm64;
 				CLANG_ANALYZER_NONNULL = YES;
 				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
 				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
@@ -359,6 +622,7 @@
 				COPY_PHASE_STRIP = NO;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				DEVELOPMENT_TEAM = 594UQF7QX3;
+				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				GCC_C_LANGUAGE_STANDARD = gnu11;
@@ -369,7 +633,7 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
-				MACOSX_DEPLOYMENT_TARGET = 11.0;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -384,6 +648,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
+				ARCHS = arm64;
 				CLANG_ANALYZER_NONNULL = YES;
 				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
 				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
@@ -417,6 +682,7 @@
 				COPY_PHASE_STRIP = NO;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				DEVELOPMENT_TEAM = 594UQF7QX3;
+				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
 				GCC_C_LANGUAGE_STANDARD = gnu11;
@@ -433,7 +699,7 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
-				MACOSX_DEPLOYMENT_TARGET = 11.0;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
@@ -445,47 +711,74 @@
 			};
 			name = Debug;
 		};
-		492A1EE5DE192662977FA4CA /* Debug */ = {
+		4BD651B1C675CD16CBF4FA57 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				COMBINE_HIDPI_IMAGES = YES;
 				HEADER_SEARCH_PATHS = "../fileprovider-core/include";
-				INFOPLIST_FILE = HostApp/Info.plist;
+				INFOPLIST_FILE = ../YadoriLinkApp/App/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
 				LIBRARY_SEARCH_PATHS = "../fileprovider-core/target/aarch64-apple-darwin/release";
-				MACOSX_DEPLOYMENT_TARGET = 12.0;
 				OTHER_LDFLAGS = "-lyadorilink_fileprovider_core -liconv";
 				PRODUCT_BUNDLE_IDENTIFIER = com.juntaki.yadorilink;
-				PRODUCT_NAME = YadoriLinkFinderSyncHost;
+				PRODUCT_NAME = YadoriLink;
 				SDKROOT = macosx;
+				SWIFT_INCLUDE_PATHS = "$(SRCROOT)/../YadoriLinkApp/FFI/Generated/include";
 				SWIFT_OBJC_BRIDGING_HEADER = "HostApp/YadoriLinkFinderSyncHost-Bridging-Header.h";
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+		56479CCD1D9F51C3598768D7 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_IDENTITY = "";
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEFINES_MODULE = YES;
+				DYLIB_COMPATIBILITY_VERSION = 1;
+				DYLIB_CURRENT_VERSION = 1;
+				DYLIB_INSTALL_NAME_BASE = "@rpath";
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GENERATE_INFOPLIST_FILE = YES;
+				INSTALL_PATH = "$(LOCAL_LIBRARY_DIR)/Frameworks";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = "$(SRCROOT)/../YadoriLinkApp/FFI/lib";
+				OTHER_LDFLAGS = "-lyadorilink_apple_ffi -liconv -framework Security -framework CoreFoundation";
+				PRODUCT_BUNDLE_IDENTIFIER = com.juntaki.yadorilink.ffi;
+				PRODUCT_NAME = YadoriLinkFFI;
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+				SWIFT_INCLUDE_PATHS = "$(SRCROOT)/../YadoriLinkApp/FFI/Generated/include";
+				SWIFT_VERSION = 5.0;
+				VERSIONING_SYSTEM = "apple-generic";
 			};
 			name = Debug;
 		};
-		82DEB5478C920F37F6D26852 /* Release */ = {
+		9973637D76C7A3334E6EEE15 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				BUNDLE_LOADER = "$(TEST_HOST)";
 				COMBINE_HIDPI_IMAGES = YES;
-				HEADER_SEARCH_PATHS = "../fileprovider-core/include";
-				INFOPLIST_FILE = HostApp/Info.plist;
+				GENERATE_INFOPLIST_FILE = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
 				);
-				LIBRARY_SEARCH_PATHS = "../fileprovider-core/target/aarch64-apple-darwin/release";
-				MACOSX_DEPLOYMENT_TARGET = 12.0;
-				OTHER_LDFLAGS = "-lyadorilink_fileprovider_core -liconv";
-				PRODUCT_BUNDLE_IDENTIFIER = com.juntaki.yadorilink;
-				PRODUCT_NAME = YadoriLinkFinderSyncHost;
+				PRODUCT_BUNDLE_IDENTIFIER = com.juntaki.yadorilink.apptests;
 				SDKROOT = macosx;
-				SWIFT_OBJC_BRIDGING_HEADER = "HostApp/YadoriLinkFinderSyncHost-Bridging-Header.h";
+				SWIFT_INCLUDE_PATHS = "$(SRCROOT)/../YadoriLinkApp/FFI/Generated/include";
+				SWIFT_VERSION = 6.0;
 			};
-			name = Release;
+			name = Debug;
 		};
 		9A2A852D4B8F4B41B59141C3 /* Release */ = {
 			isa = XCBuildConfiguration;
@@ -526,6 +819,46 @@
 				PRODUCT_NAME = YadoriLinkFinderSync;
 				SDKROOT = macosx;
 				SWIFT_OBJC_BRIDGING_HEADER = "Extension/YadoriLinkFinderSync-Bridging-Header.h";
+			};
+			name = Release;
+		};
+		CEC04601177B7C22107FEA4F /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				COMBINE_HIDPI_IMAGES = YES;
+				HEADER_SEARCH_PATHS = "../fileprovider-core/include";
+				INFOPLIST_FILE = ../YadoriLinkApp/App/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = "../fileprovider-core/target/aarch64-apple-darwin/release";
+				OTHER_LDFLAGS = "-lyadorilink_fileprovider_core -liconv";
+				PRODUCT_BUNDLE_IDENTIFIER = com.juntaki.yadorilink;
+				PRODUCT_NAME = YadoriLink;
+				SDKROOT = macosx;
+				SWIFT_INCLUDE_PATHS = "$(SRCROOT)/../YadoriLinkApp/FFI/Generated/include";
+				SWIFT_OBJC_BRIDGING_HEADER = "HostApp/YadoriLinkFinderSyncHost-Bridging-Header.h";
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		E280394A4B1AD8307DDB6D19 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				COMBINE_HIDPI_IMAGES = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.juntaki.yadorilink.apptests;
+				SDKROOT = macosx;
+				SWIFT_INCLUDE_PATHS = "$(SRCROOT)/../YadoriLinkApp/FFI/Generated/include";
+				SWIFT_VERSION = 6.0;
 			};
 			name = Release;
 		};
@@ -571,9 +904,47 @@
 			};
 			name = Debug;
 		};
+		F355D39F6B50BCAE367184D2 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_IDENTITY = "";
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEFINES_MODULE = YES;
+				DYLIB_COMPATIBILITY_VERSION = 1;
+				DYLIB_CURRENT_VERSION = 1;
+				DYLIB_INSTALL_NAME_BASE = "@rpath";
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GENERATE_INFOPLIST_FILE = YES;
+				INSTALL_PATH = "$(LOCAL_LIBRARY_DIR)/Frameworks";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = "$(SRCROOT)/../YadoriLinkApp/FFI/lib";
+				OTHER_LDFLAGS = "-lyadorilink_apple_ffi -liconv -framework Security -framework CoreFoundation";
+				PRODUCT_BUNDLE_IDENTIFIER = com.juntaki.yadorilink.ffi;
+				PRODUCT_NAME = YadoriLinkFFI;
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+				SWIFT_INCLUDE_PATHS = "$(SRCROOT)/../YadoriLinkApp/FFI/Generated/include";
+				SWIFT_VERSION = 5.0;
+				VERSIONING_SYSTEM = "apple-generic";
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		31041FC7DB5DFDF2FB83248D /* Build configuration list for PBXNativeTarget "YadoriLink" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				CEC04601177B7C22107FEA4F /* Debug */,
+				4BD651B1C675CD16CBF4FA57 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
 		31A822B1931E7A59692DEF98 /* Build configuration list for PBXNativeTarget "YadoriLinkFileProvider" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
@@ -601,16 +972,55 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;
 		};
-		5EFC9688062BA07B026347EE /* Build configuration list for PBXNativeTarget "YadoriLinkFinderSyncHost" */ = {
+		7164F1F3BED7C4613EC1B09E /* Build configuration list for PBXNativeTarget "YadoriLinkAppTests" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				492A1EE5DE192662977FA4CA /* Debug */,
-				82DEB5478C920F37F6D26852 /* Release */,
+				9973637D76C7A3334E6EEE15 /* Debug */,
+				E280394A4B1AD8307DDB6D19 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		8861FFC45C1D173C611F30AE /* Build configuration list for PBXNativeTarget "YadoriLinkFFI" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				56479CCD1D9F51C3598768D7 /* Debug */,
+				F355D39F6B50BCAE367184D2 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		DB988C1240911E16AA042E93 /* XCLocalSwiftPackageReference "../YadoriLinkApp/Packages/YadoriLinkUI" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = ../YadoriLinkApp/Packages/YadoriLinkUI;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		274970BD01D68F608E915878 /* YadoriLinkFixtures */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = YadoriLinkFixtures;
+		};
+		74E7474B32C3FF311526DE6A /* YadoriLinkModel */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = YadoriLinkModel;
+		};
+		A31CE2E090FC7F18F928FB27 /* YadoriLinkFixtures */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = YadoriLinkFixtures;
+		};
+		B018135DEC6FFF0E7229DF84 /* YadoriLinkModel */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = YadoriLinkModel;
+		};
+		F681DA7E988AE655151874DF /* YadoriLinkUI */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = YadoriLinkUI;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 2F68F241DC42D3E233EC0DEE /* Project object */;
 }

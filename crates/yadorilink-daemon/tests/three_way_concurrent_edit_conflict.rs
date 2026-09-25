@@ -17,7 +17,7 @@ use std::time::Duration;
 use support::{open_file_backed_replica_coordinator, real_entry_names, wait_until_with_context};
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 
 struct TestDevice {
     device_id: String,
@@ -36,7 +36,7 @@ fn setup_device(name: &str) -> TestDevice {
     // just a unique string.
     let device_id = name.to_string();
     let store_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let (sync_state, index_dir) = open_file_backed_replica_coordinator();
     let state = DaemonState::new(device_id.clone(), Arc::new(sync_state), store);
     // Give the device a change-signing key before its link watch starts, so the

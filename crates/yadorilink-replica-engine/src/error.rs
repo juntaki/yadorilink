@@ -1,7 +1,4 @@
-//! Errors surfaced by the replica-engine's own ports. Deliberately not
-//! `yadorilink_sync_core::SyncError` -- this crate must never depend back
-//! on `yadorilink-sync-core`, so its ports own a narrower error type and
-//! sync-core's port adapters convert `SyncError` into it at the boundary.
+//! Errors surfaced by the replica-engine's own ports.
 
 /// General-purpose port error for every port except `ChangeAdmissionPort`
 /// (which has its own narrower error -- see [`AdmissionStoreError`] -- so
@@ -17,14 +14,6 @@ pub enum ReplicaEngineError {
     InvalidInput(String),
 }
 
-/// `rebootstrap.rs`'s `prepare_rebootstrap_required`/`verify_and_install_
-/// rebootstrap` (7D-9D move from `yadorilink-sync-core`) call
-/// `SnapshotManifest`/`RebootstrapRequired`'s own sign/verify methods,
-/// which return `yadorilink_replica_domain::codec::ChangeError` -- mirrors
-/// `yadorilink-sync-core::SyncError`'s own identical bridge for the same
-/// type, collapsed to `CorruptState` for the same reason: a signature or
-/// encoding failure on an already-received protocol object is a corrupt/
-/// untrustworthy input, not a storage failure.
 impl From<yadorilink_replica_domain::codec::ChangeError> for ReplicaEngineError {
     fn from(error: yadorilink_replica_domain::codec::ChangeError) -> Self {
         ReplicaEngineError::CorruptState(error.to_string())

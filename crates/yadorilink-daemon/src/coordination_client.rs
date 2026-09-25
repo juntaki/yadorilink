@@ -1,16 +1,13 @@
 //! Unary coordination-plane calls the daemon makes outside the netmap
-//! subscription: the one-time signing-key backfill, endpoint-candidate
-//! reporting, rendezvous requests for hole punching, and the
-//! activate/cancel calls `EnrollmentRecoveryService::reconcile_once` issues for a
-//! create/join left over from a previous run. Each speaks the coordination
-//! plane over its HTTP+JSON API, the same host the netmap WebSocket
-//! subscription connects to.
+//! subscription: this device's substrate address report, and the
+//! activate/cancel calls
+//! `EnrollmentRecoveryService::reconcile_once` issues for a create/join left
+//! over from a previous run. Each speaks the coordination plane over its
+//! HTTP+JSON API, the same host the netmap WebSocket subscription connects to.
 //!
 //! Every call is best-effort: a failure is logged at debug and swallowed, so
 //! a transient coordination-plane outage never takes down the caller's task.
-//! The signing-key backfill in particular is set-once on the server (an
-//! identical re-upload is a no-op, a mismatch is refused), so it is safe to
-//! call unconditionally on every startup. The activate calls below return an
+//! The activate calls below return an
 //! [`ActivateOutcome`] (rather than swallowing the result entirely) so
 //! `EnrollmentRecoveryService::reconcile_once` knows whether it is safe to drop its
 //! local marker, must mark the link orphaned, or should leave the marker for
@@ -18,14 +15,122 @@
 //! bool: `reconcile` treats a cancel as best-effort regardless of why it
 //! failed (the coordination plane's own TTL sweep is the eventual backstop
 //! either way), so there is no extra outcome for it to branch on.
+//!
+//! # Every call here takes a credential, not a token
+//!
+//! These functions used to take `access_token: &str` and call `bearer_auth`.
+//! They now take a [`CoordinationAuth`], and the difference is not cosmetic:
+//! the Coordination API is a DPoP resource server, so an authenticated request
+//! needs a live access token **and** a proof signed by that token's key and
+//! bound to this exact method and URL. A `&str` cannot produce the second, and
+//! a token captured at daemon startup cannot produce the first either -- it
+//! lives five minutes.
+//!
+//! The whole of that is behind [`SendAuthorized::send_authorized`], which is
+//! the only place in this module that touches an `Authorization` header. It
+//! reads the method and URL **off the built request** rather than from its
+//! caller, so a proof can never be minted for a different call than the one
+//! that is sent -- a DPoP proof whose `htm`/`htu` name the wrong endpoint is
+//! refused by the server with a 401 that reads exactly like an expired token,
+//! and the two are worth being structurally unable to confuse.
 
-/// A self-reported reachable address for this device, offered to peers to
-/// probe against for a direct connection. Carries only an `ip:port` and a
-/// preference, never file content or names.
-#[derive(Debug, Clone)]
-pub struct EndpointCandidate {
-    pub address: String,
-    pub priority: i32,
+use yadorilink_fapi_client::CoordinationAuth;
+
+/// Why an authenticated coordination call did not produce a response.
+///
+/// The two arms are genuinely different facts and are kept apart rather than
+/// flattened into a string. `Transport` is the coordination plane being
+/// unreachable, which is transient and is what every retry in this daemon
+/// exists for. `Unauthenticated` is this device being unable to produce a
+/// credential at all -- the refresh was refused, the registration was revoked,
+/// the credential store is unreadable -- which no amount of retrying the
+/// *request* fixes.
+#[derive(Debug)]
+pub enum CoordinationCallError {
+    /// This device could not mint a credential for the call. It was never sent.
+    Unauthenticated(String),
+    /// The call was sent and the transport failed.
+    Transport(reqwest::Error),
+}
+
+impl std::fmt::Display for CoordinationCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CoordinationCallError::Unauthenticated(detail) => write!(f, "{detail}"),
+            CoordinationCallError::Transport(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl CoordinationCallError {
+    /// The diagnosis category for this failure.
+    ///
+    /// A credential this device could not mint is `Unauthorized`, the same
+    /// category a 401 from the plane produces -- because it is the same
+    /// situation seen one step earlier, and an operator reading a diagnosis
+    /// needs "this device's credential is the problem", not "the network".
+    fn category(&self) -> RemoteEvidenceErrorCategory {
+        match self {
+            CoordinationCallError::Unauthenticated(_) => RemoteEvidenceErrorCategory::Unauthorized,
+            CoordinationCallError::Transport(error) => categorize_transport_error(error),
+        }
+    }
+}
+
+/// Send a request authenticated as this device.
+///
+/// Replaces `.bearer_auth(token).send()`. The credential is minted from the
+/// built request's own method and URL, which is why this is a send rather than
+/// a builder step: a DPoP proof does not exist until the request it binds to
+/// does.
+pub(crate) trait SendAuthorized {
+    async fn send_authorized(
+        self,
+        auth: &CoordinationAuth,
+    ) -> Result<reqwest::Response, CoordinationCallError>;
+}
+
+impl SendAuthorized for reqwest::RequestBuilder {
+    async fn send_authorized(
+        self,
+        auth: &CoordinationAuth,
+    ) -> Result<reqwest::Response, CoordinationCallError> {
+        // `CoordinationAuth::execute` is now the one place in this crate --
+        // and the one place in the fapi-client crate's public API -- that
+        // reads `htm`/`htu` off a built request and sends it. This used to be
+        // reimplemented here with its own `build_split`, its own header
+        // insertion and its own error mapping; that copy is deleted rather
+        // than kept in sync with the canonical one.
+        auth.execute(self).await.map_err(|error| match error {
+            yadorilink_fapi_client::Error::Http(transport) => {
+                CoordinationCallError::Transport(transport)
+            }
+            other => CoordinationCallError::Unauthenticated(other.to_string()),
+        })
+    }
+}
+
+/// Where this device's reconciliation substrate can be reached, as ONE
+/// snapshot.
+///
+/// Deliberately not the netmap's legacy `endpoints` list. That list is the
+/// peer-session transport's dial targets; the substrate is a separate iroh
+/// endpoint on a separate socket with a different ALPN, and a dial landing on
+/// the wrong one completes at the QUIC layer and is then refused for an
+/// unknown ALPN -- a hard failure rather than a path worth retrying. Measured
+/// every way round, one list cannot serve both.
+///
+/// Carries no identity. The remote endpoint id IS the peer's already-pinned
+/// device signing key, so a key in here would be a second, unpinned claim that
+/// could disagree with the pinned one.
+///
+/// Both halves travel together because they describe one address generation.
+/// Published separately they could describe two, and a peer would dial a
+/// direct address from one generation with a relay from another.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SubstrateReachability {
+    pub direct: Vec<std::net::SocketAddr>,
+    pub relays: Vec<String>,
 }
 
 /// A Track Send rendezvous grant from `POST /send/authorization` --
@@ -33,7 +138,8 @@ pub struct EndpointCandidate {
 /// table (see that migration's own doc comment for what this primitive is
 /// and, deliberately, is not: never an extension of folder-group/ACL
 /// membership). Names the exact sender+receiver pair it authorizes and
-/// carries ONLY the receiver's own yadorilink-send/1 connect material --
+/// carries ONLY the receiver's own Track Send connect material -- its
+/// signing key (= iroh endpoint id) and where its iroh endpoint answers --
 /// never any other same-account device's key or address.
 #[derive(Debug, Clone)]
 pub struct SendAuthorizationGrant {
@@ -45,19 +151,31 @@ pub struct SendAuthorizationGrant {
     pub expires_at_unix: i64,
     pub receiver_device_id: String,
     pub receiver_signing_key: [u8; 32],
-    pub receiver_candidates: Vec<EndpointCandidate>,
+    /// Empty when the receiver's iroh endpoint has not published an
+    /// address yet; the dial then relies on what the endpoint's own lookup
+    /// knows.
+    pub receiver_reachability: SubstrateReachability,
 }
 
-/// The connect material `POST /send/authorization/:grantId/consume` returns
-/// on success -- the sender's own yadorilink-send/1 signing key and
-/// candidate addresses, released only once the grant is atomically and
-/// irreversibly consumed (never a second time -- see that function's own
-/// doc comment).
-#[derive(Debug, Clone)]
-pub struct SendGrantPeerMaterial {
-    pub device_id: String,
-    pub signing_key: [u8; 32],
-    pub candidates: Vec<EndpointCandidate>,
+/// Where a device's iroh endpoint answers, in the wire shape the
+/// coordination plane uses for it (`{direct, relays}`). Unparseable direct
+/// addresses are dropped.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WireSubstrateReachability {
+    #[serde(default)]
+    direct: Vec<String>,
+    #[serde(default)]
+    relays: Vec<String>,
+}
+
+impl From<WireSubstrateReachability> for SubstrateReachability {
+    fn from(wire: WireSubstrateReachability) -> Self {
+        Self {
+            direct: wire.direct.iter().filter_map(|a| a.parse().ok()).collect(),
+            relays: wire.relays,
+        }
+    }
 }
 
 /// The result of an `activate_create`/`activate_join` call, distinguished by
@@ -149,9 +267,9 @@ pub use imp::{
     commit_handoff_role_loss, compensate_handoff_role_loss, consume_send_authorization,
     fetch_edge_state, find_handoff_lease, prepare_create, prepare_invite_accept, prepare_join,
     query_enrollment_operation, query_membership_operation, query_membership_operation_categorized,
-    query_role_loss_operation, release_handoff_lease, report_endpoint, request_handoff_lease,
-    request_relay_grant, request_send_authorization, resolve_edge, send_rendezvous,
-    set_storage_mode, upload_signing_key,
+    query_role_loss_operation, release_handoff_lease, report_endpoint,
+    request_authorization_checkpoint, request_handoff_lease, request_send_authorization,
+    resolve_edge, set_storage_mode,
 };
 // `MintedInvite` is `pub(crate)` (defined in `application::model`, a
 // crate-internal module) -- unlike every other re-export above, whose
@@ -278,21 +396,10 @@ pub struct HandoffLeaseGrant {
 pub(crate) use crate::application::model::membership::{
     HandoffCommitResult, MembershipOperationLookup, MembershipOperationRecord,
     MembershipRemoteRequest, MembershipRemoteRequestGroup, MembershipRemoteResult,
-    MembershipRemoteStatus, RoleLossCommitOutcome,
+    MembershipRemoteStatus, RoleLossCommitOutcome, RoleLossCompensationOutcome,
 };
 pub(crate) use crate::application::model::MintedInvite;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RoleLossCompensationOutcome {
-    Restored,
-    Superseded,
-}
-
-/// Which stage of the create/join enrollment saga a Worker-side ledger row
-/// (`enrollment_operations`) reports -- mirrors
-/// `yadorilink_sync_core::recovery`'s own domain-specific state strings,
-/// but as a typed enum here since this is the coordination plane's OWN
-/// state machine, not a local journal state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnrollmentRemoteStatus {
     Preparing,
@@ -332,7 +439,7 @@ pub struct EnrollmentOperationRecord {
 }
 
 /// A role-loss-commit receipt read back from the coordination plane's
-/// `role_loss_operation_receipts` table (Phase 2.1-C1) -- its mere
+/// `role_loss_operation_receipts` table -- its mere
 /// existence IS the evidence: a receipt means the underlying acl mutation
 /// committed, full stop, there is no separate `status` field the way
 /// enrollment/membership have one. See
@@ -361,36 +468,21 @@ mod imp {
     use base64::Engine;
     use serde::{Deserialize, Serialize};
 
-    use crate::relay_grant::RelayGrant;
-
     use super::{
-        categorize_error_status, categorize_transport_error, evidence_http_client, ActivateOutcome,
-        EndpointCandidate, EnrollmentOperationRecord, EnrollmentRemoteRequest,
+        categorize_error_status, evidence_http_client, ActivateOutcome, CoordinationAuth,
+        CoordinationCallError, EnrollmentOperationRecord, EnrollmentRemoteRequest,
         EnrollmentRemoteStatus, HandoffCommitResult, HandoffLeaseGrant, MembershipOperationLookup,
         MembershipOperationRecord, MembershipRemoteRequest, MembershipRemoteRequestGroup,
         MembershipRemoteResult, MembershipRemoteStatus, RemoteEvidenceErrorCategory,
         RemoteQueryError, RoleLossCommitOutcome, RoleLossCommitRequest,
         RoleLossCompensationOutcome, RoleLossOperationRecord, SendAuthorizationGrant,
-        SendGrantPeerMaterial,
+        SendAuthorized,
     };
 
     /// `skip_serializing_if` predicate for an optional boolean request
     /// field whose `false` means exactly what omitting it means.
     fn is_false(value: &bool) -> bool {
         !*value
-    }
-
-    #[derive(Serialize)]
-    struct WireCandidate {
-        address: String,
-        priority: i32,
-    }
-
-    fn wire_candidates(candidates: &[EndpointCandidate]) -> Vec<WireCandidate> {
-        candidates
-            .iter()
-            .map(|c| WireCandidate { address: c.address.clone(), priority: c.priority })
-            .collect()
     }
 
     /// Extracts the coordination plane's own `{"error": "..."}` message
@@ -407,29 +499,24 @@ mod imp {
         value.get("error")?.as_str().map(str::to_string)
     }
 
-    async fn post_no_content<B: Serialize>(url: String, access_token: &str, body: &B, what: &str) {
-        let result =
-            reqwest::Client::new().post(&url).bearer_auth(access_token).json(body).send().await;
-        match result {
-            Ok(resp) if resp.status().is_success() => {}
-            Ok(resp) => {
-                tracing::debug!(status = %resp.status(), what, "coordination call rejected")
-            }
-            Err(e) => tracing::debug!(error = %e, what, "coordination call failed"),
-        }
-    }
+    /// Posts `body` and reports success/failure back to the caller instead of
+    /// only logging it -- `EnrollmentRecoveryService::reconcile_once` needs to
+    /// know whether it may drop its local marker.
+    /// Bounded for the same reason [`EVIDENCE_LOOKUP_TIMEOUT`] exists, and now
+    /// for a sharper one: the endpoint report is retried until it lands, and a
+    /// retry loop whose attempt never returns is not a retry loop. A refused
+    /// connection or a 500 reaches the backoff; a TCP connection that is
+    /// accepted and then answered by nobody would park `send()` forever, and
+    /// this device's reachability would never be republished.
+    const ENDPOINT_REPORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-    /// Same shape as `post_no_content`, but reports success/failure back to
-    /// the caller instead of only logging it -- `EnrollmentRecoveryService::reconcile_once`
-    /// needs to know whether it may drop its local marker.
     async fn post_no_content_ok<B: Serialize>(
         url: String,
-        access_token: &str,
+        auth: &CoordinationAuth,
         body: &B,
         what: &str,
     ) -> bool {
-        let result =
-            reqwest::Client::new().post(&url).bearer_auth(access_token).json(body).send().await;
+        let result = reqwest::Client::new().post(&url).json(body).send_authorized(auth).await;
         match result {
             Ok(resp) if resp.status().is_success() => true,
             Ok(resp) => {
@@ -472,12 +559,11 @@ mod imp {
     /// handlers.
     async fn post_activate<B: Serialize>(
         url: String,
-        access_token: &str,
+        auth: &CoordinationAuth,
         body: &B,
         what: &str,
     ) -> ActivateOutcome {
-        let result =
-            reqwest::Client::new().post(&url).bearer_auth(access_token).json(body).send().await;
+        let result = reqwest::Client::new().post(&url).json(body).send_authorized(auth).await;
         match result {
             Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
                 tracing::debug!(what, "coordination call: operation not found (row gone)");
@@ -533,13 +619,13 @@ mod imp {
     /// a marker left over from a killed CLI process.
     pub async fn activate_create(
         addr: &str,
-        access_token: &str,
+        auth: &CoordinationAuth,
         group_id: &str,
         operation_id: &str,
     ) -> ActivateOutcome {
         post_activate(
             format!("{addr}/shares/groups/{group_id}/activate"),
-            access_token,
+            auth,
             &OperationIdBody { operation_id },
             "create activate",
         )
@@ -551,13 +637,13 @@ mod imp {
     /// server if the group was already activated or is already gone.
     pub async fn cancel_create(
         addr: &str,
-        access_token: &str,
+        auth: &CoordinationAuth,
         group_id: &str,
         operation_id: &str,
     ) -> bool {
         post_no_content_ok(
             format!("{addr}/shares/groups/{group_id}/cancel"),
-            access_token,
+            auth,
             &OperationIdBody { operation_id },
             "create cancel",
         )
@@ -569,14 +655,14 @@ mod imp {
     /// into the real thing.
     pub async fn activate_join(
         addr: &str,
-        access_token: &str,
+        auth: &CoordinationAuth,
         group_id: &str,
         operation_id: &str,
         device_id: &str,
     ) -> ActivateOutcome {
         post_activate(
             format!("{addr}/shares/groups/{group_id}/join/activate"),
-            access_token,
+            auth,
             &JoinOperationBody { operation_id, device_id },
             "join activate",
         )
@@ -589,14 +675,14 @@ mod imp {
     /// was already activated or is already gone.
     pub async fn cancel_join(
         addr: &str,
-        access_token: &str,
+        auth: &CoordinationAuth,
         group_id: &str,
         operation_id: &str,
         device_id: &str,
     ) -> bool {
         post_no_content_ok(
             format!("{addr}/shares/groups/{group_id}/join/cancel"),
-            access_token,
+            auth,
             &JoinOperationBody { operation_id, device_id },
             "join cancel",
         )
@@ -607,7 +693,7 @@ mod imp {
     /// [`super::EnrollmentPrepareOutcome`].
     pub async fn prepare_create(
         addr: &str,
-        access_token: &str,
+        auth: &CoordinationAuth,
         operation_id: &str,
         name: &str,
         device_id: &str,
@@ -629,9 +715,8 @@ mod imp {
 
         let response = match reqwest::Client::new()
             .post(format!("{addr}/shares/groups/prepare"))
-            .bearer_auth(access_token)
             .json(&Body { operation_id, name, creating_device_id: device_id })
-            .send()
+            .send_authorized(auth)
             .await
         {
             Ok(response) => response,
@@ -671,7 +756,7 @@ mod imp {
     /// joined), so a bare 2xx is enough to confirm `Prepared`.
     pub async fn prepare_join(
         addr: &str,
-        access_token: &str,
+        auth: &CoordinationAuth,
         operation_id: &str,
         group_id: &str,
         device_id: &str,
@@ -689,9 +774,8 @@ mod imp {
 
         let response = match reqwest::Client::new()
             .post(format!("{addr}/shares/groups/{group_id}/join/prepare"))
-            .bearer_auth(access_token)
             .json(&Body { operation_id, device_id, storage_mode })
-            .send()
+            .send_authorized(auth)
             .await
         {
             Ok(response) => response,
@@ -715,7 +799,7 @@ mod imp {
     }
 
     async fn classify_cancel_response(
-        response: Result<reqwest::Response, reqwest::Error>,
+        response: Result<reqwest::Response, CoordinationCallError>,
     ) -> super::EnrollmentCancelOutcome {
         use super::EnrollmentCancelOutcome;
 
@@ -747,16 +831,15 @@ mod imp {
     /// merely-ambiguous transport failure, which a bare bool cannot.
     pub async fn cancel_create_classified(
         addr: &str,
-        access_token: &str,
+        auth: &CoordinationAuth,
         group_id: &str,
         operation_id: &str,
     ) -> super::EnrollmentCancelOutcome {
         classify_cancel_response(
             reqwest::Client::new()
                 .post(format!("{addr}/shares/groups/{group_id}/cancel"))
-                .bearer_auth(access_token)
                 .json(&OperationIdBody { operation_id })
-                .send()
+                .send_authorized(auth)
                 .await,
         )
         .await
@@ -766,7 +849,7 @@ mod imp {
     /// [`cancel_create_classified`]'s own doc comment.
     pub async fn cancel_join_classified(
         addr: &str,
-        access_token: &str,
+        auth: &CoordinationAuth,
         group_id: &str,
         operation_id: &str,
         device_id: &str,
@@ -774,9 +857,8 @@ mod imp {
         classify_cancel_response(
             reqwest::Client::new()
                 .post(format!("{addr}/shares/groups/{group_id}/join/cancel"))
-                .bearer_auth(access_token)
                 .json(&JoinOperationBody { operation_id, device_id })
-                .send()
+                .send_authorized(auth)
                 .await,
         )
         .await
@@ -789,7 +871,7 @@ mod imp {
     /// the caller learns the group actually is.
     pub async fn prepare_invite_accept(
         addr: &str,
-        access_token: &str,
+        auth: &CoordinationAuth,
         operation_id: &str,
         code: &str,
         device_id: &str,
@@ -813,9 +895,8 @@ mod imp {
 
         let response = match reqwest::Client::new()
             .post(format!("{addr}/shares/invites/accept/prepare"))
-            .bearer_auth(access_token)
             .json(&Body { operation_id, code, device_id, storage_mode })
-            .send()
+            .send_authorized(auth)
             .await
         {
             Ok(response) => response,
@@ -865,14 +946,14 @@ mod imp {
     /// this (deviceId, operationId) pair already redeemed at prepare time.
     pub async fn activate_invite_accept(
         addr: &str,
-        access_token: &str,
+        auth: &CoordinationAuth,
         group_id: &str,
         operation_id: &str,
         device_id: &str,
     ) -> ActivateOutcome {
         post_activate(
             format!("{addr}/shares/groups/{group_id}/invites/accept/activate"),
-            access_token,
+            auth,
             &JoinOperationBody { operation_id, device_id },
             "invite accept activate",
         )
@@ -886,7 +967,7 @@ mod imp {
     /// comment on that route).
     pub async fn cancel_invite_accept_classified(
         addr: &str,
-        access_token: &str,
+        auth: &CoordinationAuth,
         group_id: &str,
         operation_id: &str,
         device_id: &str,
@@ -894,9 +975,8 @@ mod imp {
         classify_cancel_response(
             reqwest::Client::new()
                 .post(format!("{addr}/shares/groups/{group_id}/invites/accept/cancel"))
-                .bearer_auth(access_token)
                 .json(&JoinOperationBody { operation_id, device_id })
-                .send()
+                .send_authorized(auth)
                 .await,
         )
         .await
@@ -911,7 +991,7 @@ mod imp {
     /// enrollment prepare/activate/cancel calls above.
     pub(crate) async fn mint_invite(
         addr: &str,
-        access_token: &str,
+        auth: &CoordinationAuth,
         group_id: &str,
         minting_device_id: &str,
         role: Option<&str>,
@@ -942,17 +1022,17 @@ mod imp {
             group_id: String,
             role: String,
             expires_at_unix: i64,
-            /// Absent from a coordination plane that predates this option,
-            /// which is exactly the same thing as "no approval step".
-            #[serde(default)]
+            /// Whether the invite is approval-gated. Required: the mint
+            /// route always reports it, and reading an absent value as
+            /// `false` would tell the daemon an approval-gated invite needs
+            /// no approval.
             requires_approval: bool,
         }
 
         let response = reqwest::Client::new()
             .post(format!("{addr}/shares/groups/{group_id}/invites"))
-            .bearer_auth(access_token)
             .json(&Body { minting_device_id, role, ttl_secs, requires_approval })
-            .send()
+            .send_authorized(auth)
             .await
             .map_err(|e| e.to_string())?;
         let status = response.status();
@@ -976,58 +1056,55 @@ mod imp {
         })
     }
 
-    pub async fn upload_signing_key(
-        addr: &str,
-        access_token: &str,
-        device_id: String,
-        signing_public_key: Vec<u8>,
-    ) {
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Body {
-            signing_public_key_base64: String,
-        }
-        let body = Body {
-            signing_public_key_base64: base64::engine::general_purpose::STANDARD
-                .encode(&signing_public_key),
-        };
-        post_no_content(
-            format!("{addr}/devices/{device_id}/signing-key"),
-            access_token,
-            &body,
-            "signing-key backfill",
-        )
-        .await;
-    }
-
+    /// Returns whether the plane accepted the report.
+    ///
+    /// Observable, not fire-and-forget, because this is now the ONLY way a
+    /// peer learns where this device's substrate answers. A POST lost to a
+    /// coordination blip used to be lost for good: the reporter waited for the
+    /// next address change, and an address that never changes again produces
+    /// none.
     pub async fn report_endpoint(
         addr: &str,
-        access_token: &str,
+        auth: &CoordinationAuth,
         device_id: String,
-        candidates: &[EndpointCandidate],
-        // P0-A: this device's own declared relay-capability, reported on
-        // this SAME path (the daemon already sends one report
-        // unconditionally at startup and again on every candidate change --
-        // see nat_traversal.rs's `report_candidates_on_change` -- so this
-        // rides an existing schedule rather than needing a dedicated
-        // capability endpoint). See coordination-worker's `NetmapPeer.
-        // relayCapable` for the other end of this value's journey.
-        relay_capable: bool,
-    ) {
+        substrate: &super::SubstrateReachability,
+    ) -> bool {
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
         struct Body {
-            candidates: Vec<WireCandidate>,
-            relay_capable: bool,
+            substrate_reachability: WireSubstrateReachability,
         }
-        let body = Body { candidates: wire_candidates(candidates), relay_capable };
-        post_no_content(
-            format!("{addr}/devices/{device_id}/endpoint"),
-            access_token,
-            &body,
-            "endpoint report",
-        )
-        .await;
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct WireSubstrateReachability {
+            direct: Vec<String>,
+            relays: Vec<String>,
+        }
+        let body = Body {
+            substrate_reachability: WireSubstrateReachability {
+                direct: substrate.direct.iter().map(ToString::to_string).collect(),
+                relays: substrate.relays.clone(),
+            },
+        };
+        let url = format!("{addr}/devices/{device_id}/endpoint");
+        let client = match reqwest::Client::builder().timeout(ENDPOINT_REPORT_TIMEOUT).build() {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::debug!(%error, "could not build the endpoint-report client");
+                return false;
+            }
+        };
+        match client.post(&url).json(&body).send_authorized(auth).await {
+            Ok(resp) if resp.status().is_success() => true,
+            Ok(resp) => {
+                tracing::debug!(status = %resp.status(), "endpoint report rejected");
+                false
+            }
+            Err(error) => {
+                tracing::debug!(%error, "endpoint report failed");
+                false
+            }
+        }
     }
 
     /// Looks up whether `target_device_id` currently holds a live handoff
@@ -1048,7 +1125,7 @@ mod imp {
     /// authorization itself).
     pub async fn find_handoff_lease(
         addr: &str,
-        access_token: &str,
+        auth: &CoordinationAuth,
         group_id: &str,
         target_device_id: &str,
     ) -> Option<String> {
@@ -1071,7 +1148,7 @@ mod imp {
                 return None;
             }
         };
-        let result = reqwest::Client::new().get(url).bearer_auth(access_token).send().await;
+        let result = reqwest::Client::new().get(url).send_authorized(auth).await;
         match result {
             Ok(resp) if resp.status().is_success() => match resp.json::<Resp>().await {
                 Ok(r) => r.lease.map(|l| l.lease_id),
@@ -1106,7 +1183,7 @@ mod imp {
     /// (retry the whole check-then-request sequence later) is unaffected.
     pub async fn request_handoff_lease(
         addr: &str,
-        access_token: &str,
+        auth: &CoordinationAuth,
         group_id: &str,
         target_device_id: &str,
     ) -> Option<HandoffLeaseGrant> {
@@ -1124,8 +1201,7 @@ mod imp {
         }
         let url = format!("{addr}/shares/groups/{group_id}/handoff/lease");
         let body = Body { target_device_id };
-        let result =
-            reqwest::Client::new().post(&url).bearer_auth(access_token).json(&body).send().await;
+        let result = reqwest::Client::new().post(&url).json(&body).send_authorized(auth).await;
         match result {
             Ok(resp) if resp.status().is_success() => match resp.json::<Resp>().await {
                 Ok(r) => Some(HandoffLeaseGrant {
@@ -1149,98 +1225,152 @@ mod imp {
         }
     }
 
-    /// M3 Pass 6 / P0-A: requests a signed [`crate::relay_grant::RelayGrant`]
-    /// authorizing `relay_device_id` to forward opaque QUIC datagrams
-    /// between this device (`source_device_id`) and `destination_device_id`,
-    /// all three members of `group_id`
-    /// (`POST /shares/groups/:groupId/relay/grant`). `source_device_id` is
-    /// this device's own id -- the Bearer token authenticates only the
-    /// account, never a specific device, so the coordination plane cannot
-    /// derive it and it must be sent explicitly (verified server-side
-    /// against the account's own device ownership; see the Worker's
-    /// `issueRelayGrant` doc comment).
+    /// Requests (or, for an already-decided `request_id`,
+    /// replays) a signed `AuthorizationCheckpoint` for `device_id`'s
+    /// pending batch, via coordination-worker's
+    /// `POST /shares/groups/:groupId/authorization-checkpoint`
+    /// (`src/routes/shares.ts`). `request_id` MUST be
+    /// deterministic in the caller for a given `(group_id, device_id,
+    /// merkle_root, leaf_count)` — see
+    /// `checkpoint_source::pending_batch_request_id` — so a retry after a
+    /// lost response reuses the SAME decided record rather than being
+    /// judged (and potentially refused) as a brand new request against
+    /// possibly-changed writer status (design doc §3.4's corrected retry
+    /// semantics).
     ///
-    /// Reconstructs the full [`RelayGrant`] from what the CALLER already
-    /// knows (`group_id`/`source_device_id`/`relay_device_id`/
-    /// `destination_device_id`, exactly what was just requested) plus what
-    /// the plane decided (`grant_id`/`version`/validity window/
-    /// `max_session_bytes`/signature) -- the response never re-states the
-    /// four ids, so there is nothing for a caller to reconcile against a
-    /// possibly-differing echo.
-    ///
-    /// `None` on any failure (unreachable plane, rejected request --
-    /// unauthorized, not a member, relay not capable -- or an unparseable
-    /// response), matching every other best-effort call in this module and
-    /// [`crate::relay_carrier::RelayGrantSource`]'s own documented "no new
-    /// connectivity authority" contract: a missing grant here is
-    /// indistinguishable from any other reason a relay candidate didn't
-    /// pan out, and [`crate::relay_carrier::open_relay_path`] simply tries
-    /// the next one.
-    pub async fn request_relay_grant(
+    /// Best-effort like every other call in this module: `None` on any
+    /// failure, including a legitimate 403 ("not currently a writer" —
+    /// expected and not logged above debug) and a 409 (idempotency
+    /// conflict — should never happen for a caller deriving `request_id`
+    /// correctly, logged at `warn` since it indicates a caller bug rather
+    /// than an expected outcome).
+    pub async fn request_authorization_checkpoint(
         addr: &str,
-        access_token: &str,
+        auth: &CoordinationAuth,
         group_id: &str,
-        source_device_id: &str,
-        relay_device_id: &str,
-        destination_device_id: &str,
-    ) -> Option<RelayGrant> {
+        device_id: &str,
+        request_id: &str,
+        merkle_root: [u8; 32],
+        leaf_count: u64,
+    ) -> Option<(
+        yadorilink_replica_domain::authorization_checkpoint::AuthorizationCheckpoint,
+        [u8; 64],
+    )> {
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
         struct Body<'a> {
-            source_device_id: &'a str,
-            relay_device_id: &'a str,
-            destination_device_id: &'a str,
+            device_id: &'a str,
+            request_id: &'a str,
+            merkle_root_base64: String,
+            leaf_count: u64,
         }
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Resp {
-            grant_id: String,
-            version: u32,
-            not_before_unix: i64,
-            expires_at_unix: i64,
-            max_session_bytes: Option<u64>,
-            signature_base64: String,
+            group_id: String,
+            device_id: String,
+            signing_key_fingerprint_base64: String,
+            merkle_root_base64: String,
+            leaf_count: u64,
+            checkpoint_seq: u64,
+            signer_key_id_base64: String,
+            policy_epoch: u64,
+            policy_seq: u64,
+            policy_head_base64: String,
+            issued_at_unix: u64,
+            signature_base64: Option<String>,
         }
-        let url = format!("{addr}/shares/groups/{group_id}/relay/grant");
-        let body = Body { source_device_id, relay_device_id, destination_device_id };
-        let result =
-            reqwest::Client::new().post(&url).bearer_auth(access_token).json(&body).send().await;
+        fn decode32(b64: &str) -> Option<[u8; 32]> {
+            let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+            bytes.try_into().ok()
+        }
+        let url = format!("{addr}/shares/groups/{group_id}/authorization-checkpoint");
+        let body = Body {
+            device_id,
+            request_id,
+            merkle_root_base64: base64::engine::general_purpose::STANDARD.encode(merkle_root),
+            leaf_count,
+        };
+        let result = reqwest::Client::new().post(&url).json(&body).send_authorized(auth).await;
         match result {
             Ok(resp) if resp.status().is_success() => match resp.json::<Resp>().await {
                 Ok(r) => {
-                    let signature = match base64::engine::general_purpose::STANDARD
-                        .decode(&r.signature_base64)
-                    {
-                        Ok(bytes) => bytes,
-                        Err(e) => {
-                            tracing::debug!(error = %e, "relay grant request: unparseable signature");
-                            return None;
-                        }
+                    let Some(signature_base64) = r.signature_base64 else {
+                        tracing::debug!(
+                            "authorization checkpoint request: response carried no signature yet"
+                        );
+                        return None;
                     };
-                    Some(RelayGrant {
-                        version: r.version,
-                        grant_id: r.grant_id,
-                        group_id: group_id.to_string(),
-                        source_device_id: source_device_id.to_string(),
-                        relay_device_id: relay_device_id.to_string(),
-                        destination_device_id: destination_device_id.to_string(),
-                        not_before_unix: r.not_before_unix,
-                        expires_at_unix: r.expires_at_unix,
-                        max_session_bytes: r.max_session_bytes,
-                        signature,
-                    })
+                    let Some(signature_bytes) = base64::engine::general_purpose::STANDARD
+                        .decode(&signature_base64)
+                        .ok()
+                        .and_then(|b| <[u8; 64]>::try_from(b).ok())
+                    else {
+                        tracing::debug!("authorization checkpoint request: unparseable signature");
+                        return None;
+                    };
+                    let (
+                        Some(signing_key_fingerprint),
+                        Some(merkle_root),
+                        Some(signer_key_id),
+                        Some(policy_head),
+                    ) = (
+                        decode32(&r.signing_key_fingerprint_base64),
+                        decode32(&r.merkle_root_base64),
+                        decode32(&r.signer_key_id_base64),
+                        decode32(&r.policy_head_base64),
+                    )
+                    else {
+                        tracing::debug!(
+                            "authorization checkpoint request: unparseable 32-byte field"
+                        );
+                        return None;
+                    };
+                    Some((
+                        yadorilink_replica_domain::authorization_checkpoint::AuthorizationCheckpoint {
+                            group_id: r.group_id,
+                            device_id: r.device_id,
+                            signing_key_fingerprint,
+                            merkle_root,
+                            leaf_count: r.leaf_count,
+                            checkpoint_seq: r.checkpoint_seq,
+                            signer_key_id,
+                            policy_epoch: r.policy_epoch,
+                            policy_seq: r.policy_seq,
+                            policy_head,
+                            issued_at_unix: r.issued_at_unix,
+                        },
+                        signature_bytes,
+                    ))
                 }
                 Err(e) => {
-                    tracing::debug!(error = %e, "relay grant request: unparseable response");
+                    tracing::debug!(error = %e, "authorization checkpoint request: unparseable response");
                     None
                 }
             },
+            Ok(resp) if resp.status() == reqwest::StatusCode::FORBIDDEN => {
+                tracing::debug!(
+                    device_id,
+                    group_id,
+                    "authorization checkpoint request: not currently a writer"
+                );
+                None
+            }
+            Ok(resp) if resp.status() == reqwest::StatusCode::CONFLICT => {
+                tracing::warn!(
+                    request_id,
+                    "authorization checkpoint request: idempotency conflict -- request_id was \
+                     reused for a different payload, which should never happen for a correctly \
+                     derived request_id"
+                );
+                None
+            }
             Ok(resp) => {
-                tracing::debug!(status = %resp.status(), "relay grant request rejected");
+                tracing::debug!(status = %resp.status(), "authorization checkpoint request rejected");
                 None
             }
             Err(e) => {
-                tracing::debug!(error = %e, "relay grant request failed");
+                tracing::debug!(error = %e, "authorization checkpoint request failed");
                 None
             }
         }
@@ -1262,7 +1392,7 @@ mod imp {
     /// surfaced to the caller.
     pub async fn release_handoff_lease(
         addr: &str,
-        access_token: &str,
+        auth: &CoordinationAuth,
         group_id: &str,
         target_device_id: &str,
         lease_id: &str,
@@ -1274,8 +1404,7 @@ mod imp {
         }
         let url = format!("{addr}/shares/groups/{group_id}/handoff/lease/{lease_id}/release");
         let body = Body { target_device_id };
-        let result =
-            reqwest::Client::new().post(&url).bearer_auth(access_token).json(&body).send().await;
+        let result = reqwest::Client::new().post(&url).json(&body).send_authorized(auth).await;
         match result {
             Ok(resp) if resp.status().is_success() => {}
             Ok(resp) => {
@@ -1308,7 +1437,7 @@ mod imp {
     /// commit itself was refused or unreachable.
     pub async fn commit_handoff_role_loss(
         addr: &str,
-        access_token: &str,
+        auth: &CoordinationAuth,
         request: RoleLossCommitRequest<'_>,
     ) -> RoleLossCommitOutcome {
         #[derive(Serialize)]
@@ -1336,13 +1465,7 @@ mod imp {
             action: request.action,
             operation_id: request.operation_id,
         };
-        let resp = match reqwest::Client::new()
-            .post(&url)
-            .bearer_auth(access_token)
-            .json(&body)
-            .send()
-            .await
-        {
+        let resp = match reqwest::Client::new().post(&url).json(&body).send_authorized(auth).await {
             Ok(resp) => resp,
             Err(e) => {
                 return RoleLossCommitOutcome::Ambiguous(format!(
@@ -1386,10 +1509,10 @@ mod imp {
     /// `ReplicaMembershipService::revoke_edge`'s doc comment).
     pub async fn resolve_edge(
         addr: &str,
-        access_token: &str,
+        auth: &CoordinationAuth,
         edge_id: &str,
     ) -> Result<Option<(String, String)>, String> {
-        Ok(list_share_edges(addr, access_token)
+        Ok(list_share_edges(addr, auth)
             .await?
             .into_iter()
             .find(|edge| edge.edge_id == edge_id)
@@ -1404,26 +1527,23 @@ mod imp {
         group_id: String,
         device_id: String,
         /// The edge's membership state (`"active"`, `"pending"`, or
-        /// `"pending_approval"`). Optional-with-default rather than
-        /// required: a coordination plane deployed before it reported edge
-        /// state must degrade to "state unknown" instead of failing the
-        /// whole listing and taking `resolve_edge` -- and with it every
-        /// `revoke <edge-id>` -- down with it. Every consumer of this field
-        /// treats `None` as "not known to be anything in particular" and
-        /// falls back to the conservative branch.
-        #[serde(default)]
-        state: Option<String>,
+        /// `"pending_approval"`). Required: `acl.state` is NOT NULL and the
+        /// listing reports it for every row, so an absent value is a
+        /// malformed response rather than an edge whose state is unknown.
+        state: String,
     }
 
-    async fn list_share_edges(addr: &str, access_token: &str) -> Result<Vec<EdgeInfo>, String> {
+    async fn list_share_edges(
+        addr: &str,
+        auth: &CoordinationAuth,
+    ) -> Result<Vec<EdgeInfo>, String> {
         #[derive(Deserialize)]
         struct Resp {
             edges: Vec<EdgeInfo>,
         }
         let resp = reqwest::Client::new()
             .get(format!("{addr}/shares"))
-            .bearer_auth(access_token)
-            .send()
+            .send_authorized(auth)
             .await
             .map_err(|e| e.to_string())?;
         if !resp.status().is_success() {
@@ -1441,15 +1561,15 @@ mod imp {
     /// active".
     pub async fn fetch_edge_state(
         addr: &str,
-        access_token: &str,
+        auth: &CoordinationAuth,
         group_id: &str,
         device_id: &str,
     ) -> Result<Option<String>, String> {
-        Ok(list_share_edges(addr, access_token)
+        Ok(list_share_edges(addr, auth)
             .await?
             .into_iter()
             .find(|edge| edge.group_id == group_id && edge.device_id == device_id)
-            .and_then(|edge| edge.state))
+            .map(|edge| edge.state))
     }
 
     /// Confirms whether a daemon-driven membership mutation actually landed,
@@ -1468,17 +1588,12 @@ mod imp {
     /// unknown, not as rejected.
     pub async fn query_membership_operation(
         addr: &str,
-        access_token: &str,
+        auth: &CoordinationAuth,
         operation_id: &str,
     ) -> Result<MembershipOperationLookup, String> {
-        query_membership_operation_categorized(
-            &evidence_http_client(),
-            addr,
-            access_token,
-            operation_id,
-        )
-        .await
-        .map_err(|e| e.message)
+        query_membership_operation_categorized(&evidence_http_client(), addr, auth, operation_id)
+            .await
+            .map_err(|e| e.message)
     }
 
     /// Same lookup as [`query_membership_operation`], sharing its entire
@@ -1499,7 +1614,7 @@ mod imp {
     pub async fn query_membership_operation_categorized(
         client: &reqwest::Client,
         addr: &str,
-        access_token: &str,
+        auth: &CoordinationAuth,
         operation_id: &str,
     ) -> Result<MembershipOperationLookup, RemoteQueryError> {
         // Decoded as a plain `String` below, not a serde enum -- see
@@ -1551,13 +1666,9 @@ mod imp {
         }
         let resp = client
             .get(format!("{addr}/devices/membership-operations/{operation_id}"))
-            .bearer_auth(access_token)
-            .send()
+            .send_authorized(auth)
             .await
-            .map_err(|e| RemoteQueryError {
-                category: categorize_transport_error(&e),
-                message: e.to_string(),
-            })?;
+            .map_err(|e| RemoteQueryError { category: e.category(), message: e.to_string() })?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(MembershipOperationLookup::NotFound);
         }
@@ -1683,7 +1794,7 @@ mod imp {
     pub async fn query_enrollment_operation(
         client: &reqwest::Client,
         addr: &str,
-        access_token: &str,
+        auth: &CoordinationAuth,
         operation_id: &str,
     ) -> Result<Option<EnrollmentOperationRecord>, RemoteQueryError> {
         // `kind`/`status` are decoded as plain `String`, not a serde enum:
@@ -1726,13 +1837,9 @@ mod imp {
         }
         let resp = client
             .get(format!("{addr}/devices/enrollment-operations/{operation_id}"))
-            .bearer_auth(access_token)
-            .send()
+            .send_authorized(auth)
             .await
-            .map_err(|e| RemoteQueryError {
-                category: categorize_transport_error(&e),
-                message: e.to_string(),
-            })?;
+            .map_err(|e| RemoteQueryError { category: e.category(), message: e.to_string() })?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -1750,7 +1857,7 @@ mod imp {
         // The endpoint's own contract is to answer for exactly the
         // requested operation_id -- a mismatch means the Worker response
         // itself broke that contract (not a local-vs-remote identity
-        // question C2's diagnosis engine handles), so this is
+        // question the diagnosis engine handles), so this is
         // `MalformedResponse`, not `Conflict` (which does not even exist
         // at this layer).
         if parsed.operation_id != operation_id {
@@ -1831,7 +1938,7 @@ mod imp {
     }
 
     /// Reads the coordination plane's `role_loss_operation_receipts` row by
-    /// `operation_id` (Phase 2.1-C1) -- the receipt's mere existence IS the
+    /// `operation_id` -- the receipt's mere existence IS the
     /// evidence that a role-loss commit landed; there is no separate
     /// status field the way enrollment/membership have one. `Ok(None)`
     /// means a genuine HTTP 404 -- no durable receipt was returned for this
@@ -1844,7 +1951,7 @@ mod imp {
     pub async fn query_role_loss_operation(
         client: &reqwest::Client,
         addr: &str,
-        access_token: &str,
+        auth: &CoordinationAuth,
         operation_id: &str,
     ) -> Result<Option<RoleLossOperationRecord>, RemoteQueryError> {
         #[derive(Deserialize)]
@@ -1861,13 +1968,9 @@ mod imp {
         }
         let resp = client
             .get(format!("{addr}/devices/role-loss-operations/{operation_id}"))
-            .bearer_auth(access_token)
-            .send()
+            .send_authorized(auth)
             .await
-            .map_err(|e| RemoteQueryError {
-                category: categorize_transport_error(&e),
-                message: e.to_string(),
-            })?;
+            .map_err(|e| RemoteQueryError { category: e.category(), message: e.to_string() })?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -1928,7 +2031,7 @@ mod imp {
 
     pub async fn compensate_handoff_role_loss(
         addr: &str,
-        access_token: &str,
+        auth: &CoordinationAuth,
         group_id: &str,
         source_device_id: &str,
         target_device_id: &str,
@@ -1950,14 +2053,13 @@ mod imp {
         }
         let response = reqwest::Client::new()
             .post(format!("{addr}/shares/groups/{group_id}/handoff/compensate"))
-            .bearer_auth(access_token)
             .json(&Body {
                 source_device_id,
                 target_device_id,
                 lease_id,
                 expected_membership_generation,
             })
-            .send()
+            .send_authorized(auth)
             .await
             .map_err(|e| format!("could not confirm role-loss compensation: {e}"))?;
         if !response.status().is_success() {
@@ -1991,7 +2093,7 @@ mod imp {
     /// peer reading its pushed netmap) still believes it is on-demand.
     pub async fn set_storage_mode(
         addr: &str,
-        access_token: &str,
+        auth: &CoordinationAuth,
         group_id: &str,
         device_id: &str,
         storage_mode: &str,
@@ -2006,9 +2108,8 @@ mod imp {
         let body = Body { device_id, storage_mode };
         let resp = reqwest::Client::new()
             .post(&url)
-            .bearer_auth(access_token)
             .json(&body)
-            .send()
+            .send_authorized(auth)
             .await
             .map_err(|e| format!("could not reach the coordination plane: {e}"))?;
         if !resp.status().is_success() {
@@ -2019,44 +2120,6 @@ mod imp {
             ));
         }
         Ok(())
-    }
-
-    pub async fn send_rendezvous(
-        addr: &str,
-        access_token: &str,
-        device_id: String,
-        target_device_id: String,
-        candidates: &[EndpointCandidate],
-    ) {
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Body {
-            device_id: String,
-            target_device_id: String,
-            candidates: Vec<WireCandidate>,
-        }
-        let body = Body { device_id, target_device_id, candidates: wire_candidates(candidates) };
-        post_no_content(
-            format!("{addr}/netmap/rendezvous"),
-            access_token,
-            &body,
-            "rendezvous send",
-        )
-        .await;
-    }
-
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct WireEndpoint {
-        address: String,
-        priority: i32,
-    }
-
-    fn decoded_endpoints(endpoints: Vec<WireEndpoint>) -> Vec<EndpointCandidate> {
-        endpoints
-            .into_iter()
-            .map(|e| EndpointCandidate { address: e.address, priority: e.priority })
-            .collect()
     }
 
     /// Decodes a base64 Ed25519 public key into the fixed-size form every
@@ -2082,7 +2145,7 @@ mod imp {
     /// that.
     pub async fn request_send_authorization(
         addr: &str,
-        access_token: &str,
+        auth: &CoordinationAuth,
         sender_device_id: &str,
         receiver_device_id: &str,
     ) -> Result<SendAuthorizationGrant, String> {
@@ -2097,7 +2160,8 @@ mod imp {
         struct ReceiverBody {
             device_id: String,
             signing_public_key_base64: String,
-            endpoints: Vec<WireEndpoint>,
+            #[serde(default)]
+            substrate_reachability: Option<super::WireSubstrateReachability>,
         }
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
@@ -2111,9 +2175,8 @@ mod imp {
         let body = Body { sender_device_id, receiver_device_id };
         let resp = reqwest::Client::new()
             .post(&url)
-            .bearer_auth(access_token)
             .json(&body)
-            .send()
+            .send_authorized(auth)
             .await
             .map_err(|e| format!("could not reach the coordination plane: {e}"))?;
         if !resp.status().is_success() {
@@ -2137,18 +2200,21 @@ mod imp {
             expires_at_unix: parsed.expires_at,
             receiver_device_id: parsed.receiver.device_id,
             receiver_signing_key,
-            receiver_candidates: decoded_endpoints(parsed.receiver.endpoints),
+            receiver_reachability: parsed
+                .receiver
+                .substrate_reachability
+                .map(Into::into)
+                .unwrap_or_default(),
         })
     }
 
     /// Atomically consumes a grant -- `POST /send/authorization/:grantId/consume`
-    /// -- naming the exact sender identity this device's own QUIC handshake
-    /// just authenticated (never a value merely claimed in the application-
+    /// -- naming the exact sender identity this device's own Track Send
+    /// handshake just authenticated (never a value merely claimed in the application-
     /// layer offer that presented `grant_id`/`nonce`; see
-    /// `yadorilink-send`'s `handle_offer`, which is what calls this). On
-    /// success, returns the sender's own connect material, released by the
-    /// coordination plane for the first and only time this grant is ever
-    /// consumed -- see `consumeSendAuthorization`'s own doc comment on the
+    /// `yadorilink-send`'s `handle_offer`, which is what calls this). Only
+    /// the first consume of a grant succeeds -- see
+    /// `consumeSendAuthorization`'s own doc comment on the
     /// Worker side for why a SECOND call with the exact same arguments
     /// (a replay, or an honest retry after this device never saw the first
     /// response) reliably fails rather than reliably succeeding twice: only
@@ -2157,12 +2223,12 @@ mod imp {
     /// requesting a fresh grant, not by re-presenting a consumed one.
     pub async fn consume_send_authorization(
         addr: &str,
-        access_token: &str,
+        auth: &CoordinationAuth,
         grant_id: &str,
         nonce: &str,
         sender_device_id: &str,
         receiver_device_id: &str,
-    ) -> Result<SendGrantPeerMaterial, String> {
+    ) -> Result<(), String> {
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
         struct Body<'a> {
@@ -2170,25 +2236,12 @@ mod imp {
             sender_device_id: &'a str,
             receiver_device_id: &'a str,
         }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct SenderBody {
-            device_id: String,
-            signing_public_key_base64: String,
-            endpoints: Vec<WireEndpoint>,
-        }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Resp {
-            sender: SenderBody,
-        }
         let url = format!("{addr}/send/authorization/{grant_id}/consume");
         let body = Body { nonce, sender_device_id, receiver_device_id };
         let resp = reqwest::Client::new()
             .post(&url)
-            .bearer_auth(access_token)
             .json(&body)
-            .send()
+            .send_authorized(auth)
             .await
             .map_err(|e| format!("could not reach the coordination plane: {e}"))?;
         if !resp.status().is_success() {
@@ -2198,20 +2251,9 @@ mod imp {
                 "send authorization is invalid, expired, or already used ({status}): {text}"
             ));
         }
-        let parsed: Resp = resp
-            .json()
-            .await
-            .map_err(|e| format!("unparseable send-authorization-consume response: {e}"))?;
-        let signing_key =
-            decode_signing_key(&parsed.sender.signing_public_key_base64).ok_or_else(|| {
-                "send-authorization-consume response carried an unparseable sender signing key"
-                    .to_string()
-            })?;
-        Ok(SendGrantPeerMaterial {
-            device_id: parsed.sender.device_id,
-            signing_key,
-            candidates: decoded_endpoints(parsed.sender.endpoints),
-        })
+        // The response also names the sender; this device already knows who
+        // it is from the authenticated connection, so the body is not read.
+        Ok(())
     }
 
     #[cfg(test)]
@@ -2223,6 +2265,15 @@ mod imp {
         use crate::coordination_client::{ActivateOutcome, EnrollmentPrepareOutcome};
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        /// The credential every call in this module now takes, wrapping the
+        /// pre-cutover opaque token these mock servers expect to see as
+        /// `Authorization: Bearer`. On the new plane the equivalent is built
+        /// from an enrolled client registration and there is no constructor
+        /// that takes a string at all.
+        fn test_auth() -> yadorilink_fapi_client::CoordinationAuth {
+            yadorilink_fapi_client::test_support::offline_auth()
+        }
 
         #[test]
         fn coord_error_message_extracts_the_coordination_planes_error_field() {
@@ -2272,7 +2323,7 @@ mod imp {
                 .await;
 
             let outcome =
-                prepare_create(&server.uri(), "test-token", "op-1", "photos", "device-a").await;
+                prepare_create(&server.uri(), &test_auth(), "op-1", "photos", "device-a").await;
             assert_eq!(
                 outcome,
                 EnrollmentPrepareOutcome::Prepared { group_id: "group-1".to_string() }
@@ -2303,7 +2354,7 @@ mod imp {
 
             let outcome = prepare_invite_accept(
                 &server.uri(),
-                "test-token",
+                &test_auth(),
                 "op-2",
                 "invite-code-1",
                 "device-b",
@@ -2335,12 +2386,13 @@ mod imp {
                         "groupId": "group-1",
                         "groupName": "photos",
                         "deviceId": "device-1",
+                        "state": "active",
                     }]
                 })))
                 .mount(&server)
                 .await;
 
-            let resolved = resolve_edge(&server.uri(), "test-token", "edge-1").await.unwrap();
+            let resolved = resolve_edge(&server.uri(), &test_auth(), "edge-1").await.unwrap();
             assert_eq!(resolved, Some(("group-1".to_string(), "device-1".to_string())));
         }
 
@@ -2357,13 +2409,14 @@ mod imp {
                         "groupId": "group-1",
                         "groupName": "photos",
                         "deviceId": "device-1",
+                        "state": "active",
                     }]
                 })))
                 .mount(&server)
                 .await;
 
             let resolved =
-                resolve_edge(&server.uri(), "test-token", "edge-does-not-exist").await.unwrap();
+                resolve_edge(&server.uri(), &test_auth(), "edge-does-not-exist").await.unwrap();
             assert_eq!(resolved, None);
         }
 
@@ -2400,27 +2453,36 @@ mod imp {
 
             let uri = server.uri();
             assert_eq!(
-                fetch_edge_state(&uri, "test-token", "group-1", "device-2").await.unwrap(),
+                fetch_edge_state(&uri, &test_auth(), "group-1", "device-2").await.unwrap(),
                 Some("pending_approval".to_string())
             );
             assert_eq!(
-                fetch_edge_state(&uri, "test-token", "group-1", "device-1").await.unwrap(),
+                fetch_edge_state(&uri, &test_auth(), "group-1", "device-1").await.unwrap(),
                 Some("active".to_string())
             );
             // An edge the listing does not carry is "unknown", never "not
             // active" -- the caller must keep failing closed on it.
             assert_eq!(
-                fetch_edge_state(&uri, "test-token", "group-1", "device-9").await.unwrap(),
+                fetch_edge_state(&uri, &test_auth(), "group-1", "device-9").await.unwrap(),
                 None
             );
         }
 
-        /// A coordination plane that predates edge-state reporting must
-        /// degrade to "unknown" rather than failing the whole listing --
-        /// which would also take `resolve_edge`, and with it every
-        /// `share revoke <edge-id>`, down with it.
+        /// A listing row with no `state` is a malformed response, not an
+        /// edge whose state is unknown.
+        ///
+        /// This asserts the opposite of what it used to. Tolerating the
+        /// absence was an affordance for a coordination plane that
+        /// predated edge-state reporting; `acl.state` is NOT NULL and the
+        /// listing reports it on every row, so the only things an absent
+        /// value can now mean are a truncated or corrupted response. The
+        /// distinction matters because "unknown" is a load-bearing answer
+        /// here -- callers fail closed on it -- so silently manufacturing
+        /// one from a broken response would hand a targeted revoke a
+        /// fail-closed verdict that looks like it was actually reported.
+        /// Failing the listing instead is the honest outcome.
         #[tokio::test]
-        async fn fetch_edge_state_is_unknown_when_the_listing_reports_no_state() {
+        async fn a_shares_listing_row_without_a_state_is_rejected_as_malformed() {
             let server = MockServer::start().await;
             Mock::given(method("GET"))
                 .and(path("/shares"))
@@ -2435,9 +2497,10 @@ mod imp {
                 .mount(&server)
                 .await;
 
-            assert_eq!(
-                fetch_edge_state(&server.uri(), "test-token", "group-1", "device-1").await.unwrap(),
-                None
+            assert!(
+                fetch_edge_state(&server.uri(), &test_auth(), "group-1", "device-1").await.is_err(),
+                "an absent state must fail the listing rather than read back as the `None` that \
+                 means 'this edge was not listed at all'"
             );
         }
 
@@ -2461,7 +2524,7 @@ mod imp {
                     .await;
 
                 let outcome =
-                    activate_invite_accept(&server.uri(), "test-token", "group-1", "op-1", "dev-1")
+                    activate_invite_accept(&server.uri(), &test_auth(), "group-1", "op-1", "dev-1")
                         .await;
                 assert_eq!(outcome, ActivateOutcome::AwaitingApproval, "for result {result:?}");
             }
@@ -2488,7 +2551,7 @@ mod imp {
                     .await;
 
                 let outcome =
-                    activate_invite_accept(&server.uri(), "test-token", "group-1", "op-1", "dev-1")
+                    activate_invite_accept(&server.uri(), &test_auth(), "group-1", "op-1", "dev-1")
                         .await;
                 assert_eq!(outcome, expected, "for result {result:?}");
             }

@@ -42,4 +42,14 @@ impl VersionRestoreService {
     ) -> Result<(), SyncError> {
         self.port.restore_trashed(group_id, path).await
     }
+
+    /// The folder restore: every trashed entry removed by the same
+    /// recursive delete or directory rename as the one at `path`.
+    pub(crate) async fn restore_trashed_operation(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<crate::hydration::TrashOperationRestore, SyncError> {
+        self.port.restore_trashed_operation(group_id, path).await
+    }
 }

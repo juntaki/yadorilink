@@ -1,0 +1,321 @@
+#!/usr/bin/env bash
+# Thin client for a persistent `nvim --headless --listen <socket>` process
+# that keeps rust-analyzer warm (see ra_assist_srv.lua). One daemon per repo
+# root; started lazily on first use and reused by every later call so the
+# workspace-load cost (tens of seconds on this monorepo) is paid once, not
+# per command.
+#
+# This file deliberately knows almost nothing about the commands: it forwards
+# its arguments to RA_ASSIST.dispatch() untouched. Adding a command is a
+# change to the Lua side only -- including the usage text below, which is the
+# one thing here that has to be kept in step by hand.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SRV_LUA="$SCRIPT_DIR/ra_assist_srv.lua"
+
+# Must match RA_ASSIST.PROTOCOL in ra_assist_srv.lua. A running daemon holds
+# its Lua in memory, so editing the server script changes nothing until the
+# daemon restarts; bumping this makes that restart automatic instead of
+# leaving a new client talking to old code.
+usage() {
+  cat >&2 <<'EOF'
+usage: ra-assist <command> [<position>] [args...] [flags]
+
+read-only (safe to run at any time):
+  def | type-def | impl   <pos>        where a symbol is defined / its type / its impls
+  refs             <pos> [--decl]      every use of a symbol, across crates
+  hover            <pos>               type and docs, as an editor would show them
+  symbols          <file> [--deep]     outline of one file
+  search           <query>             workspace symbol search ('#' = all, '*' = with deps)
+  callers|callees  <pos>               call hierarchy, one level
+  parent-mod       <pos>               the module this file belongs to
+  expand           <pos>               expand the macro at this position
+  hints            <file>[:l1-l2]      inferred types as inlay hints
+  runnables        <file> [pos]        the exact `cargo test` command for a target
+  tests            <pos>               tests that exercise this code
+  diag             [file] [--check]    diagnostics; --check runs cargo flycheck first
+  analyzer-status  [file]              rust-analyzer's own status dump
+
+writes (all accept --dry-run to print a diff instead of editing):
+  list             <range>                     code actions offered here
+  apply            <range> <exact title>       apply one of them by title
+  rename           <pos> <new name>            semantic rename across the workspace
+  extract-function <range>
+  extract-variable <range>
+  inline           <pos>
+  move-to-file     <pos>
+  ssr              '<pat> ==>> <repl>' --apply structural search and replace;
+                                               previews unless --apply is given
+
+daemon:
+  warmup [file]    start rust-analyzer and wait for indexing, nothing else
+  status           daemon + client state
+  stop             kill the daemon (and rust-analyzer under it)
+  commands         list every command the running server knows
+
+<pos> and <range> accept, interchangeably:
+  src/lib.rs 12 4          the original form (1-based, as editors show)
+  src/lib.rs 12 4 40 8     ... with an end position
+  src/lib.rs:12:4          the same, as one token
+  src/lib.rs:12-40         whole lines 12 to 40
+  src/lib.rs@some_fn       the symbol in that file, by name
+  PeerSyncSession::send    a workspace symbol, by name
+
+Prefer the symbol forms. Line/col go stale: coordinates taken from one
+`cargo check` run are wrong for every line below an edit applied since, and
+an assist aimed at a stale position does not fail -- it edits the wrong
+code. A named symbol is re-resolved on every call. When a name is ambiguous
+the tool prints the candidates and stops rather than picking one.
+
+An assist acts on the range you give it, and its title will not warn you
+otherwise: "Remove all unused imports" at a point position removes the
+unused names in the `use` item under the cursor -- the "all" is about that
+item, not the file. Pass a range covering the whole import block to clean a
+file in one call. `apply` guards against getting this wrong: after the edit
+it asks the same question again, and if the server still offers the same fix
+over that range it prints INCOMPLETE and exits 2 -- the edit landed, but it
+did not finish the job.
+
+Flags: --dry-run, --apply (ssr only), --decl, --deep, --check, --limit=N,
+--timeout=MS, --at=FILE (for ssr). Use `--` before an argument that starts
+with two dashes.
+
+Exit codes: 0 ok, 1 nothing applied (no match, or an error), 2 applied but
+incomplete.
+
+One daemon is kept per repo root (found via `git rev-parse --show-toplevel`,
+falling back to cwd), socket under $TMPDIR.
+EOF
+  exit 1
+}
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+
+# macOS has none of coreutils' hashing commands under the names Linux uses,
+# and this only needs a stable short tag for a socket name, not a digest with
+# any properties. Take whatever the machine has.
+path_hash() {
+  local input="$1" out
+  if out="$(printf '%s' "$input" | md5sum 2>/dev/null)"; then
+    :
+  elif out="$(printf '%s' "$input" | md5 -q 2>/dev/null)"; then
+    :
+  elif out="$(printf '%s' "$input" | shasum 2>/dev/null)"; then
+    :
+  else
+    out="$(printf '%s' "$input" | cksum)"
+  fi
+  printf '%s' "$out" | tr -cd '0-9a-f' | cut -c1-12
+}
+
+tmpdir="${TMPDIR:-/tmp}"
+tmpdir="${tmpdir%/}"
+sock="$tmpdir/ra-assist-$(id -u)-$(path_hash "$repo_root").sock"
+pidfile="${sock}.pid"
+logfile="${sock}.log"
+
+daemon_alive() {
+  nvim --server "$sock" --remote-expr '1' >/dev/null 2>&1
+}
+
+# Whether ra_assist_srv.lua has changed since the running daemon loaded it.
+# The daemon stats its own source, so this needs no `stat` binary and no
+# guess about which of the GNU or BSD spelling this machine has. A daemon too
+# old to answer returns something other than "0", which is the right answer
+# anyway: it is running code that predates this check.
+daemon_is_stale() {
+  [ "$(nvim --server "$sock" --remote-expr \
+    'luaeval("RA_ASSIST and RA_ASSIST.is_stale and RA_ASSIST.is_stale() or [[1]]")' 2>/dev/null)" != "0" ]
+}
+
+# Every pid below `root`, deepest last. Used instead of a process-group kill
+# because `setsid` does not exist on macOS, and instead of `pkill -f` because
+# a pattern kill matches any process whose argv merely mentions the socket --
+# including the shell that invoked this script.
+descendants() {
+  ps -Ao pid=,ppid= 2>/dev/null | awk -v root="$1" '
+    { kids[$2] = kids[$2] " " $1 }
+    END {
+      n = 1; queue[1] = root
+      for (i = 1; i <= n; i++) {
+        split(kids[queue[i]], found, " ")
+        for (k in found) {
+          if (found[k] != "" && found[k] != queue[i]) { n++; queue[n] = found[k]; print found[k] }
+        }
+      }
+    }'
+}
+
+start_daemon() {
+  rm -f "$sock" "$pidfile"
+
+  # The daemon records its own pid rather than the shell recording `$!`.
+  #
+  # `$!` is the pid of whatever bash backgrounded, which is not necessarily
+  # the process that ends up being the daemon: `setsid` forks instead of
+  # exec'ing when it is already a process group leader, and the perl
+  # fallback below has to fork for the same reason. Whether that happens
+  # depends on whether job control is on, which depends on how this script
+  # was invoked -- so a pid captured out here is right only by luck. `stop`
+  # then signals a pid that no longer exists, reports success, and leaves a
+  # rust-analyzer running forever, which is the exact failure this tool was
+  # written to prevent.
+  local write_pid="lua vim.fn.writefile({ tostring(vim.fn.getpid()) }, [[$pidfile]])"
+  local -a daemon_cmd=(
+    nvim --headless -u NONE -i NONE -n --listen "$sock"
+    -c "$write_pid"
+    -c "lua dofile([[$SRV_LUA]])"
+  )
+
+  # Detach into a session of its own, so the daemon outlives the shell that
+  # started it and terminal signals aimed at that shell's foreground group
+  # never reach it. `setsid` is the Linux answer and does not exist on
+  # macOS; perl's POSIX::setsid is the portable one, but it fails with EPERM
+  # unless the caller forks first. `nohup` is in all three branches for the
+  # part neither of them covers: ignoring SIGHUP when the terminal goes away.
+  if command -v setsid >/dev/null 2>&1; then
+    setsid nohup "${daemon_cmd[@]}" >"$logfile" 2>&1 </dev/null &
+  elif command -v perl >/dev/null 2>&1; then
+    nohup perl -MPOSIX -e 'fork and exit 0; POSIX::setsid(); exec { $ARGV[0] } @ARGV or die $!' \
+      -- "${daemon_cmd[@]}" >"$logfile" 2>&1 </dev/null &
+  else
+    nohup "${daemon_cmd[@]}" >"$logfile" 2>&1 </dev/null &
+  fi
+
+  local waited=0
+  until daemon_alive && [ -s "$pidfile" ]; do
+    sleep 0.2
+    waited=$((waited + 1))
+    if [ "$waited" -gt 50 ]; then
+      echo "ra-assist: daemon did not come up, see $logfile" >&2
+      exit 1
+    fi
+  done
+}
+
+# Returns non-zero if anything under the daemon is still alive afterwards, so
+# a failure to clean up is reported rather than being printed over with
+# "stopped" -- a leftover rust-analyzer on this workspace is expensive, and
+# invisible if nobody says so.
+stop_daemon() {
+  local pid children target survivors=""
+  [ -s "$pidfile" ] || { rm -f "$sock" "$pidfile"; return 0; }
+  pid="$(cat "$pidfile")"
+
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    # Children first: killing the parent first would reparent rust-analyzer
+    # to init and lose the only link back to it.
+    children="$(descendants "$pid")"
+    for target in $children $pid; do
+      kill -TERM "$target" 2>/dev/null || true
+    done
+
+    local waited=0
+    while [ "$waited" -lt 20 ]; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+      waited=$((waited + 1))
+    done
+
+    for target in $children $pid; do
+      kill -0 "$target" 2>/dev/null && kill -KILL "$target" 2>/dev/null || true
+    done
+
+    # Poll rather than sleeping once. A rust-analyzer holding this
+    # workspace's index takes well over a second to tear down after SIGKILL,
+    # so a single short sleep reports a survivor that is merely still
+    # exiting -- measured here at ~3s from signal to gone.
+    waited=0
+    while [ "$waited" -lt 50 ]; do
+      survivors=""
+      for target in $children $pid; do
+        kill -0 "$target" 2>/dev/null && survivors="$survivors $target"
+      done
+      [ -n "$survivors" ] || break
+      sleep 0.1
+      waited=$((waited + 1))
+    done
+  fi
+
+  rm -f "$pidfile" "$sock"
+  if [ -n "$survivors" ]; then
+    echo "ra-assist: could not kill:$survivors" >&2
+    return 1
+  fi
+  return 0
+}
+
+ensure_daemon() {
+  if daemon_alive; then
+    # A daemon started from an older copy of ra_assist_srv.lua still holds
+    # that code in its Lua VM; dofile only runs at startup. Restarting when
+    # the file has changed underneath it is what makes editing the server
+    # safe -- the alternative is silently talking to stale code, or a rule
+    # that someone has to remember.
+    if ! daemon_is_stale; then
+      return
+    fi
+    echo "ra-assist: ra_assist_srv.lua changed, restarting daemon (rust-analyzer reloads)" >&2
+    stop_daemon
+  fi
+  start_daemon
+}
+
+# Encodes an arbitrary string as a single-quoted Vimscript string literal
+# (Vimscript escapes ' by doubling it), safe to splice into --remote-expr.
+vimstr() {
+  local s="$1"
+  s="${s//\'/\'\'}"
+  printf "'%s'" "$s"
+}
+
+[ $# -ge 1 ] || usage
+
+case "$1" in
+  -h | --help | help) usage ;;
+  status)
+    daemon_alive || { echo "no daemon running for $repo_root ($sock)"; exit 0; }
+    ;;
+  stop)
+    stop_daemon || exit 1
+    echo "stopped"
+    exit 0
+    ;;
+esac
+
+ensure_daemon
+
+# Build the Vimscript list literal for _A from argv, verbatim.
+args="["
+for arg in "$@"; do
+  [ "$args" = "[" ] || args="$args, "
+  args="$args$(vimstr "$arg")"
+done
+args="$args]"
+
+out="$(nvim --server "$sock" --remote-expr "luaeval('RA_ASSIST.dispatch(_A)', ${args})" 2>&1)"
+prefix="${out%%$'\n'*}"
+rest="${out#*$'\n'}"
+
+case "$prefix" in
+  OK)
+    printf '%s\n' "$rest"
+    # An applied-but-incomplete result exits non-zero on purpose. The edit
+    # did land, so this is not the ERR case, but a caller that loops over
+    # positions and only inspects the exit status is exactly the caller this
+    # warning is for -- reporting it on stdout alone would let a scripted
+    # sweep sail past a half-finished edit and find out at the next build.
+    case "$rest" in
+      *INCOMPLETE:*) exit 2 ;;
+    esac
+    ;;
+  ERR)
+    printf '%s\n' "$rest" >&2
+    exit 1
+    ;;
+  *)
+    printf '%s\n' "$out" >&2
+    exit 1
+    ;;
+esac

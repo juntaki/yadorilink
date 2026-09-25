@@ -1,13 +1,13 @@
-//! M2-6 (Pass 4): fault-injection DST scenario for the `Evicting` crash
+//! Fault-injection DST scenario for the `Evicting` crash
 //! window `materialization_eviction::evict_file` opens between setting
 //! `MaterializationState::Evicting` and its final `Placeholder` commit --
-//! the same window M2-3b's native Windows dehydrate RPC widened (a real
-//! cross-process round trip now sits inside it, not just a local disk
+//! the same window the native Windows dehydrate RPC widens (a real
+//! cross-process round trip sits inside it, not just a local disk
 //! write).
 //!
 //! Same shape and same reasoning as the sibling
 //! `dst_materialization_crash_recovery.rs` for the `Hydrated` crash
-//! window: plain synchronous functions, no `tokio`/`madsim` scheduling to
+//! window: plain synchronous functions, no `tokio`/simulator scheduling to
 //! simulate, so the fault is injected by directly constructing the
 //! on-disk-and-index state a crash would leave behind, then asserting the
 //! real recovery path (`MaterializationStateRepository::reset_stale_
@@ -15,7 +15,7 @@
 //! startup wiring makes) self-heals it. Many seeded variations, covering
 //! both crash sub-cases plus block count/size, not one fixed scenario.
 //!
-//! # Scope, stated honestly (a Codex review finding on this file's first
+//! # Scope, stated honestly (a review finding on this file's first
 //! version)
 //!
 //! What this DOES prove, by actually running the real functions: (a)
@@ -42,19 +42,16 @@
 //! That stronger property is verified by direct code inspection of
 //! `materialization_eviction.rs::evict_file`'s own control flow (block
 //! reclamation is textually and provably unreachable before the
-//! `Placeholder` transition succeeds) and by an independent Codex review
-//! of that same ordering during M2-3b -- not by a randomized execution
+//! `Placeholder` transition succeeds) -- not by a randomized execution
 //! here. Exercising it end-to-end would need a fault-injection seam
 //! threaded through `evict_file` itself (pausing it mid-attempt) and a
-//! reclaim-spy block store, which is production-code scope beyond what
-//! this pass's test-only remit covers -- a legitimate follow-up, not
-//! something this file pretends to already do.
+//! reclaim-spy block store, which this file does not claim to provide.
 
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_local_storage::{
-    reconstruct_file, write_placeholder, BlockStore, FsBlockStore, PlaceholderDiskIdentity,
+    reconstruct_file, write_placeholder, BlockStore, PlaceholderDiskIdentity, SegmentBlockStore,
     WINDOWS_CFAPI_GENERATION_PROVIDER_KIND,
 };
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
@@ -92,7 +89,7 @@ fn run_scenario(seed: u64) -> Result<(), String> {
     let root_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
     let root = root_dir.path().canonicalize().map_err(|e| e.to_string())?;
     let store_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
-    let store = FsBlockStore::new(store_dir.path()).map_err(|e| e.to_string())?;
+    let store = SegmentBlockStore::new(store_dir.path()).map_err(|e| e.to_string())?;
     let state = ReplicaCoordinator::open_in_memory().map_err(|e| e.to_string())?;
     state
         .link_repository()
@@ -129,9 +126,9 @@ fn run_scenario(seed: u64) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
 
     // A Windows placeholder identity, recorded BEFORE eviction starts --
-    // matching the real precondition M2-3b's Windows eviction path
+    // matching the real precondition the Windows eviction path
     // depends on: a `Hydrated` row being evicted already carries the
-    // generation its placeholder object was created under (M2-3b never
+    // generation its placeholder object was created under (eviction never
     // mints a fresh one; see `materialization_eviction::evict_to_
     // placeholder`'s own doc comment). `reset_stale_evicting_to_
     // placeholder` only ever touches the `materialization_state` column

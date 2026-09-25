@@ -10,7 +10,6 @@
 
 use std::sync::Arc;
 
-use crate::maintenance::MaintenanceTrigger;
 use crate::update::manager::{UpdateError, UpdateManager};
 use crate::update::manifest::Applicability;
 
@@ -32,10 +31,7 @@ impl UpdateCheckJob {
     /// turns `Some(Err(_))` into the `consecutive_failures` backoff
     /// escalation and its own log line, since that bookkeeping spans
     /// multiple `run_once` calls and so isn't this job's own state.
-    pub(crate) async fn run_once(
-        &self,
-        _trigger: MaintenanceTrigger,
-    ) -> Option<Result<Applicability, UpdateError>> {
+    pub(crate) async fn run_once(&self) -> Option<Result<Applicability, UpdateError>> {
         let checks_enabled = self.update_manager.policy.load_or_default().automatic_checks_enabled;
         if !checks_enabled {
             return None;

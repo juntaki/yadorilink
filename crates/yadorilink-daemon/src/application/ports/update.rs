@@ -1,4 +1,4 @@
-//! What `UpdateCommandService` needs from `crate::update::{manager,
+//! What the update control commands need from `crate::update::{manager,
 //! policy}` -- `check`/`install`/`config`. Distinct from
 //! `UpdateStatusQueryService` (a read model already independent of
 //! `DaemonState`, exposed separately as `context.queries.update_status`):

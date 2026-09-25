@@ -1,31 +1,20 @@
-//! Fix-saga: the durable role-loss-operation journal
-//! (`yadorilink_sync_core::index::RoleLossOperation`) that wraps the
-//! Worker-commit-then-local-commit sequence in `control_socket::
-//! set_storage_mode`'s demotion path, and the startup + periodic
-//! reconciliation sweep (`daemon_state::run_role_loss_reconciliation_sweep`)
-//! that reconciles a journal row a crash (or a compensation attempt that
-//! couldn't reach the coordination plane) left mid-flight.
-//!
-//! Covers:
-//!   - a demotion whose Worker-side commit succeeds but whose local
-//!     recheck-then-flip afterwards fails (a genuine digest-mismatch race,
-//!     forced deterministically by racing a concurrent local index write
-//!     against a deliberately delayed `/handoff/commit` response) is
-//!     compensated: the daemon reverts the Worker back to `eager`, ends in a
-//!     consistent state (no split), returns a "safely rolled back" error
-//!     (not a silent success), and leaves no journal row behind.
-//!   - a successful demotion still leaves no journal row behind (the normal
-//!     success path is unchanged, just with a row written-then-deleted
-//!     around it).
-//!   - a `WorkerCommitted` journal row present when the reconciliation sweep
-//!     runs (the crash-between-Worker-commit-and-local-commit case) is
-//!     compensated and cleared.
-//!   - a compensation attempt that cannot reach the coordination plane
-//!     leaves the row at `Compensating` rather than losing it, and a
-//!     subsequent sweep retries it (attempts accrue, the row survives).
-//!   - INV-4: the compensating Worker call carries only
-//!     `(group_id, device_id, storage_mode)` -- never a digest, path, or
-//!     version.
+//! Covers: - a demotion whose Worker-side commit succeeds but whose local
+//! recheck-then-flip afterwards fails (a genuine digest-mismatch race,
+//! forced deterministically by racing a concurrent local index write
+//! against a deliberately delayed `/handoff/commit` response) is
+//! compensated: the daemon reverts the Worker back to `eager`, ends in a
+//! consistent state (no split), returns a "safely rolled back" error (not
+//! a silent success), and leaves no journal row behind. - a successful
+//! demotion still leaves no journal row behind (the normal success path is
+//! unchanged, just with a row written-then-deleted around it). - a
+//! `WorkerCommitted` journal row present when the reconciliation sweep
+//! runs (the crash-between-Worker-commit-and-local-commit case) is
+//! compensated and cleared. - a compensation attempt that cannot reach the
+//! coordination plane leaves the row at `Compensating` rather than losing
+//! it, and a subsequent sweep retries it (attempts accrue, the row
+//! survives). - INV-4: the compensating Worker call carries only
+//! `(group_id, device_id, storage_mode)` -- never a digest, path, or
+//! version.
 #![cfg(unix)]
 
 mod support;
@@ -39,14 +28,16 @@ use support::{
 use tokio::net::UnixStream;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-use yadorilink_daemon::daemon_state::{run_role_loss_reconciliation_sweep, DaemonState};
+use yadorilink_daemon::control_context::ControlContext;
+use yadorilink_daemon::daemon_state::DaemonState;
+use yadorilink_daemon::maintenance_coordinator::run_role_loss_reconciliation_sweep;
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
 use yadorilink_ipc_proto::daemonctl::{
     DaemonControlRequest, DaemonControlResponse, SetStorageModeRequest,
 };
 use yadorilink_ipc_proto::framing::{read_message, write_message};
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
 use yadorilink_replica_domain::session_state::MaterializationPolicy;
 use yadorilink_replica_domain::session_state::{
@@ -74,7 +65,7 @@ impl Daemon {
 
 fn new_daemon(device_id: &str) -> Daemon {
     let store_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let (sync_state, index_dir) = open_file_backed_replica_coordinator();
     let state = DaemonState::new(device_id.to_string(), Arc::new(sync_state), store);
     ensure_device_signing_key(&state);
@@ -230,13 +221,25 @@ async fn demoting_setup(server: &MockServer) -> (Daemon, Daemon, std::path::Path
         )
         .unwrap();
 
-    connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
-    b.state.set_peer_group_full_replica("device-a", GROUP, true);
-    a.state.set_peer_group_full_replica("device-b", GROUP, true);
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Must win the race against `connect_two_daemons`'s own coordination-
+    // plane wiring below: `coordination_client_config` is a set-once
+    // `OnceLock` (production semantics), so whichever caller sets it FIRST
+    // wins for the rest of the process -- this test needs both devices
+    // pointed at THIS `server`, not `connect_two_daemons`'s own in-process
+    // checkpoint-issuance fake.
+    b.state.set_coordination_client_config(
+        server.uri(),
+        yadorilink_fapi_client::test_support::offline_auth(),
+    );
+    a.state.set_coordination_client_config(
+        server.uri(),
+        yadorilink_fapi_client::test_support::offline_auth(),
+    );
 
-    b.state.set_coordination_client_config(server.uri(), "test-access-token".to_string());
-    a.state.set_coordination_client_config(server.uri(), "test-access-token-a".to_string());
+    connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
+    b.state.authority.set_peer_group_full_replica("device-a", GROUP, true);
+    a.state.authority.set_peer_group_full_replica("device-b", GROUP, true);
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     let socket_path = serve(b.state.clone(), b.root.path()).await;
     (a, b, socket_path)
@@ -580,7 +583,10 @@ async fn prepared_reconcile_restores_worker_eager_after_response_loss() {
         .await;
 
     let b = new_daemon("device-b");
-    b.state.set_coordination_client_config(server.uri(), "test-access-token".to_string());
+    b.state.set_coordination_client_config(
+        server.uri(),
+        yadorilink_fapi_client::test_support::offline_auth(),
+    );
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
         as i64;
     b.state
@@ -592,7 +598,7 @@ async fn prepared_reconcile_restores_worker_eager_after_response_loss() {
             RoleLossOperationParams {
                 source_device_id: "device-b",
                 target_device_id: "device-a",
-                lease_id: Some("lease-prepared"),
+                lease_id: "lease-prepared",
                 action: RoleLossAction::Demote,
                 local_path: Some(&b.root.path().to_string_lossy()),
                 now_unix: now,
@@ -600,7 +606,7 @@ async fn prepared_reconcile_restores_worker_eager_after_response_loss() {
         )
         .unwrap();
 
-    run_role_loss_reconciliation_sweep(&b.state).await;
+    run_role_loss_reconciliation_sweep(&ControlContext::from_state(b.state.clone())).await;
 
     assert!(request_count(&server, "POST", "/handoff/compensate").await >= 1);
     assert!(all_role_loss_operations(&b.state).is_empty());
@@ -626,7 +632,10 @@ async fn worker_committed_row_found_at_startup_is_compensated_by_the_sweep() {
         .await;
 
     let b = new_daemon("device-b");
-    b.state.set_coordination_client_config(server.uri(), "test-access-token".to_string());
+    b.state.set_coordination_client_config(
+        server.uri(),
+        yadorilink_fapi_client::test_support::offline_auth(),
+    );
 
     // Simulate the crash: a WorkerCommitted row sits in the journal with no
     // process left alive that remembers issuing it.
@@ -641,7 +650,7 @@ async fn worker_committed_row_found_at_startup_is_compensated_by_the_sweep() {
             RoleLossOperationParams {
                 source_device_id: "device-b",
                 target_device_id: "device-a",
-                lease_id: Some("lease-crash-1"),
+                lease_id: "lease-crash-1",
                 action: RoleLossAction::Demote,
                 local_path: Some(&b.root.path().to_string_lossy()),
                 now_unix: now,
@@ -654,7 +663,7 @@ async fn worker_committed_row_found_at_startup_is_compensated_by_the_sweep() {
         .advance_role_loss_operation("op-crash-1", RoleLossOperationState::WorkerCommitted, now)
         .unwrap();
 
-    run_role_loss_reconciliation_sweep(&b.state).await;
+    run_role_loss_reconciliation_sweep(&ControlContext::from_state(b.state.clone())).await;
 
     // Assert the end-state INVARIANT, not an exact call count: the auto-sweep
     // spawned by `DaemonState::new` (run-immediately-then-loop) can also fire
@@ -687,7 +696,10 @@ async fn compensation_unreachable_leaves_the_row_compensating_and_retries() {
         .await;
 
     let b = new_daemon("device-b");
-    b.state.set_coordination_client_config(server.uri(), "test-access-token".to_string());
+    b.state.set_coordination_client_config(
+        server.uri(),
+        yadorilink_fapi_client::test_support::offline_auth(),
+    );
 
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
         as i64;
@@ -700,7 +712,7 @@ async fn compensation_unreachable_leaves_the_row_compensating_and_retries() {
             RoleLossOperationParams {
                 source_device_id: "device-b",
                 target_device_id: "device-a",
-                lease_id: Some("lease-crash-2"),
+                lease_id: "lease-crash-2",
                 action: RoleLossAction::Demote,
                 local_path: Some(&b.root.path().to_string_lossy()),
                 now_unix: now,
@@ -713,7 +725,7 @@ async fn compensation_unreachable_leaves_the_row_compensating_and_retries() {
         .advance_role_loss_operation("op-crash-2", RoleLossOperationState::WorkerCommitted, now)
         .unwrap();
 
-    run_role_loss_reconciliation_sweep(&b.state).await;
+    run_role_loss_reconciliation_sweep(&ControlContext::from_state(b.state.clone())).await;
     let after_first = b
         .state
         .replica_coordinator
@@ -733,7 +745,7 @@ async fn compensation_unreachable_leaves_the_row_compensating_and_retries() {
     );
 
     // A second sweep must retry -- calling the Worker again, not giving up.
-    run_role_loss_reconciliation_sweep(&b.state).await;
+    run_role_loss_reconciliation_sweep(&ControlContext::from_state(b.state.clone())).await;
     let after_second = b
         .state
         .replica_coordinator

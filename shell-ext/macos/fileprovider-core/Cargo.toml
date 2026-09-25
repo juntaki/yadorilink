@@ -37,7 +37,6 @@ crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 yadorilink-ipc-proto = { path = "../../../crates/yadorilink-ipc-proto" }
-prost = "0.14.4"
 # `macros` (for `#[tokio::test]`) is only exercised by this crate's own
 # `#[cfg(test)]` module, but declared here rather than split into a
 # `[dev-dependencies]` override to avoid re-declaring `tokio` twice --

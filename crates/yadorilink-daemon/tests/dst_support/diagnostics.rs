@@ -8,8 +8,8 @@
 //! branch is a single [`record_failure`] call rather than re-deriving the
 //! triage → signature → known-lookup → bundle → shrink → corpus chain by hand.
 //!
-//! What it wires (INTEGRATION.md seams 2, 4, 7, 8, 9):
-//!  1. runs harden's [`triage_failures`](super::corpus::triage_failures) over
+//! What it wires:
+//!  1. runs [`triage_failures`](super::corpus::triage_failures) over
 //!  the run's violations to get a per-violation verdict;
 //!  2. computes the stable [`signature`](super::signature::compute_signature)
 //!  from the terminal violation and the (optional) first-divergence point;
@@ -117,7 +117,7 @@ pub fn record_failure(
         failures_dir,
     } = inputs;
 
-    // 1. Triage every violation (harden's runner), then pick the terminal one.
+    // 1. Triage every violation, then pick the terminal one.
     let triaged = corpus::triage_failures(violations, case, replay);
     let verdicts: Vec<TriageVerdict> = triaged.iter().map(|t| t.verdict).collect();
     let term = terminal_index(&verdicts);

@@ -1,13 +1,13 @@
-//! Typed output shapes for Phase 2.1-C2-B1's evidence-identity
+//! Typed output shapes for the evidence-identity
 //! qualification (`crate::recovery_diagnosis::identity`). Nothing here
 //! reads a database, calls the coordination plane, or decides a
-//! recommendation -- that is Phase 2.1-C2-B2's job, layered on top of these
+//! recommendation -- that is the classifier's job, layered on top of these
 //! types, not part of this module.
 
 /// One field two identity-bearing values (a local journal row and its
 /// related local/remote evidence) can disagree on. A closed enum, not a
-/// free-form string: a mismatch report a caller (an operator, or Phase
-/// 2.1-C2-B2's classifier) can match on exhaustively is worth far more than
+/// free-form string: a mismatch report a caller (an operator, or the
+/// diagnosis classifier) can match on exhaustively is worth far more than
 /// a human-readable sentence that has to be re-parsed to act on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum IdentityField {
@@ -62,7 +62,7 @@ impl IdentityField {
 /// `Exact` (every identity field this evidence carries agrees with the
 /// journal row) or `Mismatch` (at least one does not). `ConfirmedAbsent`
 /// here is a plain observation, not a verdict -- whether absence is
-/// EXPECTED for the journal row's own state is Phase 2.1-C2-B2's call, not
+/// EXPECTED for the journal row's own state is the classifier's call, not
 /// this qualification's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObservationQualification {

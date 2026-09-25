@@ -167,8 +167,8 @@ begin
   Result := not FileExists(ExpandConstant('{userappdata}\yadorilink\device.json'));
 end;
 
-// Package-manager ownership (see docs/AUTOMATIC_UPDATES.md's
-// "Package-manager-owned installs never self-update"): a WinGet manifest
+// Package-manager ownership (package-manager-owned installs never
+// self-update): a WinGet manifest
 // invokes this exact installer -- the same one a manual download would
 // run, into the same %ProgramFiles%\yadorilink layout -- so there is no
 // structural signal (unlike the Microsoft Store's WindowsApps path) this

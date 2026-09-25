@@ -13,12 +13,27 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Log in to the coordination plane. Google OIDC login opens a
-    /// device-authorization flow: no email or password, and a first login
-    /// automatically creates the account.
-    Login,
-    /// Log out and revoke the local session.
+    /// Log in to the coordination plane. Google OIDC login opens a browser
+    /// approval flow: no email or password, and a first login automatically
+    /// creates the account.
+    Login {
+        /// Use the RFC 8628 device-authorization grant for the sign-in leg
+        /// instead of a local loopback redirect. For a host with no browser
+        /// of its own, or one whose loopback port a human's browser cannot
+        /// reach (an SSH session onto a different machine): this prints a
+        /// verification URL and a short code to enter on ANY device, and
+        /// polls the server instead of waiting on a local socket.
+        #[arg(long)]
+        device: bool,
+    },
+    /// Sign out: irreversibly revoke this computer's access on the server,
+    /// then remove its stored credentials. Use `forget-local-credentials` if
+    /// you only want the local half.
     Logout,
+    /// Remove this computer's stored credentials WITHOUT revoking its access.
+    /// This computer stays authorized on the server; sign out instead unless
+    /// you specifically want the local half alone.
+    ForgetLocalCredentials,
     /// Manage registered devices.
     Device {
         #[command(subcommand)]
@@ -119,11 +134,15 @@ enum Command {
         to: Option<String>,
     },
     /// Force-hydrate a placeholder file and keep it hydrated (on-demand-sync).
+    /// A folder keeps everything below it hydrated, including what is added
+    /// to it later.
     Pin { local_path: String },
-    /// Allow a pinned file to become a placeholder again (on-demand-sync).
+    /// Allow a pinned file or folder to become a placeholder again
+    /// (on-demand-sync).
     Unpin { local_path: String },
     /// Manually convert a hydrated file back into a placeholder to
-    /// reclaim local disk space (on-demand-sync).
+    /// reclaim local disk space (on-demand-sync). A folder releases its own
+    /// pin and evicts every file below it that is not pinned on its own.
     Evict { local_path: String },
     /// Show one file's current materialization state (hydrated/
     /// placeholder/hydrating/evicting) and pin flag (on-demand-sync).
@@ -431,9 +450,6 @@ enum RecoveryAction {
     },
 }
 
-/// Mirrors `yadorilink_sync_core::recovery::RecoveryDomain::as_str`'s own
-/// wire strings -- a closed set, not a free-form string, so an invalid
-/// domain is rejected by clap itself before any request is even built.
 #[derive(Clone, Copy, ValueEnum)]
 enum RecoveryDomainArg {
     Enrollment,
@@ -557,6 +573,20 @@ enum ShareAction {
         /// access-count guard still applies regardless of this flag.
         #[arg(long)]
         force: bool,
+    },
+    /// Terminal delete of a whole folder group this account owns: the group
+    /// and every ACL edge on it, gone, with an updated netmap pushed to
+    /// every former member. Unlike `revoke`, this is NOT subject to the
+    /// last-full-replica guard -- the group ceases to exist, so there is no
+    /// group left to protect. Use this to get back to a clean state from an
+    /// abandoned group whose sole remaining full-replica device `revoke`
+    /// refuses to remove.
+    Delete {
+        group_name: String,
+        /// Required (and refused without it) only when the group has any
+        /// cross-account member.
+        #[arg(long)]
+        acknowledge_cross_account_members: bool,
     },
     /// List every ACL edge visible to this account — folder groups it
     /// owns, and its own devices' shares.
@@ -732,7 +762,13 @@ enum TrashAction {
     List,
     /// Recover a deleted file's last version before deletion as a new
     /// current version.
-    Restore { local_path: String },
+    Restore {
+        local_path: String,
+        /// Restore, together, everything removed by the same folder delete
+        /// or folder rename that removed this entry.
+        #[arg(long)]
+        folder: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -768,8 +804,9 @@ async fn main() {
 
 async fn run(command: Command) -> Result<(), CliError> {
     match command {
-        Command::Login => commands::auth::login().await,
+        Command::Login { device } => commands::auth::login(device).await,
         Command::Logout => commands::auth::logout().await,
+        Command::ForgetLocalCredentials => commands::auth::forget_local_credentials().await,
         Command::Device { action } => match action {
             DeviceAction::Register { name } => commands::device::register(name).await,
             DeviceAction::List => commands::device::list().await,
@@ -799,6 +836,9 @@ async fn run(command: Command) -> Result<(), CliError> {
                 }
                 None => commands::share::revoke_edge(group_name_or_edge, force).await,
             },
+            ShareAction::Delete { group_name, acknowledge_cross_account_members } => {
+                commands::share::delete_group(group_name, acknowledge_cross_account_members).await
+            }
             ShareAction::List => commands::share::list_shares().await,
             ShareAction::Members { group_name } => commands::share::members(group_name).await,
             ShareAction::Joinable => commands::share::list_joinable().await,
@@ -838,7 +878,10 @@ async fn run(command: Command) -> Result<(), CliError> {
         }
         Command::Trash { action } => match action {
             TrashAction::List => commands::version_history::trash_list().await,
-            TrashAction::Restore { local_path } => {
+            TrashAction::Restore { local_path, folder: true } => {
+                commands::version_history::trash_restore_folder(local_path).await
+            }
+            TrashAction::Restore { local_path, folder: false } => {
                 commands::version_history::trash_restore(local_path).await
             }
         },

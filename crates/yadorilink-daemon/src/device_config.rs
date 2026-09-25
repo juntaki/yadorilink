@@ -14,69 +14,25 @@ use serde::{Deserialize, Serialize};
 pub struct DeviceConfig {
     pub device_id: String,
     pub coordination_addr: String,
-    /// NAT-traversal settings for establishing direct peer connections. The
-    /// top-level `nat` object is required in the canonical config shape;
-    /// individual settings may still be omitted and filled from `NatConfig`'s
-    /// defaults so manual configuration stays practical.
-    pub nat: NatConfig,
-    /// Base64-encoded copy of this device's Ed25519 signing key, stored a
-    /// second time under the field name the coordination plane's
-    /// registration schema still requires for its retired transport-key
-    /// column (`NOT NULL` there; the CLI's device-registration flow sends
-    /// the same key under both names and this device ignores what comes
-    /// back in this one). Required: a config that cannot identify the
-    /// registered key is not a valid current config.
-    pub wireguard_public_key: String,
     /// Base64-encoded public half of this device's registered Ed25519
-    /// change-signing key -- this device's one real key, and the one
-    /// actually used to authenticate its transport. Required for the
-    /// same reason as the field above.
+    /// change-signing key -- this device's one key, and the one that
+    /// authenticates its transport. Required: a config that cannot
+    /// identify the registered key is not a valid current config.
     pub signing_public_key: String,
     /// Current config shape marker. Missing markers are rejected by serde;
     /// configs written by newer builds are rejected explicitly below.
     pub config_version: u32,
 }
 
-/// NAT-traversal settings, mapped onto the transport's STUN and port-mapping
-/// configuration when gathering direct candidates.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct NatConfig {
-    /// STUN servers (`host:port`) queried to discover this device's
-    /// server-reflexive address. An empty list disables STUN.
-    pub stun_servers: Vec<String>,
-    /// How often, in seconds, to re-probe STUN.
-    pub stun_refresh_secs: u64,
-    /// Whether to actively request a router port mapping.
-    pub port_mapping_enabled: bool,
-    /// Lifetime, in seconds, requested for a router port-mapping lease.
-    pub port_mapping_lease_secs: u32,
-}
-
-impl Default for NatConfig {
-    fn default() -> Self {
-        Self {
-            stun_servers: default_stun_servers(),
-            stun_refresh_secs: 300,
-            port_mapping_enabled: true,
-            port_mapping_lease_secs: 3600,
-        }
-    }
-}
-
-fn default_stun_servers() -> Vec<String> {
-    vec!["stun.l.google.com:19302".to_string(), "stun1.l.google.com:19302".to_string()]
-}
-
 /// Current pre-release `device.json` shape. Older development files are not
 /// migrated; absence of this required field fails deserialization.
-pub const CONFIG_VERSION: u32 = 1;
+pub const CONFIG_VERSION: u32 = 3;
 
 pub fn config_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("YADORILINK_CONFIG_DIR") {
         return PathBuf::from(dir);
     }
-    yadorilink_local_storage::FsBlockStore::default_root()
+    yadorilink_local_storage::SegmentBlockStore::default_root()
         .ok()
         .and_then(|p| p.parent().map(|p| p.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."))
@@ -167,136 +123,4 @@ pub fn load() -> Result<Option<DeviceConfig>, DeviceConfigError> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    use crate::test_support::CONFIG_ENV_MUTEX;
-
-    fn with_isolated_config_dir<R>(f: impl FnOnce() -> R) -> R {
-        let _guard = CONFIG_ENV_MUTEX.blocking_lock();
-        let dir = tempfile::tempdir().unwrap();
-        std::env::set_var("YADORILINK_CONFIG_DIR", dir.path());
-        let result = f();
-        std::env::remove_var("YADORILINK_CONFIG_DIR");
-        result
-    }
-
-    fn current_config_json(version: u32) -> String {
-        format!(
-            r#"{{"device_id":"device-a","coordination_addr":"http://127.0.0.1:1","nat":{{}},"wireguard_public_key":"wg-public","signing_public_key":"signing-public","config_version":{version}}}"#
-        )
-    }
-
-    #[test]
-    fn load_on_a_missing_file_is_ok_none_not_an_error() {
-        with_isolated_config_dir(|| {
-            assert!(load().unwrap().is_none());
-        });
-    }
-
-    #[test]
-    fn load_on_corrupt_json_is_an_error_not_absence() {
-        with_isolated_config_dir(|| {
-            std::fs::write(config_path(), "{ this is not valid json").unwrap();
-
-            assert!(matches!(load(), Err(DeviceConfigError::Corrupt { .. })));
-        });
-    }
-
-    #[test]
-    fn load_on_an_unreadable_file_is_an_error_not_absence() {
-        with_isolated_config_dir(|| {
-            std::fs::create_dir(config_path()).unwrap();
-
-            assert!(matches!(load(), Err(DeviceConfigError::Read { .. })));
-        });
-    }
-
-    #[test]
-    fn load_rejects_a_pre_release_config_missing_current_required_fields() {
-        with_isolated_config_dir(|| {
-            std::fs::write(
-                config_path(),
-                r#"{"device_id":"device-a","coordination_addr":"http://127.0.0.1:1"}"#,
-            )
-            .unwrap();
-
-            assert!(matches!(load(), Err(DeviceConfigError::Corrupt { .. })));
-        });
-    }
-
-    #[test]
-    fn load_rejects_removed_or_unknown_top_level_fields() {
-        with_isolated_config_dir(|| {
-            let version_field = format!("\"config_version\":{CONFIG_VERSION}");
-            // Spelled in two pieces on purpose: `check_removed_features.sh`
-            // fails on any live occurrence of the retired relay symbols, and a
-            // fixture proving the field is *rejected* must not read as a
-            // reintroduction of it.
-            let removed_field = concat!("relay", "_addr");
-            let json = current_config_json(CONFIG_VERSION).replace(
-                &version_field,
-                &format!("\"{removed_field}\":\"https://legacy.invalid\",{version_field}"),
-            );
-            std::fs::write(config_path(), json).unwrap();
-
-            assert!(matches!(load(), Err(DeviceConfigError::Corrupt { .. })));
-        });
-    }
-
-    #[test]
-    fn load_rejects_removed_or_unknown_nat_fields() {
-        with_isolated_config_dir(|| {
-            let json = current_config_json(CONFIG_VERSION)
-                .replace("\"nat\":{}", "\"nat\":{\"relay_fallback\":true}");
-            std::fs::write(config_path(), json).unwrap();
-
-            assert!(matches!(load(), Err(DeviceConfigError::Corrupt { .. })));
-        });
-    }
-
-    #[test]
-    fn load_rejects_a_newer_config_version_before_startup() {
-        with_isolated_config_dir(|| {
-            std::fs::write(config_path(), current_config_json(CONFIG_VERSION + 1)).unwrap();
-
-            let err = load().unwrap_err();
-            assert!(matches!(
-                err,
-                DeviceConfigError::UnsupportedConfigDowngrade {
-                    on_disk_version,
-                    supported_version,
-                } if on_disk_version == CONFIG_VERSION + 1 && supported_version == CONFIG_VERSION
-            ));
-        });
-    }
-
-    #[test]
-    fn load_rejects_an_older_config_version_before_startup() {
-        with_isolated_config_dir(|| {
-            std::fs::write(config_path(), current_config_json(CONFIG_VERSION - 1)).unwrap();
-
-            let err = load().unwrap_err();
-            assert!(matches!(
-                err,
-                DeviceConfigError::StaleConfigVersion {
-                    on_disk_version,
-                    supported_version,
-                } if on_disk_version == CONFIG_VERSION - 1 && supported_version == CONFIG_VERSION
-            ));
-        });
-    }
-
-    #[test]
-    fn load_accepts_only_the_current_complete_identity_shape() {
-        with_isolated_config_dir(|| {
-            std::fs::write(config_path(), current_config_json(CONFIG_VERSION)).unwrap();
-
-            let loaded = load().unwrap().unwrap();
-            assert_eq!(loaded.device_id, "device-a");
-            assert_eq!(loaded.wireguard_public_key, "wg-public");
-            assert_eq!(loaded.signing_public_key, "signing-public");
-            assert_eq!(loaded.config_version, CONFIG_VERSION);
-        });
-    }
-}
+mod tests;

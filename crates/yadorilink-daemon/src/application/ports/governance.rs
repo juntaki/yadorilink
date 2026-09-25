@@ -1,4 +1,4 @@
-//! What `GovernanceCommandService` needs to change the persisted resource
+//! What the `LimitsSet` control command needs to change the persisted resource
 //! limits AND apply them to the running daemon's shared rate-limiter/
 //! headroom state as one atomic operation -- never split into a
 //! persist-then-apply pair the caller sequences itself, so a caller can

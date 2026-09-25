@@ -1,34 +1,11 @@
-//! History compaction policy for the change DAG.
-//!
-//! The planner is conservative: a change is prunable only when every enrolled
-//! device's acknowledged frontier dominates it. A committed prune replaces the
-//! deleted prefix with a checkpoint. Re-bootstrap is intentionally stricter:
-//! mere absence from the local store is never proof that a hash was pruned.
-//! An offline device can legitimately return with a new hash this replica has
-//! never seen, so unknown and locally-pruned identities remain distinct.
-//!
-//! # Move note (7D-9D)
-//!
-//! Moved verbatim out of `yadorilink-sync-core`, together with
-//! [`crate::rebootstrap`] in the same commit — the two modules reference
-//! each other (this module's [`execute_prune`] reads `rebootstrap::
-//! COMPACTION_SCHEDULING_READY`; `rebootstrap` in turn depends on this
-//! module's `Checkpoint`/`CompactionStore`), which the sync-core ledger
-//! flagged as a possible genuine dependency cycle blocking either from
-//! moving alone. On inspection it is not a crate-level cycle at all:
-//! neither module has ever touched `rusqlite`/`Connection` (both are
-//! entirely generic over the `CompactionDagStore`/`DeviceFrontierStore`/
-//! `CheckpointStore` traits declared here, with the SQL-backed
-//! implementation living on `SyncState` in sync-core's `index.rs`, never
-//! in these two files themselves), so both belong on this one crate and
-//! the mutual reference becomes an ordinary same-crate one once they land
-//! together. The one real SQL artefact that *was* here,
-//! `CHECKPOINT_TABLE_MIGRATION`, was dropped rather than moved: it had no
-//! remaining consumer in sync-core (`yadorilink-sync-sqlite`'s own
-//! `dag_store::CHECKPOINT_TABLE_MIGRATION` has been an independent,
-//! deliberately duplicated copy since that crate could not depend back up
-//! to reach this one — see that constant's own doc comment), so keeping a
-//! second unused copy here would just be dead code.
+//! History compaction policy for the change DAG. The planner is
+//! conservative: a change is prunable only when every enrolled device's
+//! acknowledged frontier dominates it. A committed prune replaces the
+//! deleted prefix with a checkpoint. Re-bootstrap is intentionally
+//! stricter: mere absence from the local store is never proof that a hash
+//! was pruned. An offline device can legitimately return with a new hash
+//! this replica has never seen, so unknown and locally-pruned identities
+//! remain distinct.
 
 use std::collections::{HashMap, HashSet};
 
@@ -103,27 +80,14 @@ pub trait CheckpointStore {
         checkpoint: &Checkpoint,
         pruned: &[ChangeHash],
     ) -> Result<(), ReplicaEngineError>;
-
-    /// The checkpoint hash that immediately preceded this store's own
-    /// *current* HistoryBase for `group` — `None` if this store has never
-    /// crossed a compaction/re-bootstrap boundary (its current checkpoint,
-    /// if any, is the group's genesis). Embedded into every
-    /// `SnapshotManifest` this store signs for the group as a signed
-    /// hash-chain link, so a receiver can verify genuine one-hop forward
-    /// continuity rather than trusting a bare counter. See
-    /// `SnapshotManifest::previous_checkpoint_hash`'s doc comment.
-    fn history_base_previous_checkpoint_hash(
-        &self,
-        group: &FolderGroupId,
-    ) -> Result<Option<[u8; 32]>, ReplicaEngineError>;
 }
 
 pub trait CompactionStore: CompactionDagStore + DeviceFrontierStore + CheckpointStore {}
 impl<T: CompactionDagStore + DeviceFrontierStore + CheckpointStore> CompactionStore for T {}
 
 // --- Checkpoint record -------------------------------------------------
-// `Checkpoint`/`CheckpointHash` moved to `yadorilink_replica_domain::
-// rebootstrap` in Phase 7D-6 (needed directly by `yadorilink-peer-session`
+// `Checkpoint`/`CheckpointHash` live in `yadorilink_replica_domain::
+// rebootstrap` (needed directly by `yadorilink-peer-session`
 // production code, and pure -- no SQL, sort/dedup + a domain-tagged hash).
 
 pub use yadorilink_replica_domain::rebootstrap::{Checkpoint, CheckpointHash};
@@ -288,7 +252,7 @@ pub fn plan_prune<S: CompactionStore>(
 }
 
 /// The mutation primitive behind compaction. Kept private so production callers
-/// cannot bypass the R3.3 release gate; unit tests in this module exercise it
+/// cannot bypass the re-bootstrap release gate; unit tests in this module exercise it
 /// directly to keep planner/checkpoint behavior covered while scheduling is off.
 fn execute_prune_unchecked<S: CompactionStore>(
     store: &S,
@@ -304,7 +268,7 @@ fn execute_prune_unchecked<S: CompactionStore>(
     Ok(Some(checkpoint))
 }
 
-/// Executes a planned prune only after the complete R3.3 re-bootstrap pipeline
+/// Executes a planned prune only after the complete re-bootstrap pipeline
 /// is production-ready. The readiness constant is deliberately false until
 /// persisted `HistoryBase`, a production atomic snapshot installer, wire
 /// negotiation/transfer, and partition+crash DST all exist. Keeping this guard
@@ -398,8 +362,8 @@ pub struct ReBootstrapPlan {
 
 /// Builds a re-bootstrap plan only when the returning frontier contains a hash
 /// this replica can exactly attest it pruned. Unknown hashes do not trigger a
-/// snapshot reset: they may be new offline history and require the R3.3
-/// HistoryBase/RebootstrapRequired protocol to resolve safely.
+/// snapshot reset: they may be new offline history, which only a merge of
+/// the two histories' bases resolves safely.
 pub fn plan_rebootstrap<S: CompactionStore>(
     store: &S,
     group: &FolderGroupId,

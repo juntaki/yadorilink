@@ -26,6 +26,7 @@ allowed-hit count is pinned so a new raw call — even one that happens to share
 an allowlisted snippet — trips the guard for review.
 """
 
+import importlib.util
 from pathlib import Path
 import sys
 
@@ -53,12 +54,31 @@ PORT_ADAPTER_FILES = {
     "crates/yadorilink-daemon/src/replica_coordinator/peer_replica_state.rs",
 }
 
-# Entire modules compiled only behind `#[cfg(test)]` in their parent. The
-# per-file scanner cannot see that parent attribute, so record that structural
-# fact explicitly instead of treating test fixtures as production adapters.
-TEST_ONLY_FILES = {
-    "crates/yadorilink-local-capture/src/test_support.rs",
-}
+# Test code is recognised the same way the materialization-semantic guard
+# recognises it, by loading that script's scanner instead of keeping a second
+# copy: an item under a `cfg` that holds only in test builds (`#[cfg(test)]`,
+# `#[cfg(all(test, unix))]`, `#[cfg(any(test, feature = "test-support"))]`;
+# only `test` and `feature = "test-support"` are recognized test gates, so a
+# production gate such as `any(test, madsim)` is still scanned) is skipped
+# wherever it sits in a file, and a module FILE declared under
+# such a `cfg` in its parent (with `#[path]` and nested module directories
+# followed), or opening with `#![cfg(test)]`, is skipped whole. A per-file
+# scan alone cannot see the parent's attribute, which is why fixtures such as
+# `test_support/peer_session_fixture.rs` used to be reported as production.
+_SEMANTIC_GUARD = ROOT / "scripts" / "check-materialization-semantic-boundary.py"
+
+
+def _load_semantic_guard():
+    spec = importlib.util.spec_from_file_location(
+        "check_materialization_semantic_boundary", _SEMANTIC_GUARD
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+SEMANTIC = _load_semantic_guard()
 
 # The non-emitting current-row writers. Each needs a `(` right after the bare
 # name so the emitting/Projected wrappers (`*_emitting_change(`,
@@ -76,22 +96,44 @@ FORBIDDEN = (
 # non-emitting write that is provably NOT a DAG-silent local mutation:
 #   * peer_session.rs: Projected — applying a peer's already-resolved change /
 #     advertised metadata to the local index (index-only by design).
-#   * local_change.rs: a group with no change DAG yet (seeded by the chunked
+#   * local_change/{scan,event_ingest}.rs: a group with no change DAG yet (seeded by the chunked
 #     initial import right after the scan) and the standalone no-emitter build,
 #     neither of which has a DAG to diverge from.
 ALLOWLIST = {
     "crates/yadorilink-peer-session/src/peer_session.rs": [
         # Projected: apply a peer's advertised metadata (index-only).
+        # Both currently match nothing: the metadata application these named
+        # moved into `apply_projected_row_atomic`, which writes the columns
+        # inside the same transaction as the row. Kept because the seam they
+        # permit is still the sanctioned one, so a future Projected write
+        # landing here is a reviewed shape rather than a new exception.
         "state.set_record_kind(",
         "state.set_exec_bit(",
     ],
-    "crates/yadorilink-local-capture/src/local_change.rs": [
-        # No change DAG yet: the initial import seeds these rows into history.
+    "crates/yadorilink-daemon/src/replica_coordinator/local_mutation.rs": [
+        # The standalone no-emitter build, inside capture's directory
+        # operations (`commit_captured_directory`,
+        # `commit_directory_removal`): an explicit directory's row, and the
+        # point deletes of a vanished directory's observed entries.
+        "self.file_index_repository().upsert_files_batch(",
+        "self.file_index_repository().mark_deleted_at(",
+    ],
+    "crates/yadorilink-local-capture/src/local_change/scan.rs": [
+        # No change DAG yet: the initial import seeds these rows into history
+        # (the chunked scan batch).
+        "self.state.upsert_files_batch(",
+    ],
+    "crates/yadorilink-local-capture/src/local_change/event_ingest.rs": [
+        # No change DAG yet: the single-event path a build with no change
+        # emitter takes.
         "self.state.upsert_files_batch(",
         # Standalone (no change emitter) delete path.
         "self.state.mark_deleted_at(",
         # Local-column bookkeeping applied right after the emitting write that
         # already carried the same exec bit / symlink kind in its FileVersion.
+        # Both currently match nothing: the exec-bit one for the same reason
+        # as the peer-session pair above, and the record-kind one since the
+        # symlink kind moved into the single-row write that captures it.
         "self.state.set_exec_bit(",
         "self.state.set_record_kind(",
     ],
@@ -99,60 +141,25 @@ ALLOWLIST = {
 
 # Pinned total number of allowlisted raw calls across the tree. Bump this (and
 # add the ALLOWLIST snippet) only for a reviewed, provably-non-silent site.
-EXPECTED_ALLOWED = 8
-
-
-def _code_only(line: str) -> str:
-    """Drop a trailing line comment so brace counting ignores commented braces.
-
-    Approximate (does not model `{`/`}` inside string literals), which is safe
-    here: over-counting a brace only ever skips MORE lines as test code, never
-    fewer, so a real production mutation can never be hidden by it — and the
-    pinned allowed-hit count would change and fail the guard if it happened.
-    """
-    marker = line.find("//")
-    return line[:marker] if marker != -1 else line
+#
+# The five, enumerated so the next person changing this number can check the
+# same list rather than re-deriving it:
+#   local_change/scan.rs               upsert_files_batch  x1  -- scan batch
+#   local_change/event_ingest.rs       upsert_files_batch  x1  -- no-emitter event
+#   local_change/event_ingest.rs       mark_deleted_at     x1  -- no-emitter delete
+#   replica_coordinator/local_mutation.rs  upsert_files_batch  x1  -- no-emitter directory
+#   replica_coordinator/local_mutation.rs  mark_deleted_at     x1  -- no-emitter observed-set delete
+EXPECTED_ALLOWED = 5
 
 
 def production_lines(path: Path) -> list[tuple[int, str]]:
-    """Yield `(1-based line number, line)` for every PRODUCTION line.
+    """`(1-based line number, code)` for every PRODUCTION line of one file.
 
-    Excludes the body of any `#[cfg(test)]`-attributed item — a braced module
-    (`#[cfg(test)] mod tests { ... }`) or a single gated statement/item
-    (`#[cfg(test)]\\n    hook(...);`) — wherever it appears in the file, then
-    keeps scanning. The earlier "truncate at the first `#[cfg(test)]`" rule
-    silently stopped checking every production mutation that followed a mid-file
-    test-only hook, so such a hook could hide a real seam bypass after it.
+    Whole-line comments and trailing `//` comments are dropped, and every
+    item under a test-requiring `cfg` is skipped wherever it appears, so a
+    mid-file test-only hook cannot hide a real seam bypass after it.
     """
-    raw = path.read_text(encoding="utf-8").splitlines()
-    out: list[tuple[int, str]] = []
-    index = 0
-    total = len(raw)
-    while index < total:
-        if raw[index].strip() == "#[cfg(test)]":
-            index += 1
-            # Consume any stacked attributes on the same item.
-            while index < total and raw[index].strip().startswith("#["):
-                index += 1
-            # Skip the attributed item: a brace-delimited block up to its
-            # matching close, or a single statement/item terminated by `;`.
-            depth = 0
-            opened = False
-            while index < total:
-                code = _code_only(raw[index])
-                depth += code.count("{") - code.count("}")
-                if "{" in code:
-                    opened = True
-                index += 1
-                if opened:
-                    if depth <= 0:
-                        break
-                elif code.rstrip().endswith(";"):
-                    break
-            continue
-        out.append((index + 1, raw[index]))
-        index += 1
-    return out
+    return SEMANTIC.production_lines(path, path.read_text(encoding="utf-8"))
 
 
 def in_matching_port_method(
@@ -169,10 +176,13 @@ def in_matching_port_method(
 def main() -> int:
     violations: list[str] = []
     allowed_hits = 0
+    # Parents of a test module can live in any crate's source tree, so the
+    # test-module set is computed over all of them.
+    test_files = SEMANTIC.test_module_files(sorted(ROOT.glob(SEMANTIC.SOURCE_GLOB)))
     for source_root in SOURCE_ROOTS:
         for path in sorted(source_root.rglob("*.rs")):
             rel = str(path.relative_to(ROOT))
-            if rel in EXEMPT_FILES or rel in TEST_ONLY_FILES:
+            if rel in EXEMPT_FILES or path.resolve() in test_files:
                 continue
             allowed_snippets = ALLOWLIST.get(rel, [])
             lines = production_lines(path)

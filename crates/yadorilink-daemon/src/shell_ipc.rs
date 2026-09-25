@@ -31,13 +31,22 @@ use yadorilink_ipc_proto::shellipc::{
     StatusResponse,
 };
 
-use crate::daemon_state::DaemonState;
-use crate::hydration;
-use crate::shell_status::{
-    resolve_group_and_rel_path, resolve_materialization_state, resolve_status,
-};
+use crate::shell_context::ShellContext;
+use crate::shell_status::{resolve_materialization_state, resolve_status_detail};
 
 const MAX_SHELL_IPC_CONNECTIONS: usize = 64;
+
+fn shell_entry_kind(
+    kind: yadorilink_replica_domain::file::RecordKind,
+) -> yadorilink_ipc_proto::shellipc::EntryKind {
+    use yadorilink_ipc_proto::shellipc::EntryKind;
+    use yadorilink_replica_domain::file::RecordKind;
+    match kind {
+        RecordKind::File => EntryKind::File,
+        RecordKind::Directory => EntryKind::Directory,
+        RecordKind::Symlink => EntryKind::Symlink,
+    }
+}
 
 fn to_shell_materialization_state(
     state: Option<yadorilink_replica_domain::session_state::MaterializationState>,
@@ -60,13 +69,13 @@ fn to_shell_materialization_state(
 pub async fn handle_connection<R, W>(
     mut read_half: R,
     mut write_half: W,
-    state: Arc<DaemonState>,
+    context: Arc<ShellContext>,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut push_rx = state.telemetry.subscribe_status();
+    let mut push_rx = context.telemetry.subscribe_status();
     loop {
         tokio::select! {
             biased;
@@ -75,7 +84,7 @@ where
                 match incoming? {
                     None => return Ok(()), // client disconnected
                     Some(msg) => {
-                        if let Some(response) = handle_message(&state, msg).await {
+                        if let Some(response) = handle_message(&context, msg).await {
                             write_message(&mut write_half, &response).await?;
                         }
                     }
@@ -91,25 +100,37 @@ where
     }
 }
 
-async fn handle_message(state: &Arc<DaemonState>, msg: ShellIpcMessage) -> Option<ShellIpcMessage> {
+#[allow(
+    clippy::too_many_lines,
+    clippy::excessive_nesting,
+    reason = "exhaustive dispatch over every shell IPC `Payload` variant; keeping \
+              the single `match` in one place is what makes the request/response \
+              pairing for each variant reviewable and keeps the compiler's \
+              exhaustiveness check on the protocol enum. The deep arm is the \
+              per-file placeholder-generation fold, whose nesting is the \
+              option/result chain (link -> materialization state -> Windows \
+              placeholder generation) evaluated inline per listing entry."
+)]
+async fn handle_message(context: &ShellContext, msg: ShellIpcMessage) -> Option<ShellIpcMessage> {
     match msg.payload {
         Some(Payload::StatusQuery(q)) => {
-            let sync_state = resolve_status(&state.replica_coordinator, &q.path);
+            let status = resolve_status_detail(&context.replica_coordinator, &q.path);
             let materialization_state =
-                resolve_materialization_state(&state.replica_coordinator, &q.path);
+                resolve_materialization_state(&context.replica_coordinator, &q.path);
             Some(ShellIpcMessage {
                 payload: Some(Payload::StatusResponse(StatusResponse {
                     path: q.path,
-                    state: sync_state as i32,
+                    state: status.state as i32,
                     materialization_state: to_shell_materialization_state(materialization_state)
                         as i32,
+                    status_detail: status.detail.unwrap_or_default(),
                 })),
             })
         }
         Some(Payload::HydrateRequest(req)) => {
-            let response = match resolve_group_and_rel_path(&state.replica_coordinator, &req.path) {
+            let response = match context.queries.linked_path.resolve(&req.path) {
                 Some((group_id, rel_path)) => {
-                    match hydration::hydrate(state, &group_id, &rel_path).await {
+                    match context.application.materialization.hydrate(&group_id, &rel_path).await {
                         Ok(()) => HydrateResponse { ok: true, error: String::new() },
                         Err(e) => HydrateResponse { ok: false, error: e.to_string() },
                     }
@@ -126,30 +147,57 @@ async fn handle_message(state: &Arc<DaemonState>, msg: ShellIpcMessage) -> Optio
                 Ok(ContextAction::ViewStatus) => {
                     ContextActionResponse { ok: true, error: String::new() }
                 }
+                // shell-integration spec "Pause sync for a single item":
+                // the same application pause/resume service the control
+                // socket's link-level pause goes through, scoped to one
+                // file or folder of the link.
                 Ok(ContextAction::PauseItem) => {
-                    state
-                        .paused_paths
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .insert(req.path);
-                    ContextActionResponse { ok: true, error: String::new() }
+                    match context.queries.linked_path.resolve(&req.path) {
+                        Some((group_id, rel_path)) => {
+                            match context.application.pause_resume.pause_item(&group_id, &rel_path)
+                            {
+                                Ok(()) => ContextActionResponse { ok: true, error: String::new() },
+                                Err(e) => ContextActionResponse { ok: false, error: e.to_string() },
+                            }
+                        }
+                        None => ContextActionResponse {
+                            ok: false,
+                            error: "path is not under any linked folder".into(),
+                        },
+                    }
                 }
                 Ok(ContextAction::ResumeItem) => {
-                    state
-                        .paused_paths
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .remove(&req.path);
-                    ContextActionResponse { ok: true, error: String::new() }
+                    match context.queries.linked_path.resolve(&req.path) {
+                        Some((group_id, rel_path)) => {
+                            match context
+                                .application
+                                .pause_resume
+                                .resume_item(&group_id, &rel_path)
+                                .await
+                            {
+                                Ok(()) => ContextActionResponse { ok: true, error: String::new() },
+                                Err(e) => ContextActionResponse { ok: false, error: e.to_string() },
+                            }
+                        }
+                        None => ContextActionResponse {
+                            ok: false,
+                            error: "path is not under any linked folder".into(),
+                        },
+                    }
                 }
                 // on-demand-sync spec "Context Menu Actions Include Pin and
                 // Evict": the same daemon operations `yadorilink pin`/`yadorilink
                 // evict` (control_socket) drive, exposed via the shell
                 // extension's context menu instead of the CLI.
                 Ok(ContextAction::PinItem) => {
-                    match resolve_group_and_rel_path(&state.replica_coordinator, &req.path) {
+                    match context.queries.linked_path.resolve(&req.path) {
                         Some((group_id, rel_path)) => {
-                            match hydration::pin(state, &group_id, &rel_path).await {
+                            match context
+                                .application
+                                .materialization
+                                .pin(&group_id, &rel_path)
+                                .await
+                            {
                                 Ok(()) => ContextActionResponse { ok: true, error: String::new() },
                                 Err(e) => ContextActionResponse { ok: false, error: e.to_string() },
                             }
@@ -161,10 +209,10 @@ async fn handle_message(state: &Arc<DaemonState>, msg: ShellIpcMessage) -> Optio
                     }
                 }
                 Ok(ContextAction::EvictItem) => {
-                    match resolve_group_and_rel_path(&state.replica_coordinator, &req.path) {
+                    match context.queries.linked_path.resolve(&req.path) {
                         Some((group_id, rel_path)) => {
-                            match hydration::evict(state, &group_id, &rel_path) {
-                                // M4 Pass 4: `Ok` alone does not mean the
+                            match context.application.materialization.evict(&group_id, &rel_path) {
+                                // `Ok` alone does not mean the
                                 // file was actually freed -- `evict_file`
                                 // can return `Ok` while leaving it fully
                                 // materialized (pinned, busy, not yet
@@ -217,7 +265,7 @@ async fn handle_message(state: &Arc<DaemonState>, msg: ShellIpcMessage) -> Optio
         // distinction explicit on the wire instead of relying on the
         // client inferring it from a transport-level failure.
         Some(Payload::ListOnDemandFoldersRequest(_)) => {
-            let response = match state.replica_coordinator.link_repository().list_links() {
+            let response = match context.replica_coordinator.link_repository().list_links() {
                 Ok(links) => {
                     let folders = links
                         .into_iter()
@@ -246,86 +294,109 @@ async fn handle_message(state: &Arc<DaemonState>, msg: ShellIpcMessage) -> Optio
             };
             Some(ShellIpcMessage { payload: Some(Payload::ListOnDemandFoldersResponse(response)) })
         }
+        // Every read below fails the whole listing closed
+        // (`snapshot_available: false`, no entries) rather than collapsing
+        // into `[]` -- the macOS File Provider treats a successful
+        // enumeration as authoritative, so an empty listing that merely
+        // could not be read would tell it the folder has zero files. Same
+        // contract as `ListOnDemandFoldersRequest` above.
         Some(Payload::ListFolderFilesRequest(req)) => {
-            let entries = state
-                .replica_coordinator
-                .link_repository()
-                .list_links()
-                .unwrap_or_default()
-                .into_iter()
+            let listing: Result<Vec<FolderFileEntry>, String> = 'listing: {
+                let links = match context.replica_coordinator.link_repository().list_links() {
+                    Ok(links) => links,
+                    Err(e) => break 'listing Err(format!("failed to list links: {e}")),
+                };
                 // An orphaned link is no longer a live sync target -- treat
                 // it the same as "no such link" here, so its folder is
                 // never enumerated for placeholder registration either.
-                .find(|l| l.local_path == req.local_path && !l.orphaned)
-                .map(|l| {
-                    // M2-2: only needed to mint/persist a Windows CfAPI
-                    // generation for entries reported as `Placeholder`
-                    // below -- looked up once per link, not once per
-                    // file. `None` (link not currently running) means
-                    // every such entry's `placeholder_generation` stays
-                    // unset this poll; `cfapi_host.rs`'s `sync_placeholders`
-                    // already treats an unset generation as "not yet
-                    // ready to create, retry next poll", so this degrades
-                    // to a delayed placeholder creation, never a wrong one.
-                    let runtime = state.links.runtime(&req.local_path);
-                    state
+                // Neither has a listing to confirm.
+                let Some(l) =
+                    links.into_iter().find(|l| l.local_path == req.local_path && !l.orphaned)
+                else {
+                    break 'listing Err("local_path is not a currently linked, live folder".into());
+                };
+                let files = match context
+                    .replica_coordinator
+                    .file_index_repository()
+                    .list_files_with_kind(&l.group_id)
+                {
+                    Ok(files) => files,
+                    Err(e) => break 'listing Err(format!("failed to list files: {e}")),
+                };
+                // Only needed to mint/persist a Windows CfAPI
+                // generation for entries reported as `Placeholder`
+                // below -- looked up once per link, not once per
+                // file. `None` (link not currently running) means
+                // every such entry's `placeholder_generation` stays
+                // unset this poll; `cfapi_host.rs`'s `sync_placeholders`
+                // already treats an unset generation as "not yet
+                // ready to create, retry next poll", so this degrades
+                // to a delayed placeholder creation, never a wrong one.
+                let runtime = context.links.runtime(&req.local_path);
+                let mut entries = Vec::new();
+                for (f, record_kind) in files.into_iter().filter(|(f, _)| !f.deleted) {
+                    let materialization_state = match context
                         .replica_coordinator
-                        .file_index_repository()
-                        .list_files(&l.group_id)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter(|f| !f.deleted)
-                        .map(|f| {
-                            let materialization_state = to_shell_materialization_state(
-                                state
-                                    .replica_coordinator
-                                    .materialization_state_repository()
-                                    .get_materialization_state(&l.group_id, &f.path)
-                                    .ok()
-                                    .flatten(),
-                            );
-                            let placeholder_generation = if materialization_state
-                                == ShellMaterializationState::Placeholder
-                            {
-                                runtime.as_ref().and_then(|runtime| {
-                                    match runtime
-                                        .ensure_windows_placeholder_generation(&l.group_id, &f.path)
-                                    {
-                                        Ok(generation) => Some(generation),
-                                        Err(error) => {
-                                            tracing::warn!(
-                                                group_id = %l.group_id,
-                                                path = %f.path,
-                                                error = %error,
-                                                "failed to mint/persist a Windows CfAPI \
-                                                 placeholder generation; cfapi-host will retry \
-                                                 creating this placeholder next poll"
-                                            );
-                                            None
-                                        }
+                        .materialization_state_repository()
+                        .get_materialization_state(&l.group_id, &f.path)
+                    {
+                        Ok(s) => to_shell_materialization_state(s),
+                        Err(e) => {
+                            break 'listing Err(format!(
+                                "failed to read the materialization state of {}: {e}",
+                                f.path
+                            ));
+                        }
+                    };
+                    let placeholder_generation =
+                        if materialization_state == ShellMaterializationState::Placeholder {
+                            runtime.as_ref().and_then(|runtime| {
+                                match runtime
+                                    .ensure_windows_placeholder_generation(&l.group_id, &f.path)
+                                {
+                                    Ok(generation) => Some(generation),
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            group_id = %l.group_id,
+                                            path = %f.path,
+                                            error = %error,
+                                            "failed to mint/persist a Windows CfAPI \
+                                             placeholder generation; cfapi-host will retry \
+                                             creating this placeholder next poll"
+                                        );
+                                        None
                                     }
-                                })
-                            } else {
-                                None
-                            };
-                            FolderFileEntry {
-                                relative_path: f.path,
-                                size: f.size,
-                                mtime_unix_nanos: f.mtime_unix_nanos,
-                                materialization_state: materialization_state as i32,
-                                placeholder_generation,
-                            }
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            Some(ShellIpcMessage {
-                payload: Some(Payload::ListFolderFilesResponse(ListFolderFilesResponse {
-                    entries,
-                })),
-            })
+                                }
+                            })
+                        } else {
+                            None
+                        };
+                    entries.push(FolderFileEntry {
+                        relative_path: f.path,
+                        size: f.size,
+                        mtime_unix_nanos: f.mtime_unix_nanos,
+                        materialization_state: materialization_state as i32,
+                        placeholder_generation,
+                        kind: shell_entry_kind(record_kind) as i32,
+                    });
+                }
+                Ok(entries)
+            };
+            let response = match listing {
+                Ok(entries) => ListFolderFilesResponse { entries, snapshot_available: true },
+                Err(error) => {
+                    tracing::warn!(
+                        local_path = %req.local_path,
+                        %error,
+                        "ListFolderFilesRequest could not confirm the folder's listing; \
+                         reporting snapshot_available=false rather than an empty listing"
+                    );
+                    ListFolderFilesResponse { entries: Vec::new(), snapshot_available: false }
+                }
+            };
+            Some(ShellIpcMessage { payload: Some(Payload::ListFolderFilesResponse(response)) })
         }
-        // M1-3: the OS virtual-filesystem's own create/modify/delete
+        // The OS virtual-filesystem's own create/modify/delete
         // callback (macOS `NSFileProviderReplicatedExtension`'s
         // `createItem`/`modifyItem`/`deleteItem`) notifies the daemon that a
         // local write already landed on disk. Routes through the same
@@ -355,11 +426,18 @@ async fn handle_message(state: &Arc<DaemonState>, msg: ShellIpcMessage) -> Optio
                 // and `ListOnDemandFoldersRequest` above already apply, for
                 // the same reason: this must never accept a File-Provider
                 // write for a link that's no longer a live sync target.
-                let Some(group_id) = state
-                    .replica_coordinator
-                    .link_repository()
-                    .list_links()
-                    .unwrap_or_default()
+                // A read failure is not evidence that the folder is
+                // unlinked, so it is reported as what it is.
+                let links = match context.replica_coordinator.link_repository().list_links() {
+                    Ok(links) => links,
+                    Err(e) => {
+                        break 'resolve LocalWriteResponse {
+                            ok: false,
+                            error: format!("could not read the linked folders: {e}"),
+                        };
+                    }
+                };
+                let Some(group_id) = links
                     .into_iter()
                     .find(|l| l.local_path == req.local_path && !l.orphaned)
                     .map(|l| l.group_id)
@@ -369,7 +447,7 @@ async fn handle_message(state: &Arc<DaemonState>, msg: ShellIpcMessage) -> Optio
                         error: "local_path is not a currently linked, live folder".into(),
                     };
                 };
-                let Some(runtime) = state.links.runtime(&req.local_path) else {
+                let Some(runtime) = context.links.runtime(&req.local_path) else {
                     break 'resolve LocalWriteResponse {
                         ok: false,
                         error: "link is not currently running".into(),
@@ -387,211 +465,11 @@ async fn handle_message(state: &Arc<DaemonState>, msg: ShellIpcMessage) -> Optio
 }
 
 #[cfg(test)]
-mod local_write_tests {
-    use std::path::Path;
-    use std::sync::Arc;
-
-    use yadorilink_filesystem_sync::watcher::RealFolderWatchSource;
-    use yadorilink_ipc_proto::shellipc::LocalWriteRequest;
-    use yadorilink_local_storage::FsBlockStore;
-
-    use crate::adapters::runtime::link_runtime_controller::LinkRuntimeController;
-    use crate::daemon_state::DaemonState;
-    use crate::replica_coordinator::ReplicaCoordinator;
-
-    use super::*;
-
-    fn test_state() -> Arc<DaemonState> {
-        let store_dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
-        let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
-        let state = DaemonState::new("device-a".into(), sync_state, store);
-        state.set_device_signing_key(ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]));
-        state.replica_coordinator.set_local_change_auth_provider(std::sync::Arc::new(
-            |_group_id| Ok(yadorilink_replica_domain::change::ChangeAuth::PLACEHOLDER),
-        ));
-        state
-    }
-
-    async fn start_watch_and_await_scan(state: &Arc<DaemonState>, root: &Path, group: &str) {
-        let controller = LinkRuntimeController::new(state.clone());
-        controller
-            .start_with_source(
-                root.to_string_lossy().into_owned(),
-                group.to_string(),
-                Arc::new(RealFolderWatchSource),
-            )
-            .expect("the watch must start");
-        tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            state.replica_coordinator.wait_group_ready(group),
-        )
-        .await
-        .expect("the initial scan must finish")
-        .expect("the initial scan must succeed");
-    }
-
-    fn local_write_request(
-        local_path: &str,
-        relative_path: &str,
-        kind: LocalWriteKind,
-    ) -> ShellIpcMessage {
-        ShellIpcMessage {
-            payload: Some(Payload::LocalWriteRequest(LocalWriteRequest {
-                local_path: local_path.to_string(),
-                relative_path: relative_path.to_string(),
-                kind: kind as i32,
-            })),
-        }
-    }
-
-    /// The core M1-3 create-path RED test: a File Provider `createItem`
-    /// notification (here, a plain file already written to disk plus this
-    /// request -- see `LinkFlushHandle::capture_local_write`'s own doc for
-    /// why the request itself carries no content) results in exactly one
-    /// DAG change and one indexed row, through the SAME admission path a
-    /// filesystem watcher's own event takes.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn local_write_request_for_a_new_file_admits_exactly_one_dag_change() {
-        let state = test_state();
-        let root = tempfile::tempdir().unwrap();
-        let local_path = root.path().to_string_lossy().to_string();
-        state.replica_coordinator.link_repository().add_link(&local_path, "group-1").unwrap();
-        start_watch_and_await_scan(&state, root.path(), "group-1").await;
-        std::fs::write(root.path().join("new.txt"), b"hello from the file provider").unwrap();
-
-        let response = handle_message(
-            &state,
-            local_write_request(&local_path, "new.txt", LocalWriteKind::CreatedOrModified),
-        )
-        .await
-        .unwrap();
-
-        let Some(Payload::LocalWriteResponse(r)) = response.payload else {
-            panic!("expected a LocalWriteResponse");
-        };
-        assert!(r.ok, "expected ok=true, got error: {}", r.error);
-        let record = state
-            .replica_coordinator
-            .file_index_repository()
-            .get_file("group-1", "new.txt")
-            .unwrap();
-        assert!(record.is_some_and(|r| !r.deleted), "the new file must be indexed and not deleted");
-        assert_eq!(
-            state
-                .replica_coordinator
-                .sqlite()
-                .dag_list_versions("group-1", "new.txt")
-                .unwrap()
-                .len(),
-            1,
-            "exactly one DAG change for the create"
-        );
-    }
-
-    /// A duplicate `createItem` replay for the exact same unchanged content
-    /// (a real callback retry, or the OS re-delivering the same
-    /// notification) must not mint a second DAG change -- `process_event`'s
-    /// own self-echo/no-op suppression, exercised here through the new
-    /// signal source.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn duplicate_local_write_request_for_unchanged_content_does_not_duplicate_the_change() {
-        let state = test_state();
-        let root = tempfile::tempdir().unwrap();
-        let local_path = root.path().to_string_lossy().to_string();
-        state.replica_coordinator.link_repository().add_link(&local_path, "group-1").unwrap();
-        start_watch_and_await_scan(&state, root.path(), "group-1").await;
-        std::fs::write(root.path().join("new.txt"), b"hello from the file provider").unwrap();
-        handle_message(
-            &state,
-            local_write_request(&local_path, "new.txt", LocalWriteKind::CreatedOrModified),
-        )
-        .await
-        .unwrap();
-
-        let response = handle_message(
-            &state,
-            local_write_request(&local_path, "new.txt", LocalWriteKind::CreatedOrModified),
-        )
-        .await
-        .unwrap();
-
-        let Some(Payload::LocalWriteResponse(r)) = response.payload else {
-            panic!("expected a LocalWriteResponse");
-        };
-        assert!(r.ok, "a no-op replay must still report ok=true, got error: {}", r.error);
-        assert_eq!(
-            state
-                .replica_coordinator
-                .sqlite()
-                .dag_list_versions("group-1", "new.txt")
-                .unwrap()
-                .len(),
-            1,
-            "a duplicate replay of unchanged content must not mint a second DAG change"
-        );
-    }
-
-    /// A `deleteItem` notification for an existing file tombstones it
-    /// through the same admission path.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn local_write_request_for_a_delete_tombstones_the_file() {
-        let state = test_state();
-        let root = tempfile::tempdir().unwrap();
-        let local_path = root.path().to_string_lossy().to_string();
-        state.replica_coordinator.link_repository().add_link(&local_path, "group-1").unwrap();
-        start_watch_and_await_scan(&state, root.path(), "group-1").await;
-        std::fs::write(root.path().join("gone.txt"), b"will be deleted").unwrap();
-        handle_message(
-            &state,
-            local_write_request(&local_path, "gone.txt", LocalWriteKind::CreatedOrModified),
-        )
-        .await
-        .unwrap();
-        std::fs::remove_file(root.path().join("gone.txt")).unwrap();
-
-        let response = handle_message(
-            &state,
-            local_write_request(&local_path, "gone.txt", LocalWriteKind::Deleted),
-        )
-        .await
-        .unwrap();
-
-        let Some(Payload::LocalWriteResponse(r)) = response.payload else {
-            panic!("expected a LocalWriteResponse");
-        };
-        assert!(r.ok, "expected ok=true, got error: {}", r.error);
-        let record = state
-            .replica_coordinator
-            .file_index_repository()
-            .get_file("group-1", "gone.txt")
-            .unwrap();
-        assert!(
-            record.is_some_and(|r| r.deleted),
-            "the file must be tombstoned, not merely absent"
-        );
-    }
-
-    /// An unrecognized `local_path` (not currently a live linked folder)
-    /// must fail closed, never silently admit a write for a group this
-    /// request cannot actually be authorized against.
-    #[tokio::test]
-    async fn local_write_request_for_an_unknown_local_path_is_rejected() {
-        let state = test_state();
-
-        let response = handle_message(
-            &state,
-            local_write_request("/not/a/linked/folder", "x.txt", LocalWriteKind::CreatedOrModified),
-        )
-        .await
-        .unwrap();
-
-        let Some(Payload::LocalWriteResponse(r)) = response.payload else {
-            panic!("expected a LocalWriteResponse");
-        };
-        assert!(!r.ok, "an unknown local_path must not be silently accepted");
-    }
-}
+mod item_pause_tests;
+#[cfg(test)]
+mod list_folder_files_tests;
+#[cfg(test)]
+mod local_write_tests;
 
 /// Reference client implementation: the shell extension's
 /// native shim (Rust via `windows-rs` on Windows per or an FFI
@@ -690,9 +568,9 @@ pub mod unix_transport {
     use tokio::net::UnixListener;
     use tokio::sync::Semaphore;
 
-    use crate::daemon_state::DaemonState;
+    use crate::shell_context::ShellContext;
 
-    pub async fn serve(socket_path: &Path, state: Arc<DaemonState>) -> std::io::Result<()> {
+    pub async fn serve(socket_path: &Path, context: Arc<ShellContext>) -> std::io::Result<()> {
         let _ = std::fs::remove_file(socket_path);
         prepare_private_socket_parent(socket_path)?;
         let listener = UnixListener::bind(socket_path)?;
@@ -713,19 +591,11 @@ pub mod unix_transport {
                 .await
                 .map_err(|_| std::io::Error::other("shell IPC semaphore closed"))?;
             let (stream, _) = listener.accept().await?;
-            let state = state.clone();
+            let context = context.clone();
             tokio::spawn(async move {
                 let _connection_slot = connection_slot;
-                #[cfg(not(madsim))]
                 let (read_half, write_half) = stream.into_split();
-                // `madsim`'s `UnixStream` shim has no `into_split`; the
-                // in-place `tokio::io::split` yields equivalent independent
-                // read/write halves over the same simulated socket. Same
-                // substitution the Windows named-pipe path already uses
-                // above (`tokio::io::split(connected)`).
-                #[cfg(madsim)]
-                let (read_half, write_half) = tokio::io::split(stream);
-                if let Err(e) = super::handle_connection(read_half, write_half, state).await {
+                if let Err(e) = super::handle_connection(read_half, write_half, context).await {
                     tracing::debug!(error = %e, "shell IPC connection ended");
                 }
             });
@@ -754,7 +624,7 @@ pub mod windows_transport {
     use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
     use tokio::sync::Semaphore;
 
-    use crate::daemon_state::DaemonState;
+    use crate::shell_context::ShellContext;
     use crate::windows_pipe_security::PipeSecurityAttributes;
 
     // See the identical helpers in `control_socket::windows_transport`:
@@ -780,7 +650,7 @@ pub mod windows_transport {
     }
 
     /// `pipe_name` should look like `\\.\pipe\yadorilink-<user>`.
-    pub async fn serve(pipe_name: &str, state: Arc<DaemonState>) -> std::io::Result<()> {
+    pub async fn serve(pipe_name: &str, context: Arc<ShellContext>) -> std::io::Result<()> {
         tracing::info!(pipe_name, "shell-integration IPC listening (named pipe)");
         let mut server = create_first_pipe_server(pipe_name)?;
         let connection_slots = Arc::new(Semaphore::new(super::MAX_SHELL_IPC_CONNECTIONS));
@@ -796,11 +666,12 @@ pub mod windows_transport {
             let connected = server;
             server = next_server;
 
-            let state = state.clone();
+            let context = context.clone();
             tokio::spawn(async move {
                 let _connection_slot = connection_slot;
                 let (read_half, mut write_half) = tokio::io::split(connected);
-                if let Err(e) = super::handle_connection(read_half, &mut write_half, state).await {
+                if let Err(e) = super::handle_connection(read_half, &mut write_half, context).await
+                {
                     tracing::debug!(error = %e, "shell IPC connection ended");
                 }
                 let _ = write_half.shutdown().await;

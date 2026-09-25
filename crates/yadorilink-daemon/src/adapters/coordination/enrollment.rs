@@ -48,7 +48,7 @@ impl EnrollmentCoordination for HttpEnrollmentCoordination {
             };
             let outcome = coordination_client::prepare_create(
                 &config.addr,
-                &config.access_token,
+                &config.auth,
                 operation_id,
                 group_name,
                 device_id,
@@ -73,7 +73,7 @@ impl EnrollmentCoordination for HttpEnrollmentCoordination {
             };
             let outcome = coordination_client::prepare_join(
                 &config.addr,
-                &config.access_token,
+                &config.auth,
                 operation_id,
                 group_id,
                 device_id,
@@ -97,7 +97,7 @@ impl EnrollmentCoordination for HttpEnrollmentCoordination {
             };
             let outcome = coordination_client::activate_create(
                 &config.addr,
-                &config.access_token,
+                &config.auth,
                 group_id,
                 operation_id,
             )
@@ -120,7 +120,7 @@ impl EnrollmentCoordination for HttpEnrollmentCoordination {
             };
             let outcome = coordination_client::activate_join(
                 &config.addr,
-                &config.access_token,
+                &config.auth,
                 group_id,
                 operation_id,
                 device_id,
@@ -143,7 +143,7 @@ impl EnrollmentCoordination for HttpEnrollmentCoordination {
             };
             let outcome = coordination_client::cancel_create_classified(
                 &config.addr,
-                &config.access_token,
+                &config.auth,
                 group_id,
                 operation_id,
             )
@@ -166,7 +166,7 @@ impl EnrollmentCoordination for HttpEnrollmentCoordination {
             };
             let outcome = coordination_client::cancel_join_classified(
                 &config.addr,
-                &config.access_token,
+                &config.auth,
                 group_id,
                 operation_id,
                 device_id,
@@ -191,7 +191,7 @@ impl EnrollmentCoordination for HttpEnrollmentCoordination {
             };
             let outcome = coordination_client::prepare_invite_accept(
                 &config.addr,
-                &config.access_token,
+                &config.auth,
                 operation_id,
                 code,
                 device_id,
@@ -216,7 +216,7 @@ impl EnrollmentCoordination for HttpEnrollmentCoordination {
             };
             let outcome = coordination_client::activate_invite_accept(
                 &config.addr,
-                &config.access_token,
+                &config.auth,
                 group_id,
                 operation_id,
                 device_id,
@@ -240,7 +240,7 @@ impl EnrollmentCoordination for HttpEnrollmentCoordination {
             };
             let outcome = coordination_client::cancel_invite_accept_classified(
                 &config.addr,
-                &config.access_token,
+                &config.auth,
                 group_id,
                 operation_id,
                 device_id,
@@ -263,7 +263,7 @@ impl EnrollmentCoordination for HttpEnrollmentCoordination {
             };
             coordination_client::mint_invite(
                 &config.addr,
-                &config.access_token,
+                &config.auth,
                 group_id,
                 &self.state.device_id,
                 role,

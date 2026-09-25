@@ -1,29 +1,23 @@
-//! This crate's entire contribution to peer-applied mutation ("ApplyPeerChange").
-//!
-//! The actual mutation logic -- `materialize`, `hydrate`, `hold`, and the
-//! rest of what happens when a peer's change is applied -- lives in
-//! `yadorilink_peer_session::peer_session::PeerSyncSession`, a different crate
-//! this one depends on (never the reverse). That is a deliberate boundary,
-//! not a gap: `yadorilink-daemon` has no way to reach back into
-//! `yadorilink-sync-core` to inject dispatch logic without inverting the
-//! dependency graph, so "ApplyPeerChange" cannot be a daemon-owned operation
-//! module the way `link_runtime::operations::capture_local_change`/
-//! `repair_materialization` are.
-//!
-//! What this crate DOES own is the authority lookup `PeerSyncSession` calls
-//! through its injected `RootCommitAuthorityProvider` seam: resolving a
-//! `group_id` to the SAME per-link `RootLease` every other subsystem
-//! touching that link (local-change capture, periodic/startup repair, the
-//! disk-reconcile backstop) admits through, not a second independent one.
-//! `PeerSyncSession` fails closed (`SyncError::NotFound`) when this returns
-//! `None` -- no live link, no provider installed, or (in production) the
-//! link is only `Starting`, not yet `Ready` -- never a permissive fallback.
-//!
-//! Lives at the crate's top level, a sibling of `link_runtime` rather than
-//! inside it: unlike that module tree's own operations, this impl is
-//! `DaemonState`'s own (it needs the daemon-wide link table and runtime
-//! registry directly, not a narrowed per-link bundle), so it stays out of
-//! `link_runtime`'s own DaemonState-free module tree.
+//! This crate's entire contribution to peer-applied mutation
+//! ("ApplyPeerChange"). The actual mutation logic -- `materialize`,
+//! `hydrate`, `hold`, and the rest of what happens when a peer's change is
+//! applied -- lives in
+//! `yadorilink_peer_session::peer_session::PeerSyncSession`, a different
+//! crate this one depends on (never the reverse). What this crate DOES own
+//! is the authority lookup `PeerSyncSession` calls through its injected
+//! `RootCommitAuthorityProvider` seam: resolving a `group_id` to the SAME
+//! per-link `RootLease` every other subsystem touching that link
+//! (local-change capture, periodic/startup repair, the disk-reconcile
+//! backstop) admits through, not a second independent one.
+//! `PeerSyncSession` fails closed (`SyncError::NotFound`) when this
+//! returns `None` -- no live link, no provider installed, or (in
+//! production) the link is only `Starting`, not yet `Ready` -- never a
+//! permissive fallback. Lives at the crate's top level, a sibling of
+//! `link_runtime` rather than inside it: unlike that module tree's own
+//! operations, this impl is `DaemonState`'s own (it needs the daemon-wide
+//! link table and runtime registry directly, not a narrowed per-link
+//! bundle), so it stays out of `link_runtime`'s own DaemonState-free
+//! module tree.
 
 use std::sync::Arc;
 
@@ -72,11 +66,7 @@ impl DaemonState {
     /// `sync_state.add_link(...)` in a unit test that needs `hydration::
     /// hydrate_inner`/`evict`/`preflight_disk_pressure` (or any other
     /// caller of `root_lease_for`) to succeed without paying for a real
-    /// `start_link_watch`. `#[cfg(any(test, feature = "test-support"))]`,
-    /// not plain `#[cfg(test)]`, so integration test binaries in other
-    /// crates (which depend on this crate as an ordinary library, never
-    /// compiled with `--cfg test`) can reach it too -- same reasoning as
-    /// `RootCommitPermit::for_tests`'s identical gate in `yadorilink-sync-core`.
+    /// `start_link_watch`.
     pub fn install_test_root_commit_authority(&self, group_id: &str) {
         self.test_root_commit_authorities
             .lock()

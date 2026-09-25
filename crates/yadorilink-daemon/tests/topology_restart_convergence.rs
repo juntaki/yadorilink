@@ -1,6 +1,6 @@
-//! M5-A Pass 5 (restart truthfulness): a daemon restart on the canonical
+//! Restart truthfulness: a daemon restart on the canonical
 //! N/M/W topology must never resurrect a stale `Protected` reading
-//! without fresh evidence -- the SAME property M4's own
+//! without fresh evidence -- the SAME property the
 //! `restart_never_shows_a_stale_protected_status` unit test proves for a
 //! single reopened `ReplicaCoordinator`, proven here through a REAL
 //! multi-node restart: a genuinely different `DaemonState` process
@@ -8,16 +8,11 @@
 //! still running and a real re-handshake required before any fresh
 //! evidence can exist again.
 //!
-//! **Oracle discipline**: `fully_connected` (`peer_handshake_received`/
-//! handshake) reads a sticky `AtomicBool` on
-//! `PeerSyncSession` that, once set, never reset for that session
-//! object's lifetime -- a valid "has this session EVER negotiated"
-//! check, but NOT a valid "is the CURRENT session fresh" check, since a
-//! stale session object sitting in the registry (never replaced) would
-//! read identically to a genuinely fresh one. This file's own restart
-//! scenario therefore proves session REPLACEMENT by `Arc` identity
-//! (`!Arc::ptr_eq(old, new)`) FIRST, and only checks negotiation flags
-//! on the confirmed-fresh session object.
+//! **Oracle discipline**: `fully_connected` only says a session is
+//! registered, which a stale session object sitting in the registry (never
+//! replaced) would satisfy just as well as a genuinely fresh one. This
+//! file's own restart scenario therefore proves session REPLACEMENT by `Arc`
+//! identity (`!Arc::ptr_eq(old, new)`).
 
 mod support;
 
@@ -25,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use support::fake_coordination::FakeCoordination;
-use support::topology::{fully_connected, restart_node, stand_up_canonical_topology};
+use support::topology::{fully_connected, restart_node, stand_up_canonical_topology, TopologyNode};
 use support::{register_with_fake, wait_until_with_context};
 use yadorilink_daemon::durability_service::GroupDurabilityStatus;
 use yadorilink_peer_session::peer_session::PeerSyncSession;
@@ -121,6 +116,11 @@ async fn n_restart_never_shows_a_stale_protected_status() {
     // (`restart_node`'s own `LinkRuntimeController::stop` call), then
     // reopen a fresh `DaemonState` against the exact same on-disk index
     // DB and block store.
+    // Close the substrate first, while the runtime its tasks live on is still
+    // running -- see `shutdown_substrate`. Killing the runtime first leaves the
+    // socket bound with nothing polling it, which is not what a restart looks
+    // like from a peer's side.
+    support::topology::shutdown_substrate(&n).await;
     handles.take_and_shutdown(&n.device_id).await;
     let n = restart_node(n).await;
     tracing::info!(
@@ -149,10 +149,12 @@ async fn n_restart_never_shows_a_stale_protected_status() {
     // so this fresh generation's own per-peer supervisors are tracked
     // and torn down at the test's end exactly like the original three
     // nodes' -- a bare `tokio::spawn` here (an earlier version of this
-    // test) would leak them the same way finding #2 of an M5-A Pass 5
-    // Codex review found for the ORIGINAL design.
+    // test) would leak them the same way the ORIGINAL design did.
     register_with_fake(&fake, &n.state, &n.device_id, &[group_id]).await;
     let n_runtime = support::topology::spawn_orchestrator(fake.addr(), &n);
+    // The substrate rebinds on a fresh socket across a restart, so the address
+    // the plane names for this node is stale until it is republished.
+    support::topology::advertise_substrate_endpoints(&[&n, &m, &w]).await;
     handles.insert(n.device_id.clone(), n_runtime);
     tracing::info!("TEST: N's fresh orchestrator spawned, re-registered with coordination plane");
 
@@ -200,8 +202,8 @@ async fn n_restart_never_shows_a_stale_protected_status() {
         || {
             format!(
                 "fresh sessions never completed their handshake: m={:?} w={:?}",
-                m.state.peers.session(&n.device_id).map(|s| s.peer_handshake_received()),
-                w.state.peers.session(&n.device_id).map(|s| s.peer_handshake_received()),
+                m.state.peers.session(&n.device_id).is_some(),
+                w.state.peers.session(&n.device_id).is_some(),
             )
         },
     )
@@ -294,11 +296,65 @@ async fn n_restart_never_shows_a_stale_protected_status() {
     // Teardown: `handles` (Drop impl) shuts down every tracked runtime,
     // including N's post-restart generation now that it's registered
     // via `handles.insert` above -- proving a second restart would also
-    // find something in `take_and_shutdown` for N, closing finding #2.
+    // find something in `take_and_shutdown` for N.
     handles.shutdown();
 }
 
-/// M5-A Pass 5 regression-matrix item B/C (restart of a NON-anchor node):
+/// TEMPORARY (scratch/topology-diag): classify where the M -> N pipeline stops.
+///
+/// Each stage is read from the table that actually holds it, so the first stage
+/// that disagrees between the author and N is the defect boundary:
+///   author canonical -> author servable -> N staged -> N canonical
+///   -> N index row -> N disk bytes
+fn pipeline_probe(nodes: &[(&str, &TopologyNode)], group_id: &str) -> String {
+    nodes
+        .iter()
+        .map(|(tag, node)| {
+            let c = &node.state.replica_coordinator;
+            let heads = c
+                .sqlite()
+                .dag_group_heads(group_id)
+                .map(|mut h| {
+                    h.sort();
+                    h.iter().map(|x| hex::encode(x.0)[..8].to_string()).collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|e| vec![format!("err({e})")]);
+            let staged = c
+                .sqlite()
+                .dag_staged_hashes(group_id)
+                .map(|h| h.iter().map(|x| hex::encode(x.0)[..8].to_string()).collect::<Vec<_>>())
+                .unwrap_or_else(|e| vec![format!("err({e})")]);
+            let servable = c
+                .sqlite()
+                .dag_servable_hashes(group_id)
+                .map(|h| h.iter().map(|x| hex::encode(x.0)[..8].to_string()).collect::<Vec<_>>())
+                .unwrap_or_else(|e| vec![format!("err({e})")]);
+            let index = c
+                .file_index_repository()
+                .list_files(group_id)
+                .map(|f| {
+                    f.iter()
+                        .map(|r| format!("{}{}", r.path, if r.deleted { "(del)" } else { "" }))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|e| vec![format!("err({e})")]);
+            let dirty = c
+                .dirty_path_repository()
+                .list_dirty_paths(group_id)
+                .map(|d| d.into_iter().map(|e| e.path).collect::<Vec<_>>())
+                .unwrap_or_else(|e| vec![format!("err({e})")]);
+            let disk = support::real_entry_names(node.root.path());
+            format!(
+                "  {tag}({}): heads={heads:?} staged={staged:?} servable={servable:?} \
+                 dirty={dirty:?} index={index:?} disk={disk:?}",
+                node.device_id
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Restart of a NON-anchor node:
 /// the canonical topology is a full mesh (N<->M, N<->W, M<->W all
 /// connected, `stand_up_canonical_topology`'s own wait proves this), so
 /// restarting M or W -- unlike N, which is the lone full-replica/relay
@@ -325,10 +381,6 @@ async fn on_demand_node_restart_recovers_and_resyncs(restart_w: bool) {
     let (n, mut m, mut w, mut handles) = stand_up_canonical_topology(&fake, group_id).await;
     let label = if restart_w { "W" } else { "M" };
 
-    // The restarting node authors the baseline file; BOTH other nodes
-    // must converge on it before restart (Eager N via a direct read; the
-    // other On-Demand node via `hydration::hydrate`, exactly like the
-    // N-restart test's own established pattern for an On-Demand reader).
     let before_name = format!("before-restart-{label}.txt");
     {
         let author_root = if restart_w { w.root.path() } else { m.root.path() };
@@ -340,7 +392,12 @@ async fn on_demand_node_restart_recovers_and_resyncs(restart_w: bool) {
                 == Some(b"before restart" as &[u8])
         },
         Duration::from_secs(30),
-        || format!("N never converged on {label}'s pre-restart content"),
+        || {
+            format!(
+                "N never converged on {label}'s pre-restart content\n{}",
+                pipeline_probe(&[("author", if restart_w { &w } else { &m }), ("N", &n)], group_id)
+            )
+        },
     )
     .await;
     let bystander_hydrate_before = if restart_w { &m.state } else { &w.state };
@@ -379,16 +436,24 @@ async fn on_demand_node_restart_recovers_and_resyncs(restart_w: bool) {
     // same on-disk state, re-register, and re-spawn a fresh orchestrator
     // tracked back into `handles`.
     if restart_w {
+        // Close the substrate first, while the runtime its tasks live on is
+        // still running -- see `shutdown_substrate`.
+        support::topology::shutdown_substrate(&w).await;
         handles.take_and_shutdown(&w.device_id).await;
         w = restart_node(w).await;
         register_with_fake(&fake, &w.state, &w.device_id, &[group_id]).await;
         let runtime = support::topology::spawn_orchestrator(fake.addr(), &w);
+        support::topology::advertise_substrate_endpoints(&[&n, &m, &w]).await;
         handles.insert(w.device_id.clone(), runtime);
     } else {
+        // Close the substrate first, while the runtime its tasks live on is
+        // still running -- see `shutdown_substrate`.
+        support::topology::shutdown_substrate(&m).await;
         handles.take_and_shutdown(&m.device_id).await;
         m = restart_node(m).await;
         register_with_fake(&fake, &m.state, &m.device_id, &[group_id]).await;
         let runtime = support::topology::spawn_orchestrator(fake.addr(), &m);
+        support::topology::advertise_substrate_endpoints(&[&n, &m, &w]).await;
         handles.insert(m.device_id.clone(), runtime);
     }
     tracing::info!(label, "TEST: restarted node's orchestrator re-spawned and re-registered");
@@ -469,7 +534,7 @@ async fn w_restart_recovers_and_resyncs_with_both_peers() {
     on_demand_node_restart_recovers_and_resyncs(true).await;
 }
 
-/// M5-A Pass 5 regression-matrix item D: a restart while a large transfer
+/// A restart while a large transfer
 /// is actively in flight must never accept stale ACK/data from the OLD
 /// transport epoch, and must still converge to the EXACT byte content --
 /// not merely "some content", the way the other restart tests' small
@@ -518,6 +583,11 @@ async fn n_restart_mid_transfer_still_converges_exactly() {
     // restart WHILE the transfer is (plausibly) still in flight, not
     // after it has already settled.
     tokio::time::sleep(Duration::from_millis(150)).await;
+    // Close the substrate first, while the runtime its tasks live on is still
+    // running -- see `shutdown_substrate`. Killing the runtime first leaves the
+    // socket bound with nothing polling it, which is not what a restart looks
+    // like from a peer's side.
+    support::topology::shutdown_substrate(&n).await;
     handles.take_and_shutdown(&n.device_id).await;
     let n = restart_node(n).await;
     tracing::info!(
@@ -526,6 +596,9 @@ async fn n_restart_mid_transfer_still_converges_exactly() {
     );
     register_with_fake(&fake, &n.state, &n.device_id, &[group_id]).await;
     let n_runtime = support::topology::spawn_orchestrator(fake.addr(), &n);
+    // The substrate rebinds on a fresh socket across a restart, so the address
+    // the plane names for this node is stale until it is republished.
+    support::topology::advertise_substrate_endpoints(&[&n, &m, &w]).await;
     handles.insert(n.device_id.clone(), n_runtime);
 
     // Regardless of exactly when the restart landed relative to the

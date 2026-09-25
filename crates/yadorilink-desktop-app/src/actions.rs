@@ -7,14 +7,15 @@
 //! settings are validated and persisted by the daemon, not only by this
 //! UI.
 
-use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
-use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
+use yadorilink_client_core::ops::{
+    auth, daemon, devices, diagnostics, files, folders, links, shares, storage, transfers, updates,
+};
+use yadorilink_client_core::CoreError;
 use yadorilink_ipc_proto::daemonctl::{
-    ConflictedFileInfo, DiagnosticsExportRequest, EvictRequest, FileVersionInfo, HydrateRequest,
-    LimitsSetRequest, ListConflictsRequest, ListTrashRequest, ListVersionsRequest,
-    MaterializationStatusRequest, MaterializationStatusResponse, PauseRequest, PinRequest,
-    RestoreTrashRequest, RestoreVersionRequest, ResumeRequest, ShutdownRequest, TrashedFileInfo,
-    UnlinkRequest, UnpinRequest, UpdateCheckRequest, UpdateInstallRequest,
+    ConflictedFileInfo, FileVersionInfo, GcResponse, InboxTransfer, LimitsSetResponse,
+    LimitsShowResponse, MaterializationStatusResponse, ReceiveTransferResponse,
+    RestoreTrashOperationResponse, SendFileResponse, TrashedFileInfo, UpdateConfigResponse,
+    UpdateStatusResponse,
 };
 
 use crate::ipc_client::{self, IpcError};
@@ -27,32 +28,25 @@ use crate::ipc_client::{self, IpcError};
 /// request surface unchanged (spec's non-goal: no new sync policy logic
 /// in the desktop app).
 pub async fn pause_all() -> Result<(), IpcError> {
-    let links = list_link_paths().await?;
-    for local_path in links {
-        ipc_client::send(ReqPayload::Pause(PauseRequest { local_path })).await?;
-    }
-    Ok(())
+    Ok(folders::pause_all().await?)
 }
 
 pub async fn resume_all() -> Result<(), IpcError> {
-    let links = list_link_paths().await?;
-    for local_path in links {
-        ipc_client::send(ReqPayload::Resume(ResumeRequest { local_path })).await?;
-    }
-    Ok(())
+    Ok(folders::resume_all().await?)
 }
 
-async fn list_link_paths() -> Result<Vec<String>, IpcError> {
-    let resp = ipc_client::send(ReqPayload::ListLinks(
-        yadorilink_ipc_proto::daemonctl::ListLinksRequest {},
-    ))
-    .await?;
-    match resp.payload {
-        Some(RespPayload::ListLinks(list)) => {
-            Ok(list.links.into_iter().map(|l| l.local_path).collect())
-        }
-        _ => Err(IpcError::DaemonError("unexpected daemon response".to_string())),
-    }
+/// Pauses sync for exactly one linked folder — the same daemon `Pause`
+/// request `pause_all` sends per-link and `yadorilink daemon pause`'s own
+/// per-link path already sends; a Home/Folder screen's per-folder
+/// pause control (the tray so far only offers "Pause All").
+pub async fn pause_link(local_path: String) -> Result<(), IpcError> {
+    Ok(folders::pause_folder(local_path).await?)
+}
+
+/// Resumes sync for exactly one linked folder — the single-link
+/// counterpart to `pause_link` above.
+pub async fn resume_link(local_path: String) -> Result<(), IpcError> {
+    Ok(folders::resume_folder(local_path).await?)
 }
 
 // The tray's old "Add Synced Folder" path
@@ -61,7 +55,7 @@ async fn list_link_paths() -> Result<Vec<String>, IpcError> {
 // the proposal calls out as the gap to fix. Folder linking now goes through the
 // onboarding window, which runs the shared `link_preflight` and only
 // acknowledges risks the user has explicitly ticked (see `crate::window` +
-// `yadorilink_cli::commands::link::{run_link_preflight, link_resolved}`).
+// `yadorilink_client_core::ops::links::run_link_preflight`).
 
 /// "open folder": reveals a linked folder in the native file
 /// manager (Finder/Explorer) — a pure OS action, no daemon IPC involved.
@@ -115,18 +109,66 @@ pub async fn unlink(local_path: String) -> Result<(), IpcError> {
     // `force: false` -- the tray has no equivalent of the CLI's `--force`
     // data-loss override; a durability-gate refusal here surfaces as a
     // plain IPC error, same as any other failed action.
-    ipc_client::send(ReqPayload::Unlink(UnlinkRequest { local_path, force: false })).await?;
+    links::send_unlink(&local_path, false).await?;
     Ok(())
 }
 
-/// Sign out — revokes the coordination
-/// session and clears the OS keychain by reusing `yadorilink-cli`'s own
-/// `commands::auth::logout` (the single implementation, so the app and CLI
-/// can never diverge on what "sign out" does). After this returns, the
-/// tray's 2s poll finds `require_access_token` failing and rebuilds the menu
-/// into its signed-out state (offering "Login with Google…") on its own.
-pub async fn sign_out() -> Result<(), yadorilink_cli::error::CliError> {
-    yadorilink_cli::commands::auth::logout().await
+/// Switches this device's storage mode (Synced/eager <-> Selective/
+/// on-demand) for an already-linked folder group — the Folder screen's
+/// mode switch, reusing the client layer's `set_storage_mode_resolved`
+/// (the same daemon-orchestrated coordination-plane write + local policy
+/// flip `yadorilink share set-storage-mode` sends) rather than a second
+/// implementation. Addressed by `group_id` (already on hand from a
+/// `FolderSummary`/`LinkStatus` this window already fetched), not group
+/// name, so this never needs its own extra name-resolution round trip.
+///
+/// A demotion (Synced -> Selective) can be refused by the daemon's
+/// durability handoff gate (no other confirmed-ready full replica yet) --
+/// that refusal surfaces as a plain `Err`, same as any other failed
+/// action; the caller is responsible for warning the user before calling
+/// this for a demotion, the same way `main.rs`'s unlink confirm dialog
+/// warns before that data-affecting action.
+pub async fn set_folder_mode(
+    group_id: String,
+    on_demand: bool,
+    group_name_for_display: &str,
+) -> Result<shares::StorageModeOutcome, CoreError> {
+    shares::set_storage_mode_resolved(group_id, on_demand, group_name_for_display).await
+}
+
+/// De-registers a device from this account, revoking its access to every
+/// folder group at once — identical request `yadorilink device remove`
+/// sends (`commands::device::remove`), the Devices screen's "Remove
+/// device" action. `force` bypasses the daemon's durability readiness
+/// pre-check for a device that must be removed regardless (data-loss
+/// risk, audit-logged by the daemon); the caller is responsible for the
+/// same kind of confirm dialog `main.rs`'s unlink handler shows before
+/// calling this with `force: true`.
+pub async fn remove_device(device_id: String, force: bool) -> Result<(), CoreError> {
+    devices::remove_device(&device_id, force).await?;
+    Ok(())
+}
+
+/// Sign out — irreversibly revokes this installation's access on the server,
+/// confirms the revocation, and only then clears the OS keychain, by reusing
+/// `yadorilink_client_core::ops::auth::sign_out` (the single implementation
+/// `yadorilink logout` runs too, so the app and CLI can never diverge on
+/// what "sign out" does).
+///
+/// It makes a network call and it can FAIL. That is deliberate: if the
+/// revocation cannot be confirmed, the credential is kept rather than deleted,
+/// because deleting it would leave this computer signed in on the server with
+/// nothing here able to sign it out. The error text says so; show it rather
+/// than swallowing it, and do not offer a local-only clear as a "retry" —
+/// that is a different operation (`yadorilink forget-local-credentials`) with
+/// a different outcome.
+///
+/// After this returns Ok, the tray's 2s poll finds `is_signed_in` false and
+/// rebuilds the menu into its signed-out state (offering "Login with Google…")
+/// on its own.
+pub async fn sign_out() -> Result<(), CoreError> {
+    auth::sign_out().await?;
+    Ok(())
 }
 
 /// "restart daemon": a clean `Shutdown` request. The daemon is
@@ -138,67 +180,25 @@ pub async fn sign_out() -> Result<(), yadorilink_cli::error::CliError> {
 /// duplicate the installer's own supervision logic, which already has to
 /// get this right for crash recovery, not just for this menu item).
 pub async fn restart_daemon() -> Result<(), IpcError> {
-    ipc_client::send(ReqPayload::Shutdown(ShutdownRequest {})).await?;
-    Ok(())
+    Ok(daemon::stop_daemon().await?)
 }
 
 /// "degraded-state actions": the daemon-unavailable/degraded tray
 /// menu's "Start Daemon" action — unlike `restart_daemon` above, this
 /// covers the case where nothing is listening on the control socket at
 /// all (so a `Shutdown` request would just fail with "daemon not
-/// running", a no-op), by directly spawning the daemon binary — identical
-/// logic to `yadorilink-cli`'s own `commands/daemon::start` (deliberately
-/// duplicated rather than shared, matching this crate's established
-/// "own client/process code, not shared with the CLI" precedent — see
-/// `ipc_client.rs`'s doc comment).
-pub async fn start_daemon() -> Result<(), StartDaemonError> {
-    if ipc_client::send(ReqPayload::Status(yadorilink_ipc_proto::daemonctl::StatusRequest {}))
-        .await
-        .is_ok()
-    {
-        return Ok(()); // already running
-    }
-
-    let daemon_binary = daemon_binary_path();
-    std::process::Command::new(&daemon_binary)
-        .spawn()
-        .map_err(|e| StartDaemonError::Spawn(daemon_binary.clone(), e))?;
-
-    for _ in 0..20 {
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        if ipc_client::send(ReqPayload::Status(yadorilink_ipc_proto::daemonctl::StatusRequest {}))
-            .await
-            .is_ok()
-        {
-            return Ok(());
-        }
-    }
-    Err(StartDaemonError::NeverBecameReachable)
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum StartDaemonError {
-    #[error("failed to launch {0}: {1}")]
-    Spawn(std::path::PathBuf, std::io::Error),
-    #[error("daemon did not become reachable after starting")]
-    NeverBecameReachable,
-}
-
-/// Mirrors `yadorilink-cli`'s `commands/daemon::daemon_binary_path` exactly
-/// (same "look next to this executable first, fall back to PATH" logic).
-fn daemon_binary_path() -> std::path::PathBuf {
-    let name = if cfg!(windows) { "yadorilink-daemon.exe" } else { "yadorilink-daemon" };
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join(name)))
-        .filter(|p| p.exists())
-        .unwrap_or_else(|| std::path::PathBuf::from(name))
+/// running", a no-op), by directly spawning the daemon binary -- the one
+/// implementation `yadorilink daemon start` also runs
+/// (`yadorilink_client_core::ops::daemon::start_daemon`).
+pub async fn start_daemon() -> Result<(), CoreError> {
+    daemon::start_daemon().await?;
+    Ok(())
 }
 
 /// "updates": check for an available update — identical request
 /// `yadorilink update check` sends.
 pub async fn check_for_updates() -> Result<(), IpcError> {
-    ipc_client::send(ReqPayload::UpdateCheck(UpdateCheckRequest {})).await?;
+    updates::check_for_updates().await?;
     Ok(())
 }
 
@@ -208,13 +208,12 @@ pub async fn check_for_updates() -> Result<(), IpcError> {
 /// is the sole authority for whether/when this actually applies, matching
 /// its "round-trip through daemon validation" rule.
 pub async fn install_update() -> Result<(), IpcError> {
-    ipc_client::send(ReqPayload::UpdateInstall(UpdateInstallRequest {})).await?;
+    updates::install_update().await?;
     Ok(())
 }
 
 /// "resource limit" actions: a small, fixed set of bandwidth
-/// presets for the tray menu (a native numeric-entry dialog is out of
-/// scope for this pass — see this crate's top-level honesty notes) —
+/// presets for the tray menu (there is no native numeric-entry dialog) —
 /// `yadorilink limits set` itself accepts an arbitrary rate, this is just
 /// a coarser UI over the identical daemon request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,11 +275,7 @@ impl BandwidthPreset {
 /// wants asymmetric limits already has the CLI for that -- the
 /// "keep the first beta scope small" principle).
 pub async fn set_bandwidth_limit(preset: BandwidthPreset) -> Result<(), IpcError> {
-    ipc_client::send(ReqPayload::LimitsSet(LimitsSetRequest {
-        upload_bytes_per_sec: preset.bytes_per_sec(),
-        download_bytes_per_sec: preset.bytes_per_sec(),
-    }))
-    .await?;
+    storage::set_bandwidth_limits(preset.bytes_per_sec(), preset.bytes_per_sec()).await?;
     Ok(())
 }
 
@@ -289,44 +284,35 @@ pub async fn set_bandwidth_limit(preset: BandwidthPreset) -> Result<(), IpcError
 /// established "fetch the aggregate request, filter to what this caller
 /// actually needs" shape) -- the folder-status window's Conflicts panel.
 pub async fn list_conflicts_for(local_path: &str) -> Result<Vec<ConflictedFileInfo>, IpcError> {
-    let resp = ipc_client::send(ReqPayload::ListConflicts(ListConflictsRequest {})).await?;
-    match resp.payload {
-        Some(RespPayload::ListConflicts(list)) => {
-            Ok(list.files.into_iter().filter(|f| f.local_path == local_path).collect())
-        }
-        _ => Err(IpcError::DaemonError("unexpected daemon response".to_string())),
-    }
+    Ok(files::list_conflicts(Some(local_path)).await?)
 }
 
 /// This folder's currently-recoverable trashed files, same filtering
 /// shape as `list_conflicts_for` -- the folder-status window's Trash
 /// panel.
 pub async fn list_trash_for(local_path: &str) -> Result<Vec<TrashedFileInfo>, IpcError> {
-    let resp = ipc_client::send(ReqPayload::ListTrash(ListTrashRequest {})).await?;
-    match resp.payload {
-        Some(RespPayload::ListTrash(list)) => {
-            Ok(list.files.into_iter().filter(|f| f.local_path == local_path).collect())
-        }
-        _ => Err(IpcError::DaemonError("unexpected daemon response".to_string())),
-    }
+    Ok(files::list_trash(Some(local_path)).await?)
 }
 
 /// Recovers a deleted file's last version before deletion as a new
 /// current version -- identical request `yadorilink trash restore` sends.
 pub async fn restore_trash(absolute_path: String) -> Result<(), IpcError> {
-    ipc_client::send(ReqPayload::RestoreTrash(RestoreTrashRequest { absolute_path })).await?;
-    Ok(())
+    Ok(files::restore_from_trash(absolute_path).await?)
+}
+
+/// Recovers, together, every trashed entry removed by the same recursive
+/// delete or directory rename that removed the entry at `absolute_path` --
+/// identical request `yadorilink trash restore --folder` sends.
+pub async fn restore_trash_operation(
+    absolute_path: String,
+) -> Result<RestoreTrashOperationResponse, IpcError> {
+    Ok(files::restore_trash_operation(absolute_path).await?)
 }
 
 /// Every retained version of one file, newest first including the
 /// current one -- identical request `yadorilink versions <path>` sends.
 pub async fn list_versions(absolute_path: String) -> Result<Vec<FileVersionInfo>, IpcError> {
-    let resp =
-        ipc_client::send(ReqPayload::ListVersions(ListVersionsRequest { absolute_path })).await?;
-    match resp.payload {
-        Some(RespPayload::ListVersions(list)) => Ok(list.versions),
-        _ => Err(IpcError::DaemonError("unexpected daemon response".to_string())),
-    }
+    Ok(files::list_versions(absolute_path).await?)
 }
 
 /// Restores one file to a specific prior version (or, when `version_seq`
@@ -336,12 +322,7 @@ pub async fn restore_version(
     absolute_path: String,
     version_seq: Option<i64>,
 ) -> Result<(), IpcError> {
-    ipc_client::send(ReqPayload::RestoreVersion(RestoreVersionRequest {
-        absolute_path,
-        version_seq,
-    }))
-    .await?;
-    Ok(())
+    Ok(files::restore_version(absolute_path, version_seq).await?)
 }
 
 /// One file's current materialization state and pin flag -- identical
@@ -350,35 +331,25 @@ pub async fn restore_version(
 pub async fn materialization_status(
     absolute_path: String,
 ) -> Result<MaterializationStatusResponse, IpcError> {
-    let resp = ipc_client::send(ReqPayload::MaterializationStatus(MaterializationStatusRequest {
-        absolute_path,
-    }))
-    .await?;
-    match resp.payload {
-        Some(RespPayload::MaterializationStatus(status)) => Ok(status),
-        _ => Err(IpcError::DaemonError("unexpected daemon response".to_string())),
-    }
+    Ok(files::materialization_status(absolute_path).await?)
 }
 
 /// Force-hydrates a placeholder file and keeps it hydrated -- identical
 /// request `yadorilink pin <path>` sends.
 pub async fn pin_file(absolute_path: String) -> Result<(), IpcError> {
-    ipc_client::send(ReqPayload::Pin(PinRequest { absolute_path })).await?;
-    Ok(())
+    Ok(files::pin_file(absolute_path).await?)
 }
 
 /// Allows a pinned file to become a placeholder again -- identical
 /// request `yadorilink unpin <path>` sends.
 pub async fn unpin_file(absolute_path: String) -> Result<(), IpcError> {
-    ipc_client::send(ReqPayload::Unpin(UnpinRequest { absolute_path })).await?;
-    Ok(())
+    Ok(files::unpin_file(absolute_path).await?)
 }
 
 /// Fetches a placeholder file's real content -- identical request
 /// `yadorilink hydrate <path>` sends.
 pub async fn hydrate_file(absolute_path: String) -> Result<(), IpcError> {
-    ipc_client::send(ReqPayload::Hydrate(HydrateRequest { absolute_path })).await?;
-    Ok(())
+    Ok(files::hydrate_file(absolute_path).await?)
 }
 
 /// Converts a hydrated file back into a placeholder to reclaim local disk
@@ -388,11 +359,7 @@ pub async fn hydrate_file(absolute_path: String) -> Result<(), IpcError> {
 /// check -- a request that silently did nothing, e.g. the file is
 /// pinned/busy/not fully synced, must never read as success).
 pub async fn evict_file(absolute_path: String) -> Result<bool, IpcError> {
-    let resp = ipc_client::send(ReqPayload::Evict(EvictRequest { absolute_path })).await?;
-    match resp.payload {
-        Some(RespPayload::Evict(evict)) => Ok(evict.dehydrated),
-        _ => Err(IpcError::DaemonError("unexpected daemon response".to_string())),
-    }
+    Ok(files::evict_file(absolute_path).await?)
 }
 
 /// A native single-file picker scoped to start browsing inside `dir` --
@@ -413,6 +380,33 @@ pub fn pick_file_in(_dir: &str) -> Option<std::path::PathBuf> {
     None
 }
 
+/// `pick_file_in`'s folder counterpart: the same panels act on a folder as
+/// a whole (pinning it keeps everything below it, now and later).
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub fn pick_folder_in(dir: &str) -> Option<std::path::PathBuf> {
+    rfd::FileDialog::new().set_title("Choose a folder").set_directory(dir).pick_folder()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn pick_folder_in(_dir: &str) -> Option<std::path::PathBuf> {
+    None
+}
+
+/// A native single-file picker with no starting-directory restriction --
+/// the Send window's "Choose file…" button, distinct from `pick_file_in`
+/// (which is scoped to browsing inside one already-linked folder for the
+/// version-history/selective-sync panel). Same platform scope as every
+/// other `rfd` picker in this module.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub fn pick_any_file() -> Option<std::path::PathBuf> {
+    rfd::FileDialog::new().set_title("Choose a file to send").pick_file()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn pick_any_file() -> Option<std::path::PathBuf> {
+    None
+}
+
 /// A native folder-picker dialog via
 /// `rfd`, replacing the previous macOS-only `osascript` path — one
 /// cross-platform implementation covering both target platforms (the
@@ -424,11 +418,25 @@ pub fn pick_file_in(_dir: &str) -> Option<std::path::PathBuf> {
 /// `login_item.rs`'s matching platform scope).
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub fn pick_folder() -> Option<std::path::PathBuf> {
-    rfd::FileDialog::new().set_title("Choose a folder to sync").pick_folder()
+    pick_folder_titled("Choose a folder to sync")
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn pick_folder() -> Option<std::path::PathBuf> {
+    None
+}
+
+/// Same folder picker as `pick_folder`, with a caller-chosen dialog title
+/// -- the Send window's "Choose folder…" (a send source) and "Receive
+/// to…" (a receive destination) need distinct wording for the same
+/// underlying `rfd` dialog.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub fn pick_folder_titled(title: &str) -> Option<std::path::PathBuf> {
+    rfd::FileDialog::new().set_title(title).pick_folder()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn pick_folder_titled(_title: &str) -> Option<std::path::PathBuf> {
     None
 }
 
@@ -437,12 +445,13 @@ pub fn pick_folder() -> Option<std::path::PathBuf> {
 /// under this device's config directory, and reveals it in the native
 /// file manager — "without requiring a terminal" (spec scenario).
 pub async fn export_diagnostics() -> Result<std::path::PathBuf, DiagnosticsError> {
-    let resp = ipc_client::send(ReqPayload::DiagnosticsExport(DiagnosticsExportRequest {}))
-        .await
-        .map_err(DiagnosticsError::Ipc)?;
-    let bundle_json = match resp.payload {
-        Some(RespPayload::DiagnosticsExport(bundle)) => bundle.bundle_json,
-        _ => return Err(DiagnosticsError::UnexpectedResponse),
+    let bundle_json = match diagnostics::export_bundle_json().await {
+        Ok(bundle_json) => bundle_json,
+        // The client layer reports a response of the wrong kind as `Other`;
+        // everything the socket itself can fail with arrives as another
+        // category.
+        Err(CoreError::Other(_)) => return Err(DiagnosticsError::UnexpectedResponse),
+        Err(e) => return Err(DiagnosticsError::Ipc(e.into())),
     };
     let path = default_export_path();
     if let Some(parent) = path.parent() {
@@ -471,56 +480,84 @@ fn default_export_path() -> std::path::PathBuf {
     ipc_client::config_dir_public().join(format!("diagnostics-{now}.json"))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `default_export_path` always lands inside the config directory with
-    /// a `.json` extension — a pure, display-free check that the naming
-    /// scheme is stable (the real IPC round trip in `export_diagnostics`
-    /// itself needs a running daemon and is covered by this crate's
-    /// daemon-backed integration test instead).
-    #[test]
-    fn default_export_path_is_json_under_config_dir() {
-        let path = default_export_path();
-        assert_eq!(path.extension().and_then(|e| e.to_str()), Some("json"));
-        assert!(path.file_name().unwrap().to_string_lossy().starts_with("diagnostics-"));
-    }
-
-    /// Every preset's menu id round-trips back to the same preset — the
-    /// tray menu only has the id string to go on when dispatching a click
-    /// (`main.rs`'s `handle_menu_event`), so this mapping must be
-    /// bijective or a click could silently apply the wrong rate.
-    #[test]
-    fn every_bandwidth_preset_menu_id_round_trips() {
-        for preset in BandwidthPreset::ALL {
-            assert_eq!(BandwidthPreset::from_menu_id(preset.menu_id()), Some(preset));
-        }
-    }
-
-    #[test]
-    fn unlimited_preset_is_the_zero_convention() {
-        assert_eq!(BandwidthPreset::Unlimited.bytes_per_sec(), 0);
-    }
-
-    #[test]
-    fn unknown_menu_id_maps_to_no_preset() {
-        assert_eq!(BandwidthPreset::from_menu_id("not_a_real_id"), None);
-    }
-
-    /// `daemon_binary_path` picks the platform-correct binary name — the
-    /// "prefer a sibling of the current executable, else fall back to
-    /// PATH" resolution itself needs a real filesystem layout to
-    /// meaningfully test end-to-end, but the name it looks for is a pure,
-    /// display-free fact worth pinning.
-    #[test]
-    fn daemon_binary_path_uses_the_platform_correct_name() {
-        let path = daemon_binary_path();
-        let name = path.file_name().unwrap().to_string_lossy();
-        if cfg!(windows) {
-            assert_eq!(name, "yadorilink-daemon.exe");
-        } else {
-            assert_eq!(name, "yadorilink-daemon");
-        }
-    }
+/// Offers a file or directory to another device on this account -- one-shot,
+/// not linked/synced -- identical request `yadorilink send <path>
+/// <target-device>` sends (`commands::send::send`). `target_device` is a
+/// `device_id`, resolved against this account's already-known device list
+/// (the Send window's own device picker, sourced from
+/// `crate::devices::device_summaries` over the currently linked
+/// folders' groups -- there is no single "every device on my account" list,
+/// see that function's own doc comment).
+pub async fn send_file(
+    source_path: String,
+    target_device: String,
+) -> Result<SendFileResponse, IpcError> {
+    Ok(transfers::send_file(source_path, target_device).await?)
 }
+
+/// Every transfer other devices have sent to this device, whether or not
+/// `receive_transfer` has been run for it yet -- identical request
+/// `yadorilink inbox` sends.
+pub async fn list_inbox() -> Result<Vec<InboxTransfer>, IpcError> {
+    Ok(transfers::list_inbox().await?)
+}
+
+/// Accepts an inbound transfer, materializing it into `to` (or the daemon's
+/// default inbox directory when `None`) -- identical request `yadorilink
+/// receive <transfer-id> [--to <dir>]` sends. Resumable, same as the CLI.
+pub async fn receive_transfer(
+    transfer_id: String,
+    to: Option<String>,
+) -> Result<ReceiveTransferResponse, IpcError> {
+    Ok(transfers::receive_transfer(transfer_id, to).await?)
+}
+
+/// The currently configured (not measured) global transfer rate limits --
+/// identical request `yadorilink limits show` sends. The Settings window's
+/// bandwidth panel reads this to seed its editable fields, rather than
+/// assuming the tray's own coarse presets (`BandwidthPreset`) are still in
+/// effect.
+pub async fn show_limits() -> Result<LimitsShowResponse, IpcError> {
+    Ok(storage::bandwidth_limits().await?)
+}
+
+/// Sets exact global upload/download rate limits (bytes/sec, `0` =
+/// unlimited) -- identical request `yadorilink limits set --up --down`
+/// sends. Unlike `set_bandwidth_limit`'s fixed presets, this accepts any
+/// value, for the Settings window's own numeric fields.
+pub async fn set_limits(up: u64, down: u64) -> Result<LimitsSetResponse, IpcError> {
+    Ok(storage::set_bandwidth_limits(up, down).await?)
+}
+
+/// Current version/channel/install-source/last-check/state/available-
+/// version/rollout/error/automatic-checks-and-install-mode -- identical
+/// request `yadorilink update status` sends. The Settings window's Update
+/// panel renders this directly rather than re-deriving anything from it.
+pub async fn update_status() -> Result<UpdateStatusResponse, IpcError> {
+    Ok(updates::update_status().await?)
+}
+
+/// Configures automatic update checks and/or automatic install mode --
+/// identical request `yadorilink update config --checks --install` sends.
+/// `None` for either argument means "leave that setting unchanged" (same
+/// discipline the wire request itself documents).
+pub async fn set_update_config(
+    automatic_checks_enabled: Option<bool>,
+    automatic_install_mode: Option<String>,
+) -> Result<UpdateConfigResponse, IpcError> {
+    Ok(updates::set_update_config(automatic_checks_enabled, automatic_install_mode).await?)
+}
+
+/// Triggers an immediate block-store mark-and-sweep, or (when `dry_run`)
+/// reports what a real sweep would reclaim without deleting anything --
+/// identical request `yadorilink gc [--dry-run]` sends. The daemon refuses
+/// a concurrent sweep or one during active sync (surfaced as an ordinary
+/// `IpcError::DaemonError`, the same "show it, don't swallow it" path
+/// every other daemon-reported failure in this module already takes) --
+/// this wrapper never retries or masks that.
+pub async fn run_gc(dry_run: bool) -> Result<GcResponse, IpcError> {
+    Ok(storage::run_gc(dry_run).await?)
+}
+
+#[cfg(test)]
+mod tests;

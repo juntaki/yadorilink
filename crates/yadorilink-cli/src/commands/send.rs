@@ -3,20 +3,12 @@
 //! from linked-folder sync. See `yadorilink-send`'s own crate doc comment
 //! for why.
 
-use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
-use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
-use yadorilink_ipc_proto::daemonctl::{ListInboxRequest, ReceiveTransferRequest, SendFileRequest};
+use yadorilink_client_core::ops::transfers;
 
-use crate::control_client;
 use crate::error::CliError;
 
 pub async fn send(source_path: String, target_device: String) -> Result<(), CliError> {
-    let resp =
-        control_client::send(ReqPayload::SendFile(SendFileRequest { source_path, target_device }))
-            .await?;
-    let Some(RespPayload::SendFile(result)) = resp.payload else {
-        return Err(CliError::Other("unexpected daemon response".into()));
-    };
+    let result = transfers::send_file(source_path, target_device).await?;
     println!("Offered transfer {}", result.transfer_id);
     for file in &result.files_offered {
         println!("  {file}");
@@ -26,15 +18,12 @@ pub async fn send(source_path: String, target_device: String) -> Result<(), CliE
 }
 
 pub async fn inbox() -> Result<(), CliError> {
-    let resp = control_client::send(ReqPayload::ListInbox(ListInboxRequest {})).await?;
-    let Some(RespPayload::ListInbox(list)) = resp.payload else {
-        return Err(CliError::Other("unexpected daemon response".into()));
-    };
-    if list.transfers.is_empty() {
+    let transfers = transfers::list_inbox().await?;
+    if transfers.is_empty() {
         println!("Inbox is empty.");
         return Ok(());
     }
-    for transfer in &list.transfers {
+    for transfer in &transfers {
         println!(
             "{}  from {}  {} file(s), {} bytes  [{}]",
             transfer.transfer_id,
@@ -51,14 +40,7 @@ pub async fn inbox() -> Result<(), CliError> {
 }
 
 pub async fn receive(transfer_id: String, to: Option<String>) -> Result<(), CliError> {
-    let resp = control_client::send(ReqPayload::ReceiveTransfer(ReceiveTransferRequest {
-        transfer_id,
-        destination_dir: to.unwrap_or_default(),
-    }))
-    .await?;
-    let Some(RespPayload::ReceiveTransfer(result)) = resp.payload else {
-        return Err(CliError::Other("unexpected daemon response".into()));
-    };
+    let result = transfers::receive_transfer(transfer_id, to).await?;
     println!("Received into {}", result.destination_dir);
     for file in &result.files_received {
         println!("  {file}");

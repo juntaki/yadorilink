@@ -23,7 +23,7 @@ use yadorilink_ipc_proto::daemonctl::{
     ReportingStatusRequest, ShowQueueItemRequest, SubmitReportRequest, UpdateConsentRequest,
 };
 use yadorilink_ipc_proto::framing::{read_message, write_message};
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 use yadorilink_reporting::builder::{build_usage_envelope, ReportEnvironment};
 use yadorilink_reporting::schema::{OsFamily, ReportEnvelope, UsagePayload};
 
@@ -35,7 +35,7 @@ static TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 async fn start_daemon() -> (std::path::PathBuf, tempfile::TempDir, Arc<DaemonState>) {
     let dir = tempfile::tempdir().unwrap();
     std::env::set_var("YADORILINK_CONFIG_DIR", dir.path());
-    let store = Arc::new(FsBlockStore::new(dir.path().join("blocks")).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(dir.path().join("blocks")).unwrap());
     let sync_state = Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
     let state = DaemonState::new("device-under-test".into(), sync_state, store);
     let socket_path = dir.path().join("daemon.sock");

@@ -13,10 +13,6 @@ impl FrontierStorePort for SqliteSyncStore {
         device: &DeviceId,
         frontier: &[ChangeHash],
     ) -> Result<(), ReplicaEngineError> {
-        // Normalized here, not inside `set_device_frontier`, which stores
-        // exactly what it's given -- matches
-        // `yadorilink-sync-core::compaction::record_acknowledged_frontier`'s
-        // existing normalize-then-store split.
         let mut normalized = frontier.to_vec();
         normalized.sort();
         normalized.dedup();

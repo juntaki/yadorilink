@@ -1,7 +1,8 @@
 use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
-use yadorilink_replica_domain::change::{Change, ChangeAuth, Op};
+use yadorilink_replica_domain::change::Op;
 use yadorilink_replica_domain::ids::{ChangeHash, DeviceId, FolderGroupId, SyncPath};
+use yadorilink_replica_domain::test_authoring::create_signed_for_tests;
 use yadorilink_sync_sqlite::dag_store::{
     admit_change, emit_local_change, group_heads, init_dag_schema, AdmitOutcome, ChangeEmitter,
 };
@@ -41,34 +42,32 @@ fn assert_frontier_repaired_or_refused(
     }
 }
 
-/// RED: losing only one member of a concurrent frontier is subtler than losing
+/// Pins: losing only one member of a concurrent frontier is subtler than losing
 /// every head. Local emission still sees a non-empty, same-group parent set and
 /// silently signs causality that omits the other retained branch.
 #[test]
 fn schema_init_repairs_or_refuses_incomplete_concurrent_group_frontier() {
     let conn = conn();
     let signing = signing_key();
-    let left = Change::create_signed(
+    let left = create_signed_for_tests(
         vec![],
         0,
-        ChangeAuth::PLACEHOLDER,
         DeviceId("device-a".into()),
         FolderGroupId("g".into()),
         vec![Op::Delete { path: SyncPath("left.bin".into()) }],
         &signing,
     );
-    let right = Change::create_signed(
+    let right = create_signed_for_tests(
         vec![],
         0,
-        ChangeAuth::PLACEHOLDER,
         DeviceId("device-b".into()),
         FolderGroupId("g".into()),
         vec![Op::Delete { path: SyncPath("right.bin".into()) }],
         &signing,
     );
 
-    assert_eq!(admit_change(&conn, &left, true).unwrap().outcome, AdmitOutcome::Applied);
-    assert_eq!(admit_change(&conn, &right, true).unwrap().outcome, AdmitOutcome::Applied);
+    assert_eq!(admit_change(&conn, &left).unwrap().outcome, AdmitOutcome::Applied);
+    assert_eq!(admit_change(&conn, &right).unwrap().outcome, AdmitOutcome::Applied);
 
     conn.execute(
         "DELETE FROM group_heads WHERE group_id = 'g' AND change_hash = ?1",
@@ -83,7 +82,7 @@ fn schema_init_repairs_or_refuses_incomplete_concurrent_group_frontier() {
     );
 }
 
-/// RED: a superseded ancestor reinserted into `group_heads` is not a frontier.
+/// Pins: a superseded ancestor reinserted into `group_heads` is not a frontier.
 /// It passes current same-group/presence checks and changes the parent set this
 /// device signs, so startup must reconstruct the exact leaf set or refuse it.
 #[test]
@@ -93,7 +92,6 @@ fn schema_init_repairs_or_refuses_superseded_ancestor_in_group_frontier() {
         &conn,
         "g",
         vec![Op::Delete { path: SyncPath("first.bin".into()) }],
-        ChangeAuth::PLACEHOLDER,
         &emitter(),
     )
     .unwrap();
@@ -101,7 +99,6 @@ fn schema_init_repairs_or_refuses_superseded_ancestor_in_group_frontier() {
         &conn,
         "g",
         vec![Op::Delete { path: SyncPath("second.bin".into()) }],
-        ChangeAuth::PLACEHOLDER,
         &emitter(),
     )
     .unwrap();
@@ -115,7 +112,7 @@ fn schema_init_repairs_or_refuses_superseded_ancestor_in_group_frontier() {
     assert_frontier_repaired_or_refused(&conn, "g", vec![second.compute_hash()]);
 }
 
-/// RED: a `change_parents` edge naming a child that was never admitted --
+/// Pins: a `change_parents` edge naming a child that was never admitted --
 /// either a still-buffered orphan, or one `ORPHAN_BOUND` eviction removed
 /// from `orphan_changes` without also removing its edges -- must not make
 /// startup's frontier reconstruction think its parent has a real descendant.
@@ -128,7 +125,6 @@ fn schema_init_keeps_a_head_whose_only_child_edge_belongs_to_a_change_that_was_n
         &conn,
         "g",
         vec![Op::Delete { path: SyncPath("parent.bin".into()) }],
-        ChangeAuth::PLACEHOLDER,
         &emitter(),
     )
     .unwrap();
@@ -148,7 +144,7 @@ fn schema_init_keeps_a_head_whose_only_child_edge_belongs_to_a_change_that_was_n
     );
 }
 
-/// RED: a `group_heads` row for a group with zero retained `changes` rows --
+/// Pins: a `group_heads` row for a group with zero retained `changes` rows --
 /// e.g. left over from a re-bootstrap install of a group that was later fully
 /// pruned, or any other path that touches `group_heads` without a matching
 /// `changes` row -- must not survive startup as a ghost head. A ghost head

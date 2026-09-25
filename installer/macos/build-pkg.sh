@@ -5,12 +5,11 @@
 # Builds a macOS.pkg installer for yadorilink:
 #  - crates/yadorilink-cli -> /usr/local/bin/yadorilink
 #  - crates/yadorilink-daemon -> /usr/local/bin/yadorilink-daemon
-#  - crates/yadorilink-desktop-app -> /usr/local/bin/yadorilink-status-app
-#  (the menu-bar status app. Shipped as a plain
-#  signed executable, not an.app bundle — see this script's
-#  staging comment below for why.)
-#  - shell-ext/macos/YadoriLinkFinderSync (host app + both extensions)
-#  -> /Applications/YadoriLinkFinderSyncHost.app
+#  - shell-ext/macos/YadoriLinkFinderSync (the YadoriLink menu bar app,
+#  which also carries the FinderSync and File Provider extensions, and links
+#  the client core through crates/yadorilink-apple-ffi; the Xcode build runs
+#  scripts/generate-swift-bindings.sh to build it)
+#  -> /Applications/YadoriLink.app
 #
 # The server-side yadorilink-coordination binary is deliberately NOT
 # included — this is an end-user desktop installer, not a server
@@ -18,12 +17,17 @@
 #
 # SIGNING: release builds must set YADORILINK_RELEASE_BUILD=1 and provide
 # YADORILINK_APP_SIGN_IDENTITY (a Developer ID Application identity, used to
-# codesign the yadorilink/yadorilink-daemon/yadorilink-status-app Mach-O
-# binaries directly -- the FinderSync host .app is signed separately by
+# codesign the yadorilink/yadorilink-daemon Mach-O
+# binaries directly -- YadoriLink.app is signed separately by
 # xcodebuild's own automatic signing) and YADORILINK_PKG_SIGN_IDENTITY (a
 # Developer ID Installer identity, used to sign the assembled .pkg). Set
-# YADORILINK_NOTARY_PROFILE to an xcrun notarytool keychain profile to
-# notarize and staple the signed pkg -- notarization rejects a .pkg
+# YADORILINK_NOTARY_PROFILE to an xcrun notarytool keychain profile, OR all
+# three of YADORILINK_NOTARY_KEY / _KEY_ID / _ISSUER (an App Store Connect
+# API key on disk, which is the form a fresh CI runner can supply -- it has
+# no keychain profile to name), to notarize and staple the signed pkg.
+# A release build requires one of those two forms: Gatekeeper refuses an
+# un-notarized .pkg, so producing one quietly means the failure is found by
+# a user instead of by the build. Notarization also rejects a .pkg
 # containing any unsigned executable, so YADORILINK_APP_SIGN_IDENTITY is
 # not optional once notarization is in play. Local/interim unsigned builds
 # are still possible, but this script writes a SHA-256 sidecar next to the
@@ -41,6 +45,13 @@ OUT_DIR="$SCRIPT_DIR/dist"
 APP_SIGN_IDENTITY="${YADORILINK_APP_SIGN_IDENTITY:-}"
 PKG_SIGN_IDENTITY="${YADORILINK_PKG_SIGN_IDENTITY:-}"
 NOTARY_PROFILE="${YADORILINK_NOTARY_PROFILE:-}"
+# The other form notarytool accepts: an App Store Connect API key on disk
+# plus its key id and issuer. A keychain profile is convenient on a
+# developer's own machine and useless on a fresh CI runner, which has no
+# keychain profile to name and does have the three pieces of a key.
+NOTARY_KEY="${YADORILINK_NOTARY_KEY:-}"
+NOTARY_KEY_ID="${YADORILINK_NOTARY_KEY_ID:-}"
+NOTARY_ISSUER="${YADORILINK_NOTARY_ISSUER:-}"
 RELEASE_BUILD="${YADORILINK_RELEASE_BUILD:-0}"
 MANIFEST_KEY_ID="${YADORILINK_RELEASE_MANIFEST_KEY_ID:-}"
 MANIFEST_PUBLIC_KEY_HEX="${YADORILINK_RELEASE_MANIFEST_PUBLIC_KEY_HEX:-}"
@@ -48,7 +59,7 @@ MANIFEST_PUBLIC_KEY_HEX="${YADORILINK_RELEASE_MANIFEST_PUBLIC_KEY_HEX:-}"
 PKG_COMPONENT_ID="com.yadorilink.installer.component"
 PKG_VERSION="$(grep -m1 '^version' "$REPO_ROOT/Cargo.toml" | sed -E 's/.*"([^"]*)".*/\1/')"
 
-APP_NAME="YadoriLinkFinderSyncHost.app"
+APP_NAME="YadoriLink.app"
 
 log() { echo "== $* =="; }
 
@@ -56,6 +67,21 @@ log() { echo "== $* =="; }
 command -v cargo >/dev/null || { echo "cargo not found on PATH"; exit 1; }
 command -v xcodebuild >/dev/null || { echo "xcodebuild not found (install Xcode)"; exit 1; }
 command -v shasum >/dev/null || { echo "shasum not found on PATH"; exit 1; }
+
+# The packaged app must run on the live client over the Rust client core,
+# never on the fixture client Debug builds use. Its Release configuration
+# picks the live client in ClientFactory.swift; refuse, before the long Rust
+# build, if that is no longer so.
+CLIENT_FACTORY="$REPO_ROOT/shell-ext/macos/YadoriLinkApp/App/ClientFactory.swift"
+if ! awk '/^#else/{release=1} release' "$CLIENT_FACTORY" | grep -q 'makeLiveClient()'; then
+    echo "Refusing to package: Release builds of the YadoriLink app must use the live client."
+    echo "See $CLIENT_FACTORY."
+    exit 1
+fi
+# The checked-in Swift binding must be what the current Rust code generates
+# (the Xcode build regenerates it, so a stale copy would otherwise ship
+# unreviewed), and the app's mirror types must still match it.
+"$REPO_ROOT/scripts/generate-swift-bindings.sh" --check
 
 if [ "$RELEASE_BUILD" = "1" ] && [ -z "$APP_SIGN_IDENTITY" ]; then
     echo "YADORILINK_RELEASE_BUILD=1 requires YADORILINK_APP_SIGN_IDENTITY."
@@ -119,12 +145,10 @@ fi
 
 YADORILINK_BIN="$REPO_ROOT/target/release/yadorilink"
 YADORILINK_DAEMON_BIN="$REPO_ROOT/target/release/yadorilink-daemon"
-YADORILINK_STATUS_APP_BIN="$REPO_ROOT/target/release/yadorilink-status-app"
 test -x "$YADORILINK_BIN" || { echo "missing $YADORILINK_BIN"; exit 1; }
 test -x "$YADORILINK_DAEMON_BIN" || { echo "missing $YADORILINK_DAEMON_BIN"; exit 1; }
-test -x "$YADORILINK_STATUS_APP_BIN" || { echo "missing $YADORILINK_STATUS_APP_BIN"; exit 1; }
 
-# --- 2..app bundle (host app + FinderSync + File Provider extensions) -
+# --- 2. YadoriLink.app (menu bar app + FinderSync + File Provider extensions)
 log "xcodegen generate"
 ( cd "$XCODE_PROJ_DIR" && "$XCODEGEN_BIN" generate )
 
@@ -132,7 +156,7 @@ log "xcodebuild (Release, real signing identity, -allowProvisioningUpdates)"
 rm -rf "$XCODE_BUILD_DIR"
 ( cd "$XCODE_PROJ_DIR" && xcodebuild \
     -project YadoriLinkFinderSync.xcodeproj \
-    -scheme YadoriLinkFinderSyncHost \
+    -scheme YadoriLink \
     -configuration Release \
     -derivedDataPath "$XCODE_BUILD_DIR" \
     -allowProvisioningUpdates \
@@ -152,21 +176,14 @@ mkdir -p "$STAGE_DIR/usr/local/bin" "$STAGE_DIR/Applications"
 
 cp "$YADORILINK_BIN" "$STAGE_DIR/usr/local/bin/yadorilink"
 cp "$YADORILINK_DAEMON_BIN" "$STAGE_DIR/usr/local/bin/yadorilink-daemon"
-# Staged as a plain binary next to
-# `yadorilink`/`yadorilink-daemon`, not wrapped in an `.app` bundle —
-# `tray-icon`'s `NSStatusItem` works fine from a bare executable given a
-# running `NSApplication`/event loop (this app's `main.rs`), and a real
-# multi-resolution `.icns` + `Info.plist`-bundled `.app` (needed for it to
-# show in Launchpad/the Applications list) is packaging work intentionally
-# deferred for now.
-cp "$YADORILINK_STATUS_APP_BIN" "$STAGE_DIR/usr/local/bin/yadorilink-status-app"
+# The eframe status app (yadorilink-status-app) is not shipped on macOS:
+# YadoriLink.app is the menu bar app there.
 chmod 755 \
     "$STAGE_DIR/usr/local/bin/yadorilink" \
-    "$STAGE_DIR/usr/local/bin/yadorilink-daemon" \
-    "$STAGE_DIR/usr/local/bin/yadorilink-status-app"
+    "$STAGE_DIR/usr/local/bin/yadorilink-daemon"
 
 # Codesign the raw CLI/daemon Mach-O binaries directly -- xcodebuild only
-# signs the FinderSync host .app above; these three are staged via a plain
+# signs YadoriLink.app above; these two are staged via a plain
 # cp and, without this, would ship inside a "signed" .pkg while remaining
 # individually unsigned. --options runtime (hardened runtime) + --timestamp
 # (secure timestamp) are both required for notarization to accept them.
@@ -175,11 +192,9 @@ if [ -n "$APP_SIGN_IDENTITY" ]; then
     codesign --force --options runtime --timestamp \
         --sign "$APP_SIGN_IDENTITY" \
         "$STAGE_DIR/usr/local/bin/yadorilink" \
-        "$STAGE_DIR/usr/local/bin/yadorilink-daemon" \
-        "$STAGE_DIR/usr/local/bin/yadorilink-status-app"
+        "$STAGE_DIR/usr/local/bin/yadorilink-daemon"
     codesign --verify --strict "$STAGE_DIR/usr/local/bin/yadorilink"
     codesign --verify --strict "$STAGE_DIR/usr/local/bin/yadorilink-daemon"
-    codesign --verify --strict "$STAGE_DIR/usr/local/bin/yadorilink-status-app"
 fi
 
 # ditto (not cp -R) preserves the.app bundle's resource forks / extended
@@ -229,12 +244,39 @@ if [ -n "$PKG_SIGN_IDENTITY" ]; then
 
     if [ -n "$NOTARY_PROFILE" ]; then
         command -v xcrun >/dev/null || { echo "xcrun not found on PATH"; exit 1; }
-        log "notarytool submit --wait"
+        log "notarytool submit --wait (keychain profile)"
         xcrun notarytool submit "$SIGNED_PKG" --keychain-profile "$NOTARY_PROFILE" --wait
         log "stapler staple"
         xcrun stapler staple "$SIGNED_PKG"
+    elif [ -n "$NOTARY_KEY" ] && [ -n "$NOTARY_KEY_ID" ] && [ -n "$NOTARY_ISSUER" ]; then
+        command -v xcrun >/dev/null || { echo "xcrun not found on PATH"; exit 1; }
+        log "notarytool submit --wait (App Store Connect API key)"
+        xcrun notarytool submit "$SIGNED_PKG" \
+            --key "$NOTARY_KEY" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER" --wait
+        log "stapler staple"
+        xcrun stapler staple "$SIGNED_PKG"
     else
-        echo "YADORILINK_NOTARY_PROFILE not set; signed pkg was not notarized."
+        # Partial credentials are treated as a mistake, not as "no
+        # notarization requested". Supplying two of the three pieces of an
+        # API key and getting a cheerful "was not notarized" is how an
+        # un-notarized artifact reaches the verification below and fails
+        # there instead, with a message about Gatekeeper that says nothing
+        # about the actual cause.
+        if [ -n "$NOTARY_KEY$NOTARY_KEY_ID$NOTARY_ISSUER" ]; then
+            echo "Notarization credentials are incomplete: the API-key form needs all three of"
+            echo "YADORILINK_NOTARY_KEY, YADORILINK_NOTARY_KEY_ID and YADORILINK_NOTARY_ISSUER."
+            echo "Set all three, or set YADORILINK_NOTARY_PROFILE instead."
+            exit 1
+        fi
+        # A release build must not quietly produce an un-notarized artifact.
+        # Gatekeeper refuses one on any current macOS, so this would be
+        # discovered by a user rather than by the build.
+        if [ "$RELEASE_BUILD" = "1" ]; then
+            echo "YADORILINK_RELEASE_BUILD=1 requires notarization: set YADORILINK_NOTARY_PROFILE,"
+            echo "or all three of YADORILINK_NOTARY_KEY / _KEY_ID / _ISSUER."
+            exit 1
+        fi
+        echo "No notarization credentials set; signed pkg was not notarized."
     fi
 
     log "verifying signed pkg"

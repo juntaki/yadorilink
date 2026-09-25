@@ -1,19 +1,10 @@
-//! Pure decision layer for `yadorilink-sync-core`'s handoff-lease pin
-//! deadline, extracted 7D-9D.
-//!
-//! # Why only this narrow slice lives here
-//!
-//! The full handoff-lease repository
-//! (`crates/yadorilink-sync-sqlite/src/handoff_lease.rs`) is a
-//! `handoff_leases`-table-backed CRUD/query store: every method takes a live
-//! `SyncDatabase` connection and stays in `yadorilink-sync-sqlite` per the
-//! dependency plan. What moves here is the one piece of that store with no
-//! SQL and no connection in it at all: turning a lease grant's `ttl_seconds`
-//! duration into this device's own LOCAL pin deadline. Splitting it out
-//! makes that arithmetic (and, more importantly, the TTL validation guarding
-//! it) independently unit-testable with no database, matching the same
-//! pattern `retained_obligation.rs`'s split used for its own deletion
-//! judgment.
+//! # Why only this narrow slice lives here The full handoff-lease
+//! repository (`crates/yadorilink-sync-sqlite/src/handoff_lease.rs`) is a
+//! `handoff_leases`-table-backed CRUD/query store: every method takes a
+//! live `SyncDatabase` connection and stays in `yadorilink-sync-sqlite`
+//! per the dependency plan. What moves here is the one piece of that store
+//! with no SQL and no connection in it at all: turning a lease grant's
+//! `ttl_seconds` duration into this device's own LOCAL pin deadline.
 
 use crate::error::ReplicaEngineError;
 
@@ -58,30 +49,4 @@ pub fn compute_pin_deadline(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_positive_ttl_yields_created_at_plus_ttl_plus_the_safety_margin() {
-        let deadline = compute_pin_deadline(1_000, 900).unwrap();
-        assert_eq!(deadline, 1_000 + 900 + HANDOFF_LEASE_PIN_SAFETY_MARGIN_SECS);
-    }
-
-    #[test]
-    fn a_zero_ttl_is_rejected_and_produces_no_deadline() {
-        let err = compute_pin_deadline(1_000, 0).unwrap_err();
-        assert!(matches!(err, ReplicaEngineError::InvalidInput(_)));
-    }
-
-    #[test]
-    fn a_negative_ttl_is_rejected_and_produces_no_deadline() {
-        let err = compute_pin_deadline(1_000, -1).unwrap_err();
-        assert!(matches!(err, ReplicaEngineError::InvalidInput(_)));
-    }
-
-    #[test]
-    fn the_deadline_computation_saturates_rather_than_overflowing_on_extreme_inputs() {
-        let deadline = compute_pin_deadline(i64::MAX, i64::MAX).unwrap();
-        assert_eq!(deadline, i64::MAX);
-    }
-}
+mod tests;

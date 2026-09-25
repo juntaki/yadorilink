@@ -10,8 +10,7 @@
 //! exceed it, the timeline slice shrinks (K halves) until it fits and the drop
 //! is recorded in `truncated`, with a pointer to the full on-disk log.
 //!
-//! Triage verdicts come from the DST harness-artifact hardening work; on this
-//! branch they are the `triage` placeholder (see `triage.rs`).
+//! Triage verdicts are the `triage` placeholder (see `triage.rs`).
 
 #![allow(dead_code)]
 
@@ -50,6 +49,7 @@ pub fn violation_kind_label(kind: ViolationKind) -> &'static str {
         ViolationKind::SameVersionIdentityMismatch => "SameVersionIdentityMismatch",
         ViolationKind::SlowConvergence => "SlowConvergence",
         ViolationKind::RepairedBySweep => "RepairedBySweep",
+        ViolationKind::Namespace(kind) => kind.label(),
     }
 }
 
@@ -61,8 +61,8 @@ pub struct BundledViolation {
     pub content_ids: Vec<u64>,
     pub devices: Vec<usize>,
     pub detail: String,
-    /// TODO(integrate-harden): from harden's `Violation.triage`; `None` until
-    /// the triage runner exists.
+    /// The violation's triage verdict; `None` when no triage runner produced
+    /// one.
     pub triage: Option<TriageVerdict>,
 }
 
@@ -150,7 +150,7 @@ pub struct FailureBundle {
     pub seed: u64,
     pub signature: String,
     pub case: Case,
-    /// The shrunk minimal case (Group 4 / shrinker), when shrinking ran. Stored
+    /// The shrunk minimal case (see `shrinker`), when shrinking ran. Stored
     /// alongside the original so a session picks up the minimal form directly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub case_min: Option<Case>,
@@ -201,7 +201,7 @@ pub struct BundleInputs {
     pub seed: u64,
     pub signature: String,
     pub case: Case,
-    /// The shrunk minimal case (Group 4), or `None` if shrinking did not run.
+    /// The shrunk minimal case, or `None` if shrinking did not run.
     pub case_min: Option<Case>,
     pub violations: Vec<BundledViolation>,
     pub first_divergence: Option<FirstDivergence>,
@@ -284,10 +284,9 @@ fn serialized_len(value: &impl Serialize) -> usize {
     serde_json::to_vec(value).map(|v| v.len()).unwrap_or(usize::MAX)
 }
 
-/// The default failure-bundle directory: `<workspace>/target/dst-failures`,
-/// overridable with `DST_FAILURES_DIR` (used by the emit tests). The crate
-/// manifest is `crates/yadorilink-sync-core`, so `../../target` is the
-/// workspace target dir.
+/// The default failure-bundle directory:
+/// `<workspace>/target/dst-failures`, overridable with `DST_FAILURES_DIR`
+/// (used by the emit tests).
 pub fn failures_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("DST_FAILURES_DIR") {
         return PathBuf::from(dir);

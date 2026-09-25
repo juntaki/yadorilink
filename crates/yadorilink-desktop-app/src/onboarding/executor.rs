@@ -1,7 +1,7 @@
 //! The effect executor. It runs each
 //! [`Effect`] the machine emits off the UI thread on a short-lived tokio
 //! runtime (the same threading pattern `main.rs`'s `handle_menu_event` uses
-//! for its mutating actions), maps the `yadorilink_cli` result to an
+//! for its mutating actions), maps the `yadorilink_client_core` result to an
 //! [`Event`], and posts it back through an [`EventSink`] for the window to
 //! feed into the next `step`.
 //!
@@ -15,8 +15,8 @@ use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
-use yadorilink_cli::commands::{device, link, share};
-use yadorilink_cli::error::CliError;
+use yadorilink_client_core::ops::{auth, devices as device, links as link, shares as share};
+use yadorilink_client_core::CoreError;
 use yadorilink_local_storage::link_preflight::LinkPreflightReport;
 
 use super::machine::{Effect, Event, GroupOption, PreflightView};
@@ -66,7 +66,7 @@ pub fn spawn(effect: Effect, sink: EventSink) {
     });
 }
 
-/// Perform the effect's underlying `yadorilink_cli` call and map its result to
+/// Perform the effect's underlying client-layer call and map its result to
 /// an event. Split from `spawn` so the async body is exercised together with
 /// the pure mappers below.
 /// spec "Abandoned consent is surfaced": the loopback listener otherwise waits
@@ -78,7 +78,20 @@ const SIGN_IN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300)
 async fn execute(effect: &Effect) -> Event {
     match effect {
         Effect::StartLogin => {
-            match tokio::time::timeout(SIGN_IN_TIMEOUT, crate::google_login::login()).await {
+            // Always the loopback (non-device) flow: the desktop app's own
+            // browser is co-located with this process by construction, so
+            // the cross-machine loopback-reachability problem `--device`
+            // exists for cannot occur here.
+            //
+            // Each step is written to stdout exactly as `yadorilink login`
+            // prints it, which is where this window's sign-in has always
+            // reported the pages to open.
+            let print_progress = |event| {
+                for line in yadorilink_client_core::wording::login_event_lines(&event) {
+                    println!("{line}");
+                }
+            };
+            match tokio::time::timeout(SIGN_IN_TIMEOUT, auth::login(false, print_progress)).await {
                 Ok(result) => login_to_event(result),
                 Err(_) => Event::SignInFailed(
                     "timed out waiting for browser sign-in — try again".to_string(),
@@ -134,24 +147,23 @@ fn effect_error_event(effect: &Effect, msg: String) -> Event {
     }
 }
 
-fn login_to_event(result: Result<(), crate::google_login::LoginError>) -> Event {
+fn login_to_event(result: Result<(), CoreError>) -> Event {
     match result {
-        // The loopback+PKCE flow stores the session in the keychain but does
-        // not surface the account's email to this process, so the window shows
-        // a generic signed-in label.
-        Ok(()) => Event::SignInSucceeded { account: "Google account".to_string() },
+        // Enrolment stores a credential but does not surface the account's
+        // email to this process, so the window shows a generic signed-in label.
+        Ok(()) => Event::SignInSucceeded { account: "YadoriLink account".to_string() },
         Err(e) => Event::SignInFailed(e.to_string()),
     }
 }
 
-fn register_to_event(result: Result<String, CliError>) -> Event {
+fn register_to_event(result: Result<String, CoreError>) -> Event {
     match result {
         Ok(_device_id) => Event::DeviceRegistered,
         Err(e) => Event::DeviceRegisterFailed(e.to_string()),
     }
 }
 
-fn create_and_link_to_event(result: Result<String, CliError>) -> Event {
+fn create_and_link_to_event(result: Result<String, CoreError>) -> Event {
     match result {
         Ok(group_id) => Event::CreateAndLinkSucceeded { group_id },
         // The group is deleted inside `create_and_link` before the error
@@ -160,7 +172,7 @@ fn create_and_link_to_event(result: Result<String, CliError>) -> Event {
     }
 }
 
-fn list_groups_to_event(result: Result<Vec<share::GroupSummary>, CliError>) -> Event {
+fn list_groups_to_event(result: Result<Vec<share::GroupSummary>, CoreError>) -> Event {
     match result {
         Ok(groups) => Event::GroupsListed(
             groups
@@ -172,14 +184,14 @@ fn list_groups_to_event(result: Result<Vec<share::GroupSummary>, CliError>) -> E
     }
 }
 
-fn preflight_to_event(result: Result<(PathBuf, LinkPreflightReport), CliError>) -> Event {
+fn preflight_to_event(result: Result<(PathBuf, LinkPreflightReport), CoreError>) -> Event {
     match result {
         Ok((path, report)) => Event::PreflightCompleted(preflight_to_view(path, &report)),
         Err(e) => Event::PreflightFailed(e.to_string()),
     }
 }
 
-fn link_to_event(result: Result<(), CliError>) -> Event {
+fn link_to_event(result: Result<(), CoreError>) -> Event {
     match result {
         Ok(()) => Event::LinkSucceeded,
         Err(e) => Event::LinkFailed(e.to_string()),
@@ -221,79 +233,4 @@ pub fn preflight_to_view(path: PathBuf, report: &LinkPreflightReport) -> Preflig
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn register_ok_maps_to_device_registered() {
-        assert_eq!(register_to_event(Ok("dev-1".into())), Event::DeviceRegistered);
-    }
-
-    #[test]
-    fn register_err_carries_the_message() {
-        let ev = register_to_event(Err(CliError::NotLoggedIn));
-        match ev {
-            Event::DeviceRegisterFailed(msg) => assert!(msg.contains("not logged in")),
-            other => panic!("expected DeviceRegisterFailed, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn create_and_link_ok_carries_group_id() {
-        assert_eq!(
-            create_and_link_to_event(Ok("g-42".into())),
-            Event::CreateAndLinkSucceeded { group_id: "g-42".into() }
-        );
-    }
-
-    #[test]
-    fn list_groups_ok_maps_each_summary() {
-        let groups = vec![
-            share::GroupSummary { group_id: "g1".into(), name: "Photos".into() },
-            share::GroupSummary { group_id: "g2".into(), name: "Docs".into() },
-        ];
-        assert_eq!(
-            list_groups_to_event(Ok(groups)),
-            Event::GroupsListed(vec![
-                GroupOption { group_id: "g1".into(), name: "Photos".into() },
-                GroupOption { group_id: "g2".into(), name: "Docs".into() },
-            ])
-        );
-    }
-
-    #[test]
-    fn link_ok_maps_to_link_succeeded() {
-        assert_eq!(link_to_event(Ok(())), Event::LinkSucceeded);
-    }
-
-    /// The report→view conversion carries every warning through verbatim
-    /// (the window's acknowledgement cards are exactly the CLI's warnings)
-    /// and reflects the report's own risk verdict.
-    #[test]
-    fn preflight_view_carries_warnings_and_risk_from_a_real_report() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("existing.txt"), b"x").unwrap();
-        // Some(0) disables the free-space headroom check so this test's verdict
-        // is driven purely by the non-empty-folder condition, not the host's
-        // disk state.
-        let report =
-            yadorilink_local_storage::link_preflight::run_preflight(dir.path(), &[], Some(0));
-        let view = preflight_to_view(dir.path().to_path_buf(), &report);
-
-        assert!(view.is_risky);
-        assert_eq!(view.warnings, report.warnings());
-        assert!(view.warnings.iter().any(|w| w.contains("not empty")));
-        assert!(view.summary.iter().any(|s| s.contains("non-empty folder")));
-        assert_eq!(view.resolved_path, dir.path().to_string_lossy());
-    }
-
-    #[test]
-    fn preflight_view_of_an_empty_folder_has_no_non_empty_warning() {
-        let dir = tempfile::tempdir().unwrap();
-        let report =
-            yadorilink_local_storage::link_preflight::run_preflight(dir.path(), &[], Some(0));
-        let view = preflight_to_view(dir.path().to_path_buf(), &report);
-        assert!(!view.warnings.iter().any(|w| w.contains("not empty")));
-        assert!(view.summary.iter().any(|s| s.contains("empty folder")));
-    }
-}
+mod tests;

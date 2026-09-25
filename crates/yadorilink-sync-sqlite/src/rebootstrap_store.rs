@@ -1,63 +1,59 @@
-//! R3.3 HistoryBase/snapshot persistence and the production atomic
-//! installer (Phase 7D-9D).
-//!
-//! Moved from `yadorilink-sync-core::index::rebootstrap_store::base` --
-//! every function here was already either a plain `&Connection`/
-//! `&rusqlite::Transaction` free function or an `impl SyncState` method
-//! whose body was *itself* already a `self.database.read(|conn| ..)`/
-//! `self.database.write_immediate(|tx| ..)` closure over such a free
-//! function's shape; converting the closures into real free functions
-//! taking `conn`/`tx` directly required no behavioral change. The one
-//! exception, `install_rebootstrap_snapshot`, needs one piece of live
-//! `SyncState`-instance state (`local_emission_auth`, an injected signing
-//! policy callback) -- that single value is computed by the thin
-//! `SyncState::install_rebootstrap_snapshot` wrapper left behind in
-//! sync-core, BEFORE the transaction opens, and passed in here as an
-//! already-resolved `Option<ChangeAuth>`, exactly the "pre-snapshotted
-//! value in, never a live handle" shape this whole initiative's routing
-//! rules require.
-//!
-//! `build_compaction_snapshot`'s current-heads check previously ran as a
-//! *separate* `self.database.read` call (via `SyncState::dag_group_heads`)
-//! before the snapshot-building read. Folded into the same `conn` here --
-//! both are read-only, so this can only make the two reads more mutually
-//! consistent (one snapshot instead of two independently-acquired ones),
-//! never less.
+//! HistoryBase/snapshot persistence and the production atomic
+//! installer. `build_compaction_snapshot`'s current-heads
+//! check previously ran as a *separate* `self.database.read` call (via
+//! `SyncState::dag_group_heads`) before the snapshot-building read. Folded
+//! into the same `conn` here -- both are read-only, so this can only make
+//! the two reads more mutually consistent (one snapshot instead of two
+//! independently-acquired ones), never less.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use yadorilink_replica_domain::change::{Change, ChangeAuth, Op, PutOrigin};
+use yadorilink_replica_domain::change::{Change, Op};
 use yadorilink_replica_domain::file::FileVersion;
-use yadorilink_replica_domain::ids::{ChangeHash, SyncPath, VersionHash};
+use yadorilink_replica_domain::ids::{AuthorSeq, ChangeHash, VersionHash};
 use yadorilink_replica_engine::compaction::{Checkpoint, CheckpointHash, PrunePlan};
-use yadorilink_replica_engine::rebootstrap::{HistoryBase, SnapshotManifest};
+use yadorilink_replica_engine::rebootstrap::{HistoryBase, HistoryEpoch};
 use yadorilink_replica_engine::rebootstrap_snapshot::{
-    BoundaryParentAuth, RebootstrapSnapshot, SnapshotFile, SnapshotVersionState,
+    BoundaryParentAuth, RebootstrapSnapshot, SnapshotAuthorState, SnapshotFile, SnapshotPathHead,
+    SnapshotVersionState,
 };
 use yadorilink_sqlite_runtime::SyncDatabase;
 
-use crate::dag_store::ChangeEmitter;
 use crate::SyncSqliteError;
 
+mod foreign_merge;
+mod merge_install;
+mod seal;
+#[cfg(any(test, feature = "test-support"))]
+pub use foreign_merge::plan_summary_merge;
+pub use foreign_merge::{
+    find_equivocation, merge_foreign_base, verify_current_base, verify_returning_base,
+    BaseSignerAuthority, ForeignMergeError, ForeignMergeRefusal, MergedBase, SummaryEquivocation,
+    SummaryMerge, SummaryOrder, VerifiedBaseSummary,
+};
+pub use merge_install::{commit_foreign_merge, CommittedMerge};
+#[cfg(any(test, feature = "test-support"))]
+pub use merge_install::{commit_foreign_merge_interrupted_after, install_base_for_tests};
+#[cfg(any(test, feature = "test-support"))]
+pub use seal::seal_group_interrupted_after;
+pub use seal::{
+    plan_seal, prepare_seal, seal_group, verify_seal_preconditions, EpochResetStep, SealRefusal,
+    VerifiedSeal,
+};
+
 /// Direct accessor for the six pure-forward `group_history_bases`/
-/// `change_checkpoint_snapshots`/`history_boundary_parent_auth` reads and
+/// `change_checkpoint_snapshots` reads and
 /// writes below -- migrated off the former `SyncState::history_base`/
-/// `history_base_previous_checkpoint_hash`/`checkpoint_snapshot`/
+/// `checkpoint_snapshot`/
 /// `compacted_parent_auth`/`build_compaction_snapshot`/
-/// `commit_compaction_snapshot` one-line delegate wrappers (Phase 7D-9F),
+/// `commit_compaction_snapshot` one-line delegate wrappers,
 /// following the [`crate::HandoffLeaseRepository`] precedent. Opens the
-/// pooled connection/`IMMEDIATE` transaction itself instead of taking a raw
-/// `&Connection`/`&Transaction` from the caller, so no `rusqlite` type
+/// pooled connection/`IMMEDIATE` transaction itself instead of taking a
+/// raw `&Connection`/`&Transaction` from the caller, so no `rusqlite` type
 /// crosses this repository's own public boundary.
-///
-/// `install_rebootstrap_snapshot` stayed on `SyncState` in
-/// `yadorilink-sync-core` -- it needs `self.local_emission_auth(..)`, a
-/// live `SyncState`-instance-scoped signing-policy callback, resolved
-/// before the transaction opens, so it is `composition`, not a pure
-/// forward this repository can serve.
 pub struct RebootstrapStoreRepository {
     database: Arc<SyncDatabase>,
 }
@@ -67,19 +63,11 @@ impl RebootstrapStoreRepository {
         Self { database }
     }
 
-    /// Persisted R3.3 history base for a group, if this device has crossed a
+    /// Persisted history base for a group, if this device has crossed a
     /// compaction/re-bootstrap boundary. `None` is the un-compacted genesis
     /// history, not an error.
     pub fn history_base(&self, group_id: &str) -> Result<Option<HistoryBase>, SyncSqliteError> {
         self.database.read(|conn| history_base(conn, group_id))
-    }
-
-    /// See the free function of the same name for the exact contract.
-    pub fn history_base_previous_checkpoint_hash(
-        &self,
-        group_id: &str,
-    ) -> Result<Option<[u8; 32]>, SyncSqliteError> {
-        self.database.read(|conn| history_base_previous_checkpoint_hash(conn, group_id))
     }
 
     pub fn checkpoint_snapshot(
@@ -89,16 +77,6 @@ impl RebootstrapStoreRepository {
         self.database.read(|conn| checkpoint_snapshot(conn, checkpoint_hash))
     }
 
-    /// See the free function of the same name for the exact contract.
-    pub fn compacted_parent_auth(
-        &self,
-        group_id: &str,
-        child_hash: &ChangeHash,
-        parent_hash: &ChangeHash,
-    ) -> Result<Option<(u64, u64)>, SyncSqliteError> {
-        self.database.read(|conn| compacted_parent_auth(conn, group_id, child_hash, parent_hash))
-    }
-
     /// Builds the exact snapshot a destructive compaction will commit. See
     /// the free function of the same name for the exact contract.
     pub fn build_compaction_snapshot(
@@ -106,18 +84,6 @@ impl RebootstrapStoreRepository {
         plan: &PrunePlan,
     ) -> Result<RebootstrapSnapshot, SyncSqliteError> {
         self.database.read(|conn| build_compaction_snapshot(conn, plan))
-    }
-
-    /// Commits checkpoint snapshot + HistoryBase + boundary authorization
-    /// proof and deletes the prefix in one SQLite transaction.
-    pub fn commit_compaction_snapshot(
-        &self,
-        checkpoint: &Checkpoint,
-        snapshot: &RebootstrapSnapshot,
-        pruned: &[ChangeHash],
-    ) -> Result<(), SyncSqliteError> {
-        self.database
-            .write_immediate(|tx| commit_compaction_snapshot(tx, checkpoint, snapshot, pruned))
     }
 }
 
@@ -137,37 +103,6 @@ fn decode_stored_file_version(bytes: &[u8]) -> Result<FileVersion, SyncSqliteErr
     })
 }
 
-/// The checkpoint hash that immediately preceded this device's own
-/// *current* HistoryBase for `group_id` -- `None` if this device has never
-/// crossed a compaction/re-bootstrap boundary (its current checkpoint, if
-/// any, is the group's genesis) or has no HistoryBase installed at all.
-/// Runs against the caller's own connection/transaction so a caller about to
-/// overwrite the row (`commit_compaction_snapshot`, `install_rebootstrap_
-/// snapshot`) reads the value from *before* that write, within the same
-/// atomic transaction.
-fn read_history_base_previous_checkpoint_hash(
-    conn: &Connection,
-    group_id: &str,
-) -> Result<Option<[u8; 32]>, SyncSqliteError> {
-    let bytes: Option<Vec<u8>> = conn
-        .query_row(
-            "SELECT previous_checkpoint_hash FROM group_history_bases WHERE group_id = ?1",
-            [group_id],
-            |row| row.get(0),
-        )
-        .optional()?
-        .flatten();
-    bytes
-        .map(|bytes| {
-            <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
-                SyncSqliteError::CorruptState(format!(
-                    "stored previous_checkpoint_hash for group {group_id} is not 32 bytes"
-                ))
-            })
-        })
-        .transpose()
-}
-
 const REBOOTSTRAP_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS change_checkpoint_snapshots (
     checkpoint_hash BLOB PRIMARY KEY,
@@ -184,18 +119,74 @@ CREATE TABLE IF NOT EXISTS group_history_bases (
     previous_checkpoint_hash BLOB
 );
 
-CREATE TABLE IF NOT EXISTS history_boundary_parent_auth (
-    group_id          TEXT NOT NULL,
-    checkpoint_hash   BLOB NOT NULL,
-    child_hash        BLOB NOT NULL,
-    parent_hash       BLOB NOT NULL,
-    parent_lamport    INTEGER NOT NULL,
-    parent_auth_seq   INTEGER NOT NULL,
-    parent_auth_epoch INTEGER NOT NULL,
-    PRIMARY KEY (group_id, checkpoint_hash, child_hash, parent_hash)
+-- The causal summary the installed HistoryBase carries: `Q = (W, Gamma,
+-- lamport ceiling)`. Keyed by the base it belongs to, beside
+-- `group_history_bases` rather than inside it, because `W` has one row
+-- per author and `Gamma` one per live present entry head per path.
+--
+-- This is the part of a base that describes the history it replaced, as
+-- opposed to the files that history produced. Without it, an author
+-- whose every write was superseded before the checkpoint is invisible
+-- here, and this device would have no attested position to measure that
+-- author's next change against -- leaving it to take the author's own
+-- word for where it stands, which is the one thing a high-water mark may
+-- never rest on.
+CREATE TABLE IF NOT EXISTS history_base_author_state (
+    group_id        TEXT NOT NULL,
+    base_hash       BLOB NOT NULL,
+    device_id       TEXT NOT NULL,
+    watermark       INTEGER NOT NULL,
+    tip_change_hash BLOB NOT NULL,
+    PRIMARY KEY (group_id, base_hash, device_id)
 );
-CREATE INDEX IF NOT EXISTS idx_history_boundary_parent_auth_lookup
-    ON history_boundary_parent_auth(group_id, child_hash, parent_hash);
+
+-- `Gamma`: per path, the causally maximal present entry heads (a file's,
+-- a symlink's or a directory's; a structural directory has none) the base
+-- carries. Keyed by the change that wrote the head and never by
+-- `version_hash`: two devices that wrote identical bytes concurrently
+-- are two heads, and a delete descending from only one of them removes
+-- only that one.
+CREATE TABLE IF NOT EXISTS history_base_path_heads (
+    group_id         TEXT NOT NULL,
+    base_hash        BLOB NOT NULL,
+    path             TEXT NOT NULL,
+    change_hash      BLOB NOT NULL,
+    device_id        TEXT NOT NULL,
+    author_seq       INTEGER NOT NULL,
+    lamport          INTEGER NOT NULL,
+    version_hash     BLOB NOT NULL,
+    naming_device_id TEXT NOT NULL,
+    PRIMARY KEY (group_id, base_hash, path, change_hash)
+);
+-- The file index checks a current row's authoring change against the heads
+-- the installed base carries, by change and not by path: a conflict copy's
+-- row lives at another path than the head that wrote it.
+CREATE INDEX IF NOT EXISTS idx_history_base_path_heads_change
+    ON history_base_path_heads(group_id, change_hash);
+
+-- The authoring change of every file row the base carries. A row outlives
+-- the head that wrote it: a path's removal leaves a row authored by the
+-- removal, which is no content head, and a conflict copy stays current
+-- after the path it was copied from is rewritten. Neither author is in
+-- `Gamma` once a seal absorbs it, yet the row is still one the base
+-- carries, and the file index accepts it by this set.
+CREATE TABLE IF NOT EXISTS history_base_carried_authors (
+    group_id    TEXT NOT NULL,
+    base_hash   BLOB NOT NULL,
+    change_hash BLOB NOT NULL,
+    PRIMARY KEY (group_id, base_hash, change_hash)
+);
+
+-- The rest of the summary: the greatest Lamport the replaced history
+-- reached. Heads are ranked by Lamport, so a base that forgot it would
+-- have to restart the clock at its own root, and a restarted clock makes
+-- the compaction observable.
+CREATE TABLE IF NOT EXISTS history_base_meta (
+    group_id        TEXT NOT NULL,
+    base_hash       BLOB NOT NULL,
+    lamport_ceiling INTEGER NOT NULL,
+    PRIMARY KEY (group_id, base_hash)
+);
 "#;
 
 pub fn init_rebootstrap_schema(conn: &Connection) -> Result<(), SyncSqliteError> {
@@ -203,7 +194,7 @@ pub fn init_rebootstrap_schema(conn: &Connection) -> Result<(), SyncSqliteError>
     Ok(())
 }
 
-/// Persisted R3.3 history base for a group, if this device has crossed a
+/// Persisted history base for a group, if this device has crossed a
 /// compaction/re-bootstrap boundary. `None` is the un-compacted genesis
 /// history, not an error.
 pub fn history_base(
@@ -211,12 +202,77 @@ pub fn history_base(
     group_id: &str,
 ) -> Result<Option<HistoryBase>, SyncSqliteError> {
     init_rebootstrap_schema(conn)?;
+    read_history_base(conn, group_id)
+}
+
+/// The history epoch `group_id` is currently on: the epoch above its
+/// installed base, or genesis when it has none.
+///
+/// Reads the table without creating it, unlike every other accessor here,
+/// because this one is on the admission path: every incoming change is
+/// measured against it, and running the schema batch per change would turn
+/// a read into a write. `init_dag_schema` creates the table for exactly
+/// this reason -- the DAG's admission rule now depends on which base the
+/// group holds, so the row admission reads is part of the DAG's own schema.
+pub fn current_history_epoch(
+    conn: &Connection,
+    group_id: &str,
+) -> Result<HistoryEpoch, SyncSqliteError> {
+    Ok(HistoryEpoch::from_installed_base(read_history_base(conn, group_id)?))
+}
+
+/// The Lamport floor a change written on `epoch` is clocked from: the
+/// greatest Lamport value the history below that epoch reached. Zero on
+/// the group's original history; the ceiling the base carried on an
+/// epoch above one.
+///
+/// `None` for a base this replica holds no ceiling for, which is any base
+/// other than the installed one: its ceiling was replaced along with its
+/// summary when a later base was installed, or it was never held here at
+/// all. A change on such an epoch is not one this replica admits, so the
+/// only thing that still reads its floor is revalidation of history kept
+/// from an earlier epoch, which can then check the clock only against its
+/// parents. The installed base always has a ceiling -- it is written with
+/// the base -- so missing one there is damage, not an unknown.
+///
+/// Reads without the schema batch, like [`current_history_epoch`], because
+/// admission asks it for every change.
+pub(crate) fn lamport_floor(
+    conn: &Connection,
+    group_id: &str,
+    epoch: HistoryEpoch,
+) -> Result<Option<u64>, SyncSqliteError> {
+    let HistoryEpoch::Base(base) = epoch else { return Ok(Some(0)) };
+    let ceiling: Option<i64> = conn
+        .prepare_cached(
+            "SELECT lamport_ceiling FROM history_base_meta WHERE group_id = ?1 AND base_hash = ?2",
+        )?
+        .query_row(params![group_id, &base.0[..]], |row| row.get(0))
+        .optional()?;
+    match ceiling {
+        Some(ceiling) if ceiling < 0 => Err(SyncSqliteError::CorruptState(format!(
+            "history base {} of group {group_id} claims a Lamport ceiling of {ceiling}",
+            base.to_hex()
+        ))),
+        Some(ceiling) => Ok(Some(ceiling as u64)),
+        None if read_history_base(conn, group_id)? == Some(base) => {
+            Err(SyncSqliteError::CorruptState(format!(
+                "group {group_id} has history base {} installed but no stored Lamport ceiling \
+                 for it; the ceiling is written with the base, so its absence is damage",
+                base.to_hex()
+            )))
+        }
+        None => Ok(None),
+    }
+}
+
+fn read_history_base(
+    conn: &Connection,
+    group_id: &str,
+) -> Result<Option<HistoryBase>, SyncSqliteError> {
     let bytes: Option<Vec<u8>> = conn
-        .query_row(
-            "SELECT history_base FROM group_history_bases WHERE group_id = ?1",
-            [group_id],
-            |row| row.get(0),
-        )
+        .prepare_cached("SELECT history_base FROM group_history_bases WHERE group_id = ?1")?
+        .query_row([group_id], |row| row.get(0))
         .optional()?;
     bytes
         .map(|bytes| {
@@ -228,22 +284,6 @@ pub fn history_base(
             Ok(HistoryBase(array))
         })
         .transpose()
-}
-
-/// The checkpoint hash that immediately preceded this device's own
-/// *current* HistoryBase for `group_id` -- `None` if this device has
-/// never crossed a compaction/re-bootstrap boundary, or has no
-/// HistoryBase installed at all. Embedded into every `SnapshotManifest`
-/// this device signs for the group (see `prepare_rebootstrap_required`)
-/// as a signed hash-chain link, and the value `install_rebootstrap_
-/// snapshot` requires an incoming manifest's `previous_checkpoint_hash`
-/// to equal before accepting it as a genuine one-hop forward advance.
-pub fn history_base_previous_checkpoint_hash(
-    conn: &Connection,
-    group_id: &str,
-) -> Result<Option<[u8; 32]>, SyncSqliteError> {
-    init_rebootstrap_schema(conn)?;
-    read_history_base_previous_checkpoint_hash(conn, group_id)
 }
 
 pub fn checkpoint_snapshot(
@@ -260,45 +300,486 @@ pub fn checkpoint_snapshot(
         .optional()?)
 }
 
-/// Authorization coordinates for a parent that is absent specifically
-/// because it crossed the currently retained checkpoint boundary.
+/// The bounded causal summary of a group's history: `Q = (W, Gamma, L)`.
 ///
-/// A `history_boundary_parent_auth` row is only trustworthy under the
-/// checkpoint it was written for — it must not be used to vouch for a
-/// parent edge once the group has since switched to a different
-/// HistoryBase (a stale or foreign-checkpoint row proves nothing about
-/// the group's *current* boundary). This joins against
-/// `group_history_bases.checkpoint_hash` (the group's current active
-/// HistoryBase's checkpoint) rather than trusting whatever row happens
-/// to be stored, so a row left over from a since-superseded checkpoint
-/// can never be mistaken for a proof under the current one.
-pub fn compacted_parent_auth(
+/// `W` is every retained author's `(watermark, tip)`; `Gamma` is, per
+/// path, the causally maximal present entry heads -- Directory heads
+/// included, a structural directory never, since nothing writes one; `L`
+/// is the greatest Lamport the history reached. Bounded by the number of
+/// authors and by how concurrent each path is, not by how long the history
+/// is, which is what makes it something a history base can carry in place
+/// of the history.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GroupHistorySummary {
+    pub author_state: Vec<SnapshotAuthorState>,
+    pub path_heads: Vec<SnapshotPathHead>,
+    pub lamport_ceiling: u64,
+}
+
+impl GroupHistorySummary {
+    /// The namespace projection of this summary: the physical tree the
+    /// explicit state it summarises places, `project(resolve(Gamma))`.
+    ///
+    /// `Gamma` holds every present entry head, Directory heads included,
+    /// and never a structural directory, which is derived: a directory
+    /// that exists only to hold a descendant comes out of the projection,
+    /// not out of any head. `kind_of` names each head's version kind; a
+    /// head whose kind it cannot name fails the projection.
+    ///
+    /// This is what a base's rows must hold for its summary, whether the
+    /// summary is a seal's or the join of two, so a structural conflict
+    /// that only a join brings together (a file `a` on one side, `a/x` on
+    /// the other) is placed rather than left for a later seal to refuse.
+    pub fn project(
+        &self,
+        kind_of: impl Fn(&[u8; 32]) -> Option<yadorilink_replica_domain::file::RecordKind>,
+    ) -> Result<
+        yadorilink_replica_engine::namespace::NamespaceProjection,
+        yadorilink_replica_engine::namespace::ProjectionError,
+    > {
+        yadorilink_replica_engine::namespace::project(&heads_by_path(&self.path_heads), kind_of)
+    }
+
+    /// The causal join of two summaries of the same group's history: the
+    /// least summary that is above both.
+    ///
+    /// This is what merging two histories is. It replaces asking which of
+    /// them is "the" history and re-parenting the other onto it, which
+    /// cannot be done without either inventing causality or throwing away
+    /// one side's writes.
+    ///
+    /// Watermarks join by maximum, because a watermark is a prefix of one
+    /// author's chain and the higher of two prefixes contains the lower.
+    /// The tip travels with the watermark it belongs to, so the joined
+    /// position is a position that was actually attested rather than a
+    /// number paired with the wrong change.
+    ///
+    /// Head sets join by a union with one subtraction. A head present on
+    /// both sides is in the join, and both sides must describe it the same
+    /// way -- otherwise which description survived would depend on the
+    /// order of the sides, and the join would not be symmetric. A head present on only one side is in
+    /// the join unless the other side's watermark for that head's author
+    /// already covers it -- if that side has seen this author's write and
+    /// does not list it as a head, it has seen what superseded it, and
+    /// carrying it forward would resurrect content a later write removed.
+    /// A head the other side simply has not reached stays.
+    ///
+    /// Heads are never collapsed by content. Two devices that wrote
+    /// identical bytes concurrently produced two writes, and a later
+    /// delete descending from only one of them removes only that one; a
+    /// join that had merged them could not say the other survives.
+    ///
+    /// Two heads of one path by one author is corrupt state on either side
+    /// or a product of joining, and is reported rather than tolerated. The
+    /// reason is path-local DAG ordering, not the author chain: a chain
+    /// link is not a DAG parent and orders nothing in a path's own
+    /// history. What orders it is that every emission touching a path
+    /// either refreshes that path's materialized basis to a head set
+    /// containing the emitted change or invalidates that basis, while a
+    /// local edit takes exactly that basis as its parents -- so an
+    /// author's second write to a path descends its first, and the earlier
+    /// one cannot still be maximal. The check stays even so: it is what
+    /// catches a writer that ever breaks that property.
+    ///
+    /// So is one position naming two different changes, which is
+    /// equivocation and outside the merge domain entirely. A position is
+    /// compared wherever either side still names the change at it -- an
+    /// author's tip or any content head -- which is as far as a summary can
+    /// see; see [`find_equivocation`].
+    ///
+    /// Not yet called outside tests and the foreign-base merge core
+    /// ([`merge_foreign_base`]), which nothing in production calls yet.
+    pub fn join(&self, other: &Self) -> Result<Self, SyncSqliteError> {
+        if let Some(equivocation) = find_equivocation(self, other) {
+            return Err(SyncSqliteError::CorruptState(format!(
+                "cannot join histories: {equivocation}, which is equivocation and outside the \
+                 merge domain"
+            )));
+        }
+        self.join_positions_compared(other)
+    }
+
+    /// This side's heads by `(path, change)`, and each author's watermark.
+    fn head_and_watermark_index(&self) -> (HashSet<(&str, ChangeHash)>, HashMap<&str, AuthorSeq>) {
+        let heads =
+            self.path_heads.iter().map(|head| (head.path.as_str(), head.change_hash)).collect();
+        let watermarks = self
+            .author_state
+            .iter()
+            .map(|state| (state.device_id.as_str(), state.watermark))
+            .collect();
+        (heads, watermarks)
+    }
+
+    /// [`Self::join`] for a caller that has already compared every author
+    /// position both sides name and found no equivocation.
+    fn join_positions_compared(&self, other: &Self) -> Result<Self, SyncSqliteError> {
+        let author_state = Self::join_author_state(&self.author_state, &other.author_state)?;
+        let (self_heads, self_watermarks) = self.head_and_watermark_index();
+        let (other_heads, other_watermarks) = other.head_and_watermark_index();
+        let mut heads: BTreeMap<(&str, ChangeHash), &SnapshotPathHead> = BTreeMap::new();
+        for (side, (opposite_heads, opposite_watermarks)) in
+            [(self, (&other_heads, &other_watermarks)), (other, (&self_heads, &self_watermarks))]
+        {
+            for head in &side.path_heads {
+                let covered = !opposite_heads.contains(&(head.path.as_str(), head.change_hash))
+                    && opposite_watermarks
+                        .get(head.device_id.as_str())
+                        .is_some_and(|watermark| *watermark >= head.author_seq);
+                if covered {
+                    continue;
+                }
+                // Both sides name this change as a head of this path. They
+                // must say the same thing about it: which of two differing
+                // descriptions the join kept would otherwise depend on the
+                // order the sides were given in, and so would the joined
+                // summary's identity and the base minted over it.
+                if let Some(held) = heads.insert((head.path.as_str(), head.change_hash), head) {
+                    if held != head {
+                        return Err(SyncSqliteError::CorruptState(format!(
+                            "cannot join histories: the two sides describe head {} of {:?} \
+                             differently",
+                            head.change_hash.to_hex(),
+                            head.path,
+                        )));
+                    }
+                }
+            }
+        }
+        let path_heads: Vec<SnapshotPathHead> = heads.into_values().cloned().collect();
+        let mut by_author: BTreeMap<(&str, &str), &SnapshotPathHead> = BTreeMap::new();
+        for head in &path_heads {
+            if let Some(held) =
+                by_author.insert((head.path.as_str(), head.device_id.as_str()), head)
+            {
+                return Err(SyncSqliteError::CorruptState(format!(
+                    "cannot join histories: author {} holds two heads of {:?} ({} and {}), and an \
+                     author's second write to a path descends its first, so only the later one \
+                     can be maximal",
+                    head.device_id,
+                    head.path,
+                    held.change_hash.to_hex(),
+                    head.change_hash.to_hex(),
+                )));
+            }
+        }
+        Ok(Self {
+            author_state,
+            path_heads,
+            lamport_ceiling: self.lamport_ceiling.max(other.lamport_ceiling),
+        })
+    }
+
+    /// The `W` half of the join on its own: each author at the maximum of
+    /// the two watermarks, carrying the tip that watermark was attested
+    /// with.
+    ///
+    /// Separate from [`join`](Self::join) because a caller that merges two
+    /// histories' author positions is not always in a position to state
+    /// either side's `Gamma`. A replica installing a history base is
+    /// exactly that: its own head sets describe the epoch it is about to
+    /// retire, they are not used by the install, and asking for them at
+    /// all would mean building a summary of a state that may already sit
+    /// above a base. Positions are the whole of what such a caller merges,
+    /// so positions are the whole of what it asks for.
+    pub fn join_author_state(
+        left: &[SnapshotAuthorState],
+        right: &[SnapshotAuthorState],
+    ) -> Result<Vec<SnapshotAuthorState>, SyncSqliteError> {
+        let mut author_state: BTreeMap<&str, &SnapshotAuthorState> = BTreeMap::new();
+        for state in left.iter().chain(right.iter()) {
+            match author_state.entry(state.device_id.as_str()) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(state);
+                }
+                std::collections::btree_map::Entry::Occupied(mut slot) => {
+                    let held = *slot.get();
+                    if held.watermark == state.watermark
+                        && held.tip_change_hash != state.tip_change_hash
+                    {
+                        return Err(SyncSqliteError::CorruptState(format!(
+                            "cannot join histories: author {} stands at position {} with two \
+                             different changes ({} and {}), which is equivocation and outside \
+                             the merge domain",
+                            state.device_id,
+                            state.watermark,
+                            held.tip_change_hash.to_hex(),
+                            state.tip_change_hash.to_hex(),
+                        )));
+                    }
+                    if state.watermark > held.watermark {
+                        slot.insert(state);
+                    }
+                }
+            }
+        }
+        Ok(author_state.into_values().cloned().collect())
+    }
+
+    /// Where this summary puts `device_id`, if it carries a position for it
+    /// at all.
+    pub fn author_watermark(&self, device_id: &str) -> Option<AuthorSeq> {
+        self.author_state
+            .iter()
+            .find(|state| state.device_id == device_id)
+            .map(|state| state.watermark)
+    }
+}
+
+/// Reads `Q = (W, L, Gamma)` for the whole of one group's history out of the
+/// state the store already maintains: the installed base's summary, and the
+/// derived state of the epoch above it.
+///
+/// No history is walked. The per-author positions come from the
+/// author-chain state that admission advances in the same transaction as
+/// the change itself; it already continues from the positions the base
+/// carried, so it is `W` for the whole history as it stands. The head sets
+/// come from the live path frontier, which describes only what is retained
+/// here, and the base's own head sets supply the rest.
+///
+/// The two are composed per path, and the rule is what makes the base a
+/// causal root rather than a second history. Every change on the current
+/// epoch descends from the base as a whole, whatever its DAG parents say,
+/// so a path the current epoch has touched -- written, deleted, or moved
+/// away -- has exactly the current epoch's maximal writes as its heads,
+/// and nothing the base carried for it survives. A path the current epoch
+/// has not touched has exactly the heads the base carried. A live head
+/// retained from an earlier epoch is part of what the base absorbed and is
+/// never read from the frontier, because the frontier cannot see that the
+/// base orders it below the current epoch.
+///
+/// `L` is the base's ceiling, or the greatest Lamport any retained change
+/// reached if that is higher.
+///
+/// On a group with no installed base all of this reduces to the live
+/// frontier as it is: every retained change is on the original history.
+pub fn build_group_history_summary(
     conn: &Connection,
     group_id: &str,
-    child_hash: &ChangeHash,
-    parent_hash: &ChangeHash,
-) -> Result<Option<(u64, u64)>, SyncSqliteError> {
-    init_rebootstrap_schema(conn)?;
-    let row: Option<(i64, i64)> = conn
-        .query_row(
-            "SELECT h.parent_auth_seq, h.parent_auth_epoch \
-             FROM history_boundary_parent_auth h \
-             JOIN group_history_bases g \
-               ON g.group_id = h.group_id AND g.checkpoint_hash = h.checkpoint_hash \
-             WHERE h.group_id = ?1 AND h.child_hash = ?2 AND h.parent_hash = ?3",
-            params![group_id, &child_hash.0[..], &parent_hash.0[..]],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    row.map(|(seq, epoch)| {
-        if seq < 0 || epoch < 0 {
-            return Err(SyncSqliteError::CorruptState(
-                "stored compacted-parent authorization coordinate is negative".into(),
-            ));
+) -> Result<GroupHistorySummary, SyncSqliteError> {
+    let epoch = current_history_epoch(conn, group_id)?;
+    let base = match epoch {
+        HistoryEpoch::Genesis => None,
+        HistoryEpoch::Base(_) => Some(history_base_summary(conn, group_id)?.ok_or_else(|| {
+            SyncSqliteError::CorruptState(format!(
+                "group {group_id} has an installed history base with no summary"
+            ))
+        })?),
+    };
+    let author_state = crate::dag_store::author_chain::all_author_state(conn, group_id)?;
+
+    // Which live heads were written on the current epoch, and so which
+    // paths the current epoch has touched.
+    let mut epoch_of: HashMap<ChangeHash, HistoryEpoch> = HashMap::new();
+    let mut touched: HashSet<String> = HashSet::new();
+    for (path, hash) in crate::dag_store::path_frontier::live_heads_for_group(conn, group_id)? {
+        let written_on = match epoch_of.get(&hash) {
+            Some(written_on) => *written_on,
+            None => {
+                let encoded = crate::dag_store::get_encoded(conn, &hash)?.ok_or_else(|| {
+                    SyncSqliteError::CorruptState(format!(
+                        "live head {} of {path:?} in group {group_id} is not a retained change",
+                        hash.to_hex()
+                    ))
+                })?;
+                let written_on = decode_stored_change(&encoded)?.history_epoch;
+                epoch_of.insert(hash, written_on);
+                written_on
+            }
+        };
+        if written_on == epoch {
+            touched.insert(path);
         }
-        Ok((seq as u64, epoch as u64))
+    }
+    let mut path_heads: Vec<SnapshotPathHead> =
+        crate::dag_store::path_frontier::live_content_heads_for_group(conn, group_id)?
+            .into_iter()
+            .filter(|head| epoch_of.get(&head.change_hash) == Some(&epoch))
+            .collect();
+    if let Some(base) = &base {
+        path_heads
+            .extend(base.path_heads.iter().filter(|head| !touched.contains(&head.path)).cloned());
+    }
+
+    let retained_ceiling: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(lamport), 0) FROM changes WHERE group_id = ?1",
+        [group_id],
+        |row| row.get(0),
+    )?;
+    if retained_ceiling < 0 {
+        return Err(SyncSqliteError::CorruptState(format!(
+            "group {group_id} has a stored Lamport value of {retained_ceiling}, which no change \
+             can carry"
+        )));
+    }
+    let lamport_ceiling =
+        (retained_ceiling as u64).max(base.as_ref().map_or(0, |base| base.lamport_ceiling));
+    Ok(GroupHistorySummary { author_state, path_heads, lamport_ceiling })
+}
+
+/// The causal summary the currently installed HistoryBase carries, or
+/// `None` when this group has no installed base (its history is its own,
+/// un-compacted, from genesis).
+///
+/// Read back by base hash, not merely by group, so a summary left behind
+/// by a base this device has since replaced can never be returned as if
+/// it described the current one.
+///
+/// Not yet called outside tests: negotiating a common base with a peer and
+/// merging a foreign base are what will read it.
+pub fn history_base_summary(
+    conn: &Connection,
+    group_id: &str,
+) -> Result<Option<GroupHistorySummary>, SyncSqliteError> {
+    init_rebootstrap_schema(conn)?;
+    let Some(base) = history_base(conn, group_id)? else { return Ok(None) };
+    let base_hash = &base.0[..];
+
+    let mut stmt = conn.prepare(
+        "SELECT device_id, watermark, tip_change_hash FROM history_base_author_state \
+         WHERE group_id = ?1 AND base_hash = ?2 ORDER BY device_id",
+    )?;
+    let rows = stmt.query_map(params![group_id, base_hash], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, Vec<u8>>(2)?))
+    })?;
+    let mut author_state = Vec::new();
+    for row in rows {
+        let (device_id, watermark, tip) = row?;
+        if watermark < 1 {
+            return Err(SyncSqliteError::CorruptState(format!(
+                "installed base for group {group_id} puts author {device_id} at watermark \
+                 {watermark}, which is not a position in any author chain"
+            )));
+        }
+        author_state.push(SnapshotAuthorState {
+            device_id,
+            watermark: AuthorSeq(watermark as u64),
+            tip_change_hash: ChangeHash(hash_32(&tip, "history_base_author_state.tip")?),
+        });
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT path, change_hash, device_id, author_seq, lamport, version_hash, \
+                naming_device_id \
+         FROM history_base_path_heads WHERE group_id = ?1 AND base_hash = ?2 \
+         ORDER BY path, change_hash",
+    )?;
+    let rows = stmt.query_map(params![group_id, base_hash], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, Vec<u8>>(5)?,
+            row.get::<_, String>(6)?,
+        ))
+    })?;
+    let mut path_heads = Vec::new();
+    for row in rows {
+        let (path, change_hash, device_id, author_seq, lamport, version_hash, naming_device_id) =
+            row?;
+        if author_seq < 1 || lamport < 0 {
+            return Err(SyncSqliteError::CorruptState(format!(
+                "installed base for group {group_id} carries a head of {path:?} at author \
+                 sequence {author_seq} and Lamport {lamport}, which no change can hold"
+            )));
+        }
+        path_heads.push(SnapshotPathHead {
+            path,
+            change_hash: ChangeHash(hash_32(&change_hash, "history_base_path_heads.change_hash")?),
+            device_id,
+            author_seq: AuthorSeq(author_seq as u64),
+            lamport: lamport as u64,
+            version_hash: VersionHash(hash_32(
+                &version_hash,
+                "history_base_path_heads.version_hash",
+            )?),
+            naming_device_id,
+        });
+    }
+
+    // The ceiling is required, not defaulted. An install writes the meta
+    // row, the author state and the head set in the same transaction as
+    // the base itself, so a base with no meta row is a damaged database,
+    // not a history that reached Lamport 0 -- and answering 0 would be
+    // the worse of the two outcomes, because the Lamport anchor resumes
+    // from the ceiling and a zeroed one changes the order two replicas
+    // resolve a path into without anything looking wrong. At most one row
+    // can exist to read: the table is keyed by (group_id, base_hash).
+    let lamport_ceiling: i64 = conn
+        .query_row(
+            "SELECT lamport_ceiling FROM history_base_meta WHERE group_id = ?1 AND base_hash = ?2",
+            params![group_id, base_hash],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            SyncSqliteError::CorruptState(format!(
+                "group {group_id} has an installed history base but no stored Lamport ceiling \
+                 for it; the base's summary rows are written with the base itself, so their \
+                 absence is damage rather than an empty history"
+            ))
+        })?;
+    // Likewise the author positions. A base carries them or it is not
+    // installable at all (`install_base_by_reset` refuses it), so no rows
+    // where the base claims heads or a non-zero ceiling is the same
+    // damage. The one state that genuinely reads as empty is a base
+    // sealed over a history that had nothing in it: no authors, no heads,
+    // and a ceiling of zero. That stays an empty summary, and is
+    // distinguished here rather than conflated with the damaged case.
+    if author_state.is_empty() && !(path_heads.is_empty() && lamport_ceiling == 0) {
+        return Err(SyncSqliteError::CorruptState(format!(
+            "group {group_id} has an installed history base that carries {} path head(s) and a \
+             Lamport ceiling of {lamport_ceiling} but no author positions; a base that cannot \
+             say where its own authors stand is not installable, so this is damage",
+            path_heads.len()
+        )));
+    }
+    if lamport_ceiling < 0 {
+        return Err(SyncSqliteError::CorruptState(format!(
+            "installed base for group {group_id} claims a Lamport ceiling of {lamport_ceiling}"
+        )));
+    }
+    Ok(Some(GroupHistorySummary {
+        author_state,
+        path_heads,
+        lamport_ceiling: lamport_ceiling as u64,
+    }))
+}
+
+/// `Gamma`'s heads grouped by path, as the per-path resolver and the
+/// namespace projection take them. A summary head carries no mtime stamp,
+/// exactly as the live path frontier carries none, so conflict-copy names
+/// come out the same as the live projection's.
+pub(crate) fn heads_by_path(
+    heads: &[SnapshotPathHead],
+) -> BTreeMap<String, Vec<yadorilink_replica_engine::conflict::PathHead>> {
+    use yadorilink_replica_engine::conflict::{PathHead, PathHeadContent};
+    let mut by_path: BTreeMap<String, Vec<PathHead>> = BTreeMap::new();
+    for head in heads {
+        by_path.entry(head.path.clone()).or_default().push(PathHead {
+            change_hash: head.change_hash.0,
+            lamport: head.lamport,
+            device_id: head.device_id.clone(),
+            naming_device_id: head.naming_device_id.clone(),
+            content: Some(PathHeadContent {
+                version_hash: head.version_hash.0,
+                mtime_unix_nanos: 0,
+            }),
+        });
+    }
+    by_path
+}
+
+/// A stored 32-byte hash column, or a corruption report naming it.
+fn hash_32(bytes: &[u8], what: &str) -> Result<[u8; 32], SyncSqliteError> {
+    <[u8; 32]>::try_from(bytes).map_err(|_| {
+        SyncSqliteError::CorruptState(format!(
+            "{what} is {} bytes, not a 32-byte hash",
+            bytes.len()
+        ))
     })
-    .transpose()
 }
 
 /// Builds the exact snapshot a destructive compaction will commit.
@@ -314,22 +795,34 @@ pub fn build_compaction_snapshot(
 ) -> Result<RebootstrapSnapshot, SyncSqliteError> {
     let group_id = plan.group_id.as_str();
     init_rebootstrap_schema(conn)?;
-    let mut current_heads = crate::dag_store::group_heads(conn, group_id)?;
+    // Published, not raw, heads: compaction may only ever run against a
+    // fully-published frontier. A Pending head here would mean this
+    // device is about to build a snapshot some receiver installs and
+    // trusts outright -- refusing outright (rather than merely omitting
+    // the Pending head's own content) keeps "compaction runs on the
+    // Published world only" true by construction, not by every caller
+    // remembering to filter first.
+    let mut current_heads =
+        crate::dag_store::published_view::published_group_heads(conn, group_id)?;
     current_heads.sort();
     let mut checkpoint_frontier = plan.checkpoint_frontier.clone();
     checkpoint_frontier.sort();
     if current_heads != checkpoint_frontier {
         return Err(SyncSqliteError::CorruptState(format!(
-            "refusing compaction for group {group_id}: checkpoint frontier is not the current materialized frontier"
+            "refusing compaction for group {group_id}: checkpoint frontier is not the current \
+             fully-published materialized frontier"
         )));
     }
-    if plan.pruned.is_empty() {
-        return Err(SyncSqliteError::CorruptState(
-            "cannot build a compaction snapshot for an empty prune".into(),
-        ));
-    }
+    // An empty prune is still a seal: a base replaces the history it
+    // absorbs whether or not anything below its frontier is deleted yet.
+    // Whether there is anything to seal at all is a precondition of the
+    // seal, not of the snapshot (see `seal::verify_seal_preconditions`).
 
-    let files = read_snapshot_files(conn, group_id)?;
+    // Published, not raw, file rows: a snapshot builder that could ever
+    // include a Pending row would defeat the entire point of gating
+    // compaction on a published frontier above -- see
+    // `published_view::published_snapshot_files`'s own doc comment.
+    let files = crate::dag_store::published_view::published_snapshot_files(conn, group_id)?;
 
     let mut versions: BTreeMap<VersionHash, Vec<u8>> = BTreeMap::new();
     for file in &files {
@@ -390,11 +883,74 @@ pub fn build_compaction_snapshot(
                 child_hash: *hash,
                 parent_hash: *parent_hash,
                 parent_lamport: parent.lamport,
-                parent_auth_seq: parent.auth_seq,
-                parent_auth_epoch: parent.auth_epoch,
             });
         }
         frontier_changes.push(encoded);
+    }
+
+    // Every retained file's authoring change needs its own evidence
+    // carried forward as a witness, or `RebootstrapSnapshot::new` refuses
+    // to construct this snapshot at all (a compacted snapshot must never be constructible with
+    // content that
+    // has lost its evidence). A frontier change's rows are no exception:
+    // the change travels as a body, but a receiver that retires the history
+    // a base absorbs -- as a seal does, and as a merge does -- keeps no body
+    // to vouch for them, and only the witness lets it serve their content.
+    // This device already independently verified that evidence when the
+    // change was first admitted/published -- carrying it forward here is
+    // not re-trusting anything new, only preserving proof this device
+    // already checked.
+    let mut witnessed: HashSet<ChangeHash> = HashSet::new();
+    let mut published_change_witnesses = Vec::new();
+    for file in &files {
+        let Some(authoring_change_hash) = file.authoring_change_hash else { continue };
+        if !witnessed.insert(authoring_change_hash) {
+            continue;
+        }
+        published_change_witnesses.push(build_witness_for_change(conn, &authoring_change_hash)?);
+    }
+
+    // The causal summary of the history this checkpoint replaces. Without
+    // it an installed base describes a set of files and a frontier, and a
+    // receiver has no attested position for any author whose writes the
+    // frontier no longer shows -- see `SnapshotAuthorState`'s own doc
+    // comment for what that costs.
+    let summary = build_group_history_summary(conn, group_id)?;
+
+    // At most one live head per author per path. The snapshot refuses more
+    // outright; saying which author and path is the useful half of that.
+    let mut author_heads: HashSet<(&str, &str)> = HashSet::new();
+    for head in &summary.path_heads {
+        if !author_heads.insert((head.path.as_str(), head.device_id.as_str())) {
+            return Err(seal::refuse(
+                group_id,
+                SealRefusal::TwoHeadsFromOneAuthor {
+                    path: head.path.clone(),
+                    device_id: head.device_id.clone(),
+                },
+            ));
+        }
+    }
+
+    // Every head's content travels with the base, not only the content
+    // some current row holds. A losing head of a conflict is content the
+    // history still has, and the change that wrote it is one this seal
+    // prunes -- along with every version only it referenced.
+    for head in &summary.path_heads {
+        if versions.contains_key(&head.version_hash) {
+            continue;
+        }
+        let version = crate::dag_store::get_file_version(conn, group_id, &head.version_hash)?
+            .ok_or_else(|| {
+                seal::refuse(
+                    group_id,
+                    SealRefusal::ContentNotCarried {
+                        path: head.path.clone(),
+                        version: head.version_hash,
+                    },
+                )
+            })?;
+        versions.insert(head.version_hash, version.canonical_encoding());
     }
 
     Ok(RebootstrapSnapshot::new(
@@ -402,61 +958,135 @@ pub fn build_compaction_snapshot(
         files,
         frontier_changes,
         versions.into_values().collect(),
+        published_change_witnesses,
         boundary_parent_auth,
+        summary.author_state,
+        summary.path_heads,
+        summary.lamport_ceiling,
     )?)
 }
 
-/// Commits checkpoint snapshot + HistoryBase + boundary authorization proof
-/// and deletes the prefix in one SQLite transaction.
+/// Carries a single already-published Change's own checkpoint evidence
+/// into a self-contained [`yadorilink_replica_engine::rebootstrap_snapshot::PublishedChangeWitness`]
+/// -- both `change_evidence`/`checkpoint_envelope` must already be
+/// present (this device only ever calls this for a Change it has already
+/// independently verified and published; see [`build_compaction_snapshot`]'s
+/// own doc comment).
+fn build_witness_for_change(
+    conn: &Connection,
+    change_hash: &ChangeHash,
+) -> Result<yadorilink_replica_engine::rebootstrap_snapshot::PublishedChangeWitness, SyncSqliteError>
+{
+    use yadorilink_replica_engine::rebootstrap_snapshot::PublishedChangeWitness;
+
+    let (checkpoint_hash, merkle_proof_encoded) =
+        crate::dag_store::published_view::change_evidence(conn, change_hash)?.ok_or_else(|| {
+            SyncSqliteError::CorruptState(format!(
+                "cannot build a compaction-surviving witness for {}: no retained authorization \
+                 evidence",
+                change_hash.to_hex()
+            ))
+        })?;
+    let (checkpoint_encoded, checkpoint_signature, author_signing_public_key) =
+        crate::dag_store::published_view::checkpoint_envelope(conn, &checkpoint_hash)?.ok_or_else(
+            || {
+                SyncSqliteError::CorruptState(format!(
+                    "cannot build a compaction-surviving witness for {}: its checkpoint \
+                     envelope is missing",
+                    change_hash.to_hex()
+                ))
+            },
+        )?;
+    Ok(PublishedChangeWitness {
+        change_hash: *change_hash,
+        checkpoint_hash,
+        checkpoint_encoded,
+        checkpoint_signature,
+        author_signing_public_key,
+        merkle_proof_encoded,
+    })
+}
+
+/// Moves `checkpoint`'s group onto the base the checkpoint derives from, in
+/// the caller's transaction: the atomic epoch reset that commits a seal.
+///
+/// `absorbed` is every change the base replaces, and it has to be every
+/// change the group retains -- a base describes the whole history below it,
+/// so a change it does not absorb has no history left to stand on. The
+/// reset:
+///
+/// 1. records the checkpoint and the snapshot, which carries the files and
+///    the summary `Q = (W, L, Gamma)`;
+/// 2. switches the group onto the base: the base and its summary are
+///    written, and every author whose position the base carries is
+///    anchored on it, so its next change continues from the base by its
+///    signed history epoch rather than by naming a change;
+/// 3. retires the absorbed history: every absorbed change, frontier
+///    included, and everything derived from one. `W` and `L` are not
+///    cleared -- they live in the author state and the base's summary --
+///    and the files the base carries keep their versions and the evidence
+///    that authorized them.
+///
+/// Afterwards the group retains no change at all. The next one written
+/// here is a root on the new base, clocked from its ceiling.
+///
+/// All three steps commit together or not at all: a crash before the
+/// caller commits leaves the old base and its whole history, and one after
+/// leaves the new base and nothing of the old history.
+///
+/// Test fixtures only. This commits `snapshot` without checking it against
+/// the history it replaces, so it can install any base at all; a seal goes
+/// through [`seal_group`], which checks the seal's preconditions and
+/// commits it with the same reset in the same transaction.
+#[cfg(any(test, feature = "test-support"))]
 pub fn commit_compaction_snapshot(
     tx: &rusqlite::Transaction<'_>,
     checkpoint: &Checkpoint,
     snapshot: &RebootstrapSnapshot,
-    pruned: &[ChangeHash],
+    absorbed: &[ChangeHash],
 ) -> Result<(), SyncSqliteError> {
+    reset_group_epoch(tx, checkpoint, snapshot, absorbed, None)
+}
+
+/// The atomic epoch reset [`seal_group`] commits, as the doc of
+/// `commit_compaction_snapshot` describes it, optionally stopped with an
+/// error right after `interrupt_after`.
+fn reset_group_epoch(
+    tx: &rusqlite::Transaction<'_>,
+    checkpoint: &Checkpoint,
+    snapshot: &RebootstrapSnapshot,
+    absorbed: &[ChangeHash],
+    interrupt_after: Option<EpochResetStep>,
+) -> Result<(), SyncSqliteError> {
+    let group_id = checkpoint.group_id.as_str();
+    let reached = |step: EpochResetStep| -> Result<(), SyncSqliteError> {
+        if interrupt_after == Some(step) {
+            return Err(SyncSqliteError::Io(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                format!("the seal of group {group_id} was interrupted after {step:?}"),
+            )));
+        }
+        Ok(())
+    };
     snapshot.validate_against_checkpoint(checkpoint)?;
     init_rebootstrap_schema(tx)?;
-    let checkpoint_hash = checkpoint.checkpoint_hash();
+
+    // 1. The checkpoint and the snapshot carrying the summary.
     tx.execute(
         "INSERT OR REPLACE INTO change_checkpoint_snapshots \
          (checkpoint_hash, group_id, snapshot) VALUES (?1, ?2, ?3)",
-        params![
-            &checkpoint_hash.0[..],
-            checkpoint.group_id.as_str(),
-            snapshot.canonical_encoding(),
-        ],
+        params![&checkpoint.checkpoint_hash().0[..], group_id, snapshot.canonical_encoding()],
     )?;
+    record_checkpoint(tx, checkpoint)?;
+    reached(EpochResetStep::SummaryRecorded)?;
 
-    crate::dag_store::commit_prune(tx, checkpoint, pruned)?;
-
-    // `commit_prune` sweeps versions referenced only by the deleted
-    // prefix, and also deletes that prefix's `change_file_versions`
-    // rows -- the block-serving justification for any version whose
-    // only referencing change was just pruned. Restore both the
-    // canonical version bytes and an authorization justification that
-    // survives the prune, so a live (current or retained superseded)
-    // materialized version never becomes unservable purely because
-    // its originating change is gone.
-    for encoded in &snapshot.file_versions {
-        let version = decode_stored_file_version(encoded)?;
-        crate::dag_store::put_file_version(tx, checkpoint.group_id.as_str(), &version)?;
-        crate::dag_store::record_compacted_file_version_authorization(
-            tx,
-            checkpoint.group_id.as_str(),
-            &version.version_hash,
-        )?;
-    }
-
-    // A genuine local advance: this device is establishing a NEW
-    // checkpoint from its own timeline, so the new checkpoint's
-    // `previous_checkpoint_hash` is exactly whatever checkpoint this
-    // device currently has installed (its own immediate predecessor
-    // in this device's causal history) -- `None` only if this
-    // device has never crossed a compaction/re-bootstrap boundary.
+    // 2. The switch. A genuine local advance: the new checkpoint's
+    // predecessor is whatever checkpoint this device has installed now --
+    // `None` only if it has never crossed a base before.
     let previous_checkpoint_hash: Option<[u8; 32]> = tx
         .query_row(
             "SELECT checkpoint_hash FROM group_history_bases WHERE group_id = ?1",
-            [checkpoint.group_id.as_str()],
+            [group_id],
             |row| row.get::<_, Vec<u8>>(0),
         )
         .optional()?
@@ -468,375 +1098,294 @@ pub fn commit_compaction_snapshot(
             })
         })
         .transpose()?;
-    persist_history_base_and_boundary(tx, checkpoint, snapshot, previous_checkpoint_hash)?;
+    persist_history_base(tx, checkpoint, snapshot, previous_checkpoint_hash)?;
+    reached(EpochResetStep::BaseSwitched)?;
+
+    // 3. The absorbed history goes.
+    retire_absorbed_history(
+        tx,
+        group_id,
+        &HistoryBase::from_checkpoint(checkpoint),
+        absorbed,
+        snapshot,
+    )?;
+    reached(EpochResetStep::HistoryRetired)?;
     Ok(())
 }
 
-/// Production atomic installer used after a signed snapshot manifest has
-/// been verified. Existing retained branches that are descendants of the
-/// incoming checkpoint frontier are preserved (including offline local
-/// edits reached incrementally); a local head that is genuinely
-/// disconnected from the frontier -- this device was offline and edited
-/// while a peer pruned past their shared ancestor -- is squashed into one
-/// new change re-signed with `local_emitter` and re-parented onto the new
-/// frontier, rather than discarded. `local_emitter` is only needed for
-/// that case; pass `None` when the caller has no signing key on hand (a
-/// disconnected offline branch then falls back to the old fail-closed
-/// behavior: refuse the install rather than silently drop the edit).
-/// Preserved/squashed descendants are left unapplied so the ordinary DAG
-/// projection recovery path replays them on top of the installed baseline.
-///
-/// `local_auth` is the caller's own already-resolved
-/// `local_emission_auth(group_id)` result -- a live, `SyncState`-instance-
-/// scoped signing-policy lookup that must run *before* this function (and
-/// before the caller's own transaction opens), never inside it. Must be
-/// `Some` whenever `local_emitter` is `Some` (the caller's own
-/// responsibility; this function only consumes the already-resolved value
-/// when an offline branch actually needs re-signing).
-pub fn install_rebootstrap_snapshot(
-    tx: &rusqlite::Transaction<'_>,
-    manifest: &SnapshotManifest,
-    snapshot_bytes: &[u8],
-    local_emitter: Option<&ChangeEmitter>,
-    local_auth: Option<ChangeAuth>,
-) -> Result<(), SyncSqliteError> {
-    let snapshot = RebootstrapSnapshot::decode(snapshot_bytes)?;
-    snapshot.validate_against_checkpoint(&manifest.checkpoint)?;
-    if snapshot.group_id != manifest.group_id {
-        return Err(SyncSqliteError::CorruptState(
-            "re-bootstrap manifest and snapshot group disagree".into(),
-        ));
-    }
-
-    init_rebootstrap_schema(tx)?;
-    let group_id = manifest.group_id.as_str();
-    let frontier: HashSet<ChangeHash> = manifest.checkpoint.frontier.iter().copied().collect();
-
-    // Rollback/fork protection: an independently-valid manifest for
-    // this group (a replayed response, an out-of-order delivery, a
-    // stale peer, or a genuinely diverged fork from another
-    // authorized writer) must not be installed unless it provably,
-    // directly extends the HistoryBase this device currently has --
-    // `change_checkpoints.seq` alone cannot prove this, it is
-    // reassigned locally by whoever installs a manifest and proves
-    // nothing about the *signer's* actual causal history. A bare
-    // monotonic counter is not sufficient either: two devices'
-    // local compaction counts can diverge for a perfectly
-    // causally-connected lineage (ordinary incremental DAG sync
-    // never touches it), and an unrelated fork can trivially carry
-    // a higher count. `manifest.previous_checkpoint_hash` is a
-    // signed one-hop hash-chain link, checked here, first, before
-    // any other mutation: it must equal exactly what this device
-    // currently has installed, or the incoming checkpoint itself
-    // must already equal what's installed (a harmless idempotent
-    // re-install). A group that has never crossed a compaction/
-    // re-bootstrap boundary before (no existing row at all) has
-    // nothing to extend or fork away from -- any first manifest is
-    // accepted. A receiver more than one compaction behind the
-    // signer must catch up via successive re-bootstrap rounds
-    // rather than skipping ahead on an unverified claim.
-    let current_checkpoint_hash: Option<Vec<u8>> = tx
-        .query_row(
-            "SELECT checkpoint_hash FROM group_history_bases WHERE group_id = ?1",
-            [group_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if let Some(current_checkpoint_hash) = &current_checkpoint_hash {
-        let incoming_checkpoint_hash = manifest.checkpoint.checkpoint_hash();
-        let is_idempotent_reinstall =
-            current_checkpoint_hash.as_slice() == &incoming_checkpoint_hash.0[..];
-        let is_direct_advance = manifest
-            .previous_checkpoint_hash
-            .is_some_and(|hash| hash[..] == current_checkpoint_hash[..]);
-        if !is_idempotent_reinstall && !is_direct_advance {
-            return Err(SyncSqliteError::CorruptState(format!(
-                "re-bootstrap manifest for group {group_id} does not directly extend \
-                 (previous_checkpoint_hash does not match) the currently installed \
-                 HistoryBase; refusing to roll back, fork, or skip ahead without proof \
-                 of continuous lineage"
-            )));
-        }
-    }
-
-    let boundary_parents: HashSet<ChangeHash> =
-        snapshot.boundary_parent_auth.iter().map(|edge| edge.parent_hash).collect();
-    let reachability =
-        retained_descendants_reaching_frontier(tx, group_id, &frontier, &boundary_parents)?;
-    if !reachability.offline_branches.is_empty() && local_emitter.is_none() {
-        let head = reachability.offline_branches[0].head;
-        return Err(SyncSqliteError::CorruptState(format!(
-            "local retained head {} does not descend from incoming checkpoint frontier \
-             and no local signing key was provided to re-emit its offline edits; \
-             refusing to mix HistoryBases",
-            head.to_hex()
-        )));
-    }
-    let retained = reachability.retained;
-    replace_group_files_from_snapshot(tx, group_id, &snapshot.files)?;
-
-    // Remove the old base while retaining only branches demonstrably
-    // anchored above the incoming frontier. Frontier bodies themselves
-    // are reinstalled from the signed snapshot below. Offline-branch
-    // changes are captured in `reachability.offline_branches` already
-    // (full Change bodies, not just hashes) and are squashed/re-signed
-    // below, so deleting their old rows here loses nothing.
-    let existing_hashes: Vec<Vec<u8>> = {
-        let mut stmt = tx.prepare("SELECT change_hash FROM changes WHERE group_id = ?1")?;
-        let rows = stmt.query_map([group_id], |row| row.get(0))?;
-        rows.collect::<Result<_, _>>()?
-    };
-    for hash_bytes in existing_hashes {
-        let Ok(array) = <[u8; 32]>::try_from(hash_bytes.as_slice()) else {
-            return Err(SyncSqliteError::CorruptState(
-                "stored change hash is not 32 bytes during re-bootstrap".into(),
-            ));
-        };
-        let hash = ChangeHash(array);
-        if !retained.contains(&hash) && !frontier.contains(&hash) {
-            tx.execute(
-                "DELETE FROM change_file_versions WHERE group_id = ?1 AND change_hash = ?2",
-                params![group_id, &hash.0[..]],
-            )?;
-            tx.execute("DELETE FROM changes WHERE change_hash = ?1", [&hash.0[..]])?;
-        }
-    }
-    tx.execute("DELETE FROM orphan_changes WHERE group_id = ?1", [group_id])?;
-    tx.execute("DELETE FROM device_frontier WHERE group_id = ?1", [group_id])?;
-
-    // The checkpoint insert trigger normally opens a prune context. An
-    // install is a base replacement, not evidence that every discarded
-    // local row was intentionally pruned by this checkpoint, so close
-    // that context before deleting/rebuilding any ancestry rows.
-    let checkpoint_hash = manifest.checkpoint.checkpoint_hash();
-    let next_seq: i64 = tx.query_row(
+/// Records `checkpoint` as the group's newest, and closes the prune context
+/// its insertion opens: nothing deleted after it is a prune that leaves a
+/// stub behind.
+fn record_checkpoint(conn: &Connection, checkpoint: &Checkpoint) -> Result<(), SyncSqliteError> {
+    let group_id = checkpoint.group_id.as_str();
+    let next_seq: i64 = conn.query_row(
         "SELECT COALESCE(MAX(seq), 0) + 1 FROM change_checkpoints WHERE group_id = ?1",
         [group_id],
         |row| row.get(0),
     )?;
-    tx.execute(
+    conn.execute(
         "INSERT OR REPLACE INTO change_checkpoints \
          (checkpoint_hash, group_id, snapshot_hash, encoded, seq) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
-            &checkpoint_hash.0[..],
+            &checkpoint.checkpoint_hash().0[..],
             group_id,
-            &manifest.checkpoint.snapshot_hash[..],
-            manifest.checkpoint.canonical_encoding(),
+            &checkpoint.snapshot_hash[..],
+            checkpoint.canonical_encoding(),
             next_seq,
         ],
     )?;
-    tx.execute("DELETE FROM active_prune_context WHERE group_id = ?1", [group_id])?;
+    conn.execute("DELETE FROM active_prune_context WHERE group_id = ?1", [group_id])?;
+    Ok(())
+}
 
-    install_snapshot_frontier(tx, &manifest.checkpoint, &snapshot)?;
+/// Removes every change of `group_id` -- exactly `absorbed` -- and every row
+/// derived from one, leaving what `base` carries.
+///
+/// Nothing that names an absorbed change is kept as history: not a parent
+/// edge, a head, a path effect, a prune stub, an orphan waiting on the
+/// replaced history, a peer's acknowledged frontier, a conflict copy's
+/// provenance, an interned causal basis or the materialized generation
+/// that used it. A change arriving later that names an absorbed one is
+/// either written on the replaced history, and refused as another history,
+/// or names what it cannot have seen here.
+///
+/// A refusal decided against the replaced history (a change refused for
+/// being written on another one) is dropped with it: it already stopped
+/// standing when the group left that history.
+///
+/// Kept: the content of every row the base carries. Each version its rows
+/// hold stays stored, and stays linked to a change that authored it, whose
+/// authorization evidence is kept while a file row or a version link names
+/// that change (`authorization_witness_gc` collects only what nothing
+/// retained names) -- so the content stays servable with the change gone.
+fn retire_absorbed_history(
+    tx: &rusqlite::Transaction<'_>,
+    group_id: &str,
+    base: &HistoryBase,
+    absorbed: &[ChangeHash],
+    snapshot: &RebootstrapSnapshot,
+) -> Result<(), SyncSqliteError> {
+    let mut retained = seal::retained_change_hashes(tx, group_id)?;
+    retained.sort();
+    let mut expected = absorbed.to_vec();
+    expected.sort();
+    expected.dedup();
+    if retained != expected {
+        return Err(SyncSqliteError::CorruptState(format!(
+            "base {} of group {group_id} absorbs {} changes but the group retains {}; a base \
+             replaces the whole history below it",
+            base.to_hex(),
+            expected.len(),
+            retained.len()
+        )));
+    }
+    let absorbed: HashSet<ChangeHash> = expected.into_iter().collect();
 
-    // Squash every offline-diverged branch into one new change per
-    // branch, re-parented onto the full new frontier and re-signed
-    // with this device's own key -- the original signed `Change`
-    // cannot simply be reparented (`parents` is part of its signed,
-    // hashed bytes), so a fresh signature is the only valid way to
-    // carry the edit forward. Must run after `install_snapshot_frontier`
-    // (the frontier changes it parents onto must already be present)
-    // and before `rebuild_change_file_version_relations`/
-    // `rebuild_group_heads` below (both recompute their state from
-    // `changes`, so the squashed change must already be in it).
-    for branch in &reachability.offline_branches {
-        let emitter = local_emitter
-            .expect("checked above: offline_branches is non-empty only when local_emitter is Some");
-        let auth =
-            local_auth.expect("checked above: local_auth is Some whenever local_emitter is Some");
-        let ops = squash_offline_ops(&branch.chain);
-        if ops.is_empty() {
+    // Links first, while the rows that say who authored what are at hand.
+    // One link per version: any change whose evidence authorized the
+    // version justifies serving it, and a version already linked -- by an
+    // earlier seal, say -- keeps the link it has.
+    for file in &snapshot.files {
+        let Some(author) = file.authoring_change_hash else { continue };
+        if !absorbed.contains(&author) {
             continue;
         }
-        crate::dag_store::emit_local_change_onto(
-            tx,
-            group_id,
-            manifest.checkpoint.frontier.clone(),
-            ops,
-            auth,
-            emitter,
+        let version = FileVersion::from_index_row(
+            file.record.blocks.clone(),
+            file.record.size,
+            file.record.mtime_unix_nanos,
+            file.record_kind,
+            file.unix_mode,
+            file.symlink_target.clone(),
+            file.xattrs.clone(),
+        );
+        let linked: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pruned_published_change_versions \
+             WHERE group_id = ?1 AND version_hash = ?2)",
+            params![group_id, &version.version_hash.0[..]],
+            |row| row.get(0),
         )?;
-    }
-
-    for encoded in &snapshot.file_versions {
-        let version = decode_stored_file_version(encoded)?;
-        crate::dag_store::put_file_version(tx, group_id, &version)?;
-        crate::dag_store::record_compacted_file_version_authorization(
-            tx,
-            group_id,
-            &version.version_hash,
-        )?;
-    }
-
-    rebuild_change_file_version_relations(tx, group_id)?;
-    rebuild_group_heads(tx, group_id)?;
-
-    // The time-index counterpart of the head-set rebuild just above, and
-    // deliberately right after it rather than earlier in this function.
-    //
-    // Reset first, with the same whole-group scoping as the `orphan_changes`
-    // /`device_frontier` deletes and for the same reason: an installed
-    // HistoryBase replaces this group's local history outright, so every
-    // frontier snapshot recorded against the old base describes a point this
-    // device can no longer reconstruct. Left behind, those rows would be
-    // unbounded stale state naming changes that no longer exist -- and
-    // `dag_store::frontier_heads_at_or_before` would hand one back as an
-    // answer.
-    //
-    // Then re-record exactly one snapshot, because the reset alone is not a
-    // finished job: `frontier_heads_at_or_before` returns `None` when it
-    // finds no row, and its contract reads that as "this group has no
-    // admission history at or before the target". After an install that is
-    // false -- the group has a frontier, it is simply not indexed -- and it
-    // would stay false until the group's next ordinary admission.
-    //
-    // The placement is what makes the recorded row correct.
-    // `record_admission_time_index` reads `group_heads` live, so a call
-    // before `rebuild_group_heads` would capture whatever head-set the
-    // install had not finished replacing yet. That is also why the offline-
-    // branch squash's own admissions (which run before the rebuild, and do
-    // record time-index rows) are cleared here rather than preserved: they
-    // describe a head-set the rebuild then supersedes. One correct snapshot
-    // of the frontier this install actually produced -- not zero, and not a
-    // stale one.
-    tx.execute("DELETE FROM change_time_index WHERE group_id = ?1", [group_id])?;
-    crate::dag_store::record_admission_time_index(
-        tx,
-        group_id,
-        crate::dag_store::now_unix_nanos(),
-    )?;
-
-    // Reconcile serving authorization against the newly-installed
-    // HistoryBase. The loop above only *adds* to `file_versions`/
-    // `compacted_file_version_authorization` (`INSERT OR IGNORE`),
-    // so old-HistoryBase rows from a prior compaction lineage would
-    // otherwise survive re-bootstrap: `group_file_version_references_block`'s
-    // compacted-authorization fallback could then keep authorizing
-    // serving of content this new HistoryBase no longer retains.
-    // The authorized set is exactly the snapshot's own file versions
-    // plus whatever `change_file_versions` (just rebuilt above)
-    // shows the retained descendants still reference — replace the
-    // group's authorization table with precisely that set, then
-    // sweep now-unauthorized `file_versions` rows.
-    // `group_block_provenance` is deliberately left untouched: it is
-    // block-level and group-membership-scoped by design, not
-    // version-scoped, so it does not participate in this
-    // reconciliation.
-    let mut authorized_versions: HashSet<VersionHash> = HashSet::new();
-    for encoded in &snapshot.file_versions {
-        authorized_versions.insert(decode_stored_file_version(encoded)?.version_hash);
-    }
-    {
-        let mut stmt = tx.prepare(
-            "SELECT DISTINCT version_hash FROM change_file_versions WHERE group_id = ?1",
-        )?;
-        let rows = stmt.query_map([group_id], |row| row.get::<_, Vec<u8>>(0))?;
-        for row in rows {
-            let bytes = row?;
-            let array: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-                SyncSqliteError::CorruptState(
-                    "stored change_file_versions version hash is not 32 bytes".into(),
-                )
-            })?;
-            authorized_versions.insert(VersionHash(array));
+        if !linked {
+            crate::dag_store::record_pruned_published_change_version(
+                tx,
+                group_id,
+                &version.version_hash,
+                &author,
+            )?;
         }
-    }
-    tx.execute("DELETE FROM compacted_file_version_authorization WHERE group_id = ?1", [group_id])?;
-    for version_hash in &authorized_versions {
-        crate::dag_store::record_compacted_file_version_authorization(tx, group_id, version_hash)?;
-    }
-    crate::dag_store::sweep_unreferenced_file_versions(tx, group_id)?;
-
-    // Snapshot frontier effects are already represented in the baseline
-    // file rows, so the frontier itself is applied. Every retained
-    // descendant is left unapplied so `reproject_unapplied_changes`'s
-    // ordinary backstop replays it on top of the installed baseline.
-    tx.execute("UPDATE changes SET applied = 0 WHERE group_id = ?1", [group_id])?;
-    for hash in &manifest.checkpoint.frontier {
-        tx.execute(
-            "UPDATE changes SET applied = 1 WHERE group_id = ?1 AND change_hash = ?2",
-            params![group_id, &hash.0[..]],
-        )?;
     }
 
     tx.execute(
-        "INSERT OR REPLACE INTO change_checkpoint_snapshots \
-         (checkpoint_hash, group_id, snapshot) VALUES (?1, ?2, ?3)",
-        params![&checkpoint_hash.0[..], group_id, snapshot_bytes],
+        "DELETE FROM change_parents WHERE child_hash IN \
+           (SELECT change_hash FROM changes WHERE group_id = ?1 \
+            UNION ALL SELECT change_hash FROM orphan_changes WHERE group_id = ?1)",
+        [group_id],
     )?;
-    persist_history_base_and_boundary(
+    for table in [
+        "change_file_versions",
+        "changes",
+        "group_heads",
+        "orphan_changes",
+        "device_frontier",
+        "pruned_change_parents",
+        "pruned_changes",
+        "change_time_index",
+    ] {
+        tx.execute(&format!("DELETE FROM {table} WHERE group_id = ?1"), [group_id])?;
+    }
+    crate::dag_store::rebuild_group_path_frontier(tx, group_id)?;
+    crate::dag_store::init_conflict_copy_provenance_schema(tx)?;
+    tx.execute("DELETE FROM conflict_copy_provenance WHERE group_id = ?1", [group_id])?;
+    crate::materialized_generation::forget_group_materialized_generations(
         tx,
-        &manifest.checkpoint,
-        &snapshot,
-        manifest.previous_checkpoint_hash,
+        group_id,
+        "history-sealed",
+        crate::dag_store::now_unix_nanos(),
+    )?;
+    tx.execute(
+        "DELETE FROM causal_basis_members WHERE basis_id IN \
+           (SELECT basis_id FROM causal_basis_sets WHERE group_id = ?1)",
+        [group_id],
+    )?;
+    tx.execute("DELETE FROM causal_basis_sets WHERE group_id = ?1", [group_id])?;
+    tx.execute(
+        "DELETE FROM rejected_changes WHERE group_id = ?1 \
+           AND refused_on_epoch IS NOT NULL AND refused_on_epoch != ?2",
+        params![group_id, &base.0[..]],
+    )?;
+
+    // Versions nothing retained references any more go; then every version
+    // the snapshot carries is put back, the content of every head the base
+    // carries included.
+    crate::dag_store::sweep_unreferenced_file_versions(tx, group_id)?;
+    for encoded in &snapshot.file_versions {
+        crate::dag_store::put_file_version(tx, group_id, &decode_stored_file_version(encoded)?)?;
+    }
+    Ok(())
+}
+
+/// A Lamport value from a snapshot as the integer it is stored as. The
+/// snapshot refuses values beyond this range when it is built or decoded;
+/// this keeps a value that got past that from being stored wrapped negative.
+fn storable_lamport(lamport: u64) -> Result<i64, SyncSqliteError> {
+    i64::try_from(lamport).map_err(|_| {
+        SyncSqliteError::CorruptState(format!(
+            "history base Lamport value {lamport} is beyond the storable range"
+        ))
+    })
+}
+
+/// Refuses a base that does not carry every author in `local` at least as
+/// far as `local` holds it: at a later position, or at the same position
+/// attested by the same change.
+fn require_base_carries_local_authors(
+    group_id: &str,
+    carried: &[SnapshotAuthorState],
+    local: &[SnapshotAuthorState],
+) -> Result<(), SyncSqliteError> {
+    for held in local {
+        let dominated = carried.iter().any(|author| {
+            author.device_id == held.device_id
+                && (author.watermark > held.watermark
+                    || (author.watermark == held.watermark
+                        && author.tip_change_hash == held.tip_change_hash))
+        });
+        if !dominated {
+            return Err(SyncSqliteError::HistoryBaseInstallDoesNotCarryAuthor {
+                group_id: group_id.to_owned(),
+                device_id: held.device_id.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The rows a base carries, in place of the group's, and every version
+/// they and its summary name. The rows are held where the disk under them still belongs to
+/// the rows they replaced (see [`replace_group_files_from_snapshot`]).
+fn install_base_rows(
+    tx: &rusqlite::Transaction<'_>,
+    group_id: &str,
+    snapshot: &RebootstrapSnapshot,
+) -> Result<(), SyncSqliteError> {
+    replace_group_files_from_snapshot(tx, group_id, &snapshot.files)?;
+    for encoded in &snapshot.file_versions {
+        let version = decode_stored_file_version(encoded)?;
+        crate::dag_store::put_file_version(tx, group_id, &version)?;
+    }
+    Ok(())
+}
+
+/// Writes the base's causal summary beside the base itself, replacing
+/// whatever the previous base for this group left behind.
+///
+/// Scoped to the group and then keyed by the base, so the rows can never
+/// be read as belonging to a base this device no longer has: a summary
+/// left over from a replaced base would describe positions and heads from
+/// a history this device has already thrown away.
+fn persist_history_base_summary(
+    conn: &Connection,
+    group_id: &str,
+    history_base: &HistoryBase,
+    snapshot: &RebootstrapSnapshot,
+) -> Result<(), SyncSqliteError> {
+    for table in [
+        "history_base_author_state",
+        "history_base_path_heads",
+        "history_base_carried_authors",
+        "history_base_meta",
+    ] {
+        conn.execute(&format!("DELETE FROM {table} WHERE group_id = ?1"), [group_id])?;
+    }
+    for author in &snapshot.author_state {
+        conn.execute(
+            "INSERT INTO history_base_author_state \
+             (group_id, base_hash, device_id, watermark, tip_change_hash) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                group_id,
+                &history_base.0[..],
+                &author.device_id,
+                author.watermark.get() as i64,
+                &author.tip_change_hash.0[..],
+            ],
+        )?;
+    }
+    for head in &snapshot.path_heads {
+        conn.execute(
+            "INSERT INTO history_base_path_heads \
+             (group_id, base_hash, path, change_hash, device_id, author_seq, lamport, \
+              version_hash, naming_device_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                group_id,
+                &history_base.0[..],
+                &head.path,
+                &head.change_hash.0[..],
+                &head.device_id,
+                head.author_seq.get() as i64,
+                storable_lamport(head.lamport)?,
+                &head.version_hash.0[..],
+                &head.naming_device_id,
+            ],
+        )?;
+    }
+    for author in snapshot.files.iter().filter_map(|file| file.authoring_change_hash) {
+        conn.execute(
+            "INSERT OR IGNORE INTO history_base_carried_authors \
+             (group_id, base_hash, change_hash) VALUES (?1, ?2, ?3)",
+            params![group_id, &history_base.0[..], &author.0[..]],
+        )?;
+    }
+    conn.execute(
+        "INSERT INTO history_base_meta (group_id, base_hash, lamport_ceiling) \
+         VALUES (?1, ?2, ?3)",
+        params![group_id, &history_base.0[..], storable_lamport(snapshot.lamport_ceiling)?],
     )?;
     Ok(())
 }
 
-fn read_snapshot_files(
-    conn: &Connection,
-    group_id: &str,
-) -> Result<Vec<SnapshotFile>, SyncSqliteError> {
-    let mut stmt = conn.prepare(
-        "SELECT path, size, mtime_unix_nanos, blocks_json, deleted, \
-                version_seq, state, origin_device_id, record_kind, symlink_target, \
-                unix_mode, symlink_out_of_root, xattrs_json \
-         FROM files WHERE group_id = ?1 ORDER BY path, version_seq",
-    )?;
-    let rows = stmt.query_map([group_id], |row| {
-        let blocks_json: String = row.get(3)?;
-        let blocks: Vec<yadorilink_replica_domain::file::BlockInfo> =
-            serde_json::from_str(&blocks_json).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    3,
-                    rusqlite::types::Type::Text,
-                    Box::new(error),
-                )
-            })?;
-        let state_text: String = row.get(6)?;
-        let state = SnapshotVersionState::from_db_str(&state_text).ok_or_else(|| {
-            rusqlite::Error::FromSqlConversionFailure(
-                6,
-                rusqlite::types::Type::Text,
-                Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("unknown file version state {state_text}"),
-                )),
-            )
-        })?;
-        Ok(SnapshotFile {
-            record: yadorilink_replica_domain::file::FileRecord {
-                path: row.get(0)?,
-                size: row.get::<_, i64>(1)? as u64,
-                mtime_unix_nanos: row.get(2)?,
-                blocks,
-                deleted: row.get::<_, i64>(4)? != 0,
-            },
-            version_seq: row.get(5)?,
-            state,
-            origin_device_id: row.get(7)?,
-            record_kind: yadorilink_replica_domain::file::RecordKind::from_db_str(
-                &row.get::<_, String>(8)?,
-            ),
-            symlink_target: row.get(9)?,
-            unix_mode: crate::file_index::decode_unix_mode_column(row.get::<_, i64>(10)?),
-            symlink_out_of_root: row.get::<_, i64>(11)? != 0,
-            xattrs: {
-                let xattrs_json: String = row.get(12)?;
-                crate::file_index::decode_xattrs_column(&xattrs_json).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        12,
-                        rusqlite::types::Type::Text,
-                        Box::new(error),
-                    )
-                })?
-            },
-        })
-    })?;
-    Ok(rows.collect::<Result<_, _>>()?)
-}
-
-fn persist_history_base_and_boundary(
+fn persist_history_base(
     conn: &Connection,
     checkpoint: &Checkpoint,
     snapshot: &RebootstrapSnapshot,
@@ -855,27 +1404,19 @@ fn persist_history_base_and_boundary(
             previous_checkpoint_hash.as_ref().map(|h| &h[..]),
         ],
     )?;
-    conn.execute(
-        "DELETE FROM history_boundary_parent_auth WHERE group_id = ?1",
-        [checkpoint.group_id.as_str()],
-    )?;
-    for edge in &snapshot.boundary_parent_auth {
-        conn.execute(
-            "INSERT INTO history_boundary_parent_auth \
-             (group_id, checkpoint_hash, child_hash, parent_hash, parent_lamport, parent_auth_seq, parent_auth_epoch) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                checkpoint.group_id.as_str(),
-                &checkpoint_hash.0[..],
-                &edge.child_hash.0[..],
-                &edge.parent_hash.0[..],
-                edge.parent_lamport as i64,
-                edge.parent_auth_seq as i64,
-                edge.parent_auth_epoch as i64,
-            ],
-        )?;
-    }
-    Ok(())
+    persist_history_base_summary(conn, checkpoint.group_id.as_str(), &history_base, snapshot)?;
+    // Every author whose position here is the one this base carries now
+    // resumes from the base: the change that attained that position is
+    // absorbed into it, and the next change links to the base through its
+    // signed history epoch. Last, after every position the install or seal
+    // restores has been written, so only positions the base really carries
+    // are matched.
+    crate::dag_store::author_chain::anchor_carried_positions_on_base(
+        conn,
+        checkpoint.group_id.as_str(),
+        &history_base,
+        &snapshot.author_state,
+    )
 }
 
 /// A rebootstrap-from-peer-snapshot install (currently unreachable in
@@ -950,6 +1491,11 @@ fn replace_group_files_from_snapshot(
         map
     };
 
+    // What this device had placed, read before the rows describing it go:
+    // the disk still holds it after this function returns, and
+    // `settle_replaced_rows` below decides from it which paths the disk now
+    // disagrees with.
+    let replaced = crate::snapshot_install_hold::live_rows(conn, group_id)?;
     conn.execute("DELETE FROM files WHERE group_id = ?1", [group_id])?;
     // One clock read for the whole replace: every row this install writes
     // was admitted by this device at the same instant, because that is
@@ -1010,9 +1556,10 @@ fn replace_group_files_from_snapshot(
              (group_id, path, size, mtime_unix_nanos, blocks_json, deleted, \
               version_seq, state, origin_device_id, materialization_state, pinned, \
               record_kind, symlink_target, unix_mode, symlink_out_of_root, \
-              held_reason, held_since_unix_nanos, admitted_at_unix_nanos) \
+              held_reason, held_since_unix_nanos, admitted_at_unix_nanos, xattrs_json, \
+              authoring_change_hash) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-                     ?18)",
+                     ?18, ?19, ?20)",
             params![
                 group_id,
                 &file.record.path,
@@ -1032,16 +1579,31 @@ fn replace_group_files_from_snapshot(
                 held_reason,
                 held_since_unix_nanos,
                 admitted_at_unix_nanos,
+                crate::file_index::encode_xattrs_column(&file.xattrs),
+                file.authoring_change_hash.as_ref().map(|hash| &hash.0[..]),
             ],
         )?;
     }
-    // Separate, non-blocking data-fidelity gap in this same INSERT, not
-    // part of the held/pinned fix above: `file.xattrs` is decoded off the
-    // wire (`SnapshotFile::xattrs`) but never written to `xattrs_json`
-    // here, and `authoring_change_hash`/the placeholder-identity columns
-    // are dropped the same way -- none of these are read anywhere this
-    // function's own callers depend on today, so this is not part of the
-    // P0 tombstone-safety chain, just an accuracy gap worth a follow-up.
+    // A base's rows are per path, so they can name a file `a` and a live
+    // `a/x` at once, which no filesystem can hold. The index takes the
+    // namespace projection's shape instead, as the reconcile pass would
+    // leave it: `a` is a directory and its file sits at its copy name.
+    let relocated: HashMap<String, String> =
+        crate::snapshot_install_hold::relocate_rows_displaced_by_descendants(conn, group_id)?
+            .into_iter()
+            .collect();
+
+    // The rows are replaced; the disk is not, and cannot be in this
+    // transaction. Every path whose installed row places something other
+    // than what this device had placed is held here, atomically with the
+    // replacement, until a reconciliation pass has looked at its disk. See
+    // `crate::snapshot_install_hold` for what that hold stops and why.
+    crate::snapshot_install_hold::settle_replaced_rows(
+        conn,
+        group_id,
+        &replaced,
+        admitted_at_unix_nanos.unwrap_or_else(crate::dag_store::now_unix_nanos),
+    )?;
 
     // Hard, code-enforced half of this fix, not just the apply logic
     // above: re-reads the ACTUAL persisted state (a fresh SELECT, not the
@@ -1081,8 +1643,10 @@ fn replace_group_files_from_snapshot(
             if !still_live_current {
                 continue;
             }
+            // A relocated row carries its local-only state to its copy name.
+            let persisted_path = relocated.get(path).unwrap_or(path);
             let (persisted_held, persisted_since, persisted_pinned) =
-                persisted.get(path).cloned().unwrap_or((None, None, false));
+                persisted.get(persisted_path).cloned().unwrap_or((None, None, false));
             // `pinned` is checked unconditionally here -- NOT gated on
             // `captured_deleted` -- matching the apply logic above: a pin
             // must survive even when the captured row was itself already
@@ -1123,355 +1687,9 @@ fn replace_group_files_from_snapshot(
             );
         }
     }
+    // Read only by the debug check above.
+    let _ = relocated;
 
-    Ok(())
-}
-
-/// A local head that does not descend from an incoming checkpoint frontier
-/// (the offline-diverged-branch case re-bootstrap exists to rescue: this
-/// device made local edits while disconnected, and a peer pruned past their
-/// shared ancestor), together with its full local-only ancestry captured
-/// before the old base is deleted. `chain` is ordered oldest-first
-/// (ascending lamport, ties broken by hash for determinism) -- ready to
-/// squash into one new change re-parented onto the new frontier.
-struct OfflineBranch {
-    head: ChangeHash,
-    chain: Vec<Change>,
-}
-
-struct FrontierReachability {
-    /// Retained descendants of the incoming frontier, left unapplied for the
-    /// ordinary reprojection backstop to replay.
-    retained: HashSet<ChangeHash>,
-    /// Local heads that do not descend from the frontier at all.
-    offline_branches: Vec<OfflineBranch>,
-}
-
-fn retained_descendants_reaching_frontier(
-    conn: &Connection,
-    group_id: &str,
-    frontier: &HashSet<ChangeHash>,
-    boundary_parents: &HashSet<ChangeHash>,
-) -> Result<FrontierReachability, SyncSqliteError> {
-    let rows: Vec<(Vec<u8>, Vec<u8>)> = {
-        let mut stmt =
-            conn.prepare("SELECT change_hash, encoded FROM changes WHERE group_id = ?1")?;
-        let rows = stmt.query_map([group_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
-        rows.collect::<Result<_, _>>()?
-    };
-    if rows.is_empty() {
-        return Ok(FrontierReachability { retained: HashSet::new(), offline_branches: Vec::new() });
-    }
-    let mut changes = HashMap::new();
-    for (hash_bytes, encoded) in rows {
-        let array: [u8; 32] = hash_bytes.as_slice().try_into().map_err(|_| {
-            SyncSqliteError::CorruptState(
-                "stored change hash is not 32 bytes during re-bootstrap".into(),
-            )
-        })?;
-        let hash = ChangeHash(array);
-        let change = decode_stored_change(&encoded)?;
-        if change.compute_hash() != hash {
-            return Err(SyncSqliteError::CorruptState(
-                "stored change bytes disagree with their key during re-bootstrap".into(),
-            ));
-        }
-        changes.insert(hash, change);
-    }
-
-    let heads: Vec<ChangeHash> = crate::dag_store::group_heads(conn, group_id)?;
-    let mut memo: HashMap<ChangeHash, bool> = HashMap::new();
-    fn reaches(
-        hash: ChangeHash,
-        frontier: &HashSet<ChangeHash>,
-        changes: &HashMap<ChangeHash, Change>,
-        memo: &mut HashMap<ChangeHash, bool>,
-        visiting: &mut HashSet<ChangeHash>,
-    ) -> bool {
-        if frontier.contains(&hash) {
-            memo.insert(hash, true);
-            return true;
-        }
-        if let Some(value) = memo.get(&hash) {
-            return *value;
-        }
-        if !visiting.insert(hash) {
-            memo.insert(hash, false);
-            return false;
-        }
-        let result = changes.get(&hash).is_some_and(|change| {
-            change.parents.iter().any(|parent| reaches(*parent, frontier, changes, memo, visiting))
-        });
-        visiting.remove(&hash);
-        memo.insert(hash, result);
-        result
-    }
-
-    // A head that fails to reach the frontier means -- by construction of
-    // `reaches`'s memoized parent walk -- that NO ancestor of it reaches the
-    // frontier either: its entire local ancestry back to the group root is
-    // disconnected from the incoming HistoryBase. That whole chain is offline
-    // edit material to squash and re-emit, not evidence to refuse the install.
-    let mut reaching_heads = Vec::new();
-    let mut offline_heads = Vec::new();
-    for head in &heads {
-        if reaches(*head, frontier, &changes, &mut memo, &mut HashSet::new()) {
-            reaching_heads.push(*head);
-        } else {
-            offline_heads.push(*head);
-        }
-    }
-
-    let mut retained = HashSet::new();
-    let mut stack = reaching_heads;
-    while let Some(hash) = stack.pop() {
-        if !retained.insert(hash) || frontier.contains(&hash) {
-            continue;
-        }
-        if let Some(change) = changes.get(&hash) {
-            for parent in &change.parents {
-                if frontier.contains(parent) || memo.get(parent).copied().unwrap_or(false) {
-                    stack.push(*parent);
-                }
-            }
-        }
-    }
-
-    let mut offline_branches = Vec::new();
-    for head in offline_heads {
-        let mut visited = HashSet::new();
-        let mut branch_stack = vec![head];
-        let mut chain = Vec::new();
-        while let Some(hash) = branch_stack.pop() {
-            if !visited.insert(hash) {
-                continue;
-            }
-            // An ancestor that exactly matches one of the new frontier's own
-            // pruned-boundary parents is proven -- by that same boundary
-            // proof -- to already be incorporated into the new baseline
-            // snapshot. It (and everything at-or-before it) is shared
-            // history, not offline-only material: stop here rather than
-            // re-including already-baked-in ops in the squash, which could
-            // otherwise clobber content the new frontier's own later history
-            // established on the same path after this shared point.
-            if boundary_parents.contains(&hash) {
-                continue;
-            }
-            if let Some(change) = changes.get(&hash) {
-                chain.push(change.clone());
-                for parent in &change.parents {
-                    branch_stack.push(*parent);
-                }
-            }
-        }
-        chain.sort_by_key(|c| (c.lamport, c.compute_hash().0));
-        offline_branches.push(OfflineBranch { head, chain });
-    }
-
-    Ok(FrontierReachability { retained, offline_branches })
-}
-
-/// Squashes an offline-diverged local branch's ops into one final op set per
-/// path, last-write-wins across the chain (already ordered oldest-first).
-/// `FileVersion`/`VersionHash` content is copied forward unchanged -- ops are
-/// content-addressed and independent of lineage, so no transformation is
-/// needed there. A `Move` is folded into a delete-at-source plus an
-/// update-at-destination for squash bookkeeping: the destination's content is
-/// preserved exactly, only the rename's provenance across the squash boundary
-/// is not (a new frontier-attached change is being minted regardless, so nothing
-/// downstream depends on that provenance surviving).
-fn squash_offline_ops(chain: &[Change]) -> Vec<Op> {
-    #[derive(Clone, Copy)]
-    enum PathState {
-        Present { version: VersionHash },
-        Deleted,
-    }
-
-    let mut state: BTreeMap<String, PathState> = BTreeMap::new();
-    for change in chain {
-        for op in &change.ops {
-            match op {
-                Op::Put { path, version, .. } => {
-                    state.insert(
-                        path.as_str().to_string(),
-                        PathState::Present { version: *version },
-                    );
-                }
-                Op::Delete { path } => {
-                    state.insert(path.as_str().to_string(), PathState::Deleted);
-                }
-                Op::Move { from, to, version } => {
-                    state.insert(from.as_str().to_string(), PathState::Deleted);
-                    state.insert(to.as_str().to_string(), PathState::Present { version: *version });
-                }
-            }
-        }
-    }
-
-    // A squashed op's provenance across the squash boundary is not preserved
-    // (see this function's own doc comment) -- whatever `PutOrigin` any
-    // constituent op carried, the final op here is always `Direct`: a
-    // conflict copy's origin (`source_path`/`losing_change`) names a SPECIFIC
-    // historical change, which squashing has already collapsed away by
-    // construction.
-    state
-        .into_iter()
-        .map(|(path, path_state)| match path_state {
-            PathState::Present { version } => {
-                Op::Put { path: SyncPath(path), version, origin: PutOrigin::Direct }
-            }
-            PathState::Deleted => Op::Delete { path: SyncPath(path) },
-        })
-        .collect()
-}
-
-fn install_snapshot_frontier(
-    conn: &Connection,
-    checkpoint: &Checkpoint,
-    snapshot: &RebootstrapSnapshot,
-) -> Result<(), SyncSqliteError> {
-    let group_id = checkpoint.group_id.as_str();
-    // `boundary_parent_auth` is the exhaustive, authoritative list of parent
-    // edges that point at pruned checkpoint-boundary ancestors rather than at
-    // another live frontier member. Those edges belong exclusively in
-    // `pruned_change_parents` (written below); a frontier change's remaining
-    // parents (other frontier members) are the only ones that belong in the
-    // ordinary live `change_parents` table. The startup integrity validator
-    // (`retained_history_integrity::retained_parent_edges_match`) treats live
-    // and pruned edges as mutually exclusive per (child, parent) pair and
-    // fail-closes on reopen if both exist for the same pair.
-    let boundary_edges: std::collections::HashSet<(ChangeHash, ChangeHash)> = snapshot
-        .boundary_parent_auth
-        .iter()
-        .map(|edge| (edge.child_hash, edge.parent_hash))
-        .collect();
-    for encoded in &snapshot.frontier_changes {
-        let change = decode_stored_change(encoded)?;
-        let hash = change.compute_hash();
-        conn.execute(
-            "INSERT OR REPLACE INTO changes \
-             (change_hash, group_id, device_id, lamport, encoded, applied, authenticated_header) \
-             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)",
-            params![
-                &hash.0[..],
-                group_id,
-                change.device_id.as_str(),
-                change.lamport as i64,
-                encoded,
-                change.authenticated_header_encoding(),
-            ],
-        )?;
-        conn.execute("DELETE FROM change_parents WHERE child_hash = ?1", [&hash.0[..]])?;
-        for parent in &change.parents {
-            if boundary_edges.contains(&(hash, *parent)) {
-                continue;
-            }
-            conn.execute(
-                "INSERT OR IGNORE INTO change_parents (child_hash, parent_hash) VALUES (?1, ?2)",
-                params![&hash.0[..], &parent.0[..]],
-            )?;
-        }
-        // Records provenance for any `ConflictCopy` puts this frontier change
-        // carries, so a later LOCAL edit's idempotency check
-        // (`conflict_copy_already_provisioned`) does not needlessly re-derive
-        // an obligation this checkpoint already discharged. Deliberately does
-        // NOT call `validate_carrier_conflict_copy_ops` here: this change's
-        // `ConflictCopy` op may reference a `losing_change` that was itself
-        // pruned before this checkpoint, reachable only through
-        // `pruned_change_parents`/`boundary_parent_auth` (written just below,
-        // AFTER this loop) rather than the live `change_parents` table the
-        // frontier-resolution walk uses -- validating here could reject a
-        // perfectly legitimate installed change for a change_hash it cannot
-        // yet see. The checkpoint/manifest itself is authenticated separately
-        // (`SnapshotManifest::new_signed`); this is only a completeness
-        // optimization, not a trust boundary.
-        crate::dag_store::record_conflict_copy_ops_provenance(conn, group_id, &change)?;
-    }
-
-    // Recreate the compact structural proof for direct parents omitted from the
-    // snapshot. This is bounded to boundary edges, not the full pruned prefix.
-    let checkpoint_hash = checkpoint.checkpoint_hash();
-    for edge in &snapshot.boundary_parent_auth {
-        // `author_identity`/`authenticated_header` are left NULL here: the
-        // compact `BoundaryParentAuth` wire record never carried this
-        // ancestor's device id or full signed body to this replica in the
-        // first place (only its Lamport/authorization stamp, enough to
-        // preserve the causal-clock relation across the snapshot boundary
-        // -- see `pruned_changes`'s own column comments for why this is the
-        // one legitimate case those columns are absent).
-        conn.execute(
-            "INSERT OR REPLACE INTO pruned_changes \
-             (group_id, change_hash, checkpoint_hash, lamport, encoding_version) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                group_id,
-                &edge.parent_hash.0[..],
-                &checkpoint_hash.0[..],
-                edge.parent_lamport as i64,
-                yadorilink_replica_domain::change::PRUNED_STUB_ENCODING_VERSION,
-            ],
-        )?;
-        conn.execute(
-            "INSERT OR REPLACE INTO pruned_change_parents \
-             (group_id, child_hash, parent_hash, checkpoint_hash) VALUES (?1, ?2, ?3, ?4)",
-            params![
-                group_id,
-                &edge.child_hash.0[..],
-                &edge.parent_hash.0[..],
-                &checkpoint_hash.0[..],
-            ],
-        )?;
-    }
-    Ok(())
-}
-
-fn rebuild_change_file_version_relations(
-    conn: &Connection,
-    group_id: &str,
-) -> Result<(), SyncSqliteError> {
-    conn.execute("DELETE FROM change_file_versions WHERE group_id = ?1", [group_id])?;
-    let changes: Vec<(Vec<u8>, Vec<u8>)> = {
-        let mut stmt =
-            conn.prepare("SELECT change_hash, encoded FROM changes WHERE group_id = ?1")?;
-        let rows = stmt.query_map([group_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
-        rows.collect::<Result<_, _>>()?
-    };
-    for (hash_bytes, encoded) in changes {
-        let hash: [u8; 32] = hash_bytes.as_slice().try_into().map_err(|_| {
-            SyncSqliteError::CorruptState("stored change hash is not 32 bytes".into())
-        })?;
-        let change = decode_stored_change(&encoded)?;
-        for op in &change.ops {
-            if let Some(version_hash) = op_version_hash(op) {
-                conn.execute(
-                    "INSERT OR IGNORE INTO change_file_versions \
-                     (group_id, change_hash, version_hash) VALUES (?1, ?2, ?3)",
-                    params![group_id, &hash[..], &version_hash.0[..]],
-                )?;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Recomputes `group_heads` for `group_id` from whatever `changes` now
-/// holds. [`install_rebootstrap_snapshot`] resets and re-records the
-/// `change_time_index` counterpart immediately after calling this, because
-/// the snapshot it records is read live from the `group_heads` rows this
-/// function writes -- see the comment at that call.
-fn rebuild_group_heads(conn: &Connection, group_id: &str) -> Result<(), SyncSqliteError> {
-    conn.execute("DELETE FROM group_heads WHERE group_id = ?1", [group_id])?;
-    conn.execute(
-        "INSERT INTO group_heads (group_id, change_hash) \
-         SELECT ?1, c.change_hash FROM changes c \
-         WHERE c.group_id = ?1 \
-           AND NOT EXISTS (\
-             SELECT 1 FROM change_parents cp \
-             JOIN changes child ON child.change_hash = cp.child_hash \
-             WHERE cp.parent_hash = c.change_hash AND child.group_id = ?1\
-           )",
-        [group_id],
-    )?;
     Ok(())
 }
 
@@ -1482,614 +1700,151 @@ fn op_version_hash(op: &Op) -> Option<VersionHash> {
     }
 }
 
-#[cfg(test)]
-mod replace_group_files_from_snapshot_tests {
-    use super::*;
-    use yadorilink_replica_domain::file::{FileRecord, RecordKind};
+/// Installs the witness of every row the snapshot carries: for each
+/// `SnapshotFile` that names an authoring change, installs that change's
+/// witness evidence into `authorization_checkpoints`/`change_authorization`
+/// (idempotent, via the SAME `attach_authorization_evidence_on_conn` a live
+/// Change's receive path uses) and links the file's version to it via
+/// [`crate::dag_store::record_pruned_published_change_version`].
+///
+/// Every row has to be witnessed: a base install keeps no change body
+/// behind, so a witness is the only thing that can vouch for a row.
+///
+/// **Trust boundary**: this function performs NO cryptographic
+/// verification of any witness -- it trusts the caller already did
+/// (`authorization_checkpoint::verify_change_admission`, resolving the
+/// authority key against this device's OWN policy chain, exactly the way
+/// an ordinary received Change is verified). A witness for a change no
+/// file actually needs is simply not installed (this loop only walks what
+/// `files` references, never treats "the witness list" as itself the set to
+/// install).
+fn install_row_witnesses(
+    tx: &rusqlite::Transaction<'_>,
+    group_id: &str,
+    snapshot: &RebootstrapSnapshot,
+) -> Result<(), SyncSqliteError> {
+    let witnesses_by_hash: HashMap<
+        ChangeHash,
+        &yadorilink_replica_engine::rebootstrap_snapshot::PublishedChangeWitness,
+    > = snapshot.published_change_witnesses.iter().map(|w| (w.change_hash, w)).collect();
 
-    /// Full schema: DAG tables first (`yadorilink_sqlite_runtime::
-    /// init_schema` assumes `changes`/`pruned_changes` already exist, per
-    /// its own doc comment), then the real `files` table -- mirrors
-    /// `materialization_state.rs`'s own `held_state_tests::
-    /// open_full_test_db`.
-    fn open_full_test_db() -> Arc<SyncDatabase> {
-        Arc::new(
-            SyncDatabase::open_in_memory(|conn| {
-                crate::dag_store::init_dag_schema(conn).map_err(|e| {
-                    yadorilink_sqlite_runtime::DatabaseError::CorruptSchema(e.to_string())
-                })?;
-                yadorilink_sqlite_runtime::init_schema(conn)
-            })
-            .expect("open in-memory db"),
+    for file in &snapshot.files {
+        let Some(authoring_change_hash) = file.authoring_change_hash else { continue };
+        let Some(witness) = witnesses_by_hash.get(&authoring_change_hash) else {
+            return Err(SyncSqliteError::CorruptState(format!(
+                "history base snapshot retains {} authored by {} with no witness",
+                file.record.path,
+                authoring_change_hash.to_hex(),
+            )));
+        };
+
+        let checkpoint = yadorilink_replica_domain::authorization_checkpoint::decode_checkpoint(
+            &witness.checkpoint_encoded,
         )
-    }
+        .map_err(|error| {
+            SyncSqliteError::CorruptState(format!(
+                "cannot install witness for {}: its checkpoint envelope is undecodable: {error:?}",
+                authoring_change_hash.to_hex()
+            ))
+        })?;
+        let checkpoint_signature: [u8; 64] =
+            witness.checkpoint_signature.as_slice().try_into().map_err(|_| {
+                SyncSqliteError::CorruptState(format!(
+                    "cannot install witness for {}: its checkpoint signature is not 64 bytes",
+                    authoring_change_hash.to_hex()
+                ))
+            })?;
+        crate::dag_store::published_view::attach_authorization_evidence_on_conn(
+            tx,
+            &witness.checkpoint_hash,
+            group_id,
+            checkpoint.device_id.as_str(),
+            checkpoint.checkpoint_seq,
+            &witness.checkpoint_encoded,
+            &checkpoint_signature,
+            &witness.author_signing_public_key,
+            &[(authoring_change_hash, witness.merkle_proof_encoded.clone())],
+        )?;
 
-    fn snapshot_file(path: &str) -> SnapshotFile {
-        SnapshotFile {
-            record: FileRecord {
-                path: path.to_string(),
-                size: 0,
-                mtime_unix_nanos: 0,
-                blocks: vec![],
-                deleted: false,
-            },
-            version_seq: 1,
-            state: SnapshotVersionState::Current,
-            origin_device_id: Some("device-a".to_string()),
-            record_kind: RecordKind::File,
-            symlink_target: None,
-            symlink_out_of_root: false,
-            unix_mode: None,
-            xattrs: Vec::new(),
+        // One link per version, as a seal records them: any change whose
+        // evidence authorized the version justifies serving it, and two
+        // rows can hold one version under two authors (a removal's
+        // tombstone and the write it removed, say).
+        let version = FileVersion::from_index_row(
+            file.record.blocks.clone(),
+            file.record.size,
+            file.record.mtime_unix_nanos,
+            file.record_kind,
+            file.unix_mode,
+            file.symlink_target.clone(),
+            file.xattrs.clone(),
+        );
+        let linked: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pruned_published_change_versions \
+             WHERE group_id = ?1 AND version_hash = ?2)",
+            params![group_id, &version.version_hash.0[..]],
+            |row| row.get(0),
+        )?;
+        if !linked {
+            crate::dag_store::record_pruned_published_change_version(
+                tx,
+                group_id,
+                &version.version_hash,
+                &authoring_change_hash,
+            )?;
         }
     }
-
-    /// The ninth route in the "row claims content is really on disk (or
-    /// genuinely needs protecting) but nothing protects it" bug family:
-    /// `SnapshotFile` (wire-derived, peer-shared) carries no held/pinned
-    /// fields at all, so a rebootstrap-snapshot install's DELETE+re-INSERT
-    /// of `files` must explicitly carry these purely-local columns
-    /// forward itself for a path that survives the install as a live
-    /// current row -- nothing else ever will.
-    #[test]
-    fn a_held_and_pinned_path_survives_a_snapshot_install() {
-        let db = open_full_test_db();
-        let repo = crate::materialization_state::MaterializationStateRepository::new(db.clone());
-        db.write::<_, SyncSqliteError>(|conn| {
-            conn.execute(
-                "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json) \
-                 VALUES ('group-1', 'held.txt', 0, 0, '[]')",
-                [],
-            )?;
-            conn.execute(
-                "UPDATE files SET pinned = 1 WHERE group_id = 'group-1' AND path = 'held.txt'",
-                [],
-            )?;
-            Ok(())
-        })
-        .unwrap();
-        repo.set_held("group-1", "held.txt", "case_collision", 1000).unwrap();
-
-        let files = vec![snapshot_file("held.txt")];
-        db.write::<_, SyncSqliteError>(|conn| {
-            replace_group_files_from_snapshot(conn, "group-1", &files)
-        })
-        .unwrap();
-
-        assert_eq!(
-            repo.get_held_state("group-1", "held.txt").unwrap().map(|h| h.reason),
-            Some("case_collision".to_string()),
-            "a hazard hold must survive a rebootstrap-snapshot install for a path the snapshot \
-             still carries as a live current row"
-        );
-        let pinned: bool = db
-            .read::<_, SyncSqliteError>(|conn| {
-                Ok(conn.query_row(
-                    "SELECT pinned FROM files WHERE group_id = 'group-1' AND path = 'held.txt' \
-                     AND state = 'current'",
-                    [],
-                    |r| r.get::<_, i64>(0),
-                )? != 0)
-            })
-            .unwrap();
-        assert!(pinned, "pinned must survive a rebootstrap-snapshot install the same way");
-    }
-
-    /// The inverse: a path the snapshot no longer carries as a live
-    /// current row must NOT resurrect a stale hold or pin -- there is no
-    /// live row left to protect, and the row is about to be classified
-    /// `hydrated`, not `placeholder`, by this same function's own
-    /// materialization_state branch just above. Covers both shapes of
-    /// "no longer live-current": entirely absent from the snapshot, and
-    /// present but as a `Current`-but-deleted tombstone -- the latter is
-    /// the one that actually exercises `is_live_current`'s own
-    /// `!file.record.deleted` half; the former never reaches that check
-    /// at all (the path is simply never visited by the insert loop),
-    /// which alone would not have caught a regression in that condition.
-    #[test]
-    fn a_held_path_the_snapshot_no_longer_carries_as_current_does_not_resurrect_the_hold() {
-        let db = open_full_test_db();
-        let repo = crate::materialization_state::MaterializationStateRepository::new(db.clone());
-        db.write::<_, SyncSqliteError>(|conn| {
-            conn.execute(
-                "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json) \
-                 VALUES ('group-1', 'gone.txt', 0, 0, '[]')",
-                [],
-            )?;
-            conn.execute(
-                "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json) \
-                 VALUES ('group-1', 'deleted-upstream.txt', 0, 0, '[]')",
-                [],
-            )?;
-            Ok(())
-        })
-        .unwrap();
-        repo.set_held("group-1", "gone.txt", "case_collision", 1000).unwrap();
-        repo.set_held("group-1", "deleted-upstream.txt", "case_collision", 1000).unwrap();
-
-        // "gone.txt" is entirely absent from the incoming snapshot;
-        // "deleted-upstream.txt" IS present, but as a Current-but-deleted
-        // tombstone, not a live row -- the shape `is_live_current` itself
-        // must refuse to treat as still needing hold/pin protection.
-        let mut deleted_file = snapshot_file("deleted-upstream.txt");
-        deleted_file.record.deleted = true;
-        let files = vec![deleted_file];
-        db.write::<_, SyncSqliteError>(|conn| {
-            replace_group_files_from_snapshot(conn, "group-1", &files)
-        })
-        .unwrap();
-
-        assert!(
-            repo.get_held_state("group-1", "gone.txt").unwrap().is_none(),
-            "a path the snapshot no longer mentions at all must not still read as held \
-             afterward"
-        );
-        assert!(
-            repo.get_held_state("group-1", "deleted-upstream.txt").unwrap().is_none(),
-            "a path the snapshot now carries as a deleted tombstone must not still read as \
-             held afterward"
-        );
-    }
-
-    /// `pinned` and `held_reason` are captured under the same condition
-    /// but carried forward differently: a pin is path-keyed user intent,
-    /// not content-keyed, so it must survive a delete-then-resurrect at
-    /// this exact path the same way `upsert_file_in_tx`'s own ordinary
-    /// carry-forward already does unconditionally -- unlike a hold, which
-    /// is meaningless for a row this device itself already believes is
-    /// deleted, and so does NOT survive. This device had "gone-but-
-    /// pinned.txt" pinned and then (per its own local index) deleted it;
-    /// the incoming snapshot now resurrects that exact path as live
-    /// current content. The resurrected row must come back pinned; it
-    /// must NOT come back held.
-    #[test]
-    fn a_pin_survives_a_delete_then_resurrect_but_a_hold_does_not() {
-        let db = open_full_test_db();
-        let repo = crate::materialization_state::MaterializationStateRepository::new(db.clone());
-        db.write::<_, SyncSqliteError>(|conn| {
-            conn.execute(
-                "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json, deleted) \
-                 VALUES ('group-1', 'gone-but-pinned.txt', 0, 0, '[]', 1)",
-                [],
-            )?;
-            conn.execute(
-                "UPDATE files SET pinned = 1 WHERE group_id = 'group-1' AND path = \
-                 'gone-but-pinned.txt'",
-                [],
-            )?;
-            Ok(())
-        })
-        .unwrap();
-        // `set_held` requires no genuine live-row precondition of its own
-        // -- setting it here on an already-`deleted = 1` row directly
-        // models "this device held it, then later (independently) came to
-        // believe it was deleted," the exact stale-combination this test
-        // exists to refuse resurrecting.
-        repo.set_held("group-1", "gone-but-pinned.txt", "case_collision", 1000).unwrap();
-
-        let files = vec![snapshot_file("gone-but-pinned.txt")];
-        db.write::<_, SyncSqliteError>(|conn| {
-            replace_group_files_from_snapshot(conn, "group-1", &files)
-        })
-        .unwrap();
-
-        let pinned: bool = db
-            .read::<_, SyncSqliteError>(|conn| {
-                Ok(conn.query_row(
-                    "SELECT pinned FROM files WHERE group_id = 'group-1' AND \
-                     path = 'gone-but-pinned.txt' AND state = 'current'",
-                    [],
-                    |r| r.get::<_, i64>(0),
-                )? != 0)
-            })
-            .unwrap();
-        assert!(
-            pinned,
-            "a pin must survive a delete-then-resurrect at this path, matching upsert_file_in_tx's \
-             own unconditional carry-forward for the ordinary (non-rebootstrap) case"
-        );
-        assert!(
-            repo.get_held_state("group-1", "gone-but-pinned.txt").unwrap().is_none(),
-            "a hold must NOT survive a delete-then-resurrect -- it protected a row this device \
-             itself already believed was deleted, which is not the same claim as the resurrected \
-             row"
-        );
-    }
+    Ok(())
 }
 
-/// The reset half of a HistoryBase install, exercised through the real
-/// [`install_rebootstrap_snapshot`] entry point rather than through its
-/// individual helpers.
 #[cfg(test)]
-mod install_rebootstrap_snapshot_tests {
-    use super::*;
-    use ed25519_dalek::SigningKey;
-    use yadorilink_replica_domain::file::{FileRecord, RecordKind};
-    use yadorilink_replica_domain::ids::{DeviceId, FolderGroupId};
+mod summary_join_tests;
 
-    /// Full production schema in the production order (`yadorilink_sqlite_
-    /// runtime::init_schema` assumes `changes`/`pruned_changes` already
-    /// exist, per its own doc comment).
-    pub(super) fn open() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::dag_store::init_dag_schema(&conn).unwrap();
-        yadorilink_sqlite_runtime::init_schema(&conn).unwrap();
-        conn
-    }
+#[cfg(test)]
+mod replace_group_files_from_snapshot_tests;
 
-    pub(super) fn snapshot_row(
-        path: &str,
-        version_seq: i64,
-        state: SnapshotVersionState,
-        deleted: bool,
-        size: u64,
-    ) -> SnapshotFile {
-        SnapshotFile {
-            record: FileRecord {
-                path: path.to_string(),
-                size,
-                mtime_unix_nanos: 0,
-                blocks: vec![],
-                deleted,
-            },
-            version_seq,
-            state,
-            origin_device_id: Some("device-a".to_string()),
-            record_kind: RecordKind::File,
-            symlink_target: None,
-            symlink_out_of_root: false,
-            unix_mode: None,
-            xattrs: Vec::new(),
-        }
-    }
+#[cfg(test)]
+mod group_history_summary_tests;
 
-    /// A minimal but genuinely valid install: real `files` rows, and an
-    /// empty checkpoint frontier so no signed frontier change has to be
-    /// fabricated for a test that is not about frontier installation.
-    pub(super) fn install(conn: &mut Connection, group_id: &str, files: Vec<SnapshotFile>) {
-        let group = FolderGroupId(group_id.to_string());
-        let snapshot =
-            RebootstrapSnapshot::new(group.clone(), files, Vec::new(), Vec::new(), Vec::new())
-                .unwrap();
-        let checkpoint = Checkpoint::new(group, Vec::new(), snapshot.snapshot_hash());
-        let manifest = SnapshotManifest::new_signed(
-            checkpoint,
-            Vec::new(),
-            None,
-            DeviceId("device-a".to_string()),
-            &SigningKey::from_bytes(&[7u8; 32]),
-        )
-        .unwrap();
-        let tx = conn.transaction().unwrap();
-        install_rebootstrap_snapshot(&tx, &manifest, &snapshot.canonical_encoding(), None, None)
-            .unwrap();
-        tx.commit().unwrap();
-    }
+/// Installing a base with the atomic epoch reset, and the fixtures the
+/// other install tests build on.
+#[cfg(test)]
+mod base_install_tests;
 
-    /// An installed HistoryBase replaces this group's local history
-    /// outright, so every frontier snapshot recorded against the old base
-    /// describes a point that can no longer be reconstructed. Left behind,
-    /// those rows are unbounded stale state naming changes that no longer
-    /// exist -- and `dag_store::frontier_heads_at_or_before` would hand one
-    /// back as an answer.
-    ///
-    /// Clearing them is only half the job, so this also pins the other
-    /// half: the install must leave behind exactly one snapshot of its own,
-    /// or the group reads as having no admission history at all until its
-    /// next ordinary admission.
-    #[test]
-    fn installing_a_history_base_clears_the_groups_stale_frontier_time_index() {
-        let mut conn = open();
-        for (group_id, admission_seq) in [("group-1", 1i64), ("group-1", 2), ("other", 1)] {
-            conn.execute(
-                "INSERT INTO change_time_index \
-                 (group_id, admission_seq, observed_at_unix_nanos, heads_snapshot) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![group_id, admission_seq, admission_seq * 100, &[0xAAu8; 32][..]],
-            )
-            .unwrap();
-        }
+/// Where an author resumes on an installed base: the base's own carried
+/// position, continued by the change's signed history epoch rather than by
+/// naming the absorbed tip.
+#[cfg(test)]
+mod base_anchored_author_tests;
 
-        install(
-            &mut conn,
-            "group-1",
-            vec![snapshot_row("kept.txt", 1, SnapshotVersionState::Current, false, 10)],
-        );
+/// Where the Lamport clock resumes on an installed base: above the
+/// greatest value the history the base absorbed reached.
+#[cfg(test)]
+mod base_anchored_lamport_tests;
 
-        let count = |group_id: &str| -> i64 {
-            conn.query_row(
-                "SELECT COUNT(*) FROM change_time_index WHERE group_id = ?1",
-                [group_id],
-                |row| row.get(0),
-            )
-            .unwrap()
-        };
-        assert_eq!(
-            count("group-1"),
-            1,
-            "the install must leave exactly its own snapshot behind -- neither the stale rows \
-             recorded against the replaced base, nor nothing at all"
-        );
-        let stale_snapshots: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM change_time_index \
-                 WHERE group_id = 'group-1' AND heads_snapshot = ?1",
-                [&[0xAAu8; 32][..]],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            stale_snapshots, 0,
-            "snapshots recorded against the replaced base must not survive the install"
-        );
-        assert_eq!(
-            count("other"),
-            1,
-            "an unrelated group's time index must not be touched by this group's install"
-        );
-    }
+/// What an install leaves between the rows it replaced and the disk those
+/// rows described.
+#[cfg(test)]
+mod install_disk_hold_tests;
 
-    /// The half that a bare reset cannot cover: after an install the group
-    /// really does have a frontier, so
-    /// `dag_store::frontier_heads_at_or_before` must answer with it rather
-    /// than with `None` -- which its own contract reads as "no admission
-    /// history exists at all", a claim that would be false from the moment
-    /// the install commits until the group's next ordinary admission.
-    ///
-    /// Exercised with a NON-EMPTY frontier specifically: an empty one is
-    /// satisfied by an empty snapshot blob, which cannot tell a correctly
-    /// recorded frontier apart from a wrongly recorded one.
-    #[test]
-    fn an_install_leaves_the_time_index_answering_with_its_own_new_frontier() {
-        let mut conn = open();
-        let group = FolderGroupId("group-1".to_string());
-        let frontier_change = Change::create_signed(
-            Vec::new(),
-            0,
-            ChangeAuth::PLACEHOLDER,
-            DeviceId("device-a".to_string()),
-            group.clone(),
-            vec![Op::Delete { path: SyncPath("gone.txt".to_string()) }],
-            &SigningKey::from_bytes(&[9u8; 32]),
-        );
-        let frontier_hash = frontier_change.compute_hash();
-        let snapshot = RebootstrapSnapshot::new(
-            group.clone(),
-            vec![snapshot_row("kept.txt", 1, SnapshotVersionState::Current, false, 10)],
-            vec![frontier_change.to_wire_bytes()],
-            Vec::new(),
-            Vec::new(),
-        )
-        .unwrap();
-        let checkpoint = Checkpoint::new(group, vec![frontier_hash], snapshot.snapshot_hash());
-        let manifest = SnapshotManifest::new_signed(
-            checkpoint,
-            Vec::new(),
-            None,
-            DeviceId("device-a".to_string()),
-            &SigningKey::from_bytes(&[7u8; 32]),
-        )
-        .unwrap();
+/// Sealing a group's history into a new base: the exact summary it
+/// carries, its preconditions, and where authors resume after it.
+#[cfg(test)]
+mod seal_tests;
 
-        let before_install = crate::dag_store::now_unix_nanos();
-        {
-            let tx = conn.transaction().unwrap();
-            install_rebootstrap_snapshot(
-                &tx,
-                &manifest,
-                &snapshot.canonical_encoding(),
-                None,
-                None,
-            )
-            .unwrap();
-            tx.commit().unwrap();
-        }
+/// Sealing a group whose paths form a tree: the rows a seal carries are
+/// the namespace projection of the summary it carries.
+#[cfg(test)]
+mod seal_namespace_tests;
 
-        // What `group_heads` itself says, read independently of the index.
-        let real_heads: Vec<ChangeHash> = {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT change_hash FROM group_heads WHERE group_id = ?1 ORDER BY change_hash",
-                )
-                .unwrap();
-            let rows = stmt
-                .query_map(["group-1"], |row| {
-                    let bytes: Vec<u8> = row.get(0)?;
-                    Ok(ChangeHash(<[u8; 32]>::try_from(bytes.as_slice()).unwrap()))
-                })
-                .unwrap();
-            rows.collect::<Result<_, _>>().unwrap()
-        };
-        assert_eq!(
-            real_heads,
-            vec![frontier_hash],
-            "the install must actually produce a non-empty frontier for this to test anything"
-        );
+/// What a committed seal leaves: the group on the new base, nothing of the
+/// history it absorbed still retained, and authors, clock and files
+/// continuing from the base.
+#[cfg(test)]
+mod epoch_reset_tests;
 
-        assert_eq!(
-            crate::dag_store::frontier_heads_at_or_before(&conn, "group-1", i64::MAX).unwrap(),
-            Some(real_heads.clone()),
-            "the time index must answer with the frontier the install actually produced"
-        );
-        assert_eq!(
-            crate::dag_store::frontier_heads_at_or_before(&conn, "group-1", before_install - 1)
-                .unwrap(),
-            None,
-            "and must not claim to have observed that frontier before the install happened \
-             (one nanosecond back, so a clock too coarse to separate the two reads cannot \
-             make this pass or fail by accident)"
-        );
-    }
+#[cfg(test)]
+mod foreign_merge_tests;
 
-    /// A rebootstrapped group's rewind plan must report real per-path
-    /// values. Before this install path stamped `admitted_at_unix_nanos`,
-    /// every path in the group came back `Unavailable` for every target
-    /// time until the next local write to that path -- a blanket "this
-    /// device cannot answer" about a folder whose contents it plainly
-    /// holds. This also exercises the reader's `version_seq DESC`
-    /// tie-break through the real write path: an install stamps a path's
-    /// whole retained history with one instant, so every multi-version path
-    /// here is a genuine tie.
-    #[test]
-    fn a_rebootstrapped_groups_rewind_plan_reports_real_values_not_unavailable() {
-        let mut conn = open();
-        let before_install = crate::file_index::now_unix_nanos_checked().unwrap();
-        install(
-            &mut conn,
-            "group-1",
-            vec![
-                // A compacted path: real history behind it, starting above
-                // version 1, and all three rows stamped with the install's
-                // single instant -- so every one of them is a tie.
-                snapshot_row("kept.txt", 4, SnapshotVersionState::Current, false, 40),
-                snapshot_row("kept.txt", 3, SnapshotVersionState::Superseded, false, 30),
-                snapshot_row("kept.txt", 2, SnapshotVersionState::Superseded, false, 20),
-                // A path whose whole history the snapshot carries.
-                snapshot_row("fresh.txt", 1, SnapshotVersionState::Current, false, 10),
-                // A path the snapshot itself carries as deleted.
-                snapshot_row("gone.txt", 1, SnapshotVersionState::Current, true, 0),
-            ],
-        );
-        let after_install = crate::file_index::now_unix_nanos_checked().unwrap();
-
-        let plan =
-            crate::rewind_plan::compute_rewind_plan(&conn, "group-1", after_install).unwrap();
-        let counts = plan.action_counts();
-        assert_eq!(
-            counts.unavailable, 0,
-            "a rebootstrapped group must be answerable, got {plan:?}"
-        );
-        assert_eq!(
-            counts.unchanged, 3,
-            "nothing happened between the install and the target, so nothing would change"
-        );
-        // Specifically: the multi-version path resolved to its CURRENT row,
-        // not to one of the superseded rows sharing the same stamp -- that
-        // would have reported a rollback that never happened.
-        assert!(
-            plan.entries.iter().all(|entry| matches!(
-                entry.action,
-                yadorilink_replica_domain::rewind::RewindPathAction::Unchanged
-            )),
-            "expected every path unchanged, got {plan:?}"
-        );
-
-        // The honest remaining limit, asserted so it stays honest. A target
-        // BEFORE the install is before this device's own history for the
-        // group exists at all: the install emptied `files` and reinstalled
-        // the SOURCE device's rows, complete with the source's `version_seq`
-        // numbering. So EVERY path is unanswerable that early, including the
-        // ones whose reinstalled history starts at version 1 -- for those,
-        // "version 1" means "never edited since the source device created
-        // it", which says nothing about when this device first saw the path
-        // and must not be read as "created after the target".
-        use yadorilink_replica_domain::rewind::RewindPathAction;
-        let earlier =
-            crate::rewind_plan::compute_rewind_plan(&conn, "group-1", before_install).unwrap();
-        let action = |path: &str| {
-            earlier.entries.iter().find(|entry| entry.path == path).unwrap().action.clone()
-        };
-        for path in ["kept.txt", "fresh.txt", "gone.txt"] {
-            match action(path) {
-                RewindPathAction::Unavailable { reason } => {
-                    assert!(
-                        reason.contains("re-bootstrap"),
-                        "the reason must name the real cause for {path}: {reason}"
-                    );
-                    assert!(
-                        !reason.contains("retention"),
-                        "retention cannot be the cause below the install instant, and naming it \
-                         for {path} would be a confident wrong explanation: {reason}"
-                    );
-                }
-                other => {
-                    panic!("expected Unavailable before the install for {path}, got {other:?}")
-                }
-            }
-        }
-        assert_eq!(earlier.action_counts().unavailable, 3);
-        assert_eq!(
-            earlier.action_counts().delete,
-            0,
-            "reporting a never-edited pre-install file as 'created after the target' would \
-             invent history this device never observed"
-        );
-    }
-
-    /// The exact inversion the group's local history floor exists to
-    /// prevent, and the boundary it must NOT over-apply, both through the
-    /// real install path.
-    ///
-    /// A file the source device created long ago and never edited since
-    /// arrives in the snapshot as `version_seq = 1`. Read from `files`
-    /// alone that is indistinguishable from a path this device itself first
-    /// indexed after the rewind target -- which would report `Delete`,
-    /// claiming the file was created recently, for the never-modified
-    /// majority of an ordinary folder. The install records its own instant
-    /// as the floor precisely so that reading is suspended below it.
-    #[test]
-    fn an_unmodified_file_from_before_an_install_is_unavailable_below_the_floor() {
-        let mut conn = open();
-        let before_install = crate::file_index::now_unix_nanos_checked().unwrap();
-        install(
-            &mut conn,
-            "group-1",
-            vec![snapshot_row("unmodified.txt", 1, SnapshotVersionState::Current, false, 10)],
-        );
-
-        let floor: i64 = conn
-            .query_row(
-                "SELECT floor_unix_nanos FROM group_local_history_floor WHERE group_id = ?1",
-                ["group-1"],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(
-            floor >= before_install,
-            "the install must record its own instant as this group's local history floor"
-        );
-
-        // An ordinary local write after the install, at a chosen instant so
-        // the second target below can sit strictly between the two. Direct
-        // SQL for the same reason `rewind_plan`'s own tests use it: the
-        // production writer stamps the wall clock and offers no way to pick
-        // the instant (`stamps_the_local_admission_clock_at_the_write_
-        // chokepoint` covers that writer separately).
-        conn.execute(
-            "INSERT INTO files (group_id, path, version_seq, state, deleted, size, \
-                                mtime_unix_nanos, blocks_json, admitted_at_unix_nanos) \
-             VALUES ('group-1', 'typed-later.txt', 1, 'current', 0, 20, 0, '[]', ?1)",
-            params![floor + 2],
-        )
-        .unwrap();
-
-        let action = |at: i64, path: &str| {
-            crate::rewind_plan::compute_rewind_plan(&conn, "group-1", at)
-                .unwrap()
-                .entries
-                .iter()
-                .find(|entry| entry.path == path)
-                .unwrap()
-                .action
-                .clone()
-        };
-        use yadorilink_replica_domain::rewind::RewindPathAction;
-
-        // Below the floor: this device has no history of its own that early,
-        // so neither path can be classified -- least of all as `Delete`.
-        for path in ["unmodified.txt", "typed-later.txt"] {
-            assert!(
-                matches!(action(before_install, path), RewindPathAction::Unavailable { .. }),
-                "{path} must be unanswerable below the floor, got {:?}",
-                action(before_install, path)
-            );
-        }
-
-        // At or above it, the group's local history is this device's own
-        // unbroken record again and ordinary classification resumes --
-        // including the "first version admitted after the target" reading
-        // the floor suspends below itself.
-        assert_eq!(action(floor + 1, "unmodified.txt"), RewindPathAction::Unchanged);
-        assert_eq!(action(floor + 1, "typed-later.txt"), RewindPathAction::Delete);
-    }
-}
+#[cfg(test)]
+mod merge_install_tests;

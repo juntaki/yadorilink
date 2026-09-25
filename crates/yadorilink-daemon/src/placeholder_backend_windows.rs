@@ -22,9 +22,9 @@
 //! `CfConnectSyncRoot` connection with a live callback-dispatch thread
 //! translating OS fetch requests into calls into this crate's own sync
 //! engine (fetching blocks from a peer, then `CfExecute`/
-//! `CfReportProviderProgress` to stream the answer back) — a second,
-//! comparably-sized project on top of this one, deliberately left for a
-//! follow-up pass. What IS implemented and real: sync-root registration,
+//! `CfReportProviderProgress` to stream the answer back) — that
+//! callback dispatch is not part of this module. What this module
+//! implements: sync-root registration,
 //! placeholder creation with an opaque generation token stored as this
 //! placeholder's file identity, dirty detection via the OS's own
 //! `CF_PLACEHOLDER_STATE_IN_SYNC` bit (not size/mtime), and daemon-driven
@@ -152,16 +152,15 @@ impl WindowsCfApiBackend {
         // invalid"). Root-level Hydration `ALWAYS_FULL` alone is
         // documented to reject `CfCreatePlaceholders` (a placeholder is,
         // by definition, not-yet-fully-hydrated content, which an
-        // always-fully-hydrated root cannot represent) -- this change
-        // varied both policies at once, so it does NOT establish that
+        // always-fully-hydrated root cannot represent) -- that experiment
+        // varied both policies at once, so that does NOT establish that
         // Population `ALWAYS_FULL` specifically was the (or a) cause, only
         // that the combination together breaks placeholder creation.
-        // Reverted to the zeroed defaults, which this module's own smoke
-        // test (`tests/windows_cfapi_smoke.rs`) confirms actually works end
-        // to end. Finding a real, measured-correct non-default policy
-        // combination (if `Population` alone can safely be `ALWAYS_FULL`
-        // while `Hydration` stays `PARTIAL`, for instance) is follow-up
-        // work, not a hygiene fix to make blind.
+        // The zeroed defaults are used; this module's own smoke
+        // test (`tests/windows_cfapi_smoke.rs`) confirms they work end
+        // to end. A non-default policy combination (e.g. `Population`
+        // alone `ALWAYS_FULL` while `Hydration` stays `PARTIAL`) must be
+        // measured before being adopted.
         let policies = CF_SYNC_POLICIES {
             StructSize: std::mem::size_of::<CF_SYNC_POLICIES>() as u32,
             ..unsafe { std::mem::zeroed() }
@@ -324,8 +323,17 @@ impl PlaceholderBackend for WindowsCfApiBackend {
         size: u64,
         mtime_unix_nanos: i64,
     ) -> Result<PlaceholderGeneration, RootAuthorityError> {
+        // Directories inside a sync root are created only by the recording
+        // helper (`yadorilink_local_storage::create_dir_all_never_through_a_symlink`),
+        // which the caller's write-target verification runs first; a missing
+        // parent here is refused rather than created unrecorded.
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            if !std::fs::metadata(parent).is_ok_and(|meta| meta.is_dir()) {
+                return Err(RootAuthorityError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("placeholder parent {} does not exist", parent.display()),
+                )));
+            }
         }
         let generation = PlaceholderGeneration(
             // A real generation source, not a constant: two placeholders

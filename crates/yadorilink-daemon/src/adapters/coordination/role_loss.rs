@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::application::model::RoleLossCommitOutcome;
+use crate::application::model::{RoleLossCommitOutcome, RoleLossCompensationOutcome};
 use crate::application::ports::{BoxFuture, RoleLossCoordination};
 use crate::daemon_state::DaemonState;
 
@@ -38,7 +38,7 @@ impl RoleLossCoordination for HttpRoleLossCoordination {
             };
             crate::coordination_client::commit_handoff_role_loss(
                 &config.addr,
-                &config.access_token,
+                &config.auth,
                 crate::coordination_client::RoleLossCommitRequest {
                     group_id,
                     source_device_id,
@@ -64,10 +64,35 @@ impl RoleLossCoordination for HttpRoleLossCoordination {
             };
             crate::coordination_client::set_storage_mode(
                 &config.addr,
-                &config.access_token,
+                &config.auth,
                 group_id,
                 device_id,
                 mode,
+            )
+            .await
+        })
+    }
+
+    fn compensate_handoff_role_loss<'a>(
+        &'a self,
+        group_id: &'a str,
+        source_device_id: &'a str,
+        target_device_id: &'a str,
+        lease_id: &'a str,
+        expected_membership_generation: Option<i64>,
+    ) -> BoxFuture<'a, Result<RoleLossCompensationOutcome, String>> {
+        Box::pin(async move {
+            let Some(config) = self.state.coordination_client_config().cloned() else {
+                return Err(NOT_CONFIGURED_DETAIL.to_string());
+            };
+            crate::coordination_client::compensate_handoff_role_loss(
+                &config.addr,
+                &config.auth,
+                group_id,
+                source_device_id,
+                target_device_id,
+                lease_id,
+                expected_membership_generation,
             )
             .await
         })

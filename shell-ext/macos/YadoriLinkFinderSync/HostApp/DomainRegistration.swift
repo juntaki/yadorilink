@@ -60,9 +60,9 @@
 //  DOMAIN REMOVAL DATA-PRESERVATION MODE: the plain
 //  `removeDomain:completionHandler:` (no mode) DELETES the on-disk
 //  managed-location directory outright, per NSFileProviderManager.h's own
-//  doc comment. That is not an acceptable default here — File Provider
-//  write support does not exist yet (M1-3), but the READ path already
-//  hydrates real file content into the managed location today, and this
+//  doc comment. That is not an acceptable default here — the managed
+//  location holds real hydrated (and possibly locally written) file
+//  content, and this
 //  reconciliation has no way to know, from `group_id` absence alone,
 //  whether a user has anything open or otherwise depends on that content
 //  still being present at the moment removal fires. This code therefore
@@ -82,27 +82,38 @@
 //  the daemon's *link* state, not a claim that no local content matters
 //  anymore.
 //
-//  NOT YET DECIDED (left for M1-3, not resolved here): `OnDemand → Eager`
+//  NOT YET DECIDED: `OnDemand → Eager`
 //  (content should end up materialized as a normal Eager copy, not merely
 //  "preserved" wherever the OS puts it) and `unlink` (content disposition
 //  is a user decision, possibly "discard entirely") likely need DIFFERENT
 //  preservation semantics from each other and from this default. Do not
 //  read `.preserveDownloadedUserData` as a final answer for either case —
-//  it is only the conservative choice for what this PR's scope handles
+//  it is only the conservative choice for what this code handles
 //  (a group_id that dropped out of the OnDemand set, of either kind,
 //  through today's blunt reconciliation).
 
-import FileProvider
+// NSFileProviderDomain is not Sendable yet; its completion handlers run on
+// FileProvider's own queue and only read the captured domain.
+@preconcurrency import FileProvider
 
 enum DomainRegistration {
-    static func registerOnDemandDomains() {
+    /// Reconciles once. `completion` runs after every add and remove this
+    /// run started has finished, so a caller that serializes runs on it
+    /// never has two runs working from different desired sets at the same
+    /// time (a run with a stale set would remove a domain the newer run
+    /// just added). The daemon query blocks, so call this off the main
+    /// thread when the caller cares about responsiveness.
+    static func registerOnDemandDomains(completion: @escaping @Sendable () -> Void = {}) {
         guard let folders = fetchOnDemandFolders() else {
             NSLog("yadorilink: DomainRegistration could not confirm desired state (daemon unreachable); leaving existing domains untouched")
+            completion()
             return
         }
         let desiredIdentifiers = Set(folders.map { $0.group_id })
 
         NSFileProviderManager.getDomainsWithCompletionHandler { existingDomains, error in
+            let pending = DispatchGroup()
+            defer { pending.notify(queue: .global(qos: .utility), execute: completion) }
             let existingIdentifiers = Set(existingDomains.map { $0.identifier.rawValue })
 
             for folder in folders {
@@ -112,7 +123,9 @@ enum DomainRegistration {
                 let displayName = (folder.local_path as NSString).lastPathComponent
                 let identifier = NSFileProviderDomainIdentifier(folder.group_id)
                 let domain = NSFileProviderDomain(identifier: identifier, displayName: displayName)
+                pending.enter()
                 NSFileProviderManager.add(domain) { error in
+                    defer { pending.leave() }
                     if let error {
                         NSLog("yadorilink: failed to register domain \(folder.group_id) (\(displayName)): \(error)")
                     } else {
@@ -129,7 +142,9 @@ enum DomainRegistration {
                 // `.preserveDownloadedUserData`, not the mode-less
                 // overload -- see this file's own DOMAIN REMOVAL
                 // DATA-PRESERVATION MODE doc comment for why.
+                pending.enter()
                 NSFileProviderManager.remove(existingDomain, mode: .preserveDownloadedUserData) { preservedLocation, error in
+                    defer { pending.leave() }
                     if let error {
                         NSLog("yadorilink: failed to remove stale domain \(existingDomain.identifier.rawValue): \(error)")
                     } else {

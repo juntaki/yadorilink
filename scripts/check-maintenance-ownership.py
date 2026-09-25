@@ -37,7 +37,7 @@ JOB_TYPES = (
     "MaterializationRepairJob",
     "DegradedLinkRecheckJob",
     "RetentionExpiryJob",
-    "MembershipRecoveryJob",
+    "RecoveryJob",
     "DiskReconcileBackstopJob",
     "GcIdleJob",
     "ReportingRetryJob",

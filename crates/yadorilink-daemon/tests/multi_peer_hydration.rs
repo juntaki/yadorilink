@@ -1,12 +1,7 @@
-//! parallel-multi-peer-fetch real, connected-session
-//! integration tests for `yadorilink_daemon::hydration`'s multi-session
-//! block dispatch. Deliberately lightweight — directly paired transport
-//! channels over loopback plus hand-built `PeerSyncSession`s, like
-//! `yadorilink-sync-core/tests/peer_session.rs`, rather than the full
-//! coordination-plane harness other daemon tests use — so each device's
-//! block store can be populated with a precise, controlled subset of a
-//! file's blocks (asymmetric holdings aren't something normal sync traffic
-//! produces on its own).
+//! parallel-multi-peer-fetch real, connected-session integration tests for
+//! `yadorilink_daemon::hydration`'s multi-session block dispatch.
+
+mod support;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,49 +10,16 @@ use std::time::Duration;
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::hydration;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-use yadorilink_local_storage::{BlockStore, FsBlockStore, DEFAULT_BLOCK_SIZE};
+use yadorilink_local_storage::{BlockStore, SegmentBlockStore, DEFAULT_BLOCK_SIZE};
 use yadorilink_peer_session::peer_session::PeerSyncSession;
-use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
+use yadorilink_replica_domain::file::{
+    BlockInfo, FileMeta, FileRecord, FileVersion, RecordKind, VersionBlock,
+};
+use yadorilink_replica_domain::ids::BlockHash;
 use yadorilink_replica_domain::session_state::MaterializationState;
-use yadorilink_transport::{QuicPeerChannel, TransportHub};
 
 const GROUP: &str = "shared";
 const PATH: &str = "big.bin";
-
-// Peers connect directly over loopback. This still hands back a real,
-// unused address so the existing call sites keep their shape;
-// `connect_pair` ignores it and wires a direct loopback pair instead.
-async fn bind_unused_addr() -> std::net::SocketAddr {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    listener.local_addr().unwrap()
-}
-
-async fn connect_pair(_addr: std::net::SocketAddr) -> (Arc<QuicPeerChannel>, Arc<QuicPeerChannel>) {
-    use yadorilink_transport::{ConnectRole, DeviceSigningKeyPair, QuicPeerEndpoint};
-    // Direct loopback: bind each side's UDP socket and dial the other's
-    // address -- the same wiring the daemon's peer orchestrator uses.
-    let socket_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let socket_b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let addr_b = socket_b.local_addr().unwrap();
-    let key_a = DeviceSigningKeyPair::generate();
-    let key_b = DeviceSigningKeyPair::generate();
-    let public_a = key_a.public_bytes();
-    let public_b = key_b.public_bytes();
-    let endpoint_a = QuicPeerEndpoint::new(TransportHub::from_socket(socket_a), key_a).unwrap();
-    let endpoint_b = QuicPeerEndpoint::new(TransportHub::from_socket(socket_b), key_b).unwrap();
-    endpoint_a.authorize(public_b);
-    endpoint_b.authorize(public_a);
-    let accepting = {
-        let endpoint_b = endpoint_b.clone();
-        tokio::spawn(async move { endpoint_b.accept(public_a).await })
-    };
-    let dialed = endpoint_a.connect(addr_b, public_b).await.unwrap();
-    let accepted = accepting.await.unwrap().unwrap();
-    (
-        QuicPeerChannel::new(dialed, ConnectRole::Dial),
-        QuicPeerChannel::new(accepted, ConnectRole::Accept),
-    )
-}
 
 struct TestDevice {
     device_id: String,
@@ -71,7 +33,7 @@ struct TestDevice {
 
 fn new_device(device_id: &str) -> TestDevice {
     let store_root = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsBlockStore::new(store_root.path()).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(store_root.path()).unwrap());
     // File-backed WAL, not `open_in_memory`: the shared-cache in-memory
     // backend takes TABLE-level locks, so a background reader on another
     // pooled connection (the daemon tasks `DaemonState::new` spawns) makes a
@@ -99,7 +61,7 @@ fn new_device(device_id: &str) -> TestDevice {
 /// devices' block stores with different subsets.
 fn chunk_content(content: &[u8]) -> (Vec<BlockInfo>, HashMap<Vec<u8>, Vec<u8>>) {
     let dir = tempfile::tempdir().unwrap();
-    let store = FsBlockStore::new(dir.path()).unwrap();
+    let store = SegmentBlockStore::new(dir.path()).unwrap();
     let src = dir.path().join("src.bin");
     std::fs::write(&src, content).unwrap();
     let blocks = yadorilink_local_storage::chunk_file(&store, &src).unwrap();
@@ -109,6 +71,21 @@ fn chunk_content(content: &[u8]) -> (Vec<BlockInfo>, HashMap<Vec<u8>, Vec<u8>>) 
         data_by_hash.insert(block.hash.clone(), store.get(&hash_hex).unwrap());
     }
     (blocks, data_by_hash)
+}
+
+/// Installs a process-global subscriber whose filter comes from `RUST_LOG`
+/// (this workspace enables tracing-subscriber's `env-filter` feature, so
+/// with `RUST_LOG` unset nothing below ERROR is emitted). Not "inert": the
+/// subscriber is installed either way, and the first caller in this binary
+/// wins for the whole process.
+///
+/// Every failure in this file surfaces as a
+/// bare `HydrationFailed("big.bin")`, which names the file and nothing about
+/// which of the many steps between "ask a peer" and "commit the bytes"
+/// refused. The daemon logs that reason, naming the predicate that declined,
+/// and without a subscriber installed in this binary it goes nowhere.
+fn init_tracing() {
+    let _ = tracing_subscriber::fmt::try_init();
 }
 
 /// Indexes the file as a placeholder on `device` (no full-content write to
@@ -121,6 +98,115 @@ fn seed_placeholder(
     owned_blocks: &[BlockInfo],
     data_by_hash: &HashMap<Vec<u8>, Vec<u8>>,
 ) {
+    let record = seed_link_and_authority(device, blocks, total_size);
+    device
+        .state
+        .replica_coordinator
+        .file_index_repository()
+        .upsert_file(
+            GROUP,
+            &record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
+    finish_seed(device, owned_blocks, data_by_hash);
+}
+
+/// Seeds a peer that will ANSWER `BlockRequest`s: same as
+/// [`seed_placeholder`], except the file is indexed through a real signed
+/// local Change and that Change is driven to Published.
+///
+/// Block-serving authorization deliberately serves only blocks backed by a
+/// Published Change -- `published_group_file_version_references_block`
+/// joins against `change_authorization`, which a bare `upsert_file` can
+/// never satisfy. A peer seeded the raw way therefore refuses every request
+/// with `reason="not_referenced"` even while holding the bytes, which is
+/// production behaving correctly and this fixture being older than the
+/// contract. Reproduced directly, from the source side's own diagnostic:
+///
+/// ```text
+/// reason="not_referenced"  live_record_references_hash=true
+/// dag_group_file_version_references_block=Ok(false)
+/// store_get_ok=true  store_get_size=131072
+/// ```
+///
+/// The asymmetry the suite exists for is untouched: the Published version
+/// legitimately references EVERY block of the file, while
+/// [`finish_seed`] still stores only `owned_blocks` physically. A peer can
+/// be authorized to serve a version and genuinely not hold parts of it,
+/// which is exactly the case these tests construct.
+///
+/// Deliberately not applied to the hydrating device or to the local-only
+/// scenarios: they never answer a request, so publishing there would add
+/// coordination machinery for nothing.
+async fn seed_published_serving_placeholder(
+    device: &TestDevice,
+    blocks: &[BlockInfo],
+    total_size: u64,
+    owned_blocks: &[BlockInfo],
+    data_by_hash: &HashMap<Vec<u8>, Vec<u8>>,
+) {
+    let record = seed_link_and_authority(device, blocks, total_size);
+    let version = FileVersion::new(
+        blocks
+            .iter()
+            .map(|b| VersionBlock { hash: BlockHash(b.hash.clone()), size: b.size })
+            .collect(),
+        total_size,
+        FileMeta {
+            mtime_unix_nanos: 0,
+            unix_mode: None,
+            symlink_target: None,
+            record_kind: RecordKind::File,
+            xattrs: Vec::new(),
+        },
+    );
+    let signing_key = device
+        .state
+        .device_signing_key()
+        .expect("the checkpoint authority assigns every device a signing key");
+    let emitter = yadorilink_sync_sqlite::dag_store::ChangeEmitter::new(
+        device.device_id.clone(),
+        signing_key,
+    );
+    device
+        .state
+        .replica_coordinator
+        .upsert_file_emitting_change(
+            GROUP,
+            &record,
+            &device.device_id,
+            yadorilink_replica_domain::session_state::ChangeContent {
+                ops: vec![yadorilink_replica_domain::change::Op::Put {
+                    path: yadorilink_replica_domain::ids::SyncPath(PATH.to_string()),
+                    version: version.version_hash,
+                    origin: yadorilink_replica_domain::change::PutOrigin::Direct,
+                }],
+                versions: std::slice::from_ref(&version),
+            },
+            None,
+            None,
+            yadorilink_daemon::replica_coordinator::ReplicaChangeEmission {
+                emitter: &emitter,
+                permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            },
+        )
+        .unwrap();
+    finish_seed(device, owned_blocks, data_by_hash);
+    // Pending is not servable. In production a checkpoint flush is triggered
+    // by a new local mutation's broadcast or by a reconnect; this fixture
+    // runs neither, so it asks explicitly.
+    device.state.flush_pending_checkpoint_for_group_for_test(GROUP).await;
+}
+
+/// Everything both seeding helpers do before the index write: adopt the
+/// root, install the test root-commit authority, and build the record.
+fn seed_link_and_authority(
+    device: &TestDevice,
+    blocks: &[BlockInfo],
+    total_size: u64,
+) -> FileRecord {
+    init_tracing();
     // Adopted BEFORE any index row exists for this group -- `VerifiedRoot::
     // open` refuses an ambiguous adoption once the index already has a
     // live row with nothing corresponding on disk (ordinary placeholder
@@ -145,23 +231,24 @@ fn seed_placeholder(
     // logic under test) and hard-failing every test that expects success.
     device.state.install_test_root_commit_authority(GROUP);
 
-    let record = FileRecord {
+    FileRecord {
         path: PATH.to_string(),
         size: total_size,
         mtime_unix_nanos: 0,
         blocks: blocks.to_vec(),
         deleted: false,
-    };
-    device
-        .state
-        .replica_coordinator
-        .file_index_repository()
-        .upsert_file(
-            GROUP,
-            &record,
-            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-        )
-        .unwrap();
+    }
+}
+
+/// Everything both seeding helpers do after the index write: mark the row a
+/// placeholder, make the link On-Demand, and store exactly `owned_blocks`
+/// physically (with provenance), leaving every other block genuinely absent.
+fn finish_seed(
+    device: &TestDevice,
+    owned_blocks: &[BlockInfo],
+    data_by_hash: &HashMap<Vec<u8>, Vec<u8>>,
+) {
+    let local_path = device.root.path().to_string_lossy().to_string();
     device
         .state
         .replica_coordinator
@@ -198,24 +285,76 @@ fn seed_placeholder(
     }
 }
 
+/// A connected pair of real, substrate-backed `SessionTransports` plus the
+/// two `TestPeerNode`s they came from -- `SessionTransports` is a required
+/// `PeerSyncSession` constructor parameter now (A3/A4), and a caller that
+/// wants the resulting sessions to actually be reachable over these
+/// transports (every test in this file does: it is exercising multi-peer
+/// block hydration) must `serve_with` each node once its own session
+/// exists, which can only happen after construction -- hence returning the
+/// nodes too, not just the transports.
+async fn transports_and_nodes(
+    device_a_id: &str,
+    device_b_id: &str,
+) -> (
+    Arc<yadorilink_lane_ports::testing::TestPeerNode>,
+    Arc<yadorilink_lane_ports::testing::TestPeerNode>,
+    yadorilink_peer_session::ports::SessionTransports,
+    yadorilink_peer_session::ports::SessionTransports,
+) {
+    let book = yadorilink_lane_ports::testing::TestAddressBook::new();
+    let node_a =
+        yadorilink_lane_ports::testing::TestPeerNode::start(device_a_id, book.clone()).await;
+    let node_b = yadorilink_lane_ports::testing::TestPeerNode::start(device_b_id, book).await;
+    let transports_a = node_a.transports_for(device_b_id);
+    let transports_b = node_b.transports_for(device_a_id);
+    (
+        node_a.clone(),
+        node_b.clone(),
+        yadorilink_peer_session::ports::SessionTransports {
+            blocks: transports_a.clone(),
+            service: transports_a.clone(),
+            prepared_snapshots: Arc::new(yadorilink_lane_ports::PreparedSnapshots::new()),
+            snapshot_fetch: transports_a,
+        },
+        yadorilink_peer_session::ports::SessionTransports {
+            blocks: transports_b.clone(),
+            service: transports_b.clone(),
+            prepared_snapshots: Arc::new(yadorilink_lane_ports::PreparedSnapshots::new()),
+            snapshot_fetch: transports_b,
+        },
+    )
+}
+
 /// Connects `hydrating`'s session-to-`peer` (inserted into `hydrating`'s
 /// own `state.peers.sessions`, as `peer_orchestrator` would) and `peer`'s
 /// session-to-`hydrating` (spawned and running, so it can answer block
 /// requests, but not tracked anywhere `hydrating`-side needs).
-async fn connect_as_peer(addr: std::net::SocketAddr, hydrating: &TestDevice, peer: &TestDevice) {
-    let (channel_hydrating, channel_peer) = connect_pair(addr).await;
-    let session_to_peer = PeerSyncSession::new(
-        channel_hydrating,
+async fn connect_as_peer(hydrating: &TestDevice, peer: &TestDevice) {
+    let (node_hydrating, node_peer, transports_to_peer, transports_from_hydrating) =
+        transports_and_nodes(&hydrating.device_id, &peer.device_id).await;
+    let hydrating_peer_store_1 = std::sync::Arc::new(
+        yadorilink_daemon::adapters::block_store_ports::BlockStorePortsAdapter::new(
+            hydrating.state.block_store.clone(),
+        ),
+    );
+    let replica_engine_to_peer_1 =
+        yadorilink_daemon::replica_coordinator::engine_ports::build_peer_replica_engine(
+            &hydrating.state.replica_coordinator,
+            hydrating_peer_store_1.clone(),
+        );
+    let session_to_peer = PeerSyncSession::over_substrate(
         hydrating.device_id.clone(),
         peer.device_id.clone(),
-        hydrating.state.replica_coordinator.clone(),
-        std::sync::Arc::new(
-            yadorilink_daemon::adapters::block_store_ports::BlockStorePortsAdapter::new(
-                hydrating.state.block_store.clone(),
-            ),
-        ),
+        hydrating.state.replica_coordinator.clone()
+            as Arc<dyn yadorilink_peer_session::ports::BlockServeAuthorizationPort>,
+        replica_engine_to_peer_1,
+        hydrating_peer_store_1,
         vec![GROUP.to_string()],
         HashMap::from([(GROUP.to_string(), hydrating.root.path().to_path_buf())]),
+        transports_to_peer,
+        None,
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::test_permissive(),
     );
     // Every real (`DaemonState`-backed) session has a block-serve engine
     // installed by the orchestrator; without one, an incoming
@@ -226,24 +365,38 @@ async fn connect_as_peer(addr: std::net::SocketAddr, hydrating: &TestDevice, pee
     // fail-closed gate — the deterministic `HydrationFailed` this line
     // fixes was exactly that gap, on both directions of the pair.
     session_to_peer.set_block_serve_engine(hydrating.state.block_serve_engine.clone());
-    tokio::spawn(session_to_peer.clone().run());
-    hydrating.state.peers.register_session(peer.device_id.clone(), session_to_peer);
+    node_hydrating.serve_with(&peer.device_id, session_to_peer.clone());
+    hydrating.state.peers.register_session(
+        peer.device_id.clone(),
+        session_to_peer,
+        hydrating.state.local_convergence(),
+    );
 
-    let session_from_hydrating = PeerSyncSession::new(
-        channel_peer,
+    let peer_peer_store_1 = std::sync::Arc::new(
+        yadorilink_daemon::adapters::block_store_ports::BlockStorePortsAdapter::new(
+            peer.state.block_store.clone(),
+        ),
+    );
+    let replica_engine_from_hydrating_1 =
+        yadorilink_daemon::replica_coordinator::engine_ports::build_peer_replica_engine(
+            &peer.state.replica_coordinator,
+            peer_peer_store_1.clone(),
+        );
+    let session_from_hydrating = PeerSyncSession::over_substrate(
         peer.device_id.clone(),
         hydrating.device_id.clone(),
-        peer.state.replica_coordinator.clone(),
-        std::sync::Arc::new(
-            yadorilink_daemon::adapters::block_store_ports::BlockStorePortsAdapter::new(
-                peer.state.block_store.clone(),
-            ),
-        ),
+        peer.state.replica_coordinator.clone()
+            as Arc<dyn yadorilink_peer_session::ports::BlockServeAuthorizationPort>,
+        replica_engine_from_hydrating_1,
+        peer_peer_store_1,
         vec![GROUP.to_string()],
         HashMap::from([(GROUP.to_string(), peer.root.path().to_path_buf())]),
+        transports_from_hydrating,
+        None,
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::test_permissive(),
     );
     session_from_hydrating.set_block_serve_engine(peer.state.block_serve_engine.clone());
-    tokio::spawn(session_from_hydrating.run());
+    node_peer.serve_with(&hydrating.device_id, session_from_hydrating.clone());
 }
 
 fn big_content() -> Vec<u8> {
@@ -255,7 +408,6 @@ fn big_content() -> Vec<u8> {
 /// content.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn blocks_split_across_two_peers_each_holding_a_disjoint_subset() {
-    let addr = bind_unused_addr().await;
     let content = big_content();
     let (blocks, data_by_hash) = chunk_content(&content);
     assert!(blocks.len() >= 4, "test needs multiple blocks to split meaningfully");
@@ -265,12 +417,40 @@ async fn blocks_split_across_two_peers_each_holding_a_disjoint_subset() {
     let device_c = new_device("device-c");
     let device_d = new_device("device-d");
 
-    seed_placeholder(&device_b, &blocks, content.len() as u64, &blocks[..half], &data_by_hash);
-    seed_placeholder(&device_c, &blocks, content.len() as u64, &blocks[half..], &data_by_hash);
+    // One authority for the whole test: `coordination_client_config` is a
+    // `OnceLock`, so assigning devices to different fakes later cannot work.
+    let _authority = support::shared_checkpoint_authority(
+        &[
+            ("device-b", &device_b.state),
+            ("device-c", &device_c.state),
+            ("device-d", &device_d.state),
+        ],
+        &[GROUP.to_string()],
+    )
+    .await;
+
+    // B and C answer block requests, so their holdings must be backed by a
+    // Published Change. D only requests.
+    seed_published_serving_placeholder(
+        &device_b,
+        &blocks,
+        content.len() as u64,
+        &blocks[..half],
+        &data_by_hash,
+    )
+    .await;
+    seed_published_serving_placeholder(
+        &device_c,
+        &blocks,
+        content.len() as u64,
+        &blocks[half..],
+        &data_by_hash,
+    )
+    .await;
     seed_placeholder(&device_d, &blocks, content.len() as u64, &[], &data_by_hash);
 
-    connect_as_peer(addr, &device_d, &device_b).await;
-    connect_as_peer(addr, &device_d, &device_c).await;
+    connect_as_peer(&device_d, &device_b).await;
+    connect_as_peer(&device_d, &device_c).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     hydration::hydrate(&device_d.state, GROUP, PATH).await.unwrap();
@@ -292,7 +472,6 @@ async fn blocks_split_across_two_peers_each_holding_a_disjoint_subset() {
 /// does hold it — hydration still succeeds via the second peer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_block_not_found_on_one_peer_is_fetched_from_another() {
-    let addr = bind_unused_addr().await;
     let content = big_content();
     let (blocks, data_by_hash) = chunk_content(&content);
     assert!(blocks.len() >= 2);
@@ -301,12 +480,39 @@ async fn a_block_not_found_on_one_peer_is_fetched_from_another() {
     let device_c = new_device("device-c"); // has everything
     let device_d = new_device("device-d"); // hydrating
 
-    seed_placeholder(&device_b, &blocks, content.len() as u64, &[], &data_by_hash);
-    seed_placeholder(&device_c, &blocks, content.len() as u64, &blocks, &data_by_hash);
+    let _authority = support::shared_checkpoint_authority(
+        &[
+            ("device-b", &device_b.state),
+            ("device-c", &device_c.state),
+            ("device-d", &device_d.state),
+        ],
+        &[GROUP.to_string()],
+    )
+    .await;
+
+    // Both B and C answer requests -- B's whole point is answering
+    // "not found" for blocks it lacks, which it can only do once it is
+    // authorized to serve the version at all.
+    seed_published_serving_placeholder(
+        &device_b,
+        &blocks,
+        content.len() as u64,
+        &[],
+        &data_by_hash,
+    )
+    .await;
+    seed_published_serving_placeholder(
+        &device_c,
+        &blocks,
+        content.len() as u64,
+        &blocks,
+        &data_by_hash,
+    )
+    .await;
     seed_placeholder(&device_d, &blocks, content.len() as u64, &[], &data_by_hash);
 
-    connect_as_peer(addr, &device_d, &device_b).await;
-    connect_as_peer(addr, &device_d, &device_c).await;
+    connect_as_peer(&device_d, &device_b).await;
+    connect_as_peer(&device_d, &device_c).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     hydration::hydrate(&device_d.state, GROUP, PATH).await.unwrap();
@@ -320,7 +526,6 @@ async fn a_block_not_found_on_one_peer_is_fetched_from_another() {
 /// written.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_block_missing_from_every_peer_fails_hydration_cleanly() {
-    let addr = bind_unused_addr().await;
     let content = big_content();
     let (blocks, data_by_hash) = chunk_content(&content);
     assert!(blocks.len() >= 2);
@@ -330,14 +535,55 @@ async fn a_block_missing_from_every_peer_fails_hydration_cleanly() {
     let device_b = new_device("device-b");
     let device_d = new_device("device-d");
 
-    seed_placeholder(&device_b, &blocks, content.len() as u64, owned, &data_by_hash);
+    let _authority = support::shared_checkpoint_authority(
+        &[("device-b", &device_b.state), ("device-d", &device_d.state)],
+        &[GROUP.to_string()],
+    )
+    .await;
+
+    // Published metadata references EVERY block including the last one;
+    // the physical store deliberately holds only `owned`. That is what
+    // makes the failure below a genuine physical absence rather than an
+    // authorization refusal -- see the assertion at the end.
+    seed_published_serving_placeholder(
+        &device_b,
+        &blocks,
+        content.len() as u64,
+        owned,
+        &data_by_hash,
+    )
+    .await;
     seed_placeholder(&device_d, &blocks, content.len() as u64, &[], &data_by_hash);
 
-    connect_as_peer(addr, &device_d, &device_b).await;
+    connect_as_peer(&device_d, &device_b).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let result = hydration::hydrate(&device_d.state, GROUP, PATH).await;
     assert!(result.is_err(), "hydration must fail when a block is unavailable from every peer");
+
+    // ...and fail for the RIGHT reason. `is_err()` alone is not enough here:
+    // before the source side was Published, this same test passed while
+    // every request died at serving authorization
+    // (`reason="not_referenced"`), never reaching the block store at all --
+    // the same `is_err()`, a completely different proof.
+    //
+    // These two together pin the intended path: B is genuinely AUTHORIZED to
+    // serve the missing block's version, and simply does not hold the bytes.
+    let missing = &blocks[blocks.len() - 1].hash;
+    assert!(
+        device_b
+            .state
+            .replica_coordinator
+            .change_history_repository()
+            .dag_group_file_version_references_block(GROUP, missing)
+            .unwrap(),
+        "the serving peer must be authorized to serve the missing block's version -- otherwise \
+         this test proves an authorization refusal, not the physical-absence path it names"
+    );
+    assert!(
+        device_b.state.block_store.get(&hex::encode(missing)).is_err(),
+        "the serving peer must genuinely not hold the missing block's bytes"
+    );
     assert_eq!(
         device_d
             .state
@@ -358,7 +604,6 @@ async fn a_block_missing_from_every_peer_fails_hydration_cleanly() {
 /// file, completes correctly — not just the two-peer minimum case.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hydration_succeeds_with_three_full_peers() {
-    let addr = bind_unused_addr().await;
     let content = big_content();
     let (blocks, data_by_hash) = chunk_content(&content);
 
@@ -367,14 +612,32 @@ async fn hydration_succeeds_with_three_full_peers() {
     let device_e = new_device("device-e");
     let device_d = new_device("device-d");
 
+    let _authority = support::shared_checkpoint_authority(
+        &[
+            ("device-b", &device_b.state),
+            ("device-c", &device_c.state),
+            ("device-e", &device_e.state),
+            ("device-d", &device_d.state),
+        ],
+        &[GROUP.to_string()],
+    )
+    .await;
+
     for peer in [&device_b, &device_c, &device_e] {
-        seed_placeholder(peer, &blocks, content.len() as u64, &blocks, &data_by_hash);
+        seed_published_serving_placeholder(
+            peer,
+            &blocks,
+            content.len() as u64,
+            &blocks,
+            &data_by_hash,
+        )
+        .await;
     }
     seed_placeholder(&device_d, &blocks, content.len() as u64, &[], &data_by_hash);
 
-    connect_as_peer(addr, &device_d, &device_b).await;
-    connect_as_peer(addr, &device_d, &device_c).await;
-    connect_as_peer(addr, &device_d, &device_e).await;
+    connect_as_peer(&device_d, &device_b).await;
+    connect_as_peer(&device_d, &device_c).await;
+    connect_as_peer(&device_d, &device_e).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     hydration::hydrate(&device_d.state, GROUP, PATH).await.unwrap();
@@ -387,15 +650,27 @@ async fn hydration_succeeds_with_three_full_peers() {
 /// have already been found locally, without relying on transport timing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ordinary_hydration_error_restores_placeholder_state() {
-    let addr = bind_unused_addr().await;
     let content = big_content();
     let (blocks, data_by_hash) = chunk_content(&content);
 
     let peer = new_device("device-peer");
     let hydrating = new_device("device-hydrating");
-    seed_placeholder(&peer, &blocks, content.len() as u64, &blocks, &data_by_hash);
+    let _authority = support::shared_checkpoint_authority(
+        &[("device-peer", &peer.state), ("device-hydrating", &hydrating.state)],
+        &[GROUP.to_string()],
+    )
+    .await;
+
+    seed_published_serving_placeholder(
+        &peer,
+        &blocks,
+        content.len() as u64,
+        &blocks,
+        &data_by_hash,
+    )
+    .await;
     seed_placeholder(&hydrating, &blocks, content.len() as u64, &blocks, &data_by_hash);
-    connect_as_peer(addr, &hydrating, &peer).await;
+    connect_as_peer(&hydrating, &peer).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let root_path = hydrating.root.path().to_path_buf();
@@ -433,8 +708,12 @@ async fn corrupt_local_block_restores_placeholder_state() {
     seed_placeholder(&hydrating, &blocks, content.len() as u64, &blocks, &data_by_hash);
 
     let hash = hex::encode(&blocks[0].hash);
-    let block_path = hydrating.store_root.path().join(&hash[..2]).join(&hash[2..4]).join(&hash);
-    std::fs::write(block_path, b"corrupt bytes").unwrap();
+    yadorilink_local_storage::segment_store::testing::corrupt_block_payload(
+        hydrating.store_root.path(),
+        &hash,
+        b"corrupt bytes",
+    )
+    .unwrap();
 
     let result = hydration::hydrate(&hydrating.state, GROUP, PATH).await;
     assert!(result.is_err(), "an unrepairable checksum mismatch must fail hydration");
@@ -454,7 +733,6 @@ async fn corrupt_local_block_restores_placeholder_state() {
 /// flag is set correctly alongside successful multi-peer hydration.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pin_hydrates_via_multiple_peers_and_sets_the_pin_flag() {
-    let addr = bind_unused_addr().await;
     let content = big_content();
     let (blocks, data_by_hash) = chunk_content(&content);
     let half = blocks.len() / 2;
@@ -463,12 +741,36 @@ async fn pin_hydrates_via_multiple_peers_and_sets_the_pin_flag() {
     let device_c = new_device("device-c");
     let device_d = new_device("device-d");
 
-    seed_placeholder(&device_b, &blocks, content.len() as u64, &blocks[..half], &data_by_hash);
-    seed_placeholder(&device_c, &blocks, content.len() as u64, &blocks[half..], &data_by_hash);
+    let _authority = support::shared_checkpoint_authority(
+        &[
+            ("device-b", &device_b.state),
+            ("device-c", &device_c.state),
+            ("device-d", &device_d.state),
+        ],
+        &[GROUP.to_string()],
+    )
+    .await;
+
+    seed_published_serving_placeholder(
+        &device_b,
+        &blocks,
+        content.len() as u64,
+        &blocks[..half],
+        &data_by_hash,
+    )
+    .await;
+    seed_published_serving_placeholder(
+        &device_c,
+        &blocks,
+        content.len() as u64,
+        &blocks[half..],
+        &data_by_hash,
+    )
+    .await;
     seed_placeholder(&device_d, &blocks, content.len() as u64, &[], &data_by_hash);
 
-    connect_as_peer(addr, &device_d, &device_b).await;
-    connect_as_peer(addr, &device_d, &device_c).await;
+    connect_as_peer(&device_d, &device_b).await;
+    connect_as_peer(&device_d, &device_c).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     hydration::pin(&device_d.state, GROUP, PATH).await.unwrap();
@@ -508,7 +810,6 @@ async fn pin_hydrates_via_multiple_peers_and_sets_the_pin_flag() {
 /// not a regression to guard against here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hydration_deadline_bounds_an_unresponsive_peer() {
-    let addr = bind_unused_addr().await;
     let content = big_content();
     let (blocks, data_by_hash) = chunk_content(&content);
 
@@ -520,22 +821,40 @@ async fn hydration_deadline_bounds_an_unresponsive_peer() {
     // Connect D's session to B, but never start B's session-to-D — B is
     // reachable at the transport level but never answers anything,
     // simulating a peer that's connected yet fully unresponsive.
-    let (channel_d, _channel_b_unused) = connect_pair(addr).await;
-    let session_d_to_b = PeerSyncSession::new(
-        channel_d,
+    // D's own real transports; B's node exists (so a lane D opens to it has
+    // somewhere real to land) but B never `serve_with`s any session onto it
+    // and never runs one -- the lane sits unclaimed, exactly the "connected
+    // yet fully unresponsive" peer this test needs.
+    let (_node_d, _node_b, transports_d, _transports_b_unused) =
+        transports_and_nodes(&device_d.device_id, &device_b.device_id).await;
+    let device_d_peer_store_1 = std::sync::Arc::new(
+        yadorilink_daemon::adapters::block_store_ports::BlockStorePortsAdapter::new(
+            device_d.state.block_store.clone(),
+        ),
+    );
+    let replica_engine_d_to_b_1 =
+        yadorilink_daemon::replica_coordinator::engine_ports::build_peer_replica_engine(
+            &device_d.state.replica_coordinator,
+            device_d_peer_store_1.clone(),
+        );
+    let session_d_to_b = PeerSyncSession::over_substrate(
         device_d.device_id.clone(),
         device_b.device_id.clone(),
-        device_d.state.replica_coordinator.clone(),
-        std::sync::Arc::new(
-            yadorilink_daemon::adapters::block_store_ports::BlockStorePortsAdapter::new(
-                device_d.state.block_store.clone(),
-            ),
-        ),
+        device_d.state.replica_coordinator.clone()
+            as Arc<dyn yadorilink_peer_session::ports::BlockServeAuthorizationPort>,
+        replica_engine_d_to_b_1,
+        device_d_peer_store_1,
         vec![GROUP.to_string()],
         HashMap::from([(GROUP.to_string(), device_d.root.path().to_path_buf())]),
+        transports_d,
+        None,
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::test_permissive(),
     );
-    tokio::spawn(session_d_to_b.clone().run());
-    device_d.state.peers.register_session(device_b.device_id.clone(), session_d_to_b);
+    device_d.state.peers.register_session(
+        device_b.device_id.clone(),
+        session_d_to_b,
+        device_d.state.local_convergence(),
+    );
 
     let short_timeout = Duration::from_millis(500);
     let started = std::time::Instant::now();
@@ -574,28 +893,37 @@ async fn hydration_deadline_bounds_an_unresponsive_peer() {
 /// `HYDRATION_TIMEOUT`/dispatcher retry machinery entirely.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn silent_peer_is_detected_within_the_sized_per_block_deadline() {
-    let addr = bind_unused_addr().await;
     let device_d = new_device("device-d-silent-probe");
     let device_b = new_device("device-b-silent-probe");
 
     // Same fixture shape as `hydration_deadline_bounds_an_unresponsive_
     // peer` above: B is reachable at the transport level but its own
     // session task never runs, so it never answers anything.
-    let (channel_d, _channel_b_unused) = connect_pair(addr).await;
-    let session_d_to_b = PeerSyncSession::new(
-        channel_d,
+    let (_node_d, _node_b, transports_d, _transports_b_unused) =
+        transports_and_nodes(&device_d.device_id, &device_b.device_id).await;
+    let device_d_peer_store_2 = std::sync::Arc::new(
+        yadorilink_daemon::adapters::block_store_ports::BlockStorePortsAdapter::new(
+            device_d.state.block_store.clone(),
+        ),
+    );
+    let replica_engine_d_to_b_2 =
+        yadorilink_daemon::replica_coordinator::engine_ports::build_peer_replica_engine(
+            &device_d.state.replica_coordinator,
+            device_d_peer_store_2.clone(),
+        );
+    let session_d_to_b = PeerSyncSession::over_substrate(
         device_d.device_id.clone(),
         device_b.device_id.clone(),
-        device_d.state.replica_coordinator.clone(),
-        std::sync::Arc::new(
-            yadorilink_daemon::adapters::block_store_ports::BlockStorePortsAdapter::new(
-                device_d.state.block_store.clone(),
-            ),
-        ),
+        device_d.state.replica_coordinator.clone()
+            as Arc<dyn yadorilink_peer_session::ports::BlockServeAuthorizationPort>,
+        replica_engine_d_to_b_2,
+        device_d_peer_store_2,
         vec![GROUP.to_string()],
         HashMap::from([(GROUP.to_string(), device_d.root.path().to_path_buf())]),
+        transports_d,
+        None,
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::test_permissive(),
     );
-    tokio::spawn(session_d_to_b.clone().run());
 
     // A modest, arbitrary size (well below `DEFAULT_BLOCK_SIZE`) -- large
     // enough that its top-up over the fixed baseline is meaningfully
@@ -628,7 +956,6 @@ async fn silent_peer_is_detected_within_the_sized_per_block_deadline() {
 /// the same state cleanup as an ordinary error or timeout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancelled_hydration_restores_placeholder_state() {
-    let addr = bind_unused_addr().await;
     let content = big_content();
     let (blocks, data_by_hash) = chunk_content(&content);
 
@@ -636,23 +963,36 @@ async fn cancelled_hydration_restores_placeholder_state() {
     let hydrating = new_device("device-hydrating");
     seed_placeholder(&peer, &blocks, content.len() as u64, &blocks, &data_by_hash);
     seed_placeholder(&hydrating, &blocks, content.len() as u64, &[], &data_by_hash);
-
-    let (channel_hydrating, _unresponsive_peer) = connect_pair(addr).await;
-    let session = PeerSyncSession::new(
-        channel_hydrating,
+    let (_node_hydrating, _node_peer, transports_hydrating, _transports_peer_unused) =
+        transports_and_nodes(&hydrating.device_id, &peer.device_id).await;
+    let hydrating_peer_store_3 = std::sync::Arc::new(
+        yadorilink_daemon::adapters::block_store_ports::BlockStorePortsAdapter::new(
+            hydrating.state.block_store.clone(),
+        ),
+    );
+    let replica_engine_3 =
+        yadorilink_daemon::replica_coordinator::engine_ports::build_peer_replica_engine(
+            &hydrating.state.replica_coordinator,
+            hydrating_peer_store_3.clone(),
+        );
+    let session = PeerSyncSession::over_substrate(
         hydrating.device_id.clone(),
         peer.device_id.clone(),
-        hydrating.state.replica_coordinator.clone(),
-        std::sync::Arc::new(
-            yadorilink_daemon::adapters::block_store_ports::BlockStorePortsAdapter::new(
-                hydrating.state.block_store.clone(),
-            ),
-        ),
+        hydrating.state.replica_coordinator.clone()
+            as Arc<dyn yadorilink_peer_session::ports::BlockServeAuthorizationPort>,
+        replica_engine_3,
+        hydrating_peer_store_3,
         vec![GROUP.to_string()],
         HashMap::from([(GROUP.to_string(), hydrating.root.path().to_path_buf())]),
+        transports_hydrating,
+        None,
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::test_permissive(),
     );
-    tokio::spawn(session.clone().run());
-    hydrating.state.peers.register_session(peer.device_id.clone(), session);
+    hydrating.state.peers.register_session(
+        peer.device_id.clone(),
+        session,
+        hydrating.state.local_convergence(),
+    );
 
     let state = hydrating.state.clone();
     let task = tokio::spawn(async move { hydration::hydrate(&state, GROUP, PATH).await });
@@ -701,7 +1041,6 @@ async fn cancelled_hydration_restores_placeholder_state() {
 /// `(block_size - burst) / rate` — well under half the shared-bucket time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn configured_rate_caps_aggregate_throughput_across_concurrent_multi_peer_hydration() {
-    let addr = bind_unused_addr().await;
     // Exactly 2 blocks (not `big_content`'s 6) — enough to split one per
     // peer while keeping the throttled transfer's real wall-clock time
     // reasonable for a test.
@@ -714,8 +1053,32 @@ async fn configured_rate_caps_aggregate_throughput_across_concurrent_multi_peer_
     let device_c = new_device("device-c");
     let device_d = new_device("device-d");
 
-    seed_placeholder(&device_b, &blocks, content.len() as u64, &blocks[..half], &data_by_hash);
-    seed_placeholder(&device_c, &blocks, content.len() as u64, &blocks[half..], &data_by_hash);
+    let _authority = support::shared_checkpoint_authority(
+        &[
+            ("device-b", &device_b.state),
+            ("device-c", &device_c.state),
+            ("device-d", &device_d.state),
+        ],
+        &[GROUP.to_string()],
+    )
+    .await;
+
+    seed_published_serving_placeholder(
+        &device_b,
+        &blocks,
+        content.len() as u64,
+        &blocks[..half],
+        &data_by_hash,
+    )
+    .await;
+    seed_published_serving_placeholder(
+        &device_c,
+        &blocks,
+        content.len() as u64,
+        &blocks[half..],
+        &data_by_hash,
+    )
+    .await;
     seed_placeholder(&device_d, &blocks, content.len() as u64, &[], &data_by_hash);
 
     // Throttle D's *shared* download bucket before connecting — every
@@ -725,8 +1088,8 @@ async fn configured_rate_caps_aggregate_throughput_across_concurrent_multi_peer_
     let rate_bytes_per_sec = 50_000u64;
     device_d.state.rate_limiters.download.set_rate_bytes_per_sec(rate_bytes_per_sec);
 
-    connect_as_peer_sharing_hydrating_rate_limiters(addr, &device_d, &device_b).await;
-    connect_as_peer_sharing_hydrating_rate_limiters(addr, &device_d, &device_c).await;
+    connect_as_peer_sharing_hydrating_rate_limiters(&device_d, &device_b).await;
+    connect_as_peer_sharing_hydrating_rate_limiters(&device_d, &device_c).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let start = std::time::Instant::now();
@@ -786,20 +1149,37 @@ async fn placeholder_with_all_local_blocks_hydrates_without_peers() {
 /// corrupt bytes as already-satisfied.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn corrupt_local_block_is_refetched_when_peer_exists() {
-    let addr = bind_unused_addr().await;
     let content = big_content();
     let (blocks, data_by_hash) = chunk_content(&content);
 
     let peer = new_device("device-peer");
     let hydrating = new_device("device-hydrating");
-    seed_placeholder(&peer, &blocks, content.len() as u64, &blocks, &data_by_hash);
+    let _authority = support::shared_checkpoint_authority(
+        &[("device-peer", &peer.state), ("device-hydrating", &hydrating.state)],
+        &[GROUP.to_string()],
+    )
+    .await;
+
+    // The peer answers the refetch, so its holdings must be Published.
+    seed_published_serving_placeholder(
+        &peer,
+        &blocks,
+        content.len() as u64,
+        &blocks,
+        &data_by_hash,
+    )
+    .await;
     seed_placeholder(&hydrating, &blocks, content.len() as u64, &blocks, &data_by_hash);
-    connect_as_peer(addr, &hydrating, &peer).await;
+    connect_as_peer(&hydrating, &peer).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let hash = hex::encode(&blocks[0].hash);
-    let block_path = hydrating.store_root.path().join(&hash[..2]).join(&hash[2..4]).join(&hash);
-    std::fs::write(block_path, b"corrupt bytes").unwrap();
+    yadorilink_local_storage::segment_store::testing::corrupt_block_payload(
+        hydrating.store_root.path(),
+        &hash,
+        b"corrupt bytes",
+    )
+    .unwrap();
 
     hydration::hydrate(&hydrating.state, GROUP, PATH).await.expect(
         "a corrupt local block should be refetched from a peer that holds it, \
@@ -883,47 +1263,71 @@ async fn retained_last_local_copy_remains_user_accessible_offline() {
 /// every real production session) instead of each session defaulting to
 /// its own independent unlimited pair.
 async fn connect_as_peer_sharing_hydrating_rate_limiters(
-    addr: std::net::SocketAddr,
     hydrating: &TestDevice,
     peer: &TestDevice,
 ) {
-    let (channel_hydrating, channel_peer) = connect_pair(addr).await;
-    let session_to_peer = PeerSyncSession::new(
-        channel_hydrating,
+    let (node_hydrating, node_peer, transports_to_peer, transports_from_hydrating) =
+        transports_and_nodes(&hydrating.device_id, &peer.device_id).await;
+    let hydrating_peer_store_2 = std::sync::Arc::new(
+        yadorilink_daemon::adapters::block_store_ports::BlockStorePortsAdapter::new(
+            hydrating.state.block_store.clone(),
+        ),
+    );
+    let replica_engine_to_peer_2 =
+        yadorilink_daemon::replica_coordinator::engine_ports::build_peer_replica_engine(
+            &hydrating.state.replica_coordinator,
+            hydrating_peer_store_2.clone(),
+        );
+    let session_to_peer = PeerSyncSession::over_substrate(
         hydrating.device_id.clone(),
         peer.device_id.clone(),
-        hydrating.state.replica_coordinator.clone(),
-        std::sync::Arc::new(
-            yadorilink_daemon::adapters::block_store_ports::BlockStorePortsAdapter::new(
-                hydrating.state.block_store.clone(),
-            ),
-        ),
+        hydrating.state.replica_coordinator.clone()
+            as Arc<dyn yadorilink_peer_session::ports::BlockServeAuthorizationPort>,
+        replica_engine_to_peer_2,
+        hydrating_peer_store_2,
         vec![GROUP.to_string()],
         HashMap::from([(GROUP.to_string(), hydrating.root.path().to_path_buf())]),
+        transports_to_peer,
+        None,
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::test_permissive(),
     );
     session_to_peer.set_rate_limiters(hydrating.state.rate_limiters.clone());
     // See `connect_as_peer` on why the serve engine must be installed on
     // both directions of a hand-rolled pairing.
     session_to_peer.set_block_serve_engine(hydrating.state.block_serve_engine.clone());
-    tokio::spawn(session_to_peer.clone().run());
-    hydrating.state.peers.register_session(peer.device_id.clone(), session_to_peer);
+    node_hydrating.serve_with(&peer.device_id, session_to_peer.clone());
+    hydrating.state.peers.register_session(
+        peer.device_id.clone(),
+        session_to_peer,
+        hydrating.state.local_convergence(),
+    );
 
-    let session_from_hydrating = PeerSyncSession::new(
-        channel_peer,
+    let peer_peer_store_2 = std::sync::Arc::new(
+        yadorilink_daemon::adapters::block_store_ports::BlockStorePortsAdapter::new(
+            peer.state.block_store.clone(),
+        ),
+    );
+    let replica_engine_from_hydrating_2 =
+        yadorilink_daemon::replica_coordinator::engine_ports::build_peer_replica_engine(
+            &peer.state.replica_coordinator,
+            peer_peer_store_2.clone(),
+        );
+    let session_from_hydrating = PeerSyncSession::over_substrate(
         peer.device_id.clone(),
         hydrating.device_id.clone(),
-        peer.state.replica_coordinator.clone(),
-        std::sync::Arc::new(
-            yadorilink_daemon::adapters::block_store_ports::BlockStorePortsAdapter::new(
-                peer.state.block_store.clone(),
-            ),
-        ),
+        peer.state.replica_coordinator.clone()
+            as Arc<dyn yadorilink_peer_session::ports::BlockServeAuthorizationPort>,
+        replica_engine_from_hydrating_2,
+        peer_peer_store_2,
         vec![GROUP.to_string()],
         HashMap::from([(GROUP.to_string(), peer.root.path().to_path_buf())]),
+        transports_from_hydrating,
+        None,
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::test_permissive(),
     );
     // The serving peer's own upload bucket is irrelevant to this test (this
     // asserts on D's shared *download* bucket only) — left unlimited, the
     // session's construction default.
     session_from_hydrating.set_block_serve_engine(peer.state.block_serve_engine.clone());
-    tokio::spawn(session_from_hydrating.run());
+    node_peer.serve_with(&hydrating.device_id, session_from_hydrating.clone());
 }

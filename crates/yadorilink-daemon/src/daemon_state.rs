@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -18,15 +18,19 @@ use yadorilink_filesystem_sync::block_liveness::{
     BlockLivenessGate, BlockPhysicalDeletionGuard, BlockReferenceWriteGuard,
 };
 use yadorilink_local_storage::BlockStore;
-use yadorilink_replica_domain::change::{ChangeAuth, PolicyUnavailable};
+use yadorilink_replica_domain::change::PolicyUnavailable;
 use yadorilink_replica_domain::file::VersionBlock;
 use yadorilink_replica_domain::ids::VersionHash;
 use yadorilink_replica_engine::custody::{CustodyStamp, FullReplicaCustody};
 
-use crate::daemon_runtime::{DaemonBuild, RuntimeComponents};
+#[cfg(test)]
+use crate::background_custody::BackgroundCustodyEvidence;
+use crate::background_custody::BackgroundCustodyOutcome;
+use crate::daemon_runtime::DaemonBuild;
 #[cfg(test)]
 use crate::durability_service::CustodyConfirmer;
-use crate::durability_service::GroupDurabilityStatus;
+use crate::durability_service::{DurabilityEvidence, GroupDurabilityStatus};
+use crate::handoff_proof::StrongHandoffProof;
 use yadorilink_peer_session::peer_session::{
     BlockWriteActivityProvider, HandoffLeaseResponder, HandoffTicketResponder,
     PeerHandoffLeaseGrant, PeerHandoffTicketGrant, PeerSyncSession,
@@ -36,7 +40,7 @@ use yadorilink_replica_domain::file::FileRecord;
 use yadorilink_replica_domain::session_state::{
     DurabilityRoot, DurabilityRoots, MembershipCommitMode, MembershipDurabilityScope,
     MembershipOperationAction, MembershipOperationState, RoleLossAction, RoleLossOperationParams,
-    RoleLossOperationState,
+    RoleLossOperationState, RootSetSummary,
 };
 use yadorilink_replica_engine::repair_election::{AuthorizedWriter, RepairElectionContext};
 use yadorilink_sync_sqlite::handoff_lease::HandoffLeaseState;
@@ -45,6 +49,12 @@ use crate::change_policy::GroupPolicyState;
 use crate::governance_config::GovernanceConfigStore;
 use crate::reporting::ReportingStorage;
 use crate::supervise;
+
+mod offline_authorization;
+pub(crate) use offline_authorization::is_within_offline_horizon;
+pub use offline_authorization::{AuthorizationProvenance, OFFLINE_AUTHORIZATION_HORIZON_SECS};
+mod peer_authority;
+pub use peer_authority::PeerAuthorityState;
 
 /// How often the retention-expiry sweep
 /// runs — see its spawn site in `DaemonState::new` for why this is a much
@@ -62,8 +72,7 @@ const MATERIALIZATION_REPAIR_SWEEP_INTERVAL: Duration = Duration::from_secs(90);
 /// where the newly-spawned task can start executing on a different worker
 /// thread immediately, with no `.await` needed to hand it control. A test
 /// that needs to prove convergence with NO help from this periodic sweep
-/// (see `fix/conflict-copy-convergence-obligation-20260723`'s acceptance
-/// criteria) needs the FIRST sleep, not just subsequent ones, to already
+/// needs the FIRST sleep, not just subsequent ones, to already
 /// reflect the override. Set this before constructing any `DaemonState`
 /// whose scheduler should start with it.
 static MATERIALIZATION_REPAIR_SWEEP_INTERVAL_OVERRIDE_FOR_TESTS: std::sync::OnceLock<
@@ -84,132 +93,17 @@ fn default_materialization_repair_sweep_interval() -> Duration {
         .unwrap_or(MATERIALIZATION_REPAIR_SWEEP_INTERVAL)
 }
 
-/// How often `DurabilityConfirmationJob` re-runs `full_replica_handoff_
-/// ready_digest_and_peer` for every linked group, refreshing
-/// `DaemonState::custody_confirmation_cache`. Same cadence as
-/// `MATERIALIZATION_REPAIR_SWEEP_INTERVAL` — a whole-group custody check is
-/// the same order of cost (one round-trip per group) as a materialization
-/// repair pass, so there's no reason for it to run on a different clock.
-const CUSTODY_CONFIRMATION_SWEEP_INTERVAL: Duration = Duration::from_secs(90);
+pub use crate::durability_service::set_default_custody_confirmation_sweep_interval_for_tests;
 
-/// How stale a `custody_confirmation_cache` entry may be before
-/// `group_durability_status` stops trusting it as `Protected` evidence — 3x
-/// `CUSTODY_CONFIRMATION_SWEEP_INTERVAL`, so one missed sweep round (a
-/// transient peer hiccup, a slow round-trip) doesn't immediately flip a
-/// genuinely-protected group to `Unknown`. Deliberately NOT
-/// unbounded: past this bound the evidence is old enough that "was
-/// protected" stops standing in for "is protected now" — see this module's
-/// M4 durability-model doc for why stale evidence must never be reported as
-/// current.
-const CUSTODY_CONFIRMATION_STALENESS_BOUND: Duration = Duration::from_secs(270);
-
-static CUSTODY_CONFIRMATION_SWEEP_INTERVAL_OVERRIDE_FOR_TESTS: std::sync::OnceLock<
-    Mutex<Option<Duration>>,
-> = std::sync::OnceLock::new();
-
-pub fn set_default_custody_confirmation_sweep_interval_for_tests(interval: Duration) {
-    *CUSTODY_CONFIRMATION_SWEEP_INTERVAL_OVERRIDE_FOR_TESTS
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap_or_else(|p| p.into_inner()) = Some(interval);
-}
-
-fn default_custody_confirmation_sweep_interval() -> Duration {
-    CUSTODY_CONFIRMATION_SWEEP_INTERVAL_OVERRIDE_FOR_TESTS
-        .get()
-        .and_then(|m| *m.lock().unwrap_or_else(|p| p.into_inner()))
-        .unwrap_or(CUSTODY_CONFIRMATION_SWEEP_INTERVAL)
-}
-
-/// The result of one `DurabilityConfirmationJob` sweep round for a group —
-/// see `DaemonState::custody_confirmation_cache`'s own doc comment. Every
-/// sweep round writes a record regardless of outcome (`Confirmed` or
-/// `NotConfirmed`), so a cache entry's mere presence answers "has this
-/// group ever been swept at least once" (`DaemonState::
-/// has_ever_been_custody_swept`) independent of whether that most recent
-/// round actually confirmed anything — see M4 Codex review #1 findings #1
-/// and #2 for why conflating "never checked yet" with "checked and found
-/// nothing" produced both a false-`Protected` and a false-`AtRisk` bug.
-#[derive(Debug, Clone)]
-pub(crate) enum CustodyConfirmationOutcome {
-    /// `full_replica_handoff_ready_digest_and_peer` returned `Some`.
-    /// `peer_device_id` is `None` for a vacuous confirmation (the group's
-    /// real durability-root set, per `durability_roots_for_group`, is
-    /// empty) — mirrors that function's own return shape. `digest` is
-    /// stored for diagnostics only; nothing in `classify` compares it, so
-    /// this cache accepts up to `CUSTODY_CONFIRMATION_STALENESS_BOUND` of
-    /// drift between confirmation and the group's real current version,
-    /// same trust window `full_replica_handoff_ready`'s own live callers
-    /// (unlink/handoff) already accept from its single-snapshot root
-    /// enumeration.
-    Confirmed {
-        #[allow(dead_code)]
-        peer_device_id: Option<String>,
-        #[allow(dead_code)]
-        digest: [u8; 32],
-    },
-    /// The sweep ran for this group but found no confirming peer (or a
-    /// non-empty, non-vacuously-ready root set) this round.
-    NotConfirmed,
-}
-
-/// One group's most recent `DurabilityConfirmationJob` sweep result — see
-/// `DaemonState::custody_confirmation_cache`'s own doc comment.
-#[derive(Debug, Clone)]
-struct CustodyConfirmationRecord {
-    outcome: CustodyConfirmationOutcome,
-    /// Display-only (a future UI surface showing "confirmed 3 min ago").
-    /// NEVER used for the staleness gate itself -- `confirmed_at` below is
-    /// the monotonic clock that owns that, specifically because this is a
-    /// wall-clock value an adjusted system clock could roll backward (M4
-    /// Codex review #1 finding #5).
-    #[allow(dead_code)]
-    confirmed_at_unix: i64,
-    /// Monotonic staleness gate -- see `confirmed_at_unix`'s doc comment
-    /// for why this, not that, is what `has_fresh_custody_confirmation`
-    /// actually checks.
-    confirmed_at: std::time::Instant,
-    /// `DaemonState::membership_generation()` at the moment this record
-    /// was written. `has_fresh_custody_confirmation` requires this to
-    /// still match the CURRENT generation -- if any peer's writer/
-    /// full-replica/netmap state has changed since, the confirmation this
-    /// record represents may no longer hold (e.g. the confirming peer was
-    /// demoted or removed), so it's treated as stale regardless of its
-    /// age (M4 Codex review #1 finding #3's demotion sub-case).
-    membership_generation: u64,
-}
-
-/// `DaemonState::custody_confirmation_cache`'s per-group value: the most
-/// recent confirmation record (if any) PLUS an epoch counter, sharing one
-/// `HashMap` entry under one lock deliberately. An earlier version tracked
-/// the epoch in a SEPARATE `Mutex<HashMap<...>>`, which meant
-/// `clear_custody_confirmation`'s remove-then-bump and
-/// `record_custody_confirmation_outcome`'s check-then-insert each took two
-/// non-atomic lock acquisitions -- a real TOCTOU where a `clear` and an
-/// in-flight `refresh`'s publish could interleave such that the stale
-/// publish still landed after the clear (M4 Codex review #1 second
-/// follow-up, finding #3b). Keeping both fields in the same map entry,
-/// mutated under the same single lock acquisition in each method, makes
-/// that interleaving structurally impossible.
-#[derive(Debug, Clone, Default)]
-struct CustodyCacheEntry {
-    record: Option<CustodyConfirmationRecord>,
-    epoch: u64,
-}
 /// How often the role-loss-operation reconciliation sweep
-/// (`run_role_loss_reconciliation_sweep`) retries any journal row left
+/// (`ReplicaRoleService::reconcile_role_loss`, scheduled by `RecoveryJob`)
+/// retries any journal row left
 /// mid-flight by a crash or a compensation attempt that couldn't reach the
 /// coordination plane. Matches `MATERIALIZATION_REPAIR_SWEEP_INTERVAL`'s
 /// cadence rather than the much longer retention-expiry one: a role-loss
 /// split state is a user-visible correctness gap the same way a broken
 /// materialization is, not a slow-moving housekeeping concern.
 pub(crate) const ROLE_LOSS_RECONCILIATION_SWEEP_INTERVAL: Duration = Duration::from_secs(90);
-/// Past this many compensation attempts for the same role-loss operation,
-/// the sweep escalates its log level from `warn` to `error` — a visibility
-/// aid only. The row itself is never abandoned or deleted regardless of how
-/// many attempts it has accrued; see `DaemonState::compensate_role_loss_
-/// operation`'s doc comment.
-const ROLE_LOSS_COMPENSATION_ESCALATION_ATTEMPTS: i64 = 5;
 /// Overall bound on `confirm_version_present_via_peer`'s concurrent fan-out
 /// across every candidate peer. Each individual `request_version_present`
 /// already enforces its own ~10s per-request timeout (`peer_session.rs`), and
@@ -219,7 +113,7 @@ const ROLE_LOSS_COMPENSATION_ESCALATION_ATTEMPTS: i64 = 5;
 /// N-peers-times-10s worst case. This wraps the whole fan-out in one slightly
 /// longer timeout anyway, as a defense-in-depth backstop, rather than relying
 /// solely on each query's own internal bound.
-const VERSION_PRESENT_QUERY_OVERALL_TIMEOUT: Duration = Duration::from_secs(12);
+pub(crate) const VERSION_PRESENT_QUERY_OVERALL_TIMEOUT: Duration = Duration::from_secs(12);
 
 /// This crate's own build version, parsed as semver — the "current
 /// running version" `update::manifest::LocalContext` compares manifest
@@ -242,102 +136,6 @@ pub(crate) fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-/// Fix-saga: the startup + periodic reconciliation sweep for the role-loss
-/// operation journal (`yadorilink_sync_core::index::RoleLossOperation`).
-/// Scans every journal row regardless of which group it names and, per row:
-///
-/// - `LocalCommitted`/`Completed` (terminal): the operation's real outcome
-///   was already reached by the write that landed this state; only the
-///   follow-up delete never ran (a crash in that narrow window). Just
-///   finishes the delete — no coordination-plane call needed.
-/// - `Prepared`/`WorkerCommitted`/`Compensating`: every one of these means
-///   this process cannot be sure the local change ever landed while the
-///   Worker might already have committed the role loss (or, for
-///   `Compensating`, a previous revert attempt itself didn't complete) — see
-///   [`yadorilink_sync_core::index::RoleLossOperationState::Prepared`]'s doc
-///   comment for why treating `Prepared` the same as `WorkerCommitted` here
-///   is safe. All three are handed to
-///   [`DaemonState::compensate_role_loss_operation`], which reverts the
-///   source device back to `eager` on the coordination plane — the safe
-///   direction (see that method's doc comment) — and is itself idempotent
-///   and safe to call repeatedly.
-///
-/// Errors from an individual row's compensation attempt are logged (by
-/// `compensate_role_loss_operation` itself) and otherwise swallowed here: a
-/// row that can't be compensated this pass simply survives to the next
-/// sweep, never abandoned.
-///
-/// `pub` (rather than the crate-private visibility every other call site in
-/// this file gets) so integration tests can invoke exactly this function
-/// directly and deterministically, instead of racing or waiting out
-/// `ROLE_LOSS_RECONCILIATION_SWEEP_INTERVAL`'s real-time periodic spawn in
-/// `DaemonState::new` — the same production entry point either way.
-/// One scheduling owner for every membership-related recovery journal this
-/// daemon currently sweeps: this device's own role loss (demote/unlink),
-/// unknown-scope device removals, and ambiguous ticket-bound revoke/remove
-/// commits. `pub` for the same reason `run_role_loss_reconciliation_sweep`
-/// is — so a test can invoke exactly this deterministically instead of
-/// racing `DaemonState::new`'s real-time periodic spawn.
-pub async fn run_membership_recovery_sweep(state: &Arc<DaemonState>) {
-    run_role_loss_reconciliation_sweep(state).await;
-    let application = crate::adapters::build_application_services(state.clone());
-    application.membership.reconcile_unknown_scope().await;
-    application.membership.reconcile_ambiguous().await;
-}
-
-pub async fn run_role_loss_reconciliation_sweep(state: &Arc<DaemonState>) {
-    let rows = match state
-        .replica_coordinator
-        .role_loss_operation_repository()
-        .list_role_loss_operations_in_states(&[
-            RoleLossOperationState::Prepared,
-            RoleLossOperationState::WorkerCommitted,
-            RoleLossOperationState::LocalCommitted,
-            RoleLossOperationState::Compensating,
-            RoleLossOperationState::Completed,
-        ]) {
-        Ok(rows) => rows,
-        Err(e) => {
-            tracing::warn!(error = %e, "role-loss reconciliation sweep failed to list journal rows");
-            return;
-        }
-    };
-    for op in rows {
-        match op.state {
-            RoleLossOperationState::LocalCommitted | RoleLossOperationState::Completed => {
-                if let Err(e) = state
-                    .replica_coordinator
-                    .role_loss_operation_repository()
-                    .delete_role_loss_operation(&op.operation_id)
-                {
-                    tracing::warn!(
-                        error = %e,
-                        operation_id = %op.operation_id,
-                        "role-loss reconciliation sweep failed to delete a settled journal row"
-                    );
-                }
-            }
-            RoleLossOperationState::Prepared
-            | RoleLossOperationState::WorkerCommitted
-            | RoleLossOperationState::Compensating => {
-                match state.compensate_role_loss_operation(&op.operation_id).await {
-                    Ok(()) => {
-                        tracing::info!(
-                            operation_id = %op.operation_id,
-                            group_id = %op.group_id,
-                            "role-loss reconciliation sweep compensated an in-flight operation"
-                        );
-                    }
-                    Err(_) => {
-                        // Already logged inside `compensate_role_loss_operation`; the row
-                        // stays `Compensating` for the next sweep to retry.
-                    }
-                }
-            }
-        }
-    }
-}
-
 impl FullReplicaCustody for DaemonState {
     fn confirm_exact_version(
         &self,
@@ -352,61 +150,6 @@ impl FullReplicaCustody for DaemonState {
     fn confirmation_still_valid(&self, group_id: &str, stamp: &CustodyStamp) -> bool {
         self.custody_confirmation_still_valid(group_id, stamp)
     }
-}
-
-impl crate::queries::runtime_status::RelayCapabilityPort for DaemonState {
-    fn relay_capability(&self, device_id: &str) -> crate::route::RelayCapability {
-        self.peer_relay_capability(device_id)
-    }
-}
-
-/// M3 Pass 5: see `DaemonState::active_relay_sessions`'s own doc comment.
-#[derive(Debug, Clone)]
-struct RelaySessionRecord {
-    source_device_id: String,
-    group_id: String,
-    destination_device_id: String,
-}
-
-/// One relay session this device opened as the requester -- see
-/// `DaemonState::requester_relay_sessions`'s own doc comment.
-///
-/// There is deliberately no "reuse an existing session for this
-/// destination" lookup any more. A relay session now carries one QUIC
-/// connection generation and is closed with it, so the question a reuse
-/// path had to answer -- is the connection this session was negotiated on
-/// still the live one -- cannot arise: the session and the connection over
-/// it have the same lifetime by construction, and the path handle held
-/// here is what enforces that.
-#[derive(Clone)]
-struct RequesterRelaySession {
-    destination_peer_public: [u8; 32],
-    /// Mirrors the admitting grant's own expiry -- see `record_requester_
-    /// relay_session`'s own doc comment for why this device tracks it
-    /// independently rather than trusting the relay's `RelayClose` to
-    /// always arrive.
-    expires_at_unix: i64,
-    /// The synthetic transport path this session carries. Held so an
-    /// inbound `RelayData` for this session can be injected into this
-    /// device's QUIC endpoint under the address quinn already knows the
-    /// peer by, and so the path is closed exactly when this record is
-    /// forgotten rather than outliving it.
-    path: Arc<yadorilink_transport::RelayPathHandle>,
-}
-
-#[derive(Default)]
-struct PeerNetmapMetadata {
-    signing_keys: HashMap<String, [u8; 32]>,
-    writers: HashSet<(String, String)>,
-    full_replicas: HashSet<(String, String)>,
-    /// M3 Pass 4: device ids that have declared `RelayCapability::Capable`
-    /// on the coordination-plane netmap. Deliberately device-keyed, not
-    /// group-scoped like `full_replicas` -- relay capability is not a
-    /// per-group storage role, and (per `crate::route`'s own doc comment)
-    /// is never derived from or gated by group authorization/full-replica
-    /// status the way `full_replicas` is gated by `authorized_groups` in
-    /// `replace_peer_netmap_metadata`.
-    relay_capable: HashSet<String>,
 }
 
 /// The outcome of [`DaemonState::resolve_group_policy`] — the single
@@ -428,11 +171,37 @@ pub enum GroupPolicyResolution {
     Bootstrap,
 }
 
-/// One peer's live direct route: the QUIC control channel itself, plus the
-/// Ed25519 device key that authenticated it.
+/// Whether a folder group can be used locally right now — the answer to
+/// [`DaemonState::group_readiness`].
 ///
-pub(crate) struct DirectPeerRoute {
-    channel: Arc<yadorilink_transport::QuicPeerChannel>,
+/// Deliberately distinguishes "not ready yet, and this resolves itself"
+/// from "not ready, and something is wrong". `GroupPolicyResolution`
+/// collapses both into `Withhold` because for a fail-closed authorization
+/// decision they are the same answer; for a caller deciding whether to wait
+/// or to report a problem they are not, and collapsing them is why a
+/// freshly created group was indistinguishable from a broken one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupReadiness {
+    /// No link row for this group on this device. Nothing will change on its
+    /// own; the group has to be created or joined first.
+    NotJoined,
+    /// Linked, and waiting for its verified policy to arrive. Transient and
+    /// self-resolving: a newly created or joined group sits here until the
+    /// coordination plane's netmap carrying its policy lands.
+    AwaitingPolicy,
+    /// A policy was loaded and has since been distrusted — own verification
+    /// failure, or coordinator-flagged invalid. Unlike `AwaitingPolicy` this
+    /// is not expected to clear by simply waiting.
+    PolicyStale,
+    /// Linked, policy verified (or legitimately in the pre-policy bootstrap
+    /// window), and this device may author into the group.
+    Ready,
+}
+
+impl GroupReadiness {
+    pub fn is_ready(self) -> bool {
+        matches!(self, GroupReadiness::Ready)
+    }
 }
 
 /// One Track Send grant-derived peer -- see `DaemonState::send_grant_peers`'s
@@ -449,7 +218,8 @@ pub(crate) struct DirectPeerRoute {
 pub struct SendGrantPeer {
     pub device_id: String,
     pub signing_key: [u8; 32],
-    pub candidate_addresses: Vec<std::net::SocketAddr>,
+    /// Where the device's iroh endpoint answers, from the grant material.
+    pub reachability: crate::coordination_client::SubstrateReachability,
     pub grant_id: String,
     pub nonce: String,
     pub expires_at_unix: i64,
@@ -457,24 +227,21 @@ pub struct SendGrantPeer {
 
 pub struct DaemonState {
     pub device_id: String,
-    /// Phase 7D-10.9: this is now the ONLY replica/DAG/materialization
-    /// composition-root handle `DaemonState` holds -- `sync_state: Arc<
-    /// yadorilink_sync_core::index::SyncState>` (additive since 7D-10.2)
-    /// has been removed. Every production call site that used to read
-    /// `sync_state` was already repointed to this field by earlier passes,
-    /// or (the two provider-setter calls, `app::run`'s own `SyncState::open`)
-    /// removed/repointed in the same pass that deleted the field -- see
-    /// `docs/design/phase7d10-exit-report.md`'s 7D-10.9 addendum.
+    /// Observation only; see `retirement_backstop_ticks`.
+    retirement_backstop_ticks: std::sync::atomic::AtomicU64,
+    /// The daemon's single owner of replica state: every production read
+    /// and provider registration goes through this field (there is no
+    /// separate `SyncState` handle on `DaemonState`).
     pub replica_coordinator: Arc<crate::replica_coordinator::ReplicaCoordinator>,
     pub block_store: Arc<dyn BlockStore + Send + Sync>,
-    /// M2-5: coalesces concurrent `FETCH_DATA`-driven `hydration::hydrate`
+    /// Coalesces concurrent `FETCH_DATA`-driven `hydration::hydrate`
     /// calls for the same path onto one real attempt -- see
     /// `hydration_single_flight`'s own module doc for why this is
     /// layered outside, not a replacement for, `hydrate_inner`'s
     /// per-path lock. Per daemon-instance state, matching
     /// `ReplicaCoordinator::path_lock_registry`'s own reasoning (never a
-    /// process-wide `static`, which the deterministic simulator's many
-    /// in-process daemon instances would wrongly share).
+    /// process-wide `static`, which a test's many in-process daemon
+    /// instances would wrongly share).
     pub hydrate_single_flight: crate::hydration_single_flight::HydrateSingleFlight,
     /// Shared, device-wide block-serve credit/coalescing engine (stage 2)
     /// -- one instance for the whole daemon, handed to every
@@ -489,91 +256,14 @@ pub struct DaemonState {
     /// `crate::peer_registry::PeerRegistry`'s own doc comment. Reached only
     /// through its own methods; the maps themselves are private.
     pub peers: Arc<crate::peer_registry::PeerRegistry>,
-    /// The merged set of this device's local endpoint candidates (LAN, IPv6
-    /// host, port-mapped, server-reflexive), maintained by the NAT-traversal
-    /// tasks. Held here so those tasks publish into it and the peer
-    /// orchestrator can read the current set when offering candidates in a
-    /// rendezvous request.
-    pub nat_sink: Arc<yadorilink_transport::CandidateSink>,
-    /// A change-driven view of `nat_sink`'s merged candidate set, for the
-    /// candidate-reporting task and rendezvous offers.
-    pub nat_candidates: tokio::sync::watch::Receiver<Vec<yadorilink_transport::Candidate>>,
-    /// Passive NAT/firewall observations (STUN mappings, port-mapping status,
-    /// hole-punch outcomes) gathered by the NAT-traversal tasks. The
-    /// connectivity doctor classifies a snapshot of this into a NAT type.
-    pub nat_observations: yadorilink_transport::ObservationLog,
-    /// This device's single long-lived UDP socket, shared by every
-    /// `PeerChannel` and by NAT candidate gathering so the advertised
-    /// candidates describe the exact binding data flows on. Bound lazily on
-    /// first use in production; the deterministic-simulation harness sets a
-    /// pre-bound one via [`set_shared_socket`](DaemonState::set_shared_socket).
-    pub shared_socket: tokio::sync::OnceCell<Arc<yadorilink_transport::TransportHub>>,
-    /// The device's one `QuicPeerEndpoint`, published here once
-    /// `peer_orchestrator::ensure_quic_endpoint` has built it -- mirrors
-    /// `shared_socket` immediately above in every respect (same `OnceCell`
-    /// shape, same "bound/built lazily, readable by anyone once it
-    /// exists" contract), but for the endpoint layered on that socket
-    /// rather than the socket itself.
-    ///
-    /// Track Send (see `crate::send_transfer`) is the reason this exists:
-    /// it is a wholly separate protocol on the SAME endpoint (distinguished
-    /// by ALPN, not by a second endpoint -- a transport hub accepts exactly
-    /// one registered QUIC socket, so there is no second one to build), and
-    /// it needs a handle to dial/accept on, but it is not
-    /// `peer_orchestrator`'s own code and must not reach into that
-    /// module's private `NetmapDiffState` to get one.
-    pub shared_quic_peer_endpoint:
-        tokio::sync::OnceCell<Arc<yadorilink_transport::quic_peer_endpoint::QuicPeerEndpoint>>,
-    /// device_id -> the coordination-plane-advertised candidate addresses
-    /// `peer_orchestrator` most recently learned for that peer, published
-    /// on every applied netmap push (see `record_peer_candidate_addresses`'s
-    /// call site) for any other daemon subsystem that needs a dial target
-    /// for an already-known device without re-deriving netmap-fed
-    /// connectivity itself. Track Send is the first such consumer: it
-    /// reuses this instead of racing its own candidate discovery, matching
-    /// this workspace's existing device-addressing rather than inventing a
-    /// second one.
-    ///
-    /// Deliberately just the netmap-advertised set, not LAN-discovered or
-    /// rendezvous-derived candidates layered on elsewhere in
-    /// `peer_orchestrator.rs` -- good enough for a one-shot transfer to an
-    /// already-paired account device, and simpler than threading every
-    /// candidate source out of a module that keeps most of them private on
-    /// purpose.
-    pub peer_candidate_addresses: Mutex<HashMap<String, Vec<std::net::SocketAddr>>>,
-    /// A read-only view of `peer_orchestrator`'s LAN-discovered candidate
-    /// cache, published by `peer_orchestrator::run` -- same `OnceCell`
-    /// shape and same reason as `shared_quic_peer_endpoint` above:
-    /// something outside that module needs to see one of its values, and
-    /// must not reach into its private `NetmapDiffState` to get it. Here
-    /// the consumer is the diagnostics read model
-    /// (`queries::diagnostics`), which reports candidates a peer has
-    /// announced but that have not produced a connection -- the half of
-    /// LAN troubleshooting `connection_trace`'s resolved-attempt history
-    /// structurally cannot show.
-    ///
-    /// Strictly observation: `LanCandidateObserver` exposes no mutation at
-    /// all, so nothing reached through this cell can change which
-    /// candidates exist or what is done with them.
-    ///
-    /// `Arc`-wrapped, unlike `shared_quic_peer_endpoint`'s bare
-    /// `OnceCell`, purely so the diagnostics query service can hold this
-    /// one cell as a narrow, cheap-clone dependency instead of the whole
-    /// `DaemonState` -- see `queries::diagnostics`'s own module doc.
-    ///
-    /// `pub(crate)`, unlike its neighbours, because the guarantee that this
-    /// view reports the same candidate set the dial path reads rests on
-    /// `peer_orchestrator::run` being the thing that publishes it. A `pub`
-    /// cell would let any holder of a `&DaemonState` win the `OnceCell`
-    /// race with a view over an unrelated map, and nothing about the type
-    /// would notice.
-    pub(crate) lan_candidate_observer:
-        Arc<tokio::sync::OnceCell<crate::peer_orchestrator::LanCandidateObserver>>,
+    /// This device's iroh connectivity: its published relay URLs and
+    /// substrate endpoint, each peer's plane-reported substrate reachability,
+    /// and the only way to bind an iroh endpoint -- see
+    /// `PeerConnectivityRuntime`'s own doc comment.
+    pub peer_connectivity: Arc<crate::peer_connectivity_runtime::PeerConnectivityRuntime>,
     /// Track Send's own service, published by `crate::send_transfer::run`
-    /// once `shared_quic_peer_endpoint` above exists -- mirrors that
-    /// field's own `OnceCell` shape/contract exactly. `None` until this
-    /// device's coordination-plane connectivity has been established at
-    /// least once; `crate::send_transfer::SendTransferService`/
+    /// once the reconciliation stack's iroh endpoint exists (Track Send is
+    /// served on that endpoint's own ALPN). `None` until then; `crate::send_transfer::SendTransferService`/
     /// `InboxQueries` report a clear "not ready yet" error for that
     /// window rather than blocking a control-socket request on it.
     pub send_service: tokio::sync::OnceCell<Arc<yadorilink_send::SendService>>,
@@ -591,180 +281,16 @@ pub struct DaemonState {
     /// caller -- see `record_send_grant_peer`/`send_grant_peer_by_key`/
     /// `send_grant_peer_by_device_id`.
     pub send_grant_peers: Mutex<Vec<SendGrantPeer>>,
-    /// M3 Pass 5: the coordination plane's currently-pinned service
-    /// signing key -- the SAME trust anchor `change_policy::
-    /// verify_group_policy_log` uses for group policy logs, mirrored here
-    /// (from the identical pin decision `record_group_policy_states`
-    /// already makes on every netmap update) so relay-grant verification
-    /// can reach it at any later point, independent of any specific
-    /// netmap-subscription attempt. `None` until the first netmap update
-    /// with policy distribution enabled has been processed.
-    pinned_coordination_service_key: Mutex<Option<[u8; 32]>>,
-    /// M3 Pass 5: this device's own relay-session forwarding actor
-    /// registry (its role as "B") -- see
-    /// `crate::relay_forwarder::RelayForwarder`'s own doc comment. Not
-    /// present under the deterministic simulator -- see `relay_forwarder`'s
-    /// module-gating comment in `lib.rs`.
-    #[cfg(not(madsim))]
-    pub relay_forwarder: Arc<crate::relay_forwarder::RelayForwarder>,
-    /// M3 Pass 5: replay guard for grant ids this device has admitted as a
-    /// relay -- see `crate::relay_session::RelayReplayGuard`'s own doc
-    /// comment. Device-wide (not per-session), since the same grant_id
-    /// must never be usable twice regardless of which channel presents it.
-    pub(crate) relay_replay_guard: crate::relay_session::RelayReplayGuard,
-    /// device_id -> this device's live, directly-connected QUIC channel to
-    /// that peer. Registered by the peer orchestrator at the same points a
-    /// session starts and ends.
-    ///
-    /// It exists because the orchestrator's own bookkeeping is local to
-    /// `run`'s call stack and unreachable from a `RelaySessionHandler`
-    /// implementation on `DaemonState`, which needs this device's OWN
-    /// direct route to a relay destination: both to address its dedicated
-    /// forwarding socket, and to confirm a direct route exists at all --
-    /// see `relay_session::RelayAdmissionContext::has_direct_route_to_
-    /// destination`'s own doc comment for why that check specifically
-    /// forbids relay chaining.
-    direct_channels: Mutex<HashMap<String, DirectPeerRoute>>,
-    /// device_id -> the highest generation that has ever successfully
-    /// published into `direct_channels` for that peer -- see
-    /// `set_direct_channel`'s own doc comment for the ABA race this
-    /// closes.
-    direct_channel_generations: Mutex<HashMap<String, u32>>,
-    /// M3 Pass 5: session id -> the full authorization tuple it was
-    /// admitted under -- see `record_relay_session`'s own doc comment for
-    /// why (per-datagram revalidation, closing H2/M3 in the independent
-    /// review). Also what `remove_direct_channel` searches to find
-    /// sessions affected by a specific destination's route disappearing.
-    /// Known limitation, not yet worth further plumbing to close: an
-    /// entry for a session that closes NORMALLY (idle timeout, grant
-    /// expiry, explicit close, or a `revalidate_relay_session` failure --
-    /// all of which go through `RelayForwarder::close_session`, not
-    /// straight through this map) is only pruned by `forget_relay_
-    /// session`, called from `handle_relay_data`'s own dispatch once a
-    /// close is detected there -- a session that goes idle and times out
-    /// with NO further datagrams ever arriving has no such trigger and
-    /// stays in this map until this device restarts. Bounded in practice
-    /// (each entry is a few small strings, and idle sessions are rare
-    /// relative to active ones), not fixed here.
-    active_relay_sessions: Mutex<HashMap<u64, RelaySessionRecord>>,
-    /// M3 Pass 6: session id -> the destination peer's Ed25519 device
-    /// public key, for a session THIS device opened as the relay
-    /// REQUESTER ("A"), not provider ("B") -- distinct from
-    /// `active_relay_sessions` above, which only ever tracks sessions this
-    /// device is providing forwarding for. Consulted first by
-    /// `handle_relay_data`'s dispatch, before falling through to the
-    /// provider-side path, so a reply this device's own relay path is
-    /// waiting on is injected into this device's QUIC endpoint under that
-    /// path's synthetic address instead of being mistaken for a forward
-    /// request this device never opened. Keyed by `(relay_device_id, session_id)`,
-    /// not `session_id` alone -- see `requester_relay_session`'s own doc
-    /// comment for the cross-relay session-id collision this closes.
-    requester_relay_sessions: Mutex<HashMap<(String, u64), RequesterRelaySession>>,
-    /// M3 Pass 6: `grant_id -> ` the oneshot this device's own
-    /// `relay_carrier::open_relay_path` is waiting on for the matching
-    /// `RelayOpenedFrame` reply, plus the device_id the matching `RelayOpen`
-    /// was actually sent to -- `resolve_pending_relay_open` checks a
-    /// `RelayOpened`'s own authenticated sender against this before
-    /// resolving, so a different peer this device happens to also have a
-    /// session with cannot complete (or poison) an open it was never asked
-    /// to answer, even if it somehow guesses/replays a live `grant_id`.
-    /// Removed on first delivery -- a sender with nobody left waiting (the
-    /// caller already gave up) is simply dropped when its receiver goes
-    /// away, not a leak; bounded by how many opens are ever in flight at
-    /// once.
-    pending_relay_opens: Mutex<
-        HashMap<
-            String,
-            (String, tokio::sync::oneshot::Sender<yadorilink_sync_wire::RelayOpenedFrame>),
-        >,
-    >,
-    /// M3 Pass 6: how this device (as relay REQUESTER) obtains a signed
-    /// `RelayGrant` before opening a session -- see `crate::relay_carrier::
-    /// RelayGrantSource`'s own doc comment for why this is `None` in
-    /// production today (no coordination-plane endpoint exists yet to
-    /// fill it) and only ever `Some` in tests, via `FakeCoordination`.
-    relay_grant_source: Mutex<Option<Arc<dyn crate::relay_carrier::RelayGrantSource>>>,
-    /// M3 Pass 5: this device's own local configuration of whether it is
-    /// willing to relay for other peers -- see `crate::route::
-    /// RelayCapability`'s own doc comment. Defaults to `false` (the
-    /// fail-safe default: a device must explicitly opt in). Distinct from
-    /// `peer_relay_capability`, which reads OTHER peers' netmap-advertised
-    /// capability -- this is what THIS device would itself advertise, and
-    /// what its own relay-admission check consults for "am I actually
-    /// willing to do this" (defense in depth beyond trusting the
-    /// coordination plane's own issuance decision, per `relay_session`'s
-    /// own doc comment). Not yet wired into netmap registration/
-    /// advertisement (`register_with_fake`'s production counterpart) --
-    /// a device that sets this locally is not yet visible to the
-    /// coordination plane as a relay candidate; that wiring is a
-    /// remaining follow-up, tracked separately from the relay mechanism
-    /// itself.
-    local_relay_capable: std::sync::atomic::AtomicBool,
+    /// Which peers are authorized for what: netmap-derived signing keys,
+    /// writer and full-replica status, the membership generation that
+    /// versions them, the pinned coordination service key, and per-group
+    /// policy state -- see `PeerAuthorityState`'s own
+    /// doc comment. Reached only through its own methods.
+    pub authority: Arc<PeerAuthorityState>,
     /// This device's Ed25519 change-history signing key, wired once at startup
     /// when the device is registered. `None` (the default) leaves signed
     /// change-history emission off — see `set_device_signing_key`.
     pub device_signing_key: Mutex<Option<ed25519_dalek::SigningKey>>,
-    /// One atomic view of every peer's netmap-derived signing key, writer
-    /// authorization, and full-replica status. Keeping these under one lock
-    /// prevents change admission and last-replica custody from observing a
-    /// partially-applied revocation/demotion snapshot.
-    peer_netmap_metadata: Mutex<PeerNetmapMetadata>,
-    /// Monotonic counter bumped on every actual change to the netmap-derived
-    /// authorization state above (`PeerNetmapMetadata::writers` /
-    /// `PeerNetmapMetadata::full_replicas`). A version-present confirmation captures it
-    /// before the peer round-trip and requires it unchanged after the reply, so
-    /// a revoke/demote — or any membership churn — arriving during the wait
-    /// fails the confirmation closed rather than trusting a now-stale ACK.
-    membership_generation: std::sync::atomic::AtomicU64,
-    /// group_id -> current signed policy-log head coordinates from the latest
-    /// coordination netmap full update. Used to verify a change's signed
-    /// auth_seq/auth_epoch/policy_head_hash stamp after its signature verifies.
-    group_policy_states: Mutex<HashMap<String, GroupPolicyState>>,
-    /// group_id -> unix time its most recent policy snapshot FAILED
-    /// verification. A group listed here is untrusted: its verified state has
-    /// been dropped and change admission for it fails closed until a valid
-    /// snapshot clears the mark, so a revoke a corrupt snapshot hid can never
-    /// leave a revoked writer admitted. Presence is the stale flag; the value
-    /// is the failure time for diagnostics.
-    stale_policy_groups: Mutex<HashMap<String, i64>>,
-    /// group_id -> next candidate offset for daemon-level materialization
-    /// repair, so a slow or incomplete peer is not selected forever.
-    /// `pub(crate)`: read by `maintenance::materialization_repair::
-    /// MaterializationRepairJob`'s own `run_once`, a relocation of what
-    /// used to be this file's own `spawn_materialization_repair_scheduler`
-    /// loop body.
-    pub(crate) materialization_repair_cursors: Mutex<HashMap<String, usize>>,
-    /// group_id -> next candidate offset for the Convergence Engine's own
-    /// per-group peer selection (`convergence::engine::
-    /// process_group_via_obligations`) — a separate cursor from
-    /// `materialization_repair_cursors` above since the two run on
-    /// independent schedules (event-driven/~1s vs the 90s backstop) and
-    /// rotating them together would couple cadences that have no reason to
-    /// be coupled.
-    pub(crate) obligation_engine_cursors: Mutex<HashMap<String, usize>>,
-    /// group_id -> next path-budget offset for the Convergence Engine's own
-    /// per-tick path cap (`MAX_PATHS_PER_RECONCILE_ATTEMPT` in
-    /// `convergence::engine`) — a confirmed, reproduced regression (see
-    /// `fix/conflict-copy-convergence-obligation-20260723`): a single
-    /// candidate attempt handed the ENTIRE claimed batch for a group
-    /// (up to `MAX_JOBS_PER_TICK_PER_GROUP`, 128) processes every path's
-    /// blocks fully serially, and a large backlog of not-yet-referenced/
-    /// genuinely-missing blocks was measured accumulating into a 40+
-    /// second single call with no visible progress. Rotating which bounded
-    /// subset of `remaining` gets attempted each tick (this cursor) is what
-    /// lets every path eventually get its turn without needing an
-    /// unboundedly large single attempt.
-    pub(crate) obligation_engine_path_budget_cursors: Mutex<HashMap<String, usize>>,
-    /// group_id -> cached `PeerSyncSession` bound to a `LoopbackPeerMessageChannel`
-    /// rather than a live peer connection -- see `local_retirement_session`'s
-    /// own doc comment for why retirement needs a session object at all,
-    /// and why one not requiring a connected peer. Built lazily on first
-    /// use per group and reused after that, matching a real peer session's
-    /// own long-lived-per-connection shape (rate limiters, block-serve
-    /// engine, and friends are shared `Arc`s either way, so nothing here
-    /// depends on reconstructing fresh per call).
-    local_retirement_sessions:
-        Mutex<HashMap<String, Arc<yadorilink_peer_session::peer_session::PeerSyncSession>>>,
     /// Overridable copy of `MATERIALIZATION_REPAIR_SWEEP_INTERVAL` — same
     /// mutable-after-construction shape as `PeerSyncSession::
     /// maintenance_reconcile_interval` (`StdMutex`, opt-in override via
@@ -774,23 +300,6 @@ pub struct DaemonState {
     /// to fire faster than production's cadence can opt in without a
     /// constructor parameter.
     materialization_repair_sweep_interval: Mutex<Duration>,
-    /// Overridable sweep interval for `maintenance::durability_confirmation::
-    /// DurabilityConfirmationJob`, same shape/reason as
-    /// `materialization_repair_sweep_interval` above.
-    custody_confirmation_sweep_interval: Mutex<Duration>,
-    /// group_id -> that group's custody-confirmation cache entry (the most
-    /// recent whole-group peer-confirmed custody evidence, if any, plus an
-    /// epoch counter) -- populated by `DurabilityConfirmationJob`'s
-    /// periodic sweep. `group_durability_status` only trusts a record here
-    /// as `Protected` evidence within `CUSTODY_CONFIRMATION_STALENESS_BOUND`
-    /// of its confirmation time -- this is what lets `Protected` mean "a
-    /// peer positively confirmed whole-group coverage recently," not "this
-    /// device's own local copy looks complete" (the conflation M4's audit
-    /// found in the prior derivation). The epoch and the record share ONE
-    /// lock deliberately -- see `CustodyCacheEntry`'s own doc comment for
-    /// why a prior two-lock split between them was a real TOCTOU (M4 Codex
-    /// review #1 second follow-up, finding #3b).
-    custody_confirmation_cache: Mutex<HashMap<String, CustodyCacheEntry>>,
     /// local_path -> that link's single runtime record: its
     /// folder-watcher tasks (the debounce accumulator and the executor
     /// that consumes its flushes, plus the periodic repair and
@@ -847,24 +356,6 @@ pub struct DaemonState {
     /// outside test builds -- see this field's own `cfg`.
     #[cfg(any(test, feature = "test-support"))]
     pub test_placeholder_pipeline_connected: Mutex<Option<bool>>,
-    /// Test-only override consulted FIRST by `impl RelaySessionHandler for
-    /// DaemonState` (`relay_session_handler.rs`) -- `None` (the default)
-    /// leaves the real admission/forwarding pipeline wired in. Lets a test
-    /// give one specific device's own `PeerSyncSession`s a recording/
-    /// observing handler (e.g. the relay REQUESTER side, "A", which has
-    /// no production consumer of its own relayed replies yet -- that
-    /// wiring is Pass 6's job, not this mechanism's) without touching any
-    /// other device's real behavior. Not reachable outside test builds --
-    /// see this field's own `cfg`, mirroring `test_placeholder_pipeline_
-    /// connected`'s own reasoning exactly.
-    #[cfg(any(test, feature = "test-support"))]
-    pub test_relay_session_handler:
-        Mutex<Option<Arc<dyn yadorilink_peer_session::peer_session::RelaySessionHandler>>>,
-    /// Absolute paths a shell-extension client has asked to pause
-    /// individually via `ContextAction::PauseItem` — finer-grained than
-    /// the whole-link pause in `SyncState`, and deliberately in-memory
-    /// only: it's a transient UI action, not durable state.
-    pub paused_paths: Mutex<HashSet<String>>,
     /// This device's observability-facing runtime state -- see
     /// `crate::runtime_telemetry::RuntimeTelemetry`'s own doc comment.
     pub telemetry: Arc<crate::runtime_telemetry::RuntimeTelemetry>,
@@ -907,7 +398,7 @@ pub struct DaemonState {
     /// "concurrent per-peer fetches share one global ceiling"
     /// true: they all draw from these exact two `Arc<TokenBucket>`
     /// instances, not independent per-session copies. Initialized from
-    /// `governance_config` at construction; `GovernanceCommandService::
+    /// `governance_config` at construction; `GovernanceCommandPort::
     /// set_limits` (`adapters::runtime::governance`) re-reads config and
     /// updates these same buckets' rates in place (live reload) rather
     /// than replacing the `Arc`, so every already-connected session picks
@@ -934,17 +425,6 @@ pub struct DaemonState {
     /// whole-group handoff re-check clears it. The set is loaded from and
     /// written through `SyncState` so force history survives restart.
     durability: Arc<crate::durability_service::DurabilityService>,
-    durability_latch_load_failed: AtomicBool,
-    /// Set while at least one `membership_operations` journal row is in
-    /// `UnknownScope` state (a `--force` device removal proceeded without a
-    /// verified list of groups at risk). Since the AT-RISK GROUPS are
-    /// themselves unknown, this cannot be expressed as a per-group latch —
-    /// it forces every group's `group_durability_status` to
-    /// `Unknown` until a reconciliation pass narrows the scope
-    /// down to real per-group latches and clears this flag. Loaded from
-    /// `SyncState` at startup so it survives a restart, matching
-    /// `durability_latch_load_failed`'s own persistence.
-    unknown_scope_membership_marker: AtomicBool,
     /// operation_id -> consecutive `TransientFailure` count from
     /// `EnrollmentRecoveryService::reconcile_once`'s activate retries, so a
     /// coordination-plane outage (or any other unconfirmable activate) that
@@ -1005,10 +485,9 @@ pub struct DaemonState {
     pub gc: Arc<crate::gc_state::GcState>,
     /// This device's coordination-plane address + access token, set once at
     /// startup (`app.rs`, alongside the other production-only coordination
-    /// wiring: signing-key backfill, NAT traversal, pending-enrollment
+    /// wiring: NAT traversal, pending-enrollment
     /// reconcile) whenever a registered device and a stored access token are
-    /// both available. `None` under the deterministic simulator, in most unit
-    /// tests, and on a device that has never registered/logged in — every
+    /// both available. `None` in most unit tests and on a device that has never registered/logged in — every
     /// caller (currently only the handoff-lease request path,
     /// [`Self::request_handoff_lease`]) treats that as "coordination plane
     /// unavailable" and fails closed (no lease requested), the same
@@ -1020,6 +499,34 @@ pub struct DaemonState {
     /// `coordination_client` caller in this daemon already has — see
     /// `pending_enrollment`'s module doc for the same accepted limitation).
     coordination_client_config: std::sync::OnceLock<CoordinationClientConfig>,
+    /// Serializes [`Self::flush_pending_checkpoint_for_group`] across its
+    /// two production triggers (`broadcast_change`, on every local
+    /// mutation, and `peer_orchestrator.rs`'s reconnect hook, on every WS
+    /// connect) -- without this, both can race to read the SAME pending
+    /// batch before either attaches evidence, each requesting its own
+    /// checkpoint from the coordination plane, and the second `attach_
+    /// authorization_evidence` call then fails closed (`SyncSqliteError::
+    /// CorruptState`, "already has a DIFFERENT payload") since the two
+    /// checkpoints differ -- confirmed by a real flaky failure, not a
+    /// hypothetical. One mutex for the whole device (not per-group): a
+    /// flush is an infrequent, already-network-bound operation, so
+    /// serializing it globally costs nothing worth avoiding the lock
+    /// bookkeeping for.
+    pub(crate) flush_lock: tokio::sync::Mutex<()>,
+    /// The reconciliation driver, once it is running.
+    ///
+    /// This one slot is the whole cutover switch, and it is deliberately not
+    /// a separate mode flag. Which path drives Change convergence is *derived*
+    /// from whether the new stack is actually up: present means reconciliation
+    /// drives it, absent means the legacy frames do. A flag could say
+    /// "reconciliation" while nothing was listening, or leave both live at
+    /// once; this cannot represent either state.
+    ///
+    /// Both being live is the failure that matters most. It would not corrupt
+    /// anything -- both paths funnel through the same admission checks -- but
+    /// a run in which both converge cannot tell you which one did it, and the
+    /// whole point of measuring the new stack is to find that out.
+    reconciliation: Mutex<Option<Arc<crate::sync_adapter::ReconciliationDriver>>>,
     /// Test-only escape hatch from the unconditional, real-time periodic
     /// `daemon-state-membership-recovery-sweep` spawned by [`Self::new`] --
     /// see [`Self::disable_membership_recovery_sweep_for_test`]'s own doc
@@ -1030,12 +537,20 @@ pub struct DaemonState {
     pub(crate) membership_recovery_sweep_disabled_for_test: std::sync::atomic::AtomicBool,
 }
 
-/// This device's coordination-plane address + access token — see
+/// This device's coordination-plane address + credential — see
 /// [`DaemonState::coordination_client_config`]'s doc comment.
+///
+/// `auth` is a credential, not a token. It used to be the `access_token:
+/// String` this daemon read once at startup, which was authenticated for as
+/// long as that token lived -- five minutes on the Authorization Server's
+/// plane. A `CoordinationAuth` holds the shared credential manager instead, so
+/// every subsystem that reaches the coordination plane through this config
+/// refreshes through the same cache and the same cross-process rotation lock
+/// rather than presenting a token that died while the daemon was idle.
 #[derive(Debug, Clone)]
 pub struct CoordinationClientConfig {
     pub addr: String,
-    pub access_token: String,
+    pub auth: yadorilink_fapi_client::CoordinationAuth,
 }
 
 /// RAII guard for `DaemonState::in_flight_broadcasts` — decrements on
@@ -1078,6 +593,43 @@ impl BlockWriteActivityProvider for DaemonState {
 /// `link_runtime::dependencies::LinkRuntimeHostPort`'s own doc for why
 /// each of these three specifically can't just be a plain field there.
 impl crate::link_runtime::dependencies::LinkRuntimeHostPort for DaemonState {
+    fn note_capture_settled(&self, group_id: &str) {
+        // `local_dirty_paths: present -> absent` is one state transition with
+        // TWO correctness consumers, and both treat a dirty path as a veto
+        // they must re-evaluate once it clears:
+        //
+        //   admission   a staged Change touching a dirty path is
+        //               `CaptureBarrierOpen` and stays staged.
+        //   retirement  an ephemeral conflict copy on a dirty path is skipped
+        //               by `is_path_dirty` -- with a bare `continue` that
+        //               never sets `retry_required`, so the pass can still
+        //               report `Settled` and its generation is completed.
+        //
+        // Waking only one of them leaves the other holding a decision it
+        // made under uncertainty that has since resolved, with nothing left
+        // to revisit it. For retirement that means a conflict copy which is
+        // now safe to remove is never removed -- and a copy present on some
+        // devices and absent on others is precisely the divergence the
+        // retirement mechanism exists to converge.
+        //
+        // Not routed through `note_local_commit_for_group`: that runs only
+        // when a commit produced records, and `announce_local_change` returns
+        // at `records.is_empty()` before reaching it. A flush that settles a
+        // barrier while authoring nothing is exactly the missed case.
+        // Two independent consumers of one transition, so neither may be
+        // gated on the other's machinery. Retirement is local and always
+        // available; admission needs the reconciliation driver. Ordering
+        // retirement first means a device without a driver still retires.
+        self.replica_coordinator.retirement_wake().mark_dirty(group_id);
+
+        if let Some(driver) = self.reconciliation_driver() {
+            driver
+                .stack()
+                .admission()
+                .schedule(&yadorilink_replica_domain::ids::FolderGroupId(group_id.to_string()));
+        }
+    }
+
     fn broadcast_change<'a>(
         &'a self,
         group_id: &'a str,
@@ -1176,6 +728,29 @@ impl yadorilink_peer_session::peer_session::PendingLocalChangeFlush for DaemonSt
             }
         })
     }
+
+    fn capture_local_path_state<'a>(
+        &'a self,
+        group_id: &'a str,
+        rel_path: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = yadorilink_peer_session::peer_session::PendingLocalFlushOutcome>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            match self.link_runtime_for(group_id) {
+                Some(runtime) => runtime.capture_local_path_state(group_id, rel_path).await,
+                // No link: nothing can be captured, so nothing may be
+                // written over either.
+                None => {
+                    yadorilink_peer_session::peer_session::PendingLocalFlushOutcome::RetryRequired
+                }
+            }
+        })
+    }
 }
 
 /// The decision logic behind [`DaemonState::obtain_handoff_lease_from_peer`]:
@@ -1234,21 +809,11 @@ fn handoff_lease_grant_matches_digest(
 /// runtime, or called outside any runtime — e.g. tests), the plain synchronous
 /// path is correct and cannot starve a worker pool.
 pub(crate) fn run_blocking_sweep_offloaded<R>(sweep: impl FnOnce() -> R) -> R {
-    #[cfg(not(madsim))]
-    {
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(sweep)
-            }
-            _ => sweep(),
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(sweep)
         }
-    }
-    // The deterministic simulator runs a single-threaded runtime whose tokio
-    // shim exposes neither `runtime_flavor()` nor `block_in_place`; always take
-    // the plain synchronous path there, identical to the `_ =>` branch above.
-    #[cfg(madsim)]
-    {
-        sweep()
+        _ => sweep(),
     }
 }
 
@@ -1369,6 +934,16 @@ impl DaemonState {
     /// recovery I/O. The caller owns starting `MaintenanceCoordinator` on
     /// the returned state (see [`Self::new`] for the common case, or
     /// `app::run` for production's own explicit sequencing).
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one `DaemonState` struct-literal construction plus the closure \
+                  providers (local-change-auth, repair election, orphan-promotion \
+                  freshness) that must be installed on the already-built `Arc<Self>` \
+                  because they capture it. The length is the field list and its \
+                  per-field tuning rationale; splitting it would either duplicate the \
+                  literal across helpers or hand out a partially-wired state before \
+                  its providers are set."
+    )]
     pub(crate) fn build(
         device_id: String,
         replica_coordinator: Arc<crate::replica_coordinator::ReplicaCoordinator>,
@@ -1395,7 +970,7 @@ impl DaemonState {
         // Disk-headroom *enforcement* is deliberately NOT turned on here —
         // see `enable_disk_headroom_enforcement`'s doc comment for why
         // that's a separate, production-only opt-in `main.rs` calls
-        // explicitly, mirroring `FsBlockStore`/`PeerSyncSession`'s own
+        // explicitly, mirroring `SegmentBlockStore`/`PeerSyncSession`'s own
         // "off by default" behavior at every other layer of this change.
         block_store.set_headroom_override_bytes(initial_governance.headroom_override_bytes);
         let (persisted_durability_latches, durability_latch_load_failed) = match replica_coordinator
@@ -1412,9 +987,17 @@ impl DaemonState {
             .membership_operation_repository()
             .has_open_unknown_durability_scope_operation()
             .unwrap_or(true);
-        let (nat_sink, nat_candidates) = yadorilink_transport::CandidateSink::new();
+        // Built before the struct literal moves `replica_coordinator`: the
+        // authority restores this device's last-known-good peer
+        // authorization from that same database, so an offline restart can
+        // go on talking to peers a netmap already authorized. See
+        // `offline_authorization`'s module doc for why that snapshot is a
+        // cache of an already-made decision and never an authority.
+        let offline_authorization =
+            offline_authorization::OfflineAuthorizationCache::new(replica_coordinator.clone());
         let state = Arc::new(Self {
             device_id,
+            retirement_backstop_ticks: std::sync::atomic::AtomicU64::new(0),
             replica_coordinator,
             block_store,
             hydrate_single_flight: crate::hydration_single_flight::HydrateSingleFlight::new(),
@@ -1441,50 +1024,21 @@ impl DaemonState {
                 16,
             ),
             peers: Arc::new(crate::peer_registry::PeerRegistry::new()),
-            nat_sink,
-            nat_candidates,
-            nat_observations: yadorilink_transport::ObservationLog::new(),
-            shared_socket: tokio::sync::OnceCell::new(),
-            shared_quic_peer_endpoint: tokio::sync::OnceCell::new(),
-            peer_candidate_addresses: Mutex::new(HashMap::new()),
-            lan_candidate_observer: Arc::new(tokio::sync::OnceCell::new()),
+            peer_connectivity: Arc::new(
+                crate::peer_connectivity_runtime::PeerConnectivityRuntime::new(),
+            ),
             send_service: tokio::sync::OnceCell::new(),
             send_grant_peers: Mutex::new(Vec::new()),
-            pinned_coordination_service_key: Mutex::new(None),
-            #[cfg(not(madsim))]
-            relay_forwarder: Arc::new(crate::relay_forwarder::RelayForwarder::new()),
-            relay_replay_guard: crate::relay_session::RelayReplayGuard::new(),
-            direct_channels: Mutex::new(HashMap::new()),
-            direct_channel_generations: Mutex::new(HashMap::new()),
-            active_relay_sessions: Mutex::new(HashMap::new()),
-            requester_relay_sessions: Mutex::new(HashMap::new()),
-            pending_relay_opens: Mutex::new(HashMap::new()),
-            relay_grant_source: Mutex::new(None),
-            local_relay_capable: std::sync::atomic::AtomicBool::new(false),
+            authority: Arc::new(PeerAuthorityState::restored_from(offline_authorization)),
             device_signing_key: Mutex::new(None),
-            peer_netmap_metadata: Mutex::new(PeerNetmapMetadata::default()),
-            membership_generation: std::sync::atomic::AtomicU64::new(0),
-            group_policy_states: Mutex::new(HashMap::new()),
-            stale_policy_groups: Mutex::new(HashMap::new()),
-            materialization_repair_cursors: Mutex::new(HashMap::new()),
-            obligation_engine_cursors: Mutex::new(HashMap::new()),
-            obligation_engine_path_budget_cursors: Mutex::new(HashMap::new()),
-            local_retirement_sessions: Mutex::new(HashMap::new()),
             materialization_repair_sweep_interval: Mutex::new(
                 default_materialization_repair_sweep_interval(),
             ),
-            custody_confirmation_sweep_interval: Mutex::new(
-                default_custody_confirmation_sweep_interval(),
-            ),
-            custody_confirmation_cache: Mutex::new(HashMap::new()),
             links: Arc::new(crate::link_registry::LinkRegistry::new()),
             #[cfg(any(test, feature = "test-support"))]
             test_root_commit_authorities: Mutex::new(HashMap::new()),
             #[cfg(any(test, feature = "test-support"))]
             test_placeholder_pipeline_connected: Mutex::new(None),
-            #[cfg(any(test, feature = "test-support"))]
-            test_relay_session_handler: Mutex::new(None),
-            paused_paths: Mutex::new(HashSet::new()),
             telemetry: Arc::new(crate::runtime_telemetry::RuntimeTelemetry::new(status_push_tx)),
             forward_tx,
             in_flight_broadcasts: AtomicI64::new(0),
@@ -1498,9 +1052,9 @@ impl DaemonState {
                     .into_iter()
                     .map(|group_id| (group_id, GroupDurabilityStatus::Unknown))
                     .collect(),
+                durability_latch_load_failed,
+                unknown_scope_membership_marker,
             )),
-            durability_latch_load_failed: AtomicBool::new(durability_latch_load_failed),
-            unknown_scope_membership_marker: AtomicBool::new(unknown_scope_membership_marker),
             pending_enrollment_transient_attempts: Mutex::new(HashMap::new()),
             update_manager: Arc::new(crate::update::manager::UpdateManager::new(
                 crate::device_config::config_dir(),
@@ -1512,6 +1066,8 @@ impl DaemonState {
             last_activity_unix: AtomicI64::new(now_unix()),
             gc: Arc::new(crate::gc_state::GcState::new()),
             coordination_client_config: std::sync::OnceLock::new(),
+            flush_lock: tokio::sync::Mutex::new(()),
+            reconciliation: Mutex::new(None),
             #[cfg(test)]
             membership_recovery_sweep_disabled_for_test: std::sync::atomic::AtomicBool::new(false),
         });
@@ -1523,142 +1079,33 @@ impl DaemonState {
         state.update_manager.recover_on_startup();
         {
             let weak_state = Arc::downgrade(&state);
-            let local_change_auth_provider: Arc<
-                crate::replica_coordinator::LocalChangeAuthProvider,
+            let local_policy_head_provider: Arc<
+                crate::replica_coordinator::LocalPolicyHeadProvider,
             > = Arc::new(move |group_id| {
                 let Some(state) = weak_state.upgrade() else {
                     // The daemon is being torn down. Report the policy as
-                    // unavailable rather than stamping a placeholder-auth
-                    // change during shutdown.
+                    // unavailable rather than emitting during shutdown.
                     return Err(PolicyUnavailable);
                 };
-                // Local emission resolves its authorization stamp through the
-                // single group-policy resolver that inbound admission also
-                // consumes (`NetmapChangeAuthenticator::accepts_change_auth`),
-                // so both boundaries fail closed on exactly the same staleness
-                // sources: own-verification-stale, coordinator-flagged invalid,
-                // and an already-introduced group whose verified policy has not
-                // loaded yet this run. Withholding keeps the emit path from
-                // stamping a PLACEHOLDER local head every valid-policy peer
-                // rejects (stranding it and everything chained on it); the edit
-                // stays journaled dirty and re-emits with a real authorization
-                // context once the group's policy resolves.
+                // Under `AuthorizationCheckpoint` admission, writer authorization happens
+                // only at checkpoint issuance -- local emission (offline
+                // authoring) is always available to any device regardless
+                // of writer role. This resolves only the policy_head to
+                // stamp the local repair-election consistency check
+                // against; it is not itself an authorization decision.
                 match state.resolve_group_policy(group_id) {
-                    GroupPolicyResolution::Verified(policy) => {
-                        // A `Verified` policy alone is not enough: this
-                        // device must ITSELF currently hold Editor/Owner
-                        // role under that policy, exactly the same check
-                        // `NetmapChangeAuthenticator::accepts_change_auth`
-                        // runs for a REMOTE author (`change_auth.rs`'s
-                        // `Verified` arm). Without this, a Viewer's own
-                        // daemon would happily stamp its own local edits
-                        // with a valid-looking `ChangeAuth` and apply them
-                        // to its own local DAG head, while every remote
-                        // peer's `accepts_change_auth`/`author_was_writer_at`
-                        // correctly rejects the same Change -- silently and
-                        // permanently diverging the Viewer's local replica
-                        // from the rest of the group, with no error
-                        // surfaced anywhere. Withholding here is safe for
-                        // the identical reason the staleness cases above
-                        // are safe: the edit stays journaled dirty and
-                        // re-emits once this device is (re-)granted write
-                        // access, rather than minting a doomed-to-be-
-                        // globally-rejected local Change.
-                        //
-                        // What (if anything) surfaces this withholding to
-                        // the user -- e.g. a "not syncing, you have
-                        // view-only access" notification -- is a later
-                        // product-UX decision, not addressed here.
-                        let auth = policy.change_auth();
-                        let Some(signing_key) = state.device_signing_key() else {
-                            return Err(PolicyUnavailable);
-                        };
-                        let signing_key_fingerprint: [u8; 32] =
-                            sha2::Sha256::digest(signing_key.verifying_key().as_bytes()).into();
-                        if policy.author_was_writer_at(
-                            &state.device_id,
-                            signing_key_fingerprint,
-                            auth,
-                        ) {
-                            Ok(auth)
-                        } else {
-                            Err(PolicyUnavailable)
-                        }
-                    }
-                    GroupPolicyResolution::Bootstrap => Ok(ChangeAuth::PLACEHOLDER),
+                    GroupPolicyResolution::Verified(policy) => Ok(policy.policy_head),
+                    GroupPolicyResolution::Bootstrap => Ok([0u8; 32]),
                     GroupPolicyResolution::Withhold => Err(PolicyUnavailable),
                 }
             });
-            // Since 7D-10.7 repointed `build_change_processor` to construct
-            // `LocalChangeProcessor` from `replica_coordinator` (it now
-            // implements `LocalMutationStore`), real local edits resolve
-            // their authorization stamp through
-            // `ReplicaCoordinator::local_emission_auth` exclusively -- the
-            // `SyncState`-side copy this provider used to also be wired onto
-            // (removed in 7D-10.9 along with the `sync_state` field itself)
-            // had no remaining production reader. See
-            // phase7d10-exit-report.md's 7D-10.8/7D-10.9 addenda.
-            state.replica_coordinator.set_local_change_auth_provider(local_change_auth_provider);
-        }
-        {
-            // The real, policy-backed orphan-promotion freshness check --
-            // see `yadorilink_sync_sqlite::ChangeHistoryRepository`'s own
-            // field doc comment for why this exists: without it, a change
-            // buffered as an orphan (its parent deliberately withheld) from
-            // a since-downgraded/revoked author could still get durably
-            // promoted later -- including after a restart, when
-            // `init_dag_schema`'s startup self-heal sweep runs with
-            // NO trust material at all and so always defers (never promotes
-            // via that path) -- on the strength of a check that was only
-            // ever run once, back when the row was originally buffered.
-            // Checked by device id alone (`is_writer_device_now`, not
-            // `author_is_writer_now`): promotion has no live wire session of
-            // its own to re-derive a signing-key fingerprint from, and the
-            // orphan's own signature/fingerprint binding was already fully
-            // verified once at original receipt time, through this exact
-            // same live-admission path (`NetmapChangeAuthenticator::
-            // accepts_live_change_auth`).
-            let weak_state = Arc::downgrade(&state);
-            let orphan_promotion_writer_check: std::sync::Arc<
-                yadorilink_sync_sqlite::dag_store::OrphanPromotionWriterCheck,
-            > = std::sync::Arc::new(move |group_id, device_id| {
-                let state = weak_state.upgrade()?;
-                match state.resolve_group_policy(group_id) {
-                    // A group `grant_role` has never touched verifies to a
-                    // genuinely empty policy chain (`Verified`, not
-                    // `Bootstrap`, but the identical genesis state -- see
-                    // `GroupPolicyState::has_no_policy_history`'s own doc
-                    // comment, and `NetmapChangeAuthenticator::
-                    // accepts_change_auth_impl`'s matching PLACEHOLDER
-                    // short-circuit for the live-admission half of this same
-                    // fix). `is_writer_device_now` would always answer
-                    // `false` here (an empty chain has no grant record for
-                    // anyone), wrongly deferring every ordinary orphan from
-                    // this group forever -- fall back to the SAME raw
-                    // netmap-membership check the Bootstrap arm below and
-                    // `local_change_auth_provider`'s own Bootstrap branch
-                    // use, rather than the role-aware chain replay, which has
-                    // nothing to replay yet.
-                    GroupPolicyResolution::Verified(policy) if policy.has_no_policy_history() => {
-                        Some(
-                            device_id == state.device_id
-                                || state.peer_is_writer(device_id, group_id),
-                        )
-                    }
-                    GroupPolicyResolution::Verified(policy) => {
-                        Some(policy.is_writer_device_now(device_id))
-                    }
-                    // No verified policy chain to check against yet (either
-                    // genuinely pre-policy, or a stale/withheld group) --
-                    // cannot positively confirm current writer status, so
-                    // defer rather than guess either way.
-                    GroupPolicyResolution::Bootstrap | GroupPolicyResolution::Withhold => None,
-                }
-            });
-            state
-                .replica_coordinator
-                .change_history_repository()
-                .set_orphan_promotion_writer_check(orphan_promotion_writer_check);
+            // `build_change_processor` constructs `LocalChangeProcessor`
+            // from `replica_coordinator` (it implements
+            // `LocalMutationStore`), so real local edits resolve their
+            // policy-head stamp through `ReplicaCoordinator::
+            // local_policy_head` exclusively; this is the provider's only
+            // production registration.
+            state.replica_coordinator.set_local_policy_head_provider(local_policy_head_provider);
         }
         {
             let weak_state = Arc::downgrade(&state);
@@ -1673,19 +1120,8 @@ impl DaemonState {
                     let local_fingerprint: [u8; 32] =
                         sha2::Sha256::digest(signing_key.verifying_key().as_bytes()).into();
                     let netmap_writers = |state: &DaemonState| {
-                        let metadata =
-                            state.peer_netmap_metadata.lock().unwrap_or_else(|p| p.into_inner());
-                        let mut writers: Vec<AuthorizedWriter> = metadata
-                            .writers
-                            .iter()
-                            .filter(|(_, writer_group)| writer_group == group_id)
-                            .filter_map(|(device_id, _)| {
-                                metadata.signing_keys.get(device_id).map(|key| AuthorizedWriter {
-                                    device_id: device_id.clone(),
-                                    signing_key_fingerprint: sha2::Sha256::digest(key).into(),
-                                })
-                            })
-                            .collect();
+                        let mut writers: Vec<AuthorizedWriter> =
+                            state.authority.netmap_authorized_writers(group_id);
                         writers.retain(|writer| writer.device_id != state.device_id);
                         writers.push(AuthorizedWriter {
                             device_id: state.device_id.clone(),
@@ -1694,29 +1130,24 @@ impl DaemonState {
                         writers.sort();
                         writers
                     };
-                    let (auth, writers) = match state.resolve_group_policy(group_id) {
+                    let (policy_head, writers) = match state.resolve_group_policy(group_id) {
                         GroupPolicyResolution::Verified(policy) => {
                             let writers = policy.current_writers();
                             if writers.is_empty() {
-                                // TODO(follow-up, not fixed here): this is one
-                                // of THREE inconsistent ways this codebase
-                                // currently handles "a verified policy chain
-                                // whose current writer set is empty" --
+                                // "A verified policy chain whose current
+                                // writer set is empty" is handled per call
+                                // site, each for its own purpose --
                                 // `local_change_auth_provider` above falls
                                 // through to `author_was_writer_at`'s own
                                 // empty-log special case (ALLOWS local
-                                // emission), `check_signer_authorized_for_group`
+                                // emission), `authorize_base_signer`
                                 // (`rebootstrap_handler.rs`) REJECTS every
                                 // signer unconditionally with no fallback at
                                 // all, and this provider instead falls back to
                                 // the netmap's role-blind member set below
-                                // (documented in place, since removing it here
-                                // would revive issue #24's group-wide failover
-                                // deadlock). Reconciling these three into one
-                                // deliberate answer is a real follow-up; this
-                                // comment exists so whoever picks it up next
-                                // does not have to rediscover the
-                                // inconsistency from scratch.
+                                // (removing it here would reintroduce a
+                                // group-wide failover deadlock, as described
+                                // next).
                                 //
                                 // A verified policy whose Grant chain names NO
                                 // writers is the bootstrap regime with a signed
@@ -1726,26 +1157,24 @@ impl DaemonState {
                                 // replica computes `local_rank = None`, the
                                 // deterministic failover never unlocks for any
                                 // device, and the liveness guarantee this
-                                // election exists to provide (issue #24) silently
-                                // dies group-wide (measured: row14's six devices
-                                // each logging AwaitingFailover forever while a
-                                // six-head frontier never merges). Fall back to
+                                // election exists to provide silently dies
+                                // group-wide (every device waits in
+                                // AwaitingFailover forever while a multi-head
+                                // frontier never merges). Fall back to
                                 // the same netmap-derived writer set the
                                 // no-policy bootstrap arm uses; the strict
                                 // grant/fingerprint binding still applies
                                 // whenever the chain names any writer at all.
-                                (policy.change_auth(), netmap_writers(&state))
+                                (policy.policy_head, netmap_writers(&state))
                             } else {
-                                (policy.change_auth(), writers)
+                                (policy.policy_head, writers)
                             }
                         }
-                        GroupPolicyResolution::Bootstrap => {
-                            (ChangeAuth::PLACEHOLDER, netmap_writers(&state))
-                        }
+                        GroupPolicyResolution::Bootstrap => ([0u8; 32], netmap_writers(&state)),
                         GroupPolicyResolution::Withhold => return Err(PolicyUnavailable),
                     };
                     RepairElectionContext::new(
-                        auth,
+                        policy_head,
                         obligation,
                         writers,
                         state.device_id.clone(),
@@ -1761,616 +1190,73 @@ impl DaemonState {
         DaemonBuild { state, forward_rx }
     }
 
-    /// This state's runtime-owner components, as `Arc` clones -- for a
-    /// caller (the composition root, an adapter) that needs to hold them
-    /// directly rather than reach through `DaemonState`.
-    #[allow(dead_code)]
-    pub(crate) fn runtime_components(&self) -> RuntimeComponents {
-        RuntimeComponents {
-            peers: self.peers.clone(),
-            links: self.links.clone(),
-            telemetry: self.telemetry.clone(),
-            durability: self.durability.clone(),
-        }
+    /// This device's durability state owner -- for a caller that needs only
+    /// the custody-confirmation cache or the sweep interval, not the
+    /// orchestration `DaemonState` layers over them.
+    pub(crate) fn durability(&self) -> &Arc<crate::durability_service::DurabilityService> {
+        &self.durability
     }
 
-    /// M3 Pass 5: records the coordination plane's CURRENTLY pinned
-    /// service signing key, mirrored from `record_group_policy_states`'s
-    /// own pin decision on every netmap update -- see the field's own
-    /// doc comment. A `Mutex`, not a `OnceLock` like `device_static_
-    /// secret` above: unlike a device's own identity, the pinned service
-    /// key can legitimately be updated (the pin-decision logic itself
-    /// governs whether a NEW presented key is accepted as a rotation or
-    /// rejected as a mismatch; this setter just mirrors whatever that
-    /// logic already decided, it makes no decision of its own).
-    pub fn set_pinned_coordination_service_key(&self, key: [u8; 32]) {
-        *self.pinned_coordination_service_key.lock().unwrap_or_else(|p| p.into_inner()) = Some(key);
-    }
-
-    /// The coordination plane's currently pinned service signing key, if
-    /// this device has processed at least one policy-bearing netmap
-    /// update. `None` is the fail-safe default relay-grant verification
-    /// must treat as "cannot verify anything" -- never a wildcard accept.
-    pub fn pinned_coordination_service_key(&self) -> Option<[u8; 32]> {
-        *self.pinned_coordination_service_key.lock().unwrap_or_else(|p| p.into_inner())
-    }
-
-    /// Records `device_id`'s live direct QUIC route.
+    /// Records the substrate reachability the coordination plane reports for
+    /// `device_id`, then projects it.
     ///
-    /// `generation` is the peer supervisor's per-attempt counter. A
-    /// generation `<=` one already recorded for this device is rejected
-    /// outright rather than merely being overwritten afterwards: two
-    /// supervisor generations for the same peer can briefly overlap while
-    /// a teardown's `abort()` is still in flight, and if the older one
-    /// publishes *second* the map ends up naming a route that is already
-    /// being torn down. Since the relay layer consults this map to decide
-    /// whether a direct, unchained path to a destination exists, a stale
-    /// entry there is a correctness problem, not just untidiness.
-    ///
-    /// The generation lock is held across the insert so the whole
-    /// check-record-insert sequence is atomic against a concurrent call
-    /// for the same device; otherwise two calls could both pass the guard
-    /// and then apply their inserts in the reverse order, producing
-    /// exactly the outcome the guard exists to prevent.
-    pub(crate) fn set_direct_channel(
-        &self,
-        device_id: String,
-        channel: Arc<yadorilink_transport::QuicPeerChannel>,
-        generation: u32,
-    ) {
-        let mut generations =
-            self.direct_channel_generations.lock().unwrap_or_else(|p| p.into_inner());
-        if generations.get(&device_id).is_some_and(|&recorded| recorded >= generation) {
-            return;
-        }
-        generations.insert(device_id.clone(), generation);
-        let superseded = self
-            .direct_channels
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(device_id, DirectPeerRoute { channel: channel.clone() });
-        // A superseded channel is closed here, explicitly, rather than left
-        // to `Drop`. This map is not its only holder: the previous
-        // generation's `PeerSyncSession` holds one too, and its supervisor
-        // task may still be running that session -- so removing this entry
-        // does not drop the last reference, and the old connection would go
-        // on running beside the new one. Two live connections to one peer is
-        // the state the connect-role rule exists to prevent, and it is worse
-        // when one of them belongs to a generation nothing is supervising.
-        if let Some(superseded) = superseded {
-            if !Arc::ptr_eq(&superseded.channel, &channel) {
-                superseded.channel.close_revoked();
-            }
-        }
-    }
-
-    /// Removes `device_id`'s direct route only if it is STILL `expected`.
-    ///
-    /// The identity guard matters because two supervisor generations for one
-    /// peer can briefly coexist -- a teardown's `abort()` only cancels at the
-    /// old supervisor's next `.await`, by which time a new supervisor may
-    /// already have connected and registered its own route under the same
-    /// key. A key-only removal from the old supervisor's cleanup would then
-    /// delete the new one's live route, and the relay layer would go on
-    /// believing this device has no direct path to a peer it is actively
-    /// talking to.
-    pub(crate) fn remove_direct_channel_if_current(
+    /// `None` means this peer's substrate has not published an address yet,
+    /// which is NOT the claim that it is reachable nowhere -- erasing on its
+    /// account would make a peer undialable that is about to be dialable.
+    /// `Some`, including `Some` with both lists empty, IS authoritative.
+    pub fn record_peer_substrate_reachability(
         &self,
         device_id: &str,
-        expected: &Arc<yadorilink_transport::QuicPeerChannel>,
+        reachability: Option<crate::coordination_client::SubstrateReachability>,
     ) {
-        let still_ours = self
-            .direct_channels
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(device_id)
-            .is_some_and(|route| Arc::ptr_eq(&route.channel, expected));
-        if still_ours {
-            self.remove_direct_channel(device_id);
-        }
-    }
-
-    pub(crate) fn remove_direct_channel(&self, device_id: &str) {
-        self.direct_channels.lock().unwrap_or_else(|p| p.into_inner()).remove(device_id);
-        // M3 Pass 5: cleanup on route loss -- any relay session THIS
-        // device (as relay) currently has open toward `device_id` no
-        // longer has a real direct path to forward through (`device_id`
-        // disconnected, was revoked, or its channel lost the ABA race on
-        // a reconnect -- any of `remove_direct_channel`'s own callers).
-        // Closed immediately here rather than left to the forwarder's own
-        // idle timeout, which would otherwise keep a now-meaningless
-        // session (and its slot) alive for up to a minute after the route
-        // it depends on is already gone. See `active_relay_sessions`'s own
-        // doc comment for the independent-review finding (M3) this half
-        // addresses -- the OTHER half, a route that's still nominally
-        // "connected" but no longer `RouteKind::Direct` specifically
-        // (e.g. re-racing candidates without the channel object itself
-        // being removed), is covered by `revalidate_relay_session`'s own
-        // per-datagram check, not here.
-        let mut sessions = self.active_relay_sessions.lock().unwrap_or_else(|p| p.into_inner());
-        let affected: Vec<u64> = sessions
-            .iter()
-            .filter(|(_, record)| record.destination_device_id == device_id)
-            .map(|(id, _)| *id)
-            .collect();
-        for session_id in &affected {
-            sessions.remove(session_id);
-        }
-        drop(sessions);
-        // No forwarding actor to close under the deterministic simulator --
-        // see `relay_forwarder`'s module-gating comment in `lib.rs`. The
-        // bookkeeping removal above already dropped these session ids from
-        // `active_relay_sessions` either way.
-        #[cfg(not(madsim))]
-        for session_id in affected {
-            self.relay_forwarder.close_session(session_id, "destination_route_lost");
-        }
-        #[cfg(madsim)]
-        let _ = affected;
-    }
-
-    /// M3 Pass 5 (independent-review findings H2/M3): the full
-    /// authorization tuple a relay session was admitted under, keyed by
-    /// its forwarder-assigned session id. `RelayForwarder` itself tracks
-    /// sessions only by id and raw destination address -- it has no
-    /// concept of groups, peers, or authorization at all (deliberately;
-    /// see its own module doc comment) -- so THIS is what lets `handle_
-    /// relay_data` re-run the exact same group-membership/relay-
-    /// capability/direct-route checks `admit_relay_open` ran at OPEN
-    /// time, on every single subsequent datagram, closing the session
-    /// the moment any of them stops holding. Without this, an already-
-    /// open session kept forwarding on stale authorization for the rest
-    /// of its grant's lifetime after a group-edge revoke that left
-    /// another shared group intact (the exact gap the review's own
-    /// framing asked about).
-    pub(crate) fn record_relay_session(
-        &self,
-        session_id: u64,
-        source_device_id: String,
-        group_id: String,
-        destination_device_id: String,
-    ) {
-        self.active_relay_sessions.lock().unwrap_or_else(|p| p.into_inner()).insert(
-            session_id,
-            RelaySessionRecord { source_device_id, group_id, destination_device_id },
-        );
-    }
-
-    pub(crate) fn forget_relay_session(&self, session_id: u64) {
-        self.active_relay_sessions.lock().unwrap_or_else(|p| p.into_inner()).remove(&session_id);
-    }
-
-    /// M3 Pass 6 (independent-review finding H2): whether `session_id` is
-    /// CURRENTLY an active session this device is providing relay for
-    /// (role "B"), and if so, its `source_device_id`. Provider-assigned
-    /// session ids (this device's own `RelayForwarder` counter) and
-    /// requester-tracked session ids (assigned by whichever OTHER device
-    /// this device asked to relay for it) are two independent numbering
-    /// spaces that happen to share one `u64` wire representation -- a
-    /// device that is simultaneously providing relay for peer X AND has
-    /// its own requester session open THROUGH peer X can have the SAME
-    /// session_id mean two different things depending on role, both
-    /// legitimately reachable from an authenticated frame from X. Used by
-    /// `relay_session_handler::handle_relay_data`/`handle_relay_close` to
-    /// detect that ambiguity and fail closed rather than guess.
-    pub(crate) fn active_relay_session_source(&self, session_id: u64) -> Option<String> {
-        self.active_relay_sessions
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(&session_id)
-            .map(|record| record.source_device_id.clone())
-    }
-
-    /// Re-runs the exact same authorization checks `admit_relay_open` ran
-    /// when this session was first admitted, against THIS device's
-    /// CURRENT live state -- see `record_relay_session`'s own doc comment
-    /// for why this exists and what gap it closes. Returns `Ok(())` if
-    /// the session is still fully authorized, `Err(reason)` (a short,
-    /// stable slug matching `RelayClose`'s own convention) otherwise --
-    /// the caller (`handle_relay_data`) is responsible for actually
-    /// closing the session on `Err`; this method only decides, it does
-    /// not act. Treats an untracked session id as already-invalid
-    /// (`"unknown_session"`) rather than panicking or defaulting
-    /// permissive.
-    pub(crate) fn revalidate_relay_session(&self, session_id: u64) -> Result<(), &'static str> {
-        let record = self
-            .active_relay_sessions
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(&session_id)
-            .cloned();
-        let Some(record) = record else {
-            return Err("unknown_session");
+        let changed = match reachability {
+            Some(reachability) => {
+                self.peer_connectivity.record_peer_substrate_reachability(device_id, reachability)
+            }
+            // "Not published yet" leaves what is known alone -- but the
+            // projection below still has to run, and unconditionally: it
+            // reflects current state, so a peer whose signing key or
+            // reconciliation driver only arrived after its address must
+            // reach the directory without waiting for another push.
+            None => false,
         };
-        if !self.peer_is_writer(&record.source_device_id, &record.group_id) {
-            return Err("source_no_longer_a_group_member");
-        }
-        if !self.is_local_group_member(&record.group_id) {
-            return Err("relay_no_longer_a_group_member");
-        }
-        if !self.peer_is_writer(&record.destination_device_id, &record.group_id) {
-            return Err("destination_no_longer_a_group_member");
-        }
-        if !self.is_local_relay_capable() {
-            return Err("relay_capability_disabled");
-        }
-        // M3 Pass 8 (closeout, B-side): live-read `is_directly_reachable`,
-        // not `self.peers.reachability()` -- see that method's own doc
-        // comment, and `relay_session_handler.rs`'s admission-time check
-        // for the identical fix on the OPEN-time counterpart of this same
-        // per-datagram revalidation.
-        if !self.is_directly_reachable(&record.destination_device_id) {
-            return Err("destination_route_no_longer_direct");
-        }
-        Ok(())
-    }
-
-    /// `device_id`'s live direct QUIC channel, if this device currently has
-    /// one -- used by the relay-admission path to confirm a direct route
-    /// exists and to read the address to forward to.
-    pub(crate) fn direct_channel(
-        &self,
-        device_id: &str,
-    ) -> Option<Arc<yadorilink_transport::QuicPeerChannel>> {
-        self.direct_channels
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(device_id)
-            .map(|route| route.channel.clone())
-    }
-
-    /// Whether this device's OWN path to `device_id` is CURRENTLY a live
-    /// direct QUIC connection, read from the connection itself rather than
-    /// from `self.peers.reachability()`.
-    ///
-    /// That distinction is the point: the peer registry is an
-    /// asynchronously-updated mirror, so it can still report a route that
-    /// has already gone. Used by relay-candidate selection and again
-    /// immediately before sending, so the window between the two is as
-    /// narrow as this call's own cost.
-    ///
-    /// "Live" is all there is to check. A QUIC connection is only ever
-    /// established through a mutually authenticated handshake, and this
-    /// device never presents a relayed connection here -- relay-carried
-    /// QUIC has no route into the endpoint yet, by design, because it
-    /// needs a stable synthetic per-relay-session address first. So a live
-    /// connection is a confirmed *direct* one, which is exactly the
-    /// property the no-chaining rule depends on.
-    pub(crate) fn is_directly_reachable(&self, device_id: &str) -> bool {
-        self.direct_channel(device_id).is_some_and(|channel| channel.is_open())
-    }
-
-    /// M3 Pass 6 / P0-A: installs a `RelayGrantSource`. `app.rs` installs
-    /// `ProductionRelayGrantSource` here unconditionally at startup (see
-    /// its own doc comment); an integration test in `tests/` -- a separate
-    /// compilation unit from this crate's own `src/` -- installs
-    /// `FakeCoordination` instead, matching `test_relay_session_handler`'s
-    /// own visibility for the identical reason. `pub`, not `pub(crate)`,
-    /// is what makes that test-side substitution possible at all.
-    pub fn set_relay_grant_source(&self, source: Arc<dyn crate::relay_carrier::RelayGrantSource>) {
-        *self.relay_grant_source.lock().unwrap_or_else(|p| p.into_inner()) = Some(source);
-    }
-
-    pub(crate) fn relay_grant_source(
-        &self,
-    ) -> Option<Arc<dyn crate::relay_carrier::RelayGrantSource>> {
-        self.relay_grant_source.lock().unwrap_or_else(|p| p.into_inner()).clone()
-    }
-
-    /// M3 Pass 6: candidate relay devices for reaching `destination_
-    /// device_id` -- every device that (a) has declared `RelayCapability::
-    /// Capable`, (b) shares at least one group with BOTH this device and
-    /// the destination (the same group, not merely one group each -- a
-    /// relay grant is scoped to one `group_id` shared by all three, see
-    /// `relay_grant::RelayGrant`'s own fields), and (c) this device
-    /// already has a live `PeerSyncSession` with (never dials a NEW
-    /// connection purely to use someone as a relay -- a real, deliberate
-    /// scope limit of this increment, not an oversight: opening fresh
-    /// connections on the relay-selection path would make an already
-    /// best-effort fallback path responsible for its own connection
-    /// supervision too). Returns `(relay_device_id, group_id)` pairs,
-    /// most-recently-registered-writer order is not meaningful here (plain
-    /// `HashSet` iteration) -- the caller tries them in whatever order
-    /// this returns and stops at the first that actually grants.
-    pub(crate) fn relay_candidates(&self, destination_device_id: &str) -> Vec<(String, String)> {
-        let metadata = self.peer_netmap_metadata.lock().unwrap_or_else(|p| p.into_inner());
-        let groups_of = |device_id: &str| -> HashSet<String> {
-            metadata
-                .writers
-                .iter()
-                .filter(|(d, _)| d == device_id)
-                .map(|(_, g)| g.clone())
-                .collect()
-        };
-        let dest_groups = groups_of(destination_device_id);
-        let mut candidates = Vec::new();
-        for relay_device_id in &metadata.relay_capable {
-            if relay_device_id == &self.device_id || relay_device_id == destination_device_id {
-                continue;
-            }
-            // M3 Pass 8 (final-gate review finding, High -- 2nd round):
-            // requires the underlying `PeerChannel` to `relay_device_id`
-            // to be itself direct, not merely "connected" -- without this,
-            // if this device's OWN path to `relay_device_id` is itself
-            // `ConnectedRelay` (through some other device D), a session
-            // opened "through" it would actually chain A->D->B->C: every
-            // local admission check on B still passes (B sees an
-            // authenticated peer and a direct B->C route), with no
-            // provenance that A's frames were already relayed before
-            // reaching B. This is the identical requirement `relay_
-            // session::RelayAdmissionContext::has_direct_route_to_
-            // destination`'s own doc comment already enforces on B's side
-            // for the B->C leg.
-            //
-            // Reads the LIVE `PeerChannel` (`is_directly_reachable`), not
-            // `self.peers.reachability()` -- the first review round's own
-            // fix used that daemon-level registry, which is only an
-            // ASYNCHRONOUSLY updated mirror of the channel's own watch
-            // channel (`poll_reachability`'s own background task is what
-            // copies one into the other), so a route that had just
-            // flipped away from Direct could still read as Direct here
-            // for one mirror-propagation cycle. `direct_channel` is the
-            // same channel the relay path itself sends over
-            // moments later, so this reads the exact object whose state
-            // actually matters, not a lagging copy of it.
-            if !self.is_directly_reachable(relay_device_id) {
-                continue;
-            }
-            let relay_groups = groups_of(relay_device_id);
-            // This device's own membership is NOT read from `metadata.
-            // writers` -- that set is populated per-PEER from the netmap
-            // (`replace_peer_netmap_metadata`), and self is not its own
-            // netmap peer entry. `is_local_group_member` is the same
-            // check `RelayAdmissionContext::relay_is_group_member` uses
-            // on the provider side, for the identical reason.
-            if let Some(group_id) = relay_groups
-                .intersection(&dest_groups)
-                .find(|group_id| self.is_local_group_member(group_id))
-            {
-                candidates.push((relay_device_id.clone(), group_id.clone()));
+        self.project_substrate_reachability(device_id);
+        // A peer with no direct address is reachable only through what it just
+        // published, so this is the event that makes it dialable at all.
+        if changed {
+            if let Some(driver) = self.reconciliation_driver() {
+                driver.note_peer_reachable(device_id);
             }
         }
-        candidates
     }
 
-    /// M3 Pass 6: records that session `session_id`, opened by THIS device
-    /// as relay REQUESTER via `relay_device_id`, carries traffic for
-    /// `destination_peer_public` -- see `requester_relay_sessions`'s own
-    /// doc comment. `expires_at_unix` mirrors the admitting grant's own
-    /// expiry (independent-review, final-gate finding): B's forwarder
-    /// enforces its own expiry independently and closes on its own, but
-    /// its one-shot `RelayClose` frame can be lost (a dropped/full
-    /// `try_send`, or the A<->B session itself briefly backed up) with no
-    /// retry -- without also tracking the expiry HERE, a lost close would
-    /// let this device reuse (and report success for) a session B has
-    /// already forgotten, forever.
-    pub(crate) fn record_requester_relay_session(
-        &self,
-        session_id: u64,
-        relay_device_id: String,
-        destination_peer_public: [u8; 32],
-        expires_at_unix: i64,
-        path: Arc<yadorilink_transport::RelayPathHandle>,
-    ) {
-        self.requester_relay_sessions.lock().unwrap_or_else(|p| p.into_inner()).insert(
-            (relay_device_id, session_id),
-            RequesterRelaySession { destination_peer_public, expires_at_unix, path },
-        );
-    }
-
-    /// The relay path a requester-opened session carries, for injecting an
-    /// inbound `RelayData` payload into this device's QUIC endpoint -- and,
-    /// read for its presence alone, the answer to "is this relay session
-    /// still usable at all".
+    /// Projects current coordination state for `device_id` into the address
+    /// directory: pinned signing key -> PeerId, plus whatever reachability is
+    /// on record.
     ///
-    /// A session past its grant's expiry is reported gone, and removed here
-    /// rather than left for a later caller to rediscover. The relay enforces
-    /// the same expiry independently and closes on its own, but its one-shot
-    /// `RelayClose` can be lost with no retry -- so without this bound, a
-    /// lost close would leave this device believing it has a path the relay
-    /// has already forgotten, with nothing left to correct it.
+    /// The directory is a PROJECTION of current state, never a cache of the
+    /// events that produced it. That is why this is one helper with three
+    /// callers rather than three code paths: whichever of the driver, the
+    /// signing key and the reachability arrives last, the projection ends in
+    /// the same place without waiting for another netmap push. An earlier
+    /// version wrote through only when a driver already existed, and in
+    /// production the driver never does at that moment -- so nothing was ever
+    /// written, and because a push is a snapshot the next identical one
+    /// changed nothing and wrote nothing again.
     ///
-    /// Keyed the same way [`Self::requester_relay_session`] is, and for the
-    /// same reason: each relay numbers its sessions from its own counter, so
-    /// only the pair identifies one.
-    pub(crate) fn requester_relay_path(
-        &self,
-        relay_device_id: &str,
-        session_id: u64,
-    ) -> Option<Arc<yadorilink_transport::RelayPathHandle>> {
-        let key = (relay_device_id.to_string(), session_id);
-        let mut sessions = self.requester_relay_sessions.lock().unwrap_or_else(|p| p.into_inner());
-        let record = sessions.get(&key)?;
-        if now_unix() >= record.expires_at_unix {
-            sessions.remove(&key);
-            return None;
-        }
-        Some(record.path.clone())
-    }
-
-    /// The relay device a requester-opened `session_id` was opened
-    /// through, and its destination -- used to route an inbound
-    /// `RelayData`/close for this session id (this device receiving its
-    /// own relay's reply) rather than mistaking it for a forward request.
-    /// Keyed by `(relay_device_id, session_id)`, NOT `session_id` alone
-    /// (independent-review, final-gate finding): each relay assigns
-    /// session ids from its OWN independent counter starting at 1, so two
-    /// DIFFERENT relays this device is simultaneously using as requester
-    /// routinely hand back the identical number -- a bare `u64` key would
-    /// let the second `record_requester_relay_session` silently overwrite
-    /// the first device's entry. `relay_device_id` -- already known by the
-    /// caller as `authenticated_peer_device_id`, the identity of whichever
-    /// session this frame physically arrived on -- makes the lookup exact
-    /// rather than an ownership check performed after the fact.
-    pub(crate) fn requester_relay_session(
-        &self,
-        relay_device_id: &str,
-        session_id: u64,
-    ) -> Option<[u8; 32]> {
-        self.requester_relay_sessions
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(&(relay_device_id.to_string(), session_id))
-            .map(|s| s.destination_peer_public)
-    }
-
-    pub(crate) fn forget_requester_relay_session(&self, relay_device_id: &str, session_id: u64) {
-        self.requester_relay_sessions
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&(relay_device_id.to_string(), session_id));
-    }
-
-    /// M3 Pass 6: registers a oneshot to be resolved by the matching
-    /// `RelayOpenedFrame` reply, scoped to `expected_relay_device_id` (the
-    /// device this device is actually sending the `RelayOpen` to) -- see
-    /// `pending_relay_opens`'s own doc comment.
-    pub(crate) fn register_pending_relay_open(
-        &self,
-        grant_id: String,
-        expected_relay_device_id: String,
-        sender: tokio::sync::oneshot::Sender<yadorilink_sync_wire::RelayOpenedFrame>,
-    ) {
-        self.pending_relay_opens
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(grant_id, (expected_relay_device_id, sender));
-    }
-
-    /// Resolves and removes the pending open matching `opened.grant_id`,
-    /// if this device has one outstanding AND `authenticated_peer_device_id`
-    /// matches the device that open was actually sent to -- called from
-    /// `handle_relay_opened`. A miss (already timed out, an `opened` for a
-    /// grant_id this device never requested, or a sender mismatch) is
-    /// silently a no-op, matching `RelaySessionHandler::handle_relay_
-    /// opened`'s own doc comment; a mismatch specifically is put back so
-    /// the device that was actually asked can still resolve it later.
-    pub(crate) fn resolve_pending_relay_open(
-        &self,
-        opened: yadorilink_sync_wire::RelayOpenedFrame,
-        authenticated_peer_device_id: &str,
-    ) {
-        let mut pending = self.pending_relay_opens.lock().unwrap_or_else(|p| p.into_inner());
-        let Some((expected_relay_device_id, _)) = pending.get(&opened.grant_id) else {
+    /// Precedence is explicit rather than implied by call order: the substrate
+    /// field wins whenever the plane has supplied one, and the legacy relay
+    /// list is consulted only for a peer it has not.
+    pub(crate) fn project_substrate_reachability(&self, device_id: &str) {
+        let Some(driver) = self.reconciliation_driver() else {
             return;
         };
-        if expected_relay_device_id != authenticated_peer_device_id {
-            tracing::debug!(
-                grant_id = %opened.grant_id,
-                peer = authenticated_peer_device_id,
-                "relay opened reply from a device that was never sent this open; ignoring"
-            );
-            return;
-        }
-        if let Some((_, sender)) = pending.remove(&opened.grant_id) {
-            drop(pending);
-            let _ = sender.send(opened);
-        }
-    }
-
-    /// M3 Pass 6 (independent-review finding): removes a pending open
-    /// this device's own `relay_carrier::open_relay_path` is giving up on
-    /// (the `RelayOpen` send itself failed, or its reply timed out) --
-    /// without this, `pending_relay_opens` accumulates one entry per
-    /// failed/timed-out attempt forever, since `resolve_pending_relay_
-    /// open` only ever removes an entry that actually gets a matching
-    /// reply.
-    pub(crate) fn forget_pending_relay_open(&self, grant_id: &str) {
-        self.pending_relay_opens.lock().unwrap_or_else(|p| p.into_inner()).remove(grant_id);
-    }
-
-    /// Returns this device's transport hub, binding it on first use. All peer
-    /// channels and the NAT prober/mapper drive this one endpoint so the
-    /// advertised candidates describe the exact binding data flows on. A bind
-    /// failure is surfaced to the caller (NAT/traversal is best-effort and
-    /// must not panic the daemon).
-    pub async fn ensure_shared_socket(
-        &self,
-    ) -> std::io::Result<Arc<yadorilink_transport::TransportHub>> {
-        self.shared_socket
-            .get_or_try_init(|| async {
-                let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0));
-                yadorilink_transport::TransportHub::bind(addr).await
-            })
-            .await
-            .cloned()
-    }
-
-    /// Installs a pre-bound transport hub (the deterministic-simulation harness
-    /// binds one per device). A no-op if one is already set.
-    pub fn set_shared_socket(&self, socket: Arc<yadorilink_transport::TransportHub>) {
-        let _ = self.shared_socket.set(socket);
-    }
-
-    /// The shared UDP socket if it has been bound/installed yet, without
-    /// binding one.
-    pub fn shared_socket(&self) -> Option<Arc<yadorilink_transport::TransportHub>> {
-        self.shared_socket.get().cloned()
-    }
-
-    /// Publishes this device's `QuicPeerEndpoint` once
-    /// `peer_orchestrator::ensure_quic_endpoint` has built it. A no-op if
-    /// one is already published -- the endpoint is built at most once per
-    /// process (its own `OnceCell`), so every call after the first
-    /// publishes the identical `Arc`.
-    pub fn set_shared_quic_peer_endpoint(
-        &self,
-        endpoint: Arc<yadorilink_transport::quic_peer_endpoint::QuicPeerEndpoint>,
-    ) {
-        let _ = self.shared_quic_peer_endpoint.set(endpoint);
-    }
-
-    /// Publishes the diagnostics-only view of `peer_orchestrator`'s
-    /// LAN-discovered candidate cache. A no-op if one is already published
-    /// -- `peer_orchestrator::run` builds exactly one `NetmapDiffState`
-    /// per process, so every call after the first publishes the identical
-    /// view. See the field's own doc comment.
-    pub(crate) fn set_lan_candidate_observer(
-        &self,
-        observer: crate::peer_orchestrator::LanCandidateObserver,
-    ) {
-        let _ = self.lan_candidate_observer.set(observer);
-    }
-
-    /// This device's `QuicPeerEndpoint`, if `peer_orchestrator` has built
-    /// and published one yet.
-    pub fn shared_quic_peer_endpoint(
-        &self,
-    ) -> Option<Arc<yadorilink_transport::quic_peer_endpoint::QuicPeerEndpoint>> {
-        self.shared_quic_peer_endpoint.get().cloned()
-    }
-
-    /// Records the candidate addresses `peer_orchestrator` most recently
-    /// learned for `device_id` from an applied netmap push. Replaces any
-    /// prior entry outright -- the netmap push this came from is itself an
-    /// authoritative snapshot, not a delta, so a stale candidate must not
-    /// outlive the push that dropped it.
-    pub fn record_peer_candidate_addresses(
-        &self,
-        device_id: &str,
-        candidates: Vec<std::net::SocketAddr>,
-    ) {
-        self.peer_candidate_addresses
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(device_id.to_string(), candidates);
-    }
-
-    /// The candidate addresses currently on record for `device_id`, or
-    /// empty if this device has never seen a netmap entry naming one.
-    pub fn peer_candidate_addresses(&self, device_id: &str) -> Vec<std::net::SocketAddr> {
-        self.peer_candidate_addresses
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(device_id)
-            .cloned()
-            .unwrap_or_default()
+        self.peer_connectivity.project_peer_address(device_id, driver.stack().endpoint());
     }
 
     /// Publishes this device's Track Send service once
     /// `crate::send_transfer::run` has built it. A no-op if one is already
-    /// published -- same one-time-per-process `OnceCell` contract as
-    /// `set_shared_quic_peer_endpoint`.
+    /// published: one Track Send service per process.
     pub fn set_send_service(&self, service: Arc<yadorilink_send::SendService>) {
         let _ = self.send_service.set(service);
     }
@@ -2478,18 +1364,18 @@ impl DaemonState {
     /// reason to distrust its own evidence for `group_id` -- the exact
     /// same fact set `group_durability_status` folds into its own
     /// fail-closed `Unknown` branch, exposed separately so
-    /// OTHER derivations that must fail closed the same way (M4 Pass 2:
+    /// OTHER derivations that must fail closed the same way (e.g.
     /// `FetchAvailability`) can reuse it instead of re-deriving an
     /// equivalent-but-possibly-drifting copy of the same precedence.
     pub(crate) fn daemon_wide_evidence_uncertain(&self, group_id: &str) -> bool {
-        self.durability_latch_load_failed.load(Ordering::SeqCst)
-            || self.unknown_scope_membership_marker.load(Ordering::SeqCst)
+        self.durability.latch_load_failed()
+            || self.durability.scope_unknown()
             || self
                 .replica_coordinator
                 .membership_operation_repository()
                 .has_recovery_blocked_membership_operation()
                 .unwrap_or(true)
-            || self.is_group_policy_stale(group_id)
+            || self.authority.is_group_policy_stale(group_id)
             // The per-group post-`--force` latch (`durability.is_latched_unknown`)
             // is folded into `group_durability_status`'s own `Unknown`
             // branch via `DurabilityService::classify` (not visible in this
@@ -2497,21 +1383,21 @@ impl DaemonState {
             // internally) -- it belongs here too: a `--force` override that
             // bypassed the handoff gate means this daemon explicitly cannot
             // currently vouch for the group, which is exactly the condition
-            // this method exists to detect. Omitting it was a real M4 Pass 2
-            // Codex review #2 finding (#2): a group could show `durability
+            // this method exists to detect. Omitting it was a real bug: a group
+            // could show `durability
             // unknown` while `fetch_availability` still read `AvailableNow`.
             || self.durability.is_latched_unknown(group_id)
     }
 
     /// This group's current local durability status: the latched override
     /// above if one is set, otherwise a value derived live from
-    /// `custody_confirmation_cache` (a real, periodically-refreshed
+    /// `DurabilityService`'s custody confirmation cache (a real, periodically-refreshed
     /// peer-confirmed whole-group check -- see `DurabilityConfirmationJob`)
     /// plus this device's own sync state. `Protected` requires a fresh cache
     /// entry; this device's own materialization completeness alone never
     /// produces it (only `Protecting`, for a full-replica device still
-    /// catching up locally) -- see `crate::durability_service`'s own M4
-    /// model doc comment. This method itself never performs a live peer
+    /// catching up locally) -- see `crate::durability_service`'s own
+    /// durability-model doc comment. This method itself never performs a live peer
     /// round-trip (too costly to run on every `status` call); it only ever
     /// reads what the background sweep already cached.
     pub fn group_durability_status(&self, group_id: &str) -> GroupDurabilityStatus {
@@ -2541,9 +1427,33 @@ impl DaemonState {
         // `materialization`) is deliberately kept out of the `Protected`
         // path entirely -- it only ever feeds `Protecting`, for the case
         // where this device itself is a full replica still catching up to
-        // head. This is the M4 fix for the prior derivation, which
-        // reported `Protected` from local materialization alone and never
-        // consulted any peer.
+        // head. `Protected` is never derived from local materialization
+        // alone without consulting any peer.
+        let (facts, _) = self.gather_durability_facts(group_id);
+        tracing::debug!(
+            local_device_id = %self.device_id,
+            %group_id,
+            ?facts,
+            "group_durability_status computed"
+        );
+        self.durability.classify(group_id, facts)
+    }
+
+    /// The facts [`Self::group_durability_status`] classifies, plus the raw
+    /// materialization counts they were reduced from (for
+    /// [`Self::dump_durability_diagnostics`]). `latched_unknown` is left
+    /// `false`: `DurabilityService::classify` fills it in from its own latch
+    /// table.
+    fn gather_durability_facts(
+        &self,
+        group_id: &str,
+    ) -> (
+        crate::durability_service::DurabilityFacts,
+        Result<
+            yadorilink_sync_sqlite::MaterializationCounts,
+            yadorilink_sync_sqlite::SyncSqliteError,
+        >,
+    ) {
         let counts = self
             .replica_coordinator
             .materialization_state_repository()
@@ -2556,34 +1466,29 @@ impl DaemonState {
             Err(_) => Err(()),
         };
         let facts = crate::durability_service::DurabilityFacts {
-            latch_load_failed: self.durability_latch_load_failed.load(Ordering::SeqCst),
-            scope_unknown: self.unknown_scope_membership_marker.load(Ordering::SeqCst),
+            latch_load_failed: self.durability.latch_load_failed(),
+            scope_unknown: self.durability.scope_unknown(),
             recovery_blocked: self
                 .replica_coordinator
                 .membership_operation_repository()
                 .has_recovery_blocked_membership_operation()
                 .unwrap_or(true),
             latched_unknown: false,
-            group_policy_stale: self.is_group_policy_stale(group_id),
+            group_policy_stale: self.authority.is_group_policy_stale(group_id),
             materialization,
             is_local_full_replica: self.is_local_full_replica(group_id),
             any_other_full_replica_peer_configured: self
+                .authority
                 .any_other_full_replica_peer_configured(group_id),
             peer_confirmed_custody: self.has_fresh_custody_confirmation(group_id),
-            ever_confirmation_swept: self.has_ever_been_custody_swept(group_id),
+            ever_confirmation_swept: self.durability.has_ever_been_custody_swept(group_id),
             known_unobtainable_required_content: self
                 .has_known_unobtainable_required_content(group_id),
         };
-        tracing::debug!(
-            local_device_id = %self.device_id,
-            %group_id,
-            ?facts,
-            "group_durability_status computed"
-        );
-        self.durability.classify(group_id, facts)
+        (facts, counts)
     }
 
-    /// Issue #58 diagnostic: everything `group_durability_status` computed
+    /// Durability diagnostic: everything `group_durability_status` computed
     /// or consulted, formatted for a human/log reader, captured at ONE
     /// instant -- built so a caller stuck watching `Protecting` doesn't
     /// have to re-derive `DurabilityFacts` from scattered `tracing::debug!`
@@ -2595,36 +1500,8 @@ impl DaemonState {
     /// reasoning it would otherwise discard.
     pub fn dump_durability_diagnostics(&self, group_id: &str) -> String {
         use std::fmt::Write as _;
-        let counts = self
-            .replica_coordinator
-            .materialization_state_repository()
-            .materialization_counts(group_id);
-        let materialization = match &counts {
-            Ok(counts) if counts.placeholder == 0 && counts.hydrating == 0 => {
-                Ok(crate::durability_service::MaterializationHealth::FullyLocal)
-            }
-            Ok(_) => Ok(crate::durability_service::MaterializationHealth::Partial),
-            Err(_) => Err(()),
-        };
-        let facts = crate::durability_service::DurabilityFacts {
-            latch_load_failed: self.durability_latch_load_failed.load(Ordering::SeqCst),
-            scope_unknown: self.unknown_scope_membership_marker.load(Ordering::SeqCst),
-            recovery_blocked: self
-                .replica_coordinator
-                .membership_operation_repository()
-                .has_recovery_blocked_membership_operation()
-                .unwrap_or(true),
-            latched_unknown: self.durability.is_latched_unknown(group_id),
-            group_policy_stale: self.is_group_policy_stale(group_id),
-            materialization,
-            is_local_full_replica: self.is_local_full_replica(group_id),
-            any_other_full_replica_peer_configured: self
-                .any_other_full_replica_peer_configured(group_id),
-            peer_confirmed_custody: self.has_fresh_custody_confirmation(group_id),
-            ever_confirmation_swept: self.has_ever_been_custody_swept(group_id),
-            known_unobtainable_required_content: self
-                .has_known_unobtainable_required_content(group_id),
-        };
+        let (mut facts, counts) = self.gather_durability_facts(group_id);
+        facts.latched_unknown = self.durability.is_latched_unknown(group_id);
         let status = self.durability.classify(group_id, facts.clone());
         let mut out = String::new();
         let _ = writeln!(
@@ -2634,7 +1511,7 @@ impl DaemonState {
         );
         let _ = writeln!(out, "facts: {facts:?}");
         let _ = writeln!(out, "materialization_counts: {counts:?}");
-        let current_writers = self.current_group_writers(group_id);
+        let current_writers = self.authority.current_group_writers(group_id);
         let _ = writeln!(out, "current_group_writers: {current_writers:?}");
         let paths = self
             .replica_coordinator
@@ -2648,37 +1525,22 @@ impl DaemonState {
             let _ = writeln!(out, "-- path={path:?} --");
             let mat_state = materialization_repo.get_materialization_state(group_id, path);
             let _ = writeln!(out, "   materialization_state: {mat_state:?}");
-            let origin_device_id = file_index.get_origin_device_id(group_id, path);
-            let _ = writeln!(out, "   origin_device_id: {origin_device_id:?}");
-            let record = file_index.get_file(group_id, path);
-            let record_kind = file_index.get_record_kind(group_id, path);
-            let unix_mode = file_index.get_unix_mode(group_id, path);
-            let symlink_target = file_index.get_symlink_target(group_id, path);
-            let xattrs = file_index.get_xattrs(group_id, path);
-            let (Ok(Some(record)), Ok(record_kind), Ok(unix_mode), Ok(symlink_target), Ok(xattrs)) =
-                (&record, &record_kind, &unix_mode, &symlink_target, &xattrs)
-            else {
-                let _ = writeln!(
-                    out,
-                    "   (could not load index row: record={record:?} kind={record_kind:?} \
-                     unix_mode={unix_mode:?} symlink_target={symlink_target:?} xattrs={xattrs:?})"
-                );
+            // One row read, so the hash printed here is the one
+            // `refusing_peers_for_path` is about to be asked with and
+            // the one a writer recorded under -- a diagnostic that
+            // stitched its own version together could report "no
+            // refusers" for a path that has them, and send the reader
+            // looking in the wrong place.
+            let row = file_index.canonical_current_row(group_id, path);
+            let Ok(Some(row)) = &row else {
+                let _ = writeln!(out, "   (could not load index row: {row:?})");
                 continue;
             };
-            let current_version_hash =
-                yadorilink_replica_domain::file::FileVersion::from_index_row(
-                    record.blocks.clone(),
-                    record.size,
-                    record.mtime_unix_nanos,
-                    record_kind.unwrap_or_default(),
-                    *unix_mode,
-                    symlink_target.clone(),
-                    xattrs.clone(),
-                )
-                .version_hash
-                .to_hex();
+            let _ = writeln!(out, "   origin_device_id: {:?}", row.origin_device_id);
+            let current_version_hash = row.version_hash().to_hex();
             let _ = writeln!(out, "   current_version_hash: {current_version_hash}");
-            let block_hashes: Vec<_> = record.blocks.iter().map(|b| hex::encode(&b.hash)).collect();
+            let block_hashes: Vec<_> =
+                row.snapshot.blocks.iter().map(|b| hex::encode(&b.hash)).collect();
             let local_present = self.block_store.present_blocks(&block_hashes);
             let _ = writeln!(
                 out,
@@ -2688,8 +1550,8 @@ impl DaemonState {
             let refusers =
                 materialization_repo.refusing_peers_for_path(group_id, path, &current_version_hash);
             let _ = writeln!(out, "   refusing_peers (exact version): {refusers:?}");
-            // Mirrors `has_known_unobtainable_required_content`'s fixed
-            // Fact 4 (issue #58): origin is no longer carved out here --
+            // Mirrors `has_known_unobtainable_required_content`'s
+            // Fact 4: origin is not carved out here --
             // if it's present and hasn't refused, Fact 3 already exempts
             // the whole path before this ever runs.
             let unaccounted: Vec<_> = current_writers
@@ -2748,7 +1610,7 @@ impl DaemonState {
     /// Re-reads the persisted
     /// governance config and applies it to the *same* shared
     /// Turns on the block store's
-    /// disk-headroom preflight (`FsBlockStore::headroom_enforced`'s "off by
+    /// disk-headroom preflight (`SegmentBlockStore::headroom_enforced`'s "off by
     /// default" flag) for this daemon's actual production block store.
     /// Deliberately **not** called from `DaemonState::new` itself — `new`
     /// is the one constructor every test in this crate (and
@@ -2795,43 +1657,12 @@ impl DaemonState {
     /// Mirrors a peer's pinned Ed25519 change-history signing key from the
     /// netmap so the change authenticator can verify that device's changes.
     pub fn record_peer_signing_key(&self, device_id: &str, key: [u8; 32]) {
-        self.peer_netmap_metadata
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .signing_keys
-            .insert(device_id.to_string(), key);
-    }
-
-    /// The pinned Ed25519 signing key for `device_id`, if one is known.
-    pub fn peer_signing_key(&self, device_id: &str) -> Option<[u8; 32]> {
-        self.peer_netmap_metadata
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .signing_keys
-            .get(device_id)
-            .copied()
-    }
-
-    /// Reverse lookup for `peer_signing_key`: which pinned device, if any,
-    /// this key belongs to. Used to resolve an unauthenticated LAN discovery
-    /// announcement's public key back to a device id worth adding a
-    /// connection candidate for -- the linear scan is fine at this scale
-    /// (bounded by this device's own peer count, not by network traffic).
-    ///
-    /// Also doubles as local discovery's live authorization predicate
-    /// (`.is_some()`) -- deliberately a fresh lookup against current
-    /// `peer_netmap_metadata` on every call, not a set snapshotted once,
-    /// so discovery started before any peer is known starts working the
-    /// moment one is pinned, and correctly stops working the moment one is
-    /// revoked, with no explicit refresh needed on the caller's part.
-    pub fn device_id_for_signing_key(&self, key: &[u8; 32]) -> Option<String> {
-        self.peer_netmap_metadata
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .signing_keys
-            .iter()
-            .find(|(_, k)| *k == key)
-            .map(|(device_id, _)| device_id.clone())
+        self.authority.record_peer_signing_key(device_id, key);
+        // The key IS the endpoint id, so it is a prerequisite of the
+        // projection rather than an input to it. Reachability recorded before
+        // the key arrived projected nothing; this is what closes that ordering
+        // without waiting for another netmap push.
+        self.project_substrate_reachability(device_id);
     }
 
     /// Removes every already-expired entry from `send_grant_peers` -- called
@@ -2857,9 +1688,10 @@ impl DaemonState {
 
     /// The grant-derived peer currently on record for `signing_key`, if its
     /// grant has not yet expired. `device_id_for_key`'s and `consume_grant`'s
-    /// own sender-identity derivation both rest on this: an authenticated
-    /// QUIC peer key is looked up here, never trusted from anything the
-    /// connection itself claims.
+    /// own sender-identity derivation both rest on this: a Track Send
+    /// connection's handshake-authenticated key (its iroh endpoint id) is
+    /// looked up here, never trusted from anything the connection itself
+    /// claims.
     pub fn send_grant_peer_by_key(&self, signing_key: &[u8; 32]) -> Option<SendGrantPeer> {
         let mut guard = self.send_grant_peers.lock().unwrap_or_else(|p| p.into_inner());
         Self::prune_expired_send_grant_peers(&mut guard);
@@ -2886,114 +1718,231 @@ impl DaemonState {
         signing_key: Option<[u8; 32]>,
         authorized_groups: &HashSet<String>,
         full_replica_groups: &HashSet<String>,
-        relay_capable: bool,
     ) {
-        let mut metadata = self.peer_netmap_metadata.lock().unwrap_or_else(|p| p.into_inner());
-        let before_writers: HashSet<String> = metadata
-            .writers
-            .iter()
-            .filter(|(peer, _)| peer == device_id)
-            .map(|(_, group)| group.clone())
-            .collect();
-        let before_replicas: HashSet<String> = metadata
-            .full_replicas
-            .iter()
-            .filter(|(peer, _)| peer == device_id)
-            .map(|(_, group)| group.clone())
-            .collect();
-        let next_replicas: HashSet<String> =
-            full_replica_groups.intersection(authorized_groups).cloned().collect();
-        let key_changed = match signing_key {
-            Some(key) => metadata.signing_keys.insert(device_id.to_string(), key) != Some(key),
-            None => metadata.signing_keys.remove(device_id).is_some(),
-        };
-        metadata.writers.retain(|(peer, _)| peer != device_id);
-        metadata
-            .writers
-            .extend(authorized_groups.iter().cloned().map(|group| (device_id.to_string(), group)));
-        metadata.full_replicas.retain(|(peer, _)| peer != device_id);
-        metadata
-            .full_replicas
-            .extend(next_replicas.iter().cloned().map(|group| (device_id.to_string(), group)));
-        if relay_capable {
-            metadata.relay_capable.insert(device_id.to_string());
-        } else {
-            metadata.relay_capable.remove(device_id);
-        }
-        // M3 Pass 4 (independent-review finding): `relay_capable` changes
-        // deliberately do NOT bump `membership_generation` -- that counter
-        // is netmap AUTHORIZATION state (see its own doc comment), read by
-        // durability confirmations and full-replica handoffs to fail
-        // closed on ANY membership churn during their wait. Relay
-        // willingness is neither authorization nor durability -- coupling
-        // it in would make toggling a peer's relay declaration able to
-        // spuriously fail an unrelated in-flight durability confirmation,
-        // exactly the connectivity/durability coupling `crate::route`'s
-        // own doc comment says this model must never introduce.
-        let changed =
-            key_changed || before_writers != *authorized_groups || before_replicas != next_replicas;
+        self.apply_peer_netmap_metadata(
+            device_id,
+            signing_key,
+            authorized_groups,
+            full_replica_groups,
+            offline_authorization::SnapshotMirror::Now,
+        );
+    }
+
+    /// The identity-seeding first half of one netmap peer entry: the peer's
+    /// key is recorded and every group authorization is withheld until this
+    /// same pass's validation settles what it may serve.
+    ///
+    /// Separate from [`replace_peer_netmap_metadata`](Self::replace_peer_netmap_metadata)
+    /// only in that it does not mirror the intermediate onto disk -- the
+    /// call that settles the peer's groups, a few lines later in the same
+    /// pass, writes the authorization the netmap really left behind. See
+    /// `SnapshotMirror` for why that is the faithful thing to persist.
+    pub(crate) fn seed_netmap_peer_identity(&self, device_id: &str, signing_key: Option<[u8; 32]>) {
+        self.apply_peer_netmap_metadata(
+            device_id,
+            signing_key,
+            &HashSet::new(),
+            &HashSet::new(),
+            offline_authorization::SnapshotMirror::AfterThisNetmapPassSettles,
+        );
+    }
+
+    fn apply_peer_netmap_metadata(
+        &self,
+        device_id: &str,
+        signing_key: Option<[u8; 32]>,
+        authorized_groups: &HashSet<String>,
+        full_replica_groups: &HashSet<String>,
+        mirror: offline_authorization::SnapshotMirror,
+    ) {
+        let changed = self.authority.replace_peer_netmap_metadata(
+            device_id,
+            signing_key,
+            authorized_groups,
+            full_replica_groups,
+            mirror,
+        );
+
+        // Same reason as `set_peer_group_writer`: this is where a peer's
+        // authorization for a group comes into existence, so this is where
+        // reconciliation is told. Raised for the whole authorized set rather
+        // than the difference against the previous one -- a wake is cheap and
+        // coalescing, and computing the difference here would be a second
+        // place that has to agree with the snapshot logic above about what
+        // the previous state was.
         if changed {
-            self.bump_membership_generation();
+            if let Some(driver) = self.reconciliation_driver() {
+                for group in authorized_groups {
+                    driver.note_authorization(
+                        device_id,
+                        &yadorilink_replica_domain::ids::FolderGroupId(group.clone()),
+                    );
+                }
+            }
         }
-        drop(metadata);
+        // The netmap installs signing keys HERE, not through
+        // `record_peer_signing_key` -- so this is where a first-time peer's
+        // endpoint id becomes known. Reachability recorded moments earlier in
+        // the same pass found no key and projected nothing; without this it
+        // would wait for a netmap that reported something DIFFERENT, because a
+        // repeat of the same one is no change at all.
+        self.project_substrate_reachability(device_id);
     }
 
     pub fn clear_peer_netmap_metadata(&self, device_id: &str) {
-        self.replace_peer_netmap_metadata(device_id, None, &HashSet::new(), &HashSet::new(), false);
+        self.replace_peer_netmap_metadata(device_id, None, &HashSet::new(), &HashSet::new());
+    }
+
+    /// Deletes this device's last-known-good peer authorization, in memory
+    /// and on disk.
+    ///
+    /// For the events after which there is no authorization left to
+    /// remember: this machine has been signed out, or is not a registered
+    /// device. The snapshot exists so an offline restart can continue an
+    /// authorization the coordination plane granted; once the account
+    /// relationship that granted it is gone, continuing it is exactly what
+    /// must not happen, so the record goes rather than sitting on disk for
+    /// a later restart to act on.
+    pub fn forget_offline_peer_authorization(&self) {
+        self.authority.forget_offline_authorization();
+    }
+
+    /// Deletes the persisted authorization of every device `present` does
+    /// not name. `present` must be the device set of a full authoritative
+    /// netmap snapshot -- see
+    /// `PeerAuthorityState::forget_offline_authorizations_absent_from`.
+    pub(crate) fn forget_offline_peer_authorizations_absent_from(&self, present: &HashSet<String>) {
+        self.authority.forget_offline_authorizations_absent_from(present);
     }
 
     /// Records (or clears) whether `device_id` may write `group_id`, derived
     /// from the netmap's per-group share roles.
     pub fn set_peer_group_writer(&self, device_id: &str, group_id: &str, is_writer: bool) {
-        let mut metadata = self.peer_netmap_metadata.lock().unwrap_or_else(|p| p.into_inner());
-        let key = (device_id.to_string(), group_id.to_string());
-        let changed =
-            if is_writer { metadata.writers.insert(key) } else { metadata.writers.remove(&key) };
-        if changed {
-            self.bump_membership_generation();
+        let changed = self.authority.set_peer_group_writer(device_id, group_id, is_writer);
+
+        // Authorization appearing is one of the three things that make a
+        // reconciliation worth attempting, and this is where it appears. The
+        // event is raised here rather than at the netmap-application call
+        // site because this is the mutation: any other route that grants a
+        // peer a group -- and there is more than one -- would otherwise leave
+        // the pair authorized and unreconciled until something unrelated
+        // happened to wake them.
+        if changed && is_writer {
+            if let Some(driver) = self.reconciliation_driver() {
+                driver.note_authorization(
+                    device_id,
+                    &yadorilink_replica_domain::ids::FolderGroupId(group_id.to_string()),
+                );
+            }
         }
-        drop(metadata);
     }
 
-    /// Current netmap-authorization generation. A version-present confirmation
-    /// captures this before its peer round-trip and requires it unchanged after
-    /// the reply (see [`Self::confirm_version_present_via_peer`]).
-    pub fn membership_generation(&self) -> u64 {
-        self.membership_generation.load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    fn bump_membership_generation(&self) {
-        self.membership_generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    }
-
-    /// Whether `device_id` is authorized to write `group_id`.
-    pub fn peer_is_writer(&self, device_id: &str, group_id: &str) -> bool {
-        self.peer_netmap_metadata
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .writers
-            .contains(&(device_id.to_string(), group_id.to_string()))
-    }
-
-    /// Records (or clears) whether `device_id` syncs `group_id` as a full
-    /// replica, derived content-blind from the netmap.
-    pub fn set_peer_group_full_replica(
+    /// Installs the reconciliation driver, which is what retires the legacy
+    /// Change-convergence path -- see the `reconciliation` field.
+    ///
+    /// No backfill against `self.peers`: a `PeerSyncSession` requires real
+    /// `SessionTransports` at construction now (see that type's own doc
+    /// comment), so nothing already registered could have been constructed
+    /// without a stack that already existed -- there is no "session exists,
+    /// transports attach later" state left for this to reconcile.
+    pub fn install_reconciliation_driver(
         &self,
-        device_id: &str,
-        group_id: &str,
-        is_full_replica: bool,
+        driver: Arc<crate::sync_adapter::ReconciliationDriver>,
     ) {
-        let mut metadata = self.peer_netmap_metadata.lock().unwrap_or_else(|p| p.into_inner());
-        let key = (device_id.to_string(), group_id.to_string());
-        let changed = if is_full_replica {
-            metadata.full_replicas.insert(key)
-        } else {
-            metadata.full_replicas.remove(&key)
-        };
-        if changed {
-            self.bump_membership_generation();
+        *self.reconciliation.lock().unwrap_or_else(|p| p.into_inner()) = Some(driver.clone());
+
+        // Every peer address recorded before this driver existed.
+        //
+        // The netmap is normally applied first: a daemon subscribes and gets a
+        // push long before the reconciliation stack is built. Those pushes
+        // reach the recorder, find no driver, and skip the
+        // directory write -- and because a push is a snapshot, the NEXT
+        // identical push is `changed == false` and skips it again. The
+        // directory would then never learn where any peer answers, for the
+        // life of the process, and every reconciliation dial would fail with
+        // no address to use.
+        //
+        // Replaying what is already recorded is the whole fix, and it belongs
+        // here rather than in the recorder: this is the moment the consumer
+        // starts existing.
+        for device_id in self.peer_connectivity.peers_with_recorded_reachability() {
+            self.project_substrate_reachability(&device_id);
         }
-        drop(metadata);
+
+        // Everything that changed before this driver existed. Raised
+        // earlier it would close nothing — the pump could expand it against
+        // a snapshot taken while `reconciliation_driver()` still answered
+        // `None`, and a change landing in between would be in neither the
+        // snapshot nor the queue. See `Wake::All`.
+        driver.note(crate::sync_adapter::Wake::All);
+    }
+
+    /// Removes the reconciliation driver, stopping this device's half of
+    /// every reconciliation and dropping the substrate endpoint with it.
+    ///
+    /// For a test that needs a genuine partition. Forgetting a peer's
+    /// addresses is not enough on its own: iroh keeps its own address book
+    /// for a node it has already talked to, so a device that has ever
+    /// reconciled with a peer can still reach it after our own record of
+    /// where it lives is cleared.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn take_reconciliation_driver(
+        &self,
+    ) -> Option<Arc<crate::sync_adapter::ReconciliationDriver>> {
+        self.reconciliation.lock().unwrap_or_else(|p| p.into_inner()).take()
+    }
+
+    pub fn reconciliation_driver(&self) -> Option<Arc<crate::sync_adapter::ReconciliationDriver>> {
+        self.reconciliation.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Registers a live session for `peer_device_id`.
+    ///
+    /// No attach step: `session` already carries real `SessionTransports`
+    /// (a required constructor parameter -- see that type's own doc
+    /// comment), resolved by its caller from [`session_transports_for`]
+    /// before construction. There is no longer a "session exists, transports
+    /// attach later" window this needs to close, so registration is just
+    /// registration.
+    pub fn register_peer_session(
+        self: &Arc<Self>,
+        peer_device_id: &str,
+        session: Arc<yadorilink_peer_session::peer_session::PeerSyncSession>,
+        sync_roots: std::collections::HashMap<String, std::path::PathBuf>,
+    ) {
+        let local = self.local_convergence_with_roots(sync_roots);
+        self.peers.register_session(peer_device_id.to_string(), session, local);
+    }
+
+    /// Registers `session` for `peer_device_id` unless one is already
+    /// registered, returning whether it was. A session somebody else
+    /// registered is left standing.
+    pub(crate) fn register_peer_session_if_absent(
+        self: &Arc<Self>,
+        peer_device_id: &str,
+        session: Arc<yadorilink_peer_session::peer_session::PeerSyncSession>,
+        sync_roots: std::collections::HashMap<String, std::path::PathBuf>,
+    ) -> bool {
+        let local = self.local_convergence_with_roots(sync_roots);
+        self.peers.register_session_if_absent(peer_device_id, session, local)
+    }
+
+    /// The substrate transports a new session for `peer_device_id` would
+    /// need, or `None` if this device has no reconciliation stack yet.
+    ///
+    /// Callers that cannot get `Some` here must not construct a session at
+    /// all -- `SessionTransports` is required at construction, so there is
+    /// no degraded-but-representable session to fall back to. A peer that
+    /// connects before this device's own stack exists (a real window: the
+    /// stack starts asynchronously, retried by `spawn_reconciliation_
+    /// startup` until it succeeds) simply gets no session yet; the normal
+    /// reconnect path tries again, and by then the stack is almost always
+    /// up.
+    pub fn session_transports_for(
+        &self,
+        peer_device_id: &str,
+    ) -> Option<yadorilink_peer_session::ports::SessionTransports> {
+        Some(self.reconciliation_driver()?.stack().transports_for(peer_device_id))
     }
 
     /// Whether THIS device syncs `group_id` as a full replica (its link's
@@ -3016,78 +1965,6 @@ impl DaemonState {
             .link_repository()
             .materialization_policy_for_group(group_id)
             .is_ok_and(|policy| policy.is_some())
-    }
-
-    /// M3 Pass 5: sets this device's own local relay-capability
-    /// configuration -- see `local_relay_capable`'s own doc comment.
-    ///
-    /// Disabling capability closes every currently-active PROVIDER relay
-    /// session immediately, the same way `remove_direct_channel` closes
-    /// sessions on route loss -- see that method's own doc comment for
-    /// why leaving it to `revalidate_relay_session`'s per-datagram check
-    /// alone is not enough. That check only runs when this device
-    /// receives a fresh `RelayData` FROM THE REQUESTER; a session with
-    /// nothing more to send (the common case once a block fetch's single
-    /// request has gone out and it is only waiting on the destination's
-    /// reply) would otherwise never see a revalidation at all, and the
-    /// destination's replies keep flowing to completion regardless of
-    /// this flag -- they arrive over `RelayForwarder`'s own dedicated
-    /// per-session socket, whose receive loop watches only an explicit
-    /// close signal, grant expiry, idle timeout and the byte cap, never
-    /// this capability flag. Closing here, not there, is what makes the
-    /// capability change itself the revocation authority instead of a
-    /// hint the next unrelated packet might happen to notice.
-    pub fn set_local_relay_capable(&self, capable: bool) {
-        self.local_relay_capable.store(capable, std::sync::atomic::Ordering::Relaxed);
-        if !capable {
-            let mut sessions = self.active_relay_sessions.lock().unwrap_or_else(|p| p.into_inner());
-            let affected: Vec<u64> = sessions.keys().copied().collect();
-            sessions.clear();
-            drop(sessions);
-            // No forwarding actor to close under the deterministic
-            // simulator -- see `relay_forwarder`'s module-gating comment
-            // in `lib.rs`. The bookkeeping clear above already dropped
-            // these session ids from `active_relay_sessions` either way.
-            #[cfg(not(madsim))]
-            for session_id in affected {
-                self.relay_forwarder.close_session(session_id, "relay_capability_disabled");
-            }
-            #[cfg(madsim)]
-            let _ = affected;
-        }
-    }
-
-    pub fn is_local_relay_capable(&self) -> bool {
-        self.local_relay_capable.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Whether `device_id` is currently recorded as a full replica of
-    /// `group_id` (netmap-derived, content-blind).
-    pub fn peer_group_is_full_replica(&self, device_id: &str, group_id: &str) -> bool {
-        self.peer_netmap_metadata
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .full_replicas
-            .contains(&(device_id.to_string(), group_id.to_string()))
-    }
-
-    /// `device_id`'s current, netmap-derived relay capability -- see
-    /// `crate::route::RelayCapability`'s own doc comment for the
-    /// `Durability != Connectivity` invariant this deliberately does NOT
-    /// derive from `peer_group_is_full_replica` or anything else: it is
-    /// purely that peer's own self-declaration, recorded independently.
-    pub fn peer_relay_capability(&self, device_id: &str) -> crate::route::RelayCapability {
-        if self
-            .peer_netmap_metadata
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .relay_capable
-            .contains(device_id)
-        {
-            crate::route::RelayCapability::Capable
-        } else {
-            crate::route::RelayCapability::Disabled
-        }
     }
 
     /// Installs the custody confirmer used by the on-demand reclamation gate.
@@ -3200,8 +2077,8 @@ impl DaemonState {
             .all_sessions()
             .into_iter()
             .filter(|(peer_id, _session)| {
-                self.peer_group_is_full_replica(peer_id, group_id)
-                    && self.peer_is_writer(peer_id, group_id)
+                self.authority.peer_group_is_full_replica(peer_id, group_id)
+                    && self.authority.peer_is_writer(peer_id, group_id)
             })
             .collect();
         if candidates.is_empty() {
@@ -3210,7 +2087,7 @@ impl DaemonState {
 
         // Capture the authorization generation before the fan-out so a reply
         // can be rejected if the netmap changed while it was in flight.
-        let epoch_before = self.membership_generation();
+        let epoch_before = self.authority.membership_generation();
         let mut queries: FuturesUnordered<_> = candidates
             .into_iter()
             .map(|(peer_id, session)| async move {
@@ -3234,9 +2111,9 @@ impl DaemonState {
                 // revoke/demote — or any membership churn — mid-round-trip
                 // fails closed rather than trusting a now-stale ACK.
                 if confirmed
-                    && self.membership_generation() == epoch_before
-                    && self.peer_group_is_full_replica(&peer_id, group_id)
-                    && self.peer_is_writer(&peer_id, group_id)
+                    && self.authority.membership_generation() == epoch_before
+                    && self.authority.peer_group_is_full_replica(&peer_id, group_id)
+                    && self.authority.peer_is_writer(&peer_id, group_id)
                 {
                     return Some(CustodyStamp::new(peer_id, epoch_before));
                 }
@@ -3318,7 +2195,7 @@ impl DaemonState {
     /// see `durability_force.rs`'s own doc comment for why that TOCTOU window
     /// is left as a documented, bounded gap instead.
     pub async fn full_replica_handoff_ready_digest(&self, group_id: &str) -> Option<[u8; 32]> {
-        self.full_replica_handoff_ready(group_id, None).await.map(|(digest, _peer)| digest)
+        self.full_replica_handoff_ready(group_id, None).await.map(|proof| proof.root_digest())
     }
 
     /// This device's own current durability-root-set digest for `group_id`,
@@ -3335,22 +2212,25 @@ impl DaemonState {
     /// available. A no-op if already set (matches `OnceLock::set`'s own
     /// semantics; every production call site only ever calls this once
     /// anyway).
-    pub fn set_coordination_client_config(&self, addr: String, access_token: String) {
-        let _ =
-            self.coordination_client_config.set(CoordinationClientConfig { addr, access_token });
+    pub fn set_coordination_client_config(
+        &self,
+        addr: String,
+        auth: yadorilink_fapi_client::CoordinationAuth,
+    ) {
+        let _ = self.coordination_client_config.set(CoordinationClientConfig { addr, auth });
     }
 
     /// Overrides how often the daemon-level materialization-repair sweep
-    /// (`spawn_materialization_repair_scheduler`) re-drives any change still
+    /// (`spawn_materialization_repair_task`) re-drives any change still
     /// unapplied — see `materialization_repair_sweep_interval`'s doc
     /// comment. A test whose scenario can leave a change legitimately
     /// stalled for multiple production-cadence (90s) intervals with no
     /// other retry trigger in flight (no new local writes, no incoming
     /// traffic) can opt into a much shorter one instead of either widening
     /// its own timeout budget to absorb 90s gaps or accepting a wall-clock
-    /// tax production doesn't need. Takes effect on this scheduler's next
-    /// `interval.tick()`; a change after `DaemonState::new` has already
-    /// spawned it has no effect on a tick already in flight.
+    /// tax production doesn't need. The job reads the interval fresh before
+    /// each sleep, so a change takes effect from the next sleep; a sleep
+    /// already in progress still runs to its old length.
     pub fn set_materialization_repair_sweep_interval(&self, interval: Duration) {
         *self.materialization_repair_sweep_interval.lock().unwrap_or_else(|p| p.into_inner()) =
             interval;
@@ -3364,90 +2244,37 @@ impl DaemonState {
         *self.materialization_repair_sweep_interval.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Same override contract as [`Self::set_materialization_repair_sweep_interval`],
-    /// for `maintenance::durability_confirmation::DurabilityConfirmationJob`.
-    pub fn set_custody_confirmation_sweep_interval(&self, interval: Duration) {
-        *self.custody_confirmation_sweep_interval.lock().unwrap_or_else(|p| p.into_inner()) =
-            interval;
-    }
-
-    /// `pub(crate)`: read by `maintenance::durability_confirmation::
-    /// DurabilityConfirmationJob`, which owns this scheduler's sleep-loop.
-    pub(crate) fn custody_confirmation_sweep_interval(&self) -> Duration {
-        *self.custody_confirmation_sweep_interval.lock().unwrap_or_else(|p| p.into_inner())
-    }
-
-    /// Records the outcome of one `DurabilityConfirmationJob` sweep round
-    /// for `group_id`, stamped with the `membership_generation` captured
-    /// BEFORE that round's peer round-trip started (not read fresh here --
-    /// see `refresh_custody_confirmation`'s own comment for why: reading it
-    /// fresh at write time could stamp a now-current generation onto
-    /// evidence a mid-flight demotion actually invalidated).
-    ///
-    /// `epoch_before` is the cache epoch captured before that same
-    /// round-trip started. The epoch check and the write happen in ONE
-    /// critical section (a single lock acquisition) together with
-    /// `clear_custody_confirmation`'s own epoch bump+remove -- so the two
-    /// can never interleave: either `clear_custody_confirmation` runs
-    /// fully before this call observes its bumped epoch and drops the
-    /// stale result, or it runs fully after and this call has already
-    /// published (in which case the clear correctly removes what was just
-    /// published). An earlier version checked the epoch and published as
-    /// two separate lock acquisitions, which left exactly this window open
-    /// (M4 Codex review #1 second follow-up, finding #3b).
-    ///
-    /// A `NotConfirmed` outcome does NOT overwrite an existing entry that
-    /// is still a fresh `Confirmed` record (by this same generation +
-    /// staleness test `has_fresh_custody_confirmation` applies) -- one
-    /// transient round-trip miss must not immediately erase the "tolerate
-    /// one missed sweep" property `CUSTODY_CONFIRMATION_STALENESS_BOUND`
-    /// exists to provide (M4 Codex review #1 follow-up: without this, every
-    /// `NotConfirmed` round unconditionally clobbered a still-good record,
-    /// making the staleness bound meaningless in practice). It's still
-    /// written when there's no existing entry at all, so
-    /// `has_ever_been_custody_swept` still becomes true on first contact.
-    pub(crate) fn record_custody_confirmation_outcome(
+    /// Test seam: publishes a sweep round's outcome for `group_id` the way
+    /// `background_custody::run_cycle` does -- see
+    /// `DurabilityService::publish_background_custody` for the epoch and
+    /// freshness rules. `membership_generation` is the generation captured
+    /// BEFORE the round trip and is what the record is stamped with; the
+    /// current generation read here only decides whether a still-fresh
+    /// positive survives a negative.
+    #[cfg(test)]
+    pub(crate) fn publish_background_custody(
         &self,
         group_id: &str,
-        outcome: CustodyConfirmationOutcome,
+        outcome: BackgroundCustodyEvidence,
         membership_generation: u64,
         epoch_before: u64,
-    ) {
-        let current_membership_generation = self.membership_generation();
-        let mut cache = self.custody_confirmation_cache.lock().unwrap_or_else(|p| p.into_inner());
-        let entry = cache.entry(group_id.to_string()).or_default();
-        if entry.epoch != epoch_before {
-            // A clear (unlink, possibly followed by a relink) landed
-            // between when this sweep round started and now -- drop this
-            // stale result entirely rather than publish it.
-            return;
-        }
-        if matches!(outcome, CustodyConfirmationOutcome::NotConfirmed) {
-            if let Some(existing) = &entry.record {
-                let still_fresh =
-                    matches!(existing.outcome, CustodyConfirmationOutcome::Confirmed { .. })
-                        && existing.confirmed_at.elapsed() <= CUSTODY_CONFIRMATION_STALENESS_BOUND
-                        && existing.membership_generation == current_membership_generation;
-                if still_fresh {
-                    return;
-                }
-            }
-        }
-        entry.record = Some(CustodyConfirmationRecord {
+    ) -> bool {
+        let current_membership_generation = self.authority.membership_generation();
+        self.durability.publish_background_custody(
+            group_id,
             outcome,
-            confirmed_at_unix: now_unix(),
-            confirmed_at: std::time::Instant::now(),
             membership_generation,
-        });
+            epoch_before,
+            current_membership_generation,
+        )
     }
 
     /// Whether `group_id` has a whole-group peer-confirmed custody record
     /// in cache that is BOTH still within `CUSTODY_CONFIRMATION_STALENESS_
     /// BOUND` of its confirmation time (monotonic clock, immune to a wall-
-    /// clock adjustment -- M4 Codex review #1 finding #5) AND was recorded
+    /// clock adjustment) AND was recorded
     /// under the CURRENT `membership_generation` (any peer netmap change
-    /// since invalidates it outright, regardless of age -- finding #3's
-    /// demotion sub-case), AND still matches this group's CURRENT
+    /// since invalidates it outright, regardless of age), AND still matches this group's CURRENT
     /// durability-root digest (a cheap local DB read/hash, not a network
     /// round-trip -- see `durability_roots_for_group`'s own doc comment).
     ///
@@ -3456,165 +2283,109 @@ impl DaemonState {
     /// stale confirmation as `Protected` for up to the full staleness
     /// bound: a content/root-set change never bumps the netmap-
     /// authorization `membership_generation` counter, so the generation
-    /// check alone cannot catch it (an M4 Pass 7 independent review
-    /// finding -- this cache's sibling consumer,
+    /// check alone cannot catch it (this cache's sibling consumer,
     /// `fetch_available_via_confirmed_peer`, already re-derived and
     /// compared the current digest for exactly this reason; this method
     /// had not, so a group could report `Protected` while
     /// `fetch_availability` correctly, and misleadingly, showed
     /// `UnavailableNow` for content no peer had actually confirmed).
     /// Digest equality also directly proves the vacuous (no-peer,
-    /// empty-root-set) case is still vacuous, since an empty root set has
-    /// a fixed digest distinct from any non-empty one -- so this
-    /// subsumes the separate "is the group still empty" check an earlier
-    /// version of this method took as its own parameter. Fail closed
-    /// (`false`) if the current enumeration itself errors.
-    fn has_fresh_custody_confirmation(&self, group_id: &str) -> bool {
-        let confirmed_digest = {
-            let cache = self.custody_confirmation_cache.lock().unwrap_or_else(|p| p.into_inner());
-            match cache.get(group_id).and_then(|entry| entry.record.as_ref()) {
-                Some(record) => match &record.outcome {
-                    CustodyConfirmationOutcome::Confirmed { digest, .. } => {
-                        let fresh = record.confirmed_at.elapsed()
-                            <= CUSTODY_CONFIRMATION_STALENESS_BOUND
-                            && record.membership_generation == self.membership_generation();
-                        if !fresh {
-                            return false;
-                        }
-                        *digest
-                    }
-                    CustodyConfirmationOutcome::NotConfirmed => return false,
-                },
-                None => return false,
-            }
-        };
-        self.durability_roots_for_group(group_id)
-            .is_some_and(|current_roots| current_roots.digest == confirmed_digest)
-    }
-
-    /// Whether `group_id` has had at least one `DurabilityConfirmationJob`
-    /// sweep round run for it, ever (not staleness-bounded — this only
-    /// exists to distinguish "never checked yet" from "checked and found
-    /// nothing," so `classify` doesn't jump straight to `AtRisk`
-    /// during the narrow startup window before the first sweep tick has
-    /// even run once — M4 Codex review #1 findings #1/#2).
-    fn has_ever_been_custody_swept(&self, group_id: &str) -> bool {
-        self.custody_confirmation_cache
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(group_id)
-            .is_some_and(|entry| entry.record.is_some())
-    }
-
-    /// Current epoch counter for `group_id`'s custody-confirmation cache
-    /// entry (0 if never cleared).
-    fn custody_confirmation_epoch(&self, group_id: &str) -> u64 {
-        self.custody_confirmation_cache
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(group_id)
-            .map(|entry| entry.epoch)
-            .unwrap_or(0)
-    }
-
-    /// Runs one round of `DurabilityConfirmationJob`'s sweep for a single
-    /// group, synchronously from the caller's perspective (awaits the
-    /// peer round-trip), and records the outcome either way. Exists so
-    /// tests (and any other caller that needs `group_durability_status` to
-    /// reflect a fresh confirmation right now rather than waiting up to
-    /// `custody_confirmation_sweep_interval` for the background job's next
-    /// tick) can force the same real check the periodic sweep performs,
-    /// rather than reaching around it to poke the cache directly.
+    /// empty) case is still vacuous, since an empty set has a fixed digest
+    /// distinct from any non-empty one -- so this subsumes the separate "is
+    /// the group still empty" check an earlier version of this method took
+    /// as its own parameter. Fail closed (`false`) if the current
+    /// enumeration itself errors.
     ///
-    /// Captures `membership_generation` AND the cache epoch BEFORE the
-    /// round-trip and re-checks both after (the epoch check happens
-    /// atomically with the publish itself inside
-    /// `record_custody_confirmation_outcome` -- see its own doc comment):
-    /// a generation change means a peer's authorization may have shifted
-    /// mid-check (the confirmation, if any, gets recorded as `NotConfirmed`
-    /// instead of trusted); an epoch change means `clear_custody_
-    /// confirmation` ran for this exact group while the round-trip was in
-    /// flight (an unlink, possibly followed by a relink) -- the result is
-    /// dropped entirely rather than published, so a stale in-flight
-    /// confirmation can never resurrect a cache entry a concurrent unlink
-    /// just cleared (M4 Codex review #1 follow-up, findings #3a/#3b).
-    pub async fn refresh_custody_confirmation(&self, group_id: &str) {
-        let generation_before = self.membership_generation();
-        let epoch_before = self.custody_confirmation_epoch(group_id);
-        let confirmed = self.full_replica_handoff_ready_digest_and_peer(group_id).await;
-        let outcome = if self.membership_generation() != generation_before {
-            CustodyConfirmationOutcome::NotConfirmed
-        } else {
-            match confirmed {
-                Some((digest, peer_device_id)) => {
-                    CustodyConfirmationOutcome::Confirmed { peer_device_id, digest }
-                }
-                None => CustodyConfirmationOutcome::NotConfirmed,
-            }
+    /// The digest compared is the CURRENT-state one, because that is what a
+    /// background cycle publishes and the only one that converges between
+    /// honest replicas -- see `RootSetSummary`'s own doc comment. A change
+    /// to retained history alone therefore no longer invalidates a
+    /// corroboration, which is correct: the corroboration never claimed
+    /// anything about retained history in the first place.
+    fn has_fresh_custody_confirmation(&self, group_id: &str) -> bool {
+        let Some((_, confirmed_digest)) =
+            self.durability.fresh_corroboration(group_id, self.authority.membership_generation())
+        else {
+            return false;
         };
-        self.record_custody_confirmation_outcome(
-            group_id,
-            outcome,
-            generation_before,
-            epoch_before,
-        );
+        // The CURRENT-state digest, matching what a cycle publishes. Not
+        // the whole-root-set one: those are different sets the moment a
+        // group retains a single superseded version, and comparing one
+        // against the other would make this answer `false` forever.
+        self.local_root_set_summary(group_id)
+            .is_some_and(|now| now.current_digest == confirmed_digest)
     }
 
-    /// Drops `group_id`'s cached custody confirmation, if any, and bumps
-    /// its epoch, atomically (one lock acquisition) -- called whenever
-    /// this device's own link for that group is removed. The epoch bump
-    /// is what lets `refresh_custody_confirmation` detect and discard an
-    /// in-flight round-trip that started before this call and would
-    /// otherwise complete afterward and resurrect a cache entry for a
-    /// link that's no longer there (M4 Codex review #1 follow-up finding
-    /// #3b) -- doing the remove and the bump under the SAME critical
-    /// section `record_custody_confirmation_outcome` also uses is what
-    /// closes the window an earlier two-lock version left open. The
-    /// removal alone is what stops a later relink of the same `group_id`
-    /// within the staleness bound from reusing evidence confirmed under a
-    /// now-gone link/membership state (finding #3's original relink
-    /// sub-case). A no-op (beyond the epoch bump) if nothing was cached.
-    pub(crate) fn clear_custody_confirmation(&self, group_id: &str) {
-        let mut cache = self.custody_confirmation_cache.lock().unwrap_or_else(|p| p.into_inner());
-        let entry = cache.entry(group_id.to_string()).or_default();
-        entry.record = None;
-        entry.epoch += 1;
+    /// This device's own root-set summary for `group_id`, memoised against
+    /// the group's root-set generation -- see
+    /// `DurabilityService::local_root_set_summary` for the memo's validity
+    /// and fail-closed rules.
+    ///
+    /// `pub` rather than `pub(crate)` so an integration test can state the
+    /// condition it is constructing -- that two devices agree about current
+    /// content and disagree about retained history is the premise of the
+    /// test that pins those two as different questions, and a test that
+    /// merely assumed it would stop testing anything the day the premise
+    /// stopped holding.
+    pub fn local_root_set_summary(&self, group_id: &str) -> Option<RootSetSummary> {
+        self.durability
+            .local_root_set_summary(self.replica_coordinator.file_index_repository(), group_id)
     }
 
-    /// Whether any device OTHER than this one is currently recorded
-    /// (netmap-derived, content-blind) as an authorized-writer full replica
-    /// of `group_id` — the structural fact that makes `AtRisk`
-    /// (M4's `AtRisk`) a positively-known conclusion rather than merely
-    /// "not yet confirmed": with zero such peers configured, no amount of
-    /// waiting for `DurabilityConfirmationJob` will ever produce a
-    /// confirmation, so reporting anything but known-insufficient would be
-    /// false comfort.
-    fn any_other_full_replica_peer_configured(&self, group_id: &str) -> bool {
-        let metadata = self.peer_netmap_metadata.lock().unwrap_or_else(|p| p.into_inner());
-        metadata.full_replicas.iter().any(|(device_id, gid)| {
-            gid == group_id && metadata.writers.contains(&(device_id.clone(), gid.clone()))
-        })
+    /// What kind of evidence `group_id`'s durability status is currently
+    /// standing on.
+    ///
+    /// A payload-verified answer outranks an index-corroborated one, and
+    /// both are subject to the same staleness bound and the same
+    /// re-derivation of the digest they were made against -- an old proof of
+    /// a root set this device has moved past is not evidence about the one
+    /// it holds now.
+    pub fn group_durability_evidence(&self, group_id: &str) -> DurabilityEvidence {
+        if let Some(digest) = self.durability.fresh_strong_proof_digest(group_id) {
+            if self.local_durability_roots_digest(group_id) == Some(digest) {
+                return DurabilityEvidence::VerifiedPayload;
+            }
+        }
+        if self.has_fresh_custody_confirmation(group_id) {
+            return DurabilityEvidence::CorroboratedIndex;
+        }
+        DurabilityEvidence::None
     }
 
-    /// Every device id currently netmap-authorized as a WRITER (any
-    /// storage mode, not just full-replica) for `group_id` -- the
-    /// authoritative "who could theoretically still hold this group's
-    /// content" candidate set `known_unobtainable_required_content`
-    /// checks membership departure against. Unlike `full_replica_
-    /// devices_for_group`, not filtered to full replicas: an OnDemand
-    /// device that authored a conflict copy is still its origin, and
-    /// still a current member until it genuinely leaves.
-    fn current_group_writers(&self, group_id: &str) -> HashSet<String> {
-        let metadata = self.peer_netmap_metadata.lock().unwrap_or_else(|p| p.into_inner());
-        metadata
-            .writers
-            .iter()
-            .filter(|(_, gid)| gid == group_id)
-            .map(|(device_id, _)| device_id.clone())
-            .collect()
+    /// How many peers a background cycle would currently ask about
+    /// `group_id`.
+    ///
+    /// Exists so a scale test can state its own premise. The assertion that
+    /// matters there is "two candidate peers still cost zero per-root
+    /// queries", and a test that never checked there were two would pass
+    /// just as happily against one.
+    pub fn custody_candidate_peer_count_for_tests(&self, group_id: &str) -> usize {
+        crate::background_custody::custody_candidate_peers(&self.peers, &self.authority, group_id)
+            .len()
     }
 
-    /// M5-A soak-closure durability investigation: positively confirms
+    /// Runs one background custody cycle for `group_id`, synchronously from
+    /// the caller's perspective, and publishes what it found.
+    ///
+    /// The cycle itself lives in [`crate::background_custody::run_cycle`],
+    /// not here, and that is not filing. The one property this whole design
+    /// rests on is that the background path cannot reach the action-time
+    /// proof, and the architecture manifest enforces it by forbidding that
+    /// module from naming any strong-proof entry point — which requires the
+    /// cycle to be in a file such a rule can point at. This method is the
+    /// public name tests and the maintenance job call; it deliberately does
+    /// nothing but delegate.
+    pub async fn refresh_custody_confirmation(&self, group_id: &str) -> BackgroundCustodyOutcome {
+        let components = crate::background_custody::CustodyCycleComponents {
+            durability: &self.durability,
+            authority: &self.authority,
+            peers: &self.peers,
+            file_index: self.replica_coordinator.file_index_repository(),
+        };
+        crate::background_custody::run_cycle(&components, group_id).await
+    }
+
+    /// Positively confirms
     /// (never merely infers from connectivity) that at least one of this
     /// group's currently-required (repair-candidate) paths has no
     /// obtainable/durable holder among current membership -- see
@@ -3637,45 +2408,33 @@ impl DaemonState {
         if paths.is_empty() {
             return false;
         }
-        let current_writers = self.current_group_writers(group_id);
+        let current_writers = self.authority.current_group_writers(group_id);
         for path in &paths {
             // Facts 1+2 (still DAG-justified, missing locally) are
             // implied by `path` being a repair candidate at all --
             // `list_materialization_repair_candidates`'s own WHERE
             // clause already requires `state = 'current'`, `deleted = 0`,
             // and `placeholder`/`hydrating`.
-            let Ok(Some(origin_device_id)) = self
+            // ONE read for the origin and the version alike. Refusal
+            // evidence is keyed by the exact version it is about, and
+            // `ensure_blocks_present_core` records it under the version
+            // its payload named. A lookup key stitched together out of
+            // six separate reads can name a version no incarnation of
+            // the row ever had, and would then match nothing this or any
+            // other device ever recorded -- silently answering "no
+            // refusals" for a path that has them, which is the fail-open
+            // direction for "this content is unobtainable".
+            let Ok(Some(row)) = self
                 .replica_coordinator
                 .file_index_repository()
-                .get_origin_device_id(group_id, path)
+                .canonical_current_row(group_id, path)
             else {
                 continue;
             };
-            // Refusal evidence is gathered up front now (issue #58 fix --
-            // see the note on Fact 3 below for why the origin device's own
-            // refusal status has to be known before that check runs).
-            let file_index = self.replica_coordinator.file_index_repository();
-            let (Ok(Some(record)), Ok(record_kind), Ok(unix_mode), Ok(symlink_target), Ok(xattrs)) = (
-                file_index.get_file(group_id, path),
-                file_index.get_record_kind(group_id, path),
-                file_index.get_unix_mode(group_id, path),
-                file_index.get_symlink_target(group_id, path),
-                file_index.get_xattrs(group_id, path),
-            ) else {
+            let Some(origin_device_id) = row.origin_device_id.clone() else {
                 continue;
             };
-            let current_version_hash =
-                yadorilink_replica_domain::file::FileVersion::from_index_row(
-                    record.blocks,
-                    record.size,
-                    record.mtime_unix_nanos,
-                    record_kind.unwrap_or_default(),
-                    unix_mode,
-                    symlink_target,
-                    xattrs,
-                )
-                .version_hash
-                .to_hex();
+            let current_version_hash = row.version_hash().to_hex();
             let Ok(refusers) = self
                 .replica_coordinator
                 .materialization_state_repository()
@@ -3685,8 +2444,8 @@ impl DaemonState {
             };
             // Fact 3: the presumed sole holder (this path's origin) has
             // left authoritative membership, OR has itself explicitly
-            // refused this exact version. Issue #58: the original form of
-            // this check exempted the origin from Fact 4 purely on
+            // refused this exact version. Without that second clause,
+            // this check would exempt the origin from Fact 4 purely on
             // still-current-writer membership, with no way for it to ever
             // become "accounted for" -- a path could sit in `Protecting`
             // forever once the origin device itself was the (sole)
@@ -3713,8 +2472,8 @@ impl DaemonState {
             // never conflated with a refusal recorded against some OTHER
             // version this path once had -- see `block_fetch_refusals`'s
             // own schema doc comment for why refusal evidence is bound to
-            // `version_hash`, not just `path`). The origin device is no
-            // longer exempted here (issue #58): if it's still present, it
+            // `version_hash`, not just `path`). The origin device is not
+            // exempted here: if it's still present, it
             // only reached this point because it explicitly refused too
             // (the check above), so `refusers.contains` already accounts
             // for it correctly without a separate carve-out.
@@ -3727,45 +2486,40 @@ impl DaemonState {
         false
     }
 
-    /// M4 Pass 3: every device OTHER than this one currently recorded
-    /// (netmap-derived, content-blind) as an authorized-writer full
-    /// replica of `group_id` -- the enumerable counterpart to
-    /// `any_other_full_replica_peer_configured` above, feeding the
-    /// user-facing "Complete copies" per-device list (e.g. "Home NAS --
-    /// available/offline"), cross-referenced by the caller against each
-    /// device's own current `PeerReachability` to answer "available" vs.
-    /// "offline". Order is unspecified (backed by a `HashSet`); callers
-    /// needing a stable order should sort.
-    pub(crate) fn full_replica_devices_for_group(&self, group_id: &str) -> Vec<String> {
-        let metadata = self.peer_netmap_metadata.lock().unwrap_or_else(|p| p.into_inner());
-        metadata
-            .full_replicas
-            .iter()
-            .filter(|(_, gid)| gid == group_id)
-            .filter(|(device_id, gid)| metadata.writers.contains(&(device_id.clone(), gid.clone())))
-            .map(|(device_id, _)| device_id.clone())
-            .collect()
-    }
-
-    /// M4 Pass 2: whether this group has REAL content-confirmed peer
+    /// Whether this group has REAL content-confirmed peer
     /// custody evidence (the same fresh, staleness/generation-bound
-    /// `custody_confirmation_cache` entry Pass 1 built for durability's
+    /// `DurabilityService`'s custody confirmation cache entry that backs durability's
     /// `Protected`) whose confirming peer is ALSO currently reachable.
     /// `fetch_availability`'s only source of peer-served `AvailableNow`
     /// evidence for content not already hydrated locally.
     ///
     /// Deliberately NOT the netmap's content-blind "declared full-replica
     /// writer" fact alone (an earlier version of this method checked
-    /// exactly that plus reachability, which M4 Pass 2 Codex review #2
-    /// finding #1 correctly flagged: a peer can be reachable and declared
+    /// exactly that plus reachability, which is insufficient: a peer can be reachable and declared
     /// a full replica while genuinely still catching up itself, or its
     /// declaration can simply be stale/wrong -- neither proves it holds
     /// THIS group's current content). Requiring a fresh confirmation
-    /// closes that gap: `custody_confirmation_cache` is only ever
-    /// populated by a REAL peer round-trip
-    /// (`full_replica_handoff_ready_digest_and_peer`) that positively
-    /// verified whole-group coverage, so this reuses genuine content
-    /// proof rather than re-deriving a weaker approximation.
+    /// closes that gap: `DurabilityService`'s custody confirmation cache is only ever populated
+    /// by a real peer round-trip in which that peer reported an `Eager`
+    /// policy, a current-state digest equal to this device's own, and every
+    /// one of its own current rows materialized. That last part is what
+    /// keeps this from being the very approximation it replaced: a peer
+    /// that has projected the changes and fetched none of the content has
+    /// an identical digest and reports itself unmaterialized.
+    ///
+    /// It is nonetheless weaker than it was, and the difference is worth
+    /// stating rather than discovering. The cache used to be populated by
+    /// the whole-group handoff proof, whose per-root check also required
+    /// the peer to hold verified BLOCK PROVENANCE for the group -- the
+    /// serving authorization it will later demand of itself before actually
+    /// answering a block request. Nothing in the background summary
+    /// establishes that, so a peer holding the content without provenance
+    /// for this group would be reported here as able to serve it and would
+    /// then refuse the fetch. That state is narrow -- provenance is
+    /// recorded when verified bytes are obtained through the group, which
+    /// is also how the content got there -- but it is not impossible, and
+    /// this axis is the one place the background/action-time split is
+    /// visible to a user rather than only to a gate.
     ///
     /// The confirming peer's CURRENT reachability is checked in addition
     /// to the confirmation's own freshness/generation bounds: the
@@ -3779,21 +2533,10 @@ impl DaemonState {
     /// `has_fresh_custody_confirmation`'s own -- see that method's doc
     /// comment.
     pub(crate) fn fetch_available_via_confirmed_peer(&self, group_id: &str) -> bool {
-        let (peer_device_id, confirmed_digest) = {
-            let cache = self.custody_confirmation_cache.lock().unwrap_or_else(|p| p.into_inner());
-            let Some(record) = cache.get(group_id).and_then(|entry| entry.record.as_ref()) else {
-                return false;
-            };
-            let CustodyConfirmationOutcome::Confirmed { peer_device_id, digest } = &record.outcome
-            else {
-                return false;
-            };
-            let fresh = record.confirmed_at.elapsed() <= CUSTODY_CONFIRMATION_STALENESS_BOUND
-                && record.membership_generation == self.membership_generation();
-            if !fresh {
-                return false;
-            }
-            (peer_device_id.clone(), *digest)
+        let Some((peer_device_id, confirmed_digest)) =
+            self.durability.fresh_corroboration(group_id, self.authority.membership_generation())
+        else {
+            return false;
         };
         // Re-derive the group's CURRENT durability-root digest (a cheap
         // local DB read/hash, not a network round-trip -- see
@@ -3803,20 +2546,19 @@ impl DaemonState {
         // intervening content change (e.g. a new file synced in as a
         // placeholder) that its `membership_generation` binding alone
         // never catches, since content/root-set changes never bump the
-        // netmap-authorization generation counter -- a real HIGH-severity
-        // false-`AvailableNow` gap M4 Pass 2 Codex review #2's follow-up
-        // round found. Fail closed (`None`) if the current enumeration
+        // netmap-authorization generation counter -- otherwise a real
+        // HIGH-severity false-`AvailableNow` gap. Fail closed (`None`) if the current enumeration
         // itself errors.
-        let Some(current_roots) = self.durability_roots_for_group(group_id) else {
+        let Some(current_roots) = self.local_root_set_summary(group_id) else {
             return false;
         };
-        if current_roots.digest != confirmed_digest {
+        if current_roots.current_digest != confirmed_digest {
             return false;
         }
         match peer_device_id {
-            None => current_roots.roots.is_empty(),
+            None => current_roots.current_count == 0,
             Some(device_id) => {
-                self.peers.reachability(&device_id).is_some_and(|r| r.is_connected())
+                self.peer_connectivity.reachability(&device_id).is_some_and(|r| r.is_connected())
             }
         }
     }
@@ -3851,24 +2593,18 @@ impl DaemonState {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// Fix-saga: opens a durable role-loss-operation journal row for a
-    /// demote/unlink this device is about to drive as the SOURCE, BEFORE the
-    /// coordination-worker role-loss commit itself — see
-    /// [`yadorilink_sync_core::index::RoleLossOperation`]'s doc comment for
-    /// the full state machine this row moves through. `local_path` is the
-    /// link this operation concerns (both demote and unlink always name
-    /// one).
-    ///
-    /// FAIL-CLOSED: the Prepared row is the durability mechanism this whole
-    /// saga rests on, so its write is NOT best-effort. If it fails (a genuine
-    /// local storage error), this returns `Err` and the caller
-    /// (`control_socket`'s demote/unlink paths) MUST abort BEFORE calling
-    /// `commit_handoff_role_loss` — committing the role loss on the Worker
-    /// without a durable recovery record would reopen the exact split-state
-    /// hole (Worker on-demand / local eager, with nothing to drive a retry)
-    /// the journal exists to close. Aborting here is always safe: nothing has
-    /// been committed on either side yet, so a failed Prepared write leaves no
-    /// split, only a plain "couldn't start the operation, retry" error.
+    /// `local_path` is the link this operation concerns (both demote and
+    /// unlink always name one). FAIL-CLOSED: the Prepared row is the
+    /// durability mechanism this whole saga rests on, so its write is NOT
+    /// best-effort. If it fails (a genuine local storage error), this
+    /// returns `Err` and the caller (`control_socket`'s demote/unlink
+    /// paths) MUST abort BEFORE calling `commit_handoff_role_loss` —
+    /// committing the role loss on the Worker without a durable recovery
+    /// record would reopen the exact split-state hole (Worker on-demand /
+    /// local eager, with nothing to drive a retry) the journal exists to
+    /// close. Aborting here is always safe: nothing has been committed on
+    /// either side yet, so a failed Prepared write leaves no split, only a
+    /// plain "couldn't start the operation, retry" error.
     pub fn open_role_loss_operation(
         &self,
         group_id: &str,
@@ -3886,7 +2622,7 @@ impl DaemonState {
                 RoleLossOperationParams {
                     source_device_id: &self.device_id,
                     target_device_id,
-                    lease_id: Some(lease_id),
+                    lease_id,
                     action,
                     local_path: Some(local_path),
                     now_unix: now_unix(),
@@ -3910,13 +2646,9 @@ impl DaemonState {
 
     /// Advances a role-loss-operation journal row to `WorkerCommitted` —
     /// called immediately after the coordination-worker role-loss commit
-    /// succeeds, so a crash from this point on is reconciled by the startup
-    /// + periodic sweep (`run_role_loss_reconciliation_sweep`) instead of
-    ///   left as a split state. Best-effort: even if this write itself fails
-    ///   (row stays `Prepared`), the sweep treats a `Prepared` row the same as
-    ///   `WorkerCommitted` at reconciliation time — see
-    ///   [`yadorilink_sync_core::index::RoleLossOperationState::Prepared`]'s
-    ///   doc comment for why that's safe.
+    /// succeeds, so a crash from this point on is reconciled by the
+    /// startup + periodic sweep (`ReplicaRoleService::reconcile_role_loss`)
+    /// instead of left as a split state.
     pub fn mark_role_loss_worker_committed(&self, operation_id: &str, membership_generation: i64) {
         if let Err(e) = self
             .replica_coordinator
@@ -3981,15 +2713,14 @@ impl DaemonState {
         }
     }
 
-    /// Persists a membership-operation journal row -- see
-    /// [`yadorilink_sync_core::index::MembershipOperation`]'s doc comment.
     /// Called instead of releasing tickets / falling through to a plain
     /// revoke-remove, so an outcome that MAY already have committed on the
     /// coordination plane is never silently treated as "never happened".
     /// Never overwrites an existing row under `operation_id` -- returns
     /// `Ok(false)` on conflict so the caller can retry under a fresh id
-    /// (see `replica_membership_service.rs`'s `open_membership_operation`),
-    /// rather than silently clobbering whatever that row already recorded.
+    /// (see `replica_membership_service.rs`'s
+    /// `open_membership_operation`), rather than silently clobbering
+    /// whatever that row already recorded.
     #[allow(clippy::too_many_arguments)]
     pub fn try_persist_membership_operation(
         &self,
@@ -4024,7 +2755,7 @@ impl DaemonState {
             )
             .map_err(|e| e.to_string())?;
         if inserted && durability_scope == MembershipDurabilityScope::Unknown {
-            self.unknown_scope_membership_marker.store(true, Ordering::SeqCst);
+            self.durability.set_scope_unknown(true);
         }
         Ok(inserted)
     }
@@ -4034,10 +2765,6 @@ impl DaemonState {
     /// [`Self::settle_membership_operation`]: an ambiguous commit's real
     /// outcome is still unknown, so its journal row must survive for
     /// `reconcile_ambiguous_membership_operations` to resolve later.
-    /// Best-effort: even if this write fails, the row stays `Prepared`,
-    /// which the reconciler treats the same way (see
-    /// [`yadorilink_sync_core::index::MembershipOperationState::Ambiguous`]'s
-    /// doc comment for the analogous role-loss reasoning this mirrors).
     pub fn mark_membership_operation_ambiguous(&self, operation_id: &str, detail: &str) {
         if let Err(e) = self
             .replica_coordinator
@@ -4159,7 +2886,7 @@ impl DaemonState {
         }
     }
 
-    /// Re-derives `unknown_scope_membership_marker` from the journal —
+    /// Re-derives `DurabilityService`'s unknown-scope marker from the journal —
     /// called after any delete/settle that might have resolved the last
     /// outstanding `Unknown`-durability-scope row, so `group_durability_status`
     /// stops forcing `Unknown` account-wide once every such row is
@@ -4170,173 +2897,7 @@ impl DaemonState {
             .membership_operation_repository()
             .has_open_unknown_durability_scope_operation()
             .unwrap_or(true);
-        self.unknown_scope_membership_marker.store(still_present, Ordering::SeqCst);
-    }
-
-    /// Compensates a role-loss operation whose coordination-worker commit
-    /// succeeded but whose matching local change never completed (a digest
-    /// mismatch or a storage error in the local recheck-then-commit, or a
-    /// crash before that local step ever ran). The SAFE recovery direction
-    /// is to REVERT the Worker back to `eager` for the source device, not to
-    /// force-complete the local demotion: the handoff target's lease/pin may
-    /// have lapsed by the time this runs, so completing the demotion could
-    /// end up releasing the only durable copy of the group's data. Reuses
-    /// the existing storage-mode write (`coordination_client::
-    /// set_storage_mode`, action `"eager"`) — the same call a PROMOTION
-    /// already makes — since the Worker-side effect of every role-loss
-    /// commit this journal wraps today (`commit_handoff_role_loss(...,
-    /// "demote")`, for BOTH the demote and unlink call sites — see
-    /// `control_socket.rs`) is exactly a `storage_mode` narrowing, so
-    /// reverting it is exactly this one call, cleanly and idempotently.
-    ///
-    /// On success, advances the row to `Completed` and deletes it, returning
-    /// `Ok(())`. On failure (coordination plane unreachable or refused),
-    /// leaves the row at `Compensating`, bumps its retry counter (escalating
-    /// the log level past `ROLE_LOSS_COMPENSATION_ESCALATION_ATTEMPTS`
-    /// attempts, purely for visibility), and returns `Err` describing the
-    /// failure. The row is NEVER deleted on a failed compensation attempt —
-    /// the startup + periodic sweep (`run_role_loss_reconciliation_sweep`)
-    /// retries it indefinitely until a revert is confirmed.
-    ///
-    /// A missing journal row (already reconciled by a concurrent attempt, or
-    /// never written in the first place — see
-    /// [`Self::open_role_loss_operation`]'s best-effort doc comment) is
-    /// treated as already-compensated (`Ok(())`): there is nothing left here
-    /// for this call to do.
-    ///
-    /// Carries only `(group_id, source_device_id, "eager")` to the
-    /// coordination plane — no digest, path, or version content (INV-4;
-    /// same as every other call in `coordination_client`).
-    pub async fn compensate_role_loss_operation(&self, operation_id: &str) -> Result<(), String> {
-        let Some(op) = self
-            .replica_coordinator
-            .role_loss_operation_repository()
-            .get_role_loss_operation(operation_id)
-            .map_err(|e| e.to_string())?
-        else {
-            return Ok(());
-        };
-        if op.state != RoleLossOperationState::Compensating {
-            if let Err(e) = self
-                .replica_coordinator
-                .role_loss_operation_repository()
-                .advance_role_loss_operation(
-                    operation_id,
-                    RoleLossOperationState::Compensating,
-                    now_unix(),
-                )
-            {
-                tracing::warn!(
-                    error = %e,
-                    operation_id,
-                    "failed to advance a role-loss operation journal row to Compensating"
-                );
-            }
-        }
-        let Some(config) = self.coordination_client_config() else {
-            let attempts = self
-                .replica_coordinator
-                .role_loss_operation_repository()
-                .increment_role_loss_operation_attempts(operation_id, now_unix())
-                .unwrap_or(op.attempts + 1);
-            tracing::warn!(
-                operation_id,
-                group_id = %op.group_id,
-                attempts,
-                "role-loss compensation could not run: no coordination-plane config recorded; \
-                 will retry once this device is connected"
-            );
-            return Err(
-                "not connected to the coordination plane; the rollback will be retried once \
-                 connectivity is restored"
-                    .to_string(),
-            );
-        };
-        let Some(lease_id) = op.lease_id.as_deref() else {
-            tracing::warn!(
-                operation_id,
-                "legacy role-loss journal has no lease; treating it as superseded"
-            );
-            self.replica_coordinator
-                .role_loss_operation_repository()
-                .delete_role_loss_operation(operation_id)
-                .map_err(|e| e.to_string())?;
-            return Ok(());
-        };
-        match crate::coordination_client::compensate_handoff_role_loss(
-            &config.addr,
-            &config.access_token,
-            &op.group_id,
-            &op.source_device_id,
-            &op.target_device_id,
-            lease_id,
-            op.worker_membership_generation,
-        )
-        .await
-        {
-            Ok(outcome) => {
-                tracing::info!(
-                    operation_id,
-                    ?outcome,
-                    "role-loss compensation reached a terminal outcome"
-                );
-                if let Err(e) = self
-                    .replica_coordinator
-                    .role_loss_operation_repository()
-                    .advance_role_loss_operation(
-                        operation_id,
-                        RoleLossOperationState::Completed,
-                        now_unix(),
-                    )
-                {
-                    tracing::warn!(
-                        error = %e,
-                        operation_id,
-                        "failed to advance a role-loss operation journal row to Completed"
-                    );
-                }
-                if let Err(e) = self
-                    .replica_coordinator
-                    .role_loss_operation_repository()
-                    .delete_role_loss_operation(operation_id)
-                {
-                    tracing::warn!(
-                        error = %e,
-                        operation_id,
-                        "failed to delete a Completed role-loss operation journal row; it will \
-                         be cleaned up by the next reconciliation sweep"
-                    );
-                }
-                Ok(())
-            }
-            Err(e) => {
-                let attempts = self
-                    .replica_coordinator
-                    .role_loss_operation_repository()
-                    .increment_role_loss_operation_attempts(operation_id, now_unix())
-                    .unwrap_or(op.attempts + 1);
-                if attempts >= ROLE_LOSS_COMPENSATION_ESCALATION_ATTEMPTS {
-                    tracing::error!(
-                        error = %e,
-                        operation_id,
-                        group_id = %op.group_id,
-                        attempts,
-                        "role-loss compensation has failed repeatedly; this device's \
-                         full-replica status for this group may still be inconsistent with the \
-                         coordination plane"
-                    );
-                } else {
-                    tracing::warn!(
-                        error = %e,
-                        operation_id,
-                        group_id = %op.group_id,
-                        attempts,
-                        "role-loss compensation attempt failed; will retry"
-                    );
-                }
-                Err(e)
-            }
-        }
+        self.durability.set_scope_unknown(still_present);
     }
 
     /// Requests a full-replica-handoff lease for `group_id` — the daemon-side
@@ -4418,7 +2979,7 @@ impl DaemonState {
         let config = self.coordination_client_config.get()?;
         let grant = crate::coordination_client::request_handoff_lease(
             &config.addr,
-            &config.access_token,
+            &config.auth,
             group_id,
             &self.device_id,
         )
@@ -4431,7 +2992,7 @@ impl DaemonState {
         let release_worker_lease = move |lease_id: String| async move {
             crate::coordination_client::release_handoff_lease(
                 &config.addr,
-                &config.access_token,
+                &config.auth,
                 group_id,
                 &self.device_id,
                 &lease_id,
@@ -4533,7 +3094,7 @@ impl DaemonState {
         if let Some(config) = self.coordination_client_config.get() {
             crate::coordination_client::release_handoff_lease(
                 &config.addr,
-                &config.access_token,
+                &config.auth,
                 group_id,
                 &self.device_id,
                 lease_id,
@@ -4552,7 +3113,7 @@ impl DaemonState {
     ///
     /// `target_peer_device_id` must name a peer this device currently has a
     /// live session with (normally the exact peer
-    /// [`Self::full_replica_handoff_ready_digest_and_peer`] just confirmed);
+    /// [`Self::full_replica_handoff_proof`] just confirmed);
     /// no session for that id returns `None` immediately.
     ///
     /// Returns `None` — fail closed, never partially trusted — on every one
@@ -4598,7 +3159,7 @@ impl DaemonState {
     /// that a DIFFERENT operating device (X) is in the process of removing/
     /// revoking, asking B to attest and hand off ITS OWN roots before it
     /// leaves. This is exactly the Stage-B SOURCE-side flow
-    /// ([`Self::full_replica_handoff_ready_digest_and_peer`] +
+    /// ([`Self::full_replica_handoff_proof`] +
     /// [`Self::obtain_handoff_lease_from_peer`]), reused verbatim: a removed
     /// device attesting its own roots to obtain a lease from some other
     /// confirmed peer IS the source-side handoff flow, just triggered by a
@@ -4626,7 +3187,7 @@ impl DaemonState {
     /// perfectly valid "nothing to hand off" answer.
     ///
     /// `target_device_id` is the SAME confirming peer
-    /// [`Self::full_replica_handoff_ready_digest_and_peer`] already learned
+    /// [`Self::full_replica_handoff_proof`] already learned
     /// and [`Self::obtain_handoff_lease_from_peer`] requested the lease
     /// from -- this is what closes the previously-disclosed gap where the
     /// ticket carried a lease id but no target to atomically re-verify it
@@ -4644,8 +3205,9 @@ impl DaemonState {
         &self,
         group_id: &str,
     ) -> Option<PeerHandoffTicketGrant> {
-        let (digest, peer) = self.full_replica_handoff_ready_digest_and_peer(group_id).await?;
-        let (lease_id, target_device_id) = match peer {
+        let proof = self.full_replica_handoff_proof(group_id).await?;
+        let digest = proof.root_digest();
+        let (lease_id, target_device_id) = match proof.into_peer_device_id() {
             None => (None, None),
             Some(peer_id) => {
                 let lease_id =
@@ -4712,20 +3274,25 @@ impl DaemonState {
         Err(format!("no active session for removed device {device_id}"))
     }
 
-    /// Like [`Self::full_replica_handoff_ready_digest`], but also returns the
-    /// device id of the specific peer that confirmed coverage — `None` for a
-    /// vacuously-ready empty root set (there is no "the confirming peer" when
-    /// nothing needed confirming). Used by call sites that need to name a
-    /// concrete handoff TARGET for coordination-worker's role-loss commit
-    /// endpoint (`crate::coordination_client::commit_handoff_role_loss`),
-    /// not just a yes/no answer — currently only
-    /// `control_socket::ensure_unlink_keeps_a_full_replica`. Only the
-    /// non-excluding form is offered, matching `full_replica_handoff_ready_
-    /// digest`'s own doc comment on why.
-    pub async fn full_replica_handoff_ready_digest_and_peer(
-        &self,
-        group_id: &str,
-    ) -> Option<([u8; 32], Option<String>)> {
+    /// Takes a fresh [`StrongHandoffProof`] for `group_id`, or `None` if one
+    /// cannot be established right now.
+    ///
+    /// This is the only way to obtain that value, and every destructive
+    /// action that may cost this device its own durable copy takes one here,
+    /// immediately, rather than consulting anything remembered. Cached
+    /// background evidence (`crate::background_custody`) is a different type
+    /// for exactly this reason: it cannot be turned into one of these, and it
+    /// is not admissible where one is required.
+    ///
+    /// The proof names the peer that confirmed coverage — `None` inside it
+    /// for a vacuously-ready empty root set, where there is no "the
+    /// confirming peer" because nothing needed confirming. Call sites that
+    /// must name a concrete handoff TARGET for coordination-worker's
+    /// role-loss commit endpoint
+    /// (`crate::coordination_client::commit_handoff_role_loss`) read it from
+    /// there. Only the non-excluding form is offered, matching
+    /// `full_replica_handoff_ready_digest`'s own doc comment on why.
+    pub async fn full_replica_handoff_proof(&self, group_id: &str) -> Option<StrongHandoffProof> {
         self.full_replica_handoff_ready(group_id, None).await
     }
 
@@ -4733,16 +3300,19 @@ impl DaemonState {
     /// [`Self::another_full_replica_is_ready`],
     /// [`Self::another_full_replica_is_ready_excluding`],
     /// [`Self::full_replica_handoff_ready_digest`], and
-    /// [`Self::full_replica_handoff_ready_digest_and_peer`]; see their doc
-    /// comments for the semantics `excluded_device_id` (`None` for the
-    /// non-excluding forms) adds. Returns the confirmed root-set digest (and,
-    /// when a real peer confirmed it — `None` for the vacuously-ready empty
-    /// root set — that peer's device id) on success, `None` if not ready.
+    /// [`Self::full_replica_handoff_proof`]; see their doc comments for the
+    /// semantics `excluded_device_id` (`None` for the non-excluding forms)
+    /// adds.
+    ///
+    /// This is the one function in the daemon that establishes every clause
+    /// of [`StrongHandoffProof`]'s contract, and therefore the one place
+    /// allowed to construct one — pinned by the architecture manifest, not
+    /// merely by this comment.
     async fn full_replica_handoff_ready(
         &self,
         group_id: &str,
         excluded_device_id: Option<&str>,
-    ) -> Option<([u8; 32], Option<String>)> {
+    ) -> Option<StrongHandoffProof> {
         // Enumerate every durability root (current + retained superseded +
         // trash-restorable; see `SyncState::enumerate_group_durability_roots`)
         // once, up front, so each candidate peer is checked against the same
@@ -4756,26 +3326,40 @@ impl DaemonState {
         // to preserve. Only a real peer-confirmed whole-group hold below
         // clears it.
         if roots.roots.is_empty() {
-            return Some((roots.digest, None));
+            return Some(StrongHandoffProof::new(
+                roots.digest,
+                None,
+                self.authority.membership_generation(),
+            ));
         }
         for (peer_id, session) in self.peers.all_sessions() {
             if excluded_device_id == Some(peer_id.as_str()) {
                 continue;
             }
-            if !self.peer_group_is_full_replica(&peer_id, group_id)
-                || !self.peer_is_writer(&peer_id, group_id)
+            if !self.authority.peer_group_is_full_replica(&peer_id, group_id)
+                || !self.authority.peer_is_writer(&peer_id, group_id)
             {
                 continue;
             }
+            let generation = self.authority.membership_generation();
             if self.peer_holds_entire_group(&peer_id, &session, group_id, &roots.roots).await {
                 // A whole-group handoff target is confirmed again: any
                 // post-force `Unknown` latch for this group no
                 // longer reflects reality, so clear it back toward
                 // whatever the group's live sync state now derives to.
+                //
+                // This is the ONLY place that clears that latch. The latch
+                // records that a `--force` override bypassed this gate, and
+                // only the gate itself re-earning its answer may retire it.
+                // The background custody monitor deliberately does not, and
+                // is held to that by the architecture manifest: its evidence
+                // is an index comparison, which is not the kind of fact the
+                // latch was set to wait for.
                 if let Err(error) = self.clear_group_durability_latch(group_id) {
                     tracing::warn!(%error, group_id, "failed to clear persistent durability latch");
                 }
-                return Some((roots.digest, Some(peer_id)));
+                self.durability.note_strong_proof(group_id, roots.digest);
+                return Some(StrongHandoffProof::new(roots.digest, Some(peer_id), generation));
             }
         }
         None
@@ -4826,7 +3410,7 @@ impl DaemonState {
         roots: &[DurabilityRoot],
     ) -> bool {
         for root in roots {
-            let epoch_before = self.membership_generation();
+            let epoch_before = self.authority.membership_generation();
             // Whole-group handoff: `for_handoff = true` lets the peer confirm a
             // root against any version it still retains (current OR retained
             // history), since a handoff must cover every durability root, not
@@ -4847,9 +3431,9 @@ impl DaemonState {
             // full-replica writer, and the netmap-authorization view must not
             // have changed at all during the wait. Anything else fails closed
             // rather than trusting a now-stale ACK.
-            if self.membership_generation() != epoch_before
-                || !self.peer_group_is_full_replica(peer_id, group_id)
-                || !self.peer_is_writer(peer_id, group_id)
+            if self.authority.membership_generation() != epoch_before
+                || !self.authority.peer_group_is_full_replica(peer_id, group_id)
+                || !self.authority.peer_is_writer(peer_id, group_id)
             {
                 return false;
             }
@@ -4857,199 +3441,33 @@ impl DaemonState {
         true
     }
 
-    pub fn replace_group_policy_states(&self, states: HashMap<String, GroupPolicyState>) {
-        *self.group_policy_states.lock().unwrap_or_else(|p| p.into_inner()) = states;
-    }
-
-    pub fn group_policy_state(&self, group_id: &str) -> Option<GroupPolicyState> {
-        self.group_policy_states.lock().unwrap_or_else(|p| p.into_inner()).get(group_id).cloned()
-    }
-
-    /// Installs `GroupPolicyState::placeholder_for_tests()` for `group_id`,
-    /// without disturbing any other group's entry -- see that constructor's
-    /// own doc comment for why a caller outside `change_policy.rs` needs
-    /// this rather than building a `GroupPolicyState` literal directly.
-    ///
-    /// Call after `link_repository().add_link(...)` in a test/benchmark
-    /// that constructs a real `DaemonState` (which always starts the
-    /// `convergence-engine-scheduler` background task, `maintenance_
-    /// coordinator::start`) and injects `FileRecord`s directly rather than
-    /// through a real signed `Change`/DAG admission. Without a verified
-    /// policy entry, `resolve_group_policy` resolves the group to
-    /// `Withhold` the moment it is linked (`group_is_introduced` is true).
-    /// `local_retirement_session` caches its constructed synthetic session
-    /// per group, so the one thing that actually revokes authorization here
-    /// -- `NetmapChangeAuthenticator::new` (`change_auth.rs`), whose
-    /// constructor eagerly runs `validate_linked_history_best_effort` ->
-    /// `restore_group_sessions_if_currently_authorized` -- only ever
-    /// constructs, and so only ever runs, ONCE per group per process: on
-    /// the first retirement pass that reaches this group (in a bypassed
-    /// test, typically the backstop's first tick, since nothing else marks
-    /// the group dirty). That one-shot, cached construction is exactly why
-    /// the resulting deauthorization is PERMANENT rather than self-healing
-    /// -- there is no later tick that re-derives it and could grant it
-    /// back, because `local_retirement_session` never reaches
-    /// `peer_sync_session_deps`/`NetmapChangeAuthenticator::new` again for
-    /// that group in this process's lifetime. Without `policy_servable`
-    /// true on that one pass, it revokes the group from every peer session
-    /// -- including ones a raw two-device test registered by hand --
-    /// because `policy_servable` is false regardless of `peer_is_writer`.
-    /// Confirmed live: a large-file transfer benchmark whose sender-side
-    /// CDC chunking ran past the retirement loop's 30s backstop interval
-    /// (`RETIREMENT_BACKSTOP_INTERVAL`, `convergence/engine_wrapper.rs`)
-    /// had its destination-side session permanently deauthorized before
-    /// `hydration::hydrate()` ever ran, failing every retry with
-    /// `HydrationFailed` -- not a hydration bug, but this exact gap.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn install_test_group_policy_bootstrap(&self, group_id: &str) {
-        self.group_policy_states
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(group_id.to_string(), GroupPolicyState::placeholder_for_tests());
-    }
-
-    /// Test-only seam: replaces this device's real `local_change_auth_provider`
-    /// (installed by `DaemonState::new`, see that closure's own doc comment)
-    /// with one that unconditionally stamps every local edit with the
-    /// group's current policy `ChangeAuth`, regardless of whether this
-    /// device itself currently holds Editor/Owner under that policy --
-    /// exactly the pre-fix behavior `local_change_auth_provider`'s own doc
-    /// comment describes as the bug it closes.
-    ///
-    /// Models a malicious or buggy client that bypasses ITS OWN local
-    /// emission check, for an end-to-end test that needs to prove the
-    /// SECOND, independent enforcement layer
-    /// (`NetmapChangeAuthenticator::accepts_change_auth`/
-    /// `author_was_writer_at`, on whichever peer receives the resulting
-    /// Change) also holds even when the sender's own gate is defeated.
-    /// Everything else in the pipeline this bypass sits in front of --
-    /// signing the Change with this device's real key, writing it to the
-    /// local DAG, and broadcasting it to peers over a real session --
-    /// remains genuine, unmodified production code; only this ONE device's
-    /// own local gate is swapped out, and only for a test that says so
-    /// explicitly.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn install_unconditional_local_change_auth_provider_for_test(self: &Arc<Self>) {
-        let weak_state = Arc::downgrade(self);
-        let provider: Arc<crate::replica_coordinator::LocalChangeAuthProvider> =
-            Arc::new(move |group_id| {
-                let Some(state) = weak_state.upgrade() else {
-                    return Err(PolicyUnavailable);
-                };
-                match state.resolve_group_policy(group_id) {
-                    GroupPolicyResolution::Verified(policy) => Ok(policy.change_auth()),
-                    GroupPolicyResolution::Bootstrap => Ok(ChangeAuth::PLACEHOLDER),
-                    GroupPolicyResolution::Withhold => Err(PolicyUnavailable),
-                }
-            });
-        self.replica_coordinator.set_local_change_auth_provider(provider);
-    }
-
-    /// Test-only seam: replaces this device's real `local_change_auth_
-    /// provider` with one that unconditionally stamps every local edit with
-    /// a FIXED, caller-supplied `ChangeAuth` -- regardless of the group's
-    /// actual current policy state.
-    ///
-    /// Models the REALISTIC attacker for the stale-`ChangeAuth`-replay
-    /// exploit: a still-connected device that legitimately captured a
-    /// writer-granting `ChangeAuth` stamp before it was downgraded or
-    /// revoked, and simply keeps replaying that cached, now-stale stamp on
-    /// every subsequent edit instead of fetching a fresh one -- there is no
-    /// client-side bug in doing this; nothing obligates a real client to
-    /// re-derive its `ChangeAuth` on every single local edit, and this is
-    /// exactly what a real client legitimately does today between edits.
-    ///
-    /// This is a STRONGER and more realistic attacker than
-    /// `install_unconditional_local_change_auth_provider_for_test`: that
-    /// seam still stamps with the group's CURRENT policy watermark (it only
-    /// skips this device's own local writer-role gate), which the
-    /// receiver's pre-existing `author_was_writer_at` check already rejects
-    /// on its own once this device is no longer a writer at that CURRENT
-    /// watermark -- it never actually exercises the stale-pin gap.  This
-    /// seam instead proves the receiver's LIVE-ADMISSION freshness floor
-    /// (`GroupPolicyState::author_is_writer_now`, via `NetmapChangeAuthenticator
-    /// ::accepts_live_change_auth`) is what actually closes it: a pin that
-    /// was genuinely, honestly valid at the moment it was captured, but has
-    /// since gone stale.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn install_stale_pin_local_change_auth_provider_for_test(
-        self: &Arc<Self>,
-        stale_auth: ChangeAuth,
-    ) {
-        let provider: Arc<crate::replica_coordinator::LocalChangeAuthProvider> =
-            Arc::new(move |_group_id| Ok(stale_auth));
-        self.replica_coordinator.set_local_change_auth_provider(provider);
-    }
-
-    /// Whether `local_retirement_session` has ever been called for
-    /// `group_id` in this process -- true the instant its one-shot,
-    /// cached construction runs (see that method's own doc comment),
-    /// regardless of whether the authorization check it triggers ends up
-    /// granting or revoking anything. A test asserting the retirement
-    /// backstop's tick genuinely fired (not just that its own wait was long
-    /// enough) polls this rather than inferring it indirectly from
-    /// authorization state, which the fix under test is specifically
-    /// designed to keep unchanged.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn has_local_retirement_session(&self, group_id: &str) -> bool {
-        self.local_retirement_sessions
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .contains_key(group_id)
-    }
-
     /// Marks `group_id`'s policy state untrusted because its latest snapshot
     /// failed verification. Change admission for the group fails closed until
-    /// [`clear_group_policy_stale`](Self::clear_group_policy_stale) resets it.
+    /// [`clear_group_policy_stale`](PeerAuthorityState::clear_group_policy_stale) resets it.
     /// Records the failure time; the caller logs the reason.
     pub fn mark_group_policy_stale(&self, group_id: &str) {
-        self.stale_policy_groups
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(group_id.to_string(), now_unix());
+        self.authority.mark_group_policy_stale(group_id);
         for (_, session) in self.peers.all_sessions() {
             session.revoke_group(group_id);
         }
     }
 
-    /// Clears any stale marker for `group_id` — its policy snapshot verified
-    /// again, so admission may resume trusting the verified history.
-    pub fn clear_group_policy_stale(&self, group_id: &str) {
-        self.stale_policy_groups.lock().unwrap_or_else(|p| p.into_inner()).remove(group_id);
-    }
-
-    /// Whether `group_id`'s policy state is currently untrusted (its last
-    /// snapshot failed verification and no valid one has replaced it). Both
-    /// the daemon's own verification failures and coordinator-flagged
-    /// `policyInvalidGroupIds` funnel through `mark_group_policy_stale`, so
-    /// this single predicate covers every "do not trust this group" source.
-    pub fn is_group_policy_stale(&self, group_id: &str) -> bool {
-        self.stale_policy_groups.lock().unwrap_or_else(|p| p.into_inner()).contains_key(group_id)
-    }
-
-    /// Whether this device has already been introduced to `group_id` — it is
-    /// linked locally, or the netmap has named some peer as a writer for it.
-    /// An introduced group that has no verified policy state loaded is not a
-    /// genuinely policy-free group; it is one whose real policy this process
-    /// has not resolved yet this run (the startup window before the netmap
-    /// orchestrator's first fetch), so its authorization must fail closed
-    /// rather than fall back to a placeholder stamp.
-    fn group_is_introduced(&self, group_id: &str) -> bool {
-        if self
-            .peer_netmap_metadata
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .writers
-            .iter()
-            .any(|(_, gid)| gid.as_str() == group_id)
-        {
-            return true;
+    /// Applies one verified policy snapshot: `verified` becomes the whole
+    /// trusted set (its groups' stale markers cleared) and every `stale`
+    /// group is marked stale, all in one critical section so no reader sees
+    /// a mix of the old and new snapshot. Each group marked stale is then
+    /// revoked from every live session, after the switch is visible and the
+    /// lock released, exactly as [`mark_group_policy_stale`](Self::mark_group_policy_stale) does.
+    pub(crate) fn apply_policy_snapshot(
+        &self,
+        verified: HashMap<String, GroupPolicyState>,
+        stale: Vec<String>,
+    ) {
+        for group_id in self.authority.apply_policy_snapshot(verified, stale) {
+            for (_, session) in self.peers.all_sessions() {
+                session.revoke_group(&group_id);
+            }
         }
-        self.replica_coordinator
-            .link_repository()
-            .list_links()
-            .map(|links| links.iter().any(|link| link.group_id == group_id))
-            .unwrap_or(false)
     }
 
     /// The single group-policy/authorization resolution point that every
@@ -5071,17 +3489,91 @@ impl DaemonState {
     ///   no snapshot has ever existed) → [`Bootstrap`](GroupPolicyResolution::Bootstrap),
     ///   where the placeholder stamp is still legitimate on both sides.
     pub fn resolve_group_policy(&self, group_id: &str) -> GroupPolicyResolution {
-        if self.is_group_policy_stale(group_id) {
-            return GroupPolicyResolution::Withhold;
+        self.authority.resolve_group_policy(group_id, || self.group_is_linked(group_id))
+    }
+
+    /// Whether `group_id` is ready to be used locally, and if not, why not.
+    ///
+    /// "Ready" is the conjunction the name implies: the group is linked on
+    /// this device, a verified policy is loaded for it, and this device may
+    /// author into it. Before this existed there was no way to ask that
+    /// question — only ways to find out by failing, which is exactly what
+    /// callers did. A local edit made against a group whose policy had not
+    /// arrived yet failed to commit with `PolicyUnavailable` and was
+    /// journaled for re-drive; nothing distinguished "not ready yet, this
+    /// will resolve on its own" from "something is wrong", so both a user
+    /// watching a folder and a test waiting to measure something had to
+    /// write a file and see whether it converged.
+    ///
+    /// Authorization is not a separate check here, deliberately. Under
+    /// `AuthorizationCheckpoint` admission, local emission is available to
+    /// any device that holds the group regardless of writer role (writer
+    /// authorization happens at checkpoint issuance), so "this device may
+    /// author into it" is exactly `resolve_group_policy` not resolving to
+    /// `Withhold` — the same primitive `local_policy_head_provider` gates
+    /// on. Deriving it a second way here would let the two drift, and the
+    /// failure that drift produces looks like a policy bug rather than a
+    /// duplicated-predicate bug.
+    pub fn group_readiness(&self, group_id: &str) -> GroupReadiness {
+        if !self.group_is_linked(group_id) {
+            return GroupReadiness::NotJoined;
         }
-        if let Some(policy) = self.group_policy_state(group_id) {
-            return GroupPolicyResolution::Verified(policy);
+        if self.authority.is_group_policy_stale(group_id) {
+            return GroupReadiness::PolicyStale;
         }
-        if self.group_is_introduced(group_id) {
-            GroupPolicyResolution::Withhold
-        } else {
-            GroupPolicyResolution::Bootstrap
+        match self.resolve_group_policy(group_id) {
+            GroupPolicyResolution::Verified(_) | GroupPolicyResolution::Bootstrap => {
+                GroupReadiness::Ready
+            }
+            // Linked, not stale, and still withheld: the group has been
+            // introduced (a peer names it, or it is linked) but no verified
+            // policy has arrived for it yet. This is the transient state a
+            // freshly created or joined group sits in, and the one that used
+            // to be indistinguishable from a failure.
+            GroupPolicyResolution::Withhold => GroupReadiness::AwaitingPolicy,
         }
+    }
+
+    /// Whether `group_id` has a local link row. Also the link half of
+    /// `PeerAuthorityState::group_is_introduced` (passed in by
+    /// `resolve_group_policy`), which deliberately also answers true for a
+    /// group this device merely knows a peer writes to — a different
+    /// question, and the wrong one for readiness.
+    fn group_is_linked(&self, group_id: &str) -> bool {
+        self.replica_coordinator
+            .link_repository()
+            .list_links()
+            .map(|links| links.iter().any(|link| link.group_id == group_id))
+            // A link table this daemon cannot read is not evidence that the
+            // group is ready; fail closed, same as every other readiness
+            // input here.
+            .unwrap_or(false)
+    }
+
+    /// Whether this device may currently serve `group_id` to *anyone*.
+    ///
+    /// This is the local half of the disclosure question, and it is about this
+    /// device rather than about any peer: a group whose policy has gone stale
+    /// (own verification failure, or coordinator-flagged invalid) or has not
+    /// loaded yet this run is one this device can no longer vouch for, so it
+    /// is withheld from every peer regardless of how well authorized that peer
+    /// is. Disclosure is the conjunction:
+    ///
+    /// ```text
+    ///   MayDisclose(peer, group)
+    ///       = group_is_servable(group)          // this device may serve it
+    ///       AND peer_is_writer(peer, group)     // that peer may be told
+    /// ```
+    ///
+    /// Both the legacy announcement path
+    /// (`NetmapChangeAuthenticator::effective_servable_groups`) and the
+    /// reconciliation path (`sync_adapter::DaemonPeerDirectory`) call this one
+    /// primitive rather than each re-deriving the condition. That is not only
+    /// tidiness: while both paths run, any difference between them would show
+    /// up in an equivalence measurement as a transport difference when it was
+    /// really a policy difference.
+    pub fn group_is_servable(&self, group_id: &str) -> bool {
+        !matches!(self.resolve_group_policy(group_id), GroupPolicyResolution::Withhold)
     }
 
     /// Graceful shutdown: blocks until no `broadcast_change`
@@ -5215,106 +3707,284 @@ impl DaemonState {
         if records.is_empty() {
             return;
         }
-        self.announce_heads_to_group_peers(group_id).await;
+        // The ONLY Pending -> Published path is `flush_pending_checkpoint`.
+        // `peer_orchestrator.rs`'s reconnect hook fires it once per WS
+        // connect, so any local mutation committed AFTER that one-shot flush
+        // already ran (an ordinary live edit made while already connected,
+        // or content recovered by `backfill_missing_change_history` after
+        // the flush already found nothing pending) would otherwise never get
+        // checkpointed until the NEXT reconnect (exercised end to end by
+        // `chaos_coordination_unreachable.rs`'s initial-sync probe and
+        // `viewer_editor_authorization_end_to_end.rs`'s Editor scenario).
+        // Every real
+        // local-mutation path already funnels through this one
+        // `broadcast_change` chokepoint (`capture_local_change.rs`,
+        // `link_runtime_controller.rs`, `hydration.rs`,
+        // `maintenance_coordinator.rs`, and this type's own backfill-repair
+        // arm), so hooking the SAME `flush_pending_checkpoint` here closes
+        // the gap for every path at once without inventing a second
+        // publication mechanism. Awaited inline (not spawned): this method
+        // has no `Arc<Self>` receiver to hand a `'static` spawned task, and
+        // every caller is already deep in an async background task, not a
+        // latency-sensitive synchronous path -- the same "best-effort,
+        // no per-commit retry queue" tolerance this method's own doc
+        // comment already accepts for the heads announce below applies
+        // here too.
+        //
+        // Deliberately BEFORE the heads announce, not after: a peer that
+        // receives a heads announce it doesn't yet hold tries to fetch it
+        // immediately, and `send_change_batch` can only ever serve a
+        // Published Change (see item 6/7 -- an unpublished head has no
+        // evidence to attach to the wire frame at all). Announcing the raw
+        // head before this flush completes would tell a peer about content
+        // it cannot yet fetch, with no guaranteed retry until the next
+        // anti-entropy sweep or reconnect.
+        self.flush_pending_checkpoint_for_group(group_id).await;
+        self.note_local_commit_for_group(group_id).await;
     }
 
-    /// The actual per-session announce loop `broadcast_change` gates on a
-    /// non-empty `records` batch -- factored out so a caller that already
-    /// knows independently there is something new to announce (the
-    /// retroactive conflict-copy repair loop, `engine_wrapper.rs`) can
-    /// trigger the same immediate heads announce without needing to first
-    /// produce a `FileRecord` for every affected path. That gate is wrong
-    /// for the repair loop specifically: it authors a change directly
-    /// against the DAG (already durable) and may not yet have the
-    /// resulting content materialized locally (`get_file` returns `None`
-    /// while blocks are still being fetched), which must not silently
-    /// suppress the announce and leave propagation dependent on the next
-    /// periodic audit.
-    pub(crate) async fn announce_heads_to_group_peers(&self, group_id: &str) {
-        let _in_flight = self.begin_broadcast(); // let shutdown wait for this to finish
-        for (peer_id, session) in self.peers.all_sessions() {
-            if !session.shares_group(group_id) {
-                continue;
-            }
-            if let Err(e) = session.announce_local_commit(group_id).await {
-                tracing::warn!(
-                    error = %e,
-                    peer = %peer_id,
-                    "failed to announce local commit heads to peer; \
-                     will converge on next periodic audit"
+    /// One group's worth of [`crate::checkpoint_source::flush_pending_
+    /// checkpoint`] against the real coordination plane -- the shared body
+    /// `broadcast_change` (every local-mutation completion) and
+    /// `peer_orchestrator.rs`'s reconnect hook (every WS connect) both call.
+    /// A silent no-op when this device has no coordination-plane config yet
+    /// (`coordination_client_config`, set once `peer_orchestrator::run`
+    /// starts) or no signing key configured, or when this group's policy
+    /// has not verified yet -- all three resolve themselves on whichever
+    /// trigger fires next (another local mutation, or the next reconnect).
+    pub(crate) async fn flush_pending_checkpoint_for_group(&self, group_id: &str) {
+        let _guard = self.flush_lock.lock().await;
+        self.flush_pending_checkpoint_for_group_inner(group_id).await
+    }
+
+    /// Test-only entry point for [`Self::flush_pending_checkpoint_for_
+    /// group`] -- `connect_two_daemons`-paired integration tests (`yadorilink
+    /// -daemon/tests/support/mod.rs`) wire a real in-process coordination
+    /// plane but never run a real `peer_orchestrator::run` netmap loop, so
+    /// there is no reconnect trigger to flush content that became `Pending`
+    /// BEFORE the two devices were ever paired. Same method, just reachable
+    /// from outside this crate.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn flush_pending_checkpoint_for_group_for_test(&self, group_id: &str) {
+        self.flush_pending_checkpoint_for_group(group_id).await
+    }
+
+    async fn flush_pending_checkpoint_for_group_inner(&self, group_id: &str) {
+        let Some(config) = self.coordination_client_config() else { return };
+        let Some(signing_key) = self.device_signing_key() else { return };
+        let Some(policy) = self.authority.group_policy_state(group_id) else {
+            tracing::debug!(group_id, "checkpoint flush: no verified policy state yet");
+            return;
+        };
+        let source = crate::checkpoint_source::ProductionCheckpointSource::new(
+            config.addr.clone(),
+            config.auth.clone(),
+        );
+        let resolve_authority_key = |key_id: &[u8; 32], policy_head: &[u8; 32]| {
+            policy.resolve_authority_key(key_id, policy_head)
+        };
+        match crate::checkpoint_source::flush_pending_checkpoint(
+            &self.replica_coordinator.database(),
+            &source,
+            group_id,
+            &self.device_id,
+            &signing_key.verifying_key(),
+            &resolve_authority_key,
+        )
+        .await
+        {
+            Ok(crate::checkpoint_source::FlushOutcome::NothingPending) => {}
+            Ok(crate::checkpoint_source::FlushOutcome::Flushed { batch_size, checkpoint_seq }) => {
+                tracing::info!(
+                    group_id,
+                    batch_size,
+                    checkpoint_seq,
+                    "checkpoint flush: published pending batch"
                 );
             }
+            Ok(crate::checkpoint_source::FlushOutcome::Refused) => {
+                tracing::debug!(
+                    group_id,
+                    "checkpoint flush: refused (not currently a writer, or unreachable)"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(group_id, error = %e, "checkpoint flush failed");
+            }
         }
     }
 
-    /// Lazily builds and caches, per group, a `PeerSyncSession` bound to a
-    /// `local_session_channel::LoopbackPeerMessageChannel` -- an inert
-    /// channel, never a live peer connection -- rather than one drawn from
-    /// `self.peers` (`peer_registry::PeerRegistry::sessions_for_group`).
-    /// `ConvergenceRetirementService` (`convergence::retirement_service`)
-    /// uses this instead of enumerating currently-connected peer sessions
-    /// so ephemeral-conflict-copy retirement no longer requires a live
-    /// peer to run at all: retirement's own decision (is a copy-shaped
-    /// file still justified by the CURRENT frontier?) is driven entirely
-    /// by this device's own local DAG/file-index/disk state -- see
-    /// `PeerSyncSession::retire_unjustified_ephemeral_conflict_copies`'s
-    /// own doc comment -- so which peer object (if any) happens to be
-    /// connected was never actually load-bearing for it. Before this, a
-    /// solo/newly-linked/currently-offline group's ephemeral conflict
-    /// copies could never retire at all: `run_retirement_pass`
-    /// (`convergence::engine`) found zero candidate sessions, re-marked
-    /// the group dirty, and repeated forever with nothing ever able to
-    /// claim it.
+    /// The one place a locally-durable commit turns into "the
+    /// `ReconciliationDriver` knows this group changed" -- factored out of
+    /// `broadcast_change` so a caller that already knows independently there
+    /// is something new (the retroactive conflict-copy repair loop,
+    /// `engine_wrapper.rs`) can raise the same wake without needing to first
+    /// produce a `FileRecord` for every affected path. That distinction
+    /// matters for the repair loop specifically: it authors a change
+    /// directly against the DAG (already durable) and may not yet have the
+    /// resulting content materialized locally (`get_file` returns `None`
+    /// while blocks are still being fetched), which must not silently
+    /// suppress the wake and leave propagation dependent on the driver's own
+    /// periodic sweep.
     ///
-    /// `.run()` is never called on the returned session -- callers use
-    /// only its specific per-call methods (`retire_conflict_copies_only`
-    /// today), none of which read from or block on the channel for a
-    /// purely local tombstone materialize, so
-    /// `LoopbackPeerMessageChannel::recv` never resolving is never
-    /// observed. `local_device_id` doubles as `peer_device_id` here (this
-    /// session never actually talks to a peer named anything else): the
-    /// only place that value is visible afterward is the tombstone's
-    /// stored `origin_device_id` column (pure display/provenance
-    /// metadata -- `yadorilink-cli`'s `version_history` and
-    /// `control_socket`'s status API, never a resolver/hazard/conflict
-    /// decision input, confirmed by tracing every read site), so
-    /// attributing a retirement's tombstone to this device's own id is
-    /// strictly more accurate than the previous behavior of attributing
-    /// it to whichever connected peer's session happened to be selected
-    /// to run the audit.
-    pub(crate) fn local_retirement_session(
-        self: &Arc<Self>,
-        group_id: &str,
-    ) -> Arc<yadorilink_peer_session::peer_session::PeerSyncSession> {
-        if let Some(existing) = self
-            .local_retirement_sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(group_id)
-        {
-            return existing.clone();
+    /// There is no per-peer announce here any more (RBSR/reconciliation
+    /// finds the difference by comparing durable sets over its own
+    /// connection, not by a device telling its peers "I have new heads");
+    /// this method's whole job is (1) telling `ReconciliationDriver` this
+    /// group has a new local change to reconcile, and (2) the per-session
+    /// bookkeeping every commit has always needed regardless of any peer --
+    /// this device's own recorded frontier, and the retirement/hazard wakes.
+    pub(crate) async fn note_local_commit_for_group(&self, group_id: &str) {
+        // The one place a locally published commit is turned into everything
+        // that has to happen next. Every local-mutation route already reaches
+        // here -- including the retroactive-repair carrier, which calls this
+        // directly rather than through `broadcast_change` -- so a route added
+        // later cannot forget to raise the event, because it has to publish.
+        //
+        // Getting this wrong once is what put it here: an earlier version of
+        // the cutover raised the reconciliation event in `broadcast_change`
+        // instead. Every ordinary edit worked, and the repair carrier -- the
+        // one caller that does not go through `broadcast_change` -- silently
+        // raised nothing at all.
+        if let Some(driver) = self.reconciliation_driver() {
+            let group = yadorilink_replica_domain::ids::FolderGroupId(group_id.to_string());
+            driver.note_local_change(&group);
+            // A local commit is the moment this group's capture barriers
+            // settle: the observed edit has become history, and its dirty
+            // rows are cleared. That is a dependency transition from blocked
+            // to potentially admissible, and admission has to be re-asked.
+            //
+            // It was not, and nothing else would have been. Admission is
+            // scheduled from exactly one production site -- a delivery that
+            // staged something NEW -- so a Change already staged and blocked
+            // only by a barrier had no event left that could promote it. Nor
+            // could the peer rescue it: `servable_change_hashes` advertises
+            // staged objects, so the peer sees this device as already
+            // holding it and never sends it again, which means no further
+            // delivery ever occurs to schedule the drain. The Change stays
+            // staged forever and this device sits at a divergent frontier.
+            //
+            // Scheduling is cheap and self-coalescing (`AdmissionCoordinator`
+            // single-flights per group), and a drain with nothing admissible
+            // is a single query that finds an empty candidate set, so raising
+            // it on every local commit costs nothing when there is no
+            // blocked work.
+            driver.stack().admission().schedule(&group);
         }
-        let group_ids = vec![group_id.to_string()];
-        let sync_roots = crate::peer_orchestrator::sync_roots_for_groups(self, &group_ids);
-        let dependencies = crate::peer_orchestrator::peer_sync_session_deps(self);
-        let session = yadorilink_peer_session::peer_session::PeerSyncSession::new_with_dependencies(
-            Arc::new(crate::local_session_channel::LoopbackPeerMessageChannel),
-            self.device_id.clone(),
-            self.device_id.clone(),
+
+        // The bookkeeping a commit has always raised: this device's own
+        // recorded frontier, and the retirement/hazard wakes. Nothing here
+        // speaks to a peer -- and nothing here is per-peer either. The
+        // frontier recorded is THIS device's, keyed by group; both wakes are
+        // group-scoped. It nonetheless used to run inside every session that
+        // shared the group, so one identical device-local write and two
+        // identical `mark_dirty` calls were repeated once per connected peer.
+        // Done once here instead.
+        //
+        // Still gated on at least one session sharing the group, exactly as
+        // the per-session loop was. Whether a commit should raise these with
+        // no peer connected is a real question -- the retirement backstop
+        // reaches the same work eventually either way -- and not one a move
+        // gets to decide.
+        let _in_flight = self.begin_broadcast(); // let shutdown wait for this to finish
+        if !self.peers.all_sessions().iter().any(|(_, session)| session.shares_group(group_id)) {
+            return;
+        }
+        let group = yadorilink_replica_domain::ids::FolderGroupId(group_id.to_string());
+        let device = yadorilink_replica_domain::ids::DeviceId(self.device_id.clone());
+        // The two steps `PeerReplicaEngine::record_local_frontier` performs,
+        // against the same narrow ports it would reach through: `group_heads`
+        // is the *published* head set, and the frontier write normalizes
+        // (sort + dedup) before storing. Taken on the sqlite store directly
+        // because `ReplicaCoordinator`'s `set_device_frontier` is a one-line
+        // delegate to it.
+        let sqlite = self.replica_coordinator.sqlite();
+        match yadorilink_replica_engine::ports::ReplicaHistoryPort::group_heads(sqlite, &group) {
+            Ok(heads) => {
+                if let Err(e) =
+                    yadorilink_replica_engine::ports::FrontierStorePort::record_acknowledged_frontier(
+                        sqlite, &group, &device, &heads,
+                    )
+                {
+                    tracing::warn!(group_id, error = %e, "failed to record local frontier after a commit");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(group_id, error = %e, "failed to read published heads after a commit");
+            }
+        }
+        // A locally-authored commit advanced this device's own frontier the
+        // same way an admitted remote Change does -- retirement needs to know
+        // either way.
+        self.replica_coordinator.retirement_wake().mark_dirty(group_id);
+        self.replica_coordinator.hazard_recheck_wake().mark_dirty(group_id);
+    }
+
+    /// The peer-free half of convergence for this device.
+    ///
+    /// Everything it does is decided from this device's own durable state, so
+    /// there is nothing per-peer or per-group to bind: roots are resolved live
+    /// from the link table on every call, exactly as a session's are.
+    ///
+    /// This is what a caller with no peer uses. It replaces manufacturing a
+    /// session over an inert channel to borrow local behaviour from — a
+    /// construction that also ran the netmap authenticator and could
+    /// quarantine another session's authorization, which is why callers went
+    /// out of their way to avoid it.
+    ///
+    /// Built per call rather than cached, deliberately. The executor holds
+    /// this state as its root-commit authority and its pending-change flush,
+    /// so caching it here would make `DaemonState` own something that owns
+    /// `DaemonState` — a cycle nothing breaks, which would keep a daemon and
+    /// everything it holds alive forever, in tests most visibly. Construction
+    /// is a few `Arc` clones; the only thing not carried across calls is the
+    /// canonical-root cache, which stays warm for the pass that uses it,
+    /// which is where it matters.
+    /// How many times the retirement backstop has ticked in this process.
+    ///
+    /// A real-time test that waits past the backstop interval needs to know
+    /// the tick it waited for happened; a long enough sleep is an assumption,
+    /// not evidence. Nothing in production reads this.
+    pub fn retirement_backstop_ticks(&self) -> u64 {
+        self.retirement_backstop_ticks.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn note_retirement_backstop_tick(&self) {
+        self.retirement_backstop_ticks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn local_convergence(
+        self: &Arc<Self>,
+    ) -> Arc<crate::local_convergence::LocalConvergenceExecutor> {
+        self.local_convergence_with_roots(std::collections::HashMap::new())
+    }
+
+    /// The executor a session gets: same construction, with the sync roots
+    /// that session was given. One per session, which is exactly what each
+    /// session used to build for itself.
+    pub fn local_convergence_with_roots(
+        self: &Arc<Self>,
+        sync_roots: std::collections::HashMap<String, std::path::PathBuf>,
+    ) -> Arc<crate::local_convergence::LocalConvergenceExecutor> {
+        crate::local_convergence::LocalConvergenceExecutor::new(
             self.replica_coordinator.clone(),
+            self.device_id.clone(),
+            self.clone(),
+            self.clone(),
+            sync_roots,
             Arc::new(crate::adapters::block_store_ports::BlockStorePortsAdapter::new(
                 self.block_store.clone(),
             )),
-            group_ids,
-            sync_roots,
-            None,
-            dependencies,
-        );
-        self.local_retirement_sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(group_id.to_string(), session.clone());
-        session
+            self.clone(),
+            crate::local_convergence::HeadroomPolicy {
+                enforced: self.disk_headroom_enforcement_enabled(),
+                // Read per construction, not cached, for the same reason
+                // `recheck_degraded_links` re-reads it per pass: an operator
+                // can change the reserve while the daemon runs, and an
+                // executor is built per call.
+                override_bytes: self.governance_config.load_or_default().headroom_override_bytes,
+            },
+        )
     }
 }
 
@@ -5393,1655 +4063,6 @@ impl HandoffTicketResponder for DaemonState {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::replica_coordinator::ReplicaCoordinator;
-    use yadorilink_local_storage::FsBlockStore;
-
-    /// `YADORILINK_CONFIG_DIR` is a process-global env var (same pattern
-    /// used by `tests/reporting_ipc.rs` and `yadorilink-cli`'s
-    /// `tests/materialization.rs`) — every test in this module that
-    /// touches it holds this mutex for its whole body, so concurrently-
-    /// running tests in this same lib test binary never observe each
-    /// other's override. Shared with `device_config.rs` and
-    /// `reporting/retry.rs` (see `crate::test_support`'s doc comment) —
-    /// a module-local mutex here alone does not serialize against those
-    /// other modules' own tests touching the same env var.
-    use crate::test_support::CONFIG_ENV_MUTEX;
-
-    fn test_state() -> Arc<DaemonState> {
-        let store_dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
-        let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
-        DaemonState::new("device-a".into(), sync_state, store)
-    }
-
-    /// Bug 1 regression: `DaemonState::new`'s real production
-    /// `local_change_auth_provider` closure (wired via `replica_coordinator
-    /// .local_emission_auth`) must withhold a Viewer-role device's own
-    /// local edit rather than stamping it with a valid-looking `ChangeAuth`
-    /// -- the same live check `NetmapChangeAuthenticator::accepts_change_
-    /// auth` runs for a REMOTE author's Change (see `change_auth.rs`'s
-    /// `accepts_change_auth_rejects_a_viewer_and_accepts_the_same_device_
-    /// as_an_editor`, whose pattern this test mirrors from the local-
-    /// emission side). Before the fix, `local_change_auth_provider`
-    /// unconditionally returned `Ok(policy.change_auth())` for ANY
-    /// `Verified` policy regardless of the local device's own role, so a
-    /// Viewer's own daemon would happily stamp and apply its own edits
-    /// while every remote peer rejected them -- a silent, permanent local
-    /// divergence. The same device promoted to Editor at a later policy
-    /// seq must succeed.
-    #[tokio::test]
-    async fn local_change_auth_provider_withholds_a_viewers_local_edit_but_allows_an_editor() {
-        use crate::change_policy::policy_signing::grant_record;
-        use crate::change_policy::{
-            verify_group_policy_log, GroupPolicyLog, PolicyRecord, WriterRole,
-        };
-        use ed25519_dalek::SigningKey;
-
-        fn hash_of(record: &PolicyRecord) -> [u8; 32] {
-            record.record_hash.as_slice().try_into().unwrap()
-        }
-
-        let authority = SigningKey::from_bytes(&[7u8; 32]);
-        let group_id = "group-viewer";
-        // The LOCAL device's own signing key -- "device-a", matching
-        // `test_state()`'s device id, since this test is about the local
-        // emission path, not a remote peer's.
-        let device_key = SigningKey::from_bytes(&[11u8; 32]);
-        let device_fp: [u8; 32] =
-            sha2::Sha256::digest(device_key.verifying_key().to_bytes()).into();
-
-        let state = test_state();
-        state.set_device_signing_key(device_key.clone());
-
-        // device-a granted Viewer only.
-        let viewer_grant = grant_record(
-            &authority,
-            group_id,
-            1,
-            [0u8; 32],
-            "device-a",
-            device_fp,
-            WriterRole::Viewer,
-        );
-        let viewer_head = hash_of(&viewer_grant);
-        let viewer_log = GroupPolicyLog {
-            group_id: group_id.to_string(),
-            current_seq: 1,
-            current_epoch: 0,
-            policy_head: viewer_head.to_vec(),
-            records: vec![viewer_grant],
-        };
-        let viewer_policy =
-            verify_group_policy_log(&authority.verifying_key().to_bytes(), &viewer_log).unwrap();
-        state.replace_group_policy_states(HashMap::from([(group_id.to_string(), viewer_policy)]));
-
-        let viewer_result = state.replica_coordinator.local_emission_auth(group_id);
-        assert!(
-            viewer_result.is_err(),
-            "a Viewer's own local edit must be withheld, not stamped with a valid ChangeAuth; got {viewer_result:?}"
-        );
-
-        // The identical device, now granted Editor at seq 2 -- its local
-        // edit must succeed and carry the current policy watermark.
-        let editor_grant = grant_record(
-            &authority,
-            group_id,
-            2,
-            viewer_head,
-            "device-a",
-            device_fp,
-            WriterRole::Editor,
-        );
-        let editor_head = hash_of(&editor_grant);
-        let editor_log = GroupPolicyLog {
-            group_id: group_id.to_string(),
-            current_seq: 2,
-            current_epoch: 0,
-            policy_head: editor_head.to_vec(),
-            records: vec![
-                grant_record(
-                    &authority,
-                    group_id,
-                    1,
-                    [0u8; 32],
-                    "device-a",
-                    device_fp,
-                    WriterRole::Viewer,
-                ),
-                editor_grant,
-            ],
-        };
-        let editor_policy =
-            verify_group_policy_log(&authority.verifying_key().to_bytes(), &editor_log).unwrap();
-        state.replace_group_policy_states(HashMap::from([(group_id.to_string(), editor_policy)]));
-
-        let editor_result = state.replica_coordinator.local_emission_auth(group_id);
-        let auth = editor_result.expect("an Editor's own local edit must succeed");
-        assert_eq!(auth.auth_seq, 2);
-        assert_eq!(auth.policy_head_hash, editor_head);
-    }
-
-    /// Bug 2 regression: the initial-import/backfill path
-    /// (`dag_import::ensure_initial_import`/`backfill_missing_history`,
-    /// reached from `link_runtime::startup` and this type's own
-    /// `backfill_missing_change_history`) must withhold a Viewer-role
-    /// device's pre-existing local content exactly like the normal local-
-    /// edit path above -- it goes through the identical
-    /// `ReplicaCoordinator::local_emission_auth` gate
-    /// (`append_initial_import`/`append_history_backfill` both call it
-    /// before touching change history), so this is the same fix proven
-    /// against a second call site rather than a second mechanism. Before
-    /// this device's own `local_change_auth_provider` was hardened to check
-    /// `author_was_writer_at`, a Viewer's first-run disk scan (or a later
-    /// coverage-audit sweep picking up content that initial import missed)
-    /// would have been committed to this device's own signed DAG history
-    /// under a valid-looking `ChangeAuth`, even though no peer would ever
-    /// accept it -- silent, permanent local-only divergence with nothing to
-    /// reconcile it. The same content must import cleanly once the device
-    /// is promoted to Editor.
-    #[tokio::test]
-    async fn initial_import_and_backfill_withhold_a_viewers_pre_existing_content_but_allow_an_editor(
-    ) {
-        use crate::change_policy::policy_signing::grant_record;
-        use crate::change_policy::{
-            verify_group_policy_log, GroupPolicyLog, PolicyRecord, WriterRole,
-        };
-        use ed25519_dalek::SigningKey;
-        use yadorilink_replica_domain::file::BlockInfo;
-        use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
-
-        fn hash_of(record: &PolicyRecord) -> [u8; 32] {
-            record.record_hash.as_slice().try_into().unwrap()
-        }
-
-        let authority = SigningKey::from_bytes(&[7u8; 32]);
-        let group_id = "group-viewer-import";
-        let device_key = SigningKey::from_bytes(&[11u8; 32]);
-        let device_fp: [u8; 32] =
-            sha2::Sha256::digest(device_key.verifying_key().to_bytes()).into();
-
-        let state = test_state();
-        state.set_device_signing_key(device_key.clone());
-        let emitter = ChangeEmitter::new("device-a", device_key.clone());
-
-        // Pre-existing local content, indexed the way a first-run disk scan
-        // indexes it: a bare index row with no change-history behind it yet
-        // (see `dag_import`'s own module doc).
-        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
-        state
-            .replica_coordinator
-            .file_index_repository()
-            .upsert_file(
-                group_id,
-                &FileRecord {
-                    path: "pre-existing.txt".into(),
-                    size: 3,
-                    mtime_unix_nanos: 1,
-                    blocks: vec![BlockInfo { hash: vec![1, 2, 3], offset: 0, size: 3 }],
-                    deleted: false,
-                },
-                &permit,
-            )
-            .unwrap();
-
-        // device-a granted Viewer only.
-        let viewer_grant = grant_record(
-            &authority,
-            group_id,
-            1,
-            [0u8; 32],
-            "device-a",
-            device_fp,
-            WriterRole::Viewer,
-        );
-        let viewer_head = hash_of(&viewer_grant);
-        let viewer_log = GroupPolicyLog {
-            group_id: group_id.to_string(),
-            current_seq: 1,
-            current_epoch: 0,
-            policy_head: viewer_head.to_vec(),
-            records: vec![viewer_grant],
-        };
-        let viewer_policy =
-            verify_group_policy_log(&authority.verifying_key().to_bytes(), &viewer_log).unwrap();
-        state.replace_group_policy_states(HashMap::from([(group_id.to_string(), viewer_policy)]));
-
-        let import_result = crate::dag_import::ensure_initial_import(
-            state.replica_coordinator.as_ref(),
-            group_id,
-            &emitter,
-        );
-        assert!(
-            matches!(import_result, Err(crate::sync_error::SyncError::PolicyUnavailable)),
-            "a Viewer's own initial import of pre-existing content must be withheld, not \
-             committed to signed history; got {import_result:?}"
-        );
-        assert!(
-            state.replica_coordinator.sqlite().dag_group_heads(group_id).unwrap().is_empty(),
-            "a Viewer's pre-existing content must never be committed to local signed DAG history"
-        );
-
-        // The mid-life coverage audit (the retry path for content initial
-        // import missed) must withhold identically, not just the one-shot
-        // path.
-        let backfill_result = crate::dag_import::backfill_missing_history(
-            state.replica_coordinator.as_ref(),
-            group_id,
-            &emitter,
-        )
-        .await;
-        assert!(
-            matches!(backfill_result, Err(crate::sync_error::SyncError::PolicyUnavailable)),
-            "a Viewer's own backfill of pre-existing content must be withheld, not committed to \
-             signed history; got {backfill_result:?}"
-        );
-        assert!(state.replica_coordinator.sqlite().dag_group_heads(group_id).unwrap().is_empty());
-
-        // The identical device, now granted Editor -- the same pre-existing
-        // content must import successfully.
-        let editor_grant = grant_record(
-            &authority,
-            group_id,
-            2,
-            viewer_head,
-            "device-a",
-            device_fp,
-            WriterRole::Editor,
-        );
-        let editor_log = GroupPolicyLog {
-            group_id: group_id.to_string(),
-            current_seq: 2,
-            current_epoch: 0,
-            policy_head: hash_of(&editor_grant).to_vec(),
-            records: vec![
-                grant_record(
-                    &authority,
-                    group_id,
-                    1,
-                    [0u8; 32],
-                    "device-a",
-                    device_fp,
-                    WriterRole::Viewer,
-                ),
-                editor_grant,
-            ],
-        };
-        let editor_policy =
-            verify_group_policy_log(&authority.verifying_key().to_bytes(), &editor_log).unwrap();
-        state.replace_group_policy_states(HashMap::from([(group_id.to_string(), editor_policy)]));
-
-        let outcome = crate::dag_import::ensure_initial_import(
-            state.replica_coordinator.as_ref(),
-            group_id,
-            &emitter,
-        )
-        .expect("an Editor's own initial import must succeed");
-        assert_eq!(outcome, crate::dag_import::ImportOutcome::Imported { changes: 1, ops: 1 });
-        assert_eq!(state.replica_coordinator.sqlite().dag_group_heads(group_id).unwrap().len(), 1);
-    }
-
-    /// `group_id`'s real current durability-root digest -- what a genuine
-    /// `full_replica_handoff_ready_digest_and_peer` round-trip would have
-    /// captured at confirmation time. `has_fresh_custody_confirmation`
-    /// requires this to still match, so a fixture-only test digest (an
-    /// arbitrary byte array) would never register as fresh; tests that
-    /// need a confirmation to actually count use this instead.
-    fn real_digest(state: &DaemonState, group_id: &str) -> [u8; 32] {
-        state.durability_roots_for_group(group_id).unwrap().digest
-    }
-
-    /// Indexes one current file record for `group_id`, changing its
-    /// durability-root digest -- the minimal way to make a previously
-    /// confirmed digest stale.
-    fn upsert_file(state: &DaemonState, group_id: &str, path: &str) {
-        use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
-
-        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
-        state
-            .replica_coordinator
-            .file_index_repository()
-            .upsert_file(
-                group_id,
-                &FileRecord {
-                    path: path.into(),
-                    size: 4,
-                    mtime_unix_nanos: 0,
-                    blocks: vec![BlockInfo { hash: vec![1u8; 32], offset: 0, size: 4 }],
-                    deleted: false,
-                },
-                &permit,
-            )
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn custody_stamp_revalidation_rejects_wrong_peer_generation_change_and_demotion() {
-        let state = test_state();
-        state.set_peer_group_writer("peer-b", "group-a", true);
-        state.set_peer_group_full_replica("peer-b", "group-a", true);
-        let confirmer = crate::adapters::runtime::custody::P2pCustodyConfirmer::new(&state);
-        let stamp = CustodyStamp::new("peer-b".into(), state.membership_generation());
-
-        assert!(confirmer.confirmation_still_valid("group-a", &stamp));
-        assert!(!confirmer.confirmation_still_valid(
-            "group-a",
-            &CustodyStamp::new("peer-c".into(), stamp.membership_generation())
-        ));
-
-        state.set_peer_group_writer("peer-c", "unrelated-group", true);
-        assert!(!confirmer.confirmation_still_valid("group-a", &stamp));
-
-        let current_stamp = CustodyStamp::new("peer-b".into(), state.membership_generation());
-        assert!(confirmer.confirmation_still_valid("group-a", &current_stamp));
-        state.set_peer_group_full_replica("peer-b", "group-a", false);
-        assert!(!confirmer.confirmation_still_valid("group-a", &current_stamp));
-    }
-
-    // --- M4 custody-confirmation cache mechanics ----
-
-    /// A transient `NotConfirmed` round must not erase a still-fresh
-    /// `Confirmed` record -- otherwise the staleness bound's "tolerate one
-    /// missed sweep" property would be meaningless (M4 Codex review #1
-    /// follow-up).
-    #[tokio::test]
-    async fn not_confirmed_does_not_downgrade_a_still_fresh_confirmed_record() {
-        let state = test_state();
-        let generation = state.membership_generation();
-        let digest = real_digest(&state, "group-1");
-        state.record_custody_confirmation_outcome(
-            "group-1",
-            CustodyConfirmationOutcome::Confirmed { peer_device_id: Some("peer-b".into()), digest },
-            generation,
-            0,
-        );
-        assert!(state.has_fresh_custody_confirmation("group-1"));
-
-        state.record_custody_confirmation_outcome(
-            "group-1",
-            CustodyConfirmationOutcome::NotConfirmed,
-            generation,
-            0,
-        );
-        assert!(
-            state.has_fresh_custody_confirmation("group-1"),
-            "a transient NotConfirmed round must not clobber a still-fresh Confirmed record"
-        );
-    }
-
-    /// `NotConfirmed` is still written (and `has_ever_been_custody_swept`
-    /// still becomes true) the FIRST time, when there's no existing
-    /// record to preserve.
-    #[tokio::test]
-    async fn not_confirmed_is_recorded_when_nothing_cached_yet() {
-        let state = test_state();
-        assert!(!state.has_ever_been_custody_swept("group-1"));
-        state.record_custody_confirmation_outcome(
-            "group-1",
-            CustodyConfirmationOutcome::NotConfirmed,
-            state.membership_generation(),
-            0,
-        );
-        assert!(state.has_ever_been_custody_swept("group-1"));
-        assert!(!state.has_fresh_custody_confirmation("group-1"));
-    }
-
-    /// A vacuous (no-peer) confirmation only counts as fresh while the
-    /// group's CURRENT durability-root digest still matches what was
-    /// confirmed -- otherwise a group going empty -> non-empty could ride
-    /// a stale vacuous confirmation as `Protected` for up to the full
-    /// staleness bound (M4 Codex review #1 follow-up, finding #2).
-    #[tokio::test]
-    async fn vacuous_confirmation_requires_current_digest_still_match() {
-        let state = test_state();
-        let empty_digest = real_digest(&state, "group-1");
-        state.record_custody_confirmation_outcome(
-            "group-1",
-            CustodyConfirmationOutcome::Confirmed { peer_device_id: None, digest: empty_digest },
-            state.membership_generation(),
-            0,
-        );
-        assert!(
-            state.has_fresh_custody_confirmation("group-1"),
-            "a vacuous confirmation is fresh evidence while the group's digest is unchanged"
-        );
-
-        upsert_file(&state, "group-1", "a.bin");
-        assert!(
-            !state.has_fresh_custody_confirmation("group-1"),
-            "a vacuous confirmation must stop counting as fresh once the group's digest has \
-             moved off what was actually confirmed, even within the staleness bound"
-        );
-    }
-
-    /// A REAL (non-vacuous) peer confirmation is invalidated by a content
-    /// change exactly like the vacuous case -- the digest check applies
-    /// uniformly, closing the gap where only the vacuous case used to be
-    /// gated (M4 Pass 7 independent review finding: this device could
-    /// report `Protected` on a stale non-vacuous confirmation while
-    /// `fetch_availability` correctly showed `UnavailableNow` for content
-    /// no peer had actually confirmed).
-    #[tokio::test]
-    async fn non_vacuous_confirmation_is_also_invalidated_by_a_content_change() {
-        let state = test_state();
-        let digest_before = real_digest(&state, "group-1");
-        state.record_custody_confirmation_outcome(
-            "group-1",
-            CustodyConfirmationOutcome::Confirmed {
-                peer_device_id: Some("peer-b".into()),
-                digest: digest_before,
-            },
-            state.membership_generation(),
-            0,
-        );
-        assert!(state.has_fresh_custody_confirmation("group-1"));
-
-        upsert_file(&state, "group-1", "a.bin");
-        assert!(
-            !state.has_fresh_custody_confirmation("group-1"),
-            "a non-vacuous confirmation must also stop counting as fresh once the group's \
-             digest has moved off what the confirming peer actually proved"
-        );
-    }
-
-    /// A membership-generation change since the confirmation was recorded
-    /// invalidates it outright, regardless of age (M4 Codex review #1
-    /// finding #3's demotion sub-case).
-    #[tokio::test]
-    async fn confirmation_under_a_stale_membership_generation_is_not_fresh() {
-        let state = test_state();
-        let old_generation = state.membership_generation();
-        let digest = real_digest(&state, "group-1");
-        state.record_custody_confirmation_outcome(
-            "group-1",
-            CustodyConfirmationOutcome::Confirmed { peer_device_id: Some("peer-b".into()), digest },
-            old_generation,
-            0,
-        );
-        assert!(state.has_fresh_custody_confirmation("group-1"));
-
-        state.set_peer_group_writer("peer-c", "unrelated-group", true);
-        assert_ne!(state.membership_generation(), old_generation);
-        assert!(
-            !state.has_fresh_custody_confirmation("group-1"),
-            "any membership generation change since confirmation must invalidate it"
-        );
-    }
-
-    /// `clear_custody_confirmation` both drops the cached record and bumps
-    /// the group's epoch -- the epoch is what `refresh_custody_
-    /// confirmation` uses to detect and discard an in-flight round-trip
-    /// that started before an unlink and would otherwise resurrect a
-    /// cleared entry (M4 Codex review #1 follow-up, finding #3b).
-    #[tokio::test]
-    async fn clear_custody_confirmation_drops_the_record_and_bumps_the_epoch() {
-        let state = test_state();
-        let generation = state.membership_generation();
-        state.record_custody_confirmation_outcome(
-            "group-1",
-            CustodyConfirmationOutcome::Confirmed {
-                peer_device_id: Some("peer-b".into()),
-                digest: [3u8; 32],
-            },
-            generation,
-            0,
-        );
-        let epoch_before = state.custody_confirmation_epoch("group-1");
-
-        state.clear_custody_confirmation("group-1");
-
-        assert!(!state.has_ever_been_custody_swept("group-1"));
-        assert!(!state.has_fresh_custody_confirmation("group-1"));
-        assert_ne!(
-            state.custody_confirmation_epoch("group-1"),
-            epoch_before,
-            "clearing must bump the epoch so an in-flight refresh started before this call \
-             can detect it happened and drop its stale result"
-        );
-    }
-
-    /// Directly pins the TOCTOU `record_custody_confirmation_outcome`
-    /// closes: a publish carrying a stale (pre-clear) `epoch_before` must
-    /// be dropped outright, never landing in the cache at all -- even
-    /// though nothing else about the confirmation looks wrong (M4 Codex
-    /// review #1 second follow-up, finding #3b). This simulates the
-    /// in-flight-round-trip race without needing real concurrency: capture
-    /// the epoch, clear (as if an unlink raced ahead of the round-trip),
-    /// then publish using the stale, pre-clear epoch (as
-    /// `refresh_custody_confirmation` would with what it captured before
-    /// the round-trip started).
-    #[tokio::test]
-    async fn publish_with_a_stale_epoch_is_dropped_not_resurrected() {
-        let state = test_state();
-        let generation = state.membership_generation();
-        let epoch_before = state.custody_confirmation_epoch("group-1");
-
-        state.clear_custody_confirmation("group-1");
-
-        state.record_custody_confirmation_outcome(
-            "group-1",
-            CustodyConfirmationOutcome::Confirmed {
-                peer_device_id: Some("peer-b".into()),
-                digest: [9u8; 32],
-            },
-            generation,
-            epoch_before,
-        );
-
-        assert!(
-            !state.has_ever_been_custody_swept("group-1"),
-            "a publish carrying a stale pre-clear epoch must be dropped entirely, not \
-             resurrect a cache entry for a group that was unlinked mid-round-trip"
-        );
-    }
-
-    /// M4 Pass 5: `custody_confirmation_cache` is purely in-memory
-    /// (`DaemonState`'s own `Mutex<HashMap<...>>` field, never persisted
-    /// to `replica_coordinator`'s DB) -- so a daemon restart, simulated
-    /// here by reopening a REAL on-disk `ReplicaCoordinator` database
-    /// under a SECOND `DaemonState` (genuinely fresh in-process fields,
-    /// same persisted on-disk state -- not merely a second `DaemonState`
-    /// sharing one still-open in-memory connection), must never let a
-    /// group that was `Protected` under the first process instance keep
-    /// reading `Protected` under the second before a real post-restart
-    /// confirmation sweep has run. This is the exact invariant Pass 5
-    /// requires ("never flash/retain a stale Protected state solely
-    /// because the last process said Protected") -- and it holds here
-    /// purely as a structural consequence of Pass 1's design (the cache
-    /// simply doesn't exist yet in the new process), not because of any
-    /// restart-specific logic; this test pins that consequence explicitly
-    /// so a future refactor (e.g. persisting the cache for a "faster warm
-    /// start") cannot silently reintroduce a stale-Protected-across-
-    /// restart bug without breaking a named test.
-    ///
-    /// Asserts the EXACT expected state (`Unknown`), not merely
-    /// `!= Protected` -- Pass 5 also forbids manufacturing `AtRisk`
-    /// (AtRisk) purely from the startup uncertainty window, so a
-    /// regression landing there must fail this test too (M4 Pass 5 Codex
-    /// review follow-up).
-    #[tokio::test]
-    async fn restart_never_shows_a_stale_protected_status() {
-        let store_dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
-        let db_dir = tempfile::tempdir().unwrap();
-        let db_path = db_dir.path().join("sync.sqlite3");
-
-        // First "process": open the real on-disk DB, confirm the group via
-        // a REAL sweep round (`refresh_custody_confirmation`, not a
-        // manually-planted cache entry) against a genuinely empty group --
-        // `full_replica_handoff_ready` confirms an empty root set
-        // vacuously, without needing a live peer -- and observe Protected.
-        {
-            let coordinator = Arc::new(ReplicaCoordinator::open(&db_path).unwrap());
-            let first = DaemonState::new("device-a".into(), coordinator, store.clone());
-            first
-                .replica_coordinator
-                .link_repository()
-                .add_link(store_dir.path().to_str().unwrap(), "group-1")
-                .unwrap();
-            first.refresh_custody_confirmation("group-1").await;
-            assert_eq!(
-                first.group_durability_status("group-1"),
-                GroupDurabilityStatus::Protected,
-                "sanity check: the first process instance genuinely observes Protected after \
-                 a real confirmation sweep"
-            );
-        } // `first` and its `coordinator` are dropped here -- the DB file
-          // itself is all that persists, exactly like a real process exit.
-
-        // "Restart": a second DaemonState reopening the SAME on-disk
-        // database file, with entirely fresh in-memory fields -- exactly
-        // what a real process restart produces.
-        let coordinator = Arc::new(ReplicaCoordinator::open(&db_path).unwrap());
-        let second = DaemonState::new("device-a".into(), coordinator, store);
-        assert_eq!(
-            second.group_durability_status("group-1"),
-            GroupDurabilityStatus::Unknown,
-            "a fresh process must report Unknown (never Protected, and never \
-             AtRisk/AtRisk) for a group before its OWN confirmation sweep has run, \
-             even though the prior process instance had just confirmed it"
-        );
-    }
-
-    // --- Mandatory handoff-lease digest-match decision (source side) ----
-
-    /// The safety property this whole mechanism exists for: a target's
-    /// grant whose attested `root_digest` matches the source's own current
-    /// digest yields the lease id, so the source may present it.
-    #[test]
-    fn handoff_lease_grant_digest_match_yields_the_lease_id() {
-        let digest = [7u8; 32];
-        let grant = PeerHandoffLeaseGrant {
-            lease_id: "lease-abc".to_string(),
-            root_digest: digest,
-            expires_at_unix: 12345,
-        };
-        assert_eq!(
-            handoff_lease_grant_matches_digest(&grant, digest),
-            Some("lease-abc".to_string())
-        );
-    }
-
-    /// A digest MISMATCH must decline (`None`), never yield a lease id --
-    /// the target attested a different root set than what this device
-    /// currently holds, so the lease does not cover it. This is exactly the
-    /// case the caller must treat as "do not relinquish the local role."
-    #[test]
-    fn handoff_lease_grant_digest_mismatch_declines() {
-        let mut other_digest = [7u8; 32];
-        other_digest[0] = 8;
-        let grant = PeerHandoffLeaseGrant {
-            lease_id: "lease-abc".to_string(),
-            root_digest: other_digest,
-            expires_at_unix: 12345,
-        };
-        assert_eq!(handoff_lease_grant_matches_digest(&grant, [7u8; 32]), None);
-    }
-
-    // --- Degraded-link state tests ----
-
-    /// a link enters Degraded on disk pressure — `is_link_degraded`
-    /// flips true and the reason is recorded.
-    #[tokio::test]
-    async fn mark_link_degraded_makes_the_link_report_degraded_with_a_reason() {
-        let state = test_state();
-        assert!(!state.is_link_degraded("/links/photos"));
-
-        state.mark_link_degraded("/links/photos", "disk pressure on /links/photos".to_string());
-
-        assert!(state.is_link_degraded("/links/photos"));
-        let info = state.degraded_link_info("/links/photos").unwrap();
-        assert_eq!(info.reason, "disk pressure on /links/photos");
-        assert_eq!(info.backoff_attempt, 0);
-    }
-
-    /// a link leaves Degraded once cleared — the mirror case,
-    /// and the trigger `hydration::hydrate_inner`'s success path uses
-    /// directly (a snappier recovery signal beyond the periodic re-check).
-    #[tokio::test]
-    async fn clear_link_degraded_removes_the_entry() {
-        let state = test_state();
-        state.mark_link_degraded("/links/photos", "disk pressure".to_string());
-        assert!(state.is_link_degraded("/links/photos"));
-
-        state.clear_link_degraded("/links/photos");
-        assert!(!state.is_link_degraded("/links/photos"));
-        // Clearing an already-clear (or never-degraded) link is a safe no-op.
-        state.clear_link_degraded("/links/photos");
-        assert!(!state.is_link_degraded("/links/photos"));
-    }
-
-    /// Repeated disk pressure on the same link produces
-    /// backoff re-checks, not a tight retry loop — each re-mark bumps the
-    /// backoff attempt count and pushes `next_recheck_unix` further out
-    /// (via `BackoffConfig::DEGRADED_LINK_RECHECK`'s doubling schedule),
-    /// rather than resetting to the same short interval every time.
-    #[tokio::test]
-    async fn repeated_disk_pressure_increases_backoff_instead_of_resetting_it() {
-        let state = test_state();
-        state.mark_link_degraded("/links/photos", "disk pressure".to_string());
-        let first = state.degraded_link_info("/links/photos").unwrap();
-        assert_eq!(first.backoff_attempt, 0);
-
-        state.mark_link_degraded("/links/photos", "disk pressure".to_string());
-        let second = state.degraded_link_info("/links/photos").unwrap();
-        assert_eq!(second.backoff_attempt, 1);
-        assert!(
-            second.next_recheck_unix >= first.next_recheck_unix,
-            "backoff must not shrink on repeated pressure"
-        );
-        // The original onset time is preserved across re-marks, not reset —
-        // `yadorilink status` should be able to report how long a link has
-        // been degraded, not just "since the last re-check."
-        assert_eq!(second.since_unix, first.since_unix);
-
-        state.mark_link_degraded("/links/photos", "disk pressure".to_string());
-        let third = state.degraded_link_info("/links/photos").unwrap();
-        assert_eq!(third.backoff_attempt, 2);
-        assert!(third.next_recheck_unix >= second.next_recheck_unix);
-    }
-
-    /// a Degraded link recovers once its volume's free-space
-    /// check succeeds again — exercised through the real periodic
-    /// `recheck_degraded_links` sweep (not just the mark/clear API
-    /// directly), using an isolated `YADORILINK_CONFIG_DIR` so this test's
-    /// governance config never touches the real host config directory
-    /// (same pattern `tests/reporting_ipc.rs` already established for this
-    /// exact env var).
-    #[tokio::test]
-    async fn recheck_degraded_links_clears_a_link_once_headroom_check_succeeds() {
-        let _guard = CONFIG_ENV_MUTEX.lock().await;
-        let config_dir = tempfile::tempdir().unwrap();
-        std::env::set_var("YADORILINK_CONFIG_DIR", config_dir.path());
-
-        let state = test_state();
-        let link_root = tempfile::tempdir().unwrap();
-        let link_path = link_root.path().to_string_lossy().to_string();
-
-        // Mark the link degraded directly (bypassing a real preflight
-        // call) so this test only exercises the re-check/clear half.
-        state.mark_link_degraded(&link_path, "disk pressure".to_string());
-        assert!(state.is_link_degraded(&link_path));
-
-        // A headroom override of `0` ("no headroom required") always
-        // classifies as `Ok` for any real volume — configuring it via the
-        // same `GovernanceConfigStore` `recheck_degraded_links` itself
-        // reads simulates "space was freed" without needing a real
-        // multi-gigabyte write.
-        state.governance_config.set_headroom_override_bytes(Some(0)).unwrap();
-        // Force the entry's backoff window to be due right now (avoids
-        // this test waiting out even the 5s initial backoff).
-        state.links.force_degraded_recheck_due_now(&link_path, now_unix());
-
-        state.recheck_degraded_links();
-
-        assert!(
-            !state.is_link_degraded(&link_path),
-            "expected the link to clear once headroom check succeeds"
-        );
-
-        std::env::remove_var("YADORILINK_CONFIG_DIR");
-    }
-
-    /// the mirror case — a link stays Degraded (rescheduled with
-    /// bumped backoff, not cleared) when its volume is still under
-    /// pressure at re-check time.
-    #[tokio::test]
-    async fn recheck_degraded_links_reschedules_a_link_still_under_pressure() {
-        let _guard = CONFIG_ENV_MUTEX.lock().await;
-        let config_dir = tempfile::tempdir().unwrap();
-        std::env::set_var("YADORILINK_CONFIG_DIR", config_dir.path());
-
-        let state = test_state();
-        let link_root = tempfile::tempdir().unwrap();
-        let link_path = link_root.path().to_string_lossy().to_string();
-
-        state.mark_link_degraded(&link_path, "disk pressure".to_string());
-        // A headroom override far larger than any real disk's free space
-        // keeps this link `Critical` no matter what.
-        state.governance_config.set_headroom_override_bytes(Some(u64::MAX / 2)).unwrap();
-        state.links.force_degraded_recheck_due_now(&link_path, now_unix());
-        let before = state.degraded_link_info(&link_path).unwrap();
-
-        state.recheck_degraded_links();
-
-        assert!(state.is_link_degraded(&link_path), "still under pressure — must stay degraded");
-        let after = state.degraded_link_info(&link_path).unwrap();
-        assert!(
-            after.backoff_attempt > before.backoff_attempt,
-            "a still-failing re-check must bump backoff, not just repeat the same window"
-        );
-
-        std::env::remove_var("YADORILINK_CONFIG_DIR");
-    }
-
-    // --- Interrupted-update
-    // recovery is wired into the exact same daemon-startup entry point
-    // (`DaemonState::new`, the one `main.rs` calls before any watcher
-    // resumes or any control-socket request can arrive) as the
-    // `cleanup_stale_temp_files`/`repair_interrupted_materializations`
-    // calls. `UpdateManager::recover_on_startup` already has its own unit
-    // tests (`update::manager::tests::recover_on_startup_*`); these two
-    // tests instead go through the real `DaemonState::new` used
-    // by `main.rs`, with the on-disk `update_policy.json`/artifact state
-    // written exactly as a crash would leave it (matching the
-    // established "simulate the exact on-disk state a crash would leave"
-    // standard from `materialization.rs`'s own crash tests), proving the
-    // wiring itself rather than re-proving `recover_on_startup`'s own logic.
-
-    /// Simulates a crash partway through downloading an update artifact:
-    /// a stray `.partial` file on disk and a persisted policy still
-    /// claiming `Downloading` with that path recorded, exactly what
-    /// `UpdateManager::download_and_verify` would leave behind if the
-    /// process died mid-transfer. A fresh daemon startup
-    /// (`DaemonState::new`) must discard it before anything else can
-    /// observe or act on the stale state.
-    #[tokio::test]
-    async fn daemon_startup_discards_an_unverified_download_left_by_a_crash() {
-        let _guard = CONFIG_ENV_MUTEX.lock().await;
-        let config_dir = tempfile::tempdir().unwrap();
-        std::env::set_var("YADORILINK_CONFIG_DIR", config_dir.path());
-
-        let updates_dir = config_dir.path().join("updates");
-        std::fs::create_dir_all(&updates_dir).unwrap();
-        let partial = updates_dir.join("yadorilink-0.2.0.pkg.partial");
-        std::fs::write(&partial, b"not yet verified - crash mid-download").unwrap();
-        crate::update::policy::UpdatePolicyStore::new(config_dir.path())
-            .save(&crate::update::policy::UpdatePolicy {
-                state: crate::update::policy::UpdateState::Downloading,
-                downloaded_artifact_path: Some(partial.clone()),
-                downloaded_artifact_verified: false,
-                ..Default::default()
-            })
-            .unwrap();
-
-        // The real entry point `main.rs` calls at startup — not calling
-        // `UpdateManager::recover_on_startup` directly.
-        let state = test_state();
-
-        assert!(
-            !partial.exists(),
-            "a crashed, never-verified download must be discarded on startup"
-        );
-        let policy = state.update_manager.policy.load().unwrap();
-        assert_eq!(policy.state, crate::update::policy::UpdateState::Failed);
-        assert!(!policy.downloaded_artifact_verified);
-        assert_eq!(policy.downloaded_artifact_path, None);
-        assert_eq!(policy.last_error_category.as_deref(), Some("update_interrupted_download"));
-
-        std::env::remove_var("YADORILINK_CONFIG_DIR");
-    }
-
-    /// The mirror case: a crash partway through the install handoff
-    /// (`UpdateManager::install_now` had already moved the policy to
-    /// `Installing` before invoking the platform installer) must never be
-    /// read by the next startup as a successful update — it must come
-    /// back up recording `Failed`/`update_interrupted_install`, never
-    /// silently assumed to have succeeded.
-    #[tokio::test]
-    async fn daemon_startup_marks_a_mid_install_crash_as_failed_not_successful() {
-        let _guard = CONFIG_ENV_MUTEX.lock().await;
-        let config_dir = tempfile::tempdir().unwrap();
-        std::env::set_var("YADORILINK_CONFIG_DIR", config_dir.path());
-
-        crate::update::policy::UpdatePolicyStore::new(config_dir.path())
-            .save(&crate::update::policy::UpdatePolicy {
-                state: crate::update::policy::UpdateState::Installing,
-                ..Default::default()
-            })
-            .unwrap();
-
-        let state = test_state();
-
-        let policy = state.update_manager.policy.load().unwrap();
-        assert_eq!(policy.state, crate::update::policy::UpdateState::Failed);
-        assert_eq!(policy.last_error_category.as_deref(), Some("update_interrupted_install"));
-
-        std::env::remove_var("YADORILINK_CONFIG_DIR");
-    }
-
-    #[tokio::test]
-    async fn release_owned_handoff_lease_releases_local_pin_and_worker_lease() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let state = test_state();
-        let server = MockServer::start().await;
-        state.set_coordination_client_config(server.uri(), "test-token".into());
-        state
-            .replica_coordinator
-            .handoff_lease_repository()
-            .record_handoff_lease(
-                "group-release",
-                "lease-release",
-                [9u8; 32],
-                &[],
-                now_unix(),
-                now_unix() + 900,
-            )
-            .unwrap();
-        Mock::given(method("POST"))
-            .and(path("/shares/groups/group-release/handoff/lease/lease-release/release"))
-            .respond_with(ResponseTemplate::new(204))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        state.release_owned_handoff_lease("group-release", "lease-release").await;
-
-        let leases = state
-            .replica_coordinator
-            .handoff_lease_repository()
-            .list_handoff_leases_for_group("group-release")
-            .unwrap();
-        assert_eq!(leases.len(), 1);
-        assert_eq!(leases[0].state, HandoffLeaseState::Released);
-    }
-
-    /// The digest-mismatch abort path: if the group's durability-root set
-    /// changes between the readiness digest `request_handoff_lease` captures
-    /// up front and the atomic local pin that follows the coordination-worker
-    /// round trip, the mismatch must be caught, both halves of the
-    /// now-meaningless lease released, and `None` returned — never a lease
-    /// that claims to pin a set it no longer actually matches. The mismatch
-    /// is engineered deterministically, not via a timing race: the mock
-    /// coordination-worker handler below only runs once the real HTTP
-    /// request has actually been sent — which is strictly after
-    /// `full_replica_handoff_ready_digest` already ran synchronously earlier
-    /// in `request_handoff_lease` — and it inserts a new file into the group
-    /// before answering, so the atomic pin that follows the response
-    /// re-enumerates a set the readiness check never saw.
-    #[tokio::test]
-    async fn request_handoff_lease_aborts_and_releases_both_pins_on_a_digest_mismatch() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
-
-        let state = test_state();
-        let server = MockServer::start().await;
-        state.set_coordination_client_config(server.uri(), "test-token".into());
-
-        let sync_state_for_handler = state.replica_coordinator.clone();
-        Mock::given(method("POST"))
-            .and(path("/shares/groups/group-1/handoff/lease"))
-            .respond_with(move |_req: &Request| {
-                let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
-                sync_state_for_handler
-                    .file_index_repository()
-                    .upsert_file_with_origin(
-                        "group-1",
-                        &FileRecord {
-                            path: "b.txt".to_string(),
-                            size: 5,
-                            mtime_unix_nanos: 0,
-                            blocks: vec![],
-                            deleted: false,
-                        },
-                        "device-b",
-                        &permit,
-                    )
-                    .unwrap();
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "leaseId": "lease-xyz",
-                    "expiresAt": now_unix() + 900,
-                    "ttlSeconds": 900,
-                }))
-            })
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/shares/groups/group-1/handoff/lease/lease-xyz/release"))
-            .respond_with(ResponseTemplate::new(204))
-            .mount(&server)
-            .await;
-
-        // `group-1` starts EMPTY, so `full_replica_handoff_ready_digest`'s
-        // check is vacuously satisfied (an empty root set needs no
-        // confirming peer) — the readiness digest captured here is the
-        // empty-set digest, before the mock handler above adds `b.txt`.
-        let grant = state.request_handoff_lease("group-1").await;
-
-        assert!(
-            grant.is_none(),
-            "a digest mismatch between attestation and atomic pin must decline, not grant"
-        );
-
-        // The local pin must have been written (provisionally) and then
-        // explicitly released, not left dangling as a live-looking
-        // 'provisional' row.
-        let local_leases = state
-            .replica_coordinator
-            .handoff_lease_repository()
-            .list_handoff_leases_for_group("group-1")
-            .unwrap();
-        assert_eq!(local_leases.len(), 1);
-        assert_eq!(local_leases[0].lease_id, "lease-xyz");
-        assert_eq!(local_leases[0].state, HandoffLeaseState::Released);
-
-        // The coordination-worker's copy must have been released too — the
-        // release endpoint (and only it, once) was actually called.
-        let requests = server.received_requests().await.unwrap();
-        let release_calls = requests
-            .iter()
-            .filter(|r| r.url.path() == "/shares/groups/group-1/handoff/lease/lease-xyz/release")
-            .count();
-        assert_eq!(
-            release_calls, 1,
-            "the Worker-side lease must be explicitly released exactly once"
-        );
-    }
-
-    /// The symmetric-cleanup path: if the atomic LOCAL pin errors AFTER the
-    /// Worker has already granted the lease, `request_handoff_lease` must
-    /// still attempt to release the Worker-side lease (so it does not sit
-    /// granted with no local pin until its TTL) and return `None`, exactly
-    /// like the digest-mismatch abort. The local storage error is forced
-    /// deterministically: the sync database is file-backed, and a second
-    /// connection drops the `handoff_leases` table between the Worker POST
-    /// (mocked to succeed) and the atomic pin's `INSERT` into that table, so
-    /// the pin fails with a genuine storage error while the durability-root
-    /// enumeration that precedes it still reads the intact `files` table.
-    #[tokio::test]
-    async fn request_handoff_lease_releases_the_worker_lease_when_the_local_pin_fails() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
-
-        let db_dir = tempfile::tempdir().unwrap();
-        let db_path = db_dir.path().join("sync.db");
-        let sync_state = Arc::new(ReplicaCoordinator::open(&db_path).unwrap());
-        let store_dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
-        let state = DaemonState::new("device-a".into(), sync_state, store);
-
-        let server = MockServer::start().await;
-        state.set_coordination_client_config(server.uri(), "test-token".into());
-
-        // The POST handler drops `handoff_leases` out from under the pool via
-        // an independent connection to the same file before answering, so the
-        // atomic pin's INSERT that follows the response hits a genuine "no
-        // such table" storage error. `files` is untouched, so the
-        // enumeration inside the atomic call still succeeds — only the pin
-        // write fails, which is exactly the post-POST error path under test.
-        let db_path_for_handler = db_path.clone();
-        Mock::given(method("POST"))
-            .and(path("/shares/groups/group-1/handoff/lease"))
-            .respond_with(move |_req: &Request| {
-                let conn = rusqlite::Connection::open(&db_path_for_handler).unwrap();
-                conn.execute("DROP TABLE handoff_leases", []).unwrap();
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "leaseId": "lease-xyz",
-                    "expiresAt": now_unix() + 900,
-                    "ttlSeconds": 900,
-                }))
-            })
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/shares/groups/group-1/handoff/lease/lease-xyz/release"))
-            .respond_with(ResponseTemplate::new(204))
-            .mount(&server)
-            .await;
-
-        let grant = state.request_handoff_lease("group-1").await;
-
-        assert!(
-            grant.is_none(),
-            "a failed local pin after a granted lease must decline, not grant"
-        );
-
-        // The Worker-side lease must have been released best-effort, even
-        // though the local pin never landed.
-        let requests = server.received_requests().await.unwrap();
-        let release_calls = requests
-            .iter()
-            .filter(|r| r.url.path() == "/shares/groups/group-1/handoff/lease/lease-xyz/release")
-            .count();
-        assert_eq!(
-            release_calls, 1,
-            "a local-pin error after a granted lease must still release the Worker lease"
-        );
-    }
-
-    /// The clock-skew bug this change closes, end to end: a coordination
-    /// Worker whose clock runs BEHIND this target device's own is simulated
-    /// by mocking a grant whose absolute `expiresAt` already reads as being
-    /// in the past relative to this device's own clock, alongside a normal,
-    /// still-valid `ttlSeconds`. Before the fix, `request_handoff_lease`
-    /// stored that stale absolute value verbatim as the local pin deadline,
-    /// so the very next local retention sweep would have dropped the pin
-    /// immediately -- reopening the GC race the lease exists to close. After
-    /// the fix, the local pin is derived from this device's own clock plus
-    /// `ttlSeconds` (plus the fixed safety margin) and is unaffected by the
-    /// Worker's stale absolute value.
-    #[tokio::test]
-    async fn request_handoff_lease_pins_locally_from_this_devices_own_clock_even_when_the_workers_absolute_expiry_is_already_stale(
-    ) {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let state = test_state();
-        let server = MockServer::start().await;
-        state.set_coordination_client_config(server.uri(), "test-token".into());
-
-        let ttl_seconds = 900i64;
-        Mock::given(method("POST"))
-            .and(path("/shares/groups/group-1/handoff/lease"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "leaseId": "lease-skewed",
-                // Already in the past relative to this device's own clock --
-                // simulating a coordination Worker whose clock runs behind
-                // this target's. Under the pre-fix behavior (storing this
-                // verbatim as the local pin deadline) the local pin would
-                // already read as expired the instant it lands.
-                "expiresAt": now_unix() - 10_000,
-                "ttlSeconds": ttl_seconds,
-            })))
-            .mount(&server)
-            .await;
-
-        // `group-1` starts empty, so the readiness check is vacuously
-        // satisfied (see the digest-mismatch test above) -- what is under
-        // test here is the local pin deadline arithmetic, not readiness.
-        let local_now_before_request = now_unix();
-        let (grant, _root_digest) = state
-            .request_handoff_lease("group-1")
-            .await
-            .expect("an empty root set is vacuously ready; the grant must still be produced");
-        let local_now_after_request = now_unix();
-        assert_eq!(grant.ttl_seconds, ttl_seconds);
-
-        let leases = state
-            .replica_coordinator
-            .handoff_lease_repository()
-            .list_handoff_leases_for_group("group-1")
-            .unwrap();
-        assert_eq!(leases.len(), 1);
-        let recorded = &leases[0];
-        assert_eq!(recorded.lease_id, "lease-skewed");
-
-        // The recorded LOCAL expiry must not already be in the past just
-        // because the Worker's absolute `expiresAt` was stale -- it must sit
-        // close to this device's own now + ttl (+ the fixed safety margin).
-        let earliest_local_now = local_now_before_request.min(local_now_after_request);
-        let latest_local_now = local_now_before_request.max(local_now_after_request);
-        assert!(
-            recorded.expires_at_unix > latest_local_now,
-            "the local pin must not read as already expired just because the Worker's absolute \
-             expiresAt was stale relative to this device's own clock"
-        );
-        let earliest_deadline = earliest_local_now
-            + ttl_seconds
-            + yadorilink_sync_sqlite::handoff_lease::HANDOFF_LEASE_PIN_SAFETY_MARGIN_SECS;
-        let latest_deadline = latest_local_now
-            + ttl_seconds
-            + yadorilink_sync_sqlite::handoff_lease::HANDOFF_LEASE_PIN_SAFETY_MARGIN_SECS;
-        assert!(
-            recorded.expires_at_unix >= earliest_deadline - 5
-                && recorded.expires_at_unix <= latest_deadline + 5,
-            "the local pin deadline must equal this device's own now + ttlSeconds (+ a fixed \
-             safety margin), not the Worker's stale absolute expiresAt; got {}, expected in {}..={}",
-            recorded.expires_at_unix,
-            earliest_deadline,
-            latest_deadline
-        );
-    }
-
-    /// Trust-boundary fail-closed: a coordination grant carrying a
-    /// non-positive `ttlSeconds` (a buggy/hostile response the current Worker
-    /// never emits) must be rejected -- `request_handoff_lease` returns
-    /// `None`, records NO local pin, and best-effort releases the Worker-side
-    /// lease -- rather than deriving a too-short local deadline that would
-    /// lapse immediately and reopen the GC race. Checked for both a zero and
-    /// a negative TTL.
-    #[tokio::test]
-    async fn request_handoff_lease_rejects_a_non_positive_worker_ttl_and_records_no_pin() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        for bad_ttl in [0i64, -30] {
-            let state = test_state();
-            let server = MockServer::start().await;
-            state.set_coordination_client_config(server.uri(), "test-token".into());
-
-            Mock::given(method("POST"))
-                .and(path("/shares/groups/group-1/handoff/lease"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "leaseId": "lease-badttl",
-                    "expiresAt": now_unix() + 900,
-                    "ttlSeconds": bad_ttl,
-                })))
-                .mount(&server)
-                .await;
-            Mock::given(method("POST"))
-                .and(path("/shares/groups/group-1/handoff/lease/lease-badttl/release"))
-                .respond_with(ResponseTemplate::new(204))
-                .mount(&server)
-                .await;
-
-            // `group-1` starts empty -> readiness is vacuously satisfied, so
-            // the request reaches the TTL boundary check under test.
-            let grant = state.request_handoff_lease("group-1").await;
-            assert!(
-                grant.is_none(),
-                "a non-positive Worker ttl ({bad_ttl}) must decline, not grant"
-            );
-
-            // No local pin was written for the rejected grant.
-            let local_leases = state
-                .replica_coordinator
-                .handoff_lease_repository()
-                .list_handoff_leases_for_group("group-1")
-                .unwrap();
-            assert!(
-                local_leases.is_empty(),
-                "a rejected non-positive-ttl grant must record no local pin"
-            );
-
-            // The Worker-side lease was released best-effort exactly once.
-            let requests = server.received_requests().await.unwrap();
-            let release_calls = requests
-                .iter()
-                .filter(|r| {
-                    r.url.path() == "/shares/groups/group-1/handoff/lease/lease-badttl/release"
-                })
-                .count();
-            assert_eq!(
-                release_calls, 1,
-                "a rejected non-positive-ttl grant must still release the Worker lease"
-            );
-        }
-    }
-
-    // --- Removed-device handoff ticket (Stage C) -------------------------
-
-    /// An empty root set is vacuously ready and needs no lease -- the
-    /// responder half must grant a ticket with no `lease_id`, not decline
-    /// just because there is no confirming peer to ask (there is nothing to
-    /// hand off in the first place). No session/coordination config needed
-    /// at all for this case.
-    #[tokio::test]
-    async fn own_ticket_for_an_empty_root_set_is_granted_with_no_lease_id() {
-        let state = test_state();
-        let grant = state
-            .obtain_own_handoff_ticket("empty-group")
-            .await
-            .expect("an empty root set is vacuously ready and must still grant a ticket");
-        assert_eq!(grant.lease_id, None);
-        assert_eq!(grant.target_device_id, None);
-    }
-
-    /// `obtain_handoff_ticket_from_device` is the OFFLINE-detection seam: no
-    /// live session for the named device (this daemon has never connected
-    /// to it, or the connection already tore down) must fail closed
-    /// immediately, with no timeout and no attempt to attest anything --
-    /// this is exactly what routes an offline removed device to the
-    /// existing #3 interim in `durability_force.rs`.
-    #[tokio::test]
-    async fn obtain_ticket_from_an_unreachable_device_is_none() {
-        let state = test_state();
-        assert!(
-            state.obtain_handoff_ticket_from_device("group-1", "device-b").await.is_none(),
-            "no live session for the target device must be treated as offline/unreachable"
-        );
-    }
-
-    #[tokio::test]
-    async fn forced_durability_unknown_latch_survives_daemon_restart() {
-        let database_dir = tempfile::tempdir().unwrap();
-        let database_path = database_dir.path().join("sync-state.sqlite");
-        let before_restart = ReplicaCoordinator::open(&database_path).unwrap();
-        before_restart
-            .role_loss_operation_repository()
-            .latch_group_durability_unknown("group-1")
-            .unwrap();
-        drop(before_restart);
-
-        let restarted_store_dir = tempfile::tempdir().unwrap();
-        let restarted = DaemonState::new(
-            "device-a".into(),
-            Arc::new(ReplicaCoordinator::open(&database_path).unwrap()),
-            Arc::new(FsBlockStore::new(restarted_store_dir.path()).unwrap()),
-        );
-
-        assert_eq!(
-            restarted.group_durability_status("group-1"),
-            GroupDurabilityStatus::Unknown,
-            "force history must remain latched after reopening the durable index"
-        );
-        restarted.clear_group_durability_latch("group-1").unwrap();
-        let after_clear = ReplicaCoordinator::open(&database_path).unwrap();
-        assert!(after_clear
-            .role_loss_operation_repository()
-            .list_durability_unknown_latches()
-            .unwrap()
-            .is_empty());
-    }
-
-    // --- Startup-window placeholder-auth race (watcher before policy load) ---
-    //
-    // `app::run` resumes every already-linked folder's filesystem watcher
-    // (the daemon's own `LinkRuntimeController::start`, driven by `sync_state.list_links()`)
-    // before it spawns the peer/netmap orchestrator task that eventually
-    // calls `replace_group_policy_states`. Until that first netmap fetch
-    // completes, `group_policy_state(group_id)` is `None` for every group —
-    // including one that already has real, established policy elsewhere in
-    // the swarm and is only missing it locally because this process just
-    // started. The local-emission auth provider registered below
-    // (`DaemonState::new`) cannot tell that case apart from a group that has
-    // never had any policy at all, and falls back to `ChangeAuth::PLACEHOLDER`
-    // for both.
-
-    /// A local edit for an *already-linked* group (so it is exactly the set
-    /// of groups `app::run`'s watcher-resume loop restarts synchronously,
-    /// before the orchestrator task is even spawned) must not be committed to
-    /// the DAG with a placeholder authorization stamp while this process has
-    /// not yet resolved the group's real policy state — the same withholding
-    /// the group's *stale*-policy case already gets (see
-    /// `local_change::stale_policy_withholds_the_dag_change_but_keeps_the_path_journaled_dirty`
-    /// in `yadorilink-sync-core`). A peer that already holds the group's real
-    /// policy accepts a placeholder-auth change only when its own policy
-    /// chain is empty (`GroupPolicyState::author_was_writer_at`); a group with
-    /// real history elsewhere fails that check on every such peer, so the
-    /// change just committed here can never replicate — and neither can
-    /// anything chained on top of it, since the DAG is hash-linked.
-    ///
-    /// This currently fails: nothing distinguishes "never had policy" from
-    /// "policy not loaded by this process yet", so the provider takes the
-    /// same `unwrap_or(ChangeAuth::PLACEHOLDER)` branch either way and the
-    /// change lands in the DAG.
-    #[tokio::test]
-    async fn local_edit_before_policy_load_must_not_enter_the_dag_with_a_placeholder_stamp_for_an_already_linked_group(
-    ) {
-        use yadorilink_replica_domain::change::{Op, PutOrigin};
-        use yadorilink_replica_domain::file::FileMeta;
-        use yadorilink_replica_domain::file::RecordKind;
-        use yadorilink_replica_domain::ids::SyncPath;
-        use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
-
-        let state = test_state();
-        let group = "group-1";
-
-        // The group is already linked locally -- exactly the precondition
-        // `app::run` checks (`sync_state.list_links()`) before resuming its
-        // watcher ahead of the orchestrator. A brand-new group being shared
-        // for the first time never reaches this state before its own policy
-        // is established, so this precondition is what separates "existing
-        // group, not loaded yet" from "genuinely policy-free group".
-        state.replica_coordinator.link_repository().add_link("/links/photos", group).unwrap();
-
-        // The startup-gap precondition: the orchestrator has not completed
-        // its first netmap fetch, so nothing has populated policy state for
-        // this group, and — distinct from the case
-        // `is_group_policy_stale` guards — it is not marked stale either.
-        assert!(state.group_policy_state(group).is_none());
-        assert!(!state.is_group_policy_stale(group));
-
-        // A local edit races ahead of that fetch, through the daemon's real
-        // local-emission auth provider (the one `DaemonState::new` registers
-        // on `sync_state`), exactly as a live watcher callback would drive it.
-        let emitter =
-            ChangeEmitter::new("device-a", ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]));
-        let version = yadorilink_replica_domain::file::FileVersion::new(
-            vec![],
-            0,
-            FileMeta {
-                mtime_unix_nanos: 0,
-                unix_mode: None,
-                symlink_target: None,
-                record_kind: RecordKind::File,
-                xattrs: Vec::new(),
-            },
-        );
-        let record = FileRecord {
-            path: "note.txt".into(),
-            size: 0,
-            mtime_unix_nanos: 0,
-            blocks: vec![],
-            deleted: false,
-        };
-
-        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
-        let result = state.replica_coordinator.upsert_file_emitting_change(
-            group,
-            &record,
-            "device-a",
-            yadorilink_replica_domain::session_state::ChangeContent {
-                ops: vec![Op::Put {
-                    path: SyncPath("note.txt".into()),
-                    version: version.version_hash,
-                    origin: PutOrigin::Direct,
-                }],
-                versions: &[version],
-            },
-            None,
-            None,
-            crate::replica_coordinator::ReplicaChangeEmission {
-                emitter: &emitter,
-                permit: &permit,
-            },
-        );
-
-        // The fix: an already-linked group's policy merely being unresolved
-        // since startup must not be treated like a genuinely policy-free group
-        // and stamped PLACEHOLDER. The unified resolver reports it `Withhold`
-        // (introduced-but-not-loaded-yet), so local emission fails closed with
-        // `PolicyUnavailable` — withheld exactly like the stale-policy case
-        // (`local_change::stale_policy_withholds_...`), keeping the edit
-        // journaled dirty to re-emit with a real authorization context once
-        // the group's real policy loads, rather than landing a placeholder
-        // stamp every valid-policy peer rejects.
-        assert!(
-            matches!(result, Err(crate::sync_error::SyncError::PolicyUnavailable)),
-            "local emission for an already-linked, policy-not-yet-loaded group must withhold \
-             (PolicyUnavailable), not stamp a placeholder-auth change; got {result:?}"
-        );
-        assert!(
-            state.replica_coordinator.sqlite().dag_group_heads(group).unwrap().is_empty(),
-            "an already-linked group whose policy state has not loaded yet this run must not get \
-             a placeholder-auth change committed to its DAG"
-        );
-    }
-
-    /// Phase D relay-revocation investigation: `set_local_relay_capable`
-    /// used to only flip an atomic bool, leaving any already-open PROVIDER
-    /// relay session running -- its destination-to-requester reply traffic
-    /// arrives over `RelayForwarder`'s own dedicated per-session socket,
-    /// whose receive loop watches only an explicit close signal, grant
-    /// expiry, idle timeout and the byte cap, never this flag. A session
-    /// with nothing left to send from the requester side (the common case
-    /// once a fetch's one request has gone out) would then never see
-    /// `revalidate_relay_session`'s per-datagram check either, so
-    /// disabling capability had no effect on it at all. These tests are
-    /// `#[cfg(not(madsim))]` because they exercise `RelayForwarder`
-    /// directly, which does not exist under the deterministic simulator.
-    #[cfg(not(madsim))]
-    mod relay_capability_revocation {
-        use std::sync::Mutex as StdSyncMutex;
-
-        use tokio::net::UdpSocket as TokioUdpSocket;
-
-        use super::*;
-
-        struct RecordingSink {
-            closed: StdSyncMutex<Vec<(u64, String)>>,
-        }
-
-        impl RecordingSink {
-            fn new() -> Arc<Self> {
-                Arc::new(Self { closed: StdSyncMutex::new(Vec::new()) })
-            }
-        }
-
-        impl yadorilink_peer_session::peer_session::RelayReplySink for RecordingSink {
-            fn send_relay_data(&self, _session_id: u64, _payload: Vec<u8>) {}
-            fn send_relay_close(&self, session_id: u64, reason: &str) {
-                self.closed.lock().unwrap().push((session_id, reason.to_string()));
-            }
-        }
-
-        /// A destination to forward toward -- its own replies are
-        /// irrelevant here (`RecordingSink` swallows them); only that a
-        /// real, connected UDP socket exists for `RelayForwarder::
-        /// open_session` to dial.
-        async fn fake_destination() -> std::net::SocketAddr {
-            let socket = TokioUdpSocket::bind("127.0.0.1:0").await.unwrap();
-            let addr = socket.local_addr().unwrap();
-            // Kept alive for the test's duration by leaking the handle into
-            // a detached task instead of a named binding this fn would
-            // otherwise have to return and thread through every caller.
-            tokio::spawn(async move {
-                let mut buf = [0u8; 2048];
-                while socket.recv_from(&mut buf).await.is_ok() {}
-            });
-            addr
-        }
-
-        fn now_unix_seconds() -> i64 {
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
-                as i64
-        }
-
-        fn now_unix_millis() -> i64 {
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
-                as i64
-        }
-
-        /// The setter fix: open a session, confirm it is tracked, disable
-        /// capability, confirm the session actually closes (not just the
-        /// flag flipping) and the requester is notified via `RelayClose`,
-        /// then confirm capability re-enabling does not somehow block a
-        /// brand new session from opening.
-        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn disabling_relay_capability_closes_active_sessions_immediately() {
-            let state = test_state();
-            let dest_addr = fake_destination().await;
-            let sink = RecordingSink::new();
-            let now = now_unix_seconds();
-
-            let session_id = state
-                .relay_forwarder
-                .open_session(
-                    "device-source".to_string(),
-                    dest_addr,
-                    None,
-                    now + 60,
-                    now_unix_millis(),
-                    sink.clone(),
-                )
-                .unwrap();
-            state.record_relay_session(
-                session_id,
-                "device-source".to_string(),
-                "group-a".to_string(),
-                "device-destination".to_string(),
-            );
-            assert_eq!(state.relay_forwarder.active_session_count(), 1);
-
-            state.set_local_relay_capable(false);
-
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-            while state.relay_forwarder.active_session_count() != 0 {
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "session was not closed within 5s of disabling relay capability"
-                );
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-
-            assert_eq!(
-                sink.closed.lock().unwrap().as_slice(),
-                &[(session_id, "relay_capability_disabled".to_string())],
-                "the requester must be told the session closed, and why"
-            );
-            assert!(
-                state.active_relay_session_source(session_id).is_none(),
-                "bookkeeping for the closed session must not linger"
-            );
-
-            // Re-enabling must not leave anything from the closed session
-            // behind that would wrongly refuse a fresh one.
-            state.set_local_relay_capable(true);
-            let second_session_id = state
-                .relay_forwarder
-                .open_session(
-                    "device-source".to_string(),
-                    dest_addr,
-                    None,
-                    now_unix_seconds() + 60,
-                    now_unix_millis(),
-                    sink,
-                )
-                .unwrap();
-            assert_ne!(second_session_id, session_id);
-            assert_eq!(state.relay_forwarder.active_session_count(), 1);
-        }
-
-        /// `set_local_relay_capable(true)` must be a pure no-op on
-        /// existing sessions -- only the `false` transition tears
-        /// anything down.
-        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn enabling_relay_capability_does_not_touch_active_sessions() {
-            let state = test_state();
-            let dest_addr = fake_destination().await;
-            let sink = RecordingSink::new();
-            let now = now_unix_seconds();
-
-            let session_id = state
-                .relay_forwarder
-                .open_session(
-                    "device-source".to_string(),
-                    dest_addr,
-                    None,
-                    now + 60,
-                    now_unix_millis(),
-                    sink.clone(),
-                )
-                .unwrap();
-            state.record_relay_session(
-                session_id,
-                "device-source".to_string(),
-                "group-a".to_string(),
-                "device-destination".to_string(),
-            );
-
-            state.set_local_relay_capable(true);
-            state.set_local_relay_capable(true);
-
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            assert_eq!(state.relay_forwarder.active_session_count(), 1);
-            assert!(sink.closed.lock().unwrap().is_empty());
-            assert!(state.active_relay_session_source(session_id).is_some());
-        }
-    }
-
-    /// Direct coverage of `revalidate_relay_session`'s capability branch --
-    /// the same check the new post-open revalidation in `handle_relay_open`
-    /// (`relay_session_handler.rs`) relies on to close the admission race
-    /// where capability flips false between the admission-time check and
-    /// `open_session`/`record_relay_session` landing.
-    mod relay_session_revalidation {
-        use super::*;
-
-        fn linked_writer_state(group: &str, source: &str, destination: &str) -> Arc<DaemonState> {
-            let state = test_state();
-            state
-                .replica_coordinator
-                .link_repository()
-                .add_link(&format!("/links/{group}"), group)
-                .unwrap();
-            state.set_peer_group_writer(source, group, true);
-            state.set_peer_group_writer(destination, group, true);
-            state
-        }
-
-        #[tokio::test]
-        async fn revalidation_reaches_the_capability_check_once_membership_holds() {
-            let state = linked_writer_state("group-a", "device-source", "device-destination");
-            // `local_relay_capable` defaults to `false` -- must be turned
-            // on explicitly for this fixture to reach past it.
-            state.set_local_relay_capable(true);
-            state.record_relay_session(
-                1,
-                "device-source".to_string(),
-                "group-a".to_string(),
-                "device-destination".to_string(),
-            );
-            // `is_directly_reachable` is the one condition this fixture
-            // does not satisfy (no real peer channel exists), so this
-            // reaches capability but not past it -- exactly what the
-            // capability-specific assertion below needs.
-            assert_eq!(
-                state.revalidate_relay_session(1),
-                Err("destination_route_no_longer_direct")
-            );
-        }
-
-        #[tokio::test]
-        async fn revalidation_fails_closed_the_instant_capability_is_disabled() {
-            let state = linked_writer_state("group-a", "device-source", "device-destination");
-            // Capability disabled BEFORE the session is recorded -- not
-            // after, which would instead exercise `set_local_relay_
-            // capable`'s own eager close-and-forget (a different test,
-            // above) and never reach this check at all. This is the
-            // shape the new post-open revalidation in `handle_relay_open`
-            // actually guards against: `record_relay_session` running
-            // with no requirement that capability still be on, because
-            // the two are not atomic with the admission-time read that
-            // preceded them.
-            state.set_local_relay_capable(false);
-            state.record_relay_session(
-                1,
-                "device-source".to_string(),
-                "group-a".to_string(),
-                "device-destination".to_string(),
-            );
-            assert_eq!(state.revalidate_relay_session(1), Err("relay_capability_disabled"));
-        }
-
-        #[tokio::test]
-        async fn revalidation_treats_an_untracked_session_as_already_invalid() {
-            let state = test_state();
-            assert_eq!(state.revalidate_relay_session(999), Err("unknown_session"));
-        }
-    }
-}
+mod offline_authorization_tests;
+#[cfg(test)]
+mod tests;

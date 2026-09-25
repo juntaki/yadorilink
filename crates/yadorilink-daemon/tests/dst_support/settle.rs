@@ -15,7 +15,7 @@
 //! has no N-seconds-or-fail gate, so neither does the harness -- the
 //! terminal oracles still run against whatever the actual state is).
 //!
-//! `#![cfg(madsim)]`-gated like every DST scenario file.
+//! `#![cfg(turmoil)]`-gated like every DST scenario file.
 
 use std::path::Path;
 use std::time::Duration;
@@ -103,31 +103,35 @@ fn slow_finding(budget: Duration, elapsed: Duration) -> Violation {
 mod tests {
     use super::*;
 
-    // These drive the async primitive under madsim's runtime directly (no
-    // network), so a plain `#[madsim::test]` is safe -- the one-network-
-    // test-per-binary constraint is about network state, which these never
-    // touch.
+    // These drive the async primitive directly and never touch the network,
+    // so they need nothing from the substrate but its clock: a 60s budget
+    // has to resolve instantly, and `settle_until`'s whole subject is how it
+    // spends one. `sim::block_on` supplies that on either substrate.
 
-    #[madsim::test]
-    async fn settle_returns_as_soon_as_the_predicate_holds() {
-        let mut polls = 0u32;
-        let outcome = settle_until(Duration::from_secs(60), || {
-            polls += 1;
-            polls >= 3 // converges on the third poll
-        })
-        .await;
-        assert!(outcome.converged);
-        assert!(outcome.slow_convergence.is_none());
-        // Converged well within budget, so far less than the full 60s elapsed.
-        assert!(outcome.elapsed < Duration::from_secs(60));
+    #[test]
+    fn settle_returns_as_soon_as_the_predicate_holds() {
+        super::super::sim::block_on(1, || async {
+            let mut polls = 0u32;
+            let outcome = settle_until(Duration::from_secs(60), || {
+                polls += 1;
+                polls >= 3 // converges on the third poll
+            })
+            .await;
+            assert!(outcome.converged);
+            assert!(outcome.slow_convergence.is_none());
+            // Converged well within budget, so far less than the full 60s elapsed.
+            assert!(outcome.elapsed < Duration::from_secs(60));
+        });
     }
 
-    #[madsim::test]
-    async fn budget_exhaustion_records_slow_convergence_and_is_not_fatal() {
-        let outcome = settle_until(Duration::from_secs(1), || false).await;
-        assert!(!outcome.converged);
-        let finding = outcome.slow_convergence.expect("budget exhausted -> SlowConvergence");
-        assert_eq!(finding.kind, ViolationKind::SlowConvergence);
-        assert!(outcome.elapsed >= Duration::from_secs(1));
+    #[test]
+    fn budget_exhaustion_records_slow_convergence_and_is_not_fatal() {
+        super::super::sim::block_on(2, || async {
+            let outcome = settle_until(Duration::from_secs(1), || false).await;
+            assert!(!outcome.converged);
+            let finding = outcome.slow_convergence.expect("budget exhausted -> SlowConvergence");
+            assert_eq!(finding.kind, ViolationKind::SlowConvergence);
+            assert!(outcome.elapsed >= Duration::from_secs(1));
+        });
     }
 }

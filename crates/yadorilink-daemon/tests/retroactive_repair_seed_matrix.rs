@@ -14,8 +14,9 @@ use std::sync::Arc;
 use ed25519_dalek::SigningKey;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
+use sha2::{Digest, Sha256};
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-use yadorilink_replica_domain::change::{Change, ChangeAuth, ChangePurpose, Op, PutOrigin};
+use yadorilink_replica_domain::change::{Change, ChangePurpose, Op, PutOrigin};
 use yadorilink_replica_domain::file::RecordKind;
 use yadorilink_replica_domain::file::{FileMeta, FileVersion};
 use yadorilink_replica_domain::ids::{ChangeHash, SyncPath, VersionHash};
@@ -38,7 +39,7 @@ fn key(byte: u8) -> SigningKey {
 
 fn state() -> ReplicaCoordinator {
     let state = ReplicaCoordinator::open_in_memory().unwrap();
-    state.set_local_change_auth_provider(Arc::new(|_| Ok(ChangeAuth::PLACEHOLDER)));
+    state.set_local_policy_head_provider(Arc::new(|_| Ok([0u8; 32])));
     state
 }
 
@@ -98,10 +99,7 @@ fn emit_put(
 
 fn admit(state: &ReplicaCoordinator, change: &Change, versions: &VersionTable) {
     let needed = versions_for(change, versions);
-    state
-        .change_history_repository()
-        .dag_admit_change_with_versions(change, &needed, false)
-        .unwrap();
+    state.change_history_repository().dag_admit_change_with_versions(change, &needed).unwrap();
 }
 
 fn shuffle<T>(rng: &mut StdRng, values: &mut [T]) {
@@ -117,6 +115,10 @@ struct Scenario {
     winner_version: VersionHash,
     loser_version: VersionHash,
     loser_change: ChangeHash,
+    /// The change that authored the winning version. A repair carrier
+    /// reasserts the winner on the ORIGINAL author's behalf, so this is what
+    /// its `Reasserted` origin must name.
+    winner_change: ChangeHash,
 }
 
 fn build_scenario(seed: u64) -> Scenario {
@@ -154,11 +156,12 @@ fn build_scenario(seed: u64) -> Scenario {
 
     Scenario {
         path,
-        changes: vec![root, first_winner, final_winner, loser.clone()],
+        changes: vec![root, first_winner, final_winner.clone(), loser.clone()],
         versions,
         winner_version: final_winner_version.version_hash,
         loser_version: loser_version.version_hash,
         loser_change: loser.compute_hash(),
+        winner_change: final_winner.compute_hash(),
     }
 }
 
@@ -169,14 +172,29 @@ fn install_rank_one_repairer(state: &ReplicaCoordinator, emitter: &ChangeEmitter
         // local repairer at rank 1 for this exact obligation. This avoids
         // pinning a fragile hash reference vector while guaranteeing that the
         // failover branch is exercised for every seed.
-        for byte in 1..=u8::MAX {
+        //
+        // Candidates are SHA-256(counter), not a single repeated byte
+        // (`[byte;32]`): the latter only has 256 distinct possible values
+        // total, and `RepairElectionContext`'s ranking score is itself a
+        // SHA-256 digest -- when `repairer`'s own fixed score happens to
+        // land very close to the true maximum (a real, reproducible ~1/256
+        // per-obligation event, not a hypothetical: confirmed directly by
+        // computing the raw election score for a real failing obligation
+        // and finding it started with byte 0xFF), none of those 255
+        // single-repeated-byte candidates can beat it, since beating a
+        // score starting with 0xFF requires the SAME leading byte, which a
+        // uniform `[byte;32]` pattern can only ever hit at byte=255 itself.
+        // A wide pool of genuinely independent SHA-256-derived candidates
+        // does not share that structural gap.
+        for counter in 1u32..=10_000 {
+            let candidate_fingerprint: [u8; 32] = Sha256::digest(counter.to_le_bytes()).into();
             let context = RepairElectionContext::new(
-                ChangeAuth::PLACEHOLDER,
+                [0u8; 32],
                 obligation,
                 vec![
                     AuthorizedWriter {
                         device_id: "offline-primary".to_string(),
-                        signing_key_fingerprint: [byte; 32],
+                        signing_key_fingerprint: candidate_fingerprint,
                     },
                     AuthorizedWriter {
                         device_id: "repairer".to_string(),
@@ -269,9 +287,20 @@ fn seeded_delivery_order_and_rank_failover_converge_on_one_carrier() {
             let mut saw_loser_copy = false;
             for op in &carrier.ops {
                 match op {
-                    Op::Put { path, version, origin: PutOrigin::Direct }
-                        if path.as_str() == scenario.path
-                            && *version == scenario.winner_version =>
+                    // `Reasserted`, not `Direct`: a repair carrier republishes
+                    // the winner on the original author's behalf, and carries
+                    // whose naming identity it is acting under. Matching
+                    // `Direct` here could not express that at all -- it would
+                    // accept a carrier that had quietly reassigned authorship
+                    // to the repairer.
+                    Op::Put {
+                        path,
+                        version,
+                        origin: PutOrigin::Reasserted { original_change, naming_device_id },
+                    } if path.as_str() == scenario.path
+                        && *version == scenario.winner_version
+                        && naming_device_id.as_str() == "winner-descendant"
+                        && *original_change == scenario.winner_change =>
                     {
                         saw_winner_reassertion = true;
                     }

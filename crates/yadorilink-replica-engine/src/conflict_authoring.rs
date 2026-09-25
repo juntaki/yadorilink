@@ -21,8 +21,8 @@ use yadorilink_replica_domain::change::{ChangePurpose, Op, PutOrigin};
 use yadorilink_replica_domain::ids::{ChangeHash, SyncPath, VersionHash};
 
 use crate::conflict::{
-    conflict_copy_path_for_losing_change, resolve_path_heads, PathHead, PathHeadContent,
-    PathResolution,
+    conflict_copy_path_for_losing_change, resolve_path_heads_keeping_directory, PathHead,
+    PathHeadContent, PathResolution,
 };
 
 /// Every path a set of direct ops touches -- a `Put`'s `path`, a `Delete`'s
@@ -46,7 +46,8 @@ pub fn collect_touched_paths(direct_ops: &[Op]) -> BTreeSet<String> {
 
 /// One losing content head at a path's live heads, competing to be
 /// materialized as a conflict copy -- the pure per-loser projection of
-/// [`resolve_path_heads`]'s own `PathResolution::Present.conflict_copies`.
+/// [`resolve_path_heads_keeping_directory`]'s own
+/// `PathResolution::Present.conflict_copies`.
 #[derive(Clone, Debug)]
 pub struct ConflictCopyCandidate {
     pub target_path: String,
@@ -56,10 +57,17 @@ pub struct ConflictCopyCandidate {
 
 /// Every conflict-copy candidate `path`'s live `heads` (already fetched by
 /// the caller, e.g. via `path_heads_at_frontier`) produce, in
-/// [`resolve_path_heads`]'s own deterministic order. Empty when the path
-/// resolves to `Absent` or has no losing content head at all.
-pub fn conflict_copy_candidates(path: &str, heads: &[PathHead]) -> Vec<ConflictCopyCandidate> {
-    let PathResolution::Present { conflict_copies, .. } = resolve_path_heads(path, heads) else {
+/// [`resolve_path_heads_keeping_directory`]'s own deterministic order
+/// (`is_directory` says which content heads are Directories). Empty when
+/// the path resolves to `Absent` or has no losing content head at all.
+pub fn conflict_copy_candidates(
+    path: &str,
+    heads: &[PathHead],
+    is_directory: impl Fn(&PathHead) -> bool,
+) -> Vec<ConflictCopyCandidate> {
+    let PathResolution::Present { conflict_copies, .. } =
+        resolve_path_heads_keeping_directory(path, heads, is_directory)
+    else {
         return Vec::new();
     };
     conflict_copies
@@ -156,6 +164,7 @@ pub fn validate_conflict_copy_claim(
     version: &VersionHash,
     source_path: &str,
     losing_change: &ChangeHash,
+    is_directory: impl Fn(&PathHead) -> bool,
 ) -> Result<(), ConflictCopyClaimError> {
     let Some(losing_head) = heads.iter().find(|h| h.change_hash == losing_change.0) else {
         return Err(ConflictCopyClaimError::NotALiveHead {
@@ -173,7 +182,8 @@ pub fn validate_conflict_copy_claim(
         return Err(ConflictCopyClaimError::VersionMismatch);
     }
 
-    let PathResolution::Present { conflict_copies, .. } = resolve_path_heads(source_path, heads)
+    let PathResolution::Present { conflict_copies, .. } =
+        resolve_path_heads_keeping_directory(source_path, heads, is_directory)
     else {
         return Err(ConflictCopyClaimError::SourceResolvesAbsent {
             source_path: source_path.to_string(),
@@ -194,7 +204,16 @@ pub fn validate_conflict_copy_claim(
     }
     let expected_name = conflict_copy_path_for_losing_change(
         source_path,
-        &losing_head.device_id,
+        // The content's author, not this head's carrier -- the same field
+        // `resolve_path_heads` names the copy after, and for the same reason:
+        // a repair re-assertion carries someone else's content forward, so
+        // the carrier is a device that never wrote it. Deriving this one from
+        // `device_id` made the two disagree for exactly those heads, and then
+        // the claim could never be accepted: the copy `resolve_path_heads`
+        // asks for is the only copy anyone can author, and this rejected it
+        // by name. Observed as `retroactive conflict-copy repair deferred`
+        // repeating until the group stopped converging.
+        &losing_head.naming_device_id,
         content.mtime_unix_nanos,
         &content.version_hash,
     );
@@ -202,6 +221,88 @@ pub fn validate_conflict_copy_claim(
         return Err(ConflictCopyClaimError::PathDoesNotMatchDeterministicName {
             path: path.to_string(),
             expected: expected_name,
+        });
+    }
+    Ok(())
+}
+
+/// Why a `PutOrigin::Reasserted` op's provenance claim does not hold.
+///
+/// The claim is exactly "the head I name is this path's current winner, and
+/// the naming identity I carry is that head's own". Both halves are
+/// re-derivable from the carrier's parents, so a receiver checks them rather
+/// than trusting the carrier -- which matters precisely because
+/// `naming_device_id` is the one field a malicious or buggy carrier could
+/// use to attribute its own content to another device.
+#[derive(Debug, thiserror::Error)]
+pub enum ReassertionClaimError {
+    #[error("re-asserted put at {source_path:?} names a path with no live content head")]
+    NoLiveContentHead { source_path: String },
+    #[error(
+        "re-asserted put at {source_path:?} names original_change {original_change}, which is \
+         not that path's winning head"
+    )]
+    NotTheWinner { original_change: String, source_path: String },
+    #[error(
+        "re-asserted put at {source_path:?} carries version {version} but the head it names \
+         holds {expected}"
+    )]
+    VersionDoesNotMatchHead { source_path: String, version: String, expected: String },
+    #[error(
+        "re-asserted put at {source_path:?} claims naming_device_id {claimed:?} but the head it \
+         carries forward names {expected:?}"
+    )]
+    NamingIdentityDoesNotMatchHead { source_path: String, claimed: String, expected: String },
+}
+
+/// Validates one `PutOrigin::Reasserted` op against `source_path`'s own live
+/// heads at the carrier's parent frontier (`heads`, already fetched by the
+/// caller, exactly as [`validate_conflict_copy_claim`] takes them).
+///
+/// A re-assertion is only ever legitimate as "carry the current winner
+/// forward unchanged", so all three of the head it names, the content it
+/// carries, and the naming identity it claims must agree with what the
+/// frontier already says. Checking the naming identity here is what keeps
+/// `naming_device_id` a verifiable fact rather than an assertion a carrier
+/// could use to relabel someone else's content as its own.
+pub fn validate_reassertion_claim(
+    heads: &[PathHead],
+    source_path: &str,
+    version: &VersionHash,
+    original_change: &ChangeHash,
+    naming_device_id: &str,
+    is_directory: impl Fn(&PathHead) -> bool,
+) -> Result<(), ReassertionClaimError> {
+    let PathResolution::Present { winner, .. } =
+        resolve_path_heads_keeping_directory(source_path, heads, is_directory)
+    else {
+        return Err(ReassertionClaimError::NoLiveContentHead {
+            source_path: source_path.to_string(),
+        });
+    };
+    let winning_head = &heads[winner];
+    if winning_head.change_hash != original_change.0 {
+        return Err(ReassertionClaimError::NotTheWinner {
+            original_change: hex::encode(original_change.0),
+            source_path: source_path.to_string(),
+        });
+    }
+    let content = winning_head
+        .content
+        .as_ref()
+        .expect("resolve_path_heads only selects a content head as winner");
+    if content.version_hash != version.0 {
+        return Err(ReassertionClaimError::VersionDoesNotMatchHead {
+            source_path: source_path.to_string(),
+            version: hex::encode(version.0),
+            expected: hex::encode(content.version_hash),
+        });
+    }
+    if winning_head.naming_device_id != naming_device_id {
+        return Err(ReassertionClaimError::NamingIdentityDoesNotMatchHead {
+            source_path: source_path.to_string(),
+            claimed: naming_device_id.to_string(),
+            expected: winning_head.naming_device_id.clone(),
         });
     }
     Ok(())
@@ -249,7 +350,13 @@ pub fn validate_retroactive_repair_claims(
     let mut reasserted_sources = BTreeSet::new();
     for op in direct_ops {
         match op {
-            Op::Put { path, origin: PutOrigin::Direct, .. } => {
+            // `Reasserted` is the only shape a carrier's own direct op may
+            // take. A bare `Direct` put would assert that the repairer wrote
+            // this content, which is exactly the misattribution this origin
+            // exists to prevent -- and accepting both forms would leave two
+            // encodings of the same fact, so a carrier could pick the one
+            // that drops the author's identity.
+            Op::Put { path, origin: PutOrigin::Reasserted { .. }, .. } => {
                 if !declared_sources.contains(path.as_str()) {
                     return Err(RetroactiveRepairClaimError::UndeclaredReassertion(
                         path.as_str().to_string(),
@@ -315,137 +422,4 @@ pub fn validate_claimed_matches_required(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::conflict::PathHeadContent;
-
-    fn head(change_hash: u8, lamport: u64, device_id: &str, content_hash: Option<u8>) -> PathHead {
-        PathHead {
-            change_hash: [change_hash; 32],
-            lamport,
-            device_id: device_id.to_string(),
-            content: content_hash
-                .map(|c| PathHeadContent { version_hash: [c; 32], mtime_unix_nanos: 0 }),
-        }
-    }
-
-    #[test]
-    fn collect_touched_paths_covers_put_delete_and_both_sides_of_a_move() {
-        let ops = vec![
-            Op::Put {
-                path: SyncPath("a.txt".into()),
-                version: VersionHash([1; 32]),
-                origin: PutOrigin::Direct,
-            },
-            Op::Delete { path: SyncPath("b.txt".into()) },
-            Op::Move {
-                from: SyncPath("c.txt".into()),
-                to: SyncPath("d.txt".into()),
-                version: VersionHash([2; 32]),
-            },
-        ];
-        let touched = collect_touched_paths(&ops);
-        assert_eq!(
-            touched,
-            BTreeSet::from([
-                "a.txt".to_string(),
-                "b.txt".to_string(),
-                "c.txt".to_string(),
-                "d.txt".to_string(),
-            ])
-        );
-    }
-
-    #[test]
-    fn conflict_copy_candidates_is_empty_when_the_path_resolves_absent() {
-        let heads = vec![head(1, 1, "device-a", None)];
-        assert!(conflict_copy_candidates("p.txt", &heads).is_empty());
-    }
-
-    #[test]
-    fn conflict_copy_candidates_names_the_loser_for_two_concurrent_content_heads() {
-        let heads = vec![head(1, 1, "device-a", Some(0xAA)), head(2, 2, "device-b", Some(0xBB))];
-        let candidates = conflict_copy_candidates("p.txt", &heads);
-        assert_eq!(candidates.len(), 1, "exactly one loser between two concurrent content heads");
-        assert_eq!(candidates[0].losing_change.0, [1; 32], "lower lamport is the loser");
-        assert_eq!(candidates[0].losing_content.version_hash, [0xAA; 32]);
-    }
-
-    #[test]
-    fn content_already_preserved_at_target_matches_only_on_version_hash() {
-        let target_heads = vec![head(9, 1, "device-x", Some(0xCC))];
-        assert!(content_already_preserved_at_target(&target_heads, &[0xCC; 32]));
-        assert!(!content_already_preserved_at_target(&target_heads, &[0xDD; 32]));
-    }
-
-    #[test]
-    fn validate_claimed_matches_required_rejects_a_missing_claim() {
-        let required = vec![Op::Put {
-            path: SyncPath("copy.txt".into()),
-            version: VersionHash([1; 32]),
-            origin: PutOrigin::ConflictCopy {
-                source_path: SyncPath("src.txt".into()),
-                losing_change: ChangeHash([2; 32]),
-            },
-        }];
-        let claimed = BTreeSet::new();
-        assert!(matches!(
-            validate_claimed_matches_required(&required, &claimed),
-            Err(ConflictCopyClaimSetError::Missing { .. })
-        ));
-    }
-
-    #[test]
-    fn validate_claimed_matches_required_rejects_an_unrequired_claim() {
-        let claimed = BTreeSet::from([("src.txt".to_string(), ChangeHash([2; 32]))]);
-        assert!(matches!(
-            validate_claimed_matches_required(&[], &claimed),
-            Err(ConflictCopyClaimSetError::Unrequired { .. })
-        ));
-    }
-
-    #[test]
-    fn validate_claimed_matches_required_accepts_an_exact_match() {
-        let required = vec![Op::Put {
-            path: SyncPath("copy.txt".into()),
-            version: VersionHash([1; 32]),
-            origin: PutOrigin::ConflictCopy {
-                source_path: SyncPath("src.txt".into()),
-                losing_change: ChangeHash([2; 32]),
-            },
-        }];
-        let claimed = BTreeSet::from([("src.txt".to_string(), ChangeHash([2; 32]))]);
-        assert!(validate_claimed_matches_required(&required, &claimed).is_ok());
-    }
-
-    #[test]
-    fn validate_retroactive_repair_claims_is_a_no_op_for_ordinary_changes() {
-        assert!(validate_retroactive_repair_claims(
-            &ChangePurpose::Ordinary,
-            &[],
-            &BTreeSet::new(),
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn validate_retroactive_repair_claims_rejects_an_undeclared_reassertion() {
-        use yadorilink_replica_domain::change::RepairObligation;
-        let purpose = ChangePurpose::RetroactiveRepair {
-            obligations: vec![RepairObligation {
-                source_path: SyncPath("declared.txt".into()),
-                losing_change: ChangeHash([2; 32]),
-            }],
-        };
-        let claimed = BTreeSet::from([("declared.txt".to_string(), ChangeHash([2; 32]))]);
-        let direct_ops = vec![Op::Put {
-            path: SyncPath("undeclared.txt".into()),
-            version: VersionHash([3; 32]),
-            origin: PutOrigin::Direct,
-        }];
-        assert!(matches!(
-            validate_retroactive_repair_claims(&purpose, &direct_ops, &claimed),
-            Err(RetroactiveRepairClaimError::UndeclaredReassertion(_))
-        ));
-    }
-}
+mod tests;

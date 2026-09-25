@@ -1,8 +1,7 @@
 //! `DaemonState`/`LinkRuntimeController`/`hydration`-backed implementations of the
 //! remaining application ports (local link commit, materialization,
 //! handoff leases, replica-role local runtime actions) -- everything that
-//! isn't durable-storage or coordination-plane HTTP. Populated alongside
-//! each service's own Phase 2 commit.
+//! isn't durable-storage or coordination-plane HTTP.
 
 pub(crate) mod custody;
 pub(crate) mod enrollment_attempts;

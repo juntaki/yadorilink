@@ -1,8 +1,4 @@
-//! Semantic outcome types for `PeerReplicaEngine`'s own methods. Each
-//! carries exactly the extra information a caller needs to reproduce the
-//! logging `yadorilink-sync-core`'s `peer_session.rs` used to do inline --
-//! this crate has no `tracing` dependency, so callers own the actual log
-//! emission, keyed off these outcomes.
+//! Semantic outcome types for `PeerReplicaEngine`'s own methods.
 
 use std::collections::BTreeSet;
 
@@ -20,30 +16,6 @@ pub struct FrontierEvaluation {
 
 pub struct FrontierRecordWarning {
     pub message: String,
-}
-
-/// `PeerReplicaEngine::check_causal_auth_monotonicity`'s result.
-pub enum CausalAuthOutcome {
-    /// A `PLACEHOLDER` auth stamp carries no real coordinate to check.
-    Exempt,
-    /// The pinned coordinate is non-decreasing relative to every parent's.
-    Accepted,
-    /// A parent's pinned auth coordinate could not be read live (missing or
-    /// unreadable) -- the caller must not treat this as `Accepted` at THIS
-    /// point, but should still proceed to admission: the DAG-level orphan
-    /// buffer re-verifies this exact invariant at promotion time (or, for a
-    /// parent already structurally present via pruning, at direct-apply
-    /// time), once every parent's coordinate is actually resolvable. See
-    /// `yadorilink-sync-sqlite::dag_store::retained_history_integrity::
-    /// check_causal_auth_monotonicity_at_promotion`'s own doc comment.
-    Hold,
-    /// The change pins an auth coordinate older than one of its parents'.
-    Rejected {
-        auth_seq: u64,
-        auth_epoch: u64,
-        max_parent_auth_seq: u64,
-        max_parent_auth_epoch: u64,
-    },
 }
 
 /// One change that became durable as a result of an admission call --
@@ -77,6 +49,21 @@ pub enum ChangeAdmissionRejection {
     NonPortablePath { path: String },
     /// An ordinary transient admission failure.
     StorageFailure { message: String },
+    /// The Change's own author chain refuses it — equivocation, a forked
+    /// author history, a skipped sequence, or a claim to continue a chain it
+    /// does not descend. Permanent, like the two path rejections above:
+    /// re-delivering the identical Change can never produce another verdict.
+    AuthorChainRefused { reason: String },
+    /// The Change was written on a different history than this replica's:
+    /// its author holds a history base this replica does not. Permanent in
+    /// the same way -- the Change can never become admissible here, and its
+    /// author's way forward is a re-bootstrap onto this history rather than
+    /// a retry of these bytes.
+    ForeignHistoryBase { reason: String },
+    /// One of the Change's DAG parents is permanently refused here, so the
+    /// Change can never have its ancestry. Permanent for as long as that
+    /// parent's refusal stands.
+    BehindRejectedParent { reason: String },
 }
 
 /// `PeerReplicaEngine::holds_version_durably`'s result. Every non-`present`

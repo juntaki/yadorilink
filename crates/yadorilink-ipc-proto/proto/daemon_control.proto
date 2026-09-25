@@ -100,7 +100,7 @@ message LinkStatus {
   // group's latest policy snapshot failed local verification, or the
   // coordination plane flagged it as policy-invalid. While true, change
   // admission and local emission for the group fail closed. Additive; `false`
-  // on a daemon that predates this field and on a healthy group.
+  // on an unset value and on a healthy group.
   bool policy_stale = 27;
   // Whether this folder group is linked at more than one folder on this
   // device. While true the group refuses to sync entirely: the file index is
@@ -115,7 +115,7 @@ message LinkStatus {
   // this field and on a healthy group.
   bool ambiguous = 28;
   repeated string ambiguous_local_paths = 29;
-  // M4 Pass 2: this device's TRUTHFUL current local storage state --
+  // This device's TRUTHFUL current local storage state --
   // distinct from `materialization_policy` (the CONFIGURED target), which
   // only says what this device is trying to become, not what it currently
   // holds. A client must read this field directly rather than inferring it
@@ -123,22 +123,35 @@ message LinkStatus {
   // Additive; `LOCAL_STORAGE_STATE_UNSPECIFIED` (0) on a daemon that
   // predates this field.
   LocalStorageState local_storage_state = 30;
-  // M4 Pass 2: whether this link's required current-version content can
+  // Whether this link's required current-version content can
   // actually be obtained right now, locally or through a valid serving
   // path -- NOT an alias for any peer's `PeerStatus.reachability`. A
   // client must read this field directly rather than reconstructing it
   // from peer reachability or materialization counts. Additive;
-  // `FETCH_AVAILABILITY_UNSPECIFIED` (0) on a daemon that predates this
+  // `FETCH_AVAILABILITY_UNSPECIFIED` (0) on an unset value
   // field, which a client should treat the same as
   // `FETCH_AVAILABILITY_UNKNOWN` rather than assume content is available.
   FetchAvailability fetch_availability = 31;
-  // M4 Pass 3: device ids of every OTHER device currently recorded
+  // Device ids of every OTHER device currently recorded
   // (netmap-derived, content-blind) as an authorized-writer full replica
   // for this group -- feeds the "Complete copies" per-device list.
   // Cross-reference against `StatusResponse.peers`'s own `reachability`
   // for each device's current availability; this field alone says
   // nothing about whether any of them are online.
   repeated string full_replica_device_ids = 32;
+  // What kind of evidence backs `durability_status` right now.
+  //
+  // `PROTECTED` used to mean exactly one thing: a peer had, within the last
+  // few minutes, read back and re-checksummed every byte of every one of
+  // this group's durability roots. It no longer does, because establishing
+  // that costs one round-trip and one whole-file re-read per root and the
+  // background check ran every ninety seconds. The routine answer is now an
+  // index comparison, and this field is where that is said out loud rather
+  // than left for a reader to discover.
+  //
+  // Additive; `DURABILITY_EVIDENCE_UNSPECIFIED` (0) on a daemon that
+  // predates this field.
+  DurabilityEvidence durability_evidence = 33;
 }
 
 // See `LinkStatus.local_storage_state`'s own doc comment.
@@ -182,7 +195,7 @@ enum FetchAvailability {
 // currently back up with a real confirmation reports
 // `UNKNOWN`, never `PROTECTED`.
 enum GroupDurabilityStatus {
-  // Fail-safe default (also what an older daemon that predates this field
+  // Fail-safe default (also what an unset value
   // always sends): treat exactly like `UNKNOWN`, never as
   // `PROTECTED`.
   GROUP_DURABILITY_STATUS_UNSPECIFIED = 0;
@@ -206,6 +219,36 @@ enum GroupDurabilityStatus {
   // this state answers "does a durable holder exist," never "is one
   // reachable right now."
   GROUP_DURABILITY_STATUS_AT_RISK = 4;
+}
+
+// What kind of evidence backs a link's `durability_status`.
+//
+// Deliberately a separate axis rather than more values of
+// `GroupDurabilityStatus`: the question "is this group protected" and the
+// question "how do you know" have different answers and different
+// audiences, and folding them together is what made it possible for a
+// background health check to be mistaken for a safety proof in the first
+// place.
+enum DurabilityEvidence {
+  // Also what an unset value.
+  DURABILITY_EVIDENCE_UNSPECIFIED = 0;
+  // No current evidence of either kind.
+  DURABILITY_EVIDENCE_NONE = 1;
+  // A peer recently reported a durable index matching this device's own
+  // current state, and reported itself a full replica holding all of it.
+  // The ordinary steady state.
+  //
+  // This is an index-level claim the peer makes about itself. It does not
+  // establish that the bytes are on that peer's disk, nor that any of them
+  // are intact. Anything irreversible -- unlinking, demoting, removing a
+  // device -- re-proves the strong form first, against one named peer that
+  // reads every block back; this evidence is never accepted there.
+  DURABILITY_EVIDENCE_CORROBORATED_INDEX = 2;
+  // A peer read back and re-verified the checksum of every block of every
+  // durability root -- current and retained history alike -- recently
+  // enough to still count. What `PROTECTED` used to mean always, and what
+  // it still means immediately after a durability gate has run.
+  DURABILITY_EVIDENCE_VERIFIED_PAYLOAD = 3;
 }
 
 // One in-flight file transfer's
@@ -266,9 +309,10 @@ enum PeerReachability {
   PEER_REACHABILITY_CONNECTING = 1;
   PEER_REACHABILITY_CONNECTED = 2;
   PEER_REACHABILITY_UNREACHABLE = 3;
-  // Transport is connected, but the peer completed its handshake without
-  // advertising the mandatory change-DAG protocol.
-  PEER_REACHABILITY_PROTOCOL_INCOMPATIBLE = 4;
+  // A peer of another protocol generation is refused inside the TLS
+  // handshake (the generation rides the ALPN) and reported UNREACHABLE.
+  reserved 4;
+  reserved "PEER_REACHABILITY_PROTOCOL_INCOMPATIBLE";
 }
 
 // Why a peer is unreachable, mirroring
@@ -312,40 +356,32 @@ message PeerStatus {
   // `PEER_REACHABILITY_UNREACHABLE`; `UNREACHABLE_CATEGORY_UNSPECIFIED`
   // otherwise.
   UnreachableCategory unreachable_category = 6;
-  // M4 Pass 3: which kind of path `reachability == PEER_REACHABILITY_
-  // CONNECTED` is over -- `ROUTE_KIND_UNSPECIFIED` whenever `reachability`
-  // is anything other than `CONNECTED` (there is no path to classify).
-  // This is the wire contract gap a prior M3 pass's own comment flagged
-  // ("Pass 6 is the right place to extend this... once a route other than
-  // Direct can actually occur") and never filled in once relay routes
-  // actually shipped -- a client could not previously distinguish a
-  // direct connection from a relayed one at all.
+  // Which kind of path `reachability == PEER_REACHABILITY_CONNECTED` is
+  // over -- `ROUTE_KIND_UNSPECIFIED` whenever `reachability` is anything
+  // other than `CONNECTED` (there is no path to classify).
   RouteKind route_kind = 7;
-  // M4 Pass 3: whether THIS peer has declared itself able to act as a
-  // relay for OTHER peers' traffic -- a device-level self-declared
-  // capability (`crate::route::RelayCapability`), independent of
-  // `route_kind` above (which describes THIS device's own connection TO
-  // this peer) and independent of the peer's storage role. Per the
-  // `Durability != Connectivity` invariant, this must never be read as
-  // implying anything about whether the peer durably holds any group's
-  // data.
-  RelayCapability relay_capability = 8;
+  // Field 8 was `RelayCapability relay_capability` -- a peer's own
+  // declared willingness to forward opaque QUIC datagrams for other peers
+  // (`yadorilink_daemon::route::RelayCapability`). Removed together with
+  // the peer-device relay mechanism (R6 of the Iroh relay/service-plane
+  // cutover): the Iroh relay is the relay architecture now, and it needs
+  // no device to opt in.
+  reserved 8;
+  reserved "relay_capability";
 }
 
 // See `PeerStatus.route_kind`'s own doc comment, mirroring
 // `yadorilink_daemon::route::RouteKind`.
 enum RouteKind {
   ROUTE_KIND_UNSPECIFIED = 0;
+  // Endpoint to endpoint, with no server in between.
   ROUTE_KIND_DIRECT = 1;
-  ROUTE_KIND_RELAY = 2;
-}
-
-// See `PeerStatus.relay_capability`'s own doc comment, mirroring
-// `yadorilink_daemon::route::RelayCapability`.
-enum RelayCapability {
-  RELAY_CAPABILITY_UNSPECIFIED = 0;
-  RELAY_CAPABILITY_CAPABLE = 1;
-  RELAY_CAPABILITY_DISABLED = 2;
+  // Once meant "forwarded by another peer device", a mechanism that no
+  // longer exists; never reused, so an old reading cannot be mistaken for
+  // the relay-server route below.
+  reserved 2;
+  // Through a relay server, because no direct path is up.
+  ROUTE_KIND_RELAY = 3;
 }
 
 // Which side of the crash-safe create/join enrollment protocol a
@@ -449,6 +485,16 @@ message ResumeRequest {
 }
 message ResumeResponse {}
 
+// What kind of filesystem entry a versioned/trashed/conflicted record is.
+// `ENTRY_KIND_UNSPECIFIED` is only ever the proto3 default of a sender that
+// did not set it; the daemon always sets a real kind.
+enum EntryKind {
+  ENTRY_KIND_UNSPECIFIED = 0;
+  ENTRY_KIND_FILE = 1;
+  ENTRY_KIND_DIRECTORY = 2;
+  ENTRY_KIND_SYMLINK = 3;
+}
+
 // One retained version of a file, as
 // returned by `ListVersionsResponse` — mirrors
 // `yadorilink_sync_core::index::VersionRecord`.
@@ -467,6 +513,9 @@ message FileVersionInfo {
   // peer) — `optional` for real proto3 field presence, since `0` (mode
   // `0o000`, a real, distinct value) must not be confused with "absent".
   optional uint32 unix_mode = 6;
+  // A directory version carries no size or mtime of its own (both are
+  // canonically 0), so a surface must not print them as if it were a file.
+  EntryKind kind = 7;
 }
 
 // `yadorilink versions <path>`. `absolute_path` (not
@@ -511,6 +560,14 @@ message TrashedFileInfo {
   int64 last_known_size = 4;
   string origin_device_id = 5;
   int64 deleted_at_unix_nanos = 6;
+  // The kind of the trashed (last live) version.
+  EntryKind kind = 7;
+  // The recursive delete or directory rename that removed this entry, as
+  // `<author device id>:<operation id in hex>`; empty when the entry was
+  // deleted on its own. Every trashed entry sharing it was removed by the
+  // same user operation, and `RestoreTrashOperationRequest` restores them
+  // together.
+  string deleted_by_operation = 8;
 }
 message ListTrashResponse {
   repeated TrashedFileInfo files = 1;
@@ -524,6 +581,26 @@ message RestoreTrashRequest {
   string absolute_path = 1;
 }
 message RestoreTrashResponse {}
+
+// `yadorilink trash restore --folder <path>`: restores, together, every
+// trashed entry removed by the same recursive delete or directory rename
+// that removed the trashed entry at `absolute_path` -- the folder as that
+// operation found it. Refused when that entry was deleted on its own.
+message RestoreTrashOperationRequest {
+  string absolute_path = 1;
+}
+message RestoreTrashOperationFailure {
+  string path = 1;
+  string error = 2;
+}
+message RestoreTrashOperationResponse {
+  // Relative to the link root, in path order.
+  repeated string restored_paths = 1;
+  repeated RestoreTrashOperationFailure failed = 2;
+  // Not every part of the operation has reached this device, so what it
+  // removed elsewhere in the folder could not be restored here.
+  bool partial = 3;
+}
 
 // `yadorilink conflicts list`. Takes no path, same "no scope needed"
 // shape as `ListTrashRequest` — spans every linked folder at once.
@@ -539,6 +616,23 @@ message ConflictedFileInfo {
   string path = 2;
   int64 size = 3;
   int64 mtime_unix_nanos = 4;
+  EntryKind kind = 5;
+  // Why the copy is kept under its own name now.
+  ConflictReason reason = 6;
+}
+
+// Why a conflict copy is kept beside the path it came from.
+// `CONFLICT_REASON_UNSPECIFIED` is only the proto3 default of a sender that
+// did not set it.
+enum ConflictReason {
+  CONFLICT_REASON_UNSPECIFIED = 0;
+  // Devices changed the same path concurrently; the copy holds the version
+  // that did not win the path.
+  CONFLICT_REASON_CONCURRENT_EDIT = 1;
+  // The path it came from is a folder now (an explicit directory, or one
+  // that holds synced entries), so this file or link was moved aside under
+  // its own name instead of replacing the folder.
+  CONFLICT_REASON_FOLDER_AT_PATH = 2;
 }
 message ListConflictsResponse {
   repeated ConflictedFileInfo files = 1;
@@ -620,7 +714,7 @@ message StatusResponse {
   // nesting that message) so an old CLI parsing a newer daemon's
   // `StatusResponse` — or vice versa — never has to know about a second
   // message type just to read `status`. Every field is additive (new
-  // field numbers) and zero-valued/empty for a daemon that predates this
+  // field numbers) and zero-valued/empty for an unset value
   // change, decoding as "no update info available" — this file's
   // existing "absent = unchanged default behavior" convention (e.g.
   // `LinkStatus.materialization_policy`).
@@ -663,7 +757,7 @@ message StatusResponse {
   // own notion of "healthy" ("Add aggregate status
   // APIs instead of scraping per-file shell state"). "healthy" | "attention"
   // | "degraded" (see `control_socket::overall_state` for the precise
-  // precedence rules); a daemon predating this change never sets this
+  // precedence rules); an unset value
   // field, decoding as an empty string on an old daemon/new CLI pairing --
   // callers should treat empty the same as "unknown", not "healthy".
   string overall_state = 22;
@@ -823,10 +917,11 @@ message RequestHandoffLeaseResponse {
 // cross-device durability fail-closed gate (`durability_force.rs`'s
 // `guard_cross_device_removal`) for the common online case -- instead of
 // this device attesting a DIFFERENT device's roots (which it cannot do
-// soundly), the removed device itself is asked, over the peer channel, to
-// attest and hand off its own roots. See `HandoffTicketRequest`/
-// `HandoffTicketGrant` (sync.proto) for the peer-to-peer exchange this
-// drives, and `DaemonState::obtain_handoff_ticket_from_device`.
+// soundly), the removed device itself is asked, over the peer session's
+// service RPC lane, to attest and hand off its own roots. See
+// `yadorilink-peer-session::service_rpc::ServiceRequest::HandoffTicket` for
+// the peer-to-peer exchange this drives, and
+// `DaemonState::obtain_handoff_ticket_from_device`.
 message ObtainHandoffTicketRequest {
   string group_id = 1;
   // The device being removed/revoked -- must currently be a live, reachable
@@ -928,7 +1023,7 @@ message UnpinResponse {}
 message EvictRequest {
   string absolute_path = 1;
 }
-// M4 Pass 4: previously empty -- an `Evict` request that daemon-side
+// Previously empty -- an `Evict` request that daemon-side
 // silently did nothing (the file was pinned, busy, not yet fully synced,
 // or its on-disk identity changed right before the commit) still returned
 // this bare-success message, so `yadorilink evict` printed "Evicted"
@@ -945,7 +1040,7 @@ message EvictResponse {
   uint64 bytes_reclaimed = 3;
 }
 
-// P0-B: one file's current materialization state and pin flag -- the
+// One file's current materialization state and pin flag -- the
 // per-FILE analogue of `LinkStatus`'s aggregate hydrated_count/
 // placeholder_count/hydrating_count counts, which answer "how many files
 // across this whole link" but not "what state is THIS file in right
@@ -1257,8 +1352,7 @@ message ConnectionAttemptTrace {
   string failure_category = 6;
   bool selected = 7;
   // Field 8 was `string relay_identity`, removed with the operator-run
-  // relay data path. `address_class` now carries the direct candidate class
-  // (lan / port_mapped / ipv6 / server_reflexive).
+  // relay data path.
   reserved 8;
   reserved "relay_identity";
   string authorization_decision = 9;
@@ -1270,36 +1364,6 @@ message ListConnectionTracesRequest {
 }
 message ListConnectionTracesResponse {
   repeated ConnectionAttemptTrace traces = 1;
-}
-
-// One LAN-discovered address currently held as a dial candidate — the
-// announced-but-not-necessarily-connected counterpart to
-// `ConnectionAttemptTrace`, which only ever describes an attempt that has
-// already resolved. Diagnostics only: being listed here is a dial target
-// and nothing more, never authorization. Redacted on the same terms as
-// `ConnectionAttemptTrace` — the coarse address class, never the
-// announced address itself. See
-// `yadorilink-daemon::connection_trace::LanDiscoveredCandidate`.
-message LanDiscoveredCandidate {
-  string peer_device_id = 1;
-  // "lan" | "port_mapped" | "ipv6" | "server_reflexive" | "wan" |
-  // "unknown", derived from the announced address rather than assumed.
-  string address_class = 2;
-  // Daemon-side monotonic age of the last announcement. Entries past the
-  // daemon's candidate TTL are not reported at all.
-  uint64 last_seen_ms_ago = 3;
-  // Whether the peer has any live session — not necessarily over this
-  // candidate, and not necessarily over a LAN candidate at all. Repeated
-  // on every one of a peer's candidate rows, so it must not be read as
-  // "connected over this address"; named for what it measures.
-  bool peer_has_any_session = 4;
-}
-// Empty `peer_device_id` lists every peer's held candidates.
-message ListLanDiscoveredCandidatesRequest {
-  string peer_device_id = 1;
-}
-message ListLanDiscoveredCandidatesResponse {
-  repeated LanDiscoveredCandidate candidates = 1;
 }
 
 message ConnectivityDoctorRequest {}
@@ -1343,7 +1407,7 @@ message DiagnosticsBundleResponse {
   string collection_mode = 3;
 }
 
-// Phase 1b high-level application commands. The daemon owns each complete
+// High-level application commands. The daemon owns each complete
 // workflow; the CLI sends one request and only renders the structured result.
 message RemoveDeviceCommandRequest {
   string device_id = 1;
@@ -1432,6 +1496,26 @@ message RevokeEdgeCommandResponse {
   }
 }
 
+// Terminal deletion of a folder group this account owns. Not subject to
+// `RevokeEdgeCommand`'s last-full-replica guard: the group ceases to exist,
+// so there is no group left to protect.
+message DeleteGroupCommandRequest {
+  string group_id = 1;
+  // Required (and refused without it) only when the group has any
+  // cross-account member -- see the coordination plane's own
+  // `deleteFolderGroup` doc comment.
+  bool acknowledge_cross_account_members = 2;
+}
+
+message DeleteGroupCommandResponse {
+  oneof result {
+    bool ok = 1;
+    // The coordination plane's own reason, verbatim -- most commonly the
+    // unacknowledged cross-account-member refusal above.
+    string error = 2;
+  }
+}
+
 message CreateAndLinkCommandRequest {
   string group_name = 1;
   string local_path = 2;
@@ -1464,6 +1548,10 @@ message EnrollmentCommandOutcome {
   // means it will not sync until someone else acts. A caller that renders
   // both the same way tells people their folder is live when it is not.
   bool awaiting_approval = 4;
+  // The folder was already linked to this group and running, so the command
+  // changed nothing locally (a repeated `share join`). Lets a caller say so
+  // instead of reporting a fresh join.
+  bool already_linked = 5;
 }
 
 message CreateAndLinkCommandResponse {
@@ -1539,12 +1627,12 @@ message MintInviteCommandResponse {
   }
 }
 
-// Phase 2.1: `yadorilink recovery list`/`show`. `list` (Commit 2.1-B) is a
+// `yadorilink recovery list`/`show`. `list` is a
 // read-only view over the local recovery-journal inventory
 // (yadorilink_sync_core::recovery) alone -- its response has no dedicated
 // `error` variant, same as e.g. `ListLinksResponse`; a failure surfaces
 // through DaemonControlResponse's own top-level `error` fallback. `show`
-// (Commit 2.1-C2-C2) is a stable diagnosis instead: local journal state
+// is a stable diagnosis instead: local journal state
 // combined with exactly one coordination-plane lookup and a recommendation
 // (yadorilink_daemon::recovery_diagnosis) -- its response's `invalid`/
 // `not_found`/`local_evidence_changed` variants are typed, successfully-
@@ -1588,7 +1676,7 @@ message ListRecoveryOperationsResponse {
   repeated InvalidRecoveryOperation invalid = 2;
 }
 
-// Phase 2.1-C2-C2: `show` now returns a stable diagnosis (local evidence +
+// `show` returns a stable diagnosis (local evidence +
 // exactly one remote lookup + a pure recommendation), not just the local
 // journal row. `domain` is required and unambiguous -- the three recovery
 // journals are separate tables with no cross-table uniqueness on
@@ -1837,11 +1925,11 @@ message DaemonControlRequest {
     CreateAndLinkCommandRequest create_and_link_command = 59;
     JoinAndLinkCommandRequest join_and_link_command = 60;
     RevokeEdgeCommandRequest revoke_edge_command = 61;
-    // Phase 2.1: local recovery-journal inventory (`list`) and stable
+    // Local recovery-journal inventory (`list`) and stable
     // recovery diagnosis (`show`) -- see the message definitions above.
     ListRecoveryOperationsRequest list_recovery_operations = 62;
     ShowRecoveryOperationRequest show_recovery_operation = 63;
-    // P0-B: per-file materialization state/pin query.
+    // Per-file materialization state/pin query.
     MaterializationStatusRequest materialization_status = 64;
     // C5: `yadorilink conflicts list`.
     ListConflictsRequest list_conflicts = 65;
@@ -1860,28 +1948,39 @@ message DaemonControlRequest {
     RewindPreviewRequest rewind_preview = 71;
 
     // LAN-discovery diagnostics: candidates held but not (yet) connected.
-    ListLanDiscoveredCandidatesRequest list_lan_discovered_candidates = 72;
+
+    // Terminal deletion of a folder group this account owns -- see
+    // `GroupAdministration`'s own doc comment for why this is not
+    // `RevokeEdgeCommand`: deleting the whole group is not subject to the
+    // last-full-replica guard a single edge revoke is.
+    DeleteGroupCommandRequest delete_group_command = 73;
+
+    RestoreTrashOperationRequest restore_trash_operation = 74;
   }
   // Field numbers 24-26 were the directional-mode requests (set_mode,
   // override, revert); 40-43 were the directional folder-operation requests
   // (divergence summary, resolution preview, resolution confirm, audit
   // list). All removed with the directional folder modes; every folder is
   // bidirectional.
-  reserved 24, 25, 26, 40, 41, 42, 43;
+  // 72 was `list_lan_discovered_candidates`, removed with the legacy LAN
+  // broadcast discovery that produced the candidate list; LAN discovery is
+  // the iroh endpoint's own mDNS, whose candidate set this daemon does not
+  // enumerate.
+  reserved 24, 25, 26, 40, 41, 42, 43, 72;
   reserved "set_mode", "override", "revert", "folder_divergence_summary",
     "folder_resolution_preview", "folder_resolution_confirm",
-    "list_folder_operation_audit";
+    "list_folder_operation_audit", "list_lan_discovered_candidates";
   // The CLI's own control-
   // protocol version, always set by every current CLI build. A field
   // number far outside the `oneof`'s own growth range (deliberately, so
   // it never collides with a new request variant landing concurrently)
   // and a plain top-level field, not part of the oneof — it accompanies
-  // *every* request regardless of which variant is set. Absent (decodes
-  // as 0) on any request built by a CLI that predates this field, which a
-  // current daemon must treat as "an old, pre-versioning client" rather
-  // than an error (spec "Old CLI talks to newer daemon": the daemon
-  // handles the request using backward-compatible defaults) — 0 is never
-  // itself invalid.
+  // *every* request regardless of which variant is set. The daemon
+  // requires it to equal its own CONTROL_PROTOCOL_VERSION exactly and
+  // refuses the request otherwise; an unset field decodes as 0, which is
+  // one more mismatch, not a tolerated "pre-versioning client". CLI,
+  // desktop app and daemon ship as one unit, so a skew has no supported
+  // recovery path and must fail before touching daemon state.
   uint32 protocol_version = 900;
 }
 
@@ -1951,11 +2050,11 @@ message DaemonControlResponse {
     CreateAndLinkCommandResponse create_and_link_command = 59;
     JoinAndLinkCommandResponse join_and_link_command = 60;
     RevokeEdgeCommandResponse revoke_edge_command = 61;
-    // Phase 2.1: local recovery-journal inventory (`list`) and stable
+    // Local recovery-journal inventory (`list`) and stable
     // recovery diagnosis (`show`) -- see the message definitions above.
     ListRecoveryOperationsResponse list_recovery_operations = 62;
     ShowRecoveryOperationResponse show_recovery_operation = 63;
-    // P0-B: per-file materialization state/pin query.
+    // Per-file materialization state/pin query.
     MaterializationStatusResponse materialization_status = 64;
     // C5: `yadorilink conflicts list`.
     ListConflictsResponse list_conflicts = 65;
@@ -1971,21 +2070,26 @@ message DaemonControlResponse {
     RewindPreviewResponse rewind_preview = 71;
 
     // LAN-discovery diagnostics: candidates held but not (yet) connected.
-    ListLanDiscoveredCandidatesResponse list_lan_discovered_candidates = 72;
+
+    DeleteGroupCommandResponse delete_group_command = 73;
+
+    RestoreTrashOperationResponse restore_trash_operation = 74;
   }
   // Field numbers 25-27 were the directional-mode responses (set_mode,
   // override, revert); 40-43 were the directional folder-operation responses
   // (divergence summary, resolution preview, resolution confirm, audit
   // list). All removed with the directional folder modes; every folder is
   // bidirectional.
-  reserved 25, 26, 27, 40, 41, 42, 43;
+  // 72 was `list_lan_discovered_candidates`, removed with the legacy LAN
+  // broadcast discovery that produced the candidate list.
+  reserved 25, 26, 27, 40, 41, 42, 43, 72;
   reserved "set_mode", "override", "revert", "folder_divergence_summary",
     "folder_resolution_preview", "folder_resolution_confirm",
-    "list_folder_operation_audit";
+    "list_folder_operation_audit", "list_lan_discovered_candidates";
   // Mirrors
   // `DaemonControlRequest.protocol_version` above — always set by every
   // current daemon build, on every response regardless of payload variant.
-  // Decodes as 0 on a response from a daemon that predates this field,
+  // Decodes as 0 on a response from an unset value,
   // which the CLI treats as "an old, pre-versioning daemon" (spec "New CLI
   // talks to older supported daemon": report that the daemon must be
   // upgraded, rather than surfacing an ambiguous protocol error), not as a

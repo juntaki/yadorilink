@@ -1,24 +1,19 @@
-//! The intercepting network-fault decorator.
-//!
-//! Network faults were a manual `outbound_partitioned: AtomicBool`
-//! (`dst_intermittent_catchup_chaos.rs`) -- no drop/delay/reorder/duplicate,
-//! which both under-tests the product and forces artificial scenario
-//! shapes. `FaultingChannel` wraps the outbound channel seam and applies a
-//! deterministic, seed-driven `FaultPlan` (`case_ir::FaultPlan`) scheduled
-//! on the simulated clock: drop, duplicate, delay (whence reorder), and
-//! partition/heal windows, all reproducible from the serialized plan so a
-//! recorded corpus case replays with identical network behavior.
-//!
-//! This module is the decorator's *decision engine* -- pure, synchronous,
-//! and fully unit-testable without a live session: given the next outbound
-//! message's simulated timestamp it returns what should happen to it. The
-//! caller (a migrated scenario's send path, or heat-run's fault injector)
-//! wraps its actual channel `send` around `decide`. Keeping the policy here
-//! and the wrapping at the call site is what lets the *wrap point* move
-//! (sync-core test seam now, transport `PeerChannel` later for heat-run)
-//! without touching the policy.
-//!
-//! `#![cfg(madsim)]`-gated like every DST scenario file.
+//! The intercepting network-fault decorator. Network faults were a manual
+//! `outbound_partitioned: AtomicBool`
+//! (`dst_intermittent_catchup_chaos.rs`) -- no
+//! drop/delay/reorder/duplicate, which both under-tests the product and
+//! forces artificial scenario shapes. `FaultingChannel` wraps the outbound
+//! channel seam and applies a deterministic, seed-driven `FaultPlan`
+//! (`case_ir::FaultPlan`) scheduled on the simulated clock: drop,
+//! duplicate, delay (whence reorder), and partition/heal windows, all
+//! reproducible from the serialized plan so a recorded corpus case replays
+//! with identical network behavior. This module is the decorator's
+//! *decision engine* -- pure, synchronous, and fully unit-testable without
+//! a live session: given the next outbound message's simulated timestamp
+//! it returns what should happen to it. The caller (a migrated scenario's
+//! send path, or heat-run's fault injector) wraps its actual channel
+//! `send` around `decide`. `#![cfg(turmoil)]`-gated like every DST scenario
+//! file.
 
 use super::case_ir::FaultPlan;
 

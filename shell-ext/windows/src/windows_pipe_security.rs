@@ -5,7 +5,7 @@
 //! process, and `yadorilink_shell_ext`'s `cdylib` half loads into every
 //! Explorer.exe process, where pulling in the daemon's much larger
 //! dependency tree would be its own regression). Restricts a named pipe
-//! (M2-3b's dehydrate pipe -- see `dehydrate_server.rs`) to SYSTEM plus the
+//! (the dehydrate pipe -- see `dehydrate_server.rs`) to SYSTEM plus the
 //! current user, same reasoning as the daemon's own shell-IPC and control
 //! sockets: this pipe carries a privileged, data-destructive operation
 //! (native placeholder dehydration), so any other local user/process must

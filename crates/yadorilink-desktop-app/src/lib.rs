@@ -5,14 +5,19 @@
 //! `src/main.rs`) for the identical reason.
 pub mod account;
 pub mod actions;
+pub mod devices;
 pub mod folder_detail;
 pub mod folder_status_window;
-pub mod google_login;
+pub mod fonts;
+pub mod home_window;
 pub mod ipc_client;
 pub mod login_item;
 pub mod onboarding;
+pub mod send_window;
+pub mod settings_window;
 pub mod share_access;
 pub mod share_invite;
 pub mod share_window;
 pub mod status_model;
+pub mod storage_window;
 pub mod window;

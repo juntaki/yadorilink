@@ -1,9 +1,18 @@
 //! The `orphan_changes` table: a bounded, best-effort holding buffer for
-//! changes that arrived before their ancestry. A row here is never treated as
-//! durable history -- corrupt, structurally invalid, or ancestry-inconsistent
-//! rows are dropped rather than fail-closed, and [`promote_orphans`] moves a
-//! ready row into `super::retained_history_integrity`'s `changes` table once
-//! its parents are present.
+//! changes that arrived before something they name. A row here is never
+//! treated as durable history -- corrupt, structurally invalid, or
+//! ancestry-inconsistent rows are dropped rather than fail-closed, and
+//! [`promote_orphans`] moves a ready row into
+//! `super::retained_history_integrity`'s `changes` table once everything it
+//! waits on is present.
+//!
+//! A row waits on two kinds of name, and both are ordinary waiting rather
+//! than two mechanisms. Its DAG parents, recorded as `change_parents`
+//! edges, are the causal basis it was written on. Its `author_prev` --
+//! recorded in this table's own column -- is the previous change of its own
+//! author. The second is not implied by the first: author ordering is not
+//! causality, so an author's previous change is routinely not an ancestor
+//! of its next one and can arrive after it.
 
 use rusqlite::{Connection, OptionalExtension};
 
@@ -16,52 +25,22 @@ use yadorilink_replica_domain::ids::ChangeHash;
 /// oldest are evicted (and would be re-requested by a later heads exchange).
 pub const ORPHAN_BOUND: usize = 4096;
 
-/// Confirms whether `device_id` still holds writer authorization for
-/// `group_id` RIGHT NOW, at the moment an orphan is about to be promoted --
-/// independent of whatever historical `ChangeAuth` pin the orphan's own
-/// signed bytes carry. Injected so this storage-layer crate never has to
-/// depend on policy/trust types: `yadorilink_daemon`'s `DaemonState` wires
-/// the real, policy-backed answer (see `promote_orphans`'s own doc comment
-/// for why this exists and where it is actually consulted).
+/// Buffers a change that is still waiting on something it names. Evicts the
+/// oldest orphans once the bound is exceeded (see `ORPHAN_BOUND`).
 ///
-/// `None` means the check cannot currently be answered -- no trust/policy
-/// material is available yet -- and callers must fail closed: defer
-/// promotion (leave the row buffered) rather than treat unavailable trust as
-/// authorization. `Some(false)` (a definite "no longer a writer") is treated
-/// identically to `None` by `promote_orphans`: both defer rather than drop,
-/// since a later re-grant could make the row legitimately promotable again,
-/// and `ORPHAN_BOUND` eviction already bounds how long a permanently-stuck
-/// row can linger.
-pub type OrphanPromotionWriterCheck = dyn Fn(&str, &str) -> Option<bool> + Send + Sync;
-
-/// The permissive default: every author is treated as still a current
-/// writer. Used by every call site that has no revocation-freshness concern
-/// of its own -- tests, and any internal `dag_store` caller that isn't part
-/// of live remote-peer admission. Real production remote admission gets the
-/// REAL check, wired by `yadorilink_daemon::daemon_state::DaemonState::new`
-/// onto `yadorilink_sync_sqlite::ChangeHistoryRepository` the same way that
-/// module wires `local_change_auth_provider`.
-pub fn always_current_writer(_group_id: &str, _device_id: &str) -> Option<bool> {
-    Some(true)
-}
-
-/// Fails closed: no trust material is available to answer this at all. Used
-/// by `init_dag_schema`'s startup self-heal sweep, which runs directly on a
-/// freshly opened connection before any daemon-level policy/trust has even
-/// begun loading -- see that call site's own comment, and `resweep_deferred_
-/// orphan_promotions`'s own doc comment for how a row deferred here later
-/// gets a genuine second chance once real trust is available.
-pub fn defer_all_orphan_promotion(_group_id: &str, _device_id: &str) -> Option<bool> {
-    None
-}
-
-/// Buffers a change whose ancestry is not yet complete. Evicts the oldest
-/// orphans once the bound is exceeded (see `ORPHAN_BOUND`).
-pub(crate) fn insert_orphan(
-    conn: &Connection,
-    change: &Change,
-    applied: bool,
-) -> Result<(), SyncSqliteError> {
+/// `author_prev_hash` is written from the change's own signed field, so the
+/// row records the author link it may be waiting on as well as the parent
+/// edges its caller records.
+///
+/// `relay_admitted`/`relay_vouched_by` are always written as their inert
+/// defaults (`0`/`''`) -- the columns remain in the schema (dropping them
+/// is a separate, non-security-relevant cleanup) but nothing in this crate
+/// reads them for a decision anymore: under `AuthorizationCheckpoint`
+/// admission, a buffered orphan's
+/// eventual promotion depends only on its ancestry becoming complete, never
+/// on who delivered it or a re-checked freshness window -- see
+/// [`promote_orphans`]'s own doc comment.
+pub(crate) fn insert_orphan(conn: &Connection, change: &Change) -> Result<(), SyncSqliteError> {
     let hash = change.compute_hash();
     let next_seq: i64 =
         conn.query_row("SELECT COALESCE(MAX(received_seq), 0) + 1 FROM orphan_changes", [], |r| {
@@ -69,16 +48,17 @@ pub(crate) fn insert_orphan(
         })?;
     conn.execute(
         "INSERT OR IGNORE INTO orphan_changes \
-         (change_hash, group_id, device_id, lamport, encoded, applied, received_seq) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+         (change_hash, group_id, device_id, lamport, encoded, received_seq, \
+          relay_admitted, relay_vouched_by, author_prev_hash) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, '', ?7)",
         rusqlite::params![
             &hash.0[..],
             change.group_id.as_str(),
             change.device_id.as_str(),
             change.lamport as i64,
             change.to_wire_bytes(),
-            applied as i64,
             next_seq,
+            change.author_prev.map(|prev| prev.0.to_vec()),
         ],
     )?;
     // Bound the buffer: keep the newest `ORPHAN_BOUND`, evict older ones.
@@ -114,12 +94,14 @@ pub(crate) fn insert_orphan(
     Ok(())
 }
 
-/// Promotes every orphan whose ancestry is now complete into the applied
-/// store, seeded from the change hashes that just became durable (`seeds`).
-/// A currently-buffered orphan can only become promotable when one of its
-/// own parents lands, so walking outward from exactly those parent hashes
-/// (via the `change_parents_by_parent` index) finds every newly-promotable
-/// orphan in work proportional to what actually got unblocked. A prior
+/// Promotes every orphan that is now ready into the applied store, seeded
+/// from the change hashes that just became durable (`seeds`).
+/// A currently-buffered orphan can only become promotable when one of the
+/// changes it names lands — one of its own parents, or its author's
+/// previous change — so walking outward from exactly those hashes (via the
+/// `change_parents_by_parent` and `orphan_changes_by_author_prev` indexes)
+/// finds every newly-promotable orphan in work proportional to what
+/// actually got unblocked. A prior
 /// version re-scanned the *entire* orphan buffer once per promotion, which
 /// is quadratic for a long chain of orphans that each unblock exactly one
 /// more (received out of order, then promoted one generation at a time).
@@ -127,39 +109,44 @@ pub(crate) fn insert_orphan(
 /// caller projects each promoted orphan's paths, so it needs the identities,
 /// not just a count.
 ///
-/// `writer_check` is consulted for every promotion candidate, right after
-/// its ancestry is confirmed complete: this is a SEPARATE, freshness-gated
-/// re-check, distinct from whatever authorization decision let the row
-/// buffer as an orphan in the first place. An orphan's own signature and
-/// `ChangeAuth` pin were only checked against policy state AS OF THE MOMENT
-/// IT WAS RECEIVED (or, for a startup self-heal candidate, not checked
-/// against live policy at all -- see `defer_all_orphan_promotion`) --
-/// arbitrary time can pass between that receipt and this promotion, during
-/// which the author can be downgraded or revoked. Re-checking only at
-/// receipt time closes that window at the moment the change first arrives,
-/// but a still-buffered orphan sitting on a withheld parent (deliberately,
-/// by an attacker, or incidentally, across a restart) would otherwise get
-/// promoted later on the strength of a check that has since gone stale --
-/// exactly the live-admission replay gap `GroupPolicyState::
-/// author_is_writer_now` closes for the ordinary per-Change path, extended
-/// here to the promotion path a fix confined to that ordinary path cannot
-/// reach.
+/// There is no freshness/writer re-check here anymore: under
+/// `AuthorizationCheckpoint` admission, a Change's admissibility is a static,
+/// content-addressed fact (does a validly-signed checkpoint cover its
+/// hash?), never a time-varying "is the author still a writer right now"
+/// question -- there is no window for it to go stale between original
+/// receipt and this promotion, so nothing needs re-checking. An orphan
+/// buffers purely because something it names is not here; it promotes
+/// purely because everything it names arrived.
 pub fn promote_orphans(
     conn: &Connection,
     seeds: &[ChangeHash],
-    writer_check: &OrphanPromotionWriterCheck,
 ) -> Result<Vec<ChangeHash>, SyncSqliteError> {
     let mut promoted: Vec<ChangeHash> = Vec::new();
     let mut queue: std::collections::VecDeque<ChangeHash> = seeds.iter().copied().collect();
     while let Some(parent_hash) = queue.pop_front() {
         // Orphans that declare `parent_hash` as one of their own parents and
         // are still buffered, oldest-arrived first.
+        //
+        // Plus the orphans waiting on `parent_hash` as their AUTHOR's
+        // previous change rather than as a DAG parent. That is a different
+        // relation and a different column, and it has to be woken here or
+        // not at all: an author's previous change is routinely not an
+        // ancestor of its next one, so nothing in the parent walk would
+        // ever reach such a row. A single `UNION` keeps both kinds in one
+        // `received_seq` order, and a hash that qualifies under both is
+        // returned once.
         let candidates: Vec<Vec<u8>> = {
-            let mut stmt = conn.prepare(
-                "SELECT cp.child_hash FROM change_parents cp \
-                 JOIN orphan_changes o ON o.change_hash = cp.child_hash \
-                 WHERE cp.parent_hash = ?1 \
-                 ORDER BY o.received_seq",
+            let mut stmt = conn.prepare_cached(
+                "SELECT child_hash FROM ( \
+                   SELECT cp.child_hash AS child_hash, o.received_seq AS received_seq \
+                   FROM change_parents cp \
+                   JOIN orphan_changes o ON o.change_hash = cp.child_hash \
+                   WHERE cp.parent_hash = ?1 \
+                   UNION \
+                   SELECT o.change_hash AS child_hash, o.received_seq AS received_seq \
+                   FROM orphan_changes o \
+                   WHERE o.author_prev_hash = ?1 \
+                 ) ORDER BY received_seq",
             )?;
             let rows = stmt.query_map([&parent_hash.0[..]], |r| r.get::<_, Vec<u8>>(0))?;
             rows.collect::<Result<_, _>>()?
@@ -169,14 +156,11 @@ pub fn promote_orphans(
             // earlier candidate processed in this same pass may already have
             // promoted or dropped this exact row (e.g. two of its parents
             // both land within the same seed set).
-            let row: Option<(Vec<u8>, bool)> = conn
-                .query_row(
-                    "SELECT encoded, applied FROM orphan_changes WHERE change_hash = ?1",
-                    [&child_hash_blob[..]],
-                    |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)? != 0)),
-                )
+            let encoded: Option<Vec<u8>> = conn
+                .prepare_cached("SELECT encoded FROM orphan_changes WHERE change_hash = ?1")?
+                .query_row([&child_hash_blob[..]], |r| r.get::<_, Vec<u8>>(0))
                 .optional()?;
-            let Some((encoded, applied)) = row else { continue };
+            let Some(encoded) = encoded else { continue };
             let change = match Change::from_wire_bytes(&encoded) {
                 Ok(c) => c,
                 Err(_) => {
@@ -188,49 +172,6 @@ pub fn promote_orphans(
             if !super::retained_history_integrity::has_all_parents(conn, &change)? {
                 continue;
             }
-            // The freshness re-check this function's own doc comment
-            // describes: is this orphan's author STILL a writer for its
-            // group RIGHT NOW, at promotion time -- not merely whatever was
-            // true when the row was originally buffered. `None` (trust
-            // unavailable) and `Some(false)` (confirmed no longer a writer)
-            // both defer identically: leave the row buffered rather than
-            // drop it outright, matching `CausalAuthCheck::Unresolvable`'s
-            // own fail-closed-by-deferral treatment just below, not
-            // `Violated`'s permanent drop -- a later re-grant (or a later
-            // call with real trust material loaded) can still legitimately
-            // promote this exact row.
-            if writer_check(change.group_id.as_str(), change.device_id.as_str()) != Some(true) {
-                continue;
-            }
-            // Re-verifies `4175e8cd`'s causal-auth-monotonicity invariant
-            // now that every parent is structurally present -- this orphan
-            // may have been buffered specifically because ITS parent
-            // wasn't yet readable at first contact (see `admit_change`'s
-            // own `CausalAuthCheck::Unresolvable`/`Hold`-no-longer-
-            // discards handling), so promotion is the first point this can
-            // actually be checked. `Violated` is permanent and provable:
-            // drop it, same treatment as an invalid parent-group/Lamport
-            // claim below. `Unresolvable` means a parent is structurally
-            // present via a prune with no retained checkpoint-boundary
-            // auth record -- fail closed, leave this orphan buffered for a
-            // later attempt rather than promoting on trust.
-            match super::retained_history_integrity::check_causal_auth_monotonicity_at_promotion(
-                conn, &change,
-            )? {
-                super::retained_history_integrity::CausalAuthCheck::Verified => {}
-                super::retained_history_integrity::CausalAuthCheck::Violated => {
-                    tracing::warn!(
-                        change_hash = %hex::encode(&child_hash_blob),
-                        "dropping a buffered orphan whose authorization coordinate is older than \
-                         its causal parent"
-                    );
-                    drop_orphan_subtree(conn, &child_hash_blob)?;
-                    continue;
-                }
-                super::retained_history_integrity::CausalAuthCheck::Unresolvable => {
-                    continue;
-                }
-            }
             // NOT given the same drop-and-continue treatment as the checks
             // below, deliberately: `validate_referenced_versions`'s
             // `NotFound` cannot currently distinguish "this version will
@@ -239,8 +180,8 @@ pub fn promote_orphans(
             // version-transfer path" (the ordinary, expected, retriable
             // case `admit_change`'s own re-request flow already handles) --
             // treating it as poison here would risk discarding legitimate,
-            // still-pending orphans. Left as a known follow-up requiring
-            // `validate_referenced_versions` to first learn to make that
+            // still-pending orphans. Treating it as poison would first
+            // require `validate_referenced_versions` to make that
             // distinction itself (e.g. a version hash that resolves to a
             // DIFFERENT group is unambiguously foreign/invalid, vs. one
             // absent everywhere).
@@ -270,6 +211,43 @@ pub fn promote_orphans(
                     continue;
                 }
                 Err(error) => return Err(error),
+            }
+            // The full admission verdict -- the history the change was
+            // written on, then its own author's chain -- checked here for
+            // the same reason and in the same position as on the direct
+            // admission path: an orphan's parents are only confirmed
+            // present at this point, and both rules are only meaningful
+            // once they are. Promotion is an admission, so it gets the
+            // identical verdict rather than a relaxed one — the whole
+            // point of a single rule is that a change cannot slip in by
+            // arriving early.
+            //
+            // A refusal is final and specific to this one orphan, so it is
+            // dropped rather than propagated: propagating would roll back
+            // the parent's own just-appended admission. The verdict itself
+            // records the hash as permanently rejected, so a peer that
+            // keeps re-sending a change this replica can never accept
+            // stops being asked for it -- and releases whatever was
+            // waiting on it. The drop below is the same drop repeated for
+            // this one row, kept because it is this loop's own contract
+            // that a refused candidate leaves the buffer here.
+            match super::admission_verdict(conn, &change)? {
+                super::AdmissionVerdict::Admit => {}
+                // Woken by a DAG parent, but still waiting on its own
+                // author's previous change (or the reverse). Left exactly
+                // where it is, with nothing recorded: the row is already
+                // buffered against both names, and whichever of them lands
+                // next wakes it again.
+                super::AdmissionVerdict::AwaitAuthorPredecessor { .. } => continue,
+                super::AdmissionVerdict::Refuse(refusal) => {
+                    tracing::warn!(
+                        change_hash = %hex::encode(&child_hash_blob),
+                        reason = %refusal,
+                        "dropping a buffered orphan admission refuses"
+                    );
+                    drop_orphan_subtree(conn, &child_hash_blob)?;
+                    continue;
+                }
             }
             // Same reasoning as `admit_change`: an orphan's parents are only
             // confirmed present right here, so this is the first point its
@@ -305,10 +283,8 @@ pub fn promote_orphans(
                 }
                 Err(error) => return Err(error),
             }
-            conn.execute(
-                "DELETE FROM orphan_changes WHERE change_hash = ?1",
-                [&child_hash_blob[..]],
-            )?;
+            conn.prepare_cached("DELETE FROM orphan_changes WHERE change_hash = ?1")?
+                .execute([&child_hash_blob[..]])?;
             let real_hash = change.compute_hash();
             if real_hash.0[..] != child_hash_blob[..] {
                 // Stored under a key that disagrees with its own encoded
@@ -318,15 +294,12 @@ pub fn promote_orphans(
                 // keyed by that bogus hash, not the real one `append_change`
                 // is about to use, so they would become permanently
                 // unreachable ghost ancestry once the row above is gone.
-                conn.execute(
-                    "DELETE FROM change_parents WHERE child_hash = ?1",
-                    [&child_hash_blob[..]],
-                )?;
+                conn.prepare_cached("DELETE FROM change_parents WHERE child_hash = ?1")?
+                    .execute([&child_hash_blob[..]])?;
             }
             if super::retained_history_integrity::append_change(
                 conn,
                 &change,
-                applied,
                 super::now_unix_nanos(),
             )? {
                 super::conflict_authoring::record_conflict_copy_ops_provenance(
@@ -334,6 +307,7 @@ pub fn promote_orphans(
                     change.group_id.as_str(),
                     &change,
                 )?;
+                super::recursive_operations::record_recursive_operation_part(conn, &change)?;
                 promoted.push(real_hash);
                 queue.push_back(real_hash);
             }
@@ -342,22 +316,31 @@ pub fn promote_orphans(
     Ok(promoted)
 }
 
-/// The seeds for a startup self-heal pass: every hash that is both durably
-/// admitted and still named as a parent by a buffered orphan. Ordinary
-/// operation always promotes an orphan in the same call that admits its
-/// parent (see `admit_change`'s `seeds` argument), but a crash between those
-/// two steps — or an orphan buffered directly out of band — can leave a
-/// promotable orphan with nothing left to seed a promotion pass. Schema init
-/// calls this once so restart self-heals any such gap; it is not used on the
-/// hot admission path, where the seed is already known from the change that
-/// was just admitted.
+/// The seeds for a startup self-heal pass: every hash that is durably
+/// admitted and still named by a buffered orphan as something it waits on —
+/// a DAG parent, or its own author's previous change. Ordinary operation
+/// always promotes an orphan in the same call that admits what it was
+/// waiting for (see `promote_orphans`'s `seeds` argument), but a crash
+/// between those two steps — or an orphan buffered directly out of band —
+/// can leave a promotable orphan with nothing left to seed a promotion
+/// pass. Schema init calls this once so restart self-heals any such gap; it
+/// is not used on the hot admission path, where the seed is already known
+/// from the change that was just admitted.
+///
+/// Both names have to be swept, not just the parents: a change held only
+/// because its author's previous change had not arrived is reachable
+/// through no parent edge at all, so a parents-only sweep would leave it
+/// buffered forever — and buffered means never re-requested.
 pub(crate) fn already_satisfied_parents(
     conn: &Connection,
 ) -> Result<Vec<ChangeHash>, SyncSqliteError> {
     let mut stmt = conn.prepare(
         "SELECT DISTINCT cp.parent_hash FROM change_parents cp \
          JOIN changes c ON c.change_hash = cp.parent_hash \
-         JOIN orphan_changes o ON o.change_hash = cp.child_hash",
+         JOIN orphan_changes o ON o.change_hash = cp.child_hash \
+         UNION \
+         SELECT DISTINCT o.author_prev_hash FROM orphan_changes o \
+         JOIN changes c ON c.change_hash = o.author_prev_hash",
     )?;
     let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
     let mut out = Vec::new();
@@ -386,7 +369,12 @@ fn drop_orphan_change(conn: &Connection, change_hash: &[u8]) -> Result<(), SyncS
 }
 
 /// Like [`drop_orphan_change`], but also drops every OTHER still-buffered
-/// orphan that (transitively) names `change_hash` as a parent. `change_hash`
+/// orphan that (transitively) names `change_hash` -- as a DAG parent, or as
+/// its own author's previous change. Both names are followed because both
+/// are names a row waits on, and the author link is not implied by the
+/// parent edges: an author's previous change is routinely not an ancestor
+/// of its next one, so a parents-only walk reaches a row waiting on it
+/// never. `change_hash`
 /// itself need not be a buffered orphan -- `admit_change`'s own top-level
 /// causal-auth rejection (a change whose parent was already live, so it was
 /// never buffered at all) calls this too, purely to clean up any
@@ -395,10 +383,11 @@ fn drop_orphan_change(conn: &Connection, change_hash: &[u8]) -> Result<(), SyncS
 /// hash that was never in `orphan_changes` to begin with.
 ///
 /// Every permanent-drop case (corrupt bytes, an invalid parent-group/
-/// Lamport claim, invalid conflict-copy ops, or a causal-auth-monotonicity
-/// violation, in [`promote_orphans`] or in `admit_change`) means
+/// Lamport claim, invalid conflict-copy ops, a causal-auth-monotonicity
+/// violation, or a final admission refusal recorded by
+/// `dag_store::record_final_refusal`) means
 /// `change_hash` can never be promoted -- so any buffered orphan waiting on
-/// it as a parent can never be promoted either, no matter how many times
+/// it can never be promoted either, no matter how many times
 /// its own bytes are re-delivered: it will keep re-evaluating cleanly on
 /// its OWN terms (referenced versions, its own parent shape, its own
 /// causal-auth coordinate) but `has_all_parents` will never see
@@ -416,16 +405,26 @@ pub(crate) fn drop_orphan_subtree(
 ) -> Result<(), SyncSqliteError> {
     let mut queue: std::collections::VecDeque<Vec<u8>> = [change_hash.to_vec()].into();
     while let Some(hash) = queue.pop_front() {
-        let children: Vec<Vec<u8>> = {
+        // Both kinds of dependent, for the same reason `promote_orphans`
+        // wakes both: a buffered row waits on its DAG parents AND on its
+        // author's previous change, and the second is reachable through no
+        // parent edge at all. A parents-only walk would leave a row waiting
+        // on a hash that is now permanently unreachable exactly where it
+        // is -- and buffered means counted as known, so never re-requested
+        // and never asked about again.
+        let dependents: Vec<Vec<u8>> = {
             let mut stmt = conn.prepare(
                 "SELECT cp.child_hash FROM change_parents cp \
                  JOIN orphan_changes o ON o.change_hash = cp.child_hash \
-                 WHERE cp.parent_hash = ?1",
+                 WHERE cp.parent_hash = ?1 \
+                 UNION \
+                 SELECT o.change_hash FROM orphan_changes o \
+                 WHERE o.author_prev_hash = ?1",
             )?;
             let rows = stmt.query_map([&hash[..]], |r| r.get::<_, Vec<u8>>(0))?;
             rows.collect::<Result<_, _>>()?
         };
-        queue.extend(children);
+        queue.extend(dependents);
         drop_orphan_change(conn, &hash)?;
     }
     Ok(())

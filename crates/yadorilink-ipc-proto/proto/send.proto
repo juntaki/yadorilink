@@ -2,19 +2,17 @@ syntax = "proto3";
 package yadorilink.send.v1;
 
 // Track Send's own peer-to-peer wire protocol: a one-shot file
-// send/receive exchanged directly between devices over a
-// `yadorilink-transport::QuicPeerEndpoint` connection that negotiated
-// `YADORILINK_SEND_ALPN`, never the sync protocol's ALPN
-// (`yadorilink.sync.v1`, this file's sibling `sync.proto`). Nothing
-// defined here is admitted into the sync change DAG or read by any sync
-// handler; the two protocols share only the underlying QUIC transport and
-// the same Ed25519 device-identity/authorization model.
+// send/receive exchanged directly between devices over a connection on the
+// device's iroh endpoint that negotiated the ALPN `yadorilink/send/v1`,
+// never the sync protocol's ALPN (`yadorilink/sync/v1`). Nothing defined
+// here is admitted into the sync change DAG or read by any sync handler;
+// the two protocols share only the iroh endpoint (the device's Ed25519 key
+// is its endpoint id) and each has its own admission.
 //
-// Every accepted Track Send connection's first message is one
-// length-prefixed `SendEnvelope`, exactly the framing
-// `yadorilink_transport::block_stream` already uses for the sync
-// protocol's block-request headers -- so the accepting side can tell, from
-// one read, whether this connection is an inbound manifest offer or a
+// Every stream a Track Send connection opens starts with one
+// length-prefixed `SendEnvelope`, the same length-prefix framing the sync
+// protocol uses for its block-request headers -- so the accepting side can
+// tell, from one read, whether the stream is an inbound manifest offer or a
 // chunk pull.
 
 // One file's identity and content layout within a transfer -- ephemeral,

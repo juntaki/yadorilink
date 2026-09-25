@@ -1,10 +1,9 @@
-//! M2-4: proves the EXISTING, platform-neutral local-change pipeline
+//! Proves the EXISTING, platform-neutral local-change pipeline
 //! (`LocalChangeProcessor::scan_existing_files`, the same classification
 //! logic a live filesystem watcher's `process_event` uses for a
 //! `CreatedOrModified` event) correctly handles real Windows CfAPI
-//! placeholders -- no new sync logic, per the M2 roadmap's own M2-4 scope
-//! ("prove the common DAG path already handles Windows
-//! create/modify/delete, expect no code change needed").
+//! placeholders -- no Windows-specific sync logic: the common DAG path
+//! handles Windows create/modify/delete.
 //!
 //! Real, non-mocked: uses `WindowsCfApiBackend` (the same real-`CfAPI`
 //! harness `windows_cfapi_smoke.rs` uses) to create and hydrate an actual
@@ -19,20 +18,16 @@
 //! "construct a real `LocalChangeProcessor` against a real
 //! `ReplicaCoordinator` and assert on what one scan classifies".
 //!
-//! A Codex review of this file's first version caught a false-positive-
-//! proof bug worth recording: `build_record_for_created_or_modified`
-//! (`local_change.rs`) only calls the real `CfGetPlaceholderInfo`-backed
-//! Windows verdict when the row's `materialization_state` is
-//! `Placeholder` -- a row already `Hydrated` never reaches that branch at
-//! all (there is no production scenario where the daemon re-inspects an
-//! already-`Hydrated` row; any write it later observes there is by
-//! definition a real edit). The first version of this file's "hydrated
-//! content is a self-echo" test set `materialization_state: Hydrated`
-//! after hydrating, so it passed on plain byte-comparison alone and would
-//! have kept passing even if the real Windows verdict function were
-//! broken or never called. Fixed: both the self-echo and the
-//! post-hydration-edit tests below now leave the row `Placeholder` after
-//! the real `hydrate` call -- the actual scenario M2-2's Windows dirty
+//! The self-echo and post-hydration-edit tests below deliberately leave the
+//! row `Placeholder` after the real `hydrate` call.
+//! `build_record_for_created_or_modified` (`local_change.rs`) only calls the
+//! real `CfGetPlaceholderInfo`-backed Windows verdict when the row's
+//! `materialization_state` is `Placeholder` -- a row already `Hydrated`
+//! never reaches that branch (there is no production scenario where the
+//! daemon re-inspects an already-`Hydrated` row; any write it later
+//! observes there is by definition a real edit). A `Hydrated` row would let
+//! these tests pass on plain byte comparison even if the Windows verdict
+//! were never called. `Placeholder` is the actual scenario Windows dirty
 //! detection exists for (Explorer's own `FETCH_DATA` populating a
 //! placeholder's content while the daemon has not yet observed/committed
 //! a `Hydrated` transition for it), which genuinely exercises
@@ -41,12 +36,12 @@
 //! This is a steady-state classification proof, not a proof that the
 //! cross-process create/persist-generation/converge transition itself is
 //! race- or crash-safe -- production mints and persists a generation
-//! BEFORE `cfapi-host` creates the real placeholder (M2-3a), the reverse
+//! BEFORE `cfapi-host` creates the real placeholder, the reverse
 //! order this file's `index_placeholder_row` helper uses (real disk
 //! object first, index second, since this test drives `WindowsCfApiBackend`
 //! in-process rather than through the real daemon<->cfapi-host poll
-//! loop). That transition window is Pass 1/M2-3a's and M2-3c's own
-//! concern, not this file's.
+//! loop). That transition window is covered by the cfapi-host
+//! placeholder-creation path, not this file.
 #![cfg(windows)]
 
 use std::sync::Arc;
@@ -55,7 +50,7 @@ use yadorilink_daemon::placeholder_backend_windows::WindowsCfApiBackend;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_filesystem_sync::placeholder_backend::PlaceholderBackend;
 use yadorilink_local_storage::{
-    BlockStore, FsBlockStore, PlaceholderDiskIdentity, WINDOWS_CFAPI_GENERATION_PROVIDER_KIND,
+    BlockStore, PlaceholderDiskIdentity, SegmentBlockStore, WINDOWS_CFAPI_GENERATION_PROVIDER_KIND,
 };
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
 use yadorilink_replica_domain::session_state::MaterializationState;
@@ -81,14 +76,14 @@ fn adopt_root(state: &ReplicaCoordinator, group: &str, root: &std::path::Path) {
 /// placeholder identity (the same `(dev=0, ino=generation)` encoding
 /// `WINDOWS_CFAPI_GENERATION_PROVIDER_KIND` uses -- see
 /// `yadorilink_local_storage::materialize_write`'s own doc), and sets
-/// `materialization_state`. This mirrors what M2-3a's production path
+/// `materialization_state`. This mirrors what the production path
 /// (daemon mints, cfapi-host creates, poll converges) eventually leaves
 /// the index holding -- reproduced directly here since this test drives
 /// `WindowsCfApiBackend` in-process rather than through the real
 /// cross-process poll loop.
 fn index_placeholder_row(
     state: &ReplicaCoordinator,
-    store: &FsBlockStore,
+    store: &SegmentBlockStore,
     group: &str,
     path: &str,
     content: &[u8],
@@ -129,7 +124,7 @@ fn index_placeholder_row(
 
 fn processor(
     state: Arc<ReplicaCoordinator>,
-    store: Arc<FsBlockStore>,
+    store: Arc<SegmentBlockStore>,
 ) -> yadorilink_local_capture::LocalChangeProcessor {
     yadorilink_local_capture::LocalChangeProcessor::new(
         state,
@@ -139,7 +134,7 @@ fn processor(
     )
 }
 
-/// The core M2-4 property: a real `CfCreatePlaceholders` + real `hydrate`
+/// The core property: a real `CfCreatePlaceholders` + real `hydrate`
 /// (provider-populated, not `std::fs::write`) round trip, observed while
 /// the row is still `Placeholder` (the actual self-echo window -- see
 /// this file's own top-level doc comment), must be classified as an
@@ -151,7 +146,7 @@ fn processor(
 #[test]
 fn hydrated_placeholder_content_is_recognized_as_self_echo_not_a_local_edit() {
     let block_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsBlockStore::new(block_dir.path()).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(block_dir.path()).unwrap());
     let state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
     let root = unique_temp_root();
     adopt_root(&state, "group-1", &root);
@@ -210,7 +205,7 @@ fn hydrated_placeholder_content_is_recognized_as_self_echo_not_a_local_edit() {
 #[test]
 fn a_real_local_edit_after_hydration_is_still_captured() {
     let block_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsBlockStore::new(block_dir.path()).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(block_dir.path()).unwrap());
     let state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
     let root = unique_temp_root();
     adopt_root(&state, "group-1", &root);
@@ -240,7 +235,7 @@ fn a_real_local_edit_after_hydration_is_still_captured() {
 
     // A genuine local edit, same length as the original content -- the
     // exact case a size/mtime-only heuristic would miss, which is why
-    // M2-2 replaced it with a live CfAPI in-sync query on Windows. This
+    // Windows uses a live CfAPI in-sync query instead. This
     // real write clears CfAPI's in-sync bit, so `CfGetPlaceholderInfo`
     // now genuinely reports `Dirty`.
     std::fs::write(&placeholder_path, b"a real local edit!!!!!!!!").unwrap();
@@ -262,8 +257,7 @@ fn a_real_local_edit_after_hydration_is_still_captured() {
     }
 }
 
-/// M2-4's "delete" case, absent from this file's first version (a Codex
-/// review finding): a locally deleted, previously-hydrated placeholder
+/// The "delete" case: a locally deleted, previously-hydrated placeholder
 /// must be tombstoned (`FileRecord.deleted == true`) by the SAME
 /// `scan_existing_files` reconciliation pass -- `ReconcileMode::Full {
 /// emit_tombstones: true }`, `scan_existing_files`'s default -- a live
@@ -271,7 +265,7 @@ fn a_real_local_edit_after_hydration_is_still_captured() {
 #[test]
 fn a_locally_deleted_hydrated_placeholder_is_tombstoned() {
     let block_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsBlockStore::new(block_dir.path()).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(block_dir.path()).unwrap());
     let state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
     let root = unique_temp_root();
     adopt_root(&state, "group-1", &root);
@@ -325,7 +319,7 @@ fn a_locally_deleted_hydrated_placeholder_is_tombstoned() {
 #[test]
 fn a_freshly_created_unhydrated_placeholder_is_recognized_as_untouched() {
     let block_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsBlockStore::new(block_dir.path()).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(block_dir.path()).unwrap());
     let state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
     let root = unique_temp_root();
     adopt_root(&state, "group-1", &root);
@@ -371,7 +365,7 @@ fn a_freshly_created_unhydrated_placeholder_is_recognized_as_untouched() {
 #[test]
 fn an_ordinary_new_file_with_no_placeholder_history_is_captured_normally() {
     let block_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsBlockStore::new(block_dir.path()).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(block_dir.path()).unwrap());
     let state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
     let root = unique_temp_root();
     adopt_root(&state, "group-1", &root);

@@ -1,33 +1,22 @@
-//! DAG/index-mutation logic extracted out of `yadorilink-sync-core`'s
-//! `peer_session.rs` wire handlers -- responsibilities that are true
-//! regardless of which peer sent the message, as opposed to
-//! `PeerSyncSession`'s own protocol decode/admission/correlation state.
-
-use std::collections::HashSet;
-use std::collections::VecDeque;
-
-use yadorilink_replica_domain::change::{Change, ChangeAuth};
+use yadorilink_replica_domain::change::Change;
 use yadorilink_replica_domain::file::FileVersion;
 use yadorilink_replica_domain::ids::{ChangeHash, DeviceId, FolderGroupId, VersionHash};
+use yadorilink_replica_domain::session_state::RootSetSummary;
 
 use crate::change_ops;
 use crate::error::AdmissionStoreError;
 use crate::error::ReplicaEngineError;
 use crate::outcomes::{
-    AdmittedChange, CausalAuthOutcome, ChangeAdmissionOutcome, ChangeAdmissionRejection,
-    CustodyEvaluation, CustodyWarning, FrontierEvaluation, FrontierRecordWarning,
+    AdmittedChange, ChangeAdmissionOutcome, ChangeAdmissionRejection, CustodyEvaluation,
+    CustodyWarning, FrontierEvaluation, FrontierRecordWarning,
 };
 use crate::ports::{AdmissionStoreOutcome, DurabilityRoot, ReplicaRetentionPolicy};
 use crate::ReplicaEngineDependencies;
 
-/// `(encoded file versions, their hashes)`, parallel by index -- see
-/// `new_file_versions_for_change`'s own doc comment.
-type NewFileVersions = (Vec<Vec<u8>>, Vec<[u8; 32]>);
-
-/// Domain-level equivalent of `proto::VersionPresentQuery`, holding only the
-/// fields `PeerReplicaEngine::holds_version_durably` actually needs.
-/// `request_id` stays on the caller's side (needed only to build the wire
-/// reply, never read by this check).
+/// Domain-level equivalent of the wire's `VersionPresent` service request
+/// (`yadorilink_peer_session::service_rpc::ServiceRequest::VersionPresent`),
+/// holding only the fields `PeerReplicaEngine::holds_version_durably`
+/// actually needs.
 pub struct DurableVersionQuery {
     pub folder_group_id: String,
     pub file_path: String,
@@ -59,320 +48,6 @@ pub struct PeerReplicaEngine {
 impl PeerReplicaEngine {
     pub fn new(deps: ReplicaEngineDependencies) -> Self {
         Self { deps }
-    }
-
-    /// Iterative post-order walk of `hash`'s retained ancestry via the
-    /// `parents_of` port, appending newly-discovered hashes to `ordered` in
-    /// oldest-first (every parent before its children) order, `hash` itself
-    /// last. Iterative rather than recursive so a genuinely deep
-    /// single-branch history cannot blow the stack.
-    fn collect_ancestor_closure(
-        &self,
-        root: &ChangeHash,
-        seen: &mut HashSet<[u8; 32]>,
-        ordered: &mut Vec<ChangeHash>,
-    ) -> Result<(), ReplicaEngineError> {
-        enum Frame {
-            Discover(ChangeHash),
-            Emit(ChangeHash),
-        }
-        if seen.contains(&root.0) {
-            return Ok(());
-        }
-        let mut stack = vec![Frame::Discover(*root)];
-        while let Some(frame) = stack.pop() {
-            match frame {
-                Frame::Discover(hash) => {
-                    if !seen.insert(hash.0) {
-                        continue;
-                    }
-                    stack.push(Frame::Emit(hash));
-                    for parent in self.deps.history.parents_of(&hash)? {
-                        stack.push(Frame::Discover(parent));
-                    }
-                }
-                Frame::Emit(hash) => ordered.push(hash),
-            }
-        }
-        Ok(())
-    }
-
-    /// The canonical encodings of every file version one change's content ops
-    /// reference that `already_carried` does not already cover, plus their
-    /// hashes so an accepting caller can fold them into its own carried set. A
-    /// version this device does not hold is simply omitted -- the change still
-    /// transfers, and the receiver holds it until a batch carries the version
-    /// too.
-    ///
-    /// Resolved one change at a time, rather than for a whole page at once, so
-    /// page assembly can bound a page by BYTES: the budget has to know a
-    /// change's marginal version bytes *before* deciding to include it.
-    fn new_file_versions_for_change(
-        &self,
-        group_id: &FolderGroupId,
-        encoded_change: &[u8],
-        already_carried: &HashSet<[u8; 32]>,
-    ) -> Result<NewFileVersions, ReplicaEngineError> {
-        let Ok(change) = Change::from_wire_bytes(encoded_change) else {
-            return Ok((Vec::new(), Vec::new()));
-        };
-        let mut added: HashSet<[u8; 32]> = HashSet::new();
-        let mut encodings: Vec<Vec<u8>> = Vec::new();
-        let mut hashes: Vec<[u8; 32]> = Vec::new();
-        for op in &change.ops {
-            let Some(version_hash) = change_ops::op_version_hash(op) else {
-                continue;
-            };
-            if already_carried.contains(&version_hash.0) || !added.insert(version_hash.0) {
-                continue;
-            }
-            if let Some(version) = self.deps.history.file_version(group_id, &version_hash)? {
-                encodings.push(version.canonical_encoding());
-                hashes.push(version_hash.0);
-            }
-        }
-        Ok((encodings, hashes))
-    }
-
-    /// One BFS layer of `frontier`: replaces it with the not-yet-`seen`
-    /// parents of its current contents, marking each newly-seen, and
-    /// returns exactly those newly-discovered hashes so a caller can check
-    /// them against the OTHER side's own seen set.
-    fn expand_layer(
-        &self,
-        frontier: &mut VecDeque<ChangeHash>,
-        seen: &mut HashSet<[u8; 32]>,
-    ) -> Result<Vec<ChangeHash>, ReplicaEngineError> {
-        let current: Vec<ChangeHash> = frontier.drain(..).collect();
-        let mut discovered = Vec::new();
-        for hash in current {
-            for parent in self.deps.history.parents_of(&hash)? {
-                if seen.insert(parent.0) {
-                    discovered.push(parent);
-                }
-            }
-        }
-        frontier.extend(discovered.iter().copied());
-        Ok(discovered)
-    }
-
-    /// Discovers enough of `recognized_reachable(have_heads)` to correctly
-    /// bound the `want_heads` walk in `changes_for_request`, without
-    /// walking either side's full ancestry when `want_heads` and
-    /// `have_heads` are actually close together in the causal graph.
-    ///
-    /// Alternates expanding one BFS layer of the `want` side and one of the
-    /// `have` side, stopping the instant either side's newly-discovered
-    /// hashes intersect what the OTHER side has already seen -- at that
-    /// point every hash between `want_heads`/`have_heads` and the found
-    /// boundary is already recorded, which is all `changes_for_request`'s
-    /// own closure walk (seeded with this method's result) needs to stop
-    /// at the right place. If one side's frontier empties first (its
-    /// entire reachable set turned out smaller than the other's), that
-    /// side's full reachable set is now known and the other side's walk
-    /// continues alone until it also empties or an intersection is found.
-    ///
-    /// Only a hash this device can confirm is live (`self.deps.history.
-    /// change(..).is_some()`) ever seeds the `have` side -- an unrecognized
-    /// `have_heads` entry never narrows the result (see `changes_for_
-    /// request`'s own doc comment for why).
-    fn recognized_have_boundary(
-        &self,
-        want_heads: &[ChangeHash],
-        have_heads: &[ChangeHash],
-    ) -> Result<HashSet<[u8; 32]>, ReplicaEngineError> {
-        // `*_seen` is populated FIRST, in full, before any frontier
-        // decision below -- both because the return value (`have_seen`)
-        // must include every recognized `have_heads` hash regardless of
-        // whether it ever gets expanded, and because deciding what to
-        // QUEUE for expansion needs the complete opposite-side set already
-        // built (see the frontier-seeding comment below).
-        let mut want_seen: HashSet<[u8; 32]> = HashSet::new();
-        let mut have_seen: HashSet<[u8; 32]> = HashSet::new();
-        for want in want_heads {
-            want_seen.insert(want.0);
-        }
-        for have in have_heads {
-            if self.deps.history.change(have)?.is_some() {
-                have_seen.insert(have.0);
-            }
-        }
-
-        // Phase E finding, first pass: a blanket early return used to fire
-        // here on ANY want/have overlap across the WHOLE sets -- correct
-        // for the common single-head "already fully caught up" case, but
-        // wrong for a multi-head request where one head is already caught
-        // up while ANOTHER genuinely diverges deep in shared history: it
-        // returned `have_seen` as just the raw recognized `have_heads`
-        // hashes, skipping the bidirectional search below entirely, so the
-        // still-diverging head's later `collect_ancestor_closure` walk
-        // could only stop at a literal `have_heads` hash instead of its
-        // true (possibly much closer) shared ancestor.
-        //
-        // Phase E finding, second pass (a Codex review's finding on the
-        // first pass's fix): simply removing the shortcut and queueing
-        // EVERY head for expansion is not enough on its own. A head that
-        // is ALREADY directly resolved by an exact want/have match (like
-        // `branch1_tip` above) still had its own ancestry queued and
-        // expanded alongside the genuinely-diverging heads, in the SAME
-        // merged frontier/layer -- and the loop below stops the ENTIRE
-        // search the instant ANY newly-discovered hash matches the other
-        // side, regardless of WHICH head produced it. If the already-
-        // matched head has any ancestry of its own that the other side's
-        // search also reaches, that shallow, already-irrelevant
-        // intersection can trigger the `break` before the genuinely-
-        // diverging heads' own search has gone deep enough to find THEIR
-        // true shared ancestor -- silently reintroducing the same
-        // resource-shape violation the first-pass fix was meant to close,
-        // just one layer later instead of immediately.
-        //
-        // The fix: a head that is already trivially resolved (its exact
-        // hash appears on the opposite side) contributes NOTHING to
-        // expand -- its own boundary is already known (itself), and
-        // expanding its ancestry only risks contaminating the search for
-        // OTHER heads. Only a head genuinely absent from the opposite
-        // side's `*_seen` is queued at all.
-        let mut want_frontier: VecDeque<ChangeHash> = VecDeque::new();
-        let mut want_queued: HashSet<[u8; 32]> = HashSet::new();
-        for want in want_heads {
-            if !have_seen.contains(&want.0) && want_queued.insert(want.0) {
-                want_frontier.push_back(*want);
-            }
-        }
-        let mut have_frontier: VecDeque<ChangeHash> = VecDeque::new();
-        let mut have_queued: HashSet<[u8; 32]> = HashSet::new();
-        for have in have_heads {
-            if have_seen.contains(&have.0)
-                && !want_seen.contains(&have.0)
-                && have_queued.insert(have.0)
-            {
-                have_frontier.push_back(*have);
-            }
-        }
-        let mut want_turn = true;
-        while !want_frontier.is_empty() || !have_frontier.is_empty() {
-            if want_turn {
-                if !want_frontier.is_empty() {
-                    let discovered = self.expand_layer(&mut want_frontier, &mut want_seen)?;
-                    if discovered.iter().any(|hash| have_seen.contains(&hash.0)) {
-                        break;
-                    }
-                }
-            } else if !have_frontier.is_empty() {
-                let discovered = self.expand_layer(&mut have_frontier, &mut have_seen)?;
-                if discovered.iter().any(|hash| want_seen.contains(&hash.0)) {
-                    break;
-                }
-            }
-            want_turn = !want_turn;
-        }
-        Ok(have_seen)
-    }
-
-    /// Computes `reachable(want_heads) - recognized_reachable(have_heads)`
-    /// and delivers it as bounded, oldest-first pages of at most
-    /// `max_changes_per_batch` changes each -- the delta is computed
-    /// exactly once; the page cap only bounds how it is split for the
-    /// wire, never how much of history is re-walked. Returns an empty
-    /// `Vec` when there is nothing to send.
-    ///
-    /// `recognized_have_boundary` discovers the exclusion boundary via a
-    /// bidirectional search bounded by how close `want_heads` and
-    /// `have_heads` actually are, so a small divergence over a deep shared
-    /// history costs work proportional to the divergence, not to either
-    /// side's full depth -- the actual closure walk below only re-visits
-    /// what that search already discovered was needed.
-    ///
-    /// `have_heads` is untrusted peer input: a claimed `have` hash only
-    /// narrows the delta if this device *recognizes* it (a live row in
-    /// `changes`, checked via `self.deps.history.change`). An unrecognized
-    /// hash -- unknown, stale, or spoofed -- is not walked at all and so
-    /// contributes nothing to the exclusion set; this can only make the
-    /// sender include more history than strictly necessary, never omit
-    /// history the requester still needs. Recognizing a pruned/checkpointed
-    /// (non-live) `have` boundary as excludable too is a possible future
-    /// refinement, not attempted here -- today "recognized" is exactly
-    /// "live."
-    ///
-    /// Termination for a delta longer than `max_changes_per_batch` does
-    /// not depend on forcing the requested tip into every page: oldest-
-    /// first pagination guarantees every page's causal parents already
-    /// arrived in an earlier page, so the final page -- which always
-    /// contains every `want_heads` entry, since `collect_ancestor_closure`
-    /// appends each root last -- is reached by construction, not by
-    /// reservation.
-    pub fn changes_for_request(
-        &self,
-        group_id: &FolderGroupId,
-        want_heads: &[ChangeHash],
-        have_heads: &[ChangeHash],
-        max_changes_per_batch: usize,
-    ) -> Result<Vec<AntiEntropyPage>, ReplicaEngineError> {
-        let boundary = self.recognized_have_boundary(want_heads, have_heads)?;
-
-        let mut seen = boundary;
-        let mut ordered: Vec<ChangeHash> = Vec::new();
-        for want in want_heads {
-            self.collect_ancestor_closure(want, &mut seen, &mut ordered)?;
-        }
-
-        if ordered.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let page_size = max_changes_per_batch.max(1);
-        // Pages are filled greedily under BOTH bounds: at most `page_size`
-        // changes, and at most `MAX_ANTI_ENTROPY_PAGE_BYTES` of encoded
-        // payload including the file versions those changes reference (the
-        // versions ride in the same wire frame, so leaving them out of the
-        // budget would not bound the frame at all). A change that does not fit
-        // the remaining budget starts the next page instead of being dropped;
-        // a page always takes at least one change, so an over-budget change on
-        // its own can never wedge the loop.
-        let mut pages: Vec<AntiEntropyPage> = Vec::new();
-        let mut index = 0usize;
-        while index < ordered.len() {
-            let mut changes: Vec<Vec<u8>> = Vec::new();
-            let mut file_versions: Vec<Vec<u8>> = Vec::new();
-            let mut seen_versions: HashSet<[u8; 32]> = HashSet::new();
-            let mut page_bytes = 0usize;
-            while index < ordered.len() && changes.len() < page_size {
-                let Some(encoded) = self.deps.history.encoded_change(&ordered[index])? else {
-                    // Not retained any more: it contributes nothing to this
-                    // page and must not stall the walk.
-                    index += 1;
-                    continue;
-                };
-                // Resolve this change's own not-yet-carried versions before
-                // committing to it, so the fit test sees the real bytes it
-                // would add. Nothing is folded into the page's own
-                // `seen_versions`/`file_versions` until the change is
-                // accepted, so a change deferred to the next page leaves no
-                // trace here.
-                let (added_versions, added_version_hashes) =
-                    self.new_file_versions_for_change(group_id, &encoded, &seen_versions)?;
-                let added_bytes =
-                    encoded.len() + added_versions.iter().map(Vec::len).sum::<usize>();
-                if !changes.is_empty()
-                    && page_bytes.saturating_add(added_bytes)
-                        > yadorilink_replica_domain::change::MAX_ANTI_ENTROPY_PAGE_BYTES
-                {
-                    break;
-                }
-                page_bytes = page_bytes.saturating_add(added_bytes);
-                changes.push(encoded);
-                file_versions.extend(added_versions);
-                seen_versions.extend(added_version_hashes);
-                index += 1;
-            }
-            pages.push(AntiEntropyPage { changes, file_versions, more: false });
-        }
-        if let Some(last) = pages.len().checked_sub(1) {
-            for page in pages.iter_mut().take(last) {
-                page.more = true;
-            }
-        }
-        Ok(pages)
     }
 
     /// Records the peer's announced heads as its acknowledged frontier for
@@ -494,63 +169,35 @@ impl PeerReplicaEngine {
         CustodyEvaluation { present, warning: None }
     }
 
-    /// Checks that `change`'s pinned `auth_seq`/`auth_epoch` is
-    /// non-decreasing along causal order relative to its DAG parents --
-    /// closes a revoked-writer replay attack: a device revoked at policy
-    /// seq N, still holding its signing key, could otherwise craft a new
-    /// change stamped with an older grant seq M < N and have it admitted.
-    /// A PLACEHOLDER stamp is exempt (genuine pre-policy bootstrap).
+    /// This device's own durable state for a group, reduced to two digests
+    /// and two counts — the answer to a background health question, not to a
+    /// custody question.
     ///
-    /// This is an OPTIMISTIC fast-path, not the sole enforcement point: a
-    /// parent whose pinned coordinate can't be read LIVE returns `Hold`,
-    /// which the caller must treat as "proceed to admission anyway" (not
-    /// "discard") -- `yadorilink-sync-sqlite::dag_store`'s own admission/
-    /// promotion path (`check_causal_auth_monotonicity_at_promotion`)
-    /// re-verifies this exact invariant once every parent's coordinate is
-    /// actually resolvable (live or pruned), which is the real, permanent
-    /// enforcement point. See that function's own doc comment for why
-    /// discarding on `Hold` (the old behavior) turned a cold catch-up
-    /// beyond the wire batch cap into an unnecessary one-hop-per-round
-    /// staircase.
-    pub fn check_causal_auth_monotonicity(
-        &self,
-        change: &Change,
-    ) -> Result<CausalAuthOutcome, ReplicaEngineError> {
-        let incoming_auth = ChangeAuth {
-            auth_seq: change.auth_seq,
-            auth_epoch: change.auth_epoch,
-            policy_head_hash: change.policy_head_hash,
-        };
-        if incoming_auth == ChangeAuth::PLACEHOLDER {
-            return Ok(CausalAuthOutcome::Exempt);
+    /// Deliberately shaped so that the two cannot be confused at the call
+    /// site either. [`Self::holds_version_durably`] returns a
+    /// `CustodyEvaluation`, is per version, and reaches step 6; this returns
+    /// a summary, is per group, and touches no block at all. What a peer
+    /// learns from comparing this against its own is that two indexes list
+    /// the same versions — which is worth knowing every ninety seconds, and
+    /// is not grounds for anyone to drop a copy of anything.
+    ///
+    /// `None` is a refusal, and the refusals are deliberately
+    /// indistinguishable to the asker:
+    ///
+    /// 1. this device is not `Eager` for the group — the same first check
+    ///    `holds_version_durably` makes, and for the same reason: an
+    ///    on-demand device may evict at any moment, so its agreement is not
+    ///    a durability claim;
+    /// 2. the index could not be read, which fails closed like every other
+    ///    unreadable-state path here.
+    pub fn root_set_summary(&self, group: &FolderGroupId) -> Option<RootSetSummary> {
+        if !matches!(
+            self.deps.durability.retention_policy(group),
+            Ok(Some(ReplicaRetentionPolicy::Eager))
+        ) {
+            return None;
         }
-        let mut max_parent_seq = 0u64;
-        let mut max_parent_epoch = 0u64;
-        let mut parent_pin_unreadable = false;
-        for parent in &change.parents {
-            match self.deps.history.change(parent) {
-                Ok(Some(parent_change)) => {
-                    max_parent_seq = max_parent_seq.max(parent_change.auth_seq);
-                    max_parent_epoch = max_parent_epoch.max(parent_change.auth_epoch);
-                }
-                Ok(None) | Err(_) => {
-                    parent_pin_unreadable = true;
-                    break;
-                }
-            }
-        }
-        if parent_pin_unreadable {
-            return Ok(CausalAuthOutcome::Hold);
-        }
-        if change.auth_seq < max_parent_seq || change.auth_epoch < max_parent_epoch {
-            return Ok(CausalAuthOutcome::Rejected {
-                auth_seq: change.auth_seq,
-                auth_epoch: change.auth_epoch,
-                max_parent_auth_seq: max_parent_seq,
-                max_parent_auth_epoch: max_parent_epoch,
-            });
-        }
-        Ok(CausalAuthOutcome::Accepted)
+        self.deps.durability.root_set_summary(group).ok()
     }
 
     /// Returns the hash of the first referenced file version this device
@@ -575,18 +222,23 @@ impl PeerReplicaEngine {
         Ok(None)
     }
 
-    /// Admits an already-authenticated, causally-monotonic change into the
-    /// DAG as durable-but-not-yet-projected. On success, folds in the paths
-    /// of EVERY change that became durable as a result -- `change` itself
-    /// AND any orphan its arrival unblocked.
+    /// Admits an already-authenticated change into the DAG as
+    /// durable-but-not-yet-projected. On success, folds in the paths of
+    /// EVERY change that became durable as a result -- `change` itself AND
+    /// any orphan its arrival unblocked.
     pub fn admit_authenticated_change(
         &self,
         change: &Change,
         claimed_hash: ChangeHash,
         referenced_versions: &[FileVersion],
+        evidence: &crate::ports::ChangeEvidence,
     ) -> Result<ChangeAdmissionOutcome, ReplicaEngineError> {
-        let mut outcomes =
-            self.admit_authenticated_change_batch(&[(change, claimed_hash, referenced_versions)])?;
+        let mut outcomes = self.admit_authenticated_change_batch(&[(
+            change,
+            claimed_hash,
+            referenced_versions,
+            evidence,
+        )])?;
         Ok(outcomes.remove(0))
     }
 
@@ -607,13 +259,17 @@ impl PeerReplicaEngine {
     /// worth of admission work preceded it in one writer_gate hold.
     pub fn admit_authenticated_change_batch(
         &self,
-        items: &[(&Change, ChangeHash, &[FileVersion])],
+        items: &[(&Change, ChangeHash, &[FileVersion], &crate::ports::ChangeEvidence)],
     ) -> Result<Vec<ChangeAdmissionOutcome>, ReplicaEngineError> {
-        let port_items: Vec<(&Change, &[FileVersion])> =
-            items.iter().map(|(change, _hash, versions)| (*change, *versions)).collect();
+        let port_items: Vec<(&Change, &[FileVersion], &crate::ports::ChangeEvidence)> = items
+            .iter()
+            .map(|(change, _hash, versions, evidence)| (*change, *versions, *evidence))
+            .collect();
         let admission_results = self.deps.admission.admit_unprojected_change_batch(&port_items);
         let mut outcomes = Vec::with_capacity(items.len());
-        for ((change, claimed_hash, _versions), result) in items.iter().zip(admission_results) {
+        for ((change, claimed_hash, _versions, _evidence), result) in
+            items.iter().zip(admission_results)
+        {
             let outcome = match result {
                 Err(AdmissionStoreError::ReservedNamespaceCollision { path }) => {
                     ChangeAdmissionOutcome::Rejected {
@@ -657,6 +313,31 @@ impl PeerReplicaEngine {
                             self.deps.history.missing_ancestor_frontier(&[*claimed_hash])?;
                         ChangeAdmissionOutcome::Orphaned { missing_parents }
                     }
+                    // Deliberately not `Orphaned`: there is no ancestry to
+                    // ask for. The author's own chain refuses this Change,
+                    // and nothing a peer could send afterwards changes that.
+                    AdmissionStoreOutcome::RefusedAuthorChain { reason } => {
+                        ChangeAdmissionOutcome::Rejected {
+                            reason: ChangeAdmissionRejection::AuthorChainRefused { reason },
+                        }
+                    }
+                    // Deliberately not `Orphaned` either, and for a
+                    // stronger reason: this Change's ancestry is complete
+                    // in a history this replica does not have, so asking
+                    // for more of it would ask for that whole history.
+                    AdmissionStoreOutcome::RefusedForeignHistoryBase { reason } => {
+                        ChangeAdmissionOutcome::Rejected {
+                            reason: ChangeAdmissionRejection::ForeignHistoryBase { reason },
+                        }
+                    }
+                    // Not `Orphaned`: the parent it lacks is refused here,
+                    // so asking a peer for it would ask for something this
+                    // replica has already decided never to hold.
+                    AdmissionStoreOutcome::RefusedBehindRejectedParent { reason } => {
+                        ChangeAdmissionOutcome::Rejected {
+                            reason: ChangeAdmissionRejection::BehindRejectedParent { reason },
+                        }
+                    }
                 },
             };
             outcomes.push(outcome);
@@ -676,6 +357,3 @@ impl PeerReplicaEngine {
         self.deps.frontier.record_acknowledged_frontier(group_id, local_device_id, &heads)
     }
 }
-
-#[cfg(test)]
-mod tests;

@@ -1,43 +1,10 @@
-//! Originally relocated from `materialization.rs`'s own internal `#[cfg(test)]
-//! mod tests` in Phase 7D-8.6 (`LocalChangeProcessor`'s move to
-//! `yadorilink-local-capture`), then moved again from
-//! `yadorilink-sync-core/tests/` to this crate's own `tests/` in Phase
-//! 7D-10.4 (real test migration) — its subject is `LocalChangeProcessor`'s
-//! scan behavior at the seam right after a repair, so it belongs beside the
-//! crate that owns `LocalChangeProcessor`, not the crate that used to host
-//! its fixtures.
-//!
 //! This is the one materialization test that constructs a real
-//! `LocalChangeProcessor` (per the phase 7D-8 ledger's own consumer survey,
-//! `materialization.rs`'s test module had exactly one such fixture). It
-//! cannot be an internal `yadorilink-local-capture` unit test for the same
-//! type-identity reason `86efa7e1`'s `peer_session.rs` relocation and this
-//! file's own prior sync-core-hosted incarnation needed to be external: a
-//! value built *inside* an internal `#[cfg(test)]` module cannot coerce to
-//! `Arc<dyn LocalMutationStore>`/`&dyn MaterializationExecutionPort` across a
-//! different compilation of the crate that implements the trait than the one
-//! this file itself links against. An external integration test links
-//! `yadorilink-daemon` (which owns `ReplicaCoordinator`'s port impls) as an
-//! ordinary dev-dependency, the same build this crate's own library code
-//! sees, so the coercion is sound here.
-//!
-//! Phase 7D-10 (sync-core deletion): repointed from `yadorilink_sync_core::
-//! index::SyncState` to `yadorilink_daemon::replica_coordinator::
-//! ReplicaCoordinator`, this crate's own dev-only back-edge onto
-//! `yadorilink-daemon` (mirrors `local_change.rs`'s own tests, repointed the
-//! same way).
-//!
-//! `repair_interrupted_materializations` itself is `yadorilink-filesystem-sync`-owned
-//! (reached here through `yadorilink-sync-core`'s re-export shim, the same
-//! path this crate's own production code already uses for
-//! `debounce`/`watcher`) — this test's real subject is the boundary right
-//! after that repair, not the repair implementation itself: it asserts that
-//! `LocalChangeProcessor::scan_existing_files` treats the repaired file as a
-//! self-echo and neither propagates nor corrects a dropped exec bit. That
-//! assertion is about `LocalChangeProcessor`'s behavior, so this crate is its
-//! home, not `yadorilink-filesystem-sync`.
-//!
-//! The three tiny private helpers this test used
+//! `LocalChangeProcessor`. An external integration test links `yadorilink-daemon` (which
+//! owns `ReplicaCoordinator`'s port impls) as an ordinary dev-dependency,
+//! the same build this crate's own library code sees, so the coercion is
+//! sound here. That assertion is about `LocalChangeProcessor`'s behavior,
+//! so this crate is its home, not `yadorilink-filesystem-sync`. The three
+//! tiny private helpers this test used
 //! (`materialization.rs::tests::{adopt_root, crashed_executable,
 //! disk_unix_mode}`) are not `pub`, so they are reproduced here directly
 //! rather than widened — each is a few lines with no logic of its own
@@ -51,7 +18,7 @@ use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_filesystem_sync::materialization_repair::{
     repair_interrupted_materializations, RepairMode,
 };
-use yadorilink_local_storage::{BlockStore, FsBlockStore};
+use yadorilink_local_storage::{BlockStore, SegmentBlockStore};
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
 use yadorilink_replica_domain::session_state::MaterializationState;
 use yadorilink_root_authority::root_commit::{RootCommitPermit, RootLease};
@@ -77,7 +44,7 @@ fn record_with_blocks(path: &str, content: &[u8], hash: Vec<u8>) -> FileRecord {
 /// mid-write leaves behind — the exact state repair reconstructs from.
 fn crashed_executable(
     state: &ReplicaCoordinator,
-    store: &FsBlockStore,
+    store: &SegmentBlockStore,
     path: &str,
     content: &[u8],
 ) {
@@ -138,7 +105,7 @@ fn disk_unix_mode(path: &std::path::Path) -> bool {
 #[test]
 fn repair_leaves_disk_unix_mode_agreeing_with_the_index_across_a_scan() {
     let block_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsBlockStore::new(block_dir.path()).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(block_dir.path()).unwrap());
     let state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
     let root = tempfile::tempdir().unwrap();
     adopt_root(&state, "group-1", root.path());

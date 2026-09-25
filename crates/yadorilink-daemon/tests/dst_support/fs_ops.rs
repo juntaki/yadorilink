@@ -5,14 +5,13 @@
 //!
 //! These are meant to be the *only* way a migrated scenario touches its
 //! tempdir: `stamp-on-every-mutation` is enforced by construction here
-//! rather than left as a per-call reviewer convention (the pre-migration
-//! state, where each scenario carried its own `stamp_deterministic_mtime`
-//! and a forgotten call silently produced a real-clock mtime).
+//! rather than left as a per-call convention, where a forgotten stamp would
+//! silently produce a real-clock mtime.
 //!
 //! Extracted from `dst_network_fault_chaos.rs`'s `stamp_deterministic_
 //! mtime` + `deliver_local_write`/`remove_file_if_present` helpers.
 //!
-//! `#![cfg(madsim)]`-gated like every DST scenario file.
+//! `#![cfg(turmoil)]`-gated like every DST scenario file.
 
 use std::path::Path;
 use std::time::{Duration, UNIX_EPOCH};

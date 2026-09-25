@@ -1,14 +1,7 @@
-//! This crate's own error type -- `yadorilink-sync-core`'s `SyncError`
-//! cannot be reused here without a forbidden dependency edge back onto
-//! sync-core (see `docs/design/phase7d6-peer-session-extraction-boundary.md`).
 //! Every variant here mirrors one `SyncError` variant `peer_session.rs`
 //! actually constructed or matched on, same message text, so error
-//! reporting stays byte-identical for anything wrapping the message string.
-//! Concrete producer crates (`yadorilink-root-authority`,
-//! `yadorilink-local-storage`, `yadorilink-replica-engine`,
-//! `yadorilink-sync-wire`, `yadorilink-transport`) get `#[from]` bridges;
-//! `yadorilink-sync-core`'s `SyncState`-backed port implementations bridge
-//! the other direction with `From<PeerSessionError> for SyncError`.
+//! reporting stays byte-identical for anything wrapping the message
+//! string.
 
 #[derive(Debug, thiserror::Error)]
 pub enum PeerSessionError {
@@ -94,6 +87,18 @@ pub enum PeerSessionError {
         "physical object kind at {0:?} does not match the desired version's claimed record kind"
     )]
     PhysicalKindMismatch(String),
+
+    /// The file already at this path denies its owner read access, so the
+    /// replicated metadata the desired version names can be neither
+    /// confirmed nor applied to it. Raised before anything is mutated (no
+    /// fence bump, no write). The caller holds the path
+    /// ([`crate::hazard::HELD_REASON_METADATA_UNPROVABLE`]) instead of
+    /// retrying it or replacing the file.
+    #[error(
+        "the existing file at {0:?} is not readable by its owner, so its replicated metadata \
+         cannot be confirmed or applied"
+    )]
+    MetadataUnprovable(String),
 }
 
 impl From<yadorilink_local_storage::StorageError> for PeerSessionError {

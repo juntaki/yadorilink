@@ -23,7 +23,7 @@
 //! therefore return before that capture completes, letting a restore
 //! target a `version_seq` that doesn't exist yet, or letting the
 //! "concurrent" race start before one side has actually authored
-//! anything -- caught in code review before landing.
+//! anything.
 
 mod support;
 
@@ -34,7 +34,7 @@ use support::{open_file_backed_replica_coordinator, real_entry_names, wait_until
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::hydration;
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 use yadorilink_replica_domain::session_state::VersionState;
 
 struct TestDevice {
@@ -48,7 +48,7 @@ struct TestDevice {
 fn setup_device(name: &str) -> TestDevice {
     let device_id = name.to_string();
     let store_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let (sync_state, index_dir) = open_file_backed_replica_coordinator();
     let state = DaemonState::new(device_id.clone(), Arc::new(sync_state), store);
     support::ensure_device_signing_key(&state);

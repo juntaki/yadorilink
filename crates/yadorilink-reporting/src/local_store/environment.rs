@@ -11,8 +11,7 @@
 //! new dependency (e.g. `os_info`) for one field is out of scope. This
 //! field is documented as "coarse, e.g....", not guaranteed-present, so
 //! `"unknown"` is a valid, honest coarse bucket rather than a fabricated
-//! one. Flagged here for a future follow-up rather than silently guessed
-//! at.
+//! one, rather than a silent guess.
 
 use crate::builder::ReportEnvironment;
 use crate::consent::ConsentState;
@@ -43,14 +42,4 @@ pub fn current(consent: &ConsentState) -> ReportEnvironment {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn current_carries_the_reporter_id_only_when_present() {
-        let env = current(&ConsentState::default());
-        assert!(env.anonymous_reporter_id.is_none());
-        assert_eq!(env.yadorilink_version, env!("CARGO_PKG_VERSION"));
-        assert!(!env.arch.is_empty());
-    }
-}
+mod tests;

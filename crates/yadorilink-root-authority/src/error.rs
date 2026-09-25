@@ -1,8 +1,6 @@
-//! This crate's own error type -- kept separate from
-//! `yadorilink-sync-core`'s much larger `SyncError` so this crate has no
-//! dependency edge back onto sync-core. Callers convert via `From` at the
-//! crate boundary, same pattern as `yadorilink-sqlite-runtime`'s
-//! `DatabaseError` / `yadorilink-sync-sqlite`'s `SyncSqliteError`.
+//! Callers convert via `From` at the crate boundary, same pattern as
+//! `yadorilink-sqlite-runtime`'s `DatabaseError` /
+//! `yadorilink-sync-sqlite`'s `SyncSqliteError`.
 
 use std::fmt;
 
@@ -18,11 +16,8 @@ pub enum RootAuthorityError {
     CorruptState(String),
 
     /// A path component names a reserved on-disk artefact component (a
-    /// staging/tombstone name this engine reserves for its own atomic-commit
-    /// machinery) and cannot be used for ordinary content. Mirrors
-    /// `yadorilink_sync_core::SyncError::ReservedNamespaceCollision` exactly
-    /// -- both name the identical condition, this crate's callers just
-    /// reach it without a dependency on sync-core's much larger error type.
+    /// staging/tombstone name this engine reserves for its own
+    /// atomic-commit machinery) and cannot be used for ordinary content.
     #[error("path {0:?} names a reserved artefact component and cannot be used here")]
     ReservedNamespaceCollision(String),
 
@@ -34,15 +29,11 @@ pub enum RootAuthorityError {
     RootIdentityMismatch(String),
 
     /// A group has more than one live link -- `root_identity`'s
-    /// `ensure_single_root` gate refuses before any constructor touches disk
-    /// or the index. Structurally mirrors
-    /// `yadorilink_sync_core::SyncError::AmbiguousLink` field-for-field
-    /// (not collapsed to a message string, unlike this enum's other
-    /// mirrored variants): `yadorilink-local-capture`'s own tests match on
-    /// `SyncError::AmbiguousLink { .. }` after this crate's
-    /// `RootVerificationStatePort` implementation for `SyncState` round-trips
-    /// through this variant and back, so the conversion must be lossless in
-    /// both directions.
+    /// `ensure_single_root` gate refuses before any constructor touches
+    /// disk or the index. }` after this crate's
+    /// `RootVerificationStatePort` implementation for `SyncState`
+    /// round-trips through this variant and back, so the conversion must
+    /// be lossless in both directions.
     #[error(
         "folder group {group_id} is linked to {} folders on this device ({}); sync is stopped \
          for this folder group until exactly one remains. Decide which folder is this group's \

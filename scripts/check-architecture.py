@@ -115,16 +115,29 @@ def cfg_test_spans(text: str) -> list[tuple[int, int]]:
     attribute followed by a `;` before any `{` (a `#[cfg(test)] use ...;`)
     covers only its own statement.
     """
+    return item_spans(text, CFG_TEST_ATTR)
+
+
+def item_spans(
+    text: str, start: re.Pattern[str], statements: bool = True
+) -> list[tuple[int, int]]:
+    """Line ranges covered by every item that `start` introduces.
+
+    `start` is an attribute or an item header (`fn name`); the span runs to
+    the brace that closes the item it introduces, as `cfg_test_spans`
+    describes. `statements` is false for a function header, whose signature
+    may hold a `;` (`[u8; 32]`) that does not end it.
+    """
     spans: list[tuple[int, int]] = []
     i = 0
     n = len(text)
     while i < n:
-        match = CFG_TEST_ATTR.search(text, i)
+        match = start.search(text, i)
         if not match:
             break
         brace = text.find("{", match.end())
         semicolon = text.find(";", match.end())
-        if brace == -1 or (semicolon != -1 and semicolon < brace):
+        if brace == -1 or (statements and semicolon != -1 and semicolon < brace):
             end = semicolon if semicolon != -1 else match.end()
             spans.append(
                 (text.count("\n", 0, match.start()) + 1, text.count("\n", 0, end) + 1)
@@ -158,8 +171,51 @@ def cfg_test_spans(text: str) -> list[tuple[int, int]]:
     return spans
 
 
-def scannable_lines(text: str, exclude_test_spans: bool) -> list[tuple[int, str]]:
+def _parent_module_files(path: Path) -> list[Path]:
+    """Files that may declare `path` as a submodule (`mod <stem>;`)."""
+    directory = path.parent
+    if path.name == "mod.rs":
+        directory = directory.parent
+    return [
+        directory.with_suffix(".rs"),
+        directory / "mod.rs",
+        directory / "lib.rs",
+        directory / "main.rs",
+    ]
+
+
+def is_cfg_test_module_file(path: Path) -> bool:
+    """True when `path` is a module file compiled only under `cfg(test)`.
+
+    An inline `#[cfg(test)] mod tests { ... }` is excluded by its brace span;
+    the same module moved to its own file (`#[cfg(test)] mod tests;` in the
+    parent) must be excluded as a whole, or moving a test module out of line
+    would change what a rule sees. A file nested under such a module is a
+    test file too.
+    """
+    stem = path.parent.name if path.name == "mod.rs" else path.stem
+    declaration = re.compile(
+        r"#\[cfg\(\s*test\s*\)\]\s*(?:#\[[^\]]*\]\s*)*"
+        r"(?:pub(?:\([^)]*\))?\s+)?mod\s+" + re.escape(stem) + r"\s*;"
+    )
+    for parent in _parent_module_files(path):
+        if parent == path or not parent.is_file():
+            continue
+        text = parent.read_text(encoding="utf-8")
+        if not re.search(r"\bmod\s+" + re.escape(stem) + r"\s*;", text):
+            continue
+        if declaration.search(text):
+            return True
+        return is_cfg_test_module_file(parent)
+    return False
+
+
+def scannable_lines(
+    text: str, exclude_test_spans: bool, path: Path | None = None
+) -> list[tuple[int, str]]:
     """`(line number, line)` for every line a source rule may look at."""
+    if exclude_test_spans and path is not None and is_cfg_test_module_file(path):
+        return []
     spans = cfg_test_spans(text) if exclude_test_spans else []
 
     def in_test(line_no: int) -> bool:
@@ -318,7 +374,7 @@ def check_forbidden_symbols(root: Path, manifest: dict) -> list[str]:
         exclude = rule.get("test_spans") == "exclude"
         for path in paths:
             text = path.read_text(encoding="utf-8")
-            for number, line in scannable_lines(text, exclude):
+            for number, line in scannable_lines(text, exclude, path):
                 for symbol in rule["symbols"]:
                     if symbol in line:
                         failures.append(
@@ -341,7 +397,7 @@ def check_forbidden_patterns(root: Path, manifest: dict) -> list[str]:
         require_containing = rule.get("require_lines_containing", [])
         for path in paths:
             text = path.read_text(encoding="utf-8")
-            for number, line in scannable_lines(text, exclude):
+            for number, line in scannable_lines(text, exclude, path):
                 if any(token in line for token in skip_containing):
                     continue
                 if require_containing and not any(t in line for t in require_containing):
@@ -380,7 +436,7 @@ def check_confined_symbols(root: Path, manifest: dict) -> list[str]:
             if path in allowed:
                 continue
             text = path.read_text(encoding="utf-8")
-            for number, line in scannable_lines(text, exclude):
+            for number, line in scannable_lines(text, exclude, path):
                 for symbol in rule["symbols"]:
                     if symbol in line:
                         failures.append(
@@ -406,6 +462,8 @@ def check_call_sites(root: Path, manifest: dict) -> list[str]:
             )
         paths = resolve(root, rule["paths"])
         allowed = set(resolve(root, rule.get("allowed_paths", [])))
+        item_failures, allowed_spans = allowed_item_spans(root, rule)
+        failures += item_failures
         compiled = [re.compile(p) for p in rule["patterns"]]
         skip_test_paths = rule.get("skip_test_paths", False)
         exclude = rule.get("test_spans") == "exclude"
@@ -419,8 +477,11 @@ def check_call_sites(root: Path, manifest: dict) -> list[str]:
             matched_anywhere = True
             if path in allowed:
                 continue
-            for number, line in scannable_lines(text, exclude):
+            spans = allowed_spans.get(path, [])
+            for number, line in scannable_lines(text, exclude, path):
                 if not any(pattern.search(line) for pattern in compiled):
+                    continue
+                if any(first <= number <= last for first, last in spans):
                     continue
                 failures.append(
                     f"[{rule['name']}] {relative(root, path)}:{number} is not an "
@@ -432,6 +493,43 @@ def check_call_sites(root: Path, manifest: dict) -> list[str]:
                 "guards no longer exists"
             )
     return failures
+
+
+def allowed_item_spans(
+    root: Path, rule: dict
+) -> tuple[list[str], dict[Path, list[tuple[int, int]]]]:
+    """The spans of a call-site rule's `allowed_items`, one function each.
+
+    An allowed item names a single function in a single file, with the
+    reason it may call what the rule otherwise confines -- narrower than
+    allowing its whole file. A named file or function that no longer exists
+    is a failure, like any other stale allowance.
+    """
+    failures: list[str] = []
+    spans: dict[Path, list[tuple[int, int]]] = {}
+    for item in rule.get("allowed_items", []):
+        if not item.get("reason", "").strip():
+            failures.append(
+                f"call_site {rule['name']!r} allowed item {item['fn']!r} in "
+                f"{item['path']} gives no reason"
+            )
+        path = root / item["path"]
+        found = (
+            item_spans(
+                path.read_text(encoding="utf-8"),
+                re.compile(r"\bfn\s+" + re.escape(item["fn"]) + r"\b"),
+                statements=False,
+            )
+            if path.is_file()
+            else []
+        )
+        if not found:
+            failures.append(
+                f"call_site {rule['name']!r} allowed item: no fn {item['fn']!r} in "
+                f"{item['path']}"
+            )
+        spans.setdefault(path, []).extend(found)
+    return failures, spans
 
 
 def is_test_path(path: Path) -> bool:
@@ -655,6 +753,26 @@ def _self_test_source_rules() -> None:
         assert not check_forbidden_symbols(root, excluding)
         (src / "lib.rs").write_text("fn f() { tokio::spawn(g()); }\n", encoding="utf-8")
         assert check_forbidden_symbols(root, excluding), "production code is still scanned"
+        # ... and so does a cfg(test) module moved into its own file, along
+        # with anything nested under it -- but not a plain out-of-line module.
+        (src / "lib.rs").write_text(
+            "pub struct Change;\nmod prod;\n#[cfg(test)]\nmod tests;\n", encoding="utf-8"
+        )
+        (src / "prod.rs").write_text("pub struct P;\n", encoding="utf-8")
+        (src / "tests.rs").write_text(
+            "mod helpers;\nfn f() { tokio::spawn(g()); }\n", encoding="utf-8"
+        )
+        (src / "tests").mkdir()
+        (src / "tests" / "helpers.rs").write_text("fn h() { tokio::spawn(g()); }\n", encoding="utf-8")
+        assert not check_forbidden_symbols(root, excluding)
+        assert check_forbidden_symbols(root, symbol_rule), "included by default"
+        (src / "prod.rs").write_text("fn f() { tokio::spawn(g()); }\n", encoding="utf-8")
+        assert check_forbidden_symbols(root, excluding), "out-of-line production module"
+        (src / "prod.rs").unlink()
+        (src / "tests.rs").unlink()
+        (src / "tests" / "helpers.rs").unlink()
+        (src / "tests").rmdir()
+        (src / "lib.rs").write_text("fn f() { tokio::spawn(g()); }\n", encoding="utf-8")
         (src / "lib.rs").write_text("pub struct Change;\n", encoding="utf-8")
 
         pattern_rule = {
@@ -771,6 +889,34 @@ def _self_test_source_rules() -> None:
         (tests_dir / "it.rs").write_text("fn f() { Session::new(a); }\n", encoding="utf-8")
         assert not check_call_sites(root, call_rule)
         (tests_dir / "it.rs").unlink()
+
+        # An allowed item exempts that one function, not its file.
+        item_rule = {
+            "call_site": [
+                dict(
+                    call_rule["call_site"][0],
+                    allowed_items=[
+                        {"path": "crates/pure/src/lib.rs", "fn": "seam", "reason": "sim"}
+                    ],
+                )
+            ]
+        }
+        (src / "lib.rs").write_text(
+            "fn seam(k: [u8; 32]) {\n    Session::new(a);\n}\n"
+            "fn rogue() { Session::new(a); }\n",
+            encoding="utf-8",
+        )
+        found = check_call_sites(root, item_rule)
+        assert any(":4 is not an allowed call site" in f for f in found), found
+        assert not any(":2 is not an allowed call site" in f for f in found), found
+        (src / "lib.rs").write_text("fn other() {}\n", encoding="utf-8")
+        found = check_call_sites(root, item_rule)
+        assert any("no fn 'seam'" in f for f in found), found
+        item_rule["call_site"][0]["allowed_items"][0]["reason"] = " "
+        (src / "lib.rs").write_text("fn seam() {}\n", encoding="utf-8")
+        found = check_call_sites(root, item_rule)
+        assert any("gives no reason" in f for f in found), found
+        (src / "lib.rs").write_text("pub struct X;\n", encoding="utf-8")
 
         # A guard whose symbol has vanished must fail, not pass quietly.
         (app / "main.rs").write_text("fn boot() {}\n", encoding="utf-8")

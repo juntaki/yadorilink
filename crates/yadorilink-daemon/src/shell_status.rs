@@ -74,19 +74,87 @@ pub fn resolve_group_and_rel_path(
     Some((link.group_id.clone(), rel_path))
 }
 
-pub fn resolve_status(sync_state: &ReplicaCoordinator, absolute_path: &str) -> ShellSyncState {
-    let Some((group_id, rel_path)) = resolve_group_and_rel_path(sync_state, absolute_path) else {
-        return ShellSyncState::Unspecified;
-    };
+/// A path's sync status, with the reason the path is in that state when
+/// the state alone does not say it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellStatus {
+    pub state: ShellSyncState,
+    pub detail: Option<String>,
+}
 
-    match sync_state.file_index_repository().get_file(&group_id, &rel_path) {
-        Ok(Some(record)) if record.deleted => ShellSyncState::Unspecified,
-        Ok(Some(record)) if record.path.contains("(conflicted copy") => ShellSyncState::Error,
-        Ok(Some(_)) => ShellSyncState::Synced,
+impl ShellStatus {
+    fn of(state: ShellSyncState) -> Self {
+        Self { state, detail: None }
+    }
+}
+
+pub fn resolve_status(sync_state: &ReplicaCoordinator, absolute_path: &str) -> ShellSyncState {
+    resolve_status_detail(sync_state, absolute_path).state
+}
+
+/// The status of a file or directory under a linked folder.
+///
+/// A directory is not always an entry of its own. The link root never is;
+/// a directory that only holds synced files has no row; and an explicit
+/// directory a peer deleted while a file below it still lives keeps a
+/// deleted row. Each of those -- and a live explicit directory -- takes
+/// the aggregate status of what is indexed live below it: an error when a
+/// conflict copy is among it (the one per-file status worse than synced an
+/// indexed row carries), synced otherwise, rather than pending or unknown.
+/// A path's own live entry decides first, so a stale retained record never
+/// masks it. A directory a delete left on disk because it holds local
+/// content this device never synced is settled too: it takes the same
+/// aggregate status, and the detail says why it is still there.
+pub fn resolve_status_detail(sync_state: &ReplicaCoordinator, absolute_path: &str) -> ShellStatus {
+    let Some((group_id, rel_path)) = resolve_group_and_rel_path(sync_state, absolute_path) else {
+        return ShellStatus::of(ShellSyncState::Unspecified);
+    };
+    let rel_path = rel_path.trim_end_matches('/');
+    if rel_path.is_empty() {
+        return ShellStatus::of(aggregate_status(sync_state, &group_id, rel_path));
+    }
+    let own_row = match sync_state.file_index_repository().get_file(&group_id, rel_path) {
+        Ok(row) => row,
+        Err(_) => return ShellStatus::of(ShellSyncState::Unspecified),
+    };
+    if let Some(record) = own_row.as_ref().filter(|record| !record.deleted) {
+        if yadorilink_replica_domain::conflict::is_conflict_copy_path(&record.path) {
+            return ShellStatus::of(ShellSyncState::Error);
+        }
+        return ShellStatus::of(aggregate_status(sync_state, &group_id, rel_path));
+    }
+    match sync_state.sqlite().retained_directory_reason(&group_id, rel_path) {
+        Ok(Some(reason)) => {
+            return ShellStatus {
+                state: aggregate_status(sync_state, &group_id, rel_path),
+                detail: Some(reason),
+            };
+        }
+        Ok(None) => {}
+        Err(_) => return ShellStatus::of(ShellSyncState::Unspecified),
+    }
+    match sync_state.file_index_repository().has_live_descendant_row(&group_id, rel_path) {
+        Ok(true) => ShellStatus::of(aggregate_status(sync_state, &group_id, rel_path)),
+        // A deleted entry with nothing live below it has no status.
+        Ok(false) if own_row.is_some() => ShellStatus::of(ShellSyncState::Unspecified),
         // Under a linked folder but not indexed yet — either brand new
         // (about to be picked up by the watcher) or not yet reconciled
         // with peers.
-        Ok(None) => ShellSyncState::Pending,
+        Ok(false) => ShellStatus::of(ShellSyncState::Pending),
+        Err(_) => ShellStatus::of(ShellSyncState::Unspecified),
+    }
+}
+
+/// The status a directory at `rel_path` (the link root when empty) takes
+/// from what is indexed live below it.
+fn aggregate_status(
+    sync_state: &ReplicaCoordinator,
+    group_id: &str,
+    rel_path: &str,
+) -> ShellSyncState {
+    match sync_state.file_index_repository().has_live_conflict_copy_descendant(group_id, rel_path) {
+        Ok(true) => ShellSyncState::Error,
+        Ok(false) => ShellSyncState::Synced,
         Err(_) => ShellSyncState::Unspecified,
     }
 }
@@ -109,159 +177,4 @@ pub fn resolve_materialization_state(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-    use yadorilink_local_storage::FsBlockStore;
-    use yadorilink_replica_domain::file::FileRecord;
-
-    use crate::daemon_state::DaemonState;
-
-    fn state_with_link(local_path: &str, group_id: &str) -> Arc<DaemonState> {
-        let store_dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
-        let sync_state =
-            Arc::new(crate::replica_coordinator::ReplicaCoordinator::open_in_memory().unwrap());
-        sync_state.link_repository().add_link(local_path, group_id).unwrap();
-        DaemonState::new("device-a".into(), sync_state, store)
-    }
-
-    #[tokio::test]
-    async fn path_outside_any_link_is_unspecified() {
-        let state = state_with_link("/home/alice/Photos", "group-1");
-        assert_eq!(
-            resolve_status(&state.replica_coordinator, "/home/alice/Downloads/file.txt"),
-            ShellSyncState::Unspecified
-        );
-    }
-
-    #[tokio::test]
-    async fn indexed_file_is_synced() {
-        let state = state_with_link("/home/alice/Photos", "group-1");
-        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
-        state
-            .replica_coordinator
-            .file_index_repository()
-            .upsert_file(
-                "group-1",
-                &FileRecord {
-                    path: "vacation.jpg".into(),
-                    size: 10,
-                    mtime_unix_nanos: 0,
-                    blocks: vec![],
-                    deleted: false,
-                },
-                &permit,
-            )
-            .unwrap();
-        assert_eq!(
-            resolve_status(&state.replica_coordinator, "/home/alice/Photos/vacation.jpg"),
-            ShellSyncState::Synced
-        );
-    }
-
-    #[tokio::test]
-    async fn unindexed_file_under_link_is_pending() {
-        let state = state_with_link("/home/alice/Photos", "group-1");
-        assert_eq!(
-            resolve_status(&state.replica_coordinator, "/home/alice/Photos/brand-new.jpg"),
-            ShellSyncState::Pending
-        );
-    }
-
-    #[tokio::test]
-    async fn conflicted_copy_is_error() {
-        let state = state_with_link("/home/alice/Photos", "group-1");
-        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
-        state
-            .replica_coordinator
-            .file_index_repository()
-            .upsert_file(
-                "group-1",
-                &FileRecord {
-                    path: "shared (conflicted copy, 2026-01-01-000000, device-b).txt".into(),
-                    size: 10,
-                    mtime_unix_nanos: 0,
-                    blocks: vec![],
-                    deleted: false,
-                },
-                &permit,
-            )
-            .unwrap();
-        assert_eq!(
-            resolve_status(
-                &state.replica_coordinator,
-                "/home/alice/Photos/shared (conflicted copy, 2026-01-01-000000, device-b).txt"
-            ),
-            ShellSyncState::Error
-        );
-    }
-
-    /// An orphaned link is treated as though it doesn't exist here -- a
-    /// file under it must not resolve to a status (or a
-    /// `HydrateRequest`/`Pin`/`Unpin`/`Evict` target, since they share this
-    /// same resolver) even though the link row itself is still present.
-    #[tokio::test]
-    async fn nested_links_resolve_to_the_deepest_root() {
-        let parent = tempfile::tempdir().unwrap();
-        let child = parent.path().join("child");
-        std::fs::create_dir_all(&child).unwrap();
-        let store_dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
-        let sync_state =
-            Arc::new(crate::replica_coordinator::ReplicaCoordinator::open_in_memory().unwrap());
-        sync_state
-            .link_repository()
-            .add_link(&parent.path().to_string_lossy(), "parent-group")
-            .unwrap();
-        sync_state.link_repository().add_link(&child.to_string_lossy(), "child-group").unwrap();
-        let state = DaemonState::new("device-a".into(), sync_state, store);
-
-        let query = child.join("file.txt").to_string_lossy().to_string();
-        let (group, rel) = resolve_group_and_rel_path(&state.replica_coordinator, &query)
-            .expect("a path under the nested child link must resolve");
-        assert_eq!(group, "child-group");
-        assert_eq!(rel, "file.txt");
-    }
-
-    #[tokio::test]
-    async fn orphaned_link_resolves_to_no_status() {
-        let state = state_with_link("/home/alice/Photos", "group-1");
-        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
-        state
-            .replica_coordinator
-            .file_index_repository()
-            .upsert_file(
-                "group-1",
-                &FileRecord {
-                    path: "vacation.jpg".into(),
-                    size: 10,
-                    mtime_unix_nanos: 0,
-                    blocks: vec![],
-                    deleted: false,
-                },
-                &permit,
-            )
-            .unwrap();
-        state
-            .replica_coordinator
-            .link_repository()
-            .mark_link_orphaned("/home/alice/Photos")
-            .unwrap();
-
-        assert_eq!(
-            resolve_status(&state.replica_coordinator, "/home/alice/Photos/vacation.jpg"),
-            ShellSyncState::Unspecified,
-            "an orphaned link's files must not report a live sync status"
-        );
-        assert!(
-            resolve_group_and_rel_path(
-                &state.replica_coordinator,
-                "/home/alice/Photos/vacation.jpg"
-            )
-            .is_none(),
-            "an orphaned link must not resolve for the shell-IPC hydrate/pin/unpin/evict path \
-             either"
-        );
-    }
-}
+mod tests;

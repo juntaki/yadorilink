@@ -1,19 +1,9 @@
-//! `RoleLossOperationRepository` owns the `role_loss_operations` table (the
-//! per-attempt role-loss journal) and the tightly-coupled
+//! `RoleLossOperationRepository` owns the `role_loss_operations` table
+//! (the per-attempt role-loss journal) and the tightly-coupled
 //! `durability_unknown_latches` table (a per-group "durability status
 //! unknown until this device confirms otherwise" latch a role-loss handoff
 //! can set) -- both durability-recovery journal state, kept in one
-//! repository per `docs/design/syncstate-repository-ownership.md`.
-//!
-//! Moved here from `yadorilink-sync-core::repository::role_loss_operation`
-//! (Phase 7D-9F): its own value types (`RoleLossOperation`/
-//! `RoleLossOperationState`/`RoleLossAction`/`RoleLossOperationParams`)
-//! already lived in `yadorilink_replica_domain::session_state`, a crate
-//! this one already depends on; the only real blocker was
-//! `scan_all_role_loss_operations`'s own use of
-//! `crate::recovery::{InvalidRecoveryOperation, RecoveryDomain}`, which were
-//! `yadorilink-sync-core`-local types until this same pass relocated them to
-//! `yadorilink_replica_domain::recovery` for exactly this reason.
+//! repository.
 
 use std::sync::Arc;
 
@@ -161,7 +151,7 @@ impl RoleLossOperationRepository {
 
     /// Bumps a role-loss-operation's retry counter and returns the NEW
     /// attempt count — used by the reconciliation sweep
-    /// (`daemon_state::run_role_loss_reconciliation_sweep`) purely to log an
+    /// (the daemon's `ReplicaRoleService::reconcile_role_loss`) purely to log an
     /// escalation past a bounded number of attempts. This never gates
     /// whether a retry happens: a `Compensating` row is retried
     /// indefinitely regardless of `attempts`, since giving up would leave
@@ -194,7 +184,7 @@ impl RoleLossOperationRepository {
                         created_at_unix, updated_at_unix \
                  FROM role_loss_operations WHERE operation_id = ?1",
             )?;
-            let mut rows = stmt.query_map([operation_id], row_to_role_loss_operation)?;
+            let mut rows = stmt.query_map([operation_id], row_to_role_loss_operation_strict)?;
             match rows.next() {
                 Some(row) => Ok(Some(row?)),
                 None => Ok(None),
@@ -204,7 +194,7 @@ impl RoleLossOperationRepository {
 
     /// Every role-loss-operation row currently in one of `states` —
     /// consulted by the startup + periodic reconciliation sweep
-    /// (`daemon_state::run_role_loss_reconciliation_sweep`), which does not
+    /// (the daemon's `ReplicaRoleService::reconcile_role_loss`), which does not
     /// filter by group id (a crash can leave a stale row behind for any
     /// group this device was ever the source of a handoff for).
     pub fn list_role_loss_operations_in_states(
@@ -227,24 +217,19 @@ impl RoleLossOperationRepository {
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(
                 rusqlite::params_from_iter(state_strs.iter()),
-                row_to_role_loss_operation,
+                row_to_role_loss_operation_strict,
             )?;
             Ok(rows.collect::<Result<_, _>>()?)
         })
     }
 
-    /// Every `role_loss_operations` row, strictly decoded and with malformed
-    /// rows isolated -- for a read-only inventory (`recovery::inventory`)
-    /// ONLY. Deliberately does NOT reuse
-    /// [`Self::list_role_loss_operations_in_states`]: that function's row
-    /// decode goes through `RoleLossAction::from_db_str`/
-    /// `RoleLossOperationState::from_db_str`, which silently coerce an
-    /// unrecognized string to a safe default (`Demote`/`Prepared`) rather
-    /// than fail -- correct for the reconciliation sweep (it must always
-    /// have SOME action to retry), wrong for an inventory, which must
-    /// surface a genuinely corrupt row as `invalid` instead of silently
-    /// misreporting it. One malformed row is isolated into `invalid` rather
-    /// than aborting the whole scan, mirroring
+    /// Every `role_loss_operations` row, for a read-only inventory
+    /// (`recovery::inventory`). Rows decode exactly as they do for the
+    /// reconciliation sweep -- there is one decoder now, and it refuses an
+    /// unrecognized action or state rather than coercing it to a default.
+    /// What differs here is only the handling: one malformed row is
+    /// isolated into `invalid` rather than aborting the whole scan,
+    /// mirroring
     /// `EnrollmentRepository::scan_open_enrollment_operations`/
     /// `MembershipOperationRepository::scan_membership_operations_in_states`.
     pub fn scan_all_role_loss_operations(
@@ -293,6 +278,12 @@ impl RoleLossOperationRepository {
     /// `MembershipOperationRepository::plant_malformed_membership_operation_for_test`
     /// plants for membership, for a crate that has no access to this
     /// module's private `pool` field the way this crate's own tests do.
+    ///
+    /// The unparseable `action` is the whole corruption. Every other
+    /// column is deliberately well-formed, `lease_id` included: it is
+    /// `NOT NULL`, so a row without one is not a corrupt row this code
+    /// could ever read back -- it is a row the database will not accept,
+    /// and planting one tests the constraint instead of the decoder.
     #[cfg(any(test, feature = "test-support"))]
     pub fn plant_malformed_role_loss_operation_for_test(
         &self,
@@ -304,32 +295,13 @@ impl RoleLossOperationRepository {
                     (operation_id, group_id, source_device_id, target_device_id, lease_id, \
                      worker_membership_generation, action, state, local_path, attempts, \
                      created_at_unix, updated_at_unix) \
-                 VALUES (?1, 'group-1', 'device-c', 'device-d', NULL, NULL, 'not-a-real-action', \
-                    'prepared', NULL, 0, 1, 1)",
+                 VALUES (?1, 'group-1', 'device-c', 'device-d', 'lease-1', NULL, \
+                    'not-a-real-action', 'prepared', NULL, 0, 1, 1)",
                 rusqlite::params![operation_id],
             )?;
             Ok(())
         })
     }
-}
-
-pub(crate) fn row_to_role_loss_operation(
-    r: &rusqlite::Row<'_>,
-) -> rusqlite::Result<RoleLossOperation> {
-    Ok(RoleLossOperation {
-        operation_id: r.get(0)?,
-        group_id: r.get(1)?,
-        source_device_id: r.get(2)?,
-        target_device_id: r.get(3)?,
-        lease_id: r.get(4)?,
-        worker_membership_generation: r.get(5)?,
-        action: RoleLossAction::from_db_str(&r.get::<_, String>(6)?),
-        state: RoleLossOperationState::from_db_str(&r.get::<_, String>(7)?),
-        local_path: r.get(8)?,
-        attempts: r.get(9)?,
-        created_at_unix: r.get(10)?,
-        updated_at_unix: r.get(11)?,
-    })
 }
 
 fn role_loss_decode_error(column_index: usize, detail: impl Into<String>) -> rusqlite::Error {

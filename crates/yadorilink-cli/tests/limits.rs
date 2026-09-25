@@ -13,7 +13,7 @@ use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
 use yadorilink_ipc_proto::daemonctl::StatusRequest;
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 
 async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>) {
     let dir = tempfile::tempdir().unwrap();
@@ -23,7 +23,7 @@ async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>) {
     // `yadorilink-daemon/tests/reporting_ipc.rs` established for it.
     std::env::set_var("YADORILINK_CONFIG_DIR", dir.path());
 
-    let store = Arc::new(FsBlockStore::new(dir.path().join("blocks")).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(dir.path().join("blocks")).unwrap());
     let sync_state = Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
     let state = DaemonState::new("device-under-test".into(), sync_state, store);
 
@@ -65,7 +65,7 @@ async fn limits_set_persists_and_is_reflected_by_a_subsequent_read() {
     assert_eq!(config.download_limit_bytes_per_sec, 2_000_000);
 
     // `limits show`'s underlying IPC round-trip reflects the same values.
-    let resp = yadorilink_cli::control_client::send(ReqPayload::LimitsShow(
+    let resp = yadorilink_client_core::daemon::control::send(ReqPayload::LimitsShow(
         yadorilink_ipc_proto::daemonctl::LimitsShowRequest {},
     ))
     .await
@@ -87,8 +87,9 @@ async fn limits_set_is_reflected_by_status() {
 
     yadorilink_cli::commands::limits::set(500_000, 0).await.unwrap();
 
-    let resp =
-        yadorilink_cli::control_client::send(ReqPayload::Status(StatusRequest {})).await.unwrap();
+    let resp = yadorilink_client_core::daemon::control::send(ReqPayload::Status(StatusRequest {}))
+        .await
+        .unwrap();
     let Some(RespPayload::Status(status)) = resp.payload else {
         panic!("expected a Status response");
     };
@@ -132,8 +133,9 @@ async fn status_reports_free_space_state_from_local_storage_classification() {
 
     state.governance_config.set_headroom_override_bytes(Some(u64::MAX / 2)).unwrap();
 
-    let resp =
-        yadorilink_cli::control_client::send(ReqPayload::Status(StatusRequest {})).await.unwrap();
+    let resp = yadorilink_client_core::daemon::control::send(ReqPayload::Status(StatusRequest {}))
+        .await
+        .unwrap();
     let Some(RespPayload::Status(status)) = resp.payload else {
         panic!("expected a Status response");
     };

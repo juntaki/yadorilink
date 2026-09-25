@@ -6,15 +6,11 @@
 //! direct pass-through to an existing daemon request, and every displayed
 //! field comes straight from `StatusResponse` (`status_model.rs`).
 //!
-//! IMPORTANT / honesty note for reviewers: the pure logic in
-//! `status_model.rs`/`actions.rs`/`ipc_client.rs` is unit-tested and the
-//! IPC calls are exercised by this crate's `tests/` against a real daemon
-//! (same harness `yadorilink-cli`'s integration tests use). The actual
-//! tray icon / menu / event-loop wiring below can only be verified by
-//! `cargo build`/`cargo check` in this sandboxed environment — there is no
-//! display server or window manager here to click a real menu item
-//! against, so the event-loop plumbing itself (this file) is UI-verified
-//! only by inspection, not by a real run.
+//! Test coverage: the pure logic in `status_model.rs`/`actions.rs`/
+//! `ipc_client.rs` is unit-tested and the IPC calls are exercised by this
+//! crate's `tests/` against a real daemon (same harness `yadorilink-cli`'s
+//! integration tests use). The tray icon / menu / event-loop wiring below
+//! is covered by compilation, not by automated UI tests.
 
 use std::time::Duration;
 
@@ -24,8 +20,8 @@ use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use yadorilink_desktop_app::actions::{spawn_window, spawn_window_with_path};
 use yadorilink_desktop_app::{
-    account, actions, folder_status_window, ipc_client, login_item, share_window, status_model,
-    window,
+    account, actions, folder_status_window, home_window, ipc_client, login_item, send_window,
+    settings_window, share_window, status_model, storage_window, window,
 };
 use yadorilink_ipc_proto::daemonctl::StatusResponse;
 
@@ -59,6 +55,12 @@ fn main() {
             }
             return;
         }
+        Some(WindowKind::Home) => {
+            if let Err(e) = home_window::run_home() {
+                tracing::error!(error = %e, "home window exited with an error");
+            }
+            return;
+        }
         Some(WindowKind::FolderStatus(local_path)) => {
             if let Err(e) = folder_status_window::run_folder_status(local_path) {
                 tracing::error!(error = %e, "folder status window exited with an error");
@@ -68,6 +70,31 @@ fn main() {
         Some(WindowKind::Share(local_path)) => {
             if let Err(e) = share_window::run_share(local_path) {
                 tracing::error!(error = %e, "share window exited with an error");
+            }
+            return;
+        }
+        Some(WindowKind::Send) => {
+            if let Err(e) = send_window::run_send() {
+                tracing::error!(error = %e, "send window exited with an error");
+            }
+            return;
+        }
+        Some(WindowKind::Settings) => {
+            if let Err(e) = settings_window::run_settings() {
+                tracing::error!(error = %e, "settings window exited with an error");
+            }
+            return;
+        }
+        Some(WindowKind::Storage) => {
+            if let Err(e) = storage_window::run_storage() {
+                tracing::error!(error = %e, "storage window exited with an error");
+            }
+            return;
+        }
+        #[cfg(feature = "preview")]
+        Some(WindowKind::SharePreview(scene)) => {
+            if let Err(e) = share_window::preview::run(scene) {
+                tracing::error!(error = %e, "share preview window exited with an error");
             }
             return;
         }
@@ -138,13 +165,31 @@ fn main() {
 enum WindowKind {
     Onboarding,
     Account,
-    /// M4 Pass 3: the per-folder detail window -- carries the folder's
+    /// The Home screen: folder list, devices, transfers, aggregate health --
+    /// see `home_window.rs`.
+    Home,
+    /// The per-folder detail window -- carries the folder's
     /// `local_path`, since (unlike every other window kind) it needs to
     /// know WHICH folder to show.
     FolderStatus(String),
     /// The per-folder sharing window -- carries the folder's `local_path`
     /// for the same reason `FolderStatus` does.
     Share(String),
+    /// Track Send's desktop UI -- send a one-shot file/folder to another
+    /// device, and the Inbox/Receive side -- see `send_window.rs`.
+    Send,
+    /// The Settings skeleton (bandwidth, startup, update, diagnostics
+    /// entry point, account link) -- see `settings_window.rs`.
+    Settings,
+    /// The Storage view: per-folder hydrated/placeholder/hydrating counts
+    /// and disk usage, plus global block-store usage/GC health and a
+    /// manual reclaim trigger -- see `storage_window.rs`.
+    Storage,
+    /// The sharing window in one hand-built state, with no daemon and no
+    /// coordination plane behind it. Only ever built with
+    /// `--features preview`; see `share_window::preview`.
+    #[cfg(feature = "preview")]
+    SharePreview(share_window::preview::Scene),
 }
 
 /// Parses `--window <kind>` (/— the tray items and installer first-run
@@ -170,8 +215,38 @@ fn requested_window() -> Option<WindowKind> {
     match kind.as_deref() {
         Some("onboarding") => Some(WindowKind::Onboarding),
         Some("account") => Some(WindowKind::Account),
+        Some("home") => Some(WindowKind::Home),
         Some("folder-status") => Some(WindowKind::FolderStatus(path()?)),
-        Some("share") => Some(WindowKind::Share(path()?)),
+        Some("share") => {
+            #[cfg(feature = "preview")]
+            if args.iter().any(|a| a == "--preview") {
+                let requested = args
+                    .iter()
+                    .position(|a| a == "--preview")
+                    .and_then(|i| args.get(i + 1))
+                    .filter(|next| !next.starts_with("--"));
+                let scene = match requested {
+                    // `--preview` on its own opens the state the window is
+                    // hardest to reach otherwise.
+                    None => share_window::preview::Scene::Minted,
+                    Some(raw) => match share_window::preview::Scene::parse(raw) {
+                        Some(scene) => scene,
+                        None => {
+                            eprintln!(
+                                "unknown --preview scene {raw:?}; known scenes: {}",
+                                share_window::preview::Scene::names()
+                            );
+                            return None;
+                        }
+                    },
+                };
+                return Some(WindowKind::SharePreview(scene));
+            }
+            Some(WindowKind::Share(path()?))
+        }
+        Some("send") => Some(WindowKind::Send),
+        Some("settings") => Some(WindowKind::Settings),
+        Some("storage") => Some(WindowKind::Storage),
         _ => None,
     }
 }
@@ -211,14 +286,29 @@ fn build_menu(status: Option<&StatusResponse>) -> Menu {
         None => status_model::DAEMON_UNREACHABLE_HEADLINE.to_string(),
     };
     let _ = menu.append(&MenuItem::new(headline_text, false, None));
+    // The Home screen (folder list, devices, transfers, per-folder mode/
+    // pause) -- the tray menu's own items below stay as fast per-folder
+    // shortcuts, Home is where a fuller at-a-glance view + those same
+    // actions live together.
+    let _ = menu.append(&MenuItem::with_id("open_home", "Open YadoriLink…", true, None));
+    // Track Send's desktop UI (send a one-shot file/folder to another
+    // device, and Inbox/Receive) -- a top-level entry point next to Home,
+    // not nested under a folder submenu, since it's not tied to any one
+    // linked folder.
+    let _ = menu.append(&MenuItem::with_id("open_send", "Send / Receive…", true, None));
+    // Storage: per-folder hydration/disk-usage plus global block-store
+    // usage/GC -- same top-level placement as Home/Send, not nested under
+    // a folder submenu, since the block-store section spans every folder
+    // at once.
+    let _ = menu.append(&MenuItem::with_id("open_storage", "Storage…", true, None));
     let _ = menu.append(&PredefinedMenuItem::separator());
 
     // No valid session yet --
     // offer the loopback-redirect + PKCE login flow directly (see
     // `handle_menu_event`'s "login_with_google" case and
-    // `google_login::login`). Shown ahead of "Set Up YadoriLink…" below
+    // `commands::auth::login`). Shown ahead of "Set Up YadoriLink…" below
     // since device registration itself needs a valid access token.
-    if yadorilink_cli::http_client::require_access_token().is_err() {
+    if !yadorilink_client_core::coordination::http_client::is_signed_in() {
         let _ =
             menu.append(&MenuItem::with_id("login_with_google", "Login with Google…", true, None));
         let _ = menu.append(&PredefinedMenuItem::separator());
@@ -228,7 +318,7 @@ fn build_menu(status: Option<&StatusResponse>) -> Menu {
     // machine has never completed `yadorilink device register`/`login` —
     // offer a discoverable entry point into that existing, already-tested
     // CLI onboarding flow rather than reimplementing sign-in/device-setup
-    // UI natively in this pass (see `handle_menu_event`'s "setup_device"
+    // UI natively (see `handle_menu_event`'s "setup_device"
     // case for exactly what this does and why).
     if !ipc_client::is_device_registered() {
         let _ = menu.append(&MenuItem::with_id("setup_device", "Set Up YadoriLink…", true, None));
@@ -252,7 +342,7 @@ fn build_menu(status: Option<&StatusResponse>) -> Menu {
                     true,
                     None,
                 ));
-                // M4 Pass 3: opens the per-folder Data protection / This
+                // Opens the per-folder Data protection / This
                 // device / Availability / Complete copies / Connection
                 // detail window.
                 let _ = per_folder.append(&MenuItem::with_id(
@@ -302,6 +392,11 @@ fn build_menu(status: Option<&StatusResponse>) -> Menu {
         }
         let _ = menu.append(&limits);
 
+        // The consolidated Settings window (bandwidth/startup/update/
+        // diagnostics/account in one place) -- the granular items below
+        // stay as fast shortcuts, same "Home vs. per-folder submenu"
+        // relationship `open_home` already has to the per-folder items.
+        let _ = menu.append(&MenuItem::with_id("open_settings", "Settings…", true, None));
         let _ = menu.append(&MenuItem::with_id("check_updates", "Check for Updates", true, None));
         if !status.update_available_version.is_empty() {
             let _ = menu.append(&MenuItem::with_id(
@@ -344,7 +439,7 @@ fn build_menu(status: Option<&StatusResponse>) -> Menu {
     // Account management (data export + self-service deletion) and
     // CLI-free sign-out, offered only while a session exists. After sign-out
     // runs, the 2s poll rebuilds this menu into its signed-out state on its own.
-    if yadorilink_cli::http_client::require_access_token().is_ok() {
+    if yadorilink_client_core::coordination::http_client::is_signed_in() {
         let _ = menu.append(&MenuItem::with_id("account", "Account & Data…", true, None));
         let _ = menu.append(&MenuItem::with_id("sign_out", "Sign Out", true, None));
     }
@@ -402,6 +497,10 @@ fn handle_menu_event(id: &str) {
         return;
     }
     match id {
+        "open_home" => spawn_window("home"),
+        "open_send" => spawn_window("send"),
+        "open_settings" => spawn_window("settings"),
+        "open_storage" => spawn_window("storage"),
         "pause_all" => run_async(actions::pause_all()),
         "resume_all" => run_async(actions::resume_all()),
         "check_updates" => run_async(actions::check_for_updates()),
@@ -438,13 +537,18 @@ fn handle_menu_event(id: &str) {
         // (data export + self-service deletion), its own `--window account`
         // process, same as the onboarding window.
         "account" => spawn_window("account"),
-        // Sign out (revoke session + clear
-        // keychain). The next status poll rebuilds the menu into signed-out.
+        // Sign out: revoke this installation on the server, confirm it, then
+        // clear the keychain. The next status poll rebuilds the menu into
+        // signed-out -- but only if the revocation actually landed, because a
+        // failed sign-out deliberately keeps the credential (see
+        // `actions::sign_out`). A warning log is the wrong place for that
+        // outcome to end up and this is tracked as a UI gap: the user sees a
+        // menu that still says "Sign Out" and no explanation.
         "sign_out" => {
             std::thread::spawn(|| {
                 let rt = tokio::runtime::Runtime::new().expect("failed to start action runtime");
                 if let Err(e) = rt.block_on(actions::sign_out()) {
-                    tracing::warn!(error = %e, "sign out failed");
+                    tracing::warn!(error = %e, "sign out failed; credentials were kept");
                 }
             });
         }
@@ -470,9 +574,9 @@ where
     });
 }
 
-/// A minimal 16x16 solid-color placeholder icon — this change ships no
-/// real icon asset (a proper multi-resolution `.icns`/`.ico` is packaging
-/// work, tracked as a follow-up), just enough for
+/// A minimal 16x16 solid-color placeholder icon — no real icon asset is
+/// embedded here (a multi-resolution `.icns`/`.ico` belongs to
+/// packaging), just enough for
 /// `TrayIconBuilder::build` to succeed and for the tray to be visibly
 /// present.
 fn placeholder_icon() -> Icon {

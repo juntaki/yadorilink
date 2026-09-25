@@ -42,6 +42,9 @@
 
 mod support;
 
+#[path = "dst_support/namespace_oracle.rs"]
+mod namespace_oracle;
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -53,7 +56,10 @@ use support::{
 };
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
+use yadorilink_replica_domain::change::Op;
+
+use namespace_oracle::{check_trees_converge, disk_tree, sha256_hex, DiskNode, DiskTree};
 
 // These cases drive real watchers, encrypted UDP sessions, and file-backed
 // SQLite on both peers. In particular, macOS hosted runners can spend tens of
@@ -78,7 +84,7 @@ struct TestDevice {
 async fn setup_device(account: &TestAccount, name: &str) -> TestDevice {
     let device_id = support::register_device(account, name, [0u8; 32]).await;
     let store_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let (sync_state, index_dir) = open_file_backed_replica_coordinator();
     let sync_state = Arc::new(sync_state);
     let state = DaemonState::new(device_id.clone(), sync_state, store);
@@ -141,13 +147,7 @@ fn is_conflict_copy(name: &str) -> bool {
 /// A recursive relative-path -> content-hash snapshot of everything under
 /// `root`, for scenarios where the flat, non-recursive `real_entry_names`
 /// (top-level only, by design -- see its own doc comment) isn't enough to
-/// check nested directory contents. Written as a plain recursive
-/// `std::fs::read_dir` walk (this crate doesn't depend on `walkdir`
-/// itself; that's a `yadorilink-sync-core`-only dependency), skipping the
-/// same two transient artifacts `real_entry_names` already accounts for
-/// (an in-progress materialization temp file, and the case-fold hazard
-/// probe file) so a raw listing race with either never inflates a
-/// convergence check.
+/// check nested directory contents.
 fn recursive_snapshot(root: &Path) -> HashMap<String, String> {
     fn walk(base: &Path, current: &Path, out: &mut HashMap<String, String>) {
         let Ok(entries) = std::fs::read_dir(current) else { return };
@@ -525,5 +525,335 @@ async fn concurrently_creating_same_named_directory_with_a_conflicting_file_insi
     assert!(
         snap_a.keys().filter(|k| is_conflict_copy(k)).all(|k| k.starts_with("newdir/")),
         "conflict copy should stay nested under newdir/: {snap_a:?}"
+    );
+}
+
+// --- Directory-aware scenarios ---------------------------------------------
+//
+// Every scenario above compares file-only snapshots, so an empty directory
+// left behind, or a path that is a directory on one device and a file on the
+// other, reads as converged. The scenarios below compare the whole physical
+// tree, directories included (`namespace_oracle::disk_tree`), against the
+// exact tree the explicit-entry model predicts:
+//
+// * a directory needed only to hold surviving descendants is a structural
+//   container; once nothing lives under it and no device created it on
+//   purpose, it is gone;
+// * deleting a directory, `rm -rf` included, deletes the entries the device
+//   observed and nothing else, so a concurrent child survives;
+// * a file and a directory that both want the same path keep both, the
+//   file beside the directory under its conflict-copy name.
+//
+// The engine does not replicate directory entries yet, so the scenarios that
+// need it are ignored with the capability each one waits for; the rename
+// scenario and the materialization guard already hold and run normally.
+
+/// What `author` wrote to `path` in the group's history as `device` has
+/// admitted it: one label per op (`put`/`delete`/`move-from`/`move-to`).
+fn ops_by_author_at(device: &TestDevice, group_id: &str, author: &str, path: &str) -> Vec<String> {
+    let changes = device
+        .state
+        .replica_coordinator
+        .change_history_repository()
+        .dag_list_group_changes(group_id)
+        .unwrap();
+    let mut out = Vec::new();
+    for change in changes.iter().filter(|c| c.device_id.0 == author) {
+        for op in &change.ops {
+            match op {
+                Op::Put { path: p, .. } if p.as_str() == path => out.push("put".into()),
+                Op::Delete { path: p } if p.as_str() == path => out.push("delete".into()),
+                Op::Move { from, .. } if from.as_str() == path => out.push("move-from".into()),
+                Op::Move { to, .. } if to.as_str() == path => out.push("move-to".into()),
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+fn file_node(bytes: &[u8]) -> DiskNode {
+    DiskNode::File { sha256: sha256_hex(bytes) }
+}
+
+fn tree_of(entries: Vec<(&str, DiskNode)>) -> DiskTree {
+    entries.into_iter().map(|(p, n)| (p.to_string(), n)).collect()
+}
+
+/// Waits until both devices hold the same physical tree, directories
+/// included, and `done` accepts it; returns that tree.
+async fn settle_to_one_tree(
+    device_a: &TestDevice,
+    device_b: &TestDevice,
+    done: impl Fn(&DiskTree) -> bool,
+) -> DiskTree {
+    wait_until_with_context(
+        || {
+            let a = disk_tree(device_a.root.path());
+            a == disk_tree(device_b.root.path()) && done(&a)
+        },
+        SETTLE_TIMEOUT,
+        || {
+            format!(
+                "device-a={:#?}\ndevice-b={:#?}",
+                disk_tree(device_a.root.path()),
+                disk_tree(device_b.root.path())
+            )
+        },
+    )
+    .await;
+    let a = disk_tree(device_a.root.path());
+    let b = disk_tree(device_b.root.path());
+    let divergence = check_trees_converge(&[(0, a.clone()), (1, b)]);
+    assert!(divergence.is_empty(), "{divergence:#?}");
+    a
+}
+
+/// `rm -rf linux/` on one device must leave no empty `linux/` (or
+/// `linux/arch/`) on the other: the peer created those only to hold files
+/// that are now gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rm_rf_directory_removes_now_empty_directory_on_peer() {
+    let (device_a, device_b, _group_id) = two_synced_devices("dir-rm-rf-leaves-no-dir").await;
+
+    let linux = device_a.root.path().join("linux");
+    std::fs::create_dir_all(linux.join("arch")).unwrap();
+    std::fs::write(linux.join("Makefile"), b"all:").unwrap();
+    std::fs::write(linux.join("arch/setup.c"), b"int main;").unwrap();
+    wait_until(
+        || device_b.root.path().join("linux/arch/setup.c").exists(),
+        Duration::from_secs(20),
+    )
+    .await;
+
+    std::fs::remove_dir_all(&linux).unwrap();
+    let tree = settle_to_one_tree(&device_a, &device_b, |t| t.is_empty()).await;
+    assert_eq!(tree, DiskTree::new());
+}
+
+/// An empty directory is an entry like any other: created on one device, it
+/// appears on the other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn empty_directory_created_on_one_device_appears_on_peer() {
+    let (device_a, device_b, _group_id) = two_synced_devices("dir-empty-dir-syncs").await;
+
+    std::fs::create_dir(device_a.root.path().join("empty")).unwrap();
+    let tree = settle_to_one_tree(&device_a, &device_b, |t| {
+        t.get("empty").is_some_and(DiskNode::is_directory)
+    })
+    .await;
+    assert_eq!(tree, tree_of(vec![("empty", DiskNode::fresh_directory())]));
+}
+
+/// An explicit empty directory removed on one device goes on the other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rmdir_of_explicit_empty_directory_propagates() {
+    let (device_a, device_b, _group_id) = two_synced_devices("dir-rmdir-propagates").await;
+
+    std::fs::create_dir(device_a.root.path().join("empty")).unwrap();
+    settle_to_one_tree(&device_a, &device_b, |t| {
+        t.get("empty").is_some_and(DiskNode::is_directory)
+    })
+    .await;
+
+    std::fs::remove_dir(device_a.root.path().join("empty")).unwrap();
+    let tree = settle_to_one_tree(&device_a, &device_b, |t| t.is_empty()).await;
+    assert_eq!(tree, DiskTree::new());
+}
+
+/// `rm -rf target_dir` on A races B creating `target_dir/new_from_b.txt`.
+/// B's file was never observed by A's delete, so it survives, and so does
+/// `target_dir` as its container; nothing else A deleted (the files, the
+/// now-empty `sub/`) may linger on either device.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delete_directory_vs_concurrent_child_keeps_child_and_container() {
+    let (device_a, device_b, group_id) = two_synced_devices("dir-rm-rf-vs-child").await;
+
+    let dir_a = device_a.root.path().join("target_dir");
+    std::fs::create_dir_all(dir_a.join("sub")).unwrap();
+    std::fs::write(dir_a.join("existing.txt"), b"existing").unwrap();
+    std::fs::write(dir_a.join("sub/deep.txt"), b"deep").unwrap();
+    wait_until(
+        || device_b.root.path().join("target_dir/sub/deep.txt").exists(),
+        Duration::from_secs(20),
+    )
+    .await;
+
+    std::fs::remove_dir_all(&dir_a).unwrap();
+    std::fs::write(device_b.root.path().join("target_dir/new_from_b.txt"), b"new from b").unwrap();
+
+    let want = tree_of(vec![
+        ("target_dir", DiskNode::fresh_directory()),
+        ("target_dir/new_from_b.txt", file_node(b"new from b")),
+    ]);
+    let tree = settle_to_one_tree(&device_a, &device_b, |t| *t == want).await;
+    assert_eq!(tree, want);
+
+    // `target_dir` now lives on both devices only as the container of B's
+    // file. Neither device may author it back into existence: A wrote it
+    // once (its mkdir) and deleted it, B never wrote it.
+    for device in [&device_a, &device_b] {
+        let a_ops = ops_by_author_at(device, &group_id, &device_a.device_id, "target_dir");
+        assert_eq!(a_ops, ["put", "delete"], "A's ops on the container");
+        let b_ops = ops_by_author_at(device, &group_id, &device_b.device_id, "target_dir");
+        assert!(b_ops.is_empty(), "B authored the container it only holds: {b_ops:?}");
+    }
+}
+
+/// A creates File `a`; B concurrently creates `a/x`. A filesystem cannot
+/// hold both at `a`, and neither may be lost: `a` is the directory holding
+/// `a/x`, and A's file sits beside it under its conflict-copy name.
+///
+/// B's `mkdir a` is an explicit entry of its own, and it may reach a device
+/// before B's `a/x` does. File `a` and Directory `a` are then a same-path
+/// conflict, and the Directory keeps `a` whichever ranks higher (DIR-1):
+/// the file moves to its copy name, and a Directory is never copied, so the
+/// tree is exactly these three entries in every arrival order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn file_vs_descendant_structural_conflict_keeps_both() {
+    let (device_a, device_b, _group_id) = two_synced_devices("dir-file-vs-descendant").await;
+
+    std::fs::write(device_a.root.path().join("a"), b"file a").unwrap();
+    std::fs::create_dir(device_b.root.path().join("a")).unwrap();
+    std::fs::write(device_b.root.path().join("a/x"), b"file a/x").unwrap();
+
+    let tree = settle_to_one_tree(&device_a, &device_b, |t| t.len() == 3).await;
+    assert!(tree.get("a").is_some_and(DiskNode::is_directory), "{tree:#?}");
+    assert_eq!(tree.get("a/x"), Some(&file_node(b"file a/x")), "{tree:#?}");
+    let beside: Vec<(&String, &DiskNode)> =
+        tree.iter().filter(|(p, _)| p.starts_with("a (") && is_conflict_copy(p)).collect();
+    assert_eq!(beside.len(), 1, "{tree:#?}");
+    assert_eq!(beside[0].1, &file_node(b"file a"), "{tree:#?}");
+}
+
+/// DIR-1 with the Directory arriving before `a/x`: B's empty `mkdir a`
+/// races A's File `a`, and settles with the Directory at `a` and the file
+/// beside it -- no empty directory copy. B's `a/x`, written afterwards,
+/// lands in that directory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explicit_directory_keeps_its_name_against_a_file_before_and_after_its_child() {
+    let (device_a, device_b, _group_id) = two_synced_devices("dir-explicit-vs-file").await;
+
+    std::fs::write(device_a.root.path().join("a"), b"file a").unwrap();
+    std::fs::create_dir(device_b.root.path().join("a")).unwrap();
+
+    let is_the_file_beside_a =
+        |(p, n): (&String, &DiskNode)| p.starts_with("a (") && *n == file_node(b"file a");
+    let tree = settle_to_one_tree(&device_a, &device_b, |t| {
+        t.len() == 2 && t.iter().any(is_the_file_beside_a)
+    })
+    .await;
+    assert!(tree.get("a").is_some_and(DiskNode::is_directory), "{tree:#?}");
+
+    std::fs::write(device_b.root.path().join("a/x"), b"file a/x").unwrap();
+    let tree = settle_to_one_tree(&device_a, &device_b, |t| {
+        t.len() == 3 && t.get("a/x") == Some(&file_node(b"file a/x"))
+    })
+    .await;
+    assert!(tree.get("a").is_some_and(DiskNode::is_directory), "{tree:#?}");
+    assert!(tree.iter().any(is_the_file_beside_a), "{tree:#?}");
+}
+
+/// DIR-1 for a Symlink: A's symlink `a` races B's `mkdir a` and `a/x`. The
+/// Directory keeps `a`, the link sits beside it under its copy name, and
+/// nothing else is there.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explicit_directory_keeps_its_name_against_a_symlink() {
+    let (device_a, device_b, _group_id) = two_synced_devices("dir-explicit-vs-symlink").await;
+
+    std::os::unix::fs::symlink("target", device_a.root.path().join("a")).unwrap();
+    std::fs::create_dir(device_b.root.path().join("a")).unwrap();
+    std::fs::write(device_b.root.path().join("a/x"), b"file a/x").unwrap();
+
+    let tree = settle_to_one_tree(&device_a, &device_b, |t| t.len() == 3).await;
+    assert!(tree.get("a").is_some_and(DiskNode::is_directory), "{tree:#?}");
+    assert_eq!(tree.get("a/x"), Some(&file_node(b"file a/x")), "{tree:#?}");
+    let beside: Vec<(&String, &DiskNode)> =
+        tree.iter().filter(|(p, _)| p.starts_with("a (") && is_conflict_copy(p)).collect();
+    assert_eq!(beside.len(), 1, "{tree:#?}");
+    assert_eq!(beside[0].1, &DiskNode::Symlink { target: "target".to_string() }, "{tree:#?}");
+}
+
+/// A renames `d` to `e` while B creates `d/new`. The rename moves the
+/// entries A observed; B's concurrent child stays under `d`, which survives
+/// as its container. Green with file-only replication already (the rename
+/// reaches the peer as per-file delete-and-put); it pins the tree that
+/// directory entries must keep producing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn directory_rename_across_two_devices_moves_explicit_entries_only() {
+    let (device_a, device_b, _group_id) = two_synced_devices("dir-rename-vs-child").await;
+
+    std::fs::create_dir(device_a.root.path().join("d")).unwrap();
+    std::fs::write(device_a.root.path().join("d/f.txt"), b"moved").unwrap();
+    wait_until(|| device_b.root.path().join("d/f.txt").exists(), Duration::from_secs(20)).await;
+
+    std::fs::rename(device_a.root.path().join("d"), device_a.root.path().join("e")).unwrap();
+    std::fs::write(device_b.root.path().join("d/new.txt"), b"concurrent").unwrap();
+
+    let want = tree_of(vec![
+        ("d", DiskNode::fresh_directory()),
+        ("d/new.txt", file_node(b"concurrent")),
+        ("e", DiskNode::fresh_directory()),
+        ("e/f.txt", file_node(b"moved")),
+    ]);
+    let tree = settle_to_one_tree(&device_a, &device_b, |t| *t == want).await;
+    assert_eq!(tree, want);
+}
+
+/// After a peer's `rm -rf p` has settled, a fresh `mkdir p` is a new user
+/// directory, not the old container coming back: it is captured as an
+/// explicit entry and appears, empty, on the peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mkdir_after_remote_rm_rf_of_same_path_is_captured_as_explicit() {
+    let (device_a, device_b, _group_id) = two_synced_devices("dir-mkdir-after-rm-rf").await;
+
+    std::fs::create_dir(device_a.root.path().join("p")).unwrap();
+    std::fs::write(device_a.root.path().join("p/f.txt"), b"f").unwrap();
+    wait_until(|| device_b.root.path().join("p/f.txt").exists(), Duration::from_secs(20)).await;
+    std::fs::remove_dir_all(device_a.root.path().join("p")).unwrap();
+    settle_to_one_tree(&device_a, &device_b, |t| t.is_empty()).await;
+
+    std::fs::create_dir(device_b.root.path().join("p")).unwrap();
+    let want = tree_of(vec![("p", DiskNode::fresh_directory())]);
+    let tree = settle_to_one_tree(&device_a, &device_b, |t| *t == want).await;
+    assert_eq!(tree, want);
+}
+
+/// Guard, green today and required to stay green: materializing a peer's
+/// nested file creates its parent directories on the receiver, and the
+/// receiver's own capture must never author those (or anything else: the
+/// receiver did nothing) as changes of its own. They are containers the
+/// engine made, not user intent; authoring them would keep them alive after
+/// the file is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_file_materialization_never_authors_a_directory_change() {
+    let (device_a, device_b, group_id) = two_synced_devices("dir-materialize-no-author").await;
+
+    std::fs::create_dir_all(device_a.root.path().join("nested/deeper")).unwrap();
+    std::fs::write(device_a.root.path().join("nested/deeper/file.txt"), b"payload").unwrap();
+    settle_to_one_tree(&device_a, &device_b, |t| {
+        t.get("nested/deeper/file.txt") == Some(&file_node(b"payload"))
+    })
+    .await;
+    // Past the watcher's debounce, so a capture of the created directories
+    // would have landed in the history by now.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Not vacuous: B's history holds A's write of the file.
+    let a_put =
+        ops_by_author_at(&device_b, &group_id, &device_a.device_id, "nested/deeper/file.txt");
+    assert_eq!(a_put, ["put"], "B never admitted A's change");
+    let changes = device_b
+        .state
+        .replica_coordinator
+        .change_history_repository()
+        .dag_list_group_changes(&group_id)
+        .unwrap();
+    let authored: Vec<_> = changes.iter().filter(|c| c.device_id.0 == device_b.device_id).collect();
+    assert!(
+        authored.is_empty(),
+        "the receiver authored changes of its own after only materializing a peer's file: \
+         {authored:#?}"
     );
 }

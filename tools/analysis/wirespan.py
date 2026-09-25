@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Derive the receiver's wire-arrival window from raw M6PHASE logs.
+"""Derive the receiver's wire-arrival window from raw `phase T_*` marker logs.
+
+The markers are `debug`-level events; capture with RUST_LOG enabling debug
+for the daemon and local-storage crates.
 
     first block received -> last block received
 

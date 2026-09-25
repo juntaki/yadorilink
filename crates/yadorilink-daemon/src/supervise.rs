@@ -13,22 +13,13 @@ use std::time::Duration;
 
 use tokio::task::JoinHandle;
 
-/// The essential-task supervisor container.
-///
-/// Production (non-`madsim`) builds are a zero-cost newtype over
-/// `tokio::task::JoinSet<&'static str>` — every method delegates straight
-/// to it, so the daemon's supervision/shutdown behavior is byte-for-byte
-/// what it was before this wrapper existed. Under the deterministic
-/// simulator (`--cfg madsim`) `tokio::task::JoinSet` does not exist at
-/// all, so the same surface is reimplemented over
-/// `FuturesUnordered<JoinHandle<_>>` plus the tasks' `AbortHandle`s, which
-/// together reproduce `JoinSet`'s two behaviors this daemon relies on:
-/// `join_next()` (yield whichever task finishes/panics first) and
-/// `shutdown()` (abort every still-running task, then await them all).
-#[cfg(not(madsim))]
+/// The essential-task supervisor container: a zero-cost newtype over
+/// `tokio::task::JoinSet<&'static str>`, of which this daemon relies on
+/// two behaviors: `join_next()` (yield whichever task finishes/panics
+/// first) and `shutdown()` (abort every still-running task, then await
+/// them all).
 pub struct EssentialTasks(tokio::task::JoinSet<&'static str>);
 
-#[cfg(not(madsim))]
 impl EssentialTasks {
     pub fn new() -> Self {
         Self(tokio::task::JoinSet::new())
@@ -52,44 +43,6 @@ impl EssentialTasks {
     /// Abort every still-running task and await their completion.
     pub async fn shutdown(&mut self) {
         self.0.shutdown().await;
-    }
-}
-
-#[cfg(madsim)]
-pub struct EssentialTasks {
-    in_flight: futures_util::stream::FuturesUnordered<JoinHandle<&'static str>>,
-    abort_handles: Vec<tokio::task::AbortHandle>,
-}
-
-#[cfg(madsim)]
-impl EssentialTasks {
-    pub fn new() -> Self {
-        Self { in_flight: futures_util::stream::FuturesUnordered::new(), abort_handles: Vec::new() }
-    }
-
-    pub fn spawn<F>(&mut self, task: F)
-    where
-        F: Future<Output = &'static str> + Send + 'static,
-    {
-        let handle = tokio::spawn(task);
-        // Retained so `shutdown()` can abort the still-running task itself
-        // (`JoinSet::shutdown`'s semantics), not merely stop awaiting it —
-        // aborting an already-finished task is a harmless no-op.
-        self.abort_handles.push(handle.abort_handle());
-        self.in_flight.push(handle);
-    }
-
-    pub async fn join_next(&mut self) -> Option<Result<&'static str, tokio::task::JoinError>> {
-        use futures_util::stream::StreamExt;
-        self.in_flight.next().await
-    }
-
-    pub async fn shutdown(&mut self) {
-        use futures_util::stream::StreamExt;
-        for handle in &self.abort_handles {
-            handle.abort();
-        }
-        while self.in_flight.next().await.is_some() {}
     }
 }
 
@@ -159,6 +112,18 @@ impl BackoffConfig {
     /// against it.
     pub const UPDATE_CHECK_RETRY: BackoffConfig =
         BackoffConfig { initial: Duration::from_secs(60), max: Duration::from_secs(3600) };
+
+    /// Backoff for a `(peer, group)` reconciliation pair whose last attempt
+    /// failed — see `sync_adapter::driver::PairBackoff`'s own doc comment
+    /// for the abandoned-full-replica-group scenario this exists to stop
+    /// from starving a healthy pair sharing the same bounded concurrency.
+    /// Long max on purpose: a pair this stale is not expected to start
+    /// working again on any short timescale, and a genuine reason to try
+    /// sooner (a local edit, a fresh netmap grant) reaches the pump through
+    /// `Wake::Group`/`Wake::Peer`/`Wake::PeerGroup`, which bypass this
+    /// backoff entirely rather than waiting it out.
+    pub const DEAD_RECONCILIATION_PAIR: BackoffConfig =
+        BackoffConfig { initial: Duration::from_secs(30), max: Duration::from_secs(600) };
 
     /// Made `pub` (was private, used only by `spawn_restarting` below) so
     /// `daemon_state`'s Degraded-link re-check scheduling can reuse this
@@ -272,113 +237,23 @@ where
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
-    use std::sync::Arc;
-
-    /// Polls for `attempts` to reach `target` instead of sleeping a fixed
-    /// duration and then asserting a threshold. A fixed sleep + count
-    /// assertion assumes the host
-    /// scheduler gives this task's ~1-5ms backoff loop enough real
-    /// wall-clock progress within that fixed window; under heavy
-    /// concurrent CPU load (many parallel builds/tests contending for
-    /// cores) that assumption can be false even though the supervised
-    /// task's actual restart behavior is correct — this waits (bounded by
-    /// a generous `timeout`) for the real condition instead, so the test
-    /// still fails (via the caller's own assertion) on a genuine
-    /// regression where restarts stop happening, but tolerates transient
-    /// scheduling delays rather than racing a fixed clock.
-    async fn wait_for_attempts(attempts: &AtomicU32, target: u32, timeout: Duration) {
-        let deadline = tokio::time::Instant::now() + timeout;
-        while attempts.load(Ordering::SeqCst) < target {
-            if tokio::time::Instant::now() > deadline {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
+/// Spawns a task that is MEANT to finish: a one-shot job fired by some
+/// event (a reconnect, a policy update) that does its work and returns.
+/// Unlike [`spawn_logged`], whose tasks are long-running loops for which
+/// any exit is unexpected, a clean `Ok(())` here is the normal outcome and
+/// is logged at `debug`; only an `Err` is worth a `warn`. A panic still
+/// surfaces through the returned handle and tokio's own panic report.
+pub fn spawn_one_shot<Fut>(name: &'static str, task: Fut) -> JoinHandle<()>
+where
+    Fut: Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + 'static,
+{
+    tokio::spawn(async move {
+        match task.await {
+            Ok(()) => tracing::debug!(task = name, "one-shot task finished"),
+            Err(e) => tracing::warn!(task = name, error = %e, "one-shot task failed"),
         }
-    }
-
-    #[tokio::test]
-    async fn spawn_restarting_retries_after_a_returning_task() {
-        let attempts = Arc::new(AtomicU32::new(0));
-        let backoff =
-            BackoffConfig { initial: Duration::from_millis(1), max: Duration::from_millis(5) };
-        let counted = attempts.clone();
-        let handle = spawn_restarting("test-task", backoff, move || {
-            let attempts = counted.clone();
-            async move {
-                attempts.fetch_add(1, Ordering::SeqCst);
-            }
-        });
-
-        wait_for_attempts(&attempts, 3, Duration::from_secs(10)).await;
-        handle.abort();
-        assert!(
-            attempts.load(Ordering::SeqCst) >= 3,
-            "expected several restarts of ~1-5ms backoff within 10s of polling"
-        );
-    }
-
-    #[tokio::test]
-    async fn spawn_restarting_retries_after_a_panic() {
-        let attempts = Arc::new(AtomicU32::new(0));
-        let backoff =
-            BackoffConfig { initial: Duration::from_millis(1), max: Duration::from_millis(5) };
-        let counted = attempts.clone();
-        let handle = spawn_restarting("panicky-task", backoff, move || {
-            let attempts = counted.clone();
-            async move {
-                let n = attempts.fetch_add(1, Ordering::SeqCst);
-                if n < 2 {
-                    panic!("simulated failure");
-                }
-            }
-        });
-
-        wait_for_attempts(&attempts, 3, Duration::from_secs(10)).await;
-        handle.abort();
-        assert!(
-            attempts.load(Ordering::SeqCst) >= 3,
-            "expected retries past the panicking attempts within 10s of polling"
-        );
-    }
-
-    #[tokio::test]
-    async fn spawn_restarting_stops_when_aborted_from_outside() {
-        let attempts = Arc::new(AtomicU32::new(0));
-        let backoff =
-            BackoffConfig { initial: Duration::from_millis(1), max: Duration::from_millis(5) };
-        let counted = attempts.clone();
-        let handle = spawn_restarting("abortable-task", backoff, move || {
-            let attempts = counted.clone();
-            async move {
-                attempts.fetch_add(1, Ordering::SeqCst);
-                tokio::time::sleep(Duration::from_secs(10)).await; // never returns on its own
-            }
-        });
-
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        handle.abort();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let count_after_abort = attempts.load(Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(
-            attempts.load(Ordering::SeqCst),
-            count_after_abort,
-            "must not keep restarting after the supervising handle itself was aborted"
-        );
-    }
-
-    #[test]
-    fn backoff_doubles_and_caps_at_max() {
-        let backoff =
-            BackoffConfig { initial: Duration::from_secs(1), max: Duration::from_secs(10) };
-        // Jitter is ±25%, so check bounds rather than exact values.
-        let d0 = backoff.next(0);
-        assert!(d0 >= Duration::from_millis(750) && d0 <= Duration::from_millis(1250));
-        let d_large = backoff.next(10);
-        assert!(d_large <= Duration::from_secs(10) + Duration::from_millis(1));
-    }
+    })
 }
+
+#[cfg(test)]
+mod tests;

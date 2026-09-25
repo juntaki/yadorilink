@@ -5,15 +5,12 @@
 //! caught here -- before any DST seed sweep false-fails weeks later from
 //! the drift.
 //!
-//! This is a NON-madsim, per-platform test on purpose: it exercises the
-//! actual OS watcher (FSEvents / inotify / ReadDirectoryChangesW) on a real
-//! tempdir, which madsim does not simulate. It compiles the *exact*
-//! `fs_events.rs` source the madsim scenarios use, via `#[path]`, so the
-//! two share one source of truth. Under `--cfg madsim` this whole file
-//! compiles to nothing (`#![cfg(not(madsim))]`); it runs in CI's ordinary
-//! `cargo test` legs, per platform.
-
-#![cfg(not(madsim))]
+//! This is a plain, per-platform test on purpose: it exercises the actual
+//! OS watcher (FSEvents / inotify / ReadDirectoryChangesW) on a real
+//! tempdir, which no simulator models. It compiles the *exact*
+//! `fs_events.rs` source the simulation scenarios use, via `#[path]`, so
+//! the two share one source of truth. It runs in CI's ordinary `cargo test`
+//! legs, per platform.
 
 use std::path::Path;
 use std::time::Duration;

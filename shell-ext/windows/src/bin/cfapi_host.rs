@@ -28,7 +28,7 @@
 //! creation / stale-root removal lagging by up to `POLL_INTERVAL` is a
 //! modest, disclosed trade-off rather than a correctness bug.
 //!
-//! M2-1 FAIL-CLOSED RECONCILIATION: `reconcile_sync_roots` only ever runs
+//! FAIL-CLOSED RECONCILIATION: `reconcile_sync_roots` only ever runs
 //! against a *confirmed* desired-state snapshot (`Some(folders)` from
 //! `ipc_client::list_on_demand_folders`). A failure to confirm that
 //! snapshot (unreachable daemon, timeout, malformed response) makes NO
@@ -296,12 +296,20 @@ fn poll_once(backend: &mut impl SyncRootBackend, known_roots: &mut HashSet<PathB
             // succeeds.
             continue;
         }
-        let entries = yadorilink_shell_ext::ipc_client::list_folder_files(&folder.local_path);
+        let Some(entries) = yadorilink_shell_ext::ipc_client::list_folder_files(&folder.local_path)
+        else {
+            eprintln!(
+                "yadorilink-cfapi-host: could not confirm the file listing of {:?} this poll; \
+                 skipping its placeholder sync",
+                folder.local_path
+            );
+            continue;
+        };
         yadorilink_shell_ext::cfapi::sync_placeholders(&root, &entries);
     }
 }
 
-/// M2-3b: runs `dehydrate_server::serve` for the lifetime of this process
+/// Runs `dehydrate_server::serve` for the lifetime of this process
 /// on a dedicated OS thread with its own single-threaded Tokio runtime --
 /// `main`'s own poll loop (below) is plain synchronous code with no
 /// runtime of its own (see `ipc_client.rs`'s doc comment on why ITS calls

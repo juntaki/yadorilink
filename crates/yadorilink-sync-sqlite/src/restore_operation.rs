@@ -1,17 +1,9 @@
 //! `RestoreOperationRepository` owns the `restore_operations` table -- the
 //! crash-safe journal of a restore whose replacement file and index update
 //! have not both been durably committed yet.
-//!
-//! Moved from `yadorilink-sync-core::repository::restore_operation` (Phase
-//! 7D-9E) -- a plain `Arc<SyncDatabase>`-backed repository with no
-//! `SyncState` coupling of its own; `RestoreOperation`/`RestoreCommitOutcome`/
-//! `RestoreOperationState` already live in
-//! `yadorilink_filesystem_sync::materialization_types` (Phase 7D-9C), so this
-//! move only relocates the SQL half, not the value types.
-//!
 //! `record_restore_operation_emitting_change` (`restore_operations` + DAG
 //! change emission) and `commit_restore_operation` (`restore_operations` +
-//! `files` + DAG `applied` state) are two of the ownership doc's "Known
+//! `files` + DAG state) are two of the ownership doc's "Known
 //! cross-cluster atomic operations" -- reaching directly into `dag_store`
 //! free functions and raw `files`-table SQL inside their own transaction,
 //! exactly as
@@ -28,13 +20,14 @@ use crate::dag_store::{self, ChangeEmitter};
 use crate::error::SyncSqliteError;
 use crate::file_index::{apply_local_meta_columns_in_tx, upsert_file_in_tx};
 use crate::materialization_state::MaterializationStateRepository;
-use yadorilink_filesystem_sync::materialization_types::{
-    RestoreCommitOutcome, RestoreOperation, RestoreOperationState,
-};
-use yadorilink_replica_domain::change::{Change, ChangeAuth, Op, PutOrigin};
+use yadorilink_replica_domain::change::{Op, PutOrigin};
 use yadorilink_replica_domain::file::{FileRecord, FileVersion, RecordKind};
 use yadorilink_replica_domain::ids::{ChangeHash, SyncPath};
 use yadorilink_replica_domain::session_state::{LocalFileMetaColumns, MaterializationState};
+use yadorilink_replica_domain::session_state::{
+    RestoreCommitOutcome, RestoreOperation, RestoreOperationState,
+};
+use yadorilink_root_authority::root_commit::RootCommitPermit;
 use yadorilink_sqlite_runtime::SyncDatabase;
 
 // Deliberately a private, module-local duplicate rather than a shared helper
@@ -43,6 +36,15 @@ use yadorilink_sqlite_runtime::SyncDatabase;
 fn now_unix_nanos() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as i64).unwrap_or(0)
+}
+
+/// Where a recorded restore's entry is written: by the restore itself at
+/// its own path, or by the ordinary projection, wherever the namespace
+/// places it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestorePlacement {
+    InPlace,
+    Projection,
 }
 
 pub struct RestoreOperationRepository {
@@ -102,33 +104,92 @@ impl RestoreOperationRepository {
     /// doc comment for why it is a parameter here rather than resolved
     /// internally (`local_change_auth_provider` lives on `SyncState`, not on
     /// any repository).
+    ///
+    /// `permit` is verified inside the transaction, so a restore whose root
+    /// was lost after admission authors no change and journals nothing.
     pub fn record_restore_operation_emitting_change(
         &self,
         operation: &RestoreOperation,
         version: &FileVersion,
         emitter: &ChangeEmitter,
-        auth: ChangeAuth,
+        permit: &RootCommitPermit,
     ) -> Result<ChangeHash, SyncSqliteError> {
+        self.record_restore(operation, version, emitter, permit, None).map(|(hash, _)| hash)
+    }
+
+    /// Authors the restore's `Put` as
+    /// [`Self::record_restore_operation_emitting_change`] does, and decides
+    /// in the same transaction whether the restore writes its entry itself.
+    ///
+    /// It does when `disk_allows_in_place` (the caller's reading of the
+    /// disk: no synced file or symlink is an ancestor, and nothing of the
+    /// other shape occupies the path) and the namespace, with this change
+    /// admitted, keeps the entry at its own path. Only then is the journal
+    /// row written. Otherwise the ordinary projection places the entry --
+    /// the obligation the change opened drives it -- and there is no
+    /// journal row at all: no instant exists at which a crash could leave
+    /// startup recovery a row for a write that was never going to happen.
+    pub fn record_restore_placing(
+        &self,
+        operation: &RestoreOperation,
+        version: &FileVersion,
+        emitter: &ChangeEmitter,
+        permit: &RootCommitPermit,
+        disk_allows_in_place: bool,
+    ) -> Result<(ChangeHash, RestorePlacement), SyncSqliteError> {
+        self.record_restore(operation, version, emitter, permit, Some(disk_allows_in_place))
+    }
+
+    fn record_restore(
+        &self,
+        operation: &RestoreOperation,
+        version: &FileVersion,
+        emitter: &ChangeEmitter,
+        permit: &RootCommitPermit,
+        disk_allows_in_place: Option<bool>,
+    ) -> Result<(ChangeHash, RestorePlacement), SyncSqliteError> {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
+            permit.verify()?;
             let path = SyncPath(operation.path.clone());
             let change = dag_store::emit_local_change(
                 tx,
                 &operation.group_id,
                 vec![Op::Put { path, version: version.version_hash, origin: PutOrigin::Direct }],
-                auth,
                 emitter,
             )?;
             dag_store::put_file_version(tx, &operation.group_id, version)?;
             let change_hash = change.compute_hash();
-            // The direct restore is not on disk/index yet. Keep the change
-            // eligible for ordinary DAG projection until commit below marks
-            // it applied. If reconstruction fails or the process crashes,
-            // discarding the journal cannot strand an applied=true change
-            // whose content was never published.
-            tx.execute(
-                "UPDATE changes SET applied = 0 WHERE change_hash = ?1",
-                [&change_hash.0[..]],
-            )?;
+            let placement = match disk_allows_in_place {
+                None => RestorePlacement::InPlace,
+                Some(false) => RestorePlacement::Projection,
+                Some(true) => {
+                    use crate::desired_state::{desired_path_state, DesiredPathState};
+                    let desired =
+                        desired_path_state(tx, &operation.group_id, &operation.path)?;
+                    if matches!(
+                        (version.meta.record_kind, desired),
+                        (RecordKind::Directory, DesiredPathState::ExplicitDirectory { .. })
+                            | (
+                                RecordKind::File | RecordKind::Symlink,
+                                DesiredPathState::Entry { .. }
+                            )
+                    ) {
+                        RestorePlacement::InPlace
+                    } else {
+                        RestorePlacement::Projection
+                    }
+                }
+            };
+            if placement == RestorePlacement::Projection {
+                return Ok((change_hash, placement));
+            }
+            // The restored content is not on disk yet. What keeps that
+            // visible is the restore journal row written just below plus the
+            // projection obligation `emit_local_change` already bumped for
+            // this path -- not a flag on the change. A crash before the disk
+            // write leaves both, and recovery replays from them; discarding
+            // the journal cannot strand a change claiming content that was
+            // never published, because nothing claims it.
             let blocks_json = serde_json::to_string(&operation.record.blocks)?;
             tx.execute(
                 "INSERT INTO restore_operations
@@ -158,12 +219,17 @@ impl RestoreOperationRepository {
                     crate::file_index::encode_xattrs_column(&operation.meta.xattrs),
                 ],
             )?;
-            Ok(change_hash)
+            Ok((change_hash, placement))
         })
     }
 
-    pub fn mark_restore_disk_committed(&self, operation_id: &str) -> Result<(), SyncSqliteError> {
+    pub fn mark_restore_disk_committed(
+        &self,
+        operation_id: &str,
+        permit: &RootCommitPermit,
+    ) -> Result<(), SyncSqliteError> {
         let changed = self.database.write::<_, SyncSqliteError>(|conn| {
+            permit.verify()?;
             Ok(conn.execute(
                 "UPDATE restore_operations SET state = 'disk_committed' WHERE operation_id = ?1",
                 [operation_id],
@@ -205,11 +271,41 @@ impl RestoreOperationRepository {
     /// Atomically publishes the exact journaled version and removes its
     /// recovery marker. A second recovery pass observes no row and therefore
     /// cannot append another version.
+    ///
+    /// Two callers reach this, and they are not the same kind of writer.
+    ///
+    /// The LIVE restore performed the disk write itself, under this path's
+    /// lock, having bumped the mutation fence to a known epoch first. It
+    /// passes that epoch as `wrote_under_mutation_generation`, and its
+    /// proof is published by CASing against it -- so if anything touched
+    /// the path in between, this attempt no longer knows what is on disk
+    /// and publishes nothing at all, journal row included. Routing it
+    /// through the external-adoption API instead (which mints a FRESH
+    /// epoch on its way to recording the write) is what made the restore's
+    /// own epoch unusable the moment it was recorded, and left the proof
+    /// with no version besides.
+    ///
+    /// STARTUP RECOVERY did not write anything. It found a journal row, a
+    /// process that died somewhere around the rename, and disk bytes it
+    /// re-verified against the journaled version under the path's lock.
+    /// There is no epoch it could CAS against -- the journal does not
+    /// persist one -- so it passes `None` and adopts what it verified,
+    /// minting an epoch for it, exactly as an external observation does.
+    /// Its proof carries the same exact version either way.
+    ///
+    /// Both lanes pass the permit of the `LinkOperation` they hold, and it
+    /// is verified inside this transaction, before anything is written: a
+    /// root lost between the write and this commit publishes no row, no
+    /// proof, and leaves the journal entry standing for recovery.
     pub fn commit_restore_operation(
         &self,
         operation_id: &str,
+        identity: Option<&yadorilink_root_authority::fs_identity::FileIdentity>,
+        wrote_under_mutation_generation: Option<i64>,
+        permit: &RootCommitPermit,
     ) -> Result<RestoreCommitOutcome, SyncSqliteError> {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
+            permit.verify()?;
             let operation = tx
                 .query_row(
                     "SELECT operation_id, group_id, path, target_version_seq, state,
@@ -235,6 +331,34 @@ impl RestoreOperationRepository {
             if current_version_seq != operation.expected_current_version_seq {
                 return Ok(RestoreCommitOutcome::Superseded);
             }
+            // Checked HERE, before this transaction writes anything, and
+            // not only by the CAS further down. `write_immediate` commits
+            // whatever its closure returns `Ok` for, so an early return
+            // taken after the row upsert below would commit that upsert:
+            // the path would advance to the restored version with no proof
+            // behind it, carrying forward whatever `materialization_state`
+            // the row it superseded had -- the unprovable claim this whole
+            // module exists to make unreachable -- while the journal entry
+            // it left standing named a version sequence that no longer
+            // matched, so no later attempt could commit it either.
+            //
+            // A read here is conclusive for the whole transaction, not
+            // merely a hint: `BEGIN IMMEDIATE` takes SQLite's write lock at
+            // the start, so no other writer can advance this fence until
+            // this transaction ends.
+            if let Some(expected) = wrote_under_mutation_generation {
+                let live: Option<i64> = tx
+                    .query_row(
+                        "SELECT mutation_generation FROM path_actual_mutation_fences \
+                         WHERE group_id = ?1 AND path = ?2",
+                        rusqlite::params![operation.group_id, operation.path],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if live != Some(expected) {
+                    return Ok(RestoreCommitOutcome::FenceLost);
+                }
+            }
             upsert_file_in_tx(
                 tx,
                 &operation.group_id,
@@ -257,87 +381,110 @@ impl RestoreOperationRepository {
             )?;
             // Explicit, not implicit via the schema's own column default
             // (`Placeholder` as of v25). `reconcile_restore_operations`'s
-            // crash-recovery caller only ever reaches this commit after
-            // confirming `disk_bytes_match_indexed_blocks`, so it is always
-            // safe there. `restore_to_version_inner`'s own direct caller is
-            // NOT always safe by that same argument: its record-kind
-            // dispatch writes real bytes/a real symlink for every kind
-            // EXCEPT one write-nothing symlink case -- Windows-not-opted-in
-            // -- yet this still stamps `Hydrated` for that row too, and
-            // nothing in `restore_to_version_inner` demotes it back
-            // afterward (unlike `materialize_symlink_at`'s identical
-            // policy-skip shape, which does). That is not a live gap: this
-            // restore's own emit -- `record_restore_operation_emitting_
-            // change`, which runs earlier in the SAME `restore_to_version_
-            // inner` call -- durably bumps a `projection_obligations` row
-            // for this exact path in the SAME transaction as the change it
-            // journals, and nothing in this restore path (or the ordinary
-            // materialize pipeline, for a row whose disk genuinely doesn't
-            // match what `Hydrated` claims) ever completes that obligation
-            // without either confirming real content or demoting the row
-            // itself first. A path with an unsettled obligation is never
-            // read as an offline deletion by `reconcile_disk_with_ignore`'s
-            // tombstone loop (`yadorilink-local-capture`) or by the
-            // periodic repair sweep's own `has_unsettled_projection_
-            // obligation` guard -- and separately, `repair_one_interrupted_
-            // symlink` (the periodic repair sweep's own symlink arm)
-            // returns unconditionally on `!policy_permits_write`, before
-            // ever reaching a reconstruct decision for this row at all.
-            // Both mechanisms are already established elsewhere in this
-            // codebase, not something this restore path adds.
-            //
-            // A targetless symlink version (`symlink_target == None`) is
-            // NOT a second instance of this same write-nothing shape: it
-            // can never reach this function at all. `record_restore_
-            // operation_emitting_change` (the only live writer of a
-            // `restore_operations` row -- the crate's other, unvalidated
-            // `record_restore_operation` has no caller anywhere in this
-            // codebase) always calls `FileVersion::verify_hash`, which
-            // runs full `validate_structure` and rejects `RecordKind::
-            // Symlink` with no target, BEFORE this row is ever inserted;
-            // `restore_to_version_inner` dispatches its disk write from
-            // that identical `symlink_target` field, so whenever that
-            // dispatch's own targetless arm would fire, this same
-            // validation already failed the operation earlier and this
-            // function is never reached. Verified empirically, not just
-            // reasoned about: attempting to restore to such a version
-            // returns an error before any disk write or `Hydrated` stamp.
-            MaterializationStateRepository::set_materialization_state_in_tx(
-                tx,
-                &operation.group_id,
-                &operation.path,
-                MaterializationState::Hydrated,
-            )?;
-            if let Some(author) = operation.authoring_change_hash.as_ref() {
-                let encoded: Option<Vec<u8>> = tx
-                    .query_row(
-                        "SELECT encoded FROM changes WHERE change_hash = ?1",
-                        [&author.0[..]],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                let change = encoded
-                    .as_deref()
-                    .map(Change::from_wire_bytes)
-                    .transpose()
-                    .map_err(|error| {
-                        SyncSqliteError::CorruptState(format!(
-                            "restore authoring change cannot be decoded: {error}"
-                        ))
-                    })?
+            // `Hydrated` is published only together with the proof that
+            // earns it. The one record-kind arm that writes nothing --
+            // a Windows symlink with no opt-in -- observes no identity, so
+            // it now simply does not claim to hold content, instead of
+            // claiming it and relying on an unsettled projection obligation
+            // to keep anything from believing the claim.
+            match identity {
+                Some(identity) => {
+                    // The version this restore actually materialized,
+                    // derived from the row the two calls above have just
+                    // written -- the one canonical derivation, the same
+                    // one every guard and every reader uses. Not
+                    // recomputed from the journal's own copy of the
+                    // record: that would be a second derivation of one
+                    // fact, and the two can only be guaranteed to agree if
+                    // there is one.
+                    let restored_version = crate::store::read_canonical_current_row(
+                        tx,
+                        &operation.group_id,
+                        &operation.path,
+                    )?
                     .ok_or_else(|| {
                         SyncSqliteError::CorruptState(format!(
-                            "restore operation {} references missing authoring change {}",
-                            operation.operation_id,
-                            author.to_hex()
+                            "restored row for {} vanished inside its own commit",
+                            operation.path
                         ))
-                    })?;
-                let has_pending_derived_copy = change
-                    .ops
-                    .iter()
-                    .any(|op| matches!(op, Op::Put { origin: PutOrigin::ConflictCopy { .. }, .. }));
-                if !has_pending_derived_copy {
-                    dag_store::mark_applied(tx, author)?;
+                    })?
+                    .version_hash();
+                    match wrote_under_mutation_generation {
+                        Some(expected) => {
+                            let outcome = crate::exact_materialized_commit::
+                                commit_internal_materialized_state_if_fence_current(
+                                    tx,
+                                    &operation.group_id,
+                                    &operation.path,
+                                    None,
+                                    &crate::exact_materialized_commit::ExactMaterializedState::Object {
+                                        kind: operation.meta.record_kind,
+                                        version: restored_version,
+                                        identity: Box::new(Some(*identity)),
+                                    },
+                                    expected,
+                                    // The supersession guard for this
+                                    // commit is the version-seq check
+                                    // above, taken from the same
+                                    // transaction. An `ExpectedAuthoring`
+                                    // would ask a second, weaker question
+                                    // about a row this call has already
+                                    // rewritten.
+                                    None,
+                                    now_unix_nanos(),
+                                )?;
+                            match outcome {
+                                crate::exact_materialized_commit::
+                                    InternalMaterializedCommit::Published(_) => {}
+                                // Unreachable: the fence was checked above
+                                // under this transaction's own write lock,
+                                // and nothing between there and here
+                                // touches it, so a refusal now means the
+                                // isolation that argument rests on did not
+                                // hold. Report it as the error it is --
+                                // which also rolls the transaction back,
+                                // the only safe outcome once the row has
+                                // already been rewritten in it.
+                                refused => {
+                                    return Err(SyncSqliteError::CorruptState(format!(
+                                        "restore commit for {} was refused ({refused:?}) after \
+                                         its fence was confirmed inside the same transaction",
+                                        operation.path
+                                    )));
+                                }
+                            }
+                        }
+                        None => {
+                            crate::file_index::adopt_local_capture_actual_state(
+                                tx,
+                                &operation.group_id,
+                                &operation.path,
+                                operation.meta.record_kind,
+                                &restored_version,
+                                identity,
+                            )?;
+                            MaterializationStateRepository::set_materialization_state_in_tx(
+                                tx,
+                                &operation.group_id,
+                                &operation.path,
+                                MaterializationState::Hydrated,
+                            )?;
+                        }
+                    }
+                }
+                // Nothing was observed, so nothing is proven -- the one
+                // record-kind arm that writes no bytes at all (a Windows
+                // symlink with no opt-in) lands here. The row just written
+                // inherited its predecessor's `materialization_state`, and
+                // the predecessor's proof is still current against the
+                // fence in the recovery lane, so both have to go: this new
+                // version is not what either of them describes.
+                None => {
+                    crate::file_index::retire_unproven_actual_state_in_tx(
+                        tx,
+                        &operation.group_id,
+                        &operation.path,
+                    )?;
                 }
             }
             tx.execute("DELETE FROM restore_operations WHERE operation_id = ?1", [operation_id])?;
@@ -402,3 +549,26 @@ pub(crate) fn restore_operation_from_row(
         },
     })
 }
+
+/// `RestoreCommitOutcome::FenceLost` promises that nothing was written --
+/// the journal row included, since it is the only durable record that a
+/// write was ever in flight.
+///
+/// Keeping that promise is not automatic. The row upsert and its metadata
+/// land near the top of this transaction, before the version being
+/// published can even be derived from them, and `write_immediate` commits
+/// whatever a closure returns `Ok` for. An early return after those writes
+/// therefore commits them: the path advances to the restored version with
+/// no proof, carrying forward whatever `materialization_state` the row it
+/// superseded had -- the exact unprovable claim this module exists to make
+/// unreachable -- while the retained journal entry now names a version
+/// sequence that no longer matches, so no later attempt can commit it
+/// either.
+#[cfg(test)]
+mod fence_lost_atomicity_tests;
+
+/// A restore authors its change long before it writes the bytes, and the
+/// path's materialized basis must not outlive that gap as if it were
+/// current.
+#[cfg(test)]
+mod basis_currency_tests;

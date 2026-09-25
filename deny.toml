@@ -9,13 +9,13 @@ yanked = "deny"
 # directly. Deep transitive UI dependencies are frequently unmaintained with no
 # safe upgrade, and gating on them would block CI on issues we cannot fix.
 # Known transitive unmaintained deps are deliberately NOT added to `ignore`
-# (so newly-unmaintained direct deps still fail); their source and replacement
-# options are tracked in docs/third-party-unmaintained.md.
+# (so newly-unmaintained direct deps still fail); each one must be reached only
+# through a third-party dependency with no maintained drop-in replacement.
 unmaintained = "workspace"
 # Triaged, tracked vulnerability exceptions. The advisories check stays blocking
 # for every other (and future) advisory; only these specific IDs are ignored,
-# each with a documented rationale. See docs/third-party-unmaintained.md for the
-# dependency path, impact assessment, and the condition for removing them.
+# each with its dependency path, impact assessment, and the condition for
+# removing it recorded in the comment directly above the entry.
 ignore = [
     # quick-xml DoS advisories. Both vulnerable versions (0.30.0, 0.39.4) are
     # pulled in only through the Linux desktop UI (yadorilink-desktop-app ->
@@ -71,6 +71,19 @@ exceptions = [
     # Community Data License Agreement – Permissive 2.0. Covers the bundled
     # Mozilla root-certificate data set, which is permissively licensed.
     { crate = "webpki-roots", allow = ["CDLA-Permissive-2.0"] },
+    # Same rationale as webpki-roots above -- another Mozilla CA
+    # root-certificate data crate, reached transitively via iroh's TLS
+    # stack. Release artifacts that bundle this data must make the
+    # CDLA-Permissive-2.0 agreement text available per its sharing terms.
+    { crate = "webpki-root-certs", allow = ["CDLA-Permissive-2.0"] },
+    # Unlicense -- OSI-approved public-domain-equivalent dedication with a
+    # permissive fallback license. Reached only through iroh-relay's
+    # WASM-only websocket transport (`cfg(all(target_family = "wasm",
+    # target_os = "unknown"))`), never compiled into the native
+    # macOS/Linux/Windows binaries this workspace actually ships.
+    { crate = "async_io_stream", allow = ["Unlicense"] },
+    { crate = "pharos", allow = ["Unlicense"] },
+    { crate = "ws_stream_wasm", allow = ["Unlicense"] },
 ]
 
 [bans]

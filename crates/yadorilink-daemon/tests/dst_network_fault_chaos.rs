@@ -1,49 +1,45 @@
-//! Network-fault two-device DST fuzzer: extends `dst_two_device_chaos.rs`'s
-//! real two-`PeerSyncSession` harness with madsim network loss, latency /
-//! reorder, and a timed full partition/heal window. The older scenario's
-//! `fault_schedule` is intentionally always empty; this one makes network
-//! faults the thing under test.
-//!
-//! Both devices run the real watcher-boundary/debounce/`LocalChangeProcessor`
-//! pipeline with `PendingLocalChangeFlush` wired (the guard is always on
-//! here — this scenario is about finding new bugs against the
+//! Network-fault two-device DST fuzzer: extends
+//! `dst_two_device_chaos.rs`'s real two-`PeerSyncSession` harness with
+//! madsim network loss, latency / reorder, and a timed full partition/heal
+//! window. The older scenario's `fault_schedule` is intentionally always
+//! empty; this one makes network faults the thing under test. Both devices
+//! run the real watcher-boundary/debounce/`LocalChangeProcessor` pipeline
+//! with `PendingLocalChangeFlush` wired (the guard is always on here —
+//! this scenario is about finding new bugs against the
 //! *production-representative* configuration, not re-proving the specific
 //! fixed bug `dst_peer_reconcile_race.rs` already covers with the guard
 //! toggled off/on). Local changes propagate to the peer over the
 //! change-history DAG, the way production does once a device has a signing
-//! key: each device's `LocalChangeProcessor` carries a signed `ChangeEmitter`,
-//! so every accepted `process_flush`/`process_event` result also appends a
-//! signed change to the history DAG in the same transaction as its index
-//! write, and the committing device announces its new heads
-//! (`announce_local_commit`). The peer's `run()` loop diffs those heads against
-//! its own store, requests only the ancestry it is missing, and materializes
-//! the same converged state — so conflict copies are computed locally on each
-//! side from the shared change set rather than re-broadcast (the daemon-level
-//! pause/receive-only/status-push bits are out of this crate's scope, matching
-//! this whole harness's precedent of reproducing only the sync-core-relevant
-//! slice of production wiring).
-//!
-//! Invariant bookkeeping: each round writes to one of a small pool of
-//! candidate paths, either solo (one device, then a settle window ample
-//! for local dispatch + propagation to complete before the next round —
-//! so it cleanly supersedes whatever was on that path before) or racing
-//! (mirroring `dst_peer_reconcile_race.rs`'s race shape: one device's
-//! edit sits undispatched while the other's independent, causally-later
-//! change arrives). A path's *active* event set — the event(s) that must
-//! still be discoverable, live or as a conflict-copy, by the end of the
-//! run — is simply overwritten by each new round that touches that path:
-//! a solo round's one event becomes the sole active entry (the prior
-//! round's entries are legitimately, cleanly superseded); a racing
-//! round's two events both become active (neither may be silently lost,
-//! since both are genuinely concurrent from the system's perspective).
-//! `converge_path` proves that "genuinely concurrent" premise before
-//! every round (see its own doc comment) — without it, a path reused
-//! across several rounds can have its two devices' local causal state
-//! genuinely diverge (only best-effort, not verified, cross-device
-//! propagation between rounds), making a legitimate `ChangeOrdering::Before`
-//! outcome indistinguishable from real data loss.
+//! key: each device's `LocalChangeProcessor` carries a signed
+//! `ChangeEmitter`, so every accepted `process_flush`/`process_event`
+//! result also appends a signed change to the history DAG in the same
+//! transaction as its index write, and the committing device announces its
+//! new heads (`announce_local_commit`). Invariant bookkeeping: each round
+//! writes to one of a small pool of candidate paths, either solo (one
+//! device, then a settle window ample for local dispatch + propagation to
+//! complete before the next round — so it cleanly supersedes whatever was
+//! on that path before) or racing (mirroring
+//! `dst_peer_reconcile_race.rs`'s race shape: one device's edit sits
+//! undispatched while the other's independent, causally-later change
+//! arrives). A path's *active* event set — the event(s) that must still be
+//! discoverable, live or as a conflict-copy, by the end of the run — is
+//! simply overwritten by each new round that touches that path: a solo
+//! round's one event becomes the sole active entry (the prior round's
+//! entries are legitimately, cleanly superseded); a racing round's two
+//! events both become active (neither may be silently lost, since both are
+//! genuinely concurrent from the system's perspective). `converge_path`
+//! proves that "genuinely concurrent" premise before every round (see its
+//! own doc comment) — without it, a path reused across several rounds can
+//! have its two devices' local causal state genuinely diverge (only
+//! best-effort, not verified, cross-device propagation between rounds),
+//! making a legitimate `ChangeOrdering::Before` outcome indistinguishable
+//! from real data loss.
 
-#![cfg(madsim)]
+// Retired. This scenario was written for a simulator this project no longer
+// builds against, and it names APIs that have since been removed. It is kept,
+// never compiled, as the specification its turmoil re-expression has to meet;
+// delete it in the change that lands that replacement.
+#![cfg(any())]
 
 mod dst_dag_migrate_b2;
 mod dst_support;
@@ -68,7 +64,7 @@ use yadorilink_filesystem_sync::watcher::{
     FolderWatchSource, FsChangeEvent, FsChangeKind, SimulatedFolderWatchSource,
 };
 use yadorilink_local_capture::{LocalChangeOutcome, LocalChangeProcessor};
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 use yadorilink_peer_session::peer_session::{
     PeerSyncSession, PendingLocalChangeFlush, PendingLocalFlushOutcome,
 };
@@ -165,16 +161,29 @@ impl FaultProfile {
     }
 
     fn fault_schedule(&self) -> Vec<(u64, Fault)> {
+        /// Saturating rather than `as u64`: a schedule offset beyond 584
+        /// years is a mistake in the profile, and clamping it to the end of
+        /// time is a less confusing way to find that out than wrapping
+        /// around to the beginning of it.
+        fn nanos_of(d: std::time::Duration) -> u64 {
+            u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+        }
+
         vec![
             (0, Fault::Net(NetFault::Drop)),
             (0, Fault::Net(NetFault::Delay { millis: self.latency_max.as_millis() as u64 })),
             (0, Fault::Net(NetFault::Reorder)),
+            // Nanoseconds, which is what the schedule's offsets are (see
+            // `Case::fault_schedule`). These were milliseconds, so every
+            // window here opened a million times too early -- a partition
+            // configured for 20ms in opened 20ns in, before the scenario had
+            // done anything for it to interrupt.
             (
-                self.partition_start.as_millis() as u64,
+                nanos_of(self.partition_start),
                 Fault::Net(NetFault::Partition { device_a: 0, device_b: 1 }),
             ),
             (
-                (self.partition_start + self.partition_duration).as_millis() as u64,
+                nanos_of(self.partition_start + self.partition_duration),
                 Fault::Net(NetFault::Heal { device_a: 0, device_b: 1 }),
             ),
         ]
@@ -217,7 +226,7 @@ impl ChaosDevice {
         let changed = match outcome {
             LocalChangeOutcome::FileChanged(_) => true,
             LocalChangeOutcome::FilesChanged(ref records) => !records.is_empty(),
-            LocalChangeOutcome::None => false,
+            LocalChangeOutcome::None | LocalChangeOutcome::RetryLater => false,
         };
         if !changed {
             return;
@@ -355,7 +364,7 @@ fn setup_device(
     device_id: &str,
     root: PathBuf,
     sync_state: Arc<ReplicaCoordinator>,
-    store: Arc<FsBlockStore>,
+    store: Arc<SegmentBlockStore>,
 ) -> Arc<ChaosDevice> {
     let processor = Arc::new(
         LocalChangeProcessor::new(
@@ -442,11 +451,9 @@ async fn poll_until(timeout: Duration, mut condition: impl FnMut() -> bool) {
     }
 }
 
-/// PF (fidelity/artifact-reduction) gate relaxation, agmsg investigation
-/// 2026-07-09: this bound used to be 5s, which false-failed round
-/// progression against the self-echo re-index churn's ~30s hydration-
-/// timeout cycle (confirmed production-real, not a harness/madsim
-/// artifact). Production has no "N seconds or fail" gate at all -- only
+/// Round-settle budget. It must sit above the self-echo re-index churn's
+/// ~30s hydration-timeout cycle, which is production behaviour, not a
+/// harness artifact. Production has no "N seconds or fail" gate at all -- only
 /// eventual consistency -- so this bound only needs to be "comfortably
 /// above the slowest legitimate settle path this scenario can hit", not
 /// tight. Loosening it does *not* hide the churn's real cost: the caller
@@ -523,10 +530,10 @@ async fn connect_sessions(
     rng: &mut StdRng,
     device_a: &Arc<ChaosDevice>,
     state_a: Arc<ReplicaCoordinator>,
-    store_a: Arc<FsBlockStore>,
+    store_a: Arc<SegmentBlockStore>,
     device_b: &Arc<ChaosDevice>,
     state_b: Arc<ReplicaCoordinator>,
-    store_b: Arc<FsBlockStore>,
+    store_b: Arc<SegmentBlockStore>,
 ) {
     let socket_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let socket_b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -537,7 +544,7 @@ async fn connect_sessions(
     // `broadcast_change` re-fan-out: each device materializes the same conflict
     // copy locally from the shared change set (both sides pull every change via
     // the heads-announce -> change-request -> change-batch loop), so the legacy
-    // forwarding channel (`new_with_forwarding` + a re-`send_index_update`
+    // forwarding channel (`PeerSyncSession::new` + a re-`send_index_update`
     // loop) is dropped. Both devices run the plain session and converge by
     // pulling each other's announced heads.
     // Pin both devices' verifying keys (each admits the other's signed changes)
@@ -549,7 +556,7 @@ async fn connect_sessions(
 
     let mut sync_roots_a = HashMap::new();
     sync_roots_a.insert(GROUP_ID.to_string(), device_a.root.clone());
-    let session_a = PeerSyncSession::new_with_dependencies(
+    let session_a = PeerSyncSession::new(
         channel_a,
         device_a.device_id.clone(),
         device_b.device_id.clone(),
@@ -570,7 +577,7 @@ async fn connect_sessions(
 
     let mut sync_roots_b = HashMap::new();
     sync_roots_b.insert(GROUP_ID.to_string(), device_b.root.clone());
-    let session_b = PeerSyncSession::new_with_dependencies(
+    let session_b = PeerSyncSession::new(
         channel_b,
         device_b.device_id.clone(),
         device_a.device_id.clone(),
@@ -631,7 +638,7 @@ async fn deliver_local_write(
     clock: &HarnessClock,
 ) -> Result<(), String> {
     let full_path = device.root.join(path);
-    // Gap A: `fs_ops::write` writes and stamps the mtime through the shared
+    // `fs_ops::write` writes and stamps the mtime through the shared
     // `HarnessClock` in one step -- no local `stamp_deterministic_mtime`.
     dst_support::fs_ops::write(clock, &full_path, &content)?;
     device
@@ -819,19 +826,18 @@ async fn run_scenario(
     let root_dir_a = tempfile::tempdir().map_err(|e| e.to_string())?;
     let root_a = root_dir_a.path().canonicalize().map_err(|e| e.to_string())?;
     let store_dir_a = tempfile::tempdir().map_err(|e| e.to_string())?;
-    let store_a = Arc::new(FsBlockStore::new(store_dir_a.path()).map_err(|e| e.to_string())?);
+    let store_a = Arc::new(SegmentBlockStore::new(store_dir_a.path()).map_err(|e| e.to_string())?);
     let state_a = Arc::new(ReplicaCoordinator::open_in_memory().map_err(|e| e.to_string())?);
     dst_support::link::link_and_start(&state_a, &root_a, GROUP_ID).map_err(|e| e.to_string())?;
     let root_dir_b = tempfile::tempdir().map_err(|e| e.to_string())?;
     let root_b = root_dir_b.path().canonicalize().map_err(|e| e.to_string())?;
     let store_dir_b = tempfile::tempdir().map_err(|e| e.to_string())?;
-    let store_b = Arc::new(FsBlockStore::new(store_dir_b.path()).map_err(|e| e.to_string())?);
+    let store_b = Arc::new(SegmentBlockStore::new(store_dir_b.path()).map_err(|e| e.to_string())?);
     let state_b = Arc::new(ReplicaCoordinator::open_in_memory().map_err(|e| e.to_string())?);
     dst_support::link::link_and_start(&state_b, &root_b, GROUP_ID).map_err(|e| e.to_string())?;
     let device_a = setup_device("device-a", root_a.clone(), state_a.clone(), store_a.clone());
     let device_b = setup_device("device-b", root_b.clone(), state_b.clone(), store_b.clone());
-    // PF (fidelity/artifact-reduction) F.2, agmsg investigation 2026-07-09:
-    // held past `connect_sessions` moving its own clones, for the recovery
+    // Held past `connect_sessions` moving its own clones, for the recovery
     // sweep at this scenario's quiescence point (see that call site).
     let recovery_store_a = store_a.clone();
     let recovery_store_b = store_b.clone();
@@ -857,8 +863,7 @@ async fn run_scenario(
     if !std::fs::read(root_b.join(CANARY_PATH)).map(|c| c == b"canary").unwrap_or(false) {
         return Err(format!(
             "{BASELINE_TIMEOUT_MARKER}device B never adopted the startup canary within the poll \
-             timeout -- a host-load-dependent startup stall, not a bug in this scenario (the old \
-             WireGuard-handshake-livelock attribution was disproven; see issue #26)"
+             timeout -- a host-load-dependent startup stall, not a bug in this scenario"
         ));
     }
 
@@ -925,8 +930,7 @@ async fn run_scenario(
     // strictly-monotonic synthetic "now" for this run, owned by
     // `dst_support::clock::HarnessClock`. `fs_ops::write`/`fs_ops::rename`
     // stamp every tempdir mutation through it (so a forgotten stamp is
-    // unrepresentable rather than a reviewer convention -- the pre-migration
-    // per-scenario `stamp_deterministic_mtime` state), and every advance keeps
+    // unrepresentable rather than a per-call convention), and every advance keeps
     // the session-visible `now_unix_nanos` override in lockstep. Seeded from
     // `seed` itself (not a constant) so different seeds explore different
     // tie-break regions -- the full rationale the extracted-from
@@ -1152,34 +1156,21 @@ async fn run_scenario(
         (device_b.root.as_path(), device_b.state.as_ref()),
     ];
 
-    // fix (agmsg review,
-    // 2026-07-08), now via the shared `dst_support::settle` primitive:
-    // the oracle must only ever
-    // run at a genuinely converged, quiescent point -- a fixed pre-oracle
-    // settle sleep before the last round's propagation has actually finished
-    // produces exactly the same "looks like a violation, is really mid-flight"
-    // false signal this scenario's own `converge_path` was written to close for
-    // the *per-round* gate (see its doc comment's "confirmed the hard way"
-    // account) -- this is that same gap, at the *final* check instead of
-    // a mid-run one. `settle` polls `check_convergence` itself as the condition
-    // (bounded, generous -- oracle #1 wants a real timeout to
-    // be a failure, not silently ignored, but also wants the virtual time
-    // it took recorded: a few virtual seconds is normal settle, a bound
-    // anywhere near `DEFAULT_MAINTENANCE_RECONCILE_INTERVAL`'s (~90s) scale is
-    // itself a real, separate latency finding worth surfacing, not an
-    // artifact).
-    // 60s, not a few seconds: `ensure_blocks_present`'s `DEFAULT_HYDRATION_
-    // TIMEOUT` (`peer_session.rs`, 30s) is a legitimate, production
-    // latency this scenario can hit (confirmed root cause of a real
-    // dedup-guard gap in `resolve_and_apply_conflict`, agmsg investigation
-    // 2026-07-08) -- convergence taking up to ~30s after that fires is
-    // expected, not itself a bug; the bound just needs comfortable margin
-    // above it, not to suppress it.
-    // Gap B: the shared `settle` primitive polls `check_convergence` on the
-    // sim clock and returns the instant it converges. On budget exhaustion it
-    // records a non-fatal `SlowConvergence` instead of the old
-    // hand-rolled poll loop's hard timeout -- the terminal `check_convergence`
-    // below still hard-fails on a genuinely divergent final state.
+    // The oracle must only ever run at a genuinely converged, quiescent
+    // point: a fixed pre-oracle settle sleep taken before the last round's
+    // propagation has finished produces the same "looks like a violation,
+    // is really mid-flight" false signal `converge_path` closes for the
+    // per-round gate. The shared `dst_support::settle` primitive polls
+    // `check_convergence` on the sim clock and returns the instant it
+    // converges. On budget exhaustion it records a non-fatal
+    // `SlowConvergence` (a latency worth surfacing, not an artifact); the
+    // terminal `check_convergence` below still hard-fails on a genuinely
+    // divergent final state.
+    // The budget is well above `ensure_blocks_present`'s
+    // `DEFAULT_HYDRATION_TIMEOUT` (`peer_session.rs`, 30s), a legitimate
+    // production latency this scenario can hit: convergence taking up to
+    // ~30s after that timeout fires is expected, so the bound keeps
+    // comfortable margin above it instead of suppressing it.
     const FINAL_CONVERGENCE_BUDGET: Duration = Duration::from_secs(180);
     let outcome = dst_support::settle::settle(&devices, &oracle, FINAL_CONVERGENCE_BUDGET).await;
     let converged = outcome.converged;
@@ -1194,22 +1185,18 @@ async fn run_scenario(
         eprintln!("  SLOW-CONVERGENCE: {slow}");
     }
 
-    // PF (fidelity/artifact-reduction) F.2, agmsg investigation 2026-07-09:
-    // a real daemon runs `repair_interrupted_materializations` +
-    // `cleanup_stale_temp_files` at startup and periodically
-    // (`link_runtime`) -- this bare-`PeerSyncSession` harness never
-    // called either, so an interrupted eager materialize's window
-    // (`materialize`'s own `upsert_file_with_origin`-before-`reconstruct_
-    // file` ordering, see its doc comment) left a live-but-fileless index
-    // row + an orphaned `.yadorilink-tmp.*` file permanently, surfacing as
-    // `StructuralIndexDiskMismatch`/`Corruption` violations the same
-    // production self-healing sweep would have already cleared before any
-    // health check ran against it (seed 3298840595's finding). Run once
-    // per device at this scenario's own genuinely-quiescent point --
-    // matching daemon fidelity, not masking the underlying materialize-
-    // ordering gap (a separate,
-    // low-priority hardening item; this only stops it from producing
-    // harness-only oracle noise).
+    // Harness fidelity: a real daemon runs
+    // `repair_interrupted_materializations` + `cleanup_stale_temp_files` at
+    // startup and periodically (`link_runtime`). Without them, an
+    // interrupted eager materialize's window (`materialize`'s own
+    // `upsert_file_with_origin`-before-`reconstruct_file` ordering, see its
+    // doc comment) would leave a live-but-fileless index row + an orphaned
+    // `.yadorilink-tmp.*` file, surfacing as
+    // `StructuralIndexDiskMismatch`/`Corruption` violations that the
+    // production self-healing sweep clears before any health check runs
+    // (reproduction: seed 3298840595). Run once per device at this
+    // scenario's own genuinely-quiescent point, matching daemon behaviour;
+    // every sweep finding is still printed.
     for (device, store) in [(&device_a, &recovery_store_a), (&device_b, &recovery_store_b)] {
         for finding in dst_support::sweep::run_self_healing(
             &device.state,
@@ -1251,7 +1238,7 @@ async fn run_scenario(
     violations.extend(oracle.check_no_corruption(&content_table, &devices, GROUP_ID));
     violations.extend(oracle.check_structural(GROUP_ID, &devices));
 
-    // PF promptness oracle, agmsg investigation 2026-07-09: deliberately
+    // Promptness oracle: deliberately
     // *not* folded into `violations` above -- these never gate this run's
     // pass/fail (`ROUND_SETTLE_BUDGET` above already tolerates the
     // self-echo re-index churn's ~30s hydration-timeout cycle; failing
@@ -1260,8 +1247,7 @@ async fn run_scenario(
     // this is exactly the "measure it, show it, don't hide it" signal
     // `ROUND_SETTLE_BUDGET`'s own doc comment promises -- a slow-but-
     // eventually-consistent round must stay visible somewhere, or
-    // loosening the gate quietly reintroduces the thing fixed
-    // (a real cost hidden as a silent pass).
+    // loosening the gate would hide a real cost as a silent pass.
     for slow in oracle.check_convergence_promptness(CONVERGENCE_PROMPTNESS_SLA) {
         eprintln!("  PROMPTNESS: {slow}");
     }
@@ -1368,10 +1354,8 @@ fn run_in_madsim(
 /// with `DST_VARIATIONS=1` never reproduced it standalone, only as part
 /// of a larger sequential batch -- consistent with the
 /// network-touching-runtime isolation gap both DST peer-session files
-/// already document). The old attribution of these stalls to a
-/// WireGuard-handshake livelock was disproven (issue #26: the one
-/// deterministic case was missing convergence-driver wiring, which this
-/// harness has).
+/// already document). This harness wires the convergence driver, so a
+/// stall here is not a missing-driver hang.
 const TIME_LIMIT_MARKER: &str = "TIME_LIMIT: ";
 /// Prefix marking a seed as hitting the OS-level thread-creation ceiling
 /// (`EAGAIN`/`WouldBlock` on a `.unwrap`'d `bind`/`connect` call deep

@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 
 async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>) {
     let dir = tempfile::tempdir().unwrap();
@@ -20,7 +20,7 @@ async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>) {
     // behavior in this test.
     std::env::set_var("YADORILINK_UPDATE_MANIFEST_URL", "http://127.0.0.1:1/manifest.json");
 
-    let store = Arc::new(FsBlockStore::new(dir.path().join("blocks")).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(dir.path().join("blocks")).unwrap());
     let sync_state = Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
     let state = DaemonState::new("device-under-test".into(), sync_state, store);
 

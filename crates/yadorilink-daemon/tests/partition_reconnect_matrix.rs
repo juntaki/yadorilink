@@ -51,7 +51,7 @@ use support::{
 };
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 
 struct TestDevice {
     device_id: String,
@@ -68,7 +68,7 @@ struct TestDevice {
 async fn setup_device(account: &TestAccount, name: &str) -> TestDevice {
     let device_id = support::register_device(account, name, [0u8; 32]).await;
     let store_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let (sync_state, index_dir) = open_file_backed_replica_coordinator();
     let sync_state = Arc::new(sync_state);
     let state = DaemonState::new(device_id.clone(), sync_state, store);

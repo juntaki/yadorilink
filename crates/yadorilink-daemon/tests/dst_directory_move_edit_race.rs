@@ -71,7 +71,11 @@
 //! (a), silently testing one interleaving twice. Each commit is instead
 //! announced exactly once, explicitly, at the ordering-specific moment.
 
-#![cfg(madsim)]
+// Retired. This scenario was written for a simulator this project no longer
+// builds against, and it names APIs that have since been removed. It is kept,
+// never compiled, as the specification its turmoil re-expression has to meet;
+// delete it in the change that lands that replacement.
+#![cfg(any())]
 
 mod dst_dag_migrate_b2;
 mod dst_support;
@@ -90,7 +94,7 @@ use yadorilink_filesystem_sync::watcher::{
     FolderWatchSource, FsChangeEvent, FsChangeKind, SimulatedFolderWatchSource,
 };
 use yadorilink_local_capture::{LocalChangeOutcome, LocalChangeProcessor};
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 use yadorilink_peer_session::peer_session::{
     PeerSyncSession, PendingLocalChangeFlush, PendingLocalFlushOutcome,
 };
@@ -220,7 +224,7 @@ struct DeviceA {
 fn setup_device_a(
     root: PathBuf,
     sync_state: Arc<ReplicaCoordinator>,
-    store: Arc<FsBlockStore>,
+    store: Arc<SegmentBlockStore>,
 ) -> DeviceA {
     let processor = Arc::new(
         LocalChangeProcessor::new(
@@ -289,10 +293,10 @@ async fn poll_until(timeout: Duration, mut condition: impl FnMut() -> bool) {
 async fn connect_sessions(
     rng: &mut StdRng,
     state_a: Arc<ReplicaCoordinator>,
-    store_a: Arc<FsBlockStore>,
+    store_a: Arc<SegmentBlockStore>,
     root_a: PathBuf,
     state_b: Arc<ReplicaCoordinator>,
-    store_b: Arc<FsBlockStore>,
+    store_b: Arc<SegmentBlockStore>,
     root_b: PathBuf,
     pending_local_change_flush_a: Arc<dyn PendingLocalChangeFlush>,
 ) -> (Arc<PeerSyncSession>, Arc<PeerSyncSession>) {
@@ -316,7 +320,7 @@ async fn connect_sessions(
 
     let mut sync_roots_a = std::collections::HashMap::new();
     sync_roots_a.insert(GROUP_ID.to_string(), root_a);
-    let session_a = PeerSyncSession::new_with_dependencies(
+    let session_a = PeerSyncSession::new(
         channel_a,
         "device-a".to_string(),
         "device-b".to_string(),
@@ -337,7 +341,7 @@ async fn connect_sessions(
 
     let mut sync_roots_b = std::collections::HashMap::new();
     sync_roots_b.insert(GROUP_ID.to_string(), root_b);
-    let session_b = PeerSyncSession::new_with_dependencies(
+    let session_b = PeerSyncSession::new(
         channel_b,
         "device-b".to_string(),
         "device-a".to_string(),
@@ -380,7 +384,7 @@ async fn connect_sessions(
 /// written to B's store), returning the record to hand to A over the wire.
 async fn device_b_edit_child(
     state_b: &Arc<ReplicaCoordinator>,
-    store_b: &Arc<FsBlockStore>,
+    store_b: &Arc<SegmentBlockStore>,
     root_b: &Path,
 ) -> Result<FileRecord, String> {
     std::fs::write(root_b.join(CHILD_REL), B_EDIT).map_err(|e| e.to_string())?;
@@ -474,14 +478,14 @@ async fn run_scenario(seed: u64, ordering: Ordering) -> Result<(), String> {
     let root_dir_a = tempfile::tempdir().map_err(|e| e.to_string())?;
     let root_a = root_dir_a.path().canonicalize().map_err(|e| e.to_string())?;
     let store_dir_a = tempfile::tempdir().map_err(|e| e.to_string())?;
-    let store_a = Arc::new(FsBlockStore::new(store_dir_a.path()).map_err(|e| e.to_string())?);
+    let store_a = Arc::new(SegmentBlockStore::new(store_dir_a.path()).map_err(|e| e.to_string())?);
     let state_a = Arc::new(ReplicaCoordinator::open_in_memory().map_err(|e| e.to_string())?);
     link_and_start(&state_a, &root_a)?;
 
     let root_dir_b = tempfile::tempdir().map_err(|e| e.to_string())?;
     let root_b = root_dir_b.path().canonicalize().map_err(|e| e.to_string())?;
     let store_dir_b = tempfile::tempdir().map_err(|e| e.to_string())?;
-    let store_b = Arc::new(FsBlockStore::new(store_dir_b.path()).map_err(|e| e.to_string())?);
+    let store_b = Arc::new(SegmentBlockStore::new(store_dir_b.path()).map_err(|e| e.to_string())?);
     let state_b = Arc::new(ReplicaCoordinator::open_in_memory().map_err(|e| e.to_string())?);
     link_and_start(&state_b, &root_b)?;
 

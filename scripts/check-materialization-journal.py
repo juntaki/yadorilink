@@ -31,13 +31,14 @@ This guard makes the class un-reintroducible in two ways:
    guard. (The `has_materialization_intent` READ is unrestricted: repair, the
    live invariant `debug_assert`, and tests all consult it.)
 
-2. Every production `reconstruct_file(` call site must live in one of the
-   sanctioned seam files above, and the total number of such call sites is
-   pinned. A new content write anywhere — even an extra one inside an
+2. Every production `reconstruct_file(` call site (or call of the daemon's
+   off-runtime forwarder to it) must live in one of the sanctioned seam files
+   above, and the total number of such call sites is pinned. A new content write anywhere — even an extra one inside an
    already-sanctioned file — trips the guard for review, forcing the author to
    confirm it is bracketed by one of the three disciplines.
 """
 
+import importlib.util
 from pathlib import Path
 import sys
 
@@ -77,71 +78,75 @@ INTENT_PORT_ADAPTER_FILES = {
 
 # The single low-level content-to-disk writer.
 RECONSTRUCT_TOKEN = "reconstruct_file("
+# The publishing half of that writer when a caller assembles into a temp file
+# first and renames it into place later. A caller that assembles, re-checks the
+# path and then publishes writes content at the publish, so that call is the
+# content-write site.
+PERSIST_TOKEN = "persist_reconstructed_file("
+
+# The daemon runs that writer off the async runtime through one thin
+# forwarder. The forwarder's own inner `reconstruct_file(` is legal only inside
+# the forwarder and is not a call site of its own; every call of the forwarder
+# is a content-write site and is counted and file-restricted exactly like a
+# direct `reconstruct_file(` call.
+RECONSTRUCT_FORWARDER_FILE = "crates/yadorilink-daemon/src/local_convergence/types.rs"
+RECONSTRUCT_FORWARDER = "reconstruct_file_off_runtime"
+PERSIST_FORWARDER = "persist_reconstructed_file_off_runtime"
+FORWARDER_OF = {RECONSTRUCT_TOKEN: RECONSTRUCT_FORWARDER, PERSIST_TOKEN: PERSIST_FORWARDER}
+RECONSTRUCT_SITE_TOKENS = (RECONSTRUCT_TOKEN, PERSIST_TOKEN, RECONSTRUCT_FORWARDER + "(")
 
 # The sanctioned content-write seam files (each upholds one of the three
-# crash-safe disciplines described above). A `reconstruct_file(` call anywhere
-# else is a violation.
+# crash-safe disciplines described above). A content-write call anywhere else
+# is a violation.
 RECONSTRUCT_ALLOWED_FILES = {
-    # Intent-journal seam (live peer materialize) + Hydrating->Hydrated flip
-    # (hydrate_file).
-    "crates/yadorilink-peer-session/src/peer_session.rs",
     # Intent-journal seam (repair's own reconstruct).
     "crates/yadorilink-filesystem-sync/src/materialization_repair.rs",
     # Hydrating->Hydrated flip (daemon hydrate) + restore_operations journal
     # (restore).
     "crates/yadorilink-daemon/src/hydration.rs",
+    # Intent-journal seam (live peer materialize), via the forwarder.
+    "crates/yadorilink-daemon/src/local_convergence/materialize/eager.rs",
+    # Hydrating->Hydrated flip (convergence hydrate), via the forwarder.
+    "crates/yadorilink-daemon/src/local_convergence/hydrate.rs",
 }
 
-# Pinned total number of production `reconstruct_file(` call sites across the
+# Pinned total number of production content-write call sites across the
 # sanctioned files. Bump this ONLY when adding a reviewed, provably crash-safe
 # content-write site (and confirm it is bracketed by one of the three
 # disciplines). Current sites:
-#   materialization_repair.rs: reconstruct_file_journaled                (1)
-#   peer_session.rs:           hydrate_file + two materialize attempts   (3)
-#   hydration.rs:       daemon hydrate + restore                         (2)
+#   materialization_repair.rs: reconstruct_file_journaled                 (1)
+#   hydration.rs:              daemon hydrate (its publish) + restore     (2)
+#   materialize/eager.rs:      reconstruct_content, first try + retry     (2)
+#   local_convergence/hydrate.rs: hydrate_file                            (1)
+# The last three used to be direct calls in peer-session's peer_session.rs;
+# they now reach the writer through the daemon's off-runtime forwarder.
 EXPECTED_RECONSTRUCT_CALLS = 6
 
+# Test code is recognised the same way the materialization-semantic guard
+# recognises it, by loading that script's scanner instead of keeping another
+# copy: an item under a test-only `cfg` is skipped wherever it sits, and a
+# module FILE declared under such a `cfg` in its parent (file-per-module test
+# files such as `foo/tests.rs`), or opening with `#![cfg(test)]`, is skipped
+# whole. Test fixtures legitimately seed intents and call the writer directly.
+_SEMANTIC_GUARD = ROOT / "scripts" / "check-materialization-semantic-boundary.py"
 
-def _code_only(line: str) -> str:
-    """Drop a trailing line comment so brace counting ignores commented braces."""
-    marker = line.find("//")
-    return line[:marker] if marker != -1 else line
+
+def _load_semantic_guard():
+    spec = importlib.util.spec_from_file_location(
+        "check_materialization_semantic_boundary", _SEMANTIC_GUARD
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+SEMANTIC = _load_semantic_guard()
 
 
 def production_lines(path: Path) -> list[tuple[int, str]]:
-    """Yield `(1-based line number, line)` for every PRODUCTION line.
-
-    Excludes the body of any `#[cfg(test)]`-attributed item (a braced module or
-    a single gated statement), wherever it appears, then keeps scanning. Mirrors
-    `check-mutation-boundary.py`'s scanner so test fixtures (which legitimately
-    seed intents and call `reconstruct_file` directly) never count.
-    """
-    raw = path.read_text(encoding="utf-8").splitlines()
-    out: list[tuple[int, str]] = []
-    index = 0
-    total = len(raw)
-    while index < total:
-        if raw[index].strip() == "#[cfg(test)]":
-            index += 1
-            while index < total and raw[index].strip().startswith("#["):
-                index += 1
-            depth = 0
-            opened = False
-            while index < total:
-                code = _code_only(raw[index])
-                depth += code.count("{") - code.count("}")
-                if "{" in code:
-                    opened = True
-                index += 1
-                if opened:
-                    if depth <= 0:
-                        break
-                elif code.rstrip().endswith(";"):
-                    break
-            continue
-        out.append((index + 1, raw[index]))
-        index += 1
-    return out
+    """`(1-based line number, code)` for every PRODUCTION line of one file."""
+    return SEMANTIC.production_lines(path, path.read_text(encoding="utf-8"))
 
 
 def in_matching_port_method(
@@ -155,12 +160,26 @@ def in_matching_port_method(
     return False
 
 
+def enclosing_fn(lines: list[tuple[int, str]], index: int) -> str | None:
+    """Name of the nearest `fn` declared at or above a hit, if any."""
+    for _, candidate in reversed(lines[: index + 1]):
+        match = SEMANTIC.FN_NAME.match(candidate)
+        if match:
+            return match.group(1)
+    return None
+
+
 def main() -> int:
     violations: list[str] = []
     reconstruct_hits = 0
+    # Parents of a test module can live in any crate's source tree, so the
+    # test-module set is computed over all of them.
+    test_files = SEMANTIC.test_module_files(sorted(ROOT.glob(SEMANTIC.SOURCE_GLOB)))
     for source_root in SOURCE_ROOTS:
         for path in sorted(source_root.rglob("*.rs")):
             rel = str(path.relative_to(ROOT))
+            if path.resolve() in test_files:
+                continue
             lines = production_lines(path)
             for index, (lineno, line) in enumerate(lines):
                 stripped = line.strip()
@@ -185,12 +204,20 @@ def main() -> int:
                             f"bookkeeping through the guard"
                         )
 
-                if RECONSTRUCT_TOKEN in line and "fn reconstruct_file" not in line:
+                for token in RECONSTRUCT_SITE_TOKENS:
+                    if token not in line or ("fn " + token[:-1]) in line:
+                        continue
+                    if (
+                        token in FORWARDER_OF
+                        and rel == RECONSTRUCT_FORWARDER_FILE
+                        and enclosing_fn(lines, index) == FORWARDER_OF[token]
+                    ):
+                        continue
                     if rel in RECONSTRUCT_ALLOWED_FILES:
                         reconstruct_hits += 1
                     else:
                         violations.append(
-                            f"{rel}:{lineno}: `reconstruct_file` writes content to disk "
+                            f"{rel}:{lineno}: `{token[:-1]}` writes content to disk "
                             f"outside a sanctioned crash-safe materialization seam"
                         )
 

@@ -16,17 +16,23 @@
 //!
 //! # Port impls
 //!
-//! `ReplicaCoordinator` implements all five storage ports the replica/peer
-//! session engine depends on. `RootVerificationStatePort` and
-//! `AuthenticatedHistorySource` are implemented directly below; the other
-//! three -- `PeerReplicaStatePort`, `MaterializationStatePort`, and
-//! `MaterializationExecutionPort` -- are each a large, mechanical set of
-//! delegate methods and live in their own submodules (`peer_replica_state`,
-//! `materialization_state`, `materialization_execution`, declared below).
+//! `ReplicaCoordinator` implements the storage ports the replica/peer
+//! session engine depends on. `RootVerificationStatePort` is implemented
+//! directly below; `MaterializationExecutionPort` is a large, mechanical
+//! set of delegate methods and lives in its own submodule
+//! (`materialization_execution`). Custody-verified block reclamation is an
+//! inherent operation, in `block_reclamation`. The
+//! replica-state operations the local convergence executor drives are
+//! inherent methods, in `peer_replica_state`. The materialization-semantic
+//! compositions a lane used to assemble from those raw primitives (intent,
+//! fence, state, held, proof, placeholder identity) are owner operations,
+//! in `materialization_owner`.
 
+mod block_reclamation;
+pub mod engine_ports;
 mod local_mutation;
 mod materialization_execution;
-mod materialization_state;
+mod materialization_owner;
 mod peer_replica_state;
 
 // Test-only: lets `gc.rs`/`hydration.rs`'s own unit tests reach
@@ -39,6 +45,11 @@ mod peer_replica_state;
 // that has `test-support` on but `cfg(test)` off.
 #[cfg(test)]
 pub(crate) use materialization_execution::set_test_windows_dehydrate_confirmed_for_path;
+// Test-only: `hydration.rs`'s unit tests arm the access-hydration guard
+// directly, without its entry CAS, to simulate an attempt in flight.
+#[cfg(test)]
+pub(crate) use materialization_owner::AccessHydration;
+pub(crate) use materialization_owner::STALE_STRUCTURAL_INTENT_AGE;
 
 use std::sync::{Arc, Mutex};
 
@@ -51,15 +62,14 @@ use crate::sync_runtime::path_locks::PathLockRegistry;
 use crate::sync_runtime::retirement_wake::RetirementWake;
 use crate::sync_runtime::schema::{post_dag_schema, pre_dag_schema};
 use crate::sync_runtime::startup_readiness::StartupReadinessRegistry;
-use yadorilink_filesystem_sync::materialization_types::RestoreOperation;
-use yadorilink_replica_domain::change::{Change, ChangeAuth, Op, PolicyUnavailable};
+use yadorilink_replica_domain::change::{Op, PolicyUnavailable};
 use yadorilink_replica_domain::file::{FileRecord, FileVersion};
 use yadorilink_replica_domain::ids::{ChangeHash, DeviceId, FolderGroupId};
 use yadorilink_replica_domain::session_state::ChangeContent;
+use yadorilink_replica_domain::session_state::RestoreOperation;
 use yadorilink_replica_domain::session_state::{
     LocalFileMetaColumns, RetroactiveRepairOutcome, StartupFailed,
 };
-use yadorilink_replica_engine::authenticated_history::AuthenticatedHistorySource;
 use yadorilink_replica_engine::compaction::{
     Checkpoint, CheckpointStore, CompactionDagStore, DeviceFrontierStore,
 };
@@ -70,8 +80,19 @@ use yadorilink_root_authority::root_identity::RootVerificationStatePort;
 use yadorilink_sqlite_runtime::SyncDatabase;
 use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
 
-pub(crate) type LocalChangeAuthProvider =
-    dyn Fn(&str) -> Result<ChangeAuth, PolicyUnavailable> + Send + Sync + 'static;
+/// Resolves this device's current verified policy_head for a group, or
+/// `Err(PolicyUnavailable)` when this device's own policy view for the
+/// group is not currently trustworthy (stale/invalid verification, or the
+/// group has not resolved yet). NOT a writer-authorization decision --
+/// under `AuthorizationCheckpoint` admission, writer authorization happens only at
+/// checkpoint issuance; local emission (offline authoring) is always
+/// available to any device regardless of writer role, so this gate exists
+/// purely to avoid emitting against a policy view this device cannot
+/// currently vouch for, and to give the repair-election consistency check
+/// (`RepairElectionContext::expected_policy_head`) a value to compare
+/// against.
+pub(crate) type LocalPolicyHeadProvider =
+    dyn Fn(&str) -> Result<[u8; 32], PolicyUnavailable> + Send + Sync + 'static;
 
 #[derive(Clone, Copy)]
 pub struct ReplicaChangeEmission<'a> {
@@ -105,7 +126,12 @@ pub struct ReplicaCoordinator {
     change_history_repository: yadorilink_sync_sqlite::ChangeHistoryRepository,
     materialization_intent_repository: yadorilink_sync_sqlite::MaterializationIntentRepository,
     policy_watermark_repository: yadorilink_sync_sqlite::PolicyWatermarkRepository,
+    offline_peer_authorization_repository:
+        yadorilink_sync_sqlite::OfflinePeerAuthorizationRepository,
+    offline_group_policy_log_repository: yadorilink_sync_sqlite::OfflineGroupPolicyLogRepository,
     dirty_path_repository: yadorilink_sync_sqlite::DirtyPathRepository,
+    paused_item_repository: yadorilink_sync_sqlite::PausedItemRepository,
+    snapshot_install_hold_repository: yadorilink_sync_sqlite::SnapshotInstallHoldRepository,
     restore_operation_repository: yadorilink_sync_sqlite::RestoreOperationRepository,
     handoff_lease_repository: yadorilink_sync_sqlite::HandoffLeaseRepository,
     rebootstrap_store_repository: yadorilink_sync_sqlite::RebootstrapStoreRepository,
@@ -121,9 +147,14 @@ pub struct ReplicaCoordinator {
     /// reconciliation has published its results before touching that
     /// group's paths (`crate::sync_runtime::startup_readiness`).
     startup_readiness: Arc<StartupReadinessRegistry>,
-    local_change_auth_provider: Mutex<Option<Arc<LocalChangeAuthProvider>>>,
+    local_policy_head_provider: Mutex<Option<Arc<LocalPolicyHeadProvider>>>,
     repair_election_provider: Mutex<Option<Arc<RepairElectionProvider>>>,
     root_adoption_lock: Mutex<()>,
+    /// Test-only observation and injection seam -- see
+    /// `test_observers`'s own module doc. `#[cfg(test)]`, so neither the
+    /// field nor anything that touches it exists in a production build.
+    #[cfg(test)]
+    pub(crate) test_observers: crate::replica_coordinator::test_observers::TestObservers,
     materialization_wake: MaterializationWake,
     retirement_wake: RetirementWake,
     /// Same per-group dirty/generation shape as `retirement_wake` (a
@@ -144,6 +175,11 @@ pub struct ReplicaCoordinator {
 /// [`ReplicaCoordinator::open_in_memory`] below, the two constructors that
 /// open a database from scratch.
 fn schema_init(conn: &Connection) -> Result<(), yadorilink_sqlite_runtime::DatabaseError> {
+    // This database's generation policy, declared by its owner and checked
+    // before a single statement runs against it. Must come first: once
+    // `pre_dag_schema` has run, "has this database any tables?" can no
+    // longer tell a brand-new file from one an un-stamping build wrote.
+    yadorilink_sqlite_runtime::check_replica_schema_generation(conn)?;
     pre_dag_schema(conn)?;
     yadorilink_sqlite_runtime::init_schema(conn)?;
     post_dag_schema(conn)?;
@@ -187,9 +223,18 @@ impl ReplicaCoordinator {
             policy_watermark_repository: yadorilink_sync_sqlite::PolicyWatermarkRepository::new(
                 database.clone(),
             ),
+            offline_peer_authorization_repository:
+                yadorilink_sync_sqlite::OfflinePeerAuthorizationRepository::new(database.clone()),
+            offline_group_policy_log_repository:
+                yadorilink_sync_sqlite::OfflineGroupPolicyLogRepository::new(database.clone()),
             dirty_path_repository: yadorilink_sync_sqlite::DirtyPathRepository::new(
                 database.clone(),
             ),
+            paused_item_repository: yadorilink_sync_sqlite::PausedItemRepository::new(
+                database.clone(),
+            ),
+            snapshot_install_hold_repository:
+                yadorilink_sync_sqlite::SnapshotInstallHoldRepository::new(database.clone()),
             restore_operation_repository: yadorilink_sync_sqlite::RestoreOperationRepository::new(
                 database.clone(),
             ),
@@ -207,9 +252,11 @@ impl ReplicaCoordinator {
             database,
             path_lock_registry,
             startup_readiness,
-            local_change_auth_provider: Mutex::new(None),
+            local_policy_head_provider: Mutex::new(None),
             repair_election_provider: Mutex::new(None),
             root_adoption_lock: Mutex::new(()),
+            #[cfg(test)]
+            test_observers: Default::default(),
             materialization_wake: MaterializationWake::new(),
             retirement_wake: RetirementWake::new(),
             hazard_recheck_wake: RetirementWake::new(),
@@ -307,8 +354,41 @@ impl ReplicaCoordinator {
         &self.policy_watermark_repository
     }
 
+    /// This device's last-known-good record of what a live netmap last
+    /// authorized each peer for -- see the repository's own module doc for
+    /// why it is a cache of an already-made decision and not an authority.
+    pub fn offline_peer_authorization_repository(
+        &self,
+    ) -> &yadorilink_sync_sqlite::OfflinePeerAuthorizationRepository {
+        &self.offline_peer_authorization_repository
+    }
+
+    /// The raw signed policy log the coordination plane last sent for each
+    /// group -- see the repository's own module doc for why storing it
+    /// grants nothing (it is re-verified against the pinned service key and
+    /// the rollback watermark before any of it is believed).
+    pub fn offline_group_policy_log_repository(
+        &self,
+    ) -> &yadorilink_sync_sqlite::OfflineGroupPolicyLogRepository {
+        &self.offline_group_policy_log_repository
+    }
+
     pub fn dirty_path_repository(&self) -> &yadorilink_sync_sqlite::DirtyPathRepository {
         &self.dirty_path_repository
+    }
+
+    /// The items paused from the shell context menu -- see
+    /// `yadorilink_sync_sqlite::paused_items` for what a pause holds.
+    pub fn paused_item_repository(&self) -> &yadorilink_sync_sqlite::PausedItemRepository {
+        &self.paused_item_repository
+    }
+
+    /// The paths a snapshot install replaced and has not yet reconciled on
+    /// disk -- see `yadorilink_sync_sqlite::snapshot_install_hold`.
+    pub fn snapshot_install_hold_repository(
+        &self,
+    ) -> &yadorilink_sync_sqlite::SnapshotInstallHoldRepository {
+        &self.snapshot_install_hold_repository
     }
 
     pub fn restore_operation_repository(
@@ -406,34 +486,31 @@ impl ReplicaCoordinator {
         &self.hazard_recheck_wake
     }
 
-    // --- Group/change-history mutation methods: local-emission-authorized
+    // --- Group/change-history mutation methods: local-emission-gated
     // writes into the file index, change history, and restore-operation
-    // tables (see `local_emission_auth` below for the auth check they all
-    // share). ---
+    // tables (see `local_policy_head` below for the gate they all share).
+    // ---
 
-    pub fn set_local_change_auth_provider(&self, provider: Arc<LocalChangeAuthProvider>) {
-        *self.local_change_auth_provider.lock().unwrap_or_else(|p| p.into_inner()) = Some(provider);
+    pub fn set_local_policy_head_provider(&self, provider: Arc<LocalPolicyHeadProvider>) {
+        *self.local_policy_head_provider.lock().unwrap_or_else(|p| p.into_inner()) = Some(provider);
     }
 
     pub fn set_repair_election_provider(&self, provider: Arc<RepairElectionProvider>) {
         *self.repair_election_provider.lock().unwrap_or_else(|p| p.into_inner()) = Some(provider);
     }
 
-    /// Checks whether local changes are currently authorized to emit for
-    /// `group_id`, returning the auth token to attach to the emitted
-    /// change. `pub(crate)`, not private: `replica_coordinator::
-    /// materialization_state`'s own `impl MaterializationStatePort for
-    /// ReplicaCoordinator` inlines this same pre-check directly (its trait
-    /// method's error type is narrower than `mark_deleted_emitting_change`
-    /// below can return), so it needs to call this from outside this
-    /// module.
-    pub(crate) fn local_emission_auth(
-        &self,
-        group_id: &str,
-    ) -> Result<ChangeAuth, PolicyUnavailable> {
-        match self.local_change_auth_provider.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+    /// This device's current verified policy_head for `group_id`, or
+    /// `Err(PolicyUnavailable)` when this device's own policy view is not
+    /// currently trustworthy -- see [`LocalPolicyHeadProvider`]'s own doc
+    /// comment for why this is a data-availability gate, not a writer
+    /// check. `pub(crate)`, not private: port impls in this module's
+    /// submodules (e.g. `local_mutation`) inline this same pre-check
+    /// directly where their trait method's error type is narrower than
+    /// `mark_deleted_emitting_change` below can return.
+    pub(crate) fn local_policy_head(&self, group_id: &str) -> Result<[u8; 32], PolicyUnavailable> {
+        match self.local_policy_head_provider.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
             Some(provider) => provider(group_id),
-            None => Ok(ChangeAuth::PLACEHOLDER),
+            None => Ok([0u8; 32]),
         }
     }
 
@@ -487,7 +564,7 @@ impl ReplicaCoordinator {
         filesystem_identity: Option<&yadorilink_root_authority::fs_identity::FileIdentity>,
         emission: ReplicaChangeEmission<'_>,
     ) -> Result<ChangeHash, SyncError> {
-        let auth = self.local_emission_auth(group_id)?;
+        self.local_policy_head(group_id)?;
         Ok(self.file_index_repository.upsert_file_emitting_change(
             group_id,
             record,
@@ -498,35 +575,6 @@ impl ReplicaCoordinator {
             yadorilink_sync_sqlite::file_index::ChangeEmissionContext {
                 emitter: emission.emitter,
                 permit: emission.permit,
-                auth,
-            },
-        )?)
-    }
-
-    /// Upserts a batch of file records, emitting one change that covers
-    /// the whole batch (or none, if nothing changed), after the same
-    /// local-emission authorization check as
-    /// [`Self::upsert_file_emitting_change`].
-    pub fn upsert_files_batch_emitting_change(
-        &self,
-        group_id: &str,
-        records: &[FileRecord],
-        origin_device_id: &str,
-        content: ChangeContent<'_>,
-        metas: &[Option<LocalFileMetaColumns>],
-        emission: ReplicaChangeEmission<'_>,
-    ) -> Result<Option<ChangeHash>, SyncError> {
-        let auth = self.local_emission_auth(group_id)?;
-        Ok(self.file_index_repository.upsert_files_batch_emitting_change(
-            group_id,
-            records,
-            origin_device_id,
-            content,
-            metas,
-            yadorilink_sync_sqlite::file_index::ChangeEmissionContext {
-                emitter: emission.emitter,
-                permit: emission.permit,
-                auth,
             },
         )?)
     }
@@ -547,14 +595,14 @@ impl ReplicaCoordinator {
         emitter: &ChangeEmitter,
         permit: &RootCommitPermit,
     ) -> Result<ChangeHash, SyncError> {
-        let auth = self.local_emission_auth(group_id)?;
+        self.local_policy_head(group_id)?;
         Ok(self.file_index_repository.mark_deleted_emitting_change(
             group_id,
             path,
             device_id,
             observed_at_unix_nanos,
             publish_absent_proof,
-            yadorilink_sync_sqlite::file_index::ChangeEmissionContext { emitter, permit, auth },
+            yadorilink_sync_sqlite::file_index::ChangeEmissionContext { emitter, permit },
         )?)
     }
 
@@ -566,10 +614,22 @@ impl ReplicaCoordinator {
         batches: &[Vec<Op>],
         versions: &[FileVersion],
         emitter: &ChangeEmitter,
-    ) -> Result<Option<usize>, SyncError> {
-        let auth = self.local_emission_auth(group_id)?;
+        known_excluded: &std::collections::HashSet<String>,
+        actual_state: &std::collections::HashMap<
+            String,
+            yadorilink_sync_sqlite::file_index::ImportedActualState,
+        >,
+    ) -> Result<yadorilink_sync_sqlite::ImportAppendOutcome, SyncError> {
+        self.local_policy_head(group_id)?;
         self.change_history_repository
-            .append_initial_import(group_id, batches, versions, emitter, auth)
+            .append_initial_import(
+                group_id,
+                batches,
+                versions,
+                emitter,
+                known_excluded,
+                actual_state,
+            )
             .map_err(SyncError::from)
     }
 
@@ -582,9 +642,9 @@ impl ReplicaCoordinator {
         versions: &[FileVersion],
         emitter: &ChangeEmitter,
     ) -> Result<ChangeHash, SyncError> {
-        let auth = self.local_emission_auth(group_id)?;
+        self.local_policy_head(group_id)?;
         self.change_history_repository
-            .append_history_backfill(group_id, ops, versions, emitter, auth)
+            .append_history_backfill(group_id, ops, versions, emitter)
             .map_err(SyncError::from)
     }
 
@@ -598,16 +658,35 @@ impl ReplicaCoordinator {
 
     /// Records a restore operation and emits the corresponding change,
     /// after checking local-emission authorization for the operation's
-    /// group.
+    /// group. `permit` is verified inside the recording transaction.
     pub fn record_restore_operation_emitting_change(
         &self,
         operation: &RestoreOperation,
         version: &FileVersion,
         emitter: &ChangeEmitter,
+        permit: &RootCommitPermit,
     ) -> Result<ChangeHash, SyncError> {
-        let auth = self.local_emission_auth(&operation.group_id)?;
+        self.local_policy_head(&operation.group_id)?;
         self.restore_operation_repository
-            .record_restore_operation_emitting_change(operation, version, emitter, auth)
+            .record_restore_operation_emitting_change(operation, version, emitter, permit)
+            .map_err(SyncError::from)
+    }
+
+    /// [`Self::record_restore_operation_emitting_change`], deciding in the
+    /// same transaction whether the restore writes its entry itself --
+    /// see [`yadorilink_sync_sqlite::restore_operation::RestoreOperationRepository::record_restore_placing`].
+    pub fn record_restore_placing(
+        &self,
+        operation: &RestoreOperation,
+        version: &FileVersion,
+        emitter: &ChangeEmitter,
+        permit: &RootCommitPermit,
+        disk_allows_in_place: bool,
+    ) -> Result<(ChangeHash, yadorilink_sync_sqlite::restore_operation::RestorePlacement), SyncError>
+    {
+        self.local_policy_head(&operation.group_id)?;
+        self.restore_operation_repository
+            .record_restore_placing(operation, version, emitter, permit, disk_allows_in_place)
             .map_err(SyncError::from)
     }
 
@@ -630,31 +709,52 @@ impl ReplicaCoordinator {
         )?)
     }
 
-    /// Installs a rebootstrap snapshot from `manifest`/`snapshot_bytes`
-    /// inside one write transaction, optionally emitting a local change
-    /// through `local_emitter`
-    /// (`yadorilink_sync_sqlite::rebootstrap_store::install_rebootstrap_snapshot`).
-    pub fn install_rebootstrap_snapshot(
+    /// Test fixtures only: installs the base `manifest` names, with the
+    /// snapshot `snapshot_bytes` encodes, by the same atomic epoch reset a
+    /// merge commits (`yadorilink_sync_sqlite::rebootstrap_store::
+    /// install_base_for_tests`), in one write transaction. Nothing here
+    /// verifies the manifest, the signer or the witnesses: production
+    /// reaches this install only through [`Self::commit_foreign_merge`],
+    /// after `DaemonRebootstrapHandler::verify_foreign_base`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn install_base_for_tests(
         &self,
         manifest: &yadorilink_replica_engine::rebootstrap::SnapshotManifest,
         snapshot_bytes: &[u8],
-        local_emitter: Option<&ChangeEmitter>,
-    ) -> Result<(), SyncError> {
-        let group_id_owned = manifest.group_id.as_str().to_string();
-        let local_auth =
-            local_emitter.map(|_| self.local_emission_auth(&group_id_owned)).transpose()?;
+    ) -> Result<(), yadorilink_sync_sqlite::rebootstrap_store::ForeignMergeError> {
+        let snapshot =
+            yadorilink_replica_engine::rebootstrap_snapshot::RebootstrapSnapshot::decode(
+                snapshot_bytes,
+            )
+            .map_err(yadorilink_sync_sqlite::SyncSqliteError::from)?;
+        self.database.write_immediate(|tx| {
+            yadorilink_sync_sqlite::rebootstrap_store::install_base_for_tests(
+                tx,
+                &manifest.checkpoint,
+                &snapshot,
+            )
+        })
+    }
 
-        self.database
-            .write_immediate::<_, yadorilink_sync_sqlite::SyncSqliteError>(|tx| {
-                yadorilink_sync_sqlite::rebootstrap_store::install_rebootstrap_snapshot(
-                    tx,
-                    manifest,
-                    snapshot_bytes,
-                    local_emitter,
-                    local_auth,
-                )
-            })
-            .map_err(SyncError::from)
+    /// Merges a verified foreign base into this device's history for its
+    /// group, in one write transaction
+    /// (`yadorilink_sync_sqlite::rebootstrap_store::commit_foreign_merge`):
+    /// this device's own base is re-verified inside the transaction, and
+    /// the base the two histories' joined summary stands on is installed
+    /// with the atomic epoch reset -- or nothing changes when this device
+    /// already holds the other history.
+    ///
+    /// Authors nothing. Refused while history compaction is disabled.
+    pub fn commit_foreign_merge(
+        &self,
+        returning: &yadorilink_sync_sqlite::rebootstrap_store::VerifiedBaseSummary,
+    ) -> Result<
+        yadorilink_sync_sqlite::rebootstrap_store::CommittedMerge,
+        yadorilink_sync_sqlite::rebootstrap_store::ForeignMergeError,
+    > {
+        self.database.write_immediate(|tx| {
+            yadorilink_sync_sqlite::rebootstrap_store::commit_foreign_merge(tx, returning)
+        })
     }
 
     /// Plans and applies retroactive conflict-copy repairs for `group_id`:
@@ -672,80 +772,127 @@ impl ReplicaCoordinator {
             plan_retroactive_merge, RetroactiveMergeOutcome,
         };
 
+        // PLAN — read-only, with no writer transaction held. This is the
+        // expensive half: a traversal of the frontier-reachable DAG, decoding
+        // every reachable change. Run under the writer gate it was measured
+        // holding that gate for 366 of one 348-second window across 46 passes,
+        // starving every other writer in the daemon.
+        // One snapshot for the whole traversal. `read` opens no transaction,
+        // so a plan built through it could observe a different database
+        // between one statement and the next and describe a state that never
+        // existed at any instant.
+        let planning_started = std::time::Instant::now();
+        let outcome =
+            self.database.read_snapshot::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+                plan_retroactive_merge(conn, group_id)
+            })?;
+        // Worth watching rather than guarding. In WAL mode a long-lived
+        // DEFERRED reader blocks no writer, but it does stop checkpointing
+        // from reclaiming the frames it still needs — so a planner that runs
+        // for minutes shows up as WAL growth rather than as contention, and
+        // that is invisible unless the duration is recorded somewhere.
+        tracing::debug!(
+            %group_id,
+            snapshot_held_ms = planning_started.elapsed().as_millis() as u64,
+            "retroactive repair planning snapshot released"
+        );
+
+        let plan = match outcome {
+            RetroactiveMergeOutcome::PathObligationTooLarge(blocked) => {
+                // Rechecked before being reported as permanent, on the same
+                // principle as an ordinary plan. The caller caches permanence
+                // keyed on the frontier, and the state this verdict was
+                // computed against includes durable conflict-copy provenance
+                // and the retained-history boundary — neither of which
+                // disturbs the frontier when it moves. Reporting it unchecked
+                // would suppress the re-plan a provenance change should cause.
+                let staleness =
+                    self.database.read_snapshot::<_, yadorilink_sync_sqlite::SyncSqliteError>(
+                        |conn| blocked.revalidate(conn, group_id),
+                    )?;
+                if let Some(reason) = staleness {
+                    return Ok(RetroactiveRepairOutcome::PlanStale { reason });
+                }
+                return Ok(RetroactiveRepairOutcome::PermanentlyBlocked {
+                    path: blocked.path.clone(),
+                    committed_frontier: blocked.frontier().heads().to_vec(),
+                });
+            }
+            RetroactiveMergeOutcome::Plan(plan) => plan,
+        };
+
+        if plan.direct_ops.is_empty() {
+            return Ok(RetroactiveRepairOutcome::NothingToDo {
+                committed_frontier: plan.frontier.heads().to_vec(),
+            });
+        }
+
+        // The election consults a provider that may do real work of its own.
+        // It ran inside the write transaction before, which put whatever that
+        // provider does under the writer gate too.
+        let provider =
+            self.repair_election_provider.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let mut election_contexts = Vec::new();
+        if let Some(provider) = provider {
+            let group = yadorilink_replica_domain::ids::FolderGroupId(group_id.to_string());
+            let obligation_id =
+                yadorilink_replica_engine::repair_election::RepairObligationId::compute_set(
+                    &group,
+                    &plan.obligations,
+                );
+            election_contexts.push(provider(group_id, obligation_id)?);
+            let local_rank = election_contexts.iter().filter_map(|ctx| ctx.local_rank()).min();
+            if local_rank.is_none_or(|rank| rank > eligible_rank) {
+                return Ok(RetroactiveRepairOutcome::AwaitingFailover {
+                    local_rank,
+                    committed_frontier: plan.frontier.heads().to_vec(),
+                });
+            }
+        }
+
+        let policy_head = self.local_policy_head(group_id)?;
+        let fingerprint = emitter.signing_key_fingerprint();
+        if election_contexts.iter().any(|context| {
+            context.expected_policy_head() != policy_head
+                || context.local_device_id() != emitter.device_id()
+                || context.local_key_fingerprint() != fingerprint
+        }) {
+            return Err(SyncError::PolicyUnavailable);
+        }
+
+        // COMMIT — short, and holding only what emission needs. Everything
+        // above was computed against `plan.frontier`; if that frontier has
+        // moved, the plan describes a view that no longer exists and nothing
+        // may be written from it.
+        let source_paths = plan.source_paths.clone();
         let outcome = self.database.write_immediate(|tx| {
-            let outcome = plan_retroactive_merge(tx, group_id)?;
+            // The frontier token, and then a re-run of the plan's own
+            // derivation. The frontier alone would be a proxy: planning also
+            // reads durable conflict-copy provenance and the retained-history
+            // boundary, and treating an unmoved frontier as proof that those
+            // are unmoved too would be reasoning from a coincidence.
+            if let Some(reason) = plan.revalidate(tx, group_id)? {
+                tracing::debug!(%group_id, ?reason, "retroactive repair plan went stale");
+                return Ok(RetroactiveRepairOutcome::PlanStale { reason });
+            }
 
-            let plan = match outcome {
-                RetroactiveMergeOutcome::PathObligationTooLarge { path } => {
-                    let mut committed_frontier =
-                        yadorilink_sync_sqlite::dag_store::group_heads(tx, group_id)?;
-                    committed_frontier.sort();
-                    return Ok(RetroactiveRepairOutcome::PermanentlyBlocked {
-                        path,
-                        committed_frontier,
-                    });
-                }
-                RetroactiveMergeOutcome::Plan(plan) => plan,
-            };
-
-            if !plan.direct_ops.is_empty() {
-                let provider =
-                    self.repair_election_provider.lock().unwrap_or_else(|p| p.into_inner()).clone();
-                let mut election_contexts = Vec::new();
-                if let Some(provider) = provider {
-                    let group = yadorilink_replica_domain::ids::FolderGroupId(group_id.to_string());
-                    let obligation_id =
-                        yadorilink_replica_engine::repair_election::RepairObligationId::compute_set(
-                            &group,
-                            &plan.obligations,
-                        );
-                    election_contexts.push(provider(group_id, obligation_id)?);
-                    let local_rank =
-                        election_contexts.iter().filter_map(|ctx| ctx.local_rank()).min();
-                    if local_rank.is_none_or(|rank| rank > eligible_rank) {
-                        let mut committed_frontier =
-                            yadorilink_sync_sqlite::dag_store::group_heads(tx, group_id)?;
-                        committed_frontier.sort();
-                        return Ok(RetroactiveRepairOutcome::AwaitingFailover {
-                            local_rank,
-                            committed_frontier,
-                        });
-                    }
-                }
-
-                let auth = self.local_emission_auth(group_id)?;
-                let fingerprint = emitter.signing_key_fingerprint();
-                if election_contexts.iter().any(|context| {
-                    context.expected_auth() != auth
-                        || context.local_device_id() != emitter.device_id()
-                        || context.local_key_fingerprint() != fingerprint
-                }) {
-                    return Err(SyncError::PolicyUnavailable);
-                }
-
-                yadorilink_sync_sqlite::dag_store::emit_retroactive_repair(
-                    tx,
-                    group_id,
-                    plan.direct_ops,
-                    plan.obligations,
-                    auth,
-                    emitter,
-                )?;
-                if self.local_emission_auth(group_id)? != auth {
-                    return Err(SyncError::PolicyUnavailable);
-                }
+            yadorilink_sync_sqlite::dag_store::emit_retroactive_repair(
+                tx,
+                group_id,
+                plan.direct_ops.clone(),
+                plan.obligations.clone(),
+                emitter,
+            )?;
+            if self.local_policy_head(group_id)? != policy_head {
+                return Err(SyncError::PolicyUnavailable);
             }
 
             let mut committed_frontier =
                 yadorilink_sync_sqlite::dag_store::group_heads(tx, group_id)?;
             committed_frontier.sort();
-            Ok(if plan.source_paths.is_empty() {
-                RetroactiveRepairOutcome::NothingToDo { committed_frontier }
-            } else {
-                RetroactiveRepairOutcome::Repaired {
-                    repaired_paths: plan.source_paths,
-                    committed_frontier,
-                }
+            Ok(RetroactiveRepairOutcome::Repaired {
+                repaired_paths: source_paths.clone(),
+                committed_frontier,
             })
         })?;
 
@@ -853,29 +1000,6 @@ impl RootVerificationStatePort for ReplicaCoordinator {
     }
 }
 
-impl AuthenticatedHistorySource for ReplicaCoordinator {
-    type Error = SyncError;
-
-    fn retained_heads(&self, group_id: &str) -> Result<Vec<ChangeHash>, SyncError> {
-        Ok(self.sqlite.dag_group_heads(group_id)?)
-    }
-
-    fn retained_change(&self, hash: &ChangeHash) -> Result<Option<Change>, SyncError> {
-        Ok(self.sqlite.dag_get_change(hash)?)
-    }
-
-    fn compacted_parent_auth(
-        &self,
-        group_id: &str,
-        child_hash: &ChangeHash,
-        parent_hash: &ChangeHash,
-    ) -> Result<Option<(u64, u64)>, SyncError> {
-        self.rebootstrap_store_repository
-            .compacted_parent_auth(group_id, child_hash, parent_hash)
-            .map_err(SyncError::from)
-    }
-}
-
 // --- History-compaction store wiring: `CompactionDagStore`,
 // `DeviceFrontierStore`, and `CheckpointStore` (`yadorilink_replica_engine::
 // compaction`) delegate to `self.sqlite`/`self.database`, the same handles
@@ -956,165 +1080,16 @@ impl CheckpointStore for ReplicaCoordinator {
             })
             .map_err(|e| ReplicaEngineError::Storage(e.to_string()))
     }
-
-    fn history_base_previous_checkpoint_hash(
-        &self,
-        group: &FolderGroupId,
-    ) -> Result<Option<[u8; 32]>, ReplicaEngineError> {
-        self.rebootstrap_store_repository
-            .history_base_previous_checkpoint_hash(group.as_str())
-            .map_err(|e| ReplicaEngineError::Storage(e.to_string()))
-    }
-}
-
-// --- Materialization-intent journal: gives `MaterializationIntentGuard`
-// (generic over `T: MaterializationIntentJournal`, see
-// `crate::materialization_intent`) access to this struct's own
-// `MaterializationIntentRepository`, so callers can open/clear a durable
-// materialization intent against `ReplicaCoordinator`'s storage. ---
-impl crate::materialization_intent::MaterializationIntentJournal for ReplicaCoordinator {
-    fn materialization_intent_repository(
-        &self,
-    ) -> &yadorilink_sync_sqlite::MaterializationIntentRepository {
-        &self.materialization_intent_repository
-    }
-}
-
-// `ReplicaCoordinator` is `crate::recovery::RecoveryInventorySource`'s only
-// implementor.
-impl crate::recovery::RecoveryInventorySource for ReplicaCoordinator {
-    fn enrollment_repository(&self) -> &yadorilink_sync_sqlite::enrollment::EnrollmentRepository {
-        ReplicaCoordinator::enrollment_repository(self)
-    }
-
-    fn membership_operation_repository(
-        &self,
-    ) -> &yadorilink_sync_sqlite::MembershipOperationRepository {
-        ReplicaCoordinator::membership_operation_repository(self)
-    }
-
-    fn role_loss_operation_repository(
-        &self,
-    ) -> &yadorilink_sync_sqlite::RoleLossOperationRepository {
-        ReplicaCoordinator::role_loss_operation_repository(self)
-    }
-}
-
-// `ReplicaCoordinator` is `crate::dag_import::DagImportSource`'s only
-// implementor: `link_runtime::startup::ensure_initial_import` and
-// `daemon_state`'s `backfill_missing_history` call both go through a
-// `&ReplicaCoordinator`.
-impl crate::dag_import::DagImportSource for ReplicaCoordinator {
-    fn sqlite(&self) -> &yadorilink_sync_sqlite::SqliteSyncStore {
-        ReplicaCoordinator::sqlite(self)
-    }
-
-    fn file_index_repository(&self) -> &yadorilink_sync_sqlite::file_index::FileIndexRepository {
-        ReplicaCoordinator::file_index_repository(self)
-    }
-
-    fn change_history_repository(&self) -> &yadorilink_sync_sqlite::ChangeHistoryRepository {
-        ReplicaCoordinator::change_history_repository(self)
-    }
-
-    fn path_lock(&self, group_id: &str, path: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
-        ReplicaCoordinator::path_lock_registry(self).path_lock(group_id, path)
-    }
-
-    fn append_initial_import(
-        &self,
-        group_id: &str,
-        batches: &[Vec<Op>],
-        versions: &[FileVersion],
-        emitter: &ChangeEmitter,
-    ) -> Result<Option<usize>, SyncError> {
-        ReplicaCoordinator::append_initial_import(self, group_id, batches, versions, emitter)
-    }
-
-    fn append_history_backfill(
-        &self,
-        group_id: &str,
-        ops: Vec<Op>,
-        versions: &[FileVersion],
-        emitter: &ChangeEmitter,
-    ) -> Result<ChangeHash, SyncError> {
-        ReplicaCoordinator::append_history_backfill(self, group_id, ops, versions, emitter)
-    }
 }
 
 #[cfg(test)]
-mod dag_import_source_tests {
-    use super::*;
-    use crate::dag_import::{ensure_initial_import, ImportOutcome};
-
-    /// End-to-end proof that `ensure_initial_import` converts a real index
-    /// into signed history when called through a `ReplicaCoordinator` --
-    /// not merely that the trait bound type-checks.
-    #[test]
-    fn ensure_initial_import_runs_against_a_replica_coordinator() {
-        let coordinator = ReplicaCoordinator::open_in_memory().unwrap();
-        let record = FileRecord {
-            path: "a.txt".into(),
-            size: 3,
-            mtime_unix_nanos: 1,
-            blocks: vec![yadorilink_replica_domain::file::BlockInfo {
-                hash: vec![1, 2, 3],
-                offset: 0,
-                size: 3,
-            }],
-            deleted: false,
-        };
-        coordinator
-            .file_index_repository()
-            .upsert_file("g", &record, &RootCommitPermit::for_tests())
-            .unwrap();
-
-        let emitter =
-            ChangeEmitter::new("device-A", ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]));
-        let outcome = ensure_initial_import(&coordinator, "g", &emitter).unwrap();
-        assert_eq!(outcome, ImportOutcome::Imported { changes: 1, ops: 1 });
-
-        let heads = coordinator.sqlite().dag_group_heads("g").unwrap();
-        assert_eq!(heads.len(), 1);
-    }
-}
+mod dag_import_tests;
 
 #[cfg(test)]
-mod materialization_intent_journal_tests {
-    use super::*;
-    use crate::materialization_intent::MaterializationIntentGuard;
+pub(crate) mod test_observers;
 
-    /// End-to-end proof that `MaterializationIntentGuard` opens and clears
-    /// a real, durable intent against a `ReplicaCoordinator`-backed
-    /// `MaterializationIntentRepository` -- not merely that the trait bound
-    /// type-checks.
-    #[test]
-    fn guard_opens_and_clears_against_replica_coordinator() {
-        let coordinator = ReplicaCoordinator::open_in_memory().unwrap();
-        let permit = RootCommitPermit::for_tests();
+#[cfg(test)]
+mod materialization_intent_tests;
 
-        assert!(!coordinator
-            .materialization_intent_repository()
-            .has_materialization_intent("group-1", "a.bin")
-            .unwrap());
-
-        let guard = MaterializationIntentGuard::open(
-            &coordinator,
-            "group-1",
-            "a.bin",
-            b"target-version-hash",
-            &permit,
-        )
-        .unwrap();
-        assert!(coordinator
-            .materialization_intent_repository()
-            .has_materialization_intent("group-1", "a.bin")
-            .unwrap());
-
-        guard.clear().unwrap();
-        assert!(!coordinator
-            .materialization_intent_repository()
-            .has_materialization_intent("group-1", "a.bin")
-            .unwrap());
-    }
-}
+#[cfg(test)]
+mod root_permit_commit_tests;

@@ -17,27 +17,56 @@ set -uo pipefail
 log() { echo "[yadorilink preinstall] $*"; }
 
 AGENT_LABEL="com.yadorilink.daemon"
+STATUS_APP_AGENT_LABEL="com.yadorilink.status-app"
+OLD_HOST_APP="/Applications/YadoriLinkFinderSyncHost.app"
+OLD_STATUS_APP="/usr/local/bin/yadorilink-status-app"
 
 # This script intentionally does not remove files below $USER_HOME. The
 # symlink-sensitive user-home cleanup lives in uninstall.sh, where every
 # root-run deletion is guarded before it can touch a user-writable path.
+
+# The menu bar app is YadoriLink.app now. Stop a running copy so the new
+# bundle replaces a quiet one, and stop the earlier menu bar app (the eframe
+# yadorilink-status-app) and the host app it shipped with. Both keep the
+# same bundle id / extension ids as YadoriLink.app, so leaving the old
+# bundle in /Applications would leave two registrations of the same
+# extensions behind.
+/usr/bin/pkill -x YadoriLink >/dev/null 2>&1 || true
+/usr/bin/pkill -x yadorilink-status-app >/dev/null 2>&1 || true
+/usr/bin/pkill -x YadoriLinkFinderSyncHost >/dev/null 2>&1 || true
 
 CONSOLE_USER="$(/usr/bin/stat -f%Su /dev/console 2>/dev/null || true)"
 if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ]; then
     CONSOLE_USER="$(/usr/bin/who 2>/dev/null | /usr/bin/awk '$2 == "console" { print $1; exit }')"
 fi
 
-if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ] || [ "$CONSOLE_USER" = "loginwindow" ]; then
-    log "No GUI console user detected; nothing to stop."
-    exit 0
+CONSOLE_UID=""
+if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ] && [ "$CONSOLE_USER" != "loginwindow" ]; then
+    CONSOLE_UID="$(/usr/bin/id -u "$CONSOLE_USER" 2>/dev/null || true)"
 fi
 
-CONSOLE_UID="$(/usr/bin/id -u "$CONSOLE_USER" 2>/dev/null || true)"
-if [ -z "$CONSOLE_UID" ]; then
-    exit 0
+if [ -n "$CONSOLE_UID" ]; then
+    log "Stopping any existing $AGENT_LABEL and $STATUS_APP_AGENT_LABEL for $CONSOLE_USER (uid $CONSOLE_UID), if loaded..."
+    /bin/launchctl asuser "$CONSOLE_UID" /bin/launchctl bootout "gui/${CONSOLE_UID}/${AGENT_LABEL}" >/dev/null 2>&1 || true
+    /bin/launchctl asuser "$CONSOLE_UID" /bin/launchctl bootout "gui/${CONSOLE_UID}/${STATUS_APP_AGENT_LABEL}" >/dev/null 2>&1 || true
+    if [ -d "$OLD_HOST_APP" ]; then
+        /usr/bin/sudo -u "$CONSOLE_USER" /usr/bin/pluginkit -r "$OLD_HOST_APP/Contents/PlugIns/YadoriLinkFinderSync.appex" >/dev/null 2>&1 || true
+        /usr/bin/sudo -u "$CONSOLE_USER" /usr/bin/pluginkit -r "$OLD_HOST_APP/Contents/PlugIns/YadoriLinkFileProvider.appex" >/dev/null 2>&1 || true
+    fi
+else
+    log "No GUI console user detected; no per-user agents to stop."
 fi
 
-log "Stopping any existing $AGENT_LABEL for $CONSOLE_USER (uid $CONSOLE_UID), if loaded..."
-/bin/launchctl asuser "$CONSOLE_UID" /bin/launchctl bootout "gui/${CONSOLE_UID}/${AGENT_LABEL}" >/dev/null 2>&1 || true
+# Root-owned paths only; the old status-app LaunchAgent plist under the
+# user's home is removed by postinstall, which has the symlink guards.
+if [ -d "$OLD_HOST_APP" ]; then
+    /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -u "$OLD_HOST_APP" >/dev/null 2>&1 || true
+    /bin/rm -rf "$OLD_HOST_APP"
+    log "Removed $OLD_HOST_APP"
+fi
+if [ -e "$OLD_STATUS_APP" ]; then
+    /bin/rm -f "$OLD_STATUS_APP"
+    log "Removed $OLD_STATUS_APP"
+fi
 
 exit 0

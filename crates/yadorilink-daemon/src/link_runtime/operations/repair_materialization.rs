@@ -97,7 +97,7 @@ pub(crate) fn repair_interrupted_materializations(
     .map_err(SyncError::from)
 }
 
-/// M1-5: backfills a persisted placeholder identity for every path this
+/// Backfills a persisted placeholder identity for every path this
 /// link's index still shows as `Placeholder` with none recorded -- see
 /// `yadorilink_filesystem_sync::materialization_repair::
 /// backfill_placeholder_generations`'s own doc comment for the crash

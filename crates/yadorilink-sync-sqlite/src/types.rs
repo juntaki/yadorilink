@@ -1,10 +1,4 @@
 //! Value types this crate returns from its own retained-version reads.
-//! Deliberately not `yadorilink-sync-core`'s own `VersionRecord`/
-//! `CurrentVersionRecord` (this crate cannot depend on that crate) --
-//! callers map these onto their own equivalent type at their own boundary,
-//! a pure field rename with no parsing/computation left to do (all of that
-//! -- `blocks_json` decoding, `version_hash` derivation -- already
-//! happened here).
 
 use yadorilink_replica_domain::file::{BlockInfo, RecordKind};
 
@@ -59,12 +53,7 @@ pub struct CurrentVersionSnapshot {
     pub xattrs: Vec<(String, Vec<u8>)>,
 }
 
-/// Field-for-field rename -- this crate already did every parse/derivation
-/// a caller's own `get_current_version_record` used to do (blocks_json
-/// decode, corrupt-row detection); this is just the public-API type shape
-/// `yadorilink-sync-core` (and, since Phase 7D-6, `yadorilink-peer-session`
-/// transitively via `PeerReplicaStatePort`) already depends on. Written
-/// here rather than at either caller's own boundary since
+/// Written here rather than at either caller's own boundary since
 /// `yadorilink_replica_domain::session_state::CurrentVersionRecord` is
 /// foreign to both of them but local to neither -- this crate already
 /// depends on `yadorilink-replica-domain`, so it's the only crate that can

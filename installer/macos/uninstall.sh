@@ -92,7 +92,11 @@ safe_rm_user_dir() {
 }
 
 AGENT_LABEL="com.yadorilink.daemon"
-APP_PATH="/Applications/YadoriLinkFinderSyncHost.app"
+APP_PATH="/Applications/YadoriLink.app"
+# What earlier installs shipped: the eframe menu bar app with its own
+# LaunchAgent, and the host app under its old name.
+STATUS_APP_AGENT_LABEL="com.yadorilink.status-app"
+OLD_HOST_APP="/Applications/YadoriLinkFinderSyncHost.app"
 FINDER_SYNC_EXT_ID="com.juntaki.yadorilink.FinderSync"
 FILE_PROVIDER_EXT_ID="com.juntaki.yadorilink.FileProvider"
 
@@ -108,6 +112,7 @@ if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ] && [ "$CONSOLE_USER" 
     if [ -n "$CONSOLE_UID" ]; then
         log "Stopping and unloading LaunchAgent for $CONSOLE_USER..."
         /bin/launchctl asuser "$CONSOLE_UID" /bin/launchctl bootout "gui/${CONSOLE_UID}/${AGENT_LABEL}" >/dev/null 2>&1 || true
+        /bin/launchctl asuser "$CONSOLE_UID" /bin/launchctl bootout "gui/${CONSOLE_UID}/${STATUS_APP_AGENT_LABEL}" >/dev/null 2>&1 || true
 
         log "Removing PlugInKit registration for yadorilink extensions..."
         /usr/bin/sudo -u "$CONSOLE_USER" /usr/bin/pluginkit -r "$APP_PATH/Contents/PlugIns/YadoriLinkFinderSync.appex" >/dev/null 2>&1 || true
@@ -119,6 +124,7 @@ if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ] && [ "$CONSOLE_USER" 
     if [ -n "$USER_HOME" ] && [ -d "$USER_HOME" ]; then
         safe_rm_user_file "$USER_HOME" "$USER_HOME/Library/LaunchAgents/${AGENT_LABEL}.plist"
         log "Removed $USER_HOME/Library/LaunchAgents/${AGENT_LABEL}.plist"
+        safe_rm_user_file "$USER_HOME" "$USER_HOME/Library/LaunchAgents/${STATUS_APP_AGENT_LABEL}.plist"
 
         if [ "$PURGE_DATA" -eq 1 ]; then
             log "Purging data (--purge-data): sync state, blocks, device config, App Group socket dir..."
@@ -134,10 +140,14 @@ else
 fi
 
 log "Removing /usr/local/bin/yadorilink and /usr/local/bin/yadorilink-daemon..."
-rm -f /usr/local/bin/yadorilink /usr/local/bin/yadorilink-daemon
+rm -f /usr/local/bin/yadorilink /usr/local/bin/yadorilink-daemon /usr/local/bin/yadorilink-status-app
 
+# The app's open-at-login registration (SMAppService) goes away with the
+# bundle; quit it first so nothing is left running from a deleted path.
+/usr/bin/pkill -x YadoriLink >/dev/null 2>&1 || true
+/usr/bin/pkill -x yadorilink-status-app >/dev/null 2>&1 || true
 log "Removing $APP_PATH..."
-rm -rf "$APP_PATH"
+rm -rf "$APP_PATH" "$OLD_HOST_APP"
 
 log "Forgetting pkg receipt (com.yadorilink.installer.component), if present..."
 pkgutil --forget com.yadorilink.installer.component >/dev/null 2>&1 || true

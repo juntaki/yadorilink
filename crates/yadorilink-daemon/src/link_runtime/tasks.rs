@@ -246,6 +246,16 @@ fn post_scan_convergence_and_history(
 /// resolves `startup_ready_guard`), then the live flush loop that consumes
 /// `flush_rx` for the rest of this link's lifetime.
 #[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one spawned task body holding a link's whole executor lifetime: the bounded \
+              startup scan+redrive retry loop and the live `flush_rx` loop that follows it \
+              share the moved-in `startup_ready_guard` and the per-attempt \
+              `StartupGeneration` re-arming, and the guard must be resolved exactly once on \
+              the path between them. Hoisting either loop into its own fn would move that \
+              single-owner guard across a boundary and break the fail-closed \
+              settle-on-`Failed` sequencing the startup gate depends on."
+)]
 pub(crate) fn spawn_executor_task(
     executor_deps: Arc<LinkRuntimeDependencies>,
     executor_local_path: String,
@@ -312,14 +322,6 @@ pub(crate) fn spawn_executor_task(
                 // (including the `spawn_blocking` await) so an update install
                 // never starts mid-scan.
                 let _write_activity = executor_deps.begin_write_activity();
-                // `spawn_blocking` is unavailable under the single-threaded
-                // deterministic simulator (there is no blocking-thread pool to
-                // offload to). The offload is purely a production runtime-hygiene
-                // optimization; running the identical synchronous scan inline
-                // drives the exact same work to the exact same result in-sim.
-                // Wrapped in `Ok` so the `match` below sees the same
-                // `Result<Result<_, _>, JoinError>` shape either way.
-                #[cfg(not(madsim))]
                 {
                     tokio::task::spawn_blocking(move || {
                         processor.scan_existing_files_with_ignore_gated(
@@ -331,28 +333,15 @@ pub(crate) fn spawn_executor_task(
                     })
                     .await
                 }
-                #[cfg(madsim)]
-                {
-                    Ok::<_, tokio::task::JoinError>(
-                        processor.scan_existing_files_with_ignore_gated(
-                            &group_id,
-                            &root,
-                            ignore_set.as_ref(),
-                            emit_tombstones,
-                        ),
-                    )
-                }
             };
             let scan_failure: Option<String> = match scan_result {
                 Ok(Ok(records)) => {
-                    // Offloaded for the same reason the scan above is, with
-                    // the same deterministic-simulator exception -- see
+                    // Offloaded for the same reason the scan above is -- see
                     // `post_scan_convergence_and_history`'s own doc for what
                     // runs in there. A panicking blocking task is folded into
                     // the same startup-failure string the scan task's own
                     // `JoinError` produces, so this link's bounded startup
                     // retry can re-run it rather than wedging the group's gate.
-                    #[cfg(not(madsim))]
                     let history_failure = {
                         let deps = executor_deps.clone();
                         let local_path = executor_local_path.clone();
@@ -383,18 +372,14 @@ pub(crate) fn spawn_executor_task(
                             }
                         }
                     };
-                    #[cfg(madsim)]
-                    let history_failure = post_scan_convergence_and_history(
-                        &executor_deps,
-                        &executor_local_path,
-                        &executor_group_id,
-                        &executor_root,
-                        records.is_empty(),
-                    );
                     // One batched broadcast for the whole initial scan
                     // (batch processing) instead of one peer message per
                     // pre-existing file.
                     if history_failure.is_none() {
+                        // Same reason as the flush arms: a scan that resolves
+                        // dirty rows settles the barrier regardless of whether
+                        // it produced records to announce.
+                        executor_deps.note_capture_settled(&executor_group_id);
                         announce_local_change(
                             &executor_deps,
                             &executor_local_path,
@@ -431,6 +416,7 @@ pub(crate) fn spawn_executor_task(
                     .await
                 {
                     Ok(outcome) => {
+                        executor_deps.note_capture_settled(&executor_group_id);
                         if !outcome.records.is_empty() {
                             announce_local_change(
                                 &executor_deps,
@@ -474,15 +460,14 @@ pub(crate) fn spawn_executor_task(
                     // accessor, consistent with `GroupStartupReadyGuard::mark_ready`/
                     // `mark_failed` (`startup.rs`) and `link_runtime_controller.rs`'s
                     // own initial `begin_group_startup` call, which construct/resolve
-                    // generations the same way. Since Phase 7D-10.6's shared-registry
-                    // fix, `replica_coordinator.startup_readiness()` and
+                    // generations the same way. `replica_coordinator.startup_readiness()` and
                     // `sync_state.startup_readiness()` are provably the SAME live
                     // `Arc<StartupReadinessRegistry>` (see
                     // `ReplicaCoordinator::from_database`'s own doc comment and
                     // `replica_coordinator::local_mutation::tests::
                     // path_lock_is_shared_with_the_underlying_sync_state_registry`'s
                     // sibling proof for `PathLockRegistry`) -- mixing accessors here
-                    // no longer orphans a generation.
+                    // never orphans a generation.
                     let next_generation = executor_deps
                         .replica_coordinator
                         .startup_readiness()
@@ -514,25 +499,24 @@ pub(crate) fn spawn_executor_task(
                 startup_ready_guard.mark_failed(reason);
             }
         }
-        // Kept at `debug!` (downgraded 2026-09-01 from an investigation-era
-        // `warn!`, which fired on every debounced flush -- too noisy for
-        // production `warn!` on an active sync): is the executor task
+        // At `debug!` (it fires on every debounced flush -- too noisy for
+        // `warn!` on an active sync): is the executor task
         // still alive and draining flushes, or stuck?
-        let mut c4_attr_flushes_received: u64 = 0;
-        let mut c4_attr_flushes_completed: u64 = 0;
+        let mut flushes_received: u64 = 0;
+        let mut flushes_completed: u64 = 0;
         while let Some(flush) = flush_rx.recv().await {
-            c4_attr_flushes_received += 1;
-            let c4_attr_flush_kind = if matches!(flush, DebounceFlush::RescanRequired) {
+            flushes_received += 1;
+            let flush_kind = if matches!(flush, DebounceFlush::RescanRequired) {
                 "RescanRequired"
             } else {
                 "Paths"
             };
-            let c4_attr_start = std::time::Instant::now();
+            let start = std::time::Instant::now();
             tracing::debug!(
-                flush_kind = c4_attr_flush_kind,
-                flushes_received_total = c4_attr_flushes_received,
-                flushes_completed_total = c4_attr_flushes_completed,
-                "C4_ATTR_EXECUTOR flush received"
+                flush_kind,
+                flushes_received_total = flushes_received,
+                flushes_completed_total = flushes_completed,
+                "executor flush received"
             );
             let burst_fallback = matches!(flush, DebounceFlush::RescanRequired);
             let ignore_file_changed = flush_touches_ignore_file(&executor_canonical_root, &flush);
@@ -621,16 +605,14 @@ pub(crate) fn spawn_executor_task(
                 // A `RescanRequired` full-reconciliation scan already commits
                 // its detected changes to the DAG in durable, bounded chunks
                 // as it walks (`reconcile_disk_with_ignore`'s own chunk
-                // loop) -- but until this fix, nothing surfaced that
-                // progress to connected peers until the WHOLE scan returned.
-                // For a real 15,000-file scan that withheld peer visibility
-                // for the scan's entire length (measured: ~75s of zero
-                // peer-visible progress, C4 15k live-burst investigation,
-                // 2026-09-01) even though the source device's own index/DAG
-                // kept advancing the whole time -- a head-of-line-blocking
-                // bug, not a correctness one. Streaming each durably-
-                // committed chunk to `announce_local_change` as it lands
-                // fixes this without changing what gets committed, in what
+                // loop). Announcing only once the WHOLE scan returned would
+                // withhold peer visibility for the scan's entire length (a
+                // 15,000-file scan measured ~75s of zero peer-visible
+                // progress) even though the source device's own index/DAG
+                // keeps advancing the whole time -- head-of-line blocking,
+                // not a correctness issue. Streaming each durably-committed
+                // chunk to `announce_local_change` as it lands avoids this
+                // without changing what gets committed, in what
                 // order, or when: only when each already-durable chunk
                 // becomes peer-visible.
                 let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel::<
@@ -651,7 +633,6 @@ pub(crate) fn spawn_executor_task(
                     }
                 });
 
-                #[cfg(not(madsim))]
                 let flush_result = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(
                         executor_processor.process_flush_with_ignore_streaming(
@@ -666,21 +647,6 @@ pub(crate) fn spawn_executor_task(
                         ),
                     )
                 });
-                // See the non-streaming arm below for why madsim awaits
-                // directly instead of using `block_in_place`.
-                #[cfg(madsim)]
-                let flush_result = executor_processor
-                    .process_flush_with_ignore_streaming(
-                        &executor_group_id,
-                        &executor_root,
-                        flush,
-                        executor_ignore_set.as_ref(),
-                        live_emit_tombstones,
-                        &mut |chunk_records| {
-                            let _ = chunk_tx.send(chunk_records.to_vec());
-                        },
-                    )
-                    .await;
                 // Closes the channel so `announce_task`'s `while let Some`
                 // ends once every already-sent chunk is drained, then waits
                 // for that draining to actually finish before this flush is
@@ -691,15 +657,15 @@ pub(crate) fn spawn_executor_task(
                 drop(chunk_tx);
                 let _ = announce_task.await;
 
-                c4_attr_flushes_completed += 1;
+                flushes_completed += 1;
                 tracing::debug!(
-                    flush_kind = c4_attr_flush_kind,
-                    flushes_received_total = c4_attr_flushes_received,
-                    flushes_completed_total = c4_attr_flushes_completed,
-                    elapsed_ms = c4_attr_start.elapsed().as_millis() as u64,
+                    flush_kind,
+                    flushes_received_total = flushes_received,
+                    flushes_completed_total = flushes_completed,
+                    elapsed_ms = start.elapsed().as_millis() as u64,
                     ok = flush_result.is_ok(),
                     records = flush_result.as_ref().map(|o| o.records.len()).unwrap_or(0),
-                    "C4_ATTR_EXECUTOR flush completed"
+                    "executor flush completed"
                 );
                 // `outcome.records` is deliberately NOT passed to
                 // `announce_local_change` again here -- every record it
@@ -710,7 +676,6 @@ pub(crate) fn spawn_executor_task(
                     tracing::warn!(error = %e, local_path = %executor_local_path, "failed to process a local-change batch")
                 }
             } else {
-                #[cfg(not(madsim))]
                 let flush_result = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(
                         executor_processor.process_flush_with_ignore(
@@ -722,36 +687,26 @@ pub(crate) fn spawn_executor_task(
                         ),
                     )
                 });
-                // The deterministic simulator runs a single-threaded runtime:
-                // `block_in_place` and a nested `Handle::block_on` both panic
-                // there. `process_flush_with_ignore` is already `async`, so
-                // awaiting it directly drives the exact same work to the exact
-                // same result — the `block_in_place` wrapper above is only a
-                // multi-thread runtime-hygiene optimization (offloading the
-                // synchronous chunk/hash/write bursts onto a sibling worker),
-                // which has no meaning under the single-threaded simulator.
-                #[cfg(madsim)]
-                let flush_result = executor_processor
-                    .process_flush_with_ignore(
-                        &executor_group_id,
-                        &executor_root,
-                        flush,
-                        executor_ignore_set.as_ref(),
-                        live_emit_tombstones,
-                    )
-                    .await;
-                c4_attr_flushes_completed += 1;
+                flushes_completed += 1;
                 tracing::debug!(
-                    flush_kind = c4_attr_flush_kind,
-                    flushes_received_total = c4_attr_flushes_received,
-                    flushes_completed_total = c4_attr_flushes_completed,
-                    elapsed_ms = c4_attr_start.elapsed().as_millis() as u64,
+                    flush_kind,
+                    flushes_received_total = flushes_received,
+                    flushes_completed_total = flushes_completed,
+                    elapsed_ms = start.elapsed().as_millis() as u64,
                     ok = flush_result.is_ok(),
                     records = flush_result.as_ref().map(|o| o.records.len()).unwrap_or(0),
-                    "C4_ATTR_EXECUTOR flush completed"
+                    "executor flush completed"
                 );
                 match flush_result {
                     Ok(outcome) => {
+                        // Before the announce, and deliberately not inside it:
+                        // a successful flush clears the dirty rows that ARE the
+                        // capture barrier, and it can do that while authoring
+                        // nothing. `announce_local_change` returns at
+                        // `records.is_empty()`, so anything placed after it is
+                        // skipped in exactly the case that strands a staged
+                        // Change.
+                        executor_deps.note_capture_settled(&executor_group_id);
                         announce_local_change(
                             &executor_deps,
                             &executor_local_path,
@@ -797,6 +752,7 @@ pub(crate) fn spawn_dirty_journal_task(
                 .await;
             match redrive_result {
                 Ok(outcome) => {
+                    dirty_journal_deps.note_capture_settled(&dirty_journal_group_id);
                     if !outcome.records.is_empty() {
                         announce_local_change(
                             &dirty_journal_deps,
@@ -833,93 +789,4 @@ pub(crate) fn flush_touches_ignore_file(root: &std::path::Path, flush: &Debounce
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{resolve_duplicate_recovery_gate, DuplicateRecoveryOutcome};
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    struct FakeError;
-
-    impl std::fmt::Display for FakeError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "fake error")
-        }
-    }
-
-    // Ordinary startup: nothing pending. The expensive corroboration pass
-    // must never run -- proven directly (not via timing) by panicking if
-    // the closure is ever invoked, and `recheck_pending` must likewise
-    // never be consulted since there was nothing to recheck.
-    #[test]
-    fn no_recovery_pending_skips_corroboration_and_completes_immediately() {
-        let outcome = resolve_duplicate_recovery_gate::<FakeError>(
-            "group",
-            Ok(false),
-            || panic!("corroborate_and_resolve must not run when nothing is pending"),
-            || panic!("recheck_pending must not run when nothing was pending to begin with"),
-        );
-        assert_eq!(outcome, DuplicateRecoveryOutcome::Complete);
-    }
-
-    // Armed recovery, fully resolved this pass: corroboration runs exactly
-    // once and, since the durable pending set is now empty, the gate
-    // reports Complete so suppression may clear.
-    #[test]
-    fn pending_recovery_runs_corroboration_once_and_completes_when_pending_clears() {
-        let mut corroborate_calls = 0;
-        let outcome = resolve_duplicate_recovery_gate(
-            "group",
-            Ok::<bool, FakeError>(true),
-            || corroborate_calls += 1,
-            || Ok(false),
-        );
-        assert_eq!(corroborate_calls, 1);
-        assert_eq!(outcome, DuplicateRecoveryOutcome::Complete);
-    }
-
-    // Armed recovery, still unresolved after this pass (some paths were
-    // not corroborated): suppression must stay armed.
-    #[test]
-    fn pending_recovery_stays_pending_when_recheck_still_reports_pending() {
-        let mut corroborate_calls = 0;
-        let outcome = resolve_duplicate_recovery_gate(
-            "group",
-            Ok::<bool, FakeError>(true),
-            || corroborate_calls += 1,
-            || Ok(true),
-        );
-        assert_eq!(corroborate_calls, 1);
-        assert_eq!(outcome, DuplicateRecoveryOutcome::StillPending);
-    }
-
-    // Corroboration ran, but the post-corroboration recheck itself could
-    // not be read: fail closed exactly like the initial-read failure does,
-    // not optimistically treated as resolved.
-    #[test]
-    fn unreadable_recheck_after_corroboration_fails_closed() {
-        let mut corroborate_calls = 0;
-        let outcome = resolve_duplicate_recovery_gate(
-            "group",
-            Ok::<bool, FakeError>(true),
-            || corroborate_calls += 1,
-            || Err(FakeError),
-        );
-        assert_eq!(corroborate_calls, 1, "corroboration must still run once pending was true");
-        assert_eq!(outcome, DuplicateRecoveryOutcome::UnknownFailClosed);
-    }
-
-    // The durable pending state itself could not be read: fail closed.
-    // Corroboration must not run against an unknown state, and
-    // suppression must stay armed rather than being cleared optimistically.
-    #[test]
-    fn unreadable_pending_state_fails_closed_without_running_corroboration() {
-        let outcome = resolve_duplicate_recovery_gate(
-            "group",
-            Err(FakeError),
-            || panic!("corroborate_and_resolve must not run when pending state is unknown"),
-            || -> Result<bool, FakeError> {
-                panic!("recheck_pending must not run when the initial read already failed")
-            },
-        );
-        assert_eq!(outcome, DuplicateRecoveryOutcome::UnknownFailClosed);
-    }
-}
+mod tests;

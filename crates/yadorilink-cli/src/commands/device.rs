@@ -1,212 +1,60 @@
-/// The device's Ed25519 key, generated on first use. It is the device's
-/// whole identity: its public half is registered so peers can pin it, verify
-/// this device's signed change history, and authenticate its connections.
-fn signing_keypair_path() -> std::path::PathBuf {
-    crate::device_config::config_dir().join("signing_key")
+//! `yadorilink device ...`: this account's device registry.
+
+use yadorilink_client_core::ops::devices as ops;
+
+use crate::error::CliError;
+
+use yadorilink_client_core::ops::devices::DeviceInfo;
+
+/// `yadorilink device register [--name <name>]`.
+pub async fn register(device_name: String) -> Result<(), CliError> {
+    let device_id = ops::register_device(device_name).await?;
+    println!("Registered device: {device_id}");
+    Ok(())
 }
 
-mod http {
-    //! HTTP client for the coordination service's `/devices/*` routes.
-
-    use base64::Engine;
-    use serde::{Deserialize, Serialize};
-    use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
-    use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
-    use yadorilink_ipc_proto::daemonctl::{
-        remove_device_command_response, RemoveDeviceCommandRequest,
-    };
-
-    use crate::control_client;
-    use crate::error::CliError;
-    use crate::http_client::{get_json, post_json, require_access_token};
-
-    // The coordination plane reads/writes camelCase JSON keys, same contract
-    // as `commands::share`'s own request/response structs -- see that
-    // module's identical comment.
-    #[derive(Serialize)]
-    #[serde(rename_all = "camelCase")]
-    struct RegisterDeviceRequest<'a> {
-        device_name: &'a str,
-        wireguard_public_key_base64: String,
-        signing_public_key_base64: String,
-    }
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct RegisterDeviceResponse {
-        device_id: String,
-    }
-
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct DeviceInfo {
-        device_id: String,
-        device_name: String,
-        online: bool,
-    }
-    #[derive(Deserialize)]
-    struct ListDevicesResponse {
-        devices: Vec<DeviceInfo>,
-    }
-
-    /// The library form the onboarding wizard drives — registers the device and
-    /// persists the one canonical pre-release `device.json` shape, returning the
-    /// assigned `device_id` as a typed result instead of printing it.
-    pub async fn register_device(device_name: String) -> Result<String, CliError> {
-        let access_token = require_access_token()?;
-        let signing_keypair = yadorilink_transport::DeviceSigningKeyPair::load_or_generate(
-            super::signing_keypair_path(),
-        )
-        .map_err(|e| CliError::Other(e.to_string()))?;
-
-        let signing_public_key_base64 =
-            base64::engine::general_purpose::STANDARD.encode(signing_keypair.public_bytes());
-        // A device has one key now. The coordination plane's registration
-        // schema still requires a value under the retired transport key's
-        // name -- its column is `NOT NULL` -- so the same Ed25519 key is
-        // sent there too, and the daemon ignores what comes back in that
-        // field. Folding the column out of the canonical schema is a
-        // coordination-plane change and belongs with one.
-        let wireguard_public_key_base64 = signing_public_key_base64.clone();
-
-        let resp: RegisterDeviceResponse = post_json(
-            "/devices/register",
-            &RegisterDeviceRequest {
-                device_name: &device_name,
-                wireguard_public_key_base64: wireguard_public_key_base64.clone(),
-                signing_public_key_base64: signing_public_key_base64.clone(),
-            },
-            Some(&access_token),
-        )
-        .await?;
-
-        crate::device_config::save(&crate::device_config::DeviceConfig {
-            device_id: resp.device_id.clone(),
-            coordination_addr: crate::http_client::coordination_addr(),
-            nat: crate::device_config::NatConfig::default(),
-            wireguard_public_key: wireguard_public_key_base64,
-            signing_public_key: signing_public_key_base64,
-            config_version: crate::device_config::CONFIG_VERSION,
-        })?;
-        Ok(resp.device_id)
-    }
-
-    pub async fn register(device_name: String) -> Result<(), CliError> {
-        let device_id = register_device(device_name).await?;
-        println!("Registered device: {device_id}");
-        Ok(())
-    }
-
-    pub async fn list() -> Result<(), CliError> {
-        let access_token = require_access_token()?;
-        let resp: ListDevicesResponse = get_json("/devices", Some(&access_token)).await?;
-        for d in resp.devices {
-            println!(
-                "{}  {}  {}",
-                d.device_id,
-                d.device_name,
-                if d.online { "online" } else { "offline" }
-            );
-        }
-        Ok(())
-    }
-
-    /// `yadorilink device remove <device> [--force]`. Before de-registering
-    /// the device on the coordination plane, asks the local daemon whether
-    /// doing so would leave any folder group this device knows about without
-    /// a confirmed-ready full replica, AND asks the coordination Worker to
-    /// enumerate every folder group the removed device is an eager full
-    /// replica of (so a group the acting daemon doesn't itself link is still
-    /// covered. The daemon owns that fail-closed decision while the Worker's
-    /// count guard remains an independent final check. `--force` bypasses a
-    /// refusal with a data-loss warning and an audit log line.
-    pub async fn remove(device_id: String, force: bool) -> Result<(), CliError> {
-        let response =
-            control_client::send(ReqPayload::RemoveDeviceCommand(RemoveDeviceCommandRequest {
-                device_id: device_id.clone(),
-                force,
-            }))
-            .await?;
-        match response.payload {
-            Some(RespPayload::RemoveDeviceCommand(response)) => match response.result {
-                Some(remove_device_command_response::Result::Outcome(outcome)) => {
-                    crate::commands::membership_render::render_membership_outcome(
-                        "remove", &outcome,
-                    );
-                }
-                Some(remove_device_command_response::Result::Error(error)) => {
-                    return Err(CliError::Other(error.message));
-                }
-                None => {
-                    return Err(CliError::Other("daemon returned an empty remove result".into()))
-                }
-            },
-            Some(RespPayload::Error(error)) => return Err(CliError::Other(error)),
-            _ => {
-                return Err(CliError::Other("unexpected daemon response to device removal".into()))
-            }
-        }
-        println!("Removed device: {device_id}");
-        Ok(())
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        /// Regression test, same bug class as `commands::share`'s own
-        /// camelCase-deserialization fixes: `POST /devices/register`'s real
-        /// success response is `{"deviceId": ..., "serviceSigningPublicKeyBase64":
-        /// ...}` (coordination-worker's `POST /devices/register` handler) --
-        /// `RegisterDeviceResponse` was missing
-        /// `#[serde(rename_all = "camelCase")]`, so it failed to deserialize
-        /// a real response at all, breaking device registration -- a
-        /// fundamental onboarding operation -- against a real deployed
-        /// worker.
-        #[test]
-        fn register_device_response_deserializes_the_coordination_planes_camelcase_shape() {
-            let parsed: RegisterDeviceResponse = serde_json::from_str(
-                r#"{"deviceId":"device-1","serviceSigningPublicKeyBase64":"abc123"}"#,
-            )
-            .unwrap();
-            assert_eq!(parsed.device_id, "device-1");
-        }
-
-        /// Same bug, the request side: the coordination plane's `POST
-        /// /devices/register` route reads `deviceName`/
-        /// `wireguardPublicKeyBase64`/`signingPublicKeyBase64` -- a
-        /// snake_case body arrives with every field `undefined`
-        /// server-side (the handler rejects a missing
-        /// `signingPublicKeyBase64` outright).
-        #[test]
-        fn register_device_request_serializes_camelcase_for_the_coordination_plane() {
-            let body = serde_json::to_value(RegisterDeviceRequest {
-                device_name: "my-laptop",
-                wireguard_public_key_base64: "wg-key".to_string(),
-                signing_public_key_base64: "sign-key".to_string(),
-            })
-            .unwrap();
-            assert_eq!(body["deviceName"], "my-laptop");
-            assert_eq!(body["wireguardPublicKeyBase64"], "wg-key");
-            assert_eq!(body["signingPublicKeyBase64"], "sign-key");
-            assert!(body.get("device_name").is_none());
-        }
-
-        /// Regression test, same bug class: `GET /devices`'s real response
-        /// carries camelCase device keys (`listDevices`'s return shape) --
-        /// `DeviceInfo` was missing `#[serde(rename_all = "camelCase")]`,
-        /// so it silently failed to deserialize every field but `online`
-        /// against a real worker, breaking `device list`.
-        #[test]
-        fn device_info_deserializes_the_coordination_planes_camelcase_shape() {
-            let parsed: DeviceInfo = serde_json::from_str(
-                r#"{"deviceId":"device-1","deviceName":"my-laptop","online":true}"#,
-            )
-            .unwrap();
-            assert_eq!(parsed.device_id, "device-1");
-            assert_eq!(parsed.device_name, "my-laptop");
-            assert!(parsed.online);
-        }
-    }
+fn device_line(device: &DeviceInfo) -> String {
+    format!(
+        "{}  {}  {}",
+        device.device_id,
+        device.device_name,
+        if device.online { "online" } else { "offline" }
+    )
 }
 
-pub use http::{list, register, register_device, remove};
+/// `yadorilink device list`.
+pub async fn list() -> Result<(), CliError> {
+    for device in ops::list_devices().await? {
+        println!("{}", device_line(&device));
+    }
+    Ok(())
+}
+
+/// `yadorilink device remove <device> [--force]`. Before de-registering the
+/// device on the coordination plane, the daemon checks that doing so would
+/// not leave any folder group without a confirmed-ready full replica.
+/// `--force` bypasses a refusal with a data-loss warning and an audit log
+/// line.
+pub async fn remove(device_id: String, force: bool) -> Result<(), CliError> {
+    let outcome = ops::remove_device(&device_id, force).await?;
+    crate::commands::membership_render::render_membership_outcome("remove", &outcome);
+    println!("Removed device: {device_id}");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_line_is_pinned_verbatim() {
+        let mut device = DeviceInfo {
+            device_id: "device-1".into(),
+            device_name: "my-laptop".into(),
+            online: true,
+        };
+        assert_eq!(device_line(&device), "device-1  my-laptop  online");
+        device.online = false;
+        assert_eq!(device_line(&device), "device-1  my-laptop  offline");
+    }
+}

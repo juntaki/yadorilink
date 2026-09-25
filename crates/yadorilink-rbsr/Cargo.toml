@@ -1,0 +1,13 @@
+[package]
+name = "yadorilink-rbsr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+blake3 = "1.8"
+thiserror = { workspace = true }
+
+[dev-dependencies]

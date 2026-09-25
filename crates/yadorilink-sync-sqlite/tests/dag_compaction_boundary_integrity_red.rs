@@ -1,7 +1,8 @@
 use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
-use yadorilink_replica_domain::change::{Change, ChangeAuth, Op};
+use yadorilink_replica_domain::change::Op;
 use yadorilink_replica_domain::ids::{DeviceId, FolderGroupId, SyncPath};
+use yadorilink_replica_domain::test_authoring::create_signed_for_tests;
 use yadorilink_replica_engine::compaction::Checkpoint;
 use yadorilink_sync_sqlite::dag_store::{
     admit_change, commit_prune, emit_local_change, has_change, init_dag_schema, ChangeEmitter,
@@ -25,7 +26,6 @@ fn two_change_chain(
         conn,
         "g",
         vec![Op::Delete { path: SyncPath("first.bin".into()) }],
-        ChangeAuth::PLACEHOLDER,
         &emitter(),
     )
     .unwrap();
@@ -33,7 +33,6 @@ fn two_change_chain(
         conn,
         "g",
         vec![Op::Delete { path: SyncPath("second.bin".into()) }],
-        ChangeAuth::PLACEHOLDER,
         &emitter(),
     )
     .unwrap();
@@ -77,32 +76,29 @@ fn restart_accepts_surviving_non_checkpoint_branch_whose_parent_was_pruned() {
         &conn,
         "g",
         vec![Op::Delete { path: SyncPath("root.bin".into()) }],
-        ChangeAuth::PLACEHOLDER,
         &emitter(),
     )
     .unwrap();
     let root_hash = root.compute_hash();
 
-    let branch_a = Change::create_signed(
+    let branch_a = create_signed_for_tests(
         vec![root_hash],
         root.lamport,
-        ChangeAuth::PLACEHOLDER,
         DeviceId("device-b".into()),
         FolderGroupId("g".into()),
         vec![Op::Delete { path: SyncPath("a.bin".into()) }],
         &SigningKey::from_bytes(&[1u8; 32]),
     );
-    let branch_b = Change::create_signed(
+    let branch_b = create_signed_for_tests(
         vec![root_hash],
         root.lamport,
-        ChangeAuth::PLACEHOLDER,
         DeviceId("device-c".into()),
         FolderGroupId("g".into()),
         vec![Op::Delete { path: SyncPath("b.bin".into()) }],
         &SigningKey::from_bytes(&[2u8; 32]),
     );
-    admit_change(&conn, &branch_a, true).unwrap();
-    admit_change(&conn, &branch_b, true).unwrap();
+    admit_change(&conn, &branch_a).unwrap();
+    admit_change(&conn, &branch_b).unwrap();
 
     // This models a valid concurrent-prune boundary: the common root is
     // dominated/prunable, branch_a is the checkpoint cut, while branch_b is a
@@ -129,7 +125,7 @@ fn replay_of_an_explicitly_pruned_change_does_not_resurrect_history() {
     commit_prune(&conn, &checkpoint, &[root_hash]).unwrap();
     assert!(!has_change(&conn, &root_hash).unwrap());
 
-    let error = admit_change(&conn, &root, true).expect_err(
+    let error = admit_change(&conn, &root).expect_err(
         "a stale peer must not be able to re-admit a Change this replica already pruned",
     );
     assert!(matches!(error, SyncError::NotFound(_)));
@@ -143,7 +139,6 @@ fn completed_prune_context_does_not_authorize_a_later_unrelated_history_deletion
         &conn,
         "g",
         vec![Op::Delete { path: SyncPath("root.bin".into()) }],
-        ChangeAuth::PLACEHOLDER,
         &emitter(),
     )
     .unwrap();
@@ -151,7 +146,6 @@ fn completed_prune_context_does_not_authorize_a_later_unrelated_history_deletion
         &conn,
         "g",
         vec![Op::Delete { path: SyncPath("middle.bin".into()) }],
-        ChangeAuth::PLACEHOLDER,
         &emitter(),
     )
     .unwrap();
@@ -159,7 +153,6 @@ fn completed_prune_context_does_not_authorize_a_later_unrelated_history_deletion
         &conn,
         "g",
         vec![Op::Delete { path: SyncPath("leaf.bin".into()) }],
-        ChangeAuth::PLACEHOLDER,
         &emitter(),
     )
     .unwrap();
@@ -184,7 +177,7 @@ fn completed_prune_context_does_not_authorize_a_later_unrelated_history_deletion
     assert!(matches!(error, SyncError::CorruptState(_)));
 }
 
-/// RED: a change with two parents -- one still live, one legitimately
+/// Pins: a change with two parents -- one still live, one legitimately
 /// tombstoned by a real prune -- must still have its Lamport value checked
 /// against `max(parent lamports) + 1`. A partially-missing parent set must
 /// never short-circuit the Lamport check merely because resolving every
@@ -196,7 +189,6 @@ fn schema_init_fails_closed_on_lamport_mismatch_with_one_live_and_one_pruned_par
         &conn,
         "g",
         vec![Op::Delete { path: SyncPath("root.bin".into()) }],
-        ChangeAuth::PLACEHOLDER,
         &emitter(),
     )
     .unwrap();
@@ -208,7 +200,6 @@ fn schema_init_fails_closed_on_lamport_mismatch_with_one_live_and_one_pruned_par
         &conn,
         "g",
         vec![Op::Delete { path: SyncPath("a.bin".into()) }],
-        ChangeAuth::PLACEHOLDER,
         &emitter(),
     )
     .unwrap();
@@ -226,10 +217,9 @@ fn schema_init_fails_closed_on_lamport_mismatch_with_one_live_and_one_pruned_par
     // `admit_change`) since a genuine merge could only have been authored
     // this way from stale-but-real ancestry -- exactly what a startup repair
     // pass must independently distrust.
-    let merge = Change::create_signed(
+    let merge = create_signed_for_tests(
         vec![branch_a.compute_hash(), root_hash],
         99,
-        ChangeAuth::PLACEHOLDER,
         DeviceId("device-c".into()),
         FolderGroupId("g".into()),
         vec![Op::Delete { path: SyncPath("merge.bin".into()) }],
@@ -238,10 +228,12 @@ fn schema_init_fails_closed_on_lamport_mismatch_with_one_live_and_one_pruned_par
     let merge_hash = merge.compute_hash();
     conn.execute(
         "INSERT INTO changes \
-         (change_hash, group_id, device_id, lamport, encoded, applied, authenticated_header) \
-         VALUES (?1, 'g', 'device-c', 99, ?2, 1, ?3)",
+         (change_hash, group_id, device_id, author_seq, lamport, encoded, \
+          authenticated_header) \
+         VALUES (?1, 'g', 'device-c', ?2, 99, ?3, ?4)",
         rusqlite::params![
             &merge_hash.0[..],
+            merge.author_seq.get() as i64,
             merge.to_wire_bytes(),
             merge.authenticated_header_encoding()
         ],

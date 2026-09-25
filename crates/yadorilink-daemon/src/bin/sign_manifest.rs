@@ -50,9 +50,8 @@ fn keygen() {
     println!("public_key_hex: {}", hex::encode(verifying_key.to_bytes()));
     println!(
         "\nBuild release clients with this public key and a stable key id before signing \
-         any manifest with the matching private key. Follow docs/UPDATE_SIGNING.md, \
-         and never commit the private key or store it outside the protected \
-         release-signing environment."
+         any manifest with the matching private key. Never commit the private key \
+         or store it outside the protected release-signing environment."
     );
 }
 

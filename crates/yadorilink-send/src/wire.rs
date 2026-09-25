@@ -1,5 +1,5 @@
 //! Track Send's own stream framing: length-prefixed protobuf messages on a
-//! `quinn` bidirectional stream, using the exact same generic length-prefix
+//! bidirectional stream of a Track Send connection, using the exact same generic length-prefix
 //! helpers (`write_length_prefixed`/`read_length_prefixed`) the sync
 //! protocol's own `yadorilink_transport::block_stream` already exports for
 //! this -- reused directly rather than re-implemented, since they operate

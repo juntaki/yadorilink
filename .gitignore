@@ -5,7 +5,7 @@
 # dev machine) — a non-anchored pattern catches their own target/ dirs
 # too, not just the root one.
 target/
-# Parallel/isolated build directories (e.g. target-madsim, per-lane dirs used
+# Parallel/isolated build directories (e.g. target-turmoil, per-lane dirs used
 # to avoid build-dir contention across concurrent work) — same rationale as
 # target/, never checked in.
 target-*/
@@ -81,3 +81,20 @@ installer/linux/apt/dist/
 # (cargo-about). A build/packaging output bundled into release artifacts, not
 # checked in.
 /THIRD-PARTY-LICENSES.html
+
+# scripts/local-coordination-worker.sh's own scratch state: the emulated
+# D1/Durable-Object storage, PID/address files and wrangler-dev log for a
+# long-lived local coordination deployment. Rebuilt from scratch on every
+# `start`, never checked in.
+/.scratch/
+
+# Product end-to-end evidence files (scripts/e2e/*). Written per run from
+# whatever the run actually observed; the run is the source of truth, not a
+# checked-in copy of one run's output.
+/linux-product-e2e-evidence.json
+/macos-product-e2e-evidence.json
+/windows-product-e2e-evidence.json
+
+# The client core static library scripts/generate-swift-bindings.sh builds
+# for the macOS app; the generated Swift next to it is checked in.
+shell-ext/macos/YadoriLinkApp/FFI/lib/

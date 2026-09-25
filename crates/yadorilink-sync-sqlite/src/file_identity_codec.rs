@@ -1,27 +1,3 @@
-//! A minimal, versioned binary encoding for
-//! [`FileIdentity`](yadorilink_root_authority::fs_identity::FileIdentity),
-//! plus [`GenerationId`] -- the opaque identity type
-//! `yadorilink-sync-core`'s `materialized_generation` module mints for each
-//! `path_materialized_generations` row.
-//!
-//! Split out of `materialized_generation` (Phase 7D-7.2) because
-//! `filesystem_transaction`'s epoch rows persist `FileIdentity` too
-//! (`staged_identity`/`displaced_identity`) and reuse this exact encoding
-//! rather than defining a second one -- both modules needed it once
-//! `filesystem_transaction` moved into this crate. At that point,
-//! `record_materialized_generation`/`lookup_materialized_generation` (the
-//! rest of the original module) stayed in `yadorilink-sync-core` because
-//! they called `dag_store::intern_causal_basis`, which had not moved yet;
-//! `dag_store` moved into this crate in Phase 7D-7.3, and the rest of
-//! `materialized_generation` followed in Phase 7D-7.5, landing in this
-//! crate's sibling [`crate::materialized_generation`] module. This module
-//! itself has no dependency on `dag_store` or any other sync-core-internal
-//! type, so it moved first and stayed put across both phases.
-//! `yadorilink-sync-core`'s `materialized_generation` module re-exports
-//! everything here (and everything in [`crate::materialized_generation`])
-//! under its old names, so its own ~10 in-crate consumers did not need
-//! their `use` paths touched by either split.
-
 use yadorilink_root_authority::fs_identity::{
     FileIdentity, ObjectKind, PlatformObjectId, VolumeIdentity, WindowsObjectId,
 };
@@ -96,12 +72,19 @@ fn windows_object_id_subtag(w: WindowsObjectId) -> u8 {
     }
 }
 
-/// Encodes a [`FileIdentity`] as a versioned, self-describing byte blob.
-/// Not content-addressed like `causal_basis`'s encoding: this is a direct
-/// field encoding of one observation, not a hash naming a deduplicated set.
-pub fn encode_file_identity(identity: &FileIdentity) -> Vec<u8> {
+/// The part of an identity that names *which* object it is -- volume and
+/// object id -- without anything that describes its state or guards
+/// against reuse. Two observations of one object always agree on it, so it
+/// is what a lookup keyed by object (a directory that was renamed) seeks
+/// on; whether a hit really is the same object is still
+/// [`FileIdentity::compare`]'s question.
+pub fn encode_object_address(identity: &FileIdentity) -> Vec<u8> {
     let mut buf = Vec::new();
-    buf.push(MATERIALIZED_GENERATION_ENCODING_VERSION as u8);
+    push_object_address(&mut buf, identity);
+    buf
+}
+
+fn push_object_address(buf: &mut Vec<u8>, identity: &FileIdentity) {
     buf.push(volume_identity_tag(identity.volume_identity));
     match identity.volume_identity {
         VolumeIdentity::Unix { device_id } => buf.extend_from_slice(&device_id.to_be_bytes()),
@@ -122,6 +105,15 @@ pub fn encode_file_identity(identity: &FileIdentity) -> Vec<u8> {
             }
         }
     }
+}
+
+/// Encodes a [`FileIdentity`] as a versioned, self-describing byte blob.
+/// Not content-addressed like `causal_basis`'s encoding: this is a direct
+/// field encoding of one observation, not a hash naming a deduplicated set.
+pub fn encode_file_identity(identity: &FileIdentity) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.push(MATERIALIZED_GENERATION_ENCODING_VERSION as u8);
+    push_object_address(&mut buf, identity);
     buf.push(object_kind_encoding_tag(identity.object_kind));
     match identity.generation_or_usn {
         Some(g) => {
@@ -159,11 +151,8 @@ pub fn encode_file_identity(identity: &FileIdentity) -> Vec<u8> {
 
 /// A minimal cursor over a byte slice for [`decode_file_identity`] --
 /// errors on truncation rather than panicking, since this reads a stored
-/// BLOB a future encoding-version mismatch or on-disk corruption could have
-/// shortened. `pub(crate)`: `crate::filesystem_transaction` reuses it for
-/// its own `DirectoryIdentity` encoding rather than writing a second
-/// cursor -- both live in this crate now, so no re-export is needed for
-/// that reuse.
+/// BLOB a future encoding-version mismatch or on-disk corruption could
+/// have shortened.
 pub(crate) struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
@@ -271,12 +260,6 @@ pub fn decode_file_identity(blob: &[u8]) -> Result<FileIdentity, SyncSqliteError
     let metadata_fingerprint: [u8; 32] =
         r.take(32)?.try_into().expect("Reader::take(32) always returns exactly 32 bytes");
     let link_count = if r.bool_flag()? { Some(r.u64()?) } else { None };
-    // See `MATERIALIZED_GENERATION_ENCODING_VERSION`'s doc for why this is
-    // part of the encoding as of version 3: it is the only reuse
-    // discriminator a symlink identity can ever carry, and
-    // `optimistic_placement`'s commit-window binding compares a decoded
-    // `staged_identity` (this function's output) against a live
-    // re-observation through `FileIdentity::compare`, which needs it.
     let symlink_target_digest = if r.bool_flag()? {
         let bytes: [u8; 32] =
             r.take(32)?.try_into().expect("Reader::take(32) always returns exactly 32 bytes");
@@ -298,147 +281,4 @@ pub fn decode_file_identity(blob: &[u8]) -> Result<FileIdentity, SyncSqliteError
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use yadorilink_root_authority::fs_identity::Timestamp;
-
-    fn sample_identity() -> FileIdentity {
-        FileIdentity {
-            volume_identity: VolumeIdentity::Unix { device_id: 7 },
-            object_id: PlatformObjectId::Unix { inode: 42 },
-            object_kind: ObjectKind::RegularFile,
-            generation_or_usn: Some(3),
-            birth_or_creation_time: Some(Timestamp {
-                seconds_since_unix_epoch: 1_700_000_000,
-                subsec_nanos: 123,
-            }),
-            observed_size: 1024,
-            metadata_fingerprint: [9; 32],
-            link_count: Some(1),
-            symlink_target_digest: None,
-        }
-    }
-
-    #[test]
-    fn file_identity_round_trips_through_its_stored_encoding() {
-        let identity = sample_identity();
-        let blob = encode_file_identity(&identity);
-        let decoded = decode_file_identity(&blob).unwrap();
-        assert_eq!(decoded, identity);
-    }
-
-    #[test]
-    fn a_real_symlinks_identity_round_trips_through_its_stored_encoding_digest_included() {
-        // The round-trip tests above all construct a `FileIdentity` with
-        // `symlink_target_digest` already `None`, so they pass regardless
-        // of whether this encoding actually carries that field -- they
-        // never observe it being anything else. This test exercises a
-        // genuine decoded row: a real `FileIdentity::observe_path` call
-        // against an actual symlink, which -- unlike every constructed
-        // identity above -- populates `symlink_target_digest` with
-        // `Some(_)` before encoding. See `MATERIALIZED_GENERATION_ENCODING_
-        // VERSION`'s doc (bumped 2 -> 3 for exactly this) for why this
-        // field is part of the encoding: it is the only reuse
-        // discriminator a symlink identity can ever carry, so a decoded row
-        // that lost it left `FileIdentity::compare` unable to conclude
-        // `SameObject` for a symlink at all on a coarse-clock volume.
-        let dir = tempfile::tempdir().unwrap();
-        let link_path = dir.path().join("a-symlink");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink("wherever-this-points", &link_path).unwrap();
-        #[cfg(windows)]
-        std::os::windows::fs::symlink_file("wherever-this-points", &link_path).unwrap();
-        let live = FileIdentity::observe_path(&link_path).unwrap();
-        assert!(
-            live.symlink_target_digest.is_some(),
-            "a live observation of a real symlink must populate symlink_target_digest"
-        );
-
-        let blob = encode_file_identity(&live);
-        let decoded = decode_file_identity(&blob).unwrap();
-
-        assert_eq!(decoded, live);
-    }
-
-    #[test]
-    fn file_identity_round_trips_with_every_optional_field_absent() {
-        let identity = FileIdentity {
-            volume_identity: VolumeIdentity::Unix { device_id: 1 },
-            object_id: PlatformObjectId::Unix { inode: 1 },
-            object_kind: ObjectKind::Directory,
-            generation_or_usn: None,
-            birth_or_creation_time: None,
-            observed_size: 0,
-            metadata_fingerprint: [0; 32],
-            link_count: None,
-            symlink_target_digest: None,
-        };
-        let blob = encode_file_identity(&identity);
-        let decoded = decode_file_identity(&blob).unwrap();
-        assert_eq!(decoded, identity);
-    }
-
-    #[test]
-    fn file_identity_round_trips_the_windows_fallback_variant_even_off_windows() {
-        // Pure data encoding, no platform syscalls -- this must hold on
-        // every build host, not just Windows, since a peer database could
-        // in principle carry a Windows-observed identity.
-        let identity = FileIdentity {
-            volume_identity: VolumeIdentity::Windows { volume_serial_number: 0xdead_beef },
-            object_id: PlatformObjectId::Windows(WindowsObjectId::Fallback {
-                file_index: 0x1122_3344_5566_7788,
-            }),
-            object_kind: ObjectKind::ReparsePoint,
-            generation_or_usn: None,
-            birth_or_creation_time: None,
-            observed_size: 5,
-            metadata_fingerprint: [7; 32],
-            link_count: None,
-            symlink_target_digest: None,
-        };
-        let blob = encode_file_identity(&identity);
-        let decoded = decode_file_identity(&blob).unwrap();
-        assert_eq!(decoded, identity);
-    }
-
-    #[test]
-    fn file_identity_round_trips_the_windows_proven_variant_even_off_windows() {
-        // Same premise as the fallback-variant test above, for the proven
-        // 128-bit `FILE_ID_INFO` case -- a 64-bit volume serial and a
-        // 16-byte file id, both wider than the legacy fallback fields.
-        let identity = FileIdentity {
-            volume_identity: VolumeIdentity::Windows {
-                volume_serial_number: 0x1122_3344_5566_7788,
-            },
-            object_id: PlatformObjectId::Windows(WindowsObjectId::Proven { file_id: [0xab; 16] }),
-            object_kind: ObjectKind::ReparsePoint,
-            generation_or_usn: None,
-            birth_or_creation_time: None,
-            observed_size: 5,
-            metadata_fingerprint: [7; 32],
-            link_count: None,
-            symlink_target_digest: None,
-        };
-        let blob = encode_file_identity(&identity);
-        let decoded = decode_file_identity(&blob).unwrap();
-        assert_eq!(decoded, identity);
-    }
-
-    #[test]
-    fn decoding_a_truncated_filesystem_identity_blob_fails_closed_not_panics() {
-        let identity = sample_identity();
-        let blob = encode_file_identity(&identity);
-        let truncated = &blob[..blob.len() - 5];
-        let result = decode_file_identity(truncated);
-        assert!(matches!(result, Err(SyncSqliteError::CorruptState(_))));
-    }
-
-    #[test]
-    fn decoding_an_unknown_encoding_version_fails_closed() {
-        let identity = sample_identity();
-        let mut blob = encode_file_identity(&identity);
-        blob[0] = 0xff;
-        let result = decode_file_identity(&blob);
-        assert!(matches!(result, Err(SyncSqliteError::CorruptState(_))));
-    }
-}
+mod tests;

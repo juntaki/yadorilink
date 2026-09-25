@@ -1,4 +1,4 @@
-//! What `MaterializationService` needs from the on-disk materialization
+//! What the hydrate/pin/unpin/evict/status control commands need from the on-disk materialization
 //! engine (the `hydration` module), expressed as a port so `application`
 //! never imports the hydration or daemon-state modules directly.
 
@@ -6,7 +6,7 @@ use crate::sync_error::SyncError;
 
 use super::common::BoxFuture;
 
-/// M4 Pass 4: `MaterializationService::evict`'s own truthful outcome DTO --
+/// `MaterializationPort::evict`'s own truthful outcome DTO --
 /// this port's own vocabulary (see this module's doc comment: `application`
 /// never imports the hydration/daemon-state/filesystem-sync layers
 /// directly), decoupled from but mirroring `yadorilink_filesystem_sync::
@@ -29,7 +29,7 @@ pub(crate) struct EvictOutcome {
     pub bytes_reclaimed: u64,
 }
 
-/// P0-B: `MaterializationService::status`'s own vocabulary, mirroring
+/// P0-B: `MaterializationPort::status`'s own vocabulary, mirroring
 /// `yadorilink_replica_domain::session_state::MaterializationState` --
 /// decoupled per this module's own doc comment (never import that layer
 /// directly), same reasoning as `EvictOutcome` above.

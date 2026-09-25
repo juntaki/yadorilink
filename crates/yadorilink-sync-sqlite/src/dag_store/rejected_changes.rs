@@ -39,86 +39,296 @@
 //! permanent-exclusion failure mode the reserved-namespace exclusion sites
 //! were fixed to avoid, arriving through this table instead.
 //!
-//! Every row is therefore stamped with the [`reserved_namespace::
-//! RULES_VERSION`] that produced it. [`is_change_rejected`] only trusts a
-//! row stamped with the CURRENT version; an older-stamped row is treated as
-//! not settled, which lets `missing_ancestor_frontier` report the hash as
-//! missing again and the ordinary heads-announce protocol naturally
-//! re-request and re-evaluate it under the current rules — no separate
-//! sweep or migration needed. This is exactly why bumping
-//! `RULES_VERSION` is mandatory whenever the rules change: it is the only
-//! thing that makes re-evaluation happen.
+//! Every row is therefore stamped with the rules that produced it, and a
+//! row is only trusted as a settled verdict while that stamp still matches
+//! the rules running now. An older-stamped row is treated as not settled,
+//! which lets `missing_ancestor_frontier` report the hash as missing again
+//! and the ordinary heads-announce protocol naturally re-request and
+//! re-evaluate it under the current rules — no separate sweep or migration
+//! needed. Bumping a rules version is therefore mandatory whenever those
+//! rules change: it is the only thing that makes re-evaluation happen.
+//!
+//! # Rules from different domains are versioned separately
+//!
+//! The stamp is a [`RejectionDomain`] plus that domain's own version, not
+//! one number for everything. Path admissibility and the author chain are
+//! different rule sets that change for different reasons and on different
+//! days. Stamping an author-chain rejection with the reserved-namespace
+//! version means a change to the author chain leaves every old
+//! author-chain rejection still looking current — permanently excluding
+//! changes the new rules would admit, which is precisely the silent
+//! stranding the versioning exists to prevent — while a reserved-namespace
+//! bump needlessly re-opens every author-chain verdict, asking peers for
+//! changes whose verdict cannot have changed. One version per domain, and
+//! each domain answers only for its own rules.
+//!
+//! # A verdict that follows from another one stands only while that one does
+//!
+//! A change refused because a change it depends on can never be held here —
+//! a DAG parent, or the previous change of its own author — has no verdict
+//! of its own. It carries its basis's `(domain, version)` stamp, so a rules
+//! move that re-opens the basis re-opens it too, and it also names the
+//! basis in `rests_on`. It is trusted as settled only while its own stamp is
+//! current AND the change it rests on is still refused under current rules
+//! and still not held here, re-derived on every read by following
+//! `rests_on` to a verdict of its own. The stamp alone would not be enough:
+//! a basis can stop being refused without its domain's rules moving — a
+//! change refused as coming from another history becomes admissible once
+//! this replica re-bootstraps onto that history — and a dependent that kept
+//! its copy of the old stamp would stay excluded on a verdict nobody holds.
+//!
+//! # A verdict measured against this replica's history stands only on it
+//!
+//! "Written on another history" is decided against the history this replica
+//! is on, which is local state that a re-bootstrap moves. Such a row names
+//! that history in `refused_on_epoch`, and is trusted as settled only while
+//! the group is still on it. Once the replica installs the history the
+//! change was written on, the row lapses, the change is asked for again,
+//! and every refusal resting on it lapses with it.
 
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::SyncSqliteError;
 use yadorilink_replica_domain::ids::ChangeHash;
+use yadorilink_replica_domain::rebootstrap::HistoryEpoch;
 use yadorilink_root_authority::reserved_namespace;
 
-/// Records that `hash` was permanently rejected at admission, under the
-/// reserved-namespace rules as they exist right now
-/// ([`reserved_namespace::RULES_VERSION`]), so
+/// Which body of rules produced a durable rejection, and therefore which
+/// version stamp decides whether that rejection is still current.
+///
+/// A row is re-opened for re-evaluation when ITS domain's rules move, and
+/// left alone when some unrelated domain's do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RejectionDomain {
+    /// The change names a path that cannot be stored faithfully and
+    /// unambiguously everywhere this group may sync to, or that collides
+    /// with the reserved artefact namespace. Versioned by
+    /// [`reserved_namespace::RULES_VERSION`], which moves whenever the set
+    /// of paths this project considers reserved or non-portable moves.
+    Path,
+    /// The change's own author's chain cannot take it: the wrong position,
+    /// a second change at one position, or a position that names a
+    /// different previous change of its own than this replica holds.
+    ///
+    /// Versioned separately from `Path` because it changes for entirely
+    /// unrelated reasons. The current version dates from author ordering
+    /// being separated from DAG causality: before that, a change at the
+    /// right sequence had to DESCEND its author's tip in the DAG, and an
+    /// ordinary local edit authored onto the basis its own bytes came from
+    /// was refused by that rule. Every rejection recorded under it is
+    /// suspect, so the bump re-opens all of them.
+    AuthorChain,
+}
+
+/// The author-chain rules' own version. Bump whenever what the author
+/// chain admits changes at all, exactly as
+/// [`reserved_namespace::RULES_VERSION`] is bumped for path rules: a
+/// rejection recorded under superseded rules must stop looking settled, or
+/// a change the new rules would admit stays excluded forever with nothing
+/// to notice.
+const AUTHOR_CHAIN_RULES_VERSION: u32 = 1;
+
+impl RejectionDomain {
+    /// The stable string stored in `rejected_changes.rejection_domain`.
+    /// Spelled out rather than an integer so a row read by a human says
+    /// what it is; never reused for a different meaning.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Path => "path",
+            Self::AuthorChain => "author-chain",
+        }
+    }
+
+    /// This domain's rules version as it stands in this build.
+    pub(crate) fn rules_version(self) -> u32 {
+        match self {
+            Self::Path => reserved_namespace::RULES_VERSION,
+            Self::AuthorChain => AUTHOR_CHAIN_RULES_VERSION,
+        }
+    }
+}
+
+/// Records that `hash` was permanently rejected at admission, under
+/// `domain`'s rules as they exist right now, so
 /// `missing_ancestor_frontier`/`has_change_or_buffered_orphan` stop
 /// treating it as still-missing and it is never re-requested from a peer —
-/// until, if ever, the rules change and this row's stamped version falls
+/// until, if ever, THOSE rules change and this row's stamped version falls
 /// behind (see the module doc comment). Idempotent: re-recording the same
 /// hash (e.g. a peer resending the exact same rejected change) just
 /// overwrites the row, which is always identical for the same content and
-/// the same rules version anyway (rejection is a pure function of the
-/// change's own bytes plus the rules that evaluated them).
+/// the same rules anyway (rejection is a pure function of the change's own
+/// bytes plus the rules that evaluated them).
+#[cfg(test)]
 pub(crate) fn record_rejected_change(
     conn: &Connection,
     hash: &ChangeHash,
     group_id: &str,
+    domain: RejectionDomain,
+    reason: &str,
+    rejected_at_unix_nanos: i64,
+) -> Result<(), SyncSqliteError> {
+    record_rejected_change_resting_on(
+        conn,
+        hash,
+        group_id,
+        domain,
+        None,
+        None,
+        reason,
+        rejected_at_unix_nanos,
+    )
+}
+
+/// [`record_rejected_change`] for a verdict that follows from another
+/// change's refusal: `domain` is the domain that refused `rests_on`, and the
+/// row stands only while `rests_on` stays refused and unheld (see the module
+/// doc comment). `None` records a verdict of the change's own.
+///
+/// `refused_on` is the history this replica was on when a verdict measured
+/// against it was reached; the row then stands only while the group stays on
+/// that history. `None` for a verdict independent of the local history.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_rejected_change_resting_on(
+    conn: &Connection,
+    hash: &ChangeHash,
+    group_id: &str,
+    domain: RejectionDomain,
+    rests_on: Option<&ChangeHash>,
+    refused_on: Option<HistoryEpoch>,
     reason: &str,
     rejected_at_unix_nanos: i64,
 ) -> Result<(), SyncSqliteError> {
     conn.execute(
-        "INSERT INTO rejected_changes (change_hash, group_id, reason, rejected_at, rules_version) \
-         VALUES (?1, ?2, ?3, ?4, ?5) \
+        "INSERT INTO rejected_changes \
+             (change_hash, group_id, reason, rejected_at, rejection_domain, rules_version, \
+              rests_on, refused_on_epoch) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
          ON CONFLICT (change_hash) DO UPDATE SET \
              group_id = excluded.group_id, \
              reason = excluded.reason, \
              rejected_at = excluded.rejected_at, \
-             rules_version = excluded.rules_version",
+             rejection_domain = excluded.rejection_domain, \
+             rules_version = excluded.rules_version, \
+             rests_on = excluded.rests_on, \
+             refused_on_epoch = excluded.refused_on_epoch",
         rusqlite::params![
             &hash.0[..],
             group_id,
             reason,
             rejected_at_unix_nanos,
-            reserved_namespace::RULES_VERSION,
+            domain.as_str(),
+            domain.rules_version(),
+            rests_on.map(|basis| basis.0.to_vec()),
+            refused_on.map(epoch_column),
         ],
     )?;
     Ok(())
 }
 
+/// The `refused_on_epoch` value for `epoch`: empty for genesis, the base's
+/// bytes above one. Distinct from NULL, which marks a row not scoped to any
+/// history.
+fn epoch_column(epoch: HistoryEpoch) -> Vec<u8> {
+    epoch.base().map(|base| base.0.to_vec()).unwrap_or_default()
+}
+
+/// The `(domain, version)` stamps this build stands behind, for a query
+/// that must preselect rows by stamp in SQL. Such a query still has to
+/// confirm each row with [`current_rejection_domain`], which also follows
+/// `rests_on`.
+pub(crate) fn current_rules_stamps() -> [(&'static str, u32); 2] {
+    [RejectionDomain::Path, RejectionDomain::AuthorChain]
+        .map(|domain| (domain.as_str(), domain.rules_version()))
+}
+
+/// The domain a stored `(domain, version)` stamp names, when this build
+/// still stands behind it. An unrecognized domain string is not current — a
+/// row written by a build whose domains this one does not know is exactly
+/// the case for re-evaluating rather than trusting.
+fn current_domain(domain: &str, version: u32) -> Option<RejectionDomain> {
+    [RejectionDomain::Path, RejectionDomain::AuthorChain]
+        .into_iter()
+        .find(|known| known.as_str() == domain && known.rules_version() == version)
+}
+
+/// The domain whose current rules durably rejected `hash`, or `None` when
+/// it is not rejected under current rules — including a row stamped with a
+/// superseded version of its own domain, which is deliberately NOT trusted
+/// as settled (see the module doc comment): the caller's normal "still
+/// missing" handling then drives a fresh re-request and re-evaluation.
+///
+/// A verdict that rests on this rejection — a change refused because the
+/// change it names can never be held here — is exactly as settled as this
+/// one, so it is recorded under the domain this returns, naming this hash.
+///
+/// A row that rests on another change is followed to a verdict of its own,
+/// and is current only if every link on the way is: stamped under current
+/// rules, and resting on a change that is not held here.
+pub(crate) fn current_rejection_domain(
+    conn: &Connection,
+    hash: &ChangeHash,
+) -> Result<Option<RejectionDomain>, SyncSqliteError> {
+    let mut own_domain = None;
+    let mut at = *hash;
+    let mut followed = std::collections::HashSet::new();
+    loop {
+        type Row = (String, u32, String, Option<Vec<u8>>, Option<Vec<u8>>);
+        let row: Option<Row> = conn
+            .query_row(
+                "SELECT rejection_domain, rules_version, group_id, rests_on, refused_on_epoch \
+                   FROM rejected_changes WHERE change_hash = ?1",
+                [&at.0[..]],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?;
+        let Some((domain, version, group_id, rests_on, refused_on)) = row else {
+            return Ok(None);
+        };
+        let Some(domain) = current_domain(&domain, version) else {
+            return Ok(None);
+        };
+        if let Some(refused_on) = refused_on {
+            let now = crate::rebootstrap_store::current_history_epoch(conn, &group_id)?;
+            if refused_on != epoch_column(now) {
+                return Ok(None);
+            }
+        }
+        let own_domain = *own_domain.get_or_insert(domain);
+        let Some(basis) = rests_on else {
+            return Ok(Some(own_domain));
+        };
+        let basis = crate::dag_store::retained_history_integrity::hash_from_blob(basis)?;
+        if crate::dag_store::retained_history_integrity::has_change_or_pruned(
+            conn, &group_id, &basis,
+        )? {
+            return Ok(None);
+        }
+        // Content addressing makes a cycle impossible for rows this crate
+        // wrote; one here is corruption, not a verdict.
+        if !followed.insert(at) {
+            return Err(SyncSqliteError::CorruptState(format!(
+                "rejected change {hash:?} rests on a cycle through {at:?}"
+            )));
+        }
+        at = basis;
+    }
+}
+
 /// Whether `hash` is durably recorded as a permanent rejection **under the
-/// current reserved-namespace rules**. A row stamped with an older
-/// [`reserved_namespace::RULES_VERSION`] is deliberately NOT trusted as
-/// settled — see the module doc comment — so this returns `false` for it,
-/// exactly as if the hash had never been rejected at all: the caller's
-/// normal "still missing" handling then naturally drives a fresh
-/// re-request and re-evaluation under the current rules.
+/// current rules of the domain that rejected it** (see
+/// [`current_rejection_domain`]).
 pub(crate) fn is_change_rejected(
     conn: &Connection,
     hash: &ChangeHash,
 ) -> Result<bool, SyncSqliteError> {
-    let stamped_version: Option<u32> = conn
-        .query_row(
-            "SELECT rules_version FROM rejected_changes WHERE change_hash = ?1",
-            [&hash.0[..]],
-            |r| r.get(0),
-        )
-        .optional()?;
-    Ok(stamped_version == Some(reserved_namespace::RULES_VERSION))
+    Ok(current_rejection_domain(conn, hash)?.is_some())
 }
 
-/// Every hash for `group_id` durably rejected **under the current
-/// reserved-namespace rules**, most recent first — the data a status
+/// Every hash for `group_id` durably rejected **under the current rules of
+/// whichever domain rejected it**, most recent first — the data a status
 /// surface (CLI, control-socket diagnostics) would read to show a user
-/// which of their own paths are stuck behind a reserved-namespace
-/// collision or non-portable-path rejection and will never resolve
-/// without intervention. As of this writing nothing actually calls this
+/// which of their own content is stuck behind a verdict that will never
+/// resolve without intervention. As of this writing nothing actually calls this
 /// function outside its own tests: there is no CLI command, daemon status
 /// field, or `/metrics` counter that surfaces a durable rejection's exact
 /// path or reason today (`SyncSqliteError::category()`'s coarse, path-free
@@ -129,8 +339,8 @@ pub(crate) fn is_change_rejected(
 /// `tracing::error!` and never touch `recent_errors`). This function is
 /// the reader half of the missing wiring, not a currently-used one; a
 /// caller wanting to build that surface should start here rather than
-/// re-deriving this query. A row stamped with an older rules version is
-/// excluded, matching [`is_change_rejected`]'s own verdict — it is no
+/// re-deriving this query. A row whose domain's rules have moved past its
+/// stamp is excluded, matching [`is_change_rejected`]'s own verdict — it is no
 /// longer a settled rejection, only a historical one, pending
 /// re-evaluation the next time the hash is offered. Read-only; never
 /// consulted by any admission or projection path (those only ever need the
@@ -140,120 +350,26 @@ pub fn list_rejected_changes(
     group_id: &str,
 ) -> Result<Vec<(ChangeHash, String, i64)>, SyncSqliteError> {
     let mut stmt = conn.prepare(
-        "SELECT change_hash, reason, rejected_at FROM rejected_changes \
-         WHERE group_id = ?1 AND rules_version = ?2 ORDER BY rejected_at DESC",
+        "SELECT change_hash, reason, rejected_at \
+         FROM rejected_changes WHERE group_id = ?1 ORDER BY rejected_at DESC",
     )?;
-    let rows =
-        stmt.query_map(rusqlite::params![group_id, reserved_namespace::RULES_VERSION], |row| {
-            let hash_blob: Vec<u8> = row.get(0)?;
-            let reason: String = row.get(1)?;
-            let rejected_at: i64 = row.get(2)?;
-            Ok((hash_blob, reason, rejected_at))
-        })?;
+    let rows = stmt.query_map(rusqlite::params![group_id], |row| {
+        let hash_blob: Vec<u8> = row.get(0)?;
+        let reason: String = row.get(1)?;
+        let rejected_at: i64 = row.get(2)?;
+        Ok((hash_blob, reason, rejected_at))
+    })?;
     let mut out = Vec::new();
     for row in rows {
         let (hash_blob, reason, rejected_at) = row?;
         let hash = crate::dag_store::retained_history_integrity::hash_from_blob(hash_blob)?;
+        if !is_change_rejected(conn, &hash)? {
+            continue;
+        }
         out.push((hash, reason, rejected_at));
     }
     Ok(out)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::dag_store::init_dag_schema;
-
-    fn conn() -> Connection {
-        let c = Connection::open_in_memory().unwrap();
-        init_dag_schema(&c).unwrap();
-        c
-    }
-
-    fn hash(byte: u8) -> ChangeHash {
-        ChangeHash([byte; 32])
-    }
-
-    #[test]
-    fn records_and_queries_a_rejection() {
-        let c = conn();
-        assert!(!is_change_rejected(&c, &hash(1)).unwrap());
-        record_rejected_change(&c, &hash(1), "g", "reserved namespace: foo", 100).unwrap();
-        assert!(is_change_rejected(&c, &hash(1)).unwrap());
-        assert!(!is_change_rejected(&c, &hash(2)).unwrap());
-    }
-
-    #[test]
-    fn re_recording_the_same_hash_overwrites_rather_than_errors() {
-        let c = conn();
-        record_rejected_change(&c, &hash(1), "g", "first reason", 100).unwrap();
-        record_rejected_change(&c, &hash(1), "g", "second reason", 200).unwrap();
-        let listed = list_rejected_changes(&c, "g").unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].1, "second reason");
-        assert_eq!(listed[0].2, 200);
-    }
-
-    #[test]
-    fn lists_only_the_requested_group_most_recent_first() {
-        let c = conn();
-        record_rejected_change(&c, &hash(1), "g1", "first", 100).unwrap();
-        record_rejected_change(&c, &hash(2), "g1", "second", 200).unwrap();
-        record_rejected_change(&c, &hash(3), "g2", "other group", 300).unwrap();
-
-        let g1 = list_rejected_changes(&c, "g1").unwrap();
-        assert_eq!(g1.len(), 2);
-        assert_eq!(g1[0].0, hash(2), "most recent first");
-        assert_eq!(g1[1].0, hash(1));
-
-        let g2 = list_rejected_changes(&c, "g2").unwrap();
-        assert_eq!(g2.len(), 1);
-        assert_eq!(g2[0].0, hash(3));
-    }
-
-    /// The whole point of the version stamp: a row recorded under a rules
-    /// version older than the one running right now must NOT be trusted as
-    /// a settled rejection — a corrected predicate might have accepted the
-    /// same change, and nothing may ever re-evaluate it if this row is
-    /// allowed to stand in for that judgment forever.
-    #[test]
-    fn a_rejection_stamped_with_an_older_rules_version_is_not_trusted() {
-        let c = conn();
-        // Simulate a row recorded by a hypothetical earlier build, before
-        // rewriting it through `record_rejected_change` (which always
-        // stamps the CURRENT version) would defeat the point of this test.
-        c.execute(
-            "INSERT INTO rejected_changes (change_hash, group_id, reason, rejected_at, rules_version) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![
-                &hash(1).0[..],
-                "g",
-                "an old build's verdict",
-                100,
-                reserved_namespace::RULES_VERSION.saturating_sub(1),
-            ],
-        )
-        .unwrap();
-
-        assert!(
-            !is_change_rejected(&c, &hash(1)).unwrap(),
-            "a rejection stamped with an older rules version must not be trusted as settled"
-        );
-        assert!(
-            list_rejected_changes(&c, "g").unwrap().is_empty(),
-            "a stale-versioned row must not appear as a currently-settled rejection"
-        );
-    }
-
-    /// Converse of the test above: a row stamped with the CURRENT version
-    /// (what every real call through `record_rejected_change` produces) is
-    /// trusted exactly as before — the version check must not make every
-    /// rejection stale by accident.
-    #[test]
-    fn a_rejection_stamped_with_the_current_rules_version_is_trusted() {
-        let c = conn();
-        record_rejected_change(&c, &hash(1), "g", "current rules", 100).unwrap();
-        assert!(is_change_rejected(&c, &hash(1)).unwrap());
-        assert_eq!(list_rejected_changes(&c, "g").unwrap().len(), 1);
-    }
-}
+mod tests;

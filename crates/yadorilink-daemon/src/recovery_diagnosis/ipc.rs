@@ -1,4 +1,4 @@
-//! Phase 2.1-C2-C2: converts this module's Rust types into the
+//! Converts this module's Rust types into the
 //! `daemon_control.proto` wire shapes for `yadorilink recovery show`.
 //! Centralized here so `control_socket.rs` never contains a large
 //! conversion match block directly -- every wire slug is produced either by

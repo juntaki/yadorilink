@@ -15,7 +15,7 @@ mod context_menu;
 // IPC client/cfapi wrapper code via this crate's `rlib` output, instead
 // of duplicating the shell-IPC protocol handling in a second place.
 pub mod cfapi;
-// M2-3b: the daemon dials this pipe as a client to request native
+// The daemon dials this pipe as a client to request native
 // dehydration -- `pub` for the same reason as `cfapi`/`ipc_client`, so the
 // `yadorilink-cfapi-host` binary target can drive it.
 pub mod dehydrate_server;

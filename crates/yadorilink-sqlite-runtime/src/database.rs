@@ -1,14 +1,5 @@
-//! Owns the connection pool and in-process writer serialization that every
-//! caller (`yadorilink-sync-core`'s repositories today) writes through.
-//! Moved verbatim out of `yadorilink-sync-core` (Phase 7D-4.2) so it can be
-//! shared by every future crate that needs SQLite-backed storage without
-//! each one duplicating pool/writer-gate/schema-bootstrap machinery of its
-//! own -- and, just as importantly, without two independent pools/writer-
-//! gates racing each other against the same on-disk file (the exact
-//! `SQLITE_LOCKED` bug class `locked_write`'s writer_gate was built to
-//! close in the first place).
-
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use r2d2_sqlite::SqliteConnectionManager;
@@ -16,12 +7,12 @@ use rusqlite::Connection;
 
 use crate::error::{DatabaseError, SqlOperationError};
 use crate::pool::{
-    checkout, madsim_or_default_pool, retry_on_database_locked, ConnectionPool, BUSY_TIMEOUT,
+    build_pool, checkout, retry_on_database_locked, ConnectionPool, BUSY_TIMEOUT,
+    STATEMENT_CACHE_CAPACITY,
 };
 
-// `stats`/`reset`/`record_gate_acquisition` below are a small, PERMANENT
-// writer-gate observability primitive -- not temporary C4 investigation
-// scaffolding, even though they started that way. Repository-level tests
+// `stats`/`reset`/`record_gate_acquisition` below are a small, permanent
+// writer-gate observability primitive. Repository-level tests
 // (e.g. `materialization_job_repository`'s `enqueue_pending_writer_gate_
 // tests`) rely on `reset()`/`stats()` to assert that a specific operation
 // does or does not take the process-wide write lock at all -- a property
@@ -29,12 +20,10 @@ use crate::pool::{
 // UPDATE and a call that never opens a transaction leave identical
 // on-disk state.
 //
-// `call_sites`/`record_call_site`/`call_site_stats` below are PERMANENT
-// too (reclassified 2026-09-01 after a second investigation -- the
-// decision-9 dual-scheduler cutover -- relied on them again; see their
-// own doc comment for why re-deriving this every time is wasted effort).
+// `call_sites`/`record_call_site`/`call_site_stats` below are permanent
+// too; see their own doc comment for why.
 //
-// `record_gate_hold`/`hold_site_stats` are PERMANENT too, for a reason the
+// `record_gate_hold`/`hold_site_stats` are permanent too, for a reason the
 // wait-side counters structurally cannot cover: `record_gate_acquisition`
 // times how long a caller WAITED, which by construction never names the
 // caller that was holding the gate and made it wait. Every writer-gate
@@ -42,7 +31,14 @@ use crate::pool::{
 // question, and answering it by inference from a wait histogram wasted real
 // time twice. Cost is one `Instant::elapsed` and one hash-map update per
 // write transaction, inside the gate the caller already holds.
-pub mod c4_diag {
+//
+// All three key on `(file, line)` borrowed from the caller's own
+// `&'static Location`, never on a formatted `String`. They run on every
+// write, so an owned key would be a heap allocation per write for a
+// counter -- and `record_call_site` in particular is taken BEFORE the
+// writer gate rather than under it, so its cost is not absorbed by a lock
+// the caller was holding anyway.
+pub mod writer_gate_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
@@ -55,7 +51,7 @@ pub mod c4_diag {
         if wait > Duration::from_millis(500) {
             tracing::warn!(
                 wait_ms = wait.as_millis() as u64,
-                "C4_DIAG: writer_gate acquisition took a long time"
+                "writer_gate acquisition took a long time"
             );
         }
     }
@@ -81,14 +77,9 @@ pub mod c4_diag {
         hold_sites().lock().unwrap_or_else(|p| p.into_inner()).clear();
     }
 
-    // PERMANENT per-call-site attribution (reclassified from an earlier
-    // "temporary, remove after investigation" framing: this pulled its
-    // weight across two separate C4 investigations on this codebase --
-    // the original storm re-measurement that motivated it, and the
-    // decision-9 dual-scheduler cutover -- and costs a `#[track_caller]`
-    // plus one hash-map update inside a lock the caller already holds, so
-    // there is no reason to keep re-adding it every time a new writer-gate
-    // question comes up). `record_gate_acquisition` above only counts and
+    // Per-call-site attribution. It costs a `#[track_caller]` plus one
+    // hash-map update inside a lock the caller already holds, and every
+    // writer-gate contention question needs it again, so it is permanent. `record_gate_acquisition` above only counts and
     // times acquisitions in aggregate, which cannot say WHICH of
     // `SyncDatabase::write`/`write_immediate`'s many call sites is
     // actually driving that volume. `#[track_caller]` on both public
@@ -97,26 +88,29 @@ pub mod c4_diag {
     // module's -- recorded here, inside `locked_write`'s own already-held
     // `writer_gate`, so this adds no additional lock contention beyond
     // what already exists.
-    fn call_sites() -> &'static std::sync::Mutex<std::collections::HashMap<String, u64>> {
+    type SiteKey = (&'static str, u32);
+
+    fn call_sites() -> &'static std::sync::Mutex<std::collections::HashMap<SiteKey, u64>> {
         static SITES: std::sync::OnceLock<
-            std::sync::Mutex<std::collections::HashMap<String, u64>>,
+            std::sync::Mutex<std::collections::HashMap<SiteKey, u64>>,
         > = std::sync::OnceLock::new();
         SITES.get_or_init(Default::default)
     }
 
-    #[track_caller]
-    pub(crate) fn record_call_site() {
-        let location = std::panic::Location::caller().to_string();
+    /// Takes the caller's location rather than resolving it itself, so the
+    /// write path computes `Location::caller()` once and hands the same
+    /// value to both this and the writer gate.
+    pub(crate) fn record_call_site(location: &'static std::panic::Location<'static>) {
         let mut sites = call_sites().lock().unwrap_or_else(|p| p.into_inner());
-        *sites.entry(location).or_insert(0) += 1;
+        *sites.entry((location.file(), location.line())).or_insert(0) += 1;
     }
 
     // Per-call-site writer_gate HOLD time -- the other half of
     // `record_gate_acquisition` above, which can only ever say that a caller
     // waited, never who made it wait. See this module's own header comment.
-    fn hold_sites() -> &'static std::sync::Mutex<std::collections::HashMap<String, (u64, u128)>> {
+    fn hold_sites() -> &'static std::sync::Mutex<std::collections::HashMap<SiteKey, (u64, u128)>> {
         static SITES: std::sync::OnceLock<
-            std::sync::Mutex<std::collections::HashMap<String, (u64, u128)>>,
+            std::sync::Mutex<std::collections::HashMap<SiteKey, (u64, u128)>>,
         > = std::sync::OnceLock::new();
         SITES.get_or_init(Default::default)
     }
@@ -126,14 +120,14 @@ pub mod c4_diag {
         held: Duration,
     ) {
         let mut sites = hold_sites().lock().unwrap_or_else(|p| p.into_inner());
-        let entry = sites.entry(location.to_string()).or_insert((0, 0));
+        let entry = sites.entry((location.file(), location.line())).or_insert((0, 0));
         entry.0 += 1;
         entry.1 += held.as_micros();
         if held > Duration::from_millis(500) {
             tracing::warn!(
                 held_ms = held.as_millis() as u64,
                 call_site = %location,
-                "C4_DIAG: writer_gate was HELD for a long time"
+                "writer_gate was HELD for a long time"
             );
         }
     }
@@ -143,8 +137,10 @@ pub mod c4_diag {
     /// by total held time descending.
     pub fn hold_site_stats() -> Vec<(String, u64, u128)> {
         let sites = hold_sites().lock().unwrap_or_else(|p| p.into_inner());
-        let mut v: Vec<(String, u64, u128)> =
-            sites.iter().map(|(k, (n, micros))| (k.clone(), *n, *micros)).collect();
+        let mut v: Vec<(String, u64, u128)> = sites
+            .iter()
+            .map(|((file, line), (n, micros))| (format!("{file}:{line}"), *n, *micros))
+            .collect();
         v.sort_by_key(|a| std::cmp::Reverse(a.2));
         v
     }
@@ -156,7 +152,8 @@ pub mod c4_diag {
     /// by inference.
     pub fn call_site_stats() -> Vec<(String, u64)> {
         let sites = call_sites().lock().unwrap_or_else(|p| p.into_inner());
-        let mut v: Vec<(String, u64)> = sites.iter().map(|(k, n)| (k.clone(), *n)).collect();
+        let mut v: Vec<(String, u64)> =
+            sites.iter().map(|((file, line), n)| (format!("{file}:{line}"), *n)).collect();
         v.sort_by_key(|a| std::cmp::Reverse(a.1));
         v
     }
@@ -182,6 +179,11 @@ pub struct SyncDatabase {
     /// `locked_write`) makes a nested write from within a write closure
     /// run gate-free instead of deadlocking.
     writer_gate: Mutex<()>,
+    /// Outer write transactions through THIS handle -- the per-database
+    /// counterpart of `writer_gate_stats::stats().0`, which is process-wide
+    /// and so also counts every other database's writes. See
+    /// [`Self::write_transaction_count`].
+    write_transactions: AtomicU64,
 }
 
 impl SyncDatabase {
@@ -192,7 +194,6 @@ impl SyncDatabase {
     /// `BUSY_TIMEOUT` so two of this process's own writers waiting on each
     /// other resolve by retrying, not erroring, and `synchronous = FULL`
     /// so a committed transaction survives an OS crash or power loss.
-    ///
     /// Bootstraps on a single, unpooled connection BEFORE the pool exists
     /// at all -- deliberately not the previous shape (build the pool, then
     /// run the WAL pragma and schema bootstrap through `with_init` on
@@ -209,25 +210,19 @@ impl SyncDatabase {
     /// the same process, e.g. one per simulated device in a multi-device
     /// test). journal_mode is a property persisted in the database FILE
     /// itself (survives connection close), so switching it once here,
-    /// before any pooled connection is ever established, means every
-    /// later pooled connection simply observes WAL mode already in
-    /// effect -- no per-connection WAL pragma is needed or issued by the
-    /// pool's own `with_init` any more, only the two purely
-    /// per-connection settings (`busy_timeout`, `synchronous`) that carry
-    /// no mode-switch race. Schema bootstrap also moves onto this same
-    /// bootstrap connection for the identical reason: it used to run on
-    /// whichever pooled connection `checkout` happened to hand back,
-    /// itself racing the same pool-startup fan-out.
-    ///
-    /// `schema_init` is the caller's complete schema-bootstrap step, run on
-    /// the bootstrap connection before `open` returns -- the sole place
-    /// schema initialization happens. This crate does not inspect or
-    /// sequence it in any way; the caller (today, `yadorilink-sync-core`'s
-    /// composition root) owns what runs and in what order, including
-    /// whether/when it calls this crate's own [`crate::schema::init_schema`]
-    /// for the core DDL that crate doesn't own. This crate knows no
-    /// domain-specific name (DAG, filesystem transaction, materialization
-    /// job, ...) here or anywhere else.
+    /// before any pooled connection is ever established, means every later
+    /// pooled connection simply observes WAL mode already in effect -- no
+    /// per-connection WAL pragma is needed or issued by the pool's own
+    /// `with_init` any more, only the two purely per-connection settings
+    /// (`busy_timeout`, `synchronous`) that carry no mode-switch race.
+    /// Schema bootstrap also moves onto this same bootstrap connection for
+    /// the identical reason: it used to run on whichever pooled connection
+    /// `checkout` happened to hand back, itself racing the same
+    /// pool-startup fan-out. `schema_init` is the caller's complete
+    /// schema-bootstrap step, run on the bootstrap connection before
+    /// `open` returns -- the sole place schema initialization happens.
+    /// This crate knows no domain-specific name (DAG, filesystem
+    /// transaction, materialization job, ...) here or anywhere else.
     pub fn open(
         path: impl AsRef<Path>,
         schema_init: impl FnOnce(&Connection) -> Result<(), DatabaseError>,
@@ -236,6 +231,7 @@ impl SyncDatabase {
         {
             let conn = Connection::open(path)?;
             conn.busy_timeout(BUSY_TIMEOUT)?;
+            conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
             // journal_mode is itself a query (it returns the mode that
             // was actually applied), hence `pragma_update_and_check`
             // rather than `pragma_update`.
@@ -249,16 +245,20 @@ impl SyncDatabase {
             // in the pool's own per-connection init below), since this
             // bootstrap connection is also the one `schema_init` runs on.
             conn.pragma_update(None, "synchronous", "FULL")?;
-            // Defense-in-depth, ahead of `schema_init` even reaching
-            // `crate::schema::init_schema`'s own identical check: see
-            // `check_schema_version_supported`'s own doc comment for why
-            // this crate calls it directly here too, rather than trusting
-            // every current and future `schema_init` closure to reach it.
-            crate::schema::check_schema_version_supported(&conn)?;
+            // Schema generation is the CALLER's policy, not this crate's.
+            // Three different databases open through here -- the replica
+            // index, the segment block store's index, and the Send store --
+            // and only the first stamps `user_version`. Enforcing the
+            // replica's generation here forced a blanket `user_version == 0`
+            // carve-out so the other two could open at all, and that
+            // carve-out also admitted any replica database written before
+            // stamping existed. Each owner now declares its own generation
+            // in its `schema_init`.
             schema_init(&conn)?;
         }
         let manager = SqliteConnectionManager::file(path).with_init(|conn| {
             conn.busy_timeout(BUSY_TIMEOUT)?;
+            conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
             // No journal_mode pragma here -- see this method's own doc
             // comment for why the bootstrap connection above already
             // switched it once, durably, before this pool (or any pooled
@@ -266,8 +266,8 @@ impl SyncDatabase {
             conn.pragma_update(None, "synchronous", "FULL")?;
             Ok(())
         });
-        let pool = madsim_or_default_pool(manager)?;
-        Ok(Self { pool, writer_gate: Mutex::new(()) })
+        let pool = build_pool(manager)?;
+        Ok(Self { pool, writer_gate: Mutex::new(()), write_transactions: AtomicU64::new(0) })
     }
 
     /// Opens an in-memory database, pooled just like the file-backed case.
@@ -291,6 +291,7 @@ impl SyncDatabase {
     ) -> Result<Self, DatabaseError> {
         let manager = SqliteConnectionManager::memory().with_init(|conn| {
             conn.busy_timeout(BUSY_TIMEOUT)?;
+            conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
             Ok(())
         });
         Self::open_with_manager(manager, schema_init)
@@ -300,14 +301,14 @@ impl SyncDatabase {
         manager: SqliteConnectionManager,
         schema_init: impl FnOnce(&Connection) -> Result<(), DatabaseError>,
     ) -> Result<Self, DatabaseError> {
-        let pool = madsim_or_default_pool(manager)?;
+        let pool = build_pool(manager)?;
         let conn = checkout::<DatabaseError>(&pool)?;
         // Defense-in-depth -- see `Self::open`'s identical call and
         // `check_schema_version_supported`'s own doc comment for why.
         crate::schema::check_schema_version_supported(&conn)?;
         schema_init(&conn)?;
         drop(conn);
-        Ok(Self { pool, writer_gate: Mutex::new(()) })
+        Ok(Self { pool, writer_gate: Mutex::new(()), write_transactions: AtomicU64::new(0) })
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -321,6 +322,17 @@ impl SyncDatabase {
     #[cfg(any(test, feature = "test-support"))]
     pub fn pool_for_test(&self) -> &ConnectionPool {
         &self.pool
+    }
+
+    /// Outer (non-reentrant) write transactions this handle has run since it
+    /// was opened -- one per `write`/`write_immediate` call that took the
+    /// writer gate, however many rows its closure touched. Unlike the
+    /// process-wide `writer_gate_stats` counters, no other database's
+    /// writes move it, so a caller can measure one database's gate traffic
+    /// with a before/after difference while anything else in the process
+    /// keeps writing.
+    pub fn write_transaction_count(&self) -> u64 {
+        self.write_transactions.load(Ordering::Relaxed)
     }
 
     /// A read, retried on a transient SQLITE_BUSY/SQLITE_LOCKED (external
@@ -337,6 +349,37 @@ impl SyncDatabase {
         })
     }
 
+    /// A read that sees ONE snapshot for its whole duration.
+    ///
+    /// [`read`](Self::read) opens no transaction: it checks out a connection
+    /// and runs the closure, so every statement inside is its own implicit
+    /// transaction and a multi-statement read can observe a different database
+    /// between one statement and the next. For a single query that is
+    /// irrelevant. For anything that reads a value and then reads more state
+    /// *derived from* that value, it is not: the result describes a database
+    /// that never existed at any single instant.
+    ///
+    /// This opens a DEFERRED transaction, which takes its snapshot at the
+    /// first read and holds it until the closure returns. In WAL mode that
+    /// costs no writer exclusion at all — writers proceed alongside — so a
+    /// long analytical read is safe here in a way it would not be under an
+    /// IMMEDIATE transaction.
+    ///
+    /// The transaction is rolled back on the way out. Nothing here may write.
+    pub fn read_snapshot<T, E: SqlOperationError>(
+        &self,
+        mut operation: impl FnMut(&Connection) -> Result<T, E>,
+    ) -> Result<T, E> {
+        retry_on_database_locked(|| {
+            let conn = checkout::<E>(&self.pool)?;
+            let snapshot = conn.unchecked_transaction().map_err(E::from)?;
+            let result = operation(&snapshot)?;
+            // Reads only: dropping rolls back, which is what we want.
+            drop(snapshot);
+            Ok(result)
+        })
+    }
+
     /// A single-statement (or few-statement, no explicit transaction needed)
     /// write, serialized against this process's own writer_gate AND retried
     /// on a transient lock error -- the same guarantee `locked_write`
@@ -348,8 +391,9 @@ impl SyncDatabase {
         &self,
         mut operation: impl FnMut(&mut Connection) -> Result<T, E>,
     ) -> Result<T, E> {
-        c4_diag::record_call_site();
-        self.locked_write(std::panic::Location::caller(), || {
+        let caller = std::panic::Location::caller();
+        writer_gate_stats::record_call_site(caller);
+        self.locked_write(caller, || {
             let mut conn = checkout::<E>(&self.pool)?;
             operation(&mut conn)
         })
@@ -364,8 +408,9 @@ impl SyncDatabase {
         &self,
         mut operation: impl FnMut(&rusqlite::Transaction<'_>) -> Result<T, E>,
     ) -> Result<T, E> {
-        c4_diag::record_call_site();
-        self.locked_write(std::panic::Location::caller(), || {
+        let caller = std::panic::Location::caller();
+        writer_gate_stats::record_call_site(caller);
+        self.locked_write(caller, || {
             let mut conn = checkout::<E>(&self.pool)?;
             let tx = new_immediate_write_transaction(&mut conn)?;
             let result = operation(&tx)?;
@@ -388,7 +433,7 @@ impl SyncDatabase {
     /// runtime; a panicking closure restores it via the drop guard.
     fn locked_write<T, E: SqlOperationError>(
         &self,
-        c4_diag_location: &'static std::panic::Location<'static>,
+        caller_location: &'static std::panic::Location<'static>,
         op: impl FnMut() -> Result<T, E>,
     ) -> Result<T, E> {
         thread_local! {
@@ -403,7 +448,7 @@ impl SyncDatabase {
         if IN_WRITE.with(|f| f.get()) {
             return retry_on_database_locked(op);
         }
-        // PERMANENT writer-gate observability (see this module's `c4_diag`
+        // PERMANENT writer-gate observability (see this module's `writer_gate_stats`
         // header comment): total write-transaction count and cumulative
         // time spent waiting to acquire `writer_gate` -- one outer
         // (non-reentrant) `locked_write` call is exactly one fsync-backed
@@ -412,15 +457,16 @@ impl SyncDatabase {
         // write transactions has this process done, and how much time did
         // callers spend waiting for the gate" for any future writer-gate
         // contention investigation, not just the one that motivated it.
-        let c4_diag_wait_started = std::time::Instant::now();
+        let gate_wait_started = std::time::Instant::now();
         let _gate = self.writer_gate.lock().unwrap_or_else(|p| p.into_inner());
-        let c4_diag_wait_elapsed = c4_diag_wait_started.elapsed();
-        c4_diag::record_gate_acquisition(c4_diag_wait_elapsed);
+        let gate_wait_elapsed = gate_wait_started.elapsed();
+        writer_gate_stats::record_gate_acquisition(gate_wait_elapsed);
+        self.write_transactions.fetch_add(1, Ordering::Relaxed);
         IN_WRITE.with(|f| f.set(true));
         let _reset = Reset;
-        let c4_diag_held_started = std::time::Instant::now();
+        let gate_held_started = std::time::Instant::now();
         let result = retry_on_database_locked(op);
-        c4_diag::record_gate_hold(c4_diag_location, c4_diag_held_started.elapsed());
+        writer_gate_stats::record_gate_hold(caller_location, gate_held_started.elapsed());
         result
     }
 }
@@ -453,177 +499,4 @@ fn new_immediate_write_transaction(
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    use super::*;
-
-    /// The core schema's authoring-identity triggers reference
-    /// `changes`/`pruned_changes` (owned by `yadorilink-sync-core`'s
-    /// `dag_store`, not this crate) -- stand in with the minimal shape
-    /// those triggers query, then run this crate's own core `init_schema`,
-    /// so this module's tests can exercise a full `SyncDatabase::open`
-    /// standalone, without depending on sync-core.
-    fn schema_init(conn: &Connection) -> Result<(), DatabaseError> {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS changes (group_id TEXT NOT NULL, change_hash BLOB NOT NULL);
-             CREATE TABLE IF NOT EXISTS pruned_changes (group_id TEXT NOT NULL, change_hash BLOB NOT NULL);",
-        )?;
-        crate::schema::init_schema(conn)
-    }
-
-    fn open_test_db(path: &std::path::Path) -> SyncDatabase {
-        SyncDatabase::open(path, schema_init).expect("open")
-    }
-
-    /// Regression test for the exact bug this crate's writer_gate exists to
-    /// close: two independent callers (standing in for two different
-    /// `yadorilink-sync-core` repository types) sharing ONE
-    /// `Arc<SyncDatabase>` must never race each other into
-    /// `SQLITE_LOCKED`/`SQLITE_BUSY` -- a long write_immediate transaction
-    /// on one "repository" must serialize a short write on another
-    /// "repository" through the shared writer_gate, not fail.
-    #[test]
-    fn repositories_sharing_database_do_not_race_independent_writer_gates() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let database = Arc::new(open_test_db(&dir.path().join("writer-gate-regression.sqlite3")));
-
-        database
-            .write::<_, DatabaseError>(|conn: &mut Connection| {
-                Ok(conn.execute_batch("CREATE TABLE a (id INTEGER PRIMARY KEY); CREATE TABLE b (id INTEGER PRIMARY KEY);")?)
-            })
-            .expect("create tables");
-
-        let long_writer_started = Arc::new(AtomicBool::new(false));
-        let long_writer_database = database.clone();
-        let long_writer_flag = long_writer_started.clone();
-        let long_writer = std::thread::spawn(move || {
-            long_writer_database.write_immediate::<_, DatabaseError>(|tx| {
-                tx.execute("INSERT INTO a (id) VALUES (1)", [])?;
-                long_writer_flag.store(true, Ordering::SeqCst);
-                std::thread::sleep(Duration::from_millis(200));
-                Ok::<(), DatabaseError>(())
-            })
-        });
-
-        while !long_writer_started.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-
-        // While the long writer_immediate transaction on table `a` is still
-        // held, a short write on table `b` through the SAME shared
-        // `SyncDatabase` must still succeed -- serialized behind the
-        // writer_gate, never `SQLITE_LOCKED`.
-        let short_write_result = database.write::<_, DatabaseError>(|conn: &mut Connection| {
-            Ok(conn.execute("INSERT INTO b (id) VALUES (2)", [])?)
-        });
-
-        long_writer.join().expect("long writer thread panicked").expect("long writer");
-        short_write_result.expect(
-            "a write on one table must succeed while another write_immediate transaction is \
-             held on a different table through the same shared writer_gate, not \
-             SQLITE_LOCKED/SQLITE_BUSY",
-        );
-
-        let b_count: i64 = database
-            .read::<i64, DatabaseError>(|conn| {
-                Ok(conn.query_row("SELECT COUNT(*) FROM b", [], |row| row.get(0))?)
-            })
-            .expect("read back");
-        assert_eq!(b_count, 1);
-    }
-
-    /// The writer_gate must release even when the write closure itself
-    /// returns an error -- otherwise one failed write would permanently
-    /// wedge every subsequent write on this `SyncDatabase`.
-    #[test]
-    fn writer_gate_releases_after_an_operation_error() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let database = open_test_db(&dir.path().join("writer-gate-error-release.sqlite3"));
-        database
-            .write::<_, DatabaseError>(|conn: &mut Connection| {
-                Ok(conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")?)
-            })
-            .expect("create table");
-
-        let failing: Result<(), DatabaseError> =
-            database.write::<_, DatabaseError>(|conn: &mut Connection| {
-                conn.execute("INSERT INTO t (id) VALUES (1)", [])?;
-                Err(DatabaseError::CorruptSchema("deliberate test failure".into()))
-            });
-        assert!(failing.is_err());
-
-        // The gate must not be wedged: this write must still go through.
-        database
-            .write::<_, DatabaseError>(|conn: &mut Connection| {
-                Ok(conn.execute("INSERT INTO t (id) VALUES (2)", [])?)
-            })
-            .expect("writer_gate must have been released after the prior error");
-    }
-
-    /// `write_immediate` must leave no partial write behind on failure --
-    /// the transaction rolls back rather than committing a half-applied
-    /// operation.
-    #[test]
-    fn write_immediate_leaves_no_partial_write_on_failure() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let database = open_test_db(&dir.path().join("write-immediate-rollback.sqlite3"));
-        database
-            .write::<_, DatabaseError>(|conn: &mut Connection| {
-                Ok(conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")?)
-            })
-            .expect("create table");
-
-        let failing: Result<(), DatabaseError> =
-            database.write_immediate::<_, DatabaseError>(|tx| {
-                tx.execute("INSERT INTO t (id) VALUES (1)", [])?;
-                Err(DatabaseError::CorruptSchema("deliberate test failure".into()))
-            });
-        assert!(failing.is_err());
-
-        let count: i64 = database
-            .read::<i64, DatabaseError>(|conn| {
-                Ok(conn.query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))?)
-            })
-            .expect("read back");
-        assert_eq!(count, 0, "a failed write_immediate must not leave a partial row committed");
-    }
-
-    /// Data and schema must both survive a close-and-reopen of the same
-    /// file-backed database.
-    #[test]
-    fn data_and_schema_survive_a_reopen() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("reopen-survives.sqlite3");
-        {
-            let database = open_test_db(&path);
-            database
-                .write::<_, DatabaseError>(|conn: &mut Connection| {
-                    conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")?;
-                    Ok(conn.execute("INSERT INTO t (id) VALUES (42)", [])?)
-                })
-                .expect("create + insert");
-        }
-
-        let reopened = open_test_db(&path);
-        let value: i64 = reopened
-            .read::<i64, DatabaseError>(|conn| {
-                Ok(conn.query_row("SELECT id FROM t", [], |row| row.get(0))?)
-            })
-            .expect("read back after reopen");
-        assert_eq!(value, 42);
-    }
-
-    /// Opening the same database twice in a row (schema already present)
-    /// must not fail -- `init_schema`'s own `CREATE TABLE IF NOT EXISTS`
-    /// migrations must be idempotent, not just safe to run once.
-    #[test]
-    fn schema_initialization_is_idempotent() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("idempotent-init.sqlite3");
-        let _first = open_test_db(&path);
-        let _second = open_test_db(&path);
-    }
-}
+mod tests;

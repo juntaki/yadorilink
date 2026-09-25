@@ -1,5 +1,5 @@
 use rusqlite::Connection;
-use yadorilink_replica_domain::change::{ChangeAuth, Op};
+use yadorilink_replica_domain::change::Op;
 use yadorilink_replica_domain::file::RecordKind;
 use yadorilink_replica_domain::file::{FileMeta, FileVersion, VersionBlock};
 use yadorilink_replica_domain::ids::{BlockHash, SyncPath};
@@ -19,7 +19,7 @@ fn emitter() -> ChangeEmitter {
     ChangeEmitter::new("device-a", ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]))
 }
 
-/// RED: `change_file_versions` is an authorization index used when deciding
+/// Pins: `change_file_versions` is an authorization index used when deciding
 /// whether a group's retained history justifies serving a physical block. An
 /// extra relation absent from the signed Change.ops must be removed or rejected;
 /// otherwise unrelated retained metadata can manufacture block-serving rights.
@@ -44,7 +44,6 @@ fn schema_init_repairs_or_refuses_extra_change_file_version_authorization() {
         &conn,
         "g",
         vec![Op::Delete { path: SyncPath("unrelated.bin".into()) }],
-        ChangeAuth::PLACEHOLDER,
         &emitter(),
     )
     .unwrap();

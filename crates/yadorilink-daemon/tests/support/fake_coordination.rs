@@ -7,15 +7,8 @@
 //!   - `GET /netmap/subscribe?deviceId=` (WebSocket): pushes `{type:"netmap"}`
 //!     frames — the sole seam that makes the orchestrator spawn and tear down
 //!     peer sessions.
-//!   - `POST /devices/:id/endpoint`, `/netmap/rendezvous`,
-//!     `/devices/:id/signing-key`: answered `204` (best-effort on the daemon).
-//!   - `POST /shares/groups/:groupId/relay/grant` (P0-A): the one route this
-//!     fake actually implements over real HTTP rather than a blanket `204`
-//!     -- see `serve_relay_grant`'s own doc comment for why: it is what lets
-//!     [`crate::coordination_client::request_relay_grant`] and
-//!     [`crate::relay_carrier::ProductionRelayGrantSource`] be exercised
-//!     against something other than the in-process `FakeGrantSource` bypass
-//!     every other relay-scenario test uses (`tests/support/topology.rs`).
+//!   - `POST /devices/:id/endpoint`: answered `204`
+//!     (best-effort on the daemon).
 //!
 //! Revocation is expressed exactly as the real plane expresses it: recompute
 //! the netmap without the revoked peer or group and push it; the orchestrator
@@ -42,7 +35,6 @@ use tokio_tungstenite::WebSocketStream;
 
 #[derive(Clone)]
 struct DeviceInfo {
-    wireguard_public_key_b64: String,
     signing_public_key_b64: String,
     /// Every address this device advertises, in the order the netmap
     /// presents them. A real coordination plane publishes each address a
@@ -54,9 +46,6 @@ struct DeviceInfo {
     endpoints: Vec<String>,
     groups: HashSet<String>,
     full_replica_groups: HashSet<String>,
-    /// M3 Pass 4: device-scoped (not group-scoped, unlike
-    /// `full_replica_groups`) -- see `crate::route::RelayCapability`.
-    relay_capable: bool,
 }
 
 #[derive(Default)]
@@ -70,6 +59,22 @@ struct Inner {
     /// after the coordination connection disappears. Other fake users keep the
     /// legacy policy-free frame so their revocation semantics stay unchanged.
     policy_service_key: Option<SigningKey>,
+    /// Whether a device's own endpoint report is applied to its advertised
+    /// endpoints, or accepted and dropped.
+    ///
+    /// Off by default, because most tests configure reachability themselves
+    /// and a daemon's real report arriving underneath would silently replace
+    /// what the test set up. The relay-publication gate turns it on precisely
+    /// because the publication is what it is testing.
+    apply_endpoint_reports: bool,
+    /// Substrate reachability this plane has stored per device, exactly as the
+    /// real one would: an omitted field leaves it, an explicit one replaces it.
+    substrate_reachability: HashMap<String, (Vec<String>, Vec<String>)>,
+    /// How many endpoint reports to refuse before accepting again, and how many
+    /// have arrived in total. A test proving a refused report is retried needs
+    /// both -- the count alone cannot tell a retry from a first attempt.
+    endpoint_reports_to_fail: u32,
+    endpoint_reports_seen: u32,
     /// `(viewer_device_id, target_device_id) -> endpoints`, overriding what
     /// `target_device_id`'s own `DeviceInfo::endpoints` would otherwise
     /// publish, but ONLY in the netmap frame `viewer_device_id` itself
@@ -111,6 +116,73 @@ struct Inner {
     /// like a fresh production WebSocket starts with a fresh (empty)
     /// watermark map for that connection.
     policy_send_watermarks: HashMap<String, HashMap<String, u64>>,
+    /// How many netmap frames this fake has BUILT for each device, over the
+    /// fake's whole lifetime (never reset by a resubscribe, unlike
+    /// `policy_send_watermarks`). A test that needs to know a device has
+    /// actually been served a frame on a NEW connection -- rather than
+    /// merely that enough wall-clock time has passed for one -- samples this
+    /// before closing the socket and waits for it to advance.
+    netmap_frames_built: HashMap<String, u64>,
+    /// Per `(group_id, device_id)` issuance counter for
+    /// `serve_authorization_checkpoint` -- `AuthorizationCheckpoint::
+    /// checkpoint_seq` must strictly increase per issuing device, matching
+    /// `coordination-worker`'s own per-device issuance counter.
+    checkpoint_seqs: HashMap<(String, String), u64>,
+    /// Canned responses for the three handoff routes, keyed by
+    /// `(route, group_id)`.
+    ///
+    /// Absence is meaningful and is the default: a group with no configured
+    /// response for a route falls through to the same blanket `204` this
+    /// fake answered before these routes were parsed at all, so every test
+    /// that does not opt in sees byte-identical behaviour to before. Only a
+    /// test that calls one of the `set_handoff_*_response` methods changes
+    /// what it gets.
+    handoff_responses: HashMap<(HandoffRoute, String), (u16, String)>,
+    /// Runs synchronously while `/handoff/lease` is being served, before the
+    /// response is written.
+    ///
+    /// This is the narrowest available hook into the real TOCTOU window that
+    /// `DaemonState::request_handoff_lease` guards: it computes its
+    /// `attested_digest` BEFORE this HTTP round trip and re-derives
+    /// `pinned_digest` AFTER it returns, declining the lease if they differ.
+    /// A test proving that guard fires needs to make a real state change
+    /// land strictly between those two points, which means during this call.
+    handoff_lease_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Every handoff request served, in arrival order -- the counting and
+    /// payload-inspection surface tests need, since a canned responder alone
+    /// cannot prove a route was actually exercised rather than bypassed.
+    handoff_requests: Vec<HandoffRequest>,
+}
+
+/// The three coordination-plane handoff routes this fake answers.
+///
+/// Deliberately only these three. Everything else about the handoff state
+/// machine -- lease lifetime, digest verification, membership generation,
+/// who may commit -- stays in production code and is exercised there; this
+/// fake is a test double for the plane's HTTP surface, not a second
+/// implementation of its rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
+pub enum HandoffRoute {
+    /// `POST /shares/groups/{groupId}/handoff/lease`
+    Lease,
+    /// `POST /shares/groups/{groupId}/handoff/commit`
+    Commit,
+    /// `POST /shares/groups/{groupId}/handoff/lease/{leaseId}/release`
+    Release,
+}
+
+/// One handoff request this fake served.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct HandoffRequest {
+    pub route: HandoffRoute,
+    pub group_id: String,
+    /// Only `Release` carries one.
+    pub lease_id: Option<String>,
+    /// The raw request body, so a test can assert on what was actually sent
+    /// rather than only that something was.
+    pub body: String,
 }
 
 /// One in-flight (or already-consumed) Track Send grant this fake has
@@ -169,11 +241,32 @@ impl FakeCoordination {
     }
 
     /// The service signing key `enable_signed_policy` installed, for a
-    /// test that needs to sign something (e.g. a `RelayGrant`) itself the
-    /// same way this fake's own `issue_relay_grant` does, rather than
-    /// going through that method's own candidate-search logic.
+    /// test that needs to sign something itself with the same key this
+    /// fake uses.
     pub fn policy_signing_key(&self) -> Option<SigningKey> {
         self.inner.lock().unwrap().policy_service_key.clone()
+    }
+
+    /// Closes `device_id`'s live netmap WebSocket from the server side,
+    /// exactly as a coordination-plane restart, a load-balancer idle
+    /// timeout, or a Durable Object eviction would. Dropping the forwarding
+    /// sender ends `serve_netmap_subscription`'s own `rx.recv()`, which
+    /// closes the socket; the daemon's `peer_orchestrator::run` backoff loop
+    /// then redials and re-subscribes on its own.
+    ///
+    /// Deliberately does NOT clear `policy_send_watermarks` here -- the
+    /// re-subscribe path does that, which is the whole point: the daemon's
+    /// first frame after reconnecting carries each group's policy chain from
+    /// record 1 again while the daemon still holds its persistent verified
+    /// base. Returns whether a subscription was actually live to close.
+    pub fn drop_subscription(&self, device_id: &str) -> bool {
+        self.inner.lock().unwrap().subscribers.remove(device_id).is_some()
+    }
+
+    /// How many netmap frames this fake has built for `device_id` so far --
+    /// see `Inner::netmap_frames_built`.
+    pub fn netmap_frames_built(&self, device_id: &str) -> u64 {
+        self.inner.lock().unwrap().netmap_frames_built.get(device_id).copied().unwrap_or(0)
     }
 
     /// Grants `device_id` a specific writer role for `group_id` by appending
@@ -327,45 +420,179 @@ impl FakeCoordination {
     /// aborts the accept loop (freeing the listener, so the bound port stops
     /// answering and any daemon reconnect attempt fails) and drops every live
     /// subscription (closing the daemons' netmap WebSockets). Peer-to-peer
-    /// sync, which runs over the direct transport, is unaffected — which is the
-    /// whole point of the availability-independence tests.
+    /// sync, which runs over the direct transport, is unaffected — which is
+    /// the whole point of the `Published Data Plane Survives Coordination
+    /// Outage` tests: coordination-plane reachability gates NEW checkpoint
+    /// issuance, never already-Published data-plane transfer.
+    ///
+    /// Deliberately does NOT clear `devices`/`group_policy_chains`/
+    /// `checkpoint_seqs`: a real coordination plane's registration and
+    /// policy database is durable storage, not in-memory connection state --
+    /// an outage does not forget who is registered or what a group's policy
+    /// chain says, only the live connections themselves drop. Only
+    /// `subscribers` (the live netmap WebSocket handles) and
+    /// `endpoint_view_overrides` (a connection-scoped test override) are
+    /// connection-scoped and so are cleared here; see [`Self::restart`] for
+    /// resuming service on the same address once a test's outage window ends.
     pub fn shutdown(&self) {
         if let Some(task) = self.accept_task.lock().unwrap().take() {
             task.abort();
         }
         let mut inner = self.inner.lock().unwrap();
         inner.subscribers.clear();
-        inner.devices.clear();
         inner.endpoint_view_overrides.clear();
     }
 
+    /// Resumes serving on the SAME address [`Self::shutdown`] took down --
+    /// the recovery half of a coordination-plane outage chaos test. Every
+    /// device/policy-chain/checkpoint-sequence record registered before the
+    /// outage is still present (see [`Self::shutdown`]'s own doc comment),
+    /// so a daemon's own reconnect logic picks the netmap subscription back
+    /// up without needing to re-register anything.
+    pub fn restart(&self) {
+        let addr: std::net::SocketAddr = self
+            .addr
+            .trim_start_matches("http://")
+            .parse()
+            .expect("FakeCoordination::addr is always a parseable loopback socket address");
+        let inner = self.inner.clone();
+        let accept_task_handle = self.accept_task.clone();
+        let restart_task = tokio::spawn(async move {
+            // A handful of short retries: `shutdown()`'s aborted accept task
+            // drops its `TcpListener` (closing the fd) essentially
+            // immediately, but the abort itself is async-cancelled, not
+            // synchronously joined, so there is a brief window where the
+            // kernel has not yet released the port.
+            let mut bind_attempts = 0;
+            let listener = loop {
+                match TcpListener::bind(addr).await {
+                    Ok(listener) => break listener,
+                    Err(_) if bind_attempts < 20 => {
+                        bind_attempts += 1;
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    Err(e) => panic!(
+                        "the port FakeCoordination::shutdown just freed is still not bindable \
+                         after {bind_attempts} retries: {e}"
+                    ),
+                }
+            };
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { return };
+                let conn_inner = inner.clone();
+                tokio::spawn(async move {
+                    let _ = handle_connection(stream, conn_inner).await;
+                });
+            }
+        });
+        *accept_task_handle.lock().unwrap() = Some(restart_task);
+    }
+
     /// Records a device's identity and initial group membership, then pushes a
-    /// fresh netmap to everyone. A device has one real key now (its Ed25519
-    /// signing key), so callers pass the same key for both `wireguard_public_key`
-    /// and `signing_public_key` here — the two parameters exist only because
-    /// this fake mirrors the coordination plane's real registration schema,
-    /// which still names one column after the retired transport key. The
-    /// orchestrator pins both from the netmap and verifies every incoming
-    /// change against the pinned signing key.
+    /// fresh netmap to everyone. A device has one key: its Ed25519 signing
+    /// key. The orchestrator pins it from the netmap and verifies every
+    /// incoming change against it.
     pub fn register_device(
         &self,
         device_id: &str,
-        wireguard_public_key: [u8; 32],
         signing_public_key: [u8; 32],
         endpoint: String,
         groups: &[&str],
     ) {
         let b64 = base64::engine::general_purpose::STANDARD;
         let info = DeviceInfo {
-            wireguard_public_key_b64: b64.encode(wireguard_public_key),
             signing_public_key_b64: b64.encode(signing_public_key),
             endpoints: vec![endpoint],
             groups: groups.iter().map(|g| g.to_string()).collect(),
             full_replica_groups: HashSet::new(),
-            relay_capable: false,
         };
         self.inner.lock().unwrap().devices.insert(device_id.to_string(), info);
         self.push();
+    }
+
+    /// Configures what `POST /shares/groups/{group_id}/handoff/lease`
+    /// answers for this group.
+    ///
+    /// Until a test calls this, that route falls through to the blanket
+    /// `204` — an empty body where the daemon expects JSON, which it
+    /// correctly reports as "coordination unavailable". That is the real
+    /// behaviour a demotion sees against an unconfigured plane, and it is
+    /// what these routes did before this fake parsed them; opting in is
+    /// what changes it.
+    #[allow(dead_code)]
+    pub fn set_handoff_lease_response(&self, group_id: &str, status: u16, body: serde_json::Value) {
+        self.set_handoff_response(HandoffRoute::Lease, group_id, status, body);
+    }
+
+    /// Configures what `POST /shares/groups/{group_id}/handoff/commit`
+    /// answers. See [`set_handoff_lease_response`](Self::set_handoff_lease_response).
+    #[allow(dead_code)]
+    pub fn set_handoff_commit_response(
+        &self,
+        group_id: &str,
+        status: u16,
+        body: serde_json::Value,
+    ) {
+        self.set_handoff_response(HandoffRoute::Commit, group_id, status, body);
+    }
+
+    /// Configures what
+    /// `POST /shares/groups/{group_id}/handoff/lease/{leaseId}/release`
+    /// answers, for any lease id.
+    #[allow(dead_code)]
+    pub fn set_handoff_release_response(
+        &self,
+        group_id: &str,
+        status: u16,
+        body: serde_json::Value,
+    ) {
+        self.set_handoff_response(HandoffRoute::Release, group_id, status, body);
+    }
+
+    fn set_handoff_response(
+        &self,
+        route: HandoffRoute,
+        group_id: &str,
+        status: u16,
+        body: serde_json::Value,
+    ) {
+        self.inner
+            .lock()
+            .unwrap()
+            .handoff_responses
+            .insert((route, group_id.to_string()), (status, body.to_string()));
+    }
+
+    /// Installs a closure that runs synchronously while a `/handoff/lease`
+    /// request is being served, before its response is written.
+    ///
+    /// The window this opens is real, not synthetic:
+    /// `DaemonState::request_handoff_lease` computes its `attested_digest`
+    /// before this HTTP round trip and re-derives `pinned_digest` after it,
+    /// declining the lease when they differ. A closure here lands strictly
+    /// between the two, so a test can make a genuine state change (a real
+    /// file write) at the one instant that exercises that guard, with no
+    /// production code modified.
+    #[allow(dead_code)]
+    pub fn on_handoff_lease(&self, hook: impl Fn() + Send + Sync + 'static) {
+        self.inner.lock().unwrap().handoff_lease_hook = Some(Arc::new(hook));
+    }
+
+    /// How many requests this fake has served for `route`.
+    ///
+    /// Proves a route was genuinely exercised rather than bypassed — a
+    /// canned response alone cannot distinguish "the daemon asked and got
+    /// this" from "the daemon never asked".
+    #[allow(dead_code)]
+    pub fn handoff_request_count(&self, route: HandoffRoute) -> usize {
+        self.inner.lock().unwrap().handoff_requests.iter().filter(|r| r.route == route).count()
+    }
+
+    /// Every handoff request served so far, in arrival order, for a test
+    /// that needs to assert on the bodies rather than only the counts.
+    #[allow(dead_code)]
+    pub fn handoff_requests(&self) -> Vec<HandoffRequest> {
+        self.inner.lock().unwrap().handoff_requests.clone()
     }
 
     /// Marks (or clears) a device as a full replica ("store everything") of a
@@ -384,7 +611,7 @@ impl FakeCoordination {
         self.push();
     }
 
-    /// M5-A: republishes `device_id`'s advertised endpoint -- mirroring
+    /// Republishes `device_id`'s advertised endpoint -- mirroring
     /// what a real coordination plane would push over the netmap
     /// subscription if a device's network conditions changed (e.g. a new
     /// reflexive address). This is a device-GLOBAL candidate republish,
@@ -400,6 +627,48 @@ impl FakeCoordination {
     /// `set_peer_view_endpoints` and/or an explicit live-connection
     /// teardown seam respectively -- see that method's own doc comment.
     #[allow(dead_code)]
+    /// Apply each device's own endpoint report to its advertised endpoints,
+    /// instead of accepting and dropping it.
+    ///
+    /// Turns this fixture into the full publication loop: a daemon learns its
+    /// reachability, reports it here, and its peers receive exactly that in
+    /// their netmap. Off by default — see `Inner::apply_endpoint_reports`.
+    #[allow(dead_code)]
+    /// Refuse the next `n` endpoint reports with 503.
+    #[allow(dead_code)]
+    pub fn fail_next_endpoint_reports(&self, n: u32) {
+        self.inner.lock().unwrap().endpoint_reports_to_fail = n;
+    }
+
+    /// How many endpoint reports have arrived, refused ones included.
+    #[allow(dead_code)]
+    pub fn endpoint_report_count(&self) -> u32 {
+        self.inner.lock().unwrap().endpoint_reports_seen
+    }
+
+    /// The substrate reachability this plane currently stores for `device_id`,
+    /// or `None` if it has never been told.
+    #[allow(dead_code)]
+    pub fn substrate_reachability_of(&self, device_id: &str) -> Option<(Vec<String>, Vec<String>)> {
+        self.inner.lock().unwrap().substrate_reachability.get(device_id).cloned()
+    }
+
+    pub fn apply_endpoint_reports(&self) {
+        self.inner.lock().unwrap().apply_endpoint_reports = true;
+    }
+
+    /// The endpoints this plane currently advertises for `device_id`.
+    #[allow(dead_code)]
+    pub fn advertised_endpoints(&self, device_id: &str) -> Vec<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .devices
+            .get(device_id)
+            .map(|device| device.endpoints.clone())
+            .unwrap_or_default()
+    }
+
     pub fn update_endpoint(&self, device_id: &str, endpoint: String) {
         self.update_endpoints(device_id, vec![endpoint]);
     }
@@ -425,20 +694,17 @@ impl FakeCoordination {
     /// `target_device_id`, independent of what every other subscriber
     /// sees. A real coordination plane cannot generally do this (it
     /// publishes one endpoint list per device to everyone), but this test
-    /// fixture needs it anyway: a relay scenario wants `M` and `W` to be
+    /// fixture needs it anyway: a test scenario wants `M` and `W` to be
     /// mutually unreachable while both stay reachable from `N`, and
     /// `update_endpoints`'s device-global republish cannot express that
     /// asymmetry at all -- setting `W`'s endpoint dead would make `N` lose
     /// its own real direct path to `W` too.
     ///
-    /// Overriding here has no effect on group membership, full-replica
-    /// status, or relay-grant issuance -- purely which address(es)
-    /// `viewer_device_id`'s netmap names for `target_device_id`. Survives
-    /// `target_device_id` re-registering via `register_device` (a restart
-    /// pushing a fresh real endpoint does not implicitly clear a viewer's
-    /// override of it -- exactly the shape a restart-while-relayed test
-    /// needs: the restarted peer's real address must stay invisible to
-    /// the one specific viewer this override targets).
+    /// Overriding here has no effect on group membership or full-replica
+    /// status -- purely which address(es) `viewer_device_id`'s netmap
+    /// names for `target_device_id`. Survives `target_device_id`
+    /// re-registering via `register_device` (a restart pushing a fresh
+    /// real endpoint does not implicitly clear a viewer's override of it).
     #[allow(dead_code)]
     pub fn set_peer_view_endpoints(
         &self,
@@ -467,88 +733,6 @@ impl FakeCoordination {
                 .remove(&(viewer_device_id.to_string(), target_device_id.to_string()));
         }
         self.push();
-    }
-
-    /// M3 Pass 4: declares (or clears) a device's own relay capability --
-    /// mirrored onto peers' `relayCapable`. Deliberately independent of
-    /// `set_full_replica`: never coupled, never inferred from one another
-    /// (see `crate::route`'s own doc comment).
-    #[allow(dead_code)]
-    pub fn set_relay_capable(&self, device_id: &str, relay_capable: bool) {
-        {
-            let mut inner = self.inner.lock().unwrap();
-            if let Some(dev) = inner.devices.get_mut(device_id) {
-                dev.relay_capable = relay_capable;
-            }
-        }
-        self.push();
-    }
-
-    /// M3 Pass 5: synthesizes and signs a `RelayGrant` the way the real
-    /// coordination plane would, per this pass's own security spec: finds
-    /// a group ALL THREE of (`source_device_id`, some relay-capable
-    /// device, `destination_device_id`) are CURRENTLY members of, and
-    /// issues a grant scoped to exactly that one group -- never a relay
-    /// whose only shared group with the source differs from its only
-    /// shared group with the destination (that would bridge two
-    /// otherwise-disjoint groups, exactly what `relay_session::
-    /// admit_relay_open`'s own group-membership re-verification exists to
-    /// refuse regardless of what a grant claims). Returns `None` if no
-    /// such group/relay candidate exists, or if `enable_signed_policy`
-    /// was never called (no signing key to issue with -- this fake never
-    /// issues an unsigned or forged-key grant, matching the real plane's
-    /// own contract).
-    ///
-    /// A plain synchronous method, not an HTTP round trip -- this fake's
-    /// own HTTP layer only ever implements the netmap subscription itself
-    /// (see this file's own module doc comment); every other
-    /// coordination interaction this test suite exercises (`set_full_
-    /// replica`, `set_relay_capable`, and now this) is synthesized
-    /// directly, matching that established convention, since there is no
-    /// real coordination-worker in this repo to test a genuine
-    /// POST/response cycle against.
-    pub fn issue_relay_grant(
-        &self,
-        source_device_id: &str,
-        destination_device_id: &str,
-        ttl_seconds: i64,
-    ) -> Option<yadorilink_daemon::relay_grant::RelayGrant> {
-        let inner = self.inner.lock().unwrap();
-        let signing_key = inner.policy_service_key.clone()?;
-        let source_groups = inner.devices.get(source_device_id)?.groups.clone();
-        let dest_groups = inner.devices.get(destination_device_id)?.groups.clone();
-        let shared_groups: Vec<String> =
-            source_groups.intersection(&dest_groups).cloned().collect();
-        let mut candidate = None;
-        'outer: for group_id in &shared_groups {
-            for (relay_id, dev) in &inner.devices {
-                if relay_id == source_device_id || relay_id == destination_device_id {
-                    continue;
-                }
-                if dev.relay_capable && dev.groups.contains(group_id) {
-                    candidate = Some((relay_id.clone(), group_id.clone()));
-                    break 'outer;
-                }
-            }
-        }
-        let (relay_device_id, group_id) = candidate?;
-        let issued_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-        let now = issued_at.as_secs() as i64;
-        let grant_id =
-            format!("grant-{source_device_id}-{destination_device_id}-{}", issued_at.as_nanos());
-        let grant = yadorilink_daemon::relay_grant::RelayGrant {
-            version: 1,
-            grant_id,
-            group_id,
-            source_device_id: source_device_id.to_string(),
-            relay_device_id,
-            destination_device_id: destination_device_id.to_string(),
-            not_before_unix: now - 5,
-            expires_at_unix: now + ttl_seconds,
-            max_session_bytes: None,
-            signature: Vec::new(),
-        };
-        Some(yadorilink_daemon::relay_grant::sign_relay_grant(grant, &signing_key))
     }
 
     /// Revokes a device's access to one group and pushes the new netmap — the
@@ -598,6 +782,7 @@ impl FakeCoordination {
 /// sharing at least one of the subscriber's groups, each with the shared-group
 /// subset (membership = bidirectional write authority) and full-replica subset.
 fn netmap_frame_for(inner: &mut Inner, subscriber_id: &str) -> String {
+    *inner.netmap_frames_built.entry(subscriber_id.to_string()).or_default() += 1;
     let self_groups =
         inner.devices.get(subscriber_id).map(|d| d.groups.clone()).unwrap_or_default();
 
@@ -620,7 +805,6 @@ fn netmap_frame_for(inner: &mut Inner, subscriber_id: &str) -> String {
             .unwrap_or(&dev.endpoints);
         peers.push(serde_json::json!({
             "deviceId": device_id,
-            "wireguardPublicKeyBase64": dev.wireguard_public_key_b64,
             "signingPublicKeyBase64": dev.signing_public_key_b64,
             "endpoints": visible_endpoints
                 .iter()
@@ -628,7 +812,6 @@ fn netmap_frame_for(inner: &mut Inner, subscriber_id: &str) -> String {
                 .collect::<Vec<_>>(),
             "sharedGroupIds": shared,
             "fullReplicaGroupIds": full_replica,
-            "relayCapable": dev.relay_capable,
         }));
     }
     inner.snapshot_generation += 1;
@@ -643,17 +826,14 @@ fn netmap_frame_for(inner: &mut Inner, subscriber_id: &str) -> String {
                 .encode(service_key.verifying_key().to_bytes()),
         );
         frame["groupPolicyLogs"] = signed_policy_logs(inner, subscriber_id, &self_groups);
+        // Required on every push, like the two fields above: the daemon
+        // rejects a netmap without it as malformed. This fake never isolates
+        // a group, so the list is always empty.
+        frame["policyInvalidGroupIds"] = serde_json::json!([]);
     }
     frame.to_string()
 }
 
-/// The literal `ACTION_GRANT_WITH_ROLE` wire discriminant (see
-/// `yadorilink_daemon::change_policy`'s own module doc comment for why this
-/// is a distinct shape from plain `ACTION_GRANT`) -- mirrored here rather
-/// than importing the crate's private constant, since it decides whether
-/// `policy_record_to_wire_json` includes a `role` field at all, exactly like
-/// `coordination-worker`'s own `recordToWire` (`src/policy/service.ts`)
-/// includes `role` only when `r.action.role !== undefined`.
 const WIRE_ACTION_GRANT_WITH_ROLE: u32 = 3;
 
 /// Renders one signed `PolicyRecord` (built by `grant_role` via
@@ -753,17 +933,20 @@ async fn handle_connection(mut stream: TcpStream, inner: Arc<Mutex<Inner>>) -> s
     if method == "GET" && target.starts_with("/netmap/subscribe") && is_ws_upgrade {
         serve_netmap_subscription(stream, &head, &target, inner).await
     } else if method == "POST" {
-        if let Some(group_id) = parse_relay_grant_target(&target) {
-            serve_relay_grant(stream, &head, leftover, group_id, inner).await
-        } else if target.split('?').next() == Some("/send/authorization") {
+        if target.split('?').next() == Some("/send/authorization") {
             serve_send_authorization_issue(stream, &head, leftover, inner).await
         } else if let Some(grant_id) = parse_send_authorization_consume_target(&target) {
             serve_send_authorization_consume(stream, &head, leftover, grant_id, inner).await
+        } else if let Some(group_id) = parse_authorization_checkpoint_target(&target) {
+            serve_authorization_checkpoint(stream, &head, leftover, group_id, inner).await
+        } else if let Some((route, group_id, lease_id)) = parse_handoff_target(&target) {
+            serve_handoff(stream, &head, leftover, route, group_id, lease_id, inner).await
+        } else if let Some(device_id) = parse_endpoint_report_target(&target) {
+            serve_endpoint_report(stream, &head, leftover, device_id, inner).await
         } else {
-            // Every other endpoint the daemon calls (endpoint report,
-            // rendezvous, signing-key backfill) is best-effort: a 204 is all
-            // it needs. Drain any request body first so the socket closes
-            // cleanly.
+            // Every other route the daemon calls is best-effort: a 204 is
+            // all it needs. Drain any request body first so the socket
+            // closes cleanly.
             drain_body(&mut stream, &head, leftover).await?;
             stream.write_all(b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n").await?;
             stream.flush().await
@@ -775,13 +958,130 @@ async fn handle_connection(mut stream: TcpStream, inner: Arc<Mutex<Inner>>) -> s
     }
 }
 
-/// Matches `/shares/groups/{groupId}/relay/grant` and extracts `groupId`, or
-/// `None` for anything else (including a group id that itself contains a
-/// `/`, which cannot be a real path segment).
-fn parse_relay_grant_target(target: &str) -> Option<String> {
+/// Matches `/devices/{deviceId}/endpoint` and extracts `deviceId`.
+fn parse_endpoint_report_target(target: &str) -> Option<String> {
     let path = target.split('?').next().unwrap_or(target);
-    let group_id = path.strip_prefix("/shares/groups/")?.strip_suffix("/relay/grant")?;
-    (!group_id.is_empty() && !group_id.contains('/')).then(|| group_id.to_string())
+    let device_id = path.strip_prefix("/devices/")?.strip_suffix("/endpoint")?;
+    (!device_id.is_empty() && !device_id.contains('/')).then(|| device_id.to_string())
+}
+
+/// Applies a device's endpoint report, the way the real coordination plane
+/// does: the reported addresses become that device's advertised endpoints,
+/// and its peers are pushed a fresh netmap.
+///
+/// This used to be swallowed with a bare 204, which made every test's peer
+/// reachability something the *test* had configured rather than something a
+/// daemon had published. That is exactly the half of the loop a relay URL has
+/// to survive — a daemon learns its own relay from the substrate, publishes it
+/// here, and a peer can only dial it if what comes back out of the netmap is
+/// what went in.
+///
+/// Stored verbatim and forwarded unchanged, like the real plane: nothing here
+/// parses an address, because classifying one is the receiving daemon's job.
+async fn serve_endpoint_report(
+    mut stream: TcpStream,
+    head: &str,
+    leftover: Vec<u8>,
+    device_id: String,
+    inner: Arc<Mutex<Inner>>,
+) -> std::io::Result<()> {
+    let body = read_body(&mut stream, head, leftover).await?;
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Candidate {
+        address: String,
+        #[serde(default)]
+        priority: i32,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Req {
+        #[serde(default)]
+        candidates: Vec<Candidate>,
+        /// Absent leaves the stored snapshot alone; present -- including
+        /// present and empty -- replaces it.
+        #[serde(default)]
+        substrate_reachability: Option<WireSubstrate>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct WireSubstrate {
+        #[serde(default)]
+        direct: Vec<String>,
+        #[serde(default)]
+        relays: Vec<String>,
+    }
+
+    // Decided under the lock, acted on outside it: a guard alive across an
+    // await makes this whole future non-Send.
+    let refuse = {
+        let mut guard = inner.lock().unwrap();
+        guard.endpoint_reports_seen += 1;
+        let refuse = guard.endpoint_reports_to_fail > 0;
+        if refuse {
+            guard.endpoint_reports_to_fail -= 1;
+        }
+        refuse
+    };
+    if refuse {
+        // A real refusal, so only the daemon's own retry can make the next one
+        // happen.
+        stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n").await?;
+        return Ok(());
+    }
+
+    let changed = match serde_json::from_slice::<Req>(&body) {
+        Ok(req) => {
+            let mut guard = inner.lock().unwrap();
+            if let Some(substrate) = req.substrate_reachability {
+                guard
+                    .substrate_reachability
+                    .insert(device_id.clone(), (substrate.direct, substrate.relays));
+            }
+            // Accepted and dropped unless a test opted in. See
+            // `Inner::apply_endpoint_reports`.
+            if !guard.apply_endpoint_reports {
+                false
+            } else {
+                match guard.devices.get_mut(&device_id) {
+                    Some(device) => {
+                        let mut candidates = req.candidates;
+                        // Best first, matching what the real plane's
+                        // `ORDER BY priority ASC` yields for a netmap read.
+                        candidates.sort_by(|a, b| b.priority.cmp(&a.priority));
+                        let endpoints: Vec<String> =
+                            candidates.into_iter().map(|c| c.address).collect();
+                        let moved = device.endpoints != endpoints;
+                        device.endpoints = endpoints;
+                        moved
+                    }
+                    // A report for a device this fixture never registered is
+                    // accepted and dropped, exactly as the 204 before it did.
+                    None => false,
+                }
+            }
+        }
+        Err(_) => false,
+    };
+
+    if changed {
+        // Same push the fixture's own mutators do: a device's reachability
+        // moving is a netmap change for every peer of it.
+        let mut guard = inner.lock().unwrap();
+        let subscribers: Vec<_> = guard
+            .subscribers
+            .iter()
+            .map(|(device_id, tx)| (device_id.clone(), tx.clone()))
+            .collect();
+        for (subscriber_id, tx) in subscribers {
+            let frame = netmap_frame_for(&mut guard, &subscriber_id);
+            let _ = tx.send(frame);
+        }
+    }
+
+    stream.write_all(b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n").await?;
+    stream.flush().await
 }
 
 /// Matches `/send/authorization/{grantId}/consume` and extracts `grantId`.
@@ -789,6 +1089,253 @@ fn parse_send_authorization_consume_target(target: &str) -> Option<String> {
     let path = target.split('?').next().unwrap_or(target);
     let grant_id = path.strip_prefix("/send/authorization/")?.strip_suffix("/consume")?;
     (!grant_id.is_empty() && !grant_id.contains('/')).then(|| grant_id.to_string())
+}
+
+/// Matches `/shares/groups/{groupId}/authorization-checkpoint` and extracts
+/// `groupId`.
+fn parse_authorization_checkpoint_target(target: &str) -> Option<String> {
+    let path = target.split('?').next().unwrap_or(target);
+    let group_id =
+        path.strip_prefix("/shares/groups/")?.strip_suffix("/authorization-checkpoint")?;
+    (!group_id.is_empty() && !group_id.contains('/')).then(|| group_id.to_string())
+}
+
+/// Matches the three handoff routes and extracts what identifies them.
+///
+/// Release is tested FIRST because `/handoff/lease` is a strict prefix of
+/// `/handoff/lease/{leaseId}/release`: checking lease first would swallow
+/// every release call and answer it as a lease request.
+fn parse_handoff_target(target: &str) -> Option<(HandoffRoute, String, Option<String>)> {
+    let path = target.split('?').next().unwrap_or(target);
+    let rest = path.strip_prefix("/shares/groups/")?;
+    let (group_id, tail) = rest.split_once('/')?;
+    if group_id.is_empty() {
+        return None;
+    }
+    let group_id = group_id.to_string();
+    if let Some(lease_id) =
+        tail.strip_prefix("handoff/lease/").and_then(|t| t.strip_suffix("/release"))
+    {
+        if lease_id.is_empty() || lease_id.contains('/') {
+            return None;
+        }
+        return Some((HandoffRoute::Release, group_id, Some(lease_id.to_string())));
+    }
+    match tail {
+        "handoff/lease" => Some((HandoffRoute::Lease, group_id, None)),
+        "handoff/commit" => Some((HandoffRoute::Commit, group_id, None)),
+        _ => None,
+    }
+}
+
+/// Serves the three handoff routes from a test's canned configuration.
+///
+/// Deliberately not a handoff state machine: it records the request, runs
+/// the lease hook if one is installed, and answers with whatever the test
+/// configured. With nothing configured it falls through to the same blanket
+/// `204` this fake gave before it parsed these routes at all, so a test that
+/// never opts in cannot tell the difference.
+///
+/// The hook runs with the lock released, because a hook is test code that
+/// may well call back into this fake.
+async fn serve_handoff(
+    mut stream: TcpStream,
+    head: &str,
+    leftover: Vec<u8>,
+    route: HandoffRoute,
+    group_id: String,
+    lease_id: Option<String>,
+    inner: Arc<Mutex<Inner>>,
+) -> std::io::Result<()> {
+    let body = read_body(&mut stream, head, leftover).await?;
+    let body = String::from_utf8_lossy(&body).into_owned();
+
+    let (configured, hook) = {
+        let mut guard = inner.lock().unwrap();
+        guard.handoff_requests.push(HandoffRequest {
+            route,
+            group_id: group_id.clone(),
+            lease_id,
+            body,
+        });
+        let configured = guard.handoff_responses.get(&(route, group_id)).cloned();
+        let hook = matches!(route, HandoffRoute::Lease)
+            .then(|| guard.handoff_lease_hook.clone())
+            .flatten();
+        (configured, hook)
+    };
+
+    if let Some(hook) = hook {
+        hook();
+    }
+
+    match configured {
+        Some((status, body)) => {
+            let reason = match status {
+                200 => "OK",
+                204 => "No Content",
+                403 => "Forbidden",
+                409 => "Conflict",
+                _ => "Unknown",
+            };
+            respond_json(&mut stream, status, reason, &body).await
+        }
+        None => {
+            stream.write_all(b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n").await?;
+            stream.flush().await
+        }
+    }
+}
+
+/// Serves `POST /shares/groups/:groupId/authorization-checkpoint` for real
+/// -- `yadorilink_daemon::coordination_client::request_authorization_
+/// checkpoint`'s server side, `coordination-worker`'s `routes/shares.ts`
+/// (phase 2e) mirrored just enough to exercise `checkpoint_source::
+/// flush_pending_checkpoint` end to end against real daemon code, not an
+/// in-process bypass. Reuses `verify_group_policy_log` (the SAME verifier
+/// the daemon itself runs on the received netmap frame) against this fake's
+/// own `group_policy_chains` to decide current writer status and the
+/// `policy_epoch`/`policy_seq`/`policy_head` triple the issued checkpoint
+/// pins -- so a checkpoint this fake issues is byte-identical in shape to
+/// one a real coordination plane would issue for the same chain state, not
+/// an approximation. 403s (no writer role) mirror the real 403 the daemon's
+/// own `coordination_client::request_authorization_checkpoint` already
+/// treats as an expected refusal, not an error.
+async fn serve_authorization_checkpoint(
+    mut stream: TcpStream,
+    head: &str,
+    leftover: Vec<u8>,
+    group_id: String,
+    inner: Arc<Mutex<Inner>>,
+) -> std::io::Result<()> {
+    let body = read_body(&mut stream, head, leftover).await?;
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Req {
+        device_id: String,
+        merkle_root_base64: String,
+        leaf_count: u64,
+    }
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let Ok(req) = serde_json::from_slice::<Req>(&body) else {
+        return respond_json(&mut stream, 400, "Bad Request", r#"{"error":"invalid body"}"#).await;
+    };
+    let Some(merkle_root) =
+        b64.decode(&req.merkle_root_base64).ok().and_then(|v| <[u8; 32]>::try_from(v).ok())
+    else {
+        return respond_json(&mut stream, 400, "Bad Request", r#"{"error":"invalid merkle root"}"#)
+            .await;
+    };
+
+    let (policy_service_key, chain, device) = {
+        let inner = inner.lock().unwrap();
+        (
+            inner.policy_service_key.clone(),
+            inner.group_policy_chains.get(&group_id).cloned().unwrap_or_default(),
+            inner.devices.get(&req.device_id).cloned(),
+        )
+    };
+    let Some(policy_service_key) = policy_service_key else {
+        return respond_json(
+            &mut stream,
+            403,
+            "Forbidden",
+            r#"{"error":"no policy service key -- call enable_signed_policy() first"}"#,
+        )
+        .await;
+    };
+    let Some(device) = device else {
+        return respond_json(&mut stream, 404, "Not Found", r#"{"error":"unknown device"}"#).await;
+    };
+
+    use yadorilink_daemon::change_policy::{verify_group_policy_log, GroupPolicyLog};
+    let (current_seq, current_epoch, policy_head) = match chain.last() {
+        Some(head_record) => (head_record.seq, head_record.epoch, head_record.record_hash.clone()),
+        None => (0, 0, vec![0u8; 32]),
+    };
+    let log = GroupPolicyLog {
+        group_id: group_id.clone(),
+        current_seq,
+        current_epoch,
+        policy_head: policy_head.clone(),
+        records: chain,
+    };
+    let policy = verify_group_policy_log(&policy_service_key.verifying_key().to_bytes(), &log)
+        .expect(
+            "this fake's own group_policy_chains must always verify against its own signing key",
+        );
+
+    // The genuine pre-policy bootstrap window: a group `grant_role` has
+    // never touched has no chain to check a writer role against at all --
+    // see `GroupPolicyState::resolve_group_policy`'s own doc comment ("the
+    // placeholder stamp is still the legitimately accepted authorization on
+    // both sides"). Any registered device may obtain a checkpoint here; the
+    // exemption ends the instant the group's chain gets its first record.
+    let bootstrap = current_seq == 0 && current_epoch == 0 && policy.current_writers().is_empty();
+    if !bootstrap
+        && !policy.current_writers().iter().any(|writer| writer.device_id == req.device_id)
+    {
+        return respond_json(
+            &mut stream,
+            403,
+            "Forbidden",
+            r#"{"error":"not currently a writer"}"#,
+        )
+        .await;
+    }
+
+    let signing_public_key: [u8; 32] = b64
+        .decode(&device.signing_public_key_b64)
+        .ok()
+        .and_then(|v| v.try_into().ok())
+        .expect("registered device signing key is valid base64/32 bytes");
+    let signing_key_fingerprint: [u8; 32] = Sha256::digest(signing_public_key).into();
+    let signer_key_id: [u8; 32] =
+        Sha256::digest(policy_service_key.verifying_key().to_bytes()).into();
+    let policy_head_array: [u8; 32] =
+        policy_head.try_into().expect("policy_head is always 32 bytes");
+
+    let checkpoint_seq = {
+        let mut inner = inner.lock().unwrap();
+        let counter =
+            inner.checkpoint_seqs.entry((group_id.clone(), req.device_id.clone())).or_insert(0);
+        *counter += 1;
+        *counter
+    };
+
+    let checkpoint = yadorilink_replica_domain::authorization_checkpoint::AuthorizationCheckpoint {
+        group_id: group_id.clone(),
+        device_id: req.device_id.clone(),
+        signing_key_fingerprint,
+        merkle_root,
+        leaf_count: req.leaf_count,
+        checkpoint_seq,
+        signer_key_id,
+        policy_epoch: current_epoch,
+        policy_seq: current_seq,
+        policy_head: policy_head_array,
+        issued_at_unix: unix_now() as u64,
+    };
+    let signature = yadorilink_replica_domain::authorization_checkpoint::sign_checkpoint(
+        &checkpoint,
+        &policy_service_key,
+    );
+
+    let response_body = serde_json::json!({
+        "groupId": checkpoint.group_id,
+        "deviceId": checkpoint.device_id,
+        "signingKeyFingerprintBase64": b64.encode(checkpoint.signing_key_fingerprint),
+        "merkleRootBase64": b64.encode(checkpoint.merkle_root),
+        "leafCount": checkpoint.leaf_count,
+        "checkpointSeq": checkpoint.checkpoint_seq,
+        "signerKeyIdBase64": b64.encode(checkpoint.signer_key_id),
+        "policyEpoch": checkpoint.policy_epoch,
+        "policySeq": checkpoint.policy_seq,
+        "policyHeadBase64": b64.encode(checkpoint.policy_head),
+        "issuedAtUnix": checkpoint.issued_at_unix,
+        "signatureBase64": b64.encode(signature),
+    });
+    respond_json(&mut stream, 200, "OK", &response_body.to_string()).await
 }
 
 /// Serves `POST /send/authorization` for real -- Track Send's rendezvous
@@ -823,11 +1370,12 @@ async fn serve_send_authorization_issue(
         .await;
     }
 
-    let (sender, receiver) = {
+    let (sender, receiver, receiver_substrate) = {
         let inner = inner.lock().unwrap();
         (
             inner.devices.get(&req.sender_device_id).cloned(),
             inner.devices.get(&req.receiver_device_id).cloned(),
+            substrate_json(&inner, &req.receiver_device_id),
         )
     };
     let (Some(_sender), Some(receiver)) = (sender.clone(), receiver) else {
@@ -870,10 +1418,7 @@ async fn serve_send_authorization_issue(
         "receiver": {
             "deviceId": req.receiver_device_id,
             "signingPublicKeyBase64": receiver.signing_public_key_b64,
-            "endpoints": receiver.endpoints
-                .iter()
-                .map(|address| serde_json::json!({ "address": address, "priority": 0 }))
-                .collect::<Vec<_>>(),
+            "substrateReachability": receiver_substrate,
         },
     })
     .to_string();
@@ -918,12 +1463,13 @@ async fn serve_send_authorization_consume(
             && inner.devices.contains_key(&req.receiver_device_id);
         if consumable {
             inner.send_authorizations.get_mut(&grant_id).unwrap().consumed = true;
-            inner.devices.get(&req.sender_device_id).cloned()
+            let substrate = substrate_json(&inner, &req.sender_device_id);
+            inner.devices.get(&req.sender_device_id).cloned().map(|device| (device, substrate))
         } else {
             None
         }
     };
-    let Some(sender) = sender else {
+    let Some((sender, sender_substrate)) = sender else {
         return respond_json(
             &mut stream,
             403,
@@ -937,10 +1483,7 @@ async fn serve_send_authorization_consume(
         "sender": {
             "deviceId": req.sender_device_id,
             "signingPublicKeyBase64": sender.signing_public_key_b64,
-            "endpoints": sender.endpoints
-                .iter()
-                .map(|address| serde_json::json!({ "address": address, "priority": 0 }))
-                .collect::<Vec<_>>(),
+            "substrateReachability": sender_substrate,
         },
     })
     .to_string();
@@ -968,14 +1511,21 @@ fn push_send_authorization(
         "nonce": nonce,
         "from": sender_device_id,
         "senderSigningPublicKeyBase64": sender.signing_public_key_b64,
-        "senderCandidates": sender.endpoints
-            .iter()
-            .map(|address| serde_json::json!({ "address": address, "priority": 0 }))
-            .collect::<Vec<_>>(),
+        "senderSubstrateReachability": substrate_json(&inner, sender_device_id),
         "expiresAt": expires_at,
     })
     .to_string();
     let _ = tx.send(frame);
+}
+
+/// A device's stored iroh substrate reachability as the Worker's send
+/// material carries it (`{direct, relays}`), or `null` when the device has
+/// not published one.
+fn substrate_json(inner: &Inner, device_id: &str) -> serde_json::Value {
+    match inner.substrate_reachability.get(device_id) {
+        Some((direct, relays)) => serde_json::json!({ "direct": direct, "relays": relays }),
+        None => serde_json::Value::Null,
+    }
 }
 
 /// A short, sufficiently-unique id for this fake's own grant/nonce values --
@@ -997,149 +1547,6 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
-/// Serves `POST /shares/groups/:groupId/relay/grant` for real, over the same
-/// HTTP connection `coordination_client::request_relay_grant` speaks --
-/// unlike every other route this fake answers, which is a blanket `204`
-/// the daemon treats as best-effort. This route exists specifically so
-/// `ProductionRelayGrantSource` can be exercised end-to-end (request ->
-/// real HTTP -> signed response -> `verify_relay_grant`) rather than only
-/// through `FakeGrantSource`'s synchronous in-process bypass of
-/// `issue_relay_grant`, which every other relay-scenario test uses.
-///
-/// The authorization performed here mirrors `coordination-worker`'s own
-/// `issueRelayGrant` (`src/relay/service.ts`): all three device ids must be
-/// registered and current members of `group_id`, the three ids must be
-/// pairwise distinct, and `relay_device_id` must have declared relay
-/// capability. `not_before_unix`/`expires_at_unix` use the same 30s
-/// clock-skew allowance and 60s TTL as the real Worker
-/// (`RELAY_GRANT_CLOCK_SKEW_ALLOWANCE_SECONDS`/`RELAY_GRANT_TTL_SECONDS` in
-/// `coordination-worker/src/relay/service.ts`), so a test exercising this
-/// path sees the same margins production grants actually carry.
-async fn serve_relay_grant(
-    mut stream: TcpStream,
-    head: &str,
-    leftover: Vec<u8>,
-    group_id: String,
-    inner: Arc<Mutex<Inner>>,
-) -> std::io::Result<()> {
-    let body = read_body(&mut stream, head, leftover).await?;
-
-    #[derive(serde::Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Req {
-        source_device_id: String,
-        relay_device_id: String,
-        destination_device_id: String,
-    }
-
-    let outcome = match serde_json::from_slice::<Req>(&body) {
-        Ok(req) => authorize_and_issue_relay_grant(
-            &inner,
-            &group_id,
-            &req.source_device_id,
-            &req.relay_device_id,
-            &req.destination_device_id,
-        ),
-        Err(_) => Err((400, "invalid request body".to_string())),
-    };
-
-    match outcome {
-        Ok(grant) => {
-            let b64 = base64::engine::general_purpose::STANDARD;
-            let body = serde_json::json!({
-                "grantId": grant.grant_id,
-                "version": grant.version,
-                "notBeforeUnix": grant.not_before_unix,
-                "expiresAtUnix": grant.expires_at_unix,
-                "maxSessionBytes": grant.max_session_bytes,
-                "signatureBase64": b64.encode(&grant.signature),
-            })
-            .to_string();
-            respond_json(&mut stream, 200, "OK", &body).await
-        }
-        Err((status, message)) => {
-            let body = serde_json::json!({ "error": message }).to_string();
-            let reason = match status {
-                400 => "Bad Request",
-                500 => "Internal Server Error",
-                _ => "Error",
-            };
-            respond_json(&mut stream, status, reason, &body).await
-        }
-    }
-}
-
-/// The synchronous half of [`serve_relay_grant`]: every authorization check
-/// plus signing, none of it requiring `.await` -- kept separate so the
-/// `Inner` mutex guard never needs to live across an await point.
-fn authorize_and_issue_relay_grant(
-    inner: &Arc<Mutex<Inner>>,
-    group_id: &str,
-    source_device_id: &str,
-    relay_device_id: &str,
-    destination_device_id: &str,
-) -> Result<yadorilink_daemon::relay_grant::RelayGrant, (u16, String)> {
-    if source_device_id == relay_device_id
-        || relay_device_id == destination_device_id
-        || source_device_id == destination_device_id
-    {
-        return Err((
-            400,
-            "sourceDeviceId, relayDeviceId, and destinationDeviceId must be pairwise distinct"
-                .to_string(),
-        ));
-    }
-
-    let guard = inner.lock().unwrap();
-    let signing_key = guard
-        .policy_service_key
-        .clone()
-        .ok_or((500, "no service signing key installed".to_string()))?;
-    let source = guard
-        .devices
-        .get(source_device_id)
-        .ok_or((400, "sourceDeviceId is not registered".to_string()))?;
-    if !source.groups.contains(group_id) {
-        return Err((400, "sourceDeviceId is not an active member of this group".to_string()));
-    }
-    let relay = guard
-        .devices
-        .get(relay_device_id)
-        .ok_or((400, "relayDeviceId is not registered".to_string()))?;
-    if !relay.groups.contains(group_id) {
-        return Err((400, "relayDeviceId is not an active member of this group".to_string()));
-    }
-    if !relay.relay_capable {
-        return Err((400, "relayDeviceId has not declared relay capability".to_string()));
-    }
-    let destination = guard
-        .devices
-        .get(destination_device_id)
-        .ok_or((400, "destinationDeviceId is not registered".to_string()))?;
-    if !destination.groups.contains(group_id) {
-        return Err((400, "destinationDeviceId is not an active member of this group".to_string()));
-    }
-    drop(guard);
-
-    let issued_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-    let now = issued_at.as_secs() as i64;
-    let grant_id =
-        format!("grant-{source_device_id}-{destination_device_id}-{}", issued_at.as_nanos());
-    let grant = yadorilink_daemon::relay_grant::RelayGrant {
-        version: 1,
-        grant_id,
-        group_id: group_id.to_string(),
-        source_device_id: source_device_id.to_string(),
-        relay_device_id: relay_device_id.to_string(),
-        destination_device_id: destination_device_id.to_string(),
-        not_before_unix: now - 30,
-        expires_at_unix: now + 60,
-        max_session_bytes: None,
-        signature: Vec::new(),
-    };
-    Ok(yadorilink_daemon::relay_grant::sign_relay_grant(grant, &signing_key))
-}
-
 async fn respond_json(
     stream: &mut TcpStream,
     status: u16,
@@ -1156,8 +1563,7 @@ async fn respond_json(
 }
 
 /// Like `drain_body`, but returns the collected bytes instead of discarding
-/// them -- `serve_relay_grant` needs the request body itself, unlike every
-/// other route this fake answers.
+/// them -- several routes this fake answers need the request body itself.
 async fn read_body(
     stream: &mut TcpStream,
     head: &str,
@@ -1265,9 +1671,21 @@ async fn serve_netmap_subscription(
         // WebSocket `policyWatermarks` map starting empty for a new socket
         // (`durable-objects/netmap-device.ts`'s `WeakMap<WebSocket, ...>`),
         // so this device's very first frame on a (re)connect always carries
-        // each shared group's policy chain from the beginning, exactly as
-        // `verify_group_policy_log_with_base` requires when this device has
-        // no retained base state for that group yet.
+        // each shared group's policy chain from the beginning.
+        //
+        // Note what this does NOT mean: it is emphatically not "the device
+        // has no retained base state for this group". The plane's watermark
+        // is per CONNECTION; the daemon's cached `GroupPolicyState` is
+        // persistent and connection-independent, and survives every
+        // reconnect. So on an ordinary reconnect the daemon receives a
+        // from-record-1 resend while still holding a fully-verified base at
+        // some higher seq -- the exact combination `peer_orchestrator::
+        // record_group_policy_states` has to recognize as a resend rather
+        // than feed to `verify_group_policy_log_with_base` (which has zero
+        // prefix tolerance) as if it were an incremental tail. An earlier
+        // version of this comment asserted the opposite premise, which is
+        // why no test in this suite caught that; `policy_reconnect_resend.rs`
+        // now covers it directly.
         guard.policy_send_watermarks.remove(&device_id);
         netmap_frame_for(&mut guard, &device_id)
     };

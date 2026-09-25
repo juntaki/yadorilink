@@ -1,9 +1,8 @@
-//! M5-A Pass 6: safety-critical storage operations under faults, proven on
+//! Safety-critical storage operations under faults, proven on
 //! the real canonical N/M/W topology (real `peer_orchestrator`, real
 //! transport, real control socket) composed with `storage_mode_
 //! orchestration.rs`'s own established `wiremock` stand-in for
-//! coordination-worker -- per this pass's own investigation (Phase 6.1):
-//! the role-level demotion/unlink handoff gate in `replica_role_service.rs`
+//! coordination-worker. The role-level demotion/unlink handoff gate in `replica_role_service.rs`
 //! is the real, CURRENTLY-SHIPPED backend-authoritative safety operation
 //! ("Unsafe eviction/local-copy removal is backend-gated"). The PER-FILE
 //! block-reclaim custody path (`P2pCustodyConfirmer::confirms_present`,
@@ -60,7 +59,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use support::fake_coordination::FakeCoordination;
-use support::topology::{stand_up_canonical_topology, TopologyNode};
+use support::fake_coordination::HandoffRoute;
+use support::topology::{stand_up_canonical_topology_with_m_http_coordination, TopologyNode};
 use support::wait_until_with_context;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -81,7 +81,7 @@ use yadorilink_replica_domain::session_state::MaterializationPolicy;
 /// mistakenly granted one). Both paths converge on the SAME observable
 /// local-lease-state/`  /release`-call-count signals the earlier
 /// assertions already check, so distinguishing them needs the log line
-/// each one emits at its own distinct call site -- a real Codex review
+/// each one emits at its own distinct call site -- a real review
 /// finding: without this, a broken/missing target-side check could still
 /// pass this test via the source-side backstop, silently proving the
 /// wrong guard.
@@ -115,7 +115,7 @@ fn init_tracing() -> Arc<std::sync::Mutex<Vec<u8>>> {
     // `version_change_during_lease_issuance_refuses_the_demotion`'s own
     // proof (the captured log-line assertion, see `CapturingWriter`'s doc
     // comment) depends on M's `tracing::info!` event actually being
-    // emitted -- a Codex review finding that an ambient `RUST_LOG=warn`/
+    // emitted -- a review finding that an ambient `RUST_LOG=warn`/
     // `error`/`off` in the environment (e.g. a CI default) would silently
     // filter that event out and fail the assertion for a reason that has
     // nothing to do with whether the real guard fired. `add_directive`
@@ -170,7 +170,10 @@ async fn promote_to_eager_via_real_api(node: &TopologyNode, group_id: &str, serv
         .respond_with(ResponseTemplate::new(204))
         .mount(server)
         .await;
-    node.state.set_coordination_client_config(server.uri(), "test-access-token".to_string());
+    node.state.set_coordination_client_config(
+        server.uri(),
+        yadorilink_fapi_client::test_support::offline_auth(),
+    );
     let handle = support::control_socket_client::start(node.state.clone()).await;
     let resp = support::control_socket_client::send(
         &handle,
@@ -213,7 +216,7 @@ async fn hydrate_with_retries(state: &Arc<DaemonState>, group_id: &str, path: &s
     }
 }
 
-/// M5-A Pass 6 scenario A: a safe demotion on the real canonical topology.
+/// A safe demotion on the real canonical topology.
 /// M genuinely promotes itself to Eager (real control-socket request), N
 /// (the topology's own eager anchor) then demotes to on-demand once M is a
 /// REAL, content-complete full replica -- proven via N's own real
@@ -234,9 +237,16 @@ async fn safe_demotion_succeeds_when_a_real_peer_durably_holds_everything() {
     fake.enable_signed_policy();
     let group_id = "topology-storage-safety-group";
 
-    let (n, m, _w, handles) = stand_up_canonical_topology(&fake, group_id).await;
-
+    // M's own outbound coordination calls (its promotion, and the lease it
+    // mints as the handoff target) are scripted and counted here; N stays on
+    // `FakeCoordination`, which serves the stateful `authorization-checkpoint`
+    // N needs to author content at all. See
+    // `stand_up_canonical_topology_with_m_http_coordination`.
     let server = MockServer::start().await;
+    let (n, m, _w, handles) =
+        stand_up_canonical_topology_with_m_http_coordination(&fake, group_id, Some(&server.uri()))
+            .await;
+
     promote_to_eager_via_real_api(&m, group_id, &server).await;
 
     // Real content, real convergence -- M is now genuinely Eager, so its
@@ -260,7 +270,7 @@ async fn safe_demotion_succeeds_when_a_real_peer_durably_holds_everything() {
     // uses for N itself, not a raw DB mutation.
     fake.set_full_replica(&m.device_id, group_id, true);
     wait_until_with_context(
-        || n.state.peer_group_is_full_replica(&m.device_id, group_id),
+        || n.state.authority.peer_group_is_full_replica(&m.device_id, group_id),
         Duration::from_secs(30),
         || "N never saw M's full-replica declaration propagate over the real netmap".to_string(),
     )
@@ -280,21 +290,24 @@ async fn safe_demotion_succeeds_when_a_real_peer_durably_holds_everything() {
         })
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path(format!("/shares/groups/{group_id}/handoff/commit")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+    // N's commit goes to `FakeCoordination`, not the wiremock: N must keep
+    // the fake as its coordination plane for the stateful
+    // `authorization-checkpoint` route, so the fake is where its role-loss
+    // commit lands and is counted.
+    fake.set_handoff_commit_response(
+        group_id,
+        200,
+        serde_json::json!({
             "targetDeviceId": m.device_id,
             "membershipGeneration": 1,
             "leaseId": "lease-from-m",
-        })))
-        .mount(&server)
-        .await;
-    n.state.set_coordination_client_config(server.uri(), "test-access-token-n".to_string());
+        }),
+    );
 
     // N is EAGER (not on-demand), but the demotion path's own
     // placeholder-pipeline-connected check gates on-demand readiness for
     // the DEVICE ASKING to become on-demand -- test-only override for the
-    // (platform-native, out of scope for M5-A) on-demand pipeline probe,
+    // (platform-native, out of scope here) on-demand pipeline probe,
     // matching `storage_mode_orchestration.rs`'s own established use of
     // this exact override for its own demoting device.
     n.state.set_test_placeholder_pipeline_connected(true);
@@ -329,13 +342,12 @@ async fn safe_demotion_succeeds_when_a_real_peer_durably_holds_everything() {
         "N must have actually requested a lease from M over the real peer wire -- proof the \
          readiness gate was genuinely exercised, not bypassed"
     );
-    let commit_requests = server.received_requests().await.unwrap();
-    let commit_body: serde_json::Value = commit_requests
-        .iter()
-        .find(|r| r.url.path().ends_with("/handoff/commit"))
-        .expect("the role-loss commit must have been sent")
-        .body_json()
-        .unwrap();
+    let commit_body: serde_json::Value = fake
+        .handoff_requests()
+        .into_iter()
+        .find(|r| r.route == HandoffRoute::Commit)
+        .map(|r| serde_json::from_str(&r.body).expect("the commit body is JSON"))
+        .expect("the role-loss commit must have been sent");
     assert_eq!(
         commit_body["targetDeviceId"], m.device_id,
         "the commit must name M -- the SAME peer that was actually confirmed ready -- as the \
@@ -347,7 +359,7 @@ async fn safe_demotion_succeeds_when_a_real_peer_durably_holds_everything() {
          mismatched one"
     );
     assert_eq!(
-        request_count(&server, "POST", "/handoff/commit").await,
+        fake.handoff_request_count(HandoffRoute::Commit),
         1,
         "a demotion's single coordination-plane write must be the role-loss commit"
     );
@@ -367,7 +379,7 @@ async fn safe_demotion_succeeds_when_a_real_peer_durably_holds_everything() {
     handles.shutdown();
 }
 
-/// M5-A Pass 6 scenario C (exact-version race): M genuinely promotes to
+/// Exact-version race: M genuinely promotes to
 /// Eager and holds the baseline content, then a NEW version lands on M --
 /// injected via a REAL `std::fs::write` on M, executed synchronously
 /// inside the mocked Worker's `/handoff/lease` responder closure, i.e.
@@ -387,9 +399,15 @@ async fn version_change_during_lease_issuance_refuses_the_demotion() {
     fake.enable_signed_policy();
     let group_id = "topology-storage-safety-race-group";
 
-    let (n, m, _w, handles) = stand_up_canonical_topology(&fake, group_id).await;
-
+    // M on the wiremock (its promotion and the lease it mints, both scripted
+    // and counted), N on `FakeCoordination` for the stateful
+    // `authorization-checkpoint` it needs to author content. See
+    // `stand_up_canonical_topology_with_m_http_coordination`.
     let server = MockServer::start().await;
+    let (n, m, _w, handles) =
+        stand_up_canonical_topology_with_m_http_coordination(&fake, group_id, Some(&server.uri()))
+            .await;
+
     promote_to_eager_via_real_api(&m, group_id, &server).await;
 
     let target_path = n.root.path().join("only.bin");
@@ -406,7 +424,7 @@ async fn version_change_during_lease_issuance_refuses_the_demotion() {
 
     fake.set_full_replica(&m.device_id, group_id, true);
     wait_until_with_context(
-        || n.state.peer_group_is_full_replica(&m.device_id, group_id),
+        || n.state.authority.peer_group_is_full_replica(&m.device_id, group_id),
         Duration::from_secs(30),
         || "N never saw M's full-replica declaration propagate over the real netmap".to_string(),
     )
@@ -429,8 +447,7 @@ async fn version_change_during_lease_issuance_refuses_the_demotion() {
     // until M's own real filesystem watcher has actually indexed the
     // write into the DAG, not merely written the bytes to disk. Bounded
     // well UNDER the P2P `HandoffLeaseRequest`'s own 10s timeout
-    // (`peer_session.rs`'s `request_handoff_lease_from_peer`) -- a
-    // Codex-review finding on an earlier version of this test: a 30s
+    // (`peer_session.rs`'s `request_handoff_lease_from_peer`): a 30s
     // bound here could let N's OWN P2P request time out first, producing
     // the exact same "could not obtain a lease" refusal for the WRONG
     // reason (a timeout, not the digest-mismatch guard this test exists
@@ -484,20 +501,20 @@ async fn version_change_during_lease_issuance_refuses_the_demotion() {
         .respond_with(ResponseTemplate::new(204))
         .mount(&server)
         .await;
-    // A commit mock IS mounted (so a wrongly-issued commit would be
-    // recorded and this test's own assertion below would catch it), but a
-    // correct implementation must never reach it: the lease is declined
-    // before N ever attempts the commit.
-    Mock::given(method("POST"))
-        .and(path(format!("/shares/groups/{group_id}/handoff/commit")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "targetDeviceId": m.device_id,
-            "membershipGeneration": 1,
-            "leaseId": "lease-from-m-mid-race",
-        })))
-        .mount(&server)
-        .await;
-    n.state.set_coordination_client_config(server.uri(), "test-access-token-n".to_string());
+    // No commit mock is mounted here, deliberately. The commit is N's call,
+    // and N's coordination plane is the fake, not this wiremock -- so a mock
+    // here would record nothing no matter what N did, and an assertion
+    // reading its count would be vacuous. The fake records every handoff
+    // request before consulting any configured response, so leaving the
+    // commit route unconfigured there still catches a wrongly-issued one;
+    // that is what the assertion at the end of this test reads.
+    // N deliberately stays on `FakeCoordination` (see the topology helper):
+    // a `set_coordination_client_config` here would be a guaranteed no-op,
+    // because `spawn_orchestrator` already claimed N's `OnceLock` with the
+    // fake's address. So N's commit -- if the guard under test wrongly let
+    // one through -- lands on the fake, and that is where it must be
+    // counted. Counting it on the wiremock instead would be vacuous: zero
+    // there is guaranteed whether or not N commits.
 
     n.state.set_test_placeholder_pipeline_connected(true);
     let handle = support::control_socket_client::start(n.state.clone()).await;
@@ -524,7 +541,7 @@ async fn version_change_during_lease_issuance_refuses_the_demotion() {
     // converge on the identical local-lease-state/`/release`-call
     // observables the assertions below check, so a broken/missing
     // target-side check could otherwise still pass this whole test via
-    // the source-side backstop alone -- a real Codex review finding this
+    // the source-side backstop alone -- a real review finding this
     // log-line assertion closes.
     assert!(
         captured_logs.contains(
@@ -563,10 +580,13 @@ async fn version_change_during_lease_issuance_refuses_the_demotion() {
          crash-safe, TOCTOU-safe direction this whole gate exists to guarantee"
     );
     assert_eq!(
-        request_count(&server, "POST", "/handoff/commit").await,
+        fake.handoff_request_count(HandoffRoute::Commit),
         0,
         "the digest-mismatched lease must never reach a role-loss commit -- old-version \
-         readiness must not authorize a commit that would cover the NEW version too"
+         readiness must not authorize a commit that would cover the NEW version too. Counted \
+         on the fake, the plane N actually uses: the fake records every handoff request \
+         BEFORE consulting any configured response, so a wrongly-sent commit is caught here \
+         even though this scenario never configures a commit response at all"
     );
     assert_eq!(
         request_count(&server, "POST", "/handoff/lease").await,

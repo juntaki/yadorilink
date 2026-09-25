@@ -1,4 +1,12 @@
 #!/bin/bash
+# NOT THE SHIPPING APP. The app that ships is project.yml's `YadoriLink`
+# target (the SwiftUI menu bar app, macOS 14), built by
+# installer/macos/build-pkg.sh. This script builds the older AppKit host
+# (HostApp/main.swift) with only the FinderSync extension, as a
+# swiftc-only compile check of the extension and DomainRegistration.swift
+# (CI code scanning uses it). Its output uses the same bundle id,
+# com.juntaki.yadorilink, so do not install it next to YadoriLink.app.
+#
 # This script builds the Rust FFI core, the
 # FinderSync extension, and the host app, then assembles and ad-hoc signs
 # the app bundle — entirely from the command line, without an.xcodeproj.
@@ -48,9 +56,8 @@ SWIFT_TARGET="arm64-apple-macos11"
 # Host app only, not the extension: DomainRegistration.swift's domain-
 # removal reconciliation calls NSFileProviderManager.remove(_:mode:
 # completionHandler:), API_AVAILABLE(macos(12.0)) per FileProvider.
-# framework's own NSFileProviderDefines.h -- matches project.yml's own
-# YadoriLinkFinderSyncHost target override (MACOSX_DEPLOYMENT_TARGET
-# "12.0" against the project-wide 11.0 base).
+# framework's own NSFileProviderDefines.h. (project.yml builds everything
+# for macOS 14.0; this legacy path keeps its own older minimums.)
 HOST_SWIFT_TARGET="arm64-apple-macos12"
 
 HOST_APP_ID="com.juntaki.yadorilink"
@@ -121,8 +128,8 @@ cp "$EXT_DIR/Info.plist" "$APPEX_BUNDLE/Contents/Info.plist"
 # (yadorilink_fp_list_on_demand_folders/yadorilink_fp_free_string) to
 # discover which OnDemand folder groups to register as File Provider
 # domains, and FileProvider.framework itself for NSFileProviderManager/
-# NSFileProviderDomain -- see project.yml's own YadoriLinkFinderSyncHost
-# target for the reference build these flags mirror.
+# NSFileProviderDomain -- see project.yml's `YadoriLink` target for the
+# reference build these flags mirror.
 echo "-- building yadorilink-fileprovider-core (release, $RUST_TARGET) --"
 ( cd "$FP_CORE_DIR" && cargo build --release --target "$RUST_TARGET" )
 FP_CORE_LIB_DIR="$FP_CORE_DIR/target/$RUST_TARGET/release"

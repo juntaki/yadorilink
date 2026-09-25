@@ -5,14 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 # See yadorilink-local-storage/Cargo.toml's identical section for why.
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(madsim)"] }
-
 [features]
-# Exposes test-only helpers (raw pool access for fixtures that need two
-# concurrently-held connections, or direct schema corruption) to OTHER
-# crates' test builds -- mirrors yadorilink-sync-core's own identical
-# test-support feature and the reasoning documented there.
 test-support = []
 
 [dependencies]
@@ -24,3 +17,6 @@ r2d2_sqlite = "0.24"
 
 [dev-dependencies]
 tempfile = "3"
+
+[lints]
+workspace = true

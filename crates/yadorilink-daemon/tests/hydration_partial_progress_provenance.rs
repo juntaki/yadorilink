@@ -22,6 +22,8 @@
 //! `SlowBlockStore`) instead of racing real transfer speed with a poll
 //! loop.
 
+mod support;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -30,16 +32,13 @@ use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::hydration;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_local_storage::{
-    BlockStore, ContentHash, FsBlockStore, GcReport, StorageError, DEFAULT_BLOCK_SIZE,
+    BlockStore, ContentHash, GcReport, SegmentBlockStore, StorageError, DEFAULT_BLOCK_SIZE,
 };
 use yadorilink_peer_session::peer_session::PeerSyncSession;
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
 use yadorilink_replica_domain::session_state::MaterializationState;
-use yadorilink_transport::{
-    ConnectRole, DeviceSigningKeyPair, QuicPeerChannel, QuicPeerEndpoint, TransportHub,
-};
 
-/// Wraps a real `FsBlockStore` and adds a fixed delay before every `get` --
+/// Wraps a real `SegmentBlockStore` and adds a fixed delay before every `get` --
 /// used to make one test device's block-serve responses arrive well past
 /// this suite's outer hydrate deadline (never within `PER_BLOCK_FETCH_
 /// TIMEOUT` either), so a fetch through it stays genuinely "still trying"
@@ -51,7 +50,7 @@ use yadorilink_transport::{
 /// exhausted almost immediately -- not the "connection genuinely still
 /// alive but stalled" condition this regression needs).
 struct SlowBlockStore {
-    inner: Arc<FsBlockStore>,
+    inner: Arc<SegmentBlockStore>,
     delay: Duration,
 }
 
@@ -90,30 +89,6 @@ impl BlockStore for SlowBlockStore {
 const GROUP: &str = "shared";
 const PATH: &str = "big.bin";
 
-async fn connect_pair() -> (Arc<QuicPeerChannel>, Arc<QuicPeerChannel>) {
-    let socket_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let socket_b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let addr_b = socket_b.local_addr().unwrap();
-    let key_a = DeviceSigningKeyPair::generate();
-    let key_b = DeviceSigningKeyPair::generate();
-    let public_a = key_a.public_bytes();
-    let public_b = key_b.public_bytes();
-    let endpoint_a = QuicPeerEndpoint::new(TransportHub::from_socket(socket_a), key_a).unwrap();
-    let endpoint_b = QuicPeerEndpoint::new(TransportHub::from_socket(socket_b), key_b).unwrap();
-    endpoint_a.authorize(public_b);
-    endpoint_b.authorize(public_a);
-    let accepting = {
-        let endpoint_b = endpoint_b.clone();
-        tokio::spawn(async move { endpoint_b.accept(public_a).await })
-    };
-    let dialed = endpoint_a.connect(addr_b, public_b).await.unwrap();
-    let accepted = accepting.await.unwrap().unwrap();
-    (
-        QuicPeerChannel::new(dialed, ConnectRole::Dial),
-        QuicPeerChannel::new(accepted, ConnectRole::Accept),
-    )
-}
-
 struct TestDevice {
     device_id: String,
     state: Arc<DaemonState>,
@@ -124,11 +99,11 @@ struct TestDevice {
 
 fn new_device(device_id: &str) -> TestDevice {
     let store_root = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsBlockStore::new(store_root.path()).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(store_root.path()).unwrap());
     new_device_with_store(device_id, store_root, store)
 }
 
-/// Like [`new_device`], but lets the caller wrap the real `FsBlockStore` in
+/// Like [`new_device`], but lets the caller wrap the real `SegmentBlockStore` in
 /// a decorator (e.g. [`SlowBlockStore`]) before it becomes this device's
 /// `state.block_store` -- the same store `BlockServeEngine` reads from to
 /// answer an incoming peer's block requests, so wrapping it here is what
@@ -152,7 +127,7 @@ fn new_device_with_store(
 
 fn chunk_content(content: &[u8]) -> (Vec<BlockInfo>, HashMap<Vec<u8>, Vec<u8>>) {
     let dir = tempfile::tempdir().unwrap();
-    let store = FsBlockStore::new(dir.path()).unwrap();
+    let store = SegmentBlockStore::new(dir.path()).unwrap();
     let src = dir.path().join("src.bin");
     std::fs::write(&src, content).unwrap();
     let blocks = yadorilink_local_storage::chunk_file(&store, &src).unwrap();
@@ -166,6 +141,97 @@ fn chunk_content(content: &[u8]) -> (Vec<BlockInfo>, HashMap<Vec<u8>, Vec<u8>>) 
 
 /// Same shape as `multi_peer_hydration.rs`'s own `seed_placeholder` — see
 /// that file's copy for why each of these steps is required.
+/// Seeds a peer that will ANSWER block requests: [`seed_placeholder`] plus
+/// a real signed local Change for the file, driven to Published.
+///
+/// Block-serving authorization serves only blocks backed by a Published
+/// Change (`published_group_file_version_references_block` joins against
+/// `change_authorization`), which a bare `upsert_file` cannot satisfy. A
+/// peer seeded the raw way holds the bytes and still refuses every request
+/// with `reason="not_referenced"` -- measured here before this existed:
+///
+/// ```text
+/// live_record_exists=true  live_record_references_hash=true
+/// group_has_block_provenance=Ok(true)  store_get_ok=true
+/// dag_group_file_version_references_block=Ok(false)
+/// ```
+///
+/// `multi_peer_hydration.rs` carries the twin of this helper; each
+/// full-stack test file in this crate keeps its own scaffolding by
+/// established convention rather than sharing it, and the two files' device
+/// fixtures differ (this one wraps a `SlowBlockStore`).
+///
+/// The physical holdings stay exactly as the caller asked: the Published
+/// version references every block, while only `owned_blocks` are stored, so
+/// "authorized to serve, does not hold it" remains expressible.
+async fn seed_published_serving_placeholder(
+    device: &TestDevice,
+    blocks: &[BlockInfo],
+    total_size: u64,
+    owned_blocks: &[BlockInfo],
+    data_by_hash: &HashMap<Vec<u8>, Vec<u8>>,
+) {
+    seed_placeholder(device, blocks, total_size, owned_blocks, data_by_hash);
+    let version = yadorilink_replica_domain::file::FileVersion::new(
+        blocks
+            .iter()
+            .map(|b| yadorilink_replica_domain::file::VersionBlock {
+                hash: yadorilink_replica_domain::ids::BlockHash(b.hash.clone()),
+                size: b.size,
+            })
+            .collect(),
+        total_size,
+        yadorilink_replica_domain::file::FileMeta {
+            mtime_unix_nanos: 0,
+            unix_mode: None,
+            symlink_target: None,
+            record_kind: yadorilink_replica_domain::file::RecordKind::File,
+            xattrs: Vec::new(),
+        },
+    );
+    let record = FileRecord {
+        path: PATH.to_string(),
+        size: total_size,
+        mtime_unix_nanos: 0,
+        blocks: blocks.to_vec(),
+        deleted: false,
+    };
+    let signing_key = device
+        .state
+        .device_signing_key()
+        .expect("the checkpoint authority assigns every device a signing key");
+    let emitter = yadorilink_sync_sqlite::dag_store::ChangeEmitter::new(
+        device.device_id.clone(),
+        signing_key,
+    );
+    device
+        .state
+        .replica_coordinator
+        .upsert_file_emitting_change(
+            GROUP,
+            &record,
+            &device.device_id,
+            yadorilink_replica_domain::session_state::ChangeContent {
+                ops: vec![yadorilink_replica_domain::change::Op::Put {
+                    path: yadorilink_replica_domain::ids::SyncPath(PATH.to_string()),
+                    version: version.version_hash,
+                    origin: yadorilink_replica_domain::change::PutOrigin::Direct,
+                }],
+                versions: std::slice::from_ref(&version),
+            },
+            None,
+            None,
+            yadorilink_daemon::replica_coordinator::ReplicaChangeEmission {
+                emitter: &emitter,
+                permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            },
+        )
+        .unwrap();
+    // Pending is not servable, and this fixture runs neither of production's
+    // flush triggers (a new local mutation's broadcast, or a reconnect).
+    device.state.flush_pending_checkpoint_for_group_for_test(GROUP).await;
+}
+
 fn seed_placeholder(
     device: &TestDevice,
     blocks: &[BlockInfo],
@@ -246,44 +312,80 @@ fn give_blocks(
     }
 }
 
-/// Like `multi_peer_hydration.rs`'s `connect_as_peer`, but returns
-/// `hydrating`'s own channel to `peer` so the test can drop it later to
-/// deterministically sever the connection mid-transfer.
-async fn connect_as_peer_returning_channel(
-    hydrating: &TestDevice,
-    peer: &TestDevice,
-) -> Arc<QuicPeerChannel> {
-    let (channel_hydrating, channel_peer) = connect_pair().await;
-    let session_to_peer = PeerSyncSession::new(
-        channel_hydrating.clone(),
-        hydrating.device_id.clone(),
-        peer.device_id.clone(),
-        hydrating.state.replica_coordinator.clone(),
+/// Like `multi_peer_hydration.rs`'s `connect_as_peer`.
+async fn connect_as_peer(hydrating: &TestDevice, peer: &TestDevice) {
+    let book = yadorilink_lane_ports::testing::TestAddressBook::new();
+    let node_hydrating =
+        yadorilink_lane_ports::testing::TestPeerNode::start(&hydrating.device_id, book.clone())
+            .await;
+    let node_peer =
+        yadorilink_lane_ports::testing::TestPeerNode::start(&peer.device_id, book).await;
+    let transports_to_peer = node_hydrating.transports_for(&peer.device_id);
+    let transports_from_hydrating = node_peer.transports_for(&hydrating.device_id);
+    let hydrating_peer_store =
         Arc::new(yadorilink_daemon::adapters::block_store_ports::BlockStorePortsAdapter::new(
             hydrating.state.block_store.clone(),
-        )),
+        ));
+    let replica_engine_to_peer =
+        yadorilink_daemon::replica_coordinator::engine_ports::build_peer_replica_engine(
+            &hydrating.state.replica_coordinator,
+            hydrating_peer_store.clone(),
+        );
+    let session_to_peer = PeerSyncSession::over_substrate(
+        hydrating.device_id.clone(),
+        peer.device_id.clone(),
+        hydrating.state.replica_coordinator.clone()
+            as Arc<dyn yadorilink_peer_session::ports::BlockServeAuthorizationPort>,
+        replica_engine_to_peer,
+        hydrating_peer_store,
         vec![GROUP.to_string()],
         HashMap::from([(GROUP.to_string(), hydrating.root.path().to_path_buf())]),
+        yadorilink_peer_session::ports::SessionTransports {
+            blocks: transports_to_peer.clone(),
+            service: transports_to_peer.clone(),
+            prepared_snapshots: Arc::new(yadorilink_lane_ports::PreparedSnapshots::new()),
+            snapshot_fetch: transports_to_peer,
+        },
+        None,
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::test_permissive(),
     );
     session_to_peer.set_block_serve_engine(hydrating.state.block_serve_engine.clone());
-    tokio::spawn(session_to_peer.clone().run());
-    hydrating.state.peers.register_session(peer.device_id.clone(), session_to_peer);
-
-    let session_from_hydrating = PeerSyncSession::new(
-        channel_peer,
+    node_hydrating.serve_with(&peer.device_id, session_to_peer.clone());
+    hydrating.state.peers.register_session(
         peer.device_id.clone(),
-        hydrating.device_id.clone(),
-        peer.state.replica_coordinator.clone(),
+        session_to_peer,
+        hydrating.state.local_convergence(),
+    );
+
+    let peer_peer_store =
         Arc::new(yadorilink_daemon::adapters::block_store_ports::BlockStorePortsAdapter::new(
             peer.state.block_store.clone(),
-        )),
+        ));
+    let replica_engine_from_hydrating =
+        yadorilink_daemon::replica_coordinator::engine_ports::build_peer_replica_engine(
+            &peer.state.replica_coordinator,
+            peer_peer_store.clone(),
+        );
+    let session_from_hydrating = PeerSyncSession::over_substrate(
+        peer.device_id.clone(),
+        hydrating.device_id.clone(),
+        peer.state.replica_coordinator.clone()
+            as Arc<dyn yadorilink_peer_session::ports::BlockServeAuthorizationPort>,
+        replica_engine_from_hydrating,
+        peer_peer_store,
         vec![GROUP.to_string()],
         HashMap::from([(GROUP.to_string(), peer.root.path().to_path_buf())]),
+        yadorilink_peer_session::ports::SessionTransports {
+            blocks: transports_from_hydrating.clone(),
+            service: transports_from_hydrating.clone(),
+            prepared_snapshots: Arc::new(yadorilink_lane_ports::PreparedSnapshots::new()),
+            snapshot_fetch: transports_from_hydrating,
+        },
+        None,
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::test_permissive(),
     );
     session_from_hydrating.set_block_serve_engine(peer.state.block_serve_engine.clone());
-    tokio::spawn(session_from_hydrating.run());
-
-    channel_hydrating
+    node_peer.serve_with(&hydrating.device_id, session_from_hydrating.clone());
 }
 
 fn ramp_content(len: usize) -> Vec<u8> {
@@ -346,18 +448,46 @@ async fn partial_hydration_progress_survives_an_outer_timeout() {
     let fast = new_device("device-fast");
     let slow = {
         let store_root = tempfile::tempdir().unwrap();
-        let inner = Arc::new(FsBlockStore::new(store_root.path()).unwrap());
+        let inner = Arc::new(SegmentBlockStore::new(store_root.path()).unwrap());
         let store: Arc<dyn BlockStore + Send + Sync> =
             Arc::new(SlowBlockStore { inner, delay: SLOW_DELAY });
         new_device_with_store("device-slow", store_root, store)
     };
     let target = new_device("device-target");
-    seed_placeholder(&fast, &blocks, content.len() as u64, owned_prefix, &data_by_hash);
-    seed_placeholder(&slow, &blocks, content.len() as u64, &blocks[2..], &data_by_hash);
+    // One authority for the whole test: `coordination_client_config` is a
+    // `OnceLock`, so devices cannot be reassigned to another fake later.
+    let _authority = support::shared_checkpoint_authority(
+        &[
+            ("device-fast", &fast.state),
+            ("device-slow", &slow.state),
+            ("device-target", &target.state),
+        ],
+        &[GROUP.to_string()],
+    )
+    .await;
+
+    // `fast` and `slow` answer block requests, so their holdings must be
+    // backed by a Published Change. `target` only requests.
+    seed_published_serving_placeholder(
+        &fast,
+        &blocks,
+        content.len() as u64,
+        owned_prefix,
+        &data_by_hash,
+    )
+    .await;
+    seed_published_serving_placeholder(
+        &slow,
+        &blocks,
+        content.len() as u64,
+        &blocks[2..],
+        &data_by_hash,
+    )
+    .await;
     seed_placeholder(&target, &blocks, content.len() as u64, &[], &data_by_hash);
 
-    connect_as_peer_returning_channel(&target, &fast).await;
-    connect_as_peer_returning_channel(&target, &slow).await;
+    connect_as_peer(&target, &fast).await;
+    connect_as_peer(&target, &slow).await;
 
     let result = hydration::hydrate_with_timeout(&target.state, GROUP, PATH, OUTER_TIMEOUT).await;
     assert!(
@@ -396,7 +526,7 @@ async fn partial_hydration_progress_survives_an_outer_timeout() {
     // still converges to byte-exact content, proving the failure was a
     // clean, recoverable rejection.
     give_blocks(&fast, &blocks, &data_by_hash);
-    connect_as_peer_returning_channel(&target, &fast).await;
+    connect_as_peer(&target, &fast).await;
     hydration::hydrate(&target.state, GROUP, PATH).await.unwrap();
     let reconstructed = std::fs::read(target.root.path().join(PATH)).unwrap();
     assert_eq!(

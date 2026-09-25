@@ -60,9 +60,9 @@ fn endpoints_for(frame: &serde_json::Value, peer_id: &str) -> Vec<String> {
 #[tokio::test]
 async fn a_viewer_specific_override_does_not_leak_to_other_viewers() {
     let fake = FakeCoordination::start().await;
-    fake.register_device("device-a", key(1), key(1), "real-a:1".into(), &[GROUP]);
-    fake.register_device("device-b", key(2), key(2), "real-b:1".into(), &[GROUP]);
-    fake.register_device("device-c", key(3), key(3), "real-c:1".into(), &[GROUP]);
+    fake.register_device("device-a", key(1), "real-a:1".into(), &[GROUP]);
+    fake.register_device("device-b", key(2), "real-b:1".into(), &[GROUP]);
+    fake.register_device("device-c", key(3), "real-c:1".into(), &[GROUP]);
 
     fake.set_peer_view_endpoints("device-a", "device-c", vec!["127.0.0.1:1".into()]);
 
@@ -84,8 +84,8 @@ async fn a_viewer_specific_override_does_not_leak_to_other_viewers() {
 #[tokio::test]
 async fn clearing_an_override_reverts_to_the_real_endpoint() {
     let fake = FakeCoordination::start().await;
-    fake.register_device("device-a", key(1), key(1), "real-a:1".into(), &[GROUP]);
-    fake.register_device("device-c", key(3), key(3), "real-c:1".into(), &[GROUP]);
+    fake.register_device("device-a", key(1), "real-a:1".into(), &[GROUP]);
+    fake.register_device("device-c", key(3), "real-c:1".into(), &[GROUP]);
 
     fake.set_peer_view_endpoints("device-a", "device-c", vec!["127.0.0.1:1".into()]);
     assert_eq!(
@@ -104,15 +104,15 @@ async fn clearing_an_override_reverts_to_the_real_endpoint() {
 #[tokio::test]
 async fn an_override_survives_the_target_device_re_registering() {
     let fake = FakeCoordination::start().await;
-    fake.register_device("device-a", key(1), key(1), "real-a:1".into(), &[GROUP]);
-    fake.register_device("device-c", key(3), key(3), "real-c:1".into(), &[GROUP]);
+    fake.register_device("device-a", key(1), "real-a:1".into(), &[GROUP]);
+    fake.register_device("device-c", key(3), "real-c:1".into(), &[GROUP]);
     fake.set_peer_view_endpoints("device-a", "device-c", vec!["127.0.0.1:1".into()]);
 
     // A restart re-registering with a fresh real endpoint must not
     // implicitly clear a viewer's override of it -- the exact shape a
     // restart-while-relayed test depends on: the restarted peer's real
     // address must stay invisible to the one viewer the override targets.
-    fake.register_device("device-c", key(3), key(3), "real-c:2-after-restart".into(), &[GROUP]);
+    fake.register_device("device-c", key(3), "real-c:2-after-restart".into(), &[GROUP]);
 
     assert_eq!(
         endpoints_for(&subscribe_once(&fake.addr(), "device-a").await, "device-c"),
@@ -124,16 +124,16 @@ async fn an_override_survives_the_target_device_re_registering() {
 #[tokio::test]
 async fn removing_a_device_clears_every_override_that_names_it() {
     let fake = FakeCoordination::start().await;
-    fake.register_device("device-a", key(1), key(1), "real-a:1".into(), &[GROUP]);
-    fake.register_device("device-b", key(2), key(2), "real-b:1".into(), &[GROUP]);
-    fake.register_device("device-c", key(3), key(3), "real-c:1".into(), &[GROUP]);
+    fake.register_device("device-a", key(1), "real-a:1".into(), &[GROUP]);
+    fake.register_device("device-b", key(2), "real-b:1".into(), &[GROUP]);
+    fake.register_device("device-c", key(3), "real-c:1".into(), &[GROUP]);
     // One override where device-c is the TARGET, one where it is the
     // VIEWER -- `remove_device` must clear both directions.
     fake.set_peer_view_endpoints("device-a", "device-c", vec!["127.0.0.1:1".into()]);
     fake.set_peer_view_endpoints("device-c", "device-b", vec!["127.0.0.1:1".into()]);
 
     fake.remove_device("device-c");
-    fake.register_device("device-c", key(3), key(3), "real-c:2".into(), &[GROUP]);
+    fake.register_device("device-c", key(3), "real-c:2".into(), &[GROUP]);
 
     assert_eq!(
         endpoints_for(&subscribe_once(&fake.addr(), "device-a").await, "device-c"),

@@ -24,7 +24,7 @@
 //!  2. **Failure-signature memory** — the failure
 //!  *signature memory* layered on top of the same JSONL entry. Each entry
 //!  gains the optional `signature`, `note`, and `case_min` fields (every new
-//!  field is `#[serde(default)]` and skipped when empty, so a task-6.4 entry
+//!  field is `#[serde(default)]` and skipped when empty, so an older entry
 //!  carrying only `case`+`verdicts` still deserializes) plus a
 //!  `#[serde(flatten)]` catch-all so a future field is preserved verbatim
 //!  across a load→store cycle rather than dropped. On a new failure the
@@ -54,7 +54,7 @@ use super::triage::{triage_case, HarnessProfile, TriageVerdict, TriagedViolation
 /// bare `Case`, so a corpus written before (bare `Case` lines, no
 /// verdict field) still loads -- as an entry with no recorded verdicts. The
 /// fields (`signature`/`note`/`case_min`) are all optional-and-skipped, so a
-/// task-6.4 `{case, verdicts}` line loads unchanged, and `extra` preserves any
+/// `{case, verdicts}`-only line loads unchanged, and `extra` preserves any
 /// field this version does not model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CorpusEntry {
@@ -65,11 +65,11 @@ pub struct CorpusEntry {
     /// computed by [`super::signature::compute_signature`] on the failure path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
-    /// The one-line investigation note an agent records on resolution -- the
-    /// primary record replacing scattered inline `PF` comments.
+    /// The one-line investigation note recorded on resolution -- the primary
+    /// record of what a failure turned out to be.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
-    /// The shrunk minimal case ([`super::shrinker`], Group 4), when shrinking
+    /// The shrunk minimal case ([`super::shrinker`]), when shrinking
     /// ran for this entry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub case_min: Option<Case>,
@@ -252,8 +252,11 @@ fn op_paths(op: &Op) -> Vec<String> {
         | Op::Delete { path }
         | Op::Mkdir { path }
         | Op::Rmdir { path }
+        | Op::RmTree { path }
         | Op::Chmod { path, .. } => vec![path.clone()],
-        Op::Rename { from, to } | Op::Move { from, to } => vec![from.clone(), to.clone()],
+        Op::Rename { from, to } | Op::Move { from, to } | Op::RenameTree { from, to } => {
+            vec![from.clone(), to.clone()]
+        }
         Op::ConflictingConcurrent { paths } => paths.clone(),
     }
 }

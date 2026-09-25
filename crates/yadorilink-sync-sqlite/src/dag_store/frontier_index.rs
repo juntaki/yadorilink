@@ -18,9 +18,8 @@ use yadorilink_replica_domain::ids::ChangeHash;
 /// its recorded clock via the `pruned_changes` tombstone (`pruned_lamport`),
 /// which is always populated with a real value whenever a tombstone row
 /// exists at all -- there is no "pruned but Lamport unknown" case (checked
-/// against every insertion path: the ordinary prune trigger and the
-/// rebootstrap-snapshot boundary-parent path both always set `lamport`; only
-/// `author_identity`/`authenticated_header` are ever NULL). A parent absent
+/// against every insertion path: the prune trigger, the only production
+/// writer, always sets `lamport`, and the column is NOT NULL). A parent absent
 /// from both contributes nothing; an empty/rootless set yields 0, so a root
 /// change gets `lamport = 1`.
 ///
@@ -49,8 +48,9 @@ pub fn max_parent_lamport(
 
 /// The current non-superseded heads for a group.
 pub fn group_heads(conn: &Connection, group_id: &str) -> Result<Vec<ChangeHash>, SyncSqliteError> {
-    let mut stmt = conn
-        .prepare("SELECT change_hash FROM group_heads WHERE group_id = ?1 ORDER BY change_hash")?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT change_hash FROM group_heads WHERE group_id = ?1 ORDER BY change_hash",
+    )?;
     let rows = stmt.query_map([group_id], |r| r.get::<_, Vec<u8>>(0))?;
     let mut out = Vec::new();
     for row in rows {

@@ -45,11 +45,13 @@ yadorilink-ipc-proto = { path = "../../crates/yadorilink-ipc-proto" }
 # `sync` is required by the production dehydrate server's bounded
 # `tokio::sync::Semaphore` admission gate.
 tokio = { version = "1", features = ["net", "rt", "time", "io-util", "macros", "sync"] }
-prost = "0.14.4"
 # The `#[implement]` macro's generated code references `windows_core::...`
 # at the crate root directly, not through `windows::core` — an explicit
 # dependency (not just relying on `windows`'s re-export) is required for
-# that to resolve.
+# that to resolve. A dependency scanner cannot see this: no source line
+# names the crate, so `cargo machete` reports it as unused. It is not --
+# removing it fails the Windows build with `cannot find windows_core in
+# the crate root`.
 windows-core = "0.58"
 
 [dependencies.windows]
@@ -83,7 +85,7 @@ features = [
     "Win32_System_CorrelationVector",
 ]
 
-# M2-3b: `yadorilink-daemon`'s own Windows-only cfapi/named-pipe-server code
+# `yadorilink-daemon`'s own Windows-only cfapi/named-pipe-server code
 # (`placeholder_inspect_windows.rs`, `windows_pipe_security.rs`) uses
 # `windows-sys` (raw FFI, manual HRESULT/`GetLastError` checks), not the
 # higher-level `windows` crate above -- and that code has actually been

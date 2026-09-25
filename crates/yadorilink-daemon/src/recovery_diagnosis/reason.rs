@@ -1,6 +1,6 @@
-//! Phase 2.1-C2-B2: stable, closed reason codes a [`super::RecoveryDiagnosis`]
+//! Stable, closed reason codes a [`super::RecoveryDiagnosis`]
 //! attaches to its own [`super::RecoveryRecommendation`] -- never a
-//! free-form string. Wire slugs (for Phase 2.1-C2-C's future JSON output)
+//! free-form string. Wire slugs (for JSON output)
 //! are centralized in [`RecoveryReasonCode::as_str`], so a rename here is a
 //! one-place change rather than a hunt through every classifier arm that
 //! constructs one.

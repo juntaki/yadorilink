@@ -1,5 +1,5 @@
-//! Phase 2.1-C2-B2: table-driven coverage for the classifier
-//! (`super::classifier`), on top of B1's own identity tests
+//! Table-driven coverage for the classifier
+//! (`super::classifier`), on top of the identity-qualification tests
 //! (`super::identity::tests`).
 
 use crate::recovery::{LocalLinkEvidence, LocalObservation, PendingEnrollmentEvidence};
@@ -979,7 +979,7 @@ fn role_loss_op(
         group_id: "group-1".to_string(),
         source_device_id: "device-c".to_string(),
         target_device_id: "device-d".to_string(),
-        lease_id: Some("lease-1".to_string()),
+        lease_id: "lease-1".to_string(),
         worker_membership_generation,
         action,
         state,

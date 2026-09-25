@@ -1,52 +1,46 @@
 //! First-run conversion of an existing file index into signed change
-//! history.
-//!
-//! The change-history DAG is created empty by the schema migration, so an
-//! installation that predates it keeps a fully materialized file index with
-//! no history behind it. On the first run after the DAG is provisioned (the
-//! device now has a signing key, hence a [`ChangeEmitter`]), each linked
-//! group's current index is converted — once — into a chain of signed
-//! "initial-import" changes, so history begins at the observed present
-//! without fabricating a past that was never recorded.
-//!
-//! Every import change is authored and signed by the *local* device. It is
-//! an assertion of what this device currently holds, not a reconstruction of
-//! which device originally wrote each file: a change verifies against the
-//! signing key named by its own `device_id`, so a change can only ever be
-//! signed by the device it is attributed to, and attributing an imported
-//! file to some other origin device would make it unverifiable everywhere
-//! else. Live records become `Op::Put { origin: PutOrigin::Direct, .. }`,
-//! tombstoned records become `Op::Delete`, and the content version hash of
-//! each put is built exactly the way live emission builds it (block hashes +
-//! size + mtime + exec bit + symlink target/kind) — so a file imported here
-//! and the same file later re-emitted by a normal local edit hash to the same
-//! version.
-//!
-//! Idempotency and crash-safety: the whole import for a group commits in one
+//! history. The change-history DAG is created empty by the schema
+//! migration, so an installation that predates it keeps a fully
+//! materialized file index with no history behind it. On the first run
+//! after the DAG is provisioned (the device now has a signing key, hence a
+//! [`ChangeEmitter`]), each linked group's current index is converted —
+//! once — into a chain of signed "initial-import" changes, so history
+//! begins at the observed present without fabricating a past that was
+//! never recorded. Every import change is authored and signed by the
+//! *local* device. It is an assertion of what this device currently holds,
+//! not a reconstruction of which device originally wrote each file: a
+//! change verifies against the signing key named by its own `device_id`,
+//! so a change can only ever be signed by the device it is attributed to,
+//! and attributing an imported file to some other origin device would make
+//! it unverifiable everywhere else. Live records become `Op::Put { origin:
+//! PutOrigin::Direct, .. }`, tombstoned records become `Op::Delete`, and
+//! the content version hash of each put is built exactly the way live
+//! emission builds it (block hashes + size + mtime + exec bit + symlink
+//! target/kind) — so a file imported here and the same file later
+//! re-emitted by a normal local edit hash to the same version. Idempotency
+//! and crash-safety: the whole import for a group commits in one
 //! transaction, and it runs only when the group's head set is still empty
 //! (re-checked inside that transaction). A crash mid-import rolls the
 //! transaction back, leaving the group un-imported so the next run redoes
-//! it; a second start — or a concurrent one — observes the committed history
-//! and does nothing. History is therefore never duplicated.
-//!
-//! Call ordering (the daemon's responsibility): [`ensure_initial_import`]
-//! must complete for a group before that group's [`ChangeEmitter`] is wired
-//! into local emission and before any change-DAG peer session for the group
-//! runs, so import always establishes the root of history ahead of the first
-//! live mutation or admitted peer change.
-//!
-//! Authorization: this module signs and commits every change it writes, so
-//! it is bound by the same local-authoring rule as a live watcher edit --
-//! this device must itself currently be a writer (Editor/Owner) under the
-//! group's current signed policy chain, or the import must be withheld
-//! rather than stamped. This module does not check that itself; both
-//! [`DagImportSource::append_initial_import`] and
-//! [`DagImportSource::append_history_backfill`] are required to route
+//! it; a second start — or a concurrent one — observes the committed
+//! history and does nothing. History is therefore never duplicated. Call
+//! ordering (the daemon's responsibility): [`ensure_initial_import`] must
+//! complete for a group before that group's [`ChangeEmitter`] is wired
+//! into local emission and before any change-DAG peer session for the
+//! group runs, so import always establishes the root of history ahead of
+//! the first live mutation or admitted peer change. Authorization: this
+//! module signs and commits every change it writes, so it is bound by the
+//! same local-authoring rule as a live watcher edit -- this device must
+//! itself currently be a writer (Editor/Owner) under the group's current
+//! signed policy chain, or the import must be withheld rather than
+//! stamped. This module does not check that itself; both
+//! [`ReplicaCoordinator::append_initial_import`] and
+//! [`ReplicaCoordinator::append_history_backfill`] are required to route
 //! through the SAME gate a normal local edit uses (`ReplicaCoordinator::
 //! local_emission_auth`, which consults the daemon's `local_change_auth_
 //! provider`) before committing anything, exactly the way `Replica
-//! Coordinator`'s own implementation does. A device that is not currently a
-//! writer -- including the whole pre-policy Bootstrap window, where any
+//! Coordinator`'s own implementation does. A device that is not currently
+//! a writer -- including the whole pre-policy Bootstrap window, where any
 //! device may stamp a PLACEHOLDER-authorized change, same as live emission
 //! -- must have its import/backfill withheld (an `Err` from this module's
 //! functions), not silently skipped as a no-op and not committed anyway:
@@ -55,29 +49,13 @@
 //! peer will ever accept, permanently diverging this device's local state
 //! from the rest of the group for no benefit. See `daemon_state.rs`'s
 //! `initial_import_and_backfill_withhold_a_viewers_pre_existing_content_
-//! but_allow_an_editor` for the regression proof.
-//!
-//! Relocated here from `yadorilink-sync-core` (Phase 7D-10.5): every real
-//! production caller ([`crate::daemon_state::DaemonState::
-//! backfill_missing_change_history`], `crate::link_runtime::startup`) already
-//! passed a `&ReplicaCoordinator`, not a `&SyncState` — this module's own
-//! generic `DagImportSource` bound was already indifferent to which concrete
-//! type it ran against, so moving the module itself is a pure change of
-//! which crate it compiles in, not of behavior. During the transitional
-//! dual-wiring period this module kept an `impl DagImportSource for
-//! SyncState` purely for `yadorilink-local-capture`'s own test suite, which
-//! exercised the daemon's restart-reconcile sequence against a `SyncState`
-//! fixture directly; Phase 7D-10's final sync-core deletion pass repointed
-//! that test suite onto `ReplicaCoordinator` instead (same dev-only
-//! back-edge onto `yadorilink-daemon`, the same shape
-//! `yadorilink-peer-session`'s own tests already used), so `ReplicaCoordinator`
-//! (`replica_coordinator.rs`) is now this trait's sole implementor.
-//! `IMPORT_BATCH_OP_LIMIT` itself did not move here: `yadorilink-local-
-//! capture`'s own `RECONCILE_CHUNK_OP_LIMIT` (a real, non-test production
-//! constant) needs it and sits below `yadorilink-daemon` in the dependency
-//! graph, so it now lives at
-//! `yadorilink_replica_domain::change::IMPORT_BATCH_OP_LIMIT`, shared by both
-//! callers.
+//! but_allow_an_editor` for the regression proof. `IMPORT_BATCH_OP_LIMIT`
+//! itself did not move here: `yadorilink-local- capture`'s own
+//! `RECONCILE_CHUNK_OP_LIMIT` (a real, non-test production constant) needs
+//! it and sits below `yadorilink-daemon` in the dependency graph, so it
+//! now lives at
+//! `yadorilink_replica_domain::change::IMPORT_BATCH_OP_LIMIT`, shared by
+//! both callers.
 
 use std::path::Path;
 
@@ -85,57 +63,14 @@ use crate::sync_error::SyncError;
 use yadorilink_replica_domain::change::{
     encoded_op_len, Op, PutOrigin, IMPORT_BATCH_OP_LIMIT, MAX_CHANGE_OP_BYTES,
 };
-use yadorilink_replica_domain::file::{FileMeta, FileVersion, VersionBlock};
+use yadorilink_replica_domain::file::FileVersion;
 use yadorilink_replica_domain::file::{FileRecord, RecordKind};
-use yadorilink_replica_domain::ids::{BlockHash, SyncPath};
+use yadorilink_replica_domain::ids::SyncPath;
+use yadorilink_root_authority::fs_identity::metadata_mtime_matches;
 use yadorilink_root_authority::reserved_namespace::path_has_reserved_component;
 use yadorilink_root_authority::sync_root_lock::is_sync_root_lock_relative_path;
 use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
-
-/// What [`ensure_initial_import`]/[`backfill_missing_history`] need from a
-/// concrete replica-state type: read the file index, read/write the
-/// change-history DAG, serialize per-path work in flight, and append signed
-/// changes -- nothing else. Deliberately narrow, mirroring
-/// `yadorilink_sync_core::recovery::RecoveryInventorySource`/
-/// `yadorilink_sync_core::materialization::MaterializationIntentJournal`'s
-/// established crate-local pattern: prove the type owns the repository/
-/// registry handles this module needs, not the full `SyncState` surface.
-/// Both `SyncState` and this crate's own `ReplicaCoordinator` construct
-/// every one of these from the same shared `Arc<SyncDatabase>`, so any
-/// implementation reaches the identical underlying tables -- this is a pure
-/// generalization of which Rust value these functions are called through,
-/// not a change to what gets read or written.
-pub trait DagImportSource {
-    fn sqlite(&self) -> &yadorilink_sync_sqlite::SqliteSyncStore;
-    fn file_index_repository(&self) -> &yadorilink_sync_sqlite::file_index::FileIndexRepository;
-    fn change_history_repository(&self) -> &yadorilink_sync_sqlite::ChangeHistoryRepository;
-    /// Returns the shared lock for `(group_id, path)` -- see
-    /// `PathLockRegistry::path_lock`'s own doc comment for the race it
-    /// closes. Returns the lock directly rather than the registry itself:
-    /// `SyncState` (`yadorilink-sync-core`) and `ReplicaCoordinator`
-    /// (`yadorilink-daemon`) each own an independent, differently-typed
-    /// `PathLockRegistry` (Phase 7D-10.11's "temporary coexistence"
-    /// duplication), so this trait cannot name a single concrete registry
-    /// type across both implementors -- the lock type itself
-    /// (`Arc<tokio::sync::Mutex<()>>`) is identical either way.
-    fn path_lock(&self, group_id: &str, path: &str) -> std::sync::Arc<tokio::sync::Mutex<()>>;
-    /// See `SyncState::append_initial_import`'s own doc comment.
-    fn append_initial_import(
-        &self,
-        group_id: &str,
-        batches: &[Vec<Op>],
-        versions: &[FileVersion],
-        emitter: &ChangeEmitter,
-    ) -> Result<Option<usize>, SyncError>;
-    /// See `SyncState::append_history_backfill`'s own doc comment.
-    fn append_history_backfill(
-        &self,
-        group_id: &str,
-        ops: Vec<Op>,
-        versions: &[FileVersion],
-        emitter: &ChangeEmitter,
-    ) -> Result<yadorilink_replica_domain::ids::ChangeHash, SyncError>;
-}
+use yadorilink_sync_sqlite::CanonicalCurrentRow;
 
 /// Whether an indexed path must never enter change history: either the
 /// reserved artefact namespace (`reserved_namespace`, defense-in-depth
@@ -174,8 +109,8 @@ pub enum BackfillOutcome {
 /// change makes the head set non-empty, permanently closing the one-shot
 /// initial-import path; path coverage, rather than an empty-head check, is the
 /// retry trigger that remains valid in that state.
-pub async fn backfill_missing_history<S: DagImportSource>(
-    state: &S,
+pub async fn backfill_missing_history(
+    state: &crate::replica_coordinator::ReplicaCoordinator,
     group_id: &str,
     emitter: &ChangeEmitter,
 ) -> Result<BackfillOutcome, SyncError> {
@@ -231,24 +166,29 @@ pub async fn backfill_missing_history<S: DagImportSource>(
     }
     let mut appended = 0usize;
     for path in candidates {
-        let path_lock = state.path_lock(group_id, &path);
+        let path_lock = state.path_lock_registry().path_lock(group_id, &path);
         let _guard = path_lock.lock().await;
         if state.change_history_repository().dag_group_history_paths(group_id)?.contains(&path) {
             continue;
         }
-        let Some(record) = state.file_index_repository().get_file(group_id, &path)? else {
+        // ONE read, under the path lock this loop already holds: the
+        // change appended below names a version, and the version has to
+        // be the one the row actually is.
+        let Some(row) = state.file_index_repository().canonical_current_row(group_id, &path)?
+        else {
             continue;
         };
-        let (op, versions) = if record.deleted {
+        let deleted = row.snapshot.deleted;
+        let (op, versions) = if deleted {
             (Op::Delete { path: SyncPath(path.clone()) }, Vec::new())
         } else {
-            let (op, version) = import_create_op(state, group_id, &record)?;
+            let (op, version, _record_kind) = import_create_op(&path, &row);
             (op, vec![version])
         };
         tracing::info!(
             group_id,
             path = %path,
-            deleted = record.deleted,
+            deleted,
             author = %emitter.device_id(),
             "backfilling indexed path missing from change history"
         );
@@ -262,115 +202,326 @@ pub async fn backfill_missing_history<S: DagImportSource>(
     }
 }
 
-/// Converts `group_id`'s current index into initial-import changes, once.
+/// How many times [`ensure_initial_import`] will rebuild its snapshot and
+/// retry after `append_initial_import` reports [`yadorilink_sync_sqlite::
+/// ImportAppendOutcome::StaleSnapshot`]. The window a retry is closing --
+/// another writer touching this group's index between this function's
+/// snapshot read and its transaction's commit -- is normally microseconds
+/// wide; this bound exists so a group under truly pathological, unending
+/// concurrent write pressure fails loudly instead of retrying forever.
+const MAX_SNAPSHOT_RETRIES: u32 = 5;
+
+/// Converts `group_id`'s current index into initial-import changes.
 ///
-/// Idempotent and crash-safe: the append is transactional and gated on the
-/// group's history still being empty (see the module docs). Safe to call on
-/// every daemon start for every linked group; only the first call that finds
-/// an empty DAG for a non-empty index actually writes anything.
-pub fn ensure_initial_import<S: DagImportSource>(
-    state: &S,
+/// Idempotent and crash-safe: each attempt's append is transactional, and
+/// re-derives which rows still need binding from a FRESH read of the
+/// database taken inside that same transaction -- never trusting a value
+/// computed outside it. Safe to call on every daemon start for every linked
+/// group, and safe to call again later for the same group: unlike the
+/// group's-history-was-still-empty framing this function used to be gated
+/// on, "does this group still have any current row lacking a verified
+/// authoring identity" stays a well-defined, idempotent question regardless
+/// of whether the group already has SOME history (from an earlier partial
+/// import, `backfill_missing_history` claiming a path first, or live
+/// emission) -- treating "any history at all" as "fully imported" was
+/// exactly the race that would leave rows permanently unbound at real
+/// scale.
+pub fn ensure_initial_import(
+    state: &crate::replica_coordinator::ReplicaCoordinator,
     group_id: &str,
     emitter: &ChangeEmitter,
+    root: Option<&Path>,
 ) -> Result<ImportOutcome, SyncError> {
-    // Cheap pre-check outside any transaction: a group that already has a
-    // head has history, so there is nothing to import and no reason to read
-    // and convert its index. The authoritative check runs again inside the
-    // write transaction in `SyncState::append_initial_import`, so this is
-    // purely an optimization, not the correctness guard.
-    if !state.sqlite().dag_group_heads(group_id)?.is_empty() {
-        return Ok(ImportOutcome::AlreadyInitialized);
-    }
+    for _attempt in 0..MAX_SNAPSHOT_RETRIES {
+        // Cheap pre-check outside any transaction: nothing to do if every
+        // current row for this group already carries a verified authoring
+        // identity. The authoritative check re-runs inside the write
+        // transaction in `append_initial_import`, so this is purely an
+        // optimization, not the correctness guard. Deliberately NOT "does
+        // this group have a head at all" -- a group can hold some history
+        // (one path `backfill_missing_history` already claimed, say) while
+        // still holding other current rows this import must still bind.
+        let unbound = state.file_index_repository().list_unauthored_current_paths(group_id)?;
+        if unbound.is_empty() {
+            return Ok(if state.sqlite().dag_group_heads(group_id)?.is_empty() {
+                ImportOutcome::NothingToImport
+            } else {
+                ImportOutcome::AlreadyInitialized
+            });
+        }
 
-    // Sort by path so the synthesized chain is reproducible from the same
-    // index rather than depending on row iteration order.
-    let mut records = state.file_index_repository().list_files(group_id)?;
-    // Every producer of a NEW index row already excludes a
-    // reserved-component path before it is ever written
-    // (`local_change::is_excluded_from_sync`), so ordinarily this finds
-    // nothing. It is not purely defense-in-depth, though: a database from
-    // before this exclusion existed can already hold an index row for a
-    // path that happened to collide with the reserved shape while it was
-    // still ordinary content — this is the one place that stale row is
-    // caught before the one-shot initial import would otherwise turn it
-    // into signed history. Reported loudly rather than silently dropped
-    // (design's `Blocked(ReservedNamespaceCollision)` requirement: a
-    // collision must name the path, not vanish) — this device's own
-    // content is stuck unsyncable under this name until it's renamed,
-    // which nothing else in this crate is in a position to tell the user
-    // without this log.
-    let blocked: Vec<String> = records
-        .iter()
-        .filter(|r| path_must_never_enter_history(Path::new(&r.path)))
-        .map(|r| r.path.clone())
-        .collect();
-    for path in &blocked {
-        tracing::warn!(
-            group_id,
-            path = %path,
-            "indexed path collides with the reserved artefact namespace and cannot be added to \
-             change history; rename it on disk to make it syncable again"
-        );
-    }
-    records.retain(|r| !path_must_never_enter_history(Path::new(&r.path)));
-    records.sort_by(|a, b| a.path.cmp(&b.path));
-    if records.is_empty() {
-        return Ok(ImportOutcome::NothingToImport);
-    }
+        // Sort by path so the synthesized chain is reproducible from the same
+        // index rather than depending on row iteration order.
+        let mut records = state.file_index_repository().list_files(group_id)?;
+        records.retain(|r| unbound.contains(&r.path));
+        // Every producer of a NEW index row already excludes a
+        // reserved-component path before it is ever written
+        // (`local_change::is_excluded_from_sync`), so ordinarily this finds
+        // nothing. It is not purely defense-in-depth, though: a database from
+        // before this exclusion existed can already hold an index row for a
+        // path that happened to collide with the reserved shape while it was
+        // still ordinary content — this is the one place that stale row is
+        // caught before the one-shot initial import would otherwise turn it
+        // into signed history. Reported loudly rather than silently dropped
+        // (design's `Blocked(ReservedNamespaceCollision)` requirement: a
+        // collision must name the path, not vanish) — this device's own
+        // content is stuck unsyncable under this name until it's renamed,
+        // which nothing else in this crate is in a position to tell the user
+        // without this log.
+        let blocked: std::collections::HashSet<String> = records
+            .iter()
+            .filter(|r| path_must_never_enter_history(Path::new(&r.path)))
+            .map(|r| r.path.clone())
+            .collect();
+        for path in &blocked {
+            tracing::warn!(
+                group_id,
+                path = %path,
+                "indexed path collides with the reserved artefact namespace and cannot be added to \
+                 change history; rename it on disk to make it syncable again"
+            );
+        }
+        records.retain(|r| !path_must_never_enter_history(Path::new(&r.path)));
+        records.sort_by(|a, b| a.path.cmp(&b.path));
+        if records.is_empty() {
+            // Every currently-unbound row was blocked above (the reserved-
+            // namespace-collision case) -- nothing importable remains, even
+            // though the schema-level unbound count may still be nonzero.
+            // Pre-existing behavior, not something this fix changes: those
+            // rows were never bindable before this function existed either.
+            return Ok(ImportOutcome::NothingToImport);
+        }
 
-    let mut ops = Vec::with_capacity(records.len());
-    let mut versions: Vec<FileVersion> = Vec::new();
-    for record in &records {
-        if record.deleted {
-            ops.push(Op::Delete { path: SyncPath(record.path.clone()) });
-        } else {
-            let (op, version) = import_create_op(state, group_id, record)?;
+        let mut ops = Vec::with_capacity(records.len());
+        let mut versions: Vec<FileVersion> = Vec::new();
+        // Built as each record's op is, rather than recovered afterwards by
+        // searching. Re-deriving which version and record kind belong to a
+        // path by scanning the op and version lists is quadratic per record
+        // and cubic over the import -- invisible at a hundred files, and the
+        // dominant cost at ten thousand -- for an association that is known
+        // for free at the moment the op is assembled.
+        let mut prepared: std::collections::HashMap<String, PreparedImport> =
+            std::collections::HashMap::new();
+        for record in &records {
+            if record.deleted {
+                ops.push(Op::Delete { path: SyncPath(record.path.clone()) });
+                continue;
+            }
+            // Re-read as ONE row rather than composing the version out of
+            // `record` plus four point queries -- see `import_create_op`.
+            // That is four reads per path fewer, not one more: the batch
+            // listing above still decides WHICH paths are imported, and
+            // this decides what each one's change says it is.
+            let Some(row) =
+                state.file_index_repository().canonical_current_row(group_id, &record.path)?
+            else {
+                continue;
+            };
+            if row.snapshot.deleted {
+                ops.push(Op::Delete { path: SyncPath(record.path.clone()) });
+                continue;
+            }
+            let (op, version, record_kind) = import_create_op(&record.path, &row);
+            prepared.insert(
+                record.path.clone(),
+                PreparedImport {
+                    version_hash: version.version_hash,
+                    record_kind,
+                    // The row the version was minted from, carried so the
+                    // disk verification below checks the same incarnation.
+                    record: FileRecord {
+                        path: record.path.clone(),
+                        size: row.snapshot.size,
+                        mtime_unix_nanos: row.snapshot.mtime_unix_nanos,
+                        blocks: row.snapshot.blocks.clone(),
+                        deleted: false,
+                    },
+                },
+            );
             ops.push(op);
             versions.push(version);
         }
-    }
-    let total_ops = ops.len();
+        let total_ops = ops.len();
 
-    // Split the ops into chunks bounded by BOTH op count and canonical encoded
-    // byte size, each of which becomes one signed import change. Op count alone
-    // is not enough: a first import of <= IMPORT_BATCH_OP_LIMIT files with
-    // pathologically long paths could still encode to several MiB — larger than
-    // any single wire message can carry (a change cannot be wire-split), which
-    // would strand that root change permanently un-propagatable and break
-    // history replication for the whole group. The byte cap
-    // (`change::MAX_CHANGE_OP_BYTES`) is shared with the startup reconcile so
-    // whichever path first observes a bulk diff bounds it identically. At least
-    // one op is always taken per chunk (`end == start`), so a single large op
-    // can never wedge the loop. `append_initial_import` emits the batches in
-    // order, each chaining onto the head the previous one committed, so the
-    // chunks form one linear chain converging on a single head.
-    let mut batches: Vec<Vec<Op>> = Vec::new();
-    let mut start = 0usize;
-    while start < ops.len() {
-        let mut end = start;
-        let mut chunk_bytes = 0usize;
-        while end < ops.len() {
-            let op_bytes = encoded_op_len(&ops[end]);
-            if end > start
-                && (end - start >= IMPORT_BATCH_OP_LIMIT
-                    || chunk_bytes + op_bytes > MAX_CHANGE_OP_BYTES)
-            {
-                break;
+        // Split the ops into chunks bounded by BOTH op count and canonical encoded
+        // byte size, each of which becomes one signed import change. Op count alone
+        // is not enough: a first import of <= IMPORT_BATCH_OP_LIMIT files with
+        // pathologically long paths could still encode to several MiB — larger than
+        // any single wire message can carry (a change cannot be wire-split), which
+        // would strand that root change permanently un-propagatable and break
+        // history replication for the whole group. The byte cap
+        // (`change::MAX_CHANGE_OP_BYTES`) is shared with the startup reconcile so
+        // whichever path first observes a bulk diff bounds it identically. At least
+        // one op is always taken per chunk (`end == start`), so a single large op
+        // can never wedge the loop. `append_initial_import` emits the batches in
+        // order, each chaining onto the head the previous one committed, so the
+        // chunks form one linear chain converging on a single head.
+        let mut batches: Vec<Vec<Op>> = Vec::new();
+        let mut start = 0usize;
+        while start < ops.len() {
+            let mut end = start;
+            let mut chunk_bytes = 0usize;
+            while end < ops.len() {
+                let op_bytes = encoded_op_len(&ops[end]);
+                if end > start
+                    && (end - start >= IMPORT_BATCH_OP_LIMIT
+                        || chunk_bytes + op_bytes > MAX_CHANGE_OP_BYTES)
+                {
+                    break;
+                }
+                chunk_bytes += op_bytes;
+                end += 1;
             }
-            chunk_bytes += op_bytes;
-            end += 1;
+            batches.push(ops[start..end].to_vec());
+            start = end;
         }
-        batches.push(ops[start..end].to_vec());
-        start = end;
-    }
 
-    match state.append_initial_import(group_id, &batches, &versions, emitter)? {
-        Some(changes) => Ok(ImportOutcome::Imported { changes, ops: total_ops }),
-        // Lost the race to another start that imported (or began emitting)
-        // between the pre-check above and the transaction: its history now
-        // stands, and this call correctly did nothing.
-        None => Ok(ImportOutcome::AlreadyInitialized),
+        // Observed here, immediately before the commit, for exactly the
+        // paths this attempt is about to bind. A file already sitting in
+        // the folder when it was linked is already materialized -- that is
+        // what importing it means -- and recording that fact is what lets
+        // this device settle its own obligations without asking a peer
+        // about content it wrote itself. Anything unreadable is simply
+        // left out: no proof is the status quo, a wrong proof is not.
+        let mut actual_state = std::collections::HashMap::new();
+        if let Some(root) = root {
+            for record in &records {
+                if record.deleted {
+                    continue;
+                }
+                let absolute = root.join(&record.path);
+                // The version about to go into history came from the index,
+                // written when the folder was scanned. The identity below
+                // is observed now. Those are two looks at the same path at
+                // two different times, and nothing about the second one
+                // says the bytes still match the first.
+                //
+                // That gap is the whole danger. An in-place overwrite keeps
+                // the inode, so both halves still look individually sound --
+                // a real version, and a real identity of a real object at
+                // that path, which identity revalidation can even confirm.
+                // The proof would then assert the path already holds the
+                // old content and close the obligation to actually put it
+                // there, leaving the wrong bytes on disk with nothing left
+                // that would notice.
+                //
+                // So the proof is only adopted for a file that still looks
+                // like the record being imported, and only if nothing
+                // touches it across the observation itself. A mismatch
+                // means no proof, never a wrong one, and never a refusal to
+                // import: the path still enters history, it simply is not
+                // vouched for as already materialized.
+                // The row the version was minted from, NOT the batch
+                // listing's `record`. They can differ: the listing chose
+                // which paths to import, and a concurrent write can move a
+                // row between that listing and the per-path canonical read
+                // that decided what the change says. Verifying disk against
+                // the listing while the proof names the canonical row's
+                // version would vouch for the newer version on the strength
+                // of the older bytes -- the proof would say the new content
+                // is already materialized, and nothing would ever put it
+                // there.
+                let Some(prepared) = prepared.get(&record.path) else {
+                    continue;
+                };
+                let record = &prepared.record;
+                let Ok(before) = std::fs::symlink_metadata(&absolute) else {
+                    continue;
+                };
+                // Cheap rejections first, so an ordinary import does not
+                // read a file it can already tell has changed.
+                if before.len() != record.size
+                    || !metadata_mtime_matches(&before, record.mtime_unix_nanos)
+                {
+                    continue;
+                }
+                let fingerprint_before =
+                    yadorilink_root_authority::fs_identity::disk_race_fingerprint(&absolute);
+                if fingerprint_before.is_none() {
+                    continue;
+                }
+                // Then the part that actually binds the two halves
+                // together. Size and mtime are not evidence of content: an
+                // in-place overwrite can keep the length and have its mtime
+                // put back, and nothing about the file's metadata then says
+                // it was touched. Bracketing the identity observation does
+                // not help either -- it proves nothing changed *during* the
+                // observation, which is true, because the change already
+                // happened before it began.
+                //
+                // Reading the bytes and comparing them to the blocks the
+                // index recorded is what establishes that the version about
+                // to enter history and the identity about to vouch for it
+                // describe the same content. Without it the proof is two
+                // observations of one path at two different times with
+                // nothing connecting them.
+                //
+                // This re-read is real cost, paid once per imported file.
+                // It is here because correctness needs it now; the way to
+                // stop paying it is to capture content, identity and
+                // version in one pass at scan time rather than rediscover
+                // them at import time.
+                match yadorilink_local_storage::disk_verification::disk_bytes_match_indexed_blocks(
+                    &absolute,
+                    &record.blocks,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) | Err(_) => continue,
+                }
+                let Some(observed) =
+                    yadorilink_root_authority::fs_identity::FileIdentity::observe_path(&absolute)
+                        .ok()
+                else {
+                    continue;
+                };
+                // Closes the window around the read and the observation
+                // together, the way local capture brackets its own.
+                if yadorilink_root_authority::fs_identity::disk_race_fingerprint(&absolute)
+                    != fingerprint_before
+                {
+                    continue;
+                }
+                actual_state.insert(
+                    record.path.clone(),
+                    yadorilink_sync_sqlite::file_index::ImportedActualState {
+                        filesystem_identity: observed,
+                        record_kind: prepared.record_kind,
+                        version_hash: prepared.version_hash,
+                    },
+                );
+            }
+        }
+
+        match state.append_initial_import(
+            group_id,
+            &batches,
+            &versions,
+            emitter,
+            &blocked,
+            &actual_state,
+        )? {
+            yadorilink_sync_sqlite::ImportAppendOutcome::Committed(changes) => {
+                return Ok(ImportOutcome::Imported { changes, ops: total_ops });
+            }
+            // Every unbound row this attempt targeted got covered by
+            // someone else between this attempt's pre-check and its
+            // transaction's commit (another concurrent attempt, backfill,
+            // live emission) -- its own commit correctly did nothing.
+            yadorilink_sync_sqlite::ImportAppendOutcome::FullyCovered => {
+                return Ok(ImportOutcome::AlreadyInitialized);
+            }
+            // A concurrent write changed the group's unbound-row set after
+            // this attempt's snapshot was taken. Nothing was committed;
+            // rebuild the snapshot and retry rather than let a stale
+            // attempt commit an incomplete import.
+            yadorilink_sync_sqlite::ImportAppendOutcome::StaleSnapshot => {}
+        }
     }
+    Err(SyncError::CorruptState(format!(
+        "initial import for group {group_id} did not converge after {MAX_SNAPSHOT_RETRIES} \
+         attempts -- the group's unbound-row set kept changing faster than an attempt could \
+         commit"
+    )))
 }
 
 /// Builds the direct `Op::Put` for a live record, deriving its content version
@@ -380,677 +531,55 @@ pub fn ensure_initial_import<S: DagImportSource>(
 /// distinguishes a symlink from a regular file — matching how live emission
 /// classifies the same record — and a symlink carries no exec bit, which the
 /// column already reflects as `false`.
-fn import_create_op<S: DagImportSource>(
-    state: &S,
-    group_id: &str,
-    record: &FileRecord,
-) -> Result<(Op, FileVersion), SyncError> {
-    let blocks = record
-        .blocks
-        .iter()
-        .map(|b| VersionBlock { hash: BlockHash(b.hash.clone()), size: b.size })
-        .collect();
-    let symlink_target =
-        state.file_index_repository().get_symlink_target(group_id, &record.path)?;
-    let unix_mode = state.file_index_repository().get_unix_mode(group_id, &record.path)?;
-    let xattrs = state.file_index_repository().get_xattrs(group_id, &record.path)?;
+///
+/// The `Op::Put` and `FileVersion` for one indexed path, built entirely
+/// from `row` -- ONE incarnation of that path's current row.
+///
+/// Pure, and taking the row rather than fetching from it, because the
+/// version it mints is what the emitted change *claims* the path is. It
+/// used to take a `FileRecord` from the caller's own earlier read and
+/// then issue four more: `get_symlink_target`, `get_unix_mode`,
+/// `get_xattrs` and `get_record_kind`. Five reads, no isolation across
+/// them -- so the blocks, size and mtime could come from one incarnation
+/// and the mode, target, xattrs and kind from later ones, and the change
+/// signed over the result named a version the index had never held.
+/// One path's import decision: the version its change will name, the kind
+/// that version is, and the row both were taken from.
+///
+/// The record travels with them because the disk verification has to
+/// check the same incarnation the version was minted from. Keeping only
+/// the hash and re-using the batch listing's record is how a proof ends
+/// up vouching for one version on the strength of another's bytes.
+struct PreparedImport {
+    version_hash: yadorilink_replica_domain::ids::VersionHash,
+    record_kind: RecordKind,
+    record: FileRecord,
+}
+
+fn import_create_op(path: &str, row: &CanonicalCurrentRow) -> (Op, FileVersion, RecordKind) {
     // The index is authoritative for the record type. In particular a
     // directory has neither blocks nor a symlink target, just like an empty
     // regular file, so inferring kind from `symlink_target` collapses it to a
     // file during the one-time DAG import.
-    let record_kind = state
-        .file_index_repository()
-        .get_record_kind(group_id, &record.path)?
-        .unwrap_or(RecordKind::File);
-    let meta = FileMeta {
-        mtime_unix_nanos: record.mtime_unix_nanos,
-        unix_mode,
-        symlink_target,
+    let record_kind = row.snapshot.record_kind;
+    // Minted through the one row-to-version reconstruction, so a directory
+    // row's observed size and mtime never reach its identity.
+    let version = FileVersion::from_index_row(
+        row.snapshot.blocks.clone(),
+        row.snapshot.size,
+        row.snapshot.mtime_unix_nanos,
         record_kind,
-        xattrs,
-    };
-    let version = FileVersion::new(blocks, record.size, meta);
+        row.snapshot.unix_mode,
+        row.snapshot.symlink_target.clone(),
+        row.snapshot.xattrs.clone(),
+    );
     let op = Op::Put {
-        path: SyncPath(record.path.clone()),
+        path: SyncPath(path.to_string()),
         version: version.version_hash,
         origin: PutOrigin::Direct,
     };
-    Ok((op, version))
+    (op, version, record_kind)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::replica_coordinator::ReplicaCoordinator;
-    use ed25519_dalek::SigningKey;
-    use yadorilink_replica_domain::change::ChangeAuth;
-    use yadorilink_replica_domain::file::BlockInfo;
-    fn emitter() -> ChangeEmitter {
-        ChangeEmitter::new("device-A", SigningKey::from_bytes(&[9u8; 32]))
-    }
-
-    fn live(path: &str) -> FileRecord {
-        FileRecord {
-            path: path.into(),
-            size: 3,
-            mtime_unix_nanos: 1,
-            blocks: vec![BlockInfo { hash: vec![1, 2, 3], offset: 0, size: 3 }],
-            deleted: false,
-        }
-    }
-
-    fn tombstone(path: &str) -> FileRecord {
-        FileRecord {
-            path: path.into(),
-            size: 0,
-            mtime_unix_nanos: 5,
-            blocks: vec![],
-            deleted: true,
-        }
-    }
-
-    #[test]
-    fn converts_live_and_tombstoned_records_in_one_change() {
-        let state = ReplicaCoordinator::open_in_memory().unwrap();
-        state
-            .file_index_repository()
-            .upsert_file(
-                "g",
-                &live("a.txt"),
-                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-            )
-            .unwrap();
-        state
-            .file_index_repository()
-            .upsert_file(
-                "g",
-                &tombstone("gone.txt"),
-                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-            )
-            .unwrap();
-
-        let outcome = ensure_initial_import(&state, "g", &emitter()).unwrap();
-        assert_eq!(outcome, ImportOutcome::Imported { changes: 1, ops: 2 });
-
-        // Exactly one root head, whose change carries a Create for the live
-        // file and a Delete for the tombstone.
-        let heads = state.sqlite().dag_group_heads("g").unwrap();
-        assert_eq!(heads.len(), 1);
-        let change = state.sqlite().dag_get_change(&heads[0]).unwrap().unwrap();
-        assert_eq!(
-            state.file_index_repository().get_authoring_change_hash("g", "a.txt").unwrap(),
-            Some(heads[0])
-        );
-        assert_eq!(
-            state.file_index_repository().get_authoring_change_hash("g", "gone.txt").unwrap(),
-            Some(heads[0])
-        );
-        assert!(change.parents.is_empty());
-        assert!(change
-            .ops
-            .iter()
-            .any(|op| matches!(op, Op::Put { path, .. } if path.as_str() == "a.txt")));
-        assert!(change
-            .ops
-            .iter()
-            .any(|op| matches!(op, Op::Delete { path } if path.as_str() == "gone.txt")));
-    }
-
-    #[test]
-    fn dag_backed_current_rows_require_a_verified_authoring_identity() {
-        let state = ReplicaCoordinator::open_in_memory().unwrap();
-        let seeded = live("seeded.txt");
-        state
-            .file_index_repository()
-            .upsert_file(
-                "g",
-                &seeded,
-                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-            )
-            .unwrap();
-        let (op, version) = import_create_op(&state, "g", &seeded).unwrap();
-        let author = state.append_history_backfill("g", vec![op], &[version], &emitter()).unwrap();
-
-        let error = state
-            .file_index_repository()
-            .upsert_file(
-                "g",
-                &live("identity-less.txt"),
-                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-            )
-            .map_err(SyncError::from)
-            .expect_err("a DAG-backed group must reject a current row with no author");
-        assert!(matches!(error, SyncError::Db(_)), "{error:?}");
-
-        state
-            .file_index_repository()
-            .upsert_file_with_origin_and_author(
-                "g",
-                &live("identified.txt"),
-                "device-A",
-                &author,
-                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-            )
-            .unwrap();
-        assert_eq!(
-            state.file_index_repository().get_authoring_change_hash("g", "identified.txt").unwrap(),
-            Some(author)
-        );
-    }
-
-    #[test]
-    fn import_version_hash_matches_live_emission() {
-        // The create op's version hash must equal what a normal local edit
-        // would have emitted for the same record, so the two never diverge.
-        let state = ReplicaCoordinator::open_in_memory().unwrap();
-        let record = live("a.txt");
-        state
-            .file_index_repository()
-            .upsert_file(
-                "g",
-                &record,
-                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-            )
-            .unwrap();
-
-        let (op, _version) = import_create_op(&state, "g", &record).unwrap();
-        let Op::Put { version, .. } = op else { panic!("expected a put op") };
-
-        let expected = FileVersion::new(
-            record
-                .blocks
-                .iter()
-                .map(|b| VersionBlock { hash: BlockHash(b.hash.clone()), size: b.size })
-                .collect(),
-            record.size,
-            FileMeta {
-                mtime_unix_nanos: record.mtime_unix_nanos,
-                unix_mode: None,
-                symlink_target: None,
-                record_kind: RecordKind::File,
-                xattrs: Vec::new(),
-            },
-        )
-        .version_hash;
-        assert_eq!(version, expected);
-    }
-
-    #[test]
-    fn import_preserves_a_stored_directory_kind() {
-        let state = ReplicaCoordinator::open_in_memory().unwrap();
-        let mut record = live("folder");
-        record.size = 0;
-        record.blocks.clear();
-        state
-            .file_index_repository()
-            .upsert_file(
-                "g",
-                &record,
-                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-            )
-            .unwrap();
-        state
-            .file_index_repository()
-            .set_record_kind(
-                "g",
-                "folder",
-                RecordKind::Directory,
-                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-            )
-            .unwrap();
-
-        let (_, version) = import_create_op(&state, "g", &record).unwrap();
-        assert_eq!(version.meta.record_kind, RecordKind::Directory);
-    }
-
-    /// Regression test for a confirmed, reproduced convergence-killer (see
-    /// `backfill_missing_history`'s own comment on the conflict-copy
-    /// filter): a projection-derived conflict copy is indexed on every
-    /// observing device before any change carries it, and the coverage
-    /// audit used to read that window as "indexed path missing from
-    /// history" and mint a per-device `Direct` create for it — several
-    /// devices concurrently, for the same copy path. The carrier is the
-    /// retroactive conflict-copy repair's to emit, so the audit must skip
-    /// conflict-copy-shaped paths entirely (also on repeat calls: the path
-    /// must not keep the audit reporting work forever), while still
-    /// repairing an ordinary path in the same pass.
-    #[tokio::test]
-    async fn backfill_skips_a_derived_conflict_copy_path_but_repairs_an_ordinary_one() {
-        let state = ReplicaCoordinator::open_in_memory().unwrap();
-        state.set_local_change_auth_provider(std::sync::Arc::new(|_| {
-            Ok(ChangeAuth { auth_seq: 7, auth_epoch: 2, policy_head_hash: [4; 32] })
-        }));
-        // Seed one head so this exercises the mid-life coverage audit, not
-        // initial import.
-        let seeded = live("seeded.txt");
-        state
-            .file_index_repository()
-            .upsert_file(
-                "g",
-                &seeded,
-                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-            )
-            .unwrap();
-        let (op, version) = import_create_op(&state, "g", &seeded).unwrap();
-        let seed_author =
-            state.append_history_backfill("g", vec![op], &[version], &emitter()).unwrap();
-
-        let copy_path = yadorilink_replica_domain::conflict::conflict_copy_path(
-            "chaos-05.bin",
-            1_000,
-            "device-B",
-            &[0xf6, 0xca, 0xc4, 0xff],
-        );
-        state
-            .file_index_repository()
-            .upsert_file_with_origin_and_author(
-                "g",
-                &live(&copy_path),
-                "device-A",
-                &seed_author,
-                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-            )
-            .unwrap();
-        state
-            .file_index_repository()
-            .upsert_file_with_origin_and_author(
-                "g",
-                &live("ordinary.bin"),
-                "device-A",
-                &seed_author,
-                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-            )
-            .unwrap();
-
-        assert_eq!(
-            backfill_missing_history(&state, "g", &emitter()).await.unwrap(),
-            BackfillOutcome::Backfilled { paths: 1 }
-        );
-        let history = state.change_history_repository().dag_group_history_paths("g").unwrap();
-        assert!(history.contains("ordinary.bin"), "the ordinary gap must still be repaired");
-        assert!(
-            !history.contains(&copy_path),
-            "a derived conflict copy must never be minted into history by the coverage audit"
-        );
-        assert_eq!(
-            backfill_missing_history(&state, "g", &emitter()).await.unwrap(),
-            BackfillOutcome::NothingMissing,
-            "the skipped copy path must not keep the audit claiming outstanding work"
-        );
-    }
-
-    /// The mid-life coverage audit's own version of the initial-import
-    /// test above: a pre-existing index row that collides with the
-    /// reserved artefact namespace must never be backfilled into history,
-    /// while an ordinary coverage gap around it is still repaired, and the
-    /// audit must not keep reporting outstanding work once the only
-    /// remaining gap is the permanently-skipped collision.
-    #[tokio::test]
-    async fn backfill_skips_a_pre_existing_reserved_namespace_collision_but_repairs_an_ordinary_one(
-    ) {
-        let state = ReplicaCoordinator::open_in_memory().unwrap();
-        state.set_local_change_auth_provider(std::sync::Arc::new(|_| {
-            Ok(ChangeAuth { auth_seq: 7, auth_epoch: 2, policy_head_hash: [4; 32] })
-        }));
-        let seeded = live("seeded.txt");
-        state
-            .file_index_repository()
-            .upsert_file(
-                "g",
-                &seeded,
-                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-            )
-            .unwrap();
-        let (op, version) = import_create_op(&state, "g", &seeded).unwrap();
-        let seed_author =
-            state.append_history_backfill("g", vec![op], &[version], &emitter()).unwrap();
-
-        let artefact_path = yadorilink_root_authority::reserved_namespace::artefact_component_name(
-            yadorilink_root_authority::reserved_namespace::ArtefactKind::Backup,
-            "cafef00d",
-        )
-        .unwrap();
-        state
-            .file_index_repository()
-            .upsert_file_with_origin_and_author(
-                "g",
-                &live(&artefact_path),
-                "device-A",
-                &seed_author,
-                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-            )
-            .unwrap();
-        state
-            .file_index_repository()
-            .upsert_file_with_origin_and_author(
-                "g",
-                &live("ordinary.bin"),
-                "device-A",
-                &seed_author,
-                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-            )
-            .unwrap();
-
-        assert_eq!(
-            backfill_missing_history(&state, "g", &emitter()).await.unwrap(),
-            BackfillOutcome::Backfilled { paths: 1 }
-        );
-        let history = state.change_history_repository().dag_group_history_paths("g").unwrap();
-        assert!(history.contains("ordinary.bin"), "the ordinary gap must still be repaired");
-        assert!(
-            !history.contains(&artefact_path),
-            "a reserved-namespace collision must never be minted into history by the coverage audit"
-        );
-        assert_eq!(
-            backfill_missing_history(&state, "g", &emitter()).await.unwrap(),
-            BackfillOutcome::NothingMissing,
-            "the permanently-skipped collision must not keep the audit claiming outstanding work"
-        );
-    }
-
-    #[tokio::test]
-    async fn audit_repairs_policy_withheld_initial_import_after_another_path_creates_a_head() {
-        let state = ReplicaCoordinator::open_in_memory().unwrap();
-        let policy_ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let ready = policy_ready.clone();
-        state.set_local_change_auth_provider(std::sync::Arc::new(move |_| {
-            if ready.load(std::sync::atomic::Ordering::SeqCst) {
-                Ok(ChangeAuth { auth_seq: 7, auth_epoch: 2, policy_head_hash: [4; 32] })
-            } else {
-                Err(yadorilink_replica_domain::change::PolicyUnavailable)
-            }
-        }));
-        state
-            .file_index_repository()
-            .upsert_file(
-                "g",
-                &live("missed.txt"),
-                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-            )
-            .unwrap();
-        assert!(matches!(
-            ensure_initial_import(&state, "g", &emitter()),
-            Err(SyncError::PolicyUnavailable)
-        ));
-
-        policy_ready.store(true, std::sync::atomic::Ordering::SeqCst);
-        let other = live("later.txt");
-        state
-            .file_index_repository()
-            .upsert_file(
-                "g",
-                &other,
-                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-            )
-            .unwrap();
-        let (op, version) = import_create_op(&state, "g", &other).unwrap();
-        state.append_history_backfill("g", vec![op], &[version], &emitter()).unwrap();
-        assert_eq!(state.sqlite().dag_group_heads("g").unwrap().len(), 1);
-
-        assert_eq!(
-            backfill_missing_history(&state, "g", &emitter()).await.unwrap(),
-            BackfillOutcome::Backfilled { paths: 1 }
-        );
-        assert!(state
-            .change_history_repository()
-            .dag_group_history_paths("g")
-            .unwrap()
-            .contains("missed.txt"));
-        assert_eq!(
-            backfill_missing_history(&state, "g", &emitter()).await.unwrap(),
-            BackfillOutcome::NothingMissing
-        );
-    }
-
-    #[test]
-    fn second_run_does_not_duplicate_history() {
-        let state = ReplicaCoordinator::open_in_memory().unwrap();
-        state
-            .file_index_repository()
-            .upsert_file(
-                "g",
-                &live("a.txt"),
-                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-            )
-            .unwrap();
-
-        assert_eq!(
-            ensure_initial_import(&state, "g", &emitter()).unwrap(),
-            ImportOutcome::Imported { changes: 1, ops: 1 }
-        );
-        let head_after_first = state.sqlite().dag_group_heads("g").unwrap();
-
-        assert_eq!(
-            ensure_initial_import(&state, "g", &emitter()).unwrap(),
-            ImportOutcome::AlreadyInitialized
-        );
-        // No second root injected: the head set is byte-identical.
-        assert_eq!(state.sqlite().dag_group_heads("g").unwrap(), head_after_first);
-    }
-
-    /// A pre-upgrade database can already hold an index row for a path
-    /// that collides with the reserved artefact namespace — it was
-    /// ordinary content before this module's exclusion existed. Initial
-    /// import must skip that one row (never turn it into signed history)
-    /// while still importing every ordinary row around it, matching
-    /// admission's own artefact-only rejection: the blocked path is
-    /// reported (via a log line this test doesn't assert on directly) but
-    /// import does not error or stall for the rest of the index.
-    #[test]
-    fn ensure_initial_import_skips_a_pre_existing_reserved_namespace_collision() {
-        let state = ReplicaCoordinator::open_in_memory().unwrap();
-        let artefact_path = yadorilink_root_authority::reserved_namespace::artefact_component_name(
-            yadorilink_root_authority::reserved_namespace::ArtefactKind::Stage,
-            "deadbeef",
-        )
-        .unwrap();
-        state
-            .file_index_repository()
-            .upsert_file(
-                "g",
-                &live("a.txt"),
-                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-            )
-            .unwrap();
-        state
-            .file_index_repository()
-            .upsert_file(
-                "g",
-                &live(&artefact_path),
-                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-            )
-            .unwrap();
-
-        let outcome = ensure_initial_import(&state, "g", &emitter()).unwrap();
-        assert_eq!(outcome, ImportOutcome::Imported { changes: 1, ops: 1 });
-
-        let heads = state.sqlite().dag_group_heads("g").unwrap();
-        assert_eq!(heads.len(), 1);
-        let change = state.sqlite().dag_get_change(&heads[0]).unwrap().unwrap();
-        assert!(
-            change
-                .ops
-                .iter()
-                .all(|op| !matches!(op, Op::Put { path, .. } if path.as_str() == artefact_path)),
-            "the colliding path must never appear in signed history: {:?}",
-            change.ops
-        );
-        assert!(change
-            .ops
-            .iter()
-            .any(|op| matches!(op, Op::Put { path, .. } if path.as_str() == "a.txt")));
-    }
-
-    /// A database predating the sync-root lock's exclusion could hold an
-    /// indexed row for it (see the module-level rationale on
-    /// `path_must_never_enter_history`) — pins that the one-shot initial
-    /// import still skips it exactly as it does a versioned artefact.
-    #[test]
-    fn ensure_initial_import_skips_a_pre_existing_sync_root_lock_row() {
-        let state = ReplicaCoordinator::open_in_memory().unwrap();
-        let lock_path = yadorilink_root_authority::sync_root_lock::SYNC_ROOT_LOCK_FILE_NAME;
-        state
-            .file_index_repository()
-            .upsert_file(
-                "g",
-                &live("a.txt"),
-                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-            )
-            .unwrap();
-        state
-            .file_index_repository()
-            .upsert_file(
-                "g",
-                &live(lock_path),
-                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-            )
-            .unwrap();
-
-        let outcome = ensure_initial_import(&state, "g", &emitter()).unwrap();
-        assert_eq!(outcome, ImportOutcome::Imported { changes: 1, ops: 1 });
-
-        let heads = state.sqlite().dag_group_heads("g").unwrap();
-        let change = state.sqlite().dag_get_change(&heads[0]).unwrap().unwrap();
-        assert!(
-            change
-                .ops
-                .iter()
-                .all(|op| !matches!(op, Op::Put { path, .. } if path.as_str() == lock_path)),
-            "the sync-root lock path must never appear in signed history: {:?}",
-            change.ops
-        );
-    }
-
-    #[test]
-    fn empty_index_imports_nothing() {
-        let state = ReplicaCoordinator::open_in_memory().unwrap();
-        assert_eq!(
-            ensure_initial_import(&state, "g", &emitter()).unwrap(),
-            ImportOutcome::NothingToImport
-        );
-        assert!(state.sqlite().dag_group_heads("g").unwrap().is_empty());
-    }
-
-    #[test]
-    fn large_index_splits_into_bounded_chain() {
-        let state = ReplicaCoordinator::open_in_memory().unwrap();
-        let count = IMPORT_BATCH_OP_LIMIT + 5;
-        for i in 0..count {
-            state
-                .file_index_repository()
-                .upsert_file(
-                    "g",
-                    &live(&format!("f{i:05}.txt")),
-                    &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-                )
-                .unwrap();
-        }
-        let outcome = ensure_initial_import(&state, "g", &emitter()).unwrap();
-        assert_eq!(outcome, ImportOutcome::Imported { changes: 2, ops: count });
-        // A linear chain converges to a single head regardless of how many
-        // changes it took to carry every op.
-        assert_eq!(state.sqlite().dag_group_heads("g").unwrap().len(), 1);
-    }
-
-    /// Walks the linear parent chain from `head` back to the root, returning
-    /// every change on it (head-first). Asserts each non-root step has exactly
-    /// one parent, so a non-linear DAG fails loudly rather than silently
-    /// truncating the walk.
-    fn linear_chain_to_root(
-        state: &ReplicaCoordinator,
-        head: yadorilink_replica_domain::ids::ChangeHash,
-    ) -> Vec<yadorilink_replica_domain::change::Change> {
-        let mut chain = Vec::new();
-        let mut cursor = Some(head);
-        while let Some(hash) = cursor {
-            let change = state.sqlite().dag_get_change(&hash).unwrap().unwrap();
-            cursor = match change.parents.as_slice() {
-                [] => None,
-                [parent] => Some(*parent),
-                more => {
-                    panic!("expected a linear chain, found a change with {} parents", more.len())
-                }
-            };
-            chain.push(change);
-        }
-        chain
-    }
-
-    /// Byte cap: an initial import of FEWER than `IMPORT_BATCH_OP_LIMIT` files
-    /// whose ops encode to more than `change::MAX_CHANGE_OP_BYTES` (long paths)
-    /// must still split into MULTIPLE chained changes — proving the split is
-    /// driven by encoded size, not op count alone. Op count alone would leave a
-    /// single multi-hundred-KiB root change no wire message could deliver,
-    /// stranding the whole group's history permanently un-propagatable.
-    #[test]
-    fn import_splits_by_encoded_bytes_into_a_chain() {
-        let state = ReplicaCoordinator::open_in_memory().unwrap();
-        // ~289 bytes/op * 1000 ops ≈ 282 KiB > 256 KiB, yet 1000 < 1024 ops,
-        // so only the byte cap can split this — the op-count cap cannot.
-        let n = 1000usize;
-        assert!(n < IMPORT_BATCH_OP_LIMIT, "this test must stay under the op-count cap");
-        for i in 0..n {
-            state
-                .file_index_repository()
-                .upsert_file(
-                    "g",
-                    &live(&format!("d/{:0>250}", i)),
-                    &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-                )
-                .unwrap();
-        }
-
-        let outcome = ensure_initial_import(&state, "g", &emitter()).unwrap();
-        let ImportOutcome::Imported { changes, ops } = outcome else {
-            panic!("expected an import, got {outcome:?}");
-        };
-        assert_eq!(ops, n, "every file must be imported exactly once");
-        assert!(
-            changes >= 2,
-            "a >256 KiB import of {n} (< op-count-cap) files must split by bytes \
-             into >= 2 changes, got {changes}"
-        );
-
-        // The chunk chain converges on a single head and is linear to the root.
-        let heads = state.sqlite().dag_group_heads("g").unwrap();
-        assert_eq!(heads.len(), 1, "the chunk chain must converge on a single head");
-        let chain = linear_chain_to_root(&state, heads[0]);
-        assert_eq!(chain.len(), changes, "walked chain length must equal the emitted change count");
-
-        let mut total_ops = 0usize;
-        for change in &chain {
-            assert!(
-                change.ops.len() <= IMPORT_BATCH_OP_LIMIT,
-                "every chunk must stay within the op-count bound"
-            );
-            let bytes: usize = change.ops.iter().map(encoded_op_len).sum();
-            assert!(
-                bytes <= MAX_CHANGE_OP_BYTES,
-                "every chunk must stay within the byte bound, got {bytes}"
-            );
-            total_ops += change.ops.len();
-        }
-        assert_eq!(total_ops, n, "the chain's ops must cover every file exactly once");
-    }
-
-    /// Teeth for the byte cap: a normal small import — well within both bounds
-    /// — must still be a SINGLE change, so the dual-bound loop never
-    /// over-splits an ordinary folder into a needless chain.
-    #[test]
-    fn small_import_is_a_single_change() {
-        let state = ReplicaCoordinator::open_in_memory().unwrap();
-        for i in 0..8 {
-            state
-                .file_index_repository()
-                .upsert_file(
-                    "g",
-                    &live(&format!("f{i}.txt")),
-                    &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-                )
-                .unwrap();
-        }
-        let outcome = ensure_initial_import(&state, "g", &emitter()).unwrap();
-        assert_eq!(outcome, ImportOutcome::Imported { changes: 1, ops: 8 });
-        assert_eq!(state.sqlite().dag_group_heads("g").unwrap().len(), 1);
-    }
-}
+mod tests;

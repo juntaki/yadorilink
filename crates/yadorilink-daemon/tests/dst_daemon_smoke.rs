@@ -1,35 +1,27 @@
 //! Deterministic-simulation smoke test: boots the *real* daemon lifecycle
 //! (`app::run(DaemonConfig)`) inside a `madsim` simulation node and drives
 //! one end-to-end local-change indexing cycle under the seeded, simulated
-//! scheduler.
-//!
-//! Unlike the `yadorilink-sync-core` DST harness (which reproduces the
-//! watcher -> debounce -> indexing pipeline directly against
-//! `yadorilink-sync-core`, since that crate cannot depend on the daemon),
-//! this test starts the production `app::run` entry point itself: the same
-//! startup sequence, `DaemonState`, essential-task supervisor, and
-//! top-level shutdown `select!` the real binary runs. It is the first
-//! end-to-end proof that the daemon can boot and reach steady state
-//! in-simulation.
-//!
-//! What is stubbed away so no real network/socket is touched in-sim (all
-//! seams are `#[cfg(madsim)]`/`cfg(not(madsim))`-gated, so production
-//! behavior is unchanged):
-//!   - Peer orchestrator (`tonic` coordination client): started only when a
-//!     device config *and* an access token are present. This test points
-//!     `YADORILINK_CONFIG_DIR` at an empty temp dir, so the daemon is "not
-//!     logged in" and the orchestrator is never started — no `tonic`.
-//!   - Update-check scheduler (`reqwest`): not spawned under `--cfg madsim`
-//!     (see `daemon_state.rs`).
-//!   - Control socket + shell-IPC (`UnixListener`): their essential tasks
-//!     are not started under `--cfg madsim` (see `app.rs`); this test
-//!     drives the daemon through `DaemonState`/`shutdown_tx` directly via
-//!     the `state_probe` seam instead.
-//!
-//! Only compiled/run under `RUSTFLAGS="--cfg madsim"`; a plain `cargo test`
-//! never builds this file.
+//! scheduler. It is the first end-to-end proof that the daemon can boot
+//! and reach steady state in-simulation. What is stubbed away so no real
+//! network/socket is touched in-sim (all seams are
+//! `#[cfg(madsim)]`/`cfg(not(madsim))`-gated, so production behavior is
+//! unchanged): - Peer orchestrator (`tonic` coordination client): started
+//! only when a device config *and* an access token are present. This test
+//! points `YADORILINK_CONFIG_DIR` at an empty temp dir, so the daemon is
+//! "not logged in" and the orchestrator is never started — no `tonic`. -
+//! Update-check scheduler (`reqwest`): not spawned under `--cfg madsim`
+//! (see `daemon_state.rs`). - Control socket + shell-IPC (`UnixListener`):
+//! their essential tasks are not started under `--cfg madsim` (see
+//! `app.rs`); this test drives the daemon through
+//! `DaemonState`/`shutdown_tx` directly via the `state_probe` seam
+//! instead. Only compiled/run under `RUSTFLAGS="--cfg madsim"`; a plain
+//! `cargo test` never builds this file.
 
-#![cfg(madsim)]
+// Retired. This scenario was written for a simulator this project no longer
+// builds against, and it names APIs that have since been removed. It is kept,
+// never compiled, as the specification its turmoil re-expression has to meet;
+// delete it in the change that lands that replacement.
+#![cfg(any())]
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -48,31 +40,18 @@ const GROUP_ID: &str = "dst-daemon-smoke-group";
 /// The seed-derived deterministic mtime (unix-nanos) the harness stamps
 /// onto every file it writes, so the real `LocalChangeProcessor` indexes a
 /// replayable `mtime_unix_nanos` rather than a kernel-stamped real
-/// wall-clock value.
-///
-/// WHY THIS IS NEEDED: madsim virtualizes `SystemTime::now`/`clock_gettime`
-/// (so every daemon `now_unix()` read is already per-seed deterministic
-/// in-sim), but it does *not* intercept the kernel's inode-mtime stamping —
-/// a real `std::fs::write` gets a real wall-clock mtime. The daemon's
-/// indexing reads that mtime straight off `metadata.modified()`
-/// (`sync-core::local_change`) into the persisted `FileRecord`, so without
-/// this stamp two same-seed runs diverge on mtime (verified: three runs
-/// produced three distinct nanosecond mtimes). This is the one real
-/// wall-clock leak into observable in-sim index state.
-///
-/// The value mirrors `sync-core`'s `dst_support::HarnessClock::from_seed`
-/// origin (`seed * 1e9`) plus one `MTIME_STEP_NANOS` (+1s), and is pushed
-/// onto `sync-core`'s process-wide session-clock override too, so conflict
-/// resolution's `now_unix_nanos` sits on the same synthetic timeline the
-/// stamped mtimes do — the same reuse the `sync-core` DST scenarios make.
+/// wall-clock value. WHY THIS IS NEEDED: madsim virtualizes
+/// `SystemTime::now`/`clock_gettime` (so every daemon `now_unix()` read is
+/// already per-seed deterministic in-sim), but it does *not* intercept the
+/// kernel's inode-mtime stamping — a real `std::fs::write` gets a real
+/// wall-clock mtime. This is the one real wall-clock leak into observable
+/// in-sim index state.
 fn deterministic_mtime_nanos(seed: u64) -> i64 {
     (seed as i64).wrapping_mul(1_000_000_000).wrapping_add(1_000_000_000)
 }
 
-/// Stamps `path`'s on-disk mtime to `nanos`, mirroring `sync-core`'s
-/// `dst_support::fs_ops` stamp (the stable-since-1.75 `File::set_times`
-/// primitive, no extra crate). Production code is untouched — this only
-/// controls what the real indexing path later reads back off the file.
+/// Production code is untouched — this only controls what the real
+/// indexing path later reads back off the file.
 fn stamp_deterministic_mtime(path: &Path, nanos: i64) -> Result<(), String> {
     let modified = UNIX_EPOCH + Duration::from_nanos(nanos as u64);
     let file = std::fs::File::options().write(true).open(path).map_err(|e| e.to_string())?;
@@ -125,7 +104,7 @@ fn run_scenario(seed: u64) -> Result<IndexSnapshot, String> {
 
 async fn scenario_body(seed: u64) -> Result<IndexSnapshot, String> {
     // Isolate every process-global config lookup (`device_config::load`,
-    // `token_store::load_access_token`, `UpdateManager`) onto an empty temp
+    // `credential_store::legacy_access_token`, `UpdateManager`) onto an empty temp
     // dir. Empty => not logged in, no registered device => the peer
     // orchestrator (and its `tonic` coordination client) is never started.
     let config_dir = tempfile::tempdir().map_err(|e| format!("config tempdir: {e}"))?;
@@ -133,10 +112,6 @@ async fn scenario_body(seed: u64) -> Result<IndexSnapshot, String> {
 
     let block_store_dir = tempfile::tempdir().map_err(|e| format!("block-store tempdir: {e}"))?;
     let watch_root_dir = tempfile::tempdir().map_err(|e| format!("watch-root tempdir: {e}"))?;
-    // Canonicalize the watched root up front, matching what the real
-    // watcher does internally — macOS's tempdir lives under a `/var` symlink
-    // to `/private/var`, so path-prefix stripping during indexing would
-    // otherwise silently mismatch (same note as the sync-core DST harness).
     let root =
         watch_root_dir.path().canonicalize().map_err(|e| format!("canonicalize root: {e}"))?;
 
@@ -181,9 +156,8 @@ async fn scenario_body(seed: u64) -> Result<IndexSnapshot, String> {
         )
         .map_err(|e| format!("start_link_watch_with_source: {e}"))?;
 
-    // 3) INDEXES: write a file, then deliver the synthetic watcher event for
-    // it. The scenario controls the timing relative to the write, exactly
-    // like the sync-core harness.
+    // 3) INDEXES: write a file, then deliver the synthetic watcher event
+    // for it.
     let file_path = root.join("hello.txt");
     let content = b"hello daemon, from inside the simulator";
     std::fs::write(&file_path, content).map_err(|e| format!("write file: {e}"))?;
@@ -240,9 +214,7 @@ async fn wait_for_state(probe: &app::StateProbe, timeout: Duration) -> Option<Ar
     }
 }
 
-/// Single-seed smoke run. A fixed seed is enough for a plumbing smoke test;
-/// broadening into a many-seed sweep (like the sync-core harness) is a
-/// follow-up once the daemon boot path is proven in-sim.
+/// Single-seed smoke run.
 #[test]
 fn boots_watches_and_indexes_in_sim() {
     let seed: u64 = std::env::var("DST_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
@@ -253,7 +225,7 @@ fn boots_watches_and_indexes_in_sim() {
     );
 }
 
-/// P1.6 replay-equivalence gate: the whole daemon boot -> watch -> index
+/// Replay-equivalence gate: the whole daemon boot -> watch -> index
 /// cycle must be time-deterministic, so running the *same seed twice*
 /// produces a byte-identical index snapshot (paths + mtimes + content
 /// hashes). This is the concrete guard that no real wall-clock leaks into

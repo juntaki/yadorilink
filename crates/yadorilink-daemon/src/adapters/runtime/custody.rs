@@ -33,13 +33,7 @@ impl CustodyConfirmer for P2pCustodyConfirmer {
     // fails closed to `None` up front while `REMOTE_CUSTODY_LEASES_SUPPORTED`
     // is `false` (physical reclamation isn't shipped yet -- see
     // `DaemonState::install_p2p_custody_confirmer`'s doc comment), so this
-    // method is not actually reachable in any build today. madsim's
-    // simulated runtime has no `Handle::block_on`/`block_in_place` -- real
-    // blocking would break its deterministic single-threaded-per-node
-    // scheduling -- so the bridge below is real-runtime-only; the madsim
-    // build gets the same always-`None` answer this path already produces
-    // everywhere until the lease feature ships and this needs a real
-    // non-blocking bridge.
+    // method is not actually reachable in any build today.
     // `block_in_place` panics if called on a current-thread tokio runtime,
     // so the offload path below can only be taken when a *multi-threaded*
     // runtime is actually current -- the same guard used at every other
@@ -60,7 +54,6 @@ impl CustodyConfirmer for P2pCustodyConfirmer {
     // both worth surfacing loudly rather than silently returning "no
     // confirmation", which would look identical to an ordinary "peer didn't
     // confirm" result.
-    #[cfg(not(madsim))]
     fn confirms_present(
         &self,
         group_id: &str,
@@ -101,23 +94,12 @@ impl CustodyConfirmer for P2pCustodyConfirmer {
         }
     }
 
-    #[cfg(madsim)]
-    fn confirms_present(
-        &self,
-        _group_id: &str,
-        _path: &str,
-        _version_hash: &VersionHash,
-        _blocks: &[VersionBlock],
-    ) -> Option<CustodyStamp> {
-        None
-    }
-
     fn confirmation_still_valid(&self, group_id: &str, stamp: &CustodyStamp) -> bool {
         let Some(state) = self.state.upgrade() else {
             return false;
         };
-        state.membership_generation() == stamp.membership_generation()
-            && state.peer_group_is_full_replica(stamp.peer_id(), group_id)
-            && state.peer_is_writer(stamp.peer_id(), group_id)
+        state.authority.membership_generation() == stamp.membership_generation()
+            && state.authority.peer_group_is_full_replica(stamp.peer_id(), group_id)
+            && state.authority.peer_is_writer(stamp.peer_id(), group_id)
     }
 }

@@ -58,12 +58,10 @@ produces.
 ## Signing key custody
 
 **The production APT signing key was not generated as part of this
-change.** That is deliberate, not an oversight: `docs/UPDATE_SIGNING.md`
-documents this project's one existing precedent for a comparable decision
-(the Ed25519 update-manifest signing key), and its Key Ceremony section is
-explicit that generation requires *"a trusted machine with full-disk
-encryption"* and recorded *"participants, date, device, and key
-identifier"* -- a real ceremony with a human present, not something to
+change.** That is deliberate, not an oversight: the project's update-signing
+policy for the one comparable key (the Ed25519 update-manifest signing key)
+requires its generation on a trusted machine with full-disk encryption, with
+the participants, date, device, and key identifier recorded -- a real ceremony with a human present, not something to
 fold into an automated packaging change. Generating the production APT
 key is a maintainer action; this repository only ever consumes its public
 half (`installer/linux/apt/build-keyring-deb.sh`,
@@ -89,7 +87,7 @@ half (`installer/linux/apt/build-keyring-deb.sh`,
   repository.
 
 **What a maintainer needs to decide and do**, mirroring
-`docs/UPDATE_SIGNING.md`'s ceremony as closely as this signing scheme
+the update-signing key ceremony as closely as this signing scheme
 allows (GPG rather than raw Ed25519, but the same trust boundary):
 
 1. On a trusted machine, generate a **dedicated** GPG key for this purpose
@@ -109,7 +107,7 @@ allows (GPG rather than raw Ed25519, but the same trust boundary):
    key id from the imported secret key itself, and the release workflow
    exports + publishes the public half (`yadorilink-archive-keyring.asc`)
    automatically as part of the same step.
-4. Rotation/revocation should follow `docs/UPDATE_SIGNING.md`'s same
+4. Rotation/revocation should follow the update-signing key's same
    additive, overlapping procedure: publish the new key's `.asc` and
    keyring `.deb` alongside the old one for a transition window (apt has
    no equivalent of the client's own trust-root compile-time pinning, so
