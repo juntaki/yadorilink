@@ -113,6 +113,16 @@ impl EnrollmentRecoveryService {
     /// found, as a second guard: a path relinked to a different group
     /// since the marker was written no longer describes what the marker
     /// was written for, so it is treated the same as "link absent" below.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one fail-closed reconcile sweep: the links and markers snapshots \
+                  are read once up front precisely so every marker decision \
+                  (activate, cancel, orphan, leave pending) is taken against the \
+                  same consistent view. Splitting the per-marker arms into helpers \
+                  would either re-read the DB per marker or hand each helper the \
+                  full snapshot, losing the read-once invariant the doc comment \
+                  above depends on."
+    )]
     async fn reconcile_markers(&self) {
         // Fail closed on a DB read error rather than defaulting to an empty
         // view. A defaulted-empty link list would make every marker's link
@@ -389,6 +399,83 @@ impl EnrollmentRecoveryService {
         }
     }
 
+    /// Settles a `Join` left `Prepared` beside a live link for its group and
+    /// path with no marker -- a re-join of an already-linked, running folder
+    /// that was interrupted while it activated (see
+    /// `EnrollmentService::settle_rejoin_of_linked_folder`, whose outcomes
+    /// this mirrors). Activation resolves a join by (group, device), so an
+    /// Active membership answers `AlreadyActive` and a Pending one this
+    /// prepare created becomes Active; either way only the journal row is
+    /// closed. The link is never touched: it is the earlier link, which this
+    /// operation never created, so neither outcome may orphan or remove it.
+    async fn settle_interrupted_rejoin(&self, operation: &EnrollmentOperation, group_id: &str) {
+        let activation = self
+            .coordination
+            .activate_join(group_id, &operation.operation_id, &operation.device_id)
+            .await;
+        match activation {
+            EnrollmentActivationResult::Activated
+            | EnrollmentActivationResult::AlreadyActive
+            | EnrollmentActivationResult::AwaitingApproval => {
+                if let Err(e) = self.repository.delete_operation(&operation.operation_id) {
+                    tracing::warn!(error = %e, operation_id = %operation.operation_id, "failed to close a settled re-join's journal row; the next sweep will settle it again");
+                }
+            }
+            EnrollmentActivationResult::Deleted => {
+                tracing::warn!(
+                    operation_id = %operation.operation_id,
+                    group_id,
+                    local_path = %operation.local_path,
+                    "an interrupted re-join found no membership to activate; closing its journal \
+                     row and leaving the existing link as it is"
+                );
+                if let Err(e) = self.repository.delete_operation(&operation.operation_id) {
+                    tracing::warn!(error = %e, operation_id = %operation.operation_id, "failed to close an interrupted re-join's journal row");
+                }
+            }
+            EnrollmentActivationResult::TransientFailure { detail } => {
+                tracing::debug!(operation_id = %operation.operation_id, detail, "interrupted re-join activation still unresolved; will retry");
+            }
+        }
+    }
+
+    /// An operation still `LocalSetupPending` past the age gate.
+    fn roll_back_stranded_local_setup(&self, operation: &EnrollmentOperation) {
+        // This state should be purely transient -- setup runs
+        // synchronously inside the same commit that just committed
+        // the link/marker/LocalSetupPending transition, and does no
+        // network I/O. A row still found here well past the
+        // age-gate means the daemon crashed (or otherwise never
+        // finished) mid-setup: rolled back rather than risk
+        // activating a remote authorization for a link this device
+        // never finished registering. The rollback undoes exactly
+        // the link-row write the commit recorded -- a re-join of a
+        // folder whose row already existed restores that row, root
+        // token and all, instead of deleting it.
+        match self.repository.rollback_local_setup_to_cancel_pending(
+            &operation.local_path,
+            &operation.operation_id,
+            "local setup did not complete before recovery",
+            now_unix(),
+        ) {
+            Ok(true) => {
+                tracing::warn!(
+                    operation_id = %operation.operation_id,
+                    local_path = %operation.local_path,
+                    "rolled back an enrollment whose local setup did not complete"
+                );
+            }
+            Ok(false) => self.block_operation(
+                &operation.operation_id,
+                "local setup did not complete, and the operation has no recorded link \
+                 write to undo",
+            ),
+            Err(e) => {
+                tracing::warn!(error = %e, operation_id = %operation.operation_id, "could not roll back an incomplete local setup");
+            }
+        }
+    }
+
     async fn reconcile_one_operation(&self, operation: EnrollmentOperation) {
         match operation.state {
             OpState::PreparePending => {
@@ -507,13 +594,26 @@ impl EnrollmentRecoveryService {
                         // `LocalSetupPending`, NOT `ActivationPending`:
                         // this path has no way to confirm local setup
                         // actually finished, so it must not skip the
-                        // setup-confirmation gate.
+                        // setup-confirmation gate. (With no recorded link
+                        // write, that state's rollback blocks the row
+                        // rather than guess at the link.)
                         let _ = self.repository.mark_state(
                             &operation.operation_id,
                             OpState::LocalSetupPending,
                             None,
                             now_unix(),
                         );
+                    }
+                    // A join beside a LIVE link for its group and path,
+                    // with no marker: the shape a re-join of a folder
+                    // already linked and running leaves for the whole of
+                    // its activation round trip, because its link call
+                    // commits nothing. A daemon that died in that window
+                    // did nothing wrong; finish what the join was doing.
+                    (Some(link), None)
+                        if operation.kind == WireEnrollmentKind::Join && !link.orphaned =>
+                    {
+                        self.settle_interrupted_rejoin(&operation, &group_id).await;
                     }
                     (Some(_), None) => {
                         self.block_operation(
@@ -530,24 +630,7 @@ impl EnrollmentRecoveryService {
                     }
                 }
             }
-            OpState::LocalSetupPending => {
-                // This state should be purely transient -- setup runs
-                // synchronously inside the same commit that just committed
-                // the link/marker/LocalSetupPending transition, and does no
-                // network I/O. A row still found here well past the
-                // age-gate means the daemon crashed (or otherwise never
-                // finished) mid-setup: rolled back unconditionally rather
-                // than risk activating a remote authorization for a link
-                // this device never finished registering.
-                if let Err(e) = self.repository.rollback_local_setup_to_cancel_pending(
-                    &operation.local_path,
-                    &operation.operation_id,
-                    "local setup did not complete before recovery",
-                    now_unix(),
-                ) {
-                    tracing::warn!(error = %e, operation_id = %operation.operation_id, "could not roll back an incomplete local setup");
-                }
-            }
+            OpState::LocalSetupPending => self.roll_back_stranded_local_setup(&operation),
             OpState::ActivationPending => {
                 // The link + pending_enrollments marker + local setup are
                 // all confirmed, so this row's own job is usually done and
@@ -634,993 +717,4 @@ impl EnrollmentRecoveryService {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Mutex;
-
-    use yadorilink_replica_domain::session_state::MaterializationPolicy;
-    use yadorilink_replica_domain::session_state::{
-        FolderLink, InvalidEnrollmentOperation, InvalidPendingEnrollment, PendingEnrollment,
-    };
-
-    use super::*;
-    use crate::application::ports::EnrollmentLinkRequest;
-    use crate::application::EnrollmentLinkError;
-
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    enum RepoCall {
-        MarkPrepared(String, String),
-        MarkState(String, OpState),
-        DeleteOperation(String),
-        SettleActivatedAndClose(String),
-        MoveMarkerToCancelOperation(String),
-        IncrementAttempts(String),
-        RollbackLocalSetup(String),
-    }
-
-    #[derive(Default)]
-    struct FakeRepository {
-        calls: Mutex<Vec<RepoCall>>,
-        operations: Mutex<std::collections::HashMap<String, EnrollmentOperation>>,
-        links: Mutex<Vec<FolderLink>>,
-        markers: Mutex<yadorilink_replica_domain::session_state::PendingEnrollmentScan>,
-        invalid_operations: Mutex<Vec<InvalidEnrollmentOperation>>,
-        fail_list_links: AtomicBool,
-        fail_scan_pending: AtomicBool,
-        fail_scan_open: AtomicBool,
-    }
-
-    impl FakeRepository {
-        fn with_operation(self, operation: EnrollmentOperation) -> Self {
-            self.operations.lock().unwrap().insert(operation.operation_id.clone(), operation);
-            self
-        }
-
-        fn with_link(self, link: FolderLink) -> Self {
-            self.links.lock().unwrap().push(link);
-            self
-        }
-
-        fn with_marker(self, marker: PendingEnrollment) -> Self {
-            self.markers.lock().unwrap().valid.push(marker);
-            self
-        }
-    }
-
-    impl EnrollmentRepository for FakeRepository {
-        fn try_insert_operation(
-            &self,
-            _operation: &EnrollmentOperation,
-        ) -> Result<bool, crate::sync_error::SyncError> {
-            unimplemented!("not exercised by recovery-service tests")
-        }
-
-        fn delete_operation(&self, operation_id: &str) -> Result<(), crate::sync_error::SyncError> {
-            self.calls.lock().unwrap().push(RepoCall::DeleteOperation(operation_id.to_string()));
-            self.operations.lock().unwrap().remove(operation_id);
-            Ok(())
-        }
-
-        fn mark_prepared(
-            &self,
-            operation_id: &str,
-            group_id: &str,
-            _now_unix: i64,
-        ) -> Result<bool, crate::sync_error::SyncError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(RepoCall::MarkPrepared(operation_id.to_string(), group_id.to_string()));
-            let mut operations = self.operations.lock().unwrap();
-            let Some(op) = operations.get_mut(operation_id) else { return Ok(false) };
-            op.group_id = Some(group_id.to_string());
-            op.state = OpState::Prepared;
-            Ok(true)
-        }
-
-        fn mark_state(
-            &self,
-            operation_id: &str,
-            state: OpState,
-            _error: Option<&str>,
-            _now_unix: i64,
-        ) -> Result<bool, crate::sync_error::SyncError> {
-            self.calls.lock().unwrap().push(RepoCall::MarkState(operation_id.to_string(), state));
-            let mut operations = self.operations.lock().unwrap();
-            let Some(op) = operations.get_mut(operation_id) else { return Ok(false) };
-            op.state = state;
-            Ok(true)
-        }
-
-        fn list_links(&self) -> Result<Vec<FolderLink>, crate::sync_error::SyncError> {
-            if self.fail_list_links.load(Ordering::SeqCst) {
-                return Err(std::io::Error::other("fake list_links failure").into());
-            }
-            Ok(self.links.lock().unwrap().clone())
-        }
-
-        fn scan_pending(
-            &self,
-        ) -> Result<
-            yadorilink_replica_domain::session_state::PendingEnrollmentScan,
-            crate::sync_error::SyncError,
-        > {
-            if self.fail_scan_pending.load(Ordering::SeqCst) {
-                return Err(std::io::Error::other("fake scan_pending failure").into());
-            }
-            Ok(self.markers.lock().unwrap().clone())
-        }
-
-        fn settle_activated(
-            &self,
-            _operation_id: &str,
-        ) -> Result<(), crate::sync_error::SyncError> {
-            unimplemented!("recovery uses settle_activated_and_close, not settle_activated")
-        }
-
-        fn operation(
-            &self,
-            operation_id: &str,
-        ) -> Result<Option<EnrollmentOperation>, crate::sync_error::SyncError> {
-            Ok(self.operations.lock().unwrap().get(operation_id).cloned())
-        }
-
-        fn scan_open_operations(
-            &self,
-        ) -> Result<
-            yadorilink_replica_domain::session_state::EnrollmentOperationScan,
-            crate::sync_error::SyncError,
-        > {
-            if self.fail_scan_open.load(Ordering::SeqCst) {
-                return Err(std::io::Error::other("fake scan_open_operations failure").into());
-            }
-            Ok(yadorilink_replica_domain::session_state::EnrollmentOperationScan {
-                valid: self
-                    .operations
-                    .lock()
-                    .unwrap()
-                    .values()
-                    .filter(|op| op.state != OpState::RecoveryBlocked)
-                    .cloned()
-                    .collect(),
-                invalid: self.invalid_operations.lock().unwrap().clone(),
-            })
-        }
-
-        fn settle_activated_and_close(
-            &self,
-            operation_id: &str,
-        ) -> Result<(), crate::sync_error::SyncError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(RepoCall::SettleActivatedAndClose(operation_id.to_string()));
-            self.operations.lock().unwrap().remove(operation_id);
-            self.markers.lock().unwrap().valid.retain(|m| m.operation_id != operation_id);
-            Ok(())
-        }
-
-        fn move_marker_to_cancel_operation(
-            &self,
-            marker: &PendingEnrollment,
-            _now_unix: i64,
-        ) -> Result<(), crate::sync_error::SyncError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(RepoCall::MoveMarkerToCancelOperation(marker.operation_id.clone()));
-            self.markers.lock().unwrap().valid.retain(|m| m.operation_id != marker.operation_id);
-            if let Some(op) = self.operations.lock().unwrap().get_mut(&marker.operation_id) {
-                op.state = OpState::CancelPending;
-            }
-            Ok(())
-        }
-
-        fn increment_attempts(
-            &self,
-            operation_id: &str,
-            _now_unix: i64,
-        ) -> Result<i64, crate::sync_error::SyncError> {
-            self.calls.lock().unwrap().push(RepoCall::IncrementAttempts(operation_id.to_string()));
-            Ok(1)
-        }
-
-        fn rollback_local_setup_to_cancel_pending(
-            &self,
-            _local_path: &str,
-            operation_id: &str,
-            _detail: &str,
-            _now_unix: i64,
-        ) -> Result<(), crate::sync_error::SyncError> {
-            self.calls.lock().unwrap().push(RepoCall::RollbackLocalSetup(operation_id.to_string()));
-            if let Some(op) = self.operations.lock().unwrap().get_mut(operation_id) {
-                op.state = OpState::CancelPending;
-            }
-            Ok(())
-        }
-    }
-
-    #[derive(Default)]
-    struct FakeCoordination {
-        activate: Mutex<VecDeque<EnrollmentActivationResult>>,
-        cancel: Mutex<VecDeque<EnrollmentCancellationResult>>,
-        prepare: Mutex<VecDeque<EnrollmentPrepareResult>>,
-        activate_calls: Mutex<u32>,
-        cancel_calls: Mutex<u32>,
-    }
-
-    impl EnrollmentCoordination for FakeCoordination {
-        fn is_configured(&self) -> bool {
-            true
-        }
-
-        fn prepare_create<'a>(
-            &'a self,
-            _operation_id: &'a str,
-            _group_name: &'a str,
-            _device_id: &'a str,
-        ) -> crate::application::ports::BoxFuture<'a, EnrollmentPrepareResult> {
-            Box::pin(async move {
-                self.prepare.lock().unwrap().pop_front().expect("missing fake prepare")
-            })
-        }
-
-        fn prepare_join<'a>(
-            &'a self,
-            _operation_id: &'a str,
-            _group_id: &'a str,
-            _device_id: &'a str,
-            _storage_mode: &'a str,
-        ) -> crate::application::ports::BoxFuture<'a, EnrollmentPrepareResult> {
-            Box::pin(async move {
-                self.prepare.lock().unwrap().pop_front().expect("missing fake prepare")
-            })
-        }
-
-        fn activate_create<'a>(
-            &'a self,
-            _group_id: &'a str,
-            _operation_id: &'a str,
-        ) -> crate::application::ports::BoxFuture<'a, EnrollmentActivationResult> {
-            Box::pin(async move {
-                *self.activate_calls.lock().unwrap() += 1;
-                self.activate.lock().unwrap().pop_front().expect("missing fake activate")
-            })
-        }
-
-        fn activate_join<'a>(
-            &'a self,
-            _group_id: &'a str,
-            _operation_id: &'a str,
-            _device_id: &'a str,
-        ) -> crate::application::ports::BoxFuture<'a, EnrollmentActivationResult> {
-            Box::pin(async move {
-                *self.activate_calls.lock().unwrap() += 1;
-                self.activate.lock().unwrap().pop_front().expect("missing fake activate")
-            })
-        }
-
-        fn cancel_create<'a>(
-            &'a self,
-            _group_id: &'a str,
-            _operation_id: &'a str,
-        ) -> crate::application::ports::BoxFuture<'a, EnrollmentCancellationResult> {
-            Box::pin(async move {
-                *self.cancel_calls.lock().unwrap() += 1;
-                self.cancel.lock().unwrap().pop_front().expect("missing fake cancel")
-            })
-        }
-
-        fn cancel_join<'a>(
-            &'a self,
-            _group_id: &'a str,
-            _operation_id: &'a str,
-            _device_id: &'a str,
-        ) -> crate::application::ports::BoxFuture<'a, EnrollmentCancellationResult> {
-            Box::pin(async move {
-                *self.cancel_calls.lock().unwrap() += 1;
-                self.cancel.lock().unwrap().pop_front().expect("missing fake cancel")
-            })
-        }
-
-        fn prepare_invite_accept<'a>(
-            &'a self,
-            _operation_id: &'a str,
-            _code: &'a str,
-            _device_id: &'a str,
-            _storage_mode: &'a str,
-        ) -> crate::application::ports::BoxFuture<'a, EnrollmentPrepareResult> {
-            Box::pin(async move {
-                self.prepare.lock().unwrap().pop_front().expect("missing fake prepare")
-            })
-        }
-
-        fn activate_invite_accept<'a>(
-            &'a self,
-            _group_id: &'a str,
-            _operation_id: &'a str,
-            _device_id: &'a str,
-        ) -> crate::application::ports::BoxFuture<'a, EnrollmentActivationResult> {
-            Box::pin(async move {
-                *self.activate_calls.lock().unwrap() += 1;
-                self.activate.lock().unwrap().pop_front().expect("missing fake activate")
-            })
-        }
-
-        fn cancel_invite_accept<'a>(
-            &'a self,
-            _group_id: &'a str,
-            _operation_id: &'a str,
-            _device_id: &'a str,
-        ) -> crate::application::ports::BoxFuture<'a, EnrollmentCancellationResult> {
-            Box::pin(async move {
-                *self.cancel_calls.lock().unwrap() += 1;
-                self.cancel.lock().unwrap().pop_front().expect("missing fake cancel")
-            })
-        }
-
-        fn mint_invite<'a>(
-            &'a self,
-            _group_id: &'a str,
-            _role: Option<&'a str>,
-            _ttl_secs: Option<u64>,
-            _requires_approval: bool,
-        ) -> crate::application::ports::BoxFuture<
-            'a,
-            Result<crate::application::model::MintedInvite, String>,
-        > {
-            Box::pin(async move { unimplemented!("recovery never mints an invite") })
-        }
-    }
-
-    #[derive(Default)]
-    struct FakeLinkPort {
-        rollback_calls: Mutex<Vec<(String, String)>>,
-        rollback_result: Mutex<VecDeque<Result<(), String>>>,
-    }
-
-    impl EnrollmentLinkPort for FakeLinkPort {
-        fn commit<'a>(
-            &'a self,
-            _request: EnrollmentLinkRequest,
-        ) -> crate::application::ports::BoxFuture<'a, Result<(), EnrollmentLinkError>> {
-            Box::pin(async move { unimplemented!("recovery never commits a new link") })
-        }
-
-        fn rollback<'a>(
-            &'a self,
-            local_path: &'a str,
-            operation_id: &'a str,
-        ) -> crate::application::ports::BoxFuture<'a, Result<(), String>> {
-            Box::pin(async move {
-                self.rollback_calls
-                    .lock()
-                    .unwrap()
-                    .push((local_path.to_string(), operation_id.to_string()));
-                self.rollback_result
-                    .lock()
-                    .unwrap()
-                    .pop_front()
-                    .expect("missing fake rollback result")
-            })
-        }
-
-        fn commit_plain<'a>(
-            &'a self,
-            _group_id: &'a str,
-            _absolute_path: &'a std::path::Path,
-            _on_demand: bool,
-            _acknowledge_risks: bool,
-        ) -> crate::application::ports::BoxFuture<'a, Result<(), EnrollmentLinkError>> {
-            Box::pin(async move { unimplemented!("recovery never commits a plain link") })
-        }
-    }
-
-    #[derive(Default)]
-    struct FakeAttemptTracker {
-        counters: Mutex<std::collections::HashMap<String, u32>>,
-        cleared: Mutex<Vec<String>>,
-    }
-
-    impl EnrollmentAttemptTracker for FakeAttemptTracker {
-        fn note_transient_attempt(&self, operation_id: &str) -> u32 {
-            let mut counters = self.counters.lock().unwrap();
-            let count = counters.entry(operation_id.to_string()).or_insert(0);
-            *count += 1;
-            *count
-        }
-
-        fn clear_transient_attempts(&self, operation_id: &str) {
-            self.cleared.lock().unwrap().push(operation_id.to_string());
-        }
-    }
-
-    fn service(
-        repository: Arc<FakeRepository>,
-        coordination: Arc<FakeCoordination>,
-        links: Arc<FakeLinkPort>,
-        attempts: Arc<FakeAttemptTracker>,
-    ) -> EnrollmentRecoveryService {
-        EnrollmentRecoveryService::new(repository, coordination, links, attempts)
-    }
-
-    fn marker(operation_id: &str, group_id: &str) -> PendingEnrollment {
-        PendingEnrollment {
-            operation_id: operation_id.to_string(),
-            kind: WireEnrollmentKind::Create,
-            group_id: group_id.to_string(),
-            device_id: "device-a".to_string(),
-            local_path: "/home/alice/Photos".to_string(),
-        }
-    }
-
-    fn link(group_id: &str) -> FolderLink {
-        FolderLink {
-            local_path: "/home/alice/Photos".to_string(),
-            group_id: group_id.to_string(),
-            paused: false,
-            materialization_policy: MaterializationPolicy::Eager,
-            max_local_size_bytes: None,
-            orphaned: false,
-        }
-    }
-
-    fn operation(operation_id: &str, group_id: &str, state: OpState) -> EnrollmentOperation {
-        EnrollmentOperation {
-            operation_id: operation_id.to_string(),
-            kind: WireEnrollmentKind::Create,
-            group_id: Some(group_id.to_string()),
-            group_name: Some("photos".to_string()),
-            device_id: "device-a".to_string(),
-            local_path: "/home/alice/Photos".to_string(),
-            storage_mode: "eager".to_string(),
-            state,
-            last_error: None,
-            attempts: 0,
-            created_at_unix: 0,
-            updated_at_unix: 0,
-        }
-    }
-
-    // ===== Marker reconciliation =====
-
-    #[tokio::test]
-    async fn confirmed_activation_settles_marker_and_journal_together() {
-        let repository = Arc::new(
-            FakeRepository::default()
-                .with_operation(operation("op-1", "group-1", OpState::ActivationPending))
-                .with_link(link("group-1"))
-                .with_marker(marker("op-1", "group-1")),
-        );
-        let coordination = Arc::new(FakeCoordination::default());
-        coordination.activate.lock().unwrap().push_back(EnrollmentActivationResult::Activated);
-        let links = Arc::new(FakeLinkPort::default());
-        let attempts = Arc::new(FakeAttemptTracker::default());
-
-        service(repository.clone(), coordination, links.clone(), attempts.clone())
-            .reconcile_once()
-            .await;
-
-        assert!(repository
-            .calls
-            .lock()
-            .unwrap()
-            .contains(&RepoCall::SettleActivatedAndClose("op-1".to_string())));
-        assert!(links.rollback_calls.lock().unwrap().is_empty());
-        assert_eq!(*attempts.cleared.lock().unwrap(), vec!["op-1".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn deleted_activation_rolls_back_via_the_link_port() {
-        let repository = Arc::new(
-            FakeRepository::default()
-                .with_operation(operation("op-1", "group-1", OpState::ActivationPending))
-                .with_link(link("group-1"))
-                .with_marker(marker("op-1", "group-1")),
-        );
-        let coordination = Arc::new(FakeCoordination::default());
-        coordination.activate.lock().unwrap().push_back(EnrollmentActivationResult::Deleted);
-        let links = Arc::new(FakeLinkPort::default());
-        links.rollback_result.lock().unwrap().push_back(Ok(()));
-        let attempts = Arc::new(FakeAttemptTracker::default());
-
-        service(repository.clone(), coordination, links.clone(), attempts).reconcile_once().await;
-
-        assert_eq!(
-            *links.rollback_calls.lock().unwrap(),
-            vec![("/home/alice/Photos".to_string(), "op-1".to_string())]
-        );
-        assert!(!repository
-            .calls
-            .lock()
-            .unwrap()
-            .contains(&RepoCall::SettleActivatedAndClose("op-1".to_string())));
-    }
-
-    #[tokio::test]
-    async fn transient_activation_failure_never_rolls_back_and_counts_attempts() {
-        let repository = Arc::new(
-            FakeRepository::default()
-                .with_operation(operation("op-1", "group-1", OpState::ActivationPending))
-                .with_link(link("group-1"))
-                .with_marker(marker("op-1", "group-1")),
-        );
-        let coordination = Arc::new(FakeCoordination::default());
-        coordination.activate.lock().unwrap().push_back(
-            EnrollmentActivationResult::TransientFailure { detail: "timeout".to_string() },
-        );
-        let links = Arc::new(FakeLinkPort::default());
-        let attempts = Arc::new(FakeAttemptTracker::default());
-
-        service(repository, coordination, links.clone(), attempts.clone()).reconcile_once().await;
-
-        assert!(links.rollback_calls.lock().unwrap().is_empty());
-        assert_eq!(attempts.counters.lock().unwrap().get("op-1"), Some(&1));
-    }
-
-    #[tokio::test]
-    async fn activation_pending_gate_skips_a_non_activation_pending_row() {
-        let repository = Arc::new(
-            FakeRepository::default()
-                .with_operation(operation("op-1", "group-1", OpState::LocalSetupPending))
-                .with_link(link("group-1"))
-                .with_marker(marker("op-1", "group-1")),
-        );
-        let coordination = Arc::new(FakeCoordination::default());
-        let links = Arc::new(FakeLinkPort::default());
-        let attempts = Arc::new(FakeAttemptTracker::default());
-
-        service(repository, coordination.clone(), links, attempts).reconcile_once().await;
-
-        assert_eq!(*coordination.activate_calls.lock().unwrap(), 0);
-    }
-
-    #[tokio::test]
-    async fn identity_mismatch_between_marker_and_operation_blocks_recovery() {
-        let repository = Arc::new(
-            FakeRepository::default()
-                .with_operation(operation("op-1", "group-other", OpState::ActivationPending))
-                .with_link(link("group-1"))
-                .with_marker(marker("op-1", "group-1")),
-        );
-        let coordination = Arc::new(FakeCoordination::default());
-        let links = Arc::new(FakeLinkPort::default());
-        let attempts = Arc::new(FakeAttemptTracker::default());
-
-        service(repository.clone(), coordination.clone(), links, attempts).reconcile_once().await;
-
-        assert_eq!(*coordination.activate_calls.lock().unwrap(), 0);
-        assert!(repository
-            .calls
-            .lock()
-            .unwrap()
-            .contains(&RepoCall::MarkState("op-1".to_string(), OpState::RecoveryBlocked)));
-    }
-
-    #[tokio::test]
-    async fn a_marker_with_no_matching_link_transfers_to_cancel_pending_then_retries_cancel() {
-        let repository = Arc::new(
-            FakeRepository::default()
-                .with_operation(operation("op-1", "group-1", OpState::ActivationPending))
-                .with_marker(marker("op-1", "group-1")),
-        );
-        let coordination = Arc::new(FakeCoordination::default());
-        coordination.cancel.lock().unwrap().push_back(EnrollmentCancellationResult::Confirmed);
-        let links = Arc::new(FakeLinkPort::default());
-        let attempts = Arc::new(FakeAttemptTracker::default());
-
-        service(repository.clone(), coordination.clone(), links, attempts).reconcile_once().await;
-
-        assert!(repository
-            .calls
-            .lock()
-            .unwrap()
-            .contains(&RepoCall::MoveMarkerToCancelOperation("op-1".to_string())));
-        assert!(repository
-            .calls
-            .lock()
-            .unwrap()
-            .contains(&RepoCall::DeleteOperation("op-1".to_string())));
-        assert_eq!(*coordination.cancel_calls.lock().unwrap(), 1);
-    }
-
-    #[tokio::test]
-    async fn a_malformed_marker_blocks_only_that_row_not_sibling_rows() {
-        let repository = Arc::new(
-            FakeRepository::default()
-                .with_operation(operation("op-1", "group-1", OpState::ActivationPending))
-                .with_link(link("group-1"))
-                .with_marker(marker("op-2", "group-2")),
-        );
-        repository.markers.lock().unwrap().invalid.push(InvalidPendingEnrollment {
-            operation_id: "op-bad".to_string(),
-            detail: "unrecognized kind".to_string(),
-        });
-        let coordination = Arc::new(FakeCoordination::default());
-        coordination.activate.lock().unwrap().push_back(EnrollmentActivationResult::AlreadyActive);
-        // op-2's marker has no matching link (its group doesn't match
-        // op-1's link), so reconcile_markers routes it through the
-        // no-matching-link cancel path -- queue a result for that too.
-        coordination.cancel.lock().unwrap().push_back(EnrollmentCancellationResult::Confirmed);
-        let links = Arc::new(FakeLinkPort::default());
-        let attempts = Arc::new(FakeAttemptTracker::default());
-
-        service(repository.clone(), coordination.clone(), links, attempts).reconcile_once().await;
-
-        let calls = repository.calls.lock().unwrap();
-        assert!(
-            calls.contains(&RepoCall::MarkState("op-bad".to_string(), OpState::RecoveryBlocked))
-        );
-        // Sibling marker op-1/op-2 pairing doesn't line up (op-1's marker is
-        // op-2's group), so activation is never attempted for it here --
-        // proven separately above. This test only proves the malformed row
-        // did not abort the whole sweep (the call log has more than the one
-        // block entry, i.e. iteration continued).
-        drop(calls);
-    }
-
-    // ===== Journal reconciliation: PreparePending =====
-
-    #[tokio::test]
-    async fn prepare_pending_success_marks_prepared() {
-        let mut op = operation("op-1", "group-1", OpState::PreparePending);
-        op.updated_at_unix = -1000;
-        let repository = Arc::new(FakeRepository::default().with_operation(op));
-        let coordination = Arc::new(FakeCoordination::default());
-        coordination
-            .prepare
-            .lock()
-            .unwrap()
-            .push_back(EnrollmentPrepareResult::Prepared { group_id: "group-1".to_string() });
-        let links = Arc::new(FakeLinkPort::default());
-        let attempts = Arc::new(FakeAttemptTracker::default());
-
-        service(repository.clone(), coordination, links, attempts).reconcile_once().await;
-
-        assert!(repository
-            .calls
-            .lock()
-            .unwrap()
-            .contains(&RepoCall::MarkPrepared("op-1".to_string(), "group-1".to_string())));
-    }
-
-    #[tokio::test]
-    async fn prepare_pending_definitely_rejected_deletes_the_row() {
-        let mut op = operation("op-1", "group-1", OpState::PreparePending);
-        op.updated_at_unix = -1000;
-        let repository = Arc::new(FakeRepository::default().with_operation(op));
-        let coordination = Arc::new(FakeCoordination::default());
-        coordination
-            .prepare
-            .lock()
-            .unwrap()
-            .push_back(EnrollmentPrepareResult::DefinitelyRejected { detail: "gone".to_string() });
-        let links = Arc::new(FakeLinkPort::default());
-        let attempts = Arc::new(FakeAttemptTracker::default());
-
-        service(repository.clone(), coordination, links, attempts).reconcile_once().await;
-
-        assert!(repository
-            .calls
-            .lock()
-            .unwrap()
-            .contains(&RepoCall::DeleteOperation("op-1".to_string())));
-    }
-
-    #[tokio::test]
-    async fn prepare_pending_conflict_blocks_recovery() {
-        let mut op = operation("op-1", "group-1", OpState::PreparePending);
-        op.updated_at_unix = -1000;
-        let repository = Arc::new(FakeRepository::default().with_operation(op));
-        let coordination = Arc::new(FakeCoordination::default());
-        coordination
-            .prepare
-            .lock()
-            .unwrap()
-            .push_back(EnrollmentPrepareResult::Conflict { detail: "shape mismatch".to_string() });
-        let links = Arc::new(FakeLinkPort::default());
-        let attempts = Arc::new(FakeAttemptTracker::default());
-
-        service(repository.clone(), coordination, links, attempts).reconcile_once().await;
-
-        assert!(repository
-            .calls
-            .lock()
-            .unwrap()
-            .contains(&RepoCall::MarkState("op-1".to_string(), OpState::RecoveryBlocked)));
-    }
-
-    // ===== Journal reconciliation: Prepared =====
-
-    #[tokio::test]
-    async fn prepared_with_matching_link_and_marker_advances_to_local_setup_pending() {
-        let mut op = operation("op-1", "group-1", OpState::Prepared);
-        op.updated_at_unix = -1000;
-        let repository = Arc::new(
-            FakeRepository::default()
-                .with_operation(op)
-                .with_link(link("group-1"))
-                .with_marker(marker("op-1", "group-1")),
-        );
-        let coordination = Arc::new(FakeCoordination::default());
-        let links = Arc::new(FakeLinkPort::default());
-        let attempts = Arc::new(FakeAttemptTracker::default());
-
-        service(repository.clone(), coordination, links, attempts).reconcile_once().await;
-
-        assert!(repository
-            .calls
-            .lock()
-            .unwrap()
-            .contains(&RepoCall::MarkState("op-1".to_string(), OpState::LocalSetupPending)));
-    }
-
-    #[tokio::test]
-    async fn prepared_with_neither_link_nor_marker_moves_to_cancel_pending() {
-        let mut op = operation("op-1", "group-1", OpState::Prepared);
-        op.updated_at_unix = -1000;
-        let repository = Arc::new(FakeRepository::default().with_operation(op));
-        let coordination = Arc::new(FakeCoordination::default());
-        let links = Arc::new(FakeLinkPort::default());
-        let attempts = Arc::new(FakeAttemptTracker::default());
-
-        service(repository.clone(), coordination, links, attempts).reconcile_once().await;
-
-        assert!(repository
-            .calls
-            .lock()
-            .unwrap()
-            .contains(&RepoCall::MarkState("op-1".to_string(), OpState::CancelPending)));
-    }
-
-    #[tokio::test]
-    async fn prepared_with_link_but_no_marker_blocks_recovery() {
-        let mut op = operation("op-1", "group-1", OpState::Prepared);
-        op.updated_at_unix = -1000;
-        let repository =
-            Arc::new(FakeRepository::default().with_operation(op).with_link(link("group-1")));
-        let coordination = Arc::new(FakeCoordination::default());
-        let links = Arc::new(FakeLinkPort::default());
-        let attempts = Arc::new(FakeAttemptTracker::default());
-
-        service(repository.clone(), coordination, links, attempts).reconcile_once().await;
-
-        assert!(repository
-            .calls
-            .lock()
-            .unwrap()
-            .contains(&RepoCall::MarkState("op-1".to_string(), OpState::RecoveryBlocked)));
-    }
-
-    #[tokio::test]
-    async fn prepared_with_marker_but_no_link_transfers_to_cancel_operation() {
-        let mut op = operation("op-1", "group-1", OpState::Prepared);
-        op.updated_at_unix = -1000;
-        let repository = Arc::new(
-            FakeRepository::default().with_operation(op).with_marker(marker("op-1", "group-1")),
-        );
-        let coordination = Arc::new(FakeCoordination::default());
-        // No link exists, so `reconcile_markers` itself also routes this
-        // marker through the no-matching-link cancel path before
-        // `reconcile_operations`'s own `Prepared` branch ever runs.
-        coordination.cancel.lock().unwrap().push_back(EnrollmentCancellationResult::Confirmed);
-        let links = Arc::new(FakeLinkPort::default());
-        let attempts = Arc::new(FakeAttemptTracker::default());
-
-        service(repository.clone(), coordination, links, attempts).reconcile_once().await;
-
-        assert!(repository
-            .calls
-            .lock()
-            .unwrap()
-            .contains(&RepoCall::MoveMarkerToCancelOperation("op-1".to_string())));
-    }
-
-    // ===== Journal reconciliation: LocalSetupPending / ActivationPending / CancelPending =====
-
-    #[tokio::test]
-    async fn local_setup_pending_past_the_age_gate_rolls_back_unconditionally() {
-        let mut op = operation("op-1", "group-1", OpState::LocalSetupPending);
-        op.updated_at_unix = -1000;
-        let repository = Arc::new(FakeRepository::default().with_operation(op));
-        let coordination = Arc::new(FakeCoordination::default());
-        let links = Arc::new(FakeLinkPort::default());
-        let attempts = Arc::new(FakeAttemptTracker::default());
-
-        service(repository.clone(), coordination, links, attempts).reconcile_once().await;
-
-        assert!(repository
-            .calls
-            .lock()
-            .unwrap()
-            .contains(&RepoCall::RollbackLocalSetup("op-1".to_string())));
-    }
-
-    #[tokio::test]
-    async fn activation_pending_with_an_outstanding_marker_is_left_untouched() {
-        let mut op = operation("op-1", "group-1", OpState::ActivationPending);
-        op.updated_at_unix = -1000;
-        let repository = Arc::new(
-            FakeRepository::default()
-                .with_operation(op)
-                .with_link(link("group-1"))
-                .with_marker(marker("op-1", "group-1")),
-        );
-        let coordination = Arc::new(FakeCoordination::default());
-        coordination.activate.lock().unwrap().push_back(EnrollmentActivationResult::AlreadyActive);
-        let links = Arc::new(FakeLinkPort::default());
-        let attempts = Arc::new(FakeAttemptTracker::default());
-
-        service(repository.clone(), coordination, links, attempts).reconcile_once().await;
-
-        let calls = repository.calls.lock().unwrap();
-        assert!(!calls.contains(&RepoCall::DeleteOperation("op-1".to_string())));
-        assert!(!calls
-            .iter()
-            .any(|c| matches!(c, RepoCall::MarkState(id, OpState::CancelPending) if id == "op-1")));
-    }
-
-    #[tokio::test]
-    async fn activation_pending_with_no_marker_and_a_matching_link_is_confirmed_cleanup() {
-        let mut op = operation("op-1", "group-1", OpState::ActivationPending);
-        op.updated_at_unix = -1000;
-        let repository =
-            Arc::new(FakeRepository::default().with_operation(op).with_link(link("group-1")));
-        let coordination = Arc::new(FakeCoordination::default());
-        let links = Arc::new(FakeLinkPort::default());
-        let attempts = Arc::new(FakeAttemptTracker::default());
-
-        service(repository.clone(), coordination, links, attempts).reconcile_once().await;
-
-        assert!(repository
-            .calls
-            .lock()
-            .unwrap()
-            .contains(&RepoCall::DeleteOperation("op-1".to_string())));
-    }
-
-    #[tokio::test]
-    async fn activation_pending_with_neither_marker_nor_link_moves_to_cancel_pending() {
-        let mut op = operation("op-1", "group-1", OpState::ActivationPending);
-        op.updated_at_unix = -1000;
-        let repository = Arc::new(FakeRepository::default().with_operation(op));
-        let coordination = Arc::new(FakeCoordination::default());
-        let links = Arc::new(FakeLinkPort::default());
-        let attempts = Arc::new(FakeAttemptTracker::default());
-
-        service(repository.clone(), coordination, links, attempts).reconcile_once().await;
-
-        assert!(repository
-            .calls
-            .lock()
-            .unwrap()
-            .contains(&RepoCall::MarkState("op-1".to_string(), OpState::CancelPending)));
-    }
-
-    #[tokio::test]
-    async fn cancel_pending_confirmed_deletes_the_row() {
-        let mut op = operation("op-1", "group-1", OpState::CancelPending);
-        op.updated_at_unix = -1000;
-        let repository = Arc::new(FakeRepository::default().with_operation(op));
-        let coordination = Arc::new(FakeCoordination::default());
-        coordination.cancel.lock().unwrap().push_back(EnrollmentCancellationResult::Confirmed);
-        let links = Arc::new(FakeLinkPort::default());
-        let attempts = Arc::new(FakeAttemptTracker::default());
-
-        service(repository.clone(), coordination, links, attempts).reconcile_once().await;
-
-        assert!(repository
-            .calls
-            .lock()
-            .unwrap()
-            .contains(&RepoCall::DeleteOperation("op-1".to_string())));
-    }
-
-    #[tokio::test]
-    async fn cancel_pending_conflict_blocks_recovery() {
-        let mut op = operation("op-1", "group-1", OpState::CancelPending);
-        op.updated_at_unix = -1000;
-        let repository = Arc::new(FakeRepository::default().with_operation(op));
-        let coordination = Arc::new(FakeCoordination::default());
-        coordination.cancel.lock().unwrap().push_back(EnrollmentCancellationResult::Conflict {
-            detail: "identity mismatch".to_string(),
-        });
-        let links = Arc::new(FakeLinkPort::default());
-        let attempts = Arc::new(FakeAttemptTracker::default());
-
-        service(repository.clone(), coordination, links, attempts).reconcile_once().await;
-
-        assert!(repository
-            .calls
-            .lock()
-            .unwrap()
-            .contains(&RepoCall::MarkState("op-1".to_string(), OpState::RecoveryBlocked)));
-    }
-
-    #[tokio::test]
-    async fn cancel_pending_ambiguous_increments_attempts_and_never_blocks() {
-        let mut op = operation("op-1", "group-1", OpState::CancelPending);
-        op.updated_at_unix = -1000;
-        let repository = Arc::new(FakeRepository::default().with_operation(op));
-        let coordination = Arc::new(FakeCoordination::default());
-        coordination
-            .cancel
-            .lock()
-            .unwrap()
-            .push_back(EnrollmentCancellationResult::Ambiguous { detail: "timeout".to_string() });
-        let links = Arc::new(FakeLinkPort::default());
-        let attempts = Arc::new(FakeAttemptTracker::default());
-
-        service(repository.clone(), coordination, links, attempts).reconcile_once().await;
-
-        let calls = repository.calls.lock().unwrap();
-        assert!(calls.contains(&RepoCall::IncrementAttempts("op-1".to_string())));
-        assert!(!calls.iter().any(
-            |c| matches!(c, RepoCall::MarkState(id, OpState::RecoveryBlocked) if id == "op-1")
-        ));
-    }
-
-    // ===== Cross-cutting =====
-
-    #[tokio::test]
-    async fn a_row_updated_too_recently_is_left_for_the_next_sweep() {
-        let mut op = operation("op-1", "group-1", OpState::CancelPending);
-        // Freshly touched -- well inside `RECONCILE_MIN_AGE_SECS` of
-        // `now_unix()` -- proves the age-gate is keyed on `updated_at_unix`,
-        // not `created_at_unix` (which stays 0/ancient on this same row).
-        op.updated_at_unix = now_unix();
-        let repository = Arc::new(FakeRepository::default().with_operation(op));
-        let coordination = Arc::new(FakeCoordination::default());
-        let links = Arc::new(FakeLinkPort::default());
-        let attempts = Arc::new(FakeAttemptTracker::default());
-
-        service(repository.clone(), coordination.clone(), links, attempts).reconcile_once().await;
-
-        assert_eq!(*coordination.cancel_calls.lock().unwrap(), 0);
-        assert!(repository.calls.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_malformed_journal_row_blocks_only_that_row_not_a_healthy_sibling() {
-        let mut healthy = operation("op-1", "group-1", OpState::CancelPending);
-        healthy.updated_at_unix = -1000;
-        let repository = Arc::new(FakeRepository::default().with_operation(healthy));
-        repository.invalid_operations.lock().unwrap().push(InvalidEnrollmentOperation {
-            operation_id: "op-bad".to_string(),
-            raw_state: Some("unknown_state".to_string()),
-            detail: "unrecognized state".to_string(),
-        });
-        let coordination = Arc::new(FakeCoordination::default());
-        coordination.cancel.lock().unwrap().push_back(EnrollmentCancellationResult::Confirmed);
-        let links = Arc::new(FakeLinkPort::default());
-        let attempts = Arc::new(FakeAttemptTracker::default());
-
-        service(repository.clone(), coordination.clone(), links, attempts).reconcile_once().await;
-
-        let calls = repository.calls.lock().unwrap();
-        assert!(
-            calls.contains(&RepoCall::MarkState("op-bad".to_string(), OpState::RecoveryBlocked))
-        );
-        assert!(calls.contains(&RepoCall::DeleteOperation("op-1".to_string())));
-    }
-
-    #[tokio::test]
-    async fn a_list_links_read_failure_skips_the_marker_sweep_without_cancelling_valid_enrollments()
-    {
-        let repository = Arc::new(
-            FakeRepository::default()
-                .with_operation(operation("op-1", "group-1", OpState::ActivationPending))
-                .with_marker(marker("op-1", "group-1")),
-        );
-        repository.fail_list_links.store(true, Ordering::SeqCst);
-        let coordination = Arc::new(FakeCoordination::default());
-        let links = Arc::new(FakeLinkPort::default());
-        let attempts = Arc::new(FakeAttemptTracker::default());
-
-        service(repository.clone(), coordination.clone(), links, attempts).reconcile_once().await;
-
-        assert!(repository.calls.lock().unwrap().is_empty());
-        assert_eq!(*coordination.activate_calls.lock().unwrap(), 0);
-    }
-}
+mod tests;

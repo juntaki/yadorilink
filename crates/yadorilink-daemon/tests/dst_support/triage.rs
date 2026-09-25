@@ -23,7 +23,7 @@
 //! differently), so the runner takes a scenario-provided `replay` closure
 //! -- the same seam `DST full-stack heat-run framework`'s supervisor reuses.
 //!
-//! `#![cfg(madsim)]`-gated like every DST scenario file.
+//! `#![cfg(turmoil)]`-gated like every DST scenario file.
 
 use serde::{Deserialize, Serialize};
 

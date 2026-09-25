@@ -113,10 +113,8 @@ pub use macos::{disable, enable, is_enabled};
 /// installer's own Scheduled-Task startup option without touching it —
 /// it reads/writes only its own Run-key value.
 ///
-/// NOTE: cross-compilation to Windows is not available in this environment, so
-/// this module is inspection-verified only (the same honesty discipline the
-/// `ipc_client.rs` Windows named-pipe path documents); it is `#[cfg(windows)]`
-/// so it never affects the macOS build.
+/// Compiled and exercised only on Windows builds; it is `#[cfg(windows)]` so
+/// it never affects the macOS build.
 #[cfg(target_os = "windows")]
 mod windows {
     use super::LoginItemError;

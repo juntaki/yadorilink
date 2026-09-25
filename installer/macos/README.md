@@ -6,7 +6,16 @@ Builds a macOS `.pkg` that installs:
 |---|---|
 | `yadorilink` (CLI) | `/usr/local/bin/yadorilink` |
 | `yadorilink-daemon` | `/usr/local/bin/yadorilink-daemon` |
-| `YadoriLinkFinderSyncHost.app` (FinderSync + File Provider extensions) | `/Applications/YadoriLinkFinderSyncHost.app` |
+| `YadoriLink.app` (menu bar app with the FinderSync + File Provider extensions) | `/Applications/YadoriLink.app` |
+
+The eframe `yadorilink-status-app` is not part of the macOS installer;
+`YadoriLink.app` is the menu bar app and opens at login through
+`SMAppService`. `preinstall` quits it and removes what earlier installs
+left (`YadoriLinkFinderSyncHost.app`, `yadorilink-status-app`), and
+`postinstall` removes the old `com.yadorilink.status-app` LaunchAgent.
+
+`build-pkg.sh` refuses to run while `YadoriLink.app` still runs on its
+fake client (see `shell-ext/macos/YadoriLinkApp/App/ClientFactory.swift`).
 
 `yadorilink-coordination` is a server-side binary and is
 **not** part of this installer — deploy it to your own server instead.
@@ -42,8 +51,8 @@ from scratch every run; safe to delete between builds.
 
 ## Signing and notarization
 
-Release builds must codesign the `yadorilink`/`yadorilink-daemon`/
-`yadorilink-status-app` Mach-O binaries with a Developer ID Application
+Release builds must codesign the `yadorilink`/`yadorilink-daemon`
+Mach-O binaries with a Developer ID Application
 identity, and sign the outer `.pkg` with a Developer ID Installer identity:
 
 ```bash
@@ -57,7 +66,7 @@ YADORILINK_NOTARY_PROFILE=yadorilink-notary \
 ```
 
 The manifest values are the identifier and public half of the offline update
-signing key. See `docs/UPDATE_SIGNING.md`. The private half must never be
+signing key. The private half must never be
 present on this build machine.
 
 When `YADORILINK_APP_SIGN_IDENTITY` is set, the script codesigns each of the
@@ -79,7 +88,7 @@ an unsigned package will show Gatekeeper's "unidentified developer" warning;
 that's expected for local unsigned builds. Use Finder's right-click Open flow
 if you need to run an unsigned local build.
 
-The `YadoriLinkFinderSyncHost.app` bundled *inside* the pkg, however, is
+The `YadoriLink.app` bundled *inside* the pkg, however, is
 built with Xcode's automatic signing using a real "Apple Development"/
 "Apple Distribution" identity (`project.yml`: `CODE_SIGN_STYLE: Automatic`,
 `DEVELOPMENT_TEAM: 594UQF7QX3`) — deliberately, not by oversight. This

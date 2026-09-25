@@ -1,12 +1,12 @@
 //! `Health`'s read model -- task liveness and connected-peer count. See
 //! `crate::queries::link_status`'s own doc comment for this module tree's
 //! shape/rationale; this slice's dependencies (`RuntimeTelemetry`,
-//! `PeerRegistry`) are already narrow owner components, so its port
-//! implementation needs no `DaemonState` strangler step at all.
+//! `PeerConnectivityRuntime`) are already narrow owner components, so its
+//! port implementation needs no `DaemonState` strangler step at all.
 
 use std::sync::Arc;
 
-use crate::peer_registry::PeerRegistry;
+use crate::peer_connectivity_runtime::PeerConnectivityRuntime;
 use crate::runtime_telemetry::RuntimeTelemetry;
 
 #[derive(Debug, Clone)]
@@ -23,11 +23,14 @@ pub(crate) struct HealthView {
 
 pub(crate) struct HealthQueryService {
     telemetry: Arc<RuntimeTelemetry>,
-    peers: Arc<PeerRegistry>,
+    peers: Arc<PeerConnectivityRuntime>,
 }
 
 impl HealthQueryService {
-    pub(crate) fn new(telemetry: Arc<RuntimeTelemetry>, peers: Arc<PeerRegistry>) -> Self {
+    pub(crate) fn new(
+        telemetry: Arc<RuntimeTelemetry>,
+        peers: Arc<PeerConnectivityRuntime>,
+    ) -> Self {
         Self { telemetry, peers }
     }
 

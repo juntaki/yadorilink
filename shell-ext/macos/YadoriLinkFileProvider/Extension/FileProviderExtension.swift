@@ -71,7 +71,11 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
                 completionHandler(FileProviderItem.rootItem(), nil)
                 return
             }
-            let entries = FileProviderCatalog.listFiles(localPath: localPath)
+            // An unconfirmed listing is not "no such item".
+            guard let entries = FileProviderCatalog.listFiles(localPath: localPath) else {
+                completionHandler(nil, NSFileProviderError(.serverUnreachable))
+                return
+            }
             let nodes = FileProviderCatalog.buildTree(from: entries)
             guard let node = FileProviderCatalog.node(at: identifier.rawValue, in: nodes) else {
                 completionHandler(nil, NSFileProviderError(.noSuchItem))
@@ -115,7 +119,10 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
                 return
             }
 
-            let entries = FileProviderCatalog.listFiles(localPath: localPath)
+            guard let entries = FileProviderCatalog.listFiles(localPath: localPath) else {
+                completionHandler(nil, nil, NSFileProviderError(.serverUnreachable))
+                return
+            }
             let nodes = FileProviderCatalog.buildTree(from: entries)
             guard let node = FileProviderCatalog.node(at: relativePath, in: nodes) else {
                 completionHandler(nil, nil, NSFileProviderError(.noSuchItem))
@@ -135,7 +142,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         FileProviderEnumerator(containerItemIdentifier: containerItemIdentifier, localPath: localPath)
     }
 
-    // MARK: - Write path (M1-3)
+    // MARK: - Write path
     //
     // No File-Provider-specific sync engine: each of the three methods
     // below (1) makes disk match what the OS callback asked for, using
@@ -152,8 +159,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
     // location -- the daemon is the sole authority on what actually
     // landed.
     //
-    // TWO KNOWN, ACCEPTED GAPS (an independent review's findings, not
-    // fixed in this iteration):
+    // Documented behaviour of this write path:
     //
     // - No rollback story: disk is mutated BEFORE the daemon is notified,
     //   so a notify failure (daemon unreachable/timeout) after a
@@ -205,9 +211,8 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
                     // `replaceItemAt` when the destination already exists
                     // (a `createItem` replay after a prior notify timeout,
                     // say) is an ATOMIC same-directory rename, not a
-                    // remove-then-move -- an independent review's finding:
-                    // remove-then-move leaves a real window where the
-                    // filesystem watcher can observe the destination
+                    // remove followed by a move, because that sequence
+                    // leaves a real window where the filesystem watcher can observe the destination
                     // genuinely absent and emit its own tombstone for it,
                     // racing this call's own notify. `moveItem` (used only
                     // when nothing exists at the destination yet, so there
@@ -246,7 +251,10 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
                 completionHandler(nil, [], false, NSFileProviderError(.serverUnreachable))
                 return
             }
-            let entries = FileProviderCatalog.listFiles(localPath: localPath)
+            guard let entries = FileProviderCatalog.listFiles(localPath: localPath) else {
+                completionHandler(nil, [], false, NSFileProviderError(.serverUnreachable))
+                return
+            }
             let nodes = FileProviderCatalog.buildTree(from: entries)
             guard let node = FileProviderCatalog.node(at: relPath, in: nodes) else {
                 completionHandler(nil, [], false, NSFileProviderError(.noSuchItem))
@@ -302,7 +310,10 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
                 completionHandler(nil, [], false, NSFileProviderError(.serverUnreachable))
                 return
             }
-            let entries = FileProviderCatalog.listFiles(localPath: localPath)
+            guard let entries = FileProviderCatalog.listFiles(localPath: localPath) else {
+                completionHandler(nil, [], false, NSFileProviderError(.serverUnreachable))
+                return
+            }
             let nodes = FileProviderCatalog.buildTree(from: entries)
             guard let node = FileProviderCatalog.node(at: relPath, in: nodes) else {
                 completionHandler(nil, [], false, NSFileProviderError(.noSuchItem))
@@ -312,8 +323,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
             // requested field (rename, reparent, tags, ...) is neither
             // implemented nor silently discarded: report it back as still
             // pending, per this callback's own documented contract, rather
-            // than overclaiming every requested change was applied. An
-            // independent review's finding.
+            // than overclaiming every requested change was applied.
             completionHandler(FileProviderItem(node: node), changedFields.subtracting(.contents), false, nil)
         }
         return progress
@@ -339,8 +349,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
                 // Already absent from disk -- almost certainly a RETRY of
                 // a delete whose earlier attempt removed the file but
                 // never got a chance to notify the daemon (e.g. the
-                // daemon was briefly unreachable). An independent review's
-                // finding: bailing out here on "not found" would silently
+                // daemon was briefly unreachable). Bailing out here on "not found" would silently
                 // strand that earlier delete un-admitted forever, since
                 // nothing else ever re-notifies for a path the OS
                 // considers already gone. Fall through to notify exactly

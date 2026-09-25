@@ -17,5 +17,5 @@ pub(crate) use membership::{
     HandoffCommitResult, MembershipCommitOutcome, MembershipCommitResult,
     MembershipOperationLookup, MembershipOperationRecord, MembershipRemoteCommand,
     MembershipRemoteRequest, MembershipRemoteRequestGroup, MembershipRemoteResult,
-    MembershipRemoteStatus, RoleLossCommitOutcome,
+    MembershipRemoteStatus, RoleLossCommitOutcome, RoleLossCompensationOutcome,
 };

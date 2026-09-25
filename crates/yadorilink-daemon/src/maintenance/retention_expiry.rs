@@ -21,7 +21,6 @@ use std::sync::Arc;
 
 use crate::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use crate::daemon_state::run_blocking_sweep_offloaded;
-use crate::maintenance::MaintenanceTrigger;
 
 #[derive(Clone)]
 pub(crate) struct RetentionExpiryJob {
@@ -33,7 +32,7 @@ impl RetentionExpiryJob {
         Self { controller }
     }
 
-    pub(crate) fn run_once(&self, _trigger: MaintenanceTrigger) {
+    pub(crate) fn run_once(&self) {
         run_blocking_sweep_offloaded(|| self.controller.run_retention_expiry_sweep());
     }
 }

@@ -15,13 +15,13 @@ use std::sync::Arc;
 
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
 use yadorilink_replica_domain::session_state::MaterializationState;
 
 async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>) {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsBlockStore::new(dir.path().join("blocks")).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(dir.path().join("blocks")).unwrap());
     let sync_state = Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
     let state = DaemonState::new("device-under-test".into(), sync_state, store);
 
@@ -330,23 +330,25 @@ async fn pin_command_succeeds_for_an_already_hydrated_file() {
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
-    // See `evict_command_turns_a_hydrated_file_into_a_placeholder`'s
-    // identical comment: `upsert_file` no longer implies `Hydrated` --
-    // without this, `pin`'s own already_hydrated check
-    // (`hydration.rs::pin`) is false, so it falls through to a real
-    // `hydrate()` call, which needs peer/root-commit-authority setup this
-    // fixture never provides (it's testing the already-hydrated
-    // short-circuit specifically, per its own name).
-    state
-        .replica_coordinator
-        .materialization_state_repository()
-        .set_materialization_state(
-            "group-1",
-            "notes.txt",
-            MaterializationState::Hydrated,
-            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-        )
-        .unwrap();
+    // `pin`'s already-hydrated short-circuit -- the thing this test is
+    // named for -- asks for the whole of what `Hydrated` claims: the stamp
+    // AND a usable actual-state proof naming the version the row derives.
+    // A stamp on its own is the exact combination production can no longer
+    // produce, so a fixture that writes only the stamp never reaches the
+    // short-circuit at all: `pin` falls through to a real `hydrate()`,
+    // which needs peer and root-commit-authority setup this fixture does
+    // not have, and the test fails on that instead of on anything it is
+    // about.
+    //
+    // So seed the pair the one way a writer ever produces it: the single
+    // commit that publishes the proof and stamps the claim together.
+    yadorilink_daemon::test_support::seed_prior_cycle_proof(
+        &state.replica_coordinator,
+        "group-1",
+        "notes.txt",
+        &folder.join("notes.txt"),
+        &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+    );
 
     let path = folder.join("notes.txt").to_string_lossy().to_string();
     yadorilink_cli::commands::materialization::pin(path).await.unwrap();

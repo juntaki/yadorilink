@@ -5,9 +5,9 @@
 //! garbage.
 //!
 //! Scope note: unlike the watcher (`SimulatedFolderWatchSource`) and
-//! peer-network (madsim tokio shim) boundaries, this scenario is
-//! deliberately **not** built on a `MaterializeIo` trait abstraction or
-//! `madsim`'s simulated runtime. The materialization write path
+//! peer-network (simulated socket) boundaries, this scenario is
+//! deliberately **not** built on a `MaterializeIo` trait abstraction or a
+//! simulated runtime. The materialization write path
 //! (`chunker::reconstruct_file`) and its recovery path
 //! (`repair_interrupted_materializations`, `cleanup_stale_temp_files`)
 //! are both plain, synchronous functions with no `tokio`/async
@@ -25,7 +25,7 @@
 //! across many variations (block count/sizes, whether a stale temp file
 //! is also present), matching this harness's "many variations, not one
 //! scenario" shape (see `dst_watcher_debounce.rs`) -- it just doesn't
-//! need `#![cfg(madsim)]` to get there.
+//! need a simulator to get there.
 
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -34,7 +34,7 @@ use yadorilink_filesystem_sync::materialization_repair::{
     repair_interrupted_materializations, RepairMode,
 };
 use yadorilink_filesystem_sync::stale_temp_files::cleanup_stale_temp_files;
-use yadorilink_local_storage::{BlockStore, FsBlockStore};
+use yadorilink_local_storage::{BlockStore, SegmentBlockStore};
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
 use yadorilink_replica_domain::session_state::MaterializationState;
 use yadorilink_root_authority::root_commit::RootCommitPermit;
@@ -48,7 +48,7 @@ fn run_scenario(seed: u64) -> Result<(), String> {
     let root_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
     let root = root_dir.path().canonicalize().map_err(|e| e.to_string())?;
     let store_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
-    let store = FsBlockStore::new(store_dir.path()).map_err(|e| e.to_string())?;
+    let store = SegmentBlockStore::new(store_dir.path()).map_err(|e| e.to_string())?;
     let state = ReplicaCoordinator::open_in_memory().map_err(|e| e.to_string())?;
     state
         .link_repository()
@@ -64,7 +64,7 @@ fn run_scenario(seed: u64) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
 
     // Real content, chunked into a random number of real blocks, each
-    // durably stored for real in a real FsBlockStore -- the block store
+    // durably stored for real in a real SegmentBlockStore -- the block store
     // itself is assumed unaffected by the simulated crash (a separate
     // durability concern; materialize's crash-safety is specifically
     // about the disk-write-then-index-update sequence, not block

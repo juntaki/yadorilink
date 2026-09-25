@@ -2,12 +2,22 @@ name: YadoriLinkFinderSync
 options:
   bundleIdPrefix: com.juntaki.yadorilink
   deploymentTarget:
-    macOS: "11.0"
+    # One minimum for the app and both extensions. The app needs 14.0
+    # (MenuBarExtra, SMAppService, Observation, SettingsLink), and current
+    # Xcode no longer accepts 11.0.
+    macOS: "14.0"
+
+packages:
+  YadoriLinkUI:
+    path: ../YadoriLinkApp/Packages/YadoriLinkUI
 
 settings:
   base:
     SWIFT_VERSION: 5.0
-    MACOSX_DEPLOYMENT_TARGET: "11.0"
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    # Apple silicon only: every Rust library the targets link is built for
+    # aarch64-apple-darwin alone, so an Intel slice could never link.
+    ARCHS: arm64
     DEVELOPMENT_TEAM: 594UQF7QX3
     CODE_SIGN_STYLE: Automatic
     # Required for notarization: Apple's notary service rejects any
@@ -27,33 +37,39 @@ targets:
   # separate apps, and both extensions already share one App Group
   # (group.com.juntaki.yadorilink.shared) and one signing identity — there is no
   # real isolation benefit to splitting them.
-  YadoriLinkFinderSyncHost:
+  # The YadoriLink app: a SwiftUI menu bar app (LSUIElement, no Dock icon)
+  # that also carries both extensions and registers File Provider domains.
+  # It keeps the bundle id the extensions' ids are prefixed with. Views and
+  # view models live in the local YadoriLinkUI package so they build and
+  # test without Rust; this target only adds the scenes and system glue.
+  # HostApp/main.swift and HostApp/Info.plist are no longer part of this
+  # target; build.sh still compiles them for its swiftc-only path.
+  YadoriLink:
     type: application
     platform: macOS
+    scheme:
+      testTargets:
+        - YadoriLinkAppTests
     sources:
-      - path: HostApp/main.swift
+      - path: ../YadoriLinkApp/App
+        excludes:
+          - Info.plist
       - path: HostApp/DomainRegistration.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.juntaki.yadorilink
-        INFOPLIST_FILE: HostApp/Info.plist
-        PRODUCT_NAME: YadoriLinkFinderSyncHost
-        # Per-target override above the project-wide 11.0 base --
-        # DomainRegistration.swift's domain-removal reconciliation calls
-        # NSFileProviderManager.remove(_:mode:completionHandler:) (M1-1),
-        # API_AVAILABLE(macos(12.0)) per FileProvider.framework's own
-        # NSFileProviderDefines.h. YadoriLinkFileProvider (below) stays at
-        # the 11.0 base -- its own comment already verified
-        # NSFileProviderReplicatedExtension itself only needs macOS 11.0;
-        # do not raise it to "13+" on the assumption this comment once
-        # made elsewhere in this codebase (now corrected).
-        MACOSX_DEPLOYMENT_TARGET: "12.0"
+        INFOPLIST_FILE: ../YadoriLinkApp/App/Info.plist
+        PRODUCT_NAME: YadoriLink
+        SWIFT_VERSION: "6.0"
         # HostApp/DomainRegistration.swift needs the
         # fileprovider-core FFI (yadorilink_fp_list_on_demand_folders) to
         # discover which OnDemand folder groups to register as File
         # Provider domains, and the FileProvider.framework for
         # NSFileProviderManager/NSFileProviderDomain themselves.
         SWIFT_OBJC_BRIDGING_HEADER: HostApp/YadoriLinkFinderSyncHost-Bridging-Header.h
+        # The live client imports YadoriLinkFFI, whose generated Swift
+        # imports the C modules declared here.
+        SWIFT_INCLUDE_PATHS: $(SRCROOT)/../YadoriLinkApp/FFI/Generated/include
         HEADER_SEARCH_PATHS: ../fileprovider-core/include
         LIBRARY_SEARCH_PATHS: ../fileprovider-core/target/aarch64-apple-darwin/release
         OTHER_LDFLAGS: -lyadorilink_fileprovider_core -liconv
@@ -65,16 +81,104 @@ targets:
           # See the matching comment on YadoriLinkFinderSync's own
           # prebuild script above: explicit --target-dir keeps this
           # build immune to a machine-local cargo target-dir override.
-          cargo build --release --target aarch64-apple-darwin --target-dir target
+          # A clean environment: Xcode's exported linker settings (for
+          # example LD_DEPENDENCY_INFO_FILE) leak into cargo's own links and
+          # produce proc-macro libraries dyld refuses to load. A terminal's
+          # PATH, so `cc` is the xcrun shim that finds the SDK on its own.
+          # protoc is resolved from the caller's PATH first: ipc-proto's build
+          # script needs it, and CI installs it outside that fixed PATH.
+          PROTOC_BIN="${PROTOC:-$(command -v protoc || true)}"
+          env -i HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" \
+            PATH="$HOME/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin" \
+            ${PROTOC_BIN:+PROTOC="$PROTOC_BIN"} \
+            ${CARGO_HOME:+CARGO_HOME="$CARGO_HOME"} \
+            ${RUSTUP_HOME:+RUSTUP_HOME="$RUSTUP_HOME"} \
+            cargo build --release --target aarch64-apple-darwin --target-dir target
         basedOnDependencyAnalysis: false
     frameworks:
       - Cocoa.framework
       - FileProvider.framework
+      - FinderSync.framework
+      - ServiceManagement.framework
     dependencies:
+      - target: YadoriLinkFFI
+        embed: true
+      - package: YadoriLinkUI
+        product: YadoriLinkUI
+      - package: YadoriLinkUI
+        product: YadoriLinkModel
+      - package: YadoriLinkUI
+        product: YadoriLinkFixtures
       - target: YadoriLinkFinderSync
         embed: true
       - target: YadoriLinkFileProvider
         embed: true
+
+  # The Swift binding of the Rust client core (crates/yadorilink-apple-ffi):
+  # the UniFFI-generated Swift, compiled as its own module so its types never
+  # clash with the app's mirror types (YadoriLinkModel), linked against the
+  # client core's static library. The prebuild script rebuilds the library
+  # and regenerates the Swift from it, so the two always match; the
+  # generated code refuses to load a library whose API checksums differ.
+  YadoriLinkFFI:
+    type: framework
+    platform: macOS
+    sources:
+      - path: ../YadoriLinkApp/FFI/Generated
+        excludes:
+          - include
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.juntaki.yadorilink.ffi
+        PRODUCT_NAME: YadoriLinkFFI
+        GENERATE_INFOPLIST_FILE: YES
+        DEFINES_MODULE: YES
+        SKIP_INSTALL: YES
+        # Generated code: built in the language mode its generator targets.
+        SWIFT_VERSION: "5.0"
+        SWIFT_INCLUDE_PATHS: $(SRCROOT)/../YadoriLinkApp/FFI/Generated/include
+        LIBRARY_SEARCH_PATHS: $(SRCROOT)/../YadoriLinkApp/FFI/lib
+        OTHER_LDFLAGS: -lyadorilink_apple_ffi -liconv -framework Security -framework CoreFoundation
+        # The prebuild script writes the library and the generated sources
+        # outside the build directory.
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+    prebuildScripts:
+      - name: Build the Rust client core and its Swift binding
+        script: |
+          set -euo pipefail
+          "$SRCROOT/../../../scripts/generate-swift-bindings.sh"
+        basedOnDependencyAnalysis: false
+
+  # Tests of the app's glue to the Rust client core: the generated mapping
+  # between the binding and the mirror types, and the live client against no
+  # daemon. They compile the live client's sources directly rather than
+  # running inside the menu bar app.
+  YadoriLinkAppTests:
+    type: bundle.unit-test
+    platform: macOS
+    # Its own scheme, so the tests build without the extensions (which need
+    # a provisioning profile): `xcodebuild test -scheme YadoriLinkAppTests`.
+    scheme:
+      testTargets:
+        - YadoriLinkAppTests
+    sources:
+      - path: ../YadoriLinkApp/Tests/YadoriLinkAppTests
+      - path: ../YadoriLinkApp/App/Live
+      # The File Provider extension's pure catalog tree (Foundation only),
+      # compiled in directly so its tests run without the extension.
+      - path: ../YadoriLinkFileProvider/Extension/FileProviderCatalogTree.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.juntaki.yadorilink.apptests
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "6.0"
+        SWIFT_INCLUDE_PATHS: $(SRCROOT)/../YadoriLinkApp/FFI/Generated/include
+    dependencies:
+      - target: YadoriLinkFFI
+      - package: YadoriLinkUI
+        product: YadoriLinkModel
+      - package: YadoriLinkUI
+        product: YadoriLinkFixtures
 
   YadoriLinkFinderSync:
     type: app-extension
@@ -103,21 +207,29 @@ targets:
           # LIBRARY_SEARCH_PATHS below expects, breaking the link step
           # with a "library not found" error that gives no hint the
           # cause is a target-dir mismatch rather than a missing build.
-          cargo build --release --target aarch64-apple-darwin --target-dir target
+          # A clean environment: Xcode's exported linker settings (for
+          # example LD_DEPENDENCY_INFO_FILE) leak into cargo's own links and
+          # produce proc-macro libraries dyld refuses to load. A terminal's
+          # PATH, so `cc` is the xcrun shim that finds the SDK on its own.
+          # protoc is resolved from the caller's PATH first: ipc-proto's build
+          # script needs it, and CI installs it outside that fixed PATH.
+          PROTOC_BIN="${PROTOC:-$(command -v protoc || true)}"
+          env -i HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" \
+            PATH="$HOME/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin" \
+            ${PROTOC_BIN:+PROTOC="$PROTOC_BIN"} \
+            ${CARGO_HOME:+CARGO_HOME="$CARGO_HOME"} \
+            ${RUSTUP_HOME:+RUSTUP_HOME="$RUSTUP_HOME"} \
+            cargo build --release --target aarch64-apple-darwin --target-dir target
         basedOnDependencyAnalysis: false
     frameworks:
       - Cocoa.framework
       - FinderSync.framework
 
   # NSFileProviderReplicatedExtension
-  # target. Deployment target deliberately left at the project-wide 11.0
-  # base (NOT bumped, despite the task brief's expectation that it would
-  # need to be higher) — verified directly against this build machine's
-  # SDK headers (FileProvider.framework's NSFileProviderReplicatedExtension.h:
-  # `FILEPROVIDER_API_AVAILABILITY_V3_IOS` on the protocol itself expands
-  # to `API_AVAILABLE(macos(11.0), ios(16.0))` in NSFileProviderDefines.h —
-  # the replicated-extension API has been available since macOS 11, the
-  # same release FinderSync's own deployment target already targets.
+  # target. It uses the project-wide deployment target; the replicated
+  # extension API itself only needs macOS 11 (FileProvider.framework's
+  # NSFileProviderReplicatedExtension.h: `FILEPROVIDER_API_AVAILABILITY_V3_IOS`
+  # expands to `API_AVAILABLE(macos(11.0), ios(16.0))`).
   YadoriLinkFileProvider:
     type: app-extension
     platform: macOS
@@ -128,6 +240,7 @@ targets:
       # fileprovider-core's own sibling-of-core layout. All paths below
       # are relative to this project.yml's location, per xcodegen's
       # convention.
+      - path: ../YadoriLinkFileProvider/Extension/FileProviderCatalogTree.swift
       - path: ../YadoriLinkFileProvider/Extension/FileProviderModel.swift
       - path: ../YadoriLinkFileProvider/Extension/FileProviderItem.swift
       - path: ../YadoriLinkFileProvider/Extension/FileProviderEnumerator.swift
@@ -150,7 +263,19 @@ targets:
           # See the matching comment on YadoriLinkFinderSync's own
           # prebuild script above: explicit --target-dir keeps this
           # build immune to a machine-local cargo target-dir override.
-          cargo build --release --target aarch64-apple-darwin --target-dir target
+          # A clean environment: Xcode's exported linker settings (for
+          # example LD_DEPENDENCY_INFO_FILE) leak into cargo's own links and
+          # produce proc-macro libraries dyld refuses to load. A terminal's
+          # PATH, so `cc` is the xcrun shim that finds the SDK on its own.
+          # protoc is resolved from the caller's PATH first: ipc-proto's build
+          # script needs it, and CI installs it outside that fixed PATH.
+          PROTOC_BIN="${PROTOC:-$(command -v protoc || true)}"
+          env -i HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" \
+            PATH="$HOME/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin" \
+            ${PROTOC_BIN:+PROTOC="$PROTOC_BIN"} \
+            ${CARGO_HOME:+CARGO_HOME="$CARGO_HOME"} \
+            ${RUSTUP_HOME:+RUSTUP_HOME="$RUSTUP_HOME"} \
+            cargo build --release --target aarch64-apple-darwin --target-dir target
         basedOnDependencyAnalysis: false
     frameworks:
       - FileProvider.framework

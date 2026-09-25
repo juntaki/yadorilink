@@ -8,14 +8,14 @@
 //! (dir)` + one `CreatedOrModified` per moved child; canonically
 //! `dst_directory_chaos.rs`'s `deliver_local_rename` / `deliver_local_dir_
 //! rename`). Those copies could drift silently from `watcher.rs`'s real
-//! classification. `decompose` centralizes it once, and the non-madsim
+//! classification. `decompose` centralizes it once, and the plain-build
 //! conformance test (`tests/watcher_decompose_conformance.rs`) pins the
 //! output against the *real* notify-backed watcher so the two cannot
 //! diverge without CI catching it.
 //!
-//! Deliberately madsim-independent (imports only the library's
+//! Deliberately simulator-independent (imports only the library's
 //! `FsChangeKind`): the conformance test includes this exact source via
-//! `#[path]` and compiles it *without* `--cfg madsim`, so one source of
+//! `#[path]` and compiles it *without* `--cfg turmoil`, so one source of
 //! truth serves both the simulated scenarios and the real-watcher
 //! conformance check.
 

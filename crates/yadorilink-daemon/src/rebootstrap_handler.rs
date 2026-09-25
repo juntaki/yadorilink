@@ -1,30 +1,32 @@
-//! Daemon wiring for the R3.3 re-bootstrap protocol transported by
-//! `PeerSyncSession`.
+//! The daemon's authority over a history base a peer offers: who may found
+//! one, under which key, and whether everything the base carries verifies.
 //!
-//! Sync-core owns the signed protocol objects and atomic SQLite installer.  The
-//! daemon supplies the process identity/signing key and a re-bootstrap-specific
-//! trust resolver — deliberately NOT the same resolver ordinary retained-history
-//! Change verification uses. See `trust_key`'s doc comment for why.
+//! Sync-core owns the signed objects, the merge and the atomic install
+//! (`rebootstrap_store::commit_foreign_merge`). The daemon supplies the
+//! process identity and a base-specific trust resolver -- deliberately NOT
+//! the same resolver ordinary retained-history Change verification uses. See
+//! `trust_key`'s doc comment for why.
+//!
+//! The legacy wire re-bootstrap (a peer answering a request for a pruned
+//! hash with a signed `RebootstrapRequired`, installed over this device's
+//! history with its frontier bodies kept and its witnesses taken on trust)
+//! is gone. A base reaches this device only through
+//! [`DaemonRebootstrapHandler::verify_foreign_base`], which verifies every
+//! witness before the merge installs it.
 
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
 use crate::sync_error::SyncError;
-use yadorilink_peer_session::peer_session::{
-    ChangeAuthenticator, PreparedRebootstrap, RebootstrapHandler,
-};
-use yadorilink_peer_session::PeerSessionError;
 use yadorilink_replica_domain::change;
-use yadorilink_replica_domain::change::{Change, ChangeAuth};
-use yadorilink_replica_domain::ids::{ChangeHash, DeviceId, FolderGroupId};
-use yadorilink_replica_engine::error::ReplicaEngineError;
-use yadorilink_replica_engine::rebootstrap::{
-    prepare_rebootstrap_required, verify_and_install_rebootstrap, AtomicRebootstrapInstaller,
-    RebootstrapRequired, RebootstrapTrust,
-};
+use yadorilink_replica_domain::change::Change;
+use yadorilink_replica_domain::ids::ChangeHash;
+use yadorilink_replica_engine::rebootstrap::SnapshotManifest;
 use yadorilink_replica_engine::rebootstrap_snapshot::RebootstrapSnapshot;
-use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
+use yadorilink_sync_sqlite::rebootstrap_store::{
+    verify_returning_base, BaseSignerAuthority, ForeignMergeError, VerifiedBaseSummary,
+};
 
 use crate::daemon_state::{DaemonState, GroupPolicyResolution};
 
@@ -58,11 +60,11 @@ impl DaemonRebootstrapHandler {
         if device_id == self.state.device_id {
             return self.state.device_signing_key().map(|key| key.verifying_key().to_bytes());
         }
-        self.state.peer_signing_key(device_id)
+        self.state.authority.peer_signing_key(device_id)
     }
 
     /// Beyond signature validity (which only proves the manifest's signer
-    /// key produced these exact bytes), a re-bootstrap manifest must also be
+    /// key produced these exact bytes), a base's manifest must also be
     /// authorized to introduce a NEW baseline for its specific group right
     /// now: the signer must be a device this policy currently recognizes as
     /// a writer, the manifest's actual signing key must be the exact key the
@@ -71,15 +73,14 @@ impl DaemonRebootstrapHandler {
     /// signer must be a full replica of it. None of these is implied by a
     /// valid signature alone; `RebootstrapTrust::signing_key` has no group
     /// context to check them itself, so this runs as a second, explicit gate
-    /// after signature verification, before either `verify_rebootstrap` or
-    /// `install_rebootstrap` accepts the message.
+    /// after signature verification, before a base is believed.
     ///
     /// The writer-role-and-key-binding check (first two conditions above)
     /// now fully mirrors the pattern `NetmapChangeAuthenticator::
     /// accepts_change_auth` (`change_auth.rs`) uses for ordinary Change
     /// admission, via `GroupPolicyState::author_was_writer_at`: resolve the
     /// group's signed policy chain, check the signer's role against it (real,
-    /// role-aware writer authorization -- NOT `state.peer_is_writer`, which
+    /// role-aware writer authorization -- NOT `state.authority.peer_is_writer`, which
     /// is populated from plain netmap membership, every authorized group
     /// member including Viewer; see `replace_peer_netmap_metadata`), AND
     /// require the manifest's actual signer key (`self.trust_key(signer)`,
@@ -108,12 +109,16 @@ impl DaemonRebootstrapHandler {
     /// claim against. Do not assume the fingerprint-binding fix above
     /// extends to this check too -- it does not, and cannot with the policy
     /// chain's current shape.
-    fn check_signer_authorized_for_group(
+    ///
+    /// `signing_key` is the key the manifest's signature was verified under,
+    /// which must be the one the signed policy bound to `signer`. `None` (no
+    /// live key) fails closed.
+    fn authorize_base_signer(
         &self,
-        required: &RebootstrapRequired,
+        group_id: &str,
+        signer: &str,
+        signing_key: Option<&[u8; 32]>,
     ) -> Result<(), SyncError> {
-        let group_id = required.manifest.group_id.as_str();
-        let signer = required.manifest.signer_device_id.as_str();
         if signer == self.state.device_id {
             return Ok(());
         }
@@ -135,8 +140,7 @@ impl DaemonRebootstrapHandler {
                 //     Bootstrap window);
                 //   - `repair_election_provider` (daemon_state.rs) falls
                 //     back to the netmap's role-blind member set (see the
-                //     TODO on that function for the follow-up needed to
-                //     reconcile this).
+                //     comment on that function).
                 // Re-bootstrap is different in kind from both: it installs a
                 // BRAND NEW HistoryBase for the group, wholesale replacing
                 // retained history, on the strength of a single signer claim
@@ -150,7 +154,7 @@ impl DaemonRebootstrapHandler {
                 // is a real behavior change from the pre-fix
                 // membership-based version (which relied on
                 // `peer_is_writer` and so would have allowed this); see
-                // `check_signer_authorized_for_group_rejects_every_signer_when_the_verified_policy_names_no_writers`
+                // `authorize_base_signer_rejects_every_signer_when_the_verified_policy_names_no_writers`
                 // below for regression coverage.
                 policy
                     .current_writers()
@@ -160,7 +164,7 @@ impl DaemonRebootstrapHandler {
                         // Fail closed if there is no LIVE netmap-pinned key
                         // to compare against (matches `trust_key`'s own
                         // fail-closed behavior for signature verification).
-                        self.trust_key(signer)
+                        signing_key
                             .map(|signer_key| {
                                 let presented_fingerprint: [u8; 32] =
                                     Sha256::digest(signer_key).into();
@@ -178,7 +182,7 @@ impl DaemonRebootstrapHandler {
                 // `accepts_change_auth`'s own Bootstrap-arm behavior (both
                 // documented as legitimate on this narrow pre-role window;
                 // see their own comments).
-                self.state.peer_is_writer(signer, group_id)
+                self.state.authority.peer_is_writer(signer, group_id)
             }
             GroupPolicyResolution::Withhold => {
                 return Err(SyncError::CorruptState(format!(
@@ -195,7 +199,7 @@ impl DaemonRebootstrapHandler {
                  introduce"
             )));
         }
-        if !self.state.peer_group_is_full_replica(signer, group_id) {
+        if !self.state.authority.peer_group_is_full_replica(signer, group_id) {
             return Err(SyncError::CorruptState(format!(
                 "re-bootstrap manifest signer {signer} is not a current full replica for group \
                  {group_id}; only a device holding the group's complete retained history can \
@@ -213,7 +217,7 @@ impl DaemonRebootstrapHandler {
     /// the manifest signer. This independently re-verifies each embedded
     /// Change's own signature and historical authorization, the same
     /// signature/authentication boundary `authenticated_history::validate_retained_group`
-    /// and live peer admission both already use, so a re-bootstrap install
+    /// and live peer admission both already use, so a merged base
     /// can never adopt a Change whose own authorization this device has not
     /// positively checked.
     fn verify_each_frontier_change(&self, snapshot: &RebootstrapSnapshot) -> Result<(), SyncError> {
@@ -240,23 +244,16 @@ impl DaemonRebootstrapHandler {
                     frontier_change.device_id.as_str()
                 ))
             })?;
-            let signing_key_fingerprint: [u8; 32] = Sha256::digest(key_bytes).into();
-            let auth = ChangeAuth {
-                auth_seq: frontier_change.auth_seq,
-                auth_epoch: frontier_change.auth_epoch,
-                policy_head_hash: frontier_change.policy_head_hash,
-            };
+            // Raw-frontier verification: this checks that the pinned
+            // author is a CURRENT netmap writer for the group (frontier
+            // changes here carry no `AuthorizationCheckpoint` of their
+            // own).
             change::verify_change(
                 &frontier_change,
                 &hash,
                 &verifying_key,
                 |device_id, group_id| {
-                    authenticator.accepts_change_auth(
-                        device_id.as_str(),
-                        group_id.as_str(),
-                        signing_key_fingerprint,
-                        auth,
-                    )
+                    self.state.authority.peer_is_writer(device_id.as_str(), group_id.as_str())
                 },
             )
             .map_err(|error| {
@@ -272,527 +269,121 @@ impl DaemonRebootstrapHandler {
     }
 }
 
-struct SyncStateRebootstrapInstaller {
-    state: Arc<crate::replica_coordinator::ReplicaCoordinator>,
-    /// This device's own signing identity, used only if the incoming
-    /// snapshot needs to squash and re-emit an offline-diverged local
-    /// branch (see `SyncState::install_rebootstrap_snapshot`'s doc
-    /// comment). `None` when this device has no signing key configured —
-    /// an offline-diverged branch then falls back to the old fail-closed
-    /// behavior rather than being silently dropped.
-    local_emitter: Option<ChangeEmitter>,
-}
-
-impl AtomicRebootstrapInstaller for SyncStateRebootstrapInstaller {
-    fn install_snapshot_and_switch_history_base(
-        &self,
-        manifest: &yadorilink_replica_engine::rebootstrap::SnapshotManifest,
-        snapshot_bytes: &[u8],
-    ) -> Result<(), ReplicaEngineError> {
-        // `SyncState::install_rebootstrap_snapshot` stays `SyncError`-returning
-        // (it is sync-core's own SQLite-backed installer, not part of the
-        // 7D-9D move) -- this trait's own error type is `ReplicaEngineError`
-        // since `AtomicRebootstrapInstaller` moved to yadorilink-replica-engine,
-        // so the boundary conversion happens here, same as every other
-        // `SyncState`-backed replica-engine port adapter.
-        self.state
-            .install_rebootstrap_snapshot(manifest, snapshot_bytes, self.local_emitter.as_ref())
-            .map_err(|e| ReplicaEngineError::Storage(e.to_string()))
-    }
-}
-
-impl RebootstrapHandler for DaemonRebootstrapHandler {
-    fn prepare_rebootstrap(
+/// The group's authority over who may found a base, for verifying a base a
+/// peer offers to merge: the same three conditions a re-bootstrap manifest
+/// is held to, asked about the key the manifest's signature was verified
+/// under.
+impl BaseSignerAuthority for DaemonRebootstrapHandler {
+    fn may_found_base(
         &self,
         group_id: &str,
-        requested_hash: ChangeHash,
-    ) -> Result<Option<PreparedRebootstrap>, PeerSessionError> {
-        let Some(signing_key) = self.state.device_signing_key() else {
-            return Ok(None);
-        };
-        let group = FolderGroupId::from(group_id);
-        let required = prepare_rebootstrap_required(
-            self.state.replica_coordinator.as_ref(),
-            &group,
-            &requested_hash,
-            DeviceId::from(self.state.device_id.as_str()),
-            &signing_key,
-        )?;
-        let Some(required) = required else {
-            return Ok(None);
-        };
-        let checkpoint_hash = required.manifest.checkpoint.checkpoint_hash();
-        let snapshot_bytes = self
-            .state
-            .replica_coordinator
-            .rebootstrap_store_repository()
-            .checkpoint_snapshot(&checkpoint_hash)
-            .map_err(SyncError::from)?
-            .ok_or_else(|| {
-                SyncError::CorruptState(format!(
-                    "checkpoint {} can prove a prune but its re-bootstrap snapshot bytes are missing",
-                    checkpoint_hash.to_hex()
-                ))
-            })?;
-        let snapshot = RebootstrapSnapshot::decode(&snapshot_bytes)?;
-        snapshot.validate_against_checkpoint(&required.manifest.checkpoint)?;
-        Ok(Some(PreparedRebootstrap { required, snapshot_bytes }))
+        signer_device_id: &str,
+        signing_key: &[u8; 32],
+    ) -> bool {
+        self.authorize_base_signer(group_id, signer_device_id, Some(signing_key)).is_ok()
+    }
+}
+
+impl DaemonRebootstrapHandler {
+    /// The store this handler installs into.
+    pub fn coordinator(&self) -> &crate::replica_coordinator::ReplicaCoordinator {
+        &self.state.replica_coordinator
     }
 
-    fn verify_rebootstrap(&self, required: &RebootstrapRequired) -> Result<(), PeerSessionError> {
-        struct Trust<'a>(&'a DaemonRebootstrapHandler);
-        impl RebootstrapTrust for Trust<'_> {
-            fn signing_key(&self, device_id: &str) -> Option<[u8; 32]> {
-                self.0.trust_key(device_id)
-            }
-        }
-        required.verify(&Trust(self))?;
-        Ok(self.check_signer_authorized_for_group(required)?)
-    }
-
-    fn install_rebootstrap(
+    /// A base a peer offers to merge, checked before anything of it is
+    /// believed: the manifest verified under the signer's live key, the
+    /// signer one the group lets found a base, the snapshot bytes the ones
+    /// the manifest commits to, its summary consistent and its content
+    /// carried, and each frontier change and each witness it carries
+    /// independently verified.
+    pub fn verify_foreign_base(
         &self,
-        required: &RebootstrapRequired,
+        group_id: &str,
+        manifest: &SnapshotManifest,
         snapshot_bytes: &[u8],
-    ) -> Result<(), PeerSessionError> {
-        self.check_signer_authorized_for_group(required)?;
-        struct Trust<'a>(&'a DaemonRebootstrapHandler);
-        impl RebootstrapTrust for Trust<'_> {
-            fn signing_key(&self, device_id: &str) -> Option<[u8; 32]> {
-                self.0.trust_key(device_id)
+    ) -> Result<VerifiedBaseSummary, ForeignBaseMergeError> {
+        let trust = |device_id: &str| self.trust_key(device_id);
+        let returning = verify_returning_base(group_id, manifest, snapshot_bytes, &trust, self)
+            .map_err(ForeignMergeError::from)?;
+        self.verify_each_frontier_change(returning.snapshot())
+            .map_err(ForeignBaseMergeError::FrontierUnverified)?;
+        self.verify_each_witness(group_id, returning.snapshot())?;
+        Ok(returning)
+    }
+
+    /// Every witness a base carries, verified against this device's own
+    /// verified policy chain for the group, as a received change's
+    /// evidence is. A merge keeps no frontier body behind, so every row
+    /// the base carries is served on the strength of its witness alone.
+    ///
+    /// A witness must also name the author the summary gives its change:
+    /// a head's author is its position, and evidence published by another
+    /// device says nothing about that position. No verified policy for the
+    /// group verifies nothing.
+    fn verify_each_witness(
+        &self,
+        group_id: &str,
+        snapshot: &RebootstrapSnapshot,
+    ) -> Result<(), ForeignBaseMergeError> {
+        let policy = match self.state.resolve_group_policy(group_id) {
+            GroupPolicyResolution::Verified(policy) => Some(policy),
+            GroupPolicyResolution::Bootstrap | GroupPolicyResolution::Withhold => None,
+        };
+        for witness in &snapshot.published_change_witnesses {
+            let unverified = |detail: String| ForeignBaseMergeError::WitnessUnverified {
+                change: witness.change_hash,
+                detail,
+            };
+            let checkpoint = witness
+                .verify(group_id, |key_id, policy_head| {
+                    policy.as_ref()?.resolve_authority_key(key_id, policy_head)
+                })
+                .map_err(|error| unverified(error.to_string()))?;
+            let named = snapshot
+                .path_heads
+                .iter()
+                .map(|head| (head.change_hash, head.device_id.as_str()))
+                .chain(
+                    snapshot
+                        .author_state
+                        .iter()
+                        .map(|author| (author.tip_change_hash, author.device_id.as_str())),
+                )
+                .find(|(change, device)| {
+                    *change == witness.change_hash && *device != checkpoint.device_id
+                });
+            if let Some((_, device)) = named {
+                return Err(unverified(format!(
+                    "published by {} but written by {device}",
+                    checkpoint.device_id
+                )));
             }
         }
-        let local_emitter = self
-            .state
-            .device_signing_key()
-            .map(|key| ChangeEmitter::new(self.state.device_id.clone(), key));
-        let installer = SyncStateRebootstrapInstaller {
-            state: self.state.replica_coordinator.clone(),
-            local_emitter,
-        };
-        Ok(verify_and_install_rebootstrap(
-            &installer,
-            required,
-            &Trust(self),
-            snapshot_bytes,
-            |manifest, bytes| {
-                let snapshot = RebootstrapSnapshot::decode(bytes)?;
-                snapshot.validate_against_checkpoint(&manifest.checkpoint)?;
-                // `verify_each_frontier_change` stays `SyncError`-returning
-                // (daemon-local signature/authorization verification, not
-                // part of the 7D-9D move) -- the closure's own error type is
-                // fixed to `ReplicaEngineError` by `verify_and_install_
-                // rebootstrap`'s signature, so this boundary needs an
-                // explicit conversion rather than a bare `?`.
-                self.verify_each_frontier_change(&snapshot)
-                    .map_err(|e| ReplicaEngineError::CorruptState(e.to_string()))
-            },
-        )?)
+        Ok(())
     }
+}
+
+/// Why a peer's base was not merged.
+#[derive(Debug, thiserror::Error)]
+pub enum ForeignBaseMergeError {
+    /// No live claim by this peer to stand on another base: nothing asked
+    /// for a merge with it, or the claim was heard on a base this device
+    /// has since left.
+    #[error("{peer} does not claim a base this device must merge with")]
+    NotClaimed { peer: String },
+    /// The base fetched from the peer is not the one it advertised.
+    #[error("the base fetched from {peer} is not the one it advertised")]
+    NotAdvertised { peer: String },
+    /// A frontier change the base carries did not verify.
+    #[error("a frontier change of the offered base does not verify: {0}")]
+    FrontierUnverified(SyncError),
+    /// The evidence the base carries for a change did not verify.
+    #[error("the offered base's evidence for {} does not verify: {detail}", .change.to_hex())]
+    WitnessUnverified { change: ChangeHash, detail: String },
+    /// The merge was refused, or the store failed.
+    #[error(transparent)]
+    Merge(#[from] ForeignMergeError),
 }
 
 #[cfg(test)]
-mod tests {
-    use crate::replica_coordinator::ReplicaCoordinator;
-    use ed25519_dalek::SigningKey;
-    use yadorilink_local_storage::FsBlockStore;
-    use yadorilink_replica_engine::compaction::Checkpoint;
-    use yadorilink_replica_engine::rebootstrap::SnapshotManifest;
-
-    use super::*;
-
-    fn test_state() -> Arc<DaemonState> {
-        let store_dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
-        let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
-        DaemonState::new("device-a".into(), sync_state, store)
-    }
-
-    fn required_signed_by(group_id: &str, signer: &str, key: &SigningKey) -> RebootstrapRequired {
-        let frontier = ChangeHash([9u8; 32]);
-        let checkpoint = Checkpoint::new(FolderGroupId(group_id.into()), vec![frontier], [1u8; 32]);
-        let manifest = SnapshotManifest::new_signed(
-            checkpoint,
-            vec![frontier],
-            None,
-            DeviceId(signer.into()),
-            key,
-        )
-        .unwrap();
-        RebootstrapRequired::new_signed(ChangeHash([2u8; 32]), manifest, key)
-    }
-
-    /// Issue A core fix: this device's own signing key resolves without
-    /// touching anything peer-related.
-    #[tokio::test]
-    async fn trust_key_resolves_own_live_device_key() {
-        let state = test_state();
-        let key = SigningKey::from_bytes(&[7u8; 32]);
-        state.set_device_signing_key(key.clone());
-        let handler = DaemonRebootstrapHandler { state };
-        assert_eq!(handler.trust_key("device-a"), Some(key.verifying_key().to_bytes()));
-    }
-
-    /// Issue A core fix: a peer's key resolves only from the LIVE netmap
-    /// pin, and only after it has actually been recorded — there is no
-    /// fallback of any kind (in particular no historical-pin-archive
-    /// fallback) that could resolve a device this process has never seen
-    /// pinned live.
-    #[tokio::test]
-    async fn trust_key_resolves_only_a_peers_live_pinned_key() {
-        let state = test_state();
-        let peer_key = SigningKey::from_bytes(&[8u8; 32]);
-        let handler = DaemonRebootstrapHandler { state: state.clone() };
-        assert_eq!(handler.trust_key("device-b"), None);
-        state.record_peer_signing_key("device-b", peer_key.verifying_key().to_bytes());
-        assert_eq!(handler.trust_key("device-b"), Some(peer_key.verifying_key().to_bytes()));
-    }
-
-    /// Issue A core fix: a signature-valid manifest is not enough on its
-    /// own — the signer must also be a device this policy currently
-    /// recognizes as a writer for the manifest's specific group. A signer
-    /// for a group that was never introduced to this device at all (the
-    /// same shape a revoked-and-since-forgotten device would present) must
-    /// be rejected, not merely deferred.
-    #[tokio::test]
-    async fn a_signer_that_is_not_this_device_and_never_introduced_is_not_authorized() {
-        let state = test_state();
-        let key = SigningKey::from_bytes(&[9u8; 32]);
-        let handler = DaemonRebootstrapHandler { state };
-        let required = required_signed_by("brand-new-group", "device-b", &key);
-        let error = handler.check_signer_authorized_for_group(&required).unwrap_err();
-        assert!(
-            matches!(
-                error,
-                SyncError::CorruptState(ref message) if message.contains("is not a current writer")
-            ),
-            "unexpected error: {error:?}"
-        );
-    }
-
-    /// A device is always authorized to sign a manifest for its own future
-    /// HistoryBase install — no membership lookup needed or performed.
-    #[tokio::test]
-    async fn a_signer_that_is_this_device_is_trivially_authorized() {
-        let state = test_state();
-        let key = SigningKey::from_bytes(&[9u8; 32]);
-        let handler = DaemonRebootstrapHandler { state };
-        let required = required_signed_by("g", "device-a", &key);
-        handler.check_signer_authorized_for_group(&required).unwrap();
-    }
-
-    /// Bug 2 regression: this function's own doc comment says the signer
-    /// must be "a device this policy currently recognizes as a writer" --
-    /// but the pre-fix code checked `state.peer_is_writer`, which is
-    /// populated from plain netmap membership (every authorized group
-    /// member, Viewer included; see `DaemonState::replace_peer_netmap_
-    /// metadata`), not from the signed policy chain's Editor/Owner role
-    /// data. That let a Viewer-role device's re-bootstrap manifest --
-    /// installing a brand-new HistoryBase/compaction snapshot for the
-    /// group -- be accepted as though it came from a real writer. This
-    /// proves a Viewer-signed manifest is now rejected, and the identical
-    /// manifest signed by the same device once re-granted Editor (and
-    /// marked a full replica, the separate, unchanged full-replica check)
-    /// is accepted.
-    #[tokio::test]
-    async fn check_signer_authorized_for_group_rejects_a_viewer_and_accepts_the_same_device_as_an_editor(
-    ) {
-        use crate::change_policy::policy_signing::grant_record;
-        use crate::change_policy::{verify_group_policy_log, GroupPolicyLog, WriterRole};
-
-        let authority = SigningKey::from_bytes(&[7u8; 32]);
-        let group_id = "group-rebootstrap";
-        let signer_key = SigningKey::from_bytes(&[13u8; 32]);
-        let signer_fp: [u8; 32] = Sha256::digest(signer_key.verifying_key().to_bytes()).into();
-
-        let viewer_grant = grant_record(
-            &authority,
-            group_id,
-            1,
-            [0u8; 32],
-            "device-b",
-            signer_fp,
-            WriterRole::Viewer,
-        );
-        let viewer_head: [u8; 32] = viewer_grant.record_hash.as_slice().try_into().unwrap();
-        let viewer_log = GroupPolicyLog {
-            group_id: group_id.to_string(),
-            current_seq: 1,
-            current_epoch: 0,
-            policy_head: viewer_head.to_vec(),
-            records: vec![viewer_grant],
-        };
-        let viewer_policy =
-            verify_group_policy_log(&authority.verifying_key().to_bytes(), &viewer_log).unwrap();
-
-        let state = test_state();
-        // device-b is a real netmap-authorized group member -- exactly what
-        // a Viewer legitimately is (membership and write-role are separate
-        // axes; see `WriterRole`'s own doc comment). This is what makes the
-        // pre-fix check dangerous: `peer_is_writer` returns true here
-        // (membership alone), which is precisely why this test needs the
-        // real signed-policy role check instead.
-        state.set_peer_group_writer("device-b", group_id, true);
-        // Also already a full replica for the whole test, so the ONLY thing
-        // that changes between the Viewer and Editor phases below is the
-        // signed policy role -- isolating the writer-role check this test
-        // targets from the separate, unchanged full-replica check.
-        state.set_peer_group_full_replica("device-b", group_id, true);
-        // The netmap-pinned key matches the policy-bound fingerprint for the
-        // whole test (both derived from the same `signer_key`) -- fix 1's
-        // added fingerprint-binding check is exercised elsewhere
-        // (`..._rejects_a_manifest_signed_with_a_key_the_policy_never_bound_to_the_writer`);
-        // this test isolates the writer-ROLE check only, so the fingerprint
-        // half must trivially agree throughout.
-        state.record_peer_signing_key("device-b", signer_key.verifying_key().to_bytes());
-        state.replace_group_policy_states(std::collections::HashMap::from([(
-            group_id.to_string(),
-            viewer_policy,
-        )]));
-        let handler = DaemonRebootstrapHandler { state: state.clone() };
-        let required = required_signed_by(group_id, "device-b", &signer_key);
-
-        let error = handler.check_signer_authorized_for_group(&required).unwrap_err();
-        assert!(
-            matches!(
-                error,
-                SyncError::CorruptState(ref message) if message.contains("is not a current writer")
-            ),
-            "expected a Viewer-signed re-bootstrap manifest to be rejected as not-a-writer, got \
-             {error:?}"
-        );
-
-        // Promote device-b to Editor at seq 2 -- membership and full-replica
-        // status are unchanged from above, so this isolates the writer-role
-        // check. The identical manifest must now be accepted.
-        let editor_grant = grant_record(
-            &authority,
-            group_id,
-            2,
-            viewer_head,
-            "device-b",
-            signer_fp,
-            WriterRole::Editor,
-        );
-        let editor_head: [u8; 32] = editor_grant.record_hash.as_slice().try_into().unwrap();
-        let editor_log = GroupPolicyLog {
-            group_id: group_id.to_string(),
-            current_seq: 2,
-            current_epoch: 0,
-            policy_head: editor_head.to_vec(),
-            records: vec![
-                grant_record(
-                    &authority,
-                    group_id,
-                    1,
-                    [0u8; 32],
-                    "device-b",
-                    signer_fp,
-                    WriterRole::Viewer,
-                ),
-                editor_grant,
-            ],
-        };
-        let editor_policy =
-            verify_group_policy_log(&authority.verifying_key().to_bytes(), &editor_log).unwrap();
-        state.replace_group_policy_states(std::collections::HashMap::from([(
-            group_id.to_string(),
-            editor_policy,
-        )]));
-
-        handler.check_signer_authorized_for_group(&required).unwrap();
-    }
-
-    /// Signing-key fingerprint binding regression test: the writer-role
-    /// check alone is not enough -- the manifest's ACTUAL signing key must
-    /// also match the key the SIGNED POLICY CHAIN bound to that writer, not
-    /// merely whatever key the
-    /// (netmap-derived, weak) `trust_key` resolver currently has pinned for
-    /// that device id. The policy binds device-b's Editor grant to key A's
-    /// fingerprint; the netmap separately has a DIFFERENT key B pinned for
-    /// device-b; the manifest is signed with key B. Before this fix,
-    /// `check_signer_authorized_for_group` only checked `writer.device_id
-    /// == signer` against `current_writers()` and never consulted
-    /// `AuthorizedWriter::signing_key_fingerprint` at all, so this was
-    /// wrongly accepted -- a manifest signed by a key the signed policy
-    /// chain never actually authorized for that writer. The existing
-    /// `check_signer_authorized_for_group_rejects_a_viewer_and_accepts_the_same_device_as_an_editor`
-    /// test above can't catch this: it uses ONE key for both the Viewer and
-    /// Editor phases, so `writer.device_id == signer` and a hypothetical
-    /// fingerprint check would always agree there too. This test needs two
-    /// DISTINCT keys to isolate the gap.
-    #[tokio::test]
-    async fn check_signer_authorized_for_group_rejects_a_manifest_signed_with_a_key_the_policy_never_bound_to_the_writer(
-    ) {
-        use crate::change_policy::policy_signing::grant_record;
-        use crate::change_policy::{verify_group_policy_log, GroupPolicyLog, WriterRole};
-
-        let authority = SigningKey::from_bytes(&[7u8; 32]);
-        let group_id = "group-rebootstrap-fp-binding";
-        // Key A: the key the signed policy chain binds device-b's Editor
-        // grant to.
-        let policy_bound_key = SigningKey::from_bytes(&[21u8; 32]);
-        let policy_bound_fp: [u8; 32] =
-            Sha256::digest(policy_bound_key.verifying_key().to_bytes()).into();
-        // Key B: a DIFFERENT key, netmap-pinned for the SAME device id, and
-        // the one the manifest is actually signed with -- the forged/wrong
-        // key an attacker who controls the netmap pin (but not device-b's
-        // real key A) would use.
-        let netmap_pinned_key = SigningKey::from_bytes(&[22u8; 32]);
-        assert_ne!(
-            policy_bound_key.verifying_key().to_bytes(),
-            netmap_pinned_key.verifying_key().to_bytes(),
-            "test setup bug: the two keys must be distinct for this probe to mean anything"
-        );
-
-        let editor_grant = grant_record(
-            &authority,
-            group_id,
-            1,
-            [0u8; 32],
-            "device-b",
-            policy_bound_fp,
-            WriterRole::Editor,
-        );
-        let editor_head: [u8; 32] = editor_grant.record_hash.as_slice().try_into().unwrap();
-        let editor_log = GroupPolicyLog {
-            group_id: group_id.to_string(),
-            current_seq: 1,
-            current_epoch: 0,
-            policy_head: editor_head.to_vec(),
-            records: vec![editor_grant],
-        };
-        let editor_policy =
-            verify_group_policy_log(&authority.verifying_key().to_bytes(), &editor_log).unwrap();
-
-        let state = test_state();
-        state.set_peer_group_writer("device-b", group_id, true);
-        state.set_peer_group_full_replica("device-b", group_id, true);
-        // The attack: the netmap has key B pinned for device-b, NOT key A
-        // the signed policy chain actually bound.
-        state.record_peer_signing_key("device-b", netmap_pinned_key.verifying_key().to_bytes());
-        state.replace_group_policy_states(std::collections::HashMap::from([(
-            group_id.to_string(),
-            editor_policy,
-        )]));
-        let handler = DaemonRebootstrapHandler { state: state.clone() };
-        // Manifest claims signer "device-b" (a real Editor per the policy
-        // chain) but is signed with key B, which the policy chain never
-        // bound to device-b.
-        let required = required_signed_by(group_id, "device-b", &netmap_pinned_key);
-
-        let error = handler.check_signer_authorized_for_group(&required).unwrap_err();
-        assert!(
-            matches!(
-                error,
-                SyncError::CorruptState(ref message) if message.contains("is not a current writer")
-            ),
-            "expected a manifest signed with a key the signed policy chain never bound to this \
-             writer to be rejected even though the same device id is a real Editor under a \
-             DIFFERENT key, got {error:?}"
-        );
-    }
-
-    /// Empty-verified-writer-set regression test: a signed policy
-    /// chain that has been verified but currently names ZERO writers (a
-    /// genuinely empty log here; a chain where every writer has since been
-    /// revoked reaches the identical `current_writers().is_empty()` state)
-    /// must reject every signer unconditionally -- no netmap-membership
-    /// fallback of any kind, even for a device the netmap otherwise
-    /// considers both a group member and a full replica. See this
-    /// function's own doc comment (the paragraph on `current_writers()`
-    /// being empty) for why this differs, on purpose, from how
-    /// `local_change_auth_provider` and `repair_election_provider`
-    /// (`daemon_state.rs`) each handle the identical scenario.
-    #[tokio::test]
-    async fn check_signer_authorized_for_group_rejects_every_signer_when_the_verified_policy_names_no_writers(
-    ) {
-        use crate::change_policy::{verify_group_policy_log, GroupPolicyLog};
-
-        let authority = SigningKey::from_bytes(&[7u8; 32]);
-        let group_id = "group-empty-writer-set";
-        let empty_log = GroupPolicyLog {
-            group_id: group_id.to_string(),
-            current_seq: 0,
-            current_epoch: 0,
-            policy_head: vec![0u8; 32],
-            records: vec![],
-        };
-        let empty_policy =
-            verify_group_policy_log(&authority.verifying_key().to_bytes(), &empty_log).unwrap();
-        assert!(
-            empty_policy.current_writers().is_empty(),
-            "test setup bug: this policy must have an empty writer set for the probe to mean \
-             anything"
-        );
-
-        let state = test_state();
-        let signer_key = SigningKey::from_bytes(&[31u8; 32]);
-        // device-b looks like a fully legitimate signer by every
-        // netmap-derived signal -- a real member, a real full replica, and
-        // its real live key is pinned -- so the ONLY reason this must be
-        // rejected is the empty verified writer set itself.
-        state.set_peer_group_writer("device-b", group_id, true);
-        state.set_peer_group_full_replica("device-b", group_id, true);
-        state.record_peer_signing_key("device-b", signer_key.verifying_key().to_bytes());
-        state.replace_group_policy_states(std::collections::HashMap::from([(
-            group_id.to_string(),
-            empty_policy,
-        )]));
-        let handler = DaemonRebootstrapHandler { state: state.clone() };
-        let required = required_signed_by(group_id, "device-b", &signer_key);
-
-        let error = handler.check_signer_authorized_for_group(&required).unwrap_err();
-        assert!(
-            matches!(
-                error,
-                SyncError::CorruptState(ref message) if message.contains("is not a current writer")
-            ),
-            "expected a verified-but-empty writer set to reject every signer unconditionally, \
-             got {error:?}"
-        );
-    }
-
-    /// Issue D2: trusting the outer `SnapshotManifest` signer (verified
-    /// separately, via `manifest_hash`/`snapshot_hash` binding) must not be
-    /// conflated with trusting an individual embedded frontier `Change`'s
-    /// own authorization. A frontier change from an author whose signing
-    /// key this device has never pinned must be rejected independently,
-    /// even though nothing here claims the outer manifest itself is invalid.
-    #[tokio::test]
-    async fn verify_each_frontier_change_rejects_a_change_with_no_pinned_author_key() {
-        use yadorilink_replica_domain::change::Op;
-        use yadorilink_replica_domain::ids::SyncPath;
-        use yadorilink_replica_engine::rebootstrap_snapshot::RebootstrapSnapshot;
-
-        let state = test_state();
-        let handler = DaemonRebootstrapHandler { state };
-        let unpinned_author_key = SigningKey::from_bytes(&[42u8; 32]);
-        let frontier_change = Change::create_signed(
-            vec![],
-            0,
-            ChangeAuth::PLACEHOLDER,
-            DeviceId("device-unknown".into()),
-            FolderGroupId("g".into()),
-            vec![Op::Delete { path: SyncPath("a.bin".into()) }],
-            &unpinned_author_key,
-        );
-        let snapshot = RebootstrapSnapshot::new(
-            FolderGroupId("g".into()),
-            Vec::new(),
-            vec![frontier_change.to_wire_bytes()],
-            Vec::new(),
-            Vec::new(),
-        )
-        .unwrap();
-
-        let error = handler.verify_each_frontier_change(&snapshot).unwrap_err();
-        assert!(
-            matches!(
-                error,
-                SyncError::CorruptState(ref message) if message.contains("no pinned signing key")
-            ),
-            "unexpected error: {error:?}"
-        );
-    }
-}
+mod tests;

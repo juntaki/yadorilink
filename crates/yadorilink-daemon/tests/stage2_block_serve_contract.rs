@@ -1,4 +1,4 @@
-//! RED acceptance coverage for convergence-engine stage 2: the source-side
+//! Acceptance coverage for the convergence engine's source-side
 //! shared block-serving scheduler, byte fairness, explicit congestion signals,
 //! and separation of content backpressure from control/metadata traffic.
 //!
@@ -6,7 +6,7 @@
 //! `PeerSyncSession`s rather than naming a particular `BlockServeEngine` API.
 //! The implementation may choose its internal queue/coalescer types freely.
 //!
-//! Stage-1 behavior is expected to fail these tests:
+//! A serving path without that scheduler fails these tests:
 //! - identical requests arriving through different peer sessions each perform
 //!   their own source-store read;
 //! - enough stalled `BlockRequest` handlers consume the ordinary-message
@@ -23,7 +23,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use tokio::task::JoinSet;
 use yadorilink_daemon::daemon_state::DaemonState;
-use yadorilink_local_storage::{BlockStore, ContentHash, FsBlockStore, GcReport, StorageError};
+use yadorilink_local_storage::{
+    BlockStore, ContentHash, GcReport, SegmentBlockStore, StorageError,
+};
 use yadorilink_peer_session::peer_session::PeerSyncSession;
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord, RecordKind};
 use yadorilink_replica_domain::file::{FileMeta, FileVersion, VersionBlock};
@@ -46,21 +48,21 @@ struct ReadState {
     immediate_hashes: HashSet<String>,
 }
 
-/// A real `FsBlockStore` with deterministic observation/control around `get`.
+/// A real `SegmentBlockStore` with deterministic observation/control around `get`.
 ///
 /// `Delay` widens the overlap window so identical cross-session requests must
 /// coalesce. `Gate` records every source read and blocks it until the test
 /// releases a permit, making queue order and control-lane starvation directly
 /// observable without relying on machine speed.
 struct InstrumentedBlockStore {
-    inner: Arc<FsBlockStore>,
+    inner: Arc<SegmentBlockStore>,
     mode: ReadMode,
     state: Mutex<ReadState>,
     changed: Condvar,
 }
 
 impl InstrumentedBlockStore {
-    fn new(inner: Arc<FsBlockStore>, mode: ReadMode) -> Self {
+    fn new(inner: Arc<SegmentBlockStore>, mode: ReadMode) -> Self {
         Self { inner, mode, state: Mutex::new(ReadState::default()), changed: Condvar::new() }
     }
 
@@ -88,6 +90,25 @@ impl InstrumentedBlockStore {
         self.changed.notify_all();
     }
 
+    /// Let every gated read through, for good.
+    ///
+    /// The gate is deliberately untimed -- that is what makes queue order
+    /// observable without depending on machine speed -- but an untimed wait
+    /// that outlives the test body turns a failing assertion into a hung
+    /// binary rather than a failed test. A gated read parks a blocking-pool
+    /// thread, the panic unwinds past the test's own `release`, and the
+    /// `#[tokio::test]` runtime's drop then waits for those threads forever.
+    /// Measured: after the assertion at `late_small_requests...` fired, the
+    /// process sat at 28 threads and zero CPU until it was killed.
+    ///
+    /// [`GateOpenOnUnwind`] calls this from `Drop`, so it runs on the panic
+    /// path as well as the ordinary one.
+    fn open_permanently(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.permits = usize::MAX;
+        self.changed.notify_all();
+    }
+
     fn wait_for_entered_at_least(&self, count: usize, timeout: Duration) -> usize {
         let deadline = Instant::now() + timeout;
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -112,6 +133,17 @@ impl InstrumentedBlockStore {
             .entered
             .iter()
             .position(|h| h == hash_hex)
+    }
+}
+
+/// Opens a gated store's gate when the test body ends, however it ends.
+///
+/// See [`InstrumentedBlockStore::open_permanently`].
+struct GateOpenOnUnwind(Arc<InstrumentedBlockStore>);
+
+impl Drop for GateOpenOnUnwind {
+    fn drop(&mut self) {
+        self.0.open_permanently();
     }
 }
 
@@ -181,7 +213,7 @@ struct Device {
 
 fn new_plain_device(device_id: &str, groups: &[&str]) -> Device {
     let store_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     new_device(device_id, groups, store, store_dir)
 }
 
@@ -191,7 +223,7 @@ fn new_instrumented_device(
     mode: ReadMode,
 ) -> (Device, Arc<InstrumentedBlockStore>) {
     let store_dir = tempfile::tempdir().unwrap();
-    let inner = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+    let inner = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let instrumented = Arc::new(InstrumentedBlockStore::new(inner, mode));
     let store: Arc<dyn BlockStore + Send + Sync> = instrumented.clone();
     (new_device(device_id, groups, store, store_dir), instrumented)
@@ -239,33 +271,21 @@ fn seeded_data(seed: usize, len: usize) -> Vec<u8> {
     (0..len).map(|i| ((i.wrapping_mul(131) + seed.wrapping_mul(17) + i / 7) % 251) as u8).collect()
 }
 
+/// Seeds `path` in `group` via a real signed local Change (not a raw
+/// `store.put` + `upsert_file`), and publishes it. Block-serving
+/// authorization now requires a real Published Change behind a served
+/// path -- `published_file_at_path`/
+/// `published_group_file_version_references_block` both join against
+/// `change_authorization`, which a raw `upsert_file` (no authoring change
+/// at all) can never satisfy. Every caller of this function pairs the
+/// returned device via `connect()` afterward, which flushes this device's
+/// PRE-EXISTING Pending content for the shared group as part of `support::
+/// connect_two_daemons`'s own setup -- so the Change authored here
+/// deterministically becomes Published before any peer ever gets a chance
+/// to request it.
 fn seed_block(device: &Device, group: &str, path: &str, data: Vec<u8>) -> SeededBlock {
     let hash_hex = device.state.block_store.put(&data).unwrap();
     let hash = hex::decode(&hash_hex).unwrap();
-    device
-        .state
-        .replica_coordinator
-        .change_history_repository()
-        .record_group_block_provenance(group, std::slice::from_ref(&hash))
-        .unwrap();
-
-    let record = FileRecord {
-        path: path.to_string(),
-        size: data.len() as u64,
-        mtime_unix_nanos: 0,
-        blocks: vec![BlockInfo { hash: hash.clone(), offset: 0, size: data.len() as u32 }],
-        deleted: false,
-    };
-    device
-        .state
-        .replica_coordinator
-        .file_index_repository()
-        .upsert_file(
-            group,
-            &record,
-            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-        )
-        .unwrap();
 
     let version_blocks =
         vec![VersionBlock { hash: BlockHash(hash.clone()), size: data.len() as u32 }];
@@ -280,6 +300,55 @@ fn seed_block(device: &Device, group: &str, path: &str, data: Vec<u8>) -> Seeded
             xattrs: Vec::new(),
         },
     );
+    let record = FileRecord {
+        path: path.to_string(),
+        size: data.len() as u64,
+        mtime_unix_nanos: 0,
+        blocks: vec![BlockInfo { hash: hash.clone(), offset: 0, size: data.len() as u32 }],
+        deleted: false,
+    };
+    let signing_key = device.state.device_signing_key().expect(
+        "new_device calls ensure_device_signing_key, so every seed_block caller already has one",
+    );
+    let emitter = yadorilink_sync_sqlite::dag_store::ChangeEmitter::new(
+        device.device_id.clone(),
+        signing_key,
+    );
+    device
+        .state
+        .replica_coordinator
+        .upsert_file_emitting_change(
+            group,
+            &record,
+            &device.device_id,
+            yadorilink_replica_domain::session_state::ChangeContent {
+                ops: vec![yadorilink_replica_domain::change::Op::Put {
+                    path: yadorilink_replica_domain::ids::SyncPath(path.to_string()),
+                    version: version.version_hash,
+                    origin: yadorilink_replica_domain::change::PutOrigin::Direct,
+                }],
+                versions: std::slice::from_ref(&version),
+            },
+            None,
+            None,
+            yadorilink_daemon::replica_coordinator::ReplicaChangeEmission {
+                emitter: &emitter,
+                permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            },
+        )
+        .unwrap();
+    // `record_group_block_provenance`'s doc comment: without this, the
+    // block-serving path refuses this block as never having been obtained
+    // through the group. `upsert_file_emitting_change` records the
+    // authorization link but not provenance -- see `DagProducer::
+    // commit_create`'s identical two-step sequence in the peer-session
+    // test suite.
+    device
+        .state
+        .replica_coordinator
+        .change_history_repository()
+        .record_group_block_provenance(group, std::slice::from_ref(&hash))
+        .unwrap();
 
     SeededBlock {
         path: path.to_string(),
@@ -347,13 +416,18 @@ async fn identical_block_requested_by_many_peers_is_read_once_and_fanned_out() {
     support::ensure_isolated_config_dir();
     let (source, store) =
         new_instrumented_device("source", &[GROUP_A], ReadMode::Delay(Duration::from_millis(300)));
-    let block = seed_block(&source, GROUP_A, "shared.bin", seeded_data(1, 128 * 1024));
 
     let requesters =
         (0..6).map(|i| new_plain_device(&format!("requester-{i}"), &[GROUP_A])).collect::<Vec<_>>();
+    // `connect()` (via `support::connect_two_daemons`) installs the
+    // bootstrap policy `seed_block`'s `upsert_file_emitting_change` needs
+    // in order to authorize local emission at all -- it must run first,
+    // not after seeding, unlike this test's original ordering.
     for requester in &requesters {
         connect(&source, requester, &[GROUP_A]).await;
     }
+    let block = seed_block(&source, GROUP_A, "shared.bin", seeded_data(1, 128 * 1024));
+    source.state.flush_pending_checkpoint_for_group_for_test(GROUP_A).await;
 
     let barrier = Arc::new(tokio::sync::Barrier::new(requesters.len() + 1));
     let mut tasks = JoinSet::new();
@@ -403,6 +477,9 @@ async fn concurrent_requests_for_the_same_hash_across_groups_never_cross_wire_th
         ReadMode::Delay(Duration::from_millis(50)),
     );
     let requester = new_plain_device("requester", &[GROUP_A, GROUP_B]);
+    // `connect()` installs the bootstrap policy `seed_block` needs to
+    // authorize local emission at all -- must run before any seeding.
+    connect(&source, &requester, &[GROUP_A, GROUP_B]).await;
 
     // GROUP_A: real provenance recorded -- must be served.
     let block = seed_block(&source, GROUP_A, "shared.bin", seeded_data(1, 4096));
@@ -432,7 +509,7 @@ async fn concurrent_requests_for_the_same_hash_across_groups_never_cross_wire_th
         )
         .unwrap();
 
-    connect(&source, &requester, &[GROUP_A, GROUP_B]).await;
+    source.state.flush_pending_checkpoint_for_group_for_test(GROUP_A).await;
     let session = session_to(&requester, &source.device_id);
 
     let (group_a_result, group_b_result) = tokio::join!(
@@ -459,6 +536,9 @@ async fn stalled_content_requests_do_not_delay_control_messages_on_the_same_sess
     support::ensure_isolated_config_dir();
     let (source, store) = new_instrumented_device("source", &[GROUP_A], ReadMode::Gate);
     let requester = new_plain_device("requester", &[GROUP_A]);
+    // `connect()` installs the bootstrap policy `seed_block` needs to
+    // authorize local emission at all -- must run before any seeding.
+    connect(&source, &requester, &[GROUP_A]).await;
 
     let noisy = (0..72)
         .map(|i| {
@@ -474,9 +554,9 @@ async fn stalled_content_requests_do_not_delay_control_messages_on_the_same_sess
     // The control query itself verifies this block. Keep that one read outside
     // the artificial content gate; only the ordinary BlockRequest flood stalls.
     store.allow_immediate(&control.hash_hex);
+    source.state.flush_pending_checkpoint_for_group_for_test(GROUP_A).await;
 
-    connect(&source, &requester, &[GROUP_A]).await;
-    requester.state.set_peer_group_full_replica(&source.device_id, GROUP_A, true);
+    requester.state.authority.set_peer_group_full_replica(&source.device_id, GROUP_A, true);
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let session = session_to(&requester, &source.device_id);
@@ -513,8 +593,15 @@ async fn stalled_content_requests_do_not_delay_control_messages_on_the_same_sess
 async fn late_small_requests_from_another_peer_and_group_cut_ahead_of_a_large_backlog() {
     support::ensure_isolated_config_dir();
     let (source, store) = new_instrumented_device("source", &[GROUP_A, GROUP_B], ReadMode::Gate);
+    // Whatever happens below, no gated read is still parked when this test
+    // returns -- see `open_permanently`.
+    let _gate = GateOpenOnUnwind(store.clone());
     let peer_a = new_plain_device("peer-a", &[GROUP_A, GROUP_B]);
     let peer_b = new_plain_device("peer-b", &[GROUP_A]);
+    // `connect()` installs the bootstrap policy `seed_block` needs to
+    // authorize local emission at all -- must run before any seeding.
+    connect(&source, &peer_a, &[GROUP_A, GROUP_B]).await;
+    connect(&source, &peer_b, &[GROUP_A]).await;
 
     let large_backlog = (0..96)
         .map(|i| {
@@ -529,9 +616,8 @@ async fn late_small_requests_from_another_peer_and_group_cut_ahead_of_a_large_ba
     let other_group =
         seed_block(&source, GROUP_B, "small-other-group.bin", seeded_data(9_001, 1024));
     let other_peer = seed_block(&source, GROUP_A, "small-other-peer.bin", seeded_data(9_002, 1024));
-
-    connect(&source, &peer_a, &[GROUP_A, GROUP_B]).await;
-    connect(&source, &peer_b, &[GROUP_A]).await;
+    source.state.flush_pending_checkpoint_for_group_for_test(GROUP_A).await;
+    source.state.flush_pending_checkpoint_for_group_for_test(GROUP_B).await;
 
     let session_a = session_to(&peer_a, &source.device_id);
     let session_b = session_to(&peer_b, &source.device_id);
@@ -762,70 +848,20 @@ mod proto_model {
 /// Every check names one message, so a field moving between messages is a
 /// failure rather than something a whole-file search would still find.
 #[test]
-fn wire_schema_exposes_serve_credit_and_explicit_congestion_outcomes() {
+fn wire_schema_pins_block_stream_headers_and_explicit_congestion_outcomes() {
     let schema = include_str!("../../yadorilink-ipc-proto/proto/sync.proto");
     let messages = proto_model::parse(schema);
 
-    let cluster = messages.get("ClusterConfig").expect("ClusterConfig must exist");
-    // What serve credit actually consists of on the wire today. The pair of
-    // per-connection ceilings, and nothing else: the worker-slot and
-    // queue-delay hints were removed, and asserting them as required is what
-    // the substring version of this test was silently doing.
-    assert_eq!(
-        cluster.field("max_inflight_requests").map(|f| (f.ty.as_str(), f.number)),
-        Some(("uint32", 11)),
-        "the in-flight request ceiling is the requester's admission-control input"
-    );
-    assert_eq!(
-        cluster.field("max_inflight_bytes").map(|f| (f.ty.as_str(), f.number)),
-        Some(("uint64", 12)),
-        "the in-flight byte ceiling is what makes credit independent of block size"
-    );
-
-    // Every capability bit and hint this generation dropped must stay
-    // reserved BY NAME, not merely be absent: a later generation reusing the
-    // name for something else would silently change what an old peer's field
-    // means. Checking the reservation directly is the point -- the previous
-    // test could not distinguish this from the field still being live.
-    // Paired deliberately. The NAME reservation stops source-level reuse; the
-    // NUMBER reservation is what stops wire-level reuse, and it is the one
-    // that matters more: drop `reserved 13, 14;` while keeping the names and
-    // protoc will happily accept a later `uint32 shard_hint = 13;`, which an
-    // older peer decodes as `available_worker_slots`. Asserting only the name
-    // guards the weaker half.
-    for (retired, number) in [
-        ("supported_compression", 3),
-        ("supports_change_dag", 7),
-        ("supports_version_present", 8),
-        ("supports_version_hash_exact", 9),
-        ("supports_block_serve_credit", 10),
-        ("available_worker_slots", 13),
-        ("estimated_queue_delay_ms", 14),
-        ("protocol_version", 15),
-    ] {
-        assert!(
-            cluster.reserved_names.contains(retired),
-            "{retired:?} must stay reserved on ClusterConfig"
-        );
-        assert!(
-            cluster.reserved_numbers.contains(&number),
-            "field number {number} ({retired:?}) must stay reserved -- a later generation \
-             reusing it would be decoded as {retired:?} by an older peer"
-        );
-        assert!(
-            cluster.field(retired).is_none(),
-            "{retired:?} is reserved and must not also be declared"
-        );
-    }
-
-    // The protocol generation lives in exactly one place, and it is not
-    // here: it rides the ALPN, where a mismatch is refused inside the TLS
-    // handshake rather than after it. Its name and number are both covered
-    // by the loop above.
+    // Serve credit is not negotiated on the wire: each device enforces its
+    // own serving budget locally, and the session-start message that used to
+    // advertise one is gone together with the control-stream envelope that
+    // carried it.
+    assert!(!messages.contains_key("ClusterConfig"), "no session-start negotiation message");
+    assert!(!messages.contains_key("SyncMessage"), "no control-stream envelope");
 
     // One block request is one bidirectional stream, so the request and
-    // response headers are their own messages rather than `SyncMessage`
-    // payload variants, and neither carries a correlation id.
+    // response headers are their own messages, and neither carries a
+    // correlation id.
     let request = messages.get("BlockRequestHeader").expect("BlockRequestHeader must exist");
     assert!(
         request.field("request_id").is_none(),

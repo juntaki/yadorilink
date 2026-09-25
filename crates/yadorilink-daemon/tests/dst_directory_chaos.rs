@@ -56,51 +56,27 @@
 //! can be nested — the flat, root-only originals would silently miss an
 //! entire subtree.
 //!
-//! # THIS FILE IS RED. It must not gate CI yet. Read this before "fixing" it.
+//! # What the per-round gate asserts
 //!
-//! 17 of the 30 default variations still fail (0 skipped), primarily through a
-//! round-level "never converged" (the per-round gate below timing out on a path
-//! whose bytes never agree), with terminal `Convergence` and
-//! `StructuralIndexDiskMismatch` findings too. The observed product state is a
-//! path left **live in the index with no file on disk** — e.g. seed 3509503757
-//! (`DST_BASE_SEED` 0xD12E_C700 + 13) stalls at round 1 on `dir2/c.bin`.
+//! Each round waits until every device's on-disk bytes agree for every
+//! touched path, not merely until index rows agree. An index-to-index
+//! comparison is structurally blind to a path that is live in the index
+//! with no file on disk; a byte comparison is not. A path whose bytes never
+//! agree fails its round as "never converged", and the terminal
+//! `Convergence` and `StructuralIndexDiskMismatch` checks report any
+//! index-vs-disk disagreement that remains at quiescence. No oracle is
+//! relaxed to let a variation pass.
 //!
-//! The former eighteenth failure, seed 3509503762 (+18), was the sweep's sole
-//! `NoLoss` and is now classified and fixed as an oracle-bookkeeping false
-//! positive: race (d) removed its old path from `all_files`, but a later solo
-//! whole-directory rename actually emitted a causally-later tombstone for that
-//! still-live path through the product's orphan cascade. Recording only modeled
-//! `all_files` siblings omitted that real supersession. The harness now records
-//! extra tombstones observed in the actual cascade; the targeted seed passes and
-//! the 30-variation sweep retains the other 17 failures without any `NoLoss`.
-//!
-//! **What is and is not established about that red.** The honest summary is that
-//! the change-history DAG did not cause it, and neither did anything else in
-//! this file's migration:
-//!
-//!   - The gap is **pre-existing and engine-independent**. Isolating the two
-//!     things this file's migration changed at once — propagation (legacy ->
-//!     DAG) and the per-round gate (version-vector equality -> on-disk byte
-//!     comparison) — shows the whole delta is the *gate*. Holding the LEGACY
-//!     engine and swapping only the gate to bytes already fails 18/30 with 15
-//!     never-converged; the migrated DAG with the byte gate fails 18/30 with the
-//!     same counts, classes, seeds, rounds and paths. The DAG changes nothing
-//!     here.
-//!   - It is **not** true that these seeds simply "failed before too". With the
-//!     shipped vector gate the same base fails 12/30 with *zero*
-//!     never-converged. The extra seeds are ones that genuinely passed before —
-//!     but they passed for a bad reason: the vector gate compared index rows to
-//!     index rows, so it was structurally blind to exactly the index-vs-disk
-//!     disagreement that is the bug. It reported convergence while the bytes
-//!     underneath still disagreed, which is what let those runs reach the
-//!     terminal oracles at all.
-//!
-//! So the byte gate is not what to weaken to get green: it is the entire value
-//! of the migration, and it unmasked a real convergence gap that predates it on
-//! both engines. The gap itself needs its own investigation and is deliberately
-//! not addressed here; no oracle is weakened to hide it.
+//! Oracle bookkeeping: when a later whole-directory rename's orphan cascade
+//! emits a causally-later tombstone for a path `all_files` no longer
+//! targets, the harness records that tombstone as a real supersession, so
+//! the older write is not reported as a `NoLoss` violation.
 
-#![cfg(madsim)]
+// Retired. This scenario was written for a simulator this project no longer
+// builds against, and it names APIs that have since been removed. It is kept,
+// never compiled, as the specification its turmoil re-expression has to meet;
+// delete it in the change that lands that replacement.
+#![cfg(any())]
 
 mod dst_dag_migrate_b2;
 mod dst_support;
@@ -123,7 +99,7 @@ use yadorilink_filesystem_sync::watcher::{
     FolderWatchSource, FsChangeEvent, FsChangeKind, SimulatedFolderWatchSource,
 };
 use yadorilink_local_capture::{LocalChangeOutcome, LocalChangeProcessor};
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 use yadorilink_peer_session::peer_session::{
     PeerSyncSession, PendingLocalChangeFlush, PendingLocalFlushOutcome,
 };
@@ -186,7 +162,7 @@ impl ChaosDevice {
         let changed = match outcome {
             LocalChangeOutcome::FileChanged(_) => true,
             LocalChangeOutcome::FilesChanged(ref records) => !records.is_empty(),
-            LocalChangeOutcome::None => false,
+            LocalChangeOutcome::None | LocalChangeOutcome::RetryLater => false,
         };
         if !changed {
             return;
@@ -303,7 +279,7 @@ fn setup_device(
     device_id: &str,
     root: PathBuf,
     sync_state: Arc<ReplicaCoordinator>,
-    store: Arc<FsBlockStore>,
+    store: Arc<SegmentBlockStore>,
 ) -> Arc<ChaosDevice> {
     let processor = Arc::new(
         LocalChangeProcessor::new(
@@ -434,10 +410,10 @@ async fn connect_sessions(
     rng: &mut StdRng,
     device_a: &Arc<ChaosDevice>,
     state_a: Arc<ReplicaCoordinator>,
-    store_a: Arc<FsBlockStore>,
+    store_a: Arc<SegmentBlockStore>,
     device_b: &Arc<ChaosDevice>,
     state_b: Arc<ReplicaCoordinator>,
-    store_b: Arc<FsBlockStore>,
+    store_b: Arc<SegmentBlockStore>,
 ) {
     let socket_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let socket_b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -451,14 +427,14 @@ async fn connect_sessions(
     // Pin both devices' verifying keys (each admits the other's signed changes)
     // -- moved ahead of session construction so the authenticator (now a
     // construction-only `PeerSyncSessionDeps` field, not a post-hoc setter)
-    // can be supplied directly to `new_with_dependencies` below.
+    // can be supplied directly to `PeerSyncSession::new` below.
     let device_ids = [device_a.device_id.as_str(), device_b.device_id.as_str()];
     let authenticator: Arc<dyn yadorilink_peer_session::peer_session::ChangeAuthenticator> =
         dst_dag_migrate_b2::PinnedAuthenticator::new(device_ids.iter().copied());
 
     let mut sync_roots_a = HashMap::new();
     sync_roots_a.insert(GROUP_ID.to_string(), device_a.root.clone());
-    let session_a = PeerSyncSession::new_with_dependencies(
+    let session_a = PeerSyncSession::new(
         channel_a,
         device_a.device_id.clone(),
         device_b.device_id.clone(),
@@ -479,7 +455,7 @@ async fn connect_sessions(
 
     let mut sync_roots_b = HashMap::new();
     sync_roots_b.insert(GROUP_ID.to_string(), device_b.root.clone());
-    let session_b = PeerSyncSession::new_with_dependencies(
+    let session_b = PeerSyncSession::new(
         channel_b,
         device_b.device_id.clone(),
         device_a.device_id.clone(),
@@ -552,7 +528,7 @@ async fn deliver_local_write(
     if let Some(parent) = full_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    // Gap A: `fs_ops::write` writes and stamps the mtime through the shared
+    // `fs_ops::write` writes and stamps the mtime through the shared
     // `HarnessClock` in one step -- no local `stamp_deterministic_mtime`.
     dst_support::fs_ops::write(clock, &full_path, content)?;
     device
@@ -758,7 +734,7 @@ async fn apply_and_push_rename(
 /// `CreatedOrModified` per child), pushing every resulting record
 /// (including the cascade's `FilesChanged` batch) in one push. Caller has
 /// already performed the on-disk rename. Sources its event sequence from
-/// `dst_support::fs_events::decompose` (Gap D), same as `deliver_decomposed`.
+/// `dst_support::fs_events::decompose`, same as `deliver_decomposed`.
 async fn apply_and_push_dir_rename(
     device: &Arc<ChaosDevice>,
     old_dir: &str,
@@ -857,7 +833,7 @@ fn record_delete_at(
     touched_paths.insert(path.to_string());
 }
 
-/// **Model state, agmsg-review fix.** `all_files` is the complete set of
+/// **Model state.** `all_files` is the complete set of
 /// every content-bearing path this scenario has ever created and not yet
 /// deleted (path -> content_id), *including* a race's "independent" loser
 /// side that no future round ever targets directly again. `active` is the
@@ -905,14 +881,14 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
     let root_dir_a = tempfile::tempdir().map_err(|e| e.to_string())?;
     let root_a = root_dir_a.path().canonicalize().map_err(|e| e.to_string())?;
     let store_dir_a = tempfile::tempdir().map_err(|e| e.to_string())?;
-    let store_a = Arc::new(FsBlockStore::new(store_dir_a.path()).map_err(|e| e.to_string())?);
+    let store_a = Arc::new(SegmentBlockStore::new(store_dir_a.path()).map_err(|e| e.to_string())?);
     let state_a = Arc::new(ReplicaCoordinator::open_in_memory().map_err(|e| e.to_string())?);
     dst_support::link::link_and_start(&state_a, &root_a, GROUP_ID)?;
 
     let root_dir_b = tempfile::tempdir().map_err(|e| e.to_string())?;
     let root_b = root_dir_b.path().canonicalize().map_err(|e| e.to_string())?;
     let store_dir_b = tempfile::tempdir().map_err(|e| e.to_string())?;
-    let store_b = Arc::new(FsBlockStore::new(store_dir_b.path()).map_err(|e| e.to_string())?);
+    let store_b = Arc::new(SegmentBlockStore::new(store_dir_b.path()).map_err(|e| e.to_string())?);
     let state_b = Arc::new(ReplicaCoordinator::open_in_memory().map_err(|e| e.to_string())?);
     dst_support::link::link_and_start(&state_b, &root_b, GROUP_ID)?;
 
@@ -940,8 +916,7 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
     if !std::fs::read(root_b.join(CANARY_PATH)).map(|c| c == b"canary").unwrap_or(false) {
         return Err(format!(
             "{BASELINE_TIMEOUT_MARKER}device B never adopted the startup canary within the poll \
-             timeout -- a host-load-dependent startup stall, not a bug in this scenario (the old \
-             WireGuard-handshake-livelock attribution was disproven; see issue #26)"
+             timeout -- a host-load-dependent startup stall, not a bug in this scenario"
         ));
     }
 
@@ -966,8 +941,7 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
     // identical `clock` binding for the full rationale (now lives in
     // `clock.rs`). `fs_ops::write`/`fs_ops::rename` stamp every tempdir
     // mutation through it, so a forgotten stamp is unrepresentable rather
-    // than a reviewer convention (the pre-migration per-scenario
-    // `stamp_deterministic_mtime` state).
+    // than a per-call convention.
     let clock = HarnessClock::from_seed(seed);
     clock.install_as_session_clock();
 
@@ -1175,26 +1149,21 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
                 let old_dir = parent_dir(&active[idx]);
                 let siblings = siblings_under(&all_files, &old_dir);
                 let touched: Vec<String> = siblings.iter().map(|(p, _)| p.clone()).collect();
-                // agmsg investigation fix: gate a whole-directory OS-level
-                // rename on convergence of *every* path this scenario has
-                // ever touched (`touched_paths`), not just
-                // `touched` (the directory's *currently modeled* children).
-                // A real `std::fs::rename` moves every file physically
-                // present under the directory on this specific device's
-                // disk -- including a stale leftover from an *earlier*
-                // round's move-away that hasn't finished materializing
-                // (removing the old file / writing the new one) on this
-                // device yet, even though this scenario's own model
-                // already considers it relocated elsewhere. Without this,
-                // that leftover gets dragged along to a name neither this
-                // scenario's bookkeeping nor (transiently) either device's
-                // index expects, producing a tree divergence that is a
-                // harness gating gap, not a product bug (confirmed via
-                // seed 3509503759: `dir-r4-y/x-0.bin` existed only on one
-                // device because `newdir-r0`'s round-2 move-away of
-                // `x-0.bin` to `dir-r2/x-0.bin` had not yet fully
-                // materialized on that device when round 4 renamed
-                // `newdir-r0` again).
+                // Gate a whole-directory OS-level rename on convergence of
+                // *every* path this scenario has ever touched
+                // (`touched_paths`), not just `touched` (the directory's
+                // *currently modeled* children). A real `std::fs::rename`
+                // moves every file physically present under the directory
+                // on this specific device's disk -- including a stale
+                // leftover from an *earlier* round's move-away that hasn't
+                // finished materializing (removing the old file / writing
+                // the new one) on this device yet, even though this
+                // scenario's own model already considers it relocated
+                // elsewhere. Without this gate, that leftover is dragged
+                // along to a name neither this scenario's bookkeeping nor
+                // (transiently) either device's index expects, producing a
+                // tree divergence caused by the harness's gating rather
+                // than by the product (reproduction: seed 3509503759).
                 let full_gate: Vec<String> = touched_paths.iter().cloned().collect();
                 let (converged, elapsed) = converge_paths(&device_a, &device_b, &full_gate).await;
                 for p in &touched {
@@ -1290,26 +1259,21 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
                 let old_dir = parent_dir(&active[idx]);
                 let siblings = siblings_under(&all_files, &old_dir);
                 let touched: Vec<String> = siblings.iter().map(|(p, _)| p.clone()).collect();
-                // agmsg investigation fix: gate a whole-directory OS-level
-                // rename on convergence of *every* path this scenario has
-                // ever touched (`touched_paths`), not just
-                // `touched` (the directory's *currently modeled* children).
-                // A real `std::fs::rename` moves every file physically
-                // present under the directory on this specific device's
-                // disk -- including a stale leftover from an *earlier*
-                // round's move-away that hasn't finished materializing
-                // (removing the old file / writing the new one) on this
-                // device yet, even though this scenario's own model
-                // already considers it relocated elsewhere. Without this,
-                // that leftover gets dragged along to a name neither this
-                // scenario's bookkeeping nor (transiently) either device's
-                // index expects, producing a tree divergence that is a
-                // harness gating gap, not a product bug (confirmed via
-                // seed 3509503759: `dir-r4-y/x-0.bin` existed only on one
-                // device because `newdir-r0`'s round-2 move-away of
-                // `x-0.bin` to `dir-r2/x-0.bin` had not yet fully
-                // materialized on that device when round 4 renamed
-                // `newdir-r0` again).
+                // Gate a whole-directory OS-level rename on convergence of
+                // *every* path this scenario has ever touched
+                // (`touched_paths`), not just `touched` (the directory's
+                // *currently modeled* children). A real `std::fs::rename`
+                // moves every file physically present under the directory
+                // on this specific device's disk -- including a stale
+                // leftover from an *earlier* round's move-away that hasn't
+                // finished materializing (removing the old file / writing
+                // the new one) on this device yet, even though this
+                // scenario's own model already considers it relocated
+                // elsewhere. Without this gate, that leftover is dragged
+                // along to a name neither this scenario's bookkeeping nor
+                // (transiently) either device's index expects, producing a
+                // tree divergence caused by the harness's gating rather
+                // than by the product (reproduction: seed 3509503759).
                 let full_gate: Vec<String> = touched_paths.iter().cloned().collect();
                 let (converged, elapsed) = converge_paths(&device_a, &device_b, &full_gate).await;
                 for p in &touched {
@@ -1412,26 +1376,21 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
                 let old_dir = parent_dir(&active[idx]);
                 let siblings = siblings_under(&all_files, &old_dir);
                 let touched: Vec<String> = siblings.iter().map(|(p, _)| p.clone()).collect();
-                // agmsg investigation fix: gate a whole-directory OS-level
-                // rename on convergence of *every* path this scenario has
-                // ever touched (`touched_paths`), not just
-                // `touched` (the directory's *currently modeled* children).
-                // A real `std::fs::rename` moves every file physically
-                // present under the directory on this specific device's
-                // disk -- including a stale leftover from an *earlier*
-                // round's move-away that hasn't finished materializing
-                // (removing the old file / writing the new one) on this
-                // device yet, even though this scenario's own model
-                // already considers it relocated elsewhere. Without this,
-                // that leftover gets dragged along to a name neither this
-                // scenario's bookkeeping nor (transiently) either device's
-                // index expects, producing a tree divergence that is a
-                // harness gating gap, not a product bug (confirmed via
-                // seed 3509503759: `dir-r4-y/x-0.bin` existed only on one
-                // device because `newdir-r0`'s round-2 move-away of
-                // `x-0.bin` to `dir-r2/x-0.bin` had not yet fully
-                // materialized on that device when round 4 renamed
-                // `newdir-r0` again).
+                // Gate a whole-directory OS-level rename on convergence of
+                // *every* path this scenario has ever touched
+                // (`touched_paths`), not just `touched` (the directory's
+                // *currently modeled* children). A real `std::fs::rename`
+                // moves every file physically present under the directory
+                // on this specific device's disk -- including a stale
+                // leftover from an *earlier* round's move-away that hasn't
+                // finished materializing (removing the old file / writing
+                // the new one) on this device yet, even though this
+                // scenario's own model already considers it relocated
+                // elsewhere. Without this gate, that leftover is dragged
+                // along to a name neither this scenario's bookkeeping nor
+                // (transiently) either device's index expects, producing a
+                // tree divergence caused by the harness's gating rather
+                // than by the product (reproduction: seed 3509503759).
                 let full_gate: Vec<String> = touched_paths.iter().cloned().collect();
                 let (converged, elapsed) = converge_paths(&device_a, &device_b, &full_gate).await;
                 for p in &touched {
@@ -1768,8 +1727,7 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
         (device_b.root.as_path(), device_b.state.as_ref()),
     ];
 
-    // agmsg investigation, 2026-07-09 (Class-2 harness-fidelity vs.
-    // genuine-risk decisive test): mirror `dst_two_device_chaos.rs`'s F.2
+    // Harness fidelity: mirror `dst_two_device_chaos.rs`'s
     // recovery-at-quiescence, but for the directory-registrar case rather
     // than the interrupted-materialize one. A real daemon watches every
     // directory with `notify` and, every time a directory newly appears
@@ -1786,13 +1744,12 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
     // method's own doc comment), the add-only, mid-conflict-safe scope.
     // This bare-`PeerSyncSession` harness's simulated event delivery
     // replicates neither, so a file dragged to a new path by a real
-    // `std::fs::rename` of its parent directory (Class 2's stray) is never
+    // `std::fs::rename` of its parent directory is never
     // re-scanned. Run `reconcile_added_files` here, once per device at
     // quiescence, and push whatever it newly indexes to the peer the same
-    // way a live create would -- if the divergence then heals, Class 2 is
-    // a harness-fidelity gap (production self-heals via this exact
-    // recovery); if it persists, it is a genuine product risk the recovery
-    // does not cover even when invoked.
+    // way a live create would. A divergence that heals here is one
+    // production also self-heals via this exact recovery; one that
+    // persists is reported, because the recovery does not cover it.
     for device in [&device_a, &device_b] {
         if let Ok(records) = device.processor.reconcile_added_files(GROUP_ID, &device.root) {
             if !records.is_empty() {
@@ -1813,7 +1770,7 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
         }
     }
 
-    // Gap B: the shared `settle` primitive polls `check_convergence_recursive`
+    // The shared `settle` primitive polls `check_convergence_recursive`
     // on the sim clock and returns the instant it converges. On budget
     // exhaustion it records a non-fatal `SlowConvergence`
     // instead of the old hand-rolled poll loop's hard timeout -- the terminal
@@ -1833,19 +1790,17 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
         eprintln!("  SLOW-CONVERGENCE: {slow}");
     }
 
-    // PF (fidelity/artifact-reduction) F.2, agmsg investigation 2026-07-09:
-    // a real daemon runs `repair_interrupted_materializations` +
+    // Harness fidelity: a real daemon runs `repair_interrupted_materializations` +
     // `cleanup_stale_temp_files` at startup and periodically
     // (`link_runtime`) -- this bare-`PeerSyncSession` harness never
     // called either, so an interrupted eager materialize's window left a
     // live-but-fileless index row + an orphaned `.yadorilink-tmp.*` file
     // permanently, surfacing as `StructuralIndexDiskMismatch`/`Corruption`
     // violations the same production self-healing sweep would have already
-    // cleared (see `dst_two_device_chaos.rs`'s identical account, seed
-    // 3298840595's finding). Run once per device at this scenario's own
-    // genuinely-quiescent point via the shared `dst_support::sweep`
-    // primitive (Gap C), matching daemon fidelity, not masking the
-    // underlying materialize-ordering gap.
+    // cleared (see `dst_two_device_chaos.rs`'s identical account). Run
+    // once per device at this scenario's own genuinely-quiescent point via
+    // the shared `dst_support::sweep` primitive, matching what the daemon
+    // does; findings from the sweep are still printed, not hidden.
     for (device, store) in [(&device_a, &recovery_store_a), (&device_b, &recovery_store_b)] {
         for finding in dst_support::sweep::run_self_healing(
             &device.state,
@@ -1926,8 +1881,7 @@ fn run_in_madsim(seed: u64, ops_per_run: usize) -> Result<(), String> {
 
 /// Same rationale as `dst_two_device_chaos.rs`'s identical marker: a
 /// batch-load-dependent startup stall, not a deadlock in this
-/// scenario's own logic (the old WireGuard-handshake-livelock
-/// attribution was disproven -- see issue #26).
+/// scenario's own logic.
 const TIME_LIMIT_MARKER: &str = "TIME_LIMIT: ";
 /// Same rationale as `dst_two_device_chaos.rs`'s identical marker: OS
 /// thread-creation ceiling from r2d2's per-`SyncState` background thread

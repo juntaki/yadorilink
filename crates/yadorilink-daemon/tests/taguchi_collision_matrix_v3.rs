@@ -70,7 +70,7 @@ use support::{
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::peer_orchestrator;
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 
 struct TestDevice {
     device_id: String,
@@ -87,7 +87,7 @@ struct TestDevice {
 fn spawn_orchestrator(coordination_addr: String, device_id: String, state: Arc<DaemonState>) {
     let config = peer_orchestrator::OrchestratorConfig {
         coordination_addr,
-        access_token: "test".to_string(),
+        auth: yadorilink_fapi_client::test_support::offline_auth(),
         device_id,
     };
     tokio::spawn(async move {
@@ -104,7 +104,7 @@ fn spawn_orchestrator(coordination_addr: String, device_id: String, state: Arc<D
 /// registration, so co-group devices discover and connect to this one.
 async fn setup_device(fake: &FakeCoordination, device_id: &str, groups: &[&str]) -> TestDevice {
     let store_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let (sync_state, index_dir) = open_file_backed_replica_coordinator();
     let sync_state = Arc::new(sync_state);
     let state = DaemonState::new(device_id.to_string(), sync_state, store);
@@ -141,12 +141,10 @@ async fn wait_for_mesh(devices: &[&TestDevice]) {
     wait_until(
         || {
             devices.iter().all(|d| {
-                devices.iter().filter(|o| o.device_id != d.device_id).all(|o| {
-                    d.state
-                        .peers
-                        .session(&o.device_id)
-                        .is_some_and(|session| session.peer_handshake_received())
-                })
+                devices
+                    .iter()
+                    .filter(|o| o.device_id != d.device_id)
+                    .all(|o| d.state.peers.session(&o.device_id).is_some())
             })
         },
         Duration::from_secs(30),
@@ -169,14 +167,23 @@ async fn n_synced_devices(
     }
     let refs: Vec<&TestDevice> = devices.iter().collect();
     wait_for_mesh(&refs).await;
+    // The mesh wait proves the legacy peer-session transport is up. The
+    // reconciliation substrate -- the only plane that carries DAG changes --
+    // is a different socket with a different ALPN, and these fixtures wire
+    // their own devices, so nobody learns where anybody's substrate answers.
+    // Without this, changes reach nothing and every row stalls.
+    let states: Vec<&std::sync::Arc<DaemonState>> =
+        devices.iter().map(|device| &device.state).collect();
+    support::advertise_substrate_between(&states).await;
     wait_until(
         || {
             devices.iter().all(|device| {
                 device
                     .state
+                    .authority
                     .group_policy_state(group_id)
                     .is_some_and(|policy| policy.current_seq == 0)
-                    && !device.state.is_group_policy_stale(group_id)
+                    && !device.state.authority.is_group_policy_stale(group_id)
             })
         },
         Duration::from_secs(30),
@@ -194,7 +201,18 @@ fn recursive_snapshot(root: &Path) -> HashMap<String, String> {
         let Ok(entries) = std::fs::read_dir(current) else { return };
         for entry in entries.filter_map(|e| e.ok()) {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name == yadorilink_replica_domain::reserved_paths::ROOT_MARKER_FILE_NAME
+            // The sync-root lock sits at the top of every linked root and is
+            // excluded from sync, like the marker. The case-fold branch
+            // counts non-conflict-copy entries, so leaving it in makes every
+            // device report one canonical entry too many, forever. Both are
+            // excluded only at the top of the root, as the product does
+            // (`is_sync_root_lock_relative_path`,
+            // `is_root_marker_relative_path`): a nested file with either
+            // name is ordinary user content that syncs.
+            let at_root_top = current == base;
+            if (at_root_top
+                && (name == yadorilink_replica_domain::reserved_paths::ROOT_MARKER_FILE_NAME
+                    || name == yadorilink_root_authority::sync_root_lock::SYNC_ROOT_LOCK_FILE_NAME))
                 || name.contains(".yadorilink-tmp.")
                 || yadorilink_root_authority::reserved_namespace::is_reserved_component(
                     entry.file_name().as_os_str(),
@@ -560,6 +578,14 @@ async fn run_taguchi_v3_row(
         3 => {
             let new_device =
                 setup_device(&fake, &format!("{row_name}-device-churn-join"), &[group_id]).await;
+            // The joiner arrives after `n_synced_devices` ran its
+            // advertisement, so nobody knows where its reconciliation
+            // substrate answers and it knows where nobody else's does.
+            // Re-including the existing devices is idempotent.
+            let mut states: Vec<&std::sync::Arc<DaemonState>> =
+                devices.iter().map(|device| &device.state).collect();
+            states.push(&new_device.state);
+            support::advertise_substrate_between(&states).await;
             tokio::time::sleep(Duration::from_millis(300)).await;
             joined_device = Some(new_device);
         }
@@ -623,6 +649,19 @@ async fn run_taguchi_v3_row(
                 .map(|(_, content_hash)| content_hash)
                 .collect()
         }
+        // The hold latitude covers only the colliding name itself. Every
+        // other canonical entry (op_level 4's `renamed-shared.bin`, the
+        // one path all renames land on) does not collide, so it must hold
+        // the same bytes under the same name on every device -- a device
+        // count alone would pass two devices keeping different content
+        // there.
+        fn non_colliding_canonical(root: &Path) -> std::collections::BTreeMap<String, String> {
+            let colliding = target_path(4, 0).to_string_lossy().to_lowercase();
+            recursive_snapshot(root)
+                .into_iter()
+                .filter(|(k, _)| !is_conflict_copy(k) && k.to_lowercase() != colliding)
+                .collect()
+        }
         let expected_canonical_count = if op_level == 4 { 2 } else { 1 };
         wait_until_with_context(
             || {
@@ -634,6 +673,11 @@ async fn run_taguchi_v3_row(
                     active_refs[1..]
                         .iter()
                         .all(|d| conflict_copy_content(d.root.path()) == reference)
+                } && {
+                    let reference = non_colliding_canonical(active_refs[0].root.path());
+                    active_refs[1..]
+                        .iter()
+                        .all(|d| non_colliding_canonical(d.root.path()) == reference)
                 }
             },
             timeout,
@@ -667,6 +711,16 @@ async fn run_taguchi_v3_row(
                 "{row_name}: device-{i}'s conflict-copy artifacts diverged from device-0's \
                  (partition_level={partition_level}, op_level={op_level}, churn_level={churn_level}, \
                  stagger_level={stagger_level})"
+            );
+        }
+        let reference_non_colliding = non_colliding_canonical(active_refs[0].root.path());
+        for (i, device) in active_refs.iter().enumerate().skip(1) {
+            let non_colliding = non_colliding_canonical(device.root.path());
+            assert_eq!(
+                non_colliding, reference_non_colliding,
+                "{row_name}: device-{i}'s non-colliding canonical entries diverged from \
+                 device-0's (partition_level={partition_level}, op_level={op_level}, \
+                 churn_level={churn_level}, stagger_level={stagger_level})"
             );
         }
     } else {
@@ -722,6 +776,8 @@ async fn run_taguchi_v3_row(
 }
 
 // --- L16(4^5) orthogonal array rows: (A partition, B op, C path, D churn, E stagger) ---
+//
+// The case-fold rows 04, 07, 10 and 13 skip on case-sensitive filesystems.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn taguchi_v3_row_01_part_none_op_all_edit_path_flat_churn_dc2_stag_sim() {

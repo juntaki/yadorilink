@@ -81,11 +81,10 @@ fn real_register_create_hydrate_inspect_round_trip() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// Regression test for the ABA gap a cross-review found (round-5 response,
-/// commit fd7383a0): `inspect` used to ignore its `expected` generation
-/// token entirely, so a stale caller holding an old generation for a path
+/// Regression test for an ABA hazard: `inspect` must honour its `expected`
+/// generation token, so a stale caller holding an old generation for a path
 /// whose placeholder was deleted and replaced by an unrelated, genuinely
-/// in-sync one would see `Untouched` -- as if its own stale generation
+/// in-sync one never sees `Untouched` -- as if its own stale generation
 /// were still valid.
 #[test]
 fn inspect_with_a_stale_generation_never_reports_untouched() {

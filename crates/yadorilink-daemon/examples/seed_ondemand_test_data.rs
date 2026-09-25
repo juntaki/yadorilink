@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 use yadorilink_replica_domain::file::FileRecord;
 use yadorilink_replica_domain::session_state::{MaterializationPolicy, MaterializationState};
 
@@ -28,7 +28,7 @@ fn main() {
     let config_dir = std::path::PathBuf::from(config_dir);
     std::fs::create_dir_all(&config_dir).unwrap();
 
-    let store = Arc::new(FsBlockStore::new(config_dir.join("blocks")).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(config_dir.join("blocks")).unwrap());
     let sync_state =
         Arc::new(ReplicaCoordinator::open(config_dir.join("sync-state.sqlite3")).unwrap());
 

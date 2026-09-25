@@ -3,7 +3,7 @@
 //! backstop for a local write whose OS watcher event never arrives at
 //! all. See `LinkRuntimeController::run_disk_reconcile_backstop_sweep`'s
 //! own doc for the full rationale (add-only, skips paused/orphaned
-//! links, the `taguchi_v3` row 8 non-convergence this closes) -- this
+//! links) -- this
 //! job is a thin wrapper, not a new implementation.
 //!
 //! Interval-only -- no startup-immediate run: `start_link_watch`'s own
@@ -19,7 +19,6 @@
 use std::sync::Arc;
 
 use crate::adapters::runtime::link_runtime_controller::LinkRuntimeController;
-use crate::maintenance::MaintenanceTrigger;
 
 #[derive(Clone)]
 pub(crate) struct DiskReconcileBackstopJob {
@@ -31,7 +30,7 @@ impl DiskReconcileBackstopJob {
         Self { controller }
     }
 
-    pub(crate) async fn run_once(&self, _trigger: MaintenanceTrigger) {
+    pub(crate) async fn run_once(&self) {
         self.controller.run_disk_reconcile_backstop_sweep().await;
     }
 }

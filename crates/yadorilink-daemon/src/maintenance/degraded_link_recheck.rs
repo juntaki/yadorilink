@@ -18,7 +18,6 @@
 use std::sync::Arc;
 
 use crate::adapters::runtime::link_runtime_controller::LinkRuntimeController;
-use crate::maintenance::MaintenanceTrigger;
 
 pub(crate) struct DegradedLinkRecheckJob {
     controller: Arc<LinkRuntimeController>,
@@ -29,7 +28,7 @@ impl DegradedLinkRecheckJob {
         Self { controller }
     }
 
-    pub(crate) fn run_once(&self, _trigger: MaintenanceTrigger) {
+    pub(crate) fn run_once(&self) {
         self.controller.recheck_degraded_links();
     }
 }

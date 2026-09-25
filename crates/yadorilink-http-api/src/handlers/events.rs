@@ -62,6 +62,14 @@ use crate::AppState;
 /// staleness is an acceptable trade for not hammering the control socket.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+#[allow(
+    clippy::excessive_nesting,
+    reason = "the SSE poll loop lives inside the spawned task that owns the stream permit, and \
+              the status arm's nesting (loop -> match -> if let RespPayload::Status -> \
+              changed-snapshot check -> send-failure check) is what makes every disconnect path \
+              `return` out of that task and drop the permit; extracting it would move the \
+              permit's lifetime away from the loop that must release it"
+)]
 pub async fn events(
     State(state): State<AppState>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {

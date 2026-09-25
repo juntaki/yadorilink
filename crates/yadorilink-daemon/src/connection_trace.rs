@@ -28,41 +28,24 @@ fn now_unix_nanos() -> i64 {
 /// Where a connection candidate/attempt came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CandidateSource {
-    /// A peer address supplied by the coordination plane's netmap
-    /// (`yadorilink-transport`'s own `CandidateSource::Coordination`).
+    /// The coordination plane itself -- its netmap subscription. The only
+    /// source left: finding a path to a PEER belongs to the iroh endpoint,
+    /// which reports no per-candidate attempt this log could record.
     CoordinationPlane,
-    /// A peer address learned from unauthenticated local network
-    /// discovery/mDNS (`yadorilink-transport`'s own
-    /// `CandidateSource::Discovery`).
-    LocalDiscovery,
-    /// The already-established direct (NAT-traversed) path being
-    /// confirmed/used, as opposed to a *new* candidate being tried.
-    DirectPath,
 }
 
 impl CandidateSource {
     pub fn as_str(self) -> &'static str {
         match self {
             CandidateSource::CoordinationPlane => "coordination_plane",
-            CandidateSource::LocalDiscovery => "local_discovery",
-            CandidateSource::DirectPath => "direct",
         }
     }
 }
 
 /// Coarse address class — never a raw IP/hostname/port, per this
-/// module's redaction requirement. The direct-candidate classes mirror the
-/// NAT-traversal suite's own `CandidateClass`.
+/// module's redaction requirement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddressClass {
-    /// A local-network (LAN / link-local / loopback) candidate.
-    Lan,
-    /// A router-mapped external port (UPnP-IGD / NAT-PMP / PCP).
-    PortMapped,
-    /// A globally-routable IPv6 host candidate.
-    Ipv6,
-    /// A STUN-discovered server-reflexive (hole-punched) candidate.
-    ServerReflexive,
     /// A generic wide-area address (e.g. the coordination plane itself).
     Wan,
     Unknown,
@@ -71,10 +54,6 @@ pub enum AddressClass {
 impl AddressClass {
     pub fn as_str(self) -> &'static str {
         match self {
-            AddressClass::Lan => "lan",
-            AddressClass::PortMapped => "port_mapped",
-            AddressClass::Ipv6 => "ipv6",
-            AddressClass::ServerReflexive => "server_reflexive",
             AddressClass::Wan => "wan",
             AddressClass::Unknown => "unknown",
         }
@@ -119,50 +98,6 @@ pub struct ConnectionAttemptTrace {
     /// "authorized" | "denied" | "n/a".
     pub authorization_decision: &'static str,
     pub recorded_at_unix_nanos: i64,
-}
-
-/// One LAN-discovered address this device is currently holding as a dial
-/// candidate for a peer -- the diagnostics complement to
-/// `ConnectionAttemptTrace`.
-///
-/// The two answer different halves of "why isn't my LAN peer connecting".
-/// A trace exists only once an attempt has RESOLVED, so a candidate that
-/// has been announced and accepted but has not (yet, or ever) produced a
-/// connection is invisible in the trace history; this is that candidate.
-/// Purely an observation of `peer_orchestrator`'s existing candidate
-/// cache: being listed here is a dial target and nothing more -- never
-/// authorization, and never a statement that anything was or will be
-/// dialed.
-///
-/// Redacted on the same terms as every other field in this module: the
-/// coarse address class, never the announced address itself.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LanDiscoveredCandidate {
-    pub peer_device_id: String,
-    /// Coarse class of the announced address (`AddressClass::as_str`).
-    /// Usually `"lan"` by construction, but derived from the actual
-    /// address rather than assumed -- a misconfigured or spoofed
-    /// announcement can carry an off-LAN address, and that is exactly the
-    /// kind of thing someone reads this surface to find out.
-    pub address_class: &'static str,
-    /// How long ago this address was last announced, from the daemon's own
-    /// monotonic clock. Bounded by
-    /// `peer_orchestrator::LAN_DISCOVERED_CANDIDATE_TTL`: an entry older
-    /// than the TTL is not reported at all, matching exactly what the dial
-    /// path would still consider usable.
-    pub last_seen_ms_ago: u64,
-    /// Whether this peer currently has ANY live session -- not necessarily
-    /// one over this candidate, and not necessarily over a LAN candidate at
-    /// all (a peer connected on a coordination-supplied address reports
-    /// `true` here while every LAN candidate it announced went unused).
-    /// Named for what it measures rather than for the question it helps
-    /// answer, because it is repeated on every one of a peer's candidate
-    /// rows and a per-candidate reading of it would be wrong.
-    ///
-    /// `false` alongside a recent `last_seen_ms_ago` is the "the peer
-    /// announced itself but we never connected" case this surface exists
-    /// for.
-    pub peer_has_any_session: bool,
 }
 
 #[derive(Default)]
@@ -252,7 +187,7 @@ fn category(
 pub fn run_connectivity_doctor(
     telemetry: &RuntimeTelemetry,
     sync_state: &crate::replica_coordinator::ReplicaCoordinator,
-    nat_observations: &yadorilink_transport::ObservationLog,
+    device_id: &str,
 ) -> Vec<DoctorCategory> {
     let mut out = Vec::new();
 
@@ -273,26 +208,22 @@ pub fn run_connectivity_doctor(
         "local control-socket listener is running",
     ));
 
-    // "coordination_plane"/"discovery" share one underlying task
-    // (`peer_orchestrator::run` owns the netmap stream and direct-candidate
-    // handling together) — see this function's doc comment. A dead
-    // `peer_orchestrator` task means both are certainly down; a live one
-    // means only that neither has crashed the whole task, not that each is
-    // individually healthy right now (recent trace evidence below narrows
-    // that further). Direct-path failures are surfaced per-attempt (with
-    // their candidate class and failure category) through the connection
-    // trace log itself, not as a single coarse doctor category.
+    // A dead `peer_orchestrator` task means the coordination-plane
+    // subscription is certainly down; a live one means only that it has
+    // not crashed, not that it is healthy right now (the recent trace
+    // evidence below narrows that further). Peer-path failures are
+    // surfaced per-attempt through the connection trace log itself, not as
+    // a coarse doctor category: finding a path to a peer belongs to the
+    // iroh endpoint, which does not report a candidate set this device
+    // could enumerate.
     let recent = telemetry.recent_connection_attempts(None);
     let recent_window = recent.iter().take(50);
-    let mut discovery_seen_ok = false;
     let mut coordination_seen_ok = false;
     let mut denied_count = 0u32;
     for trace in recent_window {
         let ok = trace.outcome == "connected";
-        match trace.candidate_source {
-            "local_discovery" => discovery_seen_ok |= ok,
-            "coordination_plane" => coordination_seen_ok |= ok,
-            _ => {}
+        if trace.candidate_source == "coordination_plane" {
+            coordination_seen_ok |= ok;
         }
         if trace.authorization_decision == "denied" {
             denied_count += 1;
@@ -305,14 +236,6 @@ pub fn run_connectivity_doctor(
         "no recent successful coordination-plane connection observed",
         "peer-orchestrator task is running",
     ));
-    out.push(category(
-        "discovery",
-        peer_orchestrator_alive,
-        "peer-orchestrator task (which owns local discovery) is not running",
-        "peer-orchestrator task is running (local discovery has no dedicated failure signal yet)",
-    ));
-    let _ = discovery_seen_ok; // recorded for future finer-grained discovery status
-
     out.push(if denied_count > 0 {
         DoctorCategory {
             name: "authorization",
@@ -360,104 +283,115 @@ pub fn run_connectivity_doctor(
         }
     });
 
-    // NAT type: classify the passive observations the NAT-traversal tasks
-    // gathered (STUN mappings, port-mapping status, hole-punch outcomes). A
-    // punchable or open NAT — or one not yet determined — is fine; a
-    // UDP-blocked or symmetric/CGNAT one warns, since direct connectivity to
-    // some peers may not be establishable.
-    let nat_class = yadorilink_transport::classify(&nat_observations.snapshot());
-    let nat_ok =
-        nat_class.is_punchable() || matches!(nat_class, yadorilink_transport::NatClass::Unknown);
-    out.push(DoctorCategory {
-        name: "nat_type",
-        status: if nat_ok { "ok" } else { "warn" },
-        detail: nat_class.implication().to_string(),
+    // A Change this device authored but has not yet had checkpointed
+    // is not just "not synced yet" -- it is structurally
+    // invisible to every peer until this device reconnects and a checkpoint
+    // flush succeeds. Surfacing the count distinctly from ordinary sync lag
+    // matters because the cause is different (writer-status refusal or
+    // coordination-plane unreachability, not peer unavailability) and the
+    // fix is different (reconnect, or regain write access) -- collapsing it
+    // into a generic "N changes unsynced" reading would point a user at the
+    // wrong remedy.
+    let mut group_ids: Vec<&str> =
+        links.iter().filter(|l| !l.paused && !l.orphaned).map(|l| l.group_id.as_str()).collect();
+    group_ids.sort_unstable();
+    group_ids.dedup();
+    let db = sync_state.database();
+    let pending_count: usize = group_ids
+        .iter()
+        .map(|group_id| {
+            db.read(|conn| {
+                yadorilink_sync_sqlite::dag_store::published_view::pending_local_changes_for_group(
+                    conn, group_id, device_id,
+                )
+            })
+            .map(|hashes| hashes.len())
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    group_id, error = %e,
+                    "cannot read pending-checkpoint count; doctor checkpoint_pending check is not meaningful"
+                );
+                0
+            })
+        })
+        .sum();
+    out.push(if pending_count > 0 {
+        DoctorCategory {
+            name: "checkpoint_pending",
+            status: "warn",
+            detail: format!(
+                "{pending_count} locally-authored change(s) are not yet checkpointed -- \
+                 invisible to peers until the next successful reconnect flush"
+            ),
+        }
+    } else {
+        DoctorCategory {
+            name: "checkpoint_pending",
+            status: "ok",
+            detail: "no locally-authored changes are waiting on a checkpoint".to_string(),
+        }
     });
+
+    // Peer reachability: the biggest gap this whole category list used to
+    // have. `coordination_plane` above answers "is the mechanism that
+    // FINDS peers alive"; it says nothing about whether any
+    // SPECIFIC peer this device has actually been trying to reach is
+    // reachable right now. That per-attempt detail was already recorded
+    // (`connections`/`traces` prints it) but never fed back into this
+    // summary -- so a peer stuck in a long run of `no_response` failures
+    // produced an all-green `doctor` report while sync was completely
+    // stalled, exactly the failure this section closes.
+    //
+    // Per peer (not per attempt): look at that peer's own most recent
+    // attempts specifically (`recent_connection_attempts(Some(peer))`, not
+    // the coarser top-50-of-everything window above), across every
+    // candidate source -- a peer that connected via ANY path recently is
+    // fine, regardless of whether THIS one was direct. Warn only once
+    // enough attempts have piled up with zero successes among them:
+    // `PEER_UNREACHABLE_MIN_ATTEMPTS` rules out flagging a single transient
+    // retry, and `PEER_UNREACHABLE_LOOKBACK` bounds the check to recent
+    // behavior so a peer that WAS unreachable an hour ago but has since
+    // reconnected isn't held responsible for old history.
+    let mut peer_ids: Vec<&str> = recent
+        .iter()
+        .map(|trace| trace.peer_device_id.as_str())
+        .filter(|id| !id.is_empty())
+        .collect();
+    peer_ids.sort_unstable();
+    peer_ids.dedup();
+    for peer in peer_ids {
+        let peer_recent = telemetry.recent_connection_attempts(Some(peer));
+        let lookback: Vec<&ConnectionAttemptTrace> =
+            peer_recent.iter().take(PEER_UNREACHABLE_LOOKBACK).collect();
+        let attempts = lookback.len();
+        let connected_recently = lookback.iter().any(|trace| trace.outcome == "connected");
+        if !connected_recently && attempts >= PEER_UNREACHABLE_MIN_ATTEMPTS {
+            let reason = lookback
+                .first()
+                .map(|trace| trace.failure_category.as_str())
+                .filter(|category| !category.is_empty())
+                .unwrap_or("unknown");
+            out.push(DoctorCategory {
+                name: "peer_reachability",
+                status: "warn",
+                detail: format!(
+                    "peer {peer} has not connected in the last {attempts} attempt(s) \
+                     (most recent failure: {reason})"
+                ),
+            });
+        }
+    }
 
     out
 }
 
+/// How many of a peer's own most recent connection attempts to look at when
+/// deciding whether it currently reads as unreachable.
+const PEER_UNREACHABLE_LOOKBACK: usize = 10;
+
+/// How many of those attempts must exist (all failed) before this is
+/// reported as sustained failure rather than one-off retry noise.
+const PEER_UNREACHABLE_MIN_ATTEMPTS: usize = 3;
+
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn records_are_bounded_and_return_newest_first() {
-        let log = ConnectionTraceLog::new();
-        for i in 0..(MAX_TRACE_ENTRIES + 10) {
-            log.record(
-                format!("device-{i}"),
-                CandidateSource::DirectPath,
-                AddressClass::Wan,
-                AttemptOutcome::Connected,
-                10,
-                "",
-                true,
-                Some(true),
-            );
-        }
-        let recent = log.recent(None);
-        assert_eq!(recent.len(), MAX_TRACE_ENTRIES);
-        // Newest first: the very last one recorded is device-(N+9).
-        assert_eq!(recent[0].peer_device_id, format!("device-{}", MAX_TRACE_ENTRIES + 9));
-    }
-
-    #[test]
-    fn filters_by_peer_device_id() {
-        let log = ConnectionTraceLog::new();
-        log.record(
-            "device-a",
-            CandidateSource::LocalDiscovery,
-            AddressClass::Lan,
-            AttemptOutcome::Connected,
-            5,
-            "",
-            true,
-            Some(true),
-        );
-        log.record(
-            "device-b",
-            CandidateSource::DirectPath,
-            AddressClass::Unknown,
-            AttemptOutcome::Failed,
-            0,
-            "no_response",
-            false,
-            None,
-        );
-        let filtered = log.recent(Some("device-a"));
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].peer_device_id, "device-a");
-    }
-
-    #[test]
-    fn never_carries_a_raw_address_field() {
-        // Structural guarantee, not a runtime one: `ConnectionAttemptTrace`
-        // has no field that could hold a raw socket address at all — this
-        // test exists to force a compile error (via an exhaustive match
-        // with named bindings) if a future edit ever adds one without
-        // updating this note.
-        let trace = ConnectionAttemptTrace {
-            peer_device_id: "device-a".into(),
-            candidate_source: "direct",
-            address_class: "wan",
-            outcome: "connected",
-            latency_ms: 1,
-            failure_category: String::new(),
-            selected: true,
-            authorization_decision: "authorized",
-            recorded_at_unix_nanos: 0,
-        };
-        let ConnectionAttemptTrace {
-            peer_device_id: _,
-            candidate_source: _,
-            address_class: _,
-            outcome: _,
-            latency_ms: _,
-            failure_category: _,
-            selected: _,
-            authorization_decision: _,
-            recorded_at_unix_nanos: _,
-        } = trace;
-    }
-}
+mod tests;

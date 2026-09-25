@@ -1,28 +1,23 @@
 //! `MaterializationIntentRepository` owns the crash-recovery intent
-//! journal, `materialization_intents`, whose rows record "a materialization
-//! write for this path is in progress" so a startup repair can disambiguate
-//! a `Hydrated`-but-missing file from an interrupted write. This is a
-//! distinct concept from per-file `materialization_state` on the `files`
-//! table, which `yadorilink-sync-core`'s `MaterializationStateRepository`
-//! owns.
-//!
-//! `begin_materialization_intent`/`clear_materialization_intent`/
+//! journal, `materialization_intents`, whose rows record "a
+//! materialization write for this path is in progress" so a startup repair
+//! can disambiguate a `Hydrated`-but-missing file from an interrupted
+//! write. `begin_materialization_intent`/`clear_materialization_intent`/
 //! `has_materialization_intent` are plain CRUD directly on
 //! `materialization_intents`.
 
 use std::sync::Arc;
+
+use rusqlite::OptionalExtension;
 
 use crate::error::SyncSqliteError;
 use yadorilink_root_authority::root_commit::RootCommitPermit;
 use yadorilink_sqlite_runtime::SyncDatabase;
 
 /// Current wall-clock time in nanoseconds since the Unix epoch, clamped to
-/// `0` if the clock reads before the epoch. Deliberately duplicated here
-/// rather than depending on `yadorilink-sync-core`'s own `index.rs::
-/// now_unix_nanos` (private and `#[cfg(test)]`-only there) -- this crate
-/// sits strictly below sync-core in the dependency graph and must not reach
-/// back up to it. Same reasoning as this crate's existing
-/// `RESERVED_NAMESPACE_RULES_VERSION` constant duplication in `store.rs`.
+/// `0` if the clock reads before the epoch. Same reasoning as this crate's
+/// existing `RESERVED_NAMESPACE_RULES_VERSION` constant duplication in
+/// `store.rs`.
 fn now_unix_nanos() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -89,7 +84,7 @@ impl MaterializationIntentRepository {
 
     /// `_in_tx` counterpart of [`Self::begin_materialization_intent`], for a
     /// caller that already holds an open transaction spanning more writes
-    /// than just this one (C4-6: bounded batching of receiver-side
+    /// than just this one (bounded batching of receiver-side
     /// materialization commits). Identical SQL/semantics.
     pub fn begin_materialization_intent_in_tx(
         tx: &rusqlite::Transaction,
@@ -141,6 +136,32 @@ impl MaterializationIntentRepository {
             )?)
         })?;
         Ok(count > 0)
+    }
+
+    /// The live intent's `target_version_hash` for `(group_id, path)`, if one
+    /// is open right now -- the projection fence local capture consults to
+    /// tell a materialize-in-flight echo apart from a genuine concurrent
+    /// local edit. `has_materialization_intent` alone cannot do this job: it
+    /// answers "is *a* write in flight" but not "in flight toward *what*",
+    /// and a caller that suppressed on presence alone would just as
+    /// willingly suppress a real edit racing a DIFFERENT target. See
+    /// `LocalMutationStore::materialization_intent_target`'s own doc comment
+    /// for the full mechanism this backs.
+    pub fn materialization_intent_target(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<Vec<u8>>, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT target_version_hash FROM materialization_intents \
+                     WHERE group_id = ?1 AND path = ?2",
+                    rusqlite::params![group_id, path],
+                    |r| r.get::<_, Vec<u8>>(0),
+                )
+                .optional()?)
+        })
     }
 
     /// Every path in `group_id` that currently carries an intent, as one read.

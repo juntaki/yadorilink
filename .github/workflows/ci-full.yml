@@ -47,20 +47,33 @@ jobs:
         # rather than stopping at the first one, so a fix doesn't have to
         # be discovered and landed one crate at a time across repeated CI
         # round-trips.
-        run: cargo test --no-fail-fast --workspace --exclude yadorilink-daemon --exclude yadorilink-desktop-app
-      - name: Daemon E2E
-        # The two monkey-chaos cases are private seed/soak coverage. They run
-        # in private beta-heat, while every ordinary daemon integration test
-        # remains in this public, serial correctness lane.
         #
-        # Deliberately WITHOUT --no-fail-fast: this is 90 separate test
-        # binaries that has never actually run to completion in public CI --
-        # a private-side baseline run found 37 pre-existing failures across
-        # many unrelated subsystems and took 111 minutes. Running the full
-        # suite unconditionally here would make every push spend 90+ minutes
-        # re-discovering the same known-broken tail instead of catching a
-        # real new regression quickly. Full-suite triage is tracked as its
-        # own separate effort, not something every CI run should pay for.
+        # --skip: the auth-runtime-boundaries job in CI fast owns these two
+        # files, single-threaded and on their own runner. See that job.
+        run: >-
+          cargo test --no-fail-fast --workspace --exclude yadorilink-daemon --exclude yadorilink-desktop-app
+          --
+          --skip rotation_without_the_lock_destroys_the_grant
+          --skip rotation_under_the_lock_keeps_the_grant_alive
+          --skip rotation_child
+          --skip a_process_stays_authenticated_across_the_five_minute_access_token_lifetime
+      # tests/release_manifest_chain.rs drives the Python manifest verifier,
+      # which needs the cryptography package. setup-python gives a Python
+      # that pip may install into (the runner images' own may not allow it).
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Python cryptography for the release manifest chain test
+        run: python3 -m pip install --quiet --disable-pip-version-check cryptography
+      - name: Daemon E2E
+        # The two monkey-chaos cases are long-running seed/soak coverage and
+        # are skipped here; every ordinary daemon integration test runs in
+        # this serial correctness lane.
+        #
+        # Deliberately WITHOUT --no-fail-fast: this is roughly 90 separate
+        # test binaries run serially, so the lane stops at the first failing
+        # binary and reports it quickly rather than spending the full
+        # suite's runtime on every push.
         run: >-
           cargo test -p yadorilink-daemon --tests --
           --test-threads=1
@@ -94,11 +107,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master @ 2026-06-30
         with:
           toolchain: stable
+      # tests/release_manifest_chain.rs drives the Python manifest verifier,
+      # which needs the cryptography package. setup-python gives a Python
+      # that pip may install into (the runner images' own may not allow it).
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Python cryptography for the release manifest chain test
+        run: python3 -m pip install --quiet --disable-pip-version-check cryptography
       - name: Daemon E2E
         # Deliberately WITHOUT --no-fail-fast: see linux-full's own Daemon
-        # E2E step for why -- this is the same 90-binary suite, never run
-        # to completion before, with a large known-broken tail. Full-suite
-        # triage is tracked as its own separate effort.
+        # E2E step for why -- this is the same serial multi-binary suite.
         run: >-
           cargo test -p yadorilink-daemon --tests --
           --test-threads=1

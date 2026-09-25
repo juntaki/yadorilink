@@ -13,7 +13,6 @@ use std::collections::BTreeSet;
 
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
-use yadorilink_replica_domain::change::ChangeAuth;
 use yadorilink_replica_domain::ids::{ChangeHash, FolderGroupId, SyncPath};
 use yadorilink_replica_engine::repair_election::{
     rank_writers_for_obligation, AuthorizedWriter, RepairElectionContext, RepairElectionError,
@@ -62,18 +61,18 @@ fn obligation(seed: u64, rng: &mut StdRng) -> RepairObligationId {
     )
 }
 
-fn auth(seed: u64, policy_head_hash: [u8; 32]) -> ChangeAuth {
-    ChangeAuth { auth_seq: seed + 1, auth_epoch: seed % 7, policy_head_hash }
+fn auth(_seed: u64, policy_head_hash: [u8; 32]) -> [u8; 32] {
+    policy_head_hash
 }
 
 fn context(
-    auth: ChangeAuth,
+    policy_head: [u8; 32],
     obligation: RepairObligationId,
     writers: Vec<AuthorizedWriter>,
     local: &AuthorizedWriter,
 ) -> RepairElectionContext {
     RepairElectionContext::new(
-        auth,
+        policy_head,
         obligation,
         writers,
         local.device_id.clone(),
@@ -180,16 +179,14 @@ fn seeded_membership_churn_and_key_rotation_fail_closed() {
         let victim = writers[victim_index].clone();
 
         let old_auth = auth(seed, random_bytes(&mut rng));
-        let old_ranking =
-            rank_writers_for_obligation(&old_auth.policy_head_hash, obligation, &writers);
+        let old_ranking = rank_writers_for_obligation(&old_auth, obligation, &writers);
         assert!(old_ranking.contains(&victim), "seed {seed}");
 
         // Revoke: the old device/key identity must disappear completely.
         let mut revoked = writers.clone();
         revoked.retain(|writer| writer.device_id != victim.device_id);
         let revoked_auth = auth(seed + SEEDS, random_bytes(&mut rng));
-        let revoked_ranking =
-            rank_writers_for_obligation(&revoked_auth.policy_head_hash, obligation, &revoked);
+        let revoked_ranking = rank_writers_for_obligation(&revoked_auth, obligation, &revoked);
         assert!(!revoked_ranking.contains(&victim), "seed {seed}: revoked writer survived");
         let revoked_context = RepairElectionContext::new(
             revoked_auth,
@@ -247,15 +244,14 @@ fn seeded_membership_churn_and_key_rotation_fail_closed() {
         };
         granted.push(newcomer.clone());
         let granted_auth = auth(seed + 3 * SEEDS, random_bytes(&mut rng));
-        let expected =
-            rank_writers_for_obligation(&granted_auth.policy_head_hash, obligation, &granted);
+        let expected = rank_writers_for_obligation(&granted_auth, obligation, &granted);
         assert_eq!(expected.iter().filter(|writer| **writer == newcomer).count(), 1, "seed {seed}");
         for permutation in 0..PERMUTATIONS_PER_SEED {
             let mut shuffled = granted.clone();
             shuffle(&mut rng, &mut shuffled);
             assert_eq!(
                 rank_writers_for_obligation(
-                    &granted_auth.policy_head_hash,
+                    &granted_auth,
                     obligation,
                     &shuffled,
                 ),

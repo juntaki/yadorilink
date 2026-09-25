@@ -1,11 +1,11 @@
-//! M5-A Pass 3, review follow-up: `topology_n_m_w.rs`'s happy-path test
-//! never actually proves `Protected` or a confirmed-remote-holder
+//! `topology_n_m_w.rs`'s happy-path test
+//! does not prove `Protected` or a confirmed-remote-holder
 //! `AvailableNow` -- its topology has only ONE full replica (structurally
 //! `AtRisk` by design), and its `AvailableNow` assertion runs AFTER W has
 //! already hydrated the file locally, so `fully_hydrated_locally` alone
 //! (not a confirmed remote peer) could be what made it pass.
 //!
-//! This test closes both gaps with a real N(FullReplica)/M(FullReplica)/
+//! This test covers both with a real N(FullReplica)/M(FullReplica)/
 //! W(OnDemand) topology, built via the SAME production storage-mode path
 //! `stand_up_canonical_topology` already uses for N (`link_eager` plus a
 //! matching coordination-plane declaration for M too -- not a

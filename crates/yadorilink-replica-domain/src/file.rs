@@ -12,7 +12,7 @@ use crate::limits::{MAX_BLOCKS, MAX_BLOCK_SIZE_BYTES, MAX_XATTRS};
 /// same content are distinct byte strings and distinct hashes. Version 3
 /// replaced the single owner-exec bit with the full `unix_mode` permission
 /// word (see `FileMeta::unix_mode`), so v2 and v3 encodings of otherwise
-/// identical metadata are also distinct. Version 4 (C1.2a) added `xattrs`
+/// identical metadata are also distinct. Version 4 added `xattrs`
 /// (see `FileMeta::xattrs`), so v3 and v4 encodings of otherwise identical
 /// metadata are also distinct.
 const VERSION_DOMAIN_TAG: &[u8; 8] = b"YLNKver\x04";
@@ -317,6 +317,22 @@ impl FileVersion {
         v
     }
 
+    /// The canonical version of a directory: no blocks, size 0, mtime 0,
+    /// no symlink target, no xattrs. Its identity is its kind plus
+    /// `unix_mode`, which is replicated exactly as a file's is (a `chmod`
+    /// is an explicit change; `None` from a device with no Unix mode model
+    /// is a distinct version, never a fabricated mode).
+    pub fn directory(unix_mode: Option<u32>) -> FileVersion {
+        let meta = FileMeta {
+            mtime_unix_nanos: 0,
+            unix_mode,
+            symlink_target: None,
+            record_kind: RecordKind::Directory,
+            xattrs: Vec::new(),
+        };
+        FileVersion::new(Vec::new(), 0, meta)
+    }
+
     /// Structural validation of a `FileVersion`'s shape: the block layout,
     /// and its `record_kind`/`symlink_target` consistency.
     ///
@@ -324,24 +340,22 @@ impl FileVersion {
     /// file, every block is non-empty and within the chunker's ceiling,
     /// the block list is empty iff the file is empty, and the per-block
     /// sizes sum to the declared total. A symlink or directory version
-    /// carries no content blocks — its `size` is metadata (e.g. the
-    /// symlink's on-disk length), not a sum of block sizes — so only the
-    /// "no blocks" invariant applies. Content hashes are validated
+    /// carries no content blocks — a symlink's `size` is metadata (its
+    /// on-disk length), not a sum of block sizes, and a directory's is
+    /// always 0 — so only the "no blocks" invariant applies to the block
+    /// list. Content hashes are validated
     /// elsewhere (block fetch); this is the size/shape contract a
     /// receiver relies on to derive offsets safely.
     ///
-    /// `record_kind`/`symlink_target` consistency -- an independent
-    /// review's finding: a `RecordKind::Symlink` version with no recorded
-    /// target was previously only handled defensively, much further
-    /// downstream, by the local materialize path (a policy skip, not a
-    /// rejection) — nothing stopped a hand-crafted, signed version from
-    /// carrying that combination in the first place. Enforced
-    /// symmetrically rather than as a one-off check for the single
-    /// combination already observed: `Symlink` requires `Some(target)`,
+    /// `record_kind`/`symlink_target` consistency: a `RecordKind::Symlink`
+    /// version with no recorded target is rejected here, at the
+    /// decode/admission boundary, rather than only handled defensively
+    /// much further downstream by the local materialize path (a policy
+    /// skip, not a rejection). Enforced symmetrically rather than as a
+    /// one-off check for a single combination: `Symlink` requires `Some(target)`,
     /// and every other kind requires `None` (a `File`/`Directory` version
     /// claiming a symlink target it can never use is exactly as malformed
-    /// as a targetless symlink, even though nothing has hit that specific
-    /// case yet).
+    /// as a targetless symlink).
     fn validate_structure(&self) -> Result<(), ChangeError> {
         if self.blocks.len() > MAX_BLOCKS {
             return Err(ChangeError::Malformed(format!(
@@ -382,6 +396,20 @@ impl FileVersion {
                 }
             }
         }
+        // A directory's size and mtime are what the local filesystem
+        // reports about its children (entry-table size, last child
+        // change), not state of the directory itself. Letting either into
+        // the identity would re-author a directory on every child change
+        // and turn two concurrent `mkdir`s of one name into a conflict.
+        // `Self::directory` / `Self::from_index_row` produce the one
+        // canonical form; anything else is not an honest encoding.
+        if self.meta.record_kind == RecordKind::Directory
+            && (self.size != 0 || self.meta.mtime_unix_nanos != 0)
+        {
+            return Err(ChangeError::Malformed(
+                "a directory version must carry size 0 and mtime 0".into(),
+            ));
+        }
         match self.meta.record_kind {
             RecordKind::Symlink => {
                 if self.meta.symlink_target.is_none() {
@@ -398,8 +426,8 @@ impl FileVersion {
                 }
             }
         }
-        // A Codex CLI review's finding on the symlink_target check just
-        // above: `FileMeta::xattrs`'s own doc comment already says a
+        // Same shape as the symlink_target check just above:
+        // `FileMeta::xattrs`'s own doc comment already says a
         // symlink or directory is "not scanned" for xattrs (always
         // empty for those kinds on the capture side), but nothing
         // enforced it here -- and `exact_object_evidence_after_write`
@@ -456,6 +484,12 @@ impl FileVersion {
     /// identifier used for durability is always the same
     /// `FileVersion::compute_hash()` the change-DAG itself hashes versions
     /// with — never a separate, ad hoc hash over a subset of these fields.
+    ///
+    /// For a directory row, the stored `size` and `mtime_unix_nanos` are
+    /// filesystem observations and are replaced by the canonical 0 (see
+    /// [`Self::directory`]); every other field is taken as stored, so a row
+    /// that is malformed in another way still yields a version that
+    /// validation refuses.
     #[allow(clippy::too_many_arguments)]
     pub fn from_index_row(
         blocks: Vec<BlockInfo>,
@@ -470,6 +504,8 @@ impl FileVersion {
             .into_iter()
             .map(|b| VersionBlock { hash: BlockHash(b.hash), size: b.size })
             .collect();
+        let (size, mtime_unix_nanos) =
+            if record_kind == RecordKind::Directory { (0, 0) } else { (size, mtime_unix_nanos) };
         let meta = FileMeta { mtime_unix_nanos, unix_mode, symlink_target, record_kind, xattrs };
         FileVersion::new(blocks, size, meta)
     }
@@ -522,148 +558,10 @@ impl FileVersion {
 }
 
 #[cfg(test)]
-mod file_meta_decode_tests {
-    use super::*;
-
-    /// Hand-builds a canonical `FileMeta` encoding directly (rather than
-    /// going through `FileMeta`'s own encoder, which cannot be asked to
-    /// produce an invalid xattr name in the first place) -- `record_kind`
-    /// (`RecordKind::File` = 0), no unix mode, a fixed mtime, no symlink
-    /// target, then the xattr list exactly as `FileMeta::decode` expects
-    /// it: a `u32` count followed by `(name, value)` length-prefixed
-    /// pairs.
-    fn encode_file_meta_bytes_with_xattrs(xattrs: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.push(0u8);
-        buf.push(0u8);
-        put_i64(&mut buf, 0);
-        buf.push(0u8);
-        put_u32(&mut buf, xattrs.len() as u32);
-        for (name, value) in xattrs {
-            put_len_bytes(&mut buf, name.as_bytes());
-            put_len_bytes(&mut buf, value);
-        }
-        buf
-    }
-
-    #[test]
-    fn decode_accepts_an_allow_listed_xattr_name() {
-        let bytes = encode_file_meta_bytes_with_xattrs(&[("user.a", b"1")]);
-        let meta = FileMeta::decode(&mut Reader::new(&bytes)).unwrap();
-        assert_eq!(meta.xattrs, vec![("user.a".to_string(), b"1".to_vec())]);
-    }
-
-    /// Regression for an independent review's finding: this device's own
-    /// capture paths and every platform's apply-side filter in
-    /// `yadorilink-local-storage::chunker` already restrict xattr
-    /// replication to the `user.` namespace, but nothing stopped a
-    /// hand-crafted `FileVersion` from a fully authorized-but-untrusted
-    /// peer from carrying a security-relevant name
-    /// (`security.*`/`system.*`/`trusted.*` on Linux) straight through
-    /// decode and on into `apply_xattrs`. Confirmed genuinely RED by
-    /// temporarily removing the allow-list check from `decode`: this call
-    /// succeeded instead of being rejected.
-    #[test]
-    fn decode_rejects_a_non_allow_listed_xattr_name() {
-        let bytes = encode_file_meta_bytes_with_xattrs(&[("security.selinux", b"x")]);
-        let err = FileMeta::decode(&mut Reader::new(&bytes)).unwrap_err();
-        assert!(matches!(err, ChangeError::Encoding(_)), "got {err:?}");
-    }
-
-    /// A mixed list where only the second entry is outside the allow-list
-    /// must still be rejected -- the check must not be skippable by
-    /// hiding a bad name behind a good one earlier in sort order.
-    #[test]
-    fn decode_rejects_a_non_allow_listed_xattr_name_mixed_with_an_allowed_one() {
-        let bytes = encode_file_meta_bytes_with_xattrs(&[("user.a", b"1"), ("z.trusted", b"x")]);
-        let err = FileMeta::decode(&mut Reader::new(&bytes)).unwrap_err();
-        assert!(matches!(err, ChangeError::Encoding(_)), "got {err:?}");
-    }
-}
+mod file_meta_decode_tests;
 
 #[cfg(test)]
-mod record_kind_symlink_target_consistency_tests {
-    use super::*;
+mod record_kind_symlink_target_consistency_tests;
 
-    fn meta(record_kind: RecordKind, symlink_target: Option<Vec<u8>>) -> FileMeta {
-        FileMeta {
-            mtime_unix_nanos: 0,
-            unix_mode: None,
-            symlink_target,
-            record_kind,
-            xattrs: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn a_symlink_with_a_recorded_target_is_valid() {
-        FileVersion::new(vec![], 0, meta(RecordKind::Symlink, Some(b"target".to_vec())))
-            .verify_hash()
-            .unwrap();
-    }
-
-    #[test]
-    fn a_file_and_a_directory_with_no_target_are_valid() {
-        FileVersion::new(vec![], 0, meta(RecordKind::File, None)).verify_hash().unwrap();
-        FileVersion::new(vec![], 0, meta(RecordKind::Directory, None)).verify_hash().unwrap();
-    }
-
-    /// Regression for an independent review's finding: a hand-crafted,
-    /// validly-signed `Symlink` version with no recorded target was
-    /// previously only ever handled defensively, much further
-    /// downstream, by the local materialize path (a policy skip, not a
-    /// rejection) -- nothing at the wire-decode/admission boundary
-    /// stopped it in the first place. Confirmed genuinely RED by
-    /// temporarily removing this specific check from `validate_structure`
-    /// (leaving the symmetric `File`/`Directory` checks in place): this
-    /// version verified successfully instead of being rejected.
-    #[test]
-    fn a_symlink_with_no_recorded_target_is_rejected() {
-        let err =
-            FileVersion::new(vec![], 0, meta(RecordKind::Symlink, None)).verify_hash().unwrap_err();
-        assert!(matches!(err, ChangeError::Malformed(_)), "got {err:?}");
-    }
-
-    /// The symmetric case the review specifically asked not to skip: a
-    /// `File`/`Directory` version claiming a symlink target it can never
-    /// use is exactly as malformed as a targetless symlink, even though
-    /// no real capture path produces this today.
-    #[test]
-    fn a_file_or_directory_with_a_symlink_target_is_rejected() {
-        let err = FileVersion::new(vec![], 0, meta(RecordKind::File, Some(b"target".to_vec())))
-            .verify_hash()
-            .unwrap_err();
-        assert!(matches!(err, ChangeError::Malformed(_)), "got {err:?}");
-
-        let err =
-            FileVersion::new(vec![], 0, meta(RecordKind::Directory, Some(b"target".to_vec())))
-                .verify_hash()
-                .unwrap_err();
-        assert!(matches!(err, ChangeError::Malformed(_)), "got {err:?}");
-    }
-
-    /// Regression for a Codex CLI review's finding: `FileMeta::xattrs`'s
-    /// own doc comment already says a symlink or directory is "not
-    /// scanned" for xattrs, but nothing enforced it -- a hand-crafted
-    /// Symlink/Directory version carrying nonempty `xattrs` baked them
-    /// into `version_hash` while no completion proof for that path ever
-    /// verifies, applies, or even looks at them for those kinds.
-    /// Confirmed genuinely RED by temporarily removing this specific
-    /// check from `validate_structure` (leaving every other check in
-    /// place): both versions below verified successfully instead of
-    /// being rejected.
-    #[test]
-    fn a_symlink_or_directory_with_nonempty_xattrs_is_rejected() {
-        let xattrs = vec![("user.a".to_string(), b"1".to_vec())];
-
-        let mut symlink_meta = meta(RecordKind::Symlink, Some(b"target".to_vec()));
-        symlink_meta.xattrs = xattrs.clone();
-        let err = FileVersion::new(vec![], 0, symlink_meta).verify_hash().unwrap_err();
-        assert!(matches!(err, ChangeError::Malformed(_)), "got {err:?}");
-
-        let mut directory_meta = meta(RecordKind::Directory, None);
-        directory_meta.xattrs = xattrs;
-        let err = FileVersion::new(vec![], 0, directory_meta).verify_hash().unwrap_err();
-        assert!(matches!(err, ChangeError::Malformed(_)), "got {err:?}");
-    }
-}
+#[cfg(test)]
+mod directory_version_canonical_tests;

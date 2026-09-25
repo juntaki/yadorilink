@@ -1,8 +1,8 @@
 //! Read-only slice of the reporting IPC surface -- `ReportingStatus`/
 //! `ListQueueItems`/`ShowQueueItem`. The write side (`GenerateUsageReport`/
 //! `GenerateLastErrorReport`/`DeleteQueueItem`/`FlushQueue`/`SubmitReport`/
-//! `UpdateConsent`) stays in `reporting_ipc.rs` for now -- it moves to a
-//! `ReportingCommandService` in Phase 2C-R, not here.
+//! `UpdateConsent`) goes through `reporting_ipc.rs` and
+//! `ReportingCommandPort`, not here.
 
 use std::sync::Arc;
 

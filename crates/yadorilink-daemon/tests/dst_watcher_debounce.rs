@@ -1,23 +1,28 @@
 //! Deterministic simulation testing (DST) harness skeleton: runs the real
 //! watcher-boundary/debounce/local-change-indexing code (unmodified in
-//! its logic) under `madsim`'s simulated, seed-controlled scheduler,
+//! its logic) under a simulated, seed-controlled scheduler,
 //! substituting `watcher::SimulatedFolderWatchSource` for a real OS
 //! watcher (see that type's doc comment for why the watcher specifically
 //! needs a manual substitute while everything downstream of it does
 //! not).
 //!
-//! Only compiled/run when built with `RUSTFLAGS="--cfg madsim"` (the
-//! whole point is exercising the simulated scheduler) — a plain
-//! `cargo test` never builds this file at all.
+//! Only compiled/run when built with `RUSTFLAGS="--cfg turmoil"` (the whole
+//! point is exercising a simulated scheduler) — a plain `cargo test` never
+//! builds this file at all. How the simulation is constructed is
+//! `dst_support::sim`'s business, not this file's: nothing below names a
+//! simulator.
+//!
+//! It needs no simulated network at all — it proves seeding, virtual time,
+//! task spawning and the oracle, and nothing else.
 //!
 //! `run_many_seeded_variations_in_parallel` is this skeleton's actual
 //! scenario: it doesn't stop at "one seed, one scenario" but drives many
 //! independently-seeded simulated runs concurrently across OS threads,
-//! each fully isolated (its own `madsim::runtime::Runtime`) and fully
-//! reproducible from its own seed — the intended day-to-day shape of
-//! this harness, not just a smoke test of the plumbing.
+//! each fully isolated (its own simulated runtime) and fully reproducible
+//! from its own seed — the intended day-to-day shape of this harness, not
+//! just a smoke test of the plumbing.
 
-#![cfg(madsim)]
+#![cfg(turmoil)]
 
 mod dst_support;
 
@@ -34,7 +39,7 @@ use yadorilink_filesystem_sync::watcher::{
     FolderWatchSource, FsChangeEvent, FsChangeKind, SimulatedFolderWatchSource,
 };
 use yadorilink_local_capture::LocalChangeProcessor;
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 
 use dst_support::{check_no_silent_data_loss, format_violations, WriteOracle};
 
@@ -48,22 +53,27 @@ const OPS_PER_RUN: usize = 15;
 /// for a per-PR-sized fast run or a much larger heat-run/nightly sweep.
 const PARALLEL_VARIATIONS: usize = 500;
 
-/// One seeded, fully deterministic simulated run: performs
-/// `OPS_PER_RUN` randomized local writes through the real watcher-event
-/// boundary -> debounce -> `LocalChangeProcessor` indexing pipeline
-/// (`link_runtime::factory::LinkRuntimeFactory`'s production wiring,
-/// reproduced directly against `yadorilink-sync-core` here since that
-/// production entry point lives in `yadorilink-daemon`, whose coordination-
-/// plane dependency isn't part of this crate's madsim scope), then
-/// asserts the shared no-silent-data-loss invariant checker
-/// (`dst_support::check_no_silent_data_loss`) finds no violation.
+/// One simulated run's observable history: what happened, in order, at
+/// which point on the *simulated* clock. This is the artifact the
+/// determinism test compares, and it is deliberately a trace rather than a
+/// pass/fail — two runs that both satisfy the oracle can still have
+/// explored different interleavings, and a substrate that claims seeded
+/// determinism has to be held to the stronger statement.
+type Trace = Arc<Mutex<Vec<String>>>;
+
 fn run_scenario(seed: u64) -> Result<(), String> {
-    let mut rt = madsim::runtime::Runtime::with_seed_and_config(seed, madsim::Config::default());
-    rt.set_time_limit(Duration::from_secs(60));
-    rt.block_on(scenario_body(seed))
+    run_scenario_traced(seed, Arc::new(Mutex::new(Vec::new())))
 }
 
-async fn scenario_body(seed: u64) -> Result<(), String> {
+fn run_scenario_traced(seed: u64, trace: Trace) -> Result<(), String> {
+    dst_support::sim::run_scenario(seed, move || scenario_body(seed, trace))
+}
+
+async fn scenario_body(seed: u64, trace: Trace) -> Result<(), String> {
+    // Read once, at the start of simulated time, so every entry below is an
+    // offset from the run's own origin rather than from whatever the
+    // substrate's epoch happens to be.
+    let started_at = tokio::time::Instant::now();
     let root_dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
     // Canonicalize up front, matching what the real `watch_folder`
     // does to `root` internally (see watcher.rs's own tests for the
@@ -72,8 +82,9 @@ async fn scenario_body(seed: u64) -> Result<(), String> {
     // during indexing would otherwise silently mismatch.
     let root: PathBuf = root_dir.path().canonicalize().map_err(|e| format!("canonicalize: {e}"))?;
     let store_dir = tempfile::tempdir().map_err(|e| format!("store tempdir: {e}"))?;
-    let store =
-        Arc::new(FsBlockStore::new(store_dir.path()).map_err(|e| format!("block store: {e}"))?);
+    let store = Arc::new(
+        SegmentBlockStore::new(store_dir.path()).map_err(|e| format!("block store: {e}"))?,
+    );
     let sync_state =
         Arc::new(ReplicaCoordinator::open_in_memory().map_err(|e| format!("sync state: {e}"))?);
     dst_support::link::link_and_start(&sync_state, &root, GROUP_ID)
@@ -107,8 +118,14 @@ async fn scenario_body(seed: u64) -> Result<(), String> {
 
     let executor_processor = processor;
     let executor_root = root.clone();
+    let executor_trace = trace.clone();
     let executor = tokio::spawn(async move {
         while let Some(flush) = flush_rx.recv().await {
+            // Recorded before the flush is consumed: the debouncer decided
+            // both this batch's contents and the moment it fired, so those
+            // two together are where a scheduler difference between two
+            // runs of one seed would first become visible.
+            record(&executor_trace, started_at, describe_flush(&flush));
             if let Err(e) = executor_processor.process_flush(GROUP_ID, &executor_root, flush).await
             {
                 tracing::warn!(error = %e, "dst scenario: process_flush failed");
@@ -134,6 +151,7 @@ async fn scenario_body(seed: u64) -> Result<(), String> {
         // OS watcher whose timing this process doesn't control.
         let delay_ms = rng.random_range(0..40);
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        record(&trace, started_at, format!("event round={round} name={name}"));
         events_tx
             .send(FsChangeEvent { path, kind: FsChangeKind::CreatedOrModified })
             .await
@@ -148,11 +166,44 @@ async fn scenario_body(seed: u64) -> Result<(), String> {
     drop(events_tx);
     let _ = executor.await;
 
+    record(&trace, started_at, "settled".to_string());
+
     let violations = check_no_silent_data_loss(&oracle, &sync_state, GROUP_ID, &root);
     if !violations.is_empty() {
         return Err(format_violations(seed, &violations));
     }
     Ok(())
+}
+
+/// Appends one entry stamped with the *simulated* clock. Real elapsed time
+/// is deliberately absent: it differs run to run on any substrate and would
+/// make every trace comparison fail for reasons that say nothing about
+/// scheduling.
+fn record(trace: &Trace, started_at: tokio::time::Instant, what: String) {
+    let at = tokio::time::Instant::now().duration_since(started_at);
+    trace.lock().unwrap_or_else(|p| p.into_inner()).push(format!("{:>9}us {what}", at.as_micros()));
+}
+
+/// The flush's own contents, ordered, so the comparison sees *which* paths
+/// the debouncer batched together and not merely how many.
+fn describe_flush(flush: &debounce::DebounceFlush) -> String {
+    match flush {
+        debounce::DebounceFlush::Paths(entries) => {
+            let mut names: Vec<String> = entries
+                .iter()
+                .map(|(path, kind, _observed_at)| {
+                    let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+                    format!("{}:{kind:?}", name.unwrap_or_else(|| "<none>".to_string()))
+                })
+                .collect();
+            // The accumulator's iteration order is its own business and is
+            // not part of what this test pins; the *set* batched into one
+            // window is.
+            names.sort();
+            format!("flush [{}]", names.join(" "))
+        }
+        other => format!("flush {other:?}"),
+    }
 }
 
 /// The harness's actual day-to-day shape: not one seed, but many
@@ -219,4 +270,61 @@ fn run_many_seeded_variations_in_parallel() {
 fn single_seed_smoke() {
     let seed: u64 = std::env::var("DST_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
     run_scenario(seed).unwrap_or_else(|e| panic!("seed {seed} failed: {e}"));
+}
+
+fn trace_of(seed: u64) -> Vec<String> {
+    let trace: Trace = Arc::new(Mutex::new(Vec::new()));
+    run_scenario_traced(seed, trace.clone())
+        .unwrap_or_else(|e| panic!("seed {seed} failed while tracing: {e}"));
+    let collected = trace.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    // A trace of events alone would still be seed-varying and still compare
+    // equal to itself, so both determinism tests below would pass while
+    // pinning nothing about the code under test. The debouncer has to have
+    // actually fired.
+    assert!(
+        collected.iter().any(|entry| entry.contains("flush ")),
+        "seed {seed} produced a trace with no flush in it, so it pins nothing about the \
+         debouncer:\n{}",
+        collected.join("\n")
+    );
+    collected
+}
+
+/// The property that makes this a *deterministic* simulation rather than a
+/// randomized one: a seed names an execution, not just a distribution.
+///
+/// A green oracle does not establish this. Two runs can both satisfy the
+/// no-silent-data-loss invariant while having batched entirely different
+/// events into entirely different debounce windows, and a substrate that
+/// did that would reproduce no failure it ever reported. So the comparison
+/// is over the observable history — which events fired, at which point on
+/// the simulated clock, and which paths the debouncer grouped into each
+/// flush.
+#[test]
+fn the_same_seed_reproduces_the_same_history() {
+    const SEED: u64 = 0xD57_D37;
+    let first = trace_of(SEED);
+    let second = trace_of(SEED);
+    assert_eq!(
+        first, second,
+        "the same seed produced two different histories, so no failure this harness reports \
+         could be reproduced from its seed"
+    );
+}
+
+/// The other half of the same property, and the reason the seed loop is
+/// worth running at all: distinct seeds must actually reach distinct
+/// executions. A substrate that was perfectly reproducible but ignored the
+/// seed would pass the test above while exploring one interleaving 500
+/// times.
+#[test]
+fn different_seeds_reach_different_histories() {
+    let traces: Vec<Vec<String>> = (0..8).map(|i| trace_of(0xD57_D37 + i)).collect();
+    let distinct: std::collections::HashSet<&Vec<String>> = traces.iter().collect();
+    assert!(
+        distinct.len() > 1,
+        "8 different seeds all produced the identical history, so the seed is not reaching the \
+         scheduler:\n{}",
+        traces[0].join("\n")
+    );
 }

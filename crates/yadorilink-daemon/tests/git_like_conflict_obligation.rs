@@ -1,4 +1,4 @@
-//! RED regression coverage for conflict-copy obligations that must survive
+//! Regression coverage for conflict-copy obligations that must survive
 //! independently of the transient frontier a particular replica happens to
 //! observe.
 //!
@@ -30,7 +30,7 @@ use support::{
 };
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 
 type Snapshot = HashMap<String, String>;
 
@@ -59,7 +59,7 @@ struct TestDevice {
 
 fn setup_device(name: &str) -> TestDevice {
     let store_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let (sync_state, index_dir) = open_file_backed_replica_coordinator();
     let state = DaemonState::new(name.to_string(), Arc::new(sync_state), store);
     support::ensure_device_signing_key(&state);

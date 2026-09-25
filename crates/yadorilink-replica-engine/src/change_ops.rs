@@ -1,9 +1,3 @@
-//! Small, pure helpers over `change::Op`, used by `PeerReplicaEngine` (this
-//! crate) and by `yadorilink-sync-core`'s `peer_session.rs` (wire decode/
-//! authorize) directly -- neither reaches into the other for these, so
-//! `peer_session.rs` staying in `yadorilink-sync-core` never forces this
-//! crate to depend back on it.
-
 use std::collections::BTreeSet;
 
 use yadorilink_replica_domain::change::Op;

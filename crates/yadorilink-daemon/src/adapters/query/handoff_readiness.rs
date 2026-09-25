@@ -41,7 +41,8 @@ impl HandoffReadinessPort for DaemonHandoffReadinessReader {
             };
             let mut not_ready = Vec::new();
             for candidate in candidate_groups {
-                if !self.state.peer_group_is_full_replica(excluded_device_id, &candidate) {
+                if !self.state.authority.peer_group_is_full_replica(excluded_device_id, &candidate)
+                {
                     continue;
                 }
                 if !self

@@ -1,7 +1,7 @@
-//! M5-A Pass 2: canonical 3-node topology -- N (Full Replica,
+//! Canonical 3-node topology -- N (Full Replica,
 //! relay-capable, "home NAS" role conceptually), M and W (On-Demand,
-//! "Mac"/"Windows" roles conceptually). Reusable base for M5-A's
-//! automated acceptance passes.
+//! "Mac"/"Windows" roles conceptually). Reusable base for the multi-node
+//! acceptance scenarios.
 //!
 //! Real production code at every layer this exercises: real
 //! `DaemonState`, real `peer_orchestrator`-driven `PeerChannel`/
@@ -18,8 +18,6 @@
 //! **Not** OS-native (CfAPI/File Provider) acceptance -- this proves the
 //! application/daemon/transport/storage integration above the
 //! platform-native boundary, not Explorer/Finder lifecycle behavior. See
-//! `dst_three_device_mesh_chaos.rs` for the equivalent deterministic-
-//! simulation (madsim, simulated network) coverage this complements, and
 //! `relay_chaos.rs`/`relay_session_e2e.rs` for the real-transport relay
 //! coverage this reuses the relay-anchor role from.
 
@@ -32,10 +30,10 @@ use support::topology::stand_up_canonical_topology;
 use support::wait_until_with_context;
 use yadorilink_daemon::durability_service::GroupDurabilityStatus;
 
-/// M5-A Pass 3 scenario A/B/C (combined): all three peers direct-connect;
+/// All three peers direct-connect;
 /// M writes a file through the real filesystem watcher; N and W converge
 /// on the exact same content; W then authors its own file, and N/M
-/// converge on THAT (M5-A Pass 3 scenario C, symmetric direction); N's
+/// converge on THAT (symmetric direction); N's
 /// durability status is checked once a real custody-confirmation sweep
 /// has run.
 ///
@@ -49,8 +47,7 @@ use yadorilink_daemon::durability_service::GroupDurabilityStatus;
 /// tests, even with orchestrator-task teardown on each, still flaked on
 /// the mesh-connectivity wait under concurrent execution. One mesh per
 /// process avoids the contention entirely rather than chasing a resource
-/// budget that will only get more contended as later M5-A passes scale
-/// node count up.
+/// budget that only gets more contended as node count scales up.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn happy_path_direct_convergence_and_hydration() {
     support::ensure_isolated_config_dir();
@@ -61,8 +58,8 @@ async fn happy_path_direct_convergence_and_hydration() {
     let (n, m, w, _handles) = stand_up_canonical_topology(&fake, group_id).await;
 
     // M authors real content through the real watcher/debounce/executor
-    // path -- not a raw DB upsert (M5-A Pass 3's "real common DAG/sync
-    // path" requirement).
+    // path -- not a raw DB upsert, so the real common DAG/sync path is
+    // exercised.
     let path = m.root.path().join("shared.txt");
     std::fs::write(&path, b"hello from M").unwrap();
 
@@ -102,13 +99,12 @@ async fn happy_path_direct_convergence_and_hydration() {
         "W's hydrated content must be the exact bytes M authored"
     );
 
-    // Genuine M4 finding, not a test bug: in THIS canonical topology N is
+    // Expected product behaviour, not a test bug: in THIS canonical topology N is
     // the group's ONLY full replica -- M and W are both On-Demand, so
     // neither is a durability holder. `classify()`'s `Protected` path
     // deliberately requires an OTHER confirmed full-replica peer, never
-    // this device's own local completeness alone (the exact conflation
-    // the M4 audit closed -- see `durability_service.rs`'s own doc
-    // comment). With no other full-replica peer configured, this is
+    // this device's own local completeness alone (see
+    // `durability_service.rs`'s own doc comment). With no other full-replica peer configured, this is
     // structurally `AtRisk`: a single point of failure, correctly
     // reported as such -- "one full copy on an always-on device" is only
     // `Protected` once a SECOND full replica (or a fresh peer handoff
@@ -124,7 +120,7 @@ async fn happy_path_direct_convergence_and_hydration() {
          never Protected, from its own local completeness alone"
     );
 
-    // Symmetric direction (M5-A Pass 3 scenario C): W authors content;
+    // Symmetric direction: W authors content;
     // N and M converge on it.
     let path = w.root.path().join("from-w.txt");
     std::fs::write(&path, b"hello from W").unwrap();
@@ -163,9 +159,8 @@ async fn happy_path_direct_convergence_and_hydration() {
     // deliberately `pub(crate)`; going through the real control socket,
     // same as `desktop_status_parity.rs`/`storage_mode_orchestration.rs`
     // already do, exercises `control_socket.rs`'s wire-conversion
-    // functions too, closing the gap an earlier draft of this test left
-    // -- M5-A Pass 3's "CLI/desktop-facing semantic status model"
-    // requirement).
+    // functions too, so the CLI/desktop-facing semantic status model is
+    // covered end to end).
     let w_link = support::control_socket_client::query_link_status(w.state.clone(), group_id).await;
     assert_eq!(
         w_link.local_storage_state(),

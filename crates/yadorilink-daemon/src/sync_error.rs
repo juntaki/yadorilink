@@ -1,29 +1,17 @@
-//! `SyncError`, relocated from `yadorilink-sync-core::error` (Phase 7D-10
-//! Tier 2). `yadorilink-daemon`'s own `ReplicaCoordinator` is the composition
-//! root that legitimately composes every subsystem this enum's variants
-//! wrap (`yadorilink-sync-sqlite`, `yadorilink-replica-engine`,
+//! `yadorilink-daemon`'s own `ReplicaCoordinator` is the composition root
+//! that legitimately composes every subsystem this enum's variants wrap
+//! (`yadorilink-sync-sqlite`, `yadorilink-replica-engine`,
 //! `yadorilink-filesystem-sync`, `yadorilink-root-authority`,
 //! `yadorilink-transport`, ...) and needs one error type to `?`-propagate
 //! from whichever subsystem failed at its own call sites -- the same
-//! composition-root shape that already justified hosting `ReplicaCoordinator`
-//! and `dag_import.rs` here (see `docs/design/phase7d10-elimination-plan.md`
-//! §2.3). Nearly every variant already has a narrower, subsystem-owned
-//! equivalent (`SyncSqliteError`, `RootAuthorityError`,
-//! `MaterializationExecutionError`, ...); this type is the union those
-//! narrower types feed into at the one place that legitimately needs the
-//! union.
-//!
-//! `yadorilink-sync-core::error::SyncError` was a byte-identical sibling of
-//! this type during the transitional coexistence period, when `SyncState`
-//! was still live production surface and two `yadorilink-local-capture`-owned
-//! port traits (`LocalMutationStore`, `MaterializationStatePort`) were pinned
-//! to it in their own method signatures. Both traits' associated error types
-//! were since narrowed off the wide `SyncError` union onto their own
-//! subsystem-owned types (`SyncSqliteError`/`MaterializationExecutionError`),
-//! and `yadorilink-sync-core` itself was deleted in Phase 7D-10's final
-//! elimination pass -- this crate has no remaining coexistence boundary with
-//! it. Every production call site in this crate (and `yadorilink-cli`/
-//! `yadorilink-desktop-app`, which had none) uses this type.
+//! composition-root shape that already justified hosting
+//! `ReplicaCoordinator` and `dag_import.rs` here. Nearly every variant
+//! already has a narrower, subsystem-owned equivalent (`SyncSqliteError`,
+//! `RootAuthorityError`, `MaterializationExecutionError`, ...); this type
+//! is the union those narrower types feed into at the one place that
+//! legitimately needs the union. Every production call site in this crate
+//! (and `yadorilink-cli`/ `yadorilink-desktop-app`, which had none) uses
+//! this type.
 
 #[derive(Debug, thiserror::Error)]
 pub enum SyncError {
@@ -167,7 +155,7 @@ pub enum SyncError {
     #[error("cannot evict {0:?}: it is pinned")]
     EvictionRejected(String),
 
-    /// M2-3b: mirrors `MaterializationExecutionError::
+    /// Mirrors `MaterializationExecutionError::
     /// EvictionOutcomeAmbiguous`'s own doc comment exactly -- a Windows
     /// native dehydrate call's outcome could not be confirmed (transport
     /// failure after the real call may have already succeeded), so unlike
@@ -357,19 +345,9 @@ impl From<yadorilink_sync_sqlite::SyncSqliteError> for SyncError {
             yadorilink_sync_sqlite::SyncSqliteError::InvalidInput(msg) => {
                 SyncError::InvalidInput(msg)
             }
-            // `dag_store::admit_change`'s causal-auth-monotonicity check
-            // (C4-10) -- the cleanup this variant exists to let
-            // `ChangeHistoryRepository` trigger specifically already
-            // happens below this boundary, so nothing here needs to
-            // distinguish it further than `InvalidInput` already conveys.
-            yadorilink_sync_sqlite::SyncSqliteError::CausalAuthViolation => {
-                SyncError::InvalidInput(
-                    "change pins an authorization coordinate older than its causal parent".into(),
-                )
-            }
             yadorilink_sync_sqlite::SyncSqliteError::Io(e) => SyncError::Io(e),
             // `dag_store`'s reserved-namespace/portable-path admission
-            // checks (Phase 7D-7.3) -- see `SyncSqliteError`'s own doc
+            // checks -- see `SyncSqliteError`'s own doc
             // comments on these variants.
             yadorilink_sync_sqlite::SyncSqliteError::ReservedNamespaceCollision(m) => {
                 SyncError::ReservedNamespaceCollision(m)
@@ -377,38 +355,55 @@ impl From<yadorilink_sync_sqlite::SyncSqliteError> for SyncError {
             yadorilink_sync_sqlite::SyncSqliteError::NonPortablePath(m) => {
                 SyncError::NonPortablePath(m)
             }
-            // `file_index`'s `blocks_json` encode (Phase 7D-7.6) -- see
+            // `file_index`'s `blocks_json` encode -- see
             // `SyncSqliteError::Json`'s own doc comment.
             yadorilink_sync_sqlite::SyncSqliteError::Json(e) => SyncError::Json(e),
-            // `captured_authoring`'s own error boundary (7D-9C) -- see
-            // `SyncSqliteError::Hex`/`Chunking`/`Storage`'s own doc comments.
             yadorilink_sync_sqlite::SyncSqliteError::Hex(e) => SyncError::Hex(e),
             yadorilink_sync_sqlite::SyncSqliteError::Chunking(s) => SyncError::Chunking(s),
             yadorilink_sync_sqlite::SyncSqliteError::Storage(e) => SyncError::Storage(e),
-            // `link.rs`'s move to yadorilink-sync-sqlite (Phase 7D-9B
-            // follow-up) -- lossless, not flattened to a message string, for
+            // `link.rs`'s errors from yadorilink-sync-sqlite -- lossless, not flattened to a message string, for
             // the same reason `SyncError::AmbiguousLink`'s own doc comment
             // already requires for its round trip through
             // `RootAuthorityError`: callers match on the structured variant.
             yadorilink_sync_sqlite::SyncSqliteError::AmbiguousLink { group_id, local_paths } => {
                 SyncError::AmbiguousLink { group_id, local_paths }
             }
-            // `MaterializationStatePort::mark_deleted_emitting_change`'s
-            // own `local_emission_auth` pre-check, once that trait moved to
-            // `yadorilink-sync-sqlite` (Phase 7D-10) -- see
-            // `SyncSqliteError::PolicyUnavailable`'s own doc comment.
+            // A change-emitting write's `local_emission_auth` pre-check --
+            // see `SyncSqliteError::PolicyUnavailable`'s own doc comment.
             yadorilink_sync_sqlite::SyncSqliteError::PolicyUnavailable => {
                 SyncError::PolicyUnavailable
+            }
+            // A history base that does not carry every author held here --
+            // see `SyncSqliteError::HistoryBaseInstallDoesNotCarryAuthor`.
+            // Flattened to a message: nothing above this matches on the
+            // variant, it only reports it.
+            error @ yadorilink_sync_sqlite::SyncSqliteError::HistoryBaseInstallDoesNotCarryAuthor {
+                ..
+            } => SyncError::CorruptState(error.to_string()),
+            // A local authoring refused because a snapshot install has not
+            // reconciled the path's disk yet -- see
+            // `SyncSqliteError::PathAwaitingSnapshotInstallReconciliation`.
+            // Nothing is written; the edit is refused as an operation this
+            // path cannot take right now, and flattened to a message for
+            // the same reason as the arms around it.
+            error @ yadorilink_sync_sqlite::SyncSqliteError::PathAwaitingSnapshotInstallReconciliation {
+                ..
+            } => SyncError::InvalidInput(error.to_string()),
+            // A seal refused because one of its preconditions does not
+            // hold -- see `SyncSqliteError::SealRefused`. Nothing was
+            // written; flattened to a message for the same reason.
+            error @ yadorilink_sync_sqlite::SyncSqliteError::SealRefused { .. } => {
+                SyncError::InvalidInput(error.to_string())
             }
         }
     }
 }
 
-/// The forward direction: `impl PeerReplicaStatePort for ReplicaCoordinator`
-/// (`replica_coordinator/peer_replica_state.rs`) delegates to
-/// `ReplicaCoordinator`'s own `SyncError`-returning methods, but the trait
-/// itself returns `PeerSessionError` -- this is the conversion every one of
-/// those delegates uses via `?`/`.map_err`.
+/// The forward direction: the replica-state operations in
+/// `replica_coordinator/peer_replica_state.rs` delegate to
+/// `SyncError`-returning repository methods but return `PeerSessionError`
+/// -- this is the conversion every one of those delegates uses via
+/// `?`/`.map_err`.
 impl From<SyncError> for yadorilink_peer_session::PeerSessionError {
     fn from(error: SyncError) -> Self {
         use yadorilink_peer_session::PeerSessionError as E;
@@ -438,7 +433,7 @@ impl From<yadorilink_replica_domain::codec::ChangeError> for SyncError {
 }
 
 /// `compaction`/`rebootstrap`/`rebootstrap_snapshot` moved to
-/// `yadorilink-replica-engine` in Phase 7D-9D -- callers in this crate
+/// `yadorilink-replica-engine` -- callers in this crate
 /// (`ReplicaCoordinator`'s own `SyncError`-returning methods) need this at
 /// their own `?`-propagation sites. `ReplicaEngineError::Storage` has no
 /// matching `SyncError` variant carrying a bare message (`SyncError::
@@ -470,9 +465,8 @@ impl From<yadorilink_root_authority::RootAuthorityError> for SyncError {
             yadorilink_root_authority::RootAuthorityError::ReservedNamespaceCollision(msg) => {
                 SyncError::ReservedNamespaceCollision(msg)
             }
-            // `root_identity::VerifiedRoot` (moved to yadorilink-root-authority
-            // in Phase 7D-9B) used `SyncError::InvalidInput` for this exact
-            // condition before the move -- same variant, same reasoning
+            // A `root_identity::VerifiedRoot` mismatch (yadorilink-root-
+            // authority) maps to `SyncError::InvalidInput`
             // (`root_identity_mismatch`'s own doc: rejected before any state
             // is written, never a transient/retriable condition).
             yadorilink_root_authority::RootAuthorityError::RootIdentityMismatch(msg) => {
@@ -566,6 +560,9 @@ impl From<yadorilink_filesystem_sync::materialization_execution::Materialization
             E::CorruptState(msg) => SyncError::CorruptState(msg),
             E::EvictionRejected(msg) => SyncError::EvictionRejected(msg),
             E::EvictionOutcomeAmbiguous(msg) => SyncError::EvictionOutcomeAmbiguous(msg),
+            // The same outcome access hydration reports for attributes it set
+            // but could not confirm: no proof, retry later.
+            E::ReplicatedXattrsNotProven(msg) => SyncError::HydrationFailed(msg),
             E::PolicyUnavailable => SyncError::PolicyUnavailable,
             E::PathEscapesRoot(msg) => SyncError::PathEscapesRoot(msg),
             E::DiskPressure { path, volume, available_bytes, headroom_bytes } => {
@@ -638,90 +635,4 @@ impl From<yadorilink_local_storage::StorageError> for SyncError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// a `StorageError::DiskPressure` from the block store
-    /// converts to `SyncError::DiskPressure`, not the generic `Storage`
-    /// wrapper — a caller matching on `SyncError` alone (not reaching into
-    /// the wrapped `StorageError`) can still tell disk pressure apart from
-    /// every other storage error.
-    #[test]
-    fn disk_pressure_survives_conversion_from_storage_error_undisguised() {
-        let storage_err = yadorilink_local_storage::StorageError::DiskPressure {
-            path: "/root/blocks/ab/cd/abcd".into(),
-            volume: "/root/blocks".into(),
-            available_bytes: 100,
-            headroom_bytes: 1000,
-        };
-        let sync_err: SyncError = storage_err.into();
-        assert!(matches!(sync_err, SyncError::DiskPressure { .. }));
-    }
-
-    #[test]
-    fn collision_error_carries_the_exact_path() {
-        let err = SyncError::ReservedNamespaceCollision("a/.yadorilink-v1-stage.x".to_string());
-        assert!(err.to_string().contains("a/.yadorilink-v1-stage.x"));
-    }
-
-    /// The converse: an ordinary storage error (not disk pressure) still
-    /// wraps as `Storage`, not `DiskPressure` — the conversion only
-    /// special-cases the one variant it needs to.
-    #[test]
-    fn other_storage_errors_still_wrap_as_the_generic_storage_variant() {
-        let storage_err = yadorilink_local_storage::StorageError::NotFound("deadbeef".into());
-        let sync_err: SyncError = storage_err.into();
-        assert!(matches!(sync_err, SyncError::Storage(_)));
-        assert!(!matches!(sync_err, SyncError::DiskPressure { .. }));
-    }
-
-    /// Spot-checks the category
-    /// taxonomy's coarse, stable slugs for a representative sample of
-    /// variants — these are exactly the strings the recent-error ring
-    /// buffer and `/metrics` labels surface, so a typo here is a
-    /// user-visible regression.
-    #[test]
-    fn category_returns_stable_coarse_slugs() {
-        assert_eq!(
-            SyncError::Transport(yadorilink_transport::TransportError::ChannelClosed).category(),
-            "peer_unreachable"
-        );
-        assert_eq!(
-            SyncError::DiskPressure {
-                path: "a.bin".into(),
-                volume: "/root".into(),
-                available_bytes: 1,
-                headroom_bytes: 2,
-            }
-            .category(),
-            "disk_pressure"
-        );
-        assert_eq!(SyncError::NotFound("x".into()).category(), "not_found");
-        assert_eq!(SyncError::PathEscapesRoot("x".into()).category(), "permission");
-        assert_eq!(
-            SyncError::Io(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"))
-                .category(),
-            "permission"
-        );
-        assert_eq!(SyncError::Io(std::io::Error::other("transient")).category(), "io");
-    }
-
-    /// `DiskPressure` must never be confused with `Io` — a plain
-    /// transient I/O error stays `Io`, never `DiskPressure`, so callers can
-    /// branch on "disk full, back off differently" versus "network/I/O
-    /// blip, just retry" by matching the `SyncError` variant alone.
-    #[test]
-    fn disk_pressure_is_a_distinct_variant_from_io_errors() {
-        let io_err: SyncError = std::io::Error::other("transient").into();
-        assert!(matches!(io_err, SyncError::Io(_)));
-        assert!(!matches!(io_err, SyncError::DiskPressure { .. }));
-
-        let disk_pressure = SyncError::DiskPressure {
-            path: "a.bin".into(),
-            volume: "/root".into(),
-            available_bytes: 1,
-            headroom_bytes: 2,
-        };
-        assert!(!matches!(disk_pressure, SyncError::Io(_)));
-    }
-}
+mod tests;

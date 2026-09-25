@@ -2,13 +2,12 @@
 //! tiered test lanes.
 //!
 //! Every environment knob an agent would otherwise have to remember
-//! (`RUSTFLAGS="--cfg madsim"`, `DST_SEED`, `DST_VARIATIONS`, scenario
+//! (`RUSTFLAGS="--cfg turmoil"`, `DST_SEED`, `DST_VARIATIONS`, scenario
 //! selection) lives *inside* this tool, so the operator-facing surface is one
 //! command. Invoked directly (`cargo run -p xtask -- <cmd>`) or via the cargo
 //! aliases in `.cargo/config.toml` (`cargo dst-replay …`, `cargo dst-lane1`).
 //!
-//! Subcommands (kept in sync with `.cargo/config.toml` aliases and
-//! `tests/dst_support/AGENT.md`; the runbook freshness lint enforces this):
+//! Subcommands (kept in sync with the `.cargo/config.toml` aliases):
 //!  dst-replay <bundle|corpus-entry> [--trace <path>] [--scenario <name>]
 //!  (--until-divergence and --profile are accepted but currently refused --
 //!  see `single_seed_entry_point`)
@@ -26,7 +25,11 @@ use std::process::{Command, ExitCode};
 
 use serde::Deserialize;
 
-const MADSIM_RUSTFLAGS: &str = "--cfg madsim";
+const SIM_RUSTFLAGS: &str = "--cfg turmoil";
+/// The file-level gate a scenario carries once it no longer builds under any
+/// configuration. Such a file is kept as the specification for its
+/// replacement, and is neither a lane scenario nor replayable.
+const RETIRED_GATE: &str = "#![cfg(any())]";
 const DAEMON: &str = "yadorilink-daemon";
 const DEFAULT_KEEP: usize = 20;
 const DEFAULT_LANE1_OPS: usize = 4;
@@ -154,24 +157,14 @@ fn cmd_replay(args: &[String]) -> Result<(), String> {
         trace.as_deref().unwrap_or("<none>")
     );
 
-    let mut cmd = madsim_test(&scenario)?;
+    let mut cmd = sim_test(&scenario)?;
     cmd.arg("--").arg(entry_point.test_name).arg("--exact").arg("--nocapture");
-    match entry_point.seed_env {
-        SeedEnv::Direct => {
-            cmd.env("DST_SEED", seed.to_string());
-        }
-        SeedEnv::BaseSeedSingleVariation => {
-            cmd.env("DST_BASE_SEED", seed.to_string());
-            cmd.env("DST_VARIATIONS", "1");
-        }
-    }
+    cmd.env("DST_SEED", seed.to_string());
     if let Some(path_selector) = &trace {
-        // Only `dst_two_device_chaos.rs` reads this selector today (an exact
-        // path or comma-separated list, matched against `DST_TRACE_PATH` --
-        // not a glob, despite this flag's name). For every other scenario
-        // this env var is simply unread and `--trace` is a silent no-op;
-        // that mismatch is a smaller, pre-existing rough edge left as is
-        // rather than folded into this fix.
+        // Read by `dst_support`'s path tracer (an exact path or a
+        // comma-separated list, matched against `DST_TRACE_PATH` -- not a
+        // glob, despite this flag's name). A scenario that traces no path
+        // leaves it unread, and `--trace` is then a no-op.
         cmd.env("DST_TRACE_PATH", path_selector);
     }
 
@@ -188,26 +181,14 @@ fn cmd_replay(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// How a scenario's single-seed entry point takes its seed.
-enum SeedEnv {
-    /// `DST_SEED=<seed>`, read directly by a purpose-built single-seed test.
-    Direct,
-    /// `DST_BASE_SEED=<seed>` + `DST_VARIATIONS=1`, read by the scenario's
-    /// own sweep test to narrow it to exactly one variation -- the
-    /// reproduction recipe every chaos scenario's own failure message
-    /// documents (see [`cmd_targeted`]).
-    BaseSeedSingleVariation,
-}
-
 /// A scenario's single-seed entry point: the `--exact` test-name filter to
-/// pass to `cargo test`, and how that test reads the seed.
+/// pass to `cargo test`. The test reads its seed from `DST_SEED`.
 struct EntryPoint {
     test_name: &'static str,
-    seed_env: SeedEnv,
 }
 
 /// Resolves which test in `scenario`'s binary reproduces one seed in
-/// isolation, and how to pass it the seed.
+/// isolation.
 ///
 /// This used to be a single hardcoded filter (`single_seed_smoke --exact`)
 /// applied to every scenario. That name exists in exactly one scenario file
@@ -219,38 +200,26 @@ struct EntryPoint {
 /// mirrors code, not data the scenario files could plausibly assert about
 /// themselves.
 fn single_seed_entry_point(scenario: &str) -> Result<EntryPoint, String> {
-    let (test_name, seed_env) = match scenario {
-        "dst_watcher_debounce" => ("single_seed_smoke", SeedEnv::Direct),
-        "dst_two_device_chaos" => ("two_device_chaos_scenario", SeedEnv::BaseSeedSingleVariation),
-        "dst_three_device_mesh_chaos" => {
-            ("three_device_mesh_chaos_scenario", SeedEnv::BaseSeedSingleVariation)
-        }
-        "dst_network_fault_chaos" => {
-            ("network_fault_chaos_scenario", SeedEnv::BaseSeedSingleVariation)
-        }
-        "dst_directory_chaos" => ("directory_chaos_scenario", SeedEnv::BaseSeedSingleVariation),
-        "dst_disk_crash_chaos" => {
-            ("disk_fault_crash_restart_chaos_scenario", SeedEnv::BaseSeedSingleVariation)
-        }
-        "dst_hydration_under_fault_chaos" => {
-            ("hydration_under_fault_chaos_scenario", SeedEnv::BaseSeedSingleVariation)
-        }
-        "dst_dag_catchup_chaos" => ("dag_catchup_chaos_scenario", SeedEnv::BaseSeedSingleVariation),
-        "dst_generated_sweep" => ("dst_generated_sweep", SeedEnv::BaseSeedSingleVariation),
+    let test_name = match scenario {
+        "dst_watcher_debounce" => "single_seed_smoke",
         // These scenarios' own test functions run a fixed, hardcoded set of
         // seeds/orderings with no env-var seed selection at all -- there is
         // no single-seed entry point to target, and no `--exact` filter
         // changes that. Refuse rather than silently run the whole fixed set
         // (which is not what a caller asking to replay one seed asked for)
         // or, worse, a filter that matches nothing.
-        "dst_materialization_crash_recovery"
-        | "dst_peer_reconcile_race"
-        | "dst_directory_move_edit_race"
-        | "dst_sec_convergence" => {
+        "dst_sec_convergence" | "dst_turmoil_stack_case" | "dst_turmoil_substrate_case" => {
             return Err(format!(
                 "dst-replay: {scenario} has no single-seed entry point -- its test function runs \
                  a fixed set of seeds/orderings with no env-var seed selection, so there is no \
                  way to isolate one seed by re-running it"
+            ));
+        }
+        other if is_retired(other) => {
+            return Err(format!(
+                "dst-replay: {other} is retired -- it no longer builds under any configuration, \
+                 so a recorded seed of it cannot be replayed until it is re-expressed as a \
+                 turmoil scenario"
             ));
         }
         other => {
@@ -260,7 +229,7 @@ fn single_seed_entry_point(scenario: &str) -> Result<EntryPoint, String> {
             ));
         }
     };
-    Ok(EntryPoint { test_name, seed_env })
+    Ok(EntryPoint { test_name })
 }
 
 /// Reads a failure bundle (`*.json`, a single JSON object) or a corpus JSONL
@@ -336,18 +305,11 @@ fn load_case_seed(path: &Path, want_seed: Option<u64>) -> Result<u64, String> {
 
 fn cmd_lane0(_args: &[String]) -> Result<(), String> {
     // Lane 0: the cheapest, seconds-scale tier — harness unit tests and lints.
-    // The non-madsim lints (runbook freshness, fidelity) run under a plain
-    // build; the `dst_support` unit tests are madsim-gated and run through
-    // the cheapest scenario binary.
-    // The non-madsim harness guards: the runbook-freshness lint, the
-    // fidelity lint, and the watcher-event-decomposition conformance test —
-    // the last is `#![cfg(not(madsim))]`, so it belongs in this plain leg,
-    // not the madsim one.
-    // (`dst_impact_map_lint` used to run here too, but all four of its own
-    // tests were permanently `#[ignore]`d against a deleted `yadorilink-
-    // sync-core` crate — Track R, E0 cleanup removed the file entirely
-    // rather than keep running a target with zero real tests.)
-    eprintln!("dst-lane0: harness lints + watcher conformance (non-madsim)");
+    // The harness guards (the runbook-freshness lint, the fidelity lint and
+    // the watcher-event-decomposition conformance test) run under a plain
+    // build; the `dst_support` unit tests are gated on the simulation cfg and
+    // run through the cheapest scenario binary.
+    eprintln!("dst-lane0: harness lints + watcher conformance (plain build)");
     let mut lints = Command::new(cargo());
     lints
         .arg("test")
@@ -361,8 +323,8 @@ fn cmd_lane0(_args: &[String]) -> Result<(), String> {
         .arg("watcher_decompose_conformance");
     run(lints)?;
 
-    eprintln!("dst-lane0: dst_support unit tests (madsim)");
-    let mut units = madsim_test("dst_watcher_debounce")?;
+    eprintln!("dst-lane0: dst_support unit tests (turmoil)");
+    let mut units = sim_test("dst_watcher_debounce")?;
     units.arg("--").arg("dst_support::");
     run(units)?;
     Ok(())
@@ -374,7 +336,7 @@ fn cmd_lane1(args: &[String]) -> Result<(), String> {
     eprintln!("dst-lane1: {} scenarios x 1 seed, op budget {ops}", scenarios.len());
     for scenario in &scenarios {
         eprintln!("dst-lane1: {scenario}");
-        let mut cmd = madsim_test(scenario)?;
+        let mut cmd = sim_test(scenario)?;
         cmd.env("DST_VARIATIONS", "1");
         // Shared reduced-op knob (dst_support::lane::op_budget reads this).
         cmd.env("DST_OPS_BUDGET", ops.to_string());
@@ -394,7 +356,7 @@ fn cmd_lane2(args: &[String]) -> Result<(), String> {
     );
     for scenario in &scenarios {
         eprintln!("dst-lane2: {scenario}");
-        let mut cmd = madsim_test(scenario)?;
+        let mut cmd = sim_test(scenario)?;
         if let Some(v) = variations {
             cmd.env("DST_VARIATIONS", v.to_string());
         }
@@ -517,7 +479,7 @@ fn cmd_targeted(args: &[String]) -> Result<(), String> {
     let mut failing_runs = Vec::new();
     let mut loop_err: Option<String> = None;
     for i in 1..=n {
-        let mut cmd = madsim_test(&scenario)?;
+        let mut cmd = sim_test(&scenario)?;
         // `DST_BASE_SEED`+`DST_VARIATIONS=1` is the reproduction recipe every
         // chaos scenario's own failure message documents. `DST_SEED` is set
         // too, harmlessly, for the one scenario (`dst_watcher_debounce`)
@@ -700,13 +662,8 @@ fn cargo() -> String {
 
 /// Which crate `scenario`'s test file actually lives in right now: checked
 /// against the filesystem, not a hardcoded list, so this never drifts from
-/// where a scenario really is after a move (Phase 7D-10.4 relocated the
-/// daemon workflow/E2E cluster and the harness-dependent filesystem-sync
-/// scenarios from `yadorilink-sync-core` to `yadorilink-daemon`; every
-/// remaining scenario -- `dst_peer_reconcile_race` deferred to
-/// `peer_session.rs`'s own migration pass -- moved to `yadorilink-peer-session`
-/// before `yadorilink-sync-core` itself was deleted in Phase 7D-10's final
-/// elimination pass, so `yadorilink-daemon` is the only crate left to check).
+/// where a scenario really is after a move (every lane scenario lives in
+/// `yadorilink-daemon`, so it is the only crate to check).
 fn scenario_crate(scenario: &str) -> Result<&'static str, String> {
     let daemon_path =
         workspace_root().join(format!("crates/yadorilink-daemon/tests/{scenario}.rs"));
@@ -719,19 +676,19 @@ fn scenario_crate(scenario: &str) -> Result<&'static str, String> {
 }
 
 /// A `cargo test --test <scenario>` command for whichever crate `scenario`
-/// currently lives in, built with the madsim cfg. RUSTFLAGS is *appended* to
-/// any the operator already set (we don't clobber their flags, we add ours).
-fn madsim_test(scenario: &str) -> Result<Command, String> {
+/// currently lives in, built with the simulation cfg. RUSTFLAGS is *appended*
+/// to any the operator already set (we don't clobber their flags, we add ours).
+fn sim_test(scenario: &str) -> Result<Command, String> {
     let package = scenario_crate(scenario)?;
     let mut cmd = Command::new(cargo());
     cmd.arg("test").arg("-p").arg(package).arg("--test").arg(scenario);
     let existing = std::env::var("RUSTFLAGS").unwrap_or_default();
     let combined = if existing.is_empty() {
-        MADSIM_RUSTFLAGS.to_string()
-    } else if existing.contains("--cfg madsim") {
+        SIM_RUSTFLAGS.to_string()
+    } else if existing.contains(SIM_RUSTFLAGS) {
         existing
     } else {
-        format!("{existing} {MADSIM_RUSTFLAGS}")
+        format!("{existing} {SIM_RUSTFLAGS}")
     };
     cmd.env("RUSTFLAGS", combined);
     Ok(cmd)
@@ -799,22 +756,26 @@ fn coverage_dir() -> PathBuf {
 }
 
 /// The scenario test binaries, discovered from `tests/dst_*.rs` in
-/// `yadorilink-daemon` (Phase 7D-10.4 split the harness's scenario files
-/// across `yadorilink-sync-core` and `yadorilink-daemon`; Phase 7D-10's
-/// final elimination pass deleted `yadorilink-sync-core` outright, and
-/// every scenario it still owned moved to `yadorilink-peer-session` or
-/// `yadorilink-daemon` before that deletion, so `yadorilink-daemon` is now
-/// the sole scenario home) so the lane never drifts from the actual
-/// scenario set (an impact-map lint used to guard the same set from the
-/// map side; it only ever ran against the now-deleted `yadorilink-sync-core`
-/// and was removed rather than kept as a permanently-`#[ignore]`d no-op --
-/// Track R, E0 cleanup). A `dst_*.rs`
+/// `yadorilink-daemon` (the sole scenario home) so the lane never drifts
+/// from the actual scenario set. A `dst_*.rs`
 /// file only counts as a lane scenario if it actually declares
 /// `mod dst_support;` -- this excludes `yadorilink-daemon`'s own
-/// pre-existing, unrelated `dst_daemon_*.rs` integration tests (a
-/// different, non-`dst_support` DST harness that predates this move)
-/// without relying on a naming-convention guess. Returned sorted for stable
-/// ordering.
+/// unrelated `dst_daemon_*.rs` integration tests (a different,
+/// non-`dst_support` DST harness)
+/// without relying on a naming-convention guess. A retired scenario (see
+/// [`RETIRED_GATE`]) is skipped: its binary would build empty and "pass".
+/// Returned sorted for stable ordering.
+/// Whether `scenario`'s file is kept only as a specification (see
+/// [`RETIRED_GATE`]).
+fn is_retired(scenario: &str) -> bool {
+    let path = workspace_root().join(format!("crates/{DAEMON}/tests/{scenario}.rs"));
+    std::fs::read_to_string(path).map(|s| is_retired_source(&s)).unwrap_or(false)
+}
+
+fn is_retired_source(source: &str) -> bool {
+    source.lines().any(|l| l.trim() == RETIRED_GATE)
+}
+
 fn discover_scenarios() -> Result<Vec<String>, String> {
     let dirs = [workspace_root().join("crates/yadorilink-daemon/tests")];
     let mut out = BTreeMap::new();
@@ -829,7 +790,8 @@ fn discover_scenarios() -> Result<Vec<String>, String> {
             let path = entry.path();
             let source = std::fs::read_to_string(&path)
                 .map_err(|e| format!("read {}: {e}", path.display()))?;
-            if source.lines().any(|l| l.trim() == "mod dst_support;") {
+            if source.lines().any(|l| l.trim() == "mod dst_support;") && !is_retired_source(&source)
+            {
                 out.insert(stem.to_string(), ());
             }
         }

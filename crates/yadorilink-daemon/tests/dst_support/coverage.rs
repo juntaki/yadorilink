@@ -31,12 +31,22 @@ pub fn op_kind_label(op: &Op) -> &'static str {
         Op::Move { .. } => "Move",
         Op::Mkdir { .. } => "Mkdir",
         Op::Rmdir { .. } => "Rmdir",
+        Op::RmTree { .. } => "RmTree",
+        Op::RenameTree { .. } => "RenameTree",
         Op::Chmod { .. } => "Chmod",
         Op::ConflictingConcurrent { .. } => "ConflictingConcurrent",
     }
 }
 
-/// Every op kind in the Case IR vocabulary — the op axis of the validity model.
+/// The op axis of the validity model: exactly the kinds the fault-carrying
+/// generators (`generate_case`, `generate_pairwise`) draw from.
+///
+/// The whole-tree kinds (`RmTree`, `RenameTree`) are counted in
+/// `op_kinds` when a case carries them, but are not on this axis: their
+/// only generator, `generate_directory_case`, is fault-free, so every
+/// op×fault pair they would add could never be exercised and would only
+/// pad `never_exercised`. Put them here when a faulted generator emits
+/// them.
 pub const OP_KINDS: &[&str] = &[
     "Write",
     "Edit",
@@ -328,6 +338,15 @@ mod tests {
             .contains(&OpFaultPair { op: "Rename".into(), fault: "Disk.Eio".into() }));
         // Sanity: total valid pairs = exercised + never_exercised.
         assert_eq!(report.never_exercised.len() + 1, valid_op_fault_pairs().len());
+    }
+
+    /// A kind on the op axis that no faulted generator emits makes
+    /// `|FAULT_KINDS|` permanent entries in every sweep's `never_exercised`.
+    #[test]
+    fn op_axis_is_the_faulted_generators_alphabet() {
+        let generated: Vec<String> =
+            super::super::generator::OP_KINDS.iter().map(|k| format!("{k:?}")).collect();
+        assert_eq!(OP_KINDS, generated.iter().map(String::as_str).collect::<Vec<_>>());
     }
 
     #[test]

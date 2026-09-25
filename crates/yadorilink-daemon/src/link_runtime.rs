@@ -133,6 +133,16 @@ impl LinkRuntime {
         self.flush_handle.flush_pending_local_change(group_id, rel_path).await
     }
 
+    /// Captures one path's current disk state, its absence included --
+    /// see `LinkFlushHandle::capture_local_path_state`'s own doc.
+    pub(crate) async fn capture_local_path_state(
+        &self,
+        group_id: &str,
+        rel_path: &str,
+    ) -> yadorilink_peer_session::peer_session::PendingLocalFlushOutcome {
+        self.flush_handle.capture_local_path_state(group_id, rel_path).await
+    }
+
     /// Same as [`Self::flush_pending_local_change`], for a case-fold
     /// sibling collision -- see `LinkFlushHandle::flush_case_fold_sibling`'s
     /// own doc.
@@ -144,7 +154,7 @@ impl LinkRuntime {
         self.flush_handle.flush_case_fold_sibling(group_id, rel_path).await
     }
 
-    /// M1-3: routes a File-Provider-originated local write notification
+    /// Routes a File-Provider-originated local write notification
     /// through this link's `LocalChangeProcessor` -- see
     /// `LinkFlushHandle::capture_local_write`'s own doc. Reached from
     /// `shell_ipc`'s `LocalWriteRequest` handler via `LinkRegistry::runtime`.
@@ -157,7 +167,18 @@ impl LinkRuntime {
         self.flush_handle.capture_local_write(group_id, rel_path, kind).await
     }
 
-    /// M2-2: mints-or-reads this link's persisted Windows CfAPI generation
+    /// Captures the local changes a pause of `rel_path` held -- see
+    /// `LinkFlushHandle::capture_resumed_item`'s own doc. Reached from the
+    /// item pause/resume adapter via `LinkRegistry::runtime`.
+    pub(crate) async fn capture_resumed_item(
+        &self,
+        group_id: &str,
+        rel_path: &str,
+    ) -> Result<(), String> {
+        self.flush_handle.capture_resumed_item(group_id, rel_path).await
+    }
+
+    /// Mints-or-reads this link's persisted Windows CfAPI generation
     /// for `rel_path` -- see `LinkFlushHandle::ensure_windows_placeholder_
     /// generation`'s own doc. Reached from `shell_ipc`'s
     /// `ListFolderFilesRequest` handler via `LinkRegistry::runtime`.
@@ -169,18 +190,8 @@ impl LinkRuntime {
         self.flush_handle.ensure_windows_placeholder_generation(group_id, rel_path)
     }
 
-    /// The one deliberate exception to this type's "no raw internal-type
-    /// getter" rule: `yadorilink_peer_session::peer_session::
-    /// RootCommitAuthorityProvider` (implemented by `DaemonState` in the
-    /// daemon's own `root_commit_authority` module) is an EXTERNAL trait
-    /// contract
-    /// (`yadorilink-sync-core`'s own `PeerSyncSession` calls through it)
-    /// whose signature returns `Option<Arc<RootLease>>` verbatim -- there
-    /// is no semantic operation to wrap this in on our side, since the
-    /// admit/mutate logic that consumes the lease lives entirely on the
-    /// other side of that boundary, in `yadorilink-sync-core`. Every other
-    /// caller of `LinkRuntime` should use the narrower operations above
-    /// instead.
+    /// Every other caller of `LinkRuntime` should use the narrower
+    /// operations above instead.
     pub(crate) fn root_lease(&self) -> &Arc<yadorilink_root_authority::root_commit::RootLease> {
         &self.root_lease
     }

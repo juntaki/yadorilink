@@ -10,7 +10,7 @@
 //! The shrinker is generic over a caller-supplied reproduce-check
 //! (`FnMut(&Case) -> ReproOutcome`): the scenario wiring passes a closure that
 //! re-runs the candidate under the same seed/harness and reports whether the
-//! same violation still fires. Reproduction under madsim is exact by
+//! same violation still fires. Reproduction under simulation is exact by
 //! construction, so a candidate that reproduces *nondeterministically
 //! differently* is a harness-fidelity bug — the shrinker aborts and reports it
 //!  rather than silently continuing.
@@ -211,7 +211,7 @@ impl Driver<'_> {
     }
 
     /// Shrink the fault schedule by dropping faults (binary-chunk then singles).
-    /// Empty on this branch until harden's injectors land, so usually a no-op.
+    /// Usually a no-op: most cases carry no fault windows.
     fn shrink_fault_windows(&mut self) -> bool {
         let mut progressed = false;
         let mut chunk = self.best.fault_schedule.len();

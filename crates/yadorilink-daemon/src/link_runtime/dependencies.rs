@@ -43,6 +43,65 @@ pub(crate) trait LinkRuntimeHostPort: Send + Sync {
     fn begin_write_activity(&self) -> Box<dyn Send + '_>;
 
     fn device_signing_key(&self) -> Option<ed25519_dalek::SigningKey>;
+
+    /// A capture flush finished, so this group's local capture barriers may
+    /// have settled and staged Changes blocked behind them may now be
+    /// admissible.
+    ///
+    /// Deliberately separate from `broadcast_change`, and deliberately not
+    /// conditioned on any record: a flush that produces NO record still
+    /// clears the dirty rows that were the barrier. Announcing is about
+    /// telling peers what changed; this is about re-asking a question whose
+    /// answer may have changed. Tying the second to the first is what left
+    /// verified Changes staged forever -- `announce_local_change` returns at
+    /// `records.is_empty()`, before anything that could re-ask.
+    ///
+    /// The port exists so this crate's capture path does not depend on the
+    /// admission coordinator; the daemon side decides what to do with it.
+    ///
+    /// # Which call sites owe this signal
+    ///
+    /// The population is "every production path that durably clears a
+    /// `local_dirty_paths` row", NOT "every path that announces records" --
+    /// counting announce sites is what let the live watcher slip through
+    /// twice. There is exactly one repository call that clears durably:
+    /// `flush_pending_clears` inside `LocalChangeProcessor::
+    /// process_flush_with_ignore`'s `DebounceFlush::Paths` arm
+    /// (`clear_dirty_paths_conditional_batch`). Everything below is a caller
+    /// of that one arm:
+    ///
+    /// | Production path                          | Reaches the clear via                             | Signal |
+    /// |------------------------------------------|---------------------------------------------------|--------|
+    /// | live debounce executor, `Paths` flush     | `process_flush_with_ignore(Paths)`                | `tasks.rs` flush loop |
+    /// | startup dirty-journal redrive             | `redrive_dirty_journal` -> `process_flush(Paths)` | `tasks.rs` startup |
+    /// | periodic dirty-journal redrive backstop   | same                                              | `tasks.rs` redrive task |
+    /// | peer-triggered targeted flush (one path)  | `LinkFlushHandle::process_flush(Paths)`           | `capture_local_change.rs` |
+    /// | peer-triggered case-fold sibling flush    | same                                              | `capture_local_change.rs` |
+    /// | drained accumulator flush                 | same                                              | `capture_local_change.rs` |
+    /// | paused-item resume catch-up               | `capture_resumed_item` -> `process_flush(Paths)`  | `capture_local_change.rs` |
+    ///
+    /// Three paths write the index and owe nothing, because none of them can
+    /// CLEAR a row -- which is the predicate, not "does not touch the dirty
+    /// journal". The initial scan and the periodic disk-reconcile backstop
+    /// both go through `reconcile_disk_with_ignore`, which does reach the
+    /// journal: its withheld-tail branch calls `record_dirty_path` so a
+    /// policy-withheld chunk is re-driven later. That is a write, never a
+    /// delete, so it opens barriers and never closes one. The executor's
+    /// streaming arm reaches the same scan and no further: it runs only under
+    /// `burst_fallback`, which is `DebounceFlush::RescanRequired`, and
+    /// `process_flush_with_ignore_streaming` routes `RescanRequired` there --
+    /// its `Paths` case is unreachable, because a `Paths` flush never takes
+    /// the streaming arm. The initial scan signals anyway: harmless
+    /// over-notification.
+    ///
+    /// So when adding a caller, the question to ask is not whether it names
+    /// the dirty journal. It is whether it can reach
+    /// `clear_dirty_paths_conditional_batch`.
+    ///
+    /// This enumeration is the fragile part. Making the durable clear itself
+    /// the producer would remove it; until then, adding a caller of that arm
+    /// means adding a row here.
+    fn note_capture_settled(&self, group_id: &str);
 }
 
 /// Everything the per-link runtime machinery actually needs, narrowed down
@@ -56,15 +115,7 @@ pub(crate) struct LinkRuntimeDependencies {
     /// bundle threads down into the per-link runtime machinery
     /// (`factory.rs`/`startup.rs`'s startup-readiness calls/`tasks.rs`/
     /// `operations/repair_materialization.rs`, `startup.rs`'s
-    /// `build_change_processor`). Phase 7D-10.9 removed the `sync_state:
-    /// Arc<yadorilink_sync_core::index::SyncState>` field this used to
-    /// coexist additively alongside: `ReplicaCoordinator` already
-    /// implements `MaterializationStatePort`/`MaterializationExecutionPort`/
-    /// `PeerReplicaStatePort`/`LocalMutationStore` in full (the last one,
-    /// `replica_coordinator/local_mutation.rs`, closed the one remaining
-    /// blocker -- `build_change_processor`'s `LocalChangeProcessor`
-    /// construction -- named in this field's own prior doc comment), so
-    /// nothing in this module tree needs the concrete `SyncState` anymore.
+    /// `build_change_processor`).
     pub(crate) replica_coordinator: Arc<ReplicaCoordinator>,
     pub(crate) block_store: Arc<dyn BlockStore + Send + Sync>,
     pub(crate) telemetry: Arc<crate::runtime_telemetry::RuntimeTelemetry>,
@@ -82,6 +133,11 @@ impl LinkRuntimeDependencies {
 
     pub(crate) fn begin_write_activity(&self) -> Box<dyn Send + '_> {
         self.host.begin_write_activity()
+    }
+
+    /// See [`LinkRuntimeHostPort::note_capture_settled`].
+    pub(crate) fn note_capture_settled(&self, group_id: &str) {
+        self.host.note_capture_settled(group_id);
     }
 
     pub(crate) fn device_signing_key(&self) -> Option<ed25519_dalek::SigningKey> {

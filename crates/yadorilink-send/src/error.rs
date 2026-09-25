@@ -1,8 +1,4 @@
-//! This crate's single error type. `store.rs`'s `SendStore::read`/`write`/
-//! `write_immediate` closures return this directly (via `SqlOperationError`,
-//! matching the exact seam `yadorilink-sqlite-runtime`'s own doc comment
-//! describes for `yadorilink-sync-core::SyncError`), so a store call site
-//! never converts through a second, storage-only error enum first.
+//! This crate's single error type.
 
 #[derive(Debug, thiserror::Error)]
 pub enum SendError {
@@ -20,6 +16,12 @@ pub enum SendError {
 
     #[error("transport error: {0}")]
     Transport(#[from] yadorilink_transport::TransportError),
+
+    #[error("network error: {0}")]
+    Network(#[from] yadorilink_sync_substrate::SubstrateError),
+
+    #[error("could not reach device {0} in time")]
+    DialTimedOut(String),
 
     #[error("wire decode error: {0}")]
     Decode(#[from] prost::DecodeError),

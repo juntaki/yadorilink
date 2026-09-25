@@ -1,19 +1,14 @@
-//! `yadorilink_root_authority::root_identity::VerifiedRoot` exercised against
-//! a real `ReplicaCoordinator` -- moved here from `yadorilink-sync-core`'s
-//! own `#[cfg(test)]` module in Phase 7D-9B, when `root_identity.rs` itself
-//! moved to `yadorilink-root-authority` (repointed off `SyncState` in Phase
-//! 7D-10's final sync-core deletion pass). This crate's own `#[cfg(test)]`
-//! compilation and this integration-test binary are distinct builds of
-//! `ReplicaCoordinator` (same reasoning as `materialization_local_capture.rs`'s
-//! identical relocation in Phase 7D-8.6's move of `LocalChangeProcessor`),
-//! so the coverage that needs a concrete, real `ReplicaCoordinator` has to
-//! live in a binary that links `yadorilink-daemon` as an ordinary external
-//! dependency -- which an external `tests/*.rs` binary always does,
-//! regardless of `cfg(test)`.
-//!
-//! `only_the_top_level_marker_is_recognized` (pure, zero-`ReplicaCoordinator`)
-//! stayed behind in `yadorilink-root-authority::root_identity`'s own
-//! `#[cfg(test)]` module instead of moving here -- see that module's doc.
+//! This crate's own `#[cfg(test)]` compilation and this integration-test
+//! binary are distinct builds of `ReplicaCoordinator` (same reasoning as
+//! `materialization_local_capture.rs`'s identical relocation in Phase
+//! 7D-8.6's move of `LocalChangeProcessor`), so the coverage that needs a
+//! concrete, real `ReplicaCoordinator` has to live in a binary that links
+//! `yadorilink-daemon` as an ordinary external dependency -- which an
+//! external `tests/*.rs` binary always does, regardless of `cfg(test)`.
+//! `only_the_top_level_marker_is_recognized` (pure,
+//! zero-`ReplicaCoordinator`) stayed behind in
+//! `yadorilink-root-authority::root_identity`'s own `#[cfg(test)]` module
+//! instead of moving here -- see that module's doc.
 
 use std::path::{Path, PathBuf};
 

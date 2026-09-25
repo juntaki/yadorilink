@@ -10,7 +10,8 @@ use yadorilink_local_storage::BlockStore;
 
 use crate::gc_state::GcState;
 use crate::governance_config::GovernanceConfigStore;
-use crate::peer_registry::{PeerReachability, PeerRegistry};
+use crate::peer_connectivity_runtime::PeerConnectivityRuntime;
+use crate::peer_registry::PeerReachability;
 use crate::queries::link_status::{LinkStatusQueryService, LinkStatusView};
 use crate::queries::update_status::{UpdateStatusQueryService, UpdateStatusView};
 use crate::runtime_telemetry::RuntimeTelemetry;
@@ -20,20 +21,6 @@ use yadorilink_peer_session::rate_limiter::RateLimiters;
 pub(crate) struct PeerStatusView {
     pub(crate) device_id: String,
     pub(crate) reachability: PeerReachability,
-    /// M4 Pass 3: see `crate::route::RelayCapability`'s own doc comment --
-    /// a device-level self-declared capability, independent of
-    /// `reachability`'s own route kind and of storage role.
-    pub(crate) relay_capability: crate::route::RelayCapability,
-}
-
-/// M4 Pass 3: narrow port for `RelayCapability` lookups by device --
-/// `peer_netmap_metadata` (where this fact actually lives) is
-/// `DaemonState`-private, and this query service deliberately holds only
-/// narrow ports/types, not `DaemonState` itself (see this module's own
-/// doc comment). Implemented directly by `DaemonState` in
-/// `adapters/mod.rs`'s construction site.
-pub(crate) trait RelayCapabilityPort: Send + Sync {
-    fn relay_capability(&self, device_id: &str) -> crate::route::RelayCapability;
 }
 
 #[derive(Debug, Clone)]
@@ -88,8 +75,7 @@ pub(crate) struct RuntimeStatusView {
 pub(crate) struct RuntimeStatusQueryService {
     link_status: Arc<LinkStatusQueryService>,
     update_status: Arc<UpdateStatusQueryService>,
-    peers: Arc<PeerRegistry>,
-    relay_capability: Arc<dyn RelayCapabilityPort>,
+    peers: Arc<PeerConnectivityRuntime>,
     telemetry: Arc<RuntimeTelemetry>,
     governance: Arc<GovernanceConfigStore>,
     block_store: Arc<dyn BlockStore + Send + Sync>,
@@ -102,8 +88,7 @@ impl RuntimeStatusQueryService {
     pub(crate) fn new(
         link_status: Arc<LinkStatusQueryService>,
         update_status: Arc<UpdateStatusQueryService>,
-        peers: Arc<PeerRegistry>,
-        relay_capability: Arc<dyn RelayCapabilityPort>,
+        peers: Arc<PeerConnectivityRuntime>,
         telemetry: Arc<RuntimeTelemetry>,
         governance: Arc<GovernanceConfigStore>,
         block_store: Arc<dyn BlockStore + Send + Sync>,
@@ -113,7 +98,6 @@ impl RuntimeStatusQueryService {
         Self {
             link_status,
             update_status,
-            relay_capability,
             peers,
             telemetry,
             governance,
@@ -127,20 +111,12 @@ impl RuntimeStatusQueryService {
         let links = self.link_status.list_links()?;
         let peers = self
             .peers
-            .snapshot()
+            .every_peer_reachability()
             .into_iter()
-            .map(|snapshot| {
-                // A connected peer used to be promoted to
-                // `ProtocolIncompatible` here when its handshake arrived
-                // without the change-DAG capability bit. There is no such
-                // peer any more: the protocol generation rides the ALPN, so
-                // one that does not speak this generation is refused inside
-                // the TLS handshake and never becomes connected in the
-                // first place.
-                let reachability = snapshot.reachability;
-                let relay_capability = self.relay_capability.relay_capability(&snapshot.device_id);
-                PeerStatusView { device_id: snapshot.device_id, reachability, relay_capability }
-            })
+            // A peer of another protocol generation never reaches this list
+            // as connected: the generation rides the ALPN, so it is refused
+            // inside the TLS handshake and no connection to it comes up.
+            .map(|(device_id, reachability)| PeerStatusView { device_id, reachability })
             .collect();
         let governance = self.governance.load_or_default();
         let volumes = self.volumes_free_space(&links);

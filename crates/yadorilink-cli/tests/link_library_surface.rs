@@ -17,11 +17,11 @@ use std::sync::Arc;
 
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 
 async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>) {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsBlockStore::new(dir.path().join("blocks")).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(dir.path().join("blocks")).unwrap());
     let sync_state = Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
     let state = DaemonState::new("device-under-test".into(), sync_state, store);
     // A registered (non-empty device_id) device with no change-signing key is
@@ -63,7 +63,7 @@ async fn empty_folder_previews_clean_and_links() {
     std::fs::create_dir_all(&folder).unwrap();
 
     let (absolute, report) =
-        yadorilink_cli::commands::link::run_link_preflight(&folder.to_string_lossy())
+        yadorilink_client_core::ops::links::run_link_preflight(&folder.to_string_lossy())
             .await
             .unwrap();
     // Free-space state is environment-dependent, so we assert on the folder
@@ -75,7 +75,9 @@ async fn empty_folder_previews_clean_and_links() {
         report.warnings()
     );
 
-    yadorilink_cli::commands::link::link_resolved(absolute, "group-1".into(), false).await.unwrap();
+    yadorilink_client_core::ops::links::link_resolved(absolute, "group-1".into(), false)
+        .await
+        .unwrap();
 
     let linked: Vec<String> = state
         .replica_coordinator
@@ -103,7 +105,7 @@ async fn non_empty_folder_surfaces_a_warning() {
     std::fs::write(folder.join("existing.txt"), b"hi").unwrap();
 
     let (_absolute, report) =
-        yadorilink_cli::commands::link::run_link_preflight(&folder.to_string_lossy())
+        yadorilink_client_core::ops::links::run_link_preflight(&folder.to_string_lossy())
             .await
             .unwrap();
     assert!(report.is_risky());
@@ -129,16 +131,18 @@ async fn nested_link_is_refused_without_ack_and_allowed_with_ack() {
     // Register the child link first — it has no nested conflict, so the
     // daemon accepts it with ack=false regardless of free-space state.
     let (child_abs, child_report) =
-        yadorilink_cli::commands::link::run_link_preflight(&child.to_string_lossy()).await.unwrap();
+        yadorilink_client_core::ops::links::run_link_preflight(&child.to_string_lossy())
+            .await
+            .unwrap();
     assert!(child_report.nested_conflicts.is_empty());
-    yadorilink_cli::commands::link::link_resolved(child_abs, "group-child".into(), false)
+    yadorilink_client_core::ops::links::link_resolved(child_abs, "group-child".into(), false)
         .await
         .unwrap();
 
     // Now the parent nests an existing link — preflight detects it, and the
     // daemon rejects a link that does not acknowledge it.
     let (parent_abs, parent_report) =
-        yadorilink_cli::commands::link::run_link_preflight(&parent.to_string_lossy())
+        yadorilink_client_core::ops::links::run_link_preflight(&parent.to_string_lossy())
             .await
             .unwrap();
     assert!(
@@ -146,7 +150,7 @@ async fn nested_link_is_refused_without_ack_and_allowed_with_ack() {
         "preflight should detect the nested child link"
     );
 
-    let refused = yadorilink_cli::commands::link::link_resolved(
+    let refused = yadorilink_client_core::ops::links::link_resolved(
         parent_abs.clone(),
         "group-parent".into(),
         false,
@@ -154,7 +158,7 @@ async fn nested_link_is_refused_without_ack_and_allowed_with_ack() {
     .await;
     assert!(refused.is_err(), "daemon must refuse a nested link without acknowledge_risks");
 
-    yadorilink_cli::commands::link::link_resolved(parent_abs, "group-parent".into(), true)
+    yadorilink_client_core::ops::links::link_resolved(parent_abs, "group-parent".into(), true)
         .await
         .unwrap();
 

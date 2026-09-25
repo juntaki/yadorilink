@@ -48,6 +48,11 @@ message StatusResponse {
   // edit-presence-awareness capability.
   reserved 4;
   reserved "open_elsewhere_device_id";
+  // Why the path is in `state`, when the state alone does not say it --
+  // e.g. a directory whose delete was applied but that is kept on disk
+  // because it holds local content that was never synced
+  // ("retained: local untracked content"). Empty otherwise.
+  string status_detail = 5;
 }
 
 // Daemon-initiated push so the shell extension can serve most queries from
@@ -130,7 +135,7 @@ message FolderFileEntry {
   uint64 size = 2;
   int64 mtime_unix_nanos = 3;
   MaterializationState materialization_state = 4;
-  // M2-2: set only when `materialization_state == MATERIALIZATION_STATE_
+  // Set only when `materialization_state == MATERIALIZATION_STATE_
   // PLACEHOLDER`, the CfAPI generation token the daemon has minted (and
   // persisted in its own index) for this placeholder — cfapi-host encodes
   // this EXACT value into the real placeholder's `FileIdentity` when it
@@ -142,10 +147,34 @@ message FolderFileEntry {
   // would create a placeholder for the WRONG generation the very first
   // time a real mint raced ahead of a stale poll response.
   optional uint64 placeholder_generation = 5;
+  // What this entry is. An explicit (tracked) directory is listed as its own
+  // entry, so a shell that synthesizes directories from path prefixes must
+  // not create a second node for it. `ENTRY_KIND_UNSPECIFIED` is only the
+  // proto3 default; the daemon always sets a real kind.
+  EntryKind kind = 6;
+}
+
+enum EntryKind {
+  ENTRY_KIND_UNSPECIFIED = 0;
+  ENTRY_KIND_FILE = 1;
+  ENTRY_KIND_DIRECTORY = 2;
+  ENTRY_KIND_SYMLINK = 3;
 }
 
 message ListFolderFilesResponse {
   repeated FolderFileEntry entries = 1;
+  // Same contract as `ListOnDemandFoldersResponse.snapshot_available`: the
+  // daemon sets this true only when it actually confirmed the folder's file
+  // listing (found the live link and read its file index and every entry's
+  // materialization state without error). An empty `entries` is an
+  // authoritative "this folder has zero files" ONLY when this is true. A
+  // DB read failure, a `local_path` that names no live link, a decode/
+  // framing failure, or a response that omits the field all read as false.
+  // Callers MUST treat `snapshot_available == false` like a transport
+  // failure: the macOS File Provider ends the enumeration with an error
+  // rather than reporting an empty folder, and cfapi-host skips that
+  // folder's placeholder sync for the poll.
+  bool snapshot_available = 2;
 }
 
 enum LocalWriteKind {
@@ -154,7 +183,7 @@ enum LocalWriteKind {
   LOCAL_WRITE_KIND_DELETED = 2;
 }
 
-// M1-3: the OS virtual-filesystem's own create/modify/delete callbacks
+// The OS virtual-filesystem's own create/modify/delete callbacks
 // (macOS `NSFileProviderReplicatedExtension`'s `createItem`/`modifyItem`/
 // `deleteItem`) notify the daemon that a local write already landed on
 // disk under `local_path`/`relative_path` -- the daemon re-observes the
@@ -179,7 +208,7 @@ message LocalWriteResponse {
   string error = 2;
 }
 
-// M2-3b: the daemon-initiated counterpart to `HydrateRequest` -- native
+// The daemon-initiated counterpart to `HydrateRequest` -- native
 // Windows eviction must confirm real on-disk dehydration (`CfDehydrate
 // Placeholder`) happened before the daemon commits the row to `Placeholder`
 // and reclaims blocks, so (unlike every other message pair above, all of
@@ -199,12 +228,10 @@ message DehydrateRequest {
   // identity (persists unchanged across the create-then-hydrate cycle, see
   // `MaterializationExecutionPort::get_recorded_placeholder_identity`'s doc
   // comment) -- cfapi-host verifies the on-disk object's current identity
-  // matches before dehydrating, refusing otherwise. `optional`: absent only
-  // if the daemon never had a generation recorded for this path at all (a
-  // pre-M2-3a row, or a legacy/mismatched provider_kind), in which case
-  // cfapi-host skips the identity check and dehydrates unconditionally,
-  // relying solely on `evict_file`'s own disk-content revalidation.
-  optional uint64 expected_generation = 2;
+  // matches before dehydrating, refusing otherwise. Always checked: the
+  // daemon refuses to evict a row with no recorded generation before it
+  // ever sends this request.
+  uint64 expected_generation = 2;
 }
 
 message DehydrateResponse {

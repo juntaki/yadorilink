@@ -2,33 +2,18 @@
 //! (`materialization_eviction.rs`) and `repair_interrupted_materializations`/
 //! `reconcile_restore_operations`/`quarantine_dirty_disk_file`'s
 //! (`materialization_repair.rs`) need from whatever concrete state backs
-//! them -- a narrower trait than `yadorilink-sync-sqlite`'s own
-//! `MaterializationStatePort` (38 methods), which mixes this
-//! filesystem-lifecycle-flavored surface with SQL/DAG-flavored methods
-//! (`dag_get_change`/`mark_deleted`/`upsert_file`/...) that belong on
-//! `yadorilink-sync-sqlite`/`yadorilink-replica-engine` instead, and which
-//! leaks a `yadorilink-sync-sqlite` concrete type
-//! (`mark_deleted_emitting_change`'s `ChangeEmitter` parameter) that this
-//! crate must never depend on. Covers exactly the method surface a direct
-//! grep of every `state.<method>(` call across those two files' production
-//! code finds (originally enumerated in Phase 7D-9C's fourth-pass exit
-//! report, §10.3, back when this code still lived in a single
-//! `materialization.rs`), plus one narrow delegate (`reclaim_cached_blocks`)
-//! added for the same "concrete type a trait object can't produce" reason
-//! as `open_materialization_intent_guard` below: `yadorilink-sync-sqlite`'s
-//! own `BlockDeletionCoordinator::reclaim_cached_blocks` still needs `&dyn
-//! yadorilink_sync_sqlite::MaterializationStatePort` (the *wider* trait),
-//! which this crate cannot name without depending on `yadorilink-sync-
-//! sqlite`, which itself already depends on this crate -- routing the call
-//! through a method on this port instead lets `impl
-//! MaterializationExecutionPort for ReplicaCoordinator` perform the
-//! concrete call internally, where `self` already satisfies the wider
-//! trait.
+//! them. Covers exactly the method surface a direct grep of every
+//! `state.<method>(` call across those two files' production code finds,
+//! plus
+//! one semantic operation (`reclaim_verified_cached_blocks`) whose
+//! custody/pin/materialization-state revalidation is owned by the concrete
+//! state (`ReplicaCoordinator::reclaim_cached_blocks` in
+//! `yadorilink-daemon`), since it reads across repositories this crate
+//! cannot name.
 //!
 //! `impl MaterializationExecutionPort for ReplicaCoordinator` stays in
 //! `yadorilink-daemon` (orphan rule -- `ReplicaCoordinator` is
-//! daemon-local), mirroring `PeerReplicaStatePort`/`LocalMutationStore`'s
-//! own precedent exactly: the trait *definition* crosses the crate line,
+//! daemon-local), mirroring `LocalMutationStore`'s own precedent exactly: the trait *definition* crosses the crate line,
 //! the impl does not.
 
 use std::path::Path;
@@ -43,7 +28,48 @@ use yadorilink_root_authority::root_commit::RootCommitPermit;
 use yadorilink_root_authority::root_identity::VerifiedRoot;
 
 use crate::block_liveness::BlockPhysicalDeletionGuard;
-use crate::materialization_types::{EvictableFile, RestoreCommitOutcome, RestoreOperation};
+use yadorilink_replica_domain::session_state::{
+    EvictableFile, RestoreCommitOutcome, RestoreOperation,
+};
+
+/// What an open materialization intent is for, as the materialization owner
+/// classifies it ([`MaterializationExecutionPort::materialization_intent_kind`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaterializationIntentKind {
+    /// A write of content to the path is in flight. A missing file under
+    /// it is an interrupted write, and repair may rebuild it.
+    Materialize,
+    /// A removal of the path is in flight (a tombstone delete). A missing
+    /// file under it is where the delete was heading: repair must not
+    /// rebuild it, and leaves the path to the outstanding delete.
+    Delete,
+}
+
+/// What an eviction that failed after it opened (the row `Evicting`, the
+/// fence bumped) knows about the path, which decides the state
+/// [`MaterializationExecutionPort::abandon_eviction`] leaves the row in.
+#[derive(Debug, Clone)]
+pub enum AbandonedEviction {
+    /// The placeholder write did not happen, and the lane re-verified under
+    /// the path lock that the file is still the one it revalidated before
+    /// the open (same disk identity, bytes matching the evicted version's
+    /// blocks), and observed its `identity`. The row goes back to
+    /// `Hydrated` with a proof of that version published under the live
+    /// fence.
+    Intact { identity: yadorilink_root_authority::fs_identity::FileIdentity },
+    /// The placeholder write did not happen, but the file no longer
+    /// verifies (a local edit or removal landed during the attempt) or
+    /// could not be observed. The row goes back to `Hydrated` without a
+    /// proof: an edit is the watcher's and the dirty-path journal's to
+    /// capture, and the repair sweep re-proves bytes that do match.
+    NotWritten,
+    /// The placeholder may be on disk: the native dehydrate's outcome is
+    /// unknown ([`MaterializationExecutionError::EvictionOutcomeAmbiguous`]),
+    /// or the placeholder was written and the settle failed. The row goes
+    /// to `Placeholder`, the resolution the startup reset gives a stale
+    /// `Evicting` row, which is safe whether or not the write landed.
+    PlaceholderMayExist,
+}
 
 /// An open, durably-recorded materialization intent for one path, returned
 /// by [`MaterializationExecutionPort::open_materialization_intent_guard`].
@@ -54,10 +80,9 @@ use crate::materialization_types::{EvictableFile, RestoreCommitOutcome, RestoreO
 /// is durable. Dropping without calling `clear` is itself meaningful: the
 /// intent stays recorded, so the next repair pass treats a missing file at
 /// this path as a crash to recover, not an offline delete. Mirrors
-/// `yadorilink-peer-session::ports::OpenMaterializationIntent` and
-/// `yadorilink-sync-sqlite`'s own `OpenMaterializationIntent` exactly --
+/// `yadorilink-peer-session::ports::OpenMaterializationIntent` exactly --
 /// `MaterializationIntentGuard` implements one marker trait per consumer
-/// crate, since none of the three can depend on either of the others.
+/// crate, since neither can depend on the other.
 pub trait OpenMaterializationIntent: Send {
     fn clear(self: Box<Self>) -> Result<(), MaterializationExecutionError>;
 }
@@ -90,11 +115,37 @@ pub struct EvictionRevalidationSnapshot {
 /// The reads `repair_interrupted_materializations_inner`'s per-path loop
 /// re-performs under the path lock, before deciding whether a `Hydrated`
 /// row is a genuine interrupted-materialization candidate.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RepairRowSnapshot {
     pub materialization_state: Option<MaterializationState>,
     pub record_kind: Option<RecordKind>,
     pub file: Option<FileRecord>,
+    /// The raw symlink target the same row records, for a caller
+    /// verifying a symlink by kind -- see the note on `current_authoring`
+    /// for why it is carried rather than read separately.
+    pub symlink_target: Option<Vec<u8>>,
+    /// The version the current row names. Carried on the snapshot rather
+    /// than fetched where it is used: every proof this repair pass
+    /// publishes has to name it, and this snapshot is already the one
+    /// consolidated read the per-path loop performs under the path lock.
+    /// A separate accessor would add a read to every row of a sweep that
+    /// runs at whole-replica scale.
+    pub current_version: Option<yadorilink_replica_domain::ids::VersionHash>,
+    /// The authoring identity of that same row, from the same statement as
+    /// `current_version`.
+    pub current_authoring: Option<yadorilink_replica_domain::ids::ChangeHash>,
+    /// The mode and the replicated xattrs this row records, from that
+    /// same statement.
+    ///
+    /// Carried, not fetched where they are applied. Every repair arm
+    /// that writes a file follows it with a real `chmod` and
+    /// `fsetxattr`, and both fields are hashed into `current_version` --
+    /// so re-reading them after the bytes are down applies one
+    /// incarnation's metadata under another incarnation's proof, and the
+    /// exactness gate cannot catch it, because it verifies against the
+    /// same row that supplied the wrong value.
+    pub unix_mode: Option<u32>,
+    pub xattrs: Vec<(String, Vec<u8>)>,
 }
 
 /// This crate's own error type for the materialization/eviction/repair
@@ -127,10 +178,15 @@ pub enum MaterializationExecutionError {
     #[error("eviction of {0:?} was rejected")]
     EvictionRejected(String),
 
-    /// M2-3b: a `dehydrate_windows_placeholder` call's outcome could not be
-    /// determined -- a Codex-review finding on this method's own doc
-    /// comment claiming "every returned error means dehydration did NOT
-    /// happen" was false as originally written: `dehydrate_server`
+    /// A reconstruct wrote the bytes and mode, but the replicated extended
+    /// attributes it set could not be confirmed, so it has no exact proof.
+    /// Path-local and retriable, like any other failed reconstruct.
+    #[error("replicated extended attributes not proven: {0}")]
+    ReplicatedXattrsNotProven(String),
+
+    /// A `dehydrate_windows_placeholder` call's outcome could not be
+    /// determined. Not every returned error means dehydration did NOT
+    /// happen: `dehydrate_server`
     /// performs the real `CfDehydratePlaceholder` call BEFORE writing its
     /// response, so a transport-level failure (timeout, a dropped pipe,
     /// the response never arriving) can happen AFTER the native dehydrate
@@ -139,12 +195,13 @@ pub enum MaterializationExecutionError {
     /// `EvictionRejected` (a coherent response was received, so the
     /// server's own logic ran to completion and its answer is trusted),
     /// this variant must NOT be treated as "the file is still fully
-    /// materialized" -- `evict_file`'s caller must leave the row in
-    /// `Evicting` rather than roll it back to `Hydrated`, since `Evicting`
-    /// is the state `reset_stale_evicting_to_placeholder`'s startup
-    /// recovery already safely resolves regardless of which of the two
+    /// materialized" -- `evict_file` must not roll the row back to
+    /// `Hydrated`. It resolves the row to `Placeholder` instead
+    /// ([`AbandonedEviction::PlaceholderMayExist`]), the resolution
+    /// `reset_stale_evicting_to_placeholder`'s startup recovery gives a
+    /// stale `Evicting` row, which is safe regardless of which of the two
     /// real outcomes actually happened (see that function's own doc
-    /// comment; M2-3b's design never mints a fresh identity on eviction,
+    /// comment; Windows eviction never mints a fresh identity,
     /// which is exactly what makes resolving to `Placeholder` safe in
     /// both cases).
     #[error("eviction outcome for {0:?} could not be confirmed")]
@@ -177,6 +234,44 @@ pub enum MaterializationExecutionError {
     RootAuthority(#[from] yadorilink_root_authority::RootAuthorityError),
 }
 
+impl MaterializationExecutionError {
+    /// Whether this failure belongs to the one path an operation was
+    /// working on (its file could not be read, written, renamed or
+    /// observed; it was busy, rejected, missing, or escaped the root), so a
+    /// sweep over many paths may record it and go on to the next. Anything
+    /// else -- a database or invariant failure (`CorruptState`, which is
+    /// also what a SQLite error arrives as), a lost root or permit, a
+    /// group-wide policy gap, volume-wide disk pressure -- is not, and
+    /// aborts the sweep.
+    ///
+    /// `Io` and `NotFound` do not say by themselves whether the cause was
+    /// the path or the group, so group-wide causes are caught where they
+    /// can be told apart: every eviction re-verifies the root before it
+    /// touches anything and the repair sweep verifies it before its first
+    /// path (a missing link or root token, a missing marker, an unmounted
+    /// or replaced root all fail as `RootAuthority`), and both sweeps
+    /// re-verify their permit before continuing past a path-local failure,
+    /// because an owner transaction reports a lost root as `Io`.
+    pub fn is_path_local(&self) -> bool {
+        use yadorilink_local_storage::StorageError as S;
+        match self {
+            Self::Io(_)
+            | Self::NotFound(_)
+            | Self::EvictionRejected(_)
+            | Self::ReplicatedXattrsNotProven(_)
+            | Self::EvictionOutcomeAmbiguous(_)
+            | Self::PathEscapesRoot(_) => true,
+            Self::Storage(storage) => {
+                matches!(storage, S::Io(_) | S::InvalidPath(_) | S::PathEscapesRoot(_))
+            }
+            Self::CorruptState(_)
+            | Self::PolicyUnavailable
+            | Self::DiskPressure { .. }
+            | Self::RootAuthority(_) => false,
+        }
+    }
+}
+
 impl From<yadorilink_local_storage::StorageError> for MaterializationExecutionError {
     fn from(error: yadorilink_local_storage::StorageError) -> Self {
         match error {
@@ -199,53 +294,54 @@ impl From<yadorilink_local_storage::StorageError> for MaterializationExecutionEr
     }
 }
 
-/// Capability surface `evict_file`'s function family needs: deciding which
-/// files to evict, tracking the durable materialization-write-in-progress
-/// intent journal that disambiguates a crash from an offline delete, and
-/// replaying the crash-safe restore journal -- the filesystem-lifecycle
-/// subset of `yadorilink-sync-sqlite`'s own `MaterializationStatePort`'s
-/// wider surface (see this module's own doc comment for why the wider trait
-/// itself does not move into this crate).
-/// Duplicated from `yadorilink_sync_sqlite::MaterializedFingerprint` rather
-/// than adding a dependency on that crate solely for this alias -- same
-/// "duplicate small leaf types rather than force an awkward dependency"
-/// precedent this trait's own `PlaceholderDiskIdentity`-adjacent methods
-/// already follow, and matches `yadorilink-peer-session`'s own independent
-/// duplication of the identical alias.
-pub type MaterializedFingerprint = (u64, Option<std::time::SystemTime>, i64, i64);
+/// The structural-directory ledger of one group, as the materializer's
+/// `mkdir` helper (`yadorilink_local_storage::
+/// create_dir_all_never_through_a_symlink`) records into it: every
+/// directory created for a descendant goes through the owner's two-phase
+/// origin protocol on `port`.
+pub struct GroupStructuralLedger<'a> {
+    port: &'a dyn MaterializationExecutionPort,
+    group_id: &'a str,
+}
+
+impl<'a> GroupStructuralLedger<'a> {
+    pub fn new(port: &'a dyn MaterializationExecutionPort, group_id: &'a str) -> Self {
+        Self { port, group_id }
+    }
+}
+
+fn ledger_error(error: MaterializationExecutionError) -> yadorilink_local_storage::StorageError {
+    yadorilink_local_storage::StorageError::Io(std::io::Error::other(format!(
+        "structural-directory ledger: {error}"
+    )))
+}
+
+impl yadorilink_local_storage::StructuralDirectoryLedger for GroupStructuralLedger<'_> {
+    fn record_intent(&self, rel_path: &str) -> Result<(), yadorilink_local_storage::StorageError> {
+        self.port.record_structural_directory_intent(self.group_id, rel_path).map_err(ledger_error)
+    }
+
+    fn complete(
+        &self,
+        rel_path: &str,
+        identity: &yadorilink_root_authority::fs_identity::FileIdentity,
+    ) -> Result<(), yadorilink_local_storage::StorageError> {
+        self.port
+            .complete_structural_directory_origin(self.group_id, rel_path, identity)
+            .map_err(ledger_error)
+    }
+
+    fn abandon(&self, rel_path: &str) -> Result<(), yadorilink_local_storage::StorageError> {
+        self.port.abandon_structural_directory_intent(self.group_id, rel_path).map_err(ledger_error)
+    }
+}
 
 pub trait MaterializationExecutionPort: Send + Sync {
-    fn get_unix_mode(
-        &self,
-        group_id: &str,
-        path: &str,
-    ) -> Result<Option<u32>, MaterializationExecutionError>;
-
-    /// See `yadorilink_replica_domain::file::FileMeta::xattrs`'s own doc
-    /// comment -- the same allow-listed extended attributes `get_unix_mode`
-    /// above applies for the recorded permission bits.
-    fn get_xattrs(
-        &self,
-        group_id: &str,
-        path: &str,
-    ) -> Result<Vec<(String, Vec<u8>)>, MaterializationExecutionError>;
-
     fn get_file(
         &self,
         group_id: &str,
         path: &str,
     ) -> Result<Option<FileRecord>, MaterializationExecutionError>;
-
-    /// The raw, unresolved symlink target bytes recorded for `path` --
-    /// `None` when there is no row, the row is not a symlink, or no
-    /// target was ever recorded for a symlink-classified row. Repair's
-    /// own symlink-recovery path (`materialization_repair.rs`) uses this
-    /// to know what to recreate.
-    fn get_symlink_target(
-        &self,
-        group_id: &str,
-        path: &str,
-    ) -> Result<Option<Vec<u8>>, MaterializationExecutionError>;
 
     /// Whether `group_id`'s link has opted in to writing real Windows
     /// symlinks -- see `yadorilink-peer-session`'s identically-named
@@ -287,11 +383,14 @@ pub trait MaterializationExecutionPort: Send + Sync {
         MaterializationExecutionError,
     >;
 
-    fn has_materialization_intent(
+    /// What the intent open on `path` is for, if one is open: the
+    /// materialization owner's classification of its target. Repair acts
+    /// on the kind, never on the raw target.
+    fn materialization_intent_kind(
         &self,
         group_id: &str,
         path: &str,
-    ) -> Result<bool, MaterializationExecutionError>;
+    ) -> Result<Option<MaterializationIntentKind>, MaterializationExecutionError>;
 
     /// Whether `path` currently has a REMOTE-origin row in the projection-
     /// obligation worklist (any state, including the parked
@@ -307,7 +406,7 @@ pub trait MaterializationExecutionPort: Send + Sync {
     /// desired state unsettled (freshly admitted, mid-materialize-retry,
     /// or otherwise not yet placed -- see this method's own callers for
     /// the "not yet settled, not settled-but-wrong" scope this signal
-    /// covers, and does not). This is a SEPARATE signal from `has_materialization_intent`/
+    /// covers, and does not). This is a SEPARATE signal from `materialization_intent_kind`/
     /// `list_materialization_intent_paths`: an intent exists only for the
     /// narrow window of one in-flight physical write, while an obligation
     /// can be outstanding long before any write is ever attempted (or
@@ -354,17 +453,6 @@ pub trait MaterializationExecutionPort: Send + Sync {
         permit: &RootCommitPermit,
     ) -> Result<(), MaterializationExecutionError>;
 
-    /// Records the durable materialization-write-in-progress intent, which
-    /// MUST be committed before the temp-write-then-rename that
-    /// materializes content begins.
-    fn begin_materialization_intent(
-        &self,
-        group_id: &str,
-        path: &str,
-        target_version_hash: &[u8],
-        permit: &RootCommitPermit,
-    ) -> Result<(), MaterializationExecutionError>;
-
     /// Tombstones a path and appends the signed `Delete` change describing
     /// it, in one transaction. Returns `Err(PolicyUnavailable)` when the
     /// group's policy has not loaded this run, in which case the emission
@@ -393,101 +481,59 @@ pub trait MaterializationExecutionPort: Send + Sync {
         permit: &RootCommitPermit,
     ) -> Result<(), MaterializationExecutionError>;
 
-    fn set_materialization_state(
+    /// Whether `(group_id, path)`'s standing proof is a proof about the
+    /// version the row currently names -- the whole of what
+    /// `MaterializationState::Hydrated` claims exists, not just its
+    /// presence. Fail-closed: a generation published under a superseded
+    /// mutation fence is NOT usable, nor is one that names a version the
+    /// path has moved off, nor a versionless one, nor no generation at
+    /// all -- and this cannot tell those apart on purpose.
+    fn has_usable_materialized_generation(
         &self,
         group_id: &str,
         path: &str,
-        state: MaterializationState,
-        permit: &RootCommitPermit,
-    ) -> Result<(), MaterializationExecutionError>;
+    ) -> Result<bool, MaterializationExecutionError>;
 
-    /// Atomically changes a current file's materialization state only when
-    /// it still matches `expected`.
-    fn transition_materialization_state(
+    /// The recovery lane's own commit, for a path this pass has verified
+    /// byte for byte and now has to FINISH: publish the proof, promote the
+    /// row, and clear the intent, in ONE transaction, with the guard
+    /// re-evaluated inside it against the live row.
+    ///
+    /// Distinct from both sibling commits, which the repair lane now
+    /// reaches only through owner operations (the internal commit and the
+    /// re-proving call in `yadorilink-daemon`'s `materialization_owner`),
+    /// and the gap between them is why it exists. The internal commit is
+    /// anchored on an epoch its caller bumped before its own write;
+    /// recovery mutated nothing and owns no such epoch. The re-proving
+    /// call is fence-free but deliberately leaves `materialization_state`
+    /// alone, which is right for a row already `Hydrated` and not enough
+    /// for one still in the transient state an interrupted
+    /// materialization left.
+    ///
+    /// `false` means the row was superseded between the caller's
+    /// verification and this commit; nothing was written, the intent
+    /// included.
+    fn commit_recovered_materialized_state(
         &self,
         group_id: &str,
         path: &str,
-        expected: MaterializationState,
-        next: MaterializationState,
+        state: yadorilink_peer_session::ports::ExactActualState,
+        expected: yadorilink_peer_session::ports::ExpectedAuthoring<'_>,
         permit: &RootCommitPermit,
     ) -> Result<bool, MaterializationExecutionError>;
 
-    /// M5-A review follow-up (blocker #56, second round): records the disk
-    /// identity of the exact bytes this device just wrote via a successful
-    /// `reconstruct_file`, alongside that same call's `Hydrated`
-    /// transition -- always called right after `reconstruct_file_
-    /// journaled` succeeds in this module's own repair path, exactly like
-    /// the live peer materialize/hydrate paths already do at their own
-    /// equivalent call sites. See `yadorilink_sync_sqlite::
-    /// materialization_state::MaterializationStateRepository::
-    /// record_materialized_fingerprint`'s own doc comment for the full
-    /// reasoning.
-    fn record_materialized_fingerprint(
-        &self,
-        group_id: &str,
-        path: &str,
-        fingerprint: Option<MaterializedFingerprint>,
-        permit: &RootCommitPermit,
-    ) -> Result<(), MaterializationExecutionError>;
-
-    /// Records the identity of the exact on-disk object a `write_placeholder`
-    /// call just created for `(group_id, path)` (M1-2) -- always called
-    /// alongside that same call's `set_materialization_state(Placeholder)`.
-    /// See `yadorilink_sync_sqlite::materialization_state::
-    /// MaterializationStateRepository::record_placeholder_generation`'s own
-    /// doc comment.
-    fn record_placeholder_generation(
-        &self,
-        group_id: &str,
-        path: &str,
-        identity: PlaceholderDiskIdentity,
-        provider_kind: &str,
-        permit: &RootCommitPermit,
-    ) -> Result<(), MaterializationExecutionError>;
-
-    /// Like [`Self::record_placeholder_generation`], but only if nothing is
-    /// recorded yet -- a concurrent winner's value is kept instead of being
-    /// overwritten. M2-3a's Windows placeholder-creation path (via
-    /// `yadorilink_local_storage::create_or_defer_placeholder`'s
-    /// `RecordIfAbsent` outcome) MUST use this, never the unconditional
-    /// version: on Windows, real on-disk placeholder creation is deferred
-    /// to a second process (`cfapi-host.exe`) that a concurrent
-    /// `ListFolderFilesRequest` backfill can already have supplied a
-    /// generation to, and an unconditional overwrite here would silently
-    /// orphan whatever that process already used. See
-    /// `yadorilink_sync_sqlite::materialization_state::
-    /// MaterializationStateRepository::record_placeholder_generation_if_absent`'s
-    /// own doc comment.
-    fn record_placeholder_generation_if_absent(
-        &self,
-        group_id: &str,
-        path: &str,
-        candidate: PlaceholderDiskIdentity,
-        provider_kind: &str,
-        permit: &RootCommitPermit,
-    ) -> Result<PlaceholderDiskIdentity, MaterializationExecutionError>;
-
-    /// Clears any placeholder identity recorded for `(group_id, path)` -- a
-    /// no-op if none was recorded. See
-    /// `MaterializationStateRepository::clear_placeholder_generation`'s own
-    /// doc comment for when callers must call this.
-    fn clear_placeholder_generation(
-        &self,
-        group_id: &str,
-        path: &str,
-        permit: &RootCommitPermit,
-    ) -> Result<(), MaterializationExecutionError>;
-
     /// The identity currently recorded on `(group_id, path)`'s row,
     /// regardless of its current `materialization_state` -- unlike
-    /// [`Self::record_placeholder_generation`]'s read counterpart in
+    /// `MaterializationStateRepository::record_placeholder_generation`'s
+    /// read counterpart in
     /// `MaterializationStateRepository::get_placeholder_generation` (gated to
     /// `materialization_state = 'placeholder'`, so it deliberately returns
     /// nothing once a row has hydrated), no production call site clears
     /// `placeholder_dev`/`placeholder_ino`/`placeholder_provider_kind` on the
     /// `Placeholder` -> `Hydrated` transition -- they are simply left in
-    /// place until an explicit [`Self::clear_placeholder_generation`] call.
-    /// M2-3b's Windows eviction path relies on exactly that: it reads a
+    /// place until an explicit clear ([`Self::record_placeholder_identity`]'s
+    /// `Clear` arm).
+    /// The Windows eviction path relies on exactly that: it reads a
     /// `Hydrated` file's still-recorded generation here as the expected
     /// identity to pass into the native dehydrate call -- an extra
     /// defense-in-depth check on top of the disk-content revalidation
@@ -498,14 +544,15 @@ pub trait MaterializationExecutionPort: Send + Sync {
         path: &str,
     ) -> Result<Option<(PlaceholderDiskIdentity, String)>, MaterializationExecutionError>;
 
-    /// M2-3b: asks the real Windows CfAPI provider process
+    /// Asks the real Windows CfAPI provider process
     /// (`yadorilink-cfapi-host.exe`) to natively dehydrate the placeholder
     /// at `out_path` (an absolute path), blocking until it confirms
     /// success or failure. `expected_generation`: the generation
     /// [`Self::get_recorded_placeholder_identity`] returned for this row,
     /// passed through as a defense-in-depth ABA guard (see
     /// `shell-ext/windows/src/cfapi.rs::dehydrate_placeholder`'s own doc
-    /// comment) -- `None` skips that guard. `materialization_eviction::
+    /// comment). The guard is mandatory: eviction refuses a row with no
+    /// recorded identity before reaching this call. `materialization_eviction::
     /// evict_to_placeholder`'s Windows arm gates the `Placeholder`
     /// transition and block reclamation on this call's success; its
     /// non-Windows arm never calls it at all.
@@ -527,7 +574,7 @@ pub trait MaterializationExecutionPort: Send + Sync {
         &self,
         _path: &str,
         _out_path: &Path,
-        _expected_generation: Option<u64>,
+        _expected_generation: u64,
     ) -> Result<(), MaterializationExecutionError> {
         Err(MaterializationExecutionError::EvictionRejected(
             "native Windows placeholder dehydration is not supported on this platform".to_string(),
@@ -538,10 +585,140 @@ pub trait MaterializationExecutionPort: Send + Sync {
     /// identity -- see `MaterializationStateRepository::
     /// list_placeholder_paths_missing_generation`'s own doc comment for
     /// the crash window this exists to close.
+    /// Every path of `group_id` a HistoryBase snapshot install replaced
+    /// and has not yet reconciled on disk, with what the replaced row had
+    /// placed there. See `crate::snapshot_install_reconcile`.
+    fn list_snapshot_install_holds(
+        &self,
+        group_id: &str,
+    ) -> Result<
+        Vec<yadorilink_replica_domain::session_state::SnapshotInstallHold>,
+        MaterializationExecutionError,
+    >;
+
+    /// Announces that the reconciliation of a held path is about to change
+    /// what is on disk under it (remove, move aside, or place a
+    /// placeholder), invalidating any proof or in-flight writer that read
+    /// the path before. Called once, before the first such change.
+    fn begin_snapshot_install_disk_write(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<(), MaterializationExecutionError>;
+
+    /// Releases a held path at `generation` once its disk agrees with the
+    /// installed row read at that generation, and in the same transaction
+    /// schedules the installed row's projection when it is live. Returns
+    /// whether it was released: `false` when an install renewed the hold
+    /// since, which leaves it held.
+    fn release_snapshot_install_hold(
+        &self,
+        group_id: &str,
+        path: &str,
+        generation: i64,
+    ) -> Result<bool, MaterializationExecutionError>;
+
+    /// Moves the installed File or Symlink row held at `path` to the copy
+    /// name the namespace projection gives it beside a directory, holds the
+    /// copy name for the next reconciliation to place, and releases
+    /// `path`'s hold -- only while that hold is at `generation`. Returns
+    /// the copy name, or `None` when nothing moved. See
+    /// `yadorilink_sync_sqlite::snapshot_install_hold`.
+    fn relocate_held_entry_beside_directory(
+        &self,
+        group_id: &str,
+        path: &str,
+        generation: i64,
+    ) -> Result<Option<String>, MaterializationExecutionError>;
+
     fn list_placeholder_paths_missing_generation(
         &self,
         group_id: &str,
     ) -> Result<Vec<String>, MaterializationExecutionError>;
+
+    /// Phase 1 of a structural `mkdir` of `path` (a directory this device
+    /// is about to create only to hold a descendant): records the intent
+    /// and moves the path's mutation fence, durably, before the syscall.
+    /// See `yadorilink_sync_sqlite::structural_origin`.
+    fn record_structural_directory_intent(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<(), MaterializationExecutionError>;
+
+    /// Phase 2 of a structural `mkdir` that created the directory: binds
+    /// the pending intent to the identity observed on it. Records nothing
+    /// (and says nothing) when the intent is gone or the fence moved; the
+    /// directory is then `OriginUnknown`, which keeps it and authors
+    /// nothing.
+    fn complete_structural_directory_origin(
+        &self,
+        group_id: &str,
+        path: &str,
+        identity: &yadorilink_root_authority::fs_identity::FileIdentity,
+    ) -> Result<(), MaterializationExecutionError>;
+
+    /// Phase 2 of a structural `mkdir` that did not create the directory
+    /// (`EEXIST`, or any failure): drops the pending intent, claiming
+    /// nothing.
+    fn abandon_structural_directory_intent(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<(), MaterializationExecutionError>;
+
+    /// Whether a live current index row of `group_id` lies strictly below
+    /// `path`: whether the rows the index holds need `path` as a directory.
+    /// The snapshot-install reconciliation's view of the namespace, since
+    /// an installed base's rows are what its disk has to match.
+    fn index_has_live_descendant(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<bool, MaterializationExecutionError>;
+
+    /// Whether `observed`, the directory now at `path`, is one this device
+    /// created (or adopted) only to hold descendants, per the
+    /// structural-origin ledger: the one kind of directory it may remove
+    /// once nothing needs it and it is empty.
+    fn is_structural_directory(
+        &self,
+        group_id: &str,
+        path: &str,
+        sync_root: &Path,
+        observed: &yadorilink_root_authority::fs_identity::FileIdentity,
+    ) -> Result<bool, MaterializationExecutionError>;
+
+    /// Records the directory now at `path` (`identity`) as structural: its
+    /// explicit entry is gone while live descendants keep it on disk, so it
+    /// goes with the last of them instead of staying as a directory of
+    /// unknown origin.
+    fn adopt_as_structural_directory(
+        &self,
+        group_id: &str,
+        path: &str,
+        identity: &yadorilink_root_authority::fs_identity::FileIdentity,
+    ) -> Result<(), MaterializationExecutionError>;
+
+    /// Records that the directory at `path` stays on disk, settled, because
+    /// it holds content this device does not replicate (D4: nothing
+    /// untracked is ever deleted). `removable` is the identity of the
+    /// directory this device placed there, which may go once it is empty;
+    /// `None` keeps whatever is there for good.
+    fn retain_directory_with_untracked_content(
+        &self,
+        group_id: &str,
+        path: &str,
+        removable: Option<&yadorilink_root_authority::fs_identity::FileIdentity>,
+    ) -> Result<(), MaterializationExecutionError>;
+
+    /// Settles a directory removed from disk: nothing is structural or
+    /// retained at `path` any more.
+    fn forget_removed_directory(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<(), MaterializationExecutionError>;
 
     /// Acquires the per-`(group_id, path)` lock so a materialization write
     /// cannot race a concurrent local capture or peer reconciliation of the
@@ -555,10 +732,13 @@ pub trait MaterializationExecutionPort: Send + Sync {
     ) -> Result<Vec<RestoreOperation>, MaterializationExecutionError>;
 
     /// Atomically publishes the exact journaled restore version and removes
-    /// its recovery marker.
+    /// its recovery marker, verifying `permit` inside that transaction.
     fn commit_restore_operation(
         &self,
         operation_id: &str,
+        identity: Option<&yadorilink_root_authority::fs_identity::FileIdentity>,
+        wrote_under_mutation_generation: Option<i64>,
+        permit: &RootCommitPermit,
     ) -> Result<RestoreCommitOutcome, MaterializationExecutionError>;
 
     /// Drops a restore-journal entry that recovery determined no longer
@@ -632,16 +812,11 @@ pub trait MaterializationExecutionPort: Send + Sync {
         path: &str,
     ) -> Result<RepairRowSnapshot, MaterializationExecutionError>;
 
-    /// Narrow delegate for `yadorilink-sync-sqlite::block_deletion::
-    /// BlockDeletionCoordinator::reclaim_cached_blocks`, which still needs
-    /// `&dyn yadorilink_sync_sqlite::MaterializationStatePort` (the wider
-    /// trait) -- this crate cannot name that trait without depending on
-    /// `yadorilink-sync-sqlite`, which itself already depends on this crate
-    /// (a forbidden cycle), so the call is routed through this port method
-    /// instead, exactly like `open_materialization_intent_guard` above.
-    /// `impl MaterializationExecutionPort for ReplicaCoordinator` performs
-    /// the concrete call internally, where `self` already satisfies the
-    /// wider trait.
+    /// Reclaims the cached blocks of a path whose eviction custody was
+    /// verified, under the exclusive physical-deletion guard. The
+    /// implementor revalidates the custody's exact version, the pin and
+    /// materialization state, and the custody confirmation itself before
+    /// freeing any block no other indexed row still references.
     fn reclaim_verified_cached_blocks(
         &self,
         deletion_guard: &BlockPhysicalDeletionGuard<'_>,
@@ -655,8 +830,8 @@ pub trait MaterializationExecutionPort: Send + Sync {
     /// DAG-frontier proof of its own to publish under (it is a pure
     /// disk-state transition, hydrated content -> placeholder), so it only
     /// ever calls this, never a publish -- same treatment as on-demand
-    /// hydration (`PeerReplicaStatePort::dag_bump_mutation_fence`, this
-    /// port's sibling in `yadorilink-peer-session`). Must be called inside
+    /// hydration (`ReplicaCoordinator::dag_bump_mutation_fence` in
+    /// `yadorilink-daemon`). Must be called inside
     /// `path`'s lock, before the first mutating syscall.
     fn dag_bump_mutation_fence(
         &self,
@@ -664,4 +839,164 @@ pub trait MaterializationExecutionPort: Send + Sync {
         path: &str,
         mutation_kind: &str,
     ) -> Result<i64, MaterializationExecutionError>;
+
+    /// Open half of `evict_file`'s placeholder write, after its
+    /// revalidation: marks the row `Evicting` (its own transaction; an
+    /// error here fails the eviction with nothing else touched), then bumps
+    /// the fence for the placeholder write (its own transaction). The
+    /// bump's result is returned inside: the caller chains it into the
+    /// placeholder write and treats its failure as that write's, closing
+    /// the row with [`abandon_eviction`](Self::abandon_eviction).
+    fn open_eviction(
+        &self,
+        group_id: &str,
+        path: &str,
+        permit: &RootCommitPermit,
+    ) -> Result<Result<i64, MaterializationExecutionError>, MaterializationExecutionError>;
+
+    /// Settle half of `evict_file`'s placeholder write: moves the row
+    /// `Evicting` -> `Placeholder` only if it is still `Evicting`
+    /// (`false`, with nothing else written, when it is not), then records
+    /// the identity the placeholder write reported. Two transactions.
+    fn settle_eviction(
+        &self,
+        group_id: &str,
+        path: &str,
+        placeholder: yadorilink_local_storage::PlaceholderIdentityToRecord,
+        permit: &RootCommitPermit,
+    ) -> Result<bool, MaterializationExecutionError>;
+
+    /// Close half of an eviction that failed after
+    /// [`open_eviction`](Self::open_eviction) returned, so the row does
+    /// not stay `Evicting` until the next daemon start. Acts only while
+    /// the row is still `Evicting` (`false`, with nothing written, when it
+    /// is not), and moves it to the state `abandoned` names -- or to
+    /// `Placeholder` when the row no longer names `version`, the version
+    /// the eviction revalidated, since that row's content was never on
+    /// disk. One transaction, with the permit verified inside it: under a
+    /// lost root nothing is written and the row is left for the startup
+    /// reset.
+    fn abandon_eviction(
+        &self,
+        group_id: &str,
+        path: &str,
+        version: &yadorilink_replica_domain::ids::VersionHash,
+        abandoned: AbandonedEviction,
+        permit: &RootCommitPermit,
+    ) -> Result<bool, MaterializationExecutionError>;
+
+    /// Records the identity a placeholder write reported for
+    /// `(group_id, path)`: overwrite, record only if absent (a concurrent
+    /// winner's value is kept), or clear. One transaction for whichever
+    /// arm applies.
+    fn record_placeholder_identity(
+        &self,
+        group_id: &str,
+        path: &str,
+        outcome: yadorilink_local_storage::PlaceholderIdentityToRecord,
+        permit: &RootCommitPermit,
+    ) -> Result<(), MaterializationExecutionError>;
+
+    /// First step of the repair sweep's placeholder demotion, before the
+    /// placeholder write: moves the row to `Placeholder` only while it is
+    /// still in `row_state` with `authoring` and, when named, `version`
+    /// (one transaction). `false` means the row moved off what the lane
+    /// read, and the lane must write nothing for it: not the placeholder
+    /// it would size for the version it read, not its identity, and not
+    /// the intent clear.
+    fn open_repair_placeholder_demotion(
+        &self,
+        group_id: &str,
+        path: &str,
+        row_state: MaterializationState,
+        authoring: Option<&yadorilink_replica_domain::ids::ChangeHash>,
+        version: Option<&yadorilink_replica_domain::ids::VersionHash>,
+        permit: &RootCommitPermit,
+    ) -> Result<bool, MaterializationExecutionError>;
+
+    /// Open half of the repair sweep's quarantine of divergent on-disk
+    /// bytes: opens the intent naming the content the path will be rebuilt
+    /// to, then bumps the fence for the quarantine rename. Two
+    /// transactions, in that order. The caller holds the returned intent
+    /// across the rename and drops it uncleared.
+    fn open_repair_quarantine<'a>(
+        &'a self,
+        group_id: &'a str,
+        path: &'a str,
+        target_version_hash: &[u8],
+        permit: &'a RootCommitPermit<'a>,
+    ) -> Result<Box<dyn OpenMaterializationIntent + Send + 'a>, MaterializationExecutionError>;
+
+    /// Settle half of the repair sweep's journaled reconstruct of a regular
+    /// file written under `mutation_generation`: publishes the proof for
+    /// `version` with the identity now at `out_path`, guarded on the row
+    /// still being in `row_state` with `authoring` and `version`; when
+    /// nothing was published (no version, no identity, a failed or refused
+    /// commit), demotes that same row to `Hydrating`, leaving the intent
+    /// open so the next repair pass finds a candidate to prove. Logs every
+    /// failure and returns none; `true` means the proof was published.
+    // Mirrors the lane's own inputs one for one; a params struct would
+    // exist only to carry them across this one call.
+    #[allow(clippy::too_many_arguments)]
+    fn settle_repair_reconstruct(
+        &self,
+        group_id: &str,
+        path: &str,
+        out_path: &Path,
+        row_state: MaterializationState,
+        authoring: Option<&yadorilink_replica_domain::ids::ChangeHash>,
+        version: Option<yadorilink_replica_domain::ids::VersionHash>,
+        mutation_generation: i64,
+        permit: &RootCommitPermit,
+    ) -> bool;
+
+    /// Open half of the repair sweep's journaled rebuild of a single
+    /// object with no block content (a symlink, an explicit directory):
+    /// bumps the fence for the rebuild, then opens the intent naming
+    /// `target_version_hash`. Two transactions, in that order. Returns the
+    /// fence value to publish under and the intent, which the caller drops
+    /// uncleared once the object is written.
+    fn open_repair_object_rebuild<'a>(
+        &'a self,
+        group_id: &'a str,
+        path: &'a str,
+        kind: RecordKind,
+        target_version_hash: &[u8],
+        permit: &'a RootCommitPermit<'a>,
+    ) -> Result<(i64, Box<dyn OpenMaterializationIntent + Send + 'a>), MaterializationExecutionError>;
+
+    /// Settle half of the repair sweep's journaled rebuild of a `kind`
+    /// object: publishes the proof for `version` with the identity observable at
+    /// `out_path` under `mutation_generation`, guarded on the row still
+    /// being in `row_state` with `authoring` and `version` when a state was
+    /// found. `false` when the fence was lost or the row superseded.
+    // Mirrors the lane's own inputs one for one, like
+    // `settle_repair_reconstruct`.
+    #[allow(clippy::too_many_arguments)]
+    fn settle_repair_object_rebuild(
+        &self,
+        group_id: &str,
+        path: &str,
+        kind: RecordKind,
+        out_path: &Path,
+        version: yadorilink_replica_domain::ids::VersionHash,
+        row_state: Option<MaterializationState>,
+        authoring: Option<&yadorilink_replica_domain::ids::ChangeHash>,
+        mutation_generation: i64,
+        permit: &RootCommitPermit,
+    ) -> Result<bool, MaterializationExecutionError>;
+
+    /// Restore-journal recovery's preservation of bytes neither side of an
+    /// interrupted restore explains: journals `path` as dirty with
+    /// `change_kind` and `observed_at_unix_nanos`, then discards the
+    /// journal entry. Two transactions, in that order.
+    fn preserve_divergent_restore(
+        &self,
+        operation_id: &str,
+        group_id: &str,
+        path: &str,
+        change_kind: &str,
+        observed_at_unix_nanos: i64,
+        permit: &RootCommitPermit,
+    ) -> Result<(), MaterializationExecutionError>;
 }

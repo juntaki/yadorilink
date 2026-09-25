@@ -22,12 +22,12 @@ mod unix_socket_tests {
         MaterializationState as ShellMaterializationState, ShellIpcMessage, StatusQuery,
         SyncState as ShellSyncState,
     };
-    use yadorilink_local_storage::FsBlockStore;
+    use yadorilink_local_storage::SegmentBlockStore;
     use yadorilink_replica_domain::file::FileRecord;
 
     async fn start_daemon() -> (std::path::PathBuf, Arc<DaemonState>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(FsBlockStore::new(dir.path().join("blocks")).unwrap());
+        let store = Arc::new(SegmentBlockStore::new(dir.path().join("blocks")).unwrap());
         let sync_state =
             Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
         sync_state
@@ -39,13 +39,42 @@ mod unix_socket_tests {
         let state = DaemonState::new("device-a".into(), sync_state, store);
         let socket_path = dir.path().join("shell.sock");
         let serve_path = socket_path.clone();
-        let serve_state = state.clone();
+        let serve_state =
+            Arc::new(yadorilink_daemon::shell_context::ShellContext::from_state(state.clone()));
         tokio::spawn(async move {
             let _ =
                 yadorilink_daemon::shell_ipc::unix_transport::serve(&serve_path, serve_state).await;
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
         (socket_path, state, dir)
+    }
+
+    /// Stamps `path` as `Hydrated`, which `upsert_file` alone does NOT do.
+    ///
+    /// `files.materialization_state` defaults to `'placeholder'` in the
+    /// schema, and the only writer that stamps `Hydrated` as part of
+    /// indexing is the local-emission path
+    /// (`stamp_hydrated_after_local_emission_in_tx`). A test that seeds a
+    /// row with a bare `upsert_file` therefore gets a PLACEHOLDER, no
+    /// matter how hydrated the file it describes looks -- so a test whose
+    /// name says "an already hydrated file" was, before this helper, not
+    /// testing that at all: the request under test short-circuited on the
+    /// state check and never reached its own subject.
+    ///
+    /// `control_socket.rs` -- this file's sibling, exercising the same
+    /// handlers over the control socket -- already hit exactly this and was
+    /// fixed for it; these three cases were missed at the time.
+    fn set_hydrated(state: &Arc<DaemonState>, path: &str) {
+        state
+            .replica_coordinator
+            .materialization_state_repository()
+            .set_materialization_state(
+                "group-1",
+                path,
+                yadorilink_replica_domain::session_state::MaterializationState::Hydrated,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
     }
 
     /// shell-integration spec: "Shell extension queries status via IPC".
@@ -129,7 +158,8 @@ mod unix_socket_tests {
     }
 
     /// shell-integration spec: "Pause sync for a single item" via the context
-    /// menu action.
+    /// menu action, recorded durably against the linked folder's own
+    /// relative path.
     #[tokio::test]
     async fn pause_item_context_action_is_recorded() {
         let (socket_path, state, dir) = start_daemon().await;
@@ -152,8 +182,11 @@ mod unix_socket_tests {
         let Some(Payload::ContextActionResponse(r)) = resp.payload else {
             panic!("expected a ContextActionResponse")
         };
-        assert!(r.ok);
-        assert!(state.paused_paths.lock().unwrap().contains(&path));
+        assert!(r.ok, "{}", r.error);
+        assert_eq!(
+            state.replica_coordinator.paused_item_repository().list("group-1").unwrap(),
+            vec!["vacation.jpg".to_string()]
+        );
     }
 
     /// on-demand-sync spec "Context Menu Actions Include Pin and Evict":
@@ -162,6 +195,7 @@ mod unix_socket_tests {
     #[tokio::test]
     async fn pin_item_context_action_pins_an_already_hydrated_file() {
         let (socket_path, state, dir) = start_daemon().await;
+        std::fs::write(dir.path().join("photos/vacation.jpg"), b"hello").unwrap();
         state
             .replica_coordinator
             .file_index_repository()
@@ -177,6 +211,21 @@ mod unix_socket_tests {
                 &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
+        // `PinItem`'s "already hydrated" short-circuit -- the path this test
+        // is named for -- asks for everything `Hydrated` claims: the stamp
+        // AND a usable actual-state proof naming the version the row
+        // derives. A stamp alone is a state no production writer leaves
+        // behind, so with only the stamp the request falls through to a real
+        // hydration, which needs a peer this fixture does not have, and
+        // answers `ok = false`. Seed the pair the way a writer produces it:
+        // one commit that publishes the proof and stamps the claim.
+        yadorilink_daemon::test_support::seed_prior_cycle_proof(
+            &state.replica_coordinator,
+            "group-1",
+            "vacation.jpg",
+            &dir.path().join("photos/vacation.jpg"),
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        );
 
         let mut stream = UnixStream::connect(&socket_path).await.unwrap();
         let path = dir.path().join("photos/vacation.jpg").to_string_lossy().to_string();
@@ -273,6 +322,11 @@ mod unix_socket_tests {
                 &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
+        // `evict` refuses anything that is not currently hydrated, so
+        // without this the handler answers `ok = false` and the test dies on
+        // `assert!(r.ok)` (observed on the base at shell_ipc.rs:295) before
+        // it ever reaches the placeholder assertion it exists for.
+        set_hydrated(&state, "notes.txt");
 
         let mut stream = UnixStream::connect(&socket_path).await.unwrap();
         let path = dir.path().join("photos/notes.txt").to_string_lossy().to_string();
@@ -397,6 +451,10 @@ mod unix_socket_tests {
                 &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
+        // The assertion below expects `Hydrated`; the schema default is
+        // `placeholder`, so without this the test asserts the default and
+        // never exercises the status handler's state reporting at all.
+        set_hydrated(&state, "vacation.jpg");
 
         let mut stream = UnixStream::connect(&socket_path).await.unwrap();
         let path = dir.path().join("photos/vacation.jpg").to_string_lossy().to_string();
@@ -433,9 +491,8 @@ mod windows_pipe_tests {
     use yadorilink_ipc_proto::shellipc::{
         HydrateRequest, ShellIpcMessage, SyncState as ShellSyncState,
     };
-    use yadorilink_local_storage::FsBlockStore;
+    use yadorilink_local_storage::SegmentBlockStore;
     use yadorilink_replica_domain::file::FileRecord;
-    use yadorilink_sync_sqlite::materialization_state_port::MaterializationStatePort;
 
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -446,7 +503,7 @@ mod windows_pipe_tests {
 
     async fn start_daemon() -> (String, Arc<DaemonState>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(FsBlockStore::new(dir.path().join("blocks")).unwrap());
+        let store = Arc::new(SegmentBlockStore::new(dir.path().join("blocks")).unwrap());
         let sync_state =
             Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
         sync_state
@@ -458,7 +515,8 @@ mod windows_pipe_tests {
         let state = DaemonState::new("device-a".into(), sync_state, store);
         let pipe_name = unique_pipe_name();
         let serve_name = pipe_name.clone();
-        let serve_state = state.clone();
+        let serve_state =
+            Arc::new(yadorilink_daemon::shell_context::ShellContext::from_state(state.clone()));
         tokio::spawn(async move {
             let _ =
                 yadorilink_daemon::shell_ipc::windows_transport::serve(&serve_name, serve_state)
@@ -476,6 +534,7 @@ mod windows_pipe_tests {
         let (pipe_name, state, dir) = start_daemon().await;
         state
             .replica_coordinator
+            .file_index_repository()
             .upsert_file(
                 "group-1",
                 &FileRecord {
@@ -555,6 +614,7 @@ mod windows_pipe_tests {
         let (pipe_name, state, dir) = start_daemon().await;
         state
             .replica_coordinator
+            .file_index_repository()
             .upsert_file(
                 "group-1",
                 &FileRecord {
@@ -573,6 +633,7 @@ mod windows_pipe_tests {
             .unwrap();
         state
             .replica_coordinator
+            .materialization_state_repository()
             .set_materialization_state(
                 "group-1",
                 "big.zip",
@@ -614,6 +675,7 @@ mod windows_pipe_tests {
         let (pipe_name, state, dir) = start_daemon().await;
         state
             .replica_coordinator
+            .file_index_repository()
             .upsert_file(
                 "group-1",
                 &FileRecord {

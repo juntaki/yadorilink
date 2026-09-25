@@ -37,7 +37,11 @@
 //! `connect_sessions` (single-session assumptions throughout there don't
 //! generalize), not a copy-paste.
 
-#![cfg(madsim)]
+// Retired. This scenario was written for a simulator this project no longer
+// builds against, and it names APIs that have since been removed. It is kept,
+// never compiled, as the specification its turmoil re-expression has to meet;
+// delete it in the change that lands that replacement.
+#![cfg(any())]
 
 mod dst_support;
 
@@ -59,23 +63,19 @@ use rand::{RngExt, SeedableRng};
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_filesystem_sync::debounce::{self, DebounceConfig, FlushPathRequest};
 use yadorilink_local_capture::{LocalChangeOutcome, LocalChangeProcessor};
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 use yadorilink_peer_session::peer_session::{
     ChangeAuthenticator, PeerSyncSession, PendingLocalChangeFlush, PendingLocalFlushOutcome,
 };
-use yadorilink_peer_session::ports::PeerReplicaStatePort;
 use yadorilink_replica_domain::ids::ChangeHash;
 use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
 
 /// The change-history DAG replaces the legacy index-convergence wire this
-/// scenario used to drive propagation over. Each device signs the changes it
-/// originates with its own Ed25519 key (wired into its
-/// `LocalChangeProcessor` as a `ChangeEmitter`); every session pins all three
-/// devices' verifying keys so an incoming signed change can be authenticated.
-/// A permissive `is_writer` mirrors what the daemon's coordination-plane
-/// netmap would supply in production -- this is a standalone sync-core
-/// harness with no policy plane, so change emission stamps the all-zero
-/// placeholder authorization the receiver accepts here.
+/// scenario used to drive propagation over. Each device signs the changes
+/// it originates with its own Ed25519 key (wired into its
+/// `LocalChangeProcessor` as a `ChangeEmitter`); every session pins all
+/// three devices' verifying keys so an incoming signed change can be
+/// authenticated.
 struct PinnedAuthenticator {
     verifying_keys: HashMap<String, [u8; 32]>,
 }
@@ -235,7 +235,7 @@ impl MeshDevice {
         let records = match outcome {
             LocalChangeOutcome::FileChanged(record) => vec![record],
             LocalChangeOutcome::FilesChanged(records) => records,
-            LocalChangeOutcome::None => return,
+            LocalChangeOutcome::None | LocalChangeOutcome::RetryLater => return,
         };
         if records.is_empty() {
             return;
@@ -343,7 +343,7 @@ fn setup_device(
     device_id: &str,
     root: PathBuf,
     sync_state: Arc<ReplicaCoordinator>,
-    store: Arc<FsBlockStore>,
+    store: Arc<SegmentBlockStore>,
     signing_key: SigningKey,
 ) -> Arc<MeshDevice> {
     // Emitter-wired: this device's local edits are emitted as signed changes
@@ -437,14 +437,14 @@ async fn connect_edge(
     rng: &mut StdRng,
     device_a: &Arc<MeshDevice>,
     state_a: Arc<ReplicaCoordinator>,
-    store_a: Arc<FsBlockStore>,
+    store_a: Arc<SegmentBlockStore>,
     forward_tx_a: tokio::sync::mpsc::UnboundedSender<(
         String,
         yadorilink_replica_domain::file::FileRecord,
     )>,
     device_b: &Arc<MeshDevice>,
     state_b: Arc<ReplicaCoordinator>,
-    store_b: Arc<FsBlockStore>,
+    store_b: Arc<SegmentBlockStore>,
     forward_tx_b: tokio::sync::mpsc::UnboundedSender<(
         String,
         yadorilink_replica_domain::file::FileRecord,
@@ -458,7 +458,7 @@ async fn connect_edge(
 
     let mut sync_roots_a = HashMap::new();
     sync_roots_a.insert(GROUP_ID.to_string(), device_a.root.clone());
-    let session_a = PeerSyncSession::new_with_dependencies(
+    let session_a = PeerSyncSession::new(
         channel_a,
         device_a.device_id.clone(),
         device_b.device_id.clone(),
@@ -479,7 +479,7 @@ async fn connect_edge(
 
     let mut sync_roots_b = HashMap::new();
     sync_roots_b.insert(GROUP_ID.to_string(), device_b.root.clone());
-    let session_b = PeerSyncSession::new_with_dependencies(
+    let session_b = PeerSyncSession::new(
         channel_b,
         device_b.device_id.clone(),
         device_a.device_id.clone(),
@@ -538,13 +538,13 @@ async fn connect_mesh(
     rng: &mut StdRng,
     device_a: &Arc<MeshDevice>,
     state_a: Arc<ReplicaCoordinator>,
-    store_a: Arc<FsBlockStore>,
+    store_a: Arc<SegmentBlockStore>,
     device_b: &Arc<MeshDevice>,
     state_b: Arc<ReplicaCoordinator>,
-    store_b: Arc<FsBlockStore>,
+    store_b: Arc<SegmentBlockStore>,
     device_c: &Arc<MeshDevice>,
     state_c: Arc<ReplicaCoordinator>,
-    store_c: Arc<FsBlockStore>,
+    store_c: Arc<SegmentBlockStore>,
     authenticator: Arc<PinnedAuthenticator>,
 ) {
     let (fwd_tx_a, mut fwd_rx_a) = tokio::sync::mpsc::unbounded_channel();
@@ -631,27 +631,20 @@ async fn connect_mesh(
         tokio::spawn(session.run());
     }
 
-    // The Convergence Engine stand-in: since materialization was split out
-    // of the admission path, an admitted change only ENQUEUES a durable
-    // materialization job — executing it is `yadorilink-daemon`'s
-    // Convergence Engine, which a sync-core-only harness does not run.
     // Without a driver nothing ever materializes an admitted change, and
     // every seed deterministically died at the startup-canary gate (the
     // canary was admitted on B and C, its job enqueued, and the file never
-    // written) — misattributed for a while to the WireGuard-handshake
-    // livelock the baseline message cites; transport traces show that
-    // handshake completing fine.
-    //
-    // One driver per DEVICE that explicitly alternates that device's two
-    // sessions — not one `spawn_test_convergence_driver` per session: an
-    // audit block-fetches only through the session it ran on, and two
-    // per-session drivers waking on the SAME per-state notification with
-    // the audit guard admitting one of them would let a deterministic
-    // scheduler hand every wake to the same winner, pinning that device's
-    // fetches to one peer forever (the daemon rotates candidates with an
-    // explicit cursor for exactly this reason). Explicit alternation makes
-    // peer rotation a structural guarantee instead of a scheduling
-    // accident, and halves the redundant guard-contending audits.
+    // written); the transport handshake itself completes fine. One driver per DEVICE that explicitly
+    // alternates that device's two sessions — not one
+    // `spawn_test_convergence_driver` per session: an audit block-fetches
+    // only through the session it ran on, and two per-session drivers
+    // waking on the SAME per-state notification with the audit guard
+    // admitting one of them would let a deterministic scheduler hand every
+    // wake to the same winner, pinning that device's fetches to one peer
+    // forever (the daemon rotates candidates with an explicit cursor for
+    // exactly this reason). Explicit alternation makes peer rotation a
+    // structural guarantee instead of a scheduling accident, and halves
+    // the redundant guard-contending audits.
     for (device, sessions) in [
         (device_a, [session_ab_a, session_ac_a]),
         (device_b, [session_ab_b, session_bc_b]),
@@ -686,9 +679,7 @@ async fn connect_mesh(
 /// lost; the oracle was handed the wrong evidence. Adding this flush takes
 /// that scenario from 15/32 variations violating to green.
 ///
-/// `dst_network_fault_chaos` already had this fix (track A, commit
-/// 7e91146f); it was never propagated here. See that handoff's ruled-out
-/// item 3, "Reading x's evidence too early in a race. Was a real bug."
+/// `dst_network_fault_chaos` applies the same flush for the same reason.
 async fn authoring_of(device: &MeshDevice, path: &str) -> Option<ChangeHash> {
     device.flush_pending_local_change(GROUP_ID, path).await;
     device
@@ -717,7 +708,7 @@ async fn deliver_local_write(
     clock: &HarnessClock,
 ) -> Result<(), String> {
     let full_path = device.root.join(path);
-    // Gap A: `fs_ops::write` writes and stamps the mtime through the shared
+    // `fs_ops::write` writes and stamps the mtime through the shared
     // `HarnessClock` in one step -- no local `stamp_deterministic_mtime`.
     dst_support::fs_ops::write(clock, &full_path, &content)?;
     device
@@ -777,7 +768,7 @@ fn content_for(seed: u64, round: usize, device_id: &str, tag: &str) -> Vec<u8> {
 /// outcome (this round's baseline hadn't finished propagating from a
 /// prior round) is indistinguishable from real data loss.
 async fn converge_path_all3(devices: [&MeshDevice; 3], path: &str) -> (bool, Duration) {
-    // Gap B: the per-round convergence gate runs on the shared `settle_until`
+    // The per-round convergence gate runs on the shared `settle_until`
     // primitive (simulated-clock poll + budget). The predicate is a 3-way
     // *materialized-content* equality rather than the old version-vector
     // equality: the change-history DAG carries causality as change ancestry,
@@ -823,17 +814,18 @@ async fn converge_path_all3(devices: [&MeshDevice; 3], path: &str) -> (bool, Dur
                         .unwrap_or_else(|| "<none>".into())
                 })
                 .unwrap_or_else(|e| format!("<error: {e}>"));
-            let unapplied = d
+            let outstanding = d
                 .state
-                .dag_list_unapplied_changes(GROUP_ID)
-                .map(|v| v.len().to_string())
+                .sqlite()
+                .dag_count_pending_projection_obligations(GROUP_ID)
+                .map(|n| n.to_string())
                 .unwrap_or_else(|e| format!("<error: {e}>"));
             let on_disk = std::fs::read(d.root.join(path))
                 .map(|c| format!("{} bytes", c.len()))
                 .unwrap_or_else(|_| "<absent>".into());
             eprintln!(
                 "  [converge_path_all3 diagnosis] device-{i} path={path:?} heads=[{heads}] \
-                 record={record} unapplied={unapplied} on_disk={on_disk}"
+                 record={record} outstanding={outstanding} on_disk={on_disk}"
             );
         }
     }
@@ -902,19 +894,19 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
     let root_dir_a = tempfile::tempdir().map_err(|e| e.to_string())?;
     let root_a = root_dir_a.path().canonicalize().map_err(|e| e.to_string())?;
     let store_dir_a = tempfile::tempdir().map_err(|e| e.to_string())?;
-    let store_a = Arc::new(FsBlockStore::new(store_dir_a.path()).map_err(|e| e.to_string())?);
+    let store_a = Arc::new(SegmentBlockStore::new(store_dir_a.path()).map_err(|e| e.to_string())?);
     let state_a = Arc::new(ReplicaCoordinator::open_in_memory().map_err(|e| e.to_string())?);
     dst_support::link::link_and_start(&state_a, &root_a, GROUP_ID).map_err(|e| e.to_string())?;
     let root_dir_b = tempfile::tempdir().map_err(|e| e.to_string())?;
     let root_b = root_dir_b.path().canonicalize().map_err(|e| e.to_string())?;
     let store_dir_b = tempfile::tempdir().map_err(|e| e.to_string())?;
-    let store_b = Arc::new(FsBlockStore::new(store_dir_b.path()).map_err(|e| e.to_string())?);
+    let store_b = Arc::new(SegmentBlockStore::new(store_dir_b.path()).map_err(|e| e.to_string())?);
     let state_b = Arc::new(ReplicaCoordinator::open_in_memory().map_err(|e| e.to_string())?);
     dst_support::link::link_and_start(&state_b, &root_b, GROUP_ID).map_err(|e| e.to_string())?;
     let root_dir_c = tempfile::tempdir().map_err(|e| e.to_string())?;
     let root_c = root_dir_c.path().canonicalize().map_err(|e| e.to_string())?;
     let store_dir_c = tempfile::tempdir().map_err(|e| e.to_string())?;
-    let store_c = Arc::new(FsBlockStore::new(store_dir_c.path()).map_err(|e| e.to_string())?);
+    let store_c = Arc::new(SegmentBlockStore::new(store_dir_c.path()).map_err(|e| e.to_string())?);
     let state_c = Arc::new(ReplicaCoordinator::open_in_memory().map_err(|e| e.to_string())?);
     dst_support::link::link_and_start(&state_c, &root_c, GROUP_ID).map_err(|e| e.to_string())?;
     // Per-device change-signing keys; every session pins all three verifying
@@ -981,7 +973,7 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
             "{BASELINE_TIMEOUT_MARKER}device B and/or C never adopted the startup canary within the \
              poll timeout -- the same host-load-dependent startup stall \
              dst_peer_reconcile_race.rs/dst_two_device_chaos.rs describe, not a bug in this \
-             scenario (the old WireGuard-livelock attribution was disproven; issue #26)"
+             scenario"
         ));
     }
 
@@ -1356,7 +1348,7 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
         (device_c.root.as_path(), device_c.state.as_ref()),
     ];
 
-    // Gap B: the shared `settle` primitive polls `check_convergence` on the
+    // The shared `settle` primitive polls `check_convergence` on the
     // sim clock and returns the instant it converges. On budget exhaustion it
     // records a non-fatal `SlowConvergence` instead of the old
     // hand-rolled poll loop's hard timeout -- the terminal `check_convergence`
@@ -1374,7 +1366,7 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
         eprintln!("  SLOW-CONVERGENCE: {slow}");
     }
 
-    // Gap C: a real daemon runs `repair_interrupted_materializations` +
+    // A real daemon runs `repair_interrupted_materializations` +
     // `cleanup_stale_temp_files` at startup and periodically -- run once per
     // device at this scenario's genuinely-quiescent point via the shared
     // `sweep::run_self_healing`, before the terminal oracle checks. Each
@@ -1432,8 +1424,8 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
         // Terminal DAG diagnosis, printed unconditionally on a violation:
         // the single most important discriminator for a terminal
         // "divergence" is whether the devices even agree on the DAG (equal
-        // heads + zero unapplied on every device ⇒ a genuine determinism
-        // bug in resolution/projection; unequal heads or pending unapplied
+        // heads + zero outstanding on every device ⇒ a genuine determinism
+        // bug in resolution/projection; unequal heads or pending outstanding
         // ⇒ the budget-exhausted settle handed the oracle a still-in-flight
         // state, i.e. the slow-convergence class wearing a scarier name).
         for (i, (_, state)) in devices.iter().enumerate() {
@@ -1444,12 +1436,13 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
                     hs.iter().map(|h| h.to_hex()[..8].to_string()).collect::<Vec<_>>().join(",")
                 })
                 .unwrap_or_else(|e| format!("<error: {e}>"));
-            let unapplied = state
-                .dag_list_unapplied_changes(GROUP_ID)
-                .map(|v| v.len().to_string())
+            let outstanding = state
+                .sqlite()
+                .dag_count_pending_projection_obligations(GROUP_ID)
+                .map(|n| n.to_string())
                 .unwrap_or_else(|e| format!("<error: {e}>"));
             eprintln!(
-                "  [terminal DAG diagnosis] device-{i} heads=[{heads}] unapplied={unapplied}"
+                "  [terminal DAG diagnosis] device-{i} heads=[{heads}] outstanding={outstanding}"
             );
         }
         let mut workload: HashMap<usize, Vec<(u64, Op)>> = HashMap::new();

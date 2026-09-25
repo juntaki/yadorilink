@@ -1,11 +1,8 @@
-//! `SqliteSyncStore`: the shared replica-history reads every caller needs
-//! (`yadorilink-replica-engine`'s `ReplicaHistoryPort`, plus
-//! `yadorilink-sync-core`'s `LocalMutationStore`/`MaterializationStatePort`
-//! delegate here for the same data). One `Arc<SyncDatabase>`, never a
-//! second pool/writer-gate of its own -- `pub fn new(database:
-//! Arc<SyncDatabase>) -> Self` is the only constructor; there is no `open`.
+//! One `Arc<SyncDatabase>`, never a second pool/writer-gate of its own --
+//! `pub fn new(database: Arc<SyncDatabase>) -> Self` is the only
+//! constructor; there is no `open`.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use rusqlite::{Connection, OptionalExtension};
@@ -17,19 +14,148 @@ use yadorilink_sqlite_runtime::SyncDatabase;
 use crate::error::SyncSqliteError;
 use crate::types::{CurrentVersionSnapshot, RetainedVersion, RetainedVersionState};
 
-/// A permanently-rejected hash's `rejected_changes.rules_version` must equal
-/// this to be trusted as settled (see `is_change_rejected`'s own doc
-/// comment) -- mirrors `yadorilink-sync-core::reserved_namespace::
-/// RULES_VERSION`. This crate cannot depend on that crate, so this is a
-/// deliberate, narrow constant duplication (not a query/table duplication);
-/// if that constant ever changes, this one must change with it.
-const RESERVED_NAMESPACE_RULES_VERSION: u32 = 4;
+/// Everything a caller can learn about a path's `state = 'current'` row
+/// that a proof or a guard depends on, read as ONE statement.
+///
+/// They travel together on purpose. A path's version is not a stored
+/// column -- it is derived from the row's own content columns (see
+/// `FileVersion::compute_hash`) -- so reading "the version" and "the
+/// authoring hash" separately can observe two different rows if an update
+/// lands between them, and a guard built that way would compare a version
+/// from one incarnation against an authoring hash from another. The same
+/// applies to a producer: what it writes and what its proof names have to
+/// come from one incarnation, or the proof describes a state that was
+/// never assembled anywhere.
+#[derive(Debug, Clone)]
+pub struct CanonicalCurrentRow {
+    pub snapshot: CurrentVersionSnapshot,
+    pub authoring_change_hash: Option<ChangeHash>,
+    pub materialization_state:
+        Option<yadorilink_replica_domain::session_state::MaterializationState>,
+    /// The device that produced this row's content. Not part of version
+    /// identity -- carried here because a caller that needs it needs it
+    /// about the same incarnation as everything else, and a second
+    /// `get_origin_device_id` read is a second incarnation.
+    pub origin_device_id: Option<String>,
+    /// Whether this row's symlink target points outside the linked root.
+    /// Also not part of version identity, and carried for the same
+    /// reason: it is decided together with `symlink_target`, so reading
+    /// the two separately can pair a target with a flag computed for a
+    /// different target.
+    pub symlink_out_of_root: bool,
+}
 
-/// Bounds the [`SqliteSyncStore::missing_ancestor_frontier`] walk's visited
-/// set, as a latency safeguard against a pathological/adversarial chain
-/// shape rather than trusting the DB-row cap alone. Mirrors
-/// `yadorilink-sync-core::dag_store::orphan_integrity::ORPHAN_BOUND`.
-const ORPHAN_BOUND: usize = 4096;
+impl CanonicalCurrentRow {
+    /// The version this row names, derived the one canonical way.
+    pub fn version_hash(&self) -> VersionHash {
+        yadorilink_replica_domain::session_state::CurrentVersionRecord::from(self.snapshot.clone())
+            .to_file_version()
+            .version_hash
+    }
+}
+
+/// The canonical current-row read, over `&Connection` so a caller holding
+/// an open `&Transaction` can use it too (a `&Transaction` derefs to
+/// `&Connection`). Every reader of the current row goes through this, so
+/// the column list and its decoding exist exactly once -- a second copy is
+/// how a guard silently starts comparing something subtly different from
+/// what the proof records.
+pub fn read_canonical_current_row(
+    conn: &Connection,
+    group_id: &str,
+    path: &str,
+) -> Result<Option<CanonicalCurrentRow>, SyncSqliteError> {
+    #[allow(clippy::type_complexity)]
+    let row: Option<(
+        u64,
+        i64,
+        String,
+        i64,
+        String,
+        Option<Vec<u8>>,
+        i64,
+        String,
+        Option<Vec<u8>>,
+        Option<String>,
+        Option<String>,
+        i64,
+    )> = conn
+        .query_row(
+            "SELECT size, mtime_unix_nanos, blocks_json, deleted, record_kind, \
+                    symlink_target, unix_mode, xattrs_json, authoring_change_hash, \
+                    materialization_state, origin_device_id, symlink_out_of_root \
+             FROM files WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
+            rusqlite::params![group_id, path],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                    r.get(9)?,
+                    r.get(10)?,
+                    r.get(11)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        size,
+        mtime,
+        blocks_json,
+        deleted,
+        record_kind,
+        symlink_target,
+        unix_mode,
+        xattrs_json,
+        authoring,
+        mstate,
+        origin_device_id,
+        symlink_out_of_root,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    let blocks: Vec<BlockInfo> = serde_json::from_str(&blocks_json).map_err(|error| {
+        SyncSqliteError::CorruptState(format!(
+            "stored block list for current version of {path} is corrupt: {error}"
+        ))
+    })?;
+    let authoring_change_hash = match authoring {
+        None => None,
+        Some(bytes) => {
+            let exact: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+                SyncSqliteError::CorruptState(format!(
+                    "stored authoring change hash for current version of {path} is not 32 bytes"
+                ))
+            })?;
+            Some(ChangeHash(exact))
+        }
+    };
+    Ok(Some(CanonicalCurrentRow {
+        snapshot: CurrentVersionSnapshot {
+            blocks,
+            size,
+            mtime_unix_nanos: mtime,
+            deleted: deleted != 0,
+            record_kind: RecordKind::from_db_str(&record_kind),
+            symlink_target,
+            unix_mode: crate::file_index::decode_unix_mode_column(unix_mode),
+            xattrs: crate::file_index::decode_xattrs_column(&xattrs_json)?,
+        },
+        authoring_change_hash,
+        materialization_state: mstate
+            .as_deref()
+            .map(yadorilink_replica_domain::session_state::MaterializationState::from_db_str),
+        origin_device_id,
+        symlink_out_of_root: symlink_out_of_root != 0,
+    }))
+}
 
 pub struct SqliteSyncStore {
     database: Arc<SyncDatabase>,
@@ -42,16 +168,32 @@ impl SqliteSyncStore {
 
     /// The group's current non-superseded heads, ascending by hash --
     /// `group_heads` is a materialized index kept in step with `changes`,
-    /// not a live query over it. Delegates to `dag_store`'s own
-    /// `frontier_index::group_heads` -- the single SQL implementation of
-    /// this read, also called directly (same connection/transaction, no
-    /// crate-boundary crossing) by `dag_store`'s internal composite
-    /// transactions and by `yadorilink-sync-core`'s transaction-bound
-    /// callers that need this read to participate in their own already-open
-    /// transaction.
+    /// not a live query over it.
     pub fn group_heads(&self, group: &FolderGroupId) -> Result<Vec<ChangeHash>, SyncSqliteError> {
         self.database
             .read::<_, SyncSqliteError>(|conn| crate::dag_store::group_heads(conn, group.as_str()))
+    }
+
+    /// [`Self::group_heads`], restricted to the published subgraph -- see
+    /// `dag_store::published_view::published_group_heads`'s own doc
+    /// comment. This is the version any surface that hands heads to a peer
+    /// (heads-announce, have-boundary, outbound `ChangeBatch` construction)
+    /// must use instead of [`Self::group_heads`].
+    pub fn published_group_heads(
+        &self,
+        group: &FolderGroupId,
+    ) -> Result<Vec<ChangeHash>, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            crate::dag_store::published_view::published_group_heads(conn, group.as_str())
+        })
+    }
+
+    /// [`Self::get_change`], restricted to the published subgraph -- see
+    /// `dag_store::published_view::published_change`.
+    pub fn published_change(&self, hash: &ChangeHash) -> Result<Option<Change>, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            crate::dag_store::published_view::published_change(conn, hash)
+        })
     }
 
     /// A stored change decoded from its persisted bytes.
@@ -82,11 +224,8 @@ impl SqliteSyncStore {
     }
 
     /// Whether a change is already present in the admitted store (not the
-    /// orphan buffer). Exposed as its own pooled method for
-    /// `yadorilink-sync-core`'s `CompactionDagStore` impl (Phase 7D-7.3), so
-    /// that caller no longer needs to reach into `dag_store`'s own
-    /// connection-scoped `has_change` for a plain existence check. Delegates
-    /// to `dag_store::retained_history_integrity::has_change` (see
+    /// orphan buffer). Delegates to
+    /// `dag_store::retained_history_integrity::has_change` (see
     /// `group_heads`'s doc comment).
     pub fn has_change(&self, hash: &ChangeHash) -> Result<bool, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| crate::dag_store::has_change(conn, hash))
@@ -160,13 +299,11 @@ impl SqliteSyncStore {
         })
     }
 
-    /// M6-2B1.2: batched form of [`group_has_block_provenance`] -- a single
-    /// `IN (...)` query instead of one round-trip per hash. `ensure_blocks_
-    /// present`'s dedup loop previously called the single-hash form once
-    /// per block (up to ~hundreds of separate SQLite queries
-    /// for one large file), the same per-block-round-trip pattern already
-    /// identified and fixed for `present_blocks` (M6-2A's own doc comment
-    /// on that batching). Returns the SUBSET of `block_hashes` that have
+    /// Batched form of [`group_has_block_provenance`] -- a single
+    /// `IN (...)` query instead of one round-trip per hash, so
+    /// `ensure_blocks_present`'s dedup loop does not issue up to hundreds
+    /// of separate SQLite queries for one large file (the same batching
+    /// `present_blocks` uses). Returns the SUBSET of `block_hashes` that have
     /// recorded provenance for `group` -- callers check `set.contains(hash)`
     /// in place of a per-hash call. Empty input returns an empty set without
     /// touching the database (SQLite's `IN ()` is invalid syntax, and an
@@ -202,23 +339,27 @@ impl SqliteSyncStore {
         })
     }
 
-    /// The true missing frontier reachable from `roots`, walking through any
-    /// buffered orphans in between. A one-level "is this hash known"
-    /// check is not enough for a multi-generation orphan chain: an orphan
-    /// whose own parent is also missing must surface that deeper parent,
-    /// not the orphan itself (the orphan is already held, re-requesting it
-    /// would be a no-op; its missing parent is what a peer must still
-    /// send). Bounded at `ORPHAN_BOUND` visited hashes as a latency
-    /// safeguard against a pathological/adversarial chain shape; if the
-    /// bound is hit, falls back to returning `roots` unchanged -- no worse
-    /// than a one-level check, just without the deeper discovery.
+    /// The true missing frontier reachable from `roots` -- this store's
+    /// read-connection wrapper around
+    /// [`crate::dag_store::missing_ancestor_frontier`], which is where the
+    /// walk itself and the reasoning for its shape live.
+    ///
+    /// It delegates rather than repeating the walk. A second copy here had
+    /// already drifted from the one in `dag_store`: it followed only
+    /// `change_parents` edges, so a change held against its author's
+    /// previous change -- a name no parent edge reaches -- contributed
+    /// nothing to the frontier and the change it waited on was never asked
+    /// for. This is the path the engine actually re-requests through, so
+    /// that drift meant the author link was followed only where tests
+    /// looked.
     pub fn missing_ancestor_frontier(
         &self,
         roots: &[ChangeHash],
     ) -> Result<Vec<ChangeHash>, SyncSqliteError> {
         let roots: Vec<ChangeHash> = roots.to_vec();
-        self.database
-            .read::<_, SyncSqliteError>(|conn| missing_ancestor_frontier_on_conn(conn, &roots))
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            crate::dag_store::missing_ancestor_frontier(conn, roots.iter().copied())
+        })
     }
 
     /// spec "Version Listing": every retained version of `path` (current,
@@ -289,6 +430,8 @@ impl SqliteSyncStore {
         })
     }
 
+    /// See [`read_canonical_current_row`].
+    ///
     /// The `state = 'current'` row of a file, read as one atomic statement.
     pub fn get_current_version_record(
         &self,
@@ -296,74 +439,35 @@ impl SqliteSyncStore {
         path: &str,
     ) -> Result<Option<CurrentVersionSnapshot>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            #[allow(clippy::type_complexity)]
-            let row: Option<(u64, i64, String, i64, String, Option<Vec<u8>>, i64, String)> = conn
-                .query_row(
-                    "SELECT size, mtime_unix_nanos, blocks_json, deleted, record_kind, \
-                            symlink_target, unix_mode, xattrs_json \
-                     FROM files WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
-                    rusqlite::params![group.as_str(), path],
-                    |r| {
-                        Ok((
-                            r.get(0)?,
-                            r.get(1)?,
-                            r.get(2)?,
-                            r.get(3)?,
-                            r.get(4)?,
-                            r.get(5)?,
-                            r.get(6)?,
-                            r.get(7)?,
-                        ))
-                    },
-                )
-                .optional()?;
-            row.map(
-                |(size, mtime, blocks_json, deleted, record_kind, symlink_target, unix_mode, xattrs_json)| {
-                    let blocks: Vec<BlockInfo> =
-                        serde_json::from_str(&blocks_json).map_err(|error| {
-                            SyncSqliteError::CorruptState(format!(
-                                "stored block list for current version of {path} is corrupt: {error}"
-                            ))
-                        })?;
-                    Ok(CurrentVersionSnapshot {
-                        blocks,
-                        size,
-                        mtime_unix_nanos: mtime,
-                        deleted: deleted != 0,
-                        record_kind: RecordKind::from_db_str(&record_kind),
-                        symlink_target,
-                        unix_mode: crate::file_index::decode_unix_mode_column(unix_mode),
-                        xattrs: crate::file_index::decode_xattrs_column(&xattrs_json)?,
-                    })
-                },
-            )
-            .transpose()
+            Ok(read_canonical_current_row(conn, group.as_str(), path)?.map(|row| row.snapshot))
         })
     }
 
-    // --- `&str`-group-id / domain-type convenience wrappers ---
-    //
-    // The methods above are keyed by `&FolderGroupId` and return this
-    // crate's own row types (`RetainedVersion`/`CurrentVersionSnapshot`),
-    // matching `dag_store`'s and this crate's own internal callers (e.g.
-    // `replica_history.rs`). The ten wrappers below exist for callers that
-    // used to reach these reads only through `yadorilink-sync-core::SyncState`'s
-    // deleted delegate methods of the same names (Phase 7D-9F) -- each is a
-    // pure `&str` -> `FolderGroupId` construction plus, for the two whose
-    // result type differs, a `.into()`/`.map(...)` conversion into
-    // `yadorilink_replica_domain::session_state::{VersionRecord,
-    // CurrentVersionRecord}` (the `From` impls in `crate::types` already
-    // exist for exactly this). Centralizing the translation here, not at
+    // --- `&str`-group-id / domain-type convenience wrappers --- The
+    // methods above are keyed by `&FolderGroupId` and return this crate's
+    // own row types (`RetainedVersion`/`CurrentVersionSnapshot`), matching
+    // `dag_store`'s and this crate's own internal callers (e.g.
+    // `replica_history.rs`). Centralizing the translation here, not at
     // every caller, is the point: every caller gets the exact same
-    // `&str`-keyed, domain-typed call shape the deleted `SyncState` methods
-    // used to provide. Named with a `dag_`/`dag_get_current_version_record`/
-    // `dag_list_versions` prefix specifically to avoid colliding with the
-    // `&FolderGroupId`-keyed methods above, not because these are DAG-only
-    // reads (`dag_get_current_version_record`/`dag_list_versions` are
-    // file-index reads, kept in this group only for naming symmetry with
-    // their `SyncState`-era names).
+    // `&str`-keyed, domain-typed call shape the deleted `SyncState`
+    // methods used to provide. Named with a
+    // `dag_`/`dag_get_current_version_record`/ `dag_list_versions` prefix
+    // specifically to avoid colliding with the `&FolderGroupId`-keyed
+    // methods above, not because these are DAG-only reads
+    // (`dag_get_current_version_record`/`dag_list_versions` are file-index
+    // reads, kept in this group only for naming symmetry with their
+    // `SyncState`-era names).
     pub fn dag_group_heads(&self, group_id: &str) -> Result<Vec<ChangeHash>, SyncSqliteError> {
         self.group_heads(&FolderGroupId(group_id.to_string()))
+    }
+
+    /// [`Self::dag_group_heads`], restricted to the published subgraph --
+    /// see [`Self::published_group_heads`].
+    pub fn dag_published_group_heads(
+        &self,
+        group_id: &str,
+    ) -> Result<Vec<ChangeHash>, SyncSqliteError> {
+        self.published_group_heads(&FolderGroupId(group_id.to_string()))
     }
 
     pub fn dag_missing_ancestor_frontier(
@@ -374,8 +478,55 @@ impl SqliteSyncStore {
         self.missing_ancestor_frontier(&roots)
     }
 
+    /// Every hash this device has STAGED for `group_id`, read from
+    /// `verified_change_objects` directly.
+    ///
+    /// Deliberately not derived from the canonical `changes` table: that
+    /// enumerates only what has already been promoted, so filtering it for
+    /// "staged but not canonical" is vacuously empty however much is
+    /// actually staged.
+    pub fn dag_staged_hashes(&self, group_id: &str) -> Result<Vec<ChangeHash>, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT change_hash FROM verified_change_objects WHERE group_id = ?1")?;
+            let rows = stmt.query_map([group_id], |row| row.get::<_, Vec<u8>>(0))?;
+            let mut out = Vec::new();
+            for row in rows {
+                let bytes = row?;
+                if bytes.len() == 32 {
+                    let mut hash = [0u8; 32];
+                    hash.copy_from_slice(&bytes);
+                    out.push(ChangeHash(hash));
+                }
+            }
+            out.sort();
+            Ok(out)
+        })
+    }
+
+    /// The exact set reconciliation compares for `group_id` -- staged
+    /// unioned with authorized canonical. A canonical Change with no
+    /// authorization evidence is NOT in here, so this is not the same
+    /// question as "is it canonical".
+    pub fn dag_servable_hashes(&self, group_id: &str) -> Result<Vec<ChangeHash>, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            crate::verified_change_store::servable_change_hashes(
+                conn,
+                &yadorilink_replica_domain::ids::FolderGroupId(group_id.to_string()),
+            )
+        })
+    }
+
     pub fn dag_get_change(&self, hash: &ChangeHash) -> Result<Option<Change>, SyncSqliteError> {
         self.get_change(hash)
+    }
+
+    /// [`Self::dag_get_change`], restricted to the published subgraph.
+    pub fn dag_published_change(
+        &self,
+        hash: &ChangeHash,
+    ) -> Result<Option<Change>, SyncSqliteError> {
+        self.published_change(hash)
     }
 
     pub fn dag_get_encoded(&self, hash: &ChangeHash) -> Result<Option<Vec<u8>>, SyncSqliteError> {
@@ -458,14 +609,280 @@ impl SqliteSyncStore {
         })
     }
 
-    /// C4-12: the fail-closed read entry point for `(group_id, path)`'s
+    /// What the structural-directory ledger holds for `(group_id, path)`
+    /// -- see [`crate::structural_origin`].
+    pub fn dag_structural_directory_origin(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<crate::structural_origin::StructuralDirectoryOrigin, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            crate::structural_origin::structural_directory_origin(conn, group_id, path)
+        })
+    }
+
+    /// Phase 1 of a structural `mkdir`, committed on its own before the
+    /// syscall -- [`crate::structural_origin::record_structural_intent`].
+    pub fn dag_record_structural_intent(
+        &self,
+        group_id: &str,
+        path: &str,
+        now_unix_nanos: i64,
+    ) -> Result<crate::structural_origin::StructuralIntent, SyncSqliteError> {
+        self.database.write_immediate::<_, SyncSqliteError>(|tx| {
+            crate::structural_origin::record_structural_intent(tx, group_id, path, now_unix_nanos)
+        })
+    }
+
+    /// Phase 2 of a structural `mkdir` that created the directory --
+    /// [`crate::structural_origin::complete_structural_origin`].
+    pub fn dag_complete_structural_origin(
+        &self,
+        group_id: &str,
+        path: &str,
+        identity: &yadorilink_root_authority::fs_identity::FileIdentity,
+        now_unix_nanos: i64,
+    ) -> Result<crate::structural_origin::StructuralOriginCompletion, SyncSqliteError> {
+        self.database.write_immediate::<_, SyncSqliteError>(|tx| {
+            crate::structural_origin::complete_structural_origin(
+                tx,
+                group_id,
+                path,
+                identity,
+                now_unix_nanos,
+            )
+        })
+    }
+
+    /// Phase 2 of a structural `mkdir` that found the name taken --
+    /// [`crate::structural_origin::abandon_structural_intent`].
+    pub fn dag_abandon_structural_intent(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<bool, SyncSqliteError> {
+        self.database.write::<_, SyncSqliteError>(|conn| {
+            crate::structural_origin::abandon_structural_intent(conn, group_id, path)
+        })
+    }
+
+    /// Recovery of interrupted structural `mkdir`s --
+    /// [`crate::structural_origin::drop_unresolved_structural_intents`].
+    pub fn dag_drop_unresolved_structural_intents(
+        &self,
+        recorded_before_unix_nanos: i64,
+    ) -> Result<Vec<(String, String)>, SyncSqliteError> {
+        self.database.write::<_, SyncSqliteError>(|conn| {
+            crate::structural_origin::drop_unresolved_structural_intents(
+                conn,
+                recorded_before_unix_nanos,
+            )
+        })
+    }
+
+    /// The structural intents recorded before `recorded_before_unix_nanos`
+    /// -- [`crate::structural_origin::list_unresolved_structural_intents`].
+    pub fn dag_list_unresolved_structural_intents(
+        &self,
+        recorded_before_unix_nanos: i64,
+    ) -> Result<Vec<crate::structural_origin::UnresolvedStructuralIntent>, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            crate::structural_origin::list_unresolved_structural_intents(
+                conn,
+                recorded_before_unix_nanos,
+            )
+        })
+    }
+
+    /// Recovery of interrupted structural `mkdir`s, all in one transaction:
+    /// each intent dropped (if still pending) together with the lost
+    /// provenance of the directory found at its path --
+    /// [`crate::structural_origin::drop_structural_intent_recording_lost_provenance`].
+    /// Returns the `(group_id, path)` pairs dropped.
+    pub fn dag_drop_structural_intents_recording_lost_provenance(
+        &self,
+        resolutions: &[(
+            crate::structural_origin::UnresolvedStructuralIntent,
+            Option<yadorilink_root_authority::fs_identity::FileIdentity>,
+        )],
+        now_unix_nanos: i64,
+    ) -> Result<Vec<(String, String)>, SyncSqliteError> {
+        if resolutions.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.database.write_immediate::<_, SyncSqliteError>(|tx| {
+            let mut dropped = Vec::new();
+            for (intent, found) in resolutions {
+                if crate::structural_origin::drop_structural_intent_recording_lost_provenance(
+                    tx,
+                    intent,
+                    found.as_ref(),
+                    now_unix_nanos,
+                )? {
+                    dropped.push((intent.group_id.clone(), intent.path.clone()));
+                }
+            }
+            Ok(dropped)
+        })
+    }
+
+    /// Records an existing directory as structural once its explicit
+    /// entry is deleted while live descendants keep it on disk --
+    /// [`crate::structural_origin::adopt_structural_directory`].
+    pub fn dag_adopt_structural_directory(
+        &self,
+        group_id: &str,
+        path: &str,
+        identity: &yadorilink_root_authority::fs_identity::FileIdentity,
+        now_unix_nanos: i64,
+    ) -> Result<(), SyncSqliteError> {
+        self.database.write::<_, SyncSqliteError>(|conn| {
+            crate::structural_origin::adopt_structural_directory(
+                conn,
+                group_id,
+                path,
+                identity,
+                now_unix_nanos,
+            )
+        })
+    }
+
+    /// Follows a structural directory a rename moved --
+    /// [`crate::structural_origin::rekey_structural_origin`].
+    pub fn dag_rekey_structural_origin(
+        &self,
+        group_id: &str,
+        to_path: &str,
+        identity: &yadorilink_root_authority::fs_identity::FileIdentity,
+        birth_time_granularity: yadorilink_root_authority::fs_identity::TimestampGranularity,
+        now_unix_nanos: i64,
+    ) -> Result<Option<String>, SyncSqliteError> {
+        self.database.write::<_, SyncSqliteError>(|conn| {
+            crate::structural_origin::rekey_structural_origin(
+                conn,
+                group_id,
+                to_path,
+                identity,
+                birth_time_granularity,
+                now_unix_nanos,
+            )
+        })
+    }
+
+    /// Drops the structural-origin record for a directory that is gone --
+    /// [`crate::structural_origin::forget_structural_origin`].
+    pub fn dag_forget_structural_origin(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<bool, SyncSqliteError> {
+        self.database.write::<_, SyncSqliteError>(|conn| {
+            crate::structural_origin::forget_structural_origin(conn, group_id, path)
+        })
+    }
+
+    /// Whether anything strictly below `path` holds a live content head --
+    /// [`crate::dag_store::has_live_descendant`].
+    pub fn dag_has_live_descendant(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<bool, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            crate::dag_store::has_live_descendant(conn, group_id, path)
+        })
+    }
+
+    /// Records a directory kept on disk although its entry is deleted --
+    /// [`crate::structural_origin::record_retained_directory`].
+    pub fn record_retained_directory(
+        &self,
+        group_id: &str,
+        path: &str,
+        reason: &str,
+        removable: Option<&yadorilink_root_authority::fs_identity::FileIdentity>,
+        now_unix_nanos: i64,
+    ) -> Result<(), SyncSqliteError> {
+        self.database.write::<_, SyncSqliteError>(|conn| {
+            crate::structural_origin::record_retained_directory(
+                conn,
+                group_id,
+                path,
+                reason,
+                removable,
+                now_unix_nanos,
+            )
+        })
+    }
+
+    /// What this device holds of one recursive operation --
+    /// [`crate::dag_store::recursive_operation`]. `None` when none of its
+    /// parts is recorded here.
+    pub fn dag_recursive_operation(
+        &self,
+        group_id: &str,
+        operation: &yadorilink_replica_domain::recursive_operation::RecursiveOperationRef,
+    ) -> Result<Option<crate::dag_store::RecordedRecursiveOperation>, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            crate::dag_store::recursive_operation(conn, group_id, operation)
+        })
+    }
+
+    /// The retained-directory record for `path` --
+    /// [`crate::structural_origin::retained_directory`].
+    pub fn retained_directory(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<crate::structural_origin::RetainedDirectory, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            crate::structural_origin::retained_directory(conn, group_id, path)
+        })
+    }
+
+    /// Drops the retained-directory record for `path` --
+    /// [`crate::structural_origin::clear_retained_directory`].
+    pub fn clear_retained_directory(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<bool, SyncSqliteError> {
+        self.database.write::<_, SyncSqliteError>(|conn| {
+            crate::structural_origin::clear_retained_directory(conn, group_id, path)
+        })
+    }
+
+    /// Every path retained for `reason` --
+    /// [`crate::structural_origin::retained_paths_with_reason`].
+    pub fn retained_paths_with_reason(
+        &self,
+        group_id: &str,
+        reason: &str,
+    ) -> Result<Vec<String>, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            crate::structural_origin::retained_paths_with_reason(conn, group_id, reason)
+        })
+    }
+
+    /// The reason a directory at `path` is retained, if it is.
+    pub fn retained_directory_reason(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<String>, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            crate::structural_origin::retained_directory_reason(conn, group_id, path)
+        })
+    }
+
+    /// The fail-closed read entry point for `(group_id, path)`'s
     /// actual-state proof (`materialized_generation::
     /// lookup_materialized_generation`'s own doc comment) -- `None` unless
     /// `published_under_mutation_generation` still equals the path's live
     /// mutation fence. A test-facing delegate (this crate's own tests
     /// already exercise the free function directly; this is for callers
     /// outside this crate, e.g. `yadorilink-peer-session`'s integration
-    /// tests asserting what Stage 3's publication boundary actually wrote).
+    /// tests asserting what the publication boundary actually wrote).
     pub fn dag_lookup_materialized_generation(
         &self,
         group_id: &str,
@@ -473,6 +890,43 @@ impl SqliteSyncStore {
     ) -> Result<Option<crate::materialized_generation::DiskGenerationBasis>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             crate::materialized_generation::lookup_materialized_generation(conn, group_id, path)
+        })
+    }
+
+    /// The filesystem identity of the directory most recently published as
+    /// materialized for the explicit Directory entry at `(group_id, path)`,
+    /// read without the fence check: a later fence bump says the proof no
+    /// longer vouches for the path's content, but not that the object it
+    /// names was ever a different one. `None` when the last publication for
+    /// the path was not an explicit directory, or recorded no identity.
+    pub fn dag_materialized_directory_identity(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<yadorilink_root_authority::fs_identity::FileIdentity>, SyncSqliteError> {
+        use crate::materialized_generation::MaterializedObjectKind;
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            Ok(crate::materialized_generation::lookup_materialized_generation_diagnostic(
+                conn, group_id, path,
+            )?
+            .filter(|basis| basis.object_kind == MaterializedObjectKind::Directory)
+            .and_then(|basis| basis.filesystem_identity))
+        })
+    }
+
+    /// Whether the proof standing for `(group_id, path)` is a proof about
+    /// the version the row currently names -- see
+    /// [`crate::exact_materialized_commit::usable_proof_names_current_version`]
+    /// for why "a proof exists" is the answer to a different question.
+    pub fn dag_usable_proof_names_current_version(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<bool, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            crate::exact_materialized_commit::usable_proof_names_current_version(
+                conn, group_id, path,
+            )
         })
     }
 
@@ -498,6 +952,44 @@ impl SqliteSyncStore {
         })
     }
 
+    /// What `path` is required to be on its own account, namespace
+    /// included -- [`crate::desired_state::desired_path_state`], read in one
+    /// transaction so its heads and descendants come from one frontier.
+    pub fn dag_desired_path_state(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<crate::desired_state::DesiredPathState, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            crate::desired_state::desired_path_state(conn, group_id, path)
+        })
+    }
+
+    /// One directory level of the desired namespace --
+    /// [`crate::desired_state::desired_level_projection`], in one
+    /// transaction.
+    pub fn dag_desired_level_projection(
+        &self,
+        group_id: &str,
+        parent: &str,
+    ) -> Result<yadorilink_replica_engine::namespace::NamespaceProjection, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            crate::desired_state::desired_level_projection(conn, group_id, parent)
+        })
+    }
+
+    /// [`Self::dag_desired_path_state`]'s `resolved_path_state_hash`, in
+    /// one transaction.
+    pub fn dag_desired_projected_path_state_hash(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<[u8; 32], SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            crate::desired_state::desired_projected_path_state_hash(conn, group_id, path)
+        })
+    }
+
     /// Test-facing read-back of a causal basis's member change hashes by
     /// its interned id, for asserting exactly which
     /// frontier a publication's `causal_basis_id` was interned from.
@@ -507,6 +999,24 @@ impl SqliteSyncStore {
     ) -> Result<Option<Vec<ChangeHash>>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             crate::dag_store::lookup_causal_basis_members(conn, causal_basis_id)
+        })
+    }
+
+    /// How many projection obligations for `group_id` are still pending --
+    /// the "outstanding work" count a convergence diagnostic wants, now that
+    /// scheduling has exactly one ledger.
+    pub fn dag_count_pending_projection_obligations(
+        &self,
+        group_id: &str,
+    ) -> Result<u64, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM projection_obligations \
+                 WHERE group_id = ?1 AND state = 'pending'",
+                [group_id],
+                |r| r.get(0),
+            )?;
+            Ok(count as u64)
         })
     }
 
@@ -648,6 +1158,33 @@ impl SqliteSyncStore {
         })
     }
 
+    /// Scheduler-facing delegate for the zero-work close, which also
+    /// re-anchors the proof it closes against on the current frontier --
+    /// see [`crate::exact_materialized_commit::
+    /// complete_zero_work_obligation_rebasing_proof`] for why closing alone
+    /// leaves the next local edit of the path concurrent with what the
+    /// close accepted.
+    pub fn dag_complete_zero_work_obligation_rebasing_proof(
+        &self,
+        group_id: &str,
+        path: &str,
+        claimed_invalidation_generation: i64,
+        claimed_obligation_incarnation: i64,
+        desired_resolved_path_state_hash: &[u8],
+    ) -> Result<bool, SyncSqliteError> {
+        self.database.write_immediate::<_, SyncSqliteError>(|tx| {
+            crate::exact_materialized_commit::complete_zero_work_obligation_rebasing_proof(
+                tx,
+                group_id,
+                path,
+                claimed_invalidation_generation,
+                claimed_obligation_incarnation,
+                desired_resolved_path_state_hash,
+                crate::dag_store::now_unix_nanos(),
+            )
+        })
+    }
+
     /// Scheduler-facing delegate for the non-exact-outcome
     /// compound completion. Same `write_immediate` requirement as
     /// [`Self::dag_complete_obligation_if_exact_proof_current`].
@@ -698,34 +1235,13 @@ impl SqliteSyncStore {
         })
     }
 
-    /// Delegate for [`crate::projection_obligations::reconcile_compatibility_applied_flag_for_group`].
-    /// `write_immediate` (not the plain `write` the two delegates above
-    /// use) is load-bearing here, not incidental: the whole point of this
-    /// call is a race-safe check-and-update against a CONCURRENT
-    /// admission's own obligation-table insert, which is exactly the
-    /// atomicity `write_immediate`'s `BEGIN IMMEDIATE` transaction exists
-    /// to provide (see `database.rs`'s own doc comment).
-    pub fn dag_reconcile_compatibility_applied_flag_for_group(
-        &self,
-        group_id: &str,
-    ) -> Result<usize, SyncSqliteError> {
-        self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            crate::projection_obligations::reconcile_compatibility_applied_flag_for_group(
-                tx, group_id,
-            )
-        })
-    }
-
     /// Replaces `device`'s acknowledged frontier for `group` wholesale --
     /// delete then per-head insert, in one transaction, so a reader never
-    /// observes a partially-rewritten frontier. `frontier` is stored
-    /// exactly as given; normalizing it (sort/dedup) is the caller's job,
-    /// not this store's -- see `yadorilink-sync-core::compaction::
-    /// record_acknowledged_frontier`, which normalizes then calls this.
-    /// Delegates to `dag_store::frontier_index::set_device_frontier` -- the
-    /// single SQL implementation of this write (see `group_heads`'s doc
-    /// comment above for why this is a delegation rather than a second copy
-    /// of the query).
+    /// observes a partially-rewritten frontier. Delegates to
+    /// `dag_store::frontier_index::set_device_frontier` -- the single SQL
+    /// implementation of this write (see `group_heads`'s doc comment above
+    /// for why this is a delegation rather than a second copy of the
+    /// query).
     pub fn set_device_frontier(
         &self,
         group: &FolderGroupId,
@@ -767,74 +1283,6 @@ impl SqliteSyncStore {
     }
 }
 
-/// Whether `hash` is durably recorded as a permanent rejection under the
-/// current reserved-namespace rules. A row stamped with an older rules
-/// version is deliberately not trusted as settled -- this returns `false`
-/// for it, exactly as if the hash had never been rejected, so the caller's
-/// normal "still missing" handling drives a fresh re-request and
-/// re-evaluation under the current rules.
-fn is_change_rejected(conn: &Connection, hash: &ChangeHash) -> Result<bool, SyncSqliteError> {
-    let stamped_version: Option<u32> = conn
-        .query_row(
-            "SELECT rules_version FROM rejected_changes WHERE change_hash = ?1",
-            [&hash.0[..]],
-            |r| r.get(0),
-        )
-        .optional()?;
-    Ok(stamped_version == Some(RESERVED_NAMESPACE_RULES_VERSION))
-}
-
-fn missing_ancestor_frontier_on_conn(
-    conn: &Connection,
-    roots: &[ChangeHash],
-) -> Result<Vec<ChangeHash>, SyncSqliteError> {
-    let mut missing = Vec::new();
-    let mut visited: HashSet<ChangeHash> = HashSet::new();
-    let mut queue: VecDeque<ChangeHash> = VecDeque::new();
-    for root in roots {
-        if visited.insert(*root) {
-            queue.push_back(*root);
-        }
-    }
-    while let Some(hash) = queue.pop_front() {
-        if visited.len() > ORPHAN_BOUND {
-            tracing::warn!(
-                "missing-ancestor-frontier walk exceeded ORPHAN_BOUND visited hashes; \
-                 falling back to re-requesting the original roots directly"
-            );
-            return Ok(roots.to_vec());
-        }
-        if crate::dag_store::has_change(conn, &hash)? {
-            continue;
-        }
-        if is_change_rejected(conn, &hash)? {
-            continue;
-        }
-        let is_buffered: Option<i64> = conn
-            .query_row("SELECT 1 FROM orphan_changes WHERE change_hash = ?1", [&hash.0[..]], |r| {
-                r.get(0)
-            })
-            .optional()?;
-        if is_buffered.is_none() {
-            missing.push(hash);
-            continue;
-        }
-        let parents: Vec<Vec<u8>> = {
-            let mut stmt =
-                conn.prepare("SELECT parent_hash FROM change_parents WHERE child_hash = ?1")?;
-            let rows = stmt.query_map([&hash.0[..]], |r| r.get::<_, Vec<u8>>(0))?;
-            rows.collect::<Result<_, _>>()?
-        };
-        for parent_blob in parents {
-            let parent_hash = hash_from_blob(parent_blob)?;
-            if visited.insert(parent_hash) {
-                queue.push_back(parent_hash);
-            }
-        }
-    }
-    Ok(missing)
-}
-
 fn hash_from_blob(v: Vec<u8>) -> Result<ChangeHash, SyncSqliteError> {
     let array: [u8; 32] = v
         .try_into()
@@ -852,396 +1300,4 @@ fn retained_version_state_from_db_str(s: &str) -> Result<RetainedVersionState, S
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use yadorilink_sqlite_runtime::DatabaseError;
-
-    use super::*;
-
-    /// Minimal stand-in for the tables these reads need -- not this
-    /// crate's real schema (item 3 doesn't move schema ownership, only
-    /// reads), just enough shape for these tests to exercise real SQL.
-    fn test_schema(conn: &Connection) -> Result<(), DatabaseError> {
-        conn.execute_batch(
-            "CREATE TABLE changes (change_hash BLOB PRIMARY KEY, group_id TEXT NOT NULL, encoded BLOB NOT NULL);
-             CREATE TABLE change_parents (child_hash BLOB NOT NULL, parent_hash BLOB NOT NULL);
-             CREATE TABLE group_heads (group_id TEXT NOT NULL, change_hash BLOB NOT NULL);
-             CREATE TABLE orphan_changes (change_hash BLOB PRIMARY KEY);
-             CREATE TABLE rejected_changes (change_hash BLOB PRIMARY KEY, rules_version INTEGER NOT NULL);
-             CREATE TABLE file_versions (group_id TEXT NOT NULL, version_hash BLOB NOT NULL, encoded BLOB NOT NULL);
-             CREATE TABLE group_block_provenance (group_id TEXT NOT NULL, block_hash BLOB NOT NULL);
-             CREATE TABLE device_frontier (group_id TEXT NOT NULL, device_id TEXT NOT NULL, change_hash BLOB NOT NULL);
-             CREATE TABLE files (
-                 group_id TEXT NOT NULL, path TEXT NOT NULL, version_seq INTEGER NOT NULL,
-                 size INTEGER NOT NULL, mtime_unix_nanos INTEGER NOT NULL, blocks_json TEXT NOT NULL,
-                 deleted INTEGER NOT NULL, state TEXT NOT NULL, origin_device_id TEXT,
-                 record_kind TEXT NOT NULL, symlink_target BLOB, unix_mode INTEGER NOT NULL,
-                 xattrs_json TEXT NOT NULL DEFAULT '[]'
-             );",
-        )?;
-        Ok(())
-    }
-
-    fn open_test_store() -> SqliteSyncStore {
-        let database =
-            Arc::new(SyncDatabase::open_in_memory(test_schema).expect("open in-memory db"));
-        SqliteSyncStore::new(database)
-    }
-
-    fn hash(byte: u8) -> ChangeHash {
-        ChangeHash([byte; 32])
-    }
-
-    fn insert_block_provenance(
-        store: &SqliteSyncStore,
-        group: &FolderGroupId,
-        block_hashes: &[Vec<u8>],
-    ) {
-        store
-            .database
-            .write::<_, SyncSqliteError>(|conn| {
-                for h in block_hashes {
-                    conn.execute(
-                        "INSERT INTO group_block_provenance (group_id, block_hash) VALUES (?1, ?2)",
-                        rusqlite::params![group.as_str(), h],
-                    )?;
-                }
-                Ok(())
-            })
-            .expect("insert block provenance");
-    }
-
-    fn insert_change(store: &SqliteSyncStore, group: &str, h: ChangeHash, encoded: &[u8]) {
-        store
-            .database
-            .write::<_, SyncSqliteError>(|conn| {
-                conn.execute(
-                    "INSERT INTO changes (change_hash, group_id, encoded) VALUES (?1, ?2, ?3)",
-                    rusqlite::params![&h.0[..], group, encoded],
-                )?;
-                Ok(())
-            })
-            .expect("insert change");
-    }
-
-    fn insert_parent_edge(store: &SqliteSyncStore, child: ChangeHash, parent: ChangeHash) {
-        store
-            .database
-            .write::<_, SyncSqliteError>(|conn| {
-                conn.execute(
-                    "INSERT INTO change_parents (child_hash, parent_hash) VALUES (?1, ?2)",
-                    rusqlite::params![&child.0[..], &parent.0[..]],
-                )?;
-                Ok(())
-            })
-            .expect("insert parent edge");
-    }
-
-    fn insert_group_head(store: &SqliteSyncStore, group: &str, h: ChangeHash) {
-        store
-            .database
-            .write::<_, SyncSqliteError>(|conn| {
-                conn.execute(
-                    "INSERT INTO group_heads (group_id, change_hash) VALUES (?1, ?2)",
-                    rusqlite::params![group, &h.0[..]],
-                )?;
-                Ok(())
-            })
-            .expect("insert group head");
-    }
-
-    #[test]
-    fn group_heads_is_empty_for_an_unknown_group() {
-        let store = open_test_store();
-        let heads = store.group_heads(&FolderGroupId("group-1".into())).expect("group_heads");
-        assert!(heads.is_empty());
-    }
-
-    #[test]
-    fn group_heads_returns_multiple_heads_in_a_stable_hash_order() {
-        let store = open_test_store();
-        // Inserted out of order; the query itself orders by change_hash, so
-        // the result must come back sorted regardless of insertion order.
-        insert_group_head(&store, "group-1", hash(3));
-        insert_group_head(&store, "group-1", hash(1));
-        insert_group_head(&store, "group-1", hash(2));
-
-        let heads = store.group_heads(&FolderGroupId("group-1".into())).expect("group_heads");
-        assert_eq!(heads, vec![hash(1), hash(2), hash(3)]);
-
-        // Repeating the read must produce the identical order -- not just
-        // "some" order that happens to be sorted once.
-        let heads_again = store.group_heads(&FolderGroupId("group-1".into())).expect("group_heads");
-        assert_eq!(heads, heads_again);
-    }
-
-    #[test]
-    fn parents_of_returns_every_recorded_parent_edge() {
-        let store = open_test_store();
-        insert_parent_edge(&store, hash(10), hash(1));
-        insert_parent_edge(&store, hash(10), hash(2));
-
-        let mut parents = store.parents_of(&hash(10)).expect("parents_of");
-        parents.sort();
-        assert_eq!(parents, vec![hash(1), hash(2)]);
-        assert!(store.parents_of(&hash(1)).expect("parents_of").is_empty());
-    }
-
-    #[test]
-    fn get_encoded_round_trips_the_exact_stored_bytes() {
-        let store = open_test_store();
-        let encoded = b"canonical-bytes-plus-signature".to_vec();
-        insert_change(&store, "group-1", hash(1), &encoded);
-
-        let read_back = store.get_encoded(&hash(1)).expect("get_encoded").expect("present");
-        assert_eq!(read_back, encoded);
-        assert!(store.get_encoded(&hash(99)).expect("get_encoded").is_none());
-    }
-
-    #[test]
-    fn missing_ancestor_frontier_of_an_unknown_hash_is_itself() {
-        let store = open_test_store();
-        let missing =
-            store.missing_ancestor_frontier(&[hash(1)]).expect("missing_ancestor_frontier");
-        assert_eq!(missing, vec![hash(1)]);
-    }
-
-    #[test]
-    fn missing_ancestor_frontier_does_not_treat_a_rejected_change_as_missing() {
-        let store = open_test_store();
-        store
-            .database
-            .write::<_, SyncSqliteError>(|conn| {
-                conn.execute(
-                    "INSERT INTO rejected_changes (change_hash, rules_version) VALUES (?1, ?2)",
-                    rusqlite::params![&hash(1).0[..], RESERVED_NAMESPACE_RULES_VERSION],
-                )?;
-                Ok(())
-            })
-            .expect("insert rejected change");
-
-        let missing =
-            store.missing_ancestor_frontier(&[hash(1)]).expect("missing_ancestor_frontier");
-        assert!(missing.is_empty(), "a permanently-rejected hash must not be reported as missing");
-    }
-
-    #[test]
-    fn missing_ancestor_frontier_walks_through_a_buffered_orphan_to_its_missing_parent() {
-        let store = open_test_store();
-        // hash(1) is buffered as an orphan whose recorded parent, hash(2),
-        // is itself unknown -- the walk must surface hash(2), not hash(1)
-        // (hash(1) is already held; re-requesting it would be a no-op).
-        store
-            .database
-            .write::<_, SyncSqliteError>(|conn| {
-                conn.execute(
-                    "INSERT INTO orphan_changes (change_hash) VALUES (?1)",
-                    [&hash(1).0[..]],
-                )?;
-                Ok(())
-            })
-            .expect("insert orphan");
-        insert_parent_edge(&store, hash(1), hash(2));
-
-        let missing =
-            store.missing_ancestor_frontier(&[hash(1)]).expect("missing_ancestor_frontier");
-        assert_eq!(missing, vec![hash(2)]);
-    }
-
-    #[test]
-    fn missing_ancestor_frontier_falls_back_to_roots_when_orphan_bound_is_exceeded() {
-        let store = open_test_store();
-        // A chain of buffered orphans longer than ORPHAN_BOUND, each
-        // pointing at the next as its sole parent (32-byte hashes distinct
-        // by their first 4 bytes, a counter) -- the walk must give up and
-        // return the original root unchanged, not partially-walked results
-        // or an error.
-        let hash_for = |i: u32| -> ChangeHash {
-            let mut bytes = [0u8; 32];
-            bytes[0..4].copy_from_slice(&i.to_le_bytes());
-            ChangeHash(bytes)
-        };
-        store
-            .database
-            .write::<_, SyncSqliteError>(|conn| {
-                for i in 0..=(ORPHAN_BOUND as u32 + 1) {
-                    let child = hash_for(i);
-                    conn.execute(
-                        "INSERT INTO orphan_changes (change_hash) VALUES (?1)",
-                        [&child.0[..]],
-                    )?;
-                    let parent = hash_for(i + 1);
-                    conn.execute(
-                        "INSERT INTO change_parents (child_hash, parent_hash) VALUES (?1, ?2)",
-                        rusqlite::params![&child.0[..], &parent.0[..]],
-                    )?;
-                }
-                Ok(())
-            })
-            .expect("insert long orphan chain");
-        let root = hash_for(0);
-
-        let missing = store.missing_ancestor_frontier(&[root]).expect("missing_ancestor_frontier");
-        assert_eq!(
-            missing,
-            vec![root],
-            "exceeding ORPHAN_BOUND must fall back to the original roots unchanged"
-        );
-    }
-
-    #[test]
-    fn list_versions_orders_newest_first_and_preserves_metadata() {
-        let store = open_test_store();
-        store
-            .database
-            .write::<_, SyncSqliteError>(|conn| {
-                conn.execute(
-                    "INSERT INTO files (group_id, path, version_seq, size, mtime_unix_nanos, \
-                     blocks_json, deleted, state, origin_device_id, record_kind, symlink_target, unix_mode) \
-                     VALUES ('group-1', 'a.txt', 1, 10, 100, '[]', 0, 'superseded', 'device-a', 'file', NULL, 0)",
-                    [],
-                )?;
-                conn.execute(
-                    "INSERT INTO files (group_id, path, version_seq, size, mtime_unix_nanos, \
-                     blocks_json, deleted, state, origin_device_id, record_kind, symlink_target, unix_mode) \
-                     VALUES ('group-1', 'a.txt', 2, 20, 200, '[]', 0, 'current', 'device-b', 'file', NULL, 1)",
-                    [],
-                )?;
-                Ok(())
-            })
-            .expect("insert version rows");
-
-        let versions =
-            store.list_versions(&FolderGroupId("group-1".into()), "a.txt").expect("list_versions");
-        assert_eq!(versions.len(), 2);
-        assert_eq!(versions[0].version_seq, 2, "newest (highest version_seq) must come first");
-        assert_eq!(versions[0].state, RetainedVersionState::Current);
-        assert_eq!(versions[0].origin_device_id.as_deref(), Some("device-b"));
-        assert_eq!(versions[0].unix_mode, Some(1));
-        assert_eq!(versions[1].version_seq, 1);
-        assert_eq!(versions[1].state, RetainedVersionState::Superseded);
-    }
-
-    #[test]
-    fn get_current_version_record_distinguishes_missing_from_corrupt() {
-        let store = open_test_store();
-        let group = FolderGroupId("group-1".into());
-        assert!(
-            store.get_current_version_record(&group, "missing.txt").expect("query").is_none(),
-            "no row at all must read as None, not an error"
-        );
-
-        store
-            .database
-            .write::<_, SyncSqliteError>(|conn| {
-                conn.execute(
-                    "INSERT INTO files (group_id, path, version_seq, size, mtime_unix_nanos, \
-                     blocks_json, deleted, state, origin_device_id, record_kind, symlink_target, unix_mode) \
-                     VALUES ('group-1', 'corrupt.txt', 1, 1, 1, 'not-json', 0, 'current', NULL, 'file', NULL, 0)",
-                    [],
-                )?;
-                Ok(())
-            })
-            .expect("insert corrupt row");
-        let result = store.get_current_version_record(&group, "corrupt.txt");
-        assert!(
-            result.is_err(),
-            "an unparseable blocks_json column must fail closed, not default to empty"
-        );
-    }
-
-    #[test]
-    fn device_frontier_round_trips_and_replaces_wholesale() {
-        let store = open_test_store();
-        let group = FolderGroupId("group-1".into());
-        let device = yadorilink_replica_domain::ids::DeviceId("device-a".into());
-
-        assert!(store.get_device_frontier(&group, &device).expect("read").is_empty());
-
-        store.set_device_frontier(&group, &device, &[hash(2), hash(1)]).expect("set frontier");
-        assert_eq!(
-            store.get_device_frontier(&group, &device).expect("read"),
-            vec![hash(1), hash(2)],
-            "read must come back ascending by hash regardless of set order"
-        );
-
-        // A second set must replace, not accumulate.
-        store.set_device_frontier(&group, &device, &[hash(3)]).expect("replace frontier");
-        assert_eq!(store.get_device_frontier(&group, &device).expect("read"), vec![hash(3)]);
-
-        store.remove_device_frontier(&group, &device).expect("remove frontier");
-        assert!(store.get_device_frontier(&group, &device).expect("read").is_empty());
-    }
-
-    /// M6-2B1.2: `group_has_block_provenance_batch` must return exactly the
-    /// subset of queried hashes that actually have a recorded row for this
-    /// group -- not every hash ever recorded (would falsely dedup blocks
-    /// this call wasn't even asked about) and not a hash recorded under a
-    /// DIFFERENT group (provenance is group-scoped by design: a block
-    /// physically present because a different sync group already holds it
-    /// must not be trusted as available for THIS group without this
-    /// group's own independent fetch).
-    #[test]
-    fn group_has_block_provenance_batch_returns_exactly_the_recorded_subset_for_this_group() {
-        let store = open_test_store();
-        let group = FolderGroupId("group-1".into());
-        let other_group = FolderGroupId("group-2".into());
-        let h1 = vec![1u8; 32];
-        let h2 = vec![2u8; 32];
-        let h3 = vec![3u8; 32];
-
-        insert_block_provenance(&store, &group, std::slice::from_ref(&h1));
-        insert_block_provenance(&store, &other_group, std::slice::from_ref(&h2));
-        // h3 is never recorded anywhere.
-
-        let found = store
-            .group_has_block_provenance_batch(&group, &[h1.clone(), h2.clone(), h3.clone()])
-            .expect("batch query");
-        assert_eq!(
-            found,
-            std::collections::HashSet::from([h1]),
-            "only h1 (recorded under THIS group) may come back -- h2's provenance is under a \
-             different group and must not leak across the group boundary, and h3 was never \
-             recorded at all"
-        );
-    }
-
-    /// An empty query must not touch the database at all (SQLite's own
-    /// `IN ()` is invalid syntax) and must return an empty set, not an
-    /// error -- the common case at the tail of a mostly-already-deduped
-    /// batch where every remaining hash's presence still needs checking.
-    #[test]
-    fn group_has_block_provenance_batch_with_empty_input_returns_empty_without_querying() {
-        let store = open_test_store();
-        let group = FolderGroupId("group-1".into());
-        let found = store.group_has_block_provenance_batch(&group, &[]).expect("empty batch query");
-        assert!(found.is_empty());
-    }
-
-    /// The batched form must agree with the single-hash form for every
-    /// hash it's asked about -- this is a narrow performance change, not a
-    /// semantic one, and this pins that equivalence directly rather than
-    /// trusting the two implementations to stay in sync by inspection.
-    #[test]
-    fn group_has_block_provenance_batch_agrees_with_the_single_hash_form() {
-        let store = open_test_store();
-        let group = FolderGroupId("group-1".into());
-        let recorded = vec![9u8; 32];
-        let not_recorded = vec![10u8; 32];
-        insert_block_provenance(&store, &group, std::slice::from_ref(&recorded));
-
-        let batch = store
-            .group_has_block_provenance_batch(&group, &[recorded.clone(), not_recorded.clone()])
-            .expect("batch query");
-
-        assert_eq!(
-            batch.contains(&recorded),
-            store.group_has_block_provenance(&group, &recorded).expect("single query")
-        );
-        assert_eq!(
-            batch.contains(&not_recorded),
-            store.group_has_block_provenance(&group, &not_recorded).expect("single query")
-        );
-    }
-}
+mod tests;

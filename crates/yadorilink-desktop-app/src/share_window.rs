@@ -16,12 +16,9 @@
 //! and `update` only ever reads already-computed state.
 //!
 //! Every coordination-plane and daemon call this window makes goes through
-//! `yadorilink_cli::commands::share`, the same functions `yadorilink share`
-//! calls, rather than through this crate's own `ipc_client`. `ipc_client`'s
-//! precedent (its own client code, not shared with the CLI) covers reading
-//! daemon status and the plain pass-through actions in `actions.rs`;
-//! minting an invite, changing a role, admitting a device and revoking
-//! access are none of those. They each carry an authorization decision, and
+//! `yadorilink_client_core::ops::shares`, the same functions `yadorilink
+//! share` calls. Minting an invite, changing a role, admitting a device and
+//! revoking access are not plain pass-through actions. They each carry an authorization decision, and
 //! this crate's established rule for those is the opposite one: `account.rs`
 //! and `onboarding/executor.rs` both call the CLI's typed library functions
 //! ("the single implementation the CLI uses too -- so the app and CLI can
@@ -29,17 +26,13 @@
 //! divergence that ends with two different answers to "what does this role
 //! actually grant".
 //!
-//! IMPORTANT / honesty note for reviewers (matching `main.rs`'s and
-//! `folder_status_window.rs`'s own): the pure logic in `share_invite.rs`
+//! Test coverage: the pure logic in `share_invite.rs`
 //! and `share_access.rs`, the QR bitmap construction below, and
 //! `apply_action_result`'s turn from a completed action into what the
 //! window says next (which needs no `egui::Context`), are unit-tested; this
 //! file's actual `eframe`/`egui` rendering -- including every click path
-//! through the access panel and its two removal confirmations -- can only
-//! be verified by `cargo build`/`cargo check` in this sandboxed
-//! environment. There is no display server here to open a real window
-//! against, so nothing drawn below has been exercised by a human clicking
-//! it.
+//! through the access panel and its two removal confirmations -- is
+//! covered by compilation, not by automated UI tests.
 
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver};
@@ -47,7 +40,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use yadorilink_cli::commands::share::{GroupMemberInfo, PendingApproval, RevokeAttempt};
+use yadorilink_client_core::ops::shares::{GroupMemberInfo, PendingApproval, RevokeAttempt};
 use yadorilink_ipc_proto::daemonctl::{
     MintedInviteInfo, ReplicaMembershipCommandOutcome, StatusResponse,
 };
@@ -233,7 +226,12 @@ pub fn run_share(local_path: String) -> Result<(), eframe::Error> {
     let (tx, rx) = mpsc::channel::<Event>();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([460.0, 620.0])
+            // Tall enough that a freshly minted invite shows its QR code
+            // in full. At 620 the code was cut off by the window's bottom
+            // edge: reachable by scrolling, but the whole point of the
+            // flow is the thing that was off screen, and no scrollbar said
+            // so. Kept under 800 so it still fits a 900-point-tall display.
+            .with_inner_size([460.0, 780.0])
             .with_title("YadoriLink — Share Folder"),
         ..Default::default()
     };
@@ -241,6 +239,7 @@ pub fn run_share(local_path: String) -> Result<(), eframe::Error> {
         "YadoriLink Share Folder",
         options,
         Box::new(move |cc| {
+            crate::fonts::install(&cc.egui_ctx);
             let ctx = cc.egui_ctx.clone();
             let sink = EventSink::new(tx, Arc::new(move || ctx.request_repaint()));
             Ok(Box::new(ShareApp::new(local_path, rx, sink)))
@@ -302,7 +301,7 @@ fn spawn_mint(
     spawn_task(
         sink,
         async move {
-            yadorilink_cli::commands::share::mint_invite_resolved(
+            yadorilink_client_core::ops::shares::mint_invite_resolved(
                 group_id,
                 Some(role.wire_value().to_string()),
                 expiry.ttl_secs(),
@@ -324,7 +323,7 @@ fn spawn_mint(
 /// otherwise be handed its OWN pending request to approve, which it has no
 /// authority to act on.
 fn spawn_access_fetch(sink: EventSink<Event>, group_id: String) {
-    use yadorilink_cli::commands::share;
+    use yadorilink_client_core::ops::shares as share;
     spawn_task(
         sink,
         async move {
@@ -353,7 +352,7 @@ fn spawn_access_fetch(sink: EventSink<Event>, group_id: String) {
 /// offer an override for, instead of an error indistinguishable from an
 /// unreachable daemon.
 async fn run_action(group_id: String, action: Action) -> Result<ActionOutcome, String> {
-    use yadorilink_cli::commands::share;
+    use yadorilink_client_core::ops::shares as share;
     match action {
         Action::ChangeRole { device_id, role, .. } => {
             share::change_role_resolved(&group_id, &device_id, role.wire_value())
@@ -498,7 +497,7 @@ impl ShareApp {
             minted: None,
             mint_error: None,
             copied_at: None,
-            own_device_id: yadorilink_cli::commands::share::own_device_id(),
+            own_device_id: yadorilink_client_core::ops::shares::own_device_id(),
             access: None,
             access_error: None,
             access_in_flight: false,
@@ -582,7 +581,7 @@ impl eframe::App for ShareApp {
                     self.minting = false;
                     self.mint_error = None;
                     self.copied_at = None;
-                    let url = yadorilink_cli::commands::share::invite_url(&invite.code);
+                    let url = yadorilink_client_core::wording::invite_url(&invite.code);
                     self.minted = Some(MintedInvite {
                         qr: qr_modules(&url),
                         url,
@@ -696,7 +695,7 @@ impl ShareApp {
                 // Worded by the command line's own formatter, which
                 // deliberately refuses to claim "Approved" for a result this
                 // build does not recognize.
-                let line = yadorilink_cli::commands::share::approve_result_line(
+                let line = yadorilink_client_core::wording::approve_result_line(
                     &result,
                     &device_id,
                     &group_name,
@@ -715,10 +714,9 @@ impl ShareApp {
                     // are empty for an ordinary denial and must stay silent
                     // then; discarding the outcome outright is what would
                     // hide one that is not.
-                    warnings:
-                        yadorilink_cli::commands::membership_render::membership_outcome_warnings(
-                            "revoke", &outcome,
-                        ),
+                    warnings: yadorilink_client_core::wording::membership_outcome_warnings(
+                        "revoke", &outcome,
+                    ),
                 });
                 self.refresh_access();
             }
@@ -742,10 +740,9 @@ impl ShareApp {
                     // The daemon computes these, including a forced
                     // removal's data-loss warning; they are shown in its own
                     // words rather than inferred from the flag that was sent.
-                    warnings:
-                        yadorilink_cli::commands::membership_render::membership_outcome_warnings(
-                            "revoke", &outcome,
-                        ),
+                    warnings: yadorilink_client_core::wording::membership_outcome_warnings(
+                        "revoke", &outcome,
+                    ),
                 });
                 self.refresh_access();
             }
@@ -928,6 +925,10 @@ impl ShareApp {
         self.render_pending_rows(ui, &pending);
     }
 
+    #[allow(
+        clippy::excessive_nesting,
+        reason = "the role ComboBox and the Change role / Remove access buttons must be drawn inside the same `add_enabled_ui(controls_live, ..)` closure so one guard covers every control, and their clicks are collected into locals applied after the loop; extracting a level would break that single-guard property"
+    )]
     fn render_member_rows(&mut self, ui: &mut egui::Ui, rows: &[MemberRow], owns_group: bool) {
         // Clicks are collected here and applied after the loop, matching
         // `folder_status_window.rs`'s own pattern: a button handler cannot
@@ -1332,179 +1333,271 @@ fn qr_color_image(modules: &QrModules, module_px: usize) -> egui::ColorImage {
 }
 
 #[cfg(test)]
-mod tests {
+mod tests;
+
+/// Hand-built `ShareApp` states for looking at this window without an
+/// account, a coordination plane, or a linked folder.
+///
+/// Every state below is the REAL `ShareApp` with its real `update`, real
+/// pickers and real QR encoder -- only the fields a live daemon and
+/// coordination plane would have filled in are supplied here. Nothing in
+/// this module is reachable unless the crate is built with
+/// `--features preview`, which no release build enables.
+///
+/// The states exist because the populated sharing window is otherwise
+/// unreachable on a developer machine: drawing the invite form, the QR
+/// code and the access listing all require a signed-in account plus a
+/// folder group that exists on the coordination plane, so a plain
+/// `--window share` on an unconfigured machine can only ever render the
+/// "daemon unreachable" and "folder not linked" paths.
+#[cfg(feature = "preview")]
+pub mod preview {
     use super::*;
 
-    /// A window's state without a window. Nothing here needs an
-    /// `egui::Context`: the wake callback a real window supplies is the only
-    /// thing `EventSink` wants, and none of the paths exercised below paints
-    /// anything. The folder starts out `Linked` with a read already in
-    /// flight, so `refresh_access` records the refresh it was asked for
-    /// instead of starting a network call -- which is exactly the assertion
-    /// these tests want and the one thing they must not really do.
-    fn test_app() -> ShareApp {
-        let (tx, rx) = mpsc::channel();
-        let mut app = ShareApp::new("/folder".to_string(), rx, EventSink::new(tx, Arc::new(|| {})));
-        app.folder = Folder::Linked { group_id: "group-1".to_string() };
-        app.access_in_flight = true;
+    const GROUP_ID: &str = "grp_7f3a91c4e05b48d2";
+
+    /// Which hand-built state to open.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Scene {
+        /// Before anything is minted: role picker, expiry picker and the
+        /// require-approval toggle, all live.
+        Form,
+        /// After a mint: the invite URL, its QR code, Copy link and the
+        /// email hand-off.
+        Minted,
+        /// The people-with-access listing, with no request waiting.
+        Access,
+        /// The listing plus requests waiting on an Approve/Deny decision.
+        Pending,
+        /// The ordinary "remove this member?" confirmation.
+        ConfirmRevoke,
+        /// The durability override confirmation, reached only after the
+        /// daemon refuses a removal.
+        ConfirmRevokeOverride,
+    }
+
+    impl Scene {
+        pub const ALL: [Scene; 6] = [
+            Scene::Form,
+            Scene::Minted,
+            Scene::Access,
+            Scene::Pending,
+            Scene::ConfirmRevoke,
+            Scene::ConfirmRevokeOverride,
+        ];
+
+        pub fn name(self) -> &'static str {
+            match self {
+                Scene::Form => "form",
+                Scene::Minted => "minted",
+                Scene::Access => "access",
+                Scene::Pending => "pending",
+                Scene::ConfirmRevoke => "confirm-revoke",
+                Scene::ConfirmRevokeOverride => "confirm-revoke-override",
+            }
+        }
+
+        pub fn parse(raw: &str) -> Option<Scene> {
+            Scene::ALL.into_iter().find(|scene| scene.name() == raw)
+        }
+
+        pub fn names() -> String {
+            Scene::ALL.map(Scene::name).join(", ")
+        }
+    }
+
+    /// Device names chosen to exercise layout rather than to look tidy: a
+    /// very long one, one in Japanese, and one short enough to leave the
+    /// row mostly empty.
+    fn members() -> Vec<GroupMemberInfo> {
+        vec![
+            GroupMemberInfo {
+                device_id: "dev_self_0001".to_string(),
+                device_name: "Jumpei's MacBook Air (M4)".to_string(),
+                role: "editor".to_string(),
+                is_same_account: true,
+                is_caller_account: true,
+                storage_mode: "complete".to_string(),
+                online: true,
+                last_seen_unix: now() - 30,
+            },
+            GroupMemberInfo {
+                device_id: "dev_long_0002".to_string(),
+                device_name: "Design team shared workstation — studio floor 3, window seat"
+                    .to_string(),
+                role: "viewer".to_string(),
+                is_same_account: false,
+                is_caller_account: false,
+                storage_mode: "on-demand".to_string(),
+                online: false,
+                last_seen_unix: now() - 86_400 * 3,
+            },
+            GroupMemberInfo {
+                device_id: "dev_jp_0003".to_string(),
+                device_name: "高橋さんのデスクトップ（開発用）".to_string(),
+                role: "editor".to_string(),
+                is_same_account: false,
+                is_caller_account: false,
+                storage_mode: "complete".to_string(),
+                online: true,
+                last_seen_unix: now() - 120,
+            },
+            GroupMemberInfo {
+                device_id: "dev_short_0004".to_string(),
+                device_name: "iPad".to_string(),
+                role: "unknown".to_string(),
+                is_same_account: false,
+                is_caller_account: false,
+                storage_mode: "on-demand".to_string(),
+                online: false,
+                last_seen_unix: now() - 86_400 * 40,
+            },
+        ]
+    }
+
+    fn pending() -> Vec<PendingApproval> {
+        vec![
+            PendingApproval {
+                group_id: GROUP_ID.to_string(),
+                group_name: "Quarterly design review".to_string(),
+                device_id: "dev_pending_0005".to_string(),
+                role: Some("viewer".to_string()),
+            },
+            PendingApproval {
+                group_id: GROUP_ID.to_string(),
+                group_name: "Quarterly design review".to_string(),
+                device_id: "dev_pending_0006".to_string(),
+                // The coordination plane reported no role -- rendered as
+                // unknown rather than guessed at.
+                role: None,
+            },
+        ]
+    }
+
+    fn now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+
+    fn minted_invite() -> MintedInvite {
+        // A realistically-shaped invite code, so the QR encoder is handed
+        // the same payload length a real one would produce.
+        let url =
+            yadorilink_client_core::wording::invite_url("PRV7-K2M9-XQ4T-8N6B-J3WD-5HYC-1FZA-0RSE");
+        MintedInvite {
+            qr: qr_modules(&url),
+            url,
+            role: "viewer".to_string(),
+            expires_at_unix: now() + 86_400 * 7,
+            requires_approval: true,
+            qr_texture: None,
+        }
+    }
+
+    fn app(scene: Scene) -> ShareApp {
+        let (tx, rx) = mpsc::channel::<Event>();
+        // No repaint hook is needed: nothing in a preview posts an event,
+        // and the sink is kept alive only because `ShareApp` owns one.
+        let sink = EventSink::new(tx, Arc::new(|| {}));
+        let mut app =
+            ShareApp::new("/Users/jumpei/Documents/Quarterly design review".to_string(), rx, sink);
+        app.folder = Folder::Linked { group_id: GROUP_ID.to_string() };
+        app.own_device_id = Some("dev_self_0001".to_string());
+        // Every scene has already "loaded": leaving this false would make
+        // `update` start a real access fetch against a daemon that is not
+        // there and replace the hand-built listing with an error.
+        app.access_requested = true;
+        app.resolve_in_flight = false;
+
+        match scene {
+            Scene::Form => {}
+            Scene::Minted => {
+                app.minted = Some(minted_invite());
+            }
+            Scene::Access => {
+                app.access =
+                    Some(Access { members: members(), pending: Vec::new(), owns_group: true });
+            }
+            Scene::Pending => {
+                app.access =
+                    Some(Access { members: members(), pending: pending(), owns_group: true });
+            }
+            Scene::ConfirmRevoke => {
+                app.access =
+                    Some(Access { members: members(), pending: Vec::new(), owns_group: true });
+                app.confirm = Some(Confirm::Revoke {
+                    device_id: "dev_jp_0003".to_string(),
+                    device_label: "高橋さんのデスクトップ（開発用）".to_string(),
+                });
+            }
+            Scene::ConfirmRevokeOverride => {
+                app.access =
+                    Some(Access { members: members(), pending: Vec::new(), owns_group: true });
+                app.confirm = Some(Confirm::RevokeOverride {
+                    device_id: "dev_long_0002".to_string(),
+                    device_label: "Design team shared workstation — studio floor 3, window seat"
+                        .to_string(),
+                    refusal: "removing this device would leave the folder without another \
+                              confirmed-ready complete copy"
+                        .to_string(),
+                });
+            }
+        }
         app
     }
 
-    fn deny_action() -> Action {
-        // A waiting request has no device name, so its id IS its label --
-        // see `render_pending_rows`.
-        Action::Deny { device_id: "device-a".to_string(), device_label: "device-a".to_string() }
-    }
-
-    fn plain_outcome() -> ReplicaMembershipCommandOutcome {
-        ReplicaMembershipCommandOutcome {
-            handoffs: Vec::new(),
-            forced_group_ids: Vec::new(),
-            unknown_scope_operation_id: String::new(),
-        }
-    }
-
-    /// A request that was genuinely still waiting is reported the way the
-    /// button described itself.
-    #[test]
-    fn a_denial_that_was_carried_out_is_reported_as_turned_down() {
-        let mut app = test_app();
-        app.apply_action_result(
-            deny_action(),
-            Ok(ActionOutcome::Denied(Box::new(plain_outcome()))),
-        );
-
-        let notice = app.notice.as_ref().expect("a completed denial reports something");
-        assert!(notice.ok);
-        assert_eq!(notice.lines, vec![deny_done_line("device-a")]);
-        assert!(notice.warnings.is_empty(), "an ordinary denial warns about nothing");
-        assert!(app.access_refresh_queued, "the listing this changed must be re-read");
-    }
-
-    /// The bug this fix closes: a Deny clicked on a row that had already been
-    /// approved elsewhere used to revoke that live member and report it as a
-    /// request being turned down. It is no longer sent at all, and what the
-    /// person is told says so -- never "was turned down", which is the exact
-    /// claim that made a real removal read as a harmless refusal.
-    #[test]
-    fn a_denial_the_state_check_stopped_never_reports_a_request_as_turned_down() {
-        for refusal in [DenyRefusal::AlreadyAdmitted, DenyRefusal::NoLongerListed] {
-            let mut app = test_app();
-            app.apply_action_result(deny_action(), Ok(ActionOutcome::DenyNotCarriedOut(refusal)));
-
-            let notice = app.notice.as_ref().expect("a stopped denial reports something");
-            assert!(!notice.ok, "nothing happened, so this must not read as a success");
-            assert_eq!(notice.lines, vec![deny_not_carried_out_line("device-a", refusal)]);
-            let line = &notice.lines[0];
-            assert!(!line.contains("was turned down"), "{line}");
-            assert!(app.access_refresh_queued, "a panel this stale must be re-read");
-        }
-    }
-
-    /// The already-approved case points at the removal that WOULD do what the
-    /// person was reaching for, and says plainly that it is a different,
-    /// destructive action.
-    #[test]
-    fn a_denial_stopped_by_a_live_membership_points_at_the_removal_control() {
-        let mut app = test_app();
-        app.apply_action_result(
-            deny_action(),
-            Ok(ActionOutcome::DenyNotCarriedOut(DenyRefusal::AlreadyAdmitted)),
-        );
-
-        let line = &app.notice.as_ref().unwrap().lines[0];
-        assert!(line.contains("now has access to this folder"), "{line}");
-        assert!(line.contains(REMOVE_ACCESS_BUTTON), "{line}");
-    }
-
-    /// A denial runs the same mutation a removal runs, so it must show the
-    /// same daemon-computed warnings a removal shows. This outcome cannot
-    /// arise from an unforced denial in practice; the point is that the
-    /// outcome reaches the warning renderer at all, rather than being
-    /// discarded on the way -- discarding it is what let a real removal be
-    /// announced as a plain success.
-    #[test]
-    fn a_denials_daemon_outcome_is_shown_rather_than_discarded() {
-        let mut app = test_app();
-        let outcome = ReplicaMembershipCommandOutcome {
-            forced_group_ids: vec!["group-1".to_string()],
-            ..plain_outcome()
+    /// Opens the sharing window in one hand-built state.
+    pub fn run(scene: Scene) -> Result<(), eframe::Error> {
+        let options = eframe::NativeOptions {
+            viewport: egui::ViewportBuilder::default()
+                .with_inner_size([460.0, 780.0])
+                .with_title(format!("YadoriLink — Share Folder [preview: {}]", scene.name())),
+            ..Default::default()
         };
-        app.apply_action_result(deny_action(), Ok(ActionOutcome::Denied(Box::new(outcome))));
-
-        let notice = app.notice.as_ref().unwrap();
-        assert_eq!(
-            notice.warnings,
-            yadorilink_cli::commands::membership_render::membership_outcome_warnings(
-                "revoke",
-                &ReplicaMembershipCommandOutcome {
-                    forced_group_ids: vec!["group-1".to_string()],
-                    ..plain_outcome()
-                },
-            ),
-        );
-        assert!(!notice.warnings.is_empty());
+        eframe::run_native(
+            "YadoriLink Share Folder Preview",
+            options,
+            Box::new(move |cc| {
+                crate::fonts::install(&cc.egui_ctx);
+                Ok(Box::new(app(scene)))
+            }),
+        )
     }
 
-    fn test_modules() -> QrModules {
-        // A 2x2 grid with one dark module at (1, 0), so the tests below can
-        // check both the quiet-zone offset and the module scaling without
-        // depending on any particular real QR payload's layout.
-        QrModules { width: 2, dark: vec![false, true, false, false] }
-    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
 
-    #[test]
-    fn qr_image_is_square_and_includes_the_quiet_zone_on_every_side() {
-        let image = qr_color_image(&test_modules(), 3);
-        let expected = (2 + 2 * QR_QUIET_ZONE_MODULES) * 3;
-        assert_eq!(image.size, [expected, expected]);
-    }
-
-    #[test]
-    fn qr_image_paints_each_dark_module_as_a_full_square_at_its_offset() {
-        let module_px = 3;
-        let image = qr_color_image(&test_modules(), module_px);
-        let origin_x = (1 + QR_QUIET_ZONE_MODULES) * module_px;
-        let origin_y = QR_QUIET_ZONE_MODULES * module_px;
-        for dy in 0..module_px {
-            for dx in 0..module_px {
-                assert_eq!(
-                    image[(origin_x + dx, origin_y + dy)],
-                    egui::Color32::BLACK,
-                    "module pixel ({dx}, {dy}) should be dark"
-                );
+        #[test]
+        fn every_scene_name_parses_back_to_itself() {
+            for scene in Scene::ALL {
+                assert_eq!(Scene::parse(scene.name()), Some(scene));
             }
         }
-        // The neighbouring module is light, so the square does not bleed.
-        assert_eq!(image[(origin_x - 1, origin_y)], egui::Color32::WHITE);
-        assert_eq!(image[(origin_x + module_px, origin_y)], egui::Color32::WHITE);
-    }
 
-    /// The quiet zone is white all the way round -- a scanner needs it to
-    /// find the symbol's edge.
-    #[test]
-    fn qr_image_quiet_zone_is_light() {
-        let image = qr_color_image(&test_modules(), 3);
-        let [width, height] = image.size;
-        for x in 0..width {
-            assert_eq!(image[(x, 0)], egui::Color32::WHITE);
-            assert_eq!(image[(x, height - 1)], egui::Color32::WHITE);
+        #[test]
+        fn the_minted_scene_actually_encodes_a_qr_code() {
+            // The whole point of the minted scene is to draw a QR code; a
+            // payload that silently failed to encode would render the
+            // scene useless without saying so.
+            let invite = minted_invite();
+            let qr = invite.qr.expect("the preview invite URL must encode as a QR code");
+            assert!(qr.width >= 21, "a QR grid is at least 21 modules wide");
+            assert_eq!(qr.dark.len(), qr.width * qr.width);
         }
-        for y in 0..height {
-            assert_eq!(image[(0, y)], egui::Color32::WHITE);
-            assert_eq!(image[(width - 1, y)], egui::Color32::WHITE);
-        }
-    }
 
-    /// A real invite payload encodes and paints without panicking, at the
-    /// module size this window actually uses.
-    #[test]
-    fn a_real_invite_url_renders_to_a_qr_image() {
-        let url = yadorilink_cli::commands::share::invite_url("0123456789abcdef");
-        let modules = qr_modules(&url).expect("a short invite URL always encodes");
-        let image = qr_color_image(&modules, QR_MODULE_PIXELS);
-        let expected = (modules.width + 2 * QR_QUIET_ZONE_MODULES) * QR_MODULE_PIXELS;
-        assert_eq!(image.size, [expected, expected]);
-        assert!(image.pixels.contains(&egui::Color32::BLACK));
+        #[test]
+        fn the_preview_listing_covers_the_layout_cases_it_exists_for() {
+            let rows = members();
+            assert!(rows.iter().any(|m| m.device_name.chars().count() > 40), "a long name");
+            assert!(
+                rows.iter().any(|m| m.device_name.chars().any(|c| c > '\u{3000}')),
+                "a non-ASCII name"
+            );
+            assert!(rows.iter().any(|m| !m.online), "an offline device");
+            assert!(rows.iter().any(|m| m.is_caller_account), "this device's own row");
+        }
     }
 }

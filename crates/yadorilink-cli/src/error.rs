@@ -2,10 +2,21 @@
 //! message tell the user what kind of thing went wrong, not just that
 //! something did.
 
+use yadorilink_client_core::CoreError;
+use yadorilink_ipc_proto::daemonctl::ApplicationErrorCode;
+
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
     #[error("not logged in — run `yadorilink login`")]
     NotLoggedIn,
+
+    // A credential store that exists and cannot be used. Deliberately NOT
+    // folded into `NotLoggedIn`: that one means "nobody has signed in here"
+    // and its remedy is to sign in, which on a damaged or wrongly-configured
+    // store would succeed and leave the damage behind. This one's remedy is
+    // the store, and the message the store produces already names it.
+    #[error("{0}")]
+    CredentialStore(#[from] yadorilink_fapi_client::store::StoreError),
 
     #[error("authentication failed: {0}")]
     AuthFailed(String),
@@ -65,6 +76,7 @@ impl CliError {
     pub fn exit_code(&self) -> i32 {
         match self {
             CliError::NotLoggedIn | CliError::AuthFailed(_) => 2,
+            CliError::CredentialStore(_) => 9,
             CliError::CoordinationPlaneUnreachable(_) => 3,
             CliError::DaemonNotRunning => 4,
             CliError::PeerConnectivity(_) => 5,
@@ -89,6 +101,7 @@ impl CliError {
                 | CliError::PeerConnectivity(_)
                 | CliError::Other(_)
                 | CliError::EnrollmentPendingReconciliation(_)
+                | CliError::CredentialStore(_)
         )
     }
 
@@ -99,6 +112,7 @@ impl CliError {
     pub fn report_category(&self) -> &'static str {
         match self {
             CliError::NotLoggedIn => "cli_not_logged_in",
+            CliError::CredentialStore(_) => "cli_credential_store",
             CliError::AuthFailed(_) => "cli_auth_failed",
             CliError::CoordinationPlaneUnreachable(_) => "cli_coordination_plane_unreachable",
             CliError::DaemonNotRunning => "cli_daemon_not_running",
@@ -107,6 +121,52 @@ impl CliError {
             CliError::ReportingDaemonRequired(_) => "cli_reporting_daemon_required",
             CliError::LimitExceeded(_) => "cli_limit_exceeded",
             CliError::EnrollmentPendingReconciliation(_) => "cli_enrollment_pending_reconciliation",
+        }
+    }
+}
+
+/// The credential manager's failures, classified the one way
+/// `yadorilink-client-core` classifies them, then mapped onto this CLI's
+/// categories like every other client error.
+impl From<yadorilink_fapi_client::Error> for CliError {
+    fn from(e: yadorilink_fapi_client::Error) -> Self {
+        CoreError::from(e).into()
+    }
+}
+
+/// The client layer's errors, mapped onto the CLI's categories. Every message
+/// and exit code is the one this command line produced before those
+/// operations moved into the client layer; the typed categories the client
+/// layer adds (a 403, a durability refusal, a typed daemon command error,
+/// invalid input) keep printing the same text under the same exit code.
+impl From<CoreError> for CliError {
+    fn from(e: CoreError) -> Self {
+        match e {
+            CoreError::NotLoggedIn => CliError::NotLoggedIn,
+            CoreError::CredentialStore(store) => CliError::CredentialStore(store),
+            CoreError::AuthFailed(message) => CliError::AuthFailed(message),
+            CoreError::CoordinationPlaneUnreachable(message) => {
+                CliError::CoordinationPlaneUnreachable(message)
+            }
+            CoreError::LimitExceeded { message, .. } => CliError::LimitExceeded(message),
+            CoreError::DaemonNotRunning => CliError::DaemonNotRunning,
+            e @ CoreError::DaemonUnresponsive => CliError::Other(e.to_string()),
+            CoreError::DaemonProtocolMismatch { client, daemon } => CliError::Other(format!(
+                "CLI/daemon protocol version mismatch (CLI {client}, daemon {daemon}); run \
+                 matching YadoriLink CLI and daemon binaries"
+            )),
+            CoreError::DaemonCommand {
+                code: ApplicationErrorCode::ActivationAmbiguous,
+                message,
+                ..
+            } => CliError::EnrollmentPendingReconciliation(message),
+            CoreError::Forbidden(message)
+            | CoreError::DaemonRejected(message)
+            | CoreError::DaemonCommand { message, .. }
+            | CoreError::DurabilityBlocked { message, .. }
+            | CoreError::InvalidInput(message)
+            | CoreError::Io(message)
+            | CoreError::Other(message) => CliError::Other(message),
         }
     }
 }
@@ -134,3 +194,6 @@ impl From<serde_json::Error> for CliError {
         CliError::Other(e.to_string())
     }
 }
+
+#[cfg(test)]
+mod tests;

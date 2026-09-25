@@ -1,42 +1,33 @@
-//! Before/after-style regression coverage for
-//! the two scenarios not already covered by a dedicated benchmark
-//! in another crate — "large-file scan" and "large-file hydration" must
-//! not block the tokio runtime (the daemon's own link-runtime task wiring's `spawn_blocking`/
+//! Before/after-style regression coverage for the two scenarios not
+//! already covered by a dedicated benchmark in another crate — "large-file
+//! scan" and "large-file hydration" must not block the tokio runtime (the
+//! daemon's own link-runtime task wiring's `spawn_blocking`/
 //! `block_in_place` wrapping, and `hydration.rs`'s `BlockStore::put`
-//! `spawn_blocking` wrapping, respectively). The other two named
-//! scenarios already have dedicated before/after
-//! measurements elsewhere: "frequent-modify re-hash avoidance" in
-//! `yadorilink-sync-core/src/local_change.rs`'s
-//! `unchanged_size_and_mtime_skips_rechunking_entirely`, and
-//! "full-index sync of many files" is exercised end-to-end by
-//! `load_many_small_files.rs` (200 files through a real initial sync).
-//!
-//! The methodology here is deliberately "after-only, but proves the
-//! actual claim" rather than a literal old-code-vs-new-code A/B: the old,
-//! blocking code path no longer exists to compare against directly, so
-//! instead of a wall-clock speed comparison, each test proves 's
-//! real property directly — a large/expensive operation running
-//! concurrently with a trivial async task must not delay that trivial
-//! task, which is exactly what "don't block the tokio runtime" means in
-//! practice and would reliably FAIL under the pre-code (a
-//! multi-megabyte synchronous chunk/hash call occupying a worker thread
-//! for its whole duration would delay a concurrent timer tick by a
-//! similar order of magnitude).
+//! `spawn_blocking` wrapping, respectively). The methodology here is
+//! deliberately "after-only, but proves the actual claim" rather than a
+//! literal old-code-vs-new-code A/B: the old, blocking code path no longer
+//! exists to compare against directly, so instead of a wall-clock speed
+//! comparison, each test proves 's real property directly — a
+//! large/expensive operation running concurrently with a trivial async
+//! task must not delay that trivial task, which is exactly what "don't
+//! block the tokio runtime" means in practice and would reliably FAIL
+//! under the pre-code (a multi-megabyte synchronous chunk/hash call
+//! occupying a worker thread for its whole duration would delay a
+//! concurrent timer tick by a similar order of magnitude).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+mod support;
 
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::hydration;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-use yadorilink_local_storage::{chunk_file, FsBlockStore};
+use yadorilink_local_storage::{chunk_file, SegmentBlockStore};
 use yadorilink_peer_session::peer_session::PeerSyncSession;
 use yadorilink_replica_domain::file::FileRecord;
 use yadorilink_replica_domain::session_state::MaterializationState;
-use yadorilink_transport::{
-    ConnectRole, DeviceSigningKeyPair, QuicPeerChannel, QuicPeerEndpoint, TransportHub,
-};
 
 const GROUP: &str = "perf-group";
 
@@ -86,7 +77,7 @@ fn hydration_content() -> Vec<u8> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn large_file_scan_does_not_block_concurrent_async_work() {
     let store_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
     let state = DaemonState::new("device-a".into(), sync_state.clone(), store);
     // A registered (non-empty device_id) DaemonState with no signing key
@@ -96,6 +87,16 @@ async fn large_file_scan_does_not_block_concurrent_async_work() {
     // data loss from the group's perspective, not a legitimate no-emitter
     // path.
     state.set_device_signing_key(ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]));
+    // `add_link` below makes the group "introduced", and a group with no
+    // verified policy snapshot now fails closed: `resolve_group_policy`
+    // returns Withhold, every emitting write returns `PolicyUnavailable`,
+    // and the scan treats that as "withhold this chunk, journal dirty,
+    // break" -- so `large.bin` never reaches the index and the wait at the
+    // end of this test expires. The reactor property this test is actually
+    // about passes either way; this restores the precondition it needs to
+    // get far enough to state it. Byte-identical to what
+    // `link_runtime_controller` installs for the same purpose.
+    sync_state.set_local_policy_head_provider(std::sync::Arc::new(|_| Ok([0u8; 32])));
     let root = tempfile::tempdir().unwrap();
 
     std::fs::write(root.path().join("large.bin"), large_content()).unwrap();
@@ -141,7 +142,7 @@ async fn large_file_scan_does_not_block_concurrent_async_work() {
 async fn large_file_hydration_does_not_block_concurrent_async_work() {
     let content = hydration_content();
     let source_dir = tempfile::tempdir().unwrap();
-    let source_store = Arc::new(FsBlockStore::new(source_dir.path()).unwrap());
+    let source_store = Arc::new(SegmentBlockStore::new(source_dir.path()).unwrap());
     let blocks = {
         let tmp_file = source_dir.path().join("source.bin");
         std::fs::write(&tmp_file, &content).unwrap();
@@ -150,7 +151,7 @@ async fn large_file_hydration_does_not_block_concurrent_async_work() {
     assert!(blocks.len() > 4, "test needs a real multi-block file to be meaningful");
 
     let dest_dir = tempfile::tempdir().unwrap();
-    let dest_store = Arc::new(FsBlockStore::new(dest_dir.path()).unwrap());
+    let dest_store = Arc::new(SegmentBlockStore::new(dest_dir.path()).unwrap());
     let dest_sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
     let dest_root = tempfile::tempdir().unwrap();
     dest_sync_state.link_repository().add_link(&dest_root.path().to_string_lossy(), GROUP).unwrap();
@@ -191,30 +192,28 @@ async fn large_file_hydration_does_not_block_concurrent_async_work() {
     // hydration test's `install_test_root_commit_authority` call.
     dest_state.install_test_root_commit_authority(GROUP);
 
-    // Direct loopback pairing: each side binds a UDP socket and one dials
-    // the other's address.
-    let socket_source = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let socket_dest = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let addr_dest = socket_dest.local_addr().unwrap();
-
-    let key_source = DeviceSigningKeyPair::generate();
-    let key_dest = DeviceSigningKeyPair::generate();
-    let public_source = key_source.public_bytes();
-    let public_dest = key_dest.public_bytes();
-    let endpoint_source =
-        QuicPeerEndpoint::new(TransportHub::from_socket(socket_source), key_source).unwrap();
-    let endpoint_dest =
-        QuicPeerEndpoint::new(TransportHub::from_socket(socket_dest), key_dest).unwrap();
-    endpoint_source.authorize(public_dest);
-    endpoint_dest.authorize(public_source);
-    let accepting = {
-        let endpoint_dest = endpoint_dest.clone();
-        tokio::spawn(async move { endpoint_dest.accept(public_source).await })
+    // `SessionTransports` is a required `PeerSyncSession` constructor
+    // parameter now (A3/A4): a real substrate-backed pair, same fixture
+    // `yadorilink-lane-ports`' own tests and `yadorilink-peer-session`'s
+    // external integration crate use.
+    let book = yadorilink_lane_ports::testing::TestAddressBook::new();
+    let node_source =
+        yadorilink_lane_ports::testing::TestPeerNode::start("device-source", book.clone()).await;
+    let node_dest = yadorilink_lane_ports::testing::TestPeerNode::start("device-dest", book).await;
+    let transports_source = node_source.transports_for("device-dest");
+    let transports_dest = node_dest.transports_for("device-source");
+    let session_transports_source = yadorilink_peer_session::ports::SessionTransports {
+        blocks: transports_source.clone(),
+        service: transports_source.clone(),
+        prepared_snapshots: Arc::new(yadorilink_lane_ports::PreparedSnapshots::new()),
+        snapshot_fetch: transports_source,
     };
-    let dialed = endpoint_source.connect(addr_dest, public_dest).await.unwrap();
-    let accepted = accepting.await.unwrap().unwrap();
-    let channel_source = QuicPeerChannel::new(dialed, ConnectRole::Dial);
-    let channel_dest = QuicPeerChannel::new(accepted, ConnectRole::Accept);
+    let session_transports_dest = yadorilink_peer_session::ports::SessionTransports {
+        blocks: transports_dest.clone(),
+        service: transports_dest.clone(),
+        prepared_snapshots: Arc::new(yadorilink_lane_ports::PreparedSnapshots::new()),
+        snapshot_fetch: transports_dest,
+    };
 
     // The serving side needs its own link for the group, exactly as the
     // receiving side has: sync roots are derived from the link table in
@@ -229,12 +228,66 @@ async fn large_file_hydration_does_not_block_concurrent_async_work() {
         .unwrap();
     let source_record =
         dest_sync_state.file_index_repository().get_file(GROUP, "large.bin").unwrap().unwrap();
-    source_sync_state
-        .file_index_repository()
-        .upsert_file(
+    // The source must PUBLISH this version, not merely index it. Block
+    // serving authorization joins `change_authorization`, so a bare
+    // `upsert_file` row can never satisfy it and every block request comes
+    // back refused -- which reaches this test as `HydrationFailed`, long
+    // before it can observe the concurrent-async-work property it is about.
+    let source_state =
+        DaemonState::new("device-source".into(), source_sync_state.clone(), source_store.clone());
+    source_state.install_test_root_commit_authority(GROUP);
+    let source_version = yadorilink_replica_domain::file::FileVersion::new(
+        source_record
+            .blocks
+            .iter()
+            .map(|block| yadorilink_replica_domain::file::VersionBlock {
+                hash: yadorilink_replica_domain::ids::BlockHash(block.hash.clone()),
+                size: block.size,
+            })
+            .collect(),
+        source_record.size,
+        yadorilink_replica_domain::file::FileMeta {
+            mtime_unix_nanos: source_record.mtime_unix_nanos,
+            unix_mode: None,
+            symlink_target: None,
+            record_kind: yadorilink_replica_domain::file::RecordKind::File,
+            xattrs: Vec::new(),
+        },
+    );
+    let source_signing = yadorilink_transport::DeviceSigningKeyPair::generate().signing;
+    source_state.set_device_signing_key(source_signing.clone());
+    let source_emitter = yadorilink_sync_sqlite::dag_store::ChangeEmitter::new(
+        "device-source".to_string(),
+        source_signing,
+    );
+    // One checkpoint issuer for both devices: `coordination_client_config`
+    // is a `OnceLock`, so the authority has to be chosen before either side
+    // needs one.
+    let _authority = support::shared_checkpoint_authority(
+        &[("device-source", &source_state), ("device-dest", &dest_state)],
+        &[GROUP.to_string()],
+    )
+    .await;
+    source_state
+        .replica_coordinator
+        .upsert_file_emitting_change(
             GROUP,
             &source_record,
-            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            "device-source",
+            yadorilink_replica_domain::session_state::ChangeContent {
+                ops: vec![yadorilink_replica_domain::change::Op::Put {
+                    path: yadorilink_replica_domain::ids::SyncPath("large.bin".to_string()),
+                    version: source_version.version_hash,
+                    origin: yadorilink_replica_domain::change::PutOrigin::Direct,
+                }],
+                versions: std::slice::from_ref(&source_version),
+            },
+            None,
+            None,
+            yadorilink_daemon::replica_coordinator::ReplicaChangeEmission {
+                emitter: &source_emitter,
+                permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            },
         )
         .unwrap();
     // `chunk_file` above only writes these blocks into the source's own CAS
@@ -250,17 +303,30 @@ async fn large_file_hydration_does_not_block_concurrent_async_work() {
         .change_history_repository()
         .record_group_block_provenance(GROUP, &block_hashes)
         .unwrap();
+    // Pending is not servable. This fixture triggers neither of production's
+    // flush triggers (a new local mutation's broadcast, or a reconnect), so
+    // it has to ask.
+    source_state.flush_pending_checkpoint_for_group_for_test(GROUP).await;
     let generation = source_sync_state.startup_readiness().begin_group_startup(GROUP);
     source_sync_state.startup_readiness().mark_group_ready(GROUP, generation);
-    let session_source = PeerSyncSession::new(
-        channel_source,
+    let replica_engine_source =
+        yadorilink_daemon::replica_coordinator::engine_ports::build_peer_replica_engine(
+            &source_sync_state,
+            source_store.clone(),
+        );
+    let session_source = PeerSyncSession::over_substrate(
         "device-source".into(),
         "device-dest".into(),
-        source_sync_state,
+        source_sync_state as Arc<dyn yadorilink_peer_session::ports::BlockServeAuthorizationPort>,
+        replica_engine_source,
         source_store,
         vec![GROUP.to_string()],
         std::collections::HashMap::from([(GROUP.to_string(), source_dir.path().to_path_buf())]),
+        session_transports_source,
+        None,
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::test_permissive(),
     );
+    node_source.serve_with("device-dest", session_source.clone());
     // Production sessions always receive the daemon-wide mandatory stage-2
     // serving engine in `peer_orchestrator`. This test constructs sessions
     // directly, so install the equivalent engine explicitly; without it the
@@ -273,24 +339,37 @@ async fn large_file_hydration_does_not_block_concurrent_async_work() {
             1_000,
         ),
     );
-    tokio::spawn(session_source.clone().run());
 
-    let session_dest = PeerSyncSession::new(
-        channel_dest,
+    let dest_peer_store = std::sync::Arc::new(
+        yadorilink_daemon::adapters::block_store_ports::BlockStorePortsAdapter::new(
+            dest_state.block_store.clone(),
+        ),
+    );
+    let replica_engine_dest =
+        yadorilink_daemon::replica_coordinator::engine_ports::build_peer_replica_engine(
+            &dest_sync_state,
+            dest_peer_store.clone(),
+        );
+    let session_dest = PeerSyncSession::over_substrate(
         "device-dest".into(),
         "device-source".into(),
-        dest_sync_state.clone(),
-        std::sync::Arc::new(
-            yadorilink_daemon::adapters::block_store_ports::BlockStorePortsAdapter::new(
-                dest_state.block_store.clone(),
-            ),
-        ),
+        dest_sync_state.clone()
+            as Arc<dyn yadorilink_peer_session::ports::BlockServeAuthorizationPort>,
+        replica_engine_dest,
+        dest_peer_store,
         vec![GROUP.to_string()],
         std::collections::HashMap::from([(GROUP.to_string(), dest_root.path().to_path_buf())]),
+        session_transports_dest,
+        None,
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::test_permissive(),
     );
+    node_dest.serve_with("device-source", session_dest.clone());
     session_dest.set_block_serve_engine(dest_state.block_serve_engine.clone());
-    tokio::spawn(session_dest.clone().run());
-    dest_state.peers.register_session("device-source".into(), session_dest);
+    dest_state.peers.register_session(
+        "device-source".into(),
+        session_dest,
+        dest_state.local_convergence(),
+    );
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -301,16 +380,12 @@ async fn large_file_hydration_does_not_block_concurrent_async_work() {
     });
 
     let dest_state_arc = Arc::new(dest_state);
-    // The 200ms sleep above is a head start, not a guarantee: the two
-    // freshly-spawned PeerSyncSession::run tasks still need to complete
-    // their own handshake with each other over the direct channel before
-    // either is a usable hydration candidate, and that can occasionally
-    // take longer than 200ms on a colder/more loaded runner than this was
-    // tuned against (observed failing fast, in ~1s, on a first-ever
-    // ubuntu-latest CI run -- nowhere near HYDRATION_TIMEOUT's 30s, i.e.
-    // hydrate was correctly reporting "no candidate yet", not hanging).
-    // Retrying tolerates that startup race without weakening what this
-    // test actually verifies (that a real, in-progress hydration doesn't
+    // The 200ms sleep above is a head start, not a guarantee: the lanes
+    // between the two nodes still have to come up before either side is a
+    // usable hydration candidate, and that can occasionally take longer
+    // than 200ms on a loaded runner (hydrate then correctly reports "no
+    // candidate yet", not a hang). Retrying tolerates that startup race
+    // without weakening what this test actually verifies (that a real, in-progress hydration doesn't
     // block the runtime) -- once a hydration attempt gets far enough to
     // actually start fetching blocks, this loop's job is done.
     let mut hydrate_attempts = 0;

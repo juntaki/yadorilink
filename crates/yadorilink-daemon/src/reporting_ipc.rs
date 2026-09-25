@@ -1,9 +1,9 @@
 //! IPC encode/decode for the reporting write surface added to
 //! `daemon_control.proto` -- protobuf request -> application command,
 //! and application outcome -> protobuf response. All actual reporting
-//! logic lives in `ReportingCommandService`
-//! (`crate::application::reporting_command_service`); this module never
-//! touches `ReportingStorage`/`SubmissionClient` directly.
+//! logic lives behind `ReportingCommandPort`
+//! (`crate::application::ports::reporting`); this module never touches
+//! `ReportingStorage`/`SubmissionClient` directly.
 //!
 //! The read-only trio (`ReportingStatus`/`ListQueueItems`/`ShowQueueItem`)
 //! is handled entirely in `control_socket.rs` via `context.queries.
@@ -17,19 +17,20 @@ use yadorilink_ipc_proto::daemonctl::{
 };
 use yadorilink_reporting::consent::ConsentState;
 
-use crate::application::{ConsentCommand, LastErrorReport, ReportingCommandService};
+use crate::application::ports::ReportingCommandPort;
+use crate::application::{ConsentCommand, LastErrorReport};
 
 pub(crate) fn generate_usage_report(
-    service: &ReportingCommandService,
+    port: &dyn ReportingCommandPort,
 ) -> GenerateUsageReportResponse {
-    GenerateUsageReportResponse { report_json: service.generate_usage_report() }
+    GenerateUsageReportResponse { report_json: port.generate_usage_report() }
 }
 
 pub(crate) fn generate_last_error_report(
-    service: &ReportingCommandService,
+    port: &dyn ReportingCommandPort,
     report_id: Option<String>,
 ) -> Result<GenerateLastErrorReportResponse, String> {
-    service.generate_last_error_report(report_id).map(encode_last_error_report)
+    port.generate_last_error_report(report_id).map(encode_last_error_report)
 }
 
 fn encode_last_error_report(report: LastErrorReport) -> GenerateLastErrorReportResponse {
@@ -45,21 +46,21 @@ fn encode_last_error_report(report: LastErrorReport) -> GenerateLastErrorReportR
 }
 
 pub(crate) fn delete_queue_item(
-    service: &ReportingCommandService,
+    port: &dyn ReportingCommandPort,
     report_id: &str,
 ) -> Result<DeleteQueueItemResponse, String> {
-    service.delete_queue_item(report_id).map(|deleted| DeleteQueueItemResponse { deleted })
+    port.delete_queue_item(report_id).map(|deleted| DeleteQueueItemResponse { deleted })
 }
 
-pub(crate) fn flush_queue(service: &ReportingCommandService) -> Result<FlushQueueResponse, String> {
-    service.flush_queue().map(|removed_count| FlushQueueResponse { removed_count })
+pub(crate) fn flush_queue(port: &dyn ReportingCommandPort) -> Result<FlushQueueResponse, String> {
+    port.flush_queue().map(|removed_count| FlushQueueResponse { removed_count })
 }
 
 pub(crate) async fn submit_report(
-    service: &ReportingCommandService,
+    port: &dyn ReportingCommandPort,
     report_json: &str,
 ) -> Result<SubmitReportResponse, String> {
-    service.submit_report(report_json).await.map(|outcome| SubmitReportResponse {
+    port.submit_report(report_json).await.map(|outcome| SubmitReportResponse {
         receipt_id: outcome.receipt_id,
         submitted_at: outcome.submitted_at,
         queued_for_retry: outcome.queued_for_retry,
@@ -67,7 +68,7 @@ pub(crate) async fn submit_report(
 }
 
 pub(crate) fn update_consent(
-    service: &ReportingCommandService,
+    port: &dyn ReportingCommandPort,
     req: UpdateConsentRequest,
 ) -> Result<UpdateConsentResponse, String> {
     let command = match ConsentAction::try_from(req.action) {
@@ -87,8 +88,7 @@ pub(crate) fn update_consent(
             return Err("unspecified consent action".to_string())
         }
     };
-    service
-        .update_consent(command)
+    port.update_consent(command)
         .map(|consent| UpdateConsentResponse { consent: Some(consent_to_proto(&consent)) })
 }
 

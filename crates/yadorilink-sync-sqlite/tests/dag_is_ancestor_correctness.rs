@@ -1,9 +1,8 @@
-//! Correctness coverage for `is_ancestor`'s 2026-09-02 rewrite (removing
-//! the eager `edges` UNION materialization for the 100k acceptance-run
-//! performance fix). The existing basic positive/negative pair
+//! Correctness coverage for `is_ancestor`'s query shape (no eager `edges`
+//! UNION materialization, for performance at scale). The existing basic positive/negative pair
 //! (`dag_store::mod.rs`'s admission-path test) already covers the
-//! ordinary single-parent case; this file covers the two shapes the
-//! rewrite specifically changed how it queries: a genuine branch/merge
+//! ordinary single-parent case; this file covers the two shapes whose
+//! querying that design affects: a genuine branch/merge
 //! (multiple parents) and a walk that must cross the pruned/compacted
 //! history boundary (`pruned_change_parents`, now queried as its own
 //! `UNION ALL` arm instead of pre-unioned into `change_parents`).
@@ -19,11 +18,16 @@ fn hash(tag: u8, i: u64) -> ChangeHash {
     ChangeHash(h)
 }
 
-fn insert_change(conn: &Connection, group_id: &str, h: &ChangeHash, lamport: i64) {
+/// `author_seq` is passed separately from `lamport` because the two are
+/// different things and the store now enforces it: a change's dot is
+/// `(group_id, device_id, author_seq)` and no two changes of one author may
+/// share it, while concurrent siblings routinely share a Lamport clock.
+fn insert_change(conn: &Connection, group_id: &str, h: &ChangeHash, author_seq: i64, lamport: i64) {
     conn.execute(
-        "INSERT INTO changes (group_id, change_hash, device_id, lamport, applied, encoded) \
-         VALUES (?1, ?2, 'test-device', ?3, 1, x'')",
-        rusqlite::params![group_id, &h.0[..], lamport],
+        "INSERT INTO changes \
+         (group_id, change_hash, device_id, author_seq, lamport, encoded) \
+         VALUES (?1, ?2, 'test-device', ?3, ?4, x'')",
+        rusqlite::params![group_id, &h.0[..], author_seq, lamport],
     )
     .unwrap();
 }
@@ -52,11 +56,11 @@ fn is_ancestor_finds_a_common_ancestor_through_either_branch_of_a_merge() {
     let merge = hash(1, 3);
     let unrelated = hash(1, 4);
 
-    insert_change(&conn, group, &root, 1);
-    insert_change(&conn, group, &a, 2);
-    insert_change(&conn, group, &b, 2);
-    insert_change(&conn, group, &merge, 3);
-    insert_change(&conn, group, &unrelated, 1);
+    insert_change(&conn, group, &root, 1, 1);
+    insert_change(&conn, group, &a, 2, 2);
+    insert_change(&conn, group, &b, 3, 2);
+    insert_change(&conn, group, &merge, 4, 3);
+    insert_change(&conn, group, &unrelated, 5, 1);
     insert_edge(&conn, &a, &root);
     insert_edge(&conn, &b, &root);
     insert_edge(&conn, &merge, &a);
@@ -96,8 +100,8 @@ fn is_ancestor_crosses_the_pruned_history_boundary() {
 
     // `root` itself is compacted away (no `changes` row for it -- the
     // whole point of a pruned tombstone), `mid`/`newest` remain live.
-    insert_change(&conn, group, &mid, 2);
-    insert_change(&conn, group, &newest, 3);
+    insert_change(&conn, group, &mid, 2, 2);
+    insert_change(&conn, group, &newest, 3, 3);
     insert_edge(&conn, &newest, &mid); // live edge
     conn.execute(
         "INSERT INTO pruned_change_parents (group_id, child_hash, parent_hash, checkpoint_hash) \

@@ -58,8 +58,11 @@ char *yadorilink_fp_list_on_demand_folders(void);
  * non-deleted file in the folder group rooted at `local_path` (must
  * match a local_path from yadorilink_fp_list_on_demand_folders).
  * `materialization_state` is one of "hydrated" | "placeholder" |
- * "hydrating" | "unspecified". "[]" on a NULL path or any failure.
- * Caller must free with yadorilink_fp_free_string.
+ * "hydrating" | "unspecified". "[]" only for a confirmed empty folder;
+ * NULL on a NULL path or when the listing could not be confirmed (daemon
+ * unreachable, timeout, snapshot_available=false). The caller MUST end
+ * the enumeration with an error on NULL, never report an empty folder.
+ * Caller must free a non-NULL result with yadorilink_fp_free_string.
  *
  * `local_path` must be a null-terminated UTF-8 C string, or NULL.
  */

@@ -74,7 +74,8 @@ pub async fn resume(
     }
 }
 
-/// `POST /api/pin` `{"path": "<absolute file path>"}`.
+/// `POST /api/pin` `{"path": "<absolute file or folder path>"}`. A folder
+/// is pinned as a whole: what is below it now and what arrives later.
 pub async fn pin(
     State(state): State<AppState>,
     Json(body): Json<LocalPathBody>,
@@ -88,7 +89,7 @@ pub async fn pin(
     }
 }
 
-/// `POST /api/unpin` `{"path": "<absolute file path>"}`.
+/// `POST /api/unpin` `{"path": "<absolute file or folder path>"}`.
 pub async fn unpin(
     State(state): State<AppState>,
     Json(body): Json<LocalPathBody>,
@@ -104,7 +105,7 @@ pub async fn unpin(
     }
 }
 
-/// `POST /api/evict` `{"path": "<absolute file path>"}` -- returns whether
+/// `POST /api/evict` `{"path": "<absolute file or folder path>"}` -- returns whether
 /// anything was actually freed (see `EvictResponse.dehydrated`'s own doc
 /// comment in the proto: a bare "ok" here would silently overclaim
 /// success).

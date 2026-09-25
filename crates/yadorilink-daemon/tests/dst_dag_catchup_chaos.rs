@@ -142,7 +142,11 @@
 //! they are not a test of the periodic audit in isolation — do not read a pass
 //! here as evidence that the periodic re-drive works.
 
-#![cfg(madsim)]
+// Retired. This scenario was written for a simulator this project no longer
+// builds against, and it names APIs that have since been removed. It is kept,
+// never compiled, as the specification its turmoil re-expression has to meet;
+// delete it in the change that lands that replacement.
+#![cfg(any())]
 
 mod dst_dag_migrate_b2;
 mod dst_support;
@@ -156,7 +160,7 @@ use dst_support::clock::HarnessClock;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_filesystem_sync::watcher::{FsChangeEvent, FsChangeKind};
 use yadorilink_local_capture::{LocalChangeOutcome, LocalChangeProcessor};
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 use yadorilink_peer_session::peer_session::PeerSyncSession;
 
 const GROUP_ID: &str = "dst-dag-catchup-group";
@@ -202,7 +206,7 @@ fn setup_device(
     device_id: &str,
     root: PathBuf,
     state: Arc<ReplicaCoordinator>,
-    store: Arc<FsBlockStore>,
+    store: Arc<SegmentBlockStore>,
 ) -> Arc<Device> {
     let processor = Arc::new(
         LocalChangeProcessor::new(
@@ -295,9 +299,9 @@ fn snapshot(root: &std::path::Path) -> BTreeMap<String, Vec<u8>> {
 /// single-generation-only shape).
 async fn connect_once(
     laptop: &Arc<Device>,
-    store_l: Arc<FsBlockStore>,
+    store_l: Arc<SegmentBlockStore>,
     always_on: &Arc<Device>,
-    store_a: Arc<FsBlockStore>,
+    store_a: Arc<SegmentBlockStore>,
 ) -> (
     tokio::task::JoinHandle<Result<(), yadorilink_peer_session::PeerSessionError>>,
     tokio::task::JoinHandle<Result<(), yadorilink_peer_session::PeerSessionError>>,
@@ -317,7 +321,7 @@ async fn connect_once(
 
     let mut roots_l = HashMap::new();
     roots_l.insert(GROUP_ID.to_string(), laptop.root.clone());
-    let session_l = PeerSyncSession::new_with_dependencies(
+    let session_l = PeerSyncSession::new(
         channel_l,
         laptop.device_id.clone(),
         always_on.device_id.clone(),
@@ -336,7 +340,7 @@ async fn connect_once(
     );
     let mut roots_a = HashMap::new();
     roots_a.insert(GROUP_ID.to_string(), always_on.root.clone());
-    let session_a = PeerSyncSession::new_with_dependencies(
+    let session_a = PeerSyncSession::new(
         channel_a,
         always_on.device_id.clone(),
         laptop.device_id.clone(),
@@ -429,9 +433,9 @@ const RECONNECT_BACKOFF: yadorilink_daemon::supervise::BackoffConfig =
 /// (see that function's own doc comment for the identical reasoning).
 async fn connect(
     laptop: &Arc<Device>,
-    store_l: Arc<FsBlockStore>,
+    store_l: Arc<SegmentBlockStore>,
     always_on: &Arc<Device>,
-    store_a: Arc<FsBlockStore>,
+    store_a: Arc<SegmentBlockStore>,
 ) {
     let (mut h_l, mut h_a) =
         connect_once(laptop, store_l.clone(), always_on, store_a.clone()).await;
@@ -488,14 +492,14 @@ async fn run_scenario(seed: u64) -> Result<(), String> {
     let dir_l = tempfile::tempdir().map_err(|e| e.to_string())?;
     let root_l = dir_l.path().canonicalize().map_err(|e| e.to_string())?;
     let sdir_l = tempfile::tempdir().map_err(|e| e.to_string())?;
-    let store_l = Arc::new(FsBlockStore::new(sdir_l.path()).map_err(|e| e.to_string())?);
+    let store_l = Arc::new(SegmentBlockStore::new(sdir_l.path()).map_err(|e| e.to_string())?);
     let state_l = Arc::new(ReplicaCoordinator::open_in_memory().map_err(|e| e.to_string())?);
     dst_support::link::link_and_start(&state_l, &root_l, GROUP_ID)?;
 
     let dir_a = tempfile::tempdir().map_err(|e| e.to_string())?;
     let root_a = dir_a.path().canonicalize().map_err(|e| e.to_string())?;
     let sdir_a = tempfile::tempdir().map_err(|e| e.to_string())?;
-    let store_a = Arc::new(FsBlockStore::new(sdir_a.path()).map_err(|e| e.to_string())?);
+    let store_a = Arc::new(SegmentBlockStore::new(sdir_a.path()).map_err(|e| e.to_string())?);
     let state_a = Arc::new(ReplicaCoordinator::open_in_memory().map_err(|e| e.to_string())?);
     dst_support::link::link_and_start(&state_a, &root_a, GROUP_ID)?;
 
@@ -507,9 +511,8 @@ async fn run_scenario(seed: u64) -> Result<(), String> {
     // Startup gate: prove the session is actually up (handshake + a first
     // heads-announce round trip) before the cycles begin. Not part of what this
     // scenario tests -- a failure here is a host-load-dependent startup stall,
-    // classified as a skip. (The old WireGuard-handshake-livelock attribution
-    // was disproven -- issue #26: the one deterministic case was a harness
-    // missing its convergence-driver wiring, which this file has.)
+    // classified as a skip. This file wires the convergence driver, so a
+    // stall here is not a missing-driver hang.
     commit_local(&always_on, CANARY_PATH, b"canary", &clock).await?;
     let canary_ok = dst_support::settle::settle_until(Duration::from_secs(20), || {
         std::fs::read(root_l.join(CANARY_PATH)).map(|c| c == b"canary").unwrap_or(false)

@@ -1,16 +1,9 @@
-//! `PolicyWatermarkRepository` owns the `group_policy_watermark` table -- the
-//! persisted anti-rollback watermark for each group's signed policy log.
-//!
-//! Moved from `yadorilink-sync-core::repository::policy_watermark` (Phase
-//! 7D-9E) -- a plain `Arc<SyncDatabase>`-backed repository with no
-//! `SyncState` coupling of its own, same shape as `handoff_lease`'s and
-//! `rebootstrap_store`'s earlier moves. `PolicyWatermark` (the persisted
-//! value type) moved alongside it for the same reason `RestoreOperation`
-//! moved to `yadorilink-filesystem-sync` in 7D-9C: a type this repository's
-//! own signature names cannot keep living in a crate that depends on this
-//! one. Re-exported at `yadorilink_sync_core::index::PolicyWatermark` (via
-//! the now-deleted `state_model.rs` at the time of this move, Phase
-//! 7D-10.1) so every existing caller keeps resolving unchanged.
+//! `PolicyWatermarkRepository` owns the `group_policy_watermark` table --
+//! the persisted anti-rollback watermark for each group's signed policy
+//! log. `PolicyWatermark` (the persisted value type) moved alongside it
+//! for the same reason `RestoreOperation` moved to
+//! `yadorilink-filesystem-sync` in 7D-9C: a type this repository's own
+//! signature names cannot keep living in a crate that depends on this one.
 
 use std::sync::Arc;
 
@@ -27,16 +20,13 @@ use yadorilink_sqlite_runtime::SyncDatabase;
 /// key at that head. It pins WHICH trust root was verified, not just how many
 /// times it rotated (`authority_key_generation`), so the daemon can catch a
 /// fork that swaps the authority key without advancing the generation, and an
-/// audit can name the exact key that was trusted. It is `None` for a row
-/// written before this column existed (see the read path); such a row is
-/// treated as "fingerprint unknown", not as a fork, and is backfilled from the
-/// next verified snapshot.
+/// audit can name the exact key that was trusted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyWatermark {
     pub highest_verified_seq: u64,
     pub highest_verified_head: [u8; 32],
     pub authority_key_generation: u64,
-    pub authority_key_fingerprint: Option<[u8; 32]>,
+    pub authority_key_fingerprint: [u8; 32],
 }
 
 pub struct PolicyWatermarkRepository {
@@ -60,12 +50,9 @@ impl PolicyWatermarkRepository {
         group_id: &str,
     ) -> Result<Option<PolicyWatermark>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            // `authority_key_fingerprint` is NULL for a row written before that
-            // column existed, so read it as an `Option<Vec<u8>>` — a legacy row
-            // yields `None`, which the daemon's verifier treats as "unknown", not
-            // as a fork. Row shape: `(highest_verified_seq, highest_verified_head,
+            // Row shape: `(highest_verified_seq, highest_verified_head,
             // authority_key_generation, authority_key_fingerprint)`.
-            type WatermarkRow = (i64, Vec<u8>, i64, Option<Vec<u8>>);
+            type WatermarkRow = (i64, Vec<u8>, i64, Vec<u8>);
             let row: Option<WatermarkRow> = conn
             .query_row(
                 "SELECT highest_verified_seq, highest_verified_head, authority_key_generation, \
@@ -84,16 +71,13 @@ impl PolicyWatermarkRepository {
                                 "stored policy watermark head is not 32 bytes".into(),
                             )
                         })?;
-                    let authority_key_fingerprint = fingerprint_blob
-                        .map(|blob| {
-                            blob.as_slice().try_into().map_err(|_| {
-                                SyncSqliteError::CorruptState(
+                    let authority_key_fingerprint: [u8; 32] =
+                        fingerprint_blob.as_slice().try_into().map_err(|_| {
+                            SyncSqliteError::CorruptState(
                                 "stored policy watermark authority key fingerprint is not 32 bytes"
                                     .into(),
                             )
-                            })
-                        })
-                        .transpose()?;
+                        })?;
                     Ok(Some(PolicyWatermark {
                         highest_verified_seq: seq as u64,
                         highest_verified_head,
@@ -126,10 +110,9 @@ impl PolicyWatermarkRepository {
                     watermark.highest_verified_seq as i64,
                     watermark.highest_verified_head.as_slice(),
                     watermark.authority_key_generation as i64,
-                    // `None` stores SQL NULL — a verified snapshot always carries a
-                    // fingerprint, so a NULL here only ever comes from persisting a
-                    // legacy watermark unchanged, never from a fresh verification.
-                    watermark.authority_key_fingerprint.as_ref().map(|fp| fp.as_slice()),
+                    // Always present: the only writer is a completed
+                    // verification, and the column is `NOT NULL`.
+                    &watermark.authority_key_fingerprint[..],
                 ],
             )?;
             Ok(())

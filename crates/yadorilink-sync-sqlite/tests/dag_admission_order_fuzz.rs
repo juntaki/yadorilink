@@ -1,5 +1,5 @@
 //! Admission-order-invariance fuzz for the change-DAG store — no network,
-//! no madsim, no filesystem watchers: the smallest possible configuration
+//! no simulator, no filesystem watchers: the smallest possible configuration
 //! in which the order-dependence class of bug can exist at all.
 //!
 //! Three "authors" (each its own `SyncState`) interleave honest local
@@ -28,7 +28,7 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-use yadorilink_replica_domain::change::{Change, ChangeAuth, Op};
+use yadorilink_replica_domain::change::{Change, Op};
 use yadorilink_replica_domain::file::RecordKind;
 use yadorilink_replica_domain::file::{FileMeta, FileVersion};
 use yadorilink_replica_domain::ids::SyncPath;
@@ -42,9 +42,7 @@ const PERMUTATIONS_PER_SEED: usize = 3;
 
 fn author_state() -> ReplicaCoordinator {
     let state = ReplicaCoordinator::open_in_memory().unwrap();
-    state.set_local_change_auth_provider(Arc::new(|_| {
-        Ok(ChangeAuth { auth_seq: 1, auth_epoch: 1, policy_head_hash: [0; 32] })
-    }));
+    state.set_local_policy_head_provider(Arc::new(|_| Ok([0; 32])));
     state
 }
 
@@ -89,9 +87,7 @@ fn sync_authors(
             continue;
         }
         let needed = versions_for(&change, versions);
-        to.change_history_repository()
-            .dag_admit_change_with_versions(&change, &needed, false)
-            .unwrap();
+        to.change_history_repository().dag_admit_change_with_versions(&change, &needed).unwrap();
     }
 }
 
@@ -172,7 +168,7 @@ fn run_seed(
             let needed = versions_for(change, &versions);
             fresh
                 .change_history_repository()
-                .dag_admit_change_with_versions(change, &needed, false)
+                .dag_admit_change_with_versions(change, &needed)
                 .unwrap();
         }
         let diag = fresh.change_history_repository().dag_group_diagnostics(&group).unwrap();

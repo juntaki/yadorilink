@@ -5,14 +5,19 @@
 //! daemon-side glue that:
 //!
 //! - implements [`yadorilink_send::DeviceDirectory`] against this
-//!   daemon's already-known device list (`DaemonState::peer_signing_key`/
-//!   `peer_candidate_addresses`/`device_id_for_signing_key` -- all
+//!   daemon's already-known device list (`PeerAuthorityState::peer_signing_key`/
+//!   `device_id_for_signing_key`, the iroh substrate reachability the
+//!   coordination plane reported, and grant-derived peers -- all
 //!   connectivity/identity bookkeeping, never anything DAG- or
 //!   materialization-related);
-//! - waits for `peer_orchestrator`'s lazily-built `QuicPeerEndpoint` to
-//!   exist, then builds and publishes this device's one
-//!   `yadorilink_send::SendService`;
-//! - runs its inbound-connection dispatcher for the life of the daemon;
+//! - decides who may open a connection on Track Send's own ALPN
+//!   ([`track_send_admission`]): a device with a live grant, or the
+//!   receiver of an offer this device's user sent and it accepted. Folder
+//!   group membership is never a reason, in either direction;
+//! - waits for the reconciliation stack's iroh endpoint to exist, then
+//!   builds and publishes this device's one `yadorilink_send::SendService`
+//!   over it;
+//! - runs its inbound-connection dispatcher for as long as that endpoint;
 //! - exposes the two thin control-socket-facing wrappers
 //!   ([`SendTransferService`] for `send`/`receive`,
 //!   [`InboxQueries`] for `inbox`) that `adapters::build_application_
@@ -21,7 +26,6 @@
 //!   `ControlContext` itself must never gain a raw `DaemonState` field,
 //!   so this module deliberately does not ask for one.
 
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,15 +34,54 @@ use yadorilink_send::{
     DeviceDirectory, GrantedDevice, InboxEntry, ReceiveOutcome, ResolvedDevice, SendOfferOutcome,
     SendService,
 };
+use yadorilink_sync_substrate::{AdmitWhen, PeerAdmission, PeerId};
 
 use crate::daemon_state::{DaemonState, SendGrantPeer};
 
-/// How often this device checks whether `peer_orchestrator` has published
-/// a `QuicPeerEndpoint` yet, before Track Send has anything to dial or
-/// accept on. Only matters for the (short) window right after daemon
-/// startup, before the first coordination-plane netmap push has been
-/// applied.
+/// How often this device checks whether the reconciliation stack's iroh
+/// endpoint exists yet, before Track Send has anything to dial or accept
+/// on. Only matters for the (short) window right after daemon startup.
 const ENDPOINT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Who may open a connection on Track Send's ALPN to this device.
+///
+/// Exactly two reasons, both about Track Send itself:
+///
+/// - a live grant names the device (`DaemonState::send_grant_peers`, TTL
+///   pruned on every read): the sender this device was told to expect, or
+///   the receiver this device's own grant request named;
+/// - this device sent it an offer that it accepted, so it may come back to
+///   pull the content after the grant has expired -- but only while the
+///   device is still one this device's netmap pins. An accepted offer is a
+///   durable record that never expires; on its own it would keep admitting
+///   a device for the life of the send database, including after that
+///   device was removed from the account. Past the grant, the device's
+///   current authority is what admits it, exactly as for any other
+///   connection from it.
+///
+/// Being a pinned sync peer is not on its own a reason, and admission here
+/// is not a reason to be a sync peer: the sync ALPN has its own admission.
+/// Pinned means the netmap lists the device with its key, which is identity,
+/// not folder-group membership. An admitted connection still cannot deliver
+/// an offer without presenting a grant the coordination plane consumes
+/// (`SendService::handle_offer`).
+///
+/// Read live on every connection, so an expired grant or a withdrawn device
+/// stops admitting on the next one; `PeerConnectivityRuntime::revoke_device`
+/// asks it again to close the Track Send connections a withdrawn device
+/// already has. Weak, so the policy does not keep the daemon state alive.
+pub(crate) fn track_send_admission(state: &Arc<DaemonState>) -> Arc<dyn PeerAdmission> {
+    let state = Arc::downgrade(state);
+    AdmitWhen::new(move |peer: &PeerId| {
+        let Some(state) = state.upgrade() else {
+            return false;
+        };
+        let key = peer.as_bytes();
+        state.send_grant_peer_by_key(key).is_some()
+            || (state.authority.device_id_for_signing_key(key).is_some()
+                && state.send_service().is_some_and(|service| service.expects_pull_from(key)))
+    })
+}
 
 struct DaemonDeviceDirectory {
     state: Arc<DaemonState>,
@@ -47,13 +90,19 @@ struct DaemonDeviceDirectory {
 #[async_trait::async_trait]
 impl DeviceDirectory for DaemonDeviceDirectory {
     fn resolve(&self, device_query: &str) -> Option<ResolvedDevice> {
-        if let Some(signing_key) = self.state.peer_signing_key(device_query) {
-            let candidate_addresses: Vec<SocketAddr> =
-                self.state.peer_candidate_addresses(device_query);
+        if let Some(signing_key) = self.state.authority.peer_signing_key(device_query) {
+            // Where its iroh endpoint answers, as the coordination plane
+            // last reported it; the endpoint's own lookup knows the same.
+            let reachability = self
+                .state
+                .peer_connectivity
+                .substrate_reachability(device_query)
+                .unwrap_or_default();
             return Some(ResolvedDevice {
                 device_id: device_query.to_string(),
                 signing_key,
-                candidate_addresses,
+                direct_addresses: reachability.direct,
+                relay_urls: reachability.relays,
             });
         }
         // Fallback for a device this daemon has no ordinary netmap
@@ -67,12 +116,14 @@ impl DeviceDirectory for DaemonDeviceDirectory {
         Some(ResolvedDevice {
             device_id: grant_peer.device_id,
             signing_key: grant_peer.signing_key,
-            candidate_addresses: grant_peer.candidate_addresses,
+            direct_addresses: grant_peer.reachability.direct,
+            relay_urls: grant_peer.reachability.relays,
         })
     }
 
     fn device_id_for_key(&self, signing_key: &[u8; 32]) -> Option<String> {
         self.state
+            .authority
             .device_id_for_signing_key(signing_key)
             .or_else(|| self.state.send_grant_peer_by_key(signing_key).map(|p| p.device_id))
     }
@@ -81,7 +132,7 @@ impl DeviceDirectory for DaemonDeviceDirectory {
         let config = self.state.coordination_client_config()?.clone();
         let grant = crate::coordination_client::request_send_authorization(
             &config.addr,
-            &config.access_token,
+            &config.auth,
             &self.state.device_id,
             receiver_device_query,
         )
@@ -94,16 +145,16 @@ impl DeviceDirectory for DaemonDeviceDirectory {
             );
         })
         .ok()?;
-        let receiver_candidates: Vec<SocketAddr> =
-            grant.receiver_candidates.iter().filter_map(|c| c.address.parse().ok()).collect();
         // Symmetric bookkeeping with the receiver side's own record below:
         // this device (the sender) may be dialed BACK during the pull
-        // phase, and `device_id_for_key`/`resolve` fall back to this same
-        // cache for any later grant-scoped lookup naming the receiver.
+        // phase -- `track_send_admission` admits the receiver's key for as
+        // long as this record lives -- and `device_id_for_key`/`resolve`
+        // fall back to this same cache for any later grant-scoped lookup
+        // naming the receiver.
         self.state.record_send_grant_peer(SendGrantPeer {
             device_id: grant.receiver_device_id.clone(),
             signing_key: grant.receiver_signing_key,
-            candidate_addresses: receiver_candidates.clone(),
+            reachability: grant.receiver_reachability.clone(),
             grant_id: grant.grant_id.clone(),
             nonce: grant.nonce.clone(),
             expires_at_unix: grant.expires_at_unix,
@@ -112,7 +163,8 @@ impl DeviceDirectory for DaemonDeviceDirectory {
             device: ResolvedDevice {
                 device_id: grant.receiver_device_id,
                 signing_key: grant.receiver_signing_key,
-                candidate_addresses: receiver_candidates,
+                direct_addresses: grant.receiver_reachability.direct,
+                relay_urls: grant.receiver_reachability.relays,
             },
             grant_id: grant.grant_id,
             grant_nonce: grant.nonce,
@@ -127,8 +179,9 @@ impl DeviceDirectory for DaemonDeviceDirectory {
         peer_key: &[u8; 32],
     ) -> std::result::Result<(), String> {
         // The load-bearing identity binding: `pending.device_id` was
-        // derived from `peer_key` -- the QUIC-authenticated key THIS
-        // connection actually holds the private half of -- never from
+        // derived from `peer_key` -- the handshake-authenticated key (iroh
+        // endpoint id) THIS connection actually holds the private half of
+        // -- never from
         // anything the offer's own envelope claims. See `consume_grant`'s
         // own trait doc comment.
         let pending = self.state.send_grant_peer_by_key(peer_key).ok_or_else(|| {
@@ -148,7 +201,7 @@ impl DeviceDirectory for DaemonDeviceDirectory {
             .clone();
         crate::coordination_client::consume_send_authorization(
             &config.addr,
-            &config.access_token,
+            &config.auth,
             grant_id,
             grant_nonce,
             &pending.device_id,
@@ -159,11 +212,10 @@ impl DeviceDirectory for DaemonDeviceDirectory {
     }
 }
 
-/// Waits for `peer_orchestrator` to publish this device's `QuicPeerEndpoint`
-/// (built lazily, on the first applied netmap push -- see
-/// `DaemonState::shared_quic_peer_endpoint`'s own doc comment), then builds
-/// and publishes this device's `SendService` and runs its inbound-connection
-/// dispatcher for the life of the daemon.
+/// Waits for this device's reconciliation stack -- and so its iroh
+/// endpoint, which answers Track Send's ALPN -- to exist, then builds and
+/// publishes this device's `SendService` over that endpoint and serves the
+/// Track Send connections it admits.
 ///
 /// `config_dir` is this device's own config directory -- Track Send's own
 /// subdirectory of it (`config_dir/send`) is sibling to, and never shares a
@@ -184,9 +236,13 @@ pub async fn run(
     state: Arc<DaemonState>,
     config_dir: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let endpoint = loop {
-        if let Some(endpoint) = state.shared_quic_peer_endpoint() {
-            break endpoint;
+    let (node, inbound) = loop {
+        if let Some(driver) = state.reconciliation_driver() {
+            let endpoint = driver.stack().endpoint();
+            let Some(inbound) = endpoint.take_track_send_inbound() else {
+                return Err("Track Send's inbound queue was already taken".into());
+            };
+            break (endpoint.node(), inbound);
         }
         tokio::time::sleep(ENDPOINT_POLL_INTERVAL).await;
     };
@@ -199,7 +255,7 @@ pub async fn run(
         Arc::new(DaemonDeviceDirectory { state: state.clone() });
 
     let service = Arc::new(SendService::new(
-        endpoint,
+        node,
         store_db_path,
         block_store_root,
         directory,
@@ -207,7 +263,7 @@ pub async fn run(
     )?);
     state.set_send_service(service.clone());
 
-    service.run_inbound_dispatcher().await;
+    service.run_inbound_dispatcher(inbound).await;
     Ok(())
 }
 
@@ -274,3 +330,6 @@ impl InboxQueries {
         service.list_inbox().map_err(|e| e.to_string())
     }
 }
+
+#[cfg(test)]
+mod tests;

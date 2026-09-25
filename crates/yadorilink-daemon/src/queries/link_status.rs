@@ -10,9 +10,9 @@
 
 use std::sync::Arc;
 
-use crate::durability_service::GroupDurabilityStatus;
+use crate::durability_service::{DurabilityEvidence, GroupDurabilityStatus};
 
-/// M4 Pass 2: this link's TRUTHFUL current local storage state -- distinct
+/// This link's TRUTHFUL current local storage state -- distinct
 /// from `materialization_policy` (the CONFIGURED target, "eager" |
 /// "ondemand"), which only says what this device is trying to become, not
 /// what it currently holds. Deliberately NOT derived from policy alone:
@@ -20,9 +20,7 @@ use crate::durability_service::GroupDurabilityStatus;
 /// `PartiallyMaterialized`, never `FullCopy`, until every current file is
 /// recorded hydrated.
 ///
-/// Known limitation (M4 Pass 2 Codex review #2 finding #3, not newly
-/// introduced by this pass -- the OLD `hydrated_count`/`placeholder_count`
-/// fields this replaces carried the identical trust boundary): `FullCopy`
+/// Trust boundary: `FullCopy`
 /// reflects the `files.materialization_state` DB column's bookkeeping, not
 /// a live disk verification (existence/size/block-content check) -- a row
 /// left `Hydrated` after its on-disk file is externally deleted or
@@ -50,7 +48,7 @@ pub(crate) enum LocalStorageState {
     OnDemand,
 }
 
-/// M4 Pass 2: whether this link's required current-version content can
+/// Whether this link's required current-version content can
 /// actually be obtained right now, locally or through a valid serving
 /// path. Deliberately NOT an alias for `PeerReachability` -- a reachable
 /// peer that isn't a full-replica writer for this group proves nothing
@@ -120,16 +118,25 @@ pub(crate) struct LinkStatusView {
     pub(crate) degraded: Option<DegradedLinkView>,
     pub(crate) transfer: Option<LinkTransferView>,
     pub(crate) durability_status: GroupDurabilityStatus,
+    /// What kind of evidence `durability_status` is currently standing on.
+    ///
+    /// A separate axis on purpose. `Protected` used to mean exactly one
+    /// thing -- a peer had recently read back and re-checksummed every byte
+    /// of every durability root -- and no longer does, because establishing
+    /// that cost one round-trip and one whole-file re-read per root, every
+    /// ninety seconds. This field is where that is said out loud rather than
+    /// left for a reader to discover.
+    pub(crate) durability_evidence: DurabilityEvidence,
     pub(crate) policy_stale: bool,
-    /// M4 Pass 2: see `LocalStorageState`'s own doc comment.
+    /// See `LocalStorageState`'s own doc comment.
     pub(crate) local_storage_state: LocalStorageState,
-    /// M4 Pass 2: see `FetchAvailability`'s own doc comment.
+    /// See `FetchAvailability`'s own doc comment.
     pub(crate) fetch_availability: FetchAvailability,
     /// Every live folder registered for this link's group; more than one
     /// entry means the group is linked twice and refusing to sync -- the
     /// invariant this reports on.
     pub(crate) ambiguous_local_paths: Vec<String>,
-    /// M4 Pass 3: device ids of every OTHER device currently recorded
+    /// Device ids of every OTHER device currently recorded
     /// (netmap-derived, content-blind) as an authorized-writer full
     /// replica for this group -- feeds the user-facing "Complete copies"
     /// per-device list. Cross-reference against `StatusResponse.peers`'s

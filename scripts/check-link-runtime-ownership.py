@@ -75,6 +75,11 @@ def cfg_test_line_ranges(text: str) -> list[tuple[int, int]]:
     `strip_cfg_test_blocks`): every `#[cfg(test)] <item> { ... }` span, as
     (start_line, end_line) 1-indexed inclusive line numbers.
     """
+    # A file that opens with the inner attribute is a test module living in
+    # its own file: its parent declares it `#[cfg(test)] mod x;`, which this
+    # per-file scanner cannot see. The whole file is one test span.
+    if text.lstrip().startswith("#![cfg(test)]"):
+        return [(1, text.count("\n") + 1)]
     ranges: list[tuple[int, int]] = []
     i = 0
     n = len(text)

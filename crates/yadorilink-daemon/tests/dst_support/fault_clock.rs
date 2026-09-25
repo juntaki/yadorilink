@@ -64,7 +64,7 @@
 //! monotonic/wall source; DST wires this. The seam is the only place that needs
 //! to change; the plan itself is already the whole policy.
 
-#![cfg(madsim)]
+#![cfg(turmoil)]
 #![allow(dead_code)] // not every scenario exercises this injector yet
 
 use std::collections::BTreeMap;

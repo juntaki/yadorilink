@@ -17,7 +17,8 @@ Blocker classes:
 Required evidence fields:
 - build identifier;
 - platform/version/architecture;
-- matrix cell from `docs/COMPATIBILITY.md`;
+- compatibility matrix cell (the supported platform, version, and architecture
+  target the record covers);
 - owner;
 - pass/fail status;
 - blocker class;
@@ -29,7 +30,7 @@ Required evidence fields:
 
 | Area | Required Check | Blocker |
 |---|---|---|
-| Compatibility | Supported runtime target cells in `docs/COMPATIBILITY.md` have evidence | blocker |
+| Compatibility | Every supported beta platform target in the compatibility matrix has evidence | blocker |
 | Install | Fresh install succeeds on supported macOS and Windows beta targets | blocker |
 | First run | Account/device setup and first link complete with preflight warnings | blocker |
 | Sync smoke | Two-device create, modify, rename, delete, and conflict smoke pass | blocker |
@@ -49,11 +50,11 @@ the first public release, supported upgrade evidence becomes release-blocking.
 
 ## Evidence Template
 
-Before publishing a candidate, collect these fields in a JSON file and run:
-
-```bash
-python3 scripts/check-beta-release-gate.py --candidate path/to/beta-candidate.json
-```
+Before publishing a candidate, collect these fields in a JSON file and
+validate it against this gate. The supported beta platform targets are
+currently macOS 14 Sonoma and 15 Sequoia on Apple Silicon, and Windows 11
+23H2 and 24H2 on x86_64; other platforms are experimental or unsupported and
+are not release-blocking.
 
 The file uses schema `yadorilink-beta-candidate/1`, with top-level `build_id`
 and `records`. Each record carries the fields below plus separate `platform`,
@@ -63,10 +64,10 @@ record for every supported compatibility cell and every gate. Only a
 `conditional` gate may use `status: "waived"`, and it still requires an owner,
 evidence location, and rationale in `notes`.
 
-Slow load/soak evidence comes from the `Beta heat tests` workflow
-(`.github/workflows/beta-heat.yml`). It runs weekly and on demand without
-adding hours to normal pull-request CI. Record the successful Actions run URL
-in the candidate's Sync smoke or Daemon lifecycle evidence as applicable.
+Slow load/soak evidence comes from a scheduled heat-test run that is kept
+separate from normal pull-request CI so it does not add hours to every change.
+Record the successful run's location in the candidate's Sync smoke or Daemon
+lifecycle evidence as applicable.
 
 ```markdown
 ## Beta Evidence: <build-id>
@@ -100,8 +101,7 @@ in the candidate's Sync smoke or Daemon lifecycle evidence as applicable.
 ## Security Release Blockers
 
 These are `blocker`-class items under the **Security** gate row above
-(`docs/THREAT_MODEL.md`'s threat-model/security-review release blockers) —
-each must be closed or explicitly waived with documented rationale before any
+(the Threat-model/security-review release blockers) — each must be closed or explicitly waived with documented rationale before any
 beta build is published to real users, not merely tracked as a known
 limitation.
 
@@ -111,7 +111,7 @@ Developer builds pin the known `yadorilink-beta-dev-2026` key. Release builds
 instead require a key id and public key at compile time and cannot silently
 fall back to that development key. This closes the packaging path, but automatic
 or manually triggered update MUST NOT be enabled for real users until the
-production ceremony in `docs/UPDATE_SIGNING.md` has been performed and all of
+production key-generation and signing ceremony has been performed and all of
 the following have recorded evidence:
 
 - the private key matching the pinned public key exists only as the
@@ -120,8 +120,9 @@ the following have recorded evidence:
 - signing runs only after `release-signing` environment approval for a nightly
   build, an immutable beta tag, or a manual update-control operation, never for
   pull requests or ordinary build-health CI;
-- the documented signing ceremony was followed, including independent review;
-- the documented key-rotation and revocation procedures have named owners;
+- the signing ceremony was followed, including independent review of each step;
+- key-rotation and revocation procedures are written down and have named
+  owners;
 - release artifacts are reproducible and accompanied by an SBOM;
 - manifest-signing authority is kept organizationally and technically
   separate from platform code-signing authority (macOS Developer ID /

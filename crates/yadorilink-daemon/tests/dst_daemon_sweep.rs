@@ -1,38 +1,38 @@
 //! Deterministic-simulation *workload sweep* through two real daemon
 //! lifecycles. This extends `dst_daemon_two_device.rs` (which proves two
-//! in-sim `app::run` daemons discover each other and converge on a *single*
-//! file) into a multi-round, multi-operation workload -- solo
-//! writes/edits/deletes plus concurrent same-path races -- and then runs the
-//! full multi-device oracle suite (`check_convergence`, `check_no_loss`,
-//! `check_conflict_copy_accounting`, `check_structural`) against both real
-//! daemon roots + `SyncState`s at quiescence.
-//!
-//! WHY THIS TEST EXISTS. The `yadorilink-sync-core` chaos scenarios drive a
-//! *bare* `PeerSyncSession` directly, without a `DaemonState`. That bare
-//! harness surfaced a consistent data-loss class -- `[NoLoss]` (a write not
-//! causally superseded absent from every device, live or as a conflict copy)
-//! and `[StructuralIndexDiskMismatch]` (a live index row with no file on
-//! disk). The open hypothesis is that these are *harness artifacts*: the bare
-//! `PeerSyncSession` lacks the production daemon's self-healing
-//! (`repair_interrupted_materializations` / forward-rebroadcast) and real
-//! transport, so a transient mid-sync state that the real daemon would repair
-//! is observed by the bare harness as a terminal loss. This sweep answers
-//! that question empirically by running the *same oracle* the bare harness
-//! runs, but against the *real daemon* end to end. If the two classes are
-//! absent here where the bare harness showed them, the daemon's self-healing
-//! closes them (artifact confirmed); if they persist, it is a real product
-//! bug and the seed + sequence is the reproduction.
-//!
-//! Everything below discovery is the identical production path
-//! (`PeerChannel`, `PeerSyncSession`, `broadcast_change`, materialization,
-//! and the daemon's periodic self-healing sweep). Only the coordination-plane
-//! discovery is replaced by the `#[cfg(madsim)]` static-netmap seam, and the
-//! OS watcher by `SimulatedFolderWatchSource` -- exactly as in
-//! `dst_daemon_two_device.rs`. Production code is unchanged.
-//!
-//! Only compiled/run under `RUSTFLAGS="--cfg madsim"`.
+//! in-sim `app::run` daemons discover each other and converge on a
+//! *single* file) into a multi-round, multi-operation workload -- solo
+//! writes/edits/deletes plus concurrent same-path races -- and then runs
+//! the full multi-device oracle suite (`check_convergence`,
+//! `check_no_loss`, `check_conflict_copy_accounting`, `check_structural`)
+//! against both real daemon roots + `SyncState`s at quiescence. WHY THIS
+//! TEST EXISTS. That bare harness surfaced a consistent data-loss class --
+//! `[NoLoss]` (a write not causally superseded absent from every device,
+//! live or as a conflict copy) and `[StructuralIndexDiskMismatch]` (a live
+//! index row with no file on disk). The open hypothesis is that these are
+//! *harness artifacts*: the bare `PeerSyncSession` lacks the production
+//! daemon's self-healing (`repair_interrupted_materializations` /
+//! forward-rebroadcast) and real transport, so a transient mid-sync state
+//! that the real daemon would repair is observed by the bare harness as a
+//! terminal loss. This sweep answers that question empirically by running
+//! the *same oracle* the bare harness runs, but against the *real daemon*
+//! end to end. If the two classes are absent here where the bare harness
+//! showed them, the daemon's self-healing closes them (artifact
+//! confirmed); if they persist, it is a real product bug and the seed +
+//! sequence is the reproduction. Everything below discovery is the
+//! identical production path (`PeerChannel`, `PeerSyncSession`,
+//! `broadcast_change`, materialization, and the daemon's periodic
+//! self-healing sweep). Only the coordination-plane discovery is replaced
+//! by the `#[cfg(madsim)]` static-netmap seam, and the OS watcher by
+//! `SimulatedFolderWatchSource` -- exactly as in
+//! `dst_daemon_two_device.rs`. Production code is unchanged. Only
+//! compiled/run under `RUSTFLAGS="--cfg madsim"`.
 
-#![cfg(madsim)]
+// Retired. This scenario was written for a simulator this project no longer
+// builds against, and it names APIs that have since been removed. It is kept,
+// never compiled, as the specification its turmoil re-expression has to meet;
+// delete it in the change that lands that replacement.
+#![cfg(any())]
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -49,20 +49,17 @@ use yadorilink_filesystem_sync::watcher::{
     FsChangeEvent, FsChangeKind, SimulatedFolderWatchSource,
 };
 
-// --------------------------------------------------------------------------
-// The real multi-device oracle, reused verbatim from
-// `yadorilink-sync-core`'s `tests/dst_support`. `oracle.rs` only depends on
-// `super::case_ir::ContentTable` and `super::content_hash`; when included as
-// a crate-root module its `super` is this test's crate root, so those two
-// items are provided here at crate root and then `oracle.rs` is
-// `#[path]`-included *unchanged* -- so this sweep runs the identical checker
-// the bare-`PeerSyncSession` chaos scenarios run, which is the whole point (a
-// fork of the oracle would not answer the fidelity question).
-//
-// `content_hash` is used only *inside* the oracle (cross-device convergence
-// comparison + no-corruption disk hashing); it is never compared against a
-// production-computed hash, so a std-only deterministic hash keeps this test
-// dependency-free while remaining faithful.
+// `oracle.rs` only depends on `super::case_ir::ContentTable` and
+// `super::content_hash`; when included as a crate-root module its `super`
+// is this test's crate root, so those two items are provided here at crate
+// root and then `oracle.rs` is `#[path]`-included *unchanged* -- so this
+// sweep runs the identical checker the bare-`PeerSyncSession` chaos
+// scenarios run, which is the whole point (a fork of the oracle would not
+// answer the fidelity question). `content_hash` is used only *inside* the
+// oracle (cross-device convergence comparison + no-corruption disk
+// hashing); it is never compared against a production-computed hash, so a
+// std-only deterministic hash keeps this test dependency-free while
+// remaining faithful.
 pub fn content_hash(bytes: &[u8]) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();

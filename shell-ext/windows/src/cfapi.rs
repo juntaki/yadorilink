@@ -8,11 +8,15 @@
 //!   hydration), so the sync root's `Hydration` policy is `FULL` and the
 //!   fetch-data callback always serves the entire file regardless of the
 //!   OS-requested range.
-//! - Nested directories under an OnDemand folder are created as ordinary
+//! - Nested directories under an OnDemand folder are ordinary
 //!   (non-placeholder) directories, not lazily-populated placeholder
 //!   directories — `CfCreatePlaceholders` is only used for files. This
 //!   matches the design's file-level (not directory-listing-level)
-//!   on-demand scope.
+//!   on-demand scope. This process never creates them: the daemon does,
+//!   before it records the placeholder this process places, and records
+//!   each one it makes only to hold a descendant, so local capture never
+//!   mistakes it for a directory a user made. A placeholder whose parent
+//!   is not placed yet is skipped and placed on a later poll.
 //! - A placeholder's `FileIdentity` blob carries only the relative path
 //!   as an opaque marker, not real block/version state: `CfCreatePlaceholders`
 //!   documents `FileIdentity` as *mandatory for files* (confirmed the hard
@@ -217,21 +221,21 @@ pub fn unregister(local_path: &Path) -> WinResult<()> {
     unsafe { CfUnregisterSyncRoot(PCWSTR::from_raw(path_wide.as_ptr())) }
 }
 
-/// Encodes `generation` -- a `u64` the DAEMON minted and persisted (M2-2
-/// moved minting authority there; see `crates/yadorilink-daemon/src/
+/// Encodes `generation` -- a `u64` the DAEMON mints and persists (the
+/// daemon is the minting authority; see `crates/yadorilink-daemon/src/
 /// link_runtime/operations/capture_local_change.rs`'s
 /// `ensure_windows_placeholder_generation`, this value's origin) -- as
 /// the `FileIdentity` blob a placeholder is created with.
 ///
 /// Self-describing on purpose: 1 version-tag byte (`1`, "generation-token
-/// v1") followed by the 8-byte little-endian `u64`. M2-0 originally
-/// shipped a bare, untagged 8-byte value; M2-2's Windows dirty-detection
+/// v1") followed by the 8-byte little-endian `u64`. The Windows
+/// dirty-detection
 /// reader (`yadorilink-daemon::placeholder_inspect_windows::
 /// decode_generation_identity`) needs to tell "a generation token" apart
-/// from "an even older, pre-M2-0 filename-derived identity" -- both are
-/// now indistinguishable "not this format" to that reader, since this
+/// from any other identity blob (an untagged value or a filename-derived
+/// identity) -- all of which are "not this format" to that reader, since this
 /// project ships pre-release with no compatibility burden (no migration
-/// path needed for a placeholder an earlier build created; M2-2's own
+/// path needed for a placeholder an earlier build created; the
 /// doc comment on `sync_placeholders` below covers what happens to one).
 ///
 /// Matches `yadorilink_filesystem_sync::placeholder_backend::
@@ -263,9 +267,8 @@ fn decode_generation_identity(bytes: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(buf))
 }
 
-/// M2-3b: native Windows eviction. If `expected_generation` is `Some`,
-/// first verifies the placeholder currently at `path` still carries that
-/// exact generation (an ABA guard against dehydrating a placeholder that
+/// Native Windows eviction. First verifies the placeholder
+/// currently at `path` still carries exactly the `expected` generation (an ABA guard against dehydrating a placeholder that
 /// was deleted and replaced by an unrelated one at the same path since the
 /// daemon last read its index -- same defense-in-depth reasoning as
 /// `placeholder_inspect_windows::inspect_placeholder`'s own identity
@@ -274,7 +277,7 @@ fn decode_generation_identity(bytes: &[u8]) -> Option<u64> {
 /// in place. This is the Windows counterpart to `write_placeholder` on
 /// Unix, except the real on-disk dehydration happens HERE, synchronously,
 /// in THIS process (the one actually connected to the sync root) --
-/// unlike M2-3a's placeholder CREATION, which is deferred to a future
+/// unlike placeholder CREATION, which is deferred to a future
 /// `sync_placeholders` poll, eviction cannot be fire-and-forget: the
 /// caller (`dehydrate_server`) only reports success back to the daemon
 /// once this function has actually confirmed the dehydrate call
@@ -290,7 +293,7 @@ fn decode_generation_identity(bytes: &[u8]) -> Option<u64> {
 /// with a headroom buffer, raw HRESULT checks) are already proven working
 /// against real cfapi on a Windows 11 VM in `yadorilink-daemon::
 /// placeholder_inspect_windows`/`placeholder_backend_windows`.
-pub fn dehydrate_placeholder(path: &Path, expected_generation: Option<u64>) -> Result<(), String> {
+pub fn dehydrate_placeholder(path: &Path, expected: u64) -> Result<(), String> {
     use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE};
     use windows_sys::Win32::Storage::CloudFilters::{
         CfDehydratePlaceholder, CfGetPlaceholderInfo, CF_DEHYDRATE_FLAG_NONE,
@@ -331,49 +334,46 @@ pub fn dehydrate_placeholder(path: &Path, expected_generation: Option<u64>) -> R
         CloseHandle(handle);
     };
 
-    if let Some(expected) = expected_generation {
-        const IDENTITY_HEADROOM: usize = 64;
-        let mut buf =
-            vec![0u8; std::mem::size_of::<CF_PLACEHOLDER_BASIC_INFO>() + IDENTITY_HEADROOM];
-        let mut returned: u32 = 0;
-        // SAFETY: `handle` is a valid, open handle; `buf` is sized to hold
-        // at least a full `CF_PLACEHOLDER_BASIC_INFO` plus headroom for
-        // the trailing identity bytes -- mirrors `placeholder_inspect_
-        // windows::read_placeholder_identity` exactly.
-        let hr = unsafe {
-            CfGetPlaceholderInfo(
-                handle,
-                CF_PLACEHOLDER_INFO_BASIC,
-                buf.as_mut_ptr() as *mut c_void,
-                buf.len() as u32,
-                &mut returned,
-            )
-        };
-        if hr < 0 {
-            close();
-            return Err(format!(
-                "CfGetPlaceholderInfo failed for {} before dehydrate: HRESULT {hr:#x}",
-                path.display()
-            ));
-        }
-        // SAFETY: the call above reported success, so at least
-        // `size_of::<CF_PLACEHOLDER_BASIC_INFO>()` bytes of `buf` are
-        // valid; `read_unaligned` does not require alignment.
-        let info: CF_PLACEHOLDER_BASIC_INFO =
-            unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const CF_PLACEHOLDER_BASIC_INFO) };
-        let identity_offset = std::mem::offset_of!(CF_PLACEHOLDER_BASIC_INFO, FileIdentity);
-        let len = info.FileIdentityLength as usize;
-        let decoded = identity_offset
-            .checked_add(len)
-            .filter(|&end| end <= buf.len())
-            .and_then(|_| decode_generation_identity(&buf[identity_offset..identity_offset + len]));
-        if decoded != Some(expected) {
-            close();
-            return Err(format!(
-                "{} identity mismatch before dehydrate: expected generation {expected}, found {decoded:?}",
-                path.display()
-            ));
-        }
+    const IDENTITY_HEADROOM: usize = 64;
+    let mut buf = vec![0u8; std::mem::size_of::<CF_PLACEHOLDER_BASIC_INFO>() + IDENTITY_HEADROOM];
+    let mut returned: u32 = 0;
+    // SAFETY: `handle` is a valid, open handle; `buf` is sized to hold
+    // at least a full `CF_PLACEHOLDER_BASIC_INFO` plus headroom for
+    // the trailing identity bytes -- mirrors `placeholder_inspect_
+    // windows::read_placeholder_identity` exactly.
+    let hr = unsafe {
+        CfGetPlaceholderInfo(
+            handle,
+            CF_PLACEHOLDER_INFO_BASIC,
+            buf.as_mut_ptr() as *mut c_void,
+            buf.len() as u32,
+            &mut returned,
+        )
+    };
+    if hr < 0 {
+        close();
+        return Err(format!(
+            "CfGetPlaceholderInfo failed for {} before dehydrate: HRESULT {hr:#x}",
+            path.display()
+        ));
+    }
+    // SAFETY: the call above reported success, so at least
+    // `size_of::<CF_PLACEHOLDER_BASIC_INFO>()` bytes of `buf` are
+    // valid; `read_unaligned` does not require alignment.
+    let info: CF_PLACEHOLDER_BASIC_INFO =
+        unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const CF_PLACEHOLDER_BASIC_INFO) };
+    let identity_offset = std::mem::offset_of!(CF_PLACEHOLDER_BASIC_INFO, FileIdentity);
+    let len = info.FileIdentityLength as usize;
+    let decoded = identity_offset
+        .checked_add(len)
+        .filter(|&end| end <= buf.len())
+        .and_then(|_| decode_generation_identity(&buf[identity_offset..identity_offset + len]));
+    if decoded != Some(expected) {
+        close();
+        return Err(format!(
+            "{} identity mismatch before dehydrate: expected generation {expected}, found {decoded:?}",
+            path.display()
+        ));
     }
 
     // SAFETY: `handle` is a valid, open, writable handle to the
@@ -395,10 +395,10 @@ pub fn dehydrate_placeholder(path: &Path, expected_generation: Option<u64>) -> R
 
 /// Creates a cfapi placeholder for one file. `relative_path`
 /// is forward-slash-separated (matching the shell-IPC wire format);
-/// converted to backslashes here. The immediate parent directory is
-/// created as an ordinary directory if missing (see module doc's
-/// "nested directories" limitation). `generation` is minted and
-/// persisted by the DAEMON (M2-2), not this process -- see
+/// converted to backslashes here. The parent directory must already
+/// exist: this process creates no directory (see the module doc's
+/// "nested directories" note). `generation` is minted and
+/// persisted by the DAEMON, not this process -- see
 /// `encode_generation_identity`'s own doc for why.
 pub fn create_placeholder(
     root: &Path,
@@ -409,9 +409,6 @@ pub fn create_placeholder(
 ) -> WinResult<()> {
     let relative_path = relative_path.replace('/', "\\");
     let full_path = root.join(&relative_path);
-    if let Some(parent) = full_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
     let base_dir = full_path.parent().unwrap_or(root);
     let file_name =
         full_path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or(relative_path);
@@ -573,7 +570,7 @@ unsafe extern "system" fn fetch_data_callback(
 /// they either already have real content or are actively being written
 /// by a non-cfapi-routed hydration in progress, neither of which needs a
 /// placeholder created.
-/// M2-2 note: a path whose real CfAPI placeholder already exists on disk
+/// Note: a path whose real CfAPI placeholder already exists on disk
 /// (the `full_path.exists()` skip below) never has its `FileIdentity`
 /// refreshed here even if the daemon reports a different
 /// `placeholder_generation` on a later poll -- it keeps whatever identity
@@ -585,24 +582,25 @@ unsafe extern "system" fn fetch_data_callback(
 /// generation the daemon expects for it never actually diverge in
 /// practice.
 pub fn sync_placeholders(root: &Path, entries: &[yadorilink_ipc_proto::shellipc::FolderFileEntry]) {
-    for entry in entries {
-        if MaterializationState::try_from(entry.materialization_state)
-            != Ok(MaterializationState::Placeholder)
-        {
-            continue;
-        }
+    for entry in placeholder_candidates(entries) {
         let full_path = root.join(entry.relative_path.replace('/', "\\"));
         if full_path.exists() {
             continue;
         }
-        // The daemon hasn't minted/persisted a generation for this path
-        // yet (a transient race between this poll's `ListFolderFilesRequest`
-        // and the daemon's own `ensure_windows_placeholder_generation`
-        // call) -- skip creating a placeholder this poll rather than
-        // inventing an identity locally; M2-2 moved minting authority to
-        // the daemon entirely (see `encode_generation_identity`'s own
-        // doc), so there is nothing safe to do here but wait for a future
-        // poll where the daemon has caught up.
+        // The daemon places every directory -- explicit ones and the ones
+        // it makes only to hold descendants -- before it records a
+        // placeholder below it. A parent not there yet is one it has not
+        // placed; a later poll places this file. Said on every poll it
+        // waits, so a parent the daemon never places does not leave the
+        // file missing without a trace.
+        if full_path.parent().is_some_and(|parent| !parent.is_dir()) {
+            eprintln!(
+                "yadorilink-cfapi-host: waiting for the folder above {:?} before placing it",
+                entry.relative_path
+            );
+            continue;
+        }
+        // `placeholder_candidates` keeps only entries with a generation.
         let Some(generation) = entry.placeholder_generation else {
             continue;
         };
@@ -621,9 +619,77 @@ pub fn sync_placeholders(root: &Path, entries: &[yadorilink_ipc_proto::shellipc:
     }
 }
 
+/// The listed entries this process makes a placeholder for: files the
+/// daemon reports as placeholders and has minted a generation for.
+///
+/// A CfAPI placeholder is a file, so a directory is never one. Directories
+/// of an on-demand folder -- explicit directory entries and the structural
+/// ones that exist only to hold descendants -- are ordinary directories the
+/// daemon itself places (and records, so capture never mistakes one it made
+/// for a user's); a directory entry listed before the daemon has placed it
+/// must not get a file-shaped placeholder at its name. A symlink is placed
+/// by the daemon too. A file below either kind of directory is a candidate
+/// like any other.
+///
+/// A path without a generation yet is a transient race between this poll's
+/// `ListFolderFilesRequest` and the daemon's
+/// `ensure_windows_placeholder_generation`; minting authority is the
+/// daemon's (see `encode_generation_identity`), so it waits for a later
+/// poll rather than inventing an identity here.
+fn placeholder_candidates(
+    entries: &[yadorilink_ipc_proto::shellipc::FolderFileEntry],
+) -> impl Iterator<Item = &yadorilink_ipc_proto::shellipc::FolderFileEntry> {
+    entries.iter().filter(|entry| {
+        MaterializationState::try_from(entry.materialization_state)
+            == Ok(MaterializationState::Placeholder)
+            && yadorilink_ipc_proto::shellipc::EntryKind::try_from(entry.kind)
+                == Ok(yadorilink_ipc_proto::shellipc::EntryKind::File)
+            && entry.placeholder_generation.is_some()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::decode_generation_identity;
+    use yadorilink_ipc_proto::shellipc::{EntryKind, FolderFileEntry, MaterializationState};
+
+    fn entry(
+        path: &str,
+        kind: EntryKind,
+        state: MaterializationState,
+        generation: Option<u64>,
+    ) -> FolderFileEntry {
+        FolderFileEntry {
+            relative_path: path.into(),
+            materialization_state: state as i32,
+            placeholder_generation: generation,
+            kind: kind as i32,
+            ..Default::default()
+        }
+    }
+
+    /// Directories are never placeholders: an explicit directory entry and
+    /// the structural directories above a file are placed by the daemon as
+    /// ordinary directories, and the files below both kinds are the
+    /// placeholders.
+    #[test]
+    fn placeholders_are_the_files_below_explicit_and_structural_directories() {
+        use EntryKind::{Directory, File, Symlink};
+        use MaterializationState::{Hydrated, Placeholder};
+        let entries = [
+            entry("album", Directory, Placeholder, Some(1)),
+            entry("album/cover.jpg", File, Placeholder, Some(2)),
+            // `trips` and `trips/2026` are structural: no entry of their own.
+            entry("trips/2026/beach.jpg", File, Placeholder, Some(3)),
+            entry("trips/2026/link", Symlink, Placeholder, Some(4)),
+            entry("hydrated.txt", File, Hydrated, None),
+            entry("not-minted-yet.txt", File, Placeholder, None),
+        ];
+        let paths: Vec<&str> = super::placeholder_candidates(&entries)
+            .map(|entry| entry.relative_path.as_str())
+            .collect();
+        assert_eq!(paths, ["album/cover.jpg", "trips/2026/beach.jpg"]);
+    }
 
     #[test]
     fn decode_generation_identity_round_trips_through_encode() {

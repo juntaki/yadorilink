@@ -1,13 +1,9 @@
-//! Connection pool construction, the madsim-only inline-pool stand-in, and
-//! the bounded SQLITE_BUSY/SQLITE_LOCKED retry helper. Pure, stateless
-//! machinery -- no `SyncDatabase` fields live here; `SyncDatabase` owns its
-//! own `pool`/`writer_gate` and calls back into this module. Moved
-//! verbatim out of `yadorilink-sync-core` (Phase 7D-4.2) -- no pool size,
-//! timeout, locking order, retry behavior, or PRAGMA changed.
+//! Connection pool construction and the bounded SQLITE_BUSY/SQLITE_LOCKED retry helper. Pure, stateless
+//! machinery -- no `SyncDatabase` fields live here; `SyncDatabase` owns
+//! its own `pool`/`writer_gate` and calls back into this module.
 
 use std::time::Duration;
 
-#[cfg(not(madsim))]
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 
@@ -18,27 +14,27 @@ use crate::error::SqlOperationError;
 /// before giving up with `SQLITE_BUSY`, instead of erroring immediately.
 pub const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The connection "pool" backing a [`crate::SyncDatabase`].
+/// How many prepared statements each connection keeps cached, up from
+/// rusqlite's default of 16.
 ///
-/// A normal build uses r2d2's real `Pool`. Under deterministic simulation
-/// (`--cfg madsim`) it uses [`madsim_inline_pool::InlinePool`] instead --
-/// see that module's own doc comment for why.
-#[cfg(madsim)]
-pub type ConnectionPool = madsim_inline_pool::InlinePool;
-#[cfg(not(madsim))]
+/// Admitting one change runs a few dozen fixed statements through
+/// `prepare_cached`. The cache is least-recently-used, and a fixed cycle of
+/// statements longer than the cache never hits it: each one is evicted
+/// before it comes round again, so every statement would be parsed afresh
+/// on every admission, which is the cost the cache exists to remove.
+pub const STATEMENT_CACHE_CAPACITY: usize = 128;
+
+/// The connection pool backing a [`crate::SyncDatabase`].
 pub type ConnectionPool = Pool<SqliteConnectionManager>;
 
 /// Checks out a connection from `pool`, converting whichever concrete
-/// error type the real `r2d2::Pool` or the madsim inline pool produces
-/// into the caller's own error type `E`.
+/// error type the `r2d2::Pool` produces into the caller's own error type
+/// `E`.
 pub(crate) fn checkout<E: SqlOperationError>(pool: &ConnectionPool) -> Result<PooledConnection, E> {
     pool.get().map(PooledConnection).map_err(E::from)
 }
 
-#[cfg(not(madsim))]
 pub(crate) struct PooledConnection(r2d2::PooledConnection<SqliteConnectionManager>);
-#[cfg(madsim)]
-pub(crate) struct PooledConnection(madsim_inline_pool::InlineConnection);
 
 impl std::ops::Deref for PooledConnection {
     type Target = rusqlite::Connection;
@@ -53,75 +49,8 @@ impl std::ops::DerefMut for PooledConnection {
     }
 }
 
-/// A drop-in, thread-free stand-in for r2d2's `Pool`, used only under
-/// simulation. `get()` opens a fresh `rusqlite::Connection` synchronously on
-/// the calling task rather than on a background establishment thread.
-/// `SqliteConnectionManager::connect` already runs the same per-connection
-/// init (WAL / `busy_timeout` PRAGMAs) and, for a shared-cache in-memory
-/// database, keeps one connection alive internally so the database survives
-/// between checkouts — so for this crate's purposes the inline pool behaves
-/// like the real one (WAL + `busy_timeout` still govern concurrency;
-/// connections simply aren't reused, which is immaterial under simulation).
-#[cfg(madsim)]
-pub mod madsim_inline_pool {
-    use std::ops::{Deref, DerefMut};
-
-    use r2d2::ManageConnection;
-    use r2d2_sqlite::SqliteConnectionManager;
-    use rusqlite::Connection;
-
-    use crate::error::DatabaseError;
-
-    pub struct InlinePool {
-        manager: SqliteConnectionManager,
-    }
-
-    impl InlinePool {
-        pub(super) fn new(manager: SqliteConnectionManager) -> Result<Self, DatabaseError> {
-            // Establish one connection up front so a bad path/URI surfaces
-            // at open() time (matching r2d2's build-time establishment) and
-            // so a shared-cache in-memory database's internal keep-alive
-            // connection is primed before the first checkout.
-            let _ = manager.connect()?;
-            Ok(Self { manager })
-        }
-
-        pub(crate) fn get(&self) -> Result<InlineConnection, rusqlite::Error> {
-            Ok(InlineConnection(self.manager.connect()?))
-        }
-    }
-
-    /// Owns its `Connection` (unlike r2d2's `PooledConnection`, which
-    /// returns the connection to the pool on drop) but `Deref`s to it
-    /// identically, so every checkout call site compiles unchanged.
-    pub struct InlineConnection(Connection);
-
-    impl Deref for InlineConnection {
-        type Target = Connection;
-        fn deref(&self) -> &Connection {
-            &self.0
-        }
-    }
-
-    impl DerefMut for InlineConnection {
-        fn deref_mut(&mut self) -> &mut Connection {
-            &mut self.0
-        }
-    }
-}
-
-/// Builds the connection pool for a `SyncDatabase`. Production uses r2d2's
-/// real pool; under `--cfg madsim` it uses the thread-free inline pool (see
-/// [`ConnectionPool`]).
-#[cfg(madsim)]
-pub(crate) fn madsim_or_default_pool(
-    manager: SqliteConnectionManager,
-) -> Result<ConnectionPool, crate::error::DatabaseError> {
-    madsim_inline_pool::InlinePool::new(manager)
-}
-
-#[cfg(not(madsim))]
-pub(crate) fn madsim_or_default_pool(
+/// Builds the connection pool for a `SyncDatabase`.
+pub(crate) fn build_pool(
     manager: SqliteConnectionManager,
 ) -> Result<ConnectionPool, crate::error::DatabaseError> {
     // `Pool::new` (a bare `Pool::builder().build(..)`) defaults `min_idle`

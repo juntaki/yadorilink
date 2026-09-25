@@ -8,6 +8,7 @@
 //! `held_summary_suffix`/`degraded_suffix`/etc.).
 
 use yadorilink_ipc_proto::daemonctl::{LinkStatus, StatusResponse};
+use yadorilink_product_view::FolderState;
 
 /// The tray icon's headline label (menu title / tooltip prefix). Mirrors
 /// `yadorilink status`'s own `overall_state_line` semantics — same field,
@@ -41,11 +42,12 @@ pub fn reason_lines(status: &StatusResponse) -> Vec<String> {
 /// to the whole path when there is no final segment (a filesystem root).
 /// Shared by every surface that titles a folder — the tray submenu below,
 /// and the folder-detail and share windows.
+///
+/// Delegates to `yadorilink-product-view`'s `folder::display_name`, the
+/// same derivation `FolderSummary.name` uses, so the tray and the product
+/// DTO layer can never silently drift apart.
 pub fn folder_display_name(local_path: &str) -> String {
-    std::path::Path::new(local_path)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| local_path.to_string())
+    yadorilink_product_view::folder::display_name(local_path)
 }
 
 /// One label per linked folder for the tray's "Linked Folders" submenu —
@@ -53,30 +55,25 @@ pub fn folder_display_name(local_path: &str) -> String {
 /// width) plus a short state suffix, non-empty exactly when there's
 /// something to say beyond "syncing" (same "empty unless applicable"
 /// discipline `yadorilink-cli`'s `status.rs` already uses).
+///
+/// The suffix's *precedence* (which condition wins when several apply) is
+/// `FolderState::from_link`'s precedence, not a second independent
+/// ordering kept here — two copies of the same ordering would be a real
+/// duplication risk. Only the exact wording (and the degraded-vs-conflict
+/// split within a single `Attention` state, which `FolderState` doesn't
+/// need to distinguish) stays local to this function.
 pub fn folder_menu_label(link: &LinkStatus) -> String {
     let name = folder_display_name(&link.local_path);
-    let mut suffix = String::new();
-    // FIRST in the chain, ahead of `paused`/`degraded`: this is not a
-    // degradation but a full stop — the group syncs nothing until the user
-    // unlinks all but one of its folders, because otherwise each folder's scan
-    // would delete the other's files on every device. It is also the only state
-    // here the user MUST act on, and an `else if` below `paused` would let a
-    // paused-and-ambiguous folder render as merely paused, hiding it.
-    if link.ambiguous {
-        suffix.push_str("  (not syncing: this folder group is linked twice)");
-    } else if link.paused {
-        suffix.push_str("  (paused)");
-    } else if link.degraded {
-        suffix.push_str("  (degraded)");
-    } else if link.conflict_count > 0 {
-        suffix.push_str(&format!(
-            "  ({} conflict{})",
-            link.conflict_count,
-            plural(link.conflict_count)
-        ));
-    } else if link.has_active_transfer {
-        suffix.push_str("  (syncing…)");
-    }
+    let suffix = match FolderState::from_link(link) {
+        FolderState::Blocked => "  (not syncing: this folder group is linked twice)".to_string(),
+        FolderState::Paused => "  (paused)".to_string(),
+        FolderState::Attention if link.degraded => "  (degraded)".to_string(),
+        FolderState::Attention => {
+            format!("  ({} conflict{})", link.conflict_count, plural(link.conflict_count))
+        }
+        FolderState::Syncing => "  (syncing…)".to_string(),
+        FolderState::UpToDate => String::new(),
+    };
     format!("{name}{suffix}")
 }
 
@@ -89,144 +86,4 @@ fn plural(n: u64) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn base_status() -> StatusResponse {
-        StatusResponse::default()
-    }
-
-    fn base_link() -> LinkStatus {
-        LinkStatus { local_path: "/Users/alice/Photos".into(), ..Default::default() }
-    }
-
-    #[test]
-    fn folder_display_name_uses_the_last_path_segment() {
-        assert_eq!(folder_display_name("/Users/alice/Photos"), "Photos");
-    }
-
-    #[test]
-    fn folder_display_name_falls_back_to_the_whole_path_when_it_has_no_segment() {
-        assert_eq!(folder_display_name("/"), "/");
-    }
-
-    #[test]
-    fn healthy_state_renders_synced_headline() {
-        let mut status = base_status();
-        status.overall_state = "healthy".into();
-        assert_eq!(headline(&status), "YadoriLink: synced");
-    }
-
-    #[test]
-    fn attention_state_renders_needs_attention_headline() {
-        let mut status = base_status();
-        status.overall_state = "attention".into();
-        status.links = vec![base_link()];
-        assert!(headline(&status).contains("needs attention"));
-    }
-
-    #[test]
-    fn degraded_state_renders_degraded_headline() {
-        let mut status = base_status();
-        status.overall_state = "degraded".into();
-        assert_eq!(headline(&status), "YadoriLink: degraded");
-    }
-
-    /// An empty/unrecognized `overall_state` (an old daemon predating this
-    /// field) renders as "unknown", never silently as healthy — a stale
-    /// or misleading status is exactly the risk to avoid here.
-    #[test]
-    fn empty_state_renders_unknown_not_healthy() {
-        assert_eq!(headline(&base_status()), "YadoriLink: unknown");
-    }
-
-    #[test]
-    fn reason_lines_pass_through_attention_reasons_unmodified() {
-        let mut status = base_status();
-        status.attention_reasons = vec!["conflict:group-1".into(), "low_disk:/data".into()];
-        assert_eq!(reason_lines(&status), vec!["conflict:group-1", "low_disk:/data"]);
-    }
-
-    #[test]
-    fn folder_label_uses_the_last_path_segment() {
-        assert_eq!(folder_menu_label(&base_link()), "Photos");
-    }
-
-    #[test]
-    fn paused_folder_label_shows_paused_suffix() {
-        let mut link = base_link();
-        link.paused = true;
-        assert_eq!(folder_menu_label(&link), "Photos  (paused)");
-    }
-
-    #[test]
-    fn degraded_folder_label_shows_degraded_suffix() {
-        let mut link = base_link();
-        link.degraded = true;
-        assert_eq!(folder_menu_label(&link), "Photos  (degraded)");
-    }
-
-    #[test]
-    fn conflicted_folder_label_shows_conflict_count() {
-        let mut link = base_link();
-        link.conflict_count = 2;
-        assert_eq!(folder_menu_label(&link), "Photos  (2 conflicts)");
-    }
-
-    #[test]
-    fn single_conflict_uses_singular_noun() {
-        let mut link = base_link();
-        link.conflict_count = 1;
-        assert_eq!(folder_menu_label(&link), "Photos  (1 conflict)");
-    }
-
-    #[test]
-    fn syncing_folder_with_no_other_condition_shows_syncing_suffix() {
-        let mut link = base_link();
-        link.has_active_transfer = true;
-        assert_eq!(folder_menu_label(&link), "Photos  (syncing…)");
-    }
-
-    #[test]
-    fn healthy_idle_folder_shows_no_suffix() {
-        assert_eq!(folder_menu_label(&base_link()), "Photos");
-    }
-
-    /// Precedence: paused takes priority over degraded/conflict/transfer
-    /// suffixes — a paused link's other transient conditions aren't worth
-    /// showing since the user already knows sync is off for it.
-    #[test]
-    fn paused_takes_precedence_over_other_conditions() {
-        let mut link = base_link();
-        link.paused = true;
-        link.degraded = true;
-        link.conflict_count = 3;
-        assert_eq!(folder_menu_label(&link), "Photos  (paused)");
-    }
-
-    /// A folder group linked at two folders syncs NOTHING until the user
-    /// unlinks one. The tray is where a desktop user would notice, so a label
-    /// that omitted it would leave the folder looking merely idle while it
-    /// silently stopped syncing.
-    #[test]
-    fn an_ambiguous_folder_is_labelled_as_not_syncing() {
-        let link = LinkStatus { ambiguous: true, ..base_link() };
-
-        let label = folder_menu_label(&link);
-
-        assert!(label.contains("not syncing"), "got {label:?}");
-    }
-
-    /// Ambiguity outranks pause in the label chain. A paused-AND-ambiguous
-    /// folder that rendered as merely "(paused)" would hide the state the user
-    /// has to act on behind one they chose deliberately.
-    #[test]
-    fn ambiguity_outranks_pause_in_the_folder_label() {
-        let link = LinkStatus { ambiguous: true, paused: true, ..base_link() };
-
-        let label = folder_menu_label(&link);
-
-        assert!(label.contains("not syncing"), "got {label:?}");
-        assert!(!label.contains("(paused)"), "pause must not mask the refusal, got {label:?}");
-    }
-}
+mod tests;

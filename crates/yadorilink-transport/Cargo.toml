@@ -5,26 +5,17 @@ edition.workspace = true
 license.workspace = true
 
 # See yadorilink-local-storage/Cargo.toml's identical section for why.
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(madsim)"] }
-
 [dependencies]
 yadorilink-ipc-proto.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
-bytes.workspace = true
 rand = "0.10.2"
 hex = "0.4"
 prost = "0.14.4"
 if-addrs = "0.15"
 zeroize = "1"
 ed25519-dalek = "3"
-# RFC 8489 binding-message codec only (encode a binding request, parse the
-# mapped address out of a success response). Pure Rust, no networking of its
-# own, so it is madsim-safe and shared across real and simulated builds; the
-# prober loop and the socket it runs over stay ours.
-stun = { version = "0.17", default-features = false }
 
 # The production QUIC transport (`quic_socket.rs`). `quinn` 0.11.11 is
 # already resolved in this workspace's Cargo.lock (pulled in transitively),
@@ -35,7 +26,7 @@ stun = { version = "0.17", default-features = false }
 # workspace, and avoids pulling in `aws-lc-rs`'s C/cmake build requirement.
 # Available under simulation too, deliberately: `quic_socket.rs` runs the
 # real quinn stack over the transport hub's own shimmed socket, so the
-# simulator sees every datagram. Keeping quinn out of madsim builds would
+# simulator sees every datagram. Keeping quinn out of simulation builds would
 # force a simulation-only fake QUIC, which is exactly what must not exist:
 # a deterministic test that does not exercise the real transport proves
 # nothing about it.
@@ -44,10 +35,12 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # Certificate generation for TLS handshake tests. `ring` crypto backend,
 # matching the rest of this dependency set.
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+tokio.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
 tracing-subscriber.workspace = true
+tokio = { version = "1", features = ["full", "test-util"] }
 
 # Windows-only: tighten a freshly written private-key file's DACL to the
 # current user with inheritance disabled (the practical equivalent of unix
@@ -61,39 +54,28 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Threading",
 ] }
 
-# The NAT-suite unit tests drive timers with tokio's paused test clock, which
-# lives behind the `test-util` feature; simulation builds use madsim's own
-# deterministic clock instead.
-[target.'cfg(not(madsim))'.dev-dependencies]
-tokio = { version = "1", features = ["full", "test-util"] }
-
-# See yadorilink-sync-core/Cargo.toml's identical section for why. This
-# crate's real networking (`tokio::net::UdpSocket` in peer_channel.rs) is
-# exactly the surface the madsim tokio shim intercepts, so `PeerTransport`
-# needs no manual trait.
-[target.'cfg(not(madsim))'.dependencies]
-tokio.workspace = true
+# Everything below reaches for something the host operating system owns --
+# a credential store, a router, a socket option no simulator models. Under
+# simulation that is both meaningless and a source of nondeterminism, so the
+# simulation build gets none of these.
+[target.'cfg(not(turmoil))'.dependencies]
 # OS-native credential store (macOS Keychain / Windows Credential Manager /
 # Linux Secret Service) for storing device private keys at rest, the same crate
-# and native backends the coordination-token store uses. Kept out of madsim
-# builds so simulation never reaches for a real OS keychain and stays
+# and native backends the coordination-token store uses. Kept out of
+# simulation builds so they never reach for a real OS keychain and stay
 # deterministic; the on-disk hardened-file fallback is used there instead.
 keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
-# Router port mapping (PCP / NAT-PMP / UPnP-IGD probing, mapping acquisition,
-# lease renewal, external-address events). Does OS-level gateway discovery and
-# multicast, which has no meaning under simulation, so it stays out of madsim
-# builds entirely — the same reasoning that kept the earlier port-mapping
-# dependency non-madsim.
-portmapper = "0.19"
 # Socket construction only: bind the IPv6 half of the dual-stack endpoint
-# v6-only on the same port as the IPv4 half. Not used under simulation (madsim
-# provides a single shimmed socket), so it stays out of madsim builds.
+# v6-only on the same port as the IPv4 half. Not used under simulation (both
+# simulators provide a single shimmed socket), so it stays out of them.
 socket2 = "0.6"
 
-[target.'cfg(madsim)'.dependencies]
-tokio = { version = "0.2", package = "madsim-tokio", features = ["full"] }
-# Under deterministic simulation the candidate-race backoff jitter is drawn
-# from madsim's seed-derived global RNG (see supervise.rs
-# `fastrand_unit_interval`) so a given run seed always yields the same retry
-# schedule; production keeps real wall-clock entropy and never pulls this in.
-madsim = "0.2"
+# The simulated socket itself. A normal dependency rather than a
+# dev-dependency because the swap happens in this crate's own `sim_net`
+# module, on the production path — but only ever under `--cfg turmoil`,
+# which no shipped build and no ordinary `cargo test` sets.
+[target.'cfg(turmoil)'.dependencies]
+turmoil = "0.7.2"
+
+[lints]
+workspace = true

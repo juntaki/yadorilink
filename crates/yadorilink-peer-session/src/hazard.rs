@@ -68,6 +68,22 @@ pub const HELD_REASON_NORMALIZATION_COLLISION: &str = "normalization_collision";
 /// [`HELD_REASON_CASE_COLLISION`]/[`HELD_REASON_NORMALIZATION_COLLISION`]'s
 /// own single-axis checks cannot catch independently.
 pub const HELD_REASON_CASE_AND_NORMALIZATION_COLLISION: &str = "case_and_normalization_collision";
+/// Not a filename hazard: a path whose file is already on disk with a mode
+/// that denies its owner read access (for example `0o200`), where the
+/// version to be installed needs replicated metadata this device can
+/// neither read back nor set on that file. The file is left exactly as it
+/// is, content and inode included, and the path is held rather than
+/// retried: nothing changes until its mode, its content or the desired
+/// version does. See [`metadata_unprovable_reason`] for the stored text.
+pub use yadorilink_replica_domain::session_state::HELD_REASON_METADATA_UNPROVABLE;
+
+/// The full `held_reason` recorded for [`HELD_REASON_METADATA_UNPROVABLE`].
+pub fn metadata_unprovable_reason() -> String {
+    format!(
+        "{HELD_REASON_METADATA_UNPROVABLE}: replicated xattrs cannot be confirmed or applied \
+         because the existing file is owner-unreadable"
+    )
+}
 
 /// Which platform's filename rules gate materialization ("gated
 /// on the local platform" — a Windows peer holds a `CON.txt`, a POSIX peer
@@ -189,8 +205,8 @@ fn final_component_of(path: &str) -> &str {
 /// job.
 ///
 /// Uses `caseless::default_case_fold_str` (Unicode's own `CaseFolding.txt`
-/// algorithm), not `str::to_lowercase`. An independent review's finding:
-/// those are different operations that mostly agree but not always --
+/// algorithm), not `str::to_lowercase`: those are different operations that mostly agree but not
+/// always --
 /// `to_lowercase` is Unicode's *lowercase mapping*, meant for display, and
 /// applies context-sensitive special-casing (e.g. Greek sigma at the end
 /// of a word lowercases to the final form `ς`), while case folding is
@@ -330,14 +346,14 @@ pub fn normalization_collision<'a>(
 }
 
 /// A combination of both equivalence relations this module detects on its
-/// own: NFC-normalize, lowercase, then NFC-normalize again (lowercasing can
-/// introduce fresh combining sequences a prior NFC pass had no reason to
-/// compose; re-normalizing after is the safe default rather than assuming
-/// it never matters for any input). Neither `case_fold_collision` (raw
-/// `to_lowercase`, no normalization) nor `normalization_collision` (raw
-/// NFC, no case-folding) alone can catch a pair that differs on BOTH axes
-/// at once -- verified with `"Café.txt"` (capital `C`, composed `é`) vs
-/// `"café.txt"` (lowercase `c`, decomposed `é`): `case_fold_collision`
+/// own: NFC-normalize, lowercase, then NFC-normalize again (lowercasing
+/// can introduce fresh combining sequences a prior NFC pass had no reason
+/// to compose; re-normalizing after is the safe default rather than
+/// assuming it never matters for any input). Neither `case_fold_collision`
+/// (raw `to_lowercase`, no normalization) nor `normalization_collision`
+/// (raw NFC, no case-folding) alone can catch a pair that differs on BOTH
+/// axes at once -- verified with `"Café.txt"` (capital `C`, composed `é`)
+/// vs `"café.txt"` (lowercase `c`, decomposed `é`): `case_fold_collision`
 /// misses it because lowercasing alone never reconciles the differing `é`
 /// encodings, and `normalization_collision` misses it because NFC alone
 /// never reconciles the differing `C`/`c` case (`case_and_normalization_
@@ -346,12 +362,7 @@ pub fn normalization_collision<'a>(
 /// not just the positive). On a volume that is simultaneously
 /// case-insensitive AND normalization-insensitive (the macOS default, both
 /// HFS+ and APFS), that pair collides to one physical file despite
-/// differing on every axis tested independently. This is the function
-/// [`case_and_normalization_collision`] and `yadorilink-sync-core`'s
-/// `SyncState::path_lock`'s fold key both use, so the lock a hazard check
-/// runs under and the equivalence the hazard check itself applies never
-/// drift apart from each other -- moved to `yadorilink-root-authority` in
-/// Phase 7D-6 since both sides of that boundary need it.
+/// differing on every axis tested independently.
 pub use yadorilink_root_authority::canonical_fold::canonical_fold;
 
 /// the already-indexed sibling in `siblings` that `path` collides with
@@ -687,525 +698,108 @@ fn probe_normalization_insensitive_filesystem(canonical_dir: &Path) -> std::io::
     probe_in_owned_dir(canonical_dir, "nfc", normalization_insensitivity_within)
 }
 
-#[cfg(test)]
-mod invalid_name_tests {
-    use super::{invalid_name_reason, NamePolicy};
-
-    #[test]
-    fn posix_policy_never_holds_anything_windows_would_reject() {
-        for name in ["CON", "con.txt", "COM1", "trailing.", "trailing ", "bad<name>.txt"] {
-            assert_eq!(
-                invalid_name_reason(NamePolicy::Posix, name),
-                None,
-                "{name:?} must never be held under a POSIX policy"
-            );
-        }
-    }
-
-    #[test]
-    fn windows_policy_holds_a_bare_reserved_name() {
-        let reason = invalid_name_reason(NamePolicy::Windows, "CON").unwrap();
-        assert!(reason.starts_with(super::HELD_REASON_INVALID_NAME));
-    }
-
-    #[test]
-    fn windows_policy_holds_a_reserved_name_with_an_extension() {
-        // Windows reserves the device name regardless of what follows it.
-        assert!(invalid_name_reason(NamePolicy::Windows, "con.txt").is_some());
-        assert!(invalid_name_reason(NamePolicy::Windows, "COM1.tar.gz").is_some());
-    }
-
-    #[test]
-    fn windows_policy_holds_within_a_nested_path() {
-        assert!(invalid_name_reason(NamePolicy::Windows, "docs/notes/CON.txt").is_some());
-    }
-
-    #[test]
-    fn windows_policy_does_not_hold_a_name_that_merely_contains_a_reserved_word() {
-        // "CONTRACT.txt" is not "CON" — only an exact stem match reserves.
-        assert_eq!(invalid_name_reason(NamePolicy::Windows, "CONTRACT.txt"), None);
-        assert_eq!(invalid_name_reason(NamePolicy::Windows, "economics.txt"), None);
-    }
-
-    #[test]
-    fn windows_policy_holds_trailing_dot_or_space() {
-        assert!(invalid_name_reason(NamePolicy::Windows, "notes.").is_some());
-        assert!(invalid_name_reason(NamePolicy::Windows, "notes ").is_some());
-    }
-
-    #[test]
-    fn windows_policy_holds_forbidden_characters() {
-        for name in ["a<b.txt", "a>b.txt", "a:b.txt", "a\"b.txt", "a|b.txt", "a?b.txt", "a*b.txt"] {
-            assert!(invalid_name_reason(NamePolicy::Windows, name).is_some(), "{name:?}");
-        }
-    }
-
-    #[test]
-    fn windows_policy_does_not_hold_an_ordinary_name() {
-        assert_eq!(invalid_name_reason(NamePolicy::Windows, "vacation-photo.jpg"), None);
-    }
+/// Whether `path` (a `/`-separated record path under `root`) is observably
+/// absent when every component is compared by its own name, not resolved
+/// through this volume's case/normalization folding.
+///
+/// For a path already found to collide with a live sibling: on a folding
+/// volume, looking the whole path up resolves to the sibling's entry, so a
+/// lookup can never report this path absent while the sibling lives. The
+/// collision may sit in ANY component (`Docs/report.txt` against a live
+/// `docs/report.txt` collides through the parent, not the leaf -- the
+/// hazard checks fold the whole path), so each component is looked for in
+/// its parent's listing, from `root` down. The first component no entry
+/// could be proves the path absent. Every component matched means some
+/// entry may be this exact path: not absent.
+///
+/// An entry "may be" a component when its name is byte-identical to it,
+/// or canonically equivalent to it under Unicode normalization while
+/// still differing in case. The second arm is because a directory does
+/// not always record a name as it was created: HFS+ decomposes every name
+/// it stores, so an entry created as a composed `Caf\u{e9}.jpg` is listed
+/// decomposed, and a byte comparison would call it absent. Whether an
+/// equivalent-but-not-identical entry is this name's stored form or a
+/// distinct normalization sibling (APFS keeps both spellings as created)
+/// cannot be told from the listing, so it counts as present: the failure
+/// direction is a retry, never a claimed absence. Case is still compared
+/// exactly, because no filesystem rewrites a name's case when storing it.
+///
+/// Anything the listing cannot answer -- an unreadable directory, an
+/// unreadable entry, a component that is not a directory -- is not an
+/// observed absence.
+pub fn observably_absent_by_exact_name(root: &Path, path: &str) -> bool {
+    exact_name_absent_with(root, path, |dir| {
+        std::fs::read_dir(dir).map(|entries| entries.map(|entry| entry.map(|e| e.file_name())))
+    })
 }
 
-#[cfg(test)]
-mod case_fold_collision_tests {
-    use super::case_fold_collision;
-    use yadorilink_replica_domain::file::FileRecord;
-
-    fn record(path: &str) -> FileRecord {
-        FileRecord {
-            path: path.to_string(),
-            size: 0,
-            mtime_unix_nanos: 0,
-            blocks: vec![],
-            deleted: false,
-        }
-    }
-
-    #[test]
-    fn detects_a_same_directory_case_fold_collision() {
-        let siblings = vec![record("Photo.jpg")];
-        let found = case_fold_collision("photo.jpg", &siblings).unwrap();
-        assert_eq!(found.path, "Photo.jpg");
-    }
-
-    #[test]
-    fn does_not_flag_updating_the_same_path_as_a_collision_with_itself() {
-        let siblings = vec![record("photo.jpg")];
-        assert!(case_fold_collision("photo.jpg", &siblings).is_none());
-    }
-
-    #[test]
-    fn ignores_a_case_fold_match_in_a_different_directory() {
-        let siblings = vec![record("other/Photo.jpg")];
-        assert!(case_fold_collision("photo.jpg", &siblings).is_none());
-    }
-
-    #[test]
-    fn ignores_a_tombstoned_sibling() {
-        let mut deleted = record("Photo.jpg");
-        deleted.deleted = true;
-        let siblings = vec![deleted];
-        assert!(case_fold_collision("photo.jpg", &siblings).is_none());
-    }
-
-    #[test]
-    fn distinct_names_never_collide() {
-        let siblings = vec![record("vacation.jpg")];
-        assert!(case_fold_collision("photo.jpg", &siblings).is_none());
-    }
-
-    #[test]
-    fn matches_within_a_nested_directory_too() {
-        let siblings = vec![record("albums/Summer/Photo.jpg")];
-        let found = case_fold_collision("albums/Summer/photo.jpg", &siblings).unwrap();
-        assert_eq!(found.path, "albums/Summer/Photo.jpg");
-    }
-
-    /// The parent DIRECTORY itself can be what case-folds together, not
-    /// just the final component — "Docs/Report.txt" and "docs/report.txt"
-    /// resolve to one physical path on a case-insensitive volume even
-    /// though every path component differs from its counterpart. A
-    /// byte-exact parent comparison would exclude this pair before the
-    /// leaf comparison ever ran.
-    #[test]
-    fn detects_a_collision_where_the_parent_directory_itself_case_folds() {
-        let siblings = vec![record("Docs/Report.txt")];
-        let found = case_fold_collision("docs/report.txt", &siblings).unwrap();
-        assert_eq!(found.path, "Docs/Report.txt");
-    }
-}
-
-#[cfg(test)]
-mod normalization_collision_tests {
-    use super::normalization_collision;
-    use yadorilink_replica_domain::file::FileRecord;
-
-    fn record(path: &str) -> FileRecord {
-        FileRecord {
-            path: path.to_string(),
-            size: 0,
-            mtime_unix_nanos: 0,
-            blocks: vec![],
-            deleted: false,
-        }
-    }
-
-    /// THE case this hazard exists for: a composed `\u{e9}` ("é" as a
-    /// single precomposed code point) and its canonically-equivalent
-    /// decomposed spelling (`e` followed by the combining acute accent,
-    /// U+0301) are byte-different but logically the same name.
-    #[test]
-    fn detects_a_composed_vs_decomposed_collision() {
-        let composed = "caf\u{e9}.txt";
-        let decomposed = "cafe\u{301}.txt";
-        assert_ne!(
-            composed.as_bytes(),
-            decomposed.as_bytes(),
-            "the two spellings must actually be different byte sequences for this test to mean \
-             anything"
-        );
-
-        let siblings = vec![record(composed)];
-        let found = normalization_collision(decomposed, &siblings).unwrap();
-        assert_eq!(found.path, composed);
-
-        // Symmetric: the composed form must also find the decomposed one.
-        let siblings = vec![record(decomposed)];
-        let found = normalization_collision(composed, &siblings).unwrap();
-        assert_eq!(found.path, decomposed);
-    }
-
-    /// The over-rejection direction: two names that merely *look* similar
-    /// (share a common prefix, or share the same base letter with no
-    /// accent at all) are not canonically equivalent and must not collide.
-    #[test]
-    fn distinct_names_never_collide() {
-        let siblings = vec![record("cafe.txt")]; // plain "e", no accent at all
-        assert!(normalization_collision("caf\u{e9}.txt", &siblings).is_none());
-
-        let siblings = vec![record("vacation.jpg")];
-        assert!(normalization_collision("photo.jpg", &siblings).is_none());
-    }
-
-    #[test]
-    fn does_not_flag_updating_the_same_path_as_a_collision_with_itself() {
-        let siblings = vec![record("caf\u{e9}.txt")];
-        assert!(normalization_collision("caf\u{e9}.txt", &siblings).is_none());
-    }
-
-    #[test]
-    fn ignores_a_normalization_match_in_a_different_directory() {
-        let siblings = vec![record("other/caf\u{e9}.txt")];
-        assert!(normalization_collision("cafe\u{301}.txt", &siblings).is_none());
-    }
-
-    #[test]
-    fn ignores_a_tombstoned_sibling() {
-        let mut deleted = record("caf\u{e9}.txt");
-        deleted.deleted = true;
-        let siblings = vec![deleted];
-        assert!(normalization_collision("cafe\u{301}.txt", &siblings).is_none());
-    }
-
-    #[test]
-    fn matches_within_a_nested_directory_too() {
-        let siblings = vec![record("albums/Summer/caf\u{e9}.txt")];
-        let found = normalization_collision("albums/Summer/cafe\u{301}.txt", &siblings).unwrap();
-        assert_eq!(found.path, "albums/Summer/caf\u{e9}.txt");
-    }
-
-    /// Same parent-directory-itself-aliases case as
-    /// `case_fold_collision_tests`'s equivalent test, under normalization
-    /// instead of case-fold: the parent component, not just the leaf, is
-    /// what's canonically equivalent between the two paths.
-    #[test]
-    fn detects_a_collision_where_the_parent_directory_itself_normalizes_the_same() {
-        let composed_parent = "caf\u{e9}/Report.txt";
-        let decomposed_parent = "cafe\u{301}/Report.txt";
-        let siblings = vec![record(composed_parent)];
-        let found = normalization_collision(decomposed_parent, &siblings).unwrap();
-        assert_eq!(found.path, composed_parent);
-    }
-}
-
-#[cfg(test)]
-mod case_and_normalization_collision_tests {
-    use super::{case_and_normalization_collision, case_fold_collision, normalization_collision};
-    use yadorilink_replica_domain::file::FileRecord;
-
-    fn record(path: &str) -> FileRecord {
-        FileRecord {
-            path: path.to_string(),
-            size: 0,
-            mtime_unix_nanos: 0,
-            blocks: vec![],
-            deleted: false,
-        }
-    }
-
-    /// The pair neither single-axis check can catch alone: differs in case
-    /// (`C`/`c`) AND in Unicode normalization form (composed vs decomposed
-    /// `é`) at once. Real on a volume that is simultaneously
-    /// case-insensitive and normalization-insensitive (the macOS default).
-    #[test]
-    fn detects_a_pair_differing_in_both_case_and_normalization_at_once() {
-        let composed_upper = "Caf\u{e9}.txt"; // "Café.txt", composed é
-        let decomposed_lower = "cafe\u{301}.txt"; // "café.txt", decomposed é
-
-        // Precondition: prove neither single-axis check catches this pair
-        // -- that's the whole point of this test existing.
-        let siblings = vec![record(composed_upper)];
-        assert!(
-            case_fold_collision(decomposed_lower, &siblings).is_none(),
-            "precondition: case_fold_collision alone must NOT catch this pair (it doesn't \
-             normalize)"
-        );
-        assert!(
-            normalization_collision(decomposed_lower, &siblings).is_none(),
-            "precondition: normalization_collision alone must NOT catch this pair (it doesn't \
-             case-fold)"
-        );
-
-        let found = case_and_normalization_collision(decomposed_lower, &siblings).unwrap();
-        assert_eq!(found.path, composed_upper);
-
-        // Symmetric.
-        let siblings = vec![record(decomposed_lower)];
-        let found = case_and_normalization_collision(composed_upper, &siblings).unwrap();
-        assert_eq!(found.path, decomposed_lower);
-    }
-
-    #[test]
-    fn does_not_flag_updating_the_same_path_as_a_collision_with_itself() {
-        let siblings = vec![record("Caf\u{e9}.txt")];
-        assert!(case_and_normalization_collision("Caf\u{e9}.txt", &siblings).is_none());
-    }
-
-    #[test]
-    fn distinct_names_never_collide() {
-        let siblings = vec![record("vacation.jpg")];
-        assert!(case_and_normalization_collision("Photo.jpg", &siblings).is_none());
-    }
-}
-
-#[cfg(test)]
-mod case_insensitive_probe_tests {
-    use super::is_case_insensitive_filesystem;
-
-    /// This is a real filesystem probe, not a mock — it must agree with
-    /// what the actual host filesystem does. macOS's default APFS volume
-    /// (almost certainly what a dev machine's tempdir sits on) is
-    /// case-insensitive; this is documented as environment-dependent
-    /// rather than asserted as a hard fact about every possible CI runner.
-    #[test]
-    fn probe_returns_a_stable_answer_for_the_same_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        let first = is_case_insensitive_filesystem(dir.path());
-        let second = is_case_insensitive_filesystem(dir.path());
-        assert_eq!(first, second, "the cached answer must be stable across calls");
-    }
-
-    #[test]
-    fn probe_leaves_no_leftover_file_behind() {
-        let dir = tempfile::tempdir().unwrap();
-        is_case_insensitive_filesystem(dir.path());
-        let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
-        assert!(entries.is_empty(), "the probe file must be cleaned up: {entries:?}");
-    }
-
-    /// The regression this module's cache removal exists for: a stale
-    /// process-wide cache keyed on the canonicalized directory path would
-    /// answer a second call on the same directory from memory, without
-    /// touching the filesystem again. This device cannot force an actual
-    /// remount underneath a live path in a unit test, so it proves the
-    /// stronger, directly-observable property that makes a stale answer
-    /// impossible in the first place: every call, including a second call
-    /// on the exact same directory, performs its own real probe round trip
-    /// (visible as the shared probe-call counter advancing), never a cached
-    /// lookup.
-    #[test]
-    fn second_call_on_the_same_directory_performs_a_second_real_probe_not_a_cached_lookup() {
-        // The counter is process-wide and the test harness runs tests in
-        // parallel, so an EXACT delta cannot be asserted -- another test's
-        // probe can land between two reads here. What has to be true is
-        // weaker and is still the whole property: the counter ADVANCES on
-        // the second call. A cached lookup would advance it by nothing.
-        let dir = tempfile::tempdir().unwrap();
-        let before = super::probe_call_count_for_test();
-        is_case_insensitive_filesystem(dir.path());
-        let after_first = super::probe_call_count_for_test();
-        assert!(after_first > before, "the first call must perform a real probe");
-        is_case_insensitive_filesystem(dir.path());
-        let after_second = super::probe_call_count_for_test();
-        assert!(
-            after_second > after_first,
-            "a second call on the same directory must probe again, not reuse a cached answer"
-        );
-    }
-
-    #[test]
-    fn a_missing_and_uncreatable_directory_conservatively_reports_insensitive() {
-        // A path under a file (not a directory) can never be created —
-        // `create_dir_all` fails, exercising the conservative-default arm.
-        let base = tempfile::tempdir().unwrap();
-        let not_a_dir = base.path().join("plain-file");
-        std::fs::write(&not_a_dir, b"x").unwrap();
-        let unreachable = not_a_dir.join("child");
-        assert!(is_case_insensitive_filesystem(&unreachable));
-    }
-}
-
-#[cfg(test)]
-mod probe_artefact_ownership_tests {
-    use super::{
-        case_insensitivity_within, normalization_insensitivity_within, probe_in_named_dir,
-        CASE_PROBE_LEAF_NAME, NORMALIZATION_PROBE_LEAF_NAME,
-    };
-    use std::ffi::OsStr;
-    use std::path::Path;
-    use yadorilink_root_authority::reserved_namespace::{
-        artefact_component_name, is_reserved_component, path_has_reserved_component, ArtefactKind,
-    };
-
-    /// Every name either probe puts on disk sits under a component the
-    /// engine's own exclusion predicate recognizes, so the watcher, the
-    /// initial scan and local change processing skip it without needing an
-    /// ignore rule. Asserted on the real minting function, not on a
-    /// hand-written literal: the property that matters is that what the
-    /// probe actually creates is excluded.
-    #[test]
-    fn the_probe_directory_name_is_a_reserved_component() {
-        let name = yadorilink_root_authority::fs_capabilities::probe_artefact_name("case").unwrap();
-        assert!(
-            is_reserved_component(OsStr::new(&name)),
-            "{name:?} must be excluded from indexing by the reserved-namespace predicate"
-        );
-    }
-
-    /// Both probes create a *second* spelling of their leaf name (an
-    /// all-uppercase variant; a decomposed variant) that they never create
-    /// themselves but do test for existence. Neither leaf spelling needs a
-    /// reserved name of its own: the exclusion predicate matches on any
-    /// component of a relative path, so the reserved parent directory covers
-    /// every leaf under it, in every spelling.
-    #[test]
-    fn every_leaf_spelling_either_probe_uses_is_excluded_under_its_reserved_parent() {
-        let parent =
-            yadorilink_root_authority::fs_capabilities::probe_artefact_name("case").unwrap();
-        let decomposed: String = {
-            use unicode_normalization::UnicodeNormalization;
-            NORMALIZATION_PROBE_LEAF_NAME.nfd().collect()
+/// [`observably_absent_by_exact_name`] over an injected directory lister,
+/// so its fail-closed arms can be driven without a filesystem that fails
+/// on cue.
+fn exact_name_absent_with<L, I>(root: &Path, path: &str, mut list: L) -> bool
+where
+    L: FnMut(&Path) -> std::io::Result<I>,
+    I: Iterator<Item = std::io::Result<std::ffi::OsString>>,
+{
+    let mut dir = root.to_path_buf();
+    for component in path.split('/').filter(|component| !component.is_empty()) {
+        let Ok(entries) = list(&dir) else {
+            return false;
         };
-        for leaf in [
-            CASE_PROBE_LEAF_NAME.to_string(),
-            CASE_PROBE_LEAF_NAME.to_uppercase(),
-            NORMALIZATION_PROBE_LEAF_NAME.to_string(),
-            decomposed,
-        ] {
-            let relative = Path::new(&parent).join(&leaf);
-            assert!(
-                path_has_reserved_component(&relative),
-                "{relative:?} must be excluded from indexing"
-            );
+        let mut matched = false;
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return false;
+            };
+            if entry_may_be_named(&entry, component) {
+                matched = true;
+                break;
+            }
         }
-    }
-
-    /// The discipline this module's probes exist under: an entry at the
-    /// candidate probe name that this process did not create belongs to
-    /// someone else — possibly a user file — and must be neither removed nor
-    /// truncated. A collision is reported as `AlreadyExists` so the caller
-    /// can retry under a fresh name; the entry itself is left exactly as it
-    /// was found.
-    #[test]
-    fn a_pre_existing_entry_at_the_probe_name_is_neither_deleted_nor_truncated() {
-        for probe in [
-            &case_insensitivity_within as &dyn Fn(&Path) -> std::io::Result<bool>,
-            &normalization_insensitivity_within,
-        ] {
-            let dir = tempfile::tempdir().unwrap();
-            let name = artefact_component_name(ArtefactKind::Probe, "collision").unwrap();
-            let occupied = dir.path().join(&name);
-            std::fs::write(&occupied, b"irreplaceable user content").unwrap();
-
-            let outcome = probe_in_named_dir(dir.path(), &name, probe);
-
-            // Asserted before the outcome itself: what must hold is that the
-            // entry survived, whatever the probe decided to do or report.
-            assert!(occupied.is_file(), "the pre-existing entry must not be deleted");
-            assert_eq!(
-                std::fs::read(&occupied).unwrap(),
-                b"irreplaceable user content",
-                "the pre-existing entry must not be truncated or overwritten"
-            );
-
-            let err =
-                outcome.expect_err("a collision must not be resolved by taking the path over");
-            assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        if !matched {
+            return true;
         }
+        dir.push(component);
     }
+    false
+}
 
-    /// The successful path's counterpart: a probe that ran to completion
-    /// removes the directory it created, and everything inside it.
-    #[test]
-    fn a_completed_probe_leaves_nothing_behind() {
-        let dir = tempfile::tempdir().unwrap();
-        let name = artefact_component_name(ArtefactKind::Probe, "cleanup").unwrap();
-        probe_in_named_dir(dir.path(), &name, case_insensitivity_within).unwrap();
-        let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
-        assert!(entries.is_empty(), "the probe directory must be cleaned up: {entries:?}");
+/// See [`observably_absent_by_exact_name`] for why canonical equivalence
+/// counts and case-folding does not.
+fn entry_may_be_named(entry: &std::ffi::OsStr, component: &str) -> bool {
+    use unicode_normalization::UnicodeNormalization;
+    if entry.as_encoded_bytes() == component.as_bytes() {
+        return true;
     }
-
-    /// A probe whose inner work fails still owns the directory it created,
-    /// so it must still remove it — otherwise a failing volume accumulates
-    /// abandoned artefacts in the user's sync directory.
-    #[test]
-    fn a_failed_probe_still_removes_the_directory_it_created() {
-        let dir = tempfile::tempdir().unwrap();
-        let name = artefact_component_name(ArtefactKind::Probe, "failure").unwrap();
-        let err = probe_in_named_dir(dir.path(), &name, |_probe_dir| {
-            Err::<bool, _>(std::io::Error::other("probe failed halfway"))
-        })
-        .expect_err("the inner failure must propagate");
-        assert_eq!(err.kind(), std::io::ErrorKind::Other);
-        let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
-        assert!(entries.is_empty(), "the probe directory must be cleaned up: {entries:?}");
+    match entry.to_str() {
+        Some(entry) => entry.nfd().eq(component.nfd()),
+        None => false,
     }
 }
 
 #[cfg(test)]
-mod normalization_insensitive_probe_tests {
-    use super::is_normalization_insensitive_filesystem;
+mod exact_name_absence_tests;
 
-    /// The [`case_insensitive_probe_tests`] counterpart for the
-    /// normalization axis: a real filesystem probe, not a mock. macOS's
-    /// default APFS volume normalization-insensitively resolves a composed
-    /// and decomposed spelling of the same name to one entry; documented as
-    /// environment-dependent, same as the case-insensitivity probe's own
-    /// test.
-    #[test]
-    fn probe_returns_a_stable_answer_for_the_same_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        let first = is_normalization_insensitive_filesystem(dir.path());
-        let second = is_normalization_insensitive_filesystem(dir.path());
-        assert_eq!(first, second, "the answer must be stable across calls");
-    }
+#[cfg(test)]
+mod invalid_name_tests;
 
-    #[test]
-    fn probe_leaves_no_leftover_file_behind() {
-        let dir = tempfile::tempdir().unwrap();
-        is_normalization_insensitive_filesystem(dir.path());
-        let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
-        assert!(entries.is_empty(), "the probe file must be cleaned up: {entries:?}");
-    }
+#[cfg(test)]
+mod case_fold_collision_tests;
 
-    /// Mirrors `case_insensitive_probe_tests::second_call_on_the_same_
-    /// directory_performs_a_second_real_probe_not_a_cached_lookup`: every
-    /// call, including a second one on the same directory, performs its own
-    /// real probe round trip rather than serving a cached answer.
-    #[test]
-    fn second_call_on_the_same_directory_performs_a_second_real_probe_not_a_cached_lookup() {
-        let dir = tempfile::tempdir().unwrap();
-        let before = super::normalization_probe_call_count_for_test();
-        is_normalization_insensitive_filesystem(dir.path());
-        let after_first = super::normalization_probe_call_count_for_test();
-        assert!(after_first > before, "the first call must perform a real probe");
-        is_normalization_insensitive_filesystem(dir.path());
-        let after_second = super::normalization_probe_call_count_for_test();
-        assert!(
-            after_second > after_first,
-            "a second call on the same directory must probe again, not reuse a cached answer"
-        );
-    }
+#[cfg(test)]
+mod normalization_collision_tests;
 
-    #[test]
-    fn a_missing_and_uncreatable_directory_conservatively_reports_insensitive() {
-        let base = tempfile::tempdir().unwrap();
-        let not_a_dir = base.path().join("plain-file");
-        std::fs::write(&not_a_dir, b"x").unwrap();
-        let unreachable = not_a_dir.join("child");
-        assert!(is_normalization_insensitive_filesystem(&unreachable));
-    }
-}
+#[cfg(test)]
+mod case_and_normalization_collision_tests;
+
+#[cfg(test)]
+mod case_insensitive_probe_tests;
+
+#[cfg(test)]
+mod probe_artefact_ownership_tests;
+
+#[cfg(test)]
+mod normalization_insensitive_probe_tests;
 
 /// Pure, filesystem-independent tests of `case_fold_collision`/
 /// `canonical_fold`'s own folding algorithm -- unlike the case-insensitive
@@ -1214,75 +808,4 @@ mod normalization_insensitive_probe_tests {
 /// identically on every CI host regardless of the local filesystem's own
 /// case sensitivity.
 #[cfg(test)]
-mod case_folding_correctness_tests {
-    use super::{canonical_fold, case_fold_collision};
-    use yadorilink_replica_domain::file::FileRecord;
-
-    fn record(path: &str) -> FileRecord {
-        FileRecord {
-            path: path.into(),
-            size: 0,
-            mtime_unix_nanos: 0,
-            blocks: vec![],
-            deleted: false,
-        }
-    }
-
-    /// The concrete pair an independent review named: `str::to_lowercase`
-    /// applies Greek final-sigma special-casing (a *display* rule), so
-    /// lowercasing the all-caps form produces a DIFFERENT string than a
-    /// name that already contains a literal (non-final-position) sigma --
-    /// even though a real case-insensitive filesystem's own case-folding
-    /// collapses both to the same physical name. `case_fold_collision`
-    /// must use actual Unicode case folding, which ignores that
-    /// positional context and always folds every sigma to one target.
-    #[test]
-    fn folds_greek_final_and_non_final_sigma_to_the_same_target() {
-        // No extension, deliberately: `str::to_lowercase`'s final-sigma
-        // special-casing is context-sensitive to what FOLLOWS the sigma
-        // in the whole string, not just its own path component -- a
-        // trailing extension like `.txt` can itself suppress the
-        // final-sigma rule for the sigma before it (verified directly:
-        // `"ΟΔΟΣ.txt".to_lowercase()` == `"οδοσ.txt"`, already the
-        // non-final spelling, same as this test's `incoming`, which
-        // would make this test pass "by accident" under the very bug it
-        // exists to catch). A bare name with nothing after the sigma is
-        // the case unambiguously affected either way.
-        let siblings = vec![record("\u{39F}\u{394}\u{39F}\u{3A3}")]; // "ΟΔΟΣ"
-                                                                     // A name ending in the non-final sigma "σ" (U+03C3), not the
-                                                                     // final-form "ς" (U+03C3 vs U+03C2) `to_lowercase` would produce.
-        let incoming = "\u{3BF}\u{3B4}\u{3BF}\u{3C3}"; // "οδοσ"
-        assert!(
-            case_fold_collision(incoming, &siblings).is_some(),
-            "a real case-insensitive filesystem folds these to the same physical name"
-        );
-    }
-
-    /// A second concrete divergence: the MICRO SIGN (U+00B5) case-folds to
-    /// GREEK SMALL LETTER MU (U+03BC) under Unicode's `CaseFolding.txt`,
-    /// but `str::to_lowercase` leaves the micro sign untouched (it has no
-    /// lowercase mapping of its own -- it already looks lowercase).
-    #[test]
-    fn folds_micro_sign_to_greek_mu() {
-        let siblings = vec![record("\u{B5}g.txt")]; // "µg.txt" (MICRO SIGN)
-        let incoming = "\u{3BC}g.txt"; // "μg.txt" (GREEK SMALL LETTER MU)
-        assert!(
-            case_fold_collision(incoming, &siblings).is_some(),
-            "MICRO SIGN and GREEK SMALL LETTER MU case-fold to the same target"
-        );
-    }
-
-    /// `canonical_fold` (the combined NFC + case-fold `path_lock`'s own
-    /// fold key uses) must apply the same real case-folding, not
-    /// `to_lowercase`, for the same reason -- two paths differing only by
-    /// this exact sigma pair must lock together, or a concurrent
-    /// materialize of "both" could interleave physically unserialized.
-    #[test]
-    fn canonical_fold_also_folds_final_and_non_final_sigma_together() {
-        assert_eq!(
-            canonical_fold("\u{39F}\u{394}\u{39F}\u{3A3}"),
-            canonical_fold("\u{3BF}\u{3B4}\u{3BF}\u{3C3}"),
-            "canonical_fold must fold ΟΔΟΣ and οδοσ to the identical key"
-        );
-    }
-}
+mod case_folding_correctness_tests;

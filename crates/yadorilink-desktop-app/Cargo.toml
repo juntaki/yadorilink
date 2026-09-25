@@ -19,19 +19,36 @@ path = "src/lib.rs"
 name = "yadorilink-status-app"
 path = "src/main.rs"
 
+[features]
+# Off by default and never enabled by any release build: gates
+# `share_window::preview`, a set of hand-built ShareApp states used to look at
+# the sharing window without an account, a coordination plane or a linked
+# folder. A feature rather than `debug_assertions` so the gate does not depend
+# on a profile setting that a future `[profile.release]` could flip on.
+preview = []
+
 [dependencies]
 yadorilink-ipc-proto = { path = "../yadorilink-ipc-proto" }
-# Reuses `yadorilink-cli`'s already-tested coordination-plane
-# access-token/group-resolution code (`http_client::require_access_token`/
-# `resolve_group_id`) for "Add Synced Folder" rather than re-implementing
-# keyring/auth calls a second, independent way in this crate — a
-# security-sensitive code path should have exactly one implementation.
-# `google_login.rs`'s loopback-redirect flow also calls
-# `yadorilink_cli::google_auth` directly.
-yadorilink-cli = { path = "../yadorilink-cli" }
+# The product-facing DTO layer (FolderSummary/DeviceSummary) built on top
+# of LinkStatus/GroupMemberInfo. `status_model.rs`'s
+# `folder_display_name`/`folder_menu_label` delegate their derivations to
+# this crate rather than keeping an independent copy, so the two can never
+# silently drift apart. Headless (no eframe/tao/tray-icon of
+# its own), so this adds nothing to the GUI dependency graph.
+yadorilink-product-view = { path = "../yadorilink-product-view" }
+# The client application layer shared with the command line: the one daemon
+# control-socket client, the coordination-plane client and the typed
+# operations every window drives. A security-sensitive path such as building
+# a `CoordinationAuth` has exactly one implementation, there.
+yadorilink-client-core = { path = "../yadorilink-client-core" }
 tokio.workspace = true
-anyhow.workspace = true
 thiserror.workspace = true
+# Writing the font-resolution status file `yadorilink diagnose` reads.
+serde_json = "1"
+# Proving a candidate font can draw a glyph before installing it. This is
+# the same rasteriser `epaint` uses underneath, so the answer is the one
+# the renderer would give.
+ab_glyph = "0.2"
 tracing.workspace = true
 tracing-subscriber.workspace = true
 # Cross-platform tray icon + menu (muda, re-exported by tray-icon) and the
@@ -51,14 +68,8 @@ opener = { version = "0.8", features = ["reveal"] }
 # crate `reqwest` itself depends on for URL handling, and `oauth2`'s own
 # examples use it for exactly this (parsing a redirect callback).
 url = "2"
-# The onboarding executor converts the shared
-# link preflight report (`link_preflight::LinkPreflightReport`) into the
-# window's warning cards. Moved from `yadorilink-sync-core` to
-# `yadorilink-local-storage` in Phase 7D-9B along with `link_preflight`
-# itself (see that crate's `Cargo.toml` for why it landed there and not
-# `yadorilink-root-authority`) -- already a dependency below for other
-# reasons, so this adds nothing new to the shipped binary's dependency
-# closure.
+# The onboarding executor converts the shared link preflight report
+# (`link_preflight::LinkPreflightReport`) into the window's warning cards.
 yadorilink-local-storage = { path = "../yadorilink-local-storage" }
 # The onboarding wizard window. egui/eframe is
 # pure Rust with its own winit event loop (run as a separate process from the
@@ -113,6 +124,9 @@ yadorilink-daemon = { path = "../yadorilink-daemon" }
 yadorilink-local-storage = { path = "../yadorilink-local-storage" }
 # For DeviceSigningKeyPair::generate() only, wiring a registered test
 # device's change-signing key -- already transitively present via
-# yadorilink-cli's own dependency on this crate, so this adds no new
-# crate to the build graph, only a direct name the test file can use.
+# yadorilink-client-core, so this adds no new crate to the build graph,
+# only a direct name the test file can use.
 yadorilink-transport = { path = "../yadorilink-transport" }
+
+[lints]
+workspace = true

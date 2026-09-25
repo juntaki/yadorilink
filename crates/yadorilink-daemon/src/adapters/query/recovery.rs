@@ -21,9 +21,11 @@ impl DaemonCoordinationConfig {
 }
 
 impl CoordinationConfigPort for DaemonCoordinationConfig {
-    fn coordination_client_config(&self) -> Option<(String, String)> {
+    fn coordination_client_config(
+        &self,
+    ) -> Option<(String, yadorilink_fapi_client::CoordinationAuth)> {
         self.state
             .coordination_client_config()
-            .map(|config| (config.addr.clone(), config.access_token.clone()))
+            .map(|config| (config.addr.clone(), config.auth.clone()))
     }
 }

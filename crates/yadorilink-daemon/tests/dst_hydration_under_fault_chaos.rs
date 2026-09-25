@@ -1,50 +1,43 @@
 //! On-demand sync / hydration coverage: a DST chaos scenario that hydrates
-//! on-demand placeholders
-//! **while the network is faulting**, closing the gap the audit found --
-//! `daemon/tests/multi_peer_hydration.rs` hydrates only over
-//! a clean, fault-free path, and the existing DST scenarios never seed a
-//! placeholder-hydration-under-fault case — "hydration-timeout" appears in
-//! them only as incidental churn timing, never as the thing under test.
-//!
-//! What this scenario proves, under a seed-driven network fault plan that
-//! drops/partitions/heals the block-fetch traffic (the same
-//! `sync-deterministic-testing` "Hydration Under Network Fault Coverage"
-//! requirement's three scenarios):
-//!  1. Placeholders hydrate to the correct content despite faults — no
-//!     data loss, no corruption (Phase A).
-//!  2. No placeholder is left stuck mid-hydration: after heal + quiesce
-//!     every index row is `Placeholder` or `Hydrated`, never `Hydrating`,
-//!     and `check_structural` finds no live row without a file (Phase A).
-//!  3. A conflicting write that lands while a path's hydration is in
-//!     flight preserves both sides — the losing write becomes a conflict
-//!     copy and the hydrated content is not lost (Phase B). The block
-//!     fetch a conflict resolution must perform to materialize the
-//!     incoming side *is* a hydration, so faulting it exercises exactly
-//!     the "BlockRequest lost during conflict resolution" recovery the
-//!     audit's `dst_two_device_chaos.rs` history documents.
-//!
-//! **Bold note (fault seam):** an earlier design named `dst_support::fault::
-//! FaultingChannel` as the injection seam, but that decorator is a pure
-//! per-message *decision engine* with no wrap point in `PeerSyncSession`
-//! or `PeerChannel` (its own module doc: "sync-core test seam now,
-//! transport `PeerChannel` later"); wiring it would require modifying
-//! transport/production code, which this test-only change must not do.
-//! The real, already-used fault seam at this layer is
-//! `madsim::net::NetSim` packet-loss + a scheduled full-loss partition
-//! window, which the block-fetch traffic genuinely flows through (verified:
-//! `hydrate_file` → `ensure_blocks_present` → `fetch_block_raw` →
-//! `PeerSyncSession::send` → `PeerChannel::send` over the madsim UDP shim).
-//! This scenario therefore builds a seed-driven `FaultPlan` (recorded in
-//! the corpus `Case` for replay fidelity) and *applies* it via `NetSim`,
-//! using its `partition_windows`/`drop_every` as the schedule — honest
-//! coverage of the advertised behavior via the seam that actually exists.
-//!
+//! on-demand placeholders **while the network is faulting**, closing the
+//! gap the audit found -- `daemon/tests/multi_peer_hydration.rs` hydrates
+//! only over a clean, fault-free path, and the existing DST scenarios
+//! never seed a placeholder-hydration-under-fault case —
+//! "hydration-timeout" appears in them only as incidental churn timing,
+//! never as the thing under test. What this scenario proves, under a
+//! seed-driven network fault plan that drops/partitions/heals the
+//! block-fetch traffic (the same `sync-deterministic-testing` "Hydration
+//! Under Network Fault Coverage" requirement's three scenarios): 1.
+//! Placeholders hydrate to the correct content despite faults — no data
+//! loss, no corruption (Phase A). 2. No placeholder is left stuck
+//! mid-hydration: after heal + quiesce every index row is `Placeholder` or
+//! `Hydrated`, never `Hydrating`, and `check_structural` finds no live row
+//! without a file (Phase A). 3. A conflicting write that lands while a
+//! path's hydration is in flight preserves both sides — the losing write
+//! becomes a conflict copy and the hydrated content is not lost (Phase B).
+//! The block fetch a conflict resolution must perform to materialize the
+//! incoming side *is* a hydration, so faulting it exercises exactly the
+//! "BlockRequest lost during conflict resolution" recovery the audit's
+//! `dst_two_device_chaos.rs` history documents. The real, already-used
+//! fault seam at this layer is `madsim::net::NetSim` packet-loss + a
+//! scheduled full-loss partition window, which the block-fetch traffic
+//! genuinely flows through (verified: `hydrate_file` →
+//! `ensure_blocks_present` → `fetch_block_raw` → `PeerSyncSession::send` →
+//! `PeerChannel::send` over the madsim UDP shim). This scenario therefore
+//! builds a seed-driven `FaultPlan` (recorded in the corpus `Case` for
+//! replay fidelity) and *applies* it via `NetSim`, using its
+//! `partition_windows`/`drop_every` as the schedule — honest coverage of
+//! the advertised behavior via the seam that actually exists.
 //! `#![cfg(madsim)]`-gated like every DST scenario file. One
 //! network-touching `#[test]` fn per binary (madsim's simulated network
 //! state is not safe across more than one), so both phases run inside the
 //! single seeded `run_scenario`.
 
-#![cfg(madsim)]
+// Retired. This scenario was written for a simulator this project no longer
+// builds against, and it names APIs that have since been removed. It is kept,
+// never compiled, as the specification its turmoil re-expression has to meet;
+// delete it in the change that lands that replacement.
+#![cfg(any())]
 
 mod dst_dag_migrate_b2;
 mod dst_support;
@@ -62,13 +55,14 @@ use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_local_capture::ports::LocalMutationStore;
-use yadorilink_local_storage::{BlockStore, FsBlockStore};
+use yadorilink_local_storage::{BlockStore, SegmentBlockStore};
 use yadorilink_peer_session::peer_session::PeerSyncSession;
-use yadorilink_replica_domain::change::{Change, ChangeAuth, Op as ChangeOp, PutOrigin};
+use yadorilink_replica_domain::change::{Change, Op as ChangeOp, PutOrigin};
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord, RecordKind};
 use yadorilink_replica_domain::file::{FileMeta, FileVersion, VersionBlock};
 use yadorilink_replica_domain::ids::{BlockHash, DeviceId, FolderGroupId, SyncPath};
 use yadorilink_replica_domain::session_state::MaterializationState;
+use yadorilink_replica_domain::test_authoring::create_signed_for_tests;
 
 const GROUP_ID: &str = "dst-hydration-group";
 const CANARY_PATH: &str = "hydration-canary.bin";
@@ -193,7 +187,7 @@ struct Device {
     id: String,
     root: PathBuf,
     state: Arc<ReplicaCoordinator>,
-    store: Arc<FsBlockStore>,
+    store: Arc<SegmentBlockStore>,
     session: std::sync::OnceLock<Arc<PeerSyncSession>>,
 }
 
@@ -202,7 +196,7 @@ impl Device {
         let root_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
         let root = root_dir.path().canonicalize().map_err(|e| e.to_string())?;
         let store_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
-        let store = Arc::new(FsBlockStore::new(store_dir.path()).map_err(|e| e.to_string())?);
+        let store = Arc::new(SegmentBlockStore::new(store_dir.path()).map_err(|e| e.to_string())?);
         let state = Arc::new(ReplicaCoordinator::open_in_memory().map_err(|e| e.to_string())?);
         dst_support::link::link_and_start(&state, &root, GROUP_ID).map_err(|e| e.to_string())?;
         Ok((
@@ -265,10 +259,9 @@ fn seed_holder_file(dev: &Device, path: &str, content: &[u8]) -> Result<SeededFi
             xattrs: Vec::new(),
         },
     );
-    let change = Change::create_signed(
+    let change = create_signed_for_tests(
         vec![],
         0,
-        ChangeAuth::PLACEHOLDER,
         DeviceId(dev.id.clone()),
         FolderGroupId(GROUP_ID.to_string()),
         vec![ChangeOp::Put {
@@ -284,7 +277,7 @@ fn seed_holder_file(dev: &Device, path: &str, content: &[u8]) -> Result<SeededFi
     // heads would orphan on the peer and fail identity verification).
     dev.state
         .change_history_repository()
-        .dag_admit_change_with_versions(&change, std::slice::from_ref(&version), true)
+        .dag_admit_change_with_versions(&change, std::slice::from_ref(&version))
         .map_err(|e| e.to_string())?;
     dev.state
         .file_index_repository()
@@ -331,7 +324,7 @@ fn seed_holder_file(dev: &Device, path: &str, content: &[u8]) -> Result<SeededFi
 fn seed_placeholder(dev: &Device, seeded: &SeededFile) -> Result<(), String> {
     dev.state
         .change_history_repository()
-        .dag_admit_change_with_versions(&seeded.change, std::slice::from_ref(&seeded.version), true)
+        .dag_admit_change_with_versions(&seeded.change, std::slice::from_ref(&seeded.version))
         .map_err(|e| e.to_string())?;
     dev.state
         .file_index_repository()
@@ -371,7 +364,7 @@ async fn connect(a: &Device, b: &Device) -> Result<(), String> {
 
     let mut roots_a = HashMap::new();
     roots_a.insert(GROUP_ID.to_string(), a.root.clone());
-    let session_a = PeerSyncSession::new_with_dependencies(
+    let session_a = PeerSyncSession::new(
         channel_a,
         a.id.clone(),
         b.id.clone(),
@@ -391,7 +384,7 @@ async fn connect(a: &Device, b: &Device) -> Result<(), String> {
 
     let mut roots_b = HashMap::new();
     roots_b.insert(GROUP_ID.to_string(), b.root.clone());
-    let session_b = PeerSyncSession::new_with_dependencies(
+    let session_b = PeerSyncSession::new(
         channel_b,
         b.id.clone(),
         a.id.clone(),
@@ -599,7 +592,7 @@ async fn run_scenario(seed: u64, fault_profile: HydrationFaultProfile) -> Result
         return Err(format!(
             "{BASELINE_TIMEOUT_MARKER}device B never hydrated the startup canary before any \
              fault was injected -- a host-load-dependent startup stall for this seed, not a \
-             hydration bug (the old WireGuard-livelock attribution was disproven; issue #26)"
+             hydration bug"
         ));
     }
 
@@ -1096,8 +1089,7 @@ fn hydration_under_fault_chaos_scenario() {
     }
 
     // A seed can land on an infra skip (most commonly the startup canary's
-    // host-load-dependent startup stall -- the old WireGuard-livelock
-    // attribution was disproven, issue #26) independent
+    // host-load-dependent startup stall) independent
     // of whether it would otherwise have exercised anything interesting. A
     // flat `0..variations` loop therefore made this sweep's actual coverage
     // hostage to how many of exactly `variations` sequential seeds happened

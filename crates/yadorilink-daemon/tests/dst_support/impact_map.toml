@@ -1,37 +1,25 @@
-# DST module -> scenario impact map.
-#
-# Purpose: an agent (or developer) that touched `src/<module>.rs` reads this
-# file to answer "which DST scenarios plausibly cover my diff, and which do I
-# run *first*?" without reading every 1300-line scenario source. It is small,
-# reviewable data, not a build-graph analysis.
-#
-# Two tables, both lint-enforced by `tests/dst_impact_map_lint.rs`:
-#  [modules] every top-level `src/*.rs` module -> the scenarios exercising
-#  it, ordered most-directly-relevant first ("run-this-first").
-#  An empty list is legal and meaningful: it says "no DST
-#  scenario targets this module yet" (a coverage signal, not an
-#  error). The lint fails only when a module file exists with no
-#  entry here, or an entry names a module file that does not
-#  exist.
-#  [scenarios] every `tests/dst_*.rs` scenario -> the oracle kinds it runs.
-#  The lint fails when a `dst_*.rs` file has no entry, or an
-#  entry names a scenario file that does not exist.
-#
-# Oracle kinds mirror `dst_support::oracle::ViolationKind`. Derived from each
-# scenario's `check_*` oracle calls; keep in sync when a scenario gains/drops
-# an oracle.
-#
-# [modules] describes `yadorilink-sync-core`'s own `src/*.rs` modules (this
-# map's actual subject, `SyncState` and friends) even though this file
-# itself moved to `yadorilink-daemon/tests/dst_support/` in Phase 7D-10.4
-# alongside the harness's own scenario files -- the lint checks a sibling
-# crate directory for exactly this reason (see
-# `tests/dst_impact_map_lint.rs::sync_core_root`). `dst_materialization_
-# crash_recovery.rs` moved to `yadorilink-filesystem-sync/tests/` in the
-# same pass and is deliberately absent from both tables: it never used
-# `mod dst_support;` (a plain, non-madsim crash-injection test, not a
-# harness scenario by this map's own definition), so removing it here is
-# not a coverage loss, only this map catching up to what was already true.
+# DST module -> scenario impact map. Purpose: an agent (or developer) that
+# touched `src/<module>.rs` reads this file to answer "which DST scenarios
+# plausibly cover my diff, and which do I run *first*?" without reading
+# every 1300-line scenario source. It is small, reviewable data, not a
+# build-graph analysis. Two tables, both lint-enforced by
+# `tests/dst_impact_map_lint.rs`: [modules] every top-level `src/*.rs`
+# module -> the scenarios exercising it, ordered most-directly-relevant
+# first ("run-this-first"). An empty list is legal and meaningful: it says
+# "no DST scenario targets this module yet" (a coverage signal, not an
+# error). The lint fails only when a module file exists with no entry here,
+# or an entry names a module file that does not exist. [scenarios] every
+# `tests/dst_*.rs` scenario -> the oracle kinds it runs. The lint fails
+# when a `dst_*.rs` file has no entry, or an entry names a scenario file
+# that does not exist. Oracle kinds mirror
+# `dst_support::oracle::ViolationKind`. Derived from each scenario's
+# `check_*` oracle calls; keep in sync when a scenario gains/drops an
+# oracle. `dst_materialization_ crash_recovery.rs` moved to
+# `yadorilink-filesystem-sync/tests/` in the same pass and is deliberately
+# absent from both tables: it never used `mod dst_support;` (a plain,
+# unsimulated crash-injection test, not a harness scenario by this map's own
+# definition), so removing it here is not a coverage loss, only this map
+# catching up to what was already true.
 
 schema_version = 1
 
@@ -134,21 +122,17 @@ reserved_namespace = [
     "dst_peer_reconcile_race",
     "dst_watcher_debounce",
 ]
-# Modules with no DST scenario targeting them yet. Kept explicit so the lint
-# proves the list is complete (not silently forgotten) and so the emptiness is
-# itself a visible coverage gap an agent can pick up as a detection target.
-# TODO(coverage): adaptive_window/chunker/hazard/
+# Modules with no DST scenario targeting them yet. Kept explicit so the
+# lint proves the list is complete (not silently forgotten) and so the
+# emptiness is itself a visible coverage gap. adaptive_window/chunker/hazard/
 # rate_limiter/link_preflight have unit tests in `src/` but no DST scenario
-# drives them through the simulated envelope.
-# fs_identity/fs_capabilities are empty because nothing calls them yet: they
-# are the identity/capability model for the filesystem transaction engine,
-# exercised only by their own unit tests, with no production call site until
-# a later phase wires the engine onto an actual caller. They must gain
-# scenarios at that point -- an empty list here is a coverage gap, not a
-# statement that they do not need coverage. (Both, plus fs_commit's real
-# platform commit adapter, moved to yadorilink-filesystem-sync/
-# yadorilink-root-authority in Phase 7D-9B -- this map covers sync-core's
-# own remaining src/*.rs only.)
+# drives them through the simulated envelope. fs_identity/fs_capabilities
+# are empty because nothing calls them yet: they are the
+# identity/capability model for the filesystem transaction engine,
+# exercised only by their own unit tests, with no production call site
+# until a later phase wires the engine onto an actual caller. They must
+# gain scenarios at that point -- an empty list here is a coverage gap, not
+# a statement that they do not need coverage.
 adaptive_window = []
 fs_capabilities = []
 fs_identity = []
@@ -159,66 +143,27 @@ fs_identity = []
 # which is the behavioural switchover and is deliberately not done yet.
 materialized_generation = []
 # The transaction engine's journal: parent sagas, hierarchical path
-# reservations and placement epochs. Empty for the same reason as the fs_*
-# and materialized_generation modules, plus one more: every mutating entry
-# point also sits behind its own disabled `EXECUTION_ENABLED` gate, so even a
-# scenario that tried to reach it today would find nothing runs. It gains
-# scenarios once a real caller exists and the gate is turned on.
+# reservations and placement epochs. It gains scenarios once a real caller
+# exists and the gate is turned on.
 filesystem_transaction = []
-# Optimistic preparation and the short filesystem commit window built on top
-# of filesystem_transaction/fs_commit/materialized_generation. Empty for the
-# same reason as those modules: behind the same disabled `EXECUTION_ENABLED`
-# gate, with no production caller yet, exercised only by its own unit tests.
 optimistic_placement = []
-# Early physical recovery (design §14.1), built on filesystem_transaction/
-# fs_commit/fs_identity. Empty for the same reason as those modules: no
-# daemon startup call site wires this in yet (filesystem_transaction's own
-# `EXECUTION_ENABLED` gate has no bearing here -- this module deliberately
-# bypasses it via the `_unchecked` entry points, since recovery must run even
-# while forward execution is administratively disabled -- but there is
-# simply no caller at daemon startup yet). Exercised only by its own unit
-# tests, several of which drive a real filesystem commit through
-# `fs_commit::NativeCommitAdapter`. It gains scenarios once startup wiring
-# exists to actually crash mid-epoch under DST fault injection.
+# It gains scenarios once startup wiring exists to actually crash mid-epoch
+# under DST fault injection.
 early_physical_recovery = []
-# The plan/prepare/revalidate/replan loop (design §6) that drives
-# `resolution_planning`'s slices through `orchestrator`. Empty for the same
-# reason as every other module in this engine: it composes only gated
-# primitives, its `PlanEnvironment` is implemented by its own tests alone,
-# and no production caller builds one. It gains scenarios when the receiver-
-# side environment exists and the gate opens -- at which point the scenarios
-# to name here are the ones that move a path's winner while a projection is
-# in flight, since that is the staleness this loop exists to detect.
+# Empty for the same reason as every other module in this engine: it
+# composes only gated primitives, its `PlanEnvironment` is implemented by
+# its own tests alone, and no production caller builds one. It gains
+# scenarios when the receiver- side environment exists and the gate opens
+# -- at which point the scenarios to name here are the ones that move a
+# path's winner while a projection is in flight, since that is the
+# staleness this loop exists to detect.
 plan_driver = []
 # Custody transfer (design §8.1 `CustodyTransferred`, §12): moves a
 # commit's displaced preimage into retained custody by same-filesystem
-# rename. Empty for the same reason as the other filesystem-transaction-
-# engine modules above: gated behind `filesystem_transaction::
-# EXECUTION_ENABLED`, with no production caller yet, exercised only by its
-# own unit tests (real filesystem rename/identity/hardlink/FIFO cases).
-# No DST scenario drives the retained-preimage lifecycle yet: behind the
-# same disabled `EXECUTION_ENABLED` gate as `custody_transfer`/
-# `captured_authoring`, with no production caller wiring custody transfer
-# or captured authoring into it yet, exercised only by its own unit tests.
+# rename.
 retained_obligation = []
 custody_transfer = []
-# Durable planning: versioned resolution plans, bounded slices, multi-path/
-# multi-epoch resolver placement and replanning on staleness -- built
-# entirely on `filesystem_transaction`'s existing reservation and epoch
-# machinery. Empty for the same reason as the other filesystem-transaction-
-# engine modules above: gated behind `filesystem_transaction::
-# EXECUTION_ENABLED`, with no production caller yet, exercised only by its
-# own unit tests.
 resolution_planning = []
-# Phase 12 orchestrator: drives one resolution_planning::PlanSlice through
-# allocation, one acquire_reservations call, every placement's commit
-# window, release, then custody transfer/classify/author/retained
-# obligation for whatever each placement displaced. Empty for the same
-# reason as every other filesystem-transaction-engine module above:
-# everything it composes sits behind the same disabled
-# `filesystem_transaction::EXECUTION_ENABLED` gate, with no production
-# caller yet (peer_session::materialize is not routed through it in this
-# phase), exercised only by its own unit tests via the `_unchecked` seams.
 # It gains scenarios once a real caller exists and the gate is turned on.
 orchestrator = []
 authenticated_history = []
@@ -245,12 +190,10 @@ rebootstrap_snapshot = []
 # only by its own unit tests so far; no DST scenario drives captured-change
 # authoring from a retained preimage yet.
 single_pass_capture = []
-# Captured authoring (design §11.2): turns a retained preimage's single-pass
-# classification into one signed change, in one SQLite transaction, parented
-# on the displaced generation's causal basis, under the block liveness gate.
-# Empty for the same reason as the other filesystem-transaction-engine
-# modules above: gated behind `filesystem_transaction::EXECUTION_ENABLED`,
-# with no production caller yet, exercised only by its own unit tests.
+# Captured authoring (design §11.2): turns a retained preimage's
+# single-pass classification into one signed change, in one SQLite
+# transaction, parented on the displaced generation's causal basis, under
+# the block liveness gate.
 captured_authoring = []
 # Sync-root single-instance OS lock: a process-lifetime mutual-exclusion
 # primitive, exercised only by its own unit tests (including a real killed
@@ -274,8 +217,7 @@ materialization_jobs = [
 # directly yet -- it lives in yadorilink-daemon (engine_wrapper.rs), not
 # reachable from this crate's own DST harness.
 retroactive_conflict = []
-# Foundation-only deterministic ranking; the failover driver that will invoke
-# it is intentionally outside PR #25 and has no DST scenario yet.
+# Deterministic ranking helper; no DST scenario drives it directly.
 repair_election = []
 # Internal lock-scoping helper for path-keyed writes; not directly exercised
 # by any DST scenario name.

@@ -1,13 +1,10 @@
-//! `application`'s own boundary traits. Every port here is `dyn`-safe
-//! (`BoxFuture`-returning, never `async fn` in a trait) and expressed only
-//! in terms of `yadorilink_sync_core`/`application::model` types -- never
-//! the daemon-state, coordination-client, control-socket, hydration, or
-//! link-manager modules, and never the IPC-proto crate. Concrete
-//! implementations live under the adapters module tree, never here.
+//! `application`'s own boundary traits. Concrete implementations live
+//! under the adapters module tree, never here.
 
 pub(crate) mod common;
 pub(crate) mod enrollment;
 pub(crate) mod governance;
+pub(crate) mod group_admin;
 pub(crate) mod handoff;
 pub(crate) mod link_lifecycle;
 pub(crate) mod materialization;
@@ -28,12 +25,14 @@ pub(crate) use enrollment::{
 #[allow(unused_imports)]
 pub(crate) use governance::{GovernanceCommandPort, GovernanceLimits};
 #[allow(unused_imports)]
+pub(crate) use group_admin::GroupAdministration;
+#[allow(unused_imports)]
 pub(crate) use handoff::{
     DurabilityCommandPort, HandoffCommandPort, HandoffLeaseGrant, HandoffTicketGrant,
 };
 #[allow(unused_imports)]
 pub(crate) use link_lifecycle::{
-    LinkCommand, LinkRepositoryPort, LinkWatcherPort, PendingEnrollmentLinkCommand,
+    LinkCommand, LinkOutcome, LinkRepositoryPort, LinkWatcherPort, PendingEnrollmentLinkCommand,
 };
 #[allow(unused_imports)]
 pub(crate) use materialization::{

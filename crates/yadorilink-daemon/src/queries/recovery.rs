@@ -14,11 +14,13 @@ use crate::recovery_diagnosis::StableDiagnosisOutcome;
 use crate::recovery_evidence::WorkerEvidenceSource;
 use crate::replica_coordinator::ReplicaCoordinator;
 
-/// A source of this device's coordination-plane address + access token --
+/// A source of this device's coordination-plane address + credential --
 /// `None` when it isn't configured, matching
 /// `DaemonState::coordination_client_config`'s own contract.
 pub(crate) trait CoordinationConfigPort: Send + Sync {
-    fn coordination_client_config(&self) -> Option<(String, String)>;
+    fn coordination_client_config(
+        &self,
+    ) -> Option<(String, yadorilink_fapi_client::CoordinationAuth)>;
 }
 
 pub(crate) enum DiagnoseOutcome {
@@ -27,9 +29,8 @@ pub(crate) enum DiagnoseOutcome {
 }
 
 pub(crate) struct RecoveryQueryService {
-    // `crate::recovery::inventory` is generic over `RecoveryInventorySource`,
-    // implemented for `ReplicaCoordinator` -- `list()` below needs no
-    // separate `Arc<SyncState>` field.
+    // `crate::recovery::inventory` reads the three recovery journals off
+    // `ReplicaCoordinator` directly -- `list()` below needs no other field.
     replica_coordinator: Arc<ReplicaCoordinator>,
     config: Arc<dyn CoordinationConfigPort>,
 }
@@ -50,10 +51,10 @@ impl RecoveryQueryService {
         &self,
         key: &RecoveryOperationKey,
     ) -> Result<DiagnoseOutcome, SyncError> {
-        let Some((addr, access_token)) = self.config.coordination_client_config() else {
+        let Some((addr, auth)) = self.config.coordination_client_config() else {
             return Ok(DiagnoseOutcome::CoordinationNotConfigured);
         };
-        let source = WorkerEvidenceSource::new(&addr, &access_token);
+        let source = WorkerEvidenceSource::new(&addr, &auth);
         let outcome =
             crate::recovery_diagnosis::diagnose_stable(&self.replica_coordinator, &source, key)
                 .await?;

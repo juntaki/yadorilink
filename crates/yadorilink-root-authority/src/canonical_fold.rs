@@ -1,12 +1,6 @@
 //! The combined case-fold-and-Unicode-normalization equivalence key two
 //! names collide under on a volume that is simultaneously case-insensitive
 //! AND normalization-insensitive (the macOS default, both HFS+ and APFS).
-//! Shared between `yadorilink-peer-session`'s hazard checks and
-//! `yadorilink-sync-core`'s path-lock keying (`sync_runtime::path_locks`)
-//! so the lock a hazard check runs under and the equivalence the hazard
-//! check itself applies never drift apart from each other -- moved here in
-//! Phase 7D-6 since both are real production consumers on either side of
-//! the peer-session/sync-core boundary.
 
 /// Folds `path` to the case-and-normalization-insensitive key two
 /// differently-encoded names collapse to on such a volume: NFC-normalize,

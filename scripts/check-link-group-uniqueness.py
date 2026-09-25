@@ -50,6 +50,7 @@ SCHEMA_RS = ROOT / "crates/yadorilink-sqlite-runtime/src/schema.rs"
 SCAN_DIRS = [
     ROOT / "crates/yadorilink-daemon/src",
     ROOT / "crates/yadorilink-cli/src",
+    ROOT / "crates/yadorilink-client-core/src",
     ROOT / "crates/yadorilink-sync-sqlite/src",
     ROOT / "crates/yadorilink-sqlite-runtime/src",
 ]

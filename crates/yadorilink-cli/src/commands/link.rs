@@ -1,28 +1,11 @@
 use std::io::{BufRead, IsTerminal, Write};
 
-use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
-use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
-use yadorilink_ipc_proto::daemonctl::{
-    FetchAvailability, HandoffResult, LinkRequest, LinkStatus, ListLinksRequest, LocalStorageState,
-    PendingEnrollmentKind, UnlinkRequest,
-};
-use yadorilink_local_storage::link_preflight::{self, LinkPreflightReport};
+use yadorilink_ipc_proto::daemonctl::{HandoffResult, LinkStatus};
+use yadorilink_local_storage::link_preflight::LinkPreflightReport;
 
-use crate::commands::share::resolve_group_id;
-use crate::control_client;
+use yadorilink_client_core::ops::links as ops;
+
 use crate::error::CliError;
-use crate::http_client::require_access_token;
-
-/// The fields the daemon needs to write a pending-enrollment marker in the
-/// same transaction as the link itself, for a caller running the crash-safe
-/// create/join protocol. `None` (the plain `link` command, and
-/// `link_resolved`'s desktop-onboarding callers, which don't yet run the
-/// prepare/activate protocol) means "no enrollment to track".
-pub struct PendingEnrollmentFields {
-    pub operation_id: String,
-    pub kind: PendingEnrollmentKind,
-    pub device_id: String,
-}
 
 /// The ` skipped_symlinks=N` suffix appended to a link's summary line
 /// in `link list` — empty (no suffix) when the link has none, matching
@@ -67,7 +50,7 @@ pub async fn link(
     dry_run: bool,
     yes: bool,
 ) -> Result<(), CliError> {
-    let (absolute, preflight) = run_link_preflight(&local_path).await?;
+    let (absolute, preflight) = ops::run_link_preflight(&local_path).await?;
     print_preflight_report(&preflight);
 
     if dry_run {
@@ -79,132 +62,26 @@ pub async fn link(
     }
 
     let acknowledged = acknowledge_if_risky(&preflight, yes)?;
-
-    let access_token = require_access_token()?;
-    let group_id = resolve_group_id(&access_token, &group_name).await?;
-    control_client::send(ReqPayload::Link(LinkRequest {
-        local_path: absolute.to_string_lossy().to_string(),
-        group_id,
-        on_demand,
-        max_local_size_bytes,
-        acknowledge_risks: acknowledged,
-        // The plain `link` command never runs the crash-safe create/join
-        // protocol, so there is no pending enrollment to track.
-        pending_enrollment_operation_id: String::new(),
-        pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
-        pending_enrollment_device_id: String::new(),
-    }))
-    .await?;
+    ops::link_to_named_group(absolute, &group_name, on_demand, max_local_size_bytes, acknowledged)
+        .await?;
     println!("Linked {local_path} to {group_name}{}", if on_demand { " (on-demand)" } else { "" },);
-    Ok(())
-}
-
-/// The onboarding window's link
-/// step runs the *same* preflight the CLI runs — canonicalize the path,
-/// gather already-linked paths for nested-link detection, and compute the
-/// shared [`LinkPreflightReport`]. Returns the canonicalized path alongside
-/// the report so the caller can pass it straight to [`link_resolved`]
-/// without canonicalizing a second time. No printing: the window renders
-/// the report's `warnings` as per-warning acknowledgement cards.
-pub async fn run_link_preflight(
-    local_path: &str,
-) -> Result<(std::path::PathBuf, LinkPreflightReport), CliError> {
-    let absolute = std::fs::canonicalize(local_path)
-        .map_err(|_| CliError::Other(format!("no such directory: {local_path}")))?;
-    let existing_paths = fetch_existing_link_paths().await;
-    let report = link_preflight::run_preflight(&absolute, &existing_paths, None);
-    Ok((absolute, report))
-}
-
-/// Register a link for a
-/// caller-resolved `group_id` (the window already has it from the share
-/// step) through the exact same daemon `Link` request the CLI's `link`
-/// builds, carrying the caller's aggregate acknowledgement. The window
-/// gates `acknowledge_risks` behind per-warning acknowledgement of every
-/// `LinkPreflightReport::warnings` entry; the daemon still re-checks
-/// preflight as defense-in-depth (`control_socket::link`), so an
-/// unacknowledged risky link is refused there too. Onboarding links use
-/// the default link options (eager, schema-default retention); the
-/// on-demand option remains CLI-only for now.
-pub async fn link_resolved(
-    absolute_path: std::path::PathBuf,
-    group_id: String,
-    acknowledge_risks: bool,
-) -> Result<(), CliError> {
-    link_resolved_with_mode(absolute_path, group_id, false, acknowledge_risks, None).await
-}
-
-/// Like [`link_resolved`], but with an explicit storage mode instead of always
-/// eager — `link_resolved` is the `on_demand = false` special case. No preflight
-/// is re-run (the caller already did it), matching `link_resolved`.
-///
-/// `pending_enrollment` is `Some` only for `share create`/`share join`'s
-/// crash-safe protocol: when set, the daemon writes a pending-enrollment
-/// marker in the same SQLite transaction as the link itself, so a failure
-/// here means neither was created (see
-/// `yadorilink_sync_core::index::SyncState::add_link_with_pending_enrollment`'s
-/// doc comment for why that ordering matters). `None` is the plain `link`
-/// command's case: nothing to track.
-pub async fn link_resolved_with_mode(
-    absolute_path: std::path::PathBuf,
-    group_id: String,
-    on_demand: bool,
-    acknowledge_risks: bool,
-    pending_enrollment: Option<PendingEnrollmentFields>,
-) -> Result<(), CliError> {
-    let (pending_enrollment_operation_id, pending_enrollment_kind, pending_enrollment_device_id) =
-        match pending_enrollment {
-            Some(fields) => (fields.operation_id, fields.kind as i32, fields.device_id),
-            None => (String::new(), PendingEnrollmentKind::Unspecified as i32, String::new()),
-        };
-    control_client::send(ReqPayload::Link(LinkRequest {
-        local_path: absolute_path.to_string_lossy().to_string(),
-        group_id,
-        on_demand,
-        max_local_size_bytes: None,
-        acknowledge_risks,
-        pending_enrollment_operation_id,
-        pending_enrollment_kind,
-        pending_enrollment_device_id,
-    }))
-    .await?;
     Ok(())
 }
 
 /// Preflight a local path and resolve the risk acknowledgement, printing the
 /// report. The shared front half of establishing a link, exposed so a caller
 /// (e.g. `share create`/`share join`) can preflight BEFORE creating any
-/// coordination-plane state, and only then commit the link (and its
-/// pending-enrollment marker, written atomically by the daemon) with
-/// [`link_resolved_with_mode`], rolling the server state back if the link
-/// fails.
+/// coordination-plane state. Those callers then commit through the daemon's
+/// `CreateAndLink`/`JoinAndLink` commands, which write the link and its
+/// pending-enrollment marker atomically.
 pub async fn preflight_and_acknowledge(
     local_path: &str,
     yes: bool,
 ) -> Result<(std::path::PathBuf, bool), CliError> {
-    let (absolute, preflight) = run_link_preflight(local_path).await?;
+    let (absolute, preflight) = ops::run_link_preflight(local_path).await?;
     print_preflight_report(&preflight);
     let acknowledged = acknowledge_if_risky(&preflight, yes)?;
     Ok((absolute, acknowledged))
-}
-
-/// Best-effort: an unreachable daemon (or any other `ListLinks` failure)
-/// is treated as "no known existing links" rather than aborting the whole
-/// preflight — nested-link detection then just can't find anything,
-/// which is acceptable since perfect prediction of every conflict isn't
-/// a goal here. A real (non-dry-run) link attempt still fails clearly
-/// right after, when `control_client::send`'s own `Link` call hits the
-/// same unreachable daemon.
-async fn fetch_existing_link_paths() -> Vec<String> {
-    match control_client::send(ReqPayload::ListLinks(ListLinksRequest {})).await {
-        Ok(resp) => match resp.payload {
-            Some(RespPayload::ListLinks(list)) => {
-                list.links.into_iter().map(|l| l.local_path).collect()
-            }
-            _ => Vec::new(),
-        },
-        Err(_) => Vec::new(),
-    }
 }
 
 /// always prints a short factual summary of what preflight found
@@ -286,26 +163,6 @@ fn confirm_risky(warnings: &[String]) -> bool {
     confirm_risky_with_reader(warnings, &mut lock)
 }
 
-/// Send an unlink to the daemon without printing — the reusable primitive
-/// behind [`unlink`], also used as best-effort compensation when a join fails
-/// after the local link was already created (always `force: false` there --
-/// a compensating unlink of a just-created link should still respect the
-/// durability gate, not silently override it). Returns the coordination-plane
-/// handoff-commit result when this unlink actually went through one (see
-/// `control_socket::ensure_unlink_keeps_a_full_replica`'s doc comment for
-/// when it does) — `None` for every other unlink.
-pub async fn send_unlink(local_path: &str, force: bool) -> Result<Option<HandoffResult>, CliError> {
-    let resp = control_client::send(ReqPayload::Unlink(UnlinkRequest {
-        local_path: local_path.to_string(),
-        force,
-    }))
-    .await?;
-    Ok(match resp.payload {
-        Some(RespPayload::Unlink(r)) => r.handoff_result,
-        _ => None,
-    })
-}
-
 /// `yadorilink unlink [--force]`. If this device is an eager full replica for
 /// the folder's group, the daemon refuses the unlink fail-closed unless
 /// another full replica is confirmed ready to durably hold every file
@@ -323,33 +180,36 @@ pub async fn unlink(local_path: String, force: bool) -> Result<(), CliError> {
              permanently lose the only copy of that data"
         );
     }
-    let handoff_result = send_unlink(&local_path, force).await?;
+    let handoff_result = ops::send_unlink(&local_path, force).await?;
     println!("Unlinked {local_path}");
     if let Some(result) = handoff_result {
-        println!(
-            "  handoff completed: target={} membership_generation={}{}",
-            result.target_device_id,
-            result.membership_generation,
-            if result.lease_id.is_empty() {
-                String::new()
-            } else {
-                format!(" lease={}", result.lease_id)
-            }
-        );
+        println!("{}", handoff_line(&result));
     }
     Ok(())
 }
 
-pub async fn list() -> Result<(), CliError> {
-    let resp = control_client::send(ReqPayload::ListLinks(ListLinksRequest {})).await?;
-    let Some(RespPayload::ListLinks(list)) = resp.payload else {
-        return Err(CliError::Other("unexpected daemon response".into()));
-    };
-    if list.links.is_empty() {
-        println!("No linked folders.");
+/// The line an unlink prints when it went through a coordination-plane
+/// handoff commit.
+fn handoff_line(result: &HandoffResult) -> String {
+    format!(
+        "  handoff completed: target={} membership_generation={}{}",
+        result.target_device_id,
+        result.membership_generation,
+        if result.lease_id.is_empty() {
+            String::new()
+        } else {
+            format!(" lease={}", result.lease_id)
+        }
+    )
+}
+
+fn links_lines(links: &[LinkStatus]) -> Vec<String> {
+    let mut lines = Vec::new();
+    if links.is_empty() {
+        lines.push("No linked folders.".to_string());
     }
-    for link in &list.links {
-        println!(
+    for link in links {
+        lines.push(format!(
             "{}  group={}  {}{}{}{}",
             link.local_path,
             link.group_id,
@@ -359,9 +219,9 @@ pub async fn list() -> Result<(), CliError> {
             } else {
                 String::new()
             },
-            // Only show the materialization
-            // breakdown for `ondemand` folders — an `eager` folder's files
-            // are always hydrated, so the summary would be pure noise.
+            // Only show the materialization breakdown for `ondemand` folders
+            // -- an `eager` folder's files are always hydrated, so the
+            // summary would be pure noise.
             if link.materialization_policy == "ondemand" {
                 format!(
                     "  on-demand (hydrated={} placeholder={} hydrating={})",
@@ -371,118 +231,18 @@ pub async fn list() -> Result<(), CliError> {
                 String::new()
             },
             skipped_symlink_suffix(link),
-        );
+        ));
+    }
+    lines
+}
+
+/// `yadorilink links`.
+pub async fn list() -> Result<(), CliError> {
+    for line in links_lines(&ops::list_links().await?) {
+        println!("{line}");
     }
     Ok(())
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn base_link() -> LinkStatus {
-        LinkStatus {
-            local_path: "/tmp/photos".into(),
-            group_id: "group-1".into(),
-            paused: false,
-            conflict_count: 0,
-            materialization_policy: "eager".into(),
-            hydrated_count: 0,
-            placeholder_count: 0,
-            hydrating_count: 0,
-            held_file_count: 0,
-            held_files: vec![],
-            skipped_symlink_count: 0,
-            degraded: false,
-            degraded_reason: String::new(),
-            has_active_transfer: false,
-            transfer_bytes_done: 0,
-            transfer_bytes_total: 0,
-            transfer_blocks_done: 0,
-            transfer_blocks_total: 0,
-            transfer_eta_seconds: 0,
-            durability_status: 0,
-            policy_stale: false,
-            ambiguous: false,
-            ambiguous_local_paths: Vec::new(),
-            local_storage_state: LocalStorageState::FullCopy as i32,
-            fetch_availability: FetchAvailability::AvailableNow as i32,
-            full_replica_device_ids: Vec::new(),
-        }
-    }
-
-    /// a link with no skipped symlinks renders no new output.
-    #[test]
-    fn no_skipped_symlinks_renders_no_new_output() {
-        assert_eq!(skipped_symlink_suffix(&base_link()), "");
-    }
-
-    /// a link with skipped symlinks (the Windows default-skip
-    /// policy) shows the count alongside the existing sync-state summary.
-    #[test]
-    fn skipped_symlinks_render_the_count() {
-        let mut link = base_link();
-        link.skipped_symlink_count = 3;
-        assert_eq!(skipped_symlink_suffix(&link), "  skipped_symlinks=3");
-    }
-
-    // -- acknowledgement gate -------------------------------------------
-
-    fn risky_report() -> LinkPreflightReport {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("file.txt"), b"x").unwrap();
-        // Leak the tempdir so the returned report's path stays valid for the
-        // duration of the calling test; these tests only inspect the report
-        // fields the function under test cares about (`is_risky`/
-        // `warnings`), not the filesystem itself, so the directory need not
-        // be cleaned up.
-        let path = dir.keep();
-        link_preflight::run_preflight(&path, &[], Some(0))
-    }
-
-    fn safe_report() -> LinkPreflightReport {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.keep();
-        link_preflight::run_preflight(&path, &[], Some(0))
-    }
-
-    /// spec.md "Risk acknowledgement": `--yes` bypasses a risky preflight
-    /// without needing an interactive prompt at all.
-    #[test]
-    fn yes_flag_acknowledges_a_risky_report() {
-        let report = risky_report();
-        assert!(report.is_risky());
-        assert!(acknowledge_if_risky(&report, true).unwrap());
-    }
-
-    /// A non-risky report never needs acknowledgement, `--yes` or not.
-    #[test]
-    fn non_risky_report_never_needs_acknowledgement() {
-        let report = safe_report();
-        assert!(!report.is_risky());
-        assert!(!acknowledge_if_risky(&report, false).unwrap());
-        assert!(!acknowledge_if_risky(&report, true).unwrap());
-    }
-
-    /// spec.md "Risk acknowledgement": a risky preflight without `--yes`
-    /// (and, in this unit test, without a real terminal to prompt on)
-    /// genuinely blocks — `acknowledge_if_risky` returns `Err`, which
-    /// `commands::link::link` propagates as a non-zero exit.
-    #[test]
-    fn risky_report_without_yes_or_a_terminal_is_rejected() {
-        let report = risky_report();
-        let result = acknowledge_if_risky(&report, false);
-        assert!(result.is_err(), "expected risky link without --yes to be rejected");
-    }
-
-    /// The interactive confirmation prompt itself: "y"/"yes" (any case)
-    /// acknowledges, anything else (including empty input) does not.
-    #[test]
-    fn confirm_risky_reader_accepts_y_or_yes_case_insensitively() {
-        let warnings = vec!["folder is not empty".to_string()];
-        assert!(confirm_risky_with_reader(&warnings, &mut "y\n".as_bytes()));
-        assert!(confirm_risky_with_reader(&warnings, &mut "YES\n".as_bytes()));
-        assert!(!confirm_risky_with_reader(&warnings, &mut "n\n".as_bytes()));
-        assert!(!confirm_risky_with_reader(&warnings, &mut "\n".as_bytes()));
-    }
-}
+mod tests;

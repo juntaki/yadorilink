@@ -31,15 +31,20 @@
 //! reproducing seed. A failing seed is appended to the regression corpus
 //! and replayed by `corpus_regressions_replay`.
 //!
-//! End-to-end coverage that drives the real `PeerSyncSession::run` loop and
-//! change store over a simulated `PeerChannel` (the pattern in
-//! `dst_peer_reconcile_race.rs`) is the integration follow-up once the wire
-//! messages and store land; this suite pins the semantics the wire layer
-//! must preserve.
+//! This suite does not drive the real `PeerSyncSession::run` loop or change
+//! store over a simulated `PeerChannel` (the pattern in
+//! `dst_peer_reconcile_race.rs`); it pins the semantics the wire layer must
+//! preserve.
 
-#![cfg(madsim)]
-
-mod dst_support;
+// Not a simulation scenario: no `async fn`, no `.await`, and no simulator
+// API anywhere in this file or in the model it drives, so it is ungated and
+// runs under every plain `cargo test`. It takes about a second.
+//
+// The model lives in `tests/support/` rather than `tests/dst_support/` for
+// the same reason this file has no gate: `dst_support` is gated on the
+// simulation cfgs because everything in it builds a simulated runtime, and
+// `dag_sec` does not.
+mod support;
 
 use std::collections::BTreeSet;
 use std::io::Write as _;
@@ -48,13 +53,13 @@ use std::path::PathBuf;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
-use dst_support::dag_sec::{
+use support::dag_sec::{
     batch_fold, permute_with_dups, simulate, tombstoned_paths, Dag, Incremental, Materialized, Op,
     Simulation,
 };
 
-/// How many seeds each sweep covers. Kept modest so the suite stays fast
-/// under `--cfg madsim`; the corpus replay below re-checks any historically
+/// How many seeds each sweep covers. Kept modest so the suite stays fast;
+/// the corpus replay below re-checks any historically
 /// failing seed regardless of this window.
 const SWEEP_SEEDS: u64 = 160;
 

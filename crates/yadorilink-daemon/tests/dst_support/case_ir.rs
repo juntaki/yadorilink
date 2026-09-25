@@ -6,7 +6,7 @@
 //! replays as long as the generator that produced it from that seed
 //! hasn't changed).
 //!
-//! `#![cfg(madsim)]`-gated like every DST scenario file.
+//! `#![cfg(turmoil)]`-gated like every DST scenario file.
 //!
 //! Note: `Fault` and most of `Op` are defined comprehensively to
 //! match the full IR shape, avoiding breaking schema changes later.
@@ -15,7 +15,7 @@
 //! like `Op::Write`/`Op::Delete`. Extended operations like `Rename` are
 //! defined now so the type doesn't need to change shape later when used.
 
-#![cfg(madsim)]
+#![cfg(turmoil)]
 #![allow(dead_code)] // not every field/variant has a producer yet
 
 use std::collections::HashMap;
@@ -31,8 +31,30 @@ pub struct Case {
     pub seed: u64,
     pub topology: Topology,
     pub workload: Vec<DeviceTimeline>,
-    /// `(virtual_ts, Fault)`, sorted by `virtual_ts`. This schedule is fired
-    /// against madsim's virtual clock during simulation.
+    /// `(offset_nanos, Fault)`, sorted by offset, fired against the
+    /// simulated clock.
+    ///
+    /// **Nanoseconds from the run's start**, and the unit is stated here
+    /// because it was not before and each producer assumed a different one.
+    /// The scheduler reads nanoseconds (`Duration::from_nanos`); one
+    /// scenario wrote milliseconds, so a partition meant to open 20ms in
+    /// opened 20ns in and healed 20ns after that. Nothing failed -- the
+    /// fault was injected, just never where the scenario put it.
+    ///
+    /// Note this is *not* the same quantity as `DeviceTimeline`'s own
+    /// `virtual_ts`, despite both being a bare `u64` on the same `Case`.
+    /// That one is a round counter that deliberately drives no scheduling;
+    /// this one is real simulated time. Anything converting between them
+    /// has to say what a round is worth.
+    ///
+    /// **`generator.rs` does not honour this yet**, and is left alone on
+    /// purpose. It draws fault times in the workload's round counter, so its
+    /// offsets are round indices and its faults collapse into the run's
+    /// opening instants. Which way that should be resolved -- applying
+    /// generated faults at logical round boundaries, or having the generator
+    /// emit absolute simulated-time offsets -- is a question about what a
+    /// generated case means, not about this unit, and it is settled where
+    /// generated cases are actually run.
     pub fault_schedule: Vec<(u64, Fault)>,
     /// Every content value any op in `workload` can reference by
     /// `content_id`, so an oracle can prove "this surviving byte string is
@@ -79,7 +101,8 @@ pub enum Op {
     Delete {
         path: String,
     },
-    /// Extended operation for renaming files or directories.
+    /// Extended operation for renaming a file (see `RenameTree` for a
+    /// directory).
     Rename {
         from: String,
         to: String,
@@ -93,6 +116,22 @@ pub enum Op {
     },
     Rmdir {
         path: String,
+    },
+    /// `rm -rf path`: the directory and everything under it, non-empty or
+    /// not. Replicated as point deletes of the entries the device had
+    /// observed under `path`, never as a prefix tombstone, so an entry a
+    /// peer creates under `path` concurrently survives it.
+    RmTree {
+        path: String,
+    },
+    /// `mv from to` of a whole directory: one rename of the directory
+    /// entry, which moves every descendant without touching any of them.
+    /// Replicated as delete-at-old-path plus put-at-new-path for each
+    /// observed entry; a concurrent child created under `from` stays under
+    /// `from`.
+    RenameTree {
+        from: String,
+        to: String,
     },
     Chmod {
         path: String,

@@ -6,9 +6,6 @@ license.workspace = true
 description = "Track Send: one-shot P2P file send/receive, deliberately separate from the sync DAG/materialization lane."
 
 # See yadorilink-local-storage/Cargo.toml's identical section for why.
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(madsim)"] }
-
 [features]
 # A deterministic mid-transfer "crash" hook for `receive_transfer`, used
 # only by real crash-recovery tests (see `session.rs`'s own doc comment on
@@ -16,14 +13,14 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(madsim)"] }
 test-support = []
 
 [dependencies]
-# Reused, not reinvented: this crate dials/accepts over the SAME per-device
-# QUIC endpoint (same socket, same NAT traversal, same Ed25519 raw-public-
-# key mutual authentication) the sync protocol uses, distinguished purely
-# by ALPN (`QuicPeerEndpoint::connect_send`/`take_inbound_send`, added in
-# `yadorilink-transport` alongside the sync protocol's own accept path,
-# untouched). This crate never depends on `yadorilink-sync-wire`,
+# The device's iroh endpoint, reached only through Track Send's own ALPN
+# (`yadorilink/send/v1`): same identity, NAT traversal and relays as sync,
+# never a sync lane. This crate never depends on `yadorilink-sync-wire`,
 # `yadorilink-sync-sqlite`, `yadorilink-peer-session`, or any other DAG/
 # materialization-facing crate.
+yadorilink-sync-substrate = { path = "../yadorilink-sync-substrate" }
+# Only the generic length-prefix framing helpers (`block_stream`), which
+# define Track Send's message framing on the wire.
 yadorilink-transport = { path = "../yadorilink-transport" }
 # `chunker::chunk_file`/`FsBlockStore`/`materialize_write::reconstruct_file`
 # -- a clean, DAG-independent leaf crate (see that crate's own module doc:
@@ -55,27 +52,22 @@ prost = "0.14.4"
 # compatibility needs the `Pin<Box<dyn Future>>` transform this provides.
 # Same version already used by `yadorilink-daemon` for the identical reason.
 async-trait = "0.1"
-quinn = { version = "=0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 r2d2 = "0.8"
 thiserror.workspace = true
 tracing.workspace = true
 hex = "0.4"
-sha2.workspace = true
 uuid = { version = "1", features = ["v4"] }
 # Recursive directory walk for `send <dir> <target-device>` -- already a
 # workspace-established dependency (`yadorilink-local-storage`'s own
 # `link_preflight.rs` uses it for the identical purpose), not a new one.
 walkdir = "2"
-
-[target.'cfg(not(madsim))'.dependencies]
 tokio.workspace = true
-
-[target.'cfg(madsim)'.dependencies]
-tokio = { version = "0.2", package = "madsim-tokio", features = ["full"] }
 
 [dev-dependencies]
 tempfile = "3"
-
-[target.'cfg(not(madsim))'.dev-dependencies]
+yadorilink-sync-substrate = { path = "../yadorilink-sync-substrate", features = ["test-support"] }
 tokio = { version = "1", features = ["full", "test-util"] }
+
+[lints]
+workspace = true

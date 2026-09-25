@@ -1,45 +1,41 @@
 //! Deterministic-simulation two-device test: boots *two* real daemon
 //! lifecycles (`app::run(DaemonConfig)`) inside one `madsim` simulation
 //! node, pairs them over a static-netmap discovery seam (no coordination
-//! server, no relay), links the same group folder on both, writes a file on
-//! daemon A and asserts daemon B materializes it, then writes a file on
+//! server, no relay), links the same group folder on both, writes a file
+//! on daemon A and asserts daemon B materializes it, then writes a file on
 //! daemon B and asserts daemon A materializes that -- an end-to-end proof
-//! that two in-sim daemons can discover each other and converge on a file's
-//! content, in both directions, under the seeded, simulated scheduler.
-//!
-//! This builds on `dst_daemon_smoke.rs` (which proves a *single* daemon
-//! boots and indexes in-sim). The one thing the real daemon cannot do
-//! in-simulation is discover peers over its coordination-plane netmap
-//! stream: the coordination server is a separate service that isn't
-//! compiled into the simulation. So discovery is replaced by a
-//! `#[cfg(madsim)]` seam on the peer orchestrator
+//! that two in-sim daemons can discover each other and converge on a
+//! file's content, in both directions, under the seeded, simulated
+//! scheduler. This builds on `dst_daemon_smoke.rs` (which proves a
+//! *single* daemon boots and indexes in-sim). The one thing the real
+//! daemon cannot do in-simulation is discover peers over its
+//! coordination-plane netmap stream: the coordination server is a separate
+//! service that isn't compiled into the simulation. So discovery is
+//! replaced by a `#[cfg(madsim)]` seam on the peer orchestrator
 //! (`peer_orchestrator::run_sim` / `SimDiscovery`) that takes a static
 //! netmap -- each peer's device id, public key, and pre-bound direct UDP
 //! endpoint -- supplied by this harness. Every stage below discovery
 //! (`PeerChannel`, `PeerSyncSession`, `broadcast_change` fan-out,
-//! materialization) is the identical production code path.
-//!
-//! Peer transport is direct-only over two loopback UDP sockets on a single
-//! simulation node -- the same way `yadorilink-sync-core`'s two-device DST
-//! harness pairs devices in-sim (madsim intercepts the tokio UDP sockets).
-//!
-//! What is stubbed/seamed so no real coordination network is touched (all
-//! `#[cfg(madsim)]`-gated, production unchanged):
-//!   - Peer discovery: the static-netmap seam above, in place of the
-//!     `tonic`/WebSocket coordination netmap stream.
-//!   - Group policy: the harness signs the group's authorized-writer policy
-//!     log with an authority key it owns, in place of the coordination
-//!     plane's policy service, and each daemon verifies it through the
-//!     production `record_group_policy_states` path -- see `scenario_body`.
-//!   - Control socket + shell-IPC (`UnixListener`): not started under
-//!     `--cfg madsim` (see `app.rs`); each daemon is driven through
-//!     `DaemonState`/`shutdown_tx` via the `state_probe` seam.
-//!   - Local filesystem watcher: replaced by `SimulatedFolderWatchSource`,
-//!     exactly as in `dst_daemon_smoke.rs`.
-//!
-//! Only compiled/run under `RUSTFLAGS="--cfg madsim"`.
+//! materialization) is the identical production code path. What is
+//! stubbed/seamed so no real coordination network is touched (all
+//! `#[cfg(madsim)]`-gated, production unchanged): - Peer discovery: the
+//! static-netmap seam above, in place of the `tonic`/WebSocket
+//! coordination netmap stream. - Group policy: the harness signs the
+//! group's authorized-writer policy log with an authority key it owns, in
+//! place of the coordination plane's policy service, and each daemon
+//! verifies it through the production `record_group_policy_states` path --
+//! see `scenario_body`. - Control socket + shell-IPC (`UnixListener`): not
+//! started under `--cfg madsim` (see `app.rs`); each daemon is driven
+//! through `DaemonState`/`shutdown_tx` via the `state_probe` seam. - Local
+//! filesystem watcher: replaced by `SimulatedFolderWatchSource`, exactly
+//! as in `dst_daemon_smoke.rs`. Only compiled/run under `RUSTFLAGS="--cfg
+//! madsim"`.
 
-#![cfg(madsim)]
+// Retired. This scenario was written for a simulator this project no longer
+// builds against, and it names APIs that have since been removed. It is kept,
+// never compiled, as the specification its turmoil re-expression has to meet;
+// delete it in the change that lands that replacement.
+#![cfg(any())]
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -204,8 +200,7 @@ async fn scenario_body(seed: u64) -> Result<(), String> {
 
     // Pre-bind one direct UDP socket per daemon on the simulation node's
     // loopback; each daemon dials the other's address as its direct
-    // candidate (madsim intercepts these sockets). Same shape as the
-    // sync-core two-device DST harness.
+    // candidate (madsim intercepts these sockets).
     let socket_a = tokio::net::UdpSocket::bind("127.0.0.1:0")
         .await
         .map_err(|e| format!("bind socket_a: {e}"))?;

@@ -3,7 +3,7 @@
 //! Before this module every `dst_*.rs` scenario carried its own copy of a
 //! seed-derived synthetic "now" plus a `stamp_deterministic_mtime` helper
 //! (canonically `dst_network_fault_chaos.rs`'s `virtual_now_nanos` loop and
-//! `stamp_deterministic_mtime`), keeping madsim's virtual clock and the
+//! `stamp_deterministic_mtime`), keeping the simulated clock and the
 //! kernel-stamped tempdir mtimes on one timeline *by convention*. A write
 //! path that forgot to stamp produced a tie-break outcome production could
 //! never see -- the single largest DST harness-artifact source.
@@ -18,7 +18,7 @@
 //! bug. Different seeds must explore different regions of the tie-break/
 //! clamp space.
 //!
-//! `#![cfg(madsim)]`-gated like every DST scenario file.
+//! `#![cfg(turmoil)]`-gated like every DST scenario file.
 
 use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -45,7 +45,7 @@ const MTIME_STEP_NANOS: i64 = 1_000_000_000;
 /// A seed-derived, strictly-monotonic synthetic clock shared by a whole
 /// scenario run. All mtime stamping and the session-visible `now_unix_
 /// nanos` override are driven from this one value, so they can never
-/// drift onto two timelines (Gap A).
+/// drift onto two timelines.
 ///
 /// Interior-mutable (`AtomicI64`) so a `&HarnessClock` threaded through a
 /// scenario's shared device state can stamp from any write helper without

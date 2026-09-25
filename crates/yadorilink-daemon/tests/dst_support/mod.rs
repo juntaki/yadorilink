@@ -8,18 +8,15 @@
 //! when superseded by a causally-later write or delete according to
 //! that path's version vector.
 //!
-//! `#![cfg(madsim)]`-gated like every DST scenario file — a plain
-//! `cargo test` never builds this module.
+//! Gated on the simulation cfgs like every DST scenario file — a plain
+//! `cargo test` sets neither, so it never builds this module.
 
-#![cfg(madsim)]
+#![cfg(turmoil)]
 #![allow(dead_code)] // not every scenario exercises every method yet
 
 // Failure-diagnostics modules layered on
 // top of the triage/corpus machinery (bundle, first-divergence,
 // signature memory, shrinker, coverage, lane-budget knob).
-/// Harness-side twin of the crate-private `yadorilink_sync_core::dst_trace`,
-/// shared by every scenario and by the oracle itself.
-///
 /// Same `DST_TRACE_PATH` selector: one exact sync path, a comma-separated
 /// list, or `*`. Harness lines and product lines land in one stderr stream
 /// and read as a single timeline. Deliberately an `eprintln` rather than
@@ -38,16 +35,27 @@ pub fn dst_trace_path(path: &str, msg: impl FnOnce() -> String) {
     }
 }
 
+/// Where a scenario's simulated runtime is constructed. Compiles on both
+/// substrates by design — it is the seam that hides which one is running.
+pub mod sim;
+
+// Every support module. None of them names a simulator: the Case IR, the
+// oracle, the corpus, the generators, the fault injectors and their
+// scheduler are the layer worth keeping, and swapping the execution
+// substrate underneath must not touch a line of them. Their own `#[test]`
+// runners get virtual time through `sim::block_on`.
 pub mod bundle;
 pub mod case_ir;
 pub mod clock;
 pub mod convergence_driver;
 pub mod corpus;
 pub mod coverage;
-pub mod dag_sec;
+pub mod device_network;
 pub mod diagnostics;
+pub mod directory_model;
 pub mod divergence;
 pub mod fault;
+pub mod fault_carrier;
 pub mod fault_clock;
 pub mod fault_disk;
 pub mod fault_schedule;
@@ -57,6 +65,7 @@ pub mod fs_ops;
 pub mod generator;
 pub mod lane;
 pub mod link;
+pub mod namespace_oracle;
 pub mod op_applier;
 pub mod oracle;
 pub mod reference_model;
@@ -420,4 +429,16 @@ mod tests {
         let violations = check_no_silent_data_loss(&oracle, &state, group_id(), root.path());
         assert!(violations.is_empty(), "{violations:?}");
     }
+}
+
+/// How many seeds a scenario sweeps, from `DST_SEEDS` or `default`.
+///
+/// The per-PR lane sets `DST_SEEDS=1` and the scheduled sweeps do not set it
+/// at all, so a scenario's full cost is its own default and the cheap lane's
+/// cost is stated where the lane is defined rather than buried in a constant.
+/// An unparseable value is the default rather than a panic: a mistyped
+/// environment variable should not turn a scenario into an infrastructure
+/// failure.
+pub fn seeds(default: u64) -> std::ops::Range<u64> {
+    0..std::env::var("DST_SEEDS").ok().and_then(|value| value.parse().ok()).unwrap_or(default)
 }

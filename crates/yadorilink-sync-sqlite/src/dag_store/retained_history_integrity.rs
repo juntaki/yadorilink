@@ -44,11 +44,10 @@ fn ensure_prune_tombstone_schema(conn: &Connection) -> Result<(), SyncSqliteErro
             -- The pruned change's `device_id`, so a pruned change stays
             -- attributable to its author without retaining its body. Copied
             -- verbatim from `changes.device_id` by the trigger below, same as
-            -- `lamport` already is. NULL only for a boundary ancestor
-            -- installed from a re-bootstrap snapshot, whose compact
-            -- `BoundaryParentAuth` wire record never carried the parent's
-            -- full identity to begin with (see
-            -- `index::rebootstrap_store::base::install_snapshot_frontier`).
+            -- `lamport` already is. NULL means a stub known only by its
+            -- hash, never by its author; the trigger below never writes
+            -- one, and the integrity check refuses a stub where only one
+            -- of the two identity columns is NULL.
             author_identity      BLOB,
             -- `Change::authenticated_header_encoding()` for the pruned
             -- change: every signed field except `ops` plus the original
@@ -56,16 +55,13 @@ fn ensure_prune_tombstone_schema(conn: &Connection) -> Result<(), SyncSqliteErro
             -- (computed once at append time -- see `append_change`) for a
             -- change THIS replica actually pruned, so it remains a valid,
             -- attributable explicit parent without retaining its operations,
-            -- file version or block payload. NULL for the same
-            -- re-bootstrap-boundary case as `author_identity` above -- this
-            -- replica never held that ancestor's full body to derive a
-            -- header from in the first place.
+            -- file version or block payload. NULL exactly when
+            -- `author_identity` is: a stub known only by its hash.
             authenticated_header BLOB,
             encoding_version     INTEGER NOT NULL,
             PRIMARY KEY (group_id, change_hash)
         );
-        -- 2026-09-02 (100k acceptance-run attribution): `is_ancestor`'s
-        -- Lamport pre-check (`lamport_of_including_pruned`) looks up a
+        -- `is_ancestor`'s Lamport pre-check (`lamport_of_including_pruned`) looks up a
         -- pruned change's lamport by `change_hash` alone, with no
         -- `group_id` in hand at that call site -- same reasoning as
         -- `pruned_change_parents_by_child` just below.
@@ -80,8 +76,7 @@ fn ensure_prune_tombstone_schema(conn: &Connection) -> Result<(), SyncSqliteErro
         );
         CREATE INDEX IF NOT EXISTS pruned_change_parents_by_parent
             ON pruned_change_parents(group_id, parent_hash);
-        -- 2026-09-02 (100k acceptance-run attribution): `is_ancestor`'s
-        -- per-step ancestry walk looks up parents of a given CHILD hash
+        -- `is_ancestor`'s per-step ancestry walk looks up parents of a given CHILD hash
         -- with no group_id in hand at that point (`change_hash` is a
         -- SHA-256 over an encoding that already includes `group_id`, so a
         -- cross-group `child_hash` collision is cryptographically
@@ -209,11 +204,11 @@ pub fn is_pruned_change(
     group_id: &str,
     hash: &ChangeHash,
 ) -> Result<bool, SyncSqliteError> {
-    let present: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pruned_changes WHERE group_id = ?1 AND change_hash = ?2)",
-        rusqlite::params![group_id, &hash.0[..]],
-        |row| row.get(0),
-    )?;
+    let present: bool = conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM pruned_changes WHERE group_id = ?1 AND change_hash = ?2)",
+        )?
+        .query_row(rusqlite::params![group_id, &hash.0[..]], |row| row.get(0))?;
     Ok(present)
 }
 
@@ -227,11 +222,10 @@ pub(super) fn pruned_lamport(
     hash: &ChangeHash,
 ) -> Result<Option<u64>, SyncSqliteError> {
     Ok(conn
-        .query_row(
+        .prepare_cached(
             "SELECT lamport FROM pruned_changes WHERE group_id = ?1 AND change_hash = ?2",
-            rusqlite::params![group_id, &hash.0[..]],
-            |row| row.get::<_, i64>(0),
-        )
+        )?
+        .query_row(rusqlite::params![group_id, &hash.0[..]], |row| row.get::<_, i64>(0))
         .optional()?
         .map(|value| value as u64))
 }
@@ -240,7 +234,8 @@ pub(super) fn pruned_lamport(
 /// buffer). Used to make append idempotent and to decide ancestry completeness.
 pub fn has_change(conn: &Connection, hash: &ChangeHash) -> Result<bool, SyncSqliteError> {
     let present: Option<i64> = conn
-        .query_row("SELECT 1 FROM changes WHERE change_hash = ?1", [&hash.0[..]], |r| r.get(0))
+        .prepare_cached("SELECT 1 FROM changes WHERE change_hash = ?1")?
+        .query_row([&hash.0[..]], |r| r.get(0))
         .optional()?;
     Ok(present.is_some())
 }
@@ -258,12 +253,38 @@ pub fn get_encoded(
         .optional()?)
 }
 
-/// Every path mentioned by retained change history for `group_id`.
+/// Every path `group_id`'s history covers: each path a retained change
+/// mentions and, above an installed base, each path the base carries a
+/// current row for.
+///
+/// The second half is what keeps a base's files history once the changes
+/// that wrote them are retired. A current row whose authoring change is no
+/// longer retained but whose authorization evidence is -- evidence is kept
+/// while a file row names its change as author, and `authorization_witness_gc`
+/// collects only what nothing retained names -- was written by a change the
+/// base absorbed. Conflict copies
+/// the base carries count too: they are durable content of the base, not
+/// derived artifacts of a conflict still live here.
 pub fn group_history_paths(
     conn: &Connection,
     group_id: &str,
 ) -> Result<std::collections::HashSet<String>, SyncSqliteError> {
     let mut paths = std::collections::HashSet::new();
+    if crate::rebootstrap_store::current_history_epoch(conn, group_id)?.base().is_some() {
+        let mut stmt = conn.prepare(
+            "SELECT f.path FROM files f \
+             WHERE f.group_id = ?1 AND f.state = 'current' AND f.version_seq > 0 \
+               AND f.authoring_change_hash IS NOT NULL \
+               AND NOT EXISTS (SELECT 1 FROM changes c \
+                               WHERE c.change_hash = f.authoring_change_hash) \
+               AND EXISTS (SELECT 1 FROM change_authorization ca \
+                           WHERE ca.change_hash = f.authoring_change_hash)",
+        )?;
+        let rows = stmt.query_map([group_id], |r| r.get::<_, String>(0))?;
+        for row in rows {
+            paths.insert(row?);
+        }
+    }
     let mut stmt = conn.prepare("SELECT encoded FROM changes WHERE group_id = ?1")?;
     let rows = stmt.query_map([group_id], |r| r.get::<_, Vec<u8>>(0))?;
     for row in rows {
@@ -322,11 +343,8 @@ fn parent_meta(
     hash: &ChangeHash,
 ) -> Result<Option<(String, u64)>, SyncSqliteError> {
     Ok(conn
-        .query_row(
-            "SELECT group_id, lamport FROM changes WHERE change_hash = ?1",
-            [&hash.0[..]],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)),
-        )
+        .prepare_cached("SELECT group_id, lamport FROM changes WHERE change_hash = ?1")?
+        .query_row([&hash.0[..]], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))
         .optional()?)
 }
 
@@ -346,12 +364,48 @@ pub(crate) fn validate_present_parent_shape(
     conn: &Connection,
     change: &Change,
 ) -> Result<bool, SyncSqliteError> {
+    let floor = crate::rebootstrap_store::lamport_floor(
+        conn,
+        change.group_id.as_str(),
+        change.history_epoch,
+    )?;
     validate_present_parent_shape_parts(
         conn,
         change.group_id.as_str(),
         &change.parents,
         change.lamport,
+        floor,
     )
+}
+
+/// The Lamport value a change must carry: one above the greatest of its
+/// parents' values and its epoch's floor.
+///
+/// The floor is what keeps the clock from restarting at a history base. A
+/// change above a base descends the whole history the base absorbed, so it
+/// is clocked from that history's greatest value as well as from its own
+/// parents -- an epoch root takes `floor + 1`. Heads are ranked by
+/// `(lamport, change_hash)`, and a clock that restarted at the base would
+/// rank a change written after the seal below history the seal absorbed.
+///
+/// With no floor known (see `rebootstrap_store::lamport_floor`), the value
+/// cannot be pinned exactly and only has to sit above every parent, which
+/// is the ordering every ancestry shortcut relies on.
+fn lamport_is_clocked(
+    lamport: u64,
+    max_parent_lamport: u64,
+    floor: Option<u64>,
+) -> Result<Option<u64>, ()> {
+    match floor {
+        Some(floor) => {
+            let expected = max_parent_lamport.max(floor).checked_add(1).ok_or(())?;
+            Ok((lamport != expected).then_some(expected))
+        }
+        None => {
+            let least = max_parent_lamport.checked_add(1).ok_or(())?;
+            Ok((lamport < least).then_some(least))
+        }
+    }
 }
 
 /// The body of [`validate_present_parent_shape`], expressed over the three
@@ -367,6 +421,7 @@ pub(crate) fn validate_present_parent_shape_parts(
     group_id: &str,
     parents: &[ChangeHash],
     lamport: u64,
+    lamport_floor: Option<u64>,
 ) -> Result<bool, SyncSqliteError> {
     let mut max_parent_lamport = 0u64;
     let mut all_parents_present = true;
@@ -392,117 +447,17 @@ pub(crate) fn validate_present_parent_shape_parts(
         }
     }
     if all_parents_present {
-        let expected = if parents.is_empty() {
-            1
-        } else {
-            max_parent_lamport.checked_add(1).ok_or_else(|| {
+        let mismatch =
+            lamport_is_clocked(lamport, max_parent_lamport, lamport_floor).map_err(|()| {
                 SyncSqliteError::NotFound("change parent lamport would overflow".into())
-            })?
-        };
-        if lamport != expected {
+            })?;
+        if let Some(expected) = mismatch {
             return Err(SyncSqliteError::NotFound(format!(
                 "change lamport {lamport} does not match expected {expected}"
             )));
         }
     }
     Ok(all_parents_present)
-}
-
-/// A parent's own `(auth_seq, auth_epoch)` authorization coordinate, for
-/// [`check_causal_auth_monotonicity_at_promotion`]. Prefers the parent's
-/// live `changes` row (decoding its full signed bytes -- this crate does
-/// not store `auth_seq`/`auth_epoch` as their own columns); falls back to
-/// [`crate::rebootstrap_store::compacted_parent_auth`]'s checkpoint-
-/// boundary record for a parent this replica itself pruned. `None` means
-/// neither source has it -- the caller must treat that as "not yet
-/// verifiable," never as "vacuously monotonic."
-fn parent_auth_coordinate(
-    conn: &Connection,
-    group_id: &str,
-    child_hash: &ChangeHash,
-    parent_hash: &ChangeHash,
-) -> Result<Option<(u64, u64)>, SyncSqliteError> {
-    let live: Option<Vec<u8>> = conn
-        .query_row(
-            "SELECT encoded FROM changes WHERE change_hash = ?1",
-            [&parent_hash.0[..]],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if let Some(encoded) = live {
-        let parent = Change::from_wire_bytes(&encoded).map_err(|error| {
-            SyncSqliteError::CorruptState(format!(
-                "cannot read causal-auth coordinate for parent {}: retained change is corrupt: {error}",
-                parent_hash.to_hex()
-            ))
-        })?;
-        return Ok(Some((parent.auth_seq, parent.auth_epoch)));
-    }
-    crate::rebootstrap_store::compacted_parent_auth(conn, group_id, child_hash, parent_hash)
-}
-
-/// Whether re-verifying `4175e8cd`'s causal-auth-monotonicity invariant (a
-/// change's pinned `(auth_seq, auth_epoch)` must be >= the max pinned by its
-/// DAG parents) against `change` succeeds, fails, or cannot yet be decided.
-///
-/// This is [`super::orphan_integrity::promote_orphans`]'s and
-/// [`super::admit_change`]'s own counterpart to `yadorilink-replica-
-/// engine::engine::PeerReplicaEngine::check_causal_auth_monotonicity`'s
-/// admission-time check: a change whose parent wasn't yet readable at first
-/// contact is now BUFFERED (an `orphan_changes` row), not discarded, so
-/// promotion -- or, for a parent already structurally present via pruning
-/// at first contact, the direct-apply branch of `admit_change` -- is the
-/// first point every parent's authorization coordinate is guaranteed
-/// resolvable. Deferring the check to here (rather than skipping it, which
-/// is what `Hold`-and-discard used to amount to) is what makes buffering
-/// safe: the exact revoked-writer-replay attack `4175e8cd` closed is still
-/// caught, just one step later, at the point admission actually happens
-/// rather than at first contact.
-pub(crate) enum CausalAuthCheck {
-    /// PLACEHOLDER-exempt, or every parent's coordinate is known and the
-    /// invariant holds.
-    Verified,
-    /// A parent's coordinate is known and the invariant is VIOLATED --
-    /// permanent and provable; the caller must reject this change, not
-    /// retry it.
-    Violated,
-    /// At least one parent's coordinate isn't resolvable yet (structurally
-    /// present via a prune with no retained checkpoint-boundary record) --
-    /// fail closed: neither admit nor reject, leave it buffered/held for a
-    /// later attempt.
-    Unresolvable,
-}
-
-pub(crate) fn check_causal_auth_monotonicity_at_promotion(
-    conn: &Connection,
-    change: &Change,
-) -> Result<CausalAuthCheck, SyncSqliteError> {
-    let incoming = (change.auth_seq, change.auth_epoch, change.policy_head_hash);
-    let placeholder = (
-        yadorilink_replica_domain::change::ChangeAuth::PLACEHOLDER.auth_seq,
-        yadorilink_replica_domain::change::ChangeAuth::PLACEHOLDER.auth_epoch,
-        yadorilink_replica_domain::change::ChangeAuth::PLACEHOLDER.policy_head_hash,
-    );
-    if incoming == placeholder {
-        return Ok(CausalAuthCheck::Verified);
-    }
-    let child_hash = change.compute_hash();
-    let mut max_seq = 0u64;
-    let mut max_epoch = 0u64;
-    for parent in &change.parents {
-        match parent_auth_coordinate(conn, change.group_id.as_str(), &child_hash, parent)? {
-            Some((seq, epoch)) => {
-                max_seq = max_seq.max(seq);
-                max_epoch = max_epoch.max(epoch);
-            }
-            None => return Ok(CausalAuthCheck::Unresolvable),
-        }
-    }
-    if change.auth_seq < max_seq || change.auth_epoch < max_epoch {
-        Ok(CausalAuthCheck::Violated)
-    } else {
-        Ok(CausalAuthCheck::Verified)
-    }
 }
 
 /// Re-checks the same parent-group/Lamport invariant for durable retained
@@ -538,14 +493,15 @@ fn validate_retained_parent_shape(
         max_parent_lamport = max_parent_lamport.max(parent_lamport);
     }
 
-    let expected = if change.parents.is_empty() {
-        1
-    } else {
-        max_parent_lamport.checked_add(1).ok_or_else(|| {
-            SyncSqliteError::CorruptState("retained parent lamport would overflow".into())
-        })?
-    };
-    if change.lamport != expected {
+    let floor = crate::rebootstrap_store::lamport_floor(
+        conn,
+        change.group_id.as_str(),
+        change.history_epoch,
+    )?;
+    let mismatch = lamport_is_clocked(change.lamport, max_parent_lamport, floor).map_err(|()| {
+        SyncSqliteError::CorruptState("retained parent lamport would overflow".into())
+    })?;
+    if let Some(expected) = mismatch {
         return Err(SyncSqliteError::CorruptState(format!(
             "retained change {} has lamport {}, expected {} from retained/pruned parents",
             change.compute_hash().to_hex(),
@@ -584,11 +540,8 @@ pub fn has_change_or_pruned(
     hash: &ChangeHash,
 ) -> Result<bool, SyncSqliteError> {
     let retained: Option<i64> = conn
-        .query_row(
-            "SELECT 1 FROM changes WHERE group_id = ?1 AND change_hash = ?2",
-            rusqlite::params![group_id, &hash.0[..]],
-            |r| r.get(0),
-        )
+        .prepare_cached("SELECT 1 FROM changes WHERE group_id = ?1 AND change_hash = ?2")?
+        .query_row(rusqlite::params![group_id, &hash.0[..]], |r| r.get(0))
         .optional()?;
     Ok(retained.is_some() || is_pruned_change(conn, group_id, hash)?)
 }
@@ -596,7 +549,7 @@ pub fn has_change_or_pruned(
 /// Whether `ancestor` is a strict ancestor of `descendant` — reachable by
 /// walking retained parent edges upward from `descendant`, never equal to it.
 ///
-/// 2026-09-02 (100k acceptance-run attribution): reads via a `LIMIT 1` on
+/// Reads via a `LIMIT 1` on
 /// the outermost statement that consumes the recursive CTE (SQLite's own
 /// documented early-termination mechanism for a recursive query — see
 /// https://www.sqlite.org/lang_with.html's "outlandish recursive query
@@ -604,37 +557,27 @@ pub fn has_change_or_pruned(
 /// wrapping `EXISTS`/aggregate around the CTE read) instead of
 /// accumulating the FULL ancestry set of `descendant` before an outer
 /// `EXISTS` filters it. An `EXISTS(SELECT 1 FROM ancestry WHERE hash =
-/// ?2)` wrapper — what this used to be, and what an initial fix attempt
-/// here also tried with a per-row `matched` marker column instead of a
-/// real `LIMIT` — does NOT get pushed into the recursive CTE's own
-/// termination condition in SQLite: both walked every retained ancestor
-/// of `descendant` back to the root on EVERY call, regardless of how
-/// close `ancestor` actually was (confirmed empirically: the `matched`-
-/// column attempt measured identically to the original on
-/// `dag_is_ancestor_scale_benchmark.rs`, not the expected large
-/// improvement).
+/// ?2)` wrapper (or a per-row `matched` marker column in place of a real
+/// `LIMIT`) does NOT get pushed into the recursive CTE's own termination
+/// condition in SQLite: it walks every retained ancestor of `descendant`
+/// back to the root on EVERY call, regardless of how close `ancestor`
+/// actually is (`dag_is_ancestor_scale_benchmark.rs` measures both shapes).
 ///
 /// Reconciliation calls this in a hot per-record loop
 /// (`PeerSyncSession::combined_heads`'s zero-work pre-check), and a real
 /// device's own local emission chains each new change onto the group's
 /// current head (see `dag_group_heads`) -- so a device that has made N
 /// local changes to a group has, structurally, a single chain roughly N
-/// deep, even across N unrelated files. The benchmark against a synthetic
-/// N=100,000 linear chain measured the old shape at ~840ms for an
-/// ancestor 100,000 hops away, and *~260ms even for the immediate
-/// parent* (1 hop away) -- the full backward walk ran regardless of the
-/// true distance. That single-call cost, multiplied across many claimed
-/// obligations and many scheduler ticks, is the dominant mechanism behind
-/// the 100k-scale acceptance failure (see yadorilink-harness `results/
-/// scale_evidence/large.forensic_notes.md`): one recv-loop-adjacent tokio
-/// worker thread pinned near 100% CPU with the rest of the runtime
-/// (including the SQLite connection pool) idle, and a large, never-
-/// shrinking `pending` obligation backlog on both the sender and the
-/// receiver. With this fix, the immediate-parent case above drops to
-/// sub-millisecond; the genuinely-far/absent cases are unchanged (there
-/// is no way to answer "is this far/nonexistent ancestor reachable"
-/// without walking that same distance -- this fixes the common case,
-/// not the asymptotic worst case).
+/// deep, even across N unrelated files. On a synthetic N=100,000 linear
+/// chain the full-walk shape costs ~840ms for an ancestor 100,000 hops
+/// away and *~260ms even for the immediate parent* (1 hop away); that
+/// per-call cost, multiplied across many claimed obligations and
+/// scheduler ticks, would pin a worker thread and let the `pending`
+/// obligation backlog grow on both sender and receiver. With the early
+/// `LIMIT`, the immediate-parent case is sub-millisecond; the genuinely
+/// far/absent cases still cost the walk distance (there is no way to
+/// answer "is this far/nonexistent ancestor reachable" without walking
+/// that far -- the Lamport pre-check below handles the unrelated case).
 ///
 /// `UNION ALL` (rather than `UNION`) means no per-step dedup and, in a
 /// graph with a cycle, no automatic termination from that alone -- safe
@@ -643,7 +586,7 @@ pub fn has_change_or_pruned(
 /// `dag_store::admit_change`'s own structural validation), not something
 /// this function newly assumes. `WHERE edges.child_hash != ancestor` in
 /// the recursive term stops expanding past a node that has already
-/// matched (the common single-parent-chain case this fix targets); it
+/// matched (the common single-parent-chain case); it
 /// does not stop OTHER, still-unmatched branches of a genuinely branching
 /// DAG, which is the correct, conservative behavior — a merge's other
 /// parent might still be the real answer.
@@ -652,19 +595,18 @@ pub fn is_ancestor(
     ancestor: &ChangeHash,
     descendant: &ChangeHash,
 ) -> Result<bool, SyncSqliteError> {
-    // Lamport pre-check (2026-09-02, added after a 30,000-file native
-    // harness reproduction against the recursive-walk fix above still did
-    // not fully converge in a comparable-scaled time budget): a strict
-    // DAG's `lamport` is `max_parent_lamport + 1` at every edge
-    // (`Change::create_signed_with_purpose`), so a true ancestor's lamport
+    // Lamport pre-check: a strict
+    // DAG's `lamport` is at least `max_parent_lamport + 1` at every edge
+    // (`Change::create_signed_with_purpose`; above a history base it is
+    // clocked from the base's ceiling when that is higher, see
+    // `lamport_is_clocked`), so a true ancestor's lamport
     // is ALWAYS strictly less than its descendant's. `ancestor.lamport >=
     // descendant.lamport` is therefore a sound, cheap (two indexed
     // point lookups by `change_hash`) rejection with no graph walk at
-    // all -- and it is exactly the case the walk-based fix above cannot
+    // all -- and it is exactly the case the early-`LIMIT` walk cannot
     // help: a "definitely not related" comparison between two far-apart
-    // or same-generation changes still has to walk the full distance
-    // before concluding "not found" (see this function's own doc comment
-    // on the genuinely-far/absent case being unchanged by that fix).
+    // or same-generation changes would otherwise walk the full distance
+    // before concluding "not found".
     // Checks `pruned_changes` too -- a compacted ancestor's own row is
     // gone from `changes`, but its `lamport` is preserved there for
     // exactly this kind of query. Skipped (falls through to the walk,
@@ -682,9 +624,8 @@ pub fn is_ancestor(
     // visited node. Reconciliation invokes this in a hot per-record loop.
     //
     // No `edges(child_hash, parent_hash) AS (... UNION ...)` intermediate
-    // CTE: an initial fix attempt kept that shape (unchanged from the
-    // original) and measured no improvement at all despite the `ancestry`
-    // recursion itself being properly LIMIT-bounded -- SQLite materializes
+    // CTE: that shape gains nothing even with the `ancestry` recursion
+    // itself properly LIMIT-bounded -- SQLite materializes
     // a plain CTE that is referenced from INSIDE a recursive CTE's own
     // definition eagerly (a temp b-tree holding the full `change_parents
     // UNION pruned_change_parents` result) before the recursive walk ever
@@ -693,8 +634,7 @@ pub fn is_ancestor(
     // Querying `change_parents`/`pruned_change_parents` directly in each
     // recursive branch instead (two `UNION ALL` arms per level rather than
     // one pre-unioned `edges` table) lets each step be a real indexed
-    // point lookup, which is what actually let the `LIMIT 1` below start
-    // paying off.
+    // point lookup, which is what lets the `LIMIT 1` below pay off.
     let mut stmt = conn.prepare_cached(
         "WITH RECURSIVE ancestry(hash) AS (
            SELECT parent_hash FROM change_parents WHERE child_hash = ?1
@@ -713,31 +653,6 @@ pub fn is_ancestor(
     )?;
     let found = stmt.exists(rusqlite::params![&descendant.0[..], &ancestor.0[..]])?;
     Ok(found)
-}
-
-/// Marks a stored change as materialized into the file index.
-pub fn mark_applied(conn: &Connection, hash: &ChangeHash) -> Result<(), SyncSqliteError> {
-    conn.execute("UPDATE changes SET applied = 1 WHERE change_hash = ?1", [&hash.0[..]])?;
-    Ok(())
-}
-
-/// Every admitted-but-not-yet-projected change for `group_id`, decoded and
-/// ordered by Lamport timestamp (oldest-first).
-pub fn list_unapplied(conn: &Connection, group_id: &str) -> Result<Vec<Change>, SyncSqliteError> {
-    let mut stmt = conn.prepare(
-        "SELECT encoded FROM changes WHERE group_id = ?1 AND applied = 0 ORDER BY lamport, change_hash",
-    )?;
-    let rows = stmt.query_map([group_id], |r| r.get::<_, Vec<u8>>(0))?;
-    let mut out = Vec::new();
-    for row in rows {
-        let change = Change::from_wire_bytes(&row?).map_err(|error| {
-            SyncSqliteError::CorruptState(format!(
-                "cannot list unapplied changes for group {group_id}: retained change is corrupt: {error}"
-            ))
-        })?;
-        out.push(change);
-    }
-    Ok(out)
 }
 
 /// Whether every parent of a change is present in the admitted store.
@@ -769,7 +684,6 @@ pub fn has_all_parents(conn: &Connection, change: &Change) -> Result<bool, SyncS
 pub(crate) fn append_change(
     conn: &Connection,
     change: &Change,
-    applied: bool,
     now_unix_nanos: i64,
 ) -> Result<bool, SyncSqliteError> {
     let hash = change.compute_hash();
@@ -782,35 +696,52 @@ pub(crate) fn append_change(
     if has_change(conn, &hash)? {
         return Ok(false);
     }
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO changes \
-         (change_hash, group_id, device_id, lamport, encoded, applied, authenticated_header) \
+         (change_hash, group_id, device_id, author_seq, lamport, encoded, authenticated_header) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        rusqlite::params![
-            &hash.0[..],
-            change.group_id.as_str(),
-            change.device_id.as_str(),
-            change.lamport as i64,
-            change.to_wire_bytes(),
-            applied as i64,
-            change.authenticated_header_encoding(),
-        ],
+    )?
+    .execute(rusqlite::params![
+        &hash.0[..],
+        change.group_id.as_str(),
+        change.device_id.as_str(),
+        change.author_seq.get() as i64,
+        change.lamport as i64,
+        change.to_wire_bytes(),
+        change.authenticated_header_encoding(),
+    ])?;
+    // Same transaction as the insert above, and reached only on the
+    // `newly_appended` path: an already-retained hash returned early, so a
+    // duplicate delivery of a change cannot move its author's position.
+    // Committing the state apart from the change it summarizes would let a
+    // crash leave a watermark describing history this replica does not
+    // hold, or history it holds with no watermark to prove it.
+    super::author_chain::advance_author_state(
+        conn,
+        change.group_id.as_str(),
+        change.device_id.as_str(),
+        change.author_seq,
+        &hash,
     )?;
     record_change_file_versions(conn, change)?;
     for parent in &change.parents {
-        conn.execute(
+        conn.prepare_cached(
             "INSERT OR IGNORE INTO change_parents (child_hash, parent_hash) VALUES (?1, ?2)",
-            rusqlite::params![&hash.0[..], &parent.0[..]],
-        )?;
-        conn.execute(
-            "DELETE FROM group_heads WHERE group_id = ?1 AND change_hash = ?2",
-            rusqlite::params![change.group_id.as_str(), &parent.0[..]],
-        )?;
+        )?
+        .execute(rusqlite::params![&hash.0[..], &parent.0[..]])?;
+        conn.prepare_cached("DELETE FROM group_heads WHERE group_id = ?1 AND change_hash = ?2")?
+            .execute(rusqlite::params![change.group_id.as_str(), &parent.0[..]])?;
     }
-    conn.execute(
+    conn.prepare_cached(
         "INSERT OR IGNORE INTO group_heads (group_id, change_hash) VALUES (?1, ?2)",
-        rusqlite::params![change.group_id.as_str(), &hash.0[..]],
-    )?;
+    )?
+    .execute(rusqlite::params![change.group_id.as_str(), &hash.0[..]])?;
+    // Same transaction as the change insert, its parent edges and the
+    // head-set update above, so the derived path frontier can never
+    // commit apart from the history it is derived from. Placed after the
+    // `group_heads` update because it reads the post-admission head set
+    // -- see `path_frontier`'s own module doc comment.
+    crate::dag_store::record_path_frontier_admission(conn, change, &hash)?;
     record_admission_time_index(conn, change.group_id.as_str(), now_unix_nanos)?;
     Ok(true)
 }
@@ -971,7 +902,7 @@ pub(crate) fn drop_time_index_snapshots_naming(
 /// its own. `MAX(surviving) + 1` is above every survivor in every one of
 /// those cases, so a later admission always outranks every row already
 /// there. The identical
-/// hazard, and the identical fix, appear in `crate::rewind_plan`'s own
+/// hazard, and the identical tie-break, appear in `crate::rewind_plan`'s own
 /// per-path query as its `version_seq DESC` tie-break.
 ///
 /// This answers a GROUP-level question ("what was the DAG frontier") and
@@ -979,8 +910,8 @@ pub(crate) fn drop_time_index_snapshots_naming(
 /// planning layer (`crate::rewind_plan`) deliberately does not call this:
 /// going from a head-set to "what should path X contain at T" requires a
 /// per-path ancestor walk against a historical frontier, which is the
-/// exact shape [`is_ancestor`]'s doc comment records collapsing at 100k
-/// scale.
+/// exact shape [`is_ancestor`]'s doc comment describes as expensive at
+/// 100k-file scale.
 /// Shared so the query-plan assertion in `dag_store`'s own tests checks the
 /// exact statement this function issues rather than a copy of it that could
 /// drift.
@@ -1113,30 +1044,28 @@ pub(crate) fn hash_from_blob(v: Vec<u8>) -> Result<ChangeHash, SyncSqliteError> 
 /// tables are authoritative only for deletions that occurred inside the short
 /// checkpoint->delete->sweep window; a stale context from an interrupted or
 /// externally-manipulated connection is cleared before validation.
-pub(crate) fn repair(conn: &Connection) -> Result<(), SyncSqliteError> {
+/// Returns the groups whose stored path effects no longer match the
+/// changes they were derived from. Reported rather than repaired here:
+/// this function owns canonical history, and the derived path frontier is
+/// rebuilt by its own module once this pass has established that the
+/// history it derives from is sound.
+pub(crate) fn repair(conn: &Connection) -> Result<Vec<String>, SyncSqliteError> {
     ensure_prune_tombstone_schema(conn)?;
     conn.execute("DELETE FROM active_prune_context", [])?;
     validate_prune_proofs(conn)?;
 
+    let mut effect_mismatches: Vec<String> = Vec::new();
     let tx = conn.unchecked_transaction()?;
     // One admitted `changes` row: `(change_hash, group_id, device_id, lamport,
-    // applied, encoded, authenticated_header)`.
-    type AdmittedRow = (Vec<u8>, String, String, i64, i64, Vec<u8>, Vec<u8>);
+    // encoded, authenticated_header)`.
+    type AdmittedRow = (Vec<u8>, String, String, i64, Vec<u8>, Vec<u8>);
     let admitted_rows: Vec<AdmittedRow> = {
         let mut stmt = tx.prepare(
-            "SELECT change_hash, group_id, device_id, lamport, applied, encoded, \
+            "SELECT change_hash, group_id, device_id, lamport, encoded, \
              authenticated_header FROM changes",
         )?;
         let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-                row.get(6)?,
-            ))
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
         })?;
         rows.collect::<Result<_, _>>()?
     };
@@ -1146,17 +1075,10 @@ pub(crate) fn repair(conn: &Connection) -> Result<(), SyncSqliteError> {
         stored_group,
         stored_device,
         stored_lamport,
-        stored_applied,
         encoded,
         stored_authenticated_header,
     ) in admitted_rows
     {
-        if stored_applied != 0 && stored_applied != 1 {
-            return Err(SyncSqliteError::CorruptState(format!(
-                "cannot repair retained history: change {} has an invalid applied value {} (must be 0 or 1)",
-                hex::encode(&stored_hash), stored_applied,
-            )));
-        }
         let change = Change::from_wire_bytes(&encoded).map_err(|error| {
             SyncSqliteError::CorruptState(format!(
                 "cannot repair retained history: retained change is corrupt: {error}"
@@ -1169,6 +1091,17 @@ pub(crate) fn repair(conn: &Connection) -> Result<(), SyncSqliteError> {
                 hex::encode(&stored_hash),
             ))
         })?;
+        // The change is decoded and about to be verified against its own
+        // bytes; checking that its stored path effects still say what its
+        // ops say costs one indexed lookup and one op scan on top, and
+        // catches the corruption no structural check can see -- an effect
+        // row and its live head lost together, leaving an index that is
+        // perfectly self-consistent and simply missing a file.
+        if !super::path_frontier::effects_match_change(&tx, &stored_group, &change)? {
+            if !effect_mismatches.contains(&stored_group) {
+                effect_mismatches.push(stored_group.clone());
+            }
+        }
         verify_retained_change_identity(
             &change,
             &stored_hash,
@@ -1235,5 +1168,31 @@ pub(crate) fn repair(conn: &Connection) -> Result<(), SyncSqliteError> {
         )?;
     }
     tx.commit()?;
-    Ok(())
+    Ok(effect_mismatches)
+}
+
+#[cfg(test)]
+mod lamport_clock_tests {
+    use super::lamport_is_clocked;
+
+    #[test]
+    fn a_known_floor_pins_the_clock_one_above_it_or_the_parents() {
+        assert_eq!(lamport_is_clocked(1, 0, Some(0)), Ok(None), "a root on the original history");
+        assert_eq!(lamport_is_clocked(41, 0, Some(40)), Ok(None), "an epoch root above a base");
+        assert_eq!(lamport_is_clocked(1, 0, Some(40)), Ok(Some(41)));
+        assert_eq!(lamport_is_clocked(41, 2, Some(40)), Ok(None));
+        assert_eq!(lamport_is_clocked(3, 2, Some(40)), Ok(Some(41)));
+        assert_eq!(lamport_is_clocked(51, 50, Some(40)), Ok(None), "parents above the floor");
+        assert_eq!(lamport_is_clocked(52, 50, Some(40)), Ok(Some(51)));
+    }
+
+    /// Without a floor the exact value cannot be pinned, and the clock only
+    /// has to sit above every parent.
+    #[test]
+    fn an_unknown_floor_only_requires_the_clock_to_pass_the_parents() {
+        assert_eq!(lamport_is_clocked(3, 2, None), Ok(None));
+        assert_eq!(lamport_is_clocked(41, 2, None), Ok(None));
+        assert_eq!(lamport_is_clocked(2, 2, None), Ok(Some(3)));
+        assert_eq!(lamport_is_clocked(1, u64::MAX, None), Err(()));
+    }
 }

@@ -1,5 +1,5 @@
-//! What `DurabilityCommandService`/`HandoffCommandService` need from the
-//! runtime -- the durability-unknown latch and the full-replica-handoff
+//! What the durability-latch and handoff lease/ticket control commands
+//! need from the runtime -- the durability-unknown latch and the full-replica-handoff
 //! lease/ticket round trips, none of which fit `MembershipCoordination`'s
 //! shape (these act on THIS device's own local durability state and peer
 //! sessions, not the coordination-plane HTTP API).

@@ -39,9 +39,9 @@ fi
 
 # This package's own version is independent of yadorilink's release
 # version -- it only ever changes when the signing key itself rotates
-# (docs/UPDATE_SIGNING.md's rotation procedure is the precedent this
-# mirrors) or this script's packaged files change, so it does not read
-# $REPO_ROOT/Cargo.toml's `version` the way build-deb.sh does.
+# (following the update-signing key's rotation procedure) or this script's
+# packaged files change, so it does not read $REPO_ROOT/Cargo.toml's
+# `version` the way build-deb.sh does.
 VERSION="${PKG_VERSION:-1}"
 
 log "Building yadorilink-archive-keyring ${VERSION}"

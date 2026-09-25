@@ -9,7 +9,7 @@
 //! `.yadorilink-tmp.*` file -- surfaced as `StructuralIndexDiskMismatch` /
 //! `Corruption` violations that were pure harness artifacts (the
 //! canonical inline account is in `dst_two_device_chaos.rs` /
-//! `dst_network_fault_chaos.rs`, seed 3298840595's finding).
+//! `dst_network_fault_chaos.rs`; reproduction: seed 3298840595).
 //!
 //! `run_self_healing` invokes the exact same production sweep code at each
 //! quiescent point and before the terminal oracle checks. Every repair it
@@ -21,7 +21,7 @@
 //! it -- masking nothing, since the sweep runs production code and
 //! exercising it more is coverage, not suppression.
 //!
-//! `#![cfg(madsim)]`-gated like every DST scenario file.
+//! `#![cfg(turmoil)]`-gated like every DST scenario file.
 
 use std::path::Path;
 
@@ -103,22 +103,22 @@ fn repaired(path: String, what: &str) -> Violation {
 mod tests {
     use super::super::oracle::GlobalOracle;
     use super::*;
-    use yadorilink_local_storage::FsBlockStore;
+    use yadorilink_local_storage::SegmentBlockStore;
     use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
     use yadorilink_replica_domain::session_state::MaterializationState;
 
     const GROUP_ID: &str = "sweep-test-group";
 
-    fn setup() -> (ReplicaCoordinator, tempfile::TempDir, FsBlockStore, tempfile::TempDir) {
+    fn setup() -> (ReplicaCoordinator, tempfile::TempDir, SegmentBlockStore, tempfile::TempDir) {
         let root = tempfile::tempdir().unwrap();
         let store_dir = tempfile::tempdir().unwrap();
         let state = ReplicaCoordinator::open_in_memory().unwrap();
         state.link_repository().add_link(&root.path().to_string_lossy(), GROUP_ID).unwrap();
-        let store = FsBlockStore::new(store_dir.path().to_path_buf()).unwrap();
+        let store = SegmentBlockStore::new(store_dir.path().to_path_buf()).unwrap();
         (state, root, store, store_dir)
     }
 
-    /// The exact PF-investigation shape (interrupted eager materialize:
+    /// The shape the sweep exists for (interrupted eager materialize:
     /// live Hydrated row, only a partial file on disk, blocks still present
     /// in the store, plus an orphaned temp file) -- the sweep must repair
     /// it and leave the terminal structural oracle clean, and it must
@@ -149,7 +149,7 @@ mod tests {
             size: content.len() as u64,
             mtime_unix_nanos: 1,
             blocks: vec![BlockInfo {
-                hash: hex::decode(hash_hex).unwrap(),
+                hash: hex::decode(&hash_hex).unwrap(),
                 offset: 0,
                 size: content.len() as u32,
             }],
@@ -169,6 +169,25 @@ mod tests {
                 GROUP_ID,
                 "pre-crash.bin",
                 MaterializationState::Hydrated,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+        // The intent journal entry a real materialize writes before it
+        // touches the disk, and which a crash mid-write therefore leaves
+        // behind. It is not decoration: on the `Live` cadence a diverged
+        // file with no intent is deliberately NOT reconstructed, because it
+        // may be a local edit the watcher has not captured yet
+        // (`materialization_repair.rs`'s `on_disk_size.is_some() &&
+        // !has_intent && mode == RepairMode::Live` branch, which hands it to
+        // the dirty-journal backstop instead). Without this line the fixture
+        // no longer models the scenario its own name claims -- it models an
+        // uncaptured local edit, which the sweep is right to leave alone.
+        state
+            .materialization_intent_repository()
+            .begin_materialization_intent(
+                GROUP_ID,
+                "pre-crash.bin",
+                &hex::decode(&hash_hex).unwrap(),
                 &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();

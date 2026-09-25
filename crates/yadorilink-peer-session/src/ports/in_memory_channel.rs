@@ -1,34 +1,28 @@
-//! A [`PeerMessageChannel`] pair that carries messages in memory, for
-//! deterministic simulation and for tests that want two real
-//! `PeerSyncSession`s talking to each other with no socket in between.
-//!
-//! This exists because the port is about to become the only thing the
-//! session knows about its transport. A second, genuinely independent
-//! implementation is what proves that: as long as `PeerChannel` is the only
-//! implementor, "the session depends on the port, not the transport" is a
-//! claim about naming rather than about the dependency graph. Simulation
-//! builds need it for a concrete reason too -- deterministic runs cannot use
-//! the real transport, and whatever replaces the real transport will not be
-//! usable under simulation either, so the protocol and convergence logic
-//! need a transport they can be tested against on their own.
+//! An in-memory pair of block and service stream lanes, for tests that
+//! want two real `PeerSyncSession`s talking to each other with no socket in
+//! between. This crate's own tests cannot use the real substrate-backed
+//! transports (see `SessionTransports`'s doc comment), so the protocol and
+//! convergence logic need a transport they can be tested against on their
+//! own.
 //!
 //! Deliberately free of timers, wall-clock reads and randomness: everything
 //! here is a bounded queue and a message copy, so a simulated run that uses
 //! it is reproducible from its seed alone.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use tokio::io::DuplexStream;
 use tokio::sync::{mpsc, Mutex};
 use yadorilink_transport::block_stream::{read_length_prefixed, write_length_prefixed};
 use yadorilink_transport::TransportError;
 
-use super::{PeerBlockStream, PeerMessageChannel};
+use super::{
+    BlockStreamTransport, PeerBlockStream, PeerServiceStream, PreparedSnapshotStore,
+    ServiceStreamTransport, SessionTransports, SnapshotFetch,
+};
 
-/// Matches the real `PeerChannel`'s own outbound queue capacity, so a test
-/// that fills this queue is exercising the same "how many messages can be
-/// in flight before a best-effort send is dropped" boundary the production
-/// channel imposes, rather than a boundary invented here.
+/// How many opened-but-not-yet-accepted streams one end may queue.
 const QUEUE_DEPTH: usize = 64;
 
 /// Buffer capacity of one in-memory block stream's byte pipe.
@@ -44,40 +38,44 @@ const BLOCK_STREAM_PIPE_BYTES: usize = 64 * 1024;
 /// One end of an in-memory link. Obtain a connected pair from
 /// [`InMemoryPeerChannel::connected_pair`].
 pub struct InMemoryPeerChannel {
-    /// The *peer's* inbox. Dropping the far end closes this, which is what
-    /// makes a disconnect observable without any timeout.
-    outbound: mpsc::Sender<Vec<u8>>,
-    /// This end's own inbox. `Mutex` because the port takes `&self` while
-    /// `mpsc::Receiver::recv` needs `&mut` -- the session drives a single
-    /// receive loop, so this is never contended in practice.
-    inbound: Mutex<mpsc::Receiver<Vec<u8>>>,
     /// The *peer's* queue of block streams this end has opened, and this
-    /// end's own queue of streams the peer opened. Same shape and same
-    /// reasoning as the message queues above; opening a stream is a
-    /// handoff, and the pipe underneath it is what carries the bytes.
+    /// end's own queue of streams the peer opened. `Mutex` because the
+    /// transport takes `&self` while `mpsc::Receiver::recv` needs `&mut`.
+    /// Opening a stream is a handoff; the pipe underneath it is what carries
+    /// the bytes.
     outbound_block_streams: mpsc::Sender<InMemoryBlockStream>,
     inbound_block_streams: Mutex<mpsc::Receiver<InMemoryBlockStream>>,
+    /// Same shape again, for service RPC streams -- see
+    /// `ServiceStreamTransport`'s own doc comment. Nothing in this crate's
+    /// own unit tests currently drains `inbound_service_streams` (they
+    /// exercise local convergence, not the service RPC lane), but `open`
+    /// below still hands the far end to a real queue rather than dropping
+    /// it, so a future test that does call a service-RPC method gets a
+    /// stream a peer-side accept loop could actually read, not a disguised
+    /// failure.
+    outbound_service_streams: mpsc::Sender<InMemoryServiceStream>,
+    inbound_service_streams: Mutex<mpsc::Receiver<InMemoryServiceStream>>,
 }
 
 impl InMemoryPeerChannel {
     /// Two ends of one link: what `a` sends, `b` receives, and vice versa.
     pub fn connected_pair() -> (Arc<Self>, Arc<Self>) {
-        let (a_tx, a_rx) = mpsc::channel(QUEUE_DEPTH);
-        let (b_tx, b_rx) = mpsc::channel(QUEUE_DEPTH);
         let (a_streams_tx, a_streams_rx) = mpsc::channel(QUEUE_DEPTH);
         let (b_streams_tx, b_streams_rx) = mpsc::channel(QUEUE_DEPTH);
+        let (a_service_tx, a_service_rx) = mpsc::channel(QUEUE_DEPTH);
+        let (b_service_tx, b_service_rx) = mpsc::channel(QUEUE_DEPTH);
         (
             Arc::new(Self {
-                outbound: b_tx,
-                inbound: Mutex::new(a_rx),
                 outbound_block_streams: b_streams_tx,
                 inbound_block_streams: Mutex::new(a_streams_rx),
+                outbound_service_streams: b_service_tx,
+                inbound_service_streams: Mutex::new(a_service_rx),
             }),
             Arc::new(Self {
-                outbound: a_tx,
-                inbound: Mutex::new(b_rx),
                 outbound_block_streams: a_streams_tx,
                 inbound_block_streams: Mutex::new(b_streams_rx),
+                outbound_service_streams: a_service_tx,
+                inbound_service_streams: Mutex::new(b_service_rx),
             }),
         )
     }
@@ -142,25 +140,36 @@ impl PeerBlockStream for InMemoryBlockStream {
     }
 }
 
+/// One in-memory service RPC stream: a request written, a response read,
+/// same framing as [`InMemoryBlockStream`] and the same reasoning for
+/// reusing the transport's own length-prefix functions rather than
+/// reimplementing them.
+pub struct InMemoryServiceStream {
+    pipe: DuplexStream,
+}
+
 #[async_trait::async_trait]
-impl PeerMessageChannel for InMemoryPeerChannel {
-    async fn send(&self, payload: Vec<u8>) -> Result<(), TransportError> {
-        self.outbound.send(payload).await.map_err(|_| TransportError::ChannelClosed)
+impl PeerServiceStream for InMemoryServiceStream {
+    async fn send_request(&mut self, payload: &[u8]) -> Result<(), TransportError> {
+        write_length_prefixed(&mut self.pipe, payload).await
     }
 
-    fn try_send(&self, payload: Vec<u8>) -> bool {
-        // Both "queue full" and "peer gone" report the same dropped-send
-        // outcome the real channel reports, rather than distinguishing
-        // them: the caller is on a best-effort admission-control path that
-        // has no different response to make.
-        self.outbound.try_send(payload).is_ok()
+    async fn recv_message(&mut self, max_len: usize) -> Result<Vec<u8>, TransportError> {
+        read_length_prefixed(&mut self.pipe, max_len).await
     }
 
-    async fn recv(&self) -> Option<Vec<u8>> {
-        self.inbound.lock().await.recv().await
+    async fn send_response(&mut self, payload: &[u8]) -> Result<(), TransportError> {
+        write_length_prefixed(&mut self.pipe, payload).await
     }
+}
 
-    async fn open_block_stream(&self) -> Result<Box<dyn PeerBlockStream>, TransportError> {
+#[async_trait::async_trait]
+impl BlockStreamTransport for InMemoryPeerChannel {
+    async fn open(&self, _group_id: &str) -> Result<Box<dyn PeerBlockStream>, TransportError> {
+        // This in-memory channel carries only one peer's worth of streams
+        // to begin with, so there is no group to route on -- unlike the
+        // real substrate lane, which multiplexes many groups over one
+        // connection.
         let (near, far) = tokio::io::duplex(BLOCK_STREAM_PIPE_BYTES);
         self.outbound_block_streams
             .send(InMemoryBlockStream { pipe: far })
@@ -168,94 +177,118 @@ impl PeerMessageChannel for InMemoryPeerChannel {
             .map_err(|_| TransportError::ChannelClosed)?;
         Ok(Box::new(InMemoryBlockStream { pipe: near }))
     }
+}
 
-    async fn accept_block_stream(&self) -> Option<Box<dyn PeerBlockStream>> {
-        let stream = self.inbound_block_streams.lock().await.recv().await?;
-        Some(Box::new(stream))
+#[async_trait::async_trait]
+impl ServiceStreamTransport for InMemoryPeerChannel {
+    async fn open(&self, _group_id: &str) -> Result<Box<dyn PeerServiceStream>, TransportError> {
+        let (near, far) = tokio::io::duplex(BLOCK_STREAM_PIPE_BYTES);
+        self.outbound_service_streams
+            .send(InMemoryServiceStream { pipe: far })
+            .await
+            .map_err(|_| TransportError::ChannelClosed)?;
+        Ok(Box::new(InMemoryServiceStream { pipe: near }))
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Where a re-bootstrap snapshot this crate's own unit tests never actually
+/// prepare would live, if one did. See [`in_memory_transports`]'s own doc
+/// comment for why an unshared, always-empty shelf is the right default
+/// here rather than something that refuses to construct.
+#[derive(Default)]
+pub struct InMemorySnapshotShelf {
+    entries: StdMutex<HashMap<(String, [u8; 32]), Arc<Vec<u8>>>>,
+}
 
-    #[tokio::test]
-    async fn a_message_sent_from_either_end_arrives_at_the_other() {
-        let (a, b) = InMemoryPeerChannel::connected_pair();
-
-        a.send(b"from a".to_vec()).await.unwrap();
-        b.send(b"from b".to_vec()).await.unwrap();
-
-        assert_eq!(b.recv().await.as_deref(), Some(&b"from a"[..]));
-        assert_eq!(a.recv().await.as_deref(), Some(&b"from b"[..]));
+impl PreparedSnapshotStore for InMemorySnapshotShelf {
+    fn prepare(&self, group_id: &str, snapshot_hash: [u8; 32], bytes: Arc<Vec<u8>>) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert((group_id.to_string(), snapshot_hash), bytes);
     }
 
-    /// Ordering matters to the session: it decodes a stream of frames whose
-    /// meaning depends on the order they arrived in.
-    #[tokio::test]
-    async fn messages_arrive_in_send_order() {
-        let (a, b) = InMemoryPeerChannel::connected_pair();
-        for i in 0..8u8 {
-            a.send(vec![i]).await.unwrap();
-        }
-        for i in 0..8u8 {
-            assert_eq!(b.recv().await, Some(vec![i]));
-        }
+    fn take_for(&self, group_id: &str, snapshot_hash: &[u8; 32]) -> Option<Arc<Vec<u8>>> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&(group_id.to_string(), *snapshot_hash))
     }
+}
 
-    /// A closed link has to be observable as an end-of-stream rather than
-    /// as a hang, since the session's receive loop treats `None` as "this
-    /// session is over" and has no timeout of its own to fall back on.
-    #[tokio::test]
-    async fn recv_reports_end_of_stream_once_the_far_end_is_gone() {
-        let (a, b) = InMemoryPeerChannel::connected_pair();
-        a.send(b"last".to_vec()).await.unwrap();
-        drop(a);
+/// Collects a snapshot from a peer's [`InMemorySnapshotShelf`] -- the
+/// in-memory analogue of `yadorilink-lane-ports`'s real `SnapshotFetch`,
+/// reading the OTHER end's shelf rather than a real wire round trip.
+pub struct InMemorySnapshotFetch {
+    peer_shelf: Arc<InMemorySnapshotShelf>,
+}
 
-        // Anything already queued is still delivered first -- a disconnect
-        // must not lose messages the peer had already accepted.
-        assert_eq!(b.recv().await.as_deref(), Some(&b"last"[..]));
-        assert_eq!(b.recv().await, None);
+#[async_trait::async_trait]
+impl SnapshotFetch for InMemorySnapshotFetch {
+    async fn fetch(
+        &self,
+        group_id: &str,
+        snapshot_hash: [u8; 32],
+    ) -> Result<Vec<u8>, TransportError> {
+        self.peer_shelf
+            .take_for(group_id, &snapshot_hash)
+            .map(|bytes| (*bytes).clone())
+            .ok_or_else(|| TransportError::NoRoute("no such prepared snapshot".to_string()))
     }
+}
 
-    #[tokio::test]
-    async fn send_reports_channel_closed_once_the_far_end_is_gone() {
-        let (a, b) = InMemoryPeerChannel::connected_pair();
-        drop(b);
-        assert!(matches!(
-            a.send(b"nobody home".to_vec()).await,
-            Err(TransportError::ChannelClosed)
-        ));
+/// This crate's own `SessionTransports` fixture: a real block-stream and
+/// service-stream port backed by `channel`'s own connected-pair queues (so
+/// a stream opened through it really is something the far end could
+/// accept), plus a fresh, unshared snapshot shelf.
+///
+/// `yadorilink-lane-ports`'s `testing::TestPeerNode` is the *real*
+/// substrate-backed fixture other crates use, and this crate's own
+/// integration tests (`tests/peer_session.rs`) use it too -- but this
+/// crate's own `#[cfg(test)]` unit tests cannot: `yadorilink-lane-ports`
+/// depends on `yadorilink-peer-session`, so a dev-dependency back from this
+/// crate onto it would compile this crate twice under `cargo test --lib`,
+/// and the two resulting instances of `PeerBlockStream`/
+/// `BlockStreamTransport`/etc. would be distinct types that fail each
+/// other's trait bounds. Every unit test in this crate that constructs a
+/// `PeerSyncSession` directly (as opposed to `tests/peer_session.rs`'s
+/// external integration binary) uses this instead.
+///
+/// Not a null/deny stub: `blocks`/`service` are real in-memory pipes, so a
+/// test that DOES exercise `fetch_block` or a
+/// service RPC through a session built this way gets a stream a peer-side
+/// accept loop could genuinely read. `prepared_snapshots`/`snapshot_fetch`
+/// are the one part that is unshared/answers empty by construction: no
+/// unit test in this crate exercises re-bootstrap today (that machinery's
+/// real, substrate-backed coverage is `service_rpc_wire_tests` in
+/// `tests/peer_session.rs`), so an unshared shelf just means a fetch here
+/// answers `NotFound`, exactly what a peer that never prepared anything
+/// would answer over the real wire -- never a construction-time failure.
+pub fn in_memory_transports(channel: &Arc<InMemoryPeerChannel>) -> SessionTransports {
+    let shelf = Arc::new(InMemorySnapshotShelf::default());
+    SessionTransports {
+        blocks: channel.clone(),
+        service: channel.clone(),
+        prepared_snapshots: shelf.clone(),
+        snapshot_fetch: Arc::new(InMemorySnapshotFetch { peer_shelf: shelf }),
     }
+}
 
-    /// `try_send` is the session's best-effort admission-control path, and
-    /// its whole contract is that it drops rather than blocks. Filling the
-    /// queue exactly is deterministic -- no timing assumption.
-    #[tokio::test]
-    async fn try_send_drops_once_the_queue_is_full() {
-        let (a, _b) = InMemoryPeerChannel::connected_pair();
-        for i in 0..QUEUE_DEPTH {
-            assert!(a.try_send(vec![i as u8]), "queue should accept message {i}");
-        }
-        assert!(!a.try_send(b"one too many".to_vec()));
-    }
-
-    #[tokio::test]
-    async fn try_send_drops_once_the_far_end_is_gone() {
-        let (a, b) = InMemoryPeerChannel::connected_pair();
-        drop(b);
-        assert!(!a.try_send(b"nobody home".to_vec()));
-    }
-
-    /// The point of the type: a session holding `Arc<dyn PeerMessageChannel>`
-    /// can be handed one of these instead of a real transport.
-    #[tokio::test]
-    async fn coerces_to_the_port_trait_and_dispatches_through_it() {
-        let (a, b) = InMemoryPeerChannel::connected_pair();
-        let a: Arc<dyn PeerMessageChannel> = a;
-        let b: Arc<dyn PeerMessageChannel> = b;
-
-        a.send(b"through the port".to_vec()).await.unwrap();
-        assert_eq!(b.recv().await.as_deref(), Some(&b"through the port"[..]));
+impl InMemoryPeerChannel {
+    /// The next block stream the peer has opened, or `None` once the
+    /// channel has closed.
+    ///
+    /// Not on any port: a `PeerSyncSession` never accepts a block stream
+    /// itself (see
+    /// `PeerSyncSession::serve_block_stream`'s own doc comment) -- inbound
+    /// block traffic arrives on the substrate's block lane in production,
+    /// with no in-memory equivalent to that lane. A test that wires two real
+    /// sessions through a connected pair and wants one of them to actually
+    /// serve blocks calls this directly on the concrete channel and feeds
+    /// what it returns to `serve_block_stream` itself, standing in for
+    /// `sync_stack.rs`'s `serve_peer_lanes`.
+    pub async fn accept_block_stream(&self) -> Option<Box<dyn PeerBlockStream>> {
+        let stream = self.inbound_block_streams.lock().await.recv().await?;
+        Some(Box::new(stream))
     }
 }

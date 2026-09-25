@@ -232,7 +232,9 @@ pub struct FileIdentity {
     pub observed_size: u64,
     /// A stable digest over the tracked metadata subset (kind, size, mode
     /// bits, timestamps). Changes whenever a byte of that subset changes;
-    /// says nothing about content.
+    /// says nothing about content. For a directory the subset is only its
+    /// kind, mode (attributes on Windows) and object address: size and
+    /// timestamps there describe its entries, not the directory.
     pub metadata_fingerprint: [u8; 32],
     /// `st_nlink` on Unix; `BY_HANDLE_FILE_INFORMATION::nNumberOfLinks` on
     /// Windows. Always `Some` in practice: on Windows, a `GetFileInformationByHandle`
@@ -578,34 +580,30 @@ impl FileIdentity {
     /// object". Never returns a bare `bool`: an [`IdentityComparison::
     /// Ambiguous`] result means exactly what it says, and the caller must
     /// handle it explicitly rather than treat it as either answer.
-    ///
     /// `birth_time_granularity` is the caller's measurement of this
     /// volume's clock resolution (see [`TimestampGranularity`]) — it must
     /// come from actually probing the volume, never assumed `Fine` by
     /// default, since a wrong default in that direction is exactly what
     /// lets a coarse clock's equal-but-meaningless birth times pass as
-    /// proof of identity.
-    ///
-    /// On Windows, whether this can ever reach [`IdentityComparison::
-    /// SameObject`] depends on which [`WindowsObjectId`] case both
-    /// observations landed in: a match on [`WindowsObjectId::Fallback`]'s
-    /// 64-bit file index — even combined with a matching reuse
-    /// discriminator — is downgraded to [`IdentityComparison::Ambiguous`]`(
-    /// `[`AmbiguityReason::WindowsObjectIdNotProvenUniqueOnRefs`]`)` instead,
-    /// since that field is not guaranteed unique on ReFS. A match on
-    /// [`WindowsObjectId::Proven`]'s 128-bit id needs no corroborating
-    /// `generation_or_usn` or `birth_or_creation_time` at all — see its own
-    /// doc for why a matching value is itself a reuse discriminator — so it
-    /// reaches `SameObject` even when neither of those fields is available
-    /// or the volume's clock is [`TimestampGranularity::Coarse`], which is
-    /// exactly the situation a real Windows observation is in today (no
-    /// portable `generation_or_usn` source, and a system clock coarse
-    /// enough for many creates to land in one tick). Callers that already
-    /// fail closed on `Ambiguous` (see `fs_commit`'s pre-commit identity
-    /// check) therefore keep failing closed only in the fallback case, not
-    /// unconditionally on Windows. A conclusive *mismatch* on any field —
-    /// including a differing `birth_or_creation_time` when both sides
-    /// happen to carry one — is unaffected and still proves
+    /// proof of identity. On Windows, whether this can ever reach
+    /// [`IdentityComparison:: SameObject`] depends on which
+    /// [`WindowsObjectId`] case both observations landed in: a match on
+    /// [`WindowsObjectId::Fallback`]'s 64-bit file index — even combined
+    /// with a matching reuse discriminator — is downgraded to
+    /// [`IdentityComparison::Ambiguous`]`(
+    /// `[`AmbiguityReason::WindowsObjectIdNotProvenUniqueOnRefs`]`)`
+    /// instead, since that field is not guaranteed unique on ReFS. A match
+    /// on [`WindowsObjectId::Proven`]'s 128-bit id needs no corroborating
+    /// `generation_or_usn` or `birth_or_creation_time` at all — see its
+    /// own doc for why a matching value is itself a reuse discriminator —
+    /// so it reaches `SameObject` even when neither of those fields is
+    /// available or the volume's clock is
+    /// [`TimestampGranularity::Coarse`], which is exactly the situation a
+    /// real Windows observation is in today (no portable
+    /// `generation_or_usn` source, and a system clock coarse enough for
+    /// many creates to land in one tick). A conclusive *mismatch* on any
+    /// field — including a differing `birth_or_creation_time` when both
+    /// sides happen to carry one — is unaffected and still proves
     /// `DefinitelyDifferent` on every platform; a `Proven` match only
     /// rescues an otherwise-`Ambiguous` verdict, never overrides a
     /// conclusive disagreement elsewhere.
@@ -658,64 +656,47 @@ impl FileIdentity {
         // it is *any* field that a freshly (re)created object is
         // guaranteed to disagree on with whatever previously held that
         // same volume+object id. Ranked by how widely each is available:
-        //
         // 1. `generation_or_usn` — a true anti-reuse counter when the
-        //    platform exposes one. Strongest: on Linux this is `FS_IOC_
-        //    GETVERSION` on ext4/XFS (measured unprivileged and reuse-
-        //    discriminating; absent, not merely gated, on overlayfs — see
-        //    `generation_from_path`'s doc). Not available through a
-        //    portable `stat` call on any platform, which is why this is
-        //    still commonly `None`. Not granularity-dependent: it is a
-        //    counter, not a clock reading.
-        // 2. `symlink_target_digest`, for a symlink specifically — see its
-        //    own doc. Ranked with `generation_or_usn` rather than below
-        //    `birth_or_creation_time`: it is content, not a clock reading,
-        //    so it needs no granularity gate, and it is the *only*
-        //    discriminator a symlink can ever populate `generation_or_usn`
-        //    with (the ioctl that field comes from is never attempted for
-        //    this kind — see `generation_from_path`'s doc).
-        // 3. `birth_or_creation_time` — widely available (`st_birthtime`
-        //    on macOS, `statx`'s `STATX_BTIME` on modern Linux
-        //    filesystems), but only as strong as the clock behind it. A
-        //    *differing* birth time is unconditionally conclusive (it
-        //    cannot move backward on a live object, at any granularity).
-        //    An *equal* one is conclusive only when `birth_time_
-        //    granularity` is `Fine`: on a coarse clock, a delete-and-
-        //    recreate landing in the same tick as the object it replaced
-        //    would report the exact same value, so equality alone proves
-        //    nothing there.
-        // 4. Neither present on both sides, or birth time matched on a
-        //    coarse clock — genuinely nothing here excludes reuse, so the
-        //    answer must be `Ambiguous`. This is where a FIFO, socket,
-        //    device node or unresolved reparse point on a coarse-clock
-        //    Linux volume with no `FS_IOC_GETVERSION` support genuinely
-        //    lands: none of those kinds has a content-based discriminator
-        //    this module can read cheaply and safely (a FIFO/socket/device
-        //    node has no filesystem-resident "content" at all; see
-        //    `custody_transfer`'s own doc for how it handles a kind that
-        //    reaches this outcome — those kinds are refused by
-        //    `classify_replacement_eligibility` regardless of what
-        //    identity comparison concludes, so callers that check
-        //    eligibility before identity never observe this `Ambiguous`
-        //    result for them in the first place).
-        //
-        // `mtime` is deliberately never used as a fallback here: an
-        // ordinary write changes it, so it proves nothing about identity
-        // and would turn "the same file, edited" into a false positive for
-        // "the same object survived".
-        //
-        // `object_id` equality was checked above, but a `WindowsObjectId::
-        // Fallback` (unlike `WindowsObjectId::Proven`, and unlike a Unix
-        // inode) is not guaranteed unique on ReFS -- see its doc. Neither
-        // reuse discriminator below can rescue that: a matching
-        // `generation_or_usn` or `birth_or_creation_time` says "these two
-        // observations are consistent with being the same object", but says
-        // nothing about whether a *different* object could coincidentally
-        // share both the weak object id and the discriminator. So a
-        // `SameObject` conclusion drawn purely from a `Fallback` object id
-        // is downgraded to `Ambiguous` here, the same way an equal birth
-        // time is not trusted on a coarse clock. A `Proven` id gets no such
-        // downgrade -- it is trusted exactly like a Unix inode.
+        // platform exposes one. Strongest: on Linux this is `FS_IOC_
+        // GETVERSION` on ext4/XFS (measured unprivileged and reuse-
+        // discriminating; absent, not merely gated, on overlayfs — see
+        // `generation_from_path`'s doc). Not available through a portable
+        // `stat` call on any platform, which is why this is still commonly
+        // `None`. Not granularity-dependent: it is a counter, not a clock
+        // reading. 2. `symlink_target_digest`, for a symlink specifically
+        // — see its own doc. Ranked with `generation_or_usn` rather than
+        // below `birth_or_creation_time`: it is content, not a clock
+        // reading, so it needs no granularity gate, and it is the *only*
+        // discriminator a symlink can ever populate `generation_or_usn`
+        // with (the ioctl that field comes from is never attempted for
+        // this kind — see `generation_from_path`'s doc). 3.
+        // `birth_or_creation_time` — widely available (`st_birthtime` on
+        // macOS, `statx`'s `STATX_BTIME` on modern Linux filesystems), but
+        // only as strong as the clock behind it. A *differing* birth time
+        // is unconditionally conclusive (it cannot move backward on a live
+        // object, at any granularity). An *equal* one is conclusive only
+        // when `birth_time_ granularity` is `Fine`: on a coarse clock, a
+        // delete-and- recreate landing in the same tick as the object it
+        // replaced would report the exact same value, so equality alone
+        // proves nothing there. 4. Neither present on both sides, or birth
+        // time matched on a coarse clock — genuinely nothing here excludes
+        // reuse, so the answer must be `Ambiguous`. `mtime` is
+        // deliberately never used as a fallback here: an ordinary write
+        // changes it, so it proves nothing about identity and would turn
+        // "the same file, edited" into a false positive for "the same
+        // object survived". `object_id` equality was checked above, but a
+        // `WindowsObjectId:: Fallback` (unlike `WindowsObjectId::Proven`,
+        // and unlike a Unix inode) is not guaranteed unique on ReFS -- see
+        // its doc. Neither reuse discriminator below can rescue that: a
+        // matching `generation_or_usn` or `birth_or_creation_time` says
+        // "these two observations are consistent with being the same
+        // object", but says nothing about whether a *different* object
+        // could coincidentally share both the weak object id and the
+        // discriminator. So a `SameObject` conclusion drawn purely from a
+        // `Fallback` object id is downgraded to `Ambiguous` here, the same
+        // way an equal birth time is not trusted on a coarse clock. A
+        // `Proven` id gets no such downgrade -- it is trusted exactly like
+        // a Unix inode.
         let object_id_alone_may_collide_across_distinct_objects =
             matches!(self.object_id, PlatformObjectId::Windows(WindowsObjectId::Fallback { .. }));
         // A matching `WindowsObjectId::Proven` id needs no corroborating
@@ -1156,17 +1137,12 @@ fn hash_symlink_target_bytes(target: &[u8]) -> [u8; 32] {
 }
 
 /// Reads the target text of the symlink observed at `path` and hashes it,
-/// or returns `None` if this observation is not a symlink at all. Portable:
-/// `std::fs::read_link` needs no platform-specific FFI on either Unix or
-/// Windows, unlike [`generation_from_path`]'s ioctl.
-///
-/// `path` was already `lstat`ed (`symlink_metadata`) by the caller before
-/// this runs; there is a narrow window between that call and this one in
-/// which the object at `path` could be replaced by something else entirely.
-/// That is no worse than every other path-based field this module reads —
-/// see [`FileIdentity::observe_path`]'s own doc — and is not the guarantee
-/// this field exists to provide for a caller like `custody_transfer` that
-/// needs a race-free comparison; [`symlink_target_digest_from_handle`] is.
+/// or returns `None` if this observation is not a symlink at all.
+/// Portable: `std::fs::read_link` needs no platform-specific FFI on either
+/// Unix or Windows, unlike [`generation_from_path`]'s ioctl. `path` was
+/// already `lstat`ed (`symlink_metadata`) by the caller before this runs;
+/// there is a narrow window between that call and this one in which the
+/// object at `path` could be replaced by something else entirely.
 fn symlink_target_digest_from_path(path: &Path, metadata: &Metadata) -> Option<[u8; 32]> {
     if !metadata.file_type().is_symlink() {
         return None;
@@ -1290,10 +1266,7 @@ fn read_symlink_target_with_buffer_sizes(
 }
 
 /// `EINTR`-retrying wrapper for a raw libc call following the usual C
-/// convention (`-1` with `errno` set on failure). Mirrors `fs_capabilities`'s
-/// `retry_eintr` and `fs_commit`'s own copy — not imported from either (both
-/// are private and take their own closure shape), but the same small,
-/// well-understood pattern, not a third design.
+/// convention (`-1` with `errno` set on failure).
 #[cfg(target_os = "linux")]
 fn retry_eintr(mut attempt: impl FnMut() -> (i64, Option<i32>)) -> (i64, Option<i32>) {
     loop {
@@ -1304,54 +1277,41 @@ fn retry_eintr(mut attempt: impl FnMut() -> (i64, Option<i32>)) -> (i64, Option<
     }
 }
 
-/// Same as [`symlink_target_digest_from_path`], but reads the target of the
-/// object `file` is already open on — no re-resolution of a name against a
-/// parent directory, so no TOCTOU window at all, matching [`FileIdentity::
-/// observe_handle`]'s own guarantee over [`FileIdentity::observe_path`].
-///
-/// Linux only for now: `file` was opened `O_PATH | O_NOFOLLOW` (see
-/// `fs_commit::ParentDirHandle::open_child_no_follow`'s Linux branch),
-/// which refers to the symlink object itself without following it, but
-/// gives a handle `read()` cannot be used on directly.
-///
-/// An earlier version of this function read `/proc/self/fd/<fd>` via
-/// `std::fs::read_link` instead of the `readlinkat` call below, on the
-/// theory that the magic link's own target reflects what `fd` refers to.
-/// Measured wrong on real Linux (ext4, XFS, overlayfs): `/proc/self/fd/<fd>`
-/// resolves to the *pathname* of the file the descriptor is open on — for
-/// an `O_PATH | O_NOFOLLOW` descriptor on a symlink, that is the symlink's
-/// own path (e.g. `/tmp/xyz/link`), not the target text it points at. That
-/// bug shipped a digest of the wrong string, which then disagreed with the
-/// path-based digest and reported every real symlink transfer as a
-/// substitution — caught by this module's own `observe_handle_and_
+/// Same as [`symlink_target_digest_from_path`], but reads the target of
+/// the object `file` is already open on — no re-resolution of a name
+/// against a parent directory, so no TOCTOU window at all, matching
+/// [`FileIdentity:: observe_handle`]'s own guarantee over
+/// [`FileIdentity::observe_path`]. An earlier version of this function
+/// read `/proc/self/fd/<fd>` via `std::fs::read_link` instead of the
+/// `readlinkat` call below, on the theory that the magic link's own target
+/// reflects what `fd` refers to. Measured wrong on real Linux (ext4, XFS,
+/// overlayfs): `/proc/self/fd/<fd>` resolves to the *pathname* of the file
+/// the descriptor is open on — for an `O_PATH | O_NOFOLLOW` descriptor on
+/// a symlink, that is the symlink's own path (e.g. `/tmp/xyz/link`), not
+/// the target text it points at. That bug shipped a digest of the wrong
+/// string, which then disagreed with the path-based digest and reported
+/// every real symlink transfer as a substitution — caught by this module's
+/// own `observe_handle_and_
 /// observe_path_report_the_same_symlink_target_digest` test.
-///
-/// `readlinkat(fd, "", buf, len)` is the correct primitive: per `readlinkat`'s
-/// own man page, an *empty* `pathname` makes the call operate directly on
-/// `dirfd` when `dirfd` was opened `O_PATH | O_NOFOLLOW` on a symlink — no
-/// `AT_EMPTY_PATH` flag argument exists on this call (unlike `fstatat`/
-/// `linkat`/etc.), the empty-pathname special case is unconditional. This
-/// reads the symlink's actual target, exactly matching what a path-based
-/// `readlink` on the same object returns.
-///
-/// No equivalent trick is implemented for macOS/Windows yet. Checked for
-/// macOS specifically, not merely left unattempted: `fs_commit`'s macOS
-/// branch opens a symlink with `O_SYMLINK`, and Apple's own `open(2)`
-/// documents that descriptor as unreadable outright ("It is not possible to
-/// read or write from this file descriptor") — there is no portable way to
-/// recover target text from it at all, so this is a genuine platform
-/// limitation, not a gap to close later. This does not regress the held-
-/// handle comparison on macOS: [`TimestampGranularity::Fine`] already lets
-/// `birth_or_creation_time` alone reach `SameObject` for a symlink there
-/// (measured: APFS's clock is fine enough), which is what `compare` falls
-/// back to when this digest tier is unavailable on one side. A caller with
-/// only a path-based [`symlink_target_digest_from_path`] value on such a
-/// platform simply has `None` here and falls back to whatever
-/// [`FileIdentity::compare`]'s other tiers can prove.
-///
-/// The actual read (buffer growth on truncation, `EINTR` retry) is done by
-/// [`read_symlink_target_via_handle`] -- see its doc for why a single fixed-
-/// size `readlinkat` call is not safe to trust directly.
+/// `readlinkat(fd, "", buf, len)` is the correct primitive: per
+/// `readlinkat`'s own man page, an *empty* `pathname` makes the call
+/// operate directly on `dirfd` when `dirfd` was opened `O_PATH |
+/// O_NOFOLLOW` on a symlink — no `AT_EMPTY_PATH` flag argument exists on
+/// this call (unlike `fstatat`/ `linkat`/etc.), the empty-pathname special
+/// case is unconditional. This reads the symlink's actual target, exactly
+/// matching what a path-based `readlink` on the same object returns. No
+/// equivalent trick is implemented for macOS/Windows yet. This does not
+/// regress the held- handle comparison on macOS:
+/// [`TimestampGranularity::Fine`] already lets `birth_or_creation_time`
+/// alone reach `SameObject` for a symlink there (measured: APFS's clock is
+/// fine enough), which is what `compare` falls back to when this digest
+/// tier is unavailable on one side. A caller with only a path-based
+/// [`symlink_target_digest_from_path`] value on such a platform simply has
+/// `None` here and falls back to whatever [`FileIdentity::compare`]'s
+/// other tiers can prove. The actual read (buffer growth on truncation,
+/// `EINTR` retry) is done by [`read_symlink_target_via_handle`] -- see its
+/// doc for why a single fixed- size `readlinkat` call is not safe to trust
+/// directly.
 #[cfg(target_os = "linux")]
 fn symlink_target_digest_from_handle(file: &File, metadata: &Metadata) -> Option<[u8; 32]> {
     match read_symlink_target_via_handle(file, metadata) {
@@ -1365,11 +1325,51 @@ fn symlink_target_digest_from_handle(_file: &File, _metadata: &Metadata) -> Opti
     None
 }
 
+/// The metadata fingerprint of a directory with Unix `mode` at `dev`/`ino`.
+#[cfg(unix)]
+fn directory_fingerprint_unix(mode: u32, dev: u64, ino: u64) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"yadorilink-fs-identity-directory-fingerprint-v1");
+    hasher.update([u8_repr(ObjectKind::Directory)]);
+    hasher.update((mode & 0o7777).to_le_bytes());
+    hasher.update(dev.to_le_bytes());
+    hasher.update(ino.to_le_bytes());
+    hasher.finalize().into()
+}
+
+/// Whether the directory now observed as `metadata` has other permission
+/// bits (`mode & 0o777`) than it had when `recorded` was observed, rather
+/// than differing, if at all, only in its setuid, setgid or sticky bit.
+///
+/// A directory's fingerprint covers `mode & 0o7777`, so a special bit
+/// alone moves it; the fingerprint is a digest and cannot be read back, so
+/// this asks whether any combination of special bits over the observed
+/// permission bits yields the recorded fingerprint. Meaningful only for
+/// the same object (`recorded` compared as the same object as `metadata`).
+#[cfg(unix)]
+pub fn directory_permission_bits_changed(recorded: &FileIdentity, metadata: &Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let permissions = metadata.mode() & 0o777;
+    !(0..8u32).any(|special| {
+        directory_fingerprint_unix(permissions | (special << 9), metadata.dev(), metadata.ino())
+            == recorded.metadata_fingerprint
+    })
+}
+
 #[cfg(unix)]
 fn fingerprint_unix(metadata: &Metadata, object_kind: ObjectKind) -> [u8; 32] {
     use std::os::unix::fs::MetadataExt;
 
     let mut hasher = Sha256::new();
+    if object_kind == ObjectKind::Directory {
+        // A directory's size and timestamps move whenever an entry inside
+        // it is added, removed or renamed. None of that is a change to the
+        // directory itself as a replicated entry -- its only tracked state
+        // is its mode -- so they are left out, or every child landing in a
+        // directory would read as the directory having been touched.
+        return directory_fingerprint_unix(metadata.mode(), metadata.dev(), metadata.ino());
+    }
     hasher.update(b"yadorilink-fs-identity-fingerprint-v1");
     hasher.update([u8_repr(object_kind)]);
     hasher.update(metadata.len().to_le_bytes());
@@ -1386,6 +1386,17 @@ fn fingerprint_windows(metadata: &Metadata, object_kind: ObjectKind) -> [u8; 32]
     use std::os::windows::fs::MetadataExt;
 
     let mut hasher = Sha256::new();
+    if object_kind == ObjectKind::Directory {
+        // As on Unix: a directory's size and write time follow its
+        // entries, not the directory itself. Its attributes are what is
+        // left of its own state. (The object id is compared separately by
+        // `FileIdentity::compare`; `std` exposes no stable file index to
+        // fold in here.)
+        hasher.update(b"yadorilink-fs-identity-directory-fingerprint-v1");
+        hasher.update([u8_repr(object_kind)]);
+        hasher.update(metadata.file_attributes().to_le_bytes());
+        return hasher.finalize().into();
+    }
     hasher.update(b"yadorilink-fs-identity-fingerprint-v1");
     hasher.update([u8_repr(object_kind)]);
     hasher.update(metadata.len().to_le_bytes());
@@ -1394,33 +1405,27 @@ fn fingerprint_windows(metadata: &Metadata, object_kind: ObjectKind) -> [u8; 32]
     hasher.finalize().into()
 }
 
-/// Direct `GetFileInformationByHandle`/`GetFileInformationByHandleEx` FFI,
-/// declared by hand instead of taking a `windows-sys`/`winapi` dependency —
-/// the same minimal-FFI approach this crate already takes for the Win32
-/// calls `std` does not expose on stable (see `fs_commit`'s own
-/// hand-declared `platform` module). `std::os::windows::fs::MetadataExt::
-/// {volume_serial_number, file_index, number_of_links}` report the
-/// `GetFileInformationByHandle` subset of this data, but sit behind the
-/// `windows_by_handle` feature, unstable since 2019 and unavailable on
-/// stable Rust; there is no stable `std` path to the `FileIdInfo` data at
-/// all.
-///
-/// `GetFileInformationByHandle`'s 64-bit file index is not the full 128-bit
-/// ReFS-safe identifier — see [`WindowsObjectId::Fallback`](super::
-/// WindowsObjectId::Fallback)'s doc for why, and [`super::FileIdentity::
-/// compare`] for how the comparison stays fail-closed for it. The full
-/// identifier needs `GetFileInformationByHandleEx` called with the
-/// `FileIdInfo` class (`0x12`), which returns a `FILE_ID_INFO {
-/// VolumeSerialNumber: u64, FileId: [u8; 16] }` — a different struct layout
-/// from `ByHandleFileInformation` below, not merely an extension of it.
-/// [`query_raw_handle`] issues both calls: `GetFileInformationByHandle` for
-/// the link count (and as the fallback source of volume serial/file index),
-/// and `GetFileInformationByHandleEx(FileIdInfo)` for the proven 128-bit id.
-/// A third call, `GetVolumeInformationByHandleW` (see [`reuse_safe_
-/// filesystem`]), gates whether a well-formed 128-bit id is actually
-/// classified `Proven` rather than downgraded to `Fallback` -- see
-/// [`WindowsObjectId::Proven`](super::WindowsObjectId::Proven)'s doc for
-/// why that distinction exists on top of the sentinel check above.
+/// `std::os::windows::fs::MetadataExt:: {volume_serial_number, file_index,
+/// number_of_links}` report the `GetFileInformationByHandle` subset of
+/// this data, but sit behind the `windows_by_handle` feature, unstable
+/// since 2019 and unavailable on stable Rust; there is no stable `std`
+/// path to the `FileIdInfo` data at all. `GetFileInformationByHandle`'s
+/// 64-bit file index is not the full 128-bit ReFS-safe identifier — see
+/// [`WindowsObjectId::Fallback`](super:: WindowsObjectId::Fallback)'s doc
+/// for why, and [`super::FileIdentity:: compare`] for how the comparison
+/// stays fail-closed for it. The full identifier needs
+/// `GetFileInformationByHandleEx` called with the `FileIdInfo` class
+/// (`0x12`), which returns a `FILE_ID_INFO { VolumeSerialNumber: u64,
+/// FileId: [u8; 16] }` — a different struct layout from
+/// `ByHandleFileInformation` below, not merely an extension of it.
+/// [`query_raw_handle`] issues both calls: `GetFileInformationByHandle`
+/// for the link count (and as the fallback source of volume serial/file
+/// index), and `GetFileInformationByHandleEx(FileIdInfo)` for the proven
+/// 128-bit id. A third call, `GetVolumeInformationByHandleW` (see
+/// [`reuse_safe_ filesystem`]), gates whether a well-formed 128-bit id is
+/// actually classified `Proven` rather than downgraded to `Fallback` --
+/// see [`WindowsObjectId::Proven`](super::WindowsObjectId::Proven)'s doc
+/// for why that distinction exists on top of the sentinel check above.
 #[cfg(windows)]
 mod win_identity {
     use std::ffi::c_void;
@@ -1907,1201 +1912,85 @@ pub fn classify_replacement_eligibility(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn sample(
-        device_id: u64,
-        inode: u64,
-        generation_or_usn: Option<u128>,
-        birth: Option<i64>,
-    ) -> FileIdentity {
-        FileIdentity {
-            volume_identity: VolumeIdentity::Unix { device_id },
-            object_id: PlatformObjectId::Unix { inode },
-            object_kind: ObjectKind::RegularFile,
-            generation_or_usn,
-            birth_or_creation_time: birth
-                .map(|seconds| Timestamp { seconds_since_unix_epoch: seconds, subsec_nanos: 0 }),
-            observed_size: 0,
-            metadata_fingerprint: [0; 32],
-            link_count: Some(1),
-            symlink_target_digest: None,
-        }
-    }
-
-    #[test]
-    fn matching_generation_counter_proves_same_object() {
-        let a = sample(1, 2, Some(9), None);
-        let b = sample(1, 2, Some(9), None);
-        // Granularity is irrelevant here: `generation_or_usn` is a
-        // counter, not a clock reading, so `Coarse` must not change this.
-        assert_eq!(a.compare(&b, TimestampGranularity::Coarse), IdentityComparison::SameObject);
-    }
-
-    #[test]
-    fn differing_generation_counter_proves_different_object() {
-        let a = sample(1, 2, Some(9), None);
-        let b = sample(1, 2, Some(10), None);
-        assert_eq!(
-            a.compare(&b, TimestampGranularity::Fine),
-            IdentityComparison::DefinitelyDifferent
-        );
-    }
-
-    #[test]
-    fn differing_device_is_always_definitely_different() {
-        let a = sample(1, 2, Some(9), None);
-        let b = sample(2, 2, Some(9), None);
-        assert_eq!(
-            a.compare(&b, TimestampGranularity::Fine),
-            IdentityComparison::DefinitelyDifferent
-        );
-    }
-
-    #[test]
-    fn differing_inode_is_always_definitely_different() {
-        let a = sample(1, 2, None, None);
-        let b = sample(1, 3, None, None);
-        assert_eq!(
-            a.compare(&b, TimestampGranularity::Fine),
-            IdentityComparison::DefinitelyDifferent
-        );
-    }
-
-    #[test]
-    fn no_generation_counter_but_birth_time_moved_is_definitely_different() {
-        // Same device+inode, no generation/USN on either side: this is
-        // exactly the "inode reuse" shape. A birth-time change still
-        // proves it, since birth time cannot move on a live object — at
-        // any granularity, which is why this passes `Coarse`.
-        let a = sample(1, 2, None, Some(100));
-        let b = sample(1, 2, None, Some(200));
-        assert_eq!(
-            a.compare(&b, TimestampGranularity::Coarse),
-            IdentityComparison::DefinitelyDifferent
-        );
-    }
-
-    #[test]
-    fn matching_birth_time_on_a_fine_clock_proves_same_object() {
-        // Birth time is the second-ranked reuse discriminator: on almost
-        // every real Unix filesystem it is the *only* one `stat` exposes,
-        // so this is the common case `compare` must actually handle, not
-        // the exotic one. Without this, `compare` would report `Ambiguous`
-        // for the ordinary "same untouched file, observed twice" case on
-        // Linux and macOS alike, which would make every caller that blocks
-        // on ambiguity unusable on the platforms that matter most.
-        let a = sample(1, 2, None, Some(100));
-        let b = sample(1, 2, None, Some(100));
-        assert_eq!(a.compare(&b, TimestampGranularity::Fine), IdentityComparison::SameObject);
-    }
-
-    #[test]
-    fn matching_birth_time_on_a_coarse_clock_is_ambiguous_not_same() {
-        // The R6 case: a coarse clock cannot distinguish "the same object,
-        // unchanged" from "a different object created within the same
-        // tick as the one it replaced". Equal birth time on such a clock
-        // must NOT be read as proof, even though the exact same field
-        // comparison proves `SameObject` on a `Fine` clock (previous
-        // test). Getting this backwards is a real data-loss path: recovery
-        // could mistake fresh user content for the object it's meant to
-        // recognize.
-        let a = sample(1, 2, None, Some(100));
-        let b = sample(1, 2, None, Some(100));
-        assert_eq!(
-            a.compare(&b, TimestampGranularity::Coarse),
-            IdentityComparison::Ambiguous(AmbiguityReason::CoarseTimestampGranularity)
-        );
-    }
-
-    #[test]
-    fn no_generation_counter_and_no_birth_time_at_all_is_ambiguous() {
-        let a = sample(1, 2, None, None);
-        let b = sample(1, 2, None, None);
-        assert_eq!(
-            a.compare(&b, TimestampGranularity::Fine),
-            IdentityComparison::Ambiguous(AmbiguityReason::NoStableGenerationOrUsn)
-        );
-    }
-
-    fn symlink_sample(
-        device_id: u64,
-        inode: u64,
-        birth: Option<i64>,
-        symlink_target_digest: Option<[u8; 32]>,
-    ) -> FileIdentity {
-        FileIdentity {
-            volume_identity: VolumeIdentity::Unix { device_id },
-            object_id: PlatformObjectId::Unix { inode },
-            object_kind: ObjectKind::Symlink,
-            generation_or_usn: None,
-            birth_or_creation_time: birth
-                .map(|seconds| Timestamp { seconds_since_unix_epoch: seconds, subsec_nanos: 0 }),
-            observed_size: 0,
-            metadata_fingerprint: [0; 32],
-            link_count: Some(1),
-            symlink_target_digest,
-        }
-    }
-
-    #[test]
-    fn matching_symlink_target_digest_on_a_coarse_clock_with_no_generation_counter_proves_same_object(
-    ) {
-        // The exact Linux shape this field exists to close (see the module
-        // doc and `symlink_target_digest`'s own): a symlink can never
-        // supply `generation_or_usn` (the ioctl is never attempted for this
-        // kind), and on a coarse-clock volume an equal birth time is not
-        // trusted either -- without this field, two observations of the
-        // literal same, untouched symlink would be `Ambiguous`, exactly
-        // what `custody_transfer`'s Linux test failures measured. A digest
-        // match rescues it regardless of granularity, since it is content,
-        // not a clock reading.
-        let a = symlink_sample(1, 2, Some(100), Some([7; 32]));
-        let b = symlink_sample(1, 2, Some(100), Some([7; 32]));
-        assert_eq!(a.compare(&b, TimestampGranularity::Coarse), IdentityComparison::SameObject);
-    }
-
-    #[test]
-    fn differing_symlink_target_digest_is_definitely_different_even_with_a_matching_object_id() {
-        // Same volume+inode+kind, but the target text differs: since a live
-        // symlink's target cannot itself change, this can only mean the
-        // inode was reused by a different object -- conclusive, not merely
-        // suspicious, exactly like a differing birth time.
-        let a = symlink_sample(1, 2, None, Some([7; 32]));
-        let b = symlink_sample(1, 2, None, Some([9; 32]));
-        assert_eq!(
-            a.compare(&b, TimestampGranularity::Coarse),
-            IdentityComparison::DefinitelyDifferent
-        );
-    }
-
-    #[test]
-    fn symlink_with_no_target_digest_on_either_side_falls_back_to_birth_time() {
-        // A decoded-from-storage identity (or any observation this crate
-        // did not populate the digest for) must not be treated as if the
-        // digest tier ran and failed -- it should simply fall through to
-        // the next tier, same as `generation_or_usn` already does.
-        let a = symlink_sample(1, 2, Some(100), None);
-        let b = symlink_sample(1, 2, Some(100), None);
-        assert_eq!(a.compare(&b, TimestampGranularity::Fine), IdentityComparison::SameObject);
-        assert_eq!(
-            a.compare(&b, TimestampGranularity::Coarse),
-            IdentityComparison::Ambiguous(AmbiguityReason::CoarseTimestampGranularity)
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn observe_path_populates_a_symlink_target_digest_and_a_regular_file_never_does() {
-        let dir = tempfile::tempdir().unwrap();
-        let link = dir.path().join("link");
-        std::os::unix::fs::symlink("/does/not/matter", &link).unwrap();
-        let regular = dir.path().join("regular");
-        std::fs::write(&regular, b"content").unwrap();
-
-        let link_identity = FileIdentity::observe_path(&link).unwrap();
-        assert!(link_identity.symlink_target_digest.is_some());
-
-        let regular_identity = FileIdentity::observe_path(&regular).unwrap();
-        assert_eq!(regular_identity.symlink_target_digest, None);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn two_symlinks_with_different_targets_report_different_digests() {
-        let dir = tempfile::tempdir().unwrap();
-        let a = dir.path().join("a");
-        let b = dir.path().join("b");
-        std::os::unix::fs::symlink("/target/one", &a).unwrap();
-        std::os::unix::fs::symlink("/target/two", &b).unwrap();
-
-        let identity_a = FileIdentity::observe_path(&a).unwrap();
-        let identity_b = FileIdentity::observe_path(&b).unwrap();
-        assert_ne!(identity_a.symlink_target_digest, identity_b.symlink_target_digest);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn observe_handle_and_observe_path_report_the_same_symlink_target_digest() {
-        // The Linux-only path this whole fix depends on: `open_child_no_
-        // follow` opens a symlink `O_PATH | O_NOFOLLOW`, and `custody_
-        // transfer` holds that handle across a rename, re-deriving identity
-        // from it (`observe_handle`) rather than by re-resolving the name.
-        // This proves the handle-based digest actually agrees with the
-        // path-based one for the same symlink, not just that both are
-        // `Some` — the property that matters, independent of which
-        // mechanism `symlink_target_digest_from_handle` uses to get there.
-        // An earlier version of this test passed with a mechanism
-        // (`/proc/self/fd/<fd>` via `read_link`) that read the wrong string
-        // entirely -- see that function's doc for what was wrong and why
-        // this exact assertion is what caught it.
-        use std::os::unix::fs::OpenOptionsExt;
-
-        let dir = tempfile::tempdir().unwrap();
-        let link = dir.path().join("link");
-        std::os::unix::fs::symlink("/does/not/matter", &link).unwrap();
-
-        let from_path = FileIdentity::observe_path(&link).unwrap();
-        assert!(from_path.symlink_target_digest.is_some());
-
-        let handle = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
-            .open(&link)
-            .unwrap();
-        let from_handle = FileIdentity::observe_handle(&handle).unwrap();
-        assert_eq!(from_handle.symlink_target_digest, from_path.symlink_target_digest);
-    }
-
-    /// Opens `path` the same `O_PATH | O_NOFOLLOW` way `symlink_target_
-    /// digest_from_handle`'s real caller does, for tests that drive
-    /// `read_symlink_target_with_buffer_sizes` directly.
-    #[cfg(target_os = "linux")]
-    fn open_no_follow(path: &Path) -> File {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
-            .open(path)
-            .unwrap()
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn readlinkat_truncation_is_never_reported_as_a_complete_digest() {
-        // The defect this whole fix is for: a real `PATH_MAX` (4096 on
-        // Linux) is out of reach for a symlink target on a normal
-        // filesystem -- `symlink(2)` itself refuses to create one longer
-        // than that. So this drives `read_symlink_target_with_buffer_sizes`
-        // directly with a forced 8-byte starting buffer instead, which
-        // exercises the exact same truncation/growth logic
-        // `read_symlink_target_via_handle` uses against a real handle, just
-        // at a threshold a real filesystem symlink can actually cross.
-        let dir = tempfile::tempdir().unwrap();
-        let link = dir.path().join("link");
-        let target = "0123456789abcdef"; // 16 bytes, longer than the 8-byte start
-        std::os::unix::fs::symlink(target, &link).unwrap();
-        let handle = open_no_follow(&link);
-
-        // A cap equal to the starting buffer size means the first read is
-        // already truncated and can never grow past it -- this must report
-        // `Unreadable`, never a digest of the truncated first 8 bytes.
-        let capped = read_symlink_target_with_buffer_sizes(&handle, 8, 8);
-        assert!(matches!(capped, SymlinkTargetRead::Unreadable));
-
-        // The same read with room to grow must recover the complete target
-        // and produce a real digest over all 16 bytes, not the first 8.
-        let grown = read_symlink_target_with_buffer_sizes(&handle, 8, 64);
-        match grown {
-            SymlinkTargetRead::Target(bytes) => assert_eq!(bytes, target.as_bytes()),
-            other => panic!("expected a complete target, got {other:?}"),
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn two_long_shared_prefix_targets_do_not_collide_after_growth() {
-        // Two targets that agree on everything an 8-byte truncated read
-        // would see must still digest differently once the buffer is
-        // allowed to grow far enough to see where they diverge -- proving
-        // growth (not just truncation-detection) actually recovers enough
-        // of the target to distinguish them, not just enough to notice
-        // *something* was cut off.
-        let dir = tempfile::tempdir().unwrap();
-        let a = dir.path().join("a");
-        let b = dir.path().join("b");
-        let prefix = "shared-prefix-"; // 14 bytes, already > the 8-byte start
-        std::os::unix::fs::symlink(format!("{prefix}one"), &a).unwrap();
-        std::os::unix::fs::symlink(format!("{prefix}two"), &b).unwrap();
-
-        let handle_a = open_no_follow(&a);
-        let handle_b = open_no_follow(&b);
-        let read_a = read_symlink_target_with_buffer_sizes(&handle_a, 8, 64);
-        let read_b = read_symlink_target_with_buffer_sizes(&handle_b, 8, 64);
-
-        match (read_a, read_b) {
-            (SymlinkTargetRead::Target(bytes_a), SymlinkTargetRead::Target(bytes_b)) => {
-                assert_ne!(bytes_a, bytes_b);
-            }
-            other => panic!("expected two complete, distinct targets, got {other:?}"),
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn eintr_is_retried_not_surfaced_as_a_result() {
-        // Mirrors `fs_capabilities`'s own `retry_eintr` test: a mock
-        // `attempt` that reports `EINTR` twice before succeeding must be
-        // called exactly three times and must return the eventual success,
-        // never surface the interruption as a result on its own.
-        let mut calls = 0;
-        let (ret, errno) = retry_eintr(|| {
-            calls += 1;
-            if calls < 3 {
-                (-1, Some(libc::EINTR))
-            } else {
-                (7, None)
-            }
-        });
-        assert_eq!(calls, 3, "EINTR must be retried, not surfaced as a result");
-        assert_eq!((ret, errno), (7, None));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn eintr_retry_does_not_mask_a_real_error() {
-        // A `-1` with anything other than `EINTR` is a real result, not a
-        // signal interruption, and must be returned immediately rather than
-        // retried.
-        let mut calls = 0;
-        let (ret, errno) = retry_eintr(|| {
-            calls += 1;
-            (-1, Some(libc::ENOENT))
-        });
-        assert_eq!(calls, 1, "a non-EINTR error must not be retried");
-        assert_eq!((ret, errno), (-1, Some(libc::ENOENT)));
-    }
-
-    /// Builds a `FileIdentity` carrying an unproven `WindowsObjectId::
-    /// Fallback` id -- the shape a real observation takes when
-    /// `GetFileInformationByHandleEx(FileIdInfo)` is unavailable.
-    fn windows_fallback_sample(
-        volume_serial_number: u64,
-        file_index: u64,
-        generation_or_usn: Option<u128>,
-        birth: Option<i64>,
-    ) -> FileIdentity {
-        FileIdentity {
-            volume_identity: VolumeIdentity::Windows { volume_serial_number },
-            object_id: PlatformObjectId::Windows(WindowsObjectId::Fallback { file_index }),
-            object_kind: ObjectKind::Directory,
-            generation_or_usn,
-            birth_or_creation_time: birth
-                .map(|seconds| Timestamp { seconds_since_unix_epoch: seconds, subsec_nanos: 0 }),
-            observed_size: 0,
-            metadata_fingerprint: [0; 32],
-            link_count: Some(1),
-            symlink_target_digest: None,
-        }
-    }
-
-    /// Builds a `FileIdentity` carrying a proven `WindowsObjectId::Proven`
-    /// id -- the shape a real observation takes when `GetFileInformationBy
-    /// HandleEx(FileIdInfo)` succeeds.
-    fn windows_proven_sample(
-        volume_serial_number: u64,
-        file_id: [u8; 16],
-        generation_or_usn: Option<u128>,
-        birth: Option<i64>,
-    ) -> FileIdentity {
-        FileIdentity {
-            volume_identity: VolumeIdentity::Windows { volume_serial_number },
-            object_id: PlatformObjectId::Windows(WindowsObjectId::Proven { file_id }),
-            object_kind: ObjectKind::Directory,
-            generation_or_usn,
-            birth_or_creation_time: birth
-                .map(|seconds| Timestamp { seconds_since_unix_epoch: seconds, subsec_nanos: 0 }),
-            observed_size: 0,
-            metadata_fingerprint: [0; 32],
-            link_count: Some(1),
-            symlink_target_digest: None,
-        }
-    }
-
-    #[test]
-    fn windows_fallback_object_id_match_with_matching_generation_is_ambiguous_not_same() {
-        // The ReFS defect this guards: `WindowsObjectId::Fallback`'s 64-bit
-        // file index is not guaranteed unique on ReFS, so even a matching
-        // `generation_or_usn` on top of it must not be read as proof of
-        // "same object" -- two distinct, simultaneously live directories
-        // could coincidentally share both fields.
-        let a = windows_fallback_sample(1, 2, Some(9), None);
-        let b = windows_fallback_sample(1, 2, Some(9), None);
-        assert_eq!(
-            a.compare(&b, TimestampGranularity::Fine),
-            IdentityComparison::Ambiguous(AmbiguityReason::WindowsObjectIdNotProvenUniqueOnRefs)
-        );
-    }
-
-    #[test]
-    fn windows_fallback_object_id_match_with_matching_fine_birth_time_is_ambiguous_not_same() {
-        let a = windows_fallback_sample(1, 2, None, Some(100));
-        let b = windows_fallback_sample(1, 2, None, Some(100));
-        assert_eq!(
-            a.compare(&b, TimestampGranularity::Fine),
-            IdentityComparison::Ambiguous(AmbiguityReason::WindowsObjectIdNotProvenUniqueOnRefs)
-        );
-    }
-
-    #[test]
-    fn windows_fallback_object_id_match_still_reports_definitely_different_on_a_real_mismatch() {
-        // A conclusive mismatch is unaffected by the ReFS caveat: it does
-        // not depend on the object id being trustworthy, only on a field
-        // that cannot move backward on a live object.
-        let a = windows_fallback_sample(1, 2, None, Some(100));
-        let b = windows_fallback_sample(1, 2, None, Some(200));
-        assert_eq!(
-            a.compare(&b, TimestampGranularity::Coarse),
-            IdentityComparison::DefinitelyDifferent
-        );
-        let c = windows_fallback_sample(1, 2, Some(9), None);
-        let d = windows_fallback_sample(1, 2, Some(10), None);
-        assert_eq!(
-            c.compare(&d, TimestampGranularity::Fine),
-            IdentityComparison::DefinitelyDifferent
-        );
-    }
-
-    #[test]
-    fn windows_fallback_differing_volume_or_object_id_is_still_definitely_different() {
-        let a = windows_fallback_sample(1, 2, Some(9), None);
-        let b = windows_fallback_sample(2, 2, Some(9), None);
-        assert_eq!(
-            a.compare(&b, TimestampGranularity::Fine),
-            IdentityComparison::DefinitelyDifferent
-        );
-        let c = windows_fallback_sample(1, 2, Some(9), None);
-        let d = windows_fallback_sample(1, 3, Some(9), None);
-        assert_eq!(
-            c.compare(&d, TimestampGranularity::Fine),
-            IdentityComparison::DefinitelyDifferent
-        );
-    }
-
-    #[test]
-    fn windows_proven_object_id_match_with_matching_fine_birth_time_is_same_object() {
-        // The whole point of carrying the 128-bit `FILE_ID_INFO` id: unlike
-        // the fallback case above, a match here IS trusted, exactly like a
-        // Unix inode -- no ReFS collision caveat applies to it.
-        let a = windows_proven_sample(1, [7; 16], None, Some(100));
-        let b = windows_proven_sample(1, [7; 16], None, Some(100));
-        assert_eq!(a.compare(&b, TimestampGranularity::Fine), IdentityComparison::SameObject);
-    }
-
-    #[test]
-    fn windows_proven_object_id_match_with_no_generation_and_no_birth_time_is_same_object() {
-        // MEASURED regression on a real Windows 11 host: `generation_or_usn`
-        // is never populated there, and this is what an observation with no
-        // `birth_or_creation_time` either (or one this host's clock probe
-        // could not trust) resolves to. A matching `Proven` id needs
-        // neither field -- see its own doc for why a match on it is itself
-        // a reuse discriminator (the NTFS sequence number embedded in its
-        // low 64 bits increments on every MFT record reuse).
-        let a = windows_proven_sample(1, [7; 16], None, None);
-        let b = windows_proven_sample(1, [7; 16], None, None);
-        assert_eq!(a.compare(&b, TimestampGranularity::Fine), IdentityComparison::SameObject);
-    }
-
-    #[test]
-    fn windows_proven_object_id_match_with_matching_coarse_birth_time_is_same_object() {
-        // The other half of the same regression: this must resolve to
-        // `SameObject` even when the volume's clock was measured `Coarse`,
-        // unlike the equivalent `Fallback` case just above, which has
-        // nothing else to fall back on.
-        let a = windows_proven_sample(1, [7; 16], None, Some(100));
-        let b = windows_proven_sample(1, [7; 16], None, Some(100));
-        assert_eq!(a.compare(&b, TimestampGranularity::Coarse), IdentityComparison::SameObject);
-    }
-
-    #[test]
-    fn windows_proven_object_id_match_with_differing_birth_time_is_still_definitely_different() {
-        // A `Proven` match rescues an otherwise-`Ambiguous` verdict; it
-        // never overrides a conclusive mismatch found elsewhere. A live
-        // object's birth time cannot move, so two observations sharing a
-        // `Proven` id but disagreeing on it are exactly the anomaly this
-        // module refuses to paper over.
-        let a = windows_proven_sample(1, [7; 16], None, Some(100));
-        let b = windows_proven_sample(1, [7; 16], None, Some(200));
-        assert_eq!(
-            a.compare(&b, TimestampGranularity::Coarse),
-            IdentityComparison::DefinitelyDifferent
-        );
-    }
-
-    #[test]
-    fn windows_proven_object_id_mismatch_is_definitely_different() {
-        let a = windows_proven_sample(1, [7; 16], None, Some(100));
-        let b = windows_proven_sample(1, [8; 16], None, Some(100));
-        assert_eq!(
-            a.compare(&b, TimestampGranularity::Fine),
-            IdentityComparison::DefinitelyDifferent
-        );
-    }
-
-    #[test]
-    fn windows_proven_and_fallback_ids_for_one_comparison_are_ambiguous_not_compared_directly() {
-        // See `AmbiguityReason::WindowsIdentityMethodMismatch`'s doc: this
-        // shape should not arise from one running process, but `compare`
-        // must not silently coerce it into either `SameObject` (it can't
-        // prove that) or `DefinitelyDifferent` (a stronger claim than a
-        // representation mismatch actually supports).
-        let a = windows_proven_sample(1, [7; 16], None, Some(100));
-        let b = windows_fallback_sample(1, 2, None, Some(100));
-        assert_eq!(
-            a.compare(&b, TimestampGranularity::Fine),
-            IdentityComparison::Ambiguous(AmbiguityReason::WindowsIdentityMethodMismatch)
-        );
-    }
-
-    #[test]
-    fn windows_proven_and_fallback_with_differing_volume_serial_is_ambiguous_not_different() {
-        // The ordering defect this guards: a `Proven` observation's full
-        // 64-bit `FILE_ID_INFO::VolumeSerialNumber` and a `Fallback`
-        // observation's zero-extended legacy 32-bit serial are not
-        // guaranteed to come out byte-identical for the same volume (see
-        // `VolumeIdentity::Windows`'s doc). Checking volume equality before
-        // the method-mismatch check would make that disagreement report
-        // `DefinitelyDifferent` for what could be the very same object --
-        // the method mismatch must be caught first and reported `Ambiguous`
-        // regardless of whether the volume fields happen to agree.
-        let a = windows_proven_sample(0x1_0000_0001, [7; 16], None, Some(100));
-        let b = windows_fallback_sample(1, 2, None, Some(100));
-        assert_eq!(
-            a.compare(&b, TimestampGranularity::Fine),
-            IdentityComparison::Ambiguous(AmbiguityReason::WindowsIdentityMethodMismatch)
-        );
-    }
-
-    #[test]
-    fn ambiguous_result_cannot_be_read_as_a_bare_bool() {
-        // This test exists to keep the type honest: `IdentityComparison`
-        // has no `PartialEq<bool>` or `From<IdentityComparison> for bool`,
-        // so this only compiles because callers are forced to match on
-        // the variant explicitly.
-        let a = sample(1, 2, None, None);
-        let b = sample(1, 2, None, None);
-        let same = match a.compare(&b, TimestampGranularity::Fine) {
-            IdentityComparison::SameObject => true,
-            IdentityComparison::DefinitelyDifferent | IdentityComparison::Ambiguous(_) => false,
-        };
-        assert!(!same);
-    }
-
-    #[test]
-    fn observe_path_and_observe_handle_agree_on_a_real_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("probe-target");
-        std::fs::write(&path, b"content").unwrap();
-
-        let from_path = FileIdentity::observe_path(&path).unwrap();
-        let handle = File::open(&path).unwrap();
-        let from_handle = FileIdentity::observe_handle(&handle).unwrap();
-
-        assert_eq!(from_path.volume_identity, from_handle.volume_identity);
-        assert_eq!(from_path.object_id, from_handle.object_id);
-        assert_eq!(from_path.object_kind, ObjectKind::RegularFile);
-    }
-
-    #[test]
-    fn observing_the_same_untouched_file_twice_compares_same_object_given_a_fine_clock() {
-        // A real, host-observed identity, not the synthetic `sample()`
-        // fixture above: this is the case that actually exercises whatever
-        // reuse discriminator this host's filesystem actually provides —
-        // `birth_or_creation_time` on macOS and on any Linux volume without
-        // `FS_IOC_GETVERSION` (overlayfs, measured), or `generation_or_usn`
-        // on a Linux volume that has it (ext4/XFS, measured — see
-        // `linux_inode_generation_is_stable_and_deterministic_when_
-        // available` below for a test that pins that path specifically).
-        // Whichever one fires, `compare` must still land on `SameObject`
-        // for the same untouched file observed twice.
-        //
-        // `Fine` is asserted here as the premise under test, not measured:
-        // measuring a real volume's granularity is `fs_capabilities`'s
-        // job (it has the probing infrastructure this module deliberately
-        // does not), exercised there against real timing.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("untouched");
-        std::fs::write(&path, b"content").unwrap();
-
-        let first = FileIdentity::observe_path(&path).unwrap();
-        let second = FileIdentity::observe_path(&path).unwrap();
-
-        assert_eq!(
-            first.compare(&second, TimestampGranularity::Fine),
-            IdentityComparison::SameObject
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn linux_inode_generation_is_stable_and_deterministic_when_available() {
-        // Whether `FS_IOC_GETVERSION` is available at all is a property of
-        // the volume this test happens to run on (ext4/XFS: yes, measured
-        // to work unprivileged and to discriminate every observed inode
-        // reuse; overlayfs: no, measured `ENOTTY` even as root with every
-        // capability — see `generation_from_path`'s doc), so this does not
-        // assert presence unconditionally; CI's own container root is
-        // overlayfs and legitimately takes the `None` branch below. What it
-        // does assert unconditionally, once the ioctl IS available: two
-        // observations of the same untouched file report the identical
-        // generation, and `compare` reaches `SameObject` through that field
-        // specifically — passing `Coarse` granularity deliberately, so a
-        // wrongly-granularity-gated implementation of the generation branch
-        // would fail this — and a differing generation on an otherwise
-        // identical identity still proves `DefinitelyDifferent` even under
-        // `Fine` granularity, showing the generation check really runs
-        // before, not after, the birth-time fallback.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("untouched");
-        std::fs::write(&path, b"content").unwrap();
-
-        let first = FileIdentity::observe_path(&path).unwrap();
-        let second = FileIdentity::observe_path(&path).unwrap();
-        eprintln!(
-            "linux_inode_generation_is_stable_and_deterministic_when_available: \
-             generation_or_usn={:?}",
-            first.generation_or_usn
-        );
-
-        let (Some(first_generation), Some(second_generation)) =
-            (first.generation_or_usn, second.generation_or_usn)
-        else {
-            // Not available on this volume -- the fallback path is what
-            // `observing_the_same_untouched_file_twice_compares_same_
-            // object_given_a_fine_clock` above covers.
-            return;
-        };
-        assert_eq!(first_generation, second_generation);
-        assert_eq!(
-            first.compare(&second, TimestampGranularity::Coarse),
-            IdentityComparison::SameObject
-        );
-
-        let mut different_generation = second;
-        different_generation.generation_or_usn = Some(first_generation.wrapping_add(1));
-        assert_eq!(
-            first.compare(&different_generation, TimestampGranularity::Fine),
-            IdentityComparison::DefinitelyDifferent
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn observe_path_does_not_follow_a_symlink() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("target");
-        std::fs::write(&target, b"content").unwrap();
-        let link = dir.path().join("link");
-        std::os::unix::fs::symlink(&target, &link).unwrap();
-
-        let identity = FileIdentity::observe_path(&link).unwrap();
-        assert_eq!(identity.object_kind, ObjectKind::Symlink);
-    }
-
-    #[test]
-    fn regular_file_is_eligible_for_replacement() {
-        assert_eq!(
-            classify_replacement_eligibility(ObjectKind::RegularFile, Some(1)),
-            ReplacementEligibility::Eligible
-        );
-    }
-
-    #[test]
-    fn hardlinked_file_is_blocked_before_link_count_is_known_to_be_singular() {
-        assert_eq!(
-            classify_replacement_eligibility(ObjectKind::RegularFile, Some(2)),
-            ReplacementEligibility::Blocked(BlockedObjectReason::HardlinkTopologyUnsupported)
-        );
-    }
-
-    #[test]
-    fn unknown_link_count_is_blocked_not_treated_as_unlinked() {
-        // R5: an observation that cannot report a link count at all (the
-        // shape a Windows `Metadata` produces when `number_of_links`
-        // itself is unavailable) must not fall through to `Eligible`.
-        // Blocking on `None` is the fail-closed answer for "this platform
-        // cannot rule out a hardlink", not a special case to work around.
-        assert_eq!(
-            classify_replacement_eligibility(ObjectKind::RegularFile, None),
-            ReplacementEligibility::Blocked(BlockedObjectReason::UnknownHardlinkTopology)
-        );
-    }
-
-    #[test]
-    fn special_object_kinds_are_blocked_regardless_of_link_count() {
-        assert_eq!(
-            classify_replacement_eligibility(ObjectKind::Fifo, Some(1)),
-            ReplacementEligibility::Blocked(BlockedObjectReason::Fifo)
-        );
-        assert_eq!(
-            classify_replacement_eligibility(ObjectKind::Socket, Some(1)),
-            ReplacementEligibility::Blocked(BlockedObjectReason::Socket)
-        );
-        assert_eq!(
-            classify_replacement_eligibility(ObjectKind::BlockDevice, Some(1)),
-            ReplacementEligibility::Blocked(BlockedObjectReason::DeviceNode)
-        );
-        assert_eq!(
-            classify_replacement_eligibility(ObjectKind::CharDevice, Some(1)),
-            ReplacementEligibility::Blocked(BlockedObjectReason::DeviceNode)
-        );
-        assert_eq!(
-            classify_replacement_eligibility(ObjectKind::ReparsePoint, Some(1)),
-            ReplacementEligibility::Blocked(BlockedObjectReason::UnsupportedReparsePoint)
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn real_hardlink_reports_link_count_above_one() {
-        let dir = tempfile::tempdir().unwrap();
-        let original = dir.path().join("original");
-        let alias = dir.path().join("alias");
-        std::fs::write(&original, b"content").unwrap();
-        std::fs::hard_link(&original, &alias).unwrap();
-
-        let identity = FileIdentity::observe_path(&original).unwrap();
-        assert_eq!(identity.link_count, Some(2));
-        assert_eq!(
-            classify_replacement_eligibility(identity.object_kind, identity.link_count),
-            ReplacementEligibility::Blocked(BlockedObjectReason::HardlinkTopologyUnsupported)
-        );
-    }
-
-    #[test]
-    fn a_structurally_multi_linked_directory_is_still_eligible() {
-        // Regression for a real bug this module shipped: an empty
-        // directory's `nlink` is structurally 2 (`.` plus the parent's
-        // entry to it) on every mainstream filesystem, which the
-        // hardlink-topology check used to read as "more than one path to
-        // this object" and block unconditionally — meaning no directory
-        // could ever be replaced by this engine at all. The check now
-        // only applies to `RegularFile`.
-        assert_eq!(
-            classify_replacement_eligibility(ObjectKind::Directory, Some(2)),
-            ReplacementEligibility::Eligible
-        );
-        assert_eq!(
-            classify_replacement_eligibility(ObjectKind::Directory, None),
-            ReplacementEligibility::Eligible
-        );
-    }
-
-    #[test]
-    fn a_symlink_is_eligible_regardless_of_reported_link_count() {
-        // A symlink can never itself be hardlinked (its own `nlink` is
-        // always 1), but this asserts eligibility is unconditional on the
-        // field anyway, matching the directory case above rather than
-        // relying on every platform actually reporting 1.
-        assert_eq!(
-            classify_replacement_eligibility(ObjectKind::Symlink, Some(2)),
-            ReplacementEligibility::Eligible
-        );
-        assert_eq!(
-            classify_replacement_eligibility(ObjectKind::Symlink, None),
-            ReplacementEligibility::Eligible
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_real_freshly_created_directory_reports_the_structural_nlink_and_stays_eligible() {
-        let dir = tempfile::tempdir().unwrap();
-        let subdir = dir.path().join("subdir");
-        std::fs::create_dir(&subdir).unwrap();
-
-        let identity = FileIdentity::observe_path(&subdir).unwrap();
-        assert_eq!(
-            identity.link_count,
-            Some(2),
-            "an empty directory's own structural nlink -- not a hardlink"
-        );
-        assert_eq!(
-            classify_replacement_eligibility(identity.object_kind, identity.link_count),
-            ReplacementEligibility::Eligible
-        );
-    }
-
-    // --- Defect 1: FILE_ID_INFO sentinel FileId values ------------------
-    //
-    // `windows_file_id_is_sentinel` is deliberately not `#[cfg(windows)]`
-    // (see its doc), so these run on every host even though the FFI call
-    // that would actually produce a sentinel `FileId` only exists on
-    // Windows.
-
-    #[test]
-    fn all_zero_file_id_is_a_sentinel_not_a_proven_id() {
-        // [MS-FSCC]'s "128-bit file ID": "For file systems that do not
-        // support a 128-bit file ID, this field MUST be set to 0."
-        assert!(windows_file_id_is_sentinel([0; 16]));
-    }
-
-    #[test]
-    fn all_ones_file_id_is_a_sentinel_not_a_proven_id() {
-        // [MS-FSCC]'s "128-bit file ID": "For files for which a unique
-        // 128-bit file ID cannot be established, this field MUST be set to
-        // 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF."
-        assert!(windows_file_id_is_sentinel([0xff; 16]));
-    }
-
-    #[test]
-    fn an_ordinary_file_id_is_not_a_sentinel() {
-        let mut file_id = [0u8; 16];
-        file_id[0] = 1;
-        assert!(!windows_file_id_is_sentinel(file_id));
-
-        let mut almost_all_ones = [0xffu8; 16];
-        almost_all_ones[15] = 0xfe;
-        assert!(!windows_file_id_is_sentinel(almost_all_ones));
-    }
-
-    // --- Defect 2: `DirectoryIdentity::compare` --------------------------
-
-    fn directory_sample(
-        volume_serial_number: u64,
-        object_id: PlatformObjectId,
-        generation_or_usn: Option<u128>,
-    ) -> DirectoryIdentity {
-        directory_sample_with_birth(volume_serial_number, object_id, generation_or_usn, None)
-    }
-
-    fn directory_sample_with_birth(
-        volume_serial_number: u64,
-        object_id: PlatformObjectId,
-        generation_or_usn: Option<u128>,
-        birth_or_creation_time: Option<Timestamp>,
-    ) -> DirectoryIdentity {
-        DirectoryIdentity {
-            volume_identity: VolumeIdentity::Windows { volume_serial_number },
-            object_id,
-            generation_or_usn,
-            birth_or_creation_time,
-        }
-    }
-
-    #[test]
-    fn directory_matching_fallback_id_is_ambiguous_not_same_object() {
-        // The defect this closes: two distinct, simultaneously live
-        // directories on one ReFS volume can report the same
-        // `WindowsObjectId::Fallback` 64-bit index. A caller reaching for
-        // plain `==` (impossible now that the derive is gone) would read
-        // this as proof; `compare` must not. Granularity is irrelevant
-        // here: `generation_or_usn` is what decides this case.
-        let a = directory_sample(
-            1,
-            PlatformObjectId::Windows(WindowsObjectId::Fallback { file_index: 99 }),
-            Some(5),
-        );
-        let b = directory_sample(
-            1,
-            PlatformObjectId::Windows(WindowsObjectId::Fallback { file_index: 99 }),
-            Some(5),
-        );
-        assert_eq!(
-            a.compare(&b, TimestampGranularity::Coarse),
-            IdentityComparison::Ambiguous(AmbiguityReason::WindowsObjectIdNotProvenUniqueOnRefs)
-        );
-    }
-
-    #[test]
-    fn directory_matching_proven_id_and_generation_is_same_object() {
-        let a = directory_sample(
-            1,
-            PlatformObjectId::Windows(WindowsObjectId::Proven { file_id: [9; 16] }),
-            Some(5),
-        );
-        let b = directory_sample(
-            1,
-            PlatformObjectId::Windows(WindowsObjectId::Proven { file_id: [9; 16] }),
-            Some(5),
-        );
-        assert_eq!(a.compare(&b, TimestampGranularity::Coarse), IdentityComparison::SameObject);
-    }
-
-    #[test]
-    fn directory_matching_proven_id_with_no_generation_and_no_birth_time_is_same_object() {
-        // The regression this guards: a real Windows observation has no
-        // portable `generation_or_usn` source and, on some hosts, too
-        // coarse a clock to trust `birth_or_creation_time` either -- the
-        // exact shape every identity-dependent operation was measured to
-        // refuse under before this fix, for every untouched object, on a
-        // real Windows 11 host. A matching `WindowsObjectId::Proven` id
-        // needs neither field -- see its own doc for why a match on it is
-        // itself a reuse discriminator.
-        let a = directory_sample(
-            1,
-            PlatformObjectId::Windows(WindowsObjectId::Proven { file_id: [9; 16] }),
-            None,
-        );
-        let b = directory_sample(
-            1,
-            PlatformObjectId::Windows(WindowsObjectId::Proven { file_id: [9; 16] }),
-            None,
-        );
-        assert_eq!(a.compare(&b, TimestampGranularity::Fine), IdentityComparison::SameObject);
-    }
-
-    #[test]
-    fn directory_matching_birth_time_on_a_fine_clock_with_no_generation_is_same_object() {
-        let birth = Some(Timestamp { seconds_since_unix_epoch: 1_700_000_000, subsec_nanos: 0 });
-        let a = directory_sample_with_birth(
-            1,
-            PlatformObjectId::Windows(WindowsObjectId::Proven { file_id: [9; 16] }),
-            None,
-            birth,
-        );
-        let b = directory_sample_with_birth(
-            1,
-            PlatformObjectId::Windows(WindowsObjectId::Proven { file_id: [9; 16] }),
-            None,
-            birth,
-        );
-        assert_eq!(a.compare(&b, TimestampGranularity::Fine), IdentityComparison::SameObject);
-    }
-
-    #[test]
-    fn directory_matching_proven_id_and_birth_time_on_a_coarse_clock_is_same_object() {
-        // The other half of the same regression: a matching `Proven` id
-        // must resolve to `SameObject` even on a `Coarse` clock, unlike a
-        // matching `Fallback` id or a matching Unix inode, neither of which
-        // has anything else to fall back on here -- see the next test.
-        let birth = Some(Timestamp { seconds_since_unix_epoch: 1_700_000_000, subsec_nanos: 0 });
-        let a = directory_sample_with_birth(
-            1,
-            PlatformObjectId::Windows(WindowsObjectId::Proven { file_id: [9; 16] }),
-            None,
-            birth,
-        );
-        let b = directory_sample_with_birth(
-            1,
-            PlatformObjectId::Windows(WindowsObjectId::Proven { file_id: [9; 16] }),
-            None,
-            birth,
-        );
-        assert_eq!(a.compare(&b, TimestampGranularity::Coarse), IdentityComparison::SameObject);
-    }
-
-    #[test]
-    fn directory_matching_fallback_birth_time_on_a_coarse_clock_with_no_generation_is_ambiguous() {
-        // The exact overlayfs shape this whole change exists for: no
-        // generation counter, and a clock too coarse to trust an equal
-        // birth time as proof -- a delete-and-recreate landing in the same
-        // tick as the directory it replaced is indistinguishable here, so
-        // this must not be read as `SameObject`. Uses `Fallback`, not
-        // `Proven`, specifically because a `Proven` id match no longer
-        // needs the clock's help at all -- see the previous test.
-        let birth = Some(Timestamp { seconds_since_unix_epoch: 1_700_000_000, subsec_nanos: 0 });
-        let a = directory_sample_with_birth(
-            1,
-            PlatformObjectId::Windows(WindowsObjectId::Fallback { file_index: 99 }),
-            None,
-            birth,
-        );
-        let b = directory_sample_with_birth(
-            1,
-            PlatformObjectId::Windows(WindowsObjectId::Fallback { file_index: 99 }),
-            None,
-            birth,
-        );
-        assert_eq!(
-            a.compare(&b, TimestampGranularity::Coarse),
-            IdentityComparison::Ambiguous(AmbiguityReason::CoarseTimestampGranularity)
-        );
-    }
-
-    #[test]
-    fn directory_differing_birth_time_is_definitely_different_regardless_of_granularity() {
-        let a = directory_sample_with_birth(
-            1,
-            PlatformObjectId::Windows(WindowsObjectId::Proven { file_id: [9; 16] }),
-            None,
-            Some(Timestamp { seconds_since_unix_epoch: 1_700_000_000, subsec_nanos: 0 }),
-        );
-        let b = directory_sample_with_birth(
-            1,
-            PlatformObjectId::Windows(WindowsObjectId::Proven { file_id: [9; 16] }),
-            None,
-            Some(Timestamp { seconds_since_unix_epoch: 1_700_000_001, subsec_nanos: 0 }),
-        );
-        assert_eq!(
-            a.compare(&b, TimestampGranularity::Coarse),
-            IdentityComparison::DefinitelyDifferent
-        );
-    }
-
-    #[test]
-    fn directory_matching_proven_id_with_differing_generation_is_definitely_different() {
-        // When `generation_or_usn` *is* available on both sides, a
-        // difference is still conclusive proof of reuse.
-        let a = directory_sample(
-            1,
-            PlatformObjectId::Windows(WindowsObjectId::Proven { file_id: [9; 16] }),
-            Some(1),
-        );
-        let b = directory_sample(
-            1,
-            PlatformObjectId::Windows(WindowsObjectId::Proven { file_id: [9; 16] }),
-            Some(2),
-        );
-        assert_eq!(
-            a.compare(&b, TimestampGranularity::Coarse),
-            IdentityComparison::DefinitelyDifferent
-        );
-    }
-
-    #[test]
-    fn directory_differing_volume_serial_is_definitely_different() {
-        let a = directory_sample(
-            1,
-            PlatformObjectId::Windows(WindowsObjectId::Proven { file_id: [9; 16] }),
-            Some(5),
-        );
-        let b = directory_sample(
-            2,
-            PlatformObjectId::Windows(WindowsObjectId::Proven { file_id: [9; 16] }),
-            Some(5),
-        );
-        assert_eq!(
-            a.compare(&b, TimestampGranularity::Coarse),
-            IdentityComparison::DefinitelyDifferent
-        );
-    }
-
-    #[test]
-    fn directory_mixed_proven_and_fallback_with_differing_serial_width_is_ambiguous() {
-        // Defect 3's ordering fix, exercised through `DirectoryIdentity`
-        // too: a legacy 32-bit volume serial zero-extended into the 64-bit
-        // field (the shape `Fallback` observations report -- see
-        // `VolumeIdentity::Windows`'s doc) must not make a mixed-method
-        // pair read as `DefinitelyDifferent` before the method mismatch is
-        // ever considered.
-        let a = directory_sample(
-            0x1_0000_0001,
-            PlatformObjectId::Windows(WindowsObjectId::Proven { file_id: [9; 16] }),
-            Some(5),
-        );
-        let b = directory_sample(
-            1,
-            PlatformObjectId::Windows(WindowsObjectId::Fallback { file_index: 99 }),
-            Some(5),
-        );
-        assert_eq!(
-            a.compare(&b, TimestampGranularity::Coarse),
-            IdentityComparison::Ambiguous(AmbiguityReason::WindowsIdentityMethodMismatch)
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn directory_matching_unix_inode_and_generation_is_same_object() {
-        let a = directory_sample_unix(1, 2, Some(5));
-        let b = directory_sample_unix(1, 2, Some(5));
-        assert_eq!(a.compare(&b, TimestampGranularity::Coarse), IdentityComparison::SameObject);
-    }
-
-    #[cfg(unix)]
-    fn directory_sample_unix(
-        device_id: u64,
-        inode: u64,
-        generation_or_usn: Option<u128>,
-    ) -> DirectoryIdentity {
-        DirectoryIdentity {
-            volume_identity: VolumeIdentity::Unix { device_id },
-            object_id: PlatformObjectId::Unix { inode },
-            generation_or_usn,
-            birth_or_creation_time: None,
-        }
-    }
-
-    // --- Real Windows filesystem behavior ------------------------------
-    //
-    // Verifies `FileIdentity::from_metadata`'s Windows branch against a
-    // real NTFS volume: that `MetadataExt::volume_serial_number`/
-    // `file_index`/`number_of_links` actually populate (not just compile),
-    // and that two hardlinked paths report the identity a caller needs to
-    // recognize them as the same object.
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_volume_serial_and_file_index_actually_populate() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a.txt");
-        std::fs::write(&path, b"content").unwrap();
-
-        let identity = FileIdentity::observe_path(&path).unwrap();
-        match identity.volume_identity {
-            VolumeIdentity::Windows { volume_serial_number } => {
-                assert_ne!(
-                    volume_serial_number, 0,
-                    "a real NTFS volume must report a nonzero serial number"
-                );
-            }
-            other => panic!("expected VolumeIdentity::Windows, got {other:?}"),
-        }
-        // Which of the two cases this host actually takes is a property of
-        // its OS version and volume, not something this test can pin down
-        // in advance -- see `win_identity::ObjectIdFields`'s doc. Either way
-        // the id itself must be nonzero; `eprintln!` records which branch
-        // actually ran so a CI log is honest about which case it exercised,
-        // matching this module's other host-dependent tests (see
-        // `linux_inode_generation_is_stable_and_deterministic_when_
-        // available`).
-        match identity.object_id {
-            PlatformObjectId::Windows(WindowsObjectId::Proven { file_id }) => {
-                eprintln!(
-                    "windows_volume_serial_and_file_index_actually_populate: took the Proven \
-                     (FileIdInfo) branch"
-                );
-                assert_ne!(file_id, [0; 16], "a real file must report a nonzero file id");
-            }
-            PlatformObjectId::Windows(WindowsObjectId::Fallback { file_index }) => {
-                eprintln!(
-                    "windows_volume_serial_and_file_index_actually_populate: took the Fallback \
-                     (BY_HANDLE_FILE_INFORMATION) branch -- FileIdInfo unavailable on this host"
-                );
-                assert_ne!(file_index, 0, "a real file must report a nonzero file index");
-            }
-            other => panic!("expected PlatformObjectId::Windows, got {other:?}"),
-        }
-        assert_eq!(identity.link_count, Some(1), "an ordinary, non-hardlinked file's link count");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_hardlinked_files_share_identity_and_report_link_count_above_one() {
-        let dir = tempfile::tempdir().unwrap();
-        let original = dir.path().join("original.txt");
-        let alias = dir.path().join("alias.txt");
-        std::fs::write(&original, b"content").unwrap();
-        std::fs::hard_link(&original, &alias).unwrap();
-
-        let original_identity = FileIdentity::observe_path(&original).unwrap();
-        let alias_identity = FileIdentity::observe_path(&alias).unwrap();
-
-        assert_eq!(
-            original_identity.volume_identity, alias_identity.volume_identity,
-            "both paths name objects on the same volume"
-        );
-        assert_eq!(
-            original_identity.object_id, alias_identity.object_id,
-            "a hardlink's two paths must resolve to the same underlying file index -- this is \
-             the entire premise `classify_replacement_eligibility` relies on to detect and \
-             block hardlinked objects"
-        );
-        assert_eq!(original_identity.link_count, Some(2));
-        assert_eq!(alias_identity.link_count, Some(2));
-        assert_eq!(
-            classify_replacement_eligibility(
-                original_identity.object_kind,
-                original_identity.link_count
-            ),
-            ReplacementEligibility::Blocked(BlockedObjectReason::HardlinkTopologyUnsupported)
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_distinct_files_report_distinct_file_index() {
-        let dir = tempfile::tempdir().unwrap();
-        let a = dir.path().join("a.txt");
-        let b = dir.path().join("b.txt");
-        std::fs::write(&a, b"content-a").unwrap();
-        std::fs::write(&b, b"content-b").unwrap();
-
-        let identity_a = FileIdentity::observe_path(&a).unwrap();
-        let identity_b = FileIdentity::observe_path(&b).unwrap();
-        assert_ne!(identity_a.object_id, identity_b.object_id);
-    }
+/// Size, mtime and (on Unix) ctime: the cheap stat-derived signature two
+/// observations of one path are compared on to decide whether anything
+/// touched it in between. Deliberately includes ctime, which a `chmod` or
+/// `setxattr` bumps even though it leaves size, mtime and content alone.
+pub type DiskRaceFingerprint = (u64, Option<SystemTime>, i64, i64);
+
+/// Cheap "did anything else write to this path" fingerprint, sampled either
+/// side of a read or a block fetch. `None` means the path does not exist;
+/// comparing two samples answers "did this file change underneath us", never
+/// "what does it contain".
+///
+/// This is the one definition every bracket shares: the peer session's
+/// eager materialize, the daemon's hydration and DAG import, local capture's
+/// commit-time re-check, and eviction all compare samples taken here, so a
+/// change to what the fingerprint covers changes every one of them together.
+///
+/// **What it can and cannot catch.** Length plus mtime is not a content hash,
+/// and deliberately so: hashing would mean a full extra read of the target on
+/// every eager materialize, on the hot path, to defend a narrow race. The
+/// limits, checked rather than assumed:
+///
+/// - Under the DST harnesses this is exact. `dst_support::clock::HarnessClock::
+///   next_mtime` is strictly monotonic (its own `next_mtime_is_strictly_
+///   monotonic` test asserts it) and `fs_ops::write` stamps every local write
+///   through it, so a racing write always moves the mtime — a same-length
+///   overwrite can never slip past.
+/// - In production the residual is a same-length write landing inside the
+///   filesystem's mtime granularity. `ctime` closes most of that on unix: a
+///   real write always advances it, and unlike mtime it cannot be back-dated
+///   by ordinary means, so a same-length same-mtime overwrite still trips this.
+///   What remains uncovered is a same-length write on a non-unix filesystem
+///   whose mtime granularity is coarser than the write window.
+///
+/// Erring toward *over*-detection is the safe direction here: a false positive
+/// costs one `RetryRequired` round trip, while a false negative silently
+/// destroys a user's edit. That is also why `ctime` moving for a reason other
+/// than a data write (a `chmod`, a rename into place) is deliberately treated
+/// as "something touched this path, decline and re-resolve" rather than
+/// filtered out.
+pub fn disk_race_fingerprint(path: &Path) -> Option<DiskRaceFingerprint> {
+    Some(disk_race_fingerprint_of(&std::fs::symlink_metadata(path).ok()?))
 }
+
+/// What [`disk_race_fingerprint`] would report for an `lstat` the caller
+/// already holds.
+///
+/// Exists so a caller that needs BOTH a path's metadata (its size, mtime
+/// and mode) and the fingerprint that brackets its observation can derive
+/// them from ONE `lstat` rather than two. Two stats mean the metadata a
+/// mutation is built from and the fingerprint that vouches for it describe
+/// the filesystem at two different instants, and a change landing between
+/// them is invisible to both -- the exact shape of drift the bracket
+/// exists to detect.
+pub fn disk_race_fingerprint_of(meta: &Metadata) -> DiskRaceFingerprint {
+    #[cfg(unix)]
+    let (ctime, ctime_nsec) = {
+        use std::os::unix::fs::MetadataExt as _;
+        (meta.ctime(), meta.ctime_nsec())
+    };
+    #[cfg(not(unix))]
+    let (ctime, ctime_nsec) = (0i64, 0i64);
+    (meta.len(), meta.modified().ok(), ctime, ctime_nsec)
+}
+
+/// True when a filesystem `Metadata`'s mtime equals the mtime an index row
+/// recorded (`FileRecord::mtime_unix_nanos`, stored as nanoseconds since the
+/// Unix epoch). Deriving this in one place keeps the "unchanged file" verdict
+/// identical no matter which path reaches it: local capture's per-file fast
+/// path, its bulk startup/offline reconcile scan, and the daemon's DAG
+/// import MUST agree, or a same-size edit one path treats as a no-op another
+/// would silently keep at the stale version.
+pub fn metadata_mtime_matches(metadata: &Metadata, indexed_mtime_unix_nanos: i64) -> bool {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as i64)
+        == Some(indexed_mtime_unix_nanos)
+}
+
+#[cfg(test)]
+mod tests;

@@ -27,7 +27,6 @@ crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 yadorilink-ipc-proto = { path = "../../../crates/yadorilink-ipc-proto" }
-prost = "0.14.4"
 # Async runtime used the same way `shell-ext/windows`'s `ipc_client.rs`
 # uses it: a single lazily-started current-thread Tokio runtime, blocked
 # on per FFI call. This is a deliberate choice over hand-rolling a

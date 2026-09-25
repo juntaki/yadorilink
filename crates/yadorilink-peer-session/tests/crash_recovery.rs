@@ -1,46 +1,30 @@
 //! A daemon-restart integration test proving a local change already
-//! committed to this device's
-//! `ReplicaCoordinator` (as it would be by `LocalChangeProcessor` processing a
-//! real filesystem event) but never yet broadcast to a connected peer —
-//! exactly what a crash right after the DB commit but before the
-//! outbound `IndexUpdate`/broadcast would leave behind — is durably
-//! re-offered to that peer, and re-admitted onto its own DAG, once this
-//! device reconnects after "restarting", with no separate persisted
-//! retry queue needed.
-//!
-//! This lives in its own integration-test binary (new file, no edits to
-//! the existing `tests/peer_session.rs`) specifically so it can be
-//! developed and run independently of that file's own concurrent,
-//! unrelated in-flight changes — it duplicates a small slice of that
-//! file's test harness (`bind_unused_addr`/`gen_keypair`/`connect_pair`/
-//! `spawn_session`) rather than sharing code with it, deliberately, for
-//! the same reason.
-//!
-//! The mechanism this proves already exists and needed no new production
-//! code: `PeerSyncSession::run` unconditionally sends a full index for
-//! every shared folder group at the *start* of every session (see that
-//! function's doc comment, "sends the initial handshake + full index for
-//! each shared folder group"), independent of whatever the previous
-//! session for the same peer did or didn't manage to broadcast before it
-//! died. Combined with `yadorilink-daemon::main`'s startup resuming every
-//! link's watcher (a full `scan_existing_files` rescan, which independently
-//! catches any change made while the daemon was down entirely), this is
-//! what closes the "pending local changes are retried after restart" gap
-//! — this test is what turns that into a verified guarantee instead of an
-//! assumption.
-//!
-//! Deliberately scoped to durable DAG delivery only, not disk
-//! materialization: since the Convergence Engine split,
-//! `handle_change_batch` only admits an incoming change and enqueues a
-//! `materialization_jobs` row -- a background engine (owned by
-//! `yadorilink-daemon`'s `DaemonState`, not present in this
-//! `yadorilink-sync-core`-only integration test) is what actually
-//! projects that row onto disk, on its own schedule. Verifying THAT
-//! end-to-end belongs in a `yadorilink-daemon` integration test that
-//! runs the real engine -- not simulated here via a single manually
-//! driven `reconcile_local_materialization_audit` call, which can itself
-//! silently swallow an internal projection failure and still report
-//! success. `admit_change` refusing to admit a change whose referenced
+//! committed to this device's `ReplicaCoordinator` (as it would be by
+//! `LocalChangeProcessor` processing a real filesystem event) but never
+//! yet broadcast to a connected peer — exactly what a crash right after
+//! the DB commit but before the outbound `IndexUpdate`/broadcast would
+//! leave behind — is durably re-offered to that peer, and re-admitted onto
+//! its own DAG, once this device reconnects after "restarting", with no
+//! separate persisted retry queue needed. This lives in its own
+//! integration-test binary (new file, no edits to the existing
+//! `tests/peer_session.rs`) specifically so it can be developed and run
+//! independently of that file's own concurrent, unrelated in-flight
+//! changes — it duplicates a small slice of that file's test harness
+//! (`spawn_session`) rather than sharing code with it, deliberately, for
+//! the same reason. The mechanism this proves already exists and needed no
+//! new production code: reconciliation compares the two devices' durable
+//! sets whenever they connect, independent of whatever the previous session
+//! for the same peer did or didn't manage to send before it died. Combined with `yadorilink-daemon::main`'s startup resuming every
+//! link's watcher (a full `scan_existing_files` rescan, which
+//! independently catches any change made while the daemon was down
+//! entirely), this is what closes the "pending local changes are retried
+//! after restart" gap — this test is what turns that into a verified
+//! guarantee instead of an assumption. Verifying THAT end-to-end belongs
+//! in a `yadorilink-daemon` integration test that runs the real engine --
+//! not simulated here via a single manually driven
+//! `reconcile_local_materialization_audit` call, which can itself silently
+//! swallow an internal projection failure and still report success.
+//! `admit_change` refusing to admit a change whose referenced
 //! `FileVersion` is missing (re-requesting it instead) is what makes
 //! `dag_get_change` succeeding here already strong evidence both the
 //! change and its content crossed, without needing to wait on
@@ -49,35 +33,28 @@
 use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
-use tokio::net::TcpListener;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 use yadorilink_peer_session::peer_session::{PeerSyncSession, PeerSyncSessionDeps};
-use yadorilink_transport::QuicPeerChannel;
 
-mod dag_wire_support;
-use dag_wire_support::{pinned_authenticator, DagProducer};
+use yadorilink_daemon::test_support::peer_session_fixture::dag_wire_support::{
+    pinned_authenticator, DagProducer,
+};
 
 const GROUP: &str = "shared-photos";
 
-// Peers connect directly (the relay was removed). This still binds a
-// throwaway listener so it hands back a real, unused address and the
-// existing call sites keep their shape; `connect_pair` ignores it and wires
-// a direct loopback pair instead.
-async fn bind_unused_addr() -> std::net::SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    listener.local_addr().unwrap()
-}
-
 /// A persistent device identity: state and block store survive across a
-/// simulated crash/restart (only the `PeerSyncSession`/`PeerChannel` pair
+/// simulated crash/restart (only the `PeerSyncSession` pair
 /// gets torn down and rebuilt), exactly as a real daemon's on-disk SQLite
 /// DB and block store survive a process kill.
 struct Device {
     device_id: String,
     root: tempfile::TempDir,
-    store: Arc<FsBlockStore>,
+    store: Arc<SegmentBlockStore>,
     state: Arc<ReplicaCoordinator>,
+    /// Held, not dropped: the store keeps its index and segments open in
+    /// this directory for as long as the device lives.
+    _store_dir: tempfile::TempDir,
     signing_key: SigningKey,
     block_serve_engine: Arc<yadorilink_peer_session::block_serve::BlockServeEngine>,
 }
@@ -107,7 +84,8 @@ impl Device {
         Device {
             device_id: device_id.to_string(),
             root,
-            store: Arc::new(FsBlockStore::new(store_dir.path()).unwrap()),
+            store: Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap()),
+            _store_dir: store_dir,
             state,
             signing_key: SigningKey::from_bytes(&[device_id.as_bytes()[device_id.len() - 1]; 32]),
             // Without this, every block request this device receives is
@@ -130,65 +108,49 @@ impl Device {
     }
 }
 
-async fn connect_pair(_addr: std::net::SocketAddr) -> (Arc<QuicPeerChannel>, Arc<QuicPeerChannel>) {
-    use yadorilink_transport::{ConnectRole, DeviceSigningKeyPair, QuicPeerEndpoint, TransportHub};
-    // Direct loopback: bind each side's UDP socket and dial the other's
-    // address -- the same wiring the daemon's peer orchestrator uses, minus
-    // the coordination-plane candidate discovery.
-    let socket_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let socket_b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let addr_b = socket_b.local_addr().unwrap();
-    let key_a = DeviceSigningKeyPair::generate();
-    let key_b = DeviceSigningKeyPair::generate();
-    let public_a = key_a.public_bytes();
-    let public_b = key_b.public_bytes();
-    let endpoint_a = QuicPeerEndpoint::new(TransportHub::from_socket(socket_a), key_a).unwrap();
-    let endpoint_b = QuicPeerEndpoint::new(TransportHub::from_socket(socket_b), key_b).unwrap();
-    endpoint_a.authorize(public_b);
-    endpoint_b.authorize(public_a);
-    let accepting = {
-        let endpoint_b = endpoint_b.clone();
-        tokio::spawn(async move { endpoint_b.accept(public_a).await })
+async fn spawn_session(device: &Device, peer_device_id: &str) -> Arc<PeerSyncSession> {
+    // `SessionTransports` is a required `PeerSyncSession` constructor
+    // parameter now (A3/A4): a real substrate-backed pair, independent per
+    // reconnect (like the real substrate connection production would
+    // establish fresh each time) rather than shared across this test's two
+    // successive `spawn_session` calls for the same device pair.
+    let book = yadorilink_lane_ports::testing::TestAddressBook::new();
+    let node_local =
+        yadorilink_lane_ports::testing::TestPeerNode::start(&device.device_id, book.clone()).await;
+    let node_peer = yadorilink_lane_ports::testing::TestPeerNode::start(peer_device_id, book).await;
+    let transports_local = node_local.transports_for(peer_device_id);
+    let transports = yadorilink_peer_session::ports::SessionTransports {
+        blocks: transports_local.clone(),
+        service: transports_local.clone(),
+        prepared_snapshots: Arc::new(yadorilink_lane_ports::PreparedSnapshots::new()),
+        snapshot_fetch: transports_local,
     };
-    let dialed = endpoint_a.connect(addr_b, public_b).await.unwrap();
-    let accepted = accepting.await.unwrap().unwrap();
-    (
-        QuicPeerChannel::new(dialed, ConnectRole::Dial),
-        QuicPeerChannel::new(accepted, ConnectRole::Accept),
-    )
-}
-
-fn spawn_session(
-    channel: Arc<QuicPeerChannel>,
-    device: &Device,
-    peer_device_id: &str,
-) -> (Arc<PeerSyncSession>, tokio::task::JoinHandle<()>) {
-    let session = PeerSyncSession::new_with_dependencies(
-        channel,
+    let replica_engine =
+        yadorilink_daemon::replica_coordinator::engine_ports::build_peer_replica_engine(
+            &device.state,
+            device.store.clone(),
+        );
+    let session = PeerSyncSession::over_substrate(
         device.device_id.clone(),
         peer_device_id.to_string(),
-        device.state.clone(),
+        device.state.clone()
+            as Arc<dyn yadorilink_peer_session::ports::BlockServeAuthorizationPort>,
+        replica_engine,
         device.store.clone(),
         vec![GROUP.to_string()],
         device.sync_roots(),
+        transports,
         None,
         PeerSyncSessionDeps {
             change_authenticator: pinned_authenticator(&[(
                 peer_device_id,
                 &SigningKey::from_bytes(&[peer_device_id.as_bytes()[peer_device_id.len() - 1]; 32]),
             )]),
-            ..PeerSyncSessionDeps::standalone()
+            ..yadorilink_peer_session::peer_session::PeerSyncSessionDeps::standalone()
         },
     );
     session.set_block_serve_engine(device.block_serve_engine.clone());
-    session.set_maintenance_reconcile_interval(std::time::Duration::from_millis(200));
-    let handle = tokio::spawn({
-        let session = session.clone();
-        async move {
-            let _ = session.run().await;
-        }
-    });
-    (session, handle)
+    session
 }
 
 async fn wait_until<F: Fn() -> bool>(cond: F, timeout: std::time::Duration) {
@@ -215,21 +177,12 @@ async fn wait_until<F: Fn() -> bool>(cond: F, timeout: std::time::Duration) {
 /// materialization is deliberately out of scope here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_change_committed_before_a_crash_is_reoffered_and_admitted_on_reconnect() {
-    let addr = bind_unused_addr().await;
     let device_a = Device::new("device-a");
     let device_b = Device::new("device-b");
 
-    // --- "pre-crash" session pair: an empty initial sync settles first,
-    // matching a real daemon's startup handshake before any local edit
-    // happens. ---
-    let (chan_a1, chan_b1) = connect_pair(addr).await;
-    let (session_a1, handle_a1) = spawn_session(chan_a1.clone(), &device_a, "device-b");
-    let (session_b1, handle_b1) = spawn_session(chan_b1.clone(), &device_b, "device-a");
-
-    // Give the initial (empty) handshake a moment to complete before the
-    // "crash" — a real daemon restart happens well after startup, not
-    // mid-handshake.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // --- "pre-crash" session pair, up before any local edit happens. ---
+    let session_a1 = spawn_session(&device_a, "device-b").await;
+    let session_b1 = spawn_session(&device_b, "device-a").await;
 
     // Device A's local change: committed to its index and written to disk
     // and its block store — everything a real watcher-driven local change
@@ -250,6 +203,12 @@ async fn local_change_committed_before_a_crash_is_reoffered_and_admitted_on_reco
     // wait below) -- the version's content is verified structurally via
     // the admitted `Change`'s own hash instead.
     let _committed = producer.commit_create(GROUP, "new-file.txt", &content, 0);
+    // A local commit is Pending (no authorization evidence) until
+    // published; only a Published change is eligible for
+    // `send_change_batch` to pick up over the real reconnect wire path this
+    // test drives below -- see `DagProducer::publish_pending`'s own doc
+    // comment.
+    producer.publish_pending(GROUP);
 
     // Confirm the peer genuinely never received it pre-crash (the
     // baseline this test would otherwise be trivially true against).
@@ -258,51 +217,66 @@ async fn local_change_committed_before_a_crash_is_reoffered_and_admitted_on_reco
         "sanity check: peer must not already have the file before the crash"
     );
 
-    // --- simulate the crash: abort both sessions' tasks and drop their
-    // transport, exactly as a killed daemon process would drop every
-    // in-memory connection while leaving `device_a`/`device_b`'s ReplicaCoordinator
-    // and block store (their on-disk, persisted state) untouched. ---
-    handle_a1.abort();
-    handle_b1.abort();
+    // --- simulate the crash: drop both sessions, exactly as a killed
+    // daemon process would drop every in-memory connection while leaving
+    // `device_a`/`device_b`'s ReplicaCoordinator and block store (their
+    // on-disk, persisted state) untouched. ---
     drop(session_a1);
     drop(session_b1);
-    drop(chan_a1);
-    drop(chan_b1);
 
     // --- simulate the restart: a fresh session pair for the same two
     // persistent device identities, as `yadorilink-daemon::main` would
     // build on the next process start (new `PeerSyncSession`s wrapping
-    // the same, restart-surviving `ReplicaCoordinator`/`FsBlockStore`). ---
-    let (chan_a2, chan_b2) = connect_pair(addr).await;
-    let (session_a2, _handle_a2) = spawn_session(chan_a2, &device_a, "device-b");
-    let (session_b2, _handle_b2) = spawn_session(chan_b2, &device_b, "device-a");
-
-    wait_until(
-        || session_a2.peer_handshake_received() && session_b2.peer_handshake_received(),
-        std::time::Duration::from_secs(20),
-    )
-    .await;
+    // the same, restart-surviving `ReplicaCoordinator`/`SegmentBlockStore`). ---
+    let _session_a2 = spawn_session(&device_a, "device-b").await;
+    let _session_b2 = spawn_session(&device_b, "device-a").await;
 
     let committed_head =
         device_a.state.sqlite().dag_group_heads(GROUP).unwrap().into_iter().next().unwrap();
 
-    session_a2.announce_local_commit(GROUP).await.unwrap();
+    // The device-local bookkeeping the local-change pipeline does for a
+    // commit, which `DaemonState::note_local_commit_for_group` owns: record
+    // this device's own published frontier. (It also raises the retirement
+    // and hazard wakes, which have no consumer in this test -- neither loop
+    // runs here.) Spelled out rather than borrowed from a session method:
+    // none of it is per-peer, so no session is the owner of it.
+    {
+        use yadorilink_replica_engine::ports::{FrontierStorePort, ReplicaHistoryPort};
+        let group = yadorilink_replica_domain::ids::FolderGroupId(GROUP.to_string());
+        let sqlite = device_a.state.sqlite();
+        let heads = ReplicaHistoryPort::group_heads(sqlite, &group).unwrap();
+        FrontierStorePort::record_acknowledged_frontier(
+            sqlite,
+            &group,
+            &yadorilink_replica_domain::ids::DeviceId(device_a.device_id.clone()),
+            &heads,
+        )
+        .unwrap();
+    }
 
-    // This test's own scope ends at durable DAG delivery -- the reconnect's
-    // post-negotiation frontier announce re-offering the pre-crash change,
-    // and device B admitting it (which requires the change's referenced
-    // `FileVersion` to have been received and stored too, not just the
-    // change envelope itself -- `admit_change` refuses to admit a change
-    // whose referenced version is missing and re-requests it instead, so
-    // reaching `dag_get_change` succeeding here is already strong evidence
-    // both crossed). Materializing that admitted change onto disk is the
-    // Convergence Engine's job (a `yadorilink-daemon`-level background
-    // process, not present in this `yadorilink-sync-core`-only
-    // integration test) -- verifying that end-to-end belongs in a daemon
-    // integration test that actually runs `DaemonState`'s real engine, not
-    // simulated here via a single manually-driven audit call (which can
-    // itself silently swallow an internal projection failure and still
-    // report success -- not a substitute for the real thing).
+    // Changes cross by reconciliation, not by the session pair above, so the
+    // restarted devices need their stacks back — which is exactly what a
+    // restarted daemon does. Built on the same `ReplicaCoordinator` and block
+    // store the crash left untouched, so what is being tested is that a
+    // locally authored and published Change survives its author's restart and
+    // is still servable afterwards.
+    let stack_b = stand_up_reconciliation(&device_a, &device_b).await;
+    stack_b
+        .sync_with(
+            &device_a.device_id,
+            &yadorilink_replica_domain::ids::FolderGroupId(GROUP.to_string()),
+        )
+        .await
+        .expect("the reconciliation must not error");
+
+    // This test's own scope ends at durable DAG delivery -- the
+    // reconnect's post-negotiation frontier announce re-offering the
+    // pre-crash change, and device B admitting it (which requires the
+    // change's referenced `FileVersion` to have been received and stored
+    // too, not just the change envelope itself -- `admit_change` refuses
+    // to admit a change whose referenced version is missing and
+    // re-requests it instead, so reaching `dag_get_change` succeeding here
+    // is already strong evidence both crossed).
     wait_until(
         || device_b.state.sqlite().dag_get_change(&committed_head).ok().flatten().is_some(),
         std::time::Duration::from_secs(10),
@@ -316,4 +290,83 @@ async fn local_change_committed_before_a_crash_is_reoffered_and_admitted_on_reco
         .unwrap()
         .expect("pre-crash local change must be re-delivered after reconnect");
     assert_eq!(received_change.compute_hash(), committed_head);
+}
+
+/// Stands both devices' reconciliation stacks back up after the simulated
+/// restart, and returns the receiving side's.
+///
+/// A `DaemonState` per device over the same `ReplicaCoordinator` and block
+/// store the crash left on disk — the daemon-level wrapper a restarted
+/// process would rebuild around exactly that surviving state. The netmap
+/// facts are set by hand here because there is no coordination plane in this
+/// test: each side pins the other's signing key, grants it the group, and is
+/// told where it lives.
+async fn stand_up_reconciliation(
+    author: &Device,
+    receiver: &Device,
+) -> Arc<yadorilink_daemon::sync_adapter::SyncStack> {
+    use yadorilink_daemon::daemon_state::DaemonState;
+
+    let daemon_for = |device: &Device| {
+        let state =
+            DaemonState::new(device.device_id.clone(), device.state.clone(), device.store.clone());
+        state.set_device_signing_key(device.signing_key.clone());
+        state.authority.install_test_group_policy_bootstrap(GROUP);
+        state
+    };
+    let daemon_a = daemon_for(author);
+    let daemon_b = daemon_for(receiver);
+
+    for (local, peer) in [(&daemon_a, receiver), (&daemon_b, author)] {
+        local.record_peer_signing_key(&peer.device_id, peer.signing_key.verifying_key().to_bytes());
+        local.set_peer_group_writer(&peer.device_id, GROUP, true);
+    }
+
+    let authenticator = pinned_authenticator(&[
+        (author.device_id.as_str(), &author.signing_key),
+        (receiver.device_id.as_str(), &receiver.signing_key),
+    ]);
+
+    let stack_a = Arc::new(
+        yadorilink_daemon::sync_adapter::SyncStack::spawn(
+            daemon_a.clone(),
+            authenticator.clone(),
+            yadorilink_daemon::sync_adapter::NetworkConfig::direct_only(),
+        )
+        .await
+        .expect("the author's stack starts"),
+    );
+    let stack_b = Arc::new(
+        yadorilink_daemon::sync_adapter::SyncStack::spawn(
+            daemon_b.clone(),
+            authenticator,
+            yadorilink_daemon::sync_adapter::NetworkConfig::direct_only(),
+        )
+        .await
+        .expect("the receiver's stack starts"),
+    );
+
+    // Into each other's substrate address directory, which is what
+    // reconciliation's dial consults. This fixture used to fill
+    // `record_peer_candidate_addresses` instead -- the LEGACY peer-session
+    // transport's list, which no longer reaches reconciliation at all: the
+    // two transports listen on different sockets under different ALPNs. The
+    // addresses were there (11 direct each, measured), simply filed where
+    // nothing asks, so the dial below had no addressing information for a
+    // peer running on this same host.
+    yadorilink_daemon::sync_adapter::SyncStack::teach_each_other_for_tests(&stack_a, &stack_b);
+
+    // Held for the rest of the test: dropping either would close its endpoint.
+    daemon_a.install_reconciliation_driver(
+        yadorilink_daemon::sync_adapter::ReconciliationDriver::start(daemon_a.clone(), stack_a),
+    );
+    daemon_b.install_reconciliation_driver(
+        yadorilink_daemon::sync_adapter::ReconciliationDriver::start(
+            daemon_b.clone(),
+            stack_b.clone(),
+        ),
+    );
+    std::mem::forget((daemon_a, daemon_b));
+
+    stack_b
 }

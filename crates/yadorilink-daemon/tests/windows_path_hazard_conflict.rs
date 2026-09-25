@@ -1,61 +1,45 @@
-//! Two-device races around Windows-specific path-naming hazards, run
-//! through the real full daemon stack — complementary to
-//! `yadorilink-sync-core/src/hazard.rs`'s pure unit tests (`RESERVED_
-//! BASENAMES`, `invalid_name_reason`, `NamePolicy`), which only prove the
-//! hazard-detection *logic* in isolation against a bare `SyncState` +
-//! tempdir, and to `yadorilink-sync-sqlite`'s own `dag_store::tests`
-//! (`admit_change_rejects_a_reserved_windows_device_name_path`/
-//! `emit_local_change_refuses_a_reserved_windows_device_name`/their
-//! trailing-dot/illegal-character siblings), which prove the DAG-admission
-//! rejection this file's scenarios 1-3 depend on returns the right `Result`
-//! directly, on both the receiving and local-authoring call sites, without
-//! any daemon/network machinery in the way. This file instead exercises
-//! what actually happens end-to-end when two real devices race to create a
-//! hazardous name over the real watcher/local-capture/peer-session/signing
-//! pipeline.
-//!
-//! **Current understanding, read directly out of the source (this
-//! corrects an earlier version of this file's header, which described the
-//! OPPOSITE of scenarios 1-3's actual mechanism — the two must not be
-//! left contradicting each other in one file):**
-//!
-//! - Scenarios 1-3 below (`concurrent_create_of_a_windows_reserved_
-//!   basename`, `concurrent_create_with_trailing_dot_or_space`,
-//!   `concurrent_create_with_illegal_windows_characters`) all trip
-//!   `yadorilink_root_authority::reserved_namespace::path_has_non_
-//!   portable_wire_component`, invoked via `yadorilink_sync_sqlite::
-//!   dag_store::serving_authorization_index::validate_no_reserved_paths`.
-//!   Per that function's own doc comment ("An independent review's
-//!   finding"), this check is **platform-independent** (never gated on
-//!   `cfg!(windows)`) and runs on **both** the receiving side
-//!   (`admit_change`) and the local-authoring side (`emit_local_change`
-//!   and its own callers). So a hazardous name is refused DAG admission
-//!   the moment each device tries to capture its OWN local write — before
-//!   there is ever a change to send to a peer, let alone materialize or
-//!   hold. Each device keeps only its own local content forever; neither
-//!   ever learns the other created the same (or a different) hazardous
-//!   name at all. This is a permanent, by-design refusal, not a timing
-//!   gap, and it applies identically on every platform — there is no
-//!   "Windows device" vs. "non-Windows device" distinction for this check
-//!   at all, unlike scenario 4 below.
-//! - `PeerSyncSession::hazard_reason_for` (host-gated on
-//!   `hazard::NamePolicy::local`, evaluated only inside `materialize`/
-//!   `hydrate_file` when a device is about to write a RECEIVED record to
-//!   disk) is a SEPARATE, materialize-time mechanism this file's scenarios
-//!   1-3 do NOT exercise at all: `validate_no_reserved_paths` rejects
-//!   these hazardous names at DAG admission, before any of them could ever
-//!   reach a receiving device's `materialize` call. Since both simulated
-//!   devices in this file share one OS process, there is also no way,
-//!   within one test run, to have one simulated device be "the Windows
-//!   one" for that host-gated mechanism regardless — `cfg!(windows)` would
-//!   branch per test-run, not per device.
-//! - Scenario 4 (`long_path_near_windows_max_path_length`) is a genuinely
-//!   different, unrelated code path: Windows' `MAX_PATH` is an OS/Win32-API
-//!   constraint with nothing to do with `hazard.rs`'s or `reserved_
-//!   namespace`'s logic. Both devices' creates ARE admitted and
-//!   materialized normally here (a real create/create conflict-copy
-//!   scenario, same shape as `collision_matrix.rs`'s scenario 1) — this
-//!   scenario's own doc comment covers its own ground truth separately.
+//! This file instead exercises what actually happens end-to-end when two
+//! real devices race to create a hazardous name over the real
+//! watcher/local-capture/peer-session/signing pipeline. **Current
+//! understanding, read directly out of the source (this corrects an
+//! earlier version of this file's header, which described the OPPOSITE of
+//! scenarios 1-3's actual mechanism — the two must not be left
+//! contradicting each other in one file):** - Scenarios 1-3 below
+//! (`concurrent_create_of_a_windows_reserved_ basename`,
+//! `concurrent_create_with_trailing_dot_or_space`,
+//! `concurrent_create_with_illegal_windows_characters`) all trip
+//! `yadorilink_root_authority::reserved_namespace::path_has_non_
+//! portable_wire_component`, invoked via `yadorilink_sync_sqlite::
+//! dag_store::serving_authorization_index::validate_no_reserved_paths`.
+//! Per that function's own doc comment, this check is **platform-independent** (never gated on
+//! `cfg!(windows)`) and runs on **both** the receiving side
+//! (`admit_change`) and the local-authoring side (`emit_local_change` and
+//! its own callers). So a hazardous name is refused DAG admission the
+//! moment each device tries to capture its OWN local write — before there
+//! is ever a change to send to a peer, let alone materialize or hold. Each
+//! device keeps only its own local content forever; neither ever learns
+//! the other created the same (or a different) hazardous name at all. This
+//! is a permanent, by-design refusal, not a timing gap, and it applies
+//! identically on every platform — there is no "Windows device" vs.
+//! "non-Windows device" distinction for this check at all, unlike scenario
+//! 4 below. - `PeerSyncSession::hazard_reason_for` (host-gated on
+//! `hazard::NamePolicy::local`, evaluated only inside `materialize`/
+//! `hydrate_file` when a device is about to write a RECEIVED record to
+//! disk) is a SEPARATE, materialize-time mechanism this file's scenarios
+//! 1-3 do NOT exercise at all: `validate_no_reserved_paths` rejects these
+//! hazardous names at DAG admission, before any of them could ever reach a
+//! receiving device's `materialize` call. Since both simulated devices in
+//! this file share one OS process, there is also no way, within one test
+//! run, to have one simulated device be "the Windows one" for that
+//! host-gated mechanism regardless — `cfg!(windows)` would branch per
+//! test-run, not per device. - Scenario 4
+//! (`long_path_near_windows_max_path_length`) is a genuinely different,
+//! unrelated code path: Windows' `MAX_PATH` is an OS/Win32-API constraint
+//! with nothing to do with `hazard.rs`'s or `reserved_ namespace`'s logic.
+//! Both devices' creates ARE admitted and materialized normally here (a
+//! real create/create conflict-copy scenario, same shape as
+//! `collision_matrix.rs`'s scenario 1) — this scenario's own doc comment
+//! covers its own ground truth separately.
 
 mod support;
 
@@ -67,7 +51,7 @@ use support::{
 };
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 
 // --- Shared two-device harness (duplicated from collision_matrix.rs, matching
 // this codebase's convention of self-contained daemon integration test
@@ -88,7 +72,7 @@ struct TestDevice {
 async fn setup_device(account: &TestAccount, name: &str) -> TestDevice {
     let device_id = support::register_device(account, name, [0u8; 32]).await;
     let store_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let (sync_state, index_dir) = open_file_backed_replica_coordinator();
     let sync_state = Arc::new(sync_state);
     let state = DaemonState::new(device_id.clone(), sync_state, store);
@@ -115,6 +99,21 @@ async fn start_watching(device: &TestDevice, group_id: &str) {
 }
 
 async fn two_synced_devices(test_name: &str) -> (TestDevice, TestDevice, String) {
+    // Installs a process-global subscriber whose filter comes from
+    // `RUST_LOG` -- this workspace enables tracing-subscriber's `env-filter`
+    // feature, so with `RUST_LOG` unset nothing below ERROR is emitted
+    // (measured: zero INFO/WARN/DEBUG lines). Not "inert": the subscriber is
+    // still installed, and whichever test in this binary calls `try_init`
+    // first wins for the whole process.
+    //
+    // Worth having because every
+    // scenario here asserts on what did NOT arrive, so a failure surfaces
+    // only as a 15s `wait_until` timeout with no indication of which stage
+    // dropped it. The daemon already logs the answer -- local capture warns
+    // with the exact path and refusal reason when a batched commit fails --
+    // but with no subscriber installed in this binary that line goes
+    // nowhere, turning a one-line diagnosis into a blind hunt.
+    let _ = tracing_subscriber::fmt::try_init();
     let coordination_addr = support::start_coordination_server().await;
     let account =
         support::register_and_login(&coordination_addr, &format!("{test_name}@example.com")).await;
@@ -251,8 +250,8 @@ fn host_supports_literal_filename(name: &str) -> bool {
 /// validate_no_reserved_paths`) flags any path whose basename is a Windows
 /// reserved device name (`is_windows_reserved_device_name` — `"CON"` among
 /// them, matched on the stem before the first `.`, so `"CON.txt"`
-/// qualifies), and — per `dag_store::emit_local_change`'s own doc comment
-/// on "An independent review's finding" — this check now runs on BOTH the
+/// qualifies), and — per `dag_store::emit_local_change`'s own doc
+/// comment — this check runs on BOTH the
 /// receiving side (`admit_change`) AND the local-authoring side
 /// (`emit_local_change`), on every platform, not gated on `cfg!(windows)`
 /// at all. So `CON.txt` is refused a DAG admission at the moment each
@@ -319,9 +318,8 @@ async fn concurrent_create_of_a_windows_reserved_basename() {
 
     // Not just "never appeared on the other device" (which the filesystem
     // assertions above already cover) -- directly confirm the hazardous
-    // path never entered either device's own local file index/DAG at all,
-    // the repository-level observation a reviewer's finding asked this
-    // file to add.
+    // path never entered either device's own local file index/DAG at all
+    // (the repository-level observation).
     assert!(
         !admitted_to_local_index(&device_a, &group_id, "CON.txt"),
         "CON.txt must never have been admitted to device-a's own local index/DAG"

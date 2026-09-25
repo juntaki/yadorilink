@@ -1,5 +1,5 @@
 use rusqlite::Connection;
-use yadorilink_replica_domain::change::{ChangeAuth, Op};
+use yadorilink_replica_domain::change::Op;
 use yadorilink_replica_domain::ids::{FolderGroupId, SyncPath};
 use yadorilink_replica_engine::compaction::Checkpoint;
 use yadorilink_sync_sqlite::dag_store::{
@@ -16,7 +16,7 @@ fn emitter() -> ChangeEmitter {
     ChangeEmitter::new("device-a", ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]))
 }
 
-/// RED: `commit_prune` deletes a pruned change's `change_parents` edges as
+/// Pins: `commit_prune` deletes a pruned change's `change_parents` edges as
 /// both child and parent -- a legitimate outcome of ordinary compaction, not
 /// corruption. A surviving child's own encoded `parents` field still lists
 /// the pruned hash (it is part of the immutable signed body), so the next
@@ -29,7 +29,6 @@ fn schema_init_survives_a_normal_compaction_prune() {
         &conn,
         "g",
         vec![Op::Delete { path: SyncPath("parent.bin".into()) }],
-        ChangeAuth::PLACEHOLDER,
         &emitter(),
     )
     .unwrap();
@@ -37,7 +36,6 @@ fn schema_init_survives_a_normal_compaction_prune() {
         &conn,
         "g",
         vec![Op::Delete { path: SyncPath("child.bin".into()) }],
-        ChangeAuth::PLACEHOLDER,
         &emitter(),
     )
     .unwrap();

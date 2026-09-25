@@ -1,18 +1,17 @@
-//! M5-A Pass 2: canonical 3-node topology -- N (Full Replica,
-//! relay-capable, "home NAS" role conceptually), M and W (On-Demand,
-//! "Mac"/"Windows" roles conceptually). Shared, reusable base for
-//! M5-A's automated acceptance passes (moved here from
-//! `tests/topology_n_m_w.rs` once a second test binary needed it too --
-//! integration test FILES are separate crates and cannot `use` each
-//! other directly, only shared `tests/support/` modules).
+//! Canonical 3-node topology -- N (Full Replica, "home NAS"
+//! role conceptually), M and W (On-Demand, "Mac"/"Windows" roles
+//! conceptually). Shared, reusable base for the multi-node acceptance
+//! scenarios (moved here from `tests/topology_n_m_w.rs` once a second test
+//! binary needed it too -- integration test FILES are separate crates
+//! and cannot `use` each other directly, only shared `tests/support/`
+//! modules).
 //!
 //! Real production code at every layer this exercises: real
 //! `DaemonState`, real `peer_orchestrator`-driven `PeerChannel`/
-//! QUIC-shaped sessions over loopback UDP (same pattern as
-//! `relay_chaos.rs`), real DAG mutation propagation via the real
-//! filesystem watcher (`std::fs::write` on a linked local folder, not a
-//! raw DB upsert -- `monkey_chaos.rs`'s established convention), real
-//! `MaterializationPolicy::OnDemand` storage mode
+//! QUIC-shaped sessions over loopback UDP, real DAG mutation propagation
+//! via the real filesystem watcher (`std::fs::write` on a linked local
+//! folder, not a raw DB upsert -- `monkey_chaos.rs`'s established
+//! convention), real `MaterializationPolicy::OnDemand` storage mode
 //! (`storage_mode_orchestration.rs`'s API), real custody-confirmation
 //! sweep (`DaemonState::refresh_custody_confirmation`, the same method
 //! `DurabilityConfirmationJob` calls periodically in production), real
@@ -20,11 +19,15 @@
 //!
 //! **Not** OS-native (CfAPI/File Provider) acceptance -- this proves the
 //! application/daemon/transport/storage integration above the
-//! platform-native boundary, not Explorer/Finder lifecycle behavior. See
-//! `dst_three_device_mesh_chaos.rs` for the equivalent deterministic-
-//! simulation (madsim, simulated network) coverage this complements, and
-//! `relay_chaos.rs`/`relay_session_e2e.rs` for the real-transport relay
-//! coverage this reuses the relay-anchor role from.
+//! platform-native boundary, not Explorer/Finder lifecycle behavior.
+//!
+//! The peer-device relay mechanism this file's topology helpers once also
+//! covered (a relay-anchor role, forced-relay routing, `RelayGrant`
+//! wiring) was physically removed together with the rest of that
+//! mechanism: the Iroh relay
+//! carries the reconciliation/block/service substrate directly now, with
+//! no per-peer relay session for a topology helper to force or wire a
+//! grant source for.
 //!
 //! `#![allow(dead_code)]`: every integration test FILE under `tests/` is
 //! its own separate compilation unit that includes the whole `support`
@@ -38,18 +41,15 @@
 #![allow(dead_code)]
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::fake_coordination::FakeCoordination;
 use super::{register_with_fake, wait_until_with_context};
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::peer_orchestrator;
-use yadorilink_daemon::peer_registry::PeerReachability;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-use yadorilink_daemon::route::RouteKind;
-use yadorilink_local_storage::FsBlockStore;
-use yadorilink_peer_session::peer_session::PeerSyncSession;
+use yadorilink_local_storage::SegmentBlockStore;
 use yadorilink_replica_domain::session_state::MaterializationPolicy;
 
 /// One node in the canonical N/M/W topology. `root` is the linked local
@@ -89,11 +89,15 @@ pub struct TopologyNode {
     /// (wrong) new identity -- a test-harness gap, not a production one,
     /// confirmed by tracing `yadorilink_daemon::change_auth`'s own
     /// "signature does not verify against the claimed device key" error
-    /// during M5-A Pass 5 restart-convergence testing.
+    /// in restart-convergence scenarios.
     signing_key: ed25519_dalek::SigningKey,
 }
 
 pub fn new_node(device_id: &str) -> TopologyNode {
+    // Every node this fixture builds is one a daemon will start a
+    // reconciliation stack for, so the process must already be off public
+    // relay infrastructure by the time the first one exists.
+    super::ensure_no_public_relays();
     // Suffixed with a per-process-unique counter: `ensure_isolated_config_
     // dir` gives each TEST BINARY (process) its own isolated pin-file
     // directory, but a test binary with more than one `#[tokio::test]`
@@ -119,7 +123,7 @@ pub fn new_node(device_id: &str) -> TopologyNode {
     let store_dir = tempfile::tempdir().unwrap();
     let db_dir = tempfile::tempdir().unwrap();
     let db_path = db_dir.path().join("index.db");
-    let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let sync_state = Arc::new(ReplicaCoordinator::open(&db_path).unwrap());
     let state = DaemonState::new(device_id.to_string(), sync_state, store);
     let signing_key = yadorilink_transport::DeviceSigningKeyPair::generate().signing;
@@ -155,9 +159,23 @@ pub fn new_node(device_id: &str) -> TopologyNode {
 /// itself is the real production restart entry point (it reads
 /// persisted latches/policy straight from the reopened
 /// `ReplicaCoordinator`).
+/// Close a node's substrate endpoint, the way a process exiting would.
+///
+/// MUST be awaited BEFORE the node's orchestrator runtime is shut down: the
+/// endpoint's own tasks run on that runtime, so once it is gone nothing is
+/// left to send the close and the socket is simply abandoned -- still bound,
+/// nothing polling it. That is strictly weaker than production, where the
+/// kernel closes the socket when the process exits, and it leaves every peer
+/// holding a connection to an address that has silently stopped answering.
+pub async fn shutdown_substrate(node: &TopologyNode) {
+    if let Some(driver) = node.state.reconciliation_driver() {
+        driver.stack().shutdown().await;
+    }
+}
+
 pub async fn restart_node(node: TopologyNode) -> TopologyNode {
     LinkRuntimeController::new(node.state.clone()).stop(&node.root.path().to_string_lossy()).await;
-    let store = Arc::new(FsBlockStore::new(node.store_dir.path()).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(node.store_dir.path()).unwrap());
     // Bounded retry: the OLD generation's SQLite connection pool can still
     // be mid-close (a genuine, if narrow, race between `stop()` above
     // returning and its underlying `r2d2` pool actually releasing its file
@@ -280,8 +298,7 @@ pub fn link_on_demand(node: &TopologyNode, group_id: &str) {
 ///
 /// `peer_orchestrator::run` itself spawns one DETACHED (bare
 /// `tokio::spawn`, no `JoinHandle` retained anywhere) per-peer
-/// reconnect-supervisor task per peer (`spawn_peer_session` and its
-/// madsim sibling) -- by design, matching production's own assumption
+/// reconnect-supervisor task per peer (`spawn_peer_session`) -- by design, matching production's own assumption
 /// that these only ever stop via the whole PROCESS exiting, never a
 /// supervising caller cancelling just this daemon's orchestrator layer
 /// in isolation. Aborting only the top-level `run()` task (this
@@ -293,9 +310,7 @@ pub fn link_on_demand(node: &TopologyNode, group_id: &str) {
 /// node's per-peer supervisors (and everything they hold: `Arc<DaemonState>`
 /// clones, the old `ReplicaCoordinator`/SQLite connection, old
 /// `PeerChannel`/`PeerSyncSession` objects) running concurrently with the
-/// "restarted" node's fresh ones -- confirmed as a real finding in an
-/// M5-A Pass 5 Codex review of the restart-recovery fix this topology
-/// exists to test.
+/// "restarted" node's fresh ones.
 ///
 /// A dedicated child runtime is the fix: every `tokio::spawn` call made
 /// by code POLLED on that runtime (including `run()`'s own internal
@@ -308,6 +323,87 @@ pub fn link_on_demand(node: &TopologyNode, group_id: &str) {
 /// pure test-harness technique, not a new production shutdown API (which
 /// `peer_orchestrator` genuinely has none of today -- adding one is real,
 /// separate scope beyond this restart-recovery fix).
+/// Teaches every node where the others' reconciliation substrates answer.
+///
+/// This stands in for a hop these fixtures do not run, and the reason is
+/// entirely on the test side -- production carries substrate addresses over
+/// the coordination plane end to end. It breaks here twice:
+///
+/// 1. Nothing reports. `AddressDirectory::publish` reaches
+///    `PeerConnectivityState::publish_substrate_endpoint`, which only writes the
+///    `local_substrate_reachability` watch channel. Its one consumer is
+///    `peer_connectivity_runtime::report_own_address`, spawned only by the
+///    real `app.rs` startup. `spawn_orchestrator`
+///    below mirrors `peer_orchestrator::run` and nothing else, so the watch
+///    write has no reader and no endpoint report is ever POSTed.
+/// 2. Nothing fans out. `FakeCoordination` stores a substrate report it does
+///    receive, but its netmap frame carries `endpoints` only -- no
+///    `substrateReachability` key. The daemon's own netmap decoder defaults
+///    that field to `None`, so `project_substrate_reachability` takes its
+///    compatibility branch and records relay URLs alone, leaving direct
+///    addresses empty. No relay runs in these fixtures, so nothing dialable
+///    results.
+///
+/// Teaching the fake to fan substrate reachability out -- the production
+/// route, `endpoint report -> plane state -> netmap -> peer projection ->
+/// address directory` -- would retire this helper fixture by fixture. That is
+/// deliberately separate work: it changes fixture semantics for every
+/// integration binary at once, so it belongs behind an opt-in capability
+/// rather than mixed into a fix.
+///
+/// The address cannot simply ride `peer.endpoints`: that list is the legacy
+/// peer-session transport's dial targets, the two transports listen on
+/// different sockets with different ALPNs, and a dial landing on the wrong one
+/// is refused for an unknown ALPN rather than retried.
+///
+/// Re-run after a restart: the substrate rebinds, so every address previously
+/// known for it is stale from that moment. iroh republishes on its own, which
+/// is why the daemon side needs no equivalent call.
+pub async fn advertise_substrate_endpoints(nodes: &[&TopologyNode]) {
+    // Shares `support`'s barrier rather than keeping a second copy. The copy
+    // that used to live here had the same startup race: it waited for the
+    // SOURCE to be serving but skipped any target that was not yet,
+    // permanently dropping that direction.
+    super::advertise_substrate_over(&TopologySubstrateDevices(nodes)).await;
+    // ...and keep it current afterwards. A node's address is not final when
+    // it first serves, and a restarted node's changes again shortly after
+    // this barrier runs -- see `super::keep_substrate_advertised`.
+    let states: Vec<&Arc<DaemonState>> = nodes.iter().map(|node| &node.state).collect();
+    super::keep_substrate_advertised(&states);
+}
+
+/// Topology nodes as advertisement participants, naming the device in the
+/// timeout assertion the way this module's own copy used to.
+struct TopologySubstrateDevices<'a>(&'a [&'a TopologyNode]);
+
+impl super::SubstrateDevices for TopologySubstrateDevices<'_> {
+    fn device_count(&self) -> usize {
+        self.0.len()
+    }
+
+    fn serving_address(&self, index: usize) -> Option<super::SubstrateAddress> {
+        let driver = self.0[index].state.reconciliation_driver()?;
+        let address = driver.stack().local_address();
+        let direct: Vec<std::net::SocketAddr> = address.direct_addrs().copied().collect();
+        let relays: Vec<String> = address.relay_urls().map(ToString::to_string).collect();
+        (!direct.is_empty() || !relays.is_empty()).then_some((address.peer(), direct, relays))
+    }
+
+    fn record(&self, target: usize, (peer, direct, relays): &super::SubstrateAddress) {
+        self.0[target]
+            .state
+            .reconciliation_driver()
+            .expect("every node was proven to be serving in the phase above")
+            .stack()
+            .address_directory()
+            .record(*peer, direct.clone(), relays.clone());
+    }
+
+    fn describe(&self, index: usize) -> String {
+        self.0[index].device_id.clone()
+    }
+}
+
 pub fn spawn_orchestrator(
     coordination_addr: String,
     node: &TopologyNode,
@@ -323,10 +419,13 @@ pub fn spawn_orchestrator(
     // `consume_send_authorization`, and the role-loss-compensation path).
     // A no-op if already set, matching `OnceLock::set`'s own semantics, so
     // this is safe for every other existing test that never reads it.
-    state.set_coordination_client_config(coordination_addr.clone(), "test".to_string());
+    state.set_coordination_client_config(
+        coordination_addr.clone(),
+        yadorilink_fapi_client::test_support::offline_auth(),
+    );
     let config = peer_orchestrator::OrchestratorConfig {
         coordination_addr,
-        access_token: "test".to_string(),
+        auth: yadorilink_fapi_client::test_support::offline_auth(),
         device_id,
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -342,164 +441,21 @@ pub fn spawn_orchestrator(
     runtime
 }
 
-/// A real handshake-complete, DAG-negotiated session exists between
-/// `state` and `peer_device_id` -- the same predicate `relay_chaos.rs`
-/// uses, kept identical rather than duplicated with drift.
+/// A session exists between `state` and `peer_device_id` -- the peer is
+/// authorized and reachable over the iroh substrate. Shared rather than
+/// duplicated per test file with drift risk.
 pub fn fully_connected(state: &Arc<DaemonState>, peer_device_id: &str) -> bool {
-    state.peers.session(peer_device_id).is_some_and(|s| s.peer_handshake_received())
-}
-
-/// `state`'s current route to `peer_device_id` is `Connected(Relay)`
-/// specifically -- not merely "not direct" (which would also match
-/// `Unreachable`/`Connecting`). Shared rather than duplicated per test
-/// file with drift risk (several already defined an identical local
-/// copy before this moved here).
-pub fn routed_via_relay(state: &Arc<DaemonState>, peer_device_id: &str) -> bool {
-    matches!(
-        state.peers.reachability(peer_device_id),
-        Some(PeerReachability::Connected(RouteKind::Relay))
-    )
-}
-
-/// Identity snapshot of a relay-routed M<->W relationship, taken via
-/// `snapshot_relay_recovery`. Deliberately NOT just "is the route
-/// `Relay`": `RouteKind::Relay` carries no generation identity, so a peer
-/// that is still churning through repeated reconnects (or one that never
-/// actually replaced a stale relay session) reads identically to a
-/// genuinely-recovered one from `reachability()` alone -- confirmed as a
-/// real gap in `relay_failure_during_hydration`'s original recovery wait,
-/// which used bare `routed_via_relay` and could observe "recovered" while
-/// W's session was still mid-churn through several generations.
-#[derive(Clone)]
-pub struct RelayRecoverySnapshot {
-    relay_session_id: Option<u64>,
-    m_session: Option<Arc<PeerSyncSession>>,
-    w_session: Option<Arc<PeerSyncSession>>,
-}
-
-impl RelayRecoverySnapshot {
-    fn describe(&self) -> String {
-        format!(
-            "relay_session_id={:?} m_session_identity={:?} w_session_identity={:?}",
-            self.relay_session_id,
-            self.m_session.as_ref().map(|s| Arc::as_ptr(s) as usize),
-            self.w_session.as_ref().map(|s| Arc::as_ptr(s) as usize),
-        )
-    }
-}
-
-fn same_session(a: &Option<Arc<PeerSyncSession>>, b: &Option<Arc<PeerSyncSession>>) -> bool {
-    match (a, b) {
-        (Some(x), Some(y)) => Arc::ptr_eq(x, y),
-        (None, None) => true,
-        (_, _) => false,
-    }
-}
-
-fn same_relay_recovery_snapshot(a: &RelayRecoverySnapshot, b: &RelayRecoverySnapshot) -> bool {
-    a.relay_session_id == b.relay_session_id
-        && same_session(&a.m_session, &b.m_session)
-        && same_session(&a.w_session, &b.w_session)
-}
-
-/// Captures the current relay session id (as seen by the relay anchor `n`)
-/// and both ends' `PeerSyncSession` identities for the M<->W relationship
-/// -- take one of these BEFORE revoking relay capability, so the recovery
-/// wait below has something genuinely "old" to compare newly-installed
-/// generations against.
-pub fn snapshot_relay_recovery(
-    n: &Arc<DaemonState>,
-    m: &Arc<DaemonState>,
-    w: &Arc<DaemonState>,
-    m_device_id: &str,
-    w_device_id: &str,
-) -> RelayRecoverySnapshot {
-    RelayRecoverySnapshot {
-        relay_session_id: n.relay_forwarder.any_active_session_id(),
-        m_session: m.peers.session(w_device_id),
-        w_session: w.peers.session(m_device_id),
-    }
-}
-
-/// Waits for the M<->W relay relationship to reach a NEW generation --
-/// distinct relay session id AND distinct `PeerSyncSession` identity on
-/// BOTH ends from `before` -- routed `Relay` in both directions, and then
-/// holds unchanged (same relay session id, same session identity on both
-/// ends) for a short stability window before returning. This is the
-/// generation-aware replacement for a bare `routed_via_relay` poll, which
-/// cannot tell "recovered" apart from "still mid-churn through repeated
-/// reconnects": `RouteKind::Relay` alone carries no generation identity,
-/// so a relationship rebuilding its Nth generation in a row looks
-/// identical, at every single poll, to one that settled on its first.
-///
-/// Panics with a full before/candidate diagnostic if no new, stable
-/// generation is observed within `timeout` -- callers should treat that
-/// failure as a signal to stop trusting this relationship's reachability
-/// at all and investigate the underlying reconnect behavior directly
-/// (e.g. per-generation termination reasons), not as something to retry
-/// past with a longer timeout.
-pub async fn wait_for_new_stable_relay_generation(
-    n: &Arc<DaemonState>,
-    m: &Arc<DaemonState>,
-    w: &Arc<DaemonState>,
-    m_device_id: &str,
-    w_device_id: &str,
-    before: &RelayRecoverySnapshot,
-    timeout: Duration,
-) -> RelayRecoverySnapshot {
-    const STABILITY_WINDOW: Duration = Duration::from_secs(2);
-    const POLL_INTERVAL: Duration = Duration::from_millis(200);
-    let deadline = Instant::now() + timeout;
-    let mut stable_since: Option<(Instant, RelayRecoverySnapshot)> = None;
-    loop {
-        let now = Instant::now();
-        let candidate = snapshot_relay_recovery(n, m, w, m_device_id, w_device_id);
-        let is_new_generation = candidate.relay_session_id.is_some()
-            && candidate.relay_session_id != before.relay_session_id
-            && candidate.m_session.is_some()
-            && !same_session(&candidate.m_session, &before.m_session)
-            && candidate.w_session.is_some()
-            && !same_session(&candidate.w_session, &before.w_session)
-            && routed_via_relay(m, w_device_id)
-            && routed_via_relay(w, m_device_id);
-
-        if is_new_generation {
-            stable_since = match stable_since {
-                Some((since, snapshot)) if same_relay_recovery_snapshot(&snapshot, &candidate) => {
-                    if now.duration_since(since) >= STABILITY_WINDOW {
-                        return candidate;
-                    }
-                    Some((since, snapshot))
-                }
-                _ => Some((now, candidate.clone())),
-            };
-        } else {
-            stable_since = None;
-        }
-
-        if now >= deadline {
-            panic!(
-                "relay M<->W relationship never reached a new, stable generation within \
-                 {timeout:?} (a bare routed_via_relay poll would likely have reported \
-                 'recovered' anyway -- this is a real generation-churn condition, not a test \
-                 oracle gap): before=[{}] last_candidate=[{}] currently_holding_a_candidate={}",
-                before.describe(),
-                candidate.describe(),
-                stable_since.is_some(),
-            );
-        }
-        tokio::time::sleep(POLL_INTERVAL).await;
-    }
+    state.peers.has_session(peer_device_id)
 }
 
 /// Retries `hydrate` a bounded number of times with a fixed backoff.
-/// `routed_via_relay`/`fully_connected` turning true is reachability, not
-/// a guarantee the underlying `PeerSyncSession` is ready to serve a
-/// `fetch_block` call on the very next poll -- a single immediate
-/// attempt right after a route/reconnect wait can still race that by a
-/// few hundred milliseconds. Panics (with the real error) once attempts
-/// are exhausted, since a hydrate that should eventually succeed and
-/// still doesn't is a genuine failure, not something to swallow.
+/// `fully_connected` turning true is reachability, not a guarantee the
+/// underlying `PeerSyncSession` is ready to serve a `fetch_block` call on
+/// the very next poll -- a single immediate attempt right after a route/
+/// reconnect wait can still race that by a few hundred milliseconds.
+/// Panics (with the real error) once attempts are exhausted, since a
+/// hydrate that should eventually succeed and still doesn't is a genuine
+/// failure, not something to swallow.
 pub async fn hydrate_with_retries(state: &Arc<DaemonState>, group_id: &str, path: &str) {
     let mut attempts = 0;
     loop {
@@ -515,95 +471,54 @@ pub async fn hydrate_with_retries(state: &Arc<DaemonState>, group_id: &str, path
     }
 }
 
-/// Issues signed `RelayGrant`s via `FakeCoordination::issue_relay_grant`,
-/// which itself requires `enable_signed_policy` to have been called (a
-/// grant is signed with the policy service key) -- moved here from being
-/// duplicated per relay-scenario test file with drift risk, matching
-/// `routed_via_relay`'s own reasoning.
-struct FakeGrantSource {
-    fake: FakeCoordination,
-    source_device_id: String,
-    ttl_seconds: i64,
-}
-
-impl yadorilink_daemon::relay_carrier::RelayGrantSource for FakeGrantSource {
-    fn request_relay_grant<'a>(
-        &'a self,
-        destination_device_id: &'a str,
-        _relay_device_id: &'a str,
-        _group_id: &'a str,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Option<yadorilink_daemon::relay_grant::RelayGrant>>
-                + Send
-                + 'a,
-        >,
-    > {
-        let grant = self.fake.issue_relay_grant(
-            &self.source_device_id,
-            destination_device_id,
-            self.ttl_seconds,
-        );
-        Box::pin(async move { grant })
-    }
-}
-
-/// The TTL every relay-scenario test other than R3's recovery test wants:
-/// long enough to cover an ordinary test's runtime, short enough that a
-/// dedicated expiry test (`relay_session_e2e.rs`'s own) can still exercise
-/// expiry within a reasonable wait.
-const DEFAULT_GRANT_TTL_SECONDS: i64 = 60;
-
-/// Wires `state` (identified as `device_id`) to request relay grants from
-/// `fake` -- required on both the relay requester AND the destination
-/// side of a relay session (`relay_session_e2e.rs`'s own convention),
-/// since either can be the one that needs to open the path. Callers must
-/// have already called `fake.enable_signed_policy()`.
-pub fn wire_relay_grant_source(fake: &FakeCoordination, state: &Arc<DaemonState>, device_id: &str) {
-    wire_relay_grant_source_with_ttl(fake, state, device_id, DEFAULT_GRANT_TTL_SECONDS);
-}
-
-/// Like [`wire_relay_grant_source`], with an explicit grant TTL instead of
-/// [`DEFAULT_GRANT_TTL_SECONDS`].
-///
-/// A scenario whose own runtime can approach or exceed the default 60s TTL
-/// for reasons unrelated to relay-session lifecycle -- e.g. R3's recovery
-/// test, which retries hydration for up to several tens of seconds --
-/// should call this with a longer TTL rather than share the default: a
-/// grant expiring mid-scenario forces a real relay-session teardown/
-/// reconnect that has nothing to do with whatever that scenario actually
-/// means to exercise, conflating "this test's own pacing is slow" with "a
-/// production reconnect-loop bug." Raising `DEFAULT_GRANT_TTL_SECONDS`
-/// itself instead would just as wrongly weaken every OTHER relay test's
-/// coverage of the ordinary 60s expiry path for no reason those tests need.
-pub fn wire_relay_grant_source_with_ttl(
-    fake: &FakeCoordination,
-    state: &Arc<DaemonState>,
-    device_id: &str,
-    ttl_seconds: i64,
-) {
-    state.set_relay_grant_source(Arc::new(FakeGrantSource {
-        fake: fake.clone(),
-        source_device_id: device_id.to_string(),
-        ttl_seconds,
-    }));
-}
-
-/// Stands up the canonical N(FullReplica,RelayCapable)/M(OnDemand)/
-/// W(OnDemand) topology sharing `group_id`, spawns real orchestrators
-/// for all three, and waits for full mesh connectivity (N<->M, N<->W,
-/// M<->W) before returning. N is registered as the group's full-replica
-/// writer with the coordination plane (`fake.set_full_replica`) and
-/// marked relay-capable on both sides (`set_local_relay_capable` +
-/// `fake.set_relay_capable`) so relay-fallback scenarios can use it as
-/// the anchor without extra per-test setup.
+/// Stands up the canonical N(FullReplica)/M(OnDemand)/W(OnDemand) topology
+/// sharing `group_id`, spawns real orchestrators for all three, and waits
+/// for full mesh connectivity (N<->M, N<->W, M<->W) before returning. N is
+/// registered as the group's full-replica writer with the coordination
+/// plane (`fake.set_full_replica`).
 pub async fn stand_up_canonical_topology(
     fake: &FakeCoordination,
     group_id: &str,
 ) -> (TopologyNode, TopologyNode, TopologyNode, TopologyHandles) {
+    stand_up_canonical_topology_with_m_http_coordination(fake, group_id, None).await
+}
+
+/// [`stand_up_canonical_topology`], but with **M only** pointed at
+/// `m_http_addr` for plain HTTP coordination instead of the netmap fake.
+///
+/// Two things force this shape, and both are easy to get wrong.
+///
+/// First, it has to happen before the orchestrators spawn.
+/// `DaemonState::coordination_client_config` is a `OnceLock` whose `set`
+/// return value is discarded, and [`spawn_orchestrator`] claims it — so a
+/// test that stands the topology up first and calls
+/// `set_coordination_client_config` afterwards is writing into an
+/// already-claimed lock and its call does nothing, silently. Measured
+/// directly: three sets to the fake's address succeeded, and every later set
+/// to a test's own address was discarded.
+///
+/// Second, it has to be M and not every node. Redirecting a node's
+/// coordination base URL takes `authorization-checkpoint` with it, and this
+/// fake serves that route *statefully* — same policy-log verifier the daemon
+/// runs, pinned policy epoch/seq/head, per-device issuance counter, signed
+/// with the fake's own policy-service key. A device that authors content
+/// needs it to work, so N keeps the fake; M, which only receives here, can
+/// be pointed elsewhere to have its own outbound calls scripted and counted.
+pub async fn stand_up_canonical_topology_with_m_http_coordination(
+    fake: &FakeCoordination,
+    group_id: &str,
+    m_http_addr: Option<&str>,
+) -> (TopologyNode, TopologyNode, TopologyNode, TopologyHandles) {
     let n = new_node("topology-n-nas");
     let m = new_node("topology-m-mac");
     let w = new_node("topology-w-windows");
+
+    if let Some(addr) = m_http_addr {
+        m.state.set_coordination_client_config(
+            addr.to_string(),
+            yadorilink_fapi_client::test_support::offline_auth(),
+        );
+    }
 
     for node in [&n, &m, &w] {
         register_with_fake(fake, &node.state, &node.device_id, &[group_id]).await;
@@ -613,13 +528,16 @@ pub async fn stand_up_canonical_topology(
     link_on_demand(&w, group_id);
 
     fake.set_full_replica(&n.device_id, group_id, true);
-    n.state.set_local_relay_capable(true);
-    fake.set_relay_capable(&n.device_id, true);
 
     let orchestrators: Vec<(String, tokio::runtime::Runtime)> = [&n, &m, &w]
         .map(|node| (node.device_id.clone(), spawn_orchestrator(fake.addr(), node)))
         .into_iter()
         .collect();
+
+    // Before the mesh wait: every node's reconciliation substrate has to be
+    // dialable, not just its peer-session transport. See
+    // `advertise_substrate_endpoints`.
+    advertise_substrate_endpoints(&[&n, &m, &w]).await;
 
     wait_until_with_context(
         || {
@@ -642,94 +560,10 @@ pub async fn stand_up_canonical_topology(
     (n, m, w, TopologyHandles { orchestrators })
 }
 
-/// R2b: N(OnDemand,RelayCapable)/M(FullReplica,author+source)/
-/// W(OnDemand,hydrate target), with M<->W forced through N's relay and
-/// N<->M / N<->W both direct.
-///
-/// Deliberately NOT `stand_up_canonical_topology` with the relay leg
-/// added on: that helper makes N the full replica, so N independently
-/// materializes anything M authors and directly serves it to W over
-/// their own live session -- a relay-revocation test using it was
-/// exercising N as a redundant direct content source, never the relay
-/// path it meant to test, because N already had every block W asked
-/// for. Making M (not N) the full replica, and N an OnDemand relay with
-/// no reason to hold M's blocks, is what makes W's hydrate genuinely
-/// depend on the relay leg: N can forward bytes, but has none of its
-/// own to serve directly.
-///
-/// M<->W direct is forced unavailable with `FakeCoordination::
-/// set_peer_view_endpoints` in BOTH directions, applied before either
-/// orchestrator spawns -- not by breaking an address after a direct
-/// connection already exists (`update_endpoint`'s own corrected doc
-/// comment explains why that would not tear down a live one anyway).
-/// N's own view of both is left untouched.
-pub async fn stand_up_relay_forced_topology(
-    fake: &FakeCoordination,
-    group_id: &str,
-) -> (TopologyNode, TopologyNode, TopologyNode, TopologyHandles) {
-    let n = new_node("topology-n-relay");
-    let m = new_node("topology-m-source");
-    let w = new_node("topology-w-target");
-
-    for node in [&n, &m, &w] {
-        register_with_fake(fake, &node.state, &node.device_id, &[group_id]).await;
-    }
-
-    // Before either orchestrator spawns: M and W must never see each
-    // other's real address at all, not have it withdrawn after a direct
-    // connection already formed.
-    fake.set_peer_view_endpoints(&m.device_id, &w.device_id, vec!["127.0.0.1:1".to_string()]);
-    fake.set_peer_view_endpoints(&w.device_id, &m.device_id, vec!["127.0.0.1:1".to_string()]);
-
-    link_on_demand(&n, group_id);
-    link_eager(&m, group_id);
-    link_on_demand(&w, group_id);
-
-    fake.set_full_replica(&m.device_id, group_id, true);
-    n.state.set_local_relay_capable(true);
-    fake.set_relay_capable(&n.device_id, true);
-
-    // A relay session needs a signed grant, and the requester/destination
-    // roles are symmetric at the wire level -- either side can be the one
-    // that ends up opening the path -- so both M and W get a grant source,
-    // matching `relay_session_e2e.rs`'s own established convention.
-    fake.enable_signed_policy();
-    wire_relay_grant_source(fake, &m.state, &m.device_id);
-    wire_relay_grant_source(fake, &w.state, &w.device_id);
-
-    let orchestrators: Vec<(String, tokio::runtime::Runtime)> = [&n, &m, &w]
-        .map(|node| (node.device_id.clone(), spawn_orchestrator(fake.addr(), node)))
-        .into_iter()
-        .collect();
-
-    wait_until_with_context(
-        || {
-            fully_connected(&n.state, &m.device_id)
-                && fully_connected(&n.state, &w.device_id)
-                && routed_via_relay(&m.state, &w.device_id)
-                && routed_via_relay(&w.state, &m.device_id)
-        },
-        Duration::from_secs(60),
-        || {
-            format!(
-                "relay-forced topology never settled: n<->m direct={} n<->w direct={} \
-                 m->w relay={:?} w->m relay={:?}",
-                fully_connected(&n.state, &m.device_id),
-                fully_connected(&n.state, &w.device_id),
-                m.state.peers.reachability(&w.device_id),
-                w.state.peers.reachability(&m.device_id),
-            )
-        },
-    )
-    .await;
-
-    (n, m, w, TopologyHandles { orchestrators })
-}
-
 /// Like [`stand_up_canonical_topology`], but M is ALSO a real, production
 /// full replica (`link_eager` plus the matching coordination-plane
 /// declaration -- the exact pairing N already gets there) instead of
-/// On-Demand: N(FullReplica)/M(FullReplica)/W(OnDemand). M5-A Pass 3's
+/// On-Demand: N(FullReplica)/M(FullReplica)/W(OnDemand). The
 /// "real `Protected`/`AvailableNow` through a confirmed remote holder"
 /// scenario needs a SECOND real full replica -- `classify()`'s `Protected`
 /// path deliberately requires an OTHER confirmed full-replica peer, never
@@ -755,14 +589,19 @@ pub async fn stand_up_topology_two_full_replicas_one_on_demand(
     link_on_demand(&w, group_id);
 
     fake.set_full_replica(&n.device_id, group_id, true);
-    n.state.set_local_relay_capable(true);
-    fake.set_relay_capable(&n.device_id, true);
     fake.set_full_replica(&m.device_id, group_id, true);
 
     let orchestrators: Vec<(String, tokio::runtime::Runtime)> = [&n, &m, &w]
         .map(|node| (node.device_id.clone(), spawn_orchestrator(fake.addr(), node)))
         .into_iter()
         .collect();
+
+    // Before the mesh wait: every node's reconciliation substrate has to be
+    // dialable, not just its peer-session transport. `fully_connected` below
+    // checks only the latter, so without this the mesh looks complete while
+    // the plane that carries DAG changes has no route at all. This helper
+    // was a near-copy of `stand_up_canonical_topology` that lost the line.
+    advertise_substrate_endpoints(&[&n, &m, &w]).await;
 
     wait_until_with_context(
         || {
@@ -819,8 +658,7 @@ impl TopologyHandles {
     /// one node." Panics if `device_id` has no registered runtime --
     /// silently doing nothing here would mask exactly the class of bug
     /// this whole struct exists to prevent (a caller that assumed a
-    /// node's old generation was torn down when it never was), per an
-    /// M5-A Pass 5 Codex review finding.
+    /// node's old generation was torn down when it never was).
     ///
     /// Unlike `shutdown`/`Drop` (which use `shutdown_background` -- see
     /// that function's own doc comment for why they must not block), this
@@ -828,8 +666,7 @@ impl TopologyHandles {
     /// (bounded, via `shutdown_timeout`) before returning: a restart
     /// scenario's very next step reopens the SAME on-disk block store and
     /// index DB the old generation's still-running `spawn_blocking` store/
-    /// compression work could still be touching (a real race a Codex
-    /// review round caught in an earlier version of this fix, where this
+    /// compression work could still be touching (a real race if this
     /// method used the same non-blocking `shutdown_background` the other
     /// two do). The wait itself runs inside `spawn_blocking` -- off this
     /// async task's own worker thread -- specifically so blocking here

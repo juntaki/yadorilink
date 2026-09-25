@@ -67,7 +67,7 @@ impl ReplicaRoleRepository for SyncStateReplicaRoleRepository {
             .recheck_digest_then_remove_link(group_id, local_path, expected_digest)
             .map_err(SyncError::from)?;
         if removed {
-            self.state.clear_custody_confirmation(group_id);
+            self.state.durability().clear_custody_confirmation(group_id);
         }
         Ok(removed)
     }
@@ -99,7 +99,7 @@ impl ReplicaRoleRepository for SyncStateReplicaRoleRepository {
             .remove_link(local_path)
             .map_err(SyncError::from)?;
         if let Some(group_id) = group_id {
-            self.state.clear_custody_confirmation(&group_id);
+            self.state.durability().clear_custody_confirmation(&group_id);
         }
         Ok(())
     }

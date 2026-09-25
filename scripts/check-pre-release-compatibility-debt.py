@@ -31,9 +31,9 @@ RESOLVED, and worth reading before touching the schema gate below.
     checks stop being redundant and must come back. That is what the entry
     below is watching for.
 
-RESOLVED, and worth reading before touching the peer_session_public.rs gate
-below.
-    `peer_session_public.rs` used to carry its own exact-generation preflight:
+RESOLVED, and worth reading before touching the ALPN gate below.
+    `peer_session_public.rs` (a facade since removed) used to carry its own
+    exact-generation preflight:
     a `PROTOCOL_VERSION` constant plus five capability bits, checked against
     the peer's first `ClusterConfig` frame after the QUIC/TLS handshake
     completed. `09477fcf` ("session: fetch and serve blocks on their own
@@ -43,7 +43,7 @@ below.
     two serve-budget bounds, not a generation).
 
     It is not a regression. `yadorilink-transport/src/quic_identity.rs`'s
-    `YADORILINK_P2P_ALPN` (`b"yadorilink-p2p/5"`) is set as the sole ALPN
+    `YADORILINK_P2P_ALPN` is set as the sole ALPN
     protocol on both the client and server QUIC/TLS configs, so a peer
     advertising a different generation's ALPN string is refused during the
     TLS handshake itself -- strictly before any application frame, including
@@ -85,6 +85,23 @@ FORBIDDEN = {
         "UnsupportedSchemaDowngradeError",
         "row.version >",
     ),
+    # The plane sends these on every netmap push, empty arrays included, so
+    # `#[serde(default)]` here would let a truncated or corrupted message
+    # apply as "nothing changed" instead of failing the push closed.
+    "crates/yadorilink-daemon/src/peer_orchestrator/ws_netmap.rs": (
+        '#[serde(default, rename = "groupPolicyLogs")]',
+        '#[serde(default, rename = "policyInvalidGroupIds")]',
+    ),
+    # Post-construction dependency setters, retired when the session's
+    # dependencies moved into `PeerSyncSessionDeps` -- see REQUIRED below.
+    "crates/yadorilink-peer-session/src/peer_session.rs": (
+        "pub fn set_block_serve_engine",
+        "pub fn set_headroom_override_bytes",
+        "pub fn set_headroom_enforced",
+        "pub fn set_maintenance_reconcile_interval",
+        "pub fn new_with_dependencies",
+        "pub fn new_with_forwarding",
+    ),
     # `version_vector.rs` itself was fully deleted (not just emptied) once the
     # authoring-identity migration to change-hash/DAG ancestry completed; see
     # the `RETIRED_FILES_MUST_NOT_EXIST` check below for its replacement.
@@ -103,6 +120,10 @@ FORBIDDEN = {
 RETIRED_FILES_MUST_NOT_EXIST = (
     "crates/yadorilink-sync-core",
     "crates/yadorilink-sync-core/src/version_vector.rs",
+    # The facade that wrapped `PeerSyncSession` and forwarded to it. Its
+    # dependency setters are what let a session be reconfigured after
+    # construction.
+    "crates/yadorilink-peer-session/src/peer_session_public.rs",
 )
 
 REQUIRED = {
@@ -110,17 +131,31 @@ REQUIRED = {
         "assertCurrentSchema",
         "row.version !== CURRENT_SCHEMA_VERSION",
     ),
-    "crates/yadorilink-peer-session/src/peer_session_public.rs": (
+    # A session's dependencies are fixed when it is constructed, not
+    # installed by setters afterwards. This used to be a runtime assertion
+    # ("dependencies are immutable after run() starts") in a facade over
+    # `PeerSyncSession`; the facade is gone and the property is structural
+    # now: one `PeerSyncSessionDeps`, taken by the one constructor. The
+    # setters it retired are pinned as FORBIDDEN in `peer_session.rs`.
+    "crates/yadorilink-peer-session/src/peer_session/deps.rs": (
         "pub struct PeerSyncSessionDeps",
-        "pub fn new_with_dependencies",
-        "dependencies are immutable after run() starts",
+    ),
+    "crates/yadorilink-peer-session/src/peer_session.rs": (
+        "pub fn over_substrate(",
+        "deps: PeerSyncSessionDeps,",
     ),
     # The exact-generation preflight that `peer_session_public.rs` used to
     # perform after the handshake now happens *during* it -- see the
     # `RESOLVED` note above. This is what actually delivers the property
     # today; watch it, not a post-handshake application check.
+    #
+    # The generation number in the marker below is expected to move: it is a
+    # single pinned literal precisely so that bumping the constant forces a
+    # deliberate edit here, rather than letting the ALPN quietly stop being
+    # generation-specific. Whoever bumps the constant updates this line in
+    # the same change.
     "crates/yadorilink-transport/src/quic_identity.rs": (
-        'pub const YADORILINK_P2P_ALPN: &[u8] = b"yadorilink-p2p/5";',
+        "pub const YADORILINK_P2P_ALPN: &[u8] = b\"yadorilink-p2p/",
         "crypto.alpn_protocols = vec![YADORILINK_P2P_ALPN.to_vec()];",
     ),
     "crates/yadorilink-replica-domain/src/file.rs": (
@@ -156,11 +191,81 @@ REQUIRED = {
     # module doc. Watch the mechanism that actually delivers it: both halves
     # of the exact match must stay, because dropping the `<` half alone would
     # silently readmit every database old enough to hold a retired payload.
+    # Both halves of the exact match must stay. The `!= 0` term is NOT the
+    # guarded property -- it is a wart: `user_version == 0` is also what a
+    # brand-new file reports, so this function cannot tell one from a
+    # database written before stamping existed. `check_replica_schema_
+    # generation` is what draws that line, and the replica index opens
+    # through it; watch that it keeps doing so.
     "crates/yadorilink-sqlite-runtime/src/schema.rs": (
         "if on_disk_version > SCHEMA_VERSION {",
         "if on_disk_version != 0 && on_disk_version < SCHEMA_VERSION {",
+        "pub fn check_replica_schema_generation",
+        "if tables > 0 {",
+    ),
+    "crates/yadorilink-daemon/src/replica_coordinator.rs": (
+        "check_replica_schema_generation(conn)?;",
+    ),
+    # Present AND without `default` -- see the FORBIDDEN entry above.
+    "crates/yadorilink-daemon/src/peer_orchestrator/ws_netmap.rs": (
+        '#[serde(rename = "groupPolicyLogs")]',
+        '#[serde(rename = "policyInvalidGroupIds")]',
     ),
 }
+
+
+# Identifiers a completed retirement removed from EVERY source file. Unlike
+# `FORBIDDEN`, these are not tied to one path: the point is that no file
+# reintroduces them, including one that does not exist yet.
+#
+# `wg_public_key` and its wire/config spellings named the WireGuard transport
+# key. A device has one key -- its Ed25519 signing key -- and the CLI used to
+# send that same key a second time under the retired name purely because the
+# coordination plane's column was `NOT NULL`.
+#
+# `relay_capable` was a per-device flag on a relay-selection path that no
+# longer exists; it survived as a column nothing read or wrote.
+FORBIDDEN_TREE_WIDE = (
+    "wg_public_key",
+    "wgPublicKey",
+    "wireguard_public_key",
+    "wireguardPublicKeyBase64",
+    "relay_capable",
+    "relayCapable",
+    "ChangeBatchFrame",
+    "ChangeRequestFrame",
+)
+
+TREE_WIDE_ROOTS = ("crates", "coordination-worker/src", "coordination-worker/test",
+                   "coordination-worker/migrations")
+TREE_WIDE_SUFFIXES = (".rs", ".ts", ".sql", ".proto")
+
+
+def check_forbidden_tree_wide() -> list[str]:
+    """Scan every source file for identifiers a retirement removed outright.
+
+    Skips `target/` and `node_modules/`, and this script itself -- which
+    necessarily contains every one of these strings.
+    """
+    failures: list[str] = []
+    for root in TREE_WIDE_ROOTS:
+        base = ROOT / root
+        if not base.exists():
+            continue
+        for path in base.rglob("*"):
+            if not path.is_file() or path.suffix not in TREE_WIDE_SUFFIXES:
+                continue
+            parts = path.parts
+            if "target" in parts or "node_modules" in parts:
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            for needle in FORBIDDEN_TREE_WIDE:
+                if needle in text:
+                    rel = path.relative_to(ROOT)
+                    failures.append(
+                        f"{rel}: retired identifier reintroduced: {needle!r}"
+                    )
+    return failures
 
 
 SNAPSHOT_DOMAIN_RE = re.compile(
@@ -250,9 +355,8 @@ def main() -> int:
     for relative_path, needles in FORBIDDEN.items():
         path = ROOT / relative_path
         if not path.exists():
-            # The coordination service is intentionally outside the OSS
-            # projection. Its copy of this same gate still validates these
-            # markers in the private source tree.
+            # The coordination service is not part of every checkout; its
+            # markers are validated only where its sources are present.
             if relative_path.startswith("coordination-worker/"):
                 continue
             failures.append(f"missing guarded file: {relative_path}")
@@ -277,6 +381,8 @@ def main() -> int:
                 failures.append(
                     f"{relative_path}: missing exact-generation marker: {needle!r}"
                 )
+
+    failures.extend(check_forbidden_tree_wide())
 
     for relative_path in RETIRED_FILES_MUST_NOT_EXIST:
         if (ROOT / relative_path).exists():

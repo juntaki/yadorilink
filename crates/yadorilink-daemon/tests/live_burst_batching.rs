@@ -16,7 +16,7 @@ use support::{real_entry_names, wait_until_with_context};
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 
 const BURST_FILE_COUNT: usize = 300;
 
@@ -34,8 +34,8 @@ const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(180);
 // value is in running it many times to build statistical confidence, not
 // once per push -- and its real-wall-clock convergence wait makes it
 // inherently sensitive to whatever else is contending for the runner's
-// CPU at that moment, which showed up repeatedly this session as
-// CI-runner-specific flakes unrelated to any actual regression. Run
+// CPU at that moment, so a shared CI runner produces failures unrelated
+// to any actual regression. Run
 // locally with `cargo test -- --ignored` or `scripts/heat-run.sh`.
 #[ignore = "load/performance smoke test -- run via scripts/heat-run.sh, not in CI"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -50,7 +50,7 @@ async fn live_burst_of_many_small_files_converges_via_debounced_batching() {
     support::grant_access(&account, &group_id, &device_b_id).await;
 
     let store_dir_a = tempfile::tempdir().unwrap();
-    let store_a = Arc::new(FsBlockStore::new(store_dir_a.path()).unwrap());
+    let store_a = Arc::new(SegmentBlockStore::new(store_dir_a.path()).unwrap());
     let sync_state_a = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
     let state_a = DaemonState::new(device_a_id.clone(), sync_state_a, store_a);
     // Give the device a change-signing key before its link watch starts, so
@@ -59,7 +59,7 @@ async fn live_burst_of_many_small_files_converges_via_debounced_batching() {
     let root_a = tempfile::tempdir().unwrap();
 
     let store_dir_b = tempfile::tempdir().unwrap();
-    let store_b = Arc::new(FsBlockStore::new(store_dir_b.path()).unwrap());
+    let store_b = Arc::new(SegmentBlockStore::new(store_dir_b.path()).unwrap());
     let sync_state_b = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
     let state_b = DaemonState::new(device_b_id.clone(), sync_state_b, store_b);
     support::ensure_device_signing_key(&state_b);

@@ -33,7 +33,11 @@
 //!
 //! Only compiled/run under `RUSTFLAGS="--cfg madsim"`.
 
-#![cfg(madsim)]
+// Retired. This scenario was written for a simulator this project no longer
+// builds against, and it names APIs that have since been removed. It is kept,
+// never compiled, as the specification its turmoil re-expression has to meet;
+// delete it in the change that lands that replacement.
+#![cfg(any())]
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -49,7 +53,7 @@ use yadorilink_filesystem_sync::debounce::DebounceConfig;
 use yadorilink_filesystem_sync::watcher::{
     FsChangeEvent, FsChangeKind, SimulatedFolderWatchSource,
 };
-use yadorilink_local_storage::{BlockStore, FsBlockStore};
+use yadorilink_local_storage::{BlockStore, SegmentBlockStore};
 
 // --------------------------------------------------------------------------
 // Crate-root support the reused `dst_support` modules resolve via `super`.
@@ -60,7 +64,7 @@ use yadorilink_local_storage::{BlockStore, FsBlockStore};
 // keys blocks by `content_hash(data)` and returns that hash from `put`. The
 // real daemon (`chunker::chunk_file_content_defined`) trusts that returned
 // hash verbatim (`hex::decode`s it into the block manifest) and the real
-// `FsBlockStore` addresses blocks by hex-encoded SHA-256. So for a torn write
+// `SegmentBlockStore` addresses blocks by hex-encoded SHA-256. So for a torn write
 // to be a *faithful* corruption of a real content-addressed block, this
 // `content_hash` MUST be the exact hash the real store uses. It is also still
 // internally consistent for the oracle's own whole-file comparisons.
@@ -101,9 +105,6 @@ pub mod case_ir {
 #[path = "dst_support/oracle.rs"]
 pub mod oracle;
 
-// The shared, reusable disk-fault decorator, included unchanged from
-// `yadorilink-sync-core`'s `dst_support` (its `super::content_hash` binds to
-// this crate root's SHA-256 `content_hash` above).
 #[path = "dst_support/fault_disk.rs"]
 pub mod fault_disk;
 
@@ -139,7 +140,7 @@ fn stamp_deterministic_mtime(path: &Path, nanos: i64) -> Result<(), String> {
 // TORN WRITES ARE OFF BY DEFAULT (opt in with `FAULT_TORN_EVERY=<n>`). The
 // shared `FaultingBlockStore` models a torn write as a *permanent* in-decorator
 // overlay: once a block is torn, every future `get` of that hash returns the
-// tear, and (unlike a real `FsBlockStore`) the wrapped store's own self-heal --
+// tear, and (unlike a real `SegmentBlockStore`) the wrapped store's own self-heal --
 // `get` deleting the mismatched on-disk file so a later `put` can re-materialize
 // it, see `fs_backend.rs::get` -- is bypassed because the overlay is consulted
 // before the inner store. So a torn write here is un-healable *by construction*,
@@ -210,13 +211,14 @@ async fn boot_daemon(
     let root =
         watch_root_dir.path().canonicalize().map_err(|e| format!("canonicalize root: {e}"))?;
 
-    // The fault-injection seam: wrap the real `FsBlockStore` in the shared
+    // The fault-injection seam: wrap the real `SegmentBlockStore` in the shared
     // `FaultingBlockStore` decorator and hand it to `run` via the
     // simulator-only override. Everything downstream (chunking, block serving,
     // reconstruction, the periodic repair sweep) then runs against a store
     // that injects ENOSPC/EIO/torn faults on its schedule.
     let fs_store = Arc::new(
-        FsBlockStore::new(block_store_dir.path()).map_err(|e| format!("fs block store: {e}"))?,
+        SegmentBlockStore::new(block_store_dir.path())
+            .map_err(|e| format!("fs block store: {e}"))?,
     );
     let faulting: Arc<dyn BlockStore + Send + Sync> =
         Arc::new(FaultingBlockStore::new(fs_store, plan.clone()));
@@ -896,29 +898,26 @@ fn multi_op_two_daemon_fault_sweep_in_sim() {
     let variations: u64 =
         std::env::var("DST_VARIATIONS").ok().and_then(|s| s.parse().ok()).unwrap_or(40);
 
-    // This guard enforces the *materialization-error-path* fix (the reason this
-    // test exists): a transient ENOSPC/EIO during materialization must never
-    // leave a fileless live index row (`StructuralIndexDiskMismatch`), a
-    // divergence (`Convergence`), a torn/short block served as valid content
-    // (non-scratch `Corruption`), or a leaked `.yadorilink-tmp` scratch file,
-    // and must never stall a primary-file write into a convergence timeout
-    // (`errored`). Those classes are what the fix (guarded reconstruct +
-    // placeholder demotion, resilient repair, temp cleanup) closes, so a
-    // regression re-opens one of them here.
-    //
-    // `NoLoss` is tracked but, by default, reported separately rather than
-    // failing the guard: the residual `NoLoss` seeds here are a *distinct,
-    // pre-existing* defect independent of the materialization fix -- a stacked
-    // same-path conflict (a second concurrent race on an already-conflicted
-    // path) whose losing write is dropped because the causality-blind
+    // This guard enforces the *materialization-error-path* fix (the reason
+    // this test exists): a transient ENOSPC/EIO during materialization
+    // must never leave a fileless live index row
+    // (`StructuralIndexDiskMismatch`), a divergence (`Convergence`), a
+    // torn/short block served as valid content (non-scratch `Corruption`),
+    // or a leaked `.yadorilink-tmp` scratch file, and must never stall a
+    // primary-file write into a convergence timeout (`errored`). Those
+    // classes are what the fix (guarded reconstruct + placeholder
+    // demotion, resilient repair, temp cleanup) closes, so a regression
+    // re-opens one of them here. `NoLoss` is tracked but, by default,
+    // reported separately rather than failing the guard: the residual
+    // `NoLoss` seeds here are a *distinct, pre-existing* defect
+    // independent of the materialization fix -- a stacked same-path
+    // conflict (a second concurrent race on an already-conflicted path)
+    // whose losing write is dropped because the causality-blind
     // conflict-copy dedup guard suppresses the losing record's propagation
-    // while a merged version vector routes the surviving copy down the silent
-    // "adopt/overwrite" path. It reproduces on the pre-existing
-    // `yadorilink-sync-core` `dst_two_device_chaos` sweep on this same base
-    // revision (independent of any change here) and its fix touches core
-    // conflict-resolution semantics, so it is tracked on its own. Set
-    // `STRICT_NOLOSS=1` to fold `NoLoss` into the failing set (use once that
-    // separate defect is fixed, to turn this into its regression guard too).
+    // while a merged version vector routes the surviving copy down the
+    // silent "adopt/overwrite" path. Set `STRICT_NOLOSS=1` to fold
+    // `NoLoss` into the failing set (use once that separate defect is
+    // fixed, to turn this into its regression guard too).
     let strict_noloss = std::env::var("STRICT_NOLOSS").is_ok();
 
     // Per-seed process isolation.

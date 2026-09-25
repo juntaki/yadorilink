@@ -12,7 +12,6 @@
 use std::sync::Arc;
 
 use crate::daemon_state::{run_blocking_sweep_offloaded, DaemonState};
-use crate::maintenance::MaintenanceTrigger;
 
 pub(crate) struct GcIdleJob {
     state: Arc<DaemonState>,
@@ -23,7 +22,7 @@ impl GcIdleJob {
         Self { state }
     }
 
-    pub(crate) async fn run_once(&self, _trigger: MaintenanceTrigger) {
+    pub(crate) async fn run_once(&self) {
         let state = &self.state;
         match crate::gc::maybe_run_idle_sweep(state, crate::gc::GC_IDLE_THRESHOLD).await {
             None => {}

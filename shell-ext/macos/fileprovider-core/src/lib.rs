@@ -102,20 +102,29 @@ pub extern "C" fn yadorilink_fp_list_on_demand_folders() -> *mut c_char {
 /// Lists every (non-deleted) file in the folder group rooted at
 /// `local_path`, as a JSON array of `{"relative_path", "size",
 /// "mtime_unix_nanos", "materialization_state"}` objects (used as the
-/// `NSFileProviderEnumerator` data source). Empty JSON array on a null
-/// path or any failure. Caller must free with `yadorilink_fp_free_string`.
+/// `NSFileProviderEnumerator` data source). Returns NULL, deliberately
+/// distinct from a valid `"[]"` (a confirmed empty folder), on a null path
+/// or when the listing could not be confirmed (daemon unreachable,
+/// timeout, `snapshot_available: false`, panic) — the caller MUST end the
+/// enumeration with an error on NULL, never report an empty folder. Caller
+/// must free a non-NULL result with `yadorilink_fp_free_string`.
 ///
 /// # Safety
 /// `local_path` must be a valid, null-terminated C string, or NULL.
 #[no_mangle]
 pub unsafe extern "C" fn yadorilink_fp_list_folder_files(local_path: *const c_char) -> *mut c_char {
     let Some(local_path) = path_from_c_str(local_path) else {
-        return CString::new("[]").unwrap().into_raw();
+        return std::ptr::null_mut();
     };
     let result = catch_unwind(|| ipc_client::list_folder_files(&local_path));
     match result {
-        Ok(entries) => to_c_json(&entries, "[]"),
-        Err(_) => CString::new("[]").unwrap().into_raw(),
+        // Not `to_c_json`: its `"[]"` fallback on an encode failure would
+        // itself be an authoritative empty listing.
+        Ok(Some(entries)) => serde_json::to_string(&entries)
+            .ok()
+            .and_then(|json| CString::new(json).ok())
+            .map_or(std::ptr::null_mut(), CString::into_raw),
+        Ok(None) | Err(_) => std::ptr::null_mut(),
     }
 }
 

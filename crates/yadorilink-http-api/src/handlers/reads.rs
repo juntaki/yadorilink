@@ -105,6 +105,8 @@ pub async fn conflicts(State(state): State<AppState>) -> Result<Json<Value>, Api
                 "path": f.path,
                 "size": f.size,
                 "mtime_unix_nanos": f.mtime_unix_nanos,
+                "kind": f.kind().as_str_name(),
+                "reason": f.reason().as_str_name(),
             })
         })
         .collect();
@@ -164,6 +166,7 @@ pub async fn versions(
                 "state": v.state,
                 "origin_device_id": v.origin_device_id,
                 "unix_mode": v.unix_mode,
+                "kind": v.kind().as_str_name(),
             })
         })
         .collect();

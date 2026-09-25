@@ -1,15 +1,10 @@
 //! `yadorilink update status|check|install|config` — mirrors
-//! `commands::limits`'s exact shape (a thin `control_client::send`
-//! wrapper per subcommand, printing the daemon's response).
+//! `commands::limits`'s exact shape (a thin wrapper per subcommand over
+//! `yadorilink_client_core::ops::updates`, printing the daemon's response).
 
-use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
-use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
-use yadorilink_ipc_proto::daemonctl::{
-    UpdateCheckRequest, UpdateConfigRequest, UpdateInstallRequest, UpdateStatusRequest,
-    UpdateStatusResponse,
-};
+use yadorilink_client_core::ops::updates;
+use yadorilink_ipc_proto::daemonctl::UpdateStatusResponse;
 
-use crate::control_client;
 use crate::error::CliError;
 
 /// Shared by `status`/`check` — both end up printing the exact same
@@ -62,20 +57,14 @@ fn print_status(status: &UpdateStatusResponse) {
 
 /// `yadorilink update status` (spec "Show update status").
 pub async fn status() -> Result<(), CliError> {
-    let resp = control_client::send(ReqPayload::UpdateStatus(UpdateStatusRequest {})).await?;
-    let Some(RespPayload::UpdateStatus(status)) = resp.payload else {
-        return Err(CliError::Other("unexpected daemon response".into()));
-    };
+    let status = updates::update_status().await?;
     print_status(&status);
     Ok(())
 }
 
 /// `yadorilink update check` (spec "Manual update check").
 pub async fn check() -> Result<(), CliError> {
-    let resp = control_client::send(ReqPayload::UpdateCheck(UpdateCheckRequest {})).await?;
-    let Some(RespPayload::UpdateCheck(check)) = resp.payload else {
-        return Err(CliError::Other("unexpected daemon response".into()));
-    };
+    let check = updates::check_for_updates().await?;
     let Some(status) = check.status else {
         return Err(CliError::Other("daemon returned no update status".into()));
     };
@@ -90,10 +79,7 @@ pub async fn check() -> Result<(), CliError> {
 
 /// `yadorilink update install` (spec "Manual install request").
 pub async fn install() -> Result<(), CliError> {
-    let resp = control_client::send(ReqPayload::UpdateInstall(UpdateInstallRequest {})).await?;
-    let Some(RespPayload::UpdateInstall(resp)) = resp.payload else {
-        return Err(CliError::Other("unexpected daemon response".into()));
-    };
+    let resp = updates::install_update().await?;
     match resp.outcome.as_str() {
         "installing" => println!("installing update..."),
         "deferred" => println!("update install deferred until the daemon reaches a safe point"),
@@ -121,14 +107,7 @@ pub async fn config(checks: Option<String>, install: Option<String>) -> Result<(
             )));
         }
     }
-    let resp = control_client::send(ReqPayload::UpdateConfig(UpdateConfigRequest {
-        automatic_checks_enabled,
-        automatic_install_mode: install,
-    }))
-    .await?;
-    let Some(RespPayload::UpdateConfig(config)) = resp.payload else {
-        return Err(CliError::Other("unexpected daemon response".into()));
-    };
+    let config = updates::set_update_config(automatic_checks_enabled, install).await?;
     println!(
         "automatic checks: {}  automatic install: {}",
         if config.automatic_checks_enabled { "on" } else { "off" },

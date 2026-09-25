@@ -1,12 +1,18 @@
 use std::sync::Arc;
 
-use yadorilink_replica_domain::session_state::MaterializationPolicy;
+use yadorilink_replica_domain::session_state::{MaterializationPolicy, RoleLossOperationState};
 
 use super::model::{HandoffCommitResult, RoleLossCommitOutcome};
 use super::ports::{
     HandoffReadinessPort, LinkRuntimePort, PlaceholderPipelineCapabilityPort,
     ReplicaRoleRepository, RoleLossCoordination, RoleLossJournal,
 };
+
+/// Past this many compensation attempts for the same role-loss operation,
+/// a failed attempt is logged at `error` instead of `warn` -- a visibility
+/// aid only. The row itself is never abandoned or deleted regardless of how
+/// many attempts it has accrued.
+const ROLE_LOSS_COMPENSATION_ESCALATION_ATTEMPTS: i64 = 5;
 
 pub(crate) fn demotion_handoff_lease_failure_message() -> String {
     "refusing to drop full-replica status: confirmed a ready replica but could not obtain the \
@@ -187,13 +193,11 @@ impl ReplicaRoleService {
     /// direction. A DEMOTION with no config falls through to a local-only flip
     /// (it can only get there when there was no confirming peer to name, i.e. a
     /// plane-disconnected daemon, which the readiness gate above already handles
-    /// fail-closed for a real full replica). A PROMOTION in production instead
-    /// FAILS CLOSED: it has no peer gate, so a silently-skipped Worker write
-    /// would leave the plane on-demand while local goes eager, and -- because a
-    /// re-run no-ops once local already matches the target -- that split would
-    /// not self-heal. Under the deterministic simulator, where config is always
-    /// absent by design, a promotion still proceeds local-only, just like a
-    /// madsim demotion.
+    /// fail-closed for a real full replica). A PROMOTION instead FAILS CLOSED:
+    /// it has no peer gate, so a silently-skipped Worker write would leave the
+    /// plane on-demand while local goes eager, and -- because a re-run no-ops
+    /// once local already matches the target -- that split would not
+    /// self-heal.
     ///
     /// The readiness confirmation above is itself a network round trip, so
     /// there is a real window between it returning and the local policy flip
@@ -211,6 +215,17 @@ impl ReplicaRoleService {
     /// specific version's blocks stays separately gated, per file, by the
     /// on-demand eviction custody check, which is the real backstop against
     /// dropping the last copy of a version.
+    #[allow(
+        clippy::too_many_lines,
+        clippy::excessive_nesting,
+        reason = "one demotion fix-saga: readiness gate, mandatory peer lease, durable role-loss \
+                  journal open, coordination-worker commit, and the digest-recheck local policy \
+                  flip must stay in a single function because every early return is a compensation \
+                  decision that depends on how far the saga got (role_loss_operation_id / \
+                  lease_acquisition_failed); the nesting is the RoleLossCommitOutcome match inside \
+                  the lease-acquired arm, and splitting it would move the commit and its rollback \
+                  into different scopes"
+    )]
     pub(crate) async fn set_storage_mode(
         &self,
         group_id: &str,
@@ -227,15 +242,20 @@ impl ReplicaRoleService {
             );
         }
         if on_demand && self.readiness.is_local_full_replica(group_id) {
-            let Some((digest_at_check, ready_peer_device_id)) =
-                self.readiness.full_replica_handoff_ready_digest_and_peer(group_id).await
-            else {
+            let Some(proof) = self.readiness.full_replica_handoff_proof(group_id).await else {
+                // Deliberately no consultation of cached background custody
+                // evidence on this path, now or ever: this is the moment
+                // this device gives up its own durable copy, and the only
+                // admissible answer is one taken just now against a peer
+                // that read every block back.
                 return Err(
                     "refusing to drop full-replica status: no other full replica is confirmed to \
                  hold every file in this group yet"
                         .to_string(),
                 );
             };
+            let digest_at_check = proof.root_digest();
+            let ready_peer_device_id = proof.into_peer_device_id();
             // Same role-loss shape as `ensure_unlink_keeps_a_full_replica`'s
             // unlink path (this device giving up its own eager status) --
             // reuse its exact wiring: a real confirmed peer means a
@@ -334,8 +354,9 @@ impl ReplicaRoleService {
                                                 "handoff role-loss commit outcome is ambiguous; retaining the \
                                                  Prepared journal and compensating Worker state back to eager"
                                             );
-                                            if let Err(compensation_error) =
-                                                self.role_loss.compensate(&operation_id).await
+                                            if let Err(compensation_error) = self
+                                                .compensate_role_loss_operation(&operation_id)
+                                                .await
                                             {
                                                 tracing::error!(
                                                     error = %compensation_error,
@@ -385,11 +406,7 @@ impl ReplicaRoleService {
                 // obtain or commit one. Fail closed rather than relinquish the
                 // role lease-less: the mandatory-lease guarantee is encoded here,
                 // not left resting on the (implicit, unencoded) assumption that a
-                // confirmed peer cannot exist without config. Under the
-                // deterministic simulator config is always absent by design and
-                // there is no real coordination plane, so a demotion there keeps
-                // its pre-existing local-only fallthrough (see the `_` arm).
-                #[cfg(not(madsim))]
+                // confirmed peer cannot exist without config.
                 (Some(target_device_id), false) => {
                     lease_acquisition_failed = true;
                     tracing::warn!(
@@ -401,8 +418,7 @@ impl ReplicaRoleService {
                     Err(())
                 }
                 // Empty root set (vacuously ready -- no confirmed peer to name, no
-                // lease required), and, under the simulator, the (Some, false) case
-                // above (which is not compiled there) as its local-only path.
+                // lease required).
                 _ => Ok(None),
             };
             let Ok(handoff_result) = coordination_result else {
@@ -458,7 +474,7 @@ impl ReplicaRoleService {
                  set-storage-mode to re-confirm"
                 ));
             };
-            return Err(match self.role_loss.compensate(&operation_id).await {
+            return Err(match self.compensate_role_loss_operation(&operation_id).await {
                 Ok(()) => format!(
                 "demotion was committed on the coordination plane but the matching local change \
                  failed ({local_failure_reason}); the operation was SAFELY ROLLED BACK -- this \
@@ -489,11 +505,10 @@ impl ReplicaRoleService {
         // config is recorded, a promotion would flip local policy to eager while
         // the coordination plane stays on-demand -- and it would NOT self-heal,
         // since re-running the command sees the local mode already at the target
-        // and no-ops. Fail closed instead: in production a missing config means
+        // and no-ops. Fail closed instead: a missing config means
         // the daemon is not connected to the coordination plane (started before
         // login, or a token was lost and it was not restarted), so refuse rather
         // than diverge. The local flip below is never reached in that case.
-        #[cfg(not(madsim))]
         if !on_demand {
             if !self.coordination.is_configured() {
                 return Err(
@@ -504,11 +519,6 @@ impl ReplicaRoleService {
             };
             self.coordination.set_storage_mode(group_id, &self.device_id, "eager").await?;
         }
-        // Under the deterministic simulator no coordination-plane config is
-        // ever recorded, so config is ALWAYS absent by design and there is no
-        // real coordination plane to write to -- a promotion proceeds
-        // local-only here, exactly as a madsim demotion's local-only
-        // fallthrough above does.
         let policy =
             if on_demand { MaterializationPolicy::OnDemand } else { MaterializationPolicy::Eager };
         self.repository
@@ -556,6 +566,17 @@ impl ReplicaRoleService {
     /// Returns which removal step the caller still owes: the eager ready path
     /// removes the link atomically here (`AlreadyRemoved`); every other path
     /// leaves the plain removal to the caller (`RemoveNormally`).
+    #[allow(
+        clippy::too_many_lines,
+        clippy::excessive_nesting,
+        reason = "the unlink side of the same demotion fix-saga as `set_storage_mode`: the \
+                  policy/force pre-checks, the mandatory lease, the journal row, the \
+                  coordination-plane role-loss commit and the atomic digest-recheck link removal \
+                  share the saga state that decides between refusing, compensating, and settling; \
+                  the depth comes from the per-outcome RoleLossCommitOutcome arms nested in the \
+                  lease-acquired branch, and keeping them here holds the commit next to its \
+                  compensation"
+    )]
     pub(crate) async fn ensure_unlink_keeps_a_full_replica(
         &self,
         local_path: &str,
@@ -580,9 +601,9 @@ impl ReplicaRoleService {
         // device id); the atomic method below re-enumerates and removes the
         // link in one transaction only if that digest still holds.
         let mut lease_acquisition_failed = false;
-        if let Some((digest_at_check, ready_peer_device_id)) =
-            self.readiness.full_replica_handoff_ready_digest_and_peer(&link.group_id).await
-        {
+        if let Some(proof) = self.readiness.full_replica_handoff_proof(&link.group_id).await {
+            let digest_at_check = proof.root_digest();
+            let ready_peer_device_id = proof.into_peer_device_id();
             // This device giving up its own eager status is exactly the
             // role-loss shape coordination-worker's handoff-commit endpoint
             // guards: confirm the named target is currently Active+eager and
@@ -724,8 +745,9 @@ impl ReplicaRoleService {
                                                 "unlink role-loss commit outcome is ambiguous; retaining the \
                                                  Prepared journal and compensating Worker state back to eager"
                                             );
-                                            if let Err(compensation_error) =
-                                                self.role_loss.compensate(&operation_id).await
+                                            if let Err(compensation_error) = self
+                                                .compensate_role_loss_operation(&operation_id)
+                                                .await
                                             {
                                                 tracing::error!(
                                                     error = %compensation_error,
@@ -765,11 +787,7 @@ impl ReplicaRoleService {
                 // non-forced unlink is refused, and the mandatory-lease
                 // guarantee is encoded rather than resting on the
                 // implicit assumption that a confirmed peer cannot exist
-                // without config. Under the deterministic simulator
-                // config is always absent by design, so this case is not
-                // compiled there and the `_` arm's pre-existing
-                // local-only fallthrough stands.
-                #[cfg(not(madsim))]
+                // without config.
                 (Some(target_device_id), false) => {
                     lease_acquisition_failed = true;
                     tracing::warn!(
@@ -782,9 +800,7 @@ impl ReplicaRoleService {
                     Err(())
                 }
                 // Empty root set (vacuously ready -- no confirmed peer to
-                // name, no lease required), and, under the simulator,
-                // the (Some, false) case above (not compiled there) as
-                // its local-only path.
+                // name, no lease required).
                 _ => Ok(None),
             };
             if let Ok(handoff_result) = coordination_result {
@@ -824,7 +840,7 @@ impl ReplicaRoleService {
                             Err(e) => e.to_string(),
                             Ok(true) => unreachable!("Ok(true) handled by the arm above"),
                         };
-                        return Err(match self.role_loss.compensate(&operation_id).await {
+                        return Err(match self.compensate_role_loss_operation(&operation_id).await {
                             Ok(()) => format!(
                                 "unlink was committed on the coordination plane but the matching \
                                  local removal failed ({local_failure_reason}); the operation was \
@@ -885,6 +901,14 @@ impl ReplicaRoleService {
     /// legacy duplicate-root recovery restart of a surviving link -- the
     /// exact sequence `control_socket`'s `Unlink` handler used to run
     /// inline.
+    #[allow(
+        clippy::excessive_nesting,
+        reason = "the nesting is the ordered crash-safety sequence for duplicate-root recovery: \
+                  the survivor's watch may only be restarted after the removal actually \
+                  succeeded and only when exactly one survivor remains, so the guards must stay \
+                  nested inside the successful-removal branch rather than become independent \
+                  early returns"
+    )]
     pub(crate) async fn unlink(
         &self,
         local_path: &str,
@@ -935,590 +959,183 @@ impl ReplicaRoleService {
             Err(e) => Err(e),
         }
     }
+
+    /// Compensates a role-loss operation whose coordination-worker commit
+    /// succeeded (or may have succeeded) but whose matching local change
+    /// never completed: a digest mismatch or storage error in the local
+    /// recheck-then-commit, or a crash before that local step ran. The SAFE
+    /// recovery direction is to REVERT the Worker back to `eager` for the
+    /// source device, not to force-complete the local demotion: the handoff
+    /// target's lease/pin may have lapsed by the time this runs, so
+    /// completing the demotion could release the only durable copy of the
+    /// group's data. The Worker-side effect of every role-loss commit this
+    /// journal wraps (demote and unlink alike) is a `storage_mode`
+    /// narrowing, so reverting it is exactly one idempotent call.
+    ///
+    /// On success, advances the row to `Completed` and deletes it. On
+    /// failure (coordination plane unconfigured, unreachable or refusing),
+    /// leaves the row at `Compensating`, bumps its attempt counter
+    /// (escalating the log level past
+    /// `ROLE_LOSS_COMPENSATION_ESCALATION_ATTEMPTS`) and returns `Err`. The
+    /// row is NEVER deleted on a failed attempt -- [`Self::reconcile_role_loss`]
+    /// retries it indefinitely until a revert is confirmed.
+    ///
+    /// A missing journal row (already reconciled by a concurrent attempt, or
+    /// never written because the Prepared write itself failed) is treated as
+    /// already compensated: there is nothing left to do.
+    pub(crate) async fn compensate_role_loss_operation(
+        &self,
+        operation_id: &str,
+    ) -> Result<(), String> {
+        let Some(op) = self.role_loss.get_operation(operation_id)? else {
+            return Ok(());
+        };
+        if op.state != RoleLossOperationState::Compensating {
+            if let Err(e) =
+                self.role_loss.advance_operation(operation_id, RoleLossOperationState::Compensating)
+            {
+                tracing::warn!(
+                    error = %e,
+                    operation_id,
+                    "failed to advance a role-loss operation journal row to Compensating"
+                );
+            }
+        }
+        if !self.coordination.is_configured() {
+            let attempts =
+                self.role_loss.increment_attempts(operation_id).unwrap_or(op.attempts + 1);
+            tracing::warn!(
+                operation_id,
+                group_id = %op.group_id,
+                attempts,
+                "role-loss compensation could not run: no coordination-plane config recorded; \
+                 will retry once this device is connected"
+            );
+            return Err(
+                "not connected to the coordination plane; the rollback will be retried once \
+                 connectivity is restored"
+                    .to_string(),
+            );
+        }
+        match self
+            .coordination
+            .compensate_handoff_role_loss(
+                &op.group_id,
+                &op.source_device_id,
+                &op.target_device_id,
+                &op.lease_id,
+                op.worker_membership_generation,
+            )
+            .await
+        {
+            Ok(outcome) => {
+                tracing::info!(
+                    operation_id,
+                    ?outcome,
+                    "role-loss compensation reached a terminal outcome"
+                );
+                if let Err(e) = self
+                    .role_loss
+                    .advance_operation(operation_id, RoleLossOperationState::Completed)
+                {
+                    tracing::warn!(
+                        error = %e,
+                        operation_id,
+                        "failed to advance a role-loss operation journal row to Completed"
+                    );
+                }
+                if let Err(e) = self.role_loss.delete_operation(operation_id) {
+                    tracing::warn!(
+                        error = %e,
+                        operation_id,
+                        "failed to delete a Completed role-loss operation journal row; it will \
+                         be cleaned up by the next reconciliation sweep"
+                    );
+                }
+                Ok(())
+            }
+            Err(e) => {
+                let attempts =
+                    self.role_loss.increment_attempts(operation_id).unwrap_or(op.attempts + 1);
+                if attempts >= ROLE_LOSS_COMPENSATION_ESCALATION_ATTEMPTS {
+                    tracing::error!(
+                        error = %e,
+                        operation_id,
+                        group_id = %op.group_id,
+                        attempts,
+                        "role-loss compensation has failed repeatedly; this device's \
+                         full-replica status for this group may still be inconsistent with the \
+                         coordination plane"
+                    );
+                } else {
+                    tracing::warn!(
+                        error = %e,
+                        operation_id,
+                        group_id = %op.group_id,
+                        attempts,
+                        "role-loss compensation attempt failed; will retry"
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Startup + periodic reconciliation of every role-loss journal row,
+    /// whichever group it names:
+    /// - `LocalCommitted`/`Completed` (terminal): the operation's real
+    ///   outcome was already reached; only the follow-up delete never ran (a
+    ///   crash in that narrow window). Just finishes the delete.
+    /// - `Prepared`/`WorkerCommitted`/`Compensating`: handed to
+    ///   [`Self::compensate_role_loss_operation`], which reverts the source
+    ///   device back to `eager` on the coordination plane -- the safe
+    ///   direction either way, since a `Prepared` row cannot tell "the
+    ///   commit never reached the Worker" from "it committed but the reply
+    ///   was lost". A row that cannot be compensated this pass simply
+    ///   survives to the next sweep; errors are logged by the compensation
+    ///   itself and otherwise swallowed here.
+    pub(crate) async fn reconcile_role_loss(&self) {
+        let rows = match self.role_loss.list_operations_in_states(&[
+            RoleLossOperationState::Prepared,
+            RoleLossOperationState::WorkerCommitted,
+            RoleLossOperationState::LocalCommitted,
+            RoleLossOperationState::Compensating,
+            RoleLossOperationState::Completed,
+        ]) {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(error = %e, "role-loss reconciliation sweep failed to list journal rows");
+                return;
+            }
+        };
+        for op in rows {
+            match op.state {
+                RoleLossOperationState::LocalCommitted | RoleLossOperationState::Completed => {
+                    if let Err(e) = self.role_loss.delete_operation(&op.operation_id) {
+                        tracing::warn!(
+                            error = %e,
+                            operation_id = %op.operation_id,
+                            "role-loss reconciliation sweep failed to delete a settled journal row"
+                        );
+                    }
+                }
+                RoleLossOperationState::Prepared
+                | RoleLossOperationState::WorkerCommitted
+                | RoleLossOperationState::Compensating => {
+                    if self.compensate_role_loss_operation(&op.operation_id).await.is_ok() {
+                        tracing::info!(
+                            operation_id = %op.operation_id,
+                            group_id = %op.group_id,
+                            "role-loss reconciliation sweep compensated an in-flight operation"
+                        );
+                    }
+                    // On `Err` the compensation already logged; the row stays
+                    // `Compensating` for the next sweep to retry.
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Mutex;
-
-    use yadorilink_replica_domain::session_state::FolderLink;
-    use yadorilink_replica_domain::session_state::MaterializationPolicy;
-
-    use super::*;
-    use crate::application::ports::BoxFuture;
-
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    enum Call {
-        Latch(String),
-        RemoveLink(String),
-        SetPolicy(String),
-        OpenOperation(String),
-        MarkWorkerCommitted(String),
-        DiscardOperation(String),
-        SettleSuccess(String),
-        Compensate(String),
-        StartWatch(String),
-        StopWatch(String),
-    }
-
-    #[derive(Default)]
-    struct FakeRepository {
-        calls: Mutex<Vec<Call>>,
-        links: Mutex<Vec<FolderLink>>,
-        recheck_policy_result: Mutex<VecDeque<Result<bool, crate::sync_error::SyncError>>>,
-        recheck_remove_result: Mutex<VecDeque<Result<bool, crate::sync_error::SyncError>>>,
-    }
-
-    impl FakeRepository {
-        fn with_link(self, link: FolderLink) -> Self {
-            self.links.lock().unwrap().push(link);
-            self
-        }
-    }
-
-    impl ReplicaRoleRepository for FakeRepository {
-        fn list_links(&self) -> Result<Vec<FolderLink>, crate::sync_error::SyncError> {
-            Ok(self.links.lock().unwrap().clone())
-        }
-
-        fn live_link_local_path_for_group(
-            &self,
-            group_id: &str,
-        ) -> Result<Option<String>, crate::sync_error::SyncError> {
-            Ok(self
-                .links
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|l| l.group_id == group_id)
-                .map(|l| l.local_path.clone()))
-        }
-
-        fn recheck_digest_then_set_materialization_policy(
-            &self,
-            _group_id: &str,
-            local_path: &str,
-            _policy: MaterializationPolicy,
-            _expected_digest: [u8; 32],
-        ) -> Result<bool, crate::sync_error::SyncError> {
-            self.calls.lock().unwrap().push(Call::SetPolicy(local_path.to_string()));
-            self.recheck_policy_result.lock().unwrap().pop_front().unwrap_or(Ok(true))
-        }
-
-        fn recheck_digest_then_remove_link(
-            &self,
-            _group_id: &str,
-            local_path: &str,
-            _expected_digest: [u8; 32],
-        ) -> Result<bool, crate::sync_error::SyncError> {
-            self.calls.lock().unwrap().push(Call::RemoveLink(local_path.to_string()));
-            self.recheck_remove_result.lock().unwrap().pop_front().unwrap_or(Ok(true))
-        }
-
-        fn remove_link(&self, local_path: &str) -> Result<(), crate::sync_error::SyncError> {
-            self.calls.lock().unwrap().push(Call::RemoveLink(local_path.to_string()));
-            Ok(())
-        }
-
-        fn set_materialization_policy(
-            &self,
-            local_path: &str,
-            _policy: MaterializationPolicy,
-        ) -> Result<(), crate::sync_error::SyncError> {
-            self.calls.lock().unwrap().push(Call::SetPolicy(local_path.to_string()));
-            Ok(())
-        }
-
-        fn latch_group_durability_unknown(
-            &self,
-            group_id: &str,
-        ) -> Result<(), crate::sync_error::SyncError> {
-            self.calls.lock().unwrap().push(Call::Latch(group_id.to_string()));
-            Ok(())
-        }
-
-        fn arm_duplicate_recovery_paths(
-            &self,
-            _group_id: &str,
-        ) -> Result<(), crate::sync_error::SyncError> {
-            Ok(())
-        }
-
-        fn set_suppress_tombstones(
-            &self,
-            _local_path: &str,
-            _suppress: bool,
-        ) -> Result<(), crate::sync_error::SyncError> {
-            Ok(())
-        }
-    }
-
-    #[derive(Default)]
-    struct FakeRoleLoss {
-        calls: Mutex<Vec<Call>>,
-        open_result: Mutex<VecDeque<Result<String, String>>>,
-        compensate_result: Mutex<VecDeque<Result<(), String>>>,
-    }
-
-    impl RoleLossJournal for FakeRoleLoss {
-        fn open_operation(
-            &self,
-            _group_id: &str,
-            _target_device_id: &str,
-            _lease_id: &str,
-            _action: yadorilink_replica_domain::session_state::RoleLossAction,
-            _local_path: &str,
-        ) -> Result<String, String> {
-            let result =
-                self.open_result.lock().unwrap().pop_front().unwrap_or(Ok("op-1".to_string()));
-            if let Ok(id) = &result {
-                self.calls.lock().unwrap().push(Call::OpenOperation(id.clone()));
-            }
-            result
-        }
-
-        fn mark_worker_committed(&self, operation_id: &str, _membership_generation: i64) {
-            self.calls.lock().unwrap().push(Call::MarkWorkerCommitted(operation_id.to_string()));
-        }
-
-        fn discard_operation(&self, operation_id: &str) {
-            self.calls.lock().unwrap().push(Call::DiscardOperation(operation_id.to_string()));
-        }
-
-        fn settle_success(&self, operation_id: &str) {
-            self.calls.lock().unwrap().push(Call::SettleSuccess(operation_id.to_string()));
-        }
-
-        fn compensate<'a>(&'a self, operation_id: &'a str) -> BoxFuture<'a, Result<(), String>> {
-            Box::pin(async move {
-                self.calls.lock().unwrap().push(Call::Compensate(operation_id.to_string()));
-                self.compensate_result.lock().unwrap().pop_front().unwrap_or(Ok(()))
-            })
-        }
-    }
-
-    #[derive(Default)]
-    struct FakeReadiness {
-        full_replica: AtomicBool,
-        digest_and_peer: Mutex<DigestAndPeerResults>,
-        lease: Mutex<VecDeque<Option<String>>>,
-    }
-
-    type DigestAndPeerResults = VecDeque<Option<([u8; 32], Option<String>)>>;
-
-    impl HandoffReadinessPort for FakeReadiness {
-        fn is_local_full_replica(&self, _group_id: &str) -> bool {
-            self.full_replica.load(Ordering::SeqCst)
-        }
-
-        fn full_replica_handoff_ready_digest_and_peer<'a>(
-            &'a self,
-            _group_id: &'a str,
-        ) -> BoxFuture<'a, Option<([u8; 32], Option<String>)>> {
-            Box::pin(async move { self.digest_and_peer.lock().unwrap().pop_front().flatten() })
-        }
-
-        fn obtain_handoff_lease_from_peer<'a>(
-            &'a self,
-            _group_id: &'a str,
-            _target_peer_device_id: &'a str,
-            _my_digest: [u8; 32],
-        ) -> BoxFuture<'a, Option<String>> {
-            Box::pin(async move { self.lease.lock().unwrap().pop_front().flatten() })
-        }
-    }
-
-    #[derive(Default)]
-    struct FakeCoordination {
-        configured: AtomicBool,
-        commit_result: Mutex<VecDeque<RoleLossCommitOutcome>>,
-        set_storage_mode_calls: Mutex<u32>,
-        set_storage_mode_result: Mutex<VecDeque<Result<(), String>>>,
-    }
-
-    impl FakeCoordination {
-        fn configured() -> Self {
-            let this = Self::default();
-            this.configured.store(true, Ordering::SeqCst);
-            this
-        }
-    }
-
-    impl RoleLossCoordination for FakeCoordination {
-        fn is_configured(&self) -> bool {
-            self.configured.load(Ordering::SeqCst)
-        }
-
-        fn commit_handoff_role_loss<'a>(
-            &'a self,
-            _group_id: &'a str,
-            _source_device_id: &'a str,
-            _target_device_id: &'a str,
-            _lease_id: Option<&'a str>,
-            _action: &'a str,
-            _operation_id: &'a str,
-        ) -> BoxFuture<'a, RoleLossCommitOutcome> {
-            Box::pin(async move {
-                self.commit_result.lock().unwrap().pop_front().expect("missing fake commit result")
-            })
-        }
-
-        fn set_storage_mode<'a>(
-            &'a self,
-            _group_id: &'a str,
-            _device_id: &'a str,
-            _mode: &'a str,
-        ) -> BoxFuture<'a, Result<(), String>> {
-            Box::pin(async move {
-                *self.set_storage_mode_calls.lock().unwrap() += 1;
-                self.set_storage_mode_result.lock().unwrap().pop_front().unwrap_or(Ok(()))
-            })
-        }
-    }
-
-    #[derive(Default)]
-    struct FakeRuntime {
-        calls: Mutex<Vec<Call>>,
-        start_result: Mutex<VecDeque<Result<(), String>>>,
-    }
-
-    impl LinkRuntimePort for FakeRuntime {
-        fn start_link_watch(&self, local_path: String, _group_id: String) -> Result<(), String> {
-            self.calls.lock().unwrap().push(Call::StartWatch(local_path));
-            self.start_result.lock().unwrap().pop_front().unwrap_or(Ok(()))
-        }
-
-        fn stop_link_watch<'a>(&'a self, local_path: &'a str) -> BoxFuture<'a, ()> {
-            Box::pin(async move {
-                self.calls.lock().unwrap().push(Call::StopWatch(local_path.to_string()));
-            })
-        }
-    }
-
-    fn link(group_id: &str, policy: MaterializationPolicy) -> FolderLink {
-        FolderLink {
-            local_path: "/home/alice/Photos".to_string(),
-            group_id: group_id.to_string(),
-            paused: false,
-            materialization_policy: policy,
-            max_local_size_bytes: None,
-            orphaned: false,
-        }
-    }
-
-    /// Fixed-answer [`PlaceholderPipelineCapabilityPort`] fake -- defaults to
-    /// connected since none of this module's own unit tests exercise the
-    /// disconnected-gate rejection itself (that's covered by the daemon
-    /// integration tests in `tests/role_loss_saga.rs`/
-    /// `tests/storage_mode_orchestration.rs`).
-    struct FakePlaceholderPipeline {
-        connected: bool,
-    }
-
-    impl Default for FakePlaceholderPipeline {
-        fn default() -> Self {
-            Self { connected: true }
-        }
-    }
-
-    impl PlaceholderPipelineCapabilityPort for FakePlaceholderPipeline {
-        fn is_connected(&self) -> bool {
-            self.connected
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn service(
-        repository: Arc<FakeRepository>,
-        role_loss: Arc<FakeRoleLoss>,
-        readiness: Arc<FakeReadiness>,
-        coordination: Arc<FakeCoordination>,
-        runtime: Arc<FakeRuntime>,
-    ) -> ReplicaRoleService {
-        ReplicaRoleService::new(
-            "device-a".to_string(),
-            repository,
-            role_loss,
-            readiness,
-            coordination,
-            runtime,
-            Arc::new(FakePlaceholderPipeline::default()),
-        )
-    }
-
-    // ===== set_storage_mode =====
-
-    #[tokio::test]
-    async fn promotion_writes_coordination_before_the_local_flip() {
-        let repository = Arc::new(
-            FakeRepository::default().with_link(link("group-1", MaterializationPolicy::OnDemand)),
-        );
-        let role_loss = Arc::new(FakeRoleLoss::default());
-        let readiness = Arc::new(FakeReadiness::default());
-        let coordination = Arc::new(FakeCoordination::configured());
-        let runtime = Arc::new(FakeRuntime::default());
-
-        let result =
-            service(repository.clone(), role_loss, readiness, coordination.clone(), runtime)
-                .set_storage_mode("group-1", false)
-                .await;
-
-        assert!(result.is_ok());
-        assert_eq!(*coordination.set_storage_mode_calls.lock().unwrap(), 1);
-        assert!(repository
-            .calls
-            .lock()
-            .unwrap()
-            .contains(&Call::SetPolicy("/home/alice/Photos".to_string())));
-    }
-
-    #[tokio::test]
-    async fn promotion_without_coordination_config_fails_closed() {
-        let repository = Arc::new(
-            FakeRepository::default().with_link(link("group-1", MaterializationPolicy::OnDemand)),
-        );
-        let role_loss = Arc::new(FakeRoleLoss::default());
-        let readiness = Arc::new(FakeReadiness::default());
-        let coordination = Arc::new(FakeCoordination::default());
-        let runtime = Arc::new(FakeRuntime::default());
-
-        let result = service(repository.clone(), role_loss, readiness, coordination, runtime)
-            .set_storage_mode("group-1", false)
-            .await;
-
-        assert!(result.is_err());
-        assert!(repository.calls.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn demotion_of_a_vacuously_ready_empty_group_flips_locally_with_no_journal() {
-        let repository = Arc::new(
-            FakeRepository::default().with_link(link("group-1", MaterializationPolicy::Eager)),
-        );
-        let role_loss = Arc::new(FakeRoleLoss::default());
-        let readiness = Arc::new(FakeReadiness::default());
-        readiness.full_replica.store(true, Ordering::SeqCst);
-        readiness.digest_and_peer.lock().unwrap().push_back(Some(([1u8; 32], None)));
-        let coordination = Arc::new(FakeCoordination::configured());
-        let runtime = Arc::new(FakeRuntime::default());
-
-        let result = service(repository, role_loss.clone(), readiness, coordination, runtime)
-            .set_storage_mode("group-1", true)
-            .await;
-
-        assert!(result.is_ok());
-        assert!(role_loss.calls.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn demotion_with_confirmed_peer_opens_journal_commits_then_settles() {
-        let repository = Arc::new(
-            FakeRepository::default().with_link(link("group-1", MaterializationPolicy::Eager)),
-        );
-        let role_loss = Arc::new(FakeRoleLoss::default());
-        let readiness = Arc::new(FakeReadiness::default());
-        readiness.full_replica.store(true, Ordering::SeqCst);
-        readiness
-            .digest_and_peer
-            .lock()
-            .unwrap()
-            .push_back(Some(([1u8; 32], Some("device-b".to_string()))));
-        readiness.lease.lock().unwrap().push_back(Some("lease-1".to_string()));
-        let coordination = Arc::new(FakeCoordination::configured());
-        coordination.commit_result.lock().unwrap().push_back(RoleLossCommitOutcome::Committed(
-            HandoffCommitResult {
-                target_device_id: "device-b".to_string(),
-                membership_generation: 3,
-                lease_id: Some("lease-1".to_string()),
-            },
-        ));
-        let runtime = Arc::new(FakeRuntime::default());
-
-        let result = service(repository, role_loss.clone(), readiness, coordination, runtime)
-            .set_storage_mode("group-1", true)
-            .await;
-
-        assert!(result.is_ok());
-        let calls = role_loss.calls.lock().unwrap();
-        assert!(calls.contains(&Call::OpenOperation("op-1".to_string())));
-        assert!(calls.contains(&Call::MarkWorkerCommitted("op-1".to_string())));
-        assert!(calls.contains(&Call::SettleSuccess("op-1".to_string())));
-    }
-
-    #[tokio::test]
-    async fn demotion_lease_unavailable_refuses_with_the_lease_failure_message() {
-        let repository = Arc::new(
-            FakeRepository::default().with_link(link("group-1", MaterializationPolicy::Eager)),
-        );
-        let role_loss = Arc::new(FakeRoleLoss::default());
-        let readiness = Arc::new(FakeReadiness::default());
-        readiness.full_replica.store(true, Ordering::SeqCst);
-        readiness
-            .digest_and_peer
-            .lock()
-            .unwrap()
-            .push_back(Some(([1u8; 32], Some("device-b".to_string()))));
-        readiness.lease.lock().unwrap().push_back(None);
-        let coordination = Arc::new(FakeCoordination::configured());
-        let runtime = Arc::new(FakeRuntime::default());
-
-        let result = service(repository, role_loss, readiness, coordination, runtime)
-            .set_storage_mode("group-1", true)
-            .await;
-
-        assert_eq!(result.unwrap_err(), demotion_handoff_lease_failure_message());
-    }
-
-    #[tokio::test]
-    async fn demotion_ambiguous_commit_compensates_and_refuses() {
-        let repository = Arc::new(
-            FakeRepository::default().with_link(link("group-1", MaterializationPolicy::Eager)),
-        );
-        let role_loss = Arc::new(FakeRoleLoss::default());
-        let readiness = Arc::new(FakeReadiness::default());
-        readiness.full_replica.store(true, Ordering::SeqCst);
-        readiness
-            .digest_and_peer
-            .lock()
-            .unwrap()
-            .push_back(Some(([1u8; 32], Some("device-b".to_string()))));
-        readiness.lease.lock().unwrap().push_back(Some("lease-1".to_string()));
-        let coordination = Arc::new(FakeCoordination::configured());
-        coordination
-            .commit_result
-            .lock()
-            .unwrap()
-            .push_back(RoleLossCommitOutcome::Ambiguous("timeout".to_string()));
-        let runtime = Arc::new(FakeRuntime::default());
-
-        let result = service(repository, role_loss.clone(), readiness, coordination, runtime)
-            .set_storage_mode("group-1", true)
-            .await;
-
-        assert!(result.is_err());
-        assert!(role_loss.calls.lock().unwrap().contains(&Call::Compensate("op-1".to_string())));
-    }
-
-    // ===== ensure_unlink_keeps_a_full_replica =====
-
-    #[tokio::test]
-    async fn last_full_replica_cannot_unlink() {
-        let repository = Arc::new(
-            FakeRepository::default().with_link(link("group-1", MaterializationPolicy::Eager)),
-        );
-        let role_loss = Arc::new(FakeRoleLoss::default());
-        let readiness = Arc::new(FakeReadiness::default());
-        readiness.digest_and_peer.lock().unwrap().push_back(None);
-        let coordination = Arc::new(FakeCoordination::configured());
-        let runtime = Arc::new(FakeRuntime::default());
-
-        let result = service(repository, role_loss, readiness, coordination, runtime)
-            .ensure_unlink_keeps_a_full_replica("/home/alice/Photos", false)
-            .await;
-
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn forced_unlink_bypasses_the_gate_and_latches_durability_unknown() {
-        let repository = Arc::new(
-            FakeRepository::default().with_link(link("group-1", MaterializationPolicy::Eager)),
-        );
-        let role_loss = Arc::new(FakeRoleLoss::default());
-        let readiness = Arc::new(FakeReadiness::default());
-        readiness.digest_and_peer.lock().unwrap().push_back(None);
-        let coordination = Arc::new(FakeCoordination::configured());
-        let runtime = Arc::new(FakeRuntime::default());
-
-        let commit = service(repository.clone(), role_loss, readiness, coordination, runtime)
-            .ensure_unlink_keeps_a_full_replica("/home/alice/Photos", true)
-            .await
-            .unwrap();
-
-        assert_eq!(commit, UnlinkCommit::RemoveNormally);
-        assert!(repository.calls.lock().unwrap().contains(&Call::Latch("group-1".to_string())));
-    }
-
-    #[tokio::test]
-    async fn on_demand_link_always_allowed_no_gate_touched() {
-        let repository = Arc::new(
-            FakeRepository::default().with_link(link("group-1", MaterializationPolicy::OnDemand)),
-        );
-        let role_loss = Arc::new(FakeRoleLoss::default());
-        let readiness = Arc::new(FakeReadiness::default());
-        let coordination = Arc::new(FakeCoordination::configured());
-        let runtime = Arc::new(FakeRuntime::default());
-
-        let commit = service(repository, role_loss, readiness, coordination, runtime)
-            .ensure_unlink_keeps_a_full_replica("/home/alice/Photos", false)
-            .await
-            .unwrap();
-
-        assert_eq!(commit, UnlinkCommit::RemoveNormally);
-    }
-
-    #[tokio::test]
-    async fn ready_eager_unlink_removes_atomically_via_the_readiness_and_coordination_ports() {
-        let repository = Arc::new(
-            FakeRepository::default().with_link(link("group-1", MaterializationPolicy::Eager)),
-        );
-        let role_loss = Arc::new(FakeRoleLoss::default());
-        let readiness = Arc::new(FakeReadiness::default());
-        readiness
-            .digest_and_peer
-            .lock()
-            .unwrap()
-            .push_back(Some(([1u8; 32], Some("device-b".to_string()))));
-        readiness.lease.lock().unwrap().push_back(Some("lease-1".to_string()));
-        let coordination = Arc::new(FakeCoordination::configured());
-        coordination.commit_result.lock().unwrap().push_back(RoleLossCommitOutcome::Committed(
-            HandoffCommitResult {
-                target_device_id: "device-b".to_string(),
-                membership_generation: 1,
-                lease_id: Some("lease-1".to_string()),
-            },
-        ));
-        let runtime = Arc::new(FakeRuntime::default());
-
-        let commit = service(repository, role_loss.clone(), readiness, coordination, runtime)
-            .ensure_unlink_keeps_a_full_replica("/home/alice/Photos", false)
-            .await
-            .unwrap();
-
-        assert!(matches!(commit, UnlinkCommit::AlreadyRemoved(Some(_))));
-        assert!(role_loss.calls.lock().unwrap().contains(&Call::SettleSuccess("op-1".to_string())));
-    }
-
-    // ===== unlink =====
-
-    #[tokio::test]
-    async fn unlink_stops_the_watcher_and_removes_the_link_normally() {
-        let repository = Arc::new(
-            FakeRepository::default().with_link(link("group-1", MaterializationPolicy::OnDemand)),
-        );
-        let role_loss = Arc::new(FakeRoleLoss::default());
-        let readiness = Arc::new(FakeReadiness::default());
-        let coordination = Arc::new(FakeCoordination::configured());
-        let runtime = Arc::new(FakeRuntime::default());
-
-        let outcome =
-            service(repository.clone(), role_loss, readiness, coordination, runtime.clone())
-                .unlink("/home/alice/Photos", false)
-                .await
-                .unwrap();
-
-        assert!(outcome.handoff.is_none());
-        assert!(runtime
-            .calls
-            .lock()
-            .unwrap()
-            .contains(&Call::StopWatch("/home/alice/Photos".to_string())));
-        assert!(repository
-            .calls
-            .lock()
-            .unwrap()
-            .contains(&Call::RemoveLink("/home/alice/Photos".to_string())));
-    }
-}
+mod tests;

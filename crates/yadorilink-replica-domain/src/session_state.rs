@@ -1,14 +1,9 @@
 //! Pure value types describing a link's write-gate state, a hydration
 //! hold, materialization state/policy, a startup-readiness failure, and a
-//! current-version snapshot. Moved out of `yadorilink-sync-core` in Phase
-//! 7D-6: each is either returned by `PeerReplicaStatePort`'s own methods,
-//! or otherwise needed directly by `yadorilink-peer-session`'s production
-//! code, while remaining just as load-bearing for `yadorilink-sync-core`'s
-//! own local-authoring/materialization code that stays behind -- pure data,
-//! no SQL, so hoisting here (rather than duplicating) keeps exactly one
-//! definition.
+//! current-version snapshot.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::change::Op;
 use crate::file::{BlockInfo, FileRecord, FileVersion, RecordKind, VersionBlock};
@@ -109,11 +104,15 @@ impl VersionState {
         }
     }
 
-    pub fn from_db_str(s: &str) -> Self {
+    /// Strict: an unrecognized persisted state is corruption, not a
+    /// `Current` row. Coercing it to `Current` would promote an
+    /// unparseable row to the live version of its path.
+    pub fn try_from_db_str(s: &str) -> Result<Self, String> {
         match s {
-            "superseded" => VersionState::Superseded,
-            "trashed" => VersionState::Trashed,
-            _ => VersionState::Current,
+            "current" => Ok(VersionState::Current),
+            "superseded" => Ok(VersionState::Superseded),
+            "trashed" => Ok(VersionState::Trashed),
+            other => Err(format!("unknown version state: {other}")),
         }
     }
 }
@@ -144,6 +143,23 @@ pub struct VersionRecord {
 pub struct HeldState {
     pub reason: String,
     pub since_unix_nanos: i64,
+}
+
+/// Prefix of a hold recorded against a file that IS on disk: its replicated
+/// metadata cannot be confirmed or applied because the existing file denies
+/// its owner read access. Unlike a hazard hold, nothing was withheld from
+/// the path's name.
+pub const HELD_REASON_METADATA_UNPROVABLE: &str = "metadata_unprovable";
+
+impl HeldState {
+    /// Whether this hold means this device deliberately keeps nothing on
+    /// disk under the path's name (a hazard hold, such as a name collision),
+    /// so a missing file there must not be read as a deletion. A
+    /// metadata-unprovable hold is recorded against a file that was present,
+    /// so that file's disappearance is a real deletion.
+    pub fn keeps_the_name_empty(&self) -> bool {
+        !self.reason.starts_with(HELD_REASON_METADATA_UNPROVABLE)
+    }
 }
 
 /// The `state = 'current'` row of a file, read as one atomic statement --
@@ -198,22 +214,27 @@ impl std::fmt::Display for StartupFailed {
 
 impl std::error::Error for StartupFailed {}
 
-/// The result of one retroactive-conflict repair attempt against one SQLite
-/// snapshot. The caller (the daemon's repair loop) needs this three-way
-/// distinction, not just success/failure, to decide whether
+/// The result of one retroactive-conflict repair attempt against one
+/// SQLite snapshot. The caller (the daemon's repair loop) needs this
+/// three-way distinction, not just success/failure, to decide whether
 /// `committed_frontier` is safe to cache: caching it suppresses
 /// re-examining this exact frontier until a new head arrives, which is
 /// correct for `NothingToDo` and `PermanentlyBlocked` (both describe a
 /// frontier that produces the same result every time it's re-examined) but
 /// would be wrong for an ordinary transient `Err` (a database error
 /// unrelated to this frontier's own content, which deserves an
-/// unconditional retry on the very next poll). Moved out of
-/// `yadorilink-sync-core` (Phase 7D-10): pure data (no SQL, no `SyncState`
-/// coupling), needed identically by `yadorilink-sync-core`'s own
-/// `SyncState::repair_retroactive_conflict_copy_obligations` and
-/// `yadorilink-daemon`'s independently-written
-/// `ReplicaCoordinator::repair_retroactive_conflict_copy_obligations` --
-/// hoisting here (rather than duplicating) keeps exactly one definition.
+/// unconditional retry on the very next poll). Why a retroactive repair
+/// plan could not be committed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanStaleReason {
+    /// New history landed: the plan named a frontier that is no longer the
+    /// group's.
+    FrontierMoved,
+    /// The frontier is unchanged, but re-deriving the plan's own obligations
+    /// against current state produces a different answer.
+    ObligationsChanged,
+}
+
 #[derive(Debug)]
 pub enum RetroactiveRepairOutcome {
     /// Authored and committed a merge-resolution carrier for these paths.
@@ -229,16 +250,22 @@ pub enum RetroactiveRepairOutcome {
     /// A repair exists, but this device's deterministic rank has not reached
     /// the driver's current failover threshold (or it is not authorized).
     AwaitingFailover { local_rank: Option<usize>, committed_frontier: Vec<ChangeHash> },
+    /// The state the plan was built against moved before it could be
+    /// committed, so nothing was written.
+    ///
+    /// Not a failure: it is the ordinary case this design trades for not
+    /// holding the writer gate across planning. Deliberately *not* named for
+    /// the frontier — the frontier is only the cheapest of the assumptions a
+    /// plan makes, and durable conflict-copy provenance and the
+    /// retained-history boundary both move without disturbing it. The frontier
+    /// examined is deliberately absent from this variant: caching it would
+    /// suppress the very re-plan this outcome asks for.
+    PlanStale { reason: PlanStaleReason },
 }
 
-/// The DAG-facing content of a local edit: the ops to sign into the emitted
-/// `Change`, and the `FileVersion`s those ops reference (written to
-/// `file_versions` in the same transaction as the change/index update).
-/// Moved out of `yadorilink-sync-core`'s `state_model`, alongside
-/// `file_index.rs`'s move into
-/// `yadorilink-sync-sqlite` -- pure data, no SQL, needed by both that
-/// module and `yadorilink-sync-core`'s own local-authoring code that stays
-/// behind.
+/// The DAG-facing content of a local edit: the ops to sign into the
+/// emitted `Change`, and the `FileVersion`s those ops reference (written
+/// to `file_versions` in the same transaction as the change/index update).
 pub struct ChangeContent<'a> {
     pub ops: Vec<Op>,
     pub versions: &'a [FileVersion],
@@ -256,7 +283,7 @@ pub struct ChangeContent<'a> {
 /// signed DAG `Change` when committed — a batch of N of these must never
 /// collapse into one multi-op `Change` (that changes causal/apply
 /// granularity for what were N independent local edits).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum PreparedLocalMutation {
     Upsert { record: FileRecord, op: Op, version: FileVersion, meta: Option<LocalFileMetaColumns> },
     Delete { record: FileRecord, op: Op },
@@ -267,6 +294,14 @@ impl PreparedLocalMutation {
         match self {
             PreparedLocalMutation::Upsert { record, .. } => record,
             PreparedLocalMutation::Delete { record, .. } => record,
+        }
+    }
+
+    /// The op this mutation authors.
+    pub fn op(&self) -> &Op {
+        match self {
+            PreparedLocalMutation::Upsert { op, .. } => op,
+            PreparedLocalMutation::Delete { op, .. } => op,
         }
     }
 }
@@ -329,17 +364,137 @@ pub struct DurabilityRoots {
     pub digest: [u8; 32],
 }
 
-/// What `SyncState::backfill_materialized_generations` did, broken down by
-/// exactly why each skipped row was skipped — see that method's doc for
-/// what each category means. Every current row for the group falls into
-/// exactly one of these four buckets, so summing all four fields gives the
-/// group's total current-row count at the time of the call.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct MaterializedGenerationBackfillReport {
-    pub populated: u64,
-    pub skipped_no_authoring_hash: u64,
-    pub skipped_not_confirmed_materialized: u64,
-    pub skipped_deleted_tombstones: u64,
+/// Canonicalizes `roots` and hashes the length-prefixed concatenation.
+/// Order-independence is applied only ACROSS roots (sorted by `(path,
+/// version_hash)`), so the caller's collection order does not affect the
+/// digest. Each root's identity is its `version_hash` alone — the SHA-256 of
+/// its canonical `FileVersion` encoding, which already binds the ordered
+/// block list, each block's declared size, and the version's metadata, so
+/// any real change to the underlying content or metadata (including a block
+/// reorder) changes `version_hash` and therefore this digest. This is the
+/// property the digest re-confirm before a daemon-driven role-loss commit
+/// relies on: the same underlying set (same paths, same per-file version
+/// identities) always digests the same, and any real change changes it.
+pub fn durability_roots_digest(roots: &[DurabilityRoot]) -> [u8; 32] {
+    let mut canonical: Vec<(&str, &[u8; 32])> =
+        roots.iter().map(|r| (r.path.as_str(), r.version_hash.as_bytes())).collect();
+    canonical.sort_unstable_by(|a, b| a.0.cmp(b.0).then_with(|| a.1.cmp(b.1)));
+
+    let mut hasher = Sha256::new();
+    for (path, version_hash) in &canonical {
+        hasher.update((path.len() as u64).to_le_bytes());
+        hasher.update(path.as_bytes());
+        hasher.update(version_hash.as_slice());
+    }
+    hasher.finalize().into()
+}
+
+/// A group's durable state reduced to what fits in one message: two
+/// digests, three counts, and the generation the reduction was taken at.
+///
+/// This is what a background custody check exchanges instead of one
+/// round-trip per durability root. Every field comes from the `files`
+/// index — no block is read and no payload is hashed to produce one — which
+/// is exactly the difference between the background check and the handoff
+/// proof, and the reason the two must never be confused.
+///
+/// # What comparing two of these establishes, and what it does not
+///
+/// **`current_digest` is the field a positive rests on**, over
+/// `state = 'current'` alone. That is the set the sync protocol actually
+/// converges on, so two caught-up replicas agree about it, and disagreement
+/// means something real.
+///
+/// **`roots_digest` covers the full durability-root set — current plus
+/// retained superseded plus trash-restorable — and equality on it is NOT
+/// expected**, so nothing requires it. Two honest eager replicas routinely
+/// retain different history and go on doing so indefinitely:
+///
+/// * a device that links a group it did not originate starts from a local
+///   history floor, and never reconstructs versions from before it;
+/// * retention expiry keeps a version while it is within *either* the
+///   count bound or the age bound, so a version inside the count bound is
+///   retained forever no matter how old it gets — a device holding one
+///   extra historical version of an untouched file keeps it permanently;
+/// * `version_seq` is device-local, expiry runs on each device's own
+///   clock, and each device's outstanding handoff leases pin different
+///   rows.
+///
+/// Requiring `roots_digest` equality would therefore have made the common
+/// two-device topology — one device joins a folder another already had —
+/// permanently uncorroborated. It is carried as an *observation*: when it
+/// does match, more is true, and that is worth recording and reporting.
+/// The handoff proof still covers the whole root set, at the moment it
+/// matters.
+///
+/// `unmaterialized_current_count` is what stops the comparison from being
+/// vacuous. A `files` row exists as soon as its change is projected, long
+/// before the content behind it has been fetched — so a peer that has
+/// caught up on the DAG and downloaded nothing at all has an identical
+/// `current_digest`. Without this count, a second device that joined a
+/// minute ago and is still transferring would corroborate instantly, and
+/// the group would report itself protected while exactly one device held
+/// the data.
+///
+/// It is a **working-tree fact standing in for a block-store one**, and
+/// that substitution is deliberate. Durability is about whether a peer's
+/// block store holds the bytes; materialization is about whether that peer
+/// has written them out into its folder. For an eager replica the second
+/// implies the first, so this is sufficient — and it is not necessary: a
+/// peer mid-hydration holds every block and still reports rows
+/// unmaterialized, and will not be corroborated until it finishes.
+///
+/// That error direction is the reason for the choice. A false negative here
+/// costs a transient `Unknown` on a group that is, accurately, still being
+/// taken custody of. The alternative — asking the block store directly
+/// whether it holds every current root's blocks — answers the exact
+/// question, but its answer changes without any `files` write, so
+/// [`Self::generation`] would not invalidate a memo of it and a stale hit
+/// would be a false *positive*. That is the one direction this whole design
+/// exists to exclude, and buying precision with it is not a trade worth
+/// making for a health indicator.
+///
+/// Even with it, this remains an index-level claim the peer makes about
+/// itself: it says the peer believes it has the content, not that the bytes
+/// are on its disk and intact. Only the handoff proof establishes that, and
+/// only latent-corruption scrubbing looks for it at rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RootSetSummary {
+    /// Over `state = 'current'` alone — the convergent subset, and the only
+    /// digest a positive may rest on.
+    pub current_digest: [u8; 32],
+    pub current_count: u64,
+    /// How many `state = 'current'` rows are not yet `Hydrated` — still a
+    /// placeholder, or mid-hydration. Non-zero means the device this
+    /// summary describes does not yet hold all of the group's current
+    /// content, whatever its index lists.
+    pub unmaterialized_current_count: u64,
+    /// Over `state IN ('current', 'superseded', 'trashed')`, the full
+    /// durability-root set: the same digest function, over the same rows,
+    /// that the handoff proof enumerates. An observation, never a
+    /// requirement — see this type's own doc comment for why equality here
+    /// is not an invariant between honest replicas.
+    pub roots_digest: [u8; 32],
+    pub roots_count: u64,
+    /// The `file_root_set_generation` counter this summary was computed at,
+    /// on the device that computed it.
+    ///
+    /// Meaningful only to that device. A remote peer's value is recorded
+    /// for diagnostics and is never compared, never used as a freshness
+    /// bound, and never an input to whether a reply is trusted: a number a
+    /// peer reports about its own state, inside a window that peer also
+    /// controls, establishes nothing. Freshness belongs to the asking side
+    /// — its own monotonic clock, its own membership generation, and its
+    /// own re-derivation of its own digest.
+    pub generation: u64,
+}
+
+impl RootSetSummary {
+    /// Whether every current row on the device this describes is
+    /// materialized locally.
+    pub fn fully_materialized(&self) -> bool {
+        self.unmaterialized_current_count == 0
+    }
 }
 
 /// spec "CLI Trash Commands": one deleted-but-still-recoverable file, as
@@ -355,6 +510,13 @@ pub struct TrashedFile {
     /// When the deletion itself (the tombstone's own `current` row) was
     /// recorded.
     pub deleted_at_unix_nanos: i64,
+    /// The recursive delete or directory rename this deletion was a part
+    /// of, when it was one: every trashed file sharing it was removed by
+    /// the same user operation, and restoring the folder restores them
+    /// together.
+    pub deleted_by_operation: Option<crate::recursive_operation::RecursiveOperationRef>,
+    /// The kind of the trashed (last live) version.
+    pub record_kind: crate::file::RecordKind,
 }
 
 /// One currently-live conflicted-copy file, as returned by
@@ -367,20 +529,11 @@ pub struct ConflictCopyFile {
     pub path: String,
     pub size: u64,
     pub mtime_unix_nanos: i64,
+    pub record_kind: crate::file::RecordKind,
 }
 
 /// One journaled local edit awaiting durable processing into the index +
-/// change DAG — see the `local_dirty_paths` table. `change_kind` is the
-/// serialized `yadorilink-sync-core::watcher::FsChangeKind`
-/// (`"created_or_modified"` / `"removed"`) of the most recent watcher event
-/// for the path, and `observed_at_unix_nanos` its observation time, so a
-/// startup/retry re-drive can reconstruct the exact `FsChangeEvent` the
-/// debounce executor would have processed. Moved out of
-/// `yadorilink-sync-core`'s `state_model` in Phase 7D-8.2 -- a plain
-/// struct, zero SQL/fs dependency, the same move shape 7D-7.6 already
-/// applied to `ChangeContent`/`DurabilityRoot`/`DurabilityRoots`/
-/// `LocalFileMetaColumns`/`MaterializedGenerationBackfillReport`/
-/// `TrashedFile` above.
+/// change DAG — see the `local_dirty_paths` table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirtyPath {
     pub path: String,
@@ -389,31 +542,14 @@ pub struct DirtyPath {
     pub attempts: u32,
 }
 
-// The following types moved out of `yadorilink-sync-core::state_model`
-// (Phase 7D-9E, third pass): `FolderLink`, `RoleLossOperationParams`, the
-// `RoleLossOperation` cluster, and the `MembershipOperation` cluster are
-// plain persisted value types with no `SyncState`/SQL dependency of their
-// own. At the time of this move, their sibling `PendingEnrollment`/
-// `EnrollmentOperation` cluster stayed behind in `state_model.rs`/`types.rs`
-// (tightly coupled to `crate::types::EnrollmentKind`, then still local to
-// `yadorilink-sync-core`) and `InventoryScanResult<T>` also stayed (it
-// depends on `crate::recovery::InvalidRecoveryOperation`, itself still
-// pending). Both of those blockers were later resolved -- see the
-// `EnrollmentKind`/`PendingEnrollment`/`EnrollmentOperation` cluster's own
-// move note further down this file (Phase 7D-9F, ninth pass) and
-// `recovery.rs`'s `InvalidRecoveryOperation`/`RecoveryDomain` move (Phase
-// 7D-9F, eighth pass).
-// Re-exported at the matching `state_model`/`index` path in
-// `yadorilink-sync-core` so every existing caller (`yadorilink-daemon`'s
-// persistence/application layers, `yadorilink-sync-core`'s own
-// `recovery.rs`) keeps resolving unchanged.
-
 /// The fields of a role-loss operation row not already carried by its
 /// `(operation_id, group_id)` key.
 pub struct RoleLossOperationParams<'a> {
     pub source_device_id: &'a str,
     pub target_device_id: &'a str,
-    pub lease_id: Option<&'a str>,
+    /// Required: a journal row without the lease it was opened against
+    /// cannot be compensated, so there is no useful row to write.
+    pub lease_id: &'a str,
     pub action: RoleLossAction,
     pub local_path: Option<&'a str>,
     pub now_unix: i64,
@@ -437,6 +573,21 @@ pub struct FolderLink {
     /// files are never touched or deleted; only its participation in sync
     /// stops.
     pub orphaned: bool,
+}
+
+/// What committing a link did to the `links` row for its path, so that a
+/// link whose post-commit setup fails can undo exactly that and nothing
+/// more. A path that was already linked to the same group is re-linked by
+/// updating its existing row (keeping its adopted root token); deleting that
+/// row on a failed setup would destroy a link this call never created.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkRowWrite {
+    /// No row existed for the path; the commit inserted it.
+    Inserted,
+    /// A row for the same path and group already existed; the commit updated
+    /// it. Carries the row as it was before, so the columns the commit and
+    /// its setup may change can be put back.
+    Updated(FolderLink),
 }
 
 /// A durable journal row for an in-flight full-replica role-loss operation
@@ -479,7 +630,7 @@ pub struct RoleLossOperation {
     pub group_id: String,
     pub source_device_id: String,
     pub target_device_id: String,
-    pub lease_id: Option<String>,
+    pub lease_id: String,
     pub worker_membership_generation: Option<i64>,
     pub action: RoleLossAction,
     pub state: RoleLossOperationState,
@@ -498,7 +649,7 @@ pub struct RoleLossOperation {
 /// both `Demote` and `Unlink` today (both only narrow this device's
 /// `storage_mode` to on-demand; unlink does not remove group membership),
 /// so both compensate identically — reverting `storage_mode` back to
-/// `eager` — see `daemon_state::compensate_role_loss_operation`. `Revoke`
+/// `eager` — see the daemon's `ReplicaRoleService::compensate_role_loss_operation`. `Revoke`
 /// is reserved for `durability_force`'s cross-device removal path, which
 /// this change does not wire to this journal (that path still uses the
 /// pre-existing plain `/revoke` call, not `commit_handoff_role_loss`); a
@@ -519,21 +670,10 @@ impl RoleLossAction {
         }
     }
 
-    pub fn from_db_str(s: &str) -> Self {
-        match s {
-            "unlink" => RoleLossAction::Unlink,
-            "revoke" => RoleLossAction::Revoke,
-            _ => RoleLossAction::Demote,
-        }
-    }
-
-    /// Strict counterpart to [`Self::from_db_str`] -- that lenient parse
-    /// silently coerces any unrecognized string to `Demote`, which is the
-    /// right fail-safe default for the reconciliation sweep (an unrecognized
-    /// action must still be treated as SOME action rather than crash the
-    /// sweep) but the wrong behavior for a read-only inventory, which must
-    /// surface a genuinely corrupt row as `invalid` rather than silently
-    /// misreport it as a `Demote` it never was.
+    /// An unrecognized action is corruption. There is deliberately no
+    /// lenient counterpart: the previous one coerced anything unknown to
+    /// `Demote`, so a row the code could not parse still drove a
+    /// destructive action.
     pub fn try_from_db_str(s: &str) -> Result<Self, String> {
         match s {
             "demote" => Ok(RoleLossAction::Demote),
@@ -591,19 +731,8 @@ impl RoleLossOperationState {
         }
     }
 
-    pub fn from_db_str(s: &str) -> Self {
-        match s {
-            "worker_committed" => RoleLossOperationState::WorkerCommitted,
-            "local_committed" => RoleLossOperationState::LocalCommitted,
-            "compensating" => RoleLossOperationState::Compensating,
-            "completed" => RoleLossOperationState::Completed,
-            _ => RoleLossOperationState::Prepared,
-        }
-    }
-
-    /// Strict counterpart to [`Self::from_db_str`] -- see
-    /// [`RoleLossAction::try_from_db_str`]'s doc comment for why the lenient
-    /// parse's silent-default behavior is wrong for a read-only inventory.
+    /// An unrecognized state is corruption -- see
+    /// [`RoleLossAction::try_from_db_str`].
     pub fn try_from_db_str(s: &str) -> Result<Self, String> {
         match s {
             "prepared" => Ok(RoleLossOperationState::Prepared),
@@ -637,9 +766,8 @@ pub struct MembershipOperation {
     /// mutation's own outcome). A `--force` removal whose eager-group
     /// enumeration failed is `Unknown` regardless of what its remote
     /// mutation is currently doing (`Prepared`, `Ambiguous`, ...); an
-    /// ordinary ticket-bound or plain mutation is always `Known`. See the
-    /// review this separation implements: "Remote outcomeとdurability
-    /// scopeは別概念として扱います".
+    /// ordinary ticket-bound or plain mutation is always `Known`. Remote
+    /// outcome and durability scope are deliberately separate concepts.
     pub durability_scope: MembershipDurabilityScope,
     /// Folder groups to latch [`GroupDurabilityStatus::Unknown`]
     /// once (and only once) this operation's remote mutation is CONFIRMED
@@ -846,21 +974,6 @@ pub struct MembershipOperationScan {
     pub invalid: Vec<InvalidMembershipOperation>,
 }
 
-// The `PendingEnrollment`/`EnrollmentOperation` cluster below moved out of
-// `yadorilink-sync-core::state_model`/`types` (Phase 7D-9F, ninth pass),
-// mirroring the `RoleLossOperation`/`MembershipOperation` clusters' own move
-// above (7D-9E, third pass). Both of this cluster's original blockers are
-// gone: `crate::recovery::InvalidRecoveryOperation`/`RecoveryDomain` moved
-// here first (7D-9F, eighth pass), and `EnrollmentKind` itself has no
-// dependency of its own on anything still left in `yadorilink-sync-core` --
-// its "coupled to this crate's own DB string representation" reasoning
-// applied equally to `RoleLossAction`/`MembershipOperationAction`, which
-// already moved, so it did not justify staying behind on its own. Re-exported
-// at the matching `state_model`/`types`/`index` path in `yadorilink-sync-core`
-// so every existing caller (`yadorilink-daemon`'s application/persistence
-// layers, `yadorilink-sync-core`'s own `repository`/`recovery` modules) keeps
-// resolving unchanged.
-
 /// Which local action opened a `pending_enrollments`/`enrollment_operations`
 /// row -- a brand-new folder group (`Create`) or joining one an invitation
 /// named (`Join`).
@@ -1056,40 +1169,109 @@ pub struct EnrollmentOperationScan {
     pub invalid: Vec<InvalidEnrollmentOperation>,
 }
 
+/// One restore whose replacement file and index update have not both been
+/// durably committed yet. The intended new record is persisted before the
+/// filesystem rename so startup recovery can finish the exact same version
+/// instead of manufacturing a second version-vector increment.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestoreOperation {
+    pub operation_id: String,
+    pub group_id: String,
+    pub path: String,
+    pub target_version_seq: i64,
+    pub expected_current_version_seq: Option<i64>,
+    pub state: RestoreOperationState,
+    pub record: FileRecord,
+    pub origin_device_id: String,
+    /// The signed DAG change authored for this restore before the filesystem
+    /// replacement begins. Recovery publishes the journaled row with this
+    /// identity, so a crash cannot make a restored edit inherit its source
+    /// version's author.
+    pub authoring_change_hash: Option<ChangeHash>,
+    /// The restored version's own classification columns — carried
+    /// alongside `record` (a bare `FileRecord`, which has no room for
+    /// these) so `commit_restore_operation` can apply them to the
+    /// `current` row via [`LocalFileMetaColumns`]/
+    /// `apply_local_meta_columns_in_tx`, the SAME atomic in-transaction
+    /// counterpart every other local content emission already uses.
+    pub meta: LocalFileMetaColumns,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RestoreCommitOutcome {
+    Committed(FileRecord),
+    Missing,
+    Superseded,
+    /// The restore performed its own physical write, captured the fence
+    /// epoch before it, and something else advanced that fence before this
+    /// commit -- so this attempt no longer knows what is on disk. Nothing
+    /// was written, the journal row included: it is the only record that
+    /// the write happened at all, and startup recovery re-verifies the
+    /// bytes and decides again from there.
+    FenceLost,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreOperationState {
+    Prepared,
+    DiskCommitted,
+}
+
+impl RestoreOperationState {
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Prepared => "prepared",
+            Self::DiskCommitted => "disk_committed",
+        }
+    }
+
+    pub fn from_db_str(value: &str) -> Result<Self, String> {
+        match value {
+            "prepared" => Ok(Self::Prepared),
+            "disk_committed" => Ok(Self::DiskCommitted),
+            other => Err(format!("unknown restore operation state: {other}")),
+        }
+    }
+}
+
+/// One candidate for the automatic eviction sweep, in the order
+/// `list_evictable_files` returns them: least-recently-accessed first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvictableFile {
+    pub path: String,
+    pub size: u64,
+    pub last_accessed_unix: Option<i64>,
+}
+
 #[cfg(test)]
-mod tests {
-    use super::{EnrollmentKind, MaterializationPolicy, MaterializationState};
-    use crate::file::RecordKind;
+mod tests;
 
-    #[test]
-    fn persisted_enum_values_are_exact() {
-        assert_eq!(EnrollmentKind::from_db_str("create"), EnrollmentKind::Create);
-        assert_eq!(EnrollmentKind::from_db_str("join"), EnrollmentKind::Join);
-        assert_eq!(MaterializationState::from_db_str("hydrated"), MaterializationState::Hydrated);
-        assert_eq!(
-            MaterializationState::from_db_str("placeholder"),
-            MaterializationState::Placeholder
-        );
-        assert_eq!(MaterializationPolicy::from_db_str("eager"), MaterializationPolicy::Eager);
-        assert_eq!(MaterializationPolicy::from_db_str("ondemand"), MaterializationPolicy::OnDemand);
-        assert_eq!(RecordKind::from_db_str("file"), RecordKind::File);
-    }
+/// What a row replaced by a HistoryBase snapshot install had placed at its
+/// path: the only object on disk the install's reconciliation may treat as
+/// superseded rather than as something to preserve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PriorPlacement {
+    pub record_kind: RecordKind,
+    /// The replaced row was a `Placeholder`: what it left on disk is a
+    /// placeholder of `size` bytes, not content.
+    pub placeholder: bool,
+    pub size: u64,
+    pub blocks: Vec<BlockInfo>,
+    pub unix_mode: Option<u32>,
+    pub xattrs: Vec<(String, Vec<u8>)>,
+    pub symlink_target: Option<Vec<u8>>,
+}
 
-    #[test]
-    #[should_panic(expected = "unknown persisted materialization state")]
-    fn unknown_materialization_state_is_not_coerced() {
-        let _ = MaterializationState::from_db_str("future-state");
-    }
-
-    #[test]
-    #[should_panic(expected = "unknown persisted materialization policy")]
-    fn unknown_materialization_policy_is_not_coerced() {
-        let _ = MaterializationPolicy::from_db_str("future-policy");
-    }
-
-    #[test]
-    #[should_panic(expected = "unknown persisted enrollment kind")]
-    fn unknown_enrollment_kind_is_not_coerced() {
-        let _ = EnrollmentKind::from_db_str("future-kind");
-    }
+/// A path a HistoryBase snapshot install replaced in the index and has not
+/// yet reconciled on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotInstallHold {
+    pub path: String,
+    /// `None` when the replaced index had no live row at this path, so
+    /// nothing this device placed can be under its name.
+    pub prior: Option<PriorPlacement>,
+    /// Moves every time an install holds the path again. A reconciliation
+    /// releases the hold only at the generation it read, so it cannot
+    /// release a hold a later install renewed for a row it never saw.
+    pub generation: i64,
 }

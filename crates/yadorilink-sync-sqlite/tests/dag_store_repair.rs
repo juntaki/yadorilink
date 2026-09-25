@@ -1,12 +1,13 @@
 use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
-use yadorilink_replica_domain::change::{Change, ChangeAuth, Op, PutOrigin};
+use yadorilink_replica_domain::change::{Op, PutOrigin};
 use yadorilink_replica_domain::file::RecordKind;
 use yadorilink_replica_domain::file::{FileMeta, FileVersion};
 use yadorilink_replica_domain::ids::{DeviceId, FolderGroupId, SyncPath};
+use yadorilink_replica_domain::test_authoring::create_signed_for_tests;
 use yadorilink_sync_sqlite::dag_store::{
-    admit_change, always_current_writer, emit_local_change, get_file_version, init_dag_schema,
-    promote_orphans, put_file_version, AdmitOutcome, ChangeEmitter,
+    admit_change, emit_local_change, get_file_version, init_dag_schema, promote_orphans,
+    put_file_version, AdmitOutcome, ChangeEmitter,
 };
 use yadorilink_sync_sqlite::SyncSqliteError as SyncError;
 
@@ -44,19 +45,17 @@ fn schema_init_drops_unrepairable_orphan_and_child_parent_edges() {
     let signing = signing_key();
     let missing_version = test_version();
 
-    let parent = Change::create_signed(
+    let parent = create_signed_for_tests(
         vec![],
         0,
-        ChangeAuth::PLACEHOLDER,
         DeviceId("device-a".into()),
         FolderGroupId("g".into()),
         vec![Op::Delete { path: SyncPath("old.bin".into()) }],
         &signing,
     );
-    let orphan = Change::create_signed(
+    let orphan = create_signed_for_tests(
         vec![parent.compute_hash()],
         parent.lamport,
-        ChangeAuth::PLACEHOLDER,
         DeviceId("device-a".into()),
         FolderGroupId("g".into()),
         vec![Op::Put {
@@ -70,8 +69,8 @@ fn schema_init_drops_unrepairable_orphan_and_child_parent_edges() {
 
     conn.execute(
         "INSERT INTO orphan_changes \
-         (change_hash, group_id, device_id, lamport, encoded, applied, received_seq) \
-         VALUES (?1, 'g', 'device-a', ?2, ?3, 0, 1)",
+         (change_hash, group_id, device_id, lamport, encoded, received_seq) \
+         VALUES (?1, 'g', 'device-a', ?2, ?3, 0)",
         rusqlite::params![&orphan_hash.0[..], orphan.lamport as i64, orphan.to_wire_bytes()],
     )
     .unwrap();
@@ -100,7 +99,7 @@ fn schema_init_drops_unrepairable_orphan_and_child_parent_edges() {
     assert_eq!(orphan_count, 0);
     assert_eq!(edge_count, 0);
 
-    assert_eq!(admit_change(&conn, &parent, false).unwrap().outcome, AdmitOutcome::Applied);
+    assert_eq!(admit_change(&conn, &parent).unwrap().outcome, AdmitOutcome::Applied);
 }
 
 #[test]
@@ -118,7 +117,6 @@ fn schema_init_replaces_corrupt_group_row_from_valid_cross_group_source() {
             version: version.version_hash,
             origin: PutOrigin::Direct,
         }],
-        ChangeAuth::PLACEHOLDER,
         &emitter(),
     )
     .unwrap();
@@ -153,7 +151,6 @@ fn schema_init_fails_closed_when_admitted_version_has_no_valid_source() {
             version: version.version_hash,
             origin: PutOrigin::Direct,
         }],
-        ChangeAuth::PLACEHOLDER,
         &emitter(),
     )
     .unwrap();
@@ -168,7 +165,7 @@ fn schema_init_fails_closed_when_admitted_version_has_no_valid_source() {
     assert!(matches!(error, SyncError::CorruptState(_)));
 }
 
-/// RED: the durable row key is itself part of the content-addressed identity.
+/// Pins: the durable row key is itself part of the content-addressed identity.
 /// A valid encoded Change stored under a different hash must not survive startup
 /// as admitted history, because every hash-keyed lookup then refers to a row
 /// whose canonical bytes identify a different Change.
@@ -176,10 +173,9 @@ fn schema_init_fails_closed_when_admitted_version_has_no_valid_source() {
 fn schema_init_fails_closed_when_admitted_change_storage_key_disagrees_with_encoded_hash() {
     let conn = conn();
     let signing = signing_key();
-    let change = Change::create_signed(
+    let change = create_signed_for_tests(
         vec![],
         0,
-        ChangeAuth::PLACEHOLDER,
         DeviceId("device-a".into()),
         FolderGroupId("g".into()),
         vec![Op::Delete { path: SyncPath("old.bin".into()) }],
@@ -190,9 +186,14 @@ fn schema_init_fails_closed_when_admitted_change_storage_key_disagrees_with_enco
 
     conn.execute(
         "INSERT INTO changes \
-         (change_hash, group_id, device_id, lamport, encoded, applied) \
-         VALUES (?1, 'g', 'device-a', ?2, ?3, 1)",
-        rusqlite::params![&stored_hash[..], change.lamport as i64, change.to_wire_bytes()],
+         (change_hash, group_id, device_id, author_seq, lamport, encoded) \
+         VALUES (?1, 'g', 'device-a', ?2, ?3, ?4)",
+        rusqlite::params![
+            &stored_hash[..],
+            change.author_seq.get() as i64,
+            change.lamport as i64,
+            change.to_wire_bytes()
+        ],
     )
     .unwrap();
 
@@ -201,17 +202,16 @@ fn schema_init_fails_closed_when_admitted_change_storage_key_disagrees_with_enco
     assert!(matches!(error, SyncError::CorruptState(_)));
 }
 
-/// RED: the denormalized row metadata is used to scope and order retained
+/// Pins: the denormalized row metadata is used to scope and order retained
 /// history. It must agree with the signed canonical Change rather than silently
 /// creating one identity for SQL queries and another identity when decoded.
 #[test]
 fn schema_init_fails_closed_when_admitted_row_metadata_disagrees_with_encoded_change() {
     let conn = conn();
     let signing = signing_key();
-    let change = Change::create_signed(
+    let change = create_signed_for_tests(
         vec![],
         0,
-        ChangeAuth::PLACEHOLDER,
         DeviceId("device-a".into()),
         FolderGroupId("group-a".into()),
         vec![Op::Delete { path: SyncPath("old.bin".into()) }],
@@ -221,9 +221,14 @@ fn schema_init_fails_closed_when_admitted_row_metadata_disagrees_with_encoded_ch
 
     conn.execute(
         "INSERT INTO changes \
-         (change_hash, group_id, device_id, lamport, encoded, applied) \
-         VALUES (?1, 'group-b', 'device-b', ?2, ?3, 1)",
-        rusqlite::params![&hash.0[..], change.lamport as i64 + 7, change.to_wire_bytes()],
+         (change_hash, group_id, device_id, author_seq, lamport, encoded) \
+         VALUES (?1, 'group-b', 'device-b', ?2, ?3, ?4)",
+        rusqlite::params![
+            &hash.0[..],
+            change.author_seq.get() as i64,
+            change.lamport as i64 + 7,
+            change.to_wire_bytes()
+        ],
     )
     .unwrap();
 
@@ -232,26 +237,24 @@ fn schema_init_fails_closed_when_admitted_row_metadata_disagrees_with_encoded_ch
     assert!(matches!(error, SyncError::CorruptState(_)));
 }
 
-/// RED: a buffered orphan has two identities today: the SQLite storage key and
+/// Pins: a buffered orphan has two identities: the SQLite storage key and
 /// the hash of its encoded Change. Startup repair must reject the row when they
 /// disagree and remove the child-edge metadata keyed by the corrupt storage key.
 #[test]
 fn schema_init_drops_orphan_whose_storage_key_disagrees_with_encoded_hash() {
     let conn = conn();
     let signing = signing_key();
-    let parent = Change::create_signed(
+    let parent = create_signed_for_tests(
         vec![],
         0,
-        ChangeAuth::PLACEHOLDER,
         DeviceId("device-a".into()),
         FolderGroupId("g".into()),
         vec![Op::Delete { path: SyncPath("parent.bin".into()) }],
         &signing,
     );
-    let orphan = Change::create_signed(
+    let orphan = create_signed_for_tests(
         vec![parent.compute_hash()],
         parent.lamport,
-        ChangeAuth::PLACEHOLDER,
         DeviceId("device-a".into()),
         FolderGroupId("g".into()),
         vec![Op::Delete { path: SyncPath("child.bin".into()) }],
@@ -262,8 +265,8 @@ fn schema_init_drops_orphan_whose_storage_key_disagrees_with_encoded_hash() {
 
     conn.execute(
         "INSERT INTO orphan_changes \
-         (change_hash, group_id, device_id, lamport, encoded, applied, received_seq) \
-         VALUES (?1, 'g', 'device-a', ?2, ?3, 0, 1)",
+         (change_hash, group_id, device_id, lamport, encoded, received_seq) \
+         VALUES (?1, 'g', 'device-a', ?2, ?3, 0)",
         rusqlite::params![&stored_hash[..], orphan.lamport as i64, orphan.to_wire_bytes()],
     )
     .unwrap();
@@ -293,7 +296,7 @@ fn schema_init_drops_orphan_whose_storage_key_disagrees_with_encoded_hash() {
     assert_eq!(edge_count, 0, "discarding the orphan must clean its stored-key edges");
 }
 
-/// RED: if a malformed orphan row reaches promotion, the current code can
+/// Pins: if a malformed orphan row reaches promotion, a naive promotion could
 /// delete the row by its bogus storage key, append the decoded Change by its
 /// real hash, and leave the old child->parent edge behind forever. Promotion
 /// must not create such ghost ancestry.
@@ -301,21 +304,19 @@ fn schema_init_drops_orphan_whose_storage_key_disagrees_with_encoded_hash() {
 fn promoting_hash_mismatched_orphan_does_not_leave_ghost_parent_edges() {
     let conn = conn();
     let signing = signing_key();
-    let parent = Change::create_signed(
+    let parent = create_signed_for_tests(
         vec![],
         0,
-        ChangeAuth::PLACEHOLDER,
         DeviceId("device-a".into()),
         FolderGroupId("g".into()),
         vec![Op::Delete { path: SyncPath("parent.bin".into()) }],
         &signing,
     );
-    assert_eq!(admit_change(&conn, &parent, false).unwrap().outcome, AdmitOutcome::Applied);
+    assert_eq!(admit_change(&conn, &parent).unwrap().outcome, AdmitOutcome::Applied);
 
-    let orphan = Change::create_signed(
+    let orphan = create_signed_for_tests(
         vec![parent.compute_hash()],
         parent.lamport,
-        ChangeAuth::PLACEHOLDER,
         DeviceId("device-a".into()),
         FolderGroupId("g".into()),
         vec![Op::Delete { path: SyncPath("child.bin".into()) }],
@@ -326,8 +327,8 @@ fn promoting_hash_mismatched_orphan_does_not_leave_ghost_parent_edges() {
 
     conn.execute(
         "INSERT INTO orphan_changes \
-         (change_hash, group_id, device_id, lamport, encoded, applied, received_seq) \
-         VALUES (?1, 'g', 'device-a', ?2, ?3, 0, 1)",
+         (change_hash, group_id, device_id, lamport, encoded, received_seq) \
+         VALUES (?1, 'g', 'device-a', ?2, ?3, 0)",
         rusqlite::params![&stored_hash[..], orphan.lamport as i64, orphan.to_wire_bytes()],
     )
     .unwrap();
@@ -337,8 +338,7 @@ fn promoting_hash_mismatched_orphan_does_not_leave_ghost_parent_edges() {
     )
     .unwrap();
 
-    let promoted =
-        promote_orphans(&conn, &[parent.compute_hash()], &always_current_writer).unwrap();
+    let promoted = promote_orphans(&conn, &[parent.compute_hash()]).unwrap();
     assert_eq!(promoted, vec![orphan.compute_hash()]);
 
     let ghost_edge_count: i64 = conn
@@ -351,7 +351,7 @@ fn promoting_hash_mismatched_orphan_does_not_leave_ghost_parent_edges() {
     assert_eq!(ghost_edge_count, 0, "promotion must not leave ancestry under a bogus row key");
 }
 
-/// RED: `change_parents` is a derived index of the signed Change body. If it is
+/// Pins: `change_parents` is a derived index of the signed Change body. If it is
 /// corrupted independently, ancestry and orphan readiness can disagree with the
 /// canonical history while every encoded Change remains individually valid.
 #[test]
@@ -361,7 +361,6 @@ fn schema_init_fails_closed_when_parent_edges_disagree_with_encoded_change() {
         &conn,
         "g",
         vec![Op::Delete { path: SyncPath("first.bin".into()) }],
-        ChangeAuth::PLACEHOLDER,
         &emitter(),
     )
     .unwrap();
@@ -369,7 +368,6 @@ fn schema_init_fails_closed_when_parent_edges_disagree_with_encoded_change() {
         &conn,
         "g",
         vec![Op::Delete { path: SyncPath("second.bin".into()) }],
-        ChangeAuth::PLACEHOLDER,
         &emitter(),
     )
     .unwrap();
@@ -391,9 +389,9 @@ fn schema_init_fails_closed_when_parent_edges_disagree_with_encoded_change() {
     assert!(matches!(error, SyncError::CorruptState(_)));
 }
 
-/// RED: `group_heads` is trusted by local emission without re-validating that a
-/// head belongs to the target group. A corrupt cross-group head therefore makes
-/// this device sign a new Change whose parent belongs to a different history.
+/// Pins: local emission must re-validate that a `group_heads` head belongs to
+/// the target group. Otherwise a corrupt cross-group head would make this
+/// device sign a new Change whose parent belongs to a different history.
 #[test]
 fn local_emit_refuses_cross_group_head_injected_into_group_frontier() {
     let conn = conn();
@@ -401,7 +399,6 @@ fn local_emit_refuses_cross_group_head_injected_into_group_frontier() {
         &conn,
         "group-a",
         vec![Op::Delete { path: SyncPath("a.bin".into()) }],
-        ChangeAuth::PLACEHOLDER,
         &emitter(),
     )
     .unwrap();
@@ -409,7 +406,6 @@ fn local_emit_refuses_cross_group_head_injected_into_group_frontier() {
         &conn,
         "group-b",
         vec![Op::Delete { path: SyncPath("b.bin".into()) }],
-        ChangeAuth::PLACEHOLDER,
         &emitter(),
     )
     .unwrap();
@@ -425,7 +421,6 @@ fn local_emit_refuses_cross_group_head_injected_into_group_frontier() {
             &conn,
             "group-a",
             vec![Op::Delete { path: SyncPath("next.bin".into()) }],
-            ChangeAuth::PLACEHOLDER,
             &emitter(),
         )
         .is_err(),
@@ -433,7 +428,7 @@ fn local_emit_refuses_cross_group_head_injected_into_group_frontier() {
     );
 }
 
-/// RED: losing the derived `group_heads` row while retained history still exists
+/// Pins: losing the derived `group_heads` row while retained history still exists
 /// must not make the next local edit look like a fresh root. Otherwise a single
 /// SQLite-index inconsistency silently forks the signed history at Lamport 1.
 #[test]
@@ -443,7 +438,6 @@ fn local_emit_refuses_missing_head_when_retained_history_exists() {
         &conn,
         "g",
         vec![Op::Delete { path: SyncPath("first.bin".into()) }],
-        ChangeAuth::PLACEHOLDER,
         &emitter(),
     )
     .unwrap();
@@ -454,7 +448,6 @@ fn local_emit_refuses_missing_head_when_retained_history_exists() {
             &conn,
             "g",
             vec![Op::Delete { path: SyncPath("second.bin".into()) }],
-            ChangeAuth::PLACEHOLDER,
             &emitter(),
         )
         .is_err(),

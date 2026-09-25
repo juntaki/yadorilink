@@ -1,10 +1,5 @@
-//! `LinkRepository` owns the `links` table (plus `duplicate_recovery_paths`).
-//! Some of its methods are read-only lookups that also serve as internal
-//! helpers for `yadorilink-sync-core`'s `repository::enrollment::
-//! EnrollmentRepository`'s cross-table atomic methods, which write to
-//! `links` inside their own transaction -- see that module's doc comment on
-//! those methods for why it calls [`LinkRepository::insert_link_row`]
-//! directly instead of duplicating it.
+//! `LinkRepository` owns the `links` table (plus
+//! `duplicate_recovery_paths`).
 
 use std::sync::Arc;
 
@@ -12,8 +7,23 @@ use rusqlite::OptionalExtension;
 
 use crate::error::SyncSqliteError;
 use crate::file_index::enumerate_group_durability_roots_on_conn;
-use yadorilink_replica_domain::session_state::{FolderLink, LinkGate, MaterializationPolicy};
+use yadorilink_replica_domain::session_state::{
+    FolderLink, LinkGate, LinkRowWrite, MaterializationPolicy,
+};
 use yadorilink_sqlite_runtime::SyncDatabase;
+
+/// One `links` row, selected as `local_path, group_id, paused,
+/// materialization_policy, max_local_size_bytes, orphaned`.
+fn row_to_folder_link(r: &rusqlite::Row<'_>) -> rusqlite::Result<FolderLink> {
+    Ok(FolderLink {
+        local_path: r.get(0)?,
+        group_id: r.get(1)?,
+        paused: r.get::<_, i64>(2)? != 0,
+        materialization_policy: MaterializationPolicy::from_db_str(&r.get::<_, String>(3)?),
+        max_local_size_bytes: r.get(4)?,
+        orphaned: r.get::<_, i64>(5)? != 0,
+    })
+}
 
 pub struct LinkRepository {
     database: Arc<SyncDatabase>,
@@ -48,37 +58,35 @@ impl LinkRepository {
         })
     }
 
-    /// The ONLY way a row enters `links`. Both public insert entry points call
-    /// this and nothing else, so the one-live-link-per-group invariant cannot be
-    /// forgotten at a future third insert site: there is no other function in
-    /// this file that names `INSERT INTO links`.
+    /// The ONLY way a row enters `links`. Both public insert entry points
+    /// call this and nothing else, so the one-live-link-per-group
+    /// invariant cannot be forgotten at a future third insert site: there
+    /// is no other function in this file that names `INSERT INTO links`.
+    /// Takes a `&Transaction`, not a `&Connection`, on purpose: the check
+    /// and the write must be one unit under `BEGIN IMMEDIATE`, or two
+    /// concurrent `link` calls each read "no existing live link" and both
+    /// insert. That atomicity is also why this lives here and not in the
+    /// daemon's `link` handler — a check up there cannot be in the same
+    /// transaction as the insert down here, so it is a TOCTOU window by
+    /// construction. The handler's own check is an ergonomic early
+    /// refusal, not the invariant. `INSERT OR REPLACE` is deliberately NOT
+    /// used, here or anywhere else on this table. Measured, it does three
+    /// separate silent harms: with a UNIQUE index present it DELETES the
+    /// conflicting row instead of erroring; it resets `root_token` to NULL
+    /// (re-arming adoption, which disarms the unmounted-volume guard); and
+    /// it flips `orphaned` 1 → 0, an un-orphan path nothing in the code
+    /// intends. A plain `INSERT` lets the primary key refuse the repoint
+    /// case, which also makes the SQL and Rust layers agree instead of
+    /// diverge.
     ///
-    /// Takes a `&Transaction`, not a `&Connection`, on purpose: the check and
-    /// the write must be one unit under `BEGIN IMMEDIATE`, or two concurrent
-    /// `link` calls each read "no existing live link" and both insert. That
-    /// atomicity is also why this lives here and not in the daemon's `link`
-    /// handler — a check up there cannot be in the same transaction as the
-    /// insert down here, so it is a TOCTOU window by construction. The handler's
-    /// own check is an ergonomic early refusal, not the invariant.
-    ///
-    /// `INSERT OR REPLACE` is deliberately NOT used, here or anywhere else on
-    /// this table. Measured, it does three separate silent harms: with a UNIQUE
-    /// index present it DELETES the conflicting row instead of erroring; it
-    /// resets `root_token` to NULL (re-arming adoption, which disarms the
-    /// unmounted-volume guard); and it flips `orphaned` 1 → 0, an un-orphan path
-    /// nothing in the code intends. A plain `INSERT` lets the primary key refuse
-    /// the repoint case, which also makes the SQL and Rust layers agree instead
-    /// of diverge.
-    ///
-    /// `pub`, not `pub(crate)`: `yadorilink-sync-core`'s own
-    /// `repository::enrollment::EnrollmentRepository` calls this directly, on
-    /// its own already-open transaction, for the exact atomicity reason above
-    /// -- see that module's doc comment.
+    /// Reports whether it inserted the row or updated an existing one (with
+    /// that row's prior state), so a caller whose later setup fails can undo
+    /// exactly this write with [`Self::undo_link_row_on_tx`].
     pub fn insert_link_row(
         tx: &rusqlite::Transaction<'_>,
         local_path: &str,
         group_id: &str,
-    ) -> Result<(), SyncSqliteError> {
+    ) -> Result<LinkRowWrite, SyncSqliteError> {
         // A live row for this group at any OTHER path is THE bug: two roots on
         // one group tombstone each other's files group-wide. Never guess which
         // root is meant — refuse and name both. A live row at THIS path is a
@@ -96,39 +104,97 @@ impl LinkRepository {
             });
         }
 
-        let existing_group: Option<String> = tx
-            .query_row("SELECT group_id FROM links WHERE local_path = ?1", [local_path], |r| {
-                r.get(0)
-            })
+        let existing = tx
+            .query_row(
+                "SELECT local_path, group_id, paused, materialization_policy, \
+                 max_local_size_bytes, orphaned FROM links WHERE local_path = ?1",
+                [local_path],
+                row_to_folder_link,
+            )
             .optional()?;
-        match existing_group {
+        match existing {
             // This path is already registered to a DIFFERENT group. `INSERT OR
             // REPLACE` used to silently repoint the folder while every one of
             // its indexed file rows still belonged to the old group.
-            Some(g) if g != group_id => Err(SyncSqliteError::InvalidInput(format!(
-                "{local_path} is already linked to folder group {g}; unlink it before linking it \
-                 to {group_id}"
-            ))),
+            Some(prior) if prior.group_id != group_id => {
+                Err(SyncSqliteError::InvalidInput(format!(
+                    "{local_path} is already linked to folder group {}; unlink it before \
+                     linking it to {group_id}",
+                    prior.group_id
+                )))
+            }
             // Same path, same group: a deliberate re-link (including the
             // idempotent retry after a failed link's rollback). Un-orphan and
             // un-pause EXPLICITLY, preserving `root_token` and the
             // materialization policy — leaving the row untouched instead would
             // make re-linking an orphaned folder a silent no-op.
-            Some(_) => {
+            Some(prior) => {
                 tx.execute(
                     "UPDATE links SET paused = 0, orphaned = 0 WHERE local_path = ?1",
                     [local_path],
                 )?;
-                Ok(())
+                Ok(LinkRowWrite::Updated(prior))
             }
             None => {
                 tx.execute(
                     "INSERT INTO links (local_path, group_id, paused) VALUES (?1, ?2, 0)",
                     rusqlite::params![local_path, group_id],
                 )?;
-                Ok(())
+                Ok(LinkRowWrite::Inserted)
             }
         }
+    }
+
+    /// Undoes one [`Self::insert_link_row`] write: deletes a row it inserted,
+    /// or puts back the columns a re-link (and its setup) may have changed
+    /// on a row that already existed -- never the row's `root_token`, which a
+    /// re-link never touches. Scoped to `(local_path, group_id)`, so it can
+    /// never remove or rewrite another group's row. Returns what it did, in
+    /// words, for the caller's log line.
+    pub fn undo_link_row_on_tx(
+        tx: &rusqlite::Transaction<'_>,
+        local_path: &str,
+        group_id: &str,
+        write: &LinkRowWrite,
+    ) -> Result<&'static str, SyncSqliteError> {
+        match write {
+            LinkRowWrite::Inserted => {
+                tx.execute(
+                    "DELETE FROM links WHERE local_path = ?1 AND group_id = ?2",
+                    rusqlite::params![local_path, group_id],
+                )?;
+                Ok("removed the link row this attempt inserted")
+            }
+            LinkRowWrite::Updated(prior) => {
+                tx.execute(
+                    "UPDATE links SET paused = ?3, orphaned = ?4, materialization_policy = ?5, \
+                        max_local_size_bytes = ?6 \
+                     WHERE local_path = ?1 AND group_id = ?2",
+                    rusqlite::params![
+                        local_path,
+                        group_id,
+                        i64::from(prior.paused),
+                        i64::from(prior.orphaned),
+                        prior.materialization_policy.as_db_str(),
+                        prior.max_local_size_bytes,
+                    ],
+                )?;
+                Ok("restored the link row that already existed")
+            }
+        }
+    }
+
+    /// [`Self::undo_link_row_on_tx`] in its own transaction -- the rollback
+    /// of a plain link commit ([`Self::add_link`]) whose setup failed.
+    pub fn undo_link_row(
+        &self,
+        local_path: &str,
+        group_id: &str,
+        write: &LinkRowWrite,
+    ) -> Result<&'static str, SyncSqliteError> {
+        self.database.write_immediate::<_, SyncSqliteError>(|tx| {
+            Self::undo_link_row_on_tx(tx, local_path, group_id, write)
+        })
     }
 
     /// Commits a link with no enrollment marker beside it -- the shape
@@ -151,14 +217,18 @@ impl LinkRepository {
     /// commits through `EnrollmentRepository::add_link_with_pending_
     /// enrollment_and_begin_setup` with a `Create` marker, which
     /// deliberately records no floor.
-    pub fn add_link(&self, local_path: &str, group_id: &str) -> Result<(), SyncSqliteError> {
+    pub fn add_link(
+        &self,
+        local_path: &str,
+        group_id: &str,
+    ) -> Result<LinkRowWrite, SyncSqliteError> {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            Self::insert_link_row(tx, local_path, group_id)?;
+            let write = Self::insert_link_row(tx, local_path, group_id)?;
             // In the same transaction as the link row itself, for the reason
             // `record_local_history_floor` gives: a committed link with no
             // floor behind it is exactly the state the floor prevents.
             crate::rewind_plan::record_local_history_floor_for_a_first_link(tx, group_id)?;
-            Ok(())
+            Ok(write)
         })
     }
 
@@ -197,18 +267,7 @@ impl LinkRepository {
                 "SELECT local_path, group_id, paused, materialization_policy, \
                  max_local_size_bytes, orphaned FROM links",
             )?;
-            let rows = stmt.query_map([], |r| {
-                Ok(FolderLink {
-                    local_path: r.get(0)?,
-                    group_id: r.get(1)?,
-                    paused: r.get::<_, i64>(2)? != 0,
-                    materialization_policy: MaterializationPolicy::from_db_str(
-                        &r.get::<_, String>(3)?,
-                    ),
-                    max_local_size_bytes: r.get(4)?,
-                    orphaned: r.get::<_, i64>(5)? != 0,
-                })
-            })?;
+            let rows = stmt.query_map([], row_to_folder_link)?;
             Ok(rows.collect::<Result<_, _>>()?)
         })
     }
@@ -893,138 +952,4 @@ impl LinkRepository {
 /// with arbitrary history behind it while this device holds none of it, so
 /// both need the same boundary recorded that an enrollment `Join` does.
 #[cfg(test)]
-mod local_history_floor_tests {
-    use super::*;
-    use crate::rewind_plan::compute_rewind_plan;
-    use yadorilink_replica_domain::file::FileRecord;
-    use yadorilink_replica_domain::rewind::RewindPathAction;
-
-    const GROUP: &str = "group-1";
-    const LOCAL_PATH: &str = "/folders/shared";
-    /// The distance a preview like `--at 30d` asks about.
-    const THIRTY_DAYS_NANOS: i64 = 30 * 24 * 60 * 60 * 1_000_000_000;
-
-    /// Full schema, pooled exactly as production opens it -- DAG tables
-    /// first, since `yadorilink_sqlite_runtime::init_schema` assumes
-    /// `changes`/`pruned_changes` already exist.
-    fn open_full_test_db() -> Arc<SyncDatabase> {
-        Arc::new(
-            SyncDatabase::open_in_memory(|conn| {
-                crate::dag_store::init_dag_schema(conn).map_err(|e| {
-                    yadorilink_sqlite_runtime::DatabaseError::CorruptSchema(e.to_string())
-                })?;
-                yadorilink_sqlite_runtime::init_schema(conn)
-            })
-            .expect("open in-memory db"),
-        )
-    }
-
-    /// Admits one file through the real file-index write chokepoint, the
-    /// way an incoming change from a peer does -- so the row's
-    /// `version_seq` and admission stamp are the production ones.
-    fn admit_file(db: &Arc<SyncDatabase>, path: &str) {
-        db.write_immediate::<_, SyncSqliteError>(|tx| {
-            crate::file_index::upsert_file_in_tx(
-                tx,
-                GROUP,
-                &FileRecord {
-                    path: path.to_string(),
-                    size: 10,
-                    mtime_unix_nanos: 0,
-                    blocks: Vec::new(),
-                    deleted: false,
-                },
-                "device-that-was-here-first",
-                None,
-            )
-        })
-        .expect("the file admission must succeed");
-    }
-
-    fn recorded_floor(db: &Arc<SyncDatabase>) -> Option<i64> {
-        db.read::<_, SyncSqliteError>(|conn| {
-            Ok(conn
-                .query_row(
-                    "SELECT floor_unix_nanos FROM group_local_history_floor WHERE group_id = ?1",
-                    [GROUP],
-                    |row| row.get(0),
-                )
-                .optional()?)
-        })
-        .unwrap()
-    }
-
-    #[test]
-    fn a_file_inherited_at_a_plain_link_is_unavailable_before_the_link_not_delete() {
-        let db = open_full_test_db();
-        let before_link = crate::file_index::now_unix_nanos_checked().unwrap();
-        LinkRepository::new(db.clone()).add_link(LOCAL_PATH, GROUP).unwrap();
-        // Everything the folder already held syncs in after the link, each
-        // path numbered from 1 because this device is seeing it for the
-        // first time.
-        for path in ["notes.txt", "photos/trip.jpg"] {
-            admit_file(&db, path);
-        }
-
-        // The observable verdict first, so a regression reports what the
-        // user would actually be shown rather than a missing table row.
-        let plan = db
-            .read::<_, SyncSqliteError>(|conn| {
-                compute_rewind_plan(conn, GROUP, before_link - THIRTY_DAYS_NANOS)
-            })
-            .unwrap();
-        let counts = plan.action_counts();
-        assert_eq!(
-            counts.delete, 0,
-            "a folder this device inherited was not created since the target, so a preview must \
-             not offer to delete it: {counts:?}"
-        );
-        assert_eq!(
-            counts.unavailable, 2,
-            "every inherited path is unanswerable this far back: {counts:?}"
-        );
-        match &plan.entries.iter().find(|e| e.path == "notes.txt").unwrap().action {
-            RewindPathAction::Unavailable { reason } => assert!(
-                !reason.contains("retention"),
-                "retention cannot be the cause below the floor: {reason}"
-            ),
-            other => panic!("expected Unavailable before the link, got {other:?}"),
-        }
-
-        let floor = recorded_floor(&db).expect("a first link must record this group's floor");
-        assert!(floor >= before_link, "the floor must be the link instant, not something earlier");
-    }
-
-    /// Re-linking a folder this device already has an index for must NOT
-    /// move the floor. Nothing restarts `version_seq` in that case -- the
-    /// rows are all still there -- so moving it would throw away real,
-    /// answerable history for no gain.
-    #[test]
-    fn re_linking_a_group_this_device_already_indexed_leaves_the_floor_alone() {
-        let db = open_full_test_db();
-        let links = LinkRepository::new(db.clone());
-        links.add_link(LOCAL_PATH, GROUP).unwrap();
-        admit_file(&db, "notes.txt");
-        let first_floor = recorded_floor(&db).expect("a first link must record this group's floor");
-
-        links.remove_link(LOCAL_PATH).unwrap();
-        links.add_link(LOCAL_PATH, GROUP).unwrap();
-
-        assert_eq!(
-            recorded_floor(&db),
-            Some(first_floor),
-            "a re-link of an already-indexed group must not move the floor forward"
-        );
-        assert_eq!(
-            db.read::<_, SyncSqliteError>(|conn| compute_rewind_plan(conn, GROUP, i64::MAX))
-                .unwrap()
-                .entries
-                .iter()
-                .find(|e| e.path == "notes.txt")
-                .unwrap()
-                .action,
-            RewindPathAction::Unchanged,
-            "history from before the re-link stays answerable"
-        );
-    }
-}
+mod local_history_floor_tests;

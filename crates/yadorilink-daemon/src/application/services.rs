@@ -1,32 +1,42 @@
 //! The single entry point the control socket calls into `application`
 //! through. Built exactly once by the production composition root, and
-//! handed down through `ControlContext` -- every field wraps a real
-//! ports-based service.
+//! handed down through `ControlContext`.
+//!
+//! Two kinds of field live here. A `*Service` field wraps a ports-based
+//! application service that owns real saga/decision logic (validation,
+//! sequencing, rollback, error translation). A `dyn *Port` field is a
+//! command surface whose only application-level behaviour would be a 1:1
+//! forward to that port, so callers reach the port directly instead of
+//! through an extra wrapper type that adds nothing.
 
 use std::sync::Arc;
 
+use super::ports::{
+    DaemonLifecyclePort, DurabilityCommandPort, GcPort, GovernanceCommandPort, GroupAdministration,
+    HandoffCommandPort, LinkPauseResumePort, MaterializationPort, ReportingCommandPort,
+    UpdateCommandPort,
+};
 use super::{
-    DaemonLifecycleService, DurabilityCommandService, EnrollmentRecoveryService, EnrollmentService,
-    GcCommandService, GovernanceCommandService, HandoffCommandService, LinkLifecycleService,
-    MaterializationService, PauseResumeService, ReplicaMembershipService, ReplicaRoleService,
-    ReportingCommandService, UpdateCommandService, VersionRestoreService,
+    EnrollmentRecoveryService, EnrollmentService, LinkLifecycleService, ReplicaMembershipService,
+    ReplicaRoleService, VersionRestoreService,
 };
 
 pub(crate) struct ApplicationServices {
     pub(crate) enrollment: Arc<EnrollmentService>,
     pub(crate) enrollment_recovery: Arc<EnrollmentRecoveryService>,
-    pub(crate) materialization: Arc<MaterializationService>,
+    pub(crate) materialization: Arc<dyn MaterializationPort>,
     pub(crate) membership: Arc<ReplicaMembershipService>,
+    pub(crate) group_admin: Arc<dyn GroupAdministration>,
     pub(crate) replica_role: Arc<ReplicaRoleService>,
-    pub(crate) pause_resume: Arc<PauseResumeService>,
-    pub(crate) gc: Arc<GcCommandService>,
-    pub(crate) lifecycle: Arc<DaemonLifecycleService>,
-    pub(crate) durability: Arc<DurabilityCommandService>,
-    pub(crate) handoff: Arc<HandoffCommandService>,
+    pub(crate) pause_resume: Arc<dyn LinkPauseResumePort>,
+    pub(crate) gc: Arc<dyn GcPort>,
+    pub(crate) lifecycle: Arc<dyn DaemonLifecyclePort>,
+    pub(crate) durability: Arc<dyn DurabilityCommandPort>,
+    pub(crate) handoff: Arc<dyn HandoffCommandPort>,
     pub(crate) version_restore: Arc<VersionRestoreService>,
-    pub(crate) governance: Arc<GovernanceCommandService>,
-    pub(crate) reporting: Arc<ReportingCommandService>,
-    pub(crate) update: Arc<UpdateCommandService>,
+    pub(crate) governance: Arc<dyn GovernanceCommandPort>,
+    pub(crate) reporting: Arc<dyn ReportingCommandPort>,
+    pub(crate) update: Arc<dyn UpdateCommandPort>,
     pub(crate) link_lifecycle: Arc<LinkLifecycleService>,
     /// Track Send's `send`/`receive` commands -- see `crate::send_transfer`'s
     /// own module doc comment for why this is a thin wrapper rather than a

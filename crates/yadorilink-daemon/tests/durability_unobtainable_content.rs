@@ -1,8 +1,5 @@
-//! M5-A soak-closure durability investigation: deterministic regression
-//! for the durability-stuck-Protecting finding (`m5a-pass9-link-runtime-
-//! stop-fence-gap` in project memory; see the tracked comment on
-//! `topology_soak_lane.rs`'s `randomized_soak_converges_with_no_leaks_or_
-//! stuck_state` for the full root-cause trace).
+//! Deterministic regression: durability must not stay stuck in
+//! `Protecting` when content has no obtainable holder.
 //!
 //! Root cause: a full-replica device's `Placeholder` row can legitimately
 //! have NO obtainable holder among current membership -- its sole
@@ -113,6 +110,18 @@ async fn unobtainable_content_converges_to_at_risk_not_stuck_protecting() {
     register_with_fake(&fake, &x.state, &x.device_id, &[&group_id]).await;
     let x_runtime = spawn_orchestrator(fake.addr(), &x);
     handles.insert(x.device_id.clone(), x_runtime);
+
+    // X joins after the canonical topology's own barrier has already run, so
+    // nobody knows where its reconciliation substrate answers and it knows
+    // where nobody else's does. Re-including n/m/w is idempotent: `record`
+    // overwrites each entry with the identical value.
+    //
+    // Without this, all three canonical nodes are stopped at
+    // `SubstrateNode::connect` for X ("No addressing information available")
+    // while X itself authors and settles its own content perfectly well --
+    // so the test fails at "n never indexed x's unique content", long before
+    // it can reach the unobtainability it exists to check.
+    support::topology::advertise_substrate_endpoints(&[&n, &m, &w, &x]).await;
 
     // Wait for X to reach real DAG-negotiated sessions with all three
     // canonical nodes before writing -- a write before negotiation

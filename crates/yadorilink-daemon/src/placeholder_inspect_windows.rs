@@ -1,4 +1,4 @@
-//! M2-2: the daemon-process side of Windows CfAPI dirty detection --
+//! The daemon-process side of Windows CfAPI dirty detection --
 //! `local_change.rs`'s ONLY way to prove a `Placeholder`-state path is
 //! still untouched on Windows (see `ports::LocalMutationStore::
 //! inspect_windows_placeholder`'s own doc for the exact contract this
@@ -10,11 +10,9 @@
 //! `shell-ext/windows/src/cfapi.rs`'s `fetch_data_callback` and this
 //! module's own `inspect_placeholder` both end up calling into the Cloud
 //! Filter API against the same on-disk placeholders, but from two
-//! DIFFERENT OS processes. `crates/yadorilink-daemon/src/
-//! placeholder_backend_windows.rs` (dead code, M1-era) found empirically
-//! that the filter driver refuses ordinary file operations -- even a
-//! read-only attribute query -- against a placeholder under a sync root
-//! with NO connected provider at all. It does not follow (and this
+//! DIFFERENT OS processes. The filter driver refuses ordinary file
+//! operations -- even a read-only attribute query -- against a
+//! placeholder under a sync root with NO connected provider at all. It does not follow (and this
 //! module does not assume) that the connection must belong to the SAME
 //! process making the query: in production, `yadorilink-cfapi-host.exe`
 //! is ALWAYS the connected provider for every registered root, so a
@@ -23,11 +21,8 @@
 //! module makes, instead of standing up a second cross-process RPC
 //! surface (`daemon -> cfapi-host`) just to run this one read.
 //!
-//! This is UNVERIFIED against real Windows hardware -- flagged honestly,
-//! matching this codebase's own convention for CfAPI behavior that
-//! cannot be exercised on the non-Windows machine this was written on.
-//! If real-hardware testing (the pinned Windows-CI audit M2's roadmap
-//! calls for) finds this assumption wrong, every `CfGetPlaceholderInfo`
+//! This cross-process assumption is not exercised by this module's own
+//! (non-Windows) tests. If it is wrong on real hardware, every `CfGetPlaceholderInfo`
 //! call here would simply fail -- which this module already maps to
 //! `PlaceholderStatus::Unknown`, the same fail-closed outcome as every
 //! other failure mode it handles, so Windows dirty detection would
@@ -58,9 +53,9 @@ use yadorilink_filesystem_sync::placeholder_backend::PlaceholderStatus;
 /// `encode_generation_identity` writes as a placeholder's `FileIdentity`,
 /// and this function decodes: 1 version-tag byte (`1`, "generation-token
 /// v1") followed by an 8-byte little-endian `u64`. Self-describing on
-/// purpose -- M2-0 shipped a bare, untagged 8-byte timestamp with no way
-/// to tell it apart from an even-older filename-derived identity; both
-/// are now uniformly "not this format" here, since this project ships
+/// purpose -- a bare, untagged 8-byte timestamp (an older format) has no
+/// way to be told apart from a filename-derived identity; both are
+/// uniformly "not this format" here, since this project ships
 /// pre-release with no compatibility burden (no migration path needed for
 /// placeholders an earlier build created). Any blob that isn't exactly 9
 /// bytes starting with tag `1` decodes to `None` -- a caller must treat
@@ -158,12 +153,11 @@ fn read_placeholder_identity(handle: windows_sys::Win32::Foundation::HANDLE) -> 
 /// cannot positively confirm both the identity match and the in-sync
 /// bit.
 ///
-/// Reads identity BEFORE state (review finding: an earlier version read
-/// state first, then identity -- a local write landing between those two
-/// reads could clear `CF_PLACEHOLDER_STATE_IN_SYNC` while leaving the
-/// (still-matching) identity in place, and this function would still
-/// report `Untouched` using the now-stale, pre-write state it sampled
-/// first). Neither read is atomic with the other -- only an oplock or
+/// Reads identity BEFORE state (reading state first, then identity,
+/// would let a local write landing between those two reads clear
+/// `CF_PLACEHOLDER_STATE_IN_SYNC` while leaving the (still-matching)
+/// identity in place, and this function would still report `Untouched`
+/// using the now-stale, pre-write state it sampled first). Neither read is atomic with the other -- only an oplock or
 /// equivalent OS-level synchronization could close this window
 /// completely, which is out of scope here -- but sampling the state LAST,
 /// immediately before the final decision, narrows it to the smallest
@@ -231,37 +225,4 @@ pub fn inspect_placeholder(path: &Path, expected_generation: u64) -> Placeholder
 }
 
 #[cfg(test)]
-mod tests {
-    use super::decode_generation_identity;
-
-    #[test]
-    fn decodes_a_well_formed_v1_token() {
-        let mut bytes = vec![1u8];
-        bytes.extend_from_slice(&42u64.to_le_bytes());
-        assert_eq!(decode_generation_identity(&bytes), Some(42));
-    }
-
-    #[test]
-    fn rejects_wrong_length() {
-        assert_eq!(decode_generation_identity(&[1u8; 8]), None);
-        assert_eq!(decode_generation_identity(&[1u8; 10]), None);
-        assert_eq!(decode_generation_identity(&[]), None);
-    }
-
-    #[test]
-    fn rejects_wrong_version_tag() {
-        let mut bytes = vec![0u8];
-        bytes.extend_from_slice(&42u64.to_le_bytes());
-        assert_eq!(decode_generation_identity(&bytes), None);
-    }
-
-    #[test]
-    fn rejects_a_legacy_filename_derived_blob_even_at_the_right_length() {
-        // A pre-M2-0 identity was the placeholder's own filename as raw
-        // bytes -- this happens to be 9 bytes for some filenames, so
-        // length alone is not enough to accept it; the version tag must
-        // also match.
-        let legacy = b"file.ext\0"; // 9 bytes, first byte 'f' (0x66) != 1
-        assert_eq!(decode_generation_identity(legacy), None);
-    }
-}
+mod tests;

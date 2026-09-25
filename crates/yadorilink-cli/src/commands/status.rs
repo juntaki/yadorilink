@@ -1,23 +1,15 @@
-use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
-use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
 use yadorilink_ipc_proto::daemonctl::{
     FetchAvailability, GroupDurabilityStatus, LinkStatus, LocalStorageState, PeerReachability,
-    PeerStatus, RelayCapability, RouteKind, StatusRequest, StatusResponse, UnreachableCategory,
-    VolumeFreeSpace,
+    PeerStatus, RouteKind, StatusResponse, UnreachableCategory, VolumeFreeSpace,
 };
 
-use crate::control_client;
 use crate::error::CliError;
 
 /// The ` held=N` suffix appended to a link's summary line — empty
 /// (rendering no suffix at all) when the link has no held files, so an
 /// unaffected link's `status` output is byte-for-byte unchanged from
-/// before this functionality was added (to ensure "no new fields rendered when a link has
-/// none"). Factored out as a pure function (matching `yadorilink_daemon`'s
-/// and `yadorilink_sync_core`'s established pattern of pulling
-/// formatting/decision logic out of the `println!`-driven command body —
-/// see `report.rs`'s `confirm_with_reader`) so it's directly
-/// unit-testable without capturing real process stdout.
+/// before this functionality was added (to ensure "no new fields rendered
+/// when a link has none").
 fn held_summary_suffix(link: &LinkStatus) -> String {
     if link.held_file_count == 0 {
         String::new()
@@ -38,15 +30,15 @@ fn held_file_detail_lines(link: &LinkStatus) -> Vec<String> {
 ///
 /// Deliberately says "configured full copy," never "complete copy" --
 /// `full_replica_device_ids` is a netmap-derived, CONTENT-BLIND
-/// structural declaration (see `DaemonState::full_replica_devices_for_
-/// group`'s own doc comment: "a device is DECLARED a full-replica
+/// structural declaration (see `PeerAuthorityState::full_replica_devices_
+/// for_group`'s own doc comment: "a device is DECLARED a full-replica
 /// writer"), not the peer-confirmed content custody `durability_status`
-/// (Pass 1's `custody_confirmation_cache`) actually verifies. Labeling a
+/// (via `custody_confirmation_cache`) actually verifies. Labeling a
 /// merely-declared, possibly-never-confirmed, still-catching-up peer
 /// "complete copy (available)" would read as a stronger durability claim
 /// than this daemon can back up -- exactly the kind of per-device
 /// overclaim `durability_status` already exists to guard against at the
-/// group level (M4 Pass 3 Codex review #3 finding #1). This list is
+/// group level. This list is
 /// connectivity-layer inventory ONLY; `durability_status` remains the
 /// sole source of truth for whether the group is actually protected.
 ///
@@ -54,9 +46,9 @@ fn held_file_detail_lines(link: &LinkStatus) -> Vec<String> {
 /// `peers` with `Connected` reachability; `offline` requires it to
 /// appear with an explicit `Unreachable` reachability (a POSITIVELY
 /// known-down fact); anything else -- absent from `peers` entirely,
-/// `Unspecified`, `Connecting`, or `ProtocolIncompatible` -- reads
+/// `Unspecified` or `Connecting` -- reads
 /// `unknown`, since this daemon has no positive evidence either way for
-/// those (M4 Pass 3 Codex review #3 finding #2: an earlier version
+/// those (an earlier version
 /// conflated "never observed" with "known offline").
 fn complete_copies_detail_lines(link: &LinkStatus, peers: &[PeerStatus]) -> Vec<String> {
     link.full_replica_device_ids
@@ -112,7 +104,7 @@ fn ambiguous_suffix(link: &LinkStatus) -> String {
 /// "empty unless applicable" discipline as `degraded_suffix`, but
 /// deliberately the other way around: it renders *nothing extra* only for
 /// the two states that are safe to leave as plain "syncing" text
-/// (`Protected`, `Protecting`). A daemon that predates this field always sends
+/// (`Protected`, `Protecting`). an unset value always sends
 /// `Unspecified`, which is treated exactly like `Unknown` here —
 /// never silently shown as fine — so a link can never read as more durable
 /// than this daemon can actually back up right now (most notably right
@@ -128,22 +120,22 @@ fn durability_suffix(link: &LinkStatus) -> String {
     }
 }
 
-/// The ` on-demand (...)` suffix -- M4 Pass 2: reads `link.
+/// The ` on-demand (...)` suffix -- reads `link.
 /// local_storage_state()` directly, the daemon's own TRUTHFUL derivation
 /// (materialization policy AND actual current hydration state), rather
 /// than reconstructing an equivalent judgment here from
 /// `materialization_policy` plus the raw hydration counts (the earlier
 /// version of this function did exactly that, string-comparing
-/// `materialization_policy == "ondemand"` -- the anti-pattern M4's model
-/// exists to eliminate). `PartiallyMaterialized` gets its own distinct
+/// `materialization_policy == "ondemand"` -- the anti-pattern the storage-state
+/// model exists to eliminate). `PartiallyMaterialized` gets its own distinct
 /// label rather than silently reading as either `FullCopy` or `OnDemand`:
 /// an eager link still catching up is neither.
 ///
-/// `Unspecified` (an older daemon that predates `local_storage_state`)
+/// `Unspecified` an unset value
 /// falls back to the raw `materialization_policy` string check ONLY for
 /// this one legacy case -- rendering it identically to `FullCopy` would
-/// silently drop the on-demand indicator for such a daemon (M4 Pass 2
-/// Codex review #2 finding #4). This is a narrow, explicitly-scoped
+/// silently drop the on-demand indicator for such a daemon. This is a
+/// narrow, explicitly-scoped
 /// compatibility fallback, not a reversion to reconstructing state from
 /// raw fields for the common (current-daemon) case above.
 fn local_storage_suffix(link: &LinkStatus) -> String {
@@ -157,25 +149,20 @@ fn local_storage_suffix(link: &LinkStatus) -> String {
             "  making full copy (hydrated={} placeholder={} hydrating={})",
             link.hydrated_count, link.placeholder_count, link.hydrating_count
         ),
-        LocalStorageState::Unspecified => {
-            if link.materialization_policy == "ondemand" {
-                format!(
-                    "  on-demand (hydrated={} placeholder={} hydrating={})",
-                    link.hydrated_count, link.placeholder_count, link.hydrating_count
-                )
-            } else {
-                String::new()
-            }
-        }
+        // The daemon always sets this; the CLI and daemon ship together and
+        // the control protocol version is checked exactly. An unset value is
+        // therefore state the daemon could not determine, which is worth
+        // saying rather than rendering as a healthy full copy.
+        LocalStorageState::Unspecified => "  local storage unknown".to_string(),
     }
 }
 
-/// The ` cannot fetch now`/` fetch availability unknown` suffix -- M4 Pass
-/// 2: reads `link.fetch_availability()` directly, NEVER reconstructed from
+/// The ` cannot fetch now`/` fetch availability unknown` suffix --
+/// reads `link.fetch_availability()` directly, NEVER reconstructed from
 /// peer reachability (that would make it a bare alias for connectivity,
 /// exactly what this field exists to NOT be). Silent for `AvailableNow`,
 /// the common case, same "empty unless applicable" discipline as
-/// `degraded_suffix`. `Unspecified` (a daemon predating this field) reads
+/// `degraded_suffix`. `Unspecified` an unset value reads
 /// the same as `Unknown`, never as available.
 fn fetch_availability_suffix(link: &LinkStatus) -> String {
     match link.fetch_availability() {
@@ -215,7 +202,7 @@ pub(crate) fn format_rate_bytes_per_sec(bytes_per_sec: u64) -> String {
 /// the desktop-status-app spec's "App status is testable without UI
 /// automation" scenario asks for: an automated test (or a user) can read
 /// the same aggregate state from the CLI without any UI. Empty
-/// `overall_state` (an old daemon predating this field) renders nothing
+/// `overall_state` an unset value renders nothing
 /// at all, matching this file's "absent = no new output" convention for
 /// every other additive field.
 fn overall_state_line(status: &StatusResponse) -> Option<String> {
@@ -245,44 +232,23 @@ fn limits_summary_line(status: &StatusResponse) -> String {
     )
 }
 
-/// How a peer's connectivity is shown. There is no operator relay, so a
-/// peer is either being connected, connected, or honestly cannot be
-/// connected — in which case the reason (its failure category) is shown so
-/// the user understands why. A daemon that has not yet determined a peer's
-/// reachability leaves it unspecified, shown as "unknown".
-/// M4 Pass 3: `Connected` now distinguishes direct from relayed --
-/// `route_kind` is only meaningful when reachability is `Connected` (see
-/// its own proto doc comment), so this reads it ONLY in that branch,
-/// never treating `Unspecified` there as anything but "direct" (an older
-/// daemon predating this field always sends `Unspecified`, and this CLI's
-/// prior behavior -- before route_kind existed at all -- was to say
-/// simply "connected" for every route, so this is the closest
-/// backward-compatible default, not a new claim).
+/// How a peer's connectivity is shown. A peer is either being connected,
+/// connected (directly, or through a relay server when no direct path is
+/// up), or honestly cannot be connected — in which case the reason (its
+/// failure category) is shown so the user understands why. A daemon that has
+/// not yet determined a peer's reachability leaves it unspecified, shown as
+/// "unknown".
 fn peer_connectivity_label(peer: &PeerStatus) -> String {
     match peer.reachability() {
-        PeerReachability::Connected => match peer.route_kind() {
-            RouteKind::Relay => "connected (via relay)".to_string(),
-            RouteKind::Direct | RouteKind::Unspecified => "connected".to_string(),
-        },
-        PeerReachability::ProtocolIncompatible => "protocol incompatible".to_string(),
+        PeerReachability::Connected if peer.route_kind() == RouteKind::Relay => {
+            "connected (via relay)".to_string()
+        }
+        PeerReachability::Connected => "connected".to_string(),
         PeerReachability::Connecting => "connecting".to_string(),
         PeerReachability::Unreachable => {
             format!("cannot connect ({})", unreachable_category_label(peer.unreachable_category()))
         }
         PeerReachability::Unspecified => "unknown".to_string(),
-    }
-}
-
-/// The `  (relay-capable)` suffix -- M4 Pass 3: `relay_capability` is a
-/// device-level self-declared fact, independent of `route_kind` (THIS
-/// device's own connection to the peer) and independent of storage role
-/// (`Durability != Connectivity`) -- see `RelayCapability`'s own proto
-/// doc comment. Silent for `Disabled`/`Unspecified`, same "empty unless
-/// applicable" discipline as every other suffix here.
-fn relay_capability_suffix(peer: &PeerStatus) -> String {
-    match peer.relay_capability() {
-        RelayCapability::Capable => "  (relay-capable)".to_string(),
-        RelayCapability::Disabled | RelayCapability::Unspecified => String::new(),
     }
 }
 
@@ -472,18 +438,23 @@ pub async fn status(watch: bool) -> Result<(), CliError> {
 }
 
 async fn render_status_once() -> Result<(), CliError> {
-    let resp = control_client::send(ReqPayload::Status(StatusRequest {})).await?;
-    let Some(RespPayload::Status(status)) = resp.payload else {
-        return Err(CliError::Other("unexpected daemon response".into()));
-    };
-
-    if let Some(line) = overall_state_line(&status) {
+    let status = yadorilink_client_core::ops::folders::status().await?;
+    for line in status_lines(&status) {
         println!("{line}");
-        println!();
+    }
+    Ok(())
+}
+
+/// Every line one `yadorilink status` rendering prints, in order.
+fn status_lines(status: &StatusResponse) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(line) = overall_state_line(status) {
+        lines.push(line);
+        lines.push(String::new());
     }
 
     if status.links.is_empty() {
-        println!("No linked folders.");
+        lines.push("No linked folders.".to_string());
     }
     for link in &status.links {
         let state = if link.paused { "paused" } else { "syncing" };
@@ -494,776 +465,55 @@ async fn render_status_once() -> Result<(), CliError> {
         let durability = durability_suffix(link);
         let fetch_availability = fetch_availability_suffix(link);
         let ambiguous = ambiguous_suffix(link);
-        println!(
+        lines.push(format!(
             "{}  group={}  {state}  conflicts={}{materialization}{held}{degraded}{transfer}{durability}{fetch_availability}{ambiguous}",
             link.local_path, link.group_id, link.conflict_count
-        );
-        for line in held_file_detail_lines(link) {
-            println!("{line}");
-        }
-        for line in complete_copies_detail_lines(link, &status.peers) {
-            println!("{line}");
-        }
+        ));
+        lines.extend(held_file_detail_lines(link));
+        lines.extend(complete_copies_detail_lines(link, &status.peers));
     }
 
     if !status.peers.is_empty() {
-        println!();
-        println!("Peers:");
+        lines.push(String::new());
+        lines.push("Peers:".to_string());
         for peer in &status.peers {
             let connectivity = peer_connectivity_label(peer);
-            let relay = relay_capability_suffix(peer);
-            println!("  {}  {connectivity}{relay}", peer.device_id);
+            lines.push(format!("  {}  {connectivity}", peer.device_id));
         }
     }
 
-    let transfer_lines = active_transfer_detail_lines(&status);
+    let transfer_lines = active_transfer_detail_lines(status);
     if !transfer_lines.is_empty() {
-        println!();
-        println!("Active transfers:");
-        for line in transfer_lines {
-            println!("{line}");
-        }
+        lines.push(String::new());
+        lines.push("Active transfers:".to_string());
+        lines.extend(transfer_lines);
     }
 
-    println!();
-    println!("{}", limits_summary_line(&status));
-    println!("{}", block_store_summary_line(&status));
+    lines.push(String::new());
+    lines.push(limits_summary_line(status));
+    lines.push(block_store_summary_line(status));
 
     if !status.volumes.is_empty() {
-        println!("Volumes:");
+        lines.push("Volumes:".to_string());
         for volume in &status.volumes {
-            println!("{}", volume_line(volume));
+            lines.push(volume_line(volume));
         }
     }
 
-    let update_lines = update_summary_lines(&status);
+    let update_lines = update_summary_lines(status);
     if !update_lines.is_empty() {
-        println!();
-        for line in update_lines {
-            println!("{line}");
-        }
+        lines.push(String::new());
+        lines.extend(update_lines);
     }
 
-    let error_lines = recent_errors_summary_lines(&status);
+    let error_lines = recent_errors_summary_lines(status);
     if !error_lines.is_empty() {
-        println!();
-        println!("Recent errors:");
-        for line in error_lines {
-            println!("{line}");
-        }
+        lines.push(String::new());
+        lines.push("Recent errors:".to_string());
+        lines.extend(error_lines);
     }
-    Ok(())
+    lines
 }
 
 #[cfg(test)]
-mod tests {
-    use yadorilink_ipc_proto::daemonctl::{ActiveTransferProgress, HeldFile, RecentSyncError};
-
-    use super::*;
-
-    fn base_link() -> LinkStatus {
-        LinkStatus {
-            local_path: "/tmp/photos".into(),
-            group_id: "group-1".into(),
-            paused: false,
-            conflict_count: 0,
-            materialization_policy: "eager".into(),
-            hydrated_count: 0,
-            placeholder_count: 0,
-            hydrating_count: 0,
-            held_file_count: 0,
-            held_files: vec![],
-            skipped_symlink_count: 0,
-            degraded: false,
-            degraded_reason: String::new(),
-            has_active_transfer: false,
-            transfer_bytes_done: 0,
-            transfer_bytes_total: 0,
-            transfer_blocks_done: 0,
-            transfer_blocks_total: 0,
-            transfer_eta_seconds: 0,
-            durability_status: GroupDurabilityStatus::Protected as i32,
-            policy_stale: false,
-            ambiguous: false,
-            ambiguous_local_paths: Vec::new(),
-            local_storage_state: LocalStorageState::FullCopy as i32,
-            fetch_availability: FetchAvailability::AvailableNow as i32,
-            full_replica_device_ids: Vec::new(),
-        }
-    }
-
-    /// a link with no held files renders no held-related output
-    /// at all — no `held=0` suffix, no detail lines.
-    #[test]
-    fn no_held_files_renders_no_new_output() {
-        let link = base_link();
-        assert_eq!(held_summary_suffix(&link), "");
-        assert!(held_file_detail_lines(&link).is_empty());
-    }
-
-    /// M4 Pass 3: no full-replica peers configured renders no "Complete
-    /// copies" lines at all.
-    #[test]
-    fn no_full_replica_peers_renders_no_complete_copies_lines() {
-        let link = base_link();
-        assert!(complete_copies_detail_lines(&link, &[]).is_empty());
-    }
-
-    /// M4 Pass 3 Codex review #3 finding #1: the label says "configured
-    /// full copy," never "complete copy" -- this list is a structural,
-    /// content-blind netmap declaration, not peer-confirmed content
-    /// custody (that's `durability_status`'s job). A `Connected` device
-    /// reads "available".
-    #[test]
-    fn complete_copies_lines_report_available_for_a_connected_device() {
-        let mut link = base_link();
-        link.full_replica_device_ids = vec!["nas-1".into()];
-        let mut peer = base_peer();
-        peer.device_id = "nas-1".into();
-        peer.reachability = PeerReachability::Connected as i32;
-
-        let lines = complete_copies_detail_lines(&link, &[peer]);
-        assert_eq!(lines, vec!["    configured full copy: nas-1  (available)".to_string()]);
-    }
-
-    /// M4 Pass 3 Codex review #3 finding #2: a device this daemon has
-    /// never even seen (absent from `peers` entirely) reads "unknown",
-    /// NOT "offline" -- "offline" is a positive claim this daemon has no
-    /// basis for here. Only an explicit `Unreachable` reachability earns
-    /// "offline".
-    #[test]
-    fn unseen_device_reads_unknown_not_offline() {
-        let mut link = base_link();
-        link.full_replica_device_ids = vec!["unseen-device".into()];
-
-        let lines = complete_copies_detail_lines(&link, &[]);
-        assert_eq!(lines, vec!["    configured full copy: unseen-device  (unknown)".to_string()]);
-    }
-
-    /// `Connecting`/`ProtocolIncompatible`/`Unspecified` are ALSO not
-    /// positive "offline" evidence -- they read "unknown" too, the same
-    /// as a device absent from `peers` entirely.
-    #[test]
-    fn indeterminate_reachability_states_read_unknown() {
-        let mut link = base_link();
-        link.full_replica_device_ids = vec!["nas-1".into()];
-        for state in [
-            PeerReachability::Connecting,
-            PeerReachability::ProtocolIncompatible,
-            PeerReachability::Unspecified,
-        ] {
-            let mut peer = base_peer();
-            peer.device_id = "nas-1".into();
-            peer.reachability = state as i32;
-            let lines = complete_copies_detail_lines(&link, &[peer]);
-            assert_eq!(
-                lines,
-                vec!["    configured full copy: nas-1  (unknown)".to_string()],
-                "reachability {state:?} must read unknown, not offline"
-            );
-        }
-    }
-
-    /// A full-replica device that IS known but currently `Unreachable`
-    /// (a positive, known-down fact) reads "offline" -- distinct from the
-    /// "unknown" cases above.
-    #[test]
-    fn complete_copies_line_reports_offline_for_a_known_unreachable_device() {
-        let mut link = base_link();
-        link.full_replica_device_ids = vec!["nas-1".into()];
-        let mut peer = base_peer();
-        peer.device_id = "nas-1".into();
-        peer.reachability = PeerReachability::Unreachable as i32;
-
-        let lines = complete_copies_detail_lines(&link, &[peer]);
-        assert_eq!(lines, vec!["    configured full copy: nas-1  (offline)".to_string()]);
-    }
-
-    /// a link with held files shows the count and, for each
-    /// held file, its path and reason.
-    #[test]
-    fn held_files_render_count_and_per_file_reason() {
-        let mut link = base_link();
-        link.held_file_count = 2;
-        link.held_files = vec![
-            HeldFile {
-                path: "photo.jpg".into(),
-                reason: "case_collision: collides with existing 'Photo.jpg'".into(),
-                held_since_unix_nanos: 1_000,
-            },
-            HeldFile {
-                path: "CON.txt".into(),
-                reason: "invalid_name: reserved device name".into(),
-                held_since_unix_nanos: 2_000,
-            },
-        ];
-
-        assert_eq!(held_summary_suffix(&link), "  held=2");
-        let lines = held_file_detail_lines(&link);
-        assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains("photo.jpg"));
-        assert!(lines[0].contains("case_collision"));
-        assert!(lines[1].contains("CON.txt"));
-        assert!(lines[1].contains("invalid_name"));
-    }
-
-    /// A healthy (non-degraded) link renders no degraded-related output,
-    /// matching this file's "empty unless applicable" discipline.
-    #[test]
-    fn no_degraded_state_renders_no_new_output() {
-        assert_eq!(degraded_suffix(&base_link()), "");
-    }
-
-    /// a degraded link shows its reason.
-    #[test]
-    fn degraded_link_shows_its_reason() {
-        let mut link = base_link();
-        link.degraded = true;
-        link.degraded_reason = "insufficient free space to write big.bin".to_string();
-        assert_eq!(degraded_suffix(&link), "  degraded (insufficient free space to write big.bin)");
-    }
-
-    /// `Protected` and `Protecting` are both fine to leave as plain "syncing"
-    /// text -- neither renders the extra durability suffix.
-    #[test]
-    fn protected_or_protecting_durability_renders_no_new_output() {
-        let mut link = base_link();
-        link.durability_status = GroupDurabilityStatus::Protected as i32;
-        assert_eq!(durability_suffix(&link), "");
-        link.durability_status = GroupDurabilityStatus::Protecting as i32;
-        assert_eq!(durability_suffix(&link), "");
-    }
-
-    /// A group whose coverage cannot currently be confirmed -- e.g. right
-    /// after a `--force` unlink bypassed the durability handoff gate --
-    /// must show a distinct "durability unknown" suffix, never plain
-    /// "syncing" (which would read as fully caught up and safe).
-    #[test]
-    fn durability_unknown_renders_its_own_suffix() {
-        let mut link = base_link();
-        link.durability_status = GroupDurabilityStatus::Unknown as i32;
-        assert_eq!(durability_suffix(&link), "  durability unknown");
-    }
-
-    /// A group with a confirmed missing durable holder renders its own,
-    /// more severe suffix, distinct from the merely-unconfirmed case above.
-    #[test]
-    fn at_risk_durability_renders_its_own_suffix() {
-        let mut link = base_link();
-        link.durability_status = GroupDurabilityStatus::AtRisk as i32;
-        assert_eq!(durability_suffix(&link), "  durability: at risk");
-    }
-
-    /// An older daemon that predates this field always sends
-    /// `Unspecified` (proto3's zero default) -- this must fail safe and
-    /// render exactly like `Unknown`, never like `Protected`.
-    #[test]
-    fn unspecified_durability_fails_safe_like_unknown() {
-        let mut link = base_link();
-        link.durability_status = GroupDurabilityStatus::Unspecified as i32;
-        assert_eq!(durability_suffix(&link), "  durability unknown");
-    }
-
-    /// M4 Pass 2: a full copy renders no local-storage suffix at all --
-    /// the common healthy case, same "empty unless applicable" discipline
-    /// as every other suffix here.
-    #[test]
-    fn full_copy_renders_no_local_storage_suffix() {
-        let link = base_link();
-        assert_eq!(local_storage_suffix(&link), "");
-    }
-
-    /// M4 Pass 2 Codex review #2 finding #4: an older daemon that predates
-    /// `local_storage_state` sends `Unspecified` -- for an on-demand link,
-    /// this must NOT render identically to `FullCopy` (that would silently
-    /// drop the on-demand indicator). Falls back to the raw
-    /// `materialization_policy` string ONLY for this legacy case.
-    #[test]
-    fn unspecified_local_storage_falls_back_to_materialization_policy_for_on_demand() {
-        let mut link = base_link();
-        link.local_storage_state = LocalStorageState::Unspecified as i32;
-        link.materialization_policy = "ondemand".into();
-        link.hydrated_count = 1;
-        link.placeholder_count = 2;
-        link.hydrating_count = 0;
-        assert_eq!(
-            local_storage_suffix(&link),
-            "  on-demand (hydrated=1 placeholder=2 hydrating=0)"
-        );
-    }
-
-    /// The same legacy fallback renders nothing for an eager link -- an
-    /// older daemon's eager link must not be treated as on-demand either.
-    #[test]
-    fn unspecified_local_storage_renders_nothing_for_eager() {
-        let mut link = base_link();
-        link.local_storage_state = LocalStorageState::Unspecified as i32;
-        link.materialization_policy = "eager".into();
-        assert_eq!(local_storage_suffix(&link), "");
-    }
-
-    /// M4 Pass 2: on-demand reads `local_storage_state` directly, not
-    /// `materialization_policy` string-matching plus raw counts.
-    #[test]
-    fn on_demand_renders_hydration_counts() {
-        let mut link = base_link();
-        link.local_storage_state = LocalStorageState::OnDemand as i32;
-        link.hydrated_count = 3;
-        link.placeholder_count = 2;
-        link.hydrating_count = 1;
-        assert_eq!(
-            local_storage_suffix(&link),
-            "  on-demand (hydrated=3 placeholder=2 hydrating=1)"
-        );
-    }
-
-    /// M4 Pass 2: an eager link still catching up must render its own
-    /// distinct label -- never silently as `FullCopy` (the earlier
-    /// materialization_policy-string-based reconstruction this replaces
-    /// would have shown nothing at all here, since it only special-cased
-    /// "ondemand").
-    #[test]
-    fn partially_materialized_renders_its_own_suffix() {
-        let mut link = base_link();
-        link.local_storage_state = LocalStorageState::PartiallyMaterialized as i32;
-        link.hydrated_count = 5;
-        link.placeholder_count = 1;
-        link.hydrating_count = 0;
-        assert_eq!(
-            local_storage_suffix(&link),
-            "  making full copy (hydrated=5 placeholder=1 hydrating=0)"
-        );
-    }
-
-    /// M4 Pass 2: `AvailableNow` renders no suffix -- the common case.
-    #[test]
-    fn available_now_renders_no_fetch_availability_suffix() {
-        let link = base_link();
-        assert_eq!(fetch_availability_suffix(&link), "");
-    }
-
-    /// M4 Pass 2: `UnavailableNow` must be visible and distinct from
-    /// `durability_status` -- protected-but-currently-unfetchable is not
-    /// the same claim as data loss.
-    #[test]
-    fn unavailable_now_renders_its_own_suffix() {
-        let mut link = base_link();
-        link.fetch_availability = FetchAvailability::UnavailableNow as i32;
-        assert_eq!(fetch_availability_suffix(&link), "  cannot fetch now");
-    }
-
-    /// M4 Pass 2: `Unknown`, and an older daemon's `Unspecified` default,
-    /// must never render as available.
-    #[test]
-    fn unknown_fetch_availability_never_reads_as_available() {
-        let mut link = base_link();
-        link.fetch_availability = FetchAvailability::Unknown as i32;
-        assert_eq!(fetch_availability_suffix(&link), "  fetch availability unknown");
-        link.fetch_availability = FetchAvailability::Unspecified as i32;
-        assert_eq!(fetch_availability_suffix(&link), "  fetch availability unknown");
-    }
-
-    /// `0` reads as "unlimited" — the shared convention
-    /// between `status` and `limits show`.
-    #[test]
-    fn format_rate_zero_is_unlimited() {
-        assert_eq!(format_rate_bytes_per_sec(0), "unlimited");
-    }
-
-    /// non-zero rates scale to a human-readable unit.
-    #[test]
-    fn format_rate_scales_to_a_human_readable_unit() {
-        assert_eq!(format_rate_bytes_per_sec(500), "500 B/s");
-        assert_eq!(format_rate_bytes_per_sec(2048), "2.0 KiB/s");
-        assert_eq!(format_rate_bytes_per_sec(5 * 1024 * 1024), "5.0 MiB/s");
-        assert_eq!(format_rate_bytes_per_sec(3 * 1024 * 1024 * 1024), "3.0 GiB/s");
-    }
-
-    fn base_status() -> StatusResponse {
-        StatusResponse {
-            links: vec![],
-            peers: vec![],
-            upload_limit_bytes_per_sec: 0,
-            download_limit_bytes_per_sec: 0,
-            current_upload_bytes_per_sec: 0,
-            current_download_bytes_per_sec: 0,
-            volumes: vec![],
-            // `..Default::default` rather than listing every new field
-            // explicitly, since this struct literal predates those
-            // fields and most tests using this helper don't care about
-            // them.
-            ..Default::default()
-        }
-    }
-
-    /// A healthy, up-to-date status (the default) renders no
-    /// update-related output at all — matches this file's own "empty
-    /// unless applicable" discipline.
-    #[test]
-    fn no_update_available_renders_no_new_output() {
-        assert_eq!(update_summary_lines(&base_status()), Vec::<String>::new());
-    }
-
-    /// spec "Status surfaces available update": an available, non-mandatory
-    /// update not yet at a safe point/holdback renders as simply available.
-    #[test]
-    fn available_update_renders_its_version() {
-        let mut status = base_status();
-        status.update_available_version = "0.2.0".into();
-        let lines = update_summary_lines(&status);
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("0.2.0"));
-        assert!(lines[0].contains("available"));
-    }
-
-    /// A mandatory update's line says so explicitly, distinct from a
-    /// merely-available one.
-    #[test]
-    fn mandatory_update_says_so() {
-        let mut status = base_status();
-        status.update_available_version = "0.2.0".into();
-        status.update_mandatory = true;
-        let lines = update_summary_lines(&status);
-        assert!(lines[0].contains("mandatory"));
-    }
-
-    /// A held-back update shows the holdback reason as a second line.
-    #[test]
-    fn held_back_update_shows_its_reason() {
-        let mut status = base_status();
-        status.update_available_version = "0.2.0".into();
-        status.update_holdback_reason = "staged rollout at 10%".into();
-        let lines = update_summary_lines(&status);
-        assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains("held back"));
-        assert!(lines[1].contains("staged rollout at 10%"));
-    }
-
-    /// Install waits for a safe point.
-    #[test]
-    fn update_waiting_for_safe_point_says_so() {
-        let mut status = base_status();
-        status.update_available_version = "0.2.0".into();
-        status.update_waiting_for_safe_point = true;
-        let lines = update_summary_lines(&status);
-        assert!(lines[0].contains("waiting for a safe point"));
-    }
-
-    /// spec "Status surfaces failed update": a recorded update failure is
-    /// surfaced with a pointer to `update status` for more detail, even
-    /// with no update currently available.
-    #[test]
-    fn update_failure_is_surfaced_with_a_pointer_to_update_status() {
-        let mut status = base_status();
-        status.update_last_error_category = "update_manifest_fetch_failed".into();
-        let lines = update_summary_lines(&status);
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("update_manifest_fetch_failed"));
-        assert!(lines[0].contains("yadorilink update status"));
-    }
-
-    // --- overall-state rendering ---
-
-    /// An old daemon that predates `overall_state` (empty string) renders
-    /// no new output at all.
-    #[test]
-    fn empty_overall_state_renders_no_new_output() {
-        assert_eq!(overall_state_line(&base_status()), None);
-    }
-
-    #[test]
-    fn healthy_overall_state_renders_with_no_reasons() {
-        let mut status = base_status();
-        status.overall_state = "healthy".into();
-        assert_eq!(overall_state_line(&status), Some("Overall: healthy".to_string()));
-    }
-
-    #[test]
-    fn attention_overall_state_renders_its_reasons() {
-        let mut status = base_status();
-        status.overall_state = "attention".into();
-        status.attention_reasons = vec!["conflict:group-1".into(), "low_disk:/data".into()];
-        assert_eq!(
-            overall_state_line(&status),
-            Some("Overall: attention  (conflict:group-1, low_disk:/data)".to_string())
-        );
-    }
-
-    /// the limits summary line reports both configured and
-    /// current rates, `unlimited` when unconfigured.
-    #[test]
-    fn limits_summary_line_reports_configured_and_current_rates() {
-        let mut status = base_status();
-        assert_eq!(
-            limits_summary_line(&status),
-            "Limits: up=unlimited down=unlimited  (current: up=unlimited down=unlimited)"
-        );
-
-        status.upload_limit_bytes_per_sec = 1024;
-        status.current_download_bytes_per_sec = 2048;
-        assert_eq!(
-            limits_summary_line(&status),
-            "Limits: up=1.0 KiB/s down=unlimited  (current: up=unlimited down=2.0 KiB/s)"
-        );
-    }
-
-    fn base_peer() -> PeerStatus {
-        PeerStatus {
-            device_id: "device-1".into(),
-            reachability: PeerReachability::Connected as i32,
-            unreachable_category: UnreachableCategory::Unspecified as i32,
-            route_kind: RouteKind::Direct as i32,
-            relay_capability: RelayCapability::Disabled as i32,
-        }
-    }
-
-    /// A reachable peer shows "connected"; an unreachable one shows
-    /// "cannot connect" with its failure category.
-    #[test]
-    fn connectivity_label_reflects_reachability_and_category() {
-        let mut peer = base_peer();
-        assert_eq!(peer_connectivity_label(&peer), "connected");
-
-        peer.reachability = PeerReachability::Unreachable as i32;
-        peer.unreachable_category = UnreachableCategory::NoResponse as i32;
-        assert_eq!(peer_connectivity_label(&peer), "cannot connect (no response)");
-
-        peer.reachability = PeerReachability::Connecting as i32;
-        assert_eq!(peer_connectivity_label(&peer), "connecting");
-
-        peer.reachability = PeerReachability::ProtocolIncompatible as i32;
-        assert_eq!(peer_connectivity_label(&peer), "protocol incompatible");
-    }
-
-    /// M4 Pass 3: a relayed connection reads distinctly from a direct one
-    /// -- this is the exact wire-contract gap a prior M3 pass flagged and
-    /// never filled in (`PeerStatus` had no way to distinguish direct from
-    /// relayed connectivity at all before this pass).
-    #[test]
-    fn connected_via_relay_renders_its_own_label() {
-        let mut peer = base_peer();
-        peer.route_kind = RouteKind::Relay as i32;
-        assert_eq!(peer_connectivity_label(&peer), "connected (via relay)");
-    }
-
-    /// An older daemon predating `route_kind` sends `Unspecified` for a
-    /// connected peer -- must fail back to the pre-existing plain
-    /// "connected" label (the only claim this CLI ever made before
-    /// `route_kind` existed), never silently as "connected (via relay)".
-    #[test]
-    fn connected_with_unspecified_route_kind_reads_as_plain_connected() {
-        let mut peer = base_peer();
-        peer.route_kind = RouteKind::Unspecified as i32;
-        assert_eq!(peer_connectivity_label(&peer), "connected");
-    }
-
-    /// M4 Pass 3: relay capability is silent unless the peer has actually
-    /// declared it -- same "empty unless applicable" discipline as every
-    /// other suffix here.
-    #[test]
-    fn relay_incapable_peer_renders_no_suffix() {
-        let peer = base_peer();
-        assert_eq!(relay_capability_suffix(&peer), "");
-    }
-
-    #[test]
-    fn relay_capable_peer_renders_its_own_suffix() {
-        let mut peer = base_peer();
-        peer.relay_capability = RelayCapability::Capable as i32;
-        assert_eq!(relay_capability_suffix(&peer), "  (relay-capable)");
-    }
-
-    /// Relay capability must be independent of route kind -- a peer can be
-    /// relay-capable while THIS device's own connection to it is direct
-    /// (`Durability != Connectivity`'s connectivity-side parallel: relay
-    /// capability is a peer's own declared capability, not a statement
-    /// about any specific connection).
-    #[test]
-    fn relay_capability_is_independent_of_this_connections_route_kind() {
-        let mut peer = base_peer();
-        peer.route_kind = RouteKind::Direct as i32;
-        peer.relay_capability = RelayCapability::Capable as i32;
-        assert_eq!(peer_connectivity_label(&peer), "connected");
-        assert_eq!(relay_capability_suffix(&peer), "  (relay-capable)");
-    }
-
-    /// a volume line reports path, state, and byte counts.
-    #[test]
-    fn volume_line_reports_path_state_and_bytes() {
-        let volume = VolumeFreeSpace {
-            path: "/tmp/photos".into(),
-            state: "low".into(),
-            available_bytes: 1500,
-            headroom_bytes: 1000,
-        };
-        assert_eq!(volume_line(&volume), "  /tmp/photos  low  (available=1500 headroom=1000)");
-    }
-
-    /// Byte formatting scales the same way `format_rate_bytes_per_sec`
-    /// does, minus the `/s` suffix.
-    #[test]
-    fn format_bytes_scales_to_a_human_readable_unit() {
-        assert_eq!(format_bytes(500), "500 B");
-        assert_eq!(format_bytes(2048), "2.0 KiB");
-        assert_eq!(format_bytes(5 * 1024 * 1024), "5.0 MiB");
-    }
-
-    /// `0`/negative means "never run" — never rendered as a
-    /// literal unix-epoch timestamp.
-    #[test]
-    fn last_gc_summary_reports_never_when_no_sweep_has_completed() {
-        assert_eq!(last_gc_summary(0), "never");
-    }
-
-    /// a recent completion renders as a short relative bucket.
-    #[test]
-    fn last_gc_summary_reports_a_relative_bucket_for_a_recent_sweep() {
-        let now =
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
-                as i64;
-        assert_eq!(last_gc_summary(now - 30), "30s ago");
-        assert_eq!(last_gc_summary(now - 120), "2m ago");
-        assert_eq!(last_gc_summary(now - 7200), "2h ago");
-        assert_eq!(last_gc_summary(now - 2 * 86400), "2d ago");
-    }
-
-    /// `status` shows non-zero usage after files are synced
-    /// (block/byte counts) and reports the last-GC time / reclaimable
-    /// estimate alongside it — this is the pure-formatting half; the
-    /// daemon-side wiring is exercised by `control_socket.rs`'s own tests
-    /// and `yadorilink-cli`'s `tests/` integration suite.
-    #[test]
-    fn block_store_summary_line_reports_usage_and_gc_health() {
-        let mut status = base_status();
-        status.block_store_block_count = 42;
-        status.block_store_total_bytes = 5 * 1024 * 1024;
-        status.last_gc_unix = 0;
-        status.gc_reclaimable_estimate_bytes = 1024;
-
-        let line = block_store_summary_line(&status);
-
-        assert!(line.contains("42 block(s)"));
-        assert!(line.contains("5.0 MiB used"));
-        assert!(line.contains("last GC: never"));
-        assert!(line.contains("~1.0 KiB reclaimable"));
-    }
-
-    // --- progress + recent-error rendering ---
-
-    /// "Empty unless applicable" discipline: a link with no
-    /// active transfer renders no transfer-related suffix at all.
-    #[test]
-    fn no_active_transfer_renders_no_new_output() {
-        assert_eq!(transfer_progress_suffix(&base_link()), "");
-    }
-
-    /// An active transfer's headline reports a percent,
-    /// byte/block counts, and a best-effort, explicitly-labelled ETA.
-    #[test]
-    fn active_transfer_renders_percent_bytes_blocks_and_eta() {
-        let mut link = base_link();
-        link.has_active_transfer = true;
-        link.transfer_bytes_done = 50;
-        link.transfer_bytes_total = 200;
-        link.transfer_blocks_done = 1;
-        link.transfer_blocks_total = 4;
-        link.transfer_eta_seconds = 30;
-
-        let suffix = transfer_progress_suffix(&link);
-        assert!(suffix.contains("25%"));
-        assert!(suffix.contains("50/200 bytes"));
-        assert!(suffix.contains("1/4 blocks"));
-        assert!(suffix.contains("eta~30s"));
-    }
-
-    /// an active transfer with no ETA signal yet (best-effort)
-    /// omits the `eta~` fragment rather than claiming `0s`.
-    #[test]
-    fn active_transfer_with_no_eta_signal_omits_the_eta_fragment() {
-        let mut link = base_link();
-        link.has_active_transfer = true;
-        link.transfer_bytes_total = 200;
-        link.transfer_eta_seconds = 0;
-
-        assert!(!transfer_progress_suffix(&link).contains("eta~"));
-    }
-
-    /// The per-file active-transfer detail list renders one
-    /// line per entry, including its source peer.
-    #[test]
-    fn active_transfer_detail_lines_render_one_line_per_transfer() {
-        let mut status = base_status();
-        status.active_transfers = vec![ActiveTransferProgress {
-            group_id: "group-1".into(),
-            path: "big.bin".into(),
-            bytes_done: 100,
-            bytes_total: 400,
-            blocks_done: 1,
-            blocks_total: 4,
-            source_peer: "device-b".into(),
-            started_at_unix: 0,
-        }];
-
-        let lines = active_transfer_detail_lines(&status);
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("big.bin"));
-        assert!(lines[0].contains("25%"));
-        assert!(lines[0].contains("device-b"));
-    }
-
-    /// no active transfers renders no "Active transfers:" detail
-    /// at all.
-    #[test]
-    fn no_active_transfers_renders_no_detail_lines() {
-        assert!(active_transfer_detail_lines(&base_status()).is_empty());
-    }
-
-    /// Recent errors render their category and coarse
-    /// context — never anything beyond what the daemon already redacted.
-    #[test]
-    fn recent_errors_render_category_and_coarse_context() {
-        let mut status = base_status();
-        status.recent_errors = vec![RecentSyncError {
-            category: "disk_pressure".into(),
-            timestamp_unix: 12345,
-            coarse_context: "hydration".into(),
-        }];
-
-        let lines = recent_errors_summary_lines(&status);
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("disk_pressure"));
-        assert!(lines[0].contains("hydration"));
-    }
-
-    #[test]
-    fn no_recent_errors_renders_no_new_output() {
-        assert!(recent_errors_summary_lines(&base_status()).is_empty());
-    }
-
-    /// A folder group linked at two folders syncs NOTHING until the user
-    /// unlinks all but one. Without this the refusal exists only as a daemon
-    /// log line: loud in the code, invisible to the person who has to act on
-    /// it, who would see a folder that had silently stopped syncing.
-    #[test]
-    fn an_ambiguous_link_says_it_is_not_syncing_and_names_every_folder() {
-        let link = LinkStatus {
-            ambiguous: true,
-            ambiguous_local_paths: vec!["/Users/alice/A".into(), "/Users/alice/B".into()],
-            ..base_link()
-        };
-
-        let suffix = ambiguous_suffix(&link);
-
-        assert!(suffix.contains("NOT SYNCING"), "got {suffix:?}");
-        // The paths are the remedy, not decoration: unlinking is keyed by path.
-        assert!(suffix.contains("/Users/alice/A"), "got {suffix:?}");
-        assert!(suffix.contains("/Users/alice/B"), "got {suffix:?}");
-    }
-
-    /// Same "empty unless applicable" discipline as every other suffix here: a
-    /// healthy link's line must be unaffected by this state existing.
-    #[test]
-    fn a_healthy_link_renders_no_ambiguity_suffix() {
-        assert_eq!(ambiguous_suffix(&base_link()), "");
-    }
-}
+mod tests;

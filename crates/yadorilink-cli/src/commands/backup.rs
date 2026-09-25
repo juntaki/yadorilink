@@ -1,8 +1,7 @@
 //! Backup/disaster-recovery CLI helpers.
 //!
 //! Backup covers only non-sensitive local state: this device's
-//! coordination-plane address and NAT preferences, plus the list of linked
-//! folders. It deliberately never exports device identity keys, session
+//! coordination-plane address, plus the list of linked folders. It deliberately never exports device identity keys, session
 //! tokens, or any other secret. A lost or replaced device re-establishes its
 //! identity by signing in with Google and registering as a new device, then
 //! re-joins its folders and re-fetches their content from peers that still
@@ -17,7 +16,7 @@ use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPay
 use yadorilink_ipc_proto::daemonctl::ListLinksRequest;
 
 use crate::control_client;
-use crate::device_config::{self, NatConfig};
+use crate::device_config;
 use crate::error::CliError;
 
 /// The one-line recovery model every backup surface repeats: identity is
@@ -47,8 +46,6 @@ struct NonSensitiveBackup {
     /// The coordination-plane address recorded in `device.json`, if this
     /// device has been registered.
     coordination_addr: Option<String>,
-    /// NAT-traversal preferences from `device.json`, if present.
-    nat: Option<NatConfig>,
     /// Linked-folder mappings (local path -> folder group).
     links: Vec<LinkEntry>,
 }
@@ -73,25 +70,22 @@ operator-held copy"
     );
 }
 
-/// Writes a non-sensitive backup document (coordination address, NAT
-/// preferences, and link metadata) to `output_path`. It never contains a
+/// Writes a non-sensitive backup document (coordination address and link
+/// metadata) to `output_path`. It never contains a
 /// device id, a private key, or a session token, so it is written as plain
 /// JSON with no encryption step.
 pub async fn export(output_path: PathBuf) -> Result<(), CliError> {
-    let (coordination_addr, nat) = match device_config::load() {
-        Ok(cfg) => (Some(cfg.coordination_addr), Some(cfg.nat)),
-        Err(_) => (None, None),
-    };
+    let coordination_addr = device_config::load().ok().map(|cfg| cfg.coordination_addr);
     let links = fetch_link_metadata().await;
 
-    let backup = NonSensitiveBackup { coordination_addr, nat, links };
+    let backup = NonSensitiveBackup { coordination_addr, links };
     let contents = serde_json::to_string_pretty(&backup)
         .map_err(|e| CliError::Other(format!("serializing backup: {e}")))?;
     std::fs::write(&output_path, contents)?;
 
     println!(
         "Wrote a non-sensitive backup to {}.\n\n\
-         It contains only this device's coordination address, NAT preferences, and linked-folder \
+         It contains only this device's coordination address and linked-folder \
 metadata -- no device identity keys, no session tokens, no secrets. {}",
         output_path.display(),
         recovery_guidance()
@@ -100,8 +94,8 @@ metadata -- no device identity keys, no session tokens, no secrets. {}",
 }
 
 /// Applies a non-sensitive backup document to this device's local
-/// configuration. It only updates the coordination address and NAT
-/// preferences of an already-registered device; it never creates or restores
+/// configuration. It only updates the coordination address of an
+/// already-registered device; it never creates or restores
 /// a device identity (that comes from Google login + `device register`). The
 /// saved link metadata is printed as a re-link checklist rather than
 /// re-registered automatically.
@@ -122,11 +116,8 @@ non-sensitive settings from the backup"
             if let Some(addr) = backup.coordination_addr {
                 cfg.coordination_addr = addr;
             }
-            if let Some(nat) = backup.nat {
-                cfg.nat = nat;
-            }
             device_config::save(&cfg)?;
-            println!("Restored non-sensitive config (coordination address and NAT preferences).");
+            println!("Restored non-sensitive config (coordination address).");
         }
         Err(_) => {
             return Err(CliError::Other(
@@ -195,22 +186,4 @@ impl BackupInventory {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn present_labels_are_stable() {
-        assert_eq!(present(true), "present");
-        assert_eq!(present(false), "missing");
-    }
-
-    /// The recovery guidance describes the Google-login/new-device model.
-    #[test]
-    fn recovery_guidance_describes_google_login_new_device_model() {
-        let guidance = recovery_guidance();
-        let lower = guidance.to_lowercase();
-        assert!(guidance.contains("Google"));
-        assert!(lower.contains("new device"));
-        assert!(lower.contains("register"));
-    }
-}
+mod tests;

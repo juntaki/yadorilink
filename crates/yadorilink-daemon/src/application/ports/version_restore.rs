@@ -28,4 +28,12 @@ pub(crate) trait VersionRestorePort: Send + Sync {
         group_id: &'a str,
         path: &'a str,
     ) -> BoxFuture<'a, Result<(), SyncError>>;
+
+    /// Restores every trashed entry the recursive operation that removed
+    /// the trashed entry at `path` removed.
+    fn restore_trashed_operation<'a>(
+        &'a self,
+        group_id: &'a str,
+        path: &'a str,
+    ) -> BoxFuture<'a, Result<crate::hydration::TrashOperationRestore, SyncError>>;
 }

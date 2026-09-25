@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use crate::sync_error::SyncError;
+use yadorilink_replica_domain::session_state::LinkRowWrite;
 
 use crate::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use crate::application::ports::{
@@ -44,7 +45,11 @@ impl LinkRepositoryPort for DaemonLinkRepositoryAdapter {
             .collect())
     }
 
-    fn commit_plain_link(&self, local_path: &str, group_id: &str) -> Result<(), SyncError> {
+    fn commit_plain_link(
+        &self,
+        local_path: &str,
+        group_id: &str,
+    ) -> Result<LinkRowWrite, SyncError> {
         self.state
             .replica_coordinator
             .link_repository()
@@ -57,7 +62,7 @@ impl LinkRepositoryPort for DaemonLinkRepositoryAdapter {
         local_path: &str,
         group_id: &str,
         marker: &PendingEnrollmentLinkCommand,
-    ) -> Result<(), SyncError> {
+    ) -> Result<LinkRowWrite, SyncError> {
         let kind = match marker.kind {
             EnrollmentKind::Create => {
                 yadorilink_replica_domain::session_state::EnrollmentKind::Create
@@ -82,45 +87,43 @@ impl LinkRepositoryPort for DaemonLinkRepositoryAdapter {
             .map_err(SyncError::from)
     }
 
-    fn remove_link(&self, local_path: &str) -> Result<(), SyncError> {
-        // See `SyncStateReplicaRoleRepository::remove_link`'s identical
-        // comment (including the `list_links` failure logging): look up
-        // group_id before it's gone so a stale custody confirmation cached
-        // for it can't be reused by a later relink.
-        let group_id = match self.state.replica_coordinator.link_repository().list_links() {
-            Ok(links) => links.into_iter().find(|l| l.local_path == local_path).map(|l| l.group_id),
-            Err(e) => {
-                tracing::warn!(
-                    local_path,
-                    error = %e,
-                    "remove_link: list_links failed, cannot clear this group's custody \
-                     confirmation cache entry (will self-heal via staleness bound)"
-                );
-                None
-            }
-        };
-        self.state
+    fn undo_plain_link(
+        &self,
+        local_path: &str,
+        group_id: &str,
+        write: &LinkRowWrite,
+    ) -> Result<&'static str, SyncError> {
+        let undone = self
+            .state
             .replica_coordinator
             .link_repository()
-            .remove_link(local_path)
+            .undo_link_row(local_path, group_id, write)
             .map_err(SyncError::from)?;
-        if let Some(group_id) = group_id {
-            self.state.clear_custody_confirmation(&group_id);
+        // A row this attempt inserted is gone again: drop any custody
+        // confirmation cached for its group, as `remove_link` does, so a
+        // stale one can't be reused by a later relink. A restored row is
+        // the earlier link, still live -- its cache entry stays valid.
+        if matches!(write, LinkRowWrite::Inserted) {
+            self.state.durability().clear_custody_confirmation(group_id);
         }
-        Ok(())
+        Ok(undone)
     }
 
     fn rollback_local_setup_to_cancel_pending(
         &self,
         local_path: &str,
+        group_id: &str,
+        write: &LinkRowWrite,
         operation_id: &str,
         detail: &str,
-    ) -> Result<(), SyncError> {
+    ) -> Result<&'static str, SyncError> {
         self.state
             .replica_coordinator
             .enrollment_repository()
-            .rollback_local_setup_to_cancel_pending(
+            .rollback_local_setup_undoing_link_write(
                 local_path,
+                group_id,
+                write,
                 operation_id,
                 detail,
                 crate::daemon_state::now_unix(),
@@ -151,6 +154,10 @@ impl DaemonLinkWatcherAdapter {
 impl LinkWatcherPort for DaemonLinkWatcherAdapter {
     fn is_ready(&self, local_path: &str) -> bool {
         self.controller.is_ready(local_path)
+    }
+
+    fn is_registered(&self, local_path: &str) -> bool {
+        self.state.links.has_entry(local_path)
     }
 
     fn start<'a>(

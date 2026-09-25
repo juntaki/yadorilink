@@ -4,14 +4,16 @@
 pub mod adapters;
 pub mod app;
 pub mod application;
-pub mod c4_diag;
+pub mod background_custody;
 pub mod change_auth;
 pub mod change_policy;
+pub mod checkpoint_source;
 pub mod connection_trace;
 pub mod control_context;
 pub mod control_socket;
 pub mod convergence;
 pub mod coordination_client;
+pub mod credential_store;
 pub mod daemon_runtime;
 pub mod daemon_state;
 pub mod dag_import;
@@ -22,24 +24,28 @@ pub mod error;
 pub mod gc;
 pub mod gc_state;
 pub mod governance_config;
+pub mod handoff_proof;
 pub mod hydration;
 pub mod hydration_single_flight;
 pub mod link_registry;
 pub mod link_runtime;
-pub(crate) mod local_session_channel;
+pub mod local_convergence;
 pub(crate) mod maintenance;
 pub mod maintenance_coordinator;
 pub mod materialization_intent;
 pub mod metrics;
-pub mod metrics_config;
-// NAT traversal binds real UDP sockets, resolves DNS, and probes the local
-// gateway — none of which the deterministic simulator models — so the whole
-// module is production-only, matching the single (production-gated) place it
-// is spawned from in `app`.
-#[cfg(not(madsim))]
-pub mod nat_traversal;
+#[cfg(test)]
+pub(crate) mod obligation_tick_metrics;
+pub mod path_witness_sink;
+pub mod peer_connectivity_runtime;
 pub mod peer_orchestrator;
 pub mod peer_registry;
+#[cfg(windows)]
+pub mod placeholder_backend_windows;
+#[cfg(windows)]
+pub mod placeholder_dehydrate_windows;
+#[cfg(windows)]
+pub mod placeholder_inspect_windows;
 pub mod queries;
 pub mod rebootstrap_handler;
 pub mod recent_errors;
@@ -47,33 +53,8 @@ pub mod recovery;
 pub mod recovery_diagnosis;
 pub mod recovery_evidence;
 pub mod recovery_snapshot;
-pub mod relay_carrier;
-// The relay forwarder binds a real, dedicated UDP socket per relay session
-// and connects it to the destination address -- none of which the
-// deterministic simulator models -- so the whole module is production-only,
-// matching `nat_traversal`/`resource_lock` above. `relay_session_handler`
-// only exists to bridge `DaemonState` into this module (grant admission plus
-// dispatch into the forwarder), so it is production-only for the same
-// reason; `peer_orchestrator` substitutes an always-deny relay handler under
-// the simulator instead.
-#[cfg(not(madsim))]
-pub mod relay_forwarder;
-// Rust 1.97's doc_lazy_continuation lint treats explanatory paragraphs after
-// numbered security-review lists as malformed list continuations. These two
-// M3 relay modules intentionally keep those review notes as prose; scope the
-// compatibility allowance here rather than weakening the workspace lint gate.
-#[allow(clippy::doc_lazy_continuation)]
-pub mod relay_grant;
-#[allow(clippy::doc_lazy_continuation)]
-pub mod relay_session;
-// Bridges `DaemonState` into `relay_forwarder` (grant admission plus
-// dispatch into the forwarding actor) -- see `relay_forwarder`'s own gating
-// comment above for why neither exists under the deterministic simulator.
-#[cfg(not(madsim))]
-pub mod relay_session_handler;
-/// `ReplicaCoordinator` (Phase 7D-10.2) -- see that module's own doc
-/// comment for what it is and why it is additive alongside `SyncState`,
-/// not a replacement for it, in this sub-phase.
+/// `ReplicaCoordinator` -- see that module's own doc comment for what it
+/// is.
 pub mod replica_coordinator;
 pub mod reporting;
 pub mod reporting_ipc;
@@ -82,26 +63,24 @@ pub mod rewind;
 pub mod root_commit_authority;
 pub mod route;
 pub mod runtime_telemetry;
+pub mod sync_adapter;
 pub mod sync_runtime;
-// Exclusive OS locks on the block-store root and sync-state database. Not built
-// under the deterministic simulator, whose many in-process daemon instances use
-// isolated per-instance paths and must not contend on real filesystem locks.
-#[cfg(windows)]
-pub mod placeholder_backend_windows;
-#[cfg(windows)]
-pub mod placeholder_dehydrate_windows;
-#[cfg(windows)]
-pub mod placeholder_inspect_windows;
-#[cfg(not(madsim))]
+pub mod write_lease;
+// Exclusive OS locks on the block-store root and sync-state database.
 pub mod resource_lock;
 pub mod send_transfer;
+pub mod shell_context;
 pub mod shell_ipc;
 pub mod shell_status;
 pub mod supervise;
 pub mod sync_error;
-#[cfg(test)]
-pub(crate) mod test_support;
-pub mod token_store;
+// Test-harness boundary, not product surface. `peer_session_fixture` is the
+// `ReplicaCoordinator`-backed peer-session fixture, shared during the test
+// ownership move with `yadorilink-peer-session`'s own integration binaries
+// through their existing dev-dependency on this crate. Nothing outside these
+// two cfgs can name anything in here.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod transfer_progress;
 pub mod update;
 pub mod update_ipc;

@@ -12,7 +12,7 @@ use yadorilink_daemon::update::policy::{AutoInstallMode, UpdateState};
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
 use yadorilink_ipc_proto::daemonctl::UpdateStatusRequest;
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 
 async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>) {
     let dir = tempfile::tempdir().unwrap();
@@ -25,7 +25,7 @@ async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>) {
     // on network/DNS behavior in a test.
     std::env::set_var("YADORILINK_UPDATE_MANIFEST_URL", "http://127.0.0.1:1/manifest.json");
 
-    let store = Arc::new(FsBlockStore::new(dir.path().join("blocks")).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(dir.path().join("blocks")).unwrap());
     let sync_state = Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
     let state = DaemonState::new("device-under-test".into(), sync_state, store);
 
@@ -80,10 +80,11 @@ async fn update_status_reflects_fresh_daemon_defaults() {
     let _guard = TEST_MUTEX.lock().await;
     let (_dir, _state) = start_daemon().await;
 
-    let resp =
-        yadorilink_cli::control_client::send(ReqPayload::UpdateStatus(UpdateStatusRequest {}))
-            .await
-            .unwrap();
+    let resp = yadorilink_client_core::daemon::control::send(ReqPayload::UpdateStatus(
+        UpdateStatusRequest {},
+    ))
+    .await
+    .unwrap();
     let Some(RespPayload::UpdateStatus(status)) = resp.payload else {
         panic!("expected an UpdateStatus response");
     };
@@ -115,10 +116,11 @@ async fn update_status_reflects_an_available_held_back_update() {
         })
         .unwrap();
 
-    let resp =
-        yadorilink_cli::control_client::send(ReqPayload::UpdateStatus(UpdateStatusRequest {}))
-            .await
-            .unwrap();
+    let resp = yadorilink_client_core::daemon::control::send(ReqPayload::UpdateStatus(
+        UpdateStatusRequest {},
+    ))
+    .await
+    .unwrap();
     let Some(RespPayload::UpdateStatus(status)) = resp.payload else {
         panic!("expected an UpdateStatus response");
     };
@@ -127,7 +129,7 @@ async fn update_status_reflects_an_available_held_back_update() {
     assert_eq!(status.holdback_reason, "staged rollout at 10%");
 
     // `yadorilink status`'s embedded fields reflect the exact same state.
-    let status_resp = yadorilink_cli::control_client::send(ReqPayload::Status(
+    let status_resp = yadorilink_client_core::daemon::control::send(ReqPayload::Status(
         yadorilink_ipc_proto::daemonctl::StatusRequest {},
     ))
     .await
@@ -156,10 +158,11 @@ async fn update_status_reflects_a_failed_check() {
         })
         .unwrap();
 
-    let resp =
-        yadorilink_cli::control_client::send(ReqPayload::UpdateStatus(UpdateStatusRequest {}))
-            .await
-            .unwrap();
+    let resp = yadorilink_client_core::daemon::control::send(ReqPayload::UpdateStatus(
+        UpdateStatusRequest {},
+    ))
+    .await
+    .unwrap();
     let Some(RespPayload::UpdateStatus(status)) = resp.payload else {
         panic!("expected an UpdateStatus response");
     };
@@ -182,10 +185,11 @@ async fn update_config_persists_and_is_reflected_by_status() {
     assert!(!policy.automatic_checks_enabled);
     assert_eq!(policy.automatic_install_mode, AutoInstallMode::Automatic);
 
-    let resp =
-        yadorilink_cli::control_client::send(ReqPayload::UpdateStatus(UpdateStatusRequest {}))
-            .await
-            .unwrap();
+    let resp = yadorilink_client_core::daemon::control::send(ReqPayload::UpdateStatus(
+        UpdateStatusRequest {},
+    ))
+    .await
+    .unwrap();
     let Some(RespPayload::UpdateStatus(status)) = resp.payload else {
         panic!("expected an UpdateStatus response");
     };

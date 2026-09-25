@@ -18,6 +18,13 @@
 //! FSEvents-specific quirk. See `spawn_new_directory_registrar` below,
 //! which hands new-directory registration off to a tokio task instead.
 //!
+//! On macOS the gap described next is closed by never registering a watch
+//! after startup: the root is watched once, recursively (see
+//! [`RootWatch`]), and a new directory only has its contents re-reported.
+//! The per-directory registration below is what inotify and
+//! `ReadDirectoryChangesW` use, where adding a watch leaves the others
+//! alone.
+//!
 //! Moving `watch` off the callback thread closed that deadlock, but not a
 //! residual gap — confirmed directly against `notify` 8.2.0's vendored
 //! FSEvents source (`fsevent.rs`): `watch_inner`/`unwatch_inner` always
@@ -58,7 +65,7 @@
 //! deterministically — see `spawn_new_directory_registrar`'s doc comment
 //! for the full account).
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -72,13 +79,6 @@ use yadorilink_root_authority::ignore_patterns::{
 };
 use yadorilink_root_authority::reserved_namespace::path_has_reserved_component;
 
-/// This crate cannot depend back on `yadorilink-sync-core`, so this module's
-/// own fallible paths (constructing/registering the OS watcher, loading the
-/// ignore set) get a crate-local error type rather than `SyncError` —
-/// mirroring `MaterializationExecutionError`'s own precedent in
-/// `materialization_execution.rs`. `yadorilink-sync-core::SyncError` still
-/// carries an equivalent `Watch`/`Io` variant pair for any caller that needs
-/// to convert back (see its own `impl From<WatcherError> for SyncError`).
 #[derive(Debug, thiserror::Error)]
 pub enum WatcherError {
     #[error("io error: {0}")]
@@ -190,7 +190,7 @@ pub fn watch_folder_with_capacity_and_ignore(
     let overflowed = Arc::new(AtomicBool::new(false));
     let callback_overflowed = overflowed.clone();
     let watcher_holder: Arc<Mutex<Option<RecommendedWatcher>>> = Arc::new(Mutex::new(None));
-    let watched_dirs = Arc::new(Mutex::new(HashSet::new()));
+    let watched_dirs = Arc::new(Mutex::new(BTreeSet::new()));
     let callback_root = root.clone();
     let callback_ignore_set = ignore_set.clone();
 
@@ -206,7 +206,7 @@ pub fn watch_folder_with_capacity_and_ignore(
     // messages are just `PathBuf`s and only ever produced on genuine new-
     // directory events (not a hot per-event path), so never bounding this
     // channel is safe.
-    let (new_dir_tx, new_dir_rx) = mpsc::unbounded_channel::<PathBuf>();
+    let (new_dir_tx, new_dir_rx) = mpsc::unbounded_channel::<RegistrarTrigger>();
     let callback_new_dir_tx = new_dir_tx.clone();
     // The registrar task (spawned below, after `watcher_holder` is
     // populated) needs its own handle to synthesize reconciliation events
@@ -234,12 +234,18 @@ pub fn watch_folder_with_capacity_and_ignore(
                 // `send` on an unbounded channel only fails if the
                 // receiving task is gone (shutdown race), never because
                 // it's full; either way there is nothing more to do here.
-                let _ = callback_new_dir_tx.send(path.clone());
+                let _ = callback_new_dir_tx.send(RegistrarTrigger::NewDirectory(path.clone()));
             }
-            // M6-2 phase-timing diagnostic (temporary): see chunker.rs's
-            // matching M6PHASE comment for why this exists.
+            // A removal may be a watched directory's: the registrar drops
+            // it (and what was below it) from the registered set, so the
+            // directory is registered again if it is made anew.
+            if matches!(kind, FsChangeKind::Removed) {
+                let _ = callback_new_dir_tx.send(RegistrarTrigger::Removed(path.clone()));
+            }
+            // Zero-field `phase T_*` marker: a timestamp anchor for offline
+            // timing analysis of captured logs.
             if matches!(kind, FsChangeKind::CreatedOrModified) {
-                tracing::warn!("M6PHASE T_watch: raw filesystem watcher event received");
+                tracing::trace!("phase T_watch: raw filesystem watcher event received");
             }
             if tx.try_send(FsChangeEvent { path, kind }).is_err() {
                 callback_overflowed.store(true, Ordering::Relaxed);
@@ -308,7 +314,7 @@ pub fn watch_folder_with_capacity_and_ignore(
 
     {
         let mut watched = watched_dirs.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        register_non_ignored_directories(&mut watcher, &mut watched, &root, &root, &ignore_set)?;
+        register_initial_watches(&mut watcher, &mut watched, &root, &ignore_set, ROOT_WATCH)?;
     }
     *watcher_holder.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(watcher);
 
@@ -375,9 +381,8 @@ impl FolderWatchSource for RealFolderWatchSource {
 /// `run_debouncer` and everything above it (indexing, peer reconciliation,
 /// materialization) runs unmodified against events the scenario script
 /// controls directly instead of ones a real filesystem produces. Pure
-/// channel plumbing — no OS or `madsim`-specific API — so it works
-/// identically whether the binary is built against real `tokio` or
-/// `madsim`'s simulated shim; only the *scheduling* around it differs.
+/// channel plumbing — no OS-specific API — so it works identically in a
+/// native and a simulated build; only the *scheduling* around it differs.
 ///
 /// `watch` can only be called once per instance (mirroring a real
 /// link's one-watcher-per-root lifecycle); a second call is a
@@ -481,15 +486,55 @@ impl FolderWatchSource for SimulatedFolderWatchSource {
 /// runtime, and this module's own tests are all `#[tokio::test]`.
 fn spawn_new_directory_registrar(
     watcher_holder: Weak<Mutex<Option<RecommendedWatcher>>>,
-    watched_dirs: Arc<Mutex<HashSet<PathBuf>>>,
+    watched_dirs: Arc<Mutex<BTreeSet<PathBuf>>>,
     root: PathBuf,
     ignore_set: Arc<EffectiveIgnoreSet>,
-    mut new_dir_rx: mpsc::UnboundedReceiver<PathBuf>,
+    mut new_dir_rx: mpsc::UnboundedReceiver<RegistrarTrigger>,
     tx: mpsc::Sender<FsChangeEvent>,
     overflowed: Arc<AtomicBool>,
 ) {
     tokio::spawn(async move {
-        while let Some(new_dir) = new_dir_rx.recv().await {
+        while let Some(first) = new_dir_rx.recv().await {
+            // One pass serves every trigger queued while the last one ran:
+            // registration starts from `root` whichever directory
+            // triggered it, so running it once per queued trigger only
+            // repeats the same walk (and the re-reports below).
+            let mut queued = vec![first];
+            while let Ok(more) = new_dir_rx.try_recv() {
+                queued.push(more);
+            }
+            let mut triggers = Vec::new();
+            for trigger in queued {
+                match trigger {
+                    RegistrarTrigger::NewDirectory(path) => triggers.push(path),
+                    RegistrarTrigger::Removed(path) => {
+                        let mut watched =
+                            watched_dirs.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        forget_removed_directories(&mut watched, &path);
+                    }
+                }
+            }
+            if triggers.is_empty() {
+                continue;
+            }
+            if ROOT_WATCH == RootWatch::Recursive {
+                // The root's one recursive watch already covers every new
+                // directory: nothing to register, so no watch call and no
+                // blind window. What a directory moved or copied in holds
+                // is still named by no event of its own, so a directory not
+                // seen before has its contents re-reported. One already
+                // known (an event for its mode, its attributes, or a
+                // repeat) re-reports nothing.
+                let new_dirs = {
+                    let mut watched =
+                        watched_dirs.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    newly_known_directories(&mut watched, &root, &triggers, &ignore_set)
+                };
+                for new_dir in &new_dirs {
+                    reconcile_new_directory_subtree(&tx, &overflowed, &root, new_dir, &ignore_set);
+                }
+                continue;
+            }
             match register_new_directory_tree(
                 &watcher_holder,
                 &watched_dirs,
@@ -516,9 +561,32 @@ fn spawn_new_directory_registrar(
                 Err(err) => {
                     tracing::debug!(
                         error = %err,
-                        trigger = %new_dir.display(),
+                        trigger = %triggers[0].display(),
+                        triggers = triggers.len(),
                         "failed to re-register the watched directory tree"
                     );
+                    // Most often something in the new tree is already gone
+                    // again (`mkdir` then `rmdir`). Re-report each new
+                    // directory itself (capture classifies it from what is
+                    // on disk now, a removal included) and what is in it.
+                    for new_dir in &triggers {
+                        reconcile_new_directory_subtree(
+                            &tx,
+                            &overflowed,
+                            &root,
+                            new_dir,
+                            &ignore_set,
+                        );
+                        if tx
+                            .try_send(FsChangeEvent {
+                                path: new_dir.clone(),
+                                kind: FsChangeKind::CreatedOrModified,
+                            })
+                            .is_err()
+                        {
+                            overflowed.store(true, Ordering::Relaxed);
+                        }
+                    }
                 }
             }
         }
@@ -528,8 +596,8 @@ fn spawn_new_directory_registrar(
 /// Emits a synthesized `CreatedOrModified` event (through the same
 /// channel/overflow discipline as a live callback event — using a
 /// non-blocking `try_send`, never a blocking send that could stall this
-/// a slow consumer) for every real (non-symlink) file already
-/// present under `start`, so a
+/// a slow consumer) for every real (non-symlink) file and every directory
+/// already present under `start`, so a
 /// write that landed there before this subtree's watch registration
 /// completed is still picked up by `local_change.rs`'s ordinary dispatch,
 /// exactly as if the watcher had seen it live. Only ever called after
@@ -559,8 +627,12 @@ fn reconcile_new_directory_subtree(
         // `file_type` is lstat-based here (no `follow_links`, matching
         // `register_non_ignored_directories`'s own reasoning) — a symlink
         // is neither `is_dir` nor `is_file`, so it's correctly skipped
-        // rather than treated as a file to synthesize an event for.
-        if !entry.file_type().is_file() {
+        // rather than treated as a file to synthesize an event for. Every
+        // directory below `start` is re-reported too: a directory is an
+        // entry capture decides on its own, and an empty one moved or
+        // copied in is named by no other event.
+        let is_subdirectory = entry.depth() > 0 && entry.file_type().is_dir();
+        if !entry.file_type().is_file() && !is_subdirectory {
             continue;
         }
         let path = entry.path().to_path_buf();
@@ -570,6 +642,122 @@ fn reconcile_new_directory_subtree(
         if tx.try_send(FsChangeEvent { path, kind: FsChangeKind::CreatedOrModified }).is_err() {
             overflowed.store(true, Ordering::Relaxed);
         }
+    }
+}
+
+/// Whether this platform's watcher backend recreates its whole event
+/// stream to register a new directory, which blinds it for that moment
+/// over every watched path: FSEvents (see the module doc comment). inotify
+/// and `ReadDirectoryChangesW` add a watch without touching the others.
+const REGISTRATION_RECREATES_STREAM: bool = cfg!(target_os = "macos");
+
+/// What the directory registrar is told by the watcher callback.
+#[derive(Debug)]
+enum RegistrarTrigger {
+    /// A directory appeared (or was modified) at this path.
+    NewDirectory(PathBuf),
+    /// Something at this path was removed; it may have been a watched
+    /// directory.
+    Removed(PathBuf),
+}
+
+/// How the root is watched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootWatch {
+    /// One non-recursive watch per directory, each registered when the
+    /// directory is first seen: inotify's model, where adding a watch
+    /// touches no other.
+    PerDirectory,
+    /// One recursive watch of the root, registered once. On a backend whose
+    /// every registration recreates its whole event stream (FSEvents),
+    /// registering each new directory would blind the stream for every
+    /// watched path each time a directory appears, and an event anywhere
+    /// in the tree during that moment is never delivered. A recursive watch
+    /// of the root never registers again, so that window does not exist.
+    Recursive,
+}
+
+/// This platform's [`RootWatch`].
+const ROOT_WATCH: RootWatch =
+    if REGISTRATION_RECREATES_STREAM { RootWatch::Recursive } else { RootWatch::PerDirectory };
+
+/// The watches a new watcher starts with: the root recursively, or every
+/// non-ignored directory under it one by one. Every path watched is
+/// recorded in `watched`.
+fn register_initial_watches<W: Watcher>(
+    watcher: &mut W,
+    watched: &mut BTreeSet<PathBuf>,
+    root: &Path,
+    ignore_set: &EffectiveIgnoreSet,
+    root_watch: RootWatch,
+) -> Result<Vec<PathBuf>, WatcherError> {
+    match root_watch {
+        RootWatch::PerDirectory => {
+            register_non_ignored_directories(watcher, watched, root, root, ignore_set)
+        }
+        RootWatch::Recursive => {
+            watcher.watch(root, RecursiveMode::Recursive).map_err(WatcherError::from)?;
+            // Every directory already there is known, so a later event on
+            // one is not taken for a new directory.
+            record_non_ignored_directories(watched, root, root, ignore_set, |_| Ok(()))?;
+            Ok(vec![root.to_path_buf()])
+        }
+    }
+}
+
+/// Under a recursive root watch: records every directory under each of
+/// `triggers` not yet known, and returns the ones whose contents are to be
+/// re-reported -- each newly known directory not inside another one
+/// returned (its subtree re-report covers them).
+fn newly_known_directories(
+    watched: &mut BTreeSet<PathBuf>,
+    root: &Path,
+    triggers: &[PathBuf],
+    ignore_set: &EffectiveIgnoreSet,
+) -> Vec<PathBuf> {
+    let mut known = Vec::new();
+    for trigger in triggers {
+        // A known directory is not walked again: a directory made inside
+        // it has an event of its own.
+        if watched.contains(trigger) || !is_real_directory(trigger) {
+            continue;
+        }
+        if let Ok(found) =
+            record_non_ignored_directories(watched, root, trigger, ignore_set, |_| Ok(()))
+        {
+            known.extend(found);
+        }
+    }
+    known.sort();
+    let mut tops: Vec<PathBuf> = Vec::new();
+    for dir in known {
+        if !tops.iter().any(|top| dir.starts_with(top)) {
+            tops.push(dir);
+        }
+    }
+    tops
+}
+
+/// Drops `removed` and every registered directory below it from
+/// `watched`. inotify ends a watch when its directory is deleted, so a
+/// directory made again at the same path must be registered again, which
+/// only happens for a path not in the set. Nothing is unwatched: the watch
+/// the backend held is already gone.
+///
+/// Whatever is at `removed` now is not consulted. The removal and a
+/// re-creation at the same path reach the registrar in that order, often
+/// in one batch, so by the time the removal is handled the new directory
+/// may already be there; keeping it in the set would leave it unwatched.
+/// A directory forgotten while its watch is still live is registered again
+/// by the next pass, which the backend treats as the watch it already has.
+fn forget_removed_directories(watched: &mut BTreeSet<PathBuf>, removed: &Path) {
+    let gone: Vec<PathBuf> = watched
+        .range(removed.to_path_buf()..)
+        .take_while(|path| path.starts_with(removed))
+        .cloned()
+        .collect();
+    for path in gone {
+        watched.remove(&path);
     }
 }
 
@@ -626,7 +814,7 @@ fn is_real_directory(path: &Path) -> bool {
 /// caller reconciles each one's contents).
 fn register_new_directory_tree(
     watcher_holder: &Weak<Mutex<Option<RecommendedWatcher>>>,
-    watched_dirs: &Arc<Mutex<HashSet<PathBuf>>>,
+    watched_dirs: &Arc<Mutex<BTreeSet<PathBuf>>>,
     root: &Path,
     start: &Path,
     ignore_set: &EffectiveIgnoreSet,
@@ -645,10 +833,25 @@ fn register_new_directory_tree(
 /// is nothing for a caller to reconcile.
 fn register_non_ignored_directories<W: Watcher>(
     watcher: &mut W,
-    watched: &mut HashSet<PathBuf>,
+    watched: &mut BTreeSet<PathBuf>,
     root: &Path,
     start: &Path,
     ignore_set: &EffectiveIgnoreSet,
+) -> Result<Vec<PathBuf>, WatcherError> {
+    record_non_ignored_directories(watched, root, start, ignore_set, |dir| {
+        watcher.watch(dir, RecursiveMode::NonRecursive).map_err(WatcherError::from)
+    })
+}
+
+/// Walks every non-ignored directory under `start` (itself included),
+/// records each not yet in `watched` and calls `on_new` for it; returns
+/// those, in walk order.
+fn record_non_ignored_directories(
+    watched: &mut BTreeSet<PathBuf>,
+    root: &Path,
+    start: &Path,
+    ignore_set: &EffectiveIgnoreSet,
+    mut on_new: impl FnMut(&Path) -> Result<(), WatcherError>,
 ) -> Result<Vec<PathBuf>, WatcherError> {
     // Defense-in-depth: refuse to walk from a symlink root.
     // walkdir's `follow_links(false)` (explicit below) does NOT protect an
@@ -693,7 +896,7 @@ fn register_non_ignored_directories<W: Watcher>(
             continue;
         }
         if watched.insert(entry.path().to_path_buf()) {
-            watcher.watch(entry.path(), RecursiveMode::NonRecursive).map_err(WatcherError::from)?;
+            on_new(entry.path())?;
             newly_registered.push(entry.path().to_path_buf());
         }
     }
@@ -701,383 +904,4 @@ fn register_non_ignored_directories<W: Watcher>(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration;
-
-    // Only ever constructed by the #[cfg(unix)] symlink-safety tests below
-    // (they exercise std::os::unix::fs::symlink), so this whole stand-in
-    // Watcher is unix-only too -- otherwise it's dead code on Windows.
-    #[cfg(unix)]
-    #[derive(Default)]
-    struct RecordingWatcher {
-        watched: Vec<PathBuf>,
-    }
-
-    #[cfg(unix)]
-    impl Watcher for RecordingWatcher {
-        fn new<F: notify::EventHandler>(
-            _event_handler: F,
-            _config: notify::Config,
-        ) -> notify::Result<Self> {
-            Ok(Self::default())
-        }
-
-        fn watch(&mut self, path: &Path, _recursive_mode: RecursiveMode) -> notify::Result<()> {
-            self.watched.push(path.to_path_buf());
-            Ok(())
-        }
-
-        fn unwatch(&mut self, path: &Path) -> notify::Result<()> {
-            self.watched.retain(|watched| watched != path);
-            Ok(())
-        }
-
-        fn kind() -> notify::WatcherKind {
-            notify::WatcherKind::PollWatcher
-        }
-    }
-
-    #[tokio::test]
-    async fn file_creation_is_detected() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut watcher = watch_folder(dir.path()).unwrap();
-
-        let file_path = dir.path().join("new-file.txt");
-        std::fs::write(&file_path, b"hello").unwrap();
-
-        let event = tokio::time::timeout(Duration::from_secs(5), watcher.events.recv())
-            .await
-            .expect("timed out waiting for fs event")
-            .expect("watcher channel closed");
-        assert_eq!(event.kind, FsChangeKind::CreatedOrModified);
-    }
-
-    /// Waits until an event for exactly `target` is observed, ignoring any
-    /// other event in between -- FSEvents (and, in principle, the other
-    /// backends) can deliver an extra event for a directory itself (e.g.
-    /// its mtime changing when a child is added) interleaved with the
-    /// events this test actually cares about, so asserting against the
-    /// literal next `recv` is too brittle. Panics with `msg` on timeout.
-    async fn recv_until(
-        events: &mut mpsc::Receiver<FsChangeEvent>,
-        target: &Path,
-        msg: &str,
-    ) -> FsChangeEvent {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let event = events.recv().await.expect("watcher channel closed");
-                if event.path == target {
-                    return event;
-                }
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("{msg}"))
-    }
-
-    /// A minimal, fast regression for the deadlock this change fixes — a
-    /// brand-new one-level subdirectory, created after the watcher has
-    /// already started, followed by one write inside it. Before this
-    /// change, the callback's own synchronous, reentrant
-    /// `RecommendedWatcher::watch` call for the new directory would
-    /// permanently wedge the watcher's callback thread (see the module doc
-    /// comment); this test's `timeout` would never fire on the buggy code
-    /// (`recv` simply never resolves, since the callback thread that
-    /// would deliver the write's event is deadlocked inside `watch`), so
-    /// this fails loudly rather than hanging the suite. Deliberately does
-    /// not need `windows_path_hazard_conflict.rs`'s deep nesting or long
-    /// path — those were incidental to the actual bug, not required to
-    /// reproduce it.
-    #[tokio::test]
-    async fn new_subdirectory_then_write_inside_it_does_not_deadlock_the_watcher() {
-        let dir = tempfile::tempdir().unwrap();
-        // Canonicalize up front, matching what `watch_folder` does to
-        // `root` internally -- macOS's tempdir lives under a `/var` path
-        // that's itself a symlink to `/private/var`, so an event's
-        // (canonical) `path` never string-equals a path built from the
-        // raw, non-canonical `dir.path`.
-        let root = dir.path().canonicalize().unwrap();
-        let mut watcher = watch_folder(&root).unwrap();
-
-        let sub_dir = root.join("new-subdir");
-        std::fs::create_dir(&sub_dir).unwrap();
-
-        let file_path = sub_dir.join("new-file-in-new-subdir.txt");
-        std::fs::write(&file_path, b"hello from a brand-new subdirectory").unwrap();
-
-        let event = recv_until(
-            &mut watcher.events,
-            &file_path,
-            "timed out waiting for the write inside a brand-new subdirectory -- the watcher is \
-             likely deadlocked (directory-registration-race/deadlock regression)",
-        )
-        .await;
-        assert_eq!(event.kind, FsChangeKind::CreatedOrModified);
-
-        // Confirm the watcher is still alive for the *rest* of the link,
-        // not just for this one new subdirectory -- the original bug wedged
-        // the callback thread for every future event on the whole link, not
-        // only the triggering subtree.
-        let unrelated_path = root.join("unrelated-root-level-file.txt");
-        std::fs::write(&unrelated_path, b"still alive").unwrap();
-        recv_until(
-            &mut watcher.events,
-            &unrelated_path,
-            "watcher stopped delivering events after the new-subdirectory write",
-        )
-        .await;
-    }
-
-    /// The registration-race half of this change -- a write landing
-    /// inside a brand-new directory must not be silently missed
-    /// regardless of its exact timing relative to that directory's own
-    /// watch registration. Deliberately does *not* drain the
-    /// directory-creation event before writing the file (unlike the
-    /// deadlock test above), matching `create_dir_all(parent)`
-    /// immediately followed by a write into `parent` -- exactly the shape
-    /// that risks losing the write to the registration race. The
-    /// deferred registrar's reconciling scan (`reconcile_new_directory_
-    /// subtree`) is what guarantees this: it walks the newly-registered
-    /// subtree for already-on-disk files unconditionally once `watch`
-    /// succeeds, so the write is picked up either by the live watch (if it
-    /// wins the race) or by the scan (if it doesn't) -- never by neither.
-    #[tokio::test]
-    async fn write_into_a_brand_new_directory_is_not_silently_missed() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let mut watcher = watch_folder(&root).unwrap();
-
-        let sub_dir = root.join("new-subdir-no-drain");
-        std::fs::create_dir(&sub_dir).unwrap();
-        let file_path = sub_dir.join("file-written-immediately-after-mkdir.txt");
-        std::fs::write(&file_path, b"races the new directory's own watch registration").unwrap();
-
-        // The file's own event may arrive before or after the directory's,
-        // and either the live watch or the reconciling scan may be what
-        // actually produces it -- `recv_until` looks past any other event
-        // (e.g. the directory's own) rather than assuming a fixed count or
-        // order.
-        let found = recv_until(
-            &mut watcher.events,
-            &file_path,
-            "the write into a brand-new directory was never detected -- likely lost to the \
-             registration race (directory-registration-race/deadlock regression)",
-        )
-        .await;
-        assert_eq!(found.kind, FsChangeKind::CreatedOrModified);
-    }
-
-    /// The OS callback thread must never block, even when the channel is
-    /// deliberately kept full (no one draining it) — proven here by
-    /// directly exercising the callback's own non-blocking `try_send` path
-    /// via a tiny channel filled to capacity, without needing a real
-    /// filesystem event (which would be much slower and less deterministic
-    /// to arrange).
-    #[test]
-    fn try_send_never_blocks_when_the_channel_is_full() {
-        let (tx, _rx) = mpsc::channel(1);
-        let overflowed = Arc::new(AtomicBool::new(false));
-
-        // Fill the one slot.
-        assert!(tx
-            .try_send(FsChangeEvent { path: "a".into(), kind: FsChangeKind::CreatedOrModified })
-            .is_ok());
-
-        // A second attempt must return immediately (Err), not block —
-        // this is exactly what the watcher callback does internally.
-        let started = std::time::Instant::now();
-        let overflow_tx = tx.clone();
-        if overflow_tx
-            .try_send(FsChangeEvent { path: "b".into(), kind: FsChangeKind::CreatedOrModified })
-            .is_err()
-        {
-            overflowed.store(true, Ordering::Relaxed);
-        }
-        assert!(started.elapsed() < Duration::from_millis(50), "try_send must return immediately");
-        assert!(
-            overflowed.load(Ordering::Relaxed),
-            "a full channel must be recorded as an overflow"
-        );
-    }
-
-    /// The overflow flag starts clear and a normal (non-full) watcher
-    /// never sets it.
-    #[tokio::test]
-    async fn overflow_flag_stays_clear_under_normal_operation() {
-        let dir = tempfile::tempdir().unwrap();
-        let watcher = watch_folder(dir.path()).unwrap();
-        let (mut events_rx, overflowed, _guard) = watcher.split();
-
-        std::fs::write(dir.path().join("f.txt"), b"hi").unwrap();
-        let _ = tokio::time::timeout(Duration::from_secs(5), events_rx.recv()).await;
-
-        assert!(!overflowed.load(Ordering::Relaxed));
-    }
-
-    /// Capacity is configurable.
-    #[tokio::test]
-    async fn watch_folder_with_capacity_accepts_a_custom_capacity() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut watcher = watch_folder_with_capacity(dir.path(), 4).unwrap();
-
-        std::fs::write(dir.path().join("f.txt"), b"hi").unwrap();
-        let event = tokio::time::timeout(Duration::from_secs(5), watcher.events.recv())
-            .await
-            .expect("timed out")
-            .expect("channel closed");
-        assert_eq!(event.kind, FsChangeKind::CreatedOrModified);
-    }
-
-    #[tokio::test]
-    async fn ignore_aware_watcher_skips_ignored_directory_and_leaf_file_events() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("node_modules/pkg")).unwrap();
-        let ignore_set = Arc::new(EffectiveIgnoreSet::from_user_patterns("node_modules/\n*.tmp\n"));
-        let mut watcher =
-            watch_folder_with_capacity_and_ignore(dir.path(), 32, ignore_set).unwrap();
-
-        std::fs::write(dir.path().join("node_modules/pkg/index.js"), b"ignored").unwrap();
-        std::fs::write(dir.path().join("scratch.tmp"), b"ignored").unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(500), watcher.events.recv()).await.is_err(),
-            "ignored paths must not be queued"
-        );
-
-        std::fs::write(dir.path().join("keep.txt"), b"kept").unwrap();
-        let event = tokio::time::timeout(Duration::from_secs(5), watcher.events.recv())
-            .await
-            .expect("timed out waiting for non-ignored event")
-            .expect("watcher channel closed");
-        assert_eq!(event.path.file_name().and_then(|name| name.to_str()), Some("keep.txt"));
-    }
-
-    #[tokio::test]
-    async fn ignore_aware_watcher_still_queues_ignore_file_changes() {
-        let dir = tempfile::tempdir().unwrap();
-        let ignore_set = Arc::new(EffectiveIgnoreSet::from_user_patterns("*\n"));
-        let mut watcher =
-            watch_folder_with_capacity_and_ignore(dir.path(), 32, ignore_set).unwrap();
-
-        std::fs::write(dir.path().join(".yadorilinkignore"), b"*.tmp\n").unwrap();
-        let event = tokio::time::timeout(Duration::from_secs(5), watcher.events.recv())
-            .await
-            .expect("timed out waiting for ignore-file event")
-            .expect("watcher channel closed");
-        assert_eq!(
-            event.path.file_name().and_then(|name| name.to_str()),
-            Some(".yadorilinkignore")
-        );
-    }
-
-    // --- Symlink-safe directory classification and registration ---
-
-    /// `is_real_directory` is lstat-based: true only for a genuine
-    /// directory, false for a symlink even when its target is a directory,
-    /// and false for a plain file.
-    #[cfg(unix)]
-    #[test]
-    fn is_real_directory_is_lstat_based_not_follow() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("real_dir")).unwrap();
-        std::fs::write(dir.path().join("real_file.txt"), b"x").unwrap();
-        std::os::unix::fs::symlink(dir.path().join("real_dir"), dir.path().join("link_to_dir"))
-            .unwrap();
-
-        assert!(is_real_directory(&dir.path().join("real_dir")));
-        assert!(!is_real_directory(&dir.path().join("real_file.txt")));
-        assert!(
-            !is_real_directory(&dir.path().join("link_to_dir")),
-            "a symlink to a directory must not be reported as a real directory"
-        );
-        assert!(!is_real_directory(&dir.path().join("does_not_exist")));
-    }
-
-    /// Defense-in-depth: `register_non_ignored_directories` refuses to
-    /// walk from a symlink `start` outright, rather than relying solely on
-    /// the caller (`register_new_directory_tree`) never passing one —
-    /// proven directly against the function, not just through the
-    /// higher-level watcher behavior covered in `local_change.rs`'s tests.
-    #[cfg(unix)]
-    #[test]
-    fn register_non_ignored_directories_refuses_a_symlink_start() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        std::fs::create_dir_all(root.join("real_dir")).unwrap();
-        std::fs::write(root.join("real_dir/secret.txt"), b"must not be watched").unwrap();
-        let link = root.join("link_dir");
-        std::os::unix::fs::symlink(root.join("real_dir"), &link).unwrap();
-
-        let ignore_set = EffectiveIgnoreSet::defaults_only();
-        let watched_dirs = Arc::new(Mutex::new(HashSet::new()));
-        let mut watcher = RecordingWatcher::default();
-
-        let mut watched = watched_dirs.lock().unwrap();
-        let result =
-            register_non_ignored_directories(&mut watcher, &mut watched, &root, &link, &ignore_set);
-        assert!(result.is_ok(), "must not error, just decline to register anything");
-        assert!(watched.is_empty(), "a symlink start must never result in any registered watch");
-        assert!(watcher.watched.is_empty());
-    }
-
-    /// No current `ArtefactKind` is directory-shaped, so this is not
-    /// reachable today — but `register_non_ignored_directories` must never
-    /// register a native OS watch on a reserved-namespace path, matching
-    /// every other entry point in the crate. Proven directly against the
-    /// function so this holds even before anything ever creates a
-    /// directory-shaped artefact.
-    #[cfg(unix)]
-    #[test]
-    fn register_non_ignored_directories_skips_a_reserved_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let reserved_dir = root.join(
-            yadorilink_root_authority::reserved_namespace::artefact_component_name(
-                yadorilink_root_authority::reserved_namespace::ArtefactKind::Retained,
-                "deadbeef",
-            )
-            .unwrap(),
-        );
-        std::fs::create_dir_all(&reserved_dir).unwrap();
-        std::fs::write(reserved_dir.join("inside.txt"), b"must not be watched").unwrap();
-
-        let ignore_set = EffectiveIgnoreSet::defaults_only();
-        let watched_dirs = Arc::new(Mutex::new(HashSet::new()));
-        let mut watcher = RecordingWatcher::default();
-
-        let mut watched = watched_dirs.lock().unwrap();
-        let result =
-            register_non_ignored_directories(&mut watcher, &mut watched, &root, &root, &ignore_set);
-        assert!(result.is_ok());
-        assert!(
-            !watched.contains(&reserved_dir),
-            "a reserved-namespace directory must never be registered for a watch"
-        );
-        assert!(!watcher.watched.contains(&reserved_dir));
-    }
-
-    /// A self-referential symlinked-directory cycle must not hang
-    /// `register_non_ignored_directories` — real symlink cycle on disk,
-    /// wrapped in a wall-clock timeout so a genuine infinite loop fails
-    /// the test loudly instead of hanging the suite.
-    #[cfg(unix)]
-    #[test]
-    fn register_non_ignored_directories_does_not_hang_on_a_symlink_cycle() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        std::fs::create_dir_all(root.join("cyc")).unwrap();
-        std::os::unix::fs::symlink(root.join("cyc/a"), root.join("cyc/a")).unwrap();
-
-        let ignore_set = EffectiveIgnoreSet::defaults_only();
-        let mut watched = HashSet::new();
-        let mut watcher = RecordingWatcher::default();
-        let registered =
-            register_non_ignored_directories(&mut watcher, &mut watched, &root, &root, &ignore_set)
-                .unwrap();
-
-        assert_eq!(registered, watcher.watched);
-        assert!(registered.contains(&root));
-        assert!(registered.contains(&root.join("cyc")));
-        assert!(!registered.contains(&root.join("cyc/a")));
-    }
-}
+mod tests;

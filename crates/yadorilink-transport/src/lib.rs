@@ -10,38 +10,34 @@
 //! - [`quic_peer_endpoint::QuicPeerEndpoint`]: this device's single QUIC
 //!   endpoint, which authenticates every peer by its Ed25519 device key
 //!   ([`quic_identity`]) and separates peers by QUIC connection id.
-//! - [`quic_socket::TransportHubQuicSocket`]: the bridge that lets that
-//!   endpoint share the device's one UDP binding with STUN and the relay
-//!   envelope, so a NAT candidate still names the exact socket data flows
-//!   on.
-//! - [`transport_hub::TransportHub`]: that binding, its demultiplexer, and
-//!   the NAT-traversal machinery around it.
-//! - [`relay_path`]: the synthetic addresses that let a relay-carried peer
-//!   look, to that endpoint, like any other UDP path.
+//! - [`quic_socket::TransportHubQuicSocket`]: the bridge that drives that
+//!   endpoint over the device's one UDP binding.
+//! - [`transport_hub::TransportHub`]: that binding and its receive loop.
 //!
-//! Sync data travels over direct peer-to-peer paths this device establishes
-//! itself, or -- when no direct path can be had -- over a relay
-//! ([`relay_path`]), itself just another peer this device already shares a
-//! group with. A relayed peer is presented to the QUIC endpoint as an
-//! ordinary UDP path at a synthetic address, so nothing above the hub has to
-//! know the difference. A peer no path ever reaches is reported
-//! [`peer_channel::PeerReachability::Unreachable`] with a failure category,
-//! never routed through an operator-run server.
+//! This is not the production peer transport. Peer connectivity -- dialling,
+//! NAT traversal, path selection, relay fallback and LAN discovery -- belongs
+//! entirely to the iroh endpoint in `yadorilink-sync-substrate`. What this
+//! crate still supplies to shipped code is the device signing key pair and
+//! its OS keyring storage, the block-stream length framing both transports
+//! share, the netmap diff, and `TransportError`. The QUIC endpoint and
+//! channel below are kept only as an independent control plane for tests
+//! that need a reachability probe which is not the sync path itself.
 
 pub mod block_stream;
 mod error;
 mod key_secret_store;
 mod keys;
-mod local_candidates;
-mod local_discovery;
-pub mod nat;
 mod peer_channel;
 pub mod quic_identity;
 pub mod quic_peer_channel;
 pub mod quic_peer_endpoint;
 pub mod quic_socket;
-pub mod relay_path;
-mod supervise;
+/// Which UDP socket this crate's networking is built on -- the one place
+/// the native and turmoil builds differ.
+pub mod sim_net;
+/// The seeded jitter source a turmoil build draws from. Compiled away
+/// entirely in every other build.
+pub mod sim_rand;
 mod transport_hub;
 mod udp_batching;
 
@@ -50,30 +46,12 @@ pub use block_stream::{
 };
 pub use error::TransportError;
 pub use keys::{verifying_key_from_bytes, DeviceSigningKeyPair, KeyLoadError};
-pub use local_candidates::{
-    local_candidate_addresses, local_candidates_classified, routable_local_ipv4,
-    LOCAL_CANDIDATE_PRIORITY,
-};
-pub use local_discovery::{start_local_discovery, PeerAnnouncement};
-pub use nat::classify::{classify, NatClass};
-pub use nat::portmap::{PortMapConfig, PortMapper};
-pub use nat::punch::{run_burst, PunchConfig, PunchDecision, PunchLimiter, PunchTarget};
-pub use nat::stun::{StunConfig, StunProber};
-pub use nat::{
-    Candidate, CandidateClass, CandidateSink, NatObservations, ObservationLog, PortMappingStatus,
-};
-pub use peer_channel::{
-    classify_endpoint, diff_netmap, NetmapDiff, NetmapSnapshot, PeerReachability,
-    UnreachableCategory,
-};
+pub use peer_channel::{diff_netmap, NetmapDiff, NetmapSnapshot};
 pub use quic_identity::{
     device_certified_key, quic_client_config, quic_server_config, AuthorizedPeerKeys,
     PinnedPeerKeys, PEER_SERVER_NAME, YADORILINK_P2P_ALPN,
 };
 pub use quic_peer_channel::{QuicPeerChannel, MAX_CONTROL_FRAME_BYTES};
-pub use quic_peer_endpoint::{
-    connect_role, ConnectRole, QuicPeerEndpoint, PEER_IDLE_TIMEOUT, RACED_DIAL_WORST_CASE,
-};
+pub use quic_peer_endpoint::{connect_role, ConnectRole, QuicPeerEndpoint, PEER_IDLE_TIMEOUT};
 pub use quic_socket::{HubQuinnRuntime, TransportHubQuicSocket};
-pub use relay_path::{is_synthetic_relay_addr, RelayControlEgress, RelayPathHandle};
-pub use transport_hub::{wrap_relay_envelope, HubStunSocket, TransportHub};
+pub use transport_hub::TransportHub;

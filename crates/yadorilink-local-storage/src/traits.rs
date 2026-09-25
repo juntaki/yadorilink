@@ -13,7 +13,7 @@ use crate::free_space::VolumeFreeSpace;
 pub type ContentHash = String;
 
 /// The one place block bytes get SHA-256'd for `ContentHash` purposes —
-/// `FsBlockStore::put`/`hash_bytes` and `LocallyHashedBlock::from_bytes`
+/// `SegmentBlockStore::put`/`hash_bytes` and `LocallyHashedBlock::from_bytes`
 /// both call this, so there is exactly one hash implementation to keep in
 /// sync, not two that could silently drift.
 pub fn hash_block_bytes(data: &[u8]) -> ContentHash {
@@ -30,13 +30,13 @@ pub fn hash_block_bytes(data: &[u8]) -> ContentHash {
 /// cannot spoof by pairing a real hash with different bytes (or vice
 /// versa) through this type's public surface.
 ///
-/// M6-2B1.1: exists to hash a freshly-chunked block exactly ONCE and feed
+/// Exists to hash a freshly-chunked block exactly ONCE and feed
 /// that single `(hash, bytes)` pair to every downstream consumer that
 /// needs it (a per-block callback, `BlockStore::put_prepared`'s
 /// durable commit, `BlockInfo`'s own hash field) — before this type
 /// existed, `chunker.rs`'s CDC loop only had `BlockStore::put`, which
 /// always hashes internally as part of committing, forcing a caller that
-/// needs the hash before that commit finishes (M6-2B1's speculative
+/// needs the hash before that commit finishes (a speculative
 /// a callback) into hashing the same bytes a second time, or serializing
 /// entirely behind the durable commit's own fsync latency. See
 /// `chunk_file_content_defined_with_callback`'s own doc comment for the
@@ -128,7 +128,7 @@ pub trait BlockStore: Send + Sync {
     /// calls `put` and discards its returned hash (recomputing it, same
     /// as before this method existed) — correct for any implementor that
     /// hasn't overridden this, just not the performance win a real
-    /// override (like `FsBlockStore`'s) provides. Discards the hash
+    /// override (like `SegmentBlockStore`'s) provides. Discards the hash
     /// `LocallyHashedBlock` already carries in its default form
     /// specifically so implementors are never tempted to trust it
     /// unverified in a context where that would be unsafe; an override
@@ -138,20 +138,25 @@ pub trait BlockStore: Send + Sync {
         self.put(prepared.bytes()).map(|_| ())
     }
 
-    /// M6-2B2: commits every block in `prepared` as one bulk-durability
-    /// batch instead of `prepared.len()` independent commits — see
-    /// `FsBlockStore::begin_bulk_ingest`/`BulkIngest`'s own doc comment
-    /// for the `staged -> durable -> authoritative` contract a real
-    /// override provides (bounded-concurrency file writes, one shard-
-    /// directory sync per distinct touched shard instead of one per
-    /// block, batch-granularity headroom/usage accounting). The default
-    /// implementation here is exactly what calling `put_prepared` once
-    /// per block, in order, already does — correct for any implementor
-    /// that hasn't overridden this (same fallback shape `put_prepared`
-    /// itself established), just without the durability-barrier-
-    /// coalescing performance win a real per-implementor override (like
-    /// `FsBlockStore`'s) provides. Stops at the first error, same as a
-    /// plain per-block loop would.
+    /// Commits every block in `prepared` as one durability batch instead
+    /// of `prepared.len()` independent commits.
+    ///
+    /// This is the method that matters for a small-file workload. A block
+    /// store's cost is barriers, not bytes -- a folder of 100,000 tiny
+    /// files is a few megabytes of content and a hundred thousand
+    /// durability barriers -- so what a real override does with this slice
+    /// is make one barrier serve all of it. See the `segment_store` module
+    /// doc for how, and for the `staged -> durable -> authoritative`
+    /// contract that the override preserves: returning `Ok` means every
+    /// block here is durable, and nothing upstream may become
+    /// authoritative before it does.
+    ///
+    /// The default implementation is exactly what calling `put_prepared`
+    /// once per block, in order, already does -- correct for any
+    /// implementor that hasn't overridden it (the same fallback shape
+    /// `put_prepared` itself established), just without the barrier
+    /// coalescing. Stops at the first error, same as a plain per-block
+    /// loop would.
     fn put_prepared_batch(&self, prepared: &[LocallyHashedBlock]) -> Result<(), StorageError> {
         for block in prepared {
             self.put_prepared(block)?;
@@ -188,7 +193,7 @@ pub trait BlockStore: Send + Sync {
     ///
     /// The default implementation simply delegates to `get`, so it is
     /// always at least as safe as `get` unless a backend explicitly
-    /// overrides it to skip verification (as `FsBlockStore` does). No
+    /// overrides it to skip verification (as `SegmentBlockStore` does). No
     /// call site in this repository calls `get_unchecked` yet as of this
     /// change — it is added for a future, deliberate opt-in at specific
     /// call sites.
@@ -226,7 +231,7 @@ pub trait BlockStore: Send + Sync {
     /// lives on the trait — mirroring `set_headroom_enforced`'s doc
     /// comment's own precedent — because `yadorilink-daemon`'s
     /// `DaemonState` only ever holds an `Arc<dyn BlockStore>`, never the
-    /// concrete `FsBlockStore`, and the periodic/on-demand GC scheduler
+    /// concrete `SegmentBlockStore`, and the periodic/on-demand GC scheduler
     /// needs to call this through that trait object.
     fn sweep(
         &self,
@@ -261,7 +266,7 @@ pub trait BlockStore: Send + Sync {
     /// report rather than erroring, so a retried or partially-completed
     /// reclamation is safe. The default implementation sizes each block
     /// before deleting it; a backend with direct metadata access should
-    /// override this to avoid reading block contents (as `FsBlockStore`
+    /// override this to avoid reading block contents (as `SegmentBlockStore`
     /// does).
     fn reclaim_cached_blocks(&self, hashes: &[ContentHash]) -> Result<GcReport, StorageError> {
         let mut report = GcReport::default();
@@ -292,7 +297,7 @@ pub trait BlockStore: Send + Sync {
     /// amount of blocking filesystem work directly on a tokio worker
     /// thread without compensating for it (e.g. via
     /// `tokio::task::block_in_place` when actually running on a
-    /// multi-threaded tokio runtime) — see `FsBlockStore::present_blocks`
+    /// multi-threaded tokio runtime) — see `SegmentBlockStore::present_blocks`
     /// for the pattern this repo uses, kept behind this same sync
     /// signature so existing callers need no changes.
     fn present_blocks(&self, hashes: &[ContentHash]) -> Result<Vec<bool>, StorageError> {
@@ -301,13 +306,13 @@ pub trait BlockStore: Send + Sync {
 
     /// Turns this backend's disk-space headroom preflight on `put` on or
     /// off. Exposed on the trait (rather than only on the concrete
-    /// `FsBlockStore`) so
+    /// `SegmentBlockStore`) so
     /// `yadorilink-daemon`'s `DaemonState`, which only ever holds an
     /// `Arc<dyn BlockStore>` (not the concrete type), can wire governance
     /// config into whatever backend is actually running. Default: a no-op
     /// — a backend with no real disk-headroom concept (e.g. an in-memory
-    /// test double) simply ignores this; only `FsBlockStore` overrides it
-    /// with real enforcement. See `FsBlockStore::headroom_enforced`'s doc
+    /// test double) simply ignores this; only `SegmentBlockStore` overrides it
+    /// with real enforcement. See `SegmentBlockStore::headroom_enforced`'s doc
     /// comment for why enforcement itself defaults to off.
     fn set_headroom_enforced(&self, _enforced: bool) {}
 
@@ -321,7 +326,7 @@ pub trait BlockStore: Send + Sync {
     /// classification via `VolumeFreeSpace::classify` — ), for
     /// `yadorilink status`'s per-volume reporting. `None` when this backend
     /// has no real underlying volume to report on. Default: `None` — an
-    /// in-memory/test double has no real disk concept; only `FsBlockStore`
+    /// in-memory/test double has no real disk concept; only `SegmentBlockStore`
     /// overrides this with a real query.
     fn free_space(&self) -> Result<Option<VolumeFreeSpace>, StorageError> {
         Ok(None)

@@ -1,27 +1,51 @@
-//! The desktop account section --
+//! The desktop account window --
 //! view deletion status, request/confirm/cancel deletion, and export a copy
-//! of your coordination-plane records, without a terminal. Launched as its
+//! of your coordination-plane records, without a terminal; PLUS the
+//! account-level, cross-device concerns this window has grown into the
+//! natural home for: every device registered on this account (not just
+//! ones sharing a currently-linked folder -- see `home_window.rs`'s own,
+//! narrower Devices section), every ACL edge across every folder this
+//! account can see, every request waiting for this account's approval
+//! across every owned folder, and every not-yet-redeemed invite this
+//! account has minted. "Who can see/manage what across this whole
+//! account", distinct from Home's per-folder Share window, which shows the
+//! same three listings narrowed to one already-open folder. Launched as its
 //! own process (`--window account`) from the tray, mirroring the onboarding
 //! window's separate-process model.
 //!
 //! Same "pure machine + thin renderer + off-thread executor" discipline as
 //! `crate::onboarding`: `step` and the `*_to_event` mappers are unit-tested
 //! here; the eframe screen is `cargo check`-gated only (there is no display
-//! server in CI). Every coordination call goes through `yadorilink_cli::commands::
-//! account`'s typed library fns -- the single implementation the CLI uses too
-//! -- so the app and CLI can never diverge on what deletion/export does. This
-//! module has no code path that deletes a local folder: export
-//! writes the user's own data to a file, and deletion is purely server-side.
+//! server in CI). Every coordination/daemon call goes through
+//! `yadorilink_client_core::ops::{account,devices,shares}` -- the single
+//! implementation the CLI uses too -- so the app and CLI can never diverge
+//! on what any of this does. This module has no code path
+//! that deletes a local folder or a local file: every mutation here is
+//! either an export to a file under this device's own config dir, or a
+//! coordination-plane/daemon call already exercised by an existing CLI
+//! command.
+//!
+//! The mutating actions added for the cross-device sections are
+//! deliberately less capable than their per-folder counterparts in
+//! `share_window.rs`: revoking an ACL edge or denying a request here never
+//! offers the durability-override retry `share_window.rs` offers (a
+//! refusal is reported as a plain failure, pointing at the per-folder Share
+//! window). That is a scope decision, not an oversight -- an account-wide
+//! listing is the wrong place to introduce a second implementation of an
+//! override flow that already has exactly one home.
 
+use std::collections::HashSet;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 
 use eframe::egui;
-use yadorilink_cli::commands::account;
-use yadorilink_cli::commands::account::LOCAL_FIRST_NOTICE;
+use yadorilink_client_core::ops::shares::{self as share, RevokeAttempt, RevokeEdgeOutcome};
+use yadorilink_client_core::ops::{account, devices as device};
+use yadorilink_client_core::wording::LOCAL_FIRST_NOTICE;
 
 use crate::onboarding::executor::EventSink;
 use crate::onboarding::machine::OpStatus;
+use crate::share_access;
 
 /// The app's view of where the account is in the deletion lifecycle -- the
 /// UI-facing projection of coordination-worker's `DeletionStatus`.
@@ -50,7 +74,19 @@ pub fn lifecycle_from_status(status: &account::DeletionStatus) -> Lifecycle {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A cross-folder access snapshot: every ACL edge, every request waiting
+/// for this account's approval, and every not-yet-redeemed invite this
+/// account can see -- fetched together for the same reason `Access` in
+/// `share_window.rs` is: so the panel never renders a half-loaded mixture
+/// of one listing's answer and another's.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AccessOverview {
+    pub edges: Vec<share::ShareEdgeInfo>,
+    pub pending: Vec<share::PendingApproval>,
+    pub invites: Vec<share::PendingInviteInfo>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct State {
     pub status: OpStatus,
     /// None until the first status load completes.
@@ -61,8 +97,30 @@ pub struct State {
     /// The token the user will submit to confirm (editable in case they came
     /// back to a request made earlier / from the CLI).
     pub confirm_input: String,
-    /// A transient success line (export written, deletion cancelled,...).
+    /// A transient success line (export written, deletion cancelled, a
+    /// device removed, access revoked, a request approved/denied, an
+    /// invite cancelled,...).
     pub notice: Option<String>,
+    /// Every device registered on this account -- `None` until the first
+    /// load completes.
+    pub devices: Option<Vec<device::DeviceInfo>>,
+    pub devices_status: OpStatus,
+    /// The cross-folder ACL/pending/invites snapshot -- `None` until the
+    /// first load completes.
+    pub access: Option<AccessOverview>,
+    pub access_status: OpStatus,
+    /// A transient failure line for one of the per-row mutations below
+    /// (device removal, edge revoke, approve/deny, invite cancel) --
+    /// separate from `notice`, which this same set of actions also uses for
+    /// success, so a failure never gets overwritten by an unrelated success
+    /// line still on screen from a moment earlier.
+    pub action_error: Option<String>,
+    /// Keys for mutations currently in flight, so only the row that was
+    /// clicked shows a spinner / has its own button disabled, rather than
+    /// the whole window: `"device:<id>"`, `"edge:<id>"`,
+    /// `"approve:<group_id>:<device_id>"`, `"deny:<group_id>:<device_id>"`,
+    /// `"invite:<id>"`.
+    pub busy: HashSet<String>,
 }
 
 impl Default for State {
@@ -73,6 +131,12 @@ impl Default for State {
             confirmation_token: None,
             confirm_input: String::new(),
             notice: None,
+            devices: None,
+            devices_status: OpStatus::Idle,
+            access: None,
+            access_status: OpStatus::Idle,
+            action_error: None,
+            busy: HashSet::new(),
         }
     }
 }
@@ -95,6 +159,35 @@ pub enum Event {
     ExportRequested,
     Exported(String),
     ExportFailed(String),
+
+    DevicesRequested,
+    DevicesLoaded(Vec<device::DeviceInfo>),
+    DevicesFailed(String),
+    RemoveDeviceRequested { device_id: String },
+    DeviceRemoved { device_id: String },
+    RemoveDeviceFailed { device_id: String, msg: String },
+
+    AccessRequested,
+    // Boxed for the same reason `share_window.rs`'s `AccessFetched` is:
+    // this carries three whole listings at once.
+    AccessLoaded(Box<AccessOverview>),
+    AccessFailed(String),
+
+    RevokeEdgeRequested { edge_id: String },
+    EdgeRevoked { edge_id: String },
+    RevokeEdgeFailed { edge_id: String, msg: String },
+
+    ApproveRequested { group_id: String, device_id: String, group_name: String },
+    ApproveDone { group_id: String, device_id: String, group_name: String, result: String },
+    ApproveFailed { group_id: String, device_id: String, msg: String },
+
+    DenyRequested { group_id: String, device_id: String, group_name: String },
+    DenyDone { group_id: String, device_id: String },
+    DenyFailed { group_id: String, device_id: String, msg: String },
+
+    CancelInviteRequested { invite_id: String },
+    InviteCancelled { invite_id: String },
+    CancelInviteFailed { invite_id: String, msg: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -104,6 +197,14 @@ pub enum Effect {
     Confirm { confirmation_token: String },
     Cancel,
     Export,
+
+    LoadDevices,
+    RemoveDevice { device_id: String },
+    LoadAccess,
+    RevokeEdge { edge_id: String },
+    Approve { group_id: String, device_id: String, group_name: String },
+    Deny { group_id: String, device_id: String, group_name: String },
+    CancelInvite { invite_id: String },
 }
 
 /// Pure transition. Mid-operation events (while `status == Working`) that would
@@ -178,6 +279,125 @@ pub fn step(mut state: State, event: Event) -> (State, Vec<Effect>) {
         }
         Event::ExportFailed(msg) => state.status = OpStatus::Failed(msg),
 
+        Event::DevicesRequested if state.devices_status != OpStatus::Working => {
+            state.devices_status = OpStatus::Working;
+            return (state, vec![Effect::LoadDevices]);
+        }
+        Event::DevicesLoaded(devices) => {
+            state.devices = Some(devices);
+            state.devices_status = OpStatus::Idle;
+        }
+        Event::DevicesFailed(msg) => state.devices_status = OpStatus::Failed(msg),
+
+        Event::RemoveDeviceRequested { device_id } => {
+            let key = format!("device:{device_id}");
+            if state.busy.insert(key) {
+                state.action_error = None;
+                return (state, vec![Effect::RemoveDevice { device_id }]);
+            }
+        }
+        Event::DeviceRemoved { device_id } => {
+            state.busy.remove(&format!("device:{device_id}"));
+            if let Some(devices) = &mut state.devices {
+                devices.retain(|d| d.device_id != device_id);
+            }
+            state.notice = Some(format!("Removed device {device_id}."));
+        }
+        Event::RemoveDeviceFailed { device_id, msg } => {
+            state.busy.remove(&format!("device:{device_id}"));
+            state.action_error = Some(msg);
+        }
+
+        Event::AccessRequested if state.access_status != OpStatus::Working => {
+            state.access_status = OpStatus::Working;
+            return (state, vec![Effect::LoadAccess]);
+        }
+        Event::AccessLoaded(access) => {
+            state.access = Some(*access);
+            state.access_status = OpStatus::Idle;
+        }
+        Event::AccessFailed(msg) => state.access_status = OpStatus::Failed(msg),
+
+        Event::RevokeEdgeRequested { edge_id } => {
+            let key = format!("edge:{edge_id}");
+            if state.busy.insert(key) {
+                state.action_error = None;
+                return (state, vec![Effect::RevokeEdge { edge_id }]);
+            }
+        }
+        Event::EdgeRevoked { edge_id } => {
+            state.busy.remove(&format!("edge:{edge_id}"));
+            if let Some(access) = &mut state.access {
+                access.edges.retain(|e| e.edge_id != edge_id);
+            }
+            state.notice = Some("Access revoked.".to_string());
+        }
+        Event::RevokeEdgeFailed { edge_id, msg } => {
+            state.busy.remove(&format!("edge:{edge_id}"));
+            state.action_error = Some(msg);
+        }
+
+        Event::ApproveRequested { group_id, device_id, group_name } => {
+            let key = format!("approve:{group_id}:{device_id}");
+            if state.busy.insert(key) {
+                state.action_error = None;
+                return (state, vec![Effect::Approve { group_id, device_id, group_name }]);
+            }
+        }
+        Event::ApproveDone { group_id, device_id, group_name, result } => {
+            state.busy.remove(&format!("approve:{group_id}:{device_id}"));
+            if let Some(access) = &mut state.access {
+                access.pending.retain(|p| !(p.group_id == group_id && p.device_id == device_id));
+            }
+            state.notice = Some(yadorilink_client_core::wording::approve_result_line(
+                &result,
+                &device_id,
+                &group_name,
+            ));
+        }
+        Event::ApproveFailed { group_id, device_id, msg } => {
+            state.busy.remove(&format!("approve:{group_id}:{device_id}"));
+            state.action_error = Some(msg);
+        }
+
+        Event::DenyRequested { group_id, device_id, group_name } => {
+            let key = format!("deny:{group_id}:{device_id}");
+            if state.busy.insert(key) {
+                state.action_error = None;
+                return (state, vec![Effect::Deny { group_id, device_id, group_name }]);
+            }
+        }
+        Event::DenyDone { group_id, device_id } => {
+            state.busy.remove(&format!("deny:{group_id}:{device_id}"));
+            if let Some(access) = &mut state.access {
+                access.pending.retain(|p| !(p.group_id == group_id && p.device_id == device_id));
+            }
+            state.notice = Some(format!("Denied {device_id}'s request."));
+        }
+        Event::DenyFailed { group_id, device_id, msg } => {
+            state.busy.remove(&format!("deny:{group_id}:{device_id}"));
+            state.action_error = Some(msg);
+        }
+
+        Event::CancelInviteRequested { invite_id } => {
+            let key = format!("invite:{invite_id}");
+            if state.busy.insert(key) {
+                state.action_error = None;
+                return (state, vec![Effect::CancelInvite { invite_id }]);
+            }
+        }
+        Event::InviteCancelled { invite_id } => {
+            state.busy.remove(&format!("invite:{invite_id}"));
+            if let Some(access) = &mut state.access {
+                access.invites.retain(|i| i.invite_id != invite_id);
+            }
+            state.notice = Some("Invite cancelled.".to_string());
+        }
+        Event::CancelInviteFailed { invite_id, msg } => {
+            state.busy.remove(&format!("invite:{invite_id}"));
+            state.action_error = Some(msg);
+        }
+
         // Out-of-status or otherwise inapplicable events: no-op.
         _ => {}
     }
@@ -201,6 +421,20 @@ pub fn spawn(effect: Effect, sink: EventSink<Event>) {
     });
 }
 
+/// Fetches the cross-folder access snapshot in one background task -- the
+/// same "read everything the panel shows together" shape
+/// `share_window.rs`'s own `spawn_access_fetch` uses, extended to a third
+/// listing (invites). Unlike that per-folder fetch, `pending_approvals` here
+/// is never conditioned on "does this account own the group being looked
+/// at" -- there is no single group in view, so every request this account
+/// has to decide on, across every group it owns, belongs on screen.
+async fn load_access() -> Result<AccessOverview, String> {
+    let edges = share::list_shares_resolved().await.map_err(|e| e.to_string())?;
+    let pending = share::pending_approvals().await.map_err(|e| e.to_string())?;
+    let invites = share::list_invites_resolved().await.map_err(|e| e.to_string())?;
+    Ok(AccessOverview { edges, pending, invites })
+}
+
 async fn execute(effect: Effect) -> Event {
     match effect {
         Effect::LoadStatus => status_to_event(account::deletion_status().await),
@@ -210,6 +444,63 @@ async fn execute(effect: Effect) -> Event {
         }
         Effect::Cancel => cancel_to_event(account::cancel_deletion().await),
         Effect::Export => export_to_event(account::export_account_json().await),
+
+        Effect::LoadDevices => match device::list_devices().await {
+            Ok(devices) => Event::DevicesLoaded(devices),
+            Err(e) => Event::DevicesFailed(e.to_string()),
+        },
+        // `force: false` always -- the same data-loss override
+        // `home_window.rs`'s Devices section also never offers itself
+        // (see `actions::remove_device`'s own doc comment); a device that
+        // genuinely needs the override is removed from there or the CLI.
+        Effect::RemoveDevice { device_id } => {
+            match crate::actions::remove_device(device_id.clone(), false).await {
+                Ok(()) => Event::DeviceRemoved { device_id },
+                Err(e) => Event::RemoveDeviceFailed { device_id, msg: e.to_string() },
+            }
+        }
+
+        Effect::LoadAccess => match load_access().await {
+            Ok(access) => Event::AccessLoaded(Box::new(access)),
+            Err(msg) => Event::AccessFailed(msg),
+        },
+        // Plain revoke only -- see this module's top doc comment on why the
+        // durability override stays exclusive to `share_window.rs`.
+        Effect::RevokeEdge { edge_id } => match share::revoke_edge(&edge_id, false).await {
+            // An edge that is already gone is the end state asked for.
+            Ok(RevokeEdgeOutcome::Revoked(_) | RevokeEdgeOutcome::AlreadyRevoked) => {
+                Event::EdgeRevoked { edge_id }
+            }
+            Err(e) => Event::RevokeEdgeFailed { edge_id, msg: e.to_string() },
+        },
+        Effect::Approve { group_id, device_id, group_name } => {
+            match share::approve_resolved(&group_id, &device_id).await {
+                Ok(result) => Event::ApproveDone { group_id, device_id, group_name, result },
+                Err(e) => Event::ApproveFailed { group_id, device_id, msg: e.to_string() },
+            }
+        }
+        // `try_revoke_resolved`, not the CLI's name-resolving `deny` --
+        // this row already carries `group_id`, so there is no name to
+        // resolve, exactly `share_window.rs`'s own `Action::Deny` handling.
+        // A `NotDurable` refusal is reported as a plain failure, same
+        // reasoning as `share_window.rs`'s: the daemon's readiness gate
+        // does not apply to a not-yet-active edge, so hitting it here means
+        // a concurrent admission raced this denial -- a real removal,
+        // which belongs in the per-folder Share window that can offer its
+        // override with the member's name in front of it.
+        Effect::Deny { group_id, device_id, group_name: _ } => {
+            match share::try_revoke_resolved(group_id.clone(), device_id.clone(), false).await {
+                Ok(RevokeAttempt::Committed(_)) => Event::DenyDone { group_id, device_id },
+                Ok(RevokeAttempt::NotDurable { message, .. }) => {
+                    Event::DenyFailed { group_id, device_id, msg: message }
+                }
+                Err(e) => Event::DenyFailed { group_id, device_id, msg: e.to_string() },
+            }
+        }
+        Effect::CancelInvite { invite_id } => match share::cancel_invite(&invite_id).await {
+            Ok(()) => Event::InviteCancelled { invite_id },
+            Err(e) => Event::CancelInviteFailed { invite_id, msg: e.to_string() },
+        },
     }
 }
 
@@ -220,11 +511,26 @@ fn runtime_error_event(effect: &Effect, msg: String) -> Event {
         Effect::Confirm { .. } => Event::ConfirmFailed(msg),
         Effect::Cancel => Event::CancelFailed(msg),
         Effect::Export => Event::ExportFailed(msg),
+        Effect::LoadDevices => Event::DevicesFailed(msg),
+        Effect::RemoveDevice { device_id } => {
+            Event::RemoveDeviceFailed { device_id: device_id.clone(), msg }
+        }
+        Effect::LoadAccess => Event::AccessFailed(msg),
+        Effect::RevokeEdge { edge_id } => Event::RevokeEdgeFailed { edge_id: edge_id.clone(), msg },
+        Effect::Approve { group_id, device_id, .. } => {
+            Event::ApproveFailed { group_id: group_id.clone(), device_id: device_id.clone(), msg }
+        }
+        Effect::Deny { group_id, device_id, .. } => {
+            Event::DenyFailed { group_id: group_id.clone(), device_id: device_id.clone(), msg }
+        }
+        Effect::CancelInvite { invite_id } => {
+            Event::CancelInviteFailed { invite_id: invite_id.clone(), msg }
+        }
     }
 }
 
 fn status_to_event(
-    result: Result<account::DeletionStatus, yadorilink_cli::error::CliError>,
+    result: Result<account::DeletionStatus, yadorilink_client_core::CoreError>,
 ) -> Event {
     match result {
         Ok(status) => Event::StatusLoaded(lifecycle_from_status(&status)),
@@ -233,7 +539,7 @@ fn status_to_event(
 }
 
 fn request_to_event(
-    result: Result<account::DeletionRequested, yadorilink_cli::error::CliError>,
+    result: Result<account::DeletionRequested, yadorilink_client_core::CoreError>,
 ) -> Event {
     match result {
         Ok(requested) => {
@@ -244,7 +550,7 @@ fn request_to_event(
 }
 
 fn confirm_to_event(
-    result: Result<account::DeletionStatus, yadorilink_cli::error::CliError>,
+    result: Result<account::DeletionStatus, yadorilink_client_core::CoreError>,
 ) -> Event {
     match result {
         Ok(status) => Event::DeletionConfirmed(lifecycle_from_status(&status)),
@@ -253,7 +559,7 @@ fn confirm_to_event(
 }
 
 fn cancel_to_event(
-    result: Result<account::DeletionStatus, yadorilink_cli::error::CliError>,
+    result: Result<account::DeletionStatus, yadorilink_client_core::CoreError>,
 ) -> Event {
     match result {
         Ok(status) => Event::DeletionCancelled(lifecycle_from_status(&status)),
@@ -265,7 +571,7 @@ fn cancel_to_event(
 /// (revealed in the file manager), mirroring `actions::export_diagnostics`.
 /// Writing the export is a create/write of the user's own data -- no local
 /// folder is ever deleted here.
-fn export_to_event(result: Result<String, yadorilink_cli::error::CliError>) -> Event {
+fn export_to_event(result: Result<String, yadorilink_client_core::CoreError>) -> Event {
     let pretty = match result {
         Ok(json) => json,
         Err(e) => return Event::ExportFailed(e.to_string()),
@@ -300,7 +606,7 @@ pub fn run_account() -> Result<(), eframe::Error> {
     let (tx, rx) = mpsc::channel::<Event>();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([560.0, 520.0])
+            .with_inner_size([620.0, 760.0])
             .with_title("YadoriLink — Account"),
         ..Default::default()
     };
@@ -308,6 +614,7 @@ pub fn run_account() -> Result<(), eframe::Error> {
         "YadoriLink Account",
         options,
         Box::new(move |cc| {
+            crate::fonts::install(&cc.egui_ctx);
             let ctx = cc.egui_ctx.clone();
             let sink = EventSink::new(tx, Arc::new(move || ctx.request_repaint()));
             Ok(Box::new(AccountApp::new(rx, sink)))
@@ -320,11 +627,22 @@ struct AccountApp {
     rx: Receiver<Event>,
     sink: EventSink<Event>,
     status_fetch_started: bool,
+    /// Both cross-device listings are kicked off once, on the first frame,
+    /// alongside `status_fetch_started` -- independent of deletion status,
+    /// so a slow/failed deletion-status load never holds up the Devices/
+    /// Access sections (see `render_body`'s own ordering).
+    cross_device_fetch_started: bool,
 }
 
 impl AccountApp {
     fn new(rx: Receiver<Event>, sink: EventSink<Event>) -> Self {
-        AccountApp { state: State::default(), rx, sink, status_fetch_started: false }
+        AccountApp {
+            state: State::default(),
+            rx,
+            sink,
+            status_fetch_started: false,
+            cross_device_fetch_started: false,
+        }
     }
 
     fn apply(&mut self, event: Event) {
@@ -345,6 +663,11 @@ impl eframe::App for AccountApp {
             self.status_fetch_started = true;
             self.apply(Event::StatusRequested);
         }
+        if !self.cross_device_fetch_started {
+            self.cross_device_fetch_started = true;
+            self.apply(Event::DevicesRequested);
+            self.apply(Event::AccessRequested);
+        }
 
         let mut pending: Vec<Event> = Vec::new();
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -355,7 +678,9 @@ impl eframe::App for AccountApp {
             ui.add_space(12.0);
             ui.separator();
             ui.add_space(10.0);
-            self.render_body(ui, &mut pending);
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                self.render_body(ui, &mut pending);
+            });
         });
         for event in pending {
             self.apply(event);
@@ -381,6 +706,26 @@ impl AccountApp {
             ui.label(egui::RichText::new(notice).color(ACCENT));
             ui.add_space(8.0);
         }
+        if let Some(err) = &self.state.action_error {
+            ui.colored_label(
+                egui::Color32::from_rgb(0xc0, 0x39, 0x2b),
+                format!("That didn't go through: {err}"),
+            );
+            ui.add_space(8.0);
+        }
+
+        // The cross-device sections below never wait on deletion status --
+        // that load can be slow or fail independently, and none of these
+        // sections need it.
+        self.render_devices(ui, pending);
+        ui.add_space(14.0);
+        ui.separator();
+        ui.add_space(10.0);
+        self.render_access(ui, pending);
+
+        ui.add_space(14.0);
+        ui.separator();
+        ui.add_space(10.0);
 
         let working = self.state.status == OpStatus::Working;
         if working && self.state.lifecycle.is_none() {
@@ -410,6 +755,253 @@ impl AccountApp {
             }
             Lifecycle::Unknown(state) => {
                 ui.label(format!("Account deletion state: {state}."));
+            }
+        }
+    }
+
+    /// Every device registered on this account -- unscoped by folder
+    /// sharing, unlike Home's own Devices section (which only ever shows a
+    /// device that shares a currently-linked folder with this one). A
+    /// device registered but not yet linked to anything shared appears
+    /// here and nowhere else in this app.
+    fn render_devices(&self, ui: &mut egui::Ui, pending: &mut Vec<Event>) {
+        ui.label(egui::RichText::new("Your devices").strong());
+        match (&self.state.devices, &self.state.devices_status) {
+            (None, OpStatus::Failed(msg)) => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(0xc0, 0x39, 0x2b),
+                    format!("Could not load your devices: {msg}"),
+                );
+                return;
+            }
+            (None, _) => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Loading devices…");
+                });
+                return;
+            }
+            (Some(devices), _) if devices.is_empty() => {
+                ui.label(egui::RichText::new("No devices registered yet.").weak());
+                return;
+            }
+            (Some(_), _) => {}
+        }
+        let devices = self.state.devices.clone().unwrap_or_default();
+        let mut remove_clicked: Option<(String, String)> = None;
+        for d in &devices {
+            let key = format!("device:{}", d.device_id);
+            let busy = self.state.busy.contains(&key);
+            ui.horizontal(|ui| {
+                let dot = if d.online { "●" } else { "○" };
+                let dot_color = if d.online {
+                    egui::Color32::from_rgb(0x2e, 0x9e, 0x5b)
+                } else {
+                    ui.visuals().weak_text_color()
+                };
+                ui.colored_label(dot_color, dot);
+                ui.label(&d.device_name);
+                ui.label(egui::RichText::new(&d.device_id).weak().small().monospace());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add_enabled(!busy, egui::Button::new("Remove…")).clicked() {
+                        remove_clicked = Some((d.device_id.clone(), d.device_name.clone()));
+                    }
+                    if busy {
+                        ui.spinner();
+                    }
+                });
+            });
+        }
+        // No rename capability exists on this coordination plane
+        // (`yadorilink device` has `register`/`list`/`remove` only), same
+        // confirmed gap `home_window.rs`'s own Devices section documents --
+        // this section deliberately offers no rename control either.
+        if let Some((device_id, device_name)) = remove_clicked {
+            let confirmed = rfd::MessageDialog::new()
+                .set_title("Remove this device?")
+                .set_description(format!(
+                    "{device_name}\n\nThis revokes its access to every folder group at once. \
+                     A currently-connected session on that device is disconnected promptly."
+                ))
+                .set_buttons(rfd::MessageButtons::OkCancel)
+                .show()
+                == rfd::MessageDialogResult::Ok;
+            if confirmed {
+                pending.push(Event::RemoveDeviceRequested { device_id });
+            }
+        }
+    }
+
+    /// The cross-folder access snapshot: every ACL edge, every request
+    /// waiting for this account's approval, and every invite this account
+    /// has minted, none of it narrowed to one already-open folder.
+    fn render_access(&self, ui: &mut egui::Ui, pending: &mut Vec<Event>) {
+        ui.label(egui::RichText::new("Access across your folders").strong());
+        match (&self.state.access, &self.state.access_status) {
+            (None, OpStatus::Failed(msg)) => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(0xc0, 0x39, 0x2b),
+                    format!("Could not load your sharing settings: {msg}"),
+                );
+                return;
+            }
+            (None, _) => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Loading access…");
+                });
+                return;
+            }
+            (Some(_), _) => {}
+        }
+        let access = self.state.access.clone().unwrap();
+
+        if access.edges.is_empty() {
+            ui.label(egui::RichText::new("No one has access to any of your folders yet.").weak());
+        }
+        let mut revoke_clicked: Option<(String, String)> = None;
+        for edge in &access.edges {
+            let key = format!("edge:{}", edge.edge_id);
+            let busy = self.state.busy.contains(&key);
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(&edge.group_name).strong());
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{}  ·  {}",
+                        edge.role.as_deref().unwrap_or("unknown"),
+                        yadorilink_client_core::wording::state_label(&edge.state),
+                    ))
+                    .weak()
+                    .small(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add_enabled(!busy, egui::Button::new("Revoke…")).clicked() {
+                        revoke_clicked = Some((edge.edge_id.clone(), edge.group_name.clone()));
+                    }
+                    if busy {
+                        ui.spinner();
+                    }
+                });
+            });
+            ui.label(egui::RichText::new(&edge.device_id).weak().small().monospace());
+        }
+        if let Some((edge_id, group_name)) = revoke_clicked {
+            let confirmed = rfd::MessageDialog::new()
+                .set_title("Revoke this access?")
+                .set_description(format!(
+                    "This removes access to \"{group_name}\". If the daemon refuses because \
+                     this would leave the folder without another confirmed-ready full replica, \
+                     use that folder's own Share window to review and, if you're sure, force it."
+                ))
+                .set_buttons(rfd::MessageButtons::OkCancel)
+                .show()
+                == rfd::MessageDialogResult::Ok;
+            if confirmed {
+                pending.push(Event::RevokeEdgeRequested { edge_id });
+            }
+        }
+
+        ui.add_space(14.0);
+        ui.label(egui::RichText::new(share_access::PENDING_REQUESTS_HEADING).strong());
+        let rows = share_access::all_pending_rows(&access.pending);
+        if rows.is_empty() {
+            ui.label(egui::RichText::new(share_access::no_pending_requests_line()).weak().small());
+        }
+        let mut approve_clicked: Option<(String, String, String)> = None;
+        let mut deny_clicked: Option<(String, String, String)> = None;
+        for row in &rows {
+            let approve_key = format!("approve:{}:{}", row.group_id, row.device_id);
+            let deny_key = format!("deny:{}:{}", row.group_id, row.device_id);
+            let row_busy =
+                self.state.busy.contains(&approve_key) || self.state.busy.contains(&deny_key);
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(&row.group_name).strong());
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} is asking for {} access",
+                        row.short_device_id, row.requested_role_label
+                    ))
+                    .weak()
+                    .small(),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.add_enabled_ui(!row_busy, |ui| {
+                    if ui.button("Approve").clicked() {
+                        approve_clicked = Some((
+                            row.group_id.clone(),
+                            row.device_id.clone(),
+                            row.group_name.clone(),
+                        ));
+                    }
+                    if ui.button("Deny").clicked() {
+                        deny_clicked = Some((
+                            row.group_id.clone(),
+                            row.device_id.clone(),
+                            row.group_name.clone(),
+                        ));
+                    }
+                });
+                if row_busy {
+                    ui.spinner();
+                }
+            });
+        }
+        if let Some((group_id, device_id, group_name)) = approve_clicked {
+            pending.push(Event::ApproveRequested { group_id, device_id, group_name });
+        }
+        if let Some((group_id, device_id, group_name)) = deny_clicked {
+            pending.push(Event::DenyRequested { group_id, device_id, group_name });
+        }
+
+        ui.add_space(14.0);
+        ui.label(egui::RichText::new("Invites you've sent").strong());
+        if access.invites.is_empty() {
+            ui.label(
+                egui::RichText::new(
+                    "No pending invites. Mint one from a folder's own Share window.",
+                )
+                .weak()
+                .small(),
+            );
+        }
+        let mut cancel_clicked: Option<String> = None;
+        for invite in &access.invites {
+            let key = format!("invite:{}", invite.invite_id);
+            let busy = self.state.busy.contains(&key);
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(&invite.group_name).strong());
+                ui.label(
+                    egui::RichText::new(format!("{}  ·  {}", invite.role, invite.status))
+                        .weak()
+                        .small(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if invite.status == "pending"
+                        && ui.add_enabled(!busy, egui::Button::new("Cancel…")).clicked()
+                    {
+                        cancel_clicked = Some(invite.invite_id.clone());
+                    }
+                    if busy {
+                        ui.spinner();
+                    }
+                });
+            });
+        }
+        if let Some(invite_id) = cancel_clicked {
+            let confirmed = rfd::MessageDialog::new()
+                .set_title("Cancel this invite?")
+                .set_description(
+                    "Anyone who has this invite link will no longer be able to redeem it.",
+                )
+                .set_buttons(rfd::MessageButtons::OkCancel)
+                .show()
+                == rfd::MessageDialogResult::Ok;
+            if confirmed {
+                pending.push(Event::CancelInviteRequested { invite_id });
             }
         }
     }
@@ -492,107 +1084,4 @@ fn format_remaining(secs: i64) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn status(state: &str, remaining: Option<i64>) -> account::DeletionStatus {
-        account::DeletionStatus {
-            state: state.to_string(),
-            grace_expires_at_unix: remaining.map(|_| 1_000),
-            remaining_secs: remaining,
-        }
-    }
-
-    #[test]
-    fn lifecycle_projects_each_server_state() {
-        assert_eq!(lifecycle_from_status(&status("active", None)), Lifecycle::Active);
-        assert_eq!(lifecycle_from_status(&status("requested", None)), Lifecycle::Requested);
-        assert_eq!(
-            lifecycle_from_status(&status("grace", Some(120))),
-            Lifecycle::Grace { remaining_secs: 120, grace_expires_at_unix: 1_000 }
-        );
-        assert_eq!(
-            lifecycle_from_status(&status("weird", None)),
-            Lifecycle::Unknown("weird".to_string())
-        );
-    }
-
-    #[test]
-    fn requesting_status_emits_load_effect_once() {
-        let (state, fx) = step(State::default(), Event::StatusRequested);
-        assert_eq!(fx, vec![Effect::LoadStatus]);
-        assert_eq!(state.status, OpStatus::Working);
-        // A second StatusRequested while working is a no-op (no double fetch).
-        let (_state, fx2) = step(state, Event::StatusRequested);
-        assert!(fx2.is_empty());
-    }
-
-    #[test]
-    fn request_then_confirm_carries_the_token() {
-        let mut s = State { status: OpStatus::Idle, ..State::default() };
-        s = step(s, Event::RequestDeletion).0;
-        assert_eq!(s.status, OpStatus::Working);
-        s = step(s, Event::DeletionRequested { confirmation_token: "tok-123".into() }).0;
-        assert_eq!(s.confirmation_token.as_deref(), Some("tok-123"));
-        assert_eq!(s.confirm_input, "tok-123");
-        assert_eq!(s.lifecycle, Some(Lifecycle::Requested));
-
-        let (s2, fx) = step(s, Event::ConfirmDeletion);
-        assert_eq!(fx, vec![Effect::Confirm { confirmation_token: "tok-123".into() }]);
-        assert_eq!(s2.status, OpStatus::Working);
-    }
-
-    #[test]
-    fn confirm_is_blocked_when_the_token_is_empty() {
-        let s = State { status: OpStatus::Idle, confirm_input: "   ".into(), ..State::default() };
-        let (s2, fx) = step(s, Event::ConfirmDeletion);
-        assert!(fx.is_empty());
-        assert_eq!(s2.status, OpStatus::Idle);
-    }
-
-    #[test]
-    fn cancel_restores_active_and_clears_the_token() {
-        let s = State {
-            status: OpStatus::Working,
-            confirmation_token: Some("tok".into()),
-            confirm_input: "tok".into(),
-            lifecycle: Some(Lifecycle::Grace { remaining_secs: 10, grace_expires_at_unix: 1 }),
-            notice: None,
-        };
-        let s = step(s, Event::DeletionCancelled(Lifecycle::Active)).0;
-        assert_eq!(s.lifecycle, Some(Lifecycle::Active));
-        assert!(s.confirmation_token.is_none());
-        assert!(s.confirm_input.is_empty());
-        assert!(s.notice.is_some());
-    }
-
-    #[test]
-    fn export_result_maps_to_a_written_path_notice() {
-        let s = step(State::default(), Event::Exported("/tmp/export.json".into())).0;
-        assert_eq!(s.notice.as_deref(), Some("Exported your account data to /tmp/export.json."));
-        assert_eq!(s.status, OpStatus::Idle);
-    }
-
-    #[test]
-    fn export_default_path_is_json_under_config_dir() {
-        let path = default_export_path();
-        assert_eq!(path.extension().and_then(|e| e.to_str()), Some("json"));
-        assert!(path.file_name().unwrap().to_string_lossy().starts_with("account-export-"));
-    }
-
-    #[test]
-    fn status_mapper_surfaces_errors() {
-        let ev = status_to_event(Err(yadorilink_cli::error::CliError::NotLoggedIn));
-        match ev {
-            Event::StatusFailed(msg) => assert!(msg.contains("not logged in")),
-            other => panic!("expected StatusFailed, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn format_remaining_renders_coarse_buckets() {
-        assert_eq!(format_remaining(-5), "0m");
-        assert_eq!(format_remaining(90), "1m");
-        assert_eq!(format_remaining(2 * 86_400 + 5 * 3600), "2d 5h");
-    }
-}
+mod tests;

@@ -1,5 +1,5 @@
-//! What `PauseResumeService`/`GcCommandService`/`DaemonLifecycleService`
-//! need from the runtime -- daemon-wide operations that don't fit
+//! What the pause/resume, GC and shutdown control commands need from the
+//! runtime -- daemon-wide operations that don't fit
 //! `MaterializationPort`'s per-file shape (pause/resume act on a link as a
 //! whole; GC and shutdown aren't scoped to a link at all).
 
@@ -11,6 +11,23 @@ pub(crate) trait LinkPauseResumePort: Send + Sync {
     fn pause(&self, local_path: &str) -> Result<(), SyncError>;
 
     fn resume<'a>(&'a self, local_path: &'a str) -> BoxFuture<'a, Result<(), SyncError>>;
+
+    /// Pauses one file or folder of `group_id` (`rel_path` relative to the
+    /// linked folder's root, empty for the root itself) until
+    /// [`Self::resume_item`], durably: local edits under it are not sent to
+    /// peers and remote changes under it are not written to disk, while
+    /// both keep being recorded so nothing is lost.
+    fn pause_item(&self, group_id: &str, rel_path: &str) -> Result<(), SyncError>;
+
+    /// Ends a pause of `rel_path` and catches up everything it held: local
+    /// edits made meanwhile are sent, remote changes admitted meanwhile are
+    /// written to disk (as conflicts where both sides changed). Safe to
+    /// repeat -- a retry after a failed catch-up runs the catch-up again.
+    fn resume_item<'a>(
+        &'a self,
+        group_id: &'a str,
+        rel_path: &'a str,
+    ) -> BoxFuture<'a, Result<(), SyncError>>;
 }
 
 /// Application-owned mirror of `yadorilink_local_storage::GcReport` --

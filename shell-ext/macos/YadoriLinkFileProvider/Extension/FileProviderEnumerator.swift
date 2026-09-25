@@ -38,7 +38,13 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
         // unpaginated, so there is nothing to page through on our end
         // either; a very large folder group would want real paging on
         // both sides as a follow-up).
-        let entries = FileProviderCatalog.listFiles(localPath: localPath)
+        // An unconfirmed listing ends the enumeration with an
+        // error. Reporting zero children would tell the system this
+        // container is authoritatively empty.
+        guard let entries = FileProviderCatalog.listFiles(localPath: localPath) else {
+            observer.finishEnumeratingWithError(NSFileProviderError(.serverUnreachable))
+            return
+        }
         let nodes = FileProviderCatalog.buildTree(from: entries)
         let children = FileProviderCatalog.children(of: containerRelativePath, in: nodes)
         observer.didEnumerate(children.map { FileProviderItem(node: $0) })

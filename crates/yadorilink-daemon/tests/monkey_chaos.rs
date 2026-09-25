@@ -34,7 +34,7 @@ use sha2::{Digest, Sha256};
 use support::{open_file_backed_replica_coordinator, real_entry_names, TestAccount};
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 use yadorilink_replica_domain::change::{Op, PutOrigin};
 use yadorilink_replica_domain::ids::ChangeHash;
 use yadorilink_sync_sqlite::dag_store::DagHashDisposition;
@@ -155,7 +155,7 @@ struct TestDevice {
 async fn setup_device(account: &TestAccount, name: &str) -> TestDevice {
     let device_id = support::register_device(account, name, [0u8; 32]).await;
     let store_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let (sync_state, index_dir) = open_file_backed_replica_coordinator();
     let sync_state = Arc::new(sync_state);
     let state = DaemonState::new(device_id.clone(), sync_state, store);
@@ -465,6 +465,13 @@ fn summarize_ops(ops: &[Op]) -> String {
             Op::Put { path, origin: PutOrigin::ConflictCopy { source_path, .. }, .. } => {
                 format!("conflict-copy {} (from {})", path.as_str(), source_path.as_str())
             }
+            Op::Put { path, origin: PutOrigin::Reasserted { naming_device_id, .. }, .. } => {
+                // Names the content's author, not this change's signer --
+                // the two differ here by construction, and which device a
+                // re-assertion carries content for is exactly what these
+                // chaos-run lines need to show.
+                format!("reassert {} (wrote by {})", path.as_str(), naming_device_id.as_str())
+            }
             Op::Delete { path } => format!("delete {}", path.as_str()),
             Op::Move { from, to, .. } => format!("move {} -> {}", from.as_str(), to.as_str()),
         })
@@ -512,10 +519,10 @@ fn dag_progress_report(devices: &[TestDevice], group_id: &str, elapsed: Duration
                 let missing: Vec<String> =
                     diag.orphan_missing_frontier.iter().map(short_hash).collect();
                 format!(
-                    "[dag t={t:>3}s] device-{d} heads={heads} admitted={} unapplied={} \
+                    "[dag t={t:>3}s] device-{d} heads={heads} admitted={} \
                      orphans={} missing={missing:?} self_authored={self_authored} dirty={dirty} \
                      mat(h/p/hy)={mat}",
-                    diag.admitted_total, diag.admitted_unapplied, diag.orphan_total,
+                    diag.admitted_total, diag.orphan_total,
                 )
             }
             Err(e) => {
@@ -568,9 +575,8 @@ fn divergent_head_report(devices: &[TestDevice], group_id: &str) -> String {
             let is_head = per_device_heads[d].contains(hash);
             let head_marker = if is_head { "*" } else { "" };
             match sync.change_history_repository().dag_describe_hash(hash) {
-                Ok(DagHashDisposition::Admitted { applied, change }) => {
-                    let projected = if applied { "" } else { ",unprojected" };
-                    states.push(format!("device-{d}{head_marker}=admitted{projected}"));
+                Ok(DagHashDisposition::Admitted { change }) => {
+                    states.push(format!("device-{d}{head_marker}=admitted"));
                     decoded.get_or_insert(change);
                 }
                 Ok(DagHashDisposition::Orphaned { received_seq, change }) => {
@@ -607,6 +613,14 @@ fn divergent_head_report(devices: &[TestDevice], group_id: &str) -> String {
     out
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one seeded chaos run as a single ordered script: the sweep-cadence override must \
+              happen before any `DaemonState::new`, device setup/grant/watch/mesh-connect must \
+              precede the randomized op storm, and the convergence assertions read the same \
+              `devices` the storm mutated. The step order is the property under test, so \
+              carving it into helpers would hide the ordering these assertions depend on"
+)]
 async fn run_chaos(seed: u64) {
     let _ = tracing_subscriber::fmt::try_init();
     // Run the daemon's materialization-repair sweep from the very start of

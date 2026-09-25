@@ -1,18 +1,20 @@
 //! DAG-engine conflict resolution built on top of the deterministic
 //! conflict-copy naming policy, which now lives entirely in
 //! `yadorilink_replica_domain::conflict` -- every caller in this crate and
-//! beyond reaches it there directly (Phase 7D-1). `PathHead`/
+//! beyond reaches it there directly. `PathHead`/
 //! `PathHeadContent`/`ConflictCopy`/`resolve_path_heads`/
 //! `dag_conflict_loser_is_a`/`conflict_copy_path_for_losing_change`/
 //! `change_touches_path`/`path_head_from_change` stay here: they operate
 //! directly on `Change`/`Op` and the DAG's own ancestry-fold semantics, not
 //! on the pure identity/naming model the domain crate owns.
 
+use yadorilink_replica_domain::change::PutOrigin;
 use yadorilink_replica_domain::conflict::conflict_copy_path;
 #[cfg(test)]
 use yadorilink_replica_domain::conflict::{
-    a_is_loser, conflict_copy_source_path, is_conflict_copy_of, is_conflict_copy_path,
-    resolve_conflict_names, MAX_FUTURE_MTIME_SKEW_NANOS,
+    a_is_loser, conflict_copy_source_path, conflict_copy_stem_was_truncated, is_conflict_copy_of,
+    is_conflict_copy_path, resolve_conflict_names, MAX_COMPONENT_BYTES,
+    MAX_FUTURE_MTIME_SKEW_NANOS, STEM_TRUNCATION_MARKER,
 };
 
 /// Ancestry-grounded conflict resolution for the change-history model:
@@ -62,8 +64,10 @@ pub fn dag_conflict_loser_is_a(
 ///   deterministic — not a wall-clock read taken at resolution time), used
 ///   only to format the human-readable stamp in the filename,
 /// - `losing_version_hash`: the losing file version's content address,
-///   used as the collision-proof `hash8` disambiguator exactly as
-///   `combined_block_hash` is on the legacy path.
+///   used as the disambiguator that keeps two different losing contents
+///   off one conflict-copy path, exactly as `combined_block_hash` is on
+///   the legacy path. Carried whole, never truncated -- see
+///   `conflict_copy_path`'s own module doc comment.
 ///
 /// Because the *winner* is chosen by `dag_conflict_loser_is_a`
 /// (`(lamport, change_hash)`), not by the mtime embedded here, an
@@ -113,11 +117,23 @@ pub fn path_head_from_change(
     use yadorilink_replica_domain::change::Op;
     let mut touches = false;
     let mut content: Option<[u8; 32]> = None;
+    // Defaults to the signing device: for every op except a repair
+    // re-assertion, whoever signed the change is whoever wrote the content.
+    let mut naming_device_id = change.device_id.as_str().to_string();
     for op in &change.ops {
         match op {
-            Op::Put { path: p, version, .. } if p.as_str() == path => {
+            Op::Put { path: p, version, origin } if p.as_str() == path => {
                 touches = true;
                 content = Some(version.0);
+                // A `ConflictCopy` put deliberately keeps the carrier's id
+                // here. Its target path is derived from the losing content's
+                // own hash, so two different contents can never contend for
+                // that path and its naming identity is never consulted --
+                // unlike a re-assertion, which lands at the ordinary shared
+                // path where content genuinely does contend.
+                if let PutOrigin::Reasserted { naming_device_id: original, .. } = origin {
+                    naming_device_id = original.as_str().to_string();
+                }
             }
             Op::Delete { path: p } if p.as_str() == path => {
                 touches = true;
@@ -140,8 +156,113 @@ pub fn path_head_from_change(
         change_hash: change.change_hash().0,
         lamport: change.lamport,
         device_id: change.device_id.as_str().to_string(),
+        naming_device_id,
         content: content.map(|version_hash| PathHeadContent { version_hash, mtime_unix_nanos: 0 }),
     })
+}
+
+/// Every path a change touches, each paired with the head that change
+/// contributes there — i.e. [`path_head_from_change`] evaluated for every
+/// path at once, in a single pass over `ops`.
+///
+/// This is the *normalization* step that lets a store persist a change's
+/// path effects next to the change itself, so answering "what does this
+/// change do to path P" later never needs the encoded change decoded and
+/// its op list rescanned. `Move` is normalized here exactly as the
+/// per-path fold normalizes it: a removing effect at `from` and a content
+/// effect at `to`.
+///
+/// Equivalence with the per-path fold is a hard requirement, not an
+/// aspiration: a store that derived a *different* answer here would
+/// silently resolve paths differently from every code path that still
+/// calls `path_head_from_change`. Three details carry that equivalence
+/// and are easy to lose in a rewrite:
+///
+/// - Within one op, at most one match arm fires per path. A self-move
+///   (`from == to`) therefore takes the `to` arm only, and lands content.
+/// - Effects accumulate in `ops` order, last write winning for `content`,
+///   so a change carrying both a `Put` and a `Delete` for one path
+///   resolves the same way the fold resolves it.
+/// - `Move { from }` marks the path touched but does *not* clear content
+///   an earlier op in the same change put there.
+///
+/// The returned paths are unique, and ordered by first appearance in
+/// `ops`. `yadorilink-replica-engine`'s own test module checks this
+/// function against `path_head_from_change` over generated changes.
+pub fn path_effects_of_change(
+    change: &yadorilink_replica_domain::change::Change,
+) -> Vec<(String, PathHead)> {
+    use yadorilink_replica_domain::change::Op;
+
+    // `content` carries the same three-state meaning the per-path fold
+    // gives it: `None` = this path is removed by the change, `Some` = this
+    // path holds that version.
+    struct Acc {
+        content: Option<[u8; 32]>,
+        naming_device_id: String,
+    }
+
+    let signing_device_id = change.device_id.as_str();
+    let mut order: Vec<String> = Vec::new();
+    let mut acc: std::collections::HashMap<String, Acc> = std::collections::HashMap::new();
+    let touch =
+        |order: &mut Vec<String>, acc: &mut std::collections::HashMap<String, Acc>, path: &str| {
+            if !acc.contains_key(path) {
+                order.push(path.to_string());
+                acc.insert(
+                    path.to_string(),
+                    Acc { content: None, naming_device_id: signing_device_id.to_string() },
+                );
+            }
+        };
+
+    for op in &change.ops {
+        match op {
+            Op::Put { path, version, origin } => {
+                touch(&mut order, &mut acc, path.as_str());
+                let entry = acc.get_mut(path.as_str()).expect("just inserted");
+                entry.content = Some(version.0);
+                if let PutOrigin::Reasserted { naming_device_id: original, .. } = origin {
+                    entry.naming_device_id = original.as_str().to_string();
+                }
+            }
+            Op::Delete { path } => {
+                touch(&mut order, &mut acc, path.as_str());
+                acc.get_mut(path.as_str()).expect("just inserted").content = None;
+            }
+            Op::Move { from, to, version } => {
+                // The `to` arm precedes the `from` arm in the per-path
+                // fold's match, so a self-move takes `to` and only `to`.
+                touch(&mut order, &mut acc, to.as_str());
+                acc.get_mut(to.as_str()).expect("just inserted").content = Some(version.0);
+                if from.as_str() != to.as_str() {
+                    // Marks `from` touched without clearing content an
+                    // earlier op in this same change may have put there --
+                    // the fold's `Move { from, .. }` arm sets `touches`
+                    // and nothing else.
+                    touch(&mut order, &mut acc, from.as_str());
+                }
+            }
+        }
+    }
+
+    let change_hash = change.change_hash().0;
+    order
+        .into_iter()
+        .map(|path| {
+            let entry = acc.remove(&path).expect("every ordered path has an accumulator");
+            let head = PathHead {
+                change_hash,
+                lamport: change.lamport,
+                device_id: signing_device_id.to_string(),
+                naming_device_id: entry.naming_device_id,
+                content: entry
+                    .content
+                    .map(|version_hash| PathHeadContent { version_hash, mtime_unix_nanos: 0 }),
+            };
+            (path, head)
+        })
+        .collect()
 }
 
 /// One live head competing to own — or to remove — a single path `P`,
@@ -165,6 +286,21 @@ pub struct PathHead {
     pub change_hash: [u8; 32],
     pub lamport: u64,
     pub device_id: String,
+    /// The device that actually wrote this head's content, used *only* for
+    /// deterministic conflict-copy naming — never for ancestry, supersession,
+    /// or ordering, all of which stay on `device_id`.
+    ///
+    /// Equal to `device_id` for an ordinary put: the device that signed the
+    /// change is the device that wrote the content. They diverge exactly
+    /// when a head carries content forward on someone else's behalf — a
+    /// retroactive-repair re-assertion — where `device_id` is the repairer
+    /// and this stays the original author, copied from the op
+    /// (`PutOrigin::Reasserted`) rather than looked up in history, so a
+    /// path's converged name never depends on what a replica still retains.
+    ///
+    /// A re-assertion may change a path's carrier identity; it must never
+    /// change the naming identity of the content it carries.
+    pub naming_device_id: String,
     /// The content this head lands at `P`, or `None` when this head removes
     /// `P` — a tombstone, or the source side of a move away from `P`.
     pub content: Option<PathHeadContent>,
@@ -173,7 +309,7 @@ pub struct PathHead {
 #[derive(Clone, Debug)]
 pub struct PathHeadContent {
     /// Content address of the file version — doubles as the deterministic
-    /// conflict-copy disambiguator (`hash8`).
+    /// conflict-copy disambiguator, embedded in the copy's name in full.
     pub version_hash: [u8; 32],
     /// The version's recorded mtime, used only to format the human-readable
     /// stamp in a conflict-copy filename. Part of the signed version, not a
@@ -288,7 +424,12 @@ pub fn resolve_path_heads(path: &str, heads: &[PathHead]) -> PathResolution {
                 head: i,
                 path: conflict_copy_path_for_losing_change(
                     path,
-                    &heads[i].device_id,
+                    // The content's author, not this head's carrier: a
+                    // repair re-assertion carries someone else's content
+                    // forward, and naming the copy after the carrier
+                    // attributes that content to a device that never wrote
+                    // it (and erases the device that did).
+                    &heads[i].naming_device_id,
                     content.mtime_unix_nanos,
                     &content.version_hash,
                 ),
@@ -298,369 +439,67 @@ pub fn resolve_path_heads(path: &str, heads: &[PathHead]) -> PathResolution {
     PathResolution::Present { winner, conflict_copies }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A fixed "now" far beyond any of the small epoch-relative mtimes
-    /// used throughout this test module, so `MAX_FUTURE_MTIME_SKEW_NANOS`
-    /// clamping is a no-op for them — these tests exercise ordinary,
-    /// non-adversarial mtime comparisons and must behave exactly as
-    /// before the skew bound was added.
-    const FAR_FUTURE_NOW: i64 = 2_000_000_000 * 1_000_000_000;
-
-    const HASH_A: &[u8] = b"content-a-loser-bytes";
-    const HASH_B: &[u8] = b"content-b-winner-bytes";
-
-    #[test]
-    fn conflict_copy_source_path_inverts_generated_names() {
-        for original in ["chaos-05.bin", "no-extension", "sub/dir/report.txt"] {
-            let copy = conflict_copy_path(original, 1_000, "device-2", &[0xaa, 0xbb, 0xcc, 0xdd]);
-            assert_eq!(
-                conflict_copy_source_path(&copy),
-                original,
-                "source reconstruction must invert conflict_copy_path for {original}"
-            );
-        }
-        // A non-copy path maps to itself.
-        assert_eq!(conflict_copy_source_path("plain.txt"), "plain.txt");
+/// [`resolve_path_heads`] under DIR-1, for authoring and validating the
+/// changes that resolve a fork at `path`.
+///
+/// An explicit Directory keeps its path whoever wins the rank: when any
+/// live content head is a Directory, the best-ranked Directory head is the
+/// winner, every File or Symlink content class -- the ranked winner's
+/// included -- is owed its copy, and a losing Directory is owed none (an
+/// empty directory's copy carries nothing). With no Directory head this is
+/// exactly [`resolve_path_heads`].
+///
+/// This is what the namespace projection already shows (a Directory head
+/// makes `path` an explicit directory and relocates a ranked File or
+/// Symlink to its copy name); a change that supersedes `path`'s heads has
+/// to agree with it, or it re-asserts a File over the Directory, or drops
+/// the relocated File, which no copy ever made durable.
+///
+/// `is_directory` is asked only about content heads.
+pub fn resolve_path_heads_keeping_directory(
+    path: &str,
+    heads: &[PathHead],
+    is_directory: impl Fn(&PathHead) -> bool,
+) -> PathResolution {
+    let PathResolution::Present { winner, conflict_copies } = resolve_path_heads(path, heads)
+    else {
+        return PathResolution::Absent;
+    };
+    let best_directory = heads
+        .iter()
+        .enumerate()
+        .filter(|(_, head)| head.content.is_some() && is_directory(head))
+        .max_by(|(_, a), (_, b)| {
+            if dag_conflict_loser_is_a(a.lamport, &a.change_hash, b.lamport, &b.change_hash) {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            }
+        })
+        .map(|(index, _)| index);
+    let Some(directory) = best_directory else {
+        return PathResolution::Present { winner, conflict_copies };
+    };
+    let mut copies: Vec<ConflictCopy> =
+        conflict_copies.into_iter().filter(|copy| !is_directory(&heads[copy.head])).collect();
+    if directory != winner {
+        // The ranked winner is a File or Symlink (the best Directory would
+        // otherwise be the winner itself), and it represents its whole
+        // content class: every head with its version collapsed into it.
+        let head = &heads[winner];
+        let content = head.content.as_ref().expect("resolve_path_heads selects a content head");
+        copies.push(ConflictCopy {
+            head: winner,
+            path: conflict_copy_path_for_losing_change(
+                path,
+                &head.naming_device_id,
+                content.mtime_unix_nanos,
+                &content.version_hash,
+            ),
+        });
     }
-
-    #[test]
-    fn is_conflict_copy_path_matches_generated_names_and_only_filename_markers() {
-        // Whatever `conflict_copy_path` generates must be recognized, with
-        // and without an extension, in a subdirectory or not.
-        for original in ["chaos-05.bin", "no-extension", "sub/dir/report.txt"] {
-            let copy = conflict_copy_path(original, 1_000, "device-2", &[0xaa, 0xbb, 0xcc, 0xdd]);
-            assert!(is_conflict_copy_path(&copy), "generated copy path not recognized: {copy}");
-            assert!(!is_conflict_copy_path(original), "original misread as a copy: {original}");
-        }
-        // The marker only counts in the filename stem: a directory
-        // component carrying it must not make its ordinary contents read
-        // as conflict copies.
-        assert!(!is_conflict_copy_path(
-            "backups (conflicted copy, 2026-01-01-000000, device-1, aabbccdd)/notes.txt"
-        ));
-    }
-
-    #[test]
-    fn older_mtime_loses() {
-        let (winner, loser) = resolve_conflict_names(
-            "docs/report.txt",
-            1000,
-            "device-a",
-            HASH_A,
-            2000,
-            "device-b",
-            HASH_B,
-            FAR_FUTURE_NOW,
-        );
-        assert_eq!(winner, "docs/report.txt");
-        assert!(loser.contains("device-a")); // device-a had the older mtime
-        assert!(loser.starts_with("docs/report (conflicted copy"));
-        assert!(loser.ends_with(".txt"));
-        assert!(loser.contains(&hex::encode(&HASH_A[..4])), "{loser}");
-    }
-
-    #[test]
-    fn tie_broken_by_device_id_deterministically() {
-        let (_, loser1) = resolve_conflict_names(
-            "f.txt",
-            5000,
-            "device-a",
-            HASH_A,
-            5000,
-            "device-b",
-            HASH_B,
-            FAR_FUTURE_NOW,
-        );
-        let (_, loser2) = resolve_conflict_names(
-            "f.txt",
-            5000,
-            "device-b",
-            HASH_B,
-            5000,
-            "device-a",
-            HASH_A,
-            FAR_FUTURE_NOW,
-        );
-        // Same inputs regardless of argument order must produce the same
-        // result on every peer independently computing this.
-        assert_eq!(loser1, loser2);
-    }
-
-    #[test]
-    fn extensionless_file_has_no_trailing_dot() {
-        let name = conflict_copy_path("README", 0, "device-a", HASH_A);
-        assert_eq!(
-            name,
-            format!(
-                "README (conflicted copy, 1970-01-01-000000, device-a, {})",
-                hex::encode(&HASH_A[..4])
-            )
-        );
-    }
-
-    #[test]
-    fn nested_path_preserves_directory() {
-        let name = conflict_copy_path("a/b/c.txt", 0, "device-a", HASH_A);
-        assert!(name.starts_with("a/b/c (conflicted copy"));
-    }
-
-    /// Two different losing contents resolved
-    /// within the same second never collide onto one filename: the same
-    /// device losing two structurally distinct conflicts for genuinely
-    /// different content, with mtimes that truncate to the identical
-    /// second, must never produce the same conflict-copy filename — this
-    /// is the exact mechanism `monkey_chaos.rs` caught live (see this
-    /// module's top-level doc comment).
-    #[test]
-    fn different_losing_content_in_the_same_second_never_collides() {
-        // Both mtimes fall in the same truncated second (999_000_000ns
-        // apart, same whole second under `div_euclid(1_000_000_000)`).
-        let mtime_1 = 1_700_000_000 * 1_000_000_000i64;
-        let mtime_2 = mtime_1 + 999_000_000;
-        let (_, loser_1) = resolve_conflict_names(
-            "chaos.bin",
-            mtime_1,
-            "device-loser",
-            b"first losing content",
-            mtime_1 + 10_000_000_000,
-            "device-winner",
-            b"winner content unused",
-            FAR_FUTURE_NOW,
-        );
-        let (_, loser_2) = resolve_conflict_names(
-            "chaos.bin",
-            mtime_2,
-            "device-loser",
-            b"second losing content, genuinely different",
-            mtime_2 + 10_000_000_000,
-            "device-winner",
-            b"winner content unused",
-            FAR_FUTURE_NOW,
-        );
-        assert_ne!(
-            loser_1, loser_2,
-            "two different losing contents for the same device/second must not collide: {loser_1} vs {loser_2}"
-        );
-    }
-
-    /// an already-conflict-suffixed path fed back through
-    /// conflict resolution (e.g. the conflict copy itself hits a second,
-    /// genuine conflict) must not compound into a doubly-suffixed name.
-    #[test]
-    fn conflict_copy_naming_does_not_compound_on_an_already_suffixed_path() {
-        let already_suffixed = conflict_copy_path("chaos.bin", 0, "device-a", HASH_A);
-        let re_resolved = conflict_copy_path(&already_suffixed, 1_000_000_000, "device-b", HASH_B);
-        assert_eq!(
-            re_resolved.matches("(conflicted copy").count(),
-            1,
-            "must not compound a second suffix onto an already-suffixed path: {re_resolved}"
-        );
-        assert!(re_resolved.starts_with("chaos (conflicted copy"), "{re_resolved}");
-        assert!(re_resolved.ends_with(".bin"), "{re_resolved}");
-    }
-
-    /// extensionless variant: same idempotency guarantee without
-    /// an extension in play (exercises the `ext == None` formatting path).
-    #[test]
-    fn conflict_copy_naming_does_not_compound_without_an_extension() {
-        let already_suffixed = conflict_copy_path("README", 0, "device-a", HASH_A);
-        let re_resolved = conflict_copy_path(&already_suffixed, 1_000_000_000, "device-b", HASH_B);
-        assert_eq!(re_resolved.matches("(conflicted copy").count(), 1, "{re_resolved}");
-        assert!(re_resolved.starts_with("README (conflicted copy"), "{re_resolved}");
-    }
-
-    /// Adversarial case: a peer advertising
-    /// an absurd future `mtime_unix_nanos` (`i64::MAX`) must not
-    /// unconditionally win the real filename against a local file with an
-    /// ordinary, plausible (near-"now") mtime — the claim gets clamped to
-    /// `now + MAX_FUTURE_MTIME_SKEW_NANOS` before comparison, so it can
-    /// only win by the bounded skew margin, not by claiming to be
-    /// billions of years in the future.
-    #[test]
-    fn extreme_future_mtime_cannot_unconditionally_win_the_canonical_name() {
-        let now = 1_700_000_000 * 1_000_000_000i64; // an ordinary real-world "now"
-        let local_mtime = now - 60 * 1_000_000_000; // local edited a minute ago
-        let (winner, loser) = resolve_conflict_names(
-            "shared.txt",
-            local_mtime,
-            "device-local",
-            HASH_A,
-            i64::MAX,
-            "device-attacker",
-            HASH_B,
-            now,
-        );
-        assert_eq!(winner, "shared.txt");
-        // The attacker's file is still the loser (its clamped effective
-        // mtime is `now + skew`, later than local's real recent edit) —
-        // but the conflict-copy filename embeds the *clamped* timestamp,
-        // not the nonsensical far-future date `i64::MAX` would naively
-        // format as (year ~292471208677, per `format_timestamp`).
-        assert!(loser.contains("device-local"));
-        let unclamped_attacker_name =
-            conflict_copy_path("shared.txt", i64::MAX, "device-attacker", HASH_B);
-        assert_ne!(
-            loser, unclamped_attacker_name,
-            "conflict-copy filename must not embed the raw unclamped i64::MAX timestamp"
-        );
-        assert!(!loser.contains("292471208677"), "must not embed i64::MAX's absurd year: {loser}");
-    }
-
-    /// Once local's own mtime is *also*
-    /// implausibly far in the future relative to "now" (or once the
-    /// attacker's clamped value ties with it), the extreme value no
-    /// longer wins outright — it degrades to the deterministic device-id
-    /// tie-break rather than granting the attacker an unbounded
-    /// advantage. This pins down that the bound is a real ceiling, not
-    /// just cosmetic: an attacker cannot out-claim a target that is
-    /// itself already at (or past) the plausible-future ceiling.
-    #[test]
-    fn future_skew_bound_caps_the_winning_margin_not_just_the_filename() {
-        let now = 1_700_000_000 * 1_000_000_000i64;
-        // Local's own mtime is already at the far edge of what's trusted.
-        let local_mtime = now + MAX_FUTURE_MTIME_SKEW_NANOS;
-        let is_a_loser = a_is_loser(local_mtime, "device-local", i64::MAX, "device-attacker", now);
-        // Both sides clamp to the same effective ceiling (`now + skew`),
-        // so this degrades to the device-id tie-break, not an automatic
-        // attacker win.
-        assert_eq!(is_a_loser, "device-local" < "device-attacker");
-    }
-
-    /// Legitimate case: an ordinary,
-    /// non-adversarial mtime comparison (both well in the past relative
-    /// to "now") is completely unaffected by the skew bound — the older,
-    /// real mtime loses exactly as it always did.
-    #[test]
-    fn plausible_past_mtimes_are_unaffected_by_the_skew_bound() {
-        let now = 1_700_000_000 * 1_000_000_000i64;
-        let older = now - 3600 * 1_000_000_000; // an hour ago
-        let newer = now - 60 * 1_000_000_000; // a minute ago
-        let (winner, loser) = resolve_conflict_names(
-            "notes.md", older, "device-a", HASH_A, newer, "device-b", HASH_B, now,
-        );
-        assert_eq!(winner, "notes.md");
-        assert!(loser.contains("device-a")); // the genuinely older edit loses, as before
-    }
-
-    // `is_conflict_copy_of` coverage.
-
-    #[test]
-    fn is_conflict_copy_of_matches_a_genuine_sibling() {
-        assert!(is_conflict_copy_of(
-            "chaos-b (conflicted copy, 2026-07-08-120000, device-a, 6c455bc2).bin",
-            "chaos-b.bin",
-        ));
-    }
-
-    #[test]
-    fn is_conflict_copy_of_matches_within_a_subdirectory() {
-        assert!(is_conflict_copy_of(
-            "docs/report (conflicted copy, 2026-07-08-120000, device-a, aabbccdd).txt",
-            "docs/report.txt",
-        ));
-    }
-
-    #[test]
-    fn is_conflict_copy_of_rejects_the_original_path_itself() {
-        assert!(!is_conflict_copy_of("chaos-b.bin", "chaos-b.bin"));
-    }
-
-    #[test]
-    fn is_conflict_copy_of_rejects_an_unrelated_file_with_no_conflict_marker() {
-        assert!(!is_conflict_copy_of("chaos-b-backup.bin", "chaos-b.bin"));
-    }
-
-    #[test]
-    fn is_conflict_copy_of_rejects_a_conflict_copy_of_a_different_stem() {
-        assert!(!is_conflict_copy_of(
-            "chaos-c (conflicted copy, 2026-07-08-120000, device-a, 6c455bc2).bin",
-            "chaos-b.bin",
-        ));
-    }
-
-    #[test]
-    fn is_conflict_copy_of_rejects_a_conflict_copy_with_a_different_extension() {
-        assert!(!is_conflict_copy_of(
-            "chaos-b (conflicted copy, 2026-07-08-120000, device-a, 6c455bc2).txt",
-            "chaos-b.bin",
-        ));
-    }
-
-    #[test]
-    fn is_conflict_copy_of_rejects_a_conflict_copy_in_a_different_directory() {
-        assert!(!is_conflict_copy_of(
-            "other/chaos-b (conflicted copy, 2026-07-08-120000, device-a, 6c455bc2).bin",
-            "chaos-b.bin",
-        ));
-    }
-
-    // Ancestry-grounded `(lamport, change_hash)` conflict resolution.
-
-    #[test]
-    fn higher_lamport_wins_regardless_of_hash() {
-        // a has the higher lamport, so a wins and b is the loser, even
-        // though b's hash sorts higher.
-        assert!(!dag_conflict_loser_is_a(9, b"\x00\x00", 8, b"\xff\xff"));
-        assert!(dag_conflict_loser_is_a(8, b"\xff\xff", 9, b"\x00\x00"));
-    }
-
-    #[test]
-    fn equal_lamport_breaks_on_change_hash() {
-        // Same lamport: the lexicographically smaller change hash loses.
-        assert!(dag_conflict_loser_is_a(5, b"\x01", 5, b"\x02"));
-        assert!(!dag_conflict_loser_is_a(5, b"\x02", 5, b"\x01"));
-    }
-
-    #[test]
-    fn dag_resolution_is_observer_independent() {
-        // Whichever way the pair is presented, the same change is the
-        // loser — the property that makes every replica agree without
-        // communicating.
-        let a = (7u64, &b"aaaa"[..]);
-        let b = (7u64, &b"bbbb"[..]);
-        let a_loses = dag_conflict_loser_is_a(a.0, a.1, b.0, b.1);
-        let b_loses = dag_conflict_loser_is_a(b.0, b.1, a.0, a.1);
-        assert_ne!(a_loses, b_loses, "exactly one side must be the loser");
-        assert!(a_loses, "the lexicographically smaller change hash loses");
-    }
-
-    #[test]
-    fn losing_change_name_is_a_pure_function_of_its_fields() {
-        // Two replicas independently naming the same losing change from
-        // its (path, device, mtime, version-hash) must land on the exact
-        // same conflict-copy filename.
-        let version_hash = [0xABu8, 0xCD, 0xEF, 0x01, 0x02, 0x03];
-        let name_replica_1 = conflict_copy_path_for_losing_change(
-            "docs/report.docx",
-            "device-c",
-            1_700_000_000 * 1_000_000_000,
-            &version_hash,
-        );
-        let name_replica_2 = conflict_copy_path_for_losing_change(
-            "docs/report.docx",
-            "device-c",
-            1_700_000_000 * 1_000_000_000,
-            &version_hash,
-        );
-        assert_eq!(name_replica_1, name_replica_2);
-        assert!(name_replica_1.starts_with("docs/report (conflicted copy"));
-        assert!(name_replica_1.contains("device-c"));
-        assert!(name_replica_1.ends_with(".docx"));
-        assert!(name_replica_1.contains(&hex::encode(&version_hash[..4])));
-    }
-
-    #[test]
-    fn losing_change_name_matches_the_underlying_primitive() {
-        // The DAG entry point is exactly the existing naming primitive
-        // with the argument order that reads naturally for a change, so
-        // the two can never drift apart.
-        let vh = [1u8, 2, 3, 4];
-        assert_eq!(
-            conflict_copy_path_for_losing_change("a/b.txt", "dev-x", 42, &vh),
-            conflict_copy_path("a/b.txt", 42, "dev-x", &vh),
-        );
-    }
+    PathResolution::Present { winner: directory, conflict_copies: copies }
 }
+
+#[cfg(test)]
+mod tests;

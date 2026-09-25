@@ -4,10 +4,7 @@
 //! off it. Shares the same `files` table (and the same `Arc<SyncDatabase>`
 //! shape) as the sibling [`crate::file_index::FileIndexRepository`], which
 //! owns plain file-record CRUD instead -- a responsibility split, not a
-//! storage boundary, per `docs/design/syncstate-repository-ownership.md`.
-//!
-//! Moved out of `yadorilink-sync-core` in Phase 7D-9C, following the exact
-//! precedent `dirty_path.rs`'s own move already established.
+//! storage boundary: both share the same database and transaction model.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -15,27 +12,15 @@ use std::sync::Arc;
 use rusqlite::OptionalExtension;
 
 use crate::error::SyncSqliteError;
-use yadorilink_filesystem_sync::materialization_types::EvictableFile;
-use yadorilink_replica_domain::file::BlockInfo;
+use yadorilink_replica_domain::file::{BlockInfo, RecordKind};
 use yadorilink_replica_domain::ids::ChangeHash;
+use yadorilink_replica_domain::session_state::EvictableFile;
 use yadorilink_replica_domain::session_state::{HeldState, MaterializationState};
 use yadorilink_root_authority::root_commit::RootCommitPermit;
 use yadorilink_sqlite_runtime::SyncDatabase;
 
-/// Content-addressed block hash, hex-encoded. Deliberately duplicated here
-/// rather than depending on another crate solely for this alias -- same
-/// "duplicate small leaf types rather than force an awkward shared
-/// dependency" precedent `yadorilink-local-storage::traits::ContentHash`
-/// and `yadorilink-sync-core::index::ContentHash` already established
-/// independently of each other.
+/// Content-addressed block hash, hex-encoded.
 pub type ContentHash = String;
-
-/// Mirrors `peer_session::disk_race_fingerprint`'s own `(len, mtime, ctime,
-/// ctime_nsec)` return shape as a plain tuple, so this lower-level crate
-/// doesn't need a dependency on `yadorilink-peer-session` just for a type
-/// alias -- see [`MaterializationStateRepository::record_materialized_
-/// fingerprint`]'s own doc comment for what this identifies.
-pub type MaterializedFingerprint = (u64, Option<std::time::SystemTime>, i64, i64);
 
 /// Counts of non-deleted files in a group by materialization state --
 /// `yadorilink status`'s per-folder summary.
@@ -73,6 +58,37 @@ impl MaterializationStateRepository {
         })
     }
 
+    /// The materialization state of a directory at `prefix` (`""` is the
+    /// link root), read from the live files below it: hydrating while any
+    /// is, then evicting, then placeholder while any file's bytes are not
+    /// here, hydrated otherwise -- an empty directory included, since there
+    /// is nothing of it to fetch.
+    pub fn directory_materialization_state(
+        &self,
+        group_id: &str,
+        prefix: &str,
+    ) -> Result<MaterializationState, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT materialization_state FROM files WHERE group_id = ?1 AND \
+                 state = 'current' AND deleted = 0 AND record_kind = 'file' AND \
+                 (?2 = '' OR substr(path, 1, length(?2) + 1) = ?2 || '/')",
+            )?;
+            let states = stmt
+                .query_map(rusqlite::params![group_id, prefix], |r| r.get::<_, String>(0))?
+                .map(|state| state.map(|state| MaterializationState::from_db_str(&state)))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok([
+                MaterializationState::Hydrating,
+                MaterializationState::Evicting,
+                MaterializationState::Placeholder,
+            ]
+            .into_iter()
+            .find(|state| states.contains(state))
+            .unwrap_or(MaterializationState::Hydrated))
+        })
+    }
+
     pub fn set_materialization_state(
         &self,
         group_id: &str,
@@ -96,7 +112,7 @@ impl MaterializationStateRepository {
 
     /// `_in_tx` counterpart of [`Self::set_materialization_state`], for a
     /// caller that already holds an open transaction spanning more writes
-    /// than just this one (C4-6: bounded batching of receiver-side
+    /// than just this one (bounded batching of receiver-side
     /// materialization commits) -- see `open_projected_upserts_batch`'s own
     /// call site for why it needs this: the row it just upserted no longer
     /// gets `Hydrated` from the schema's own column default (v25 changed
@@ -147,43 +163,71 @@ impl MaterializationStateRepository {
 
     /// Like `transition_materialization_state`, but also requires the
     /// `current` row's `authoring_change_hash` to still match
-    /// `expected_authoring_hash` — a plain state-only CAS is not enough to
-    /// tell "this row is still the same version this caller started
-    /// working on, just still `Hydrating`" apart from "a NEWER version of
-    /// this same path became `current`, and happened to also land in
-    /// `Hydrating` before this caller's cleanup ran" (e.g. a peer's
-    /// concurrent update superseding the row mid-hydration). A cleanup
-    /// guard bounding a hydration attempt uses this, not the plain
-    /// version, to avoid rolling back a materialization state that
-    /// belongs to a different, later version than the one it started
-    /// with — see `HydratingStateGuard`'s own doc comment.
+    /// `expected_authoring_hash`, and — when the caller supplies one —
+    /// the version the row derives to still be `expected_version`.
+    ///
+    /// A plain state-only CAS cannot tell "this row is still the same
+    /// version this caller started working on, just still `Hydrating`"
+    /// apart from "a NEWER version of this path became `current` and
+    /// happened to also land in `Hydrating` before this caller's cleanup
+    /// ran". The authoring hash narrows that, and for a long time was
+    /// treated as sufficient — but authoring identity is not version
+    /// identity: a supersession can keep the authoring hash while moving
+    /// the content columns the version is derived from, which is the
+    /// whole premise of the payload-provenance work. A guard bounding an
+    /// attempt that was about ONE version has to say so.
+    ///
+    /// `expected_version` is checked against
+    /// [`crate::read_canonical_current_row`] inside this same
+    /// transaction, because a version is not a stored column — reading it
+    /// first and then updating would be two statements with nothing
+    /// holding the row between them, which is the defect this parameter
+    /// exists to close.
     pub fn transition_materialization_state_if_same_authoring(
         &self,
         group_id: &str,
         path: &str,
-        expected: MaterializationState,
+        expected: Option<MaterializationState>,
         expected_authoring_hash: Option<&ChangeHash>,
+        expected_version: Option<&yadorilink_replica_domain::ids::VersionHash>,
         next: MaterializationState,
     ) -> Result<bool, SyncSqliteError> {
+        // `expected` is exact in both directions: `None` requires the
+        // column to still be NULL rather than matching anything.
+        let expected_state_sql = match expected {
+            Some(_) => "materialization_state = ?4",
+            None => "materialization_state IS NULL AND ?4 IS NULL",
+        };
+        let expected_state_param: Option<&'static str> = expected.map(|s| s.as_db_str());
         let affected = self.database.write::<_, SyncSqliteError>(|conn| {
+            if let Some(expected_version) = expected_version {
+                let live = crate::read_canonical_current_row(conn, group_id, path)?;
+                if !live.as_ref().is_some_and(|row| row.version_hash() == *expected_version) {
+                    return Ok(0);
+                }
+            }
             Ok(match expected_authoring_hash {
                 Some(hash) => conn.execute(
-                    "UPDATE files SET materialization_state = ?1 \
-                     WHERE group_id = ?2 AND path = ?3 AND state = 'current' \
-                       AND materialization_state = ?4 AND authoring_change_hash = ?5",
+                    &format!(
+                        "UPDATE files SET materialization_state = ?1 \
+                         WHERE group_id = ?2 AND path = ?3 AND state = 'current' \
+                           AND {expected_state_sql} AND authoring_change_hash = ?5"
+                    ),
                     rusqlite::params![
                         next.as_db_str(),
                         group_id,
                         path,
-                        expected.as_db_str(),
+                        expected_state_param,
                         &hash.0[..],
                     ],
                 )?,
                 None => conn.execute(
-                    "UPDATE files SET materialization_state = ?1 \
-                     WHERE group_id = ?2 AND path = ?3 AND state = 'current' \
-                       AND materialization_state = ?4 AND authoring_change_hash IS NULL",
-                    rusqlite::params![next.as_db_str(), group_id, path, expected.as_db_str()],
+                    &format!(
+                        "UPDATE files SET materialization_state = ?1 \
+                         WHERE group_id = ?2 AND path = ?3 AND state = 'current' \
+                           AND {expected_state_sql} AND authoring_change_hash IS NULL"
+                    ),
+                    rusqlite::params![next.as_db_str(), group_id, path, expected_state_param],
                 )?,
             })
         })?;
@@ -200,21 +244,119 @@ impl MaterializationStateRepository {
     /// until something happens to re-hydrate it — which nothing will,
     /// since nothing believes it's still a placeholder. Called once at
     /// daemon startup (never mid-run, since a live daemon's own
-    /// `Hydrating` rows are legitimately in progress) to reset every
-    /// stale `Hydrating` row, across every group, back to `Placeholder`
-    /// — safe because `Placeholder` just means "not fetched yet," and a
-    /// startup is definitionally after any hydration that was running
-    /// crashed with it.
+    /// `Hydrating` rows are legitimately in progress) to move every
+    /// stale `Hydrating` row, across every group, out of that state. The
+    /// name says `Placeholder`, the default resolution -- safe because
+    /// `Placeholder` just means "not fetched yet," and a startup is
+    /// definitionally after any hydration that was running crashed with
+    /// it -- but it is not the only one: a row over a standing proof goes
+    /// back to `Hydrated` (below), and a row repair will take keeps
+    /// `Hydrating` (next paragraph).
+    ///
+    /// Except for a row that startup repair will take instead. A
+    /// `Hydrating` row holding an open materialization intent is not an
+    /// abandoned fetch: it is a write whose bytes were assembled and whose
+    /// index row was committed, with a durable journal entry saying so --
+    /// the shape the projected-upserts batch leaves behind between its two
+    /// transactions. Repair can finish or redo those from blocks that are
+    /// already local. Demoting them here first would hand them to the
+    /// ordinary startup scan instead, which sees a `Placeholder` over
+    /// bytes that do not match the row, has no way to tell a half-finished
+    /// materialization from an edit made while the daemon was down, and
+    /// republishes the stale bytes as a new local version.
+    ///
+    /// The carve-out is therefore exactly as wide as what repair will
+    /// actually pick up, and no wider -- a row it declines still has to be
+    /// freed here, or nothing frees it at all. Repair walks non-deleted
+    /// symlink and directory rows, and non-deleted file rows with at least
+    /// one block; it skips a tombstone and an empty file outright. An
+    /// empty file is the reachable one: the eager batch happily carries a
+    /// zero-byte version, and preserving its transient row for a pass that
+    /// will never look at it leaves it wedged in that state for good,
+    /// rather than merely until the next restart.
+    ///
+    /// And except for a row the attempt found `Hydrated`. Access
+    /// hydration and convergence rehydration both enter from `Hydrated`
+    /// (a proof about a version the row has moved off), CAS the row to
+    /// `Hydrating` with no intent, and bump the mutation fence only right
+    /// before they touch disk. A crash before that bump leaves `Hydrating`
+    /// over a present-file proof that still stands against the path's
+    /// fence -- and a standing proof means no physical write has happened
+    /// since it was published, so disk holds what it vouches for or an
+    /// edit nobody has journalled yet. `Placeholder` is the one claim
+    /// access hydration reconstructs over without asking, so demoting
+    /// such a row hands a user's offline edit to the next fetch or pin to
+    /// overwrite. It goes back to `Hydrated` instead: what the attempt's
+    /// own guard reverts to on failure, the state under which hydrate
+    /// refuses to overwrite bytes the proof does not describe, and a
+    /// repair candidate that startup repair re-proves or quarantines
+    /// before anything else can touch the path. A fence moved past the
+    /// proof (an eviction, or an attempt that crashed after its own bump)
+    /// proves nothing about disk and still resets to `Placeholder`. That
+    /// includes an attempt that crashed after its own bump and before its
+    /// write landed: a moved fence cannot be told from an evicted row's.
+    /// A row with an intent stays with the carve-out above.
+    /// The row does not record its entry state, so a `Placeholder` entry
+    /// whose superseded proof still stands (a version admitted over a
+    /// `Hydrated` row strips the claim without moving the fence) comes
+    /// back `Hydrated` too; the same argument makes that claim true of its
+    /// disk, and repair, not a blind reconstruct, is what then decides it.
+    /// Both updates share one transaction; the count is every row moved
+    /// out of `Hydrating`.
     pub fn reset_stale_hydrating_to_placeholder(&self) -> Result<usize, SyncSqliteError> {
-        self.database.write::<_, SyncSqliteError>(|conn| {
-            Ok(conn.execute(
+        self.database.write_immediate::<_, SyncSqliteError>(|tx| {
+            let restored = tx.execute(
                 "UPDATE files SET materialization_state = ?1 \
-                 WHERE materialization_state = ?2 AND state = 'current'",
+                 WHERE materialization_state = ?2 AND state = 'current' AND deleted = 0 \
+                   AND COALESCE(record_kind, ?3) = ?3 \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM materialization_intents i \
+                        WHERE i.group_id = files.group_id AND i.path = files.path \
+                   ) \
+                   AND EXISTS ( \
+                       SELECT 1 FROM path_materialized_generations g \
+                         JOIN path_actual_mutation_fences f \
+                           ON f.group_id = g.group_id AND f.path = g.path \
+                        WHERE g.group_id = files.group_id AND g.path = files.path \
+                          AND g.published_under_mutation_generation = f.mutation_generation \
+                          AND g.object_kind = 'regular_file' \
+                          AND g.version_hash IS NOT NULL \
+                   )",
+                rusqlite::params![
+                    MaterializationState::Hydrated.as_db_str(),
+                    MaterializationState::Hydrating.as_db_str(),
+                    RecordKind::File.as_db_str(),
+                ],
+            )?;
+            let demoted = tx.execute(
+                "UPDATE files SET materialization_state = ?1 \
+                 WHERE materialization_state = ?2 AND state = 'current' \
+                   AND NOT ( \
+                       EXISTS ( \
+                           SELECT 1 FROM materialization_intents i \
+                            WHERE i.group_id = files.group_id AND i.path = files.path \
+                       ) \
+                       AND files.deleted = 0 \
+                       AND ( \
+                           files.record_kind IN (?3, ?5) \
+                           OR ( \
+                               COALESCE(files.record_kind, ?4) = ?4 \
+                               AND COALESCE(files.blocks_json, '[]') NOT IN ('[]', '') \
+                           ) \
+                       ) \
+                   )",
                 rusqlite::params![
                     MaterializationState::Placeholder.as_db_str(),
-                    MaterializationState::Hydrating.as_db_str()
+                    MaterializationState::Hydrating.as_db_str(),
+                    RecordKind::Symlink.as_db_str(),
+                    // Repair reads a missing kind as `File`, so this
+                    // comparison has to as well, or a row with no recorded
+                    // kind would be reset here AND walked there.
+                    RecordKind::File.as_db_str(),
+                    RecordKind::Directory.as_db_str(),
                 ],
-            )?)
+            )?;
+            Ok(restored + demoted)
         })
     }
 
@@ -273,12 +415,19 @@ impl MaterializationStateRepository {
         group_id: &str,
     ) -> Result<Vec<EvictableFile>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT path, size, last_accessed_unix FROM files
-                 WHERE group_id = ?1 AND state = 'current' AND deleted = 0 AND pinned = 0
-                    AND materialization_state = 'hydrated'
-                 ORDER BY last_accessed_unix ASC NULLS FIRST",
-            )?;
+            // A file below a pinned directory is pinned too.
+            let mut stmt = conn.prepare(&format!(
+                "SELECT f.path, f.size, f.last_accessed_unix FROM files f
+                 WHERE f.group_id = ?1 AND f.state = 'current' AND f.deleted = 0 AND f.pinned = 0
+                    AND f.materialization_state = 'hydrated'
+                    AND NOT EXISTS (SELECT 1 FROM pinned_directories p
+                                    WHERE p.group_id = f.group_id AND {})
+                 ORDER BY f.last_accessed_unix ASC NULLS FIRST",
+                crate::file_index::pinned_directory_covers_sql(
+                    "f.path",
+                    "f.record_kind = 'directory'"
+                )
+            ))?;
             let rows = stmt.query_map([group_id], |r| {
                 Ok(EvictableFile {
                     path: r.get(0)?,
@@ -318,6 +467,9 @@ impl MaterializationStateRepository {
     /// dumping every individual file path for what's meant to be a
     /// glance-able overview (matching how `conflict_count` already
     /// summarizes rather than lists).
+    /// Directories are not counted: they have no content to hydrate or
+    /// evict. Symlinks are, since their rows carry a materialization state
+    /// of their own.
     pub fn materialization_counts(
         &self,
         group_id: &str,
@@ -326,11 +478,13 @@ impl MaterializationStateRepository {
             let mut stmt = conn.prepare(
                 "SELECT materialization_state, COUNT(*) FROM files
                  WHERE group_id = ?1 AND state = 'current' AND deleted = 0
+                   AND record_kind <> ?2
                  GROUP BY materialization_state",
             )?;
-            let rows = stmt.query_map([group_id], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
-            })?;
+            let rows = stmt
+                .query_map(rusqlite::params![group_id, RecordKind::Directory.as_db_str()], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+                })?;
             let mut counts = MaterializationCounts::default();
             for row in rows {
                 let (state, count) = row?;
@@ -367,39 +521,6 @@ impl MaterializationStateRepository {
                 out.insert(path, MaterializationState::from_db_str(&state));
             }
             Ok(out)
-        })
-    }
-
-    /// Block hashes (hex) that back content this device is holding
-    /// materialized on disk right now for `group_id`: every block referenced
-    /// by a non-deleted, current file that is either hydrated or pinned.
-    ///
-    /// These blocks must never be reclaimed as on-demand cache — dropping one
-    /// would corrupt a file whose bytes are supposed to be present on disk.
-    /// Eviction uses this set to compute which of an evicted file's blocks are
-    /// safe to reclaim: only blocks NOT in this set (i.e. no longer backing any
-    /// locally-present file) may be freed, and only then after full-replica
-    /// custody is confirmed. A block that is still shared with another
-    /// hydrated/pinned file stays; a block referenced only by placeholdered
-    /// (non-hydrated) files is reclaimable because that content is re-fetched
-    /// on demand.
-    pub fn blocks_backing_local_content(
-        &self,
-        group_id: &str,
-    ) -> Result<HashSet<ContentHash>, SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT blocks_json FROM files \
-                 WHERE group_id = ?1 AND deleted = 0 AND state = 'current' \
-                   AND (materialization_state = 'hydrated' OR pinned = 1)",
-            )?;
-            let rows = stmt.query_map([group_id], |r| r.get::<_, String>(0))?;
-            let mut needed: HashSet<ContentHash> = HashSet::new();
-            for row in rows {
-                let blocks: Vec<BlockInfo> = serde_json::from_str(&row?)?;
-                needed.extend(blocks.into_iter().map(|block| hex::encode(block.hash)));
-            }
-            Ok(needed)
         })
     }
 
@@ -478,12 +599,15 @@ impl MaterializationStateRepository {
         group_id: &str,
     ) -> Result<Vec<String>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            let mut stmt = conn.prepare(
-                // `l.orphaned = 0` keeps this fail-closed at the storage layer: an
-                // orphaned link's coordination-side authorization is permanently
-                // gone, so none of its files are ever repair-eligible. The daemon
-                // scheduler already filters orphaned links before calling this, but
-                // the core query must not depend on that to stay correct.
+            // `l.orphaned = 0` keeps this fail-closed at the storage layer: an
+            // orphaned link's coordination-side authorization is permanently
+            // gone, so none of its files are ever repair-eligible. The daemon
+            // scheduler already filters orphaned links before calling this, but
+            // the core query must not depend on that to stay correct. A
+            // placeholder below a pinned directory is owed its bytes like one
+            // pinned on its own -- including one that arrived after the pin;
+            // a directory entry has none to fetch.
+            let mut stmt = conn.prepare(&format!(
                 "SELECT f.path FROM files f \
                  JOIN links l ON l.group_id = f.group_id \
                  WHERE f.group_id = ?1 \
@@ -494,10 +618,18 @@ impl MaterializationStateRepository {
                      (f.materialization_state = 'placeholder' AND l.materialization_policy = \
                       'eager') \
                      OR (f.materialization_state = 'placeholder' AND f.pinned = 1) \
+                     OR (f.materialization_state = 'placeholder' \
+                         AND f.record_kind <> 'directory' \
+                         AND EXISTS (SELECT 1 FROM pinned_directories p \
+                                     WHERE p.group_id = f.group_id AND {})) \
                      OR f.materialization_state = 'hydrating' \
                    ) \
                  ORDER BY f.path",
-            )?;
+                crate::file_index::pinned_directory_covers_sql(
+                    "f.path",
+                    "f.record_kind = 'directory'"
+                )
+            ))?;
             let rows = stmt.query_map([group_id], |r| r.get::<_, String>(0))?;
             let mut out = Vec::new();
             for row in rows {
@@ -600,14 +732,7 @@ impl MaterializationStateRepository {
 
     /// Bare `files`-table live set, with no `dag_retention_roots`
     /// contribution — kept for callers (this module's own tests, an
-    /// explicit per-group check) that want exactly that. Physical
-    /// block-store GC must use
-    /// [`live_block_hashes_including_all_dag_retention_roots`](Self::live_block_hashes_including_all_dag_retention_roots)
-    /// instead: a `full_payload`-rooted change's blocks are not necessarily
-    /// reachable through any `files` row yet (`captured_authoring` writes a
-    /// `file_versions`/`change_file_versions` row, not a `files` row, at
-    /// authoring time — see that module), so this bare query alone does not
-    /// protect them.
+    /// explicit per-group check) that want exactly that.
     pub fn live_block_hashes(&self) -> Result<HashSet<ContentHash>, SyncSqliteError> {
         self.live_block_hashes_with_extra_roots(std::iter::empty())
     }
@@ -741,7 +866,7 @@ impl MaterializationStateRepository {
     ) -> Result<(), SyncSqliteError> {
         self.database.write::<_, SyncSqliteError>(|conn| {
             let affected = conn.execute(
-                "UPDATE files SET held_reason = ?1, held_since_unix_nanos = ?2 \
+                "UPDATE files SET held_reason = ?1, held_since_unix_nanos = ?2, held_key = NULL \
                  WHERE group_id = ?3 AND path = ?4 AND state = 'current'",
                 rusqlite::params![reason, since_unix_nanos, group_id, path],
             )?;
@@ -749,6 +874,53 @@ impl MaterializationStateRepository {
                 return Err(SyncSqliteError::NotFound(format!("file {group_id}/{path}")));
             }
             Ok(())
+        })
+    }
+
+    /// [`Self::set_held`] for a hold that waits on the file itself rather
+    /// than on its name, recording `key`: what the hold was decided
+    /// against. A re-check whose own observation still produces `key` has
+    /// nothing new to look at ([`Self::get_held_key`]). `None` records no
+    /// key, so the next re-check looks again.
+    pub fn set_held_with_key(
+        &self,
+        group_id: &str,
+        path: &str,
+        reason: &str,
+        since_unix_nanos: i64,
+        key: Option<&str>,
+    ) -> Result<(), SyncSqliteError> {
+        self.database.write::<_, SyncSqliteError>(|conn| {
+            let affected = conn.execute(
+                "UPDATE files SET held_reason = ?1, held_since_unix_nanos = ?2, held_key = ?3 \
+                 WHERE group_id = ?4 AND path = ?5 AND state = 'current'",
+                rusqlite::params![reason, since_unix_nanos, key, group_id, path],
+            )?;
+            if affected == 0 {
+                return Err(SyncSqliteError::NotFound(format!("file {group_id}/{path}")));
+            }
+            Ok(())
+        })
+    }
+
+    /// The key [`Self::set_held_with_key`] recorded for a held path, or
+    /// `None` when it is not held or was held without one.
+    pub fn get_held_key(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<String>, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT held_key FROM files \
+                     WHERE group_id = ?1 AND path = ?2 AND state = 'current' \
+                       AND held_reason IS NOT NULL",
+                    rusqlite::params![group_id, path],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten())
         })
     }
 
@@ -782,7 +954,8 @@ impl MaterializationStateRepository {
     pub fn clear_held(&self, group_id: &str, path: &str) -> Result<(), SyncSqliteError> {
         self.database.write::<_, SyncSqliteError>(|conn| {
             conn.execute(
-                "UPDATE files SET held_reason = NULL, held_since_unix_nanos = NULL \
+                "UPDATE files SET held_reason = NULL, held_since_unix_nanos = NULL, \
+                 held_key = NULL \
                  WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
                 rusqlite::params![group_id, path],
             )?;
@@ -792,7 +965,7 @@ impl MaterializationStateRepository {
 
     /// `_in_tx` counterpart of [`Self::clear_held`], for a caller that
     /// already holds an open transaction spanning more writes than just
-    /// this one (C4-6: bounded batching of receiver-side materialization
+    /// this one (bounded batching of receiver-side materialization
     /// commits). Identical SQL/semantics.
     pub fn clear_held_in_tx(
         tx: &rusqlite::Transaction,
@@ -800,7 +973,8 @@ impl MaterializationStateRepository {
         path: &str,
     ) -> Result<(), SyncSqliteError> {
         tx.execute(
-            "UPDATE files SET held_reason = NULL, held_since_unix_nanos = NULL \
+            "UPDATE files SET held_reason = NULL, held_since_unix_nanos = NULL, \
+             held_key = NULL \
              WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
             rusqlite::params![group_id, path],
         )?;
@@ -808,7 +982,7 @@ impl MaterializationStateRepository {
     }
 
     /// Records the identity of the exact on-disk object a `write_placeholder`
-    /// call just created for `group_id`/`path` (M1-2) — always paired with
+    /// call just created for `group_id`/`path` — always paired with
     /// that same call's `Placeholder` state transition, never called on its
     /// own. `dev`/`ino` round-trip losslessly through SQLite's signed
     /// 64-bit `INTEGER` via a bit-pattern cast (`as i64`/`as u64`); the
@@ -843,7 +1017,7 @@ impl MaterializationStateRepository {
         Ok(())
     }
 
-    /// M2-2: atomically "mint-or-read" a placeholder identity -- returns
+    /// Atomically "mint-or-read" a placeholder identity -- returns
     /// whatever identity `group_id`/`path` ends up recorded with, which is
     /// `candidate` if none was recorded yet for `provider_kind`, or the
     /// ALREADY-recorded one otherwise (`candidate` is then discarded,
@@ -853,8 +1027,8 @@ impl MaterializationStateRepository {
     /// this does the check-then-write in ONE `database.write` closure, so
     /// two callers racing to mint a generation for the same path (e.g. two
     /// concurrent `ListFolderFilesRequest` handlers) cannot both "win" --
-    /// exactly the race an independent review found in the two-call
-    /// pattern this replaces at its one call site
+    /// exactly the race a two-call read-then-insert pattern would have
+    /// at its one call site
     /// (`LinkFlushHandle::ensure_windows_placeholder_generation`).
     ///
     /// Only compares against a currently-recorded identity whose
@@ -948,8 +1122,8 @@ impl MaterializationStateRepository {
     /// not merely `placeholder_dev IS NOT NULL`: no production call site
     /// clears a row's identity on every transition OUT of `Placeholder`
     /// today (only `write_placeholder` returning `None` clears it, when a
-    /// fresh placeholder write captured no identity) -- an independent
-    /// review's finding. Without this filter, a file hydrated after being
+    /// fresh placeholder write captured no identity). Without this filter, a file hydrated after
+    /// being
     /// a placeholder would keep exposing its now-meaningless prior
     /// identity here, which a caller comparing against a freshly-observed
     /// disk object could wrongly read as "matches, still untouched" even
@@ -996,7 +1170,7 @@ impl MaterializationStateRepository {
     /// on the `Placeholder` -> `Hydrated` transition (only an explicit
     /// [`Self::clear_placeholder_generation`] call does), so a `Hydrated`
     /// row still exposes the generation its placeholder identity was minted
-    /// under here. M2-3b's Windows eviction path uses this -- reading a
+    /// under here. The Windows eviction path uses this -- reading a
     /// `Hydrated` file's own still-recorded generation as the expected
     /// identity for the native dehydrate call's defense-in-depth check --
     /// which is exactly the "now-meaningless prior identity" scenario
@@ -1082,8 +1256,8 @@ impl MaterializationStateRepository {
     }
 
     /// Every non-deleted, still-`Placeholder` path in `group_id` with NO
-    /// recorded identity -- the exact crash window M1-2's own eviction
-    /// call sites cannot close atomically: `write_placeholder` durably
+    /// recorded identity -- the exact crash window the eviction call
+    /// sites cannot close atomically: `write_placeholder` durably
     /// writes the sparse file, then a SEPARATE commit records its
     /// identity; a crash between the two leaves a row exactly like this.
     /// A caller (`materialization_repair::backfill_placeholder_
@@ -1108,117 +1282,54 @@ impl MaterializationStateRepository {
         })
     }
 
-    /// M5-A review follow-up (blocker #56): records the disk identity
-    /// (`peer_session::disk_race_fingerprint`'s own `(len, mtime, ctime,
-    /// ctime_nsec)` shape, passed here as a plain tuple to avoid this
-    /// lower-level crate depending on `yadorilink-peer-session`) of the
-    /// exact bytes this process JUST wrote via a successful
-    /// `reconstruct_file`, alongside that same call's `Hydrated`
-    /// transition. `None` (this platform/moment could not produce a
-    /// fingerprint, or the just-written file's own `metadata()` call
-    /// failed) clears every column to NULL rather than leaving a stale
-    /// prior fingerprint behind -- same "never trust a fingerprint this
-    /// exact write didn't itself confirm" discipline as `write_placeholder`
-    /// returning `None` clearing `placeholder_dev`/`placeholder_ino`.
-    pub fn record_materialized_fingerprint(
+    /// The internal-mutator commit: publishes the actual-state generation
+    /// for a write this device just performed, stamps the state that
+    /// vouches for it, and clears the materialization intent -- all in one
+    /// durable transaction, and only while the mutation fence is still the
+    /// one this mutator bumped before its first mutating syscall.
+    ///
+    /// Use this whenever THIS device performed the write. The external
+    /// lane -- [`crate::file_index::adopt_local_capture_actual_state`],
+    /// reachable only from inside the local-capture upserts that admit the
+    /// change alongside it -- is not interchangeable with it: adoption
+    /// mints a fresh epoch, which is correct only for an external change
+    /// this device is discovering after the fact. An internal mutator that
+    /// adopts its own write mints an epoch no concurrent mutator can lose
+    /// against, so a racing write silently keeps a proof for bytes that are
+    /// no longer on disk.
+    ///
+    /// Losing -- either the fence moved or `expected_authoring` no longer
+    /// holds -- writes nothing at all, including leaving the caller's
+    /// materialization intent open, since that intent is the only record
+    /// that a write was ever in flight.
+    pub fn commit_internal_materialized_state_if_fence_current(
         &self,
         group_id: &str,
         path: &str,
-        fingerprint: Option<MaterializedFingerprint>,
+        causal_basis: Option<&[yadorilink_replica_domain::ids::ChangeHash]>,
+        exact_state: &crate::exact_materialized_commit::ExactMaterializedState,
+        expected_mutation_generation: i64,
+        expected_authoring: Option<crate::exact_materialized_commit::ExpectedAuthoring<'_>>,
         permit: &RootCommitPermit,
-    ) -> Result<(), SyncSqliteError> {
-        let (len, mtime_nanos, ctime, ctime_nsec) = match fingerprint {
-            Some((len, mtime, ctime, ctime_nsec)) => (
-                Some(len as i64),
-                mtime.and_then(|t| {
-                    t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_nanos() as i64)
-                }),
-                Some(ctime),
-                Some(ctime_nsec),
-            ),
-            None => (None, None, None, None),
-        };
-        self.database.write::<_, SyncSqliteError>(|conn| {
+    ) -> Result<crate::exact_materialized_commit::InternalMaterializedCommit, SyncSqliteError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        self.database.write_immediate::<_, SyncSqliteError>(|tx| {
+            let outcome =
+                crate::exact_materialized_commit::commit_internal_materialized_state_if_fence_current(
+                    tx,
+                    group_id,
+                    path,
+                    causal_basis,
+                    exact_state,
+                    expected_mutation_generation,
+                    expected_authoring,
+                    now,
+                )?;
             permit.verify()?;
-            conn.execute(
-                "UPDATE files SET materialized_fingerprint_len = ?1, \
-                 materialized_fingerprint_mtime_nanos = ?2, materialized_fingerprint_ctime = ?3, \
-                 materialized_fingerprint_ctime_nsec = ?4 \
-                 WHERE group_id = ?5 AND path = ?6 AND state = 'current'",
-                rusqlite::params![len, mtime_nanos, ctime, ctime_nsec, group_id, path],
-            )?;
-            Ok(())
-        })
-    }
-
-    /// `_in_tx` counterpart of [`Self::record_materialized_fingerprint`],
-    /// for a caller that already holds an open transaction spanning more
-    /// writes than just this one (C4-6: bounded batching of receiver-side
-    /// materialization commits). Identical decomposition/SQL/semantics.
-    pub fn record_materialized_fingerprint_in_tx(
-        tx: &rusqlite::Transaction,
-        group_id: &str,
-        path: &str,
-        fingerprint: Option<MaterializedFingerprint>,
-    ) -> Result<(), SyncSqliteError> {
-        let (len, mtime_nanos, ctime, ctime_nsec) = match fingerprint {
-            Some((len, mtime, ctime, ctime_nsec)) => (
-                Some(len as i64),
-                mtime.and_then(|t| {
-                    t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_nanos() as i64)
-                }),
-                Some(ctime),
-                Some(ctime_nsec),
-            ),
-            None => (None, None, None, None),
-        };
-        tx.execute(
-            "UPDATE files SET materialized_fingerprint_len = ?1, \
-             materialized_fingerprint_mtime_nanos = ?2, materialized_fingerprint_ctime = ?3, \
-             materialized_fingerprint_ctime_nsec = ?4 \
-             WHERE group_id = ?5 AND path = ?6 AND state = 'current'",
-            rusqlite::params![len, mtime_nanos, ctime, ctime_nsec, group_id, path],
-        )?;
-        Ok(())
-    }
-
-    /// The materialized-content fingerprint recorded for `group_id`/`path`,
-    /// if any -- `None` if no fingerprint was ever recorded (a pre-existing
-    /// row from before this column existed, or a `Hydrated` row this
-    /// device reached some other way than a verified `reconstruct_file`
-    /// completing) OR the row is not currently `Hydrated`. Every caller
-    /// must treat `None` as "not proven, do not trust the file's current
-    /// bytes as untouched" -- the same fail-closed discipline
-    /// [`Self::get_placeholder_generation`] documents for its own
-    /// identical `materialization_state`-gated shape.
-    pub fn get_materialized_fingerprint(
-        &self,
-        group_id: &str,
-        path: &str,
-    ) -> Result<Option<MaterializedFingerprint>, SyncSqliteError> {
-        type RawFingerprintRow = (Option<i64>, Option<i64>, Option<i64>, Option<i64>);
-        self.database.read::<_, SyncSqliteError>(|conn| {
-            let row: Option<RawFingerprintRow> = conn
-                .query_row(
-                    "SELECT materialized_fingerprint_len, materialized_fingerprint_mtime_nanos, \
-                     materialized_fingerprint_ctime, materialized_fingerprint_ctime_nsec \
-                     FROM files \
-                     WHERE group_id = ?1 AND path = ?2 AND state = 'current' \
-                       AND materialization_state = 'hydrated'",
-                    rusqlite::params![group_id, path],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-                )
-                .optional()?;
-            Ok(row.and_then(|(len, mtime_nanos, ctime, ctime_nsec)| {
-                let (len, ctime, ctime_nsec) = match (len, ctime, ctime_nsec) {
-                    (Some(len), Some(ctime), Some(ctime_nsec)) => (len, ctime, ctime_nsec),
-                    _ => return None,
-                };
-                let mtime = mtime_nanos.map(|nanos| {
-                    std::time::UNIX_EPOCH + std::time::Duration::from_nanos(nanos as u64)
-                });
-                Some((len as u64, mtime, ctime, ctime_nsec))
-            }))
+            Ok(outcome)
         })
     }
 }
@@ -1235,247 +1346,47 @@ pub struct RecordedPlaceholderGeneration {
     pub provider_kind: String,
 }
 
-/// M5-A soak-closure durability investigation, review follow-up: a
-/// reviewer's adversarial pass on the `known_unobtainable_required_content`
-/// fix found the ORIGINAL `block_fetch_refusals` table keyed refusal
-/// evidence by `(group_id, path, peer_device_id)` only -- no version
-/// binding at all. That meant a refusal recorded against an OLDER version
-/// of a path could be misread as evidence about a NEWER version that later
+/// `block_fetch_refusals` binds refusal evidence to the exact version
+/// refused, not just `(group_id, path, peer_device_id)`. Without that
+/// binding, a refusal recorded against an OLDER version of a path could
+/// be misread as evidence about a NEWER version that later
 /// superseded it: author writes V1, a peer refuses V1 (recorded), the
 /// author writes V2 (a distinct version, never refused by anyone) and then
-/// leaves the group -- the OLD V1 refusal alone was enough to flip V2 to
+/// leaves the group -- the OLD V1 refusal alone would flip V2 to
 /// `AtRisk`, a false positive with no true evidence behind it. These tests
-/// exercise the fix directly at the repository layer (deterministic, no
+/// exercise the version binding directly at the repository layer (deterministic, no
 /// topology/network involved) rather than only via the much heavier
 /// full-daemon integration test.
 #[cfg(test)]
-mod block_fetch_refusal_tests {
-    use super::*;
-
-    /// A minimal schema covering only what these tests touch
-    /// (`block_fetch_refusals`) -- `yadorilink_sqlite_runtime::init_schema`
-    /// itself assumes a sibling schema-init call already created `changes`/
-    /// `pruned_changes` (see that function's own doc comment), which these
-    /// tests have no need for. Kept byte-identical to the `CREATE TABLE`
-    /// in `yadorilink-sqlite-runtime/src/schema.rs`.
-    fn open_test_db() -> Arc<SyncDatabase> {
-        Arc::new(
-            SyncDatabase::open_in_memory(|conn| {
-                conn.execute_batch(
-                    "CREATE TABLE IF NOT EXISTS block_fetch_refusals (
-                        group_id              TEXT NOT NULL,
-                        path                  TEXT NOT NULL,
-                        version_hash          TEXT NOT NULL,
-                        peer_device_id        TEXT NOT NULL,
-                        reason                TEXT NOT NULL,
-                        refused_at_unix_nanos INTEGER NOT NULL,
-                        PRIMARY KEY (group_id, path, version_hash, peer_device_id)
-                    );",
-                )
-                .map_err(yadorilink_sqlite_runtime::DatabaseError::from)
-            })
-            .expect("open in-memory db"),
-        )
-    }
-
-    /// The exact false-positive scenario the reviewer described: a refusal
-    /// recorded against V1 must never show up as evidence when the query is
-    /// asked about V2, even for the same `(group_id, path, peer_device_id)`.
-    #[test]
-    fn refusal_recorded_against_one_version_is_invisible_to_a_different_version() {
-        let repo = MaterializationStateRepository::new(open_test_db());
-        let group_id = "group-1";
-        let path = "foo.txt";
-        let v1 = "version-hash-v1";
-        let v2 = "version-hash-v2";
-        let peer = "peer-m";
-
-        repo.record_block_fetch_refusal(
-            group_id,
-            path,
-            v1,
-            peer,
-            "no verified group provenance for this block",
-            1000,
-        )
-        .unwrap();
-
-        assert_eq!(
-            repo.refusing_peers_for_path(group_id, path, v1).unwrap(),
-            std::collections::HashSet::from([peer.to_string()]),
-            "the refused version must see the refusal"
-        );
-        assert!(
-            repo.refusing_peers_for_path(group_id, path, v2).unwrap().is_empty(),
-            "a DIFFERENT version of the same path must never inherit another version's refusal \
-             evidence"
-        );
-    }
-
-    /// A peer that once refused a version but has since successfully
-    /// delivered it can never be read as still refusing it -- the stale-
-    /// evidence-invalidation half of the fix.
-    #[test]
-    fn clearing_a_refusal_removes_only_that_exact_peer_path_version_row() {
-        let repo = MaterializationStateRepository::new(open_test_db());
-        let group_id = "group-1";
-        let path = "foo.txt";
-        let version = "version-hash-v1";
-        let refusing_peer = "peer-m";
-        let other_refusing_peer = "peer-w";
-
-        repo.record_block_fetch_refusal(
-            group_id,
-            path,
-            version,
-            refusing_peer,
-            "no verified group provenance for this block",
-            1000,
-        )
-        .unwrap();
-        repo.record_block_fetch_refusal(
-            group_id,
-            path,
-            version,
-            other_refusing_peer,
-            "no verified group provenance for this block",
-            1000,
-        )
-        .unwrap();
-        assert_eq!(
-            repo.refusing_peers_for_path(group_id, path, version).unwrap().len(),
-            2,
-            "both refusals must be visible before either is cleared"
-        );
-
-        // `refusing_peer` later successfully delivers the block.
-        repo.clear_block_fetch_refusal(group_id, path, version, refusing_peer).unwrap();
-
-        let remaining = repo.refusing_peers_for_path(group_id, path, version).unwrap();
-        assert_eq!(
-            remaining,
-            std::collections::HashSet::from([other_refusing_peer.to_string()]),
-            "clearing one peer's refusal must not affect a different peer's still-standing \
-             refusal for the same path/version"
-        );
-    }
-
-    /// Clearing a refusal for one version must never touch a refusal
-    /// recorded against a DIFFERENT version of the same path/peer -- the
-    /// two rows are independent by construction (different primary keys),
-    /// but this pins that invariant explicitly since it is exactly the kind
-    /// of thing a future schema change could silently break.
-    #[test]
-    fn clearing_a_refusal_for_one_version_does_not_affect_a_different_version() {
-        let repo = MaterializationStateRepository::new(open_test_db());
-        let group_id = "group-1";
-        let path = "foo.txt";
-        let v1 = "version-hash-v1";
-        let v2 = "version-hash-v2";
-        let peer = "peer-m";
-
-        repo.record_block_fetch_refusal(
-            group_id,
-            path,
-            v1,
-            peer,
-            "no verified group provenance for this block",
-            1000,
-        )
-        .unwrap();
-        repo.record_block_fetch_refusal(
-            group_id,
-            path,
-            v2,
-            peer,
-            "no verified group provenance for this block",
-            1000,
-        )
-        .unwrap();
-
-        repo.clear_block_fetch_refusal(group_id, path, v1, peer).unwrap();
-
-        assert!(
-            repo.refusing_peers_for_path(group_id, path, v1).unwrap().is_empty(),
-            "v1's refusal must be gone"
-        );
-        assert_eq!(
-            repo.refusing_peers_for_path(group_id, path, v2).unwrap(),
-            std::collections::HashSet::from([peer.to_string()]),
-            "v2's independent refusal must be untouched by clearing v1's"
-        );
-    }
-}
+mod block_fetch_refusal_tests;
 
 /// `list_held_paths` is the candidate set a hazard re-check sweep walks --
 /// nothing today re-evaluates a held path's hazard once the sibling that
 /// caused it changes, so this listing is the piece that makes such a sweep
 /// possible at all (see the method's own doc comment).
 #[cfg(test)]
-mod held_state_tests {
-    use super::*;
+mod held_state_tests;
 
-    /// Full schema: DAG tables first (`yadorilink_sqlite_runtime::
-    /// init_schema` assumes `changes`/`pruned_changes` already exist, per
-    /// its own doc comment), then the real `files` table.
-    fn open_full_test_db() -> Arc<SyncDatabase> {
-        Arc::new(
-            SyncDatabase::open_in_memory(|conn| {
-                crate::dag_store::init_dag_schema(conn).map_err(|e| {
-                    yadorilink_sqlite_runtime::DatabaseError::CorruptSchema(e.to_string())
-                })?;
-                yadorilink_sqlite_runtime::init_schema(conn)
-            })
-            .expect("open in-memory db"),
-        )
-    }
+/// The startup `Hydrating` reset and the projected-upserts batch both use
+/// that state, for different things, and only the materialization intent
+/// tells them apart.
+///
+/// An abandoned block fetch is `Hydrating` with nothing else: the reset
+/// owns it, and `Placeholder` is exactly right, because nothing was
+/// written and the ordinary hydrate path will redo it.
+///
+/// A batch interrupted between its index commit and its finalizer is
+/// `Hydrating` with an open intent: a row naming the new version, a
+/// durable journal entry saying a write for it was in flight, and on-disk
+/// bytes that may still be the old ones. Startup repair owns that, and can
+/// finish or redo it from blocks that are already local. Demoting it first
+/// hands it instead to the ordinary scan, which sees a `Placeholder` over
+/// bytes that do not match the row and cannot tell a half-finished
+/// materialization from an edit made while the daemon was down -- so it
+/// republishes the stale bytes as a new local version.
+#[cfg(test)]
+mod stale_hydrating_reset_tests;
 
-    fn seed_file_row(conn: &rusqlite::Connection, group_id: &str, path: &str) {
-        conn.execute(
-            "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json) \
-             VALUES (?1, ?2, 0, 0, '[]')",
-            rusqlite::params![group_id, path],
-        )
-        .unwrap();
-    }
-
-    /// Only currently-held paths in the requested group are listed -- an
-    /// unheld path, and a held path from a DIFFERENT group, must not leak
-    /// in.
-    #[test]
-    fn lists_only_currently_held_paths_in_the_requested_group() {
-        let db = open_full_test_db();
-        db.write::<_, SyncSqliteError>(|conn| {
-            seed_file_row(conn, "group-1", "held.txt");
-            seed_file_row(conn, "group-1", "not-held.txt");
-            seed_file_row(conn, "group-2", "held-in-other-group.txt");
-            Ok(())
-        })
-        .unwrap();
-        let repo = MaterializationStateRepository::new(db);
-        repo.set_held("group-1", "held.txt", "case_collision", 1000).unwrap();
-        repo.set_held("group-2", "held-in-other-group.txt", "case_collision", 1000).unwrap();
-
-        assert_eq!(repo.list_held_paths("group-1").unwrap(), vec!["held.txt".to_string()]);
-    }
-
-    /// Once a hold is cleared, the path must disappear from the listing --
-    /// otherwise a sweep built on this method would keep re-visiting a path
-    /// that no longer needs it.
-    #[test]
-    fn a_cleared_hold_disappears_from_the_listing() {
-        let db = open_full_test_db();
-        db.write::<_, SyncSqliteError>(|conn| {
-            seed_file_row(conn, "group-1", "was-held.txt");
-            Ok(())
-        })
-        .unwrap();
-        let repo = MaterializationStateRepository::new(db);
-        repo.set_held("group-1", "was-held.txt", "case_collision", 1000).unwrap();
-        assert_eq!(repo.list_held_paths("group-1").unwrap(), vec!["was-held.txt".to_string()]);
-
-        repo.clear_held("group-1", "was-held.txt").unwrap();
-
-        assert!(repo.list_held_paths("group-1").unwrap().is_empty());
-    }
-}
+/// `materialization_counts` summarizes files, not directories.
+#[cfg(test)]
+mod counts_tests;

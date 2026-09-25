@@ -29,7 +29,7 @@ Artifacts spec (generate --artifacts FILE), JSON:
   [
     {"platform":"macos","arch":"aarch64","install_source":"standalone",
      "artifact_url":"https://.../yadorilink-macos.pkg",
-     "artifact_sha256":"<64 hex>", "artifact_publisher_identity":"Developer ID Installer: ..."},
+     "artifact_sha256":"<64 hex>", "artifact_size":<bytes>, "artifact_publisher_identity":"Developer ID Installer: ..."},
     ...
   ]
 The shared fields (channel, version, minimum_supported_version,
@@ -49,7 +49,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-MANIFEST_SCHEMA_VERSION = 1
+MANIFEST_SCHEMA_VERSION = 2
 CHANNELS = ("nightly", "beta")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -63,6 +63,7 @@ REQUIRED_ENTRY_FIELDS = (
     "minimum_supported_version",
     "artifact_url",
     "artifact_sha256",
+    "artifact_size",
 )
 
 
@@ -102,6 +103,7 @@ def build_manifest(shared: dict, artifacts: list[dict], generated_at: str) -> di
             "mandatory": bool(shared["mandatory"]),
             "artifact_url": a["artifact_url"],
             "artifact_sha256": a["artifact_sha256"].lower(),
+            "artifact_size": int(a["artifact_size"]),
             "artifact_publisher_identity": a.get("artifact_publisher_identity", ""),
             "release_notes_url": shared.get("release_notes_url", ""),
         }
@@ -138,6 +140,9 @@ def validate_manifest(manifest: dict, check_urls: bool) -> list[str]:
         roll = e.get("rollout_percentage", 0)
         if not isinstance(roll, int) or not (0 <= roll <= 100):
             problems.append(f"{where}.rollout_percentage {roll!r} must be an int in 0..100")
+        size = e.get("artifact_size")
+        if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+            problems.append(f"{where}.artifact_size must be a positive integer byte count")
         sha = e.get("artifact_sha256", "")
         if not SHA256_RE.match(sha):
             problems.append(f"{where}.artifact_sha256 must be 64 lowercase hex chars")

@@ -1,0 +1,37 @@
+[package]
+name = "yadorilink-apple-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The Swift binding of the client layer for the macOS app. It exports the
+# product facade (`ClientCore`, `LoginSession`, `StatusWatch`) and owns the
+# one long-lived async runtime every call runs on. Nothing here adds
+# behavior: each method forwards to yadorilink-client-core.
+
+[lib]
+# `staticlib` is what the app links; `lib` lets the bindgen and the tests use
+# the crate as an ordinary Rust library.
+crate-type = ["staticlib", "lib"]
+
+[[bin]]
+# Generates the Swift binding from the built library:
+# `scripts/generate-swift-bindings.sh` runs it.
+name = "uniffi-bindgen-swift"
+path = "src/bin/uniffi-bindgen-swift.rs"
+required-features = ["bindgen"]
+
+[features]
+default = []
+bindgen = ["uniffi/cli"]
+
+[dependencies]
+yadorilink-client-core = { path = "../yadorilink-client-core", features = ["ffi"] }
+uniffi.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -1,14 +1,5 @@
 //! Recovery-inventory domain identity: which local recovery journal a
-//! decoded (or undecoded) row belongs to. Moved down from
-//! `yadorilink-sync-core::recovery` (Phase 7D-9F) so it can be referenced
-//! from `yadorilink-sync-sqlite`'s own repository implementations without
-//! creating a `sync-sqlite -> sync-core` dependency cycle -- the production
-//! dependency direction is `sync-core -> sync-sqlite`, so a type only
-//! `sync-core` owned could never be named from `sync-sqlite`'s own inherent
-//! methods. Pure data with no SQL/database/`SyncState` coupling of its own;
-//! `yadorilink-sync-core::recovery` keeps the business-logic layer (severity
-//! classification, `RecoveryOperationSummary`, the read-only inventory
-//! assembly) that is genuinely coupled to `SyncState` and stays behind.
+//! decoded (or undecoded) row belongs to.
 
 /// Which local journal a decoded/undecoded recovery-inventory row came
 /// from.

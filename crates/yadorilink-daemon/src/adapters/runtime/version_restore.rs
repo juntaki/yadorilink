@@ -43,4 +43,12 @@ impl VersionRestorePort for DaemonVersionRestoreAdapter {
     ) -> BoxFuture<'a, Result<(), SyncError>> {
         Box::pin(hydration::restore_trashed(&self.state, group_id, path))
     }
+
+    fn restore_trashed_operation<'a>(
+        &'a self,
+        group_id: &'a str,
+        path: &'a str,
+    ) -> BoxFuture<'a, Result<hydration::TrashOperationRestore, SyncError>> {
+        Box::pin(hydration::restore_trashed_operation(&self.state, group_id, path))
+    }
 }

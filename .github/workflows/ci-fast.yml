@@ -2,7 +2,7 @@ name: CI fast
 
 on:
   push:
-    branches: [main, "ci/private-pr-*"]
+    branches: [main, "ci/**"]
   pull_request:
 
 permissions:
@@ -41,9 +41,73 @@ jobs:
         # rather than stopping at the first one, so a fix doesn't have to
         # be discovered and landed one crate at a time across repeated CI
         # round-trips.
-        run: cargo test --no-fail-fast --workspace --exclude yadorilink-daemon --exclude yadorilink-desktop-app
+        #
+        # --skip: the auth-runtime-boundaries job owns these two files. They
+        # are skipped here rather than merely tolerated, because one of them
+        # sleeps for 5m20s by design; running it in this job as well would
+        # spend that budget three times over for no additional coverage.
+        #
+        # Spelled out in full rather than as a shared `--skip rotation_`
+        # prefix: `--skip` matches a substring of the whole test path, and that
+        # prefix also silences credential_manager.rs's
+        # `..._while_the_first_holds_the_rotation_lock`, which is not in the
+        # lane and would then run nowhere. check-test-inventory.py derives this
+        # list from the two files and fails if it drifts.
+        run: >-
+          cargo test --no-fail-fast --workspace --exclude yadorilink-daemon --exclude yadorilink-desktop-app
+          --exclude yadorilink-transport --exclude yadorilink-lane-ports
+          --exclude yadorilink-sync-substrate --exclude yadorilink-sync-sqlite
+          --exclude yadorilink-http-api
+          --
+          --skip rotation_without_the_lock_destroys_the_grant
+          --skip rotation_under_the_lock_keeps_the_grant_alive
+          --skip rotation_child
+          --skip a_process_stays_authenticated_across_the_five_minute_access_token_lifetime
       - name: Daemon library tests
         run: cargo test --no-fail-fast -p yadorilink-daemon --lib -- --test-threads=1
+      - name: Change-DAG consistency properties
+        # Seven Strong Eventual Consistency properties over the change-history
+        # DAG in under a second: convergence to an independent batch fold,
+        # store-and-forward chains, crash-restart idempotence, conflict-copy
+        # accounting. Synchronous, no runtime, no simulator. Named here rather
+        # than left to the daemon `--tests` lane in ci-full, because a property
+        # this cheap should fail on the PR that breaks it.
+        run: cargo test --no-fail-fast -p yadorilink-daemon --test dst_sec_convergence
+      - name: Endpoint-binding and timing-sensitive crates, single-threaded
+        # Excluded from the workspace run above and given a lane instead,
+        # because running them alongside everything else is what makes them
+        # flaky rather than what makes them fast:
+        #
+        # * transport, lane-ports, sync-substrate, http-api each bind real
+        #   QUIC endpoints, substrate nodes or an HTTP listener.
+        # * sync-sqlite holds the scale tests, which assert wall-clock
+        #   budgets that concurrent load would distort.
+        #
+        # A whole-crate `--tests -- --test-threads=1` lane is what
+        # check-test-inventory.py reads to exempt a crate's integration files,
+        # so adding a file to one of these crates needs no registration.
+        run: >-
+          cargo test --no-fail-fast -p yadorilink-transport --tests -- --test-threads=1 &&
+          cargo test --no-fail-fast -p yadorilink-lane-ports --tests -- --test-threads=1 &&
+          cargo test --no-fail-fast -p yadorilink-sync-substrate --tests -- --test-threads=1 &&
+          cargo test --no-fail-fast -p yadorilink-sync-sqlite --tests -- --test-threads=1 &&
+          cargo test --no-fail-fast -p yadorilink-http-api --tests -- --test-threads=1
+      - name: Simulation scenarios (turmoil), one seed
+        # The cheap execution lane. `simulation-build` type-checks the turmoil
+        # build; it does not run it, and "compiles but nobody runs it" is
+        # exactly how the madsim suite was lost. One seed each here; the
+        # multi-seed sweeps belong in the scheduled heat workflow.
+        #
+        # DST_SEEDS is read by the scenarios themselves, so the lane's cost is
+        # stated here rather than hidden in a constant.
+        env:
+          RUSTFLAGS: --cfg turmoil
+          DST_SEEDS: "1"
+        run: >-
+          cargo test --no-fail-fast -p yadorilink-daemon
+          --test dst_turmoil_substrate_case
+          --test dst_turmoil_stack_case
+          -- --test-threads=1
       - name: Public boundary checks
         run: |
           python3 scripts/check-architecture.py --self-test
@@ -59,9 +123,58 @@ jobs:
           python3 scripts/check-maintenance-ownership.py
           python3 scripts/check-materialization-journal.py
           python3 scripts/check-mutation-boundary.py
+          python3 scripts/check-materialization-semantic-boundary.py
+          python3 scripts/check-materialization-semantic-boundary.py --self-test
           python3 scripts/check-stored-blocklist-fail-closed.py
           python3 scripts/check-pre-release-compatibility-debt.py
+          bash scripts/check_removed_features.sh --self-test
           bash scripts/check_removed_features.sh
+
+  # The two runtime proofs about the Coordination credential itself. They are a
+  # lane of their own rather than part of the workspace run, and neither reason
+  # is convenience.
+  #
+  # `five_minute_boundary` spends 320 seconds of real wall clock on purpose: it
+  # exists to cross the deployment's own 300-second access-token lifetime, and
+  # shortening that lifetime would only prove the client can refresh a token the
+  # product does not issue. That is five and a half minutes the 20-minute
+  # workspace jobs should not each pay on three platforms.
+  #
+  # `cross_process_rotation` forks two real OS processes that rendezvous on one
+  # credential store. Its control case asserts that refresh-token reuse *is*
+  # detected when the rotation lock is removed, and the locked case asserts an
+  # exact rotation count. Neither should be sharing a runner with a
+  # multi-threaded workspace suite.
+  #
+  # Single-threaded, because these two files are the ones in this workspace that
+  # measure real elapsed time and real process scheduling.
+  auth-runtime-boundaries:
+    runs-on: ubuntu-latest
+    # The boundary test alone is 5m20s; the rest is build time.
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ github.token }}
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master @ 2026-06-30
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: auth-runtime-boundaries
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Coordination credential runtime boundaries
+        # Pinned verbatim by scripts/check-test-inventory.py. Removing either
+        # `--test` argument, or the `--test-threads=1`, fails the inventory gate
+        # rather than silently dropping a security proof out of CI.
+        run: >-
+          cargo test -p yadorilink-fapi-client
+          --test cross_process_rotation
+          --test five_minute_boundary
+          -- --test-threads=1
 
   windows:
     runs-on: windows-latest
@@ -87,7 +200,17 @@ jobs:
         # slower CI hardware (confirmed: exceeded 20 minutes and got
         # cancelled with it). Linux/macOS keep --no-fail-fast since their
         # runs stayed well within budget.
-        run: cargo test --workspace --exclude yadorilink-daemon -- --test-threads=4
+        #
+        # --skip: owned by the auth-runtime-boundaries job; see the Linux
+        # workspace step. On this runner the 5m20s boundary test alone would
+        # be a quarter of the job's whole budget.
+        run: >-
+          cargo test --workspace --exclude yadorilink-daemon
+          -- --test-threads=4
+          --skip rotation_without_the_lock_destroys_the_grant
+          --skip rotation_under_the_lock_keeps_the_grant_alive
+          --skip rotation_child
+          --skip a_process_stays_authenticated_across_the_five_minute_access_token_lifetime
       - name: Windows shell extension
         working-directory: shell-ext/windows
         run: cargo build --release
@@ -111,7 +234,15 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo build --workspace --all-targets
       - name: macOS tests
-        run: cargo test --no-fail-fast --workspace --exclude yadorilink-daemon
+        # --skip: owned by the auth-runtime-boundaries job; see the Linux
+        # workspace step.
+        run: >-
+          cargo test --no-fail-fast --workspace --exclude yadorilink-daemon
+          --
+          --skip rotation_without_the_lock_destroys_the_grant
+          --skip rotation_under_the_lock_keeps_the_grant_alive
+          --skip rotation_child
+          --skip a_process_stays_authenticated_across_the_five_minute_access_token_lifetime
       - name: macOS shell extensions
         run: |
           cargo build --release --manifest-path shell-ext/macos/core/Cargo.toml

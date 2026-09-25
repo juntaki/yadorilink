@@ -1,13 +1,6 @@
-//! Beta acceptance scenario for
-//! non-technical diagnosis of a failed peer connection, exercised
-//! end-to-end over the real control socket (mirrors
-//! `tests/control_socket.rs`/`tests/reporting_ipc.rs`'s own pattern). The
-//! "unexpected ignored path" scenario is covered instead by
-//! `yadorilink-sync-core`'s `ignore_patterns::tests::explain_path_*` suite
-//! and `yadorilink-cli`'s `tests/ignore.rs` `ignore_explain_*` test —
-//! ignore explanation is filesystem-only (no daemon involved, see
-//! `commands::ignore::explain_path_output`), so a daemon-control-socket
-//! test would exercise nothing this suite's own tests don't already cover.
+//! Beta acceptance scenario for non-technical diagnosis of a failed peer
+//! connection, exercised end-to-end over the real control socket (mirrors
+//! `tests/control_socket.rs`/`tests/reporting_ipc.rs`'s own pattern).
 #![cfg(unix)]
 
 use std::sync::Arc;
@@ -21,11 +14,11 @@ use yadorilink_ipc_proto::daemonctl::{
     ConnectivityDoctorRequest, DaemonControlRequest, DaemonControlResponse,
 };
 use yadorilink_ipc_proto::framing::{read_message, write_message};
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 
 async fn start_daemon_with_state() -> (std::path::PathBuf, tempfile::TempDir, Arc<DaemonState>) {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsBlockStore::new(dir.path().join("blocks")).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(dir.path().join("blocks")).unwrap());
     let state_db = Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
     let state = DaemonState::new("device-under-test".into(), state_db, store);
     let socket_path = dir.path().join("daemon.sock");
@@ -78,7 +71,6 @@ async fn diagnosing_a_failed_peer_connection_via_the_doctor() {
         "daemon",
         "listener",
         "coordination_plane",
-        "discovery",
         "authorization",
         "clock_config",
         "policy_disabled",

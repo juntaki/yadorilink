@@ -30,7 +30,7 @@ use yadorilink_ipc_proto::daemonctl::{
     DaemonControlRequest, DaemonControlResponse, ObtainHandoffTicketRequest,
 };
 use yadorilink_ipc_proto::framing::{read_message, write_message};
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
 
 const GROUP: &str = "ticket-durability-group";
@@ -44,7 +44,7 @@ struct Daemon {
 
 fn new_daemon(device_id: &str) -> Daemon {
     let store_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let (sync_state, index_dir) = open_file_backed_replica_coordinator();
     let state = DaemonState::new(device_id.to_string(), Arc::new(sync_state), store);
     ensure_device_signing_key(&state);
@@ -153,6 +153,18 @@ async fn ticket_granted_when_b_is_online_and_can_pin_its_own_roots_at_a_confirme
         .mount(&server)
         .await;
 
+    // Must win the race against `connect_two_daemons`'s own coordination-
+    // plane wiring below: `coordination_client_config` is a set-once
+    // `OnceLock` (matching production semantics -- see its own doc
+    // comment), so whichever caller sets it FIRST wins for the rest of the
+    // process. This test needs device-c's config to be THIS wiremock
+    // server (only it implements the handoff-lease endpoint this test
+    // exercises), not `connect_two_daemons`'s own in-process checkpoint-
+    // issuance fake.
+    c.state.set_coordination_client_config(
+        server.uri(),
+        yadorilink_fapi_client::test_support::offline_auth(),
+    );
     connect_two_daemons(&b.state, "device-b", &c.state, "device-c", &[GROUP.to_string()]).await;
     // Symmetric marking, matching `unlink_and_removal_durability.rs`'s
     // `unlink_setup`: device-c's own target-side readiness self-check (run
@@ -160,9 +172,8 @@ async fn ticket_granted_when_b_is_online_and_can_pin_its_own_roots_at_a_confirme
     // `HandoffLeaseRequest`) needs device-b marked as its own confirming
     // full replica too -- device-c's root set (just `shared.bin`) is a
     // subset of what device-b holds, so this is trivially satisfied.
-    b.state.set_peer_group_full_replica("device-c", GROUP, true);
-    c.state.set_peer_group_full_replica("device-b", GROUP, true);
-    c.state.set_coordination_client_config(server.uri(), "test-access-token-c".to_string());
+    b.state.authority.set_peer_group_full_replica("device-c", GROUP, true);
+    c.state.authority.set_peer_group_full_replica("device-b", GROUP, true);
 
     connect_two_daemons(&x.state, "device-x", &b.state, "device-b", &[GROUP.to_string()]).await;
     tokio::time::sleep(Duration::from_millis(500)).await; // let both sessions establish
@@ -261,12 +272,15 @@ async fn b_attests_its_own_roots_and_x_never_self_attests() {
     give_file(&b, "b_unique.bin", b"only device-b ever holds this", "device-b");
 
     connect_two_daemons(&x.state, "device-x", &c.state, "device-c", &[GROUP.to_string()]).await;
-    x.state.set_peer_group_full_replica("device-c", GROUP, true);
+    x.state.authority.set_peer_group_full_replica("device-c", GROUP, true);
 
     connect_two_daemons(&b.state, "device-b", &c.state, "device-c", &[GROUP.to_string()]).await;
-    b.state.set_peer_group_full_replica("device-c", GROUP, true);
-    c.state.set_peer_group_full_replica("device-b", GROUP, true);
-    c.state.set_coordination_client_config("http://127.0.0.1:1".to_string(), "unused".to_string());
+    b.state.authority.set_peer_group_full_replica("device-c", GROUP, true);
+    c.state.authority.set_peer_group_full_replica("device-b", GROUP, true);
+    c.state.set_coordination_client_config(
+        "http://127.0.0.1:1".to_string(),
+        yadorilink_fapi_client::test_support::offline_auth(),
+    );
 
     connect_two_daemons(&x.state, "device-x", &b.state, "device-b", &[GROUP.to_string()]).await;
     tokio::time::sleep(Duration::from_millis(600)).await; // let every session establish
@@ -275,7 +289,7 @@ async fn b_attests_its_own_roots_and_x_never_self_attests() {
     // call itself ready, confirmed by device-c -- proving this is a
     // realistic case where a self-attesting X would have gotten it wrong.
     assert!(
-        x.state.full_replica_handoff_ready_digest_and_peer(GROUP).await.is_some(),
+        x.state.full_replica_handoff_proof(GROUP).await.is_some(),
         "sanity check: device-x's own (incomplete, missing b_unique.bin) root view must look ready"
     );
 

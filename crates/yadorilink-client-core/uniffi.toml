@@ -1,0 +1,5 @@
+[bindings.swift]
+# The product types' generated Swift file. It is compiled into the same Swift
+# module as the binding crate's (`YadoriLinkFFI`), which refers to these types
+# directly; only the file and its C header are named after this crate.
+module_name = "YadoriLinkCore"

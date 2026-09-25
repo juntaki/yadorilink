@@ -1,15 +1,7 @@
 //! `HandoffLeaseRepository` owns the `handoff_leases` table -- the local
 //! record of a version set this device has pinned against retention expiry
-//! while a full-replica handoff is in progress.
-//!
-//! # Crate split (7D-9D)
-//!
-//! The pin-deadline arithmetic and TTL validation
-//! [`HandoffLeaseRepository::record_handoff_lease_atomic`] uses moved to
-//! `yadorilink_replica_engine::handoff_lease` -- the one piece of this
-//! lifecycle with no SQL and no connection in it, matching the same split
-//! `retained_obligation.rs` already used for its own deletion judgment. This
-//! module keeps the SQL-backed half: schema-shaped row CRUD, the atomic
+//! while a full-replica handoff is in progress. This module keeps the
+//! SQL-backed half: schema-shaped row CRUD, the atomic
 //! re-enumerate-and-pin transaction, and the persisted `HandoffLease`/
 //! `HandoffLeaseState`/`PinnedVersion` value types.
 
@@ -87,12 +79,16 @@ impl HandoffLeaseState {
         }
     }
 
-    pub fn from_db_str(s: &str) -> Self {
+    /// Strict: an unrecognized state is corruption. Coercing it to
+    /// `Provisional` would reopen a lease the writer may have already
+    /// confirmed, released or expired.
+    pub fn try_from_db_str(s: &str) -> Result<Self, String> {
         match s {
-            "confirmed" => HandoffLeaseState::Confirmed,
-            "released" => HandoffLeaseState::Released,
-            "expired" => HandoffLeaseState::Expired,
-            _ => HandoffLeaseState::Provisional,
+            "provisional" => Ok(HandoffLeaseState::Provisional),
+            "confirmed" => Ok(HandoffLeaseState::Confirmed),
+            "released" => Ok(HandoffLeaseState::Released),
+            "expired" => Ok(HandoffLeaseState::Expired),
+            other => Err(format!("unknown handoff-lease state: {other}")),
         }
     }
 }
@@ -324,20 +320,36 @@ impl HandoffLeaseRepository {
     }
 }
 
+fn handoff_lease_decode_error(column_index: usize, detail: impl Into<String>) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        column_index,
+        rusqlite::types::Type::Text,
+        Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, detail.into())),
+    )
+}
+
 pub fn row_to_handoff_lease(r: &rusqlite::Row<'_>) -> rusqlite::Result<HandoffLease> {
+    // Every writer stores a 32-byte digest and `serde_json::to_string` of
+    // the pinned set. A short digest or unparseable JSON is corruption: an
+    // all-zero root would compare equal to nothing and an empty pinned set
+    // would silently unpin every version this lease is holding.
     let root_digest_vec: Vec<u8> = r.get(2)?;
-    let mut root_digest = [0u8; 32];
-    if root_digest_vec.len() == 32 {
-        root_digest.copy_from_slice(&root_digest_vec);
-    }
+    let root_digest: [u8; 32] = root_digest_vec.as_slice().try_into().map_err(|_| {
+        handoff_lease_decode_error(
+            2,
+            format!("root digest is {} bytes, not 32", root_digest_vec.len()),
+        )
+    })?;
     let pinned_json: String = r.get(4)?;
-    let pinned_versions: Vec<PinnedVersion> =
-        serde_json::from_str(&pinned_json).unwrap_or_default();
+    let pinned_versions: Vec<PinnedVersion> = serde_json::from_str(&pinned_json).map_err(|e| {
+        handoff_lease_decode_error(4, format!("pinned versions are not valid JSON: {e}"))
+    })?;
     Ok(HandoffLease {
         lease_id: r.get(0)?,
         group_id: r.get(1)?,
         root_digest,
-        state: HandoffLeaseState::from_db_str(&r.get::<_, String>(3)?),
+        state: HandoffLeaseState::try_from_db_str(&r.get::<_, String>(3)?)
+            .map_err(|e| handoff_lease_decode_error(3, e))?,
         pinned_versions,
         created_at_unix: r.get(5)?,
         expires_at_unix: r.get(6)?,

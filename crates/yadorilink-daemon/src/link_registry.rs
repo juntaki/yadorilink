@@ -86,8 +86,7 @@ pub(crate) enum DrainedLink {
 }
 
 /// A linked folder's Degraded (disk-pressure) state -- in-memory only,
-/// deliberately not persisted (mirrors `paused_paths`'s "transient"
-/// rationale): it's re-derived from live disk state on the very next
+/// deliberately not persisted: it's re-derived from live disk state on the very next
 /// preflight/re-check either way, so persisting it across a restart would
 /// only risk it going stale.
 #[derive(Debug, Clone)]

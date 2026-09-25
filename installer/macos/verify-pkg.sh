@@ -118,20 +118,24 @@ else
 fi
 
 # --- 5. Payload contents --------------------------------------------------
-# Confirms the status app binary is actually present in the built payload
-# — a real, if narrow, smoke test that doesn't require installing the pkg
-# or a running window manager: `pkgutil --expand-full` recursively expands
-# the outer distribution pkg's nested component pkg(s) and unpacks each
-# `Payload` to plain files, so this is checking the exact bytes that would
-# land on disk at `/usr/local/bin/yadorilink-status-app`.
-log "payload contents (yadorilink-status-app)"
+# Confirms the payload carries the YadoriLink menu bar app and no longer
+# carries the eframe status app — a narrow smoke test that doesn't require
+# installing the pkg: `pkgutil --expand-full` recursively expands the outer
+# distribution pkg's nested component pkg(s) and unpacks each `Payload` to
+# plain files, so this checks what would land on disk.
+log "payload contents (YadoriLink.app, no yadorilink-status-app)"
 EXPAND_DIR="$(mktemp -d "${TMPDIR:-/tmp}/verify-pkg-expand.XXXXXX")"
 trap 'rm -rf "$EXPAND_DIR"' EXIT
 if pkgutil --expand-full "$PKG" "$EXPAND_DIR/expanded" >/tmp/verify-pkg-expand.$$ 2>&1; then
-    if find "$EXPAND_DIR/expanded" -type f -name "yadorilink-status-app" | grep -q .; then
-        ok "payload includes usr/local/bin/yadorilink-status-app"
+    if find "$EXPAND_DIR/expanded" -type d -path "*/Applications/YadoriLink.app" | grep -q .; then
+        ok "payload includes Applications/YadoriLink.app"
     else
-        fail "payload does not include yadorilink-status-app"
+        fail "payload does not include Applications/YadoriLink.app"
+    fi
+    if find "$EXPAND_DIR/expanded" -name "yadorilink-status-app" | grep -q .; then
+        fail "payload still includes yadorilink-status-app"
+    else
+        ok "payload does not include yadorilink-status-app"
     fi
 else
     fail "pkgutil --expand-full failed"

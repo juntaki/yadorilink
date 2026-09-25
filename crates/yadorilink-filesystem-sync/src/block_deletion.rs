@@ -1,26 +1,9 @@
-//! Mark-and-sweep physical block-store GC, split out of
-//! `yadorilink-sync-core`'s `block_deletion.rs` in Phase 7D-9C.
-//!
-//! `BlockDeletionCoordinator` originally held two methods: `sweep` (this
-//! function) and `reclaim_cached_blocks` (stays in sync-core — it needs
-//! `&dyn crate::ports::MaterializationStatePort`, a trait definition that
-//! has not itself left sync-core yet). `sweep` has no such dependency: it
-//! only ever calls through `&dyn BlockReclamationStore` (already owned by
-//! `yadorilink-local-storage`, re-exported from `yadorilink-sync-core::ports`
-//! only for convenience) and returns exactly what that trait's own `sweep`
-//! method returns, so it moves independently, without waiting on the port
-//! split.
-//!
 //! `sweep`'s original signature took a `BlockDeletionReason` enum and
 //! refused any value but `GloballyUnreferenced` with a `SyncError::
 //! InvalidInput` at runtime. A workspace-wide grep before this move found
 //! `BlockDeletionReason::CorruptBlock` (the enum's only other variant) is
 //! never constructed anywhere — not in production code, not in any test —
-//! so the guard existed to gate a value nothing has ever passed. Moving
-//! this function to a crate that must not depend on `yadorilink-sync-core`'s
-//! `SyncError` for the sole purpose of preserving a guard against a dead
-//! enum variant would mean either inventing a new error type just for this,
-//! or leaving the function returning the wrong crate's error type. Neither
+//! so the guard existed to gate a value nothing has ever passed. Neither
 //! is warranted: the `reason` parameter and `BlockDeletionReason` are
 //! dropped here rather than carried forward, and this function returns
 //! `yadorilink_local_storage::StorageError` directly — the same type

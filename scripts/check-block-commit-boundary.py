@@ -1,5 +1,21 @@
 #!/usr/bin/env python3
-"""Keep final block publication/removal behind FsBlockStore's commit backend."""
+"""Keep block-store publication/removal primitives behind one capability seam.
+
+`yadorilink-local-storage` removes and replaces filesystem objects (retired
+block segments, recovery leftovers, materialization temp files) and issues
+directory durability barriers. All of that goes through `fs_ops.rs`, so an
+audit of "where does this crate unlink, rename, or flush a directory?" has
+exactly one place to look. This guard pins that seam:
+
+  * `fs_ops.rs` holds exactly one of each primitive; and
+  * no other module in the crate calls a raw `fs::hard_link`, `fs::rename`,
+    `fs::remove_file`, `fs::remove_dir` or `fs::remove_dir_all`.
+
+The segment store's own ordering invariant (segment bytes are fsynced before
+the index transaction that names them commits) is not a textual property; it
+is proven by the crash matrix in
+`crates/yadorilink-local-storage/tests/segment_store_crash.rs`.
+"""
 
 from pathlib import Path
 import re
@@ -7,7 +23,7 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BACKEND = ROOT / "crates/yadorilink-local-storage/src/fs_backend.rs"
+SEAM = ROOT / "crates/yadorilink-local-storage/src/fs_ops.rs"
 LOCAL_STORAGE_SRC = ROOT / "crates/yadorilink-local-storage/src"
 
 
@@ -16,43 +32,57 @@ def production_text(path: Path) -> str:
     return text.split("\n#[cfg(test)]\nmod tests", 1)[0]
 
 
+def is_test_file(path: Path) -> bool:
+    return path.name == "tests.rs" or path.name.endswith("_tests.rs")
+
+
 def locations(pattern: str, text: str) -> list[int]:
     compiled = re.compile(pattern)
     return [index for index, line in enumerate(text.splitlines(), 1) if compiled.search(line)]
 
 
 def main() -> int:
-    backend = production_text(BACKEND)
+    if not SEAM.is_file():
+        print(
+            f"block commit boundary: {SEAM.relative_to(ROOT)} is missing; "
+            "retarget this guard to wherever the crate's filesystem seam now lives",
+            file=sys.stderr,
+        )
+        return 1
+    seam = production_text(SEAM)
     violations: list[str] = []
 
     expected_counts = {
-        r"\bfs::hard_link\(": (1, "atomic no-replace publish primitive"),
+        r"\bfs::hard_link\(": (1, "publish-if-absent primitive"),
         r"\bfs::remove_file\(": (1, "physical removal primitive"),
-        r"\bfs::rename\(": (1, "corrupt-block quarantine relocation primitive"),
-        r"\.commit_block\(": (1, "commit_block caller"),
-        r"\bfile\.sync_all\(": (1, "temp-file durability sync"),
+        r"\bfs::rename\(": (1, "atomic replace primitive"),
         r"fs::File::open\(path\)\?\.sync_all\(": (1, "Unix directory durability sync"),
         r"\bCreateFileW\(": (1, "Windows directory handle open"),
         r"\bFlushFileBuffers\(": (1, "Windows directory durability flush"),
     }
     for pattern, (expected, label) in expected_counts.items():
-        found = locations(pattern, backend)
+        found = locations(pattern, seam)
         if len(found) != expected:
             violations.append(
-                f"{BACKEND.relative_to(ROOT)}: expected {expected} {label}, "
+                f"{SEAM.relative_to(ROOT)}: expected {expected} {label}, "
                 f"found {len(found)} at lines {found}"
             )
 
-    # Other local-storage modules may delegate through BlockStore, but must
-    # never acquire a second raw filesystem publication/removal primitive.
-    raw_mutation = re.compile(r"\b(?:std::)?fs::(?:hard_link|rename|remove_file)\(")
-    for path in LOCAL_STORAGE_SRC.rglob("*.rs"):
-        if path == BACKEND:
+    # Every other module must go through `fs_ops` rather than acquire a
+    # second raw publication/removal primitive.
+    raw_mutation = re.compile(
+        r"\b(?:std::)?fs::(?:hard_link|rename|remove_file|remove_dir|remove_dir_all)\("
+    )
+    for path in sorted(LOCAL_STORAGE_SRC.rglob("*.rs")):
+        if path == SEAM or is_test_file(path):
             continue
         for line_number, line in enumerate(production_text(path).splitlines(), 1):
+            if line.lstrip().startswith("//"):
+                continue
             if raw_mutation.search(line):
                 violations.append(
-                    f"{path.relative_to(ROOT)}:{line_number}: raw block mutation outside fs_backend"
+                    f"{path.relative_to(ROOT)}:{line_number}: raw filesystem "
+                    "publication/removal outside fs_ops.rs"
                 )
 
     if violations:

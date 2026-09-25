@@ -1,6 +1,7 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
-use super::ports::{LinkCommand, LinkRepositoryPort, LinkWatcherPort};
+use super::ports::{LinkCommand, LinkOutcome, LinkRepositoryPort, LinkWatcherPort};
 use crate::error::DaemonError;
 
 /// The single entry point for creating a link -- both the plain
@@ -19,6 +20,15 @@ use crate::error::DaemonError;
 pub(crate) struct LinkLifecycleService {
     repository: Arc<dyn LinkRepositoryPort>,
     watcher: Arc<dyn LinkWatcherPort>,
+    /// One async lock per local path with a `link()` call in flight. Held
+    /// across the whole call -- the already-linked check, the commit, the
+    /// watcher start and any rollback -- so two concurrent links of one
+    /// folder (the CLI and the desktop app, a double submit) run one after
+    /// the other. Without it both can pass the check before either runtime
+    /// holds the path, and the one that loses the start rolls back a row
+    /// the other's running link now depends on. An entry is removed once
+    /// no call holds or waits for it.
+    path_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl LinkLifecycleService {
@@ -26,7 +36,7 @@ impl LinkLifecycleService {
         repository: Arc<dyn LinkRepositoryPort>,
         watcher: Arc<dyn LinkWatcherPort>,
     ) -> Self {
-        Self { repository, watcher }
+        Self { repository, watcher, path_locks: Mutex::new(HashMap::new()) }
     }
 
     /// Whether `local_path` is CURRENTLY a live link for `group_id`, read
@@ -46,7 +56,30 @@ impl LinkLifecycleService {
         Ok(self.repository.live_link_paths_for_group(group_id)?.iter().any(|p| p == local_path))
     }
 
-    pub(crate) async fn link(&self, command: LinkCommand) -> Result<(), DaemonError> {
+    pub(crate) async fn link(&self, command: LinkCommand) -> Result<LinkOutcome, DaemonError> {
+        let path_lock = self
+            .path_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(command.local_path.clone())
+            .or_default()
+            .clone();
+        let local_path = command.local_path.clone();
+        let result = {
+            let _serialized = path_lock.lock().await;
+            self.link_serialized(command).await
+        };
+        let mut locks = self.path_locks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The map's own reference plus this call's: nobody else holds or
+        // waits for it, so the entry can go.
+        if Arc::strong_count(&path_lock) == 2 {
+            locks.remove(&local_path);
+        }
+        result
+    }
+
+    /// [`Self::link`]'s body, run while this path's lock is held.
+    async fn link_serialized(&self, command: LinkCommand) -> Result<LinkOutcome, DaemonError> {
         // Deliberately NOT gated by `!command.acknowledge_risks` the way the
         // nested-path preflight below is: a second live root on one group is
         // never acceptable at any confirmation level, because each root's
@@ -55,7 +88,8 @@ impl LinkLifecycleService {
         // `any(|p| p != &command.local_path)` rather than `!is_empty()`:
         // re-linking the SAME folder to the same group is idempotent and
         // must stay allowed -- it is exactly what a `share join` retry does
-        // after a failed link's rollback.
+        // after a failed link's rollback, and (below) a no-op when that
+        // link is already running.
         let live_for_group = self.repository.live_link_paths_for_group(&command.group_id)?;
         if live_for_group.iter().any(|p| p != &command.local_path) {
             return Err(DaemonError::Config(format!(
@@ -67,11 +101,35 @@ impl LinkLifecycleService {
                 live_for_group.join(", ")
             )));
         }
-        if command.pending_enrollment.is_none()
-            && live_for_group.iter().any(|path| path == &command.local_path)
-            && self.watcher.is_ready(&command.local_path)
+        // The same folder, already linked to this group, with a runtime
+        // holding it: settle it here, before anything is committed. The
+        // watcher refuses a second start for a path it already holds, so a
+        // call that got past this point would always fail at start -- and
+        // its rollback would then be undoing a row the running link depends
+        // on. This applies to an enrollment re-join (`share join` run again)
+        // exactly as to a plain `link`: no second pending marker is written
+        // for a link that is already live.
+        if live_for_group.iter().any(|path| path == &command.local_path)
+            && self.watcher.is_registered(&command.local_path)
         {
-            return Ok(());
+            if self.watcher.is_ready(&command.local_path) {
+                tracing::info!(
+                    local_path = %command.local_path,
+                    group_id = %command.group_id,
+                    "folder is already linked to this group and running; nothing to do"
+                );
+                return Ok(LinkOutcome::AlreadyLinked);
+            }
+            // Still `Starting`: that attempt's fallible work has not landed
+            // yet and may still fail and roll back, so reporting "already
+            // linked" now could claim a link that is about to disappear.
+            // Refuse without touching anything instead; a retry once it has
+            // settled gets a definite answer.
+            return Err(DaemonError::Config(format!(
+                "{} is still being linked to folder group {}; wait for that to finish, then \
+                 check `yadorilink status`",
+                command.local_path, command.group_id
+            )));
         }
 
         let existing_paths = self.repository.list_link_paths()?;
@@ -114,14 +172,14 @@ impl LinkLifecycleService {
         // method returns as "nothing was created", so a failure past this
         // point must roll the just-committed row(s) back rather than return
         // `Err` with local state left behind.
-        match &command.pending_enrollment {
+        let link_write = match &command.pending_enrollment {
             None => self.repository.commit_plain_link(&command.local_path, &command.group_id)?,
             Some(marker) => self.repository.commit_link_with_pending_enrollment(
                 &command.local_path,
                 &command.group_id,
                 marker,
             )?,
-        }
+        };
 
         if let Err(e) = self
             .watcher
@@ -133,6 +191,13 @@ impl LinkLifecycleService {
             )
             .await
         {
+            // The rollback undoes exactly what the commit above did to the
+            // link row -- deletes a row it inserted, restores a row it
+            // updated -- never an unconditional delete of whatever row sits
+            // at this path: a re-link of a folder that was already linked
+            // updated that existing row, and deleting it would destroy the
+            // earlier link and its adopted root token.
+            //
             // The rollback itself is best-effort against the same SQLite
             // database the commit above just used, so it is expected to
             // succeed in practice -- but it is not guaranteed to (e.g. a
@@ -144,15 +209,31 @@ impl LinkLifecycleService {
             // live, reconcile-eligible link this device's own logs are the
             // only record of.
             let rollback_result = match &command.pending_enrollment {
-                None => self.repository.remove_link(&command.local_path),
+                None => self.repository.undo_plain_link(
+                    &command.local_path,
+                    &command.group_id,
+                    &link_write,
+                ),
                 Some(marker) => self.repository.rollback_local_setup_to_cancel_pending(
                     &command.local_path,
+                    &command.group_id,
+                    &link_write,
                     &marker.operation_id,
                     &e.to_string(),
                 ),
             };
             return Err(match rollback_result {
-                Ok(()) => e,
+                Ok(undone) => {
+                    tracing::warn!(
+                        error = %e,
+                        local_path = %command.local_path,
+                        group_id = %command.group_id,
+                        undone,
+                        "link setup failed after its commit; rolled back this attempt's local \
+                         link state"
+                    );
+                    e
+                }
                 Err(rollback_err) => {
                     tracing::error!(
                         error = %rollback_err,
@@ -209,6 +290,6 @@ impl LinkLifecycleService {
             }
         }
 
-        Ok(())
+        Ok(LinkOutcome::Linked)
     }
 }

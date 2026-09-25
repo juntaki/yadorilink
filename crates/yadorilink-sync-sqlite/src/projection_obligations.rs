@@ -22,7 +22,6 @@
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::SyncSqliteError;
-use yadorilink_replica_domain::change::Change;
 
 pub fn init_projection_obligations_schema(conn: &Connection) -> Result<(), SyncSqliteError> {
     conn.execute_batch(
@@ -34,6 +33,12 @@ pub fn init_projection_obligations_schema(conn: &Connection) -> Result<(), SyncS
             state                   TEXT NOT NULL,
             created_at              INTEGER NOT NULL,
             updated_at              INTEGER NOT NULL,
+            attempt_count           INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at         INTEGER NOT NULL DEFAULT 0,
+            obligation_incarnation  INTEGER NOT NULL DEFAULT 0,
+            -- Which bump seam last touched this row; `'remote'` is the
+            -- veto-preserving value (see `ObligationOrigin`).
+            origin                  TEXT NOT NULL DEFAULT 'remote',
             PRIMARY KEY (group_id, path)
         );
         -- Backs `obligation_incarnation` below: a real SQLite `AUTOINCREMENT`
@@ -49,63 +54,13 @@ pub fn init_projection_obligations_schema(conn: &Connection) -> Result<(), SyncS
         );
         "#,
     )?;
-    // Lightweight migration, same idempotent shape as `materialization_jobs`'s
-    // own `trigger_lamport` column: a database from before these columns
-    // existed keeps `attempt_count = 0`/`next_attempt_at = 0` on every
-    // pre-existing row, which is safe -- both defaults mean "never failed,
-    // immediately claimable," exactly what a row with no attempt history
-    // yet should read as.
-    //
-    // `attempt_count`/`next_attempt_at` back the scheduler's own retry
-    // backoff (`mark_obligation_attempt_failed`): a transient failure
-    // advances `next_attempt_at` into the future without touching
-    // `invalidation_generation`, so `claim_runnable_obligations` stops
-    // reclaiming the row until then; a fresh admission's bump (`bump_
-    // projection_obligations_for_touched_paths`) unconditionally resets
-    // both back to 0, since a new desired state must never be delayed by
-    // an old generation's backoff. `HazardHeld`/`IgnoreExcluded` settlements
-    // are deliberately NOT recorded through this mechanism at all -- they
-    // close (or stay outstanding) via their own dedicated liveness sweeps
-    // (the hazard-recheck loop, the ignore-set refresh), never generic
-    // scheduler backoff; see `yadorilink-daemon`'s `process_group_via_
-    // obligations` for where that separation is enforced.
-    // `obligation_incarnation` migrates the same idempotent way, defaulting
-    // existing rows to the sentinel `0` -- safe forever, not just at
-    // migration time, because `projection_obligation_incarnations`'
-    // `AUTOINCREMENT` sequence starts at 1 and only grows, so `0` is never
-    // handed out to any row's fresh incarnation and can never collide with
-    // one. A pre-migration row is, by construction, the only live
-    // incarnation of its `(group_id, path)` at the moment the migration
-    // runs (nothing holds an in-memory `ClaimedObligation` across a process
-    // restart, which a schema migration requires), so it needs no more than
-    // this one shared, permanently-unique sentinel.
-    // `origin` migrates the same idempotent way, defaulting existing rows to
-    // `'remote'` -- the fail-closed choice: a pre-migration row carries no
-    // record of which of the four bump seams last touched it, and `'remote'`
-    // is exactly the veto-preserving default (see `ObligationOrigin`'s own
-    // doc comment) -- treating an unknown-origin row as if it might still
-    // need content placed from elsewhere, never as self-evidently safe to
-    // wave through.
-    for stmt in [
-        "ALTER TABLE projection_obligations ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE projection_obligations ADD COLUMN next_attempt_at INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE projection_obligations ADD COLUMN obligation_incarnation INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE projection_obligations ADD COLUMN origin TEXT NOT NULL DEFAULT 'remote'",
-    ] {
-        match conn.execute(stmt, []) {
-            Ok(_) => {}
-            Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
-                if msg.starts_with("duplicate column name") =>
-            {
-                // Already migrated.
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_projection_obligations_runnable
              ON projection_obligations (state, next_attempt_at);",
     )?;
+    // The claim below reads it, so it exists wherever obligations do.
+    crate::paused_items::init_paused_items_schema(conn)?;
+    crate::snapshot_install_hold::init_snapshot_install_hold_schema(conn)?;
     Ok(())
 }
 
@@ -121,11 +76,11 @@ pub fn init_projection_obligations_schema(conn: &Connection) -> Result<(), SyncS
 /// (`admit_change`'s primary/promoted-orphan arms, `admit_prepared_
 /// emission`) that transaction is the caller's `write_immediate`; for
 /// startup self-heal it is `init_dag_schema`'s own explicit
-/// `unchecked_transaction` (C4-12 Stage 0.5.2). A no-op for an empty
+/// `unchecked_transaction`. A no-op for an empty
 /// `touched_paths` (matches `bump_execution_fence_for_change`'s own
 /// early-return shape for the same case).
 ///
-/// **Phase E finding (obligation row-incarnation ABA)**: `invalidation_
+/// **Obligation row-incarnation ABA**: `invalidation_
 /// generation` alone identifies a claim only for as long as the row it was
 /// read from keeps existing. The completion primitives below all `DELETE`
 /// the row on success (`IgnoreExcluded` is the one exception -- see its own
@@ -162,20 +117,19 @@ pub fn bump_projection_obligations_for_touched_paths(
         // upsert below is about to insert or update, which is exactly the
         // information a single upsert statement doesn't expose. The ROW
         // this INSERT creates, however, is immediately deleted again right
-        // below (a Codex review's finding on an earlier draft of this fix:
-        // leaving it in place made `projection_obligation_incarnations`
+        // below (an earlier draft of this fix left it in place:
+        // that made `projection_obligation_incarnations`
         // grow by one permanent row per touched-path event -- unbounded
         // storage growth proportional to total admitted mutations, not to
         // live obligations). This is safe: SQLite's `AUTOINCREMENT` tracks
         // the high-water mark for this table in `sqlite_sequence`
         // independently of which rows currently exist, so deleting the row
         // can never cause a later `INSERT` to reuse `fresh_incarnation`.
-        conn.execute("INSERT INTO projection_obligation_incarnations DEFAULT VALUES", [])?;
+        conn.prepare_cached("INSERT INTO projection_obligation_incarnations DEFAULT VALUES")?
+            .execute([])?;
         let fresh_incarnation = conn.last_insert_rowid();
-        conn.execute(
-            "DELETE FROM projection_obligation_incarnations WHERE id = ?1",
-            rusqlite::params![fresh_incarnation],
-        )?;
+        conn.prepare_cached("DELETE FROM projection_obligation_incarnations WHERE id = ?1")?
+            .execute(rusqlite::params![fresh_incarnation])?;
         // `origin` is always written as `'remote'` here, on BOTH the fresh
         // `INSERT` and the `ON CONFLICT` bump-in-place arm -- this is the
         // universal, conservative default every one of this function's
@@ -191,7 +145,7 @@ pub fn bump_projection_obligations_for_touched_paths(
         // this device has not necessarily placed -- see `ObligationOrigin`'s
         // own doc comment for why leaving a stale `'local'` tag in place
         // across a subsequent remote bump would be unsound.
-        conn.execute(
+        conn.prepare_cached(
             "INSERT INTO projection_obligations
                 (group_id, path, invalidation_generation, state, attempt_count,
                  next_attempt_at, created_at, updated_at, obligation_incarnation, origin)
@@ -203,15 +157,16 @@ pub fn bump_projection_obligations_for_touched_paths(
                 next_attempt_at = ?3,
                 updated_at = ?3,
                 origin = 'remote'",
-            rusqlite::params![group_id, path, now_unix_nanos, fresh_incarnation],
-        )?;
+        )?
+        .execute(rusqlite::params![group_id, path, now_unix_nanos, fresh_incarnation])?;
     }
     Ok(())
 }
 
 /// Diagnostic/test-only read of one path's current obligation, or `None` if
 /// no admission has ever touched it. Not consumed by any production
-/// scheduling path yet -- that is Stage 4's claim mechanism.
+/// scheduling path -- production claims go through
+/// [`claim_runnable_obligations`].
 pub fn lookup_projection_obligation(
     conn: &Connection,
     group_id: &str,
@@ -248,7 +203,7 @@ pub struct ProjectionObligation {
     pub created_at: i64,
     pub updated_at: i64,
     /// See [`bump_projection_obligations_for_touched_paths`]'s own doc
-    /// comment (Phase E finding: obligation row-incarnation ABA).
+    /// comment (obligation row-incarnation ABA).
     pub obligation_incarnation: i64,
     /// Which of the four admission seams' bump most recently touched this
     /// row. See [`ObligationOrigin`]'s own doc comment for what this
@@ -350,8 +305,8 @@ pub fn mark_projection_obligations_local_origin(
 /// desired state is always recomputed fresh at resolve time, never carried
 /// from claim time, so there is nothing here that could go stale between
 /// claim and close other than `G` itself and `obligation_incarnation`,
-/// which the completion primitives re-check directly (Phase E finding: `G`
-/// alone is not enough -- see `bump_projection_obligations_for_touched_
+/// which the completion primitives re-check directly (`G` alone is not
+/// enough -- see `bump_projection_obligations_for_touched_
 /// paths`'s own doc comment for the row-incarnation ABA this closes).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimedObligation {
@@ -387,13 +342,27 @@ pub struct ClaimedObligation {
 /// that reclaims the same still-outstanding obligation on a later tick
 /// before a prior attempt finishes is therefore a performance question
 /// (redundant concurrent work), never a correctness one.
+///
+/// A path covered by a paused item (see `crate::paused_items`) is not
+/// runnable: its obligation stays exactly as admission left it, pending,
+/// until the item is resumed. Excluded here rather than skipped after the
+/// claim, because a paused row skipped later would still take a slot of
+/// its group's per-group window on every tick, and the oldest rows fill
+/// that window first -- a paused folder with enough held changes would
+/// starve every other path of its group.
+///
+/// A path a snapshot install holds (see `crate::snapshot_install_hold`) is
+/// excluded the same way, for a stronger reason: projecting the installed
+/// version would overwrite whatever is on disk there, and until the
+/// install's reconciliation has looked at it that may be an edit nobody has
+/// captured.
 pub fn claim_runnable_obligations(
     conn: &Connection,
     now_unix_nanos: i64,
     per_group_limit: u32,
     total_limit: u32,
 ) -> Result<Vec<ClaimedObligation>, SyncSqliteError> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "WITH runnable AS ( \
             SELECT group_id, path, invalidation_generation, obligation_incarnation, \
                    attempt_count, updated_at, \
@@ -402,13 +371,23 @@ pub fn claim_runnable_obligations(
             ) AS group_rank \
             FROM projection_obligations \
             WHERE state = 'pending' AND next_attempt_at <= ?1 \
+              AND NOT {paused} \
+              AND NOT {held} \
          ) \
          SELECT group_id, path, invalidation_generation, obligation_incarnation, attempt_count \
          FROM runnable \
          WHERE group_rank <= ?2 \
          ORDER BY updated_at ASC, path ASC \
          LIMIT ?3",
-    )?;
+        paused = crate::paused_items::covered_by_paused_item_sql(
+            "projection_obligations.group_id",
+            "projection_obligations.path",
+        ),
+        held = crate::snapshot_install_hold::held_sql(
+            "projection_obligations.group_id",
+            "projection_obligations.path",
+        ),
+    ))?;
     let rows =
         stmt.query_map(rusqlite::params![now_unix_nanos, per_group_limit, total_limit], |r| {
             Ok(ClaimedObligation {
@@ -513,7 +492,7 @@ pub fn defer_obligation_without_penalty(
 /// already bounds worst-case retry latency to about a second regardless of
 /// backoff, which is sufficient liveness for the initial obligation-driven
 /// cutover -- a dynamic earliest-deadline timer built on this query is a
-/// possible future optimization, not a Phase B/C requirement. `None` when
+/// possible future optimization, not a requirement. `None` when
 /// there is nothing pending at all, or everything pending is already
 /// runnable (in which case the caller should be draining, not computing a
 /// wake deadline).
@@ -642,6 +621,13 @@ pub enum NonExactProofKind {
     /// durable row to find and `rearm_ignore_blocked_obligation` back to
     /// `'pending'` once the path is no longer locally ignored.
     IgnoreExcluded,
+    /// Closes against the path's EXISTING retained-directory record
+    /// (`crate::structural_origin::record_retained_directory`): the
+    /// replicated entry is settled as deleted, and the physical directory
+    /// stays because it is not empty. A record cleared between the
+    /// decision and this close (the directory was removed, or the path
+    /// took an entry again) leaves the obligation for re-resolution.
+    RetainedDirectory,
 }
 
 /// The non-exact-outcome counterpart of
@@ -706,6 +692,22 @@ pub fn complete_obligation_if_non_exact_proof_current(
         // DIFFERENT, already-deleted incarnation of this same path must
         // never be able to park a brand-new incarnation as ignore-blocked
         // just because the generation numbers happen to coincide.
+        NonExactProofKind::RetainedDirectory => conn.execute(
+            "DELETE FROM projection_obligations
+              WHERE group_id = ?1 AND path = ?2
+                AND invalidation_generation = ?3
+                AND obligation_incarnation = ?4
+                AND EXISTS (
+                     SELECT 1 FROM retained_directories
+                      WHERE group_id = ?1 AND path = ?2
+                )",
+            rusqlite::params![
+                group_id,
+                path,
+                claimed_invalidation_generation,
+                claimed_obligation_incarnation
+            ],
+        )?,
         NonExactProofKind::IgnoreExcluded => conn.execute(
             "UPDATE projection_obligations
                 SET state = 'ignore_blocked'
@@ -769,1617 +771,16 @@ pub fn rearm_ignore_blocked_obligation(
     Ok(affected == 1)
 }
 
-/// Name of the one-time bootstrap migration's marker row in
-/// `schema_migration_markers` — see [`bootstrap_obligations_from_legacy_
-/// unapplied_changes`]'s own doc comment.
-const LEGACY_UNAPPLIED_CHANGES_BOOTSTRAP_MARKER: &str =
-    "legacy_applied_changes_to_obligations_bootstrap";
-
-/// One-time upgrade migration: a database that predates complete
-/// `projection_obligations`
-/// creation on every durable-transition seam can hold retained
-/// `changes.applied = 0` rows with no corresponding obligation at all --
-/// nothing schedules their projection once the legacy `reproject_
-/// unapplied_changes` executor (which used to independently re-drive this
-/// exact set) is retired. This backfills a pending obligation for every
-/// such row's distinct touched `(group_id, path)` that does not already
-/// have one, exactly once per database, so upgrading never silently drops
-/// pre-cutover unprojected work.
-///
-/// Idempotent by construction on two levels: the marker check makes a
-/// second call a pure no-op (an early return, no query against `changes`
-/// at all), and even without the marker, every insert is `ON CONFLICT ...
-/// DO NOTHING` -- this NEVER bumps or replaces an existing obligation's
-/// `invalidation_generation`/`state`/incarnation, unlike `bump_projection_
-/// obligations_for_touched_paths`'s ordinary upsert. That distinction is
-/// load-bearing: a genuine fresh admission's bump is SUPPOSED to invalidate
-/// whatever a worker currently holds, but this migration must never
-/// re-arm or otherwise disturb an obligation a normal admission already
-/// created and that may already be claimed/in-flight.
-///
-/// May conservatively re-arm a small number of paths whose obligation had
-/// already completed (and been deleted) under an intermediate, incomplete
-/// version of the obligation-creation rollout, while `changes.applied`
-/// still read `0` for the Change that touched them (obligation completion
-/// never updates that column — see [`bump_projection_obligations_for_
-/// touched_paths`]'s doc comment on why not). That is an acceptable
-/// one-time upgrade cost, not a recurring one: this function runs exactly
-/// once per database, ever, gated by its own marker -- running it again
-/// after the marker is written performs zero work and creates zero new
-/// obligations, even for a path whose freshly re-armed obligation from the
-/// first run has since completed and been deleted again.
-///
-/// Runs on whatever transaction the caller supplies -- opens none of its
-/// own, matching `bump_projection_obligations_for_touched_paths`'s own
-/// shape, so a caller controls the commit boundary (see `init_dag_schema`'s
-/// own call site, wrapped in an explicit `unchecked_transaction` so the
-/// marker and every backfilled obligation commit atomically or not at
-/// all).
-pub fn bootstrap_obligations_from_legacy_unapplied_changes(
-    conn: &Connection,
-    now_unix_nanos: i64,
-) -> Result<(), SyncSqliteError> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS schema_migration_markers (
-            name         TEXT PRIMARY KEY,
-            completed_at INTEGER NOT NULL
-        );",
-    )?;
-    let already_migrated: Option<i64> = conn
-        .query_row(
-            "SELECT completed_at FROM schema_migration_markers WHERE name = ?1",
-            rusqlite::params![LEGACY_UNAPPLIED_CHANGES_BOOTSTRAP_MARKER],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if already_migrated.is_some() {
-        return Ok(());
-    }
-
-    let mut touched_paths: std::collections::BTreeSet<(String, String)> =
-        std::collections::BTreeSet::new();
-    {
-        let mut stmt = conn.prepare("SELECT group_id, encoded FROM changes WHERE applied = 0")?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            let group_id: String = row.get(0)?;
-            let encoded: Vec<u8> = row.get(1)?;
-            let change = Change::from_wire_bytes(&encoded).map_err(|error| {
-                SyncSqliteError::CorruptState(format!(
-                    "legacy-unapplied-changes bootstrap: retained change in group \
-                     {group_id} is corrupt: {error}"
-                ))
-            })?;
-            for op in &change.ops {
-                for path in crate::dag_store::op_touched_paths(op) {
-                    touched_paths.insert((group_id.clone(), path.to_string()));
-                }
-            }
-        }
-    }
-
-    for (group_id, path) in &touched_paths {
-        // Same "always allocate, immediately delete if unused" fresh-
-        // incarnation pattern as `bump_projection_obligations_for_touched_
-        // paths` -- see that function's own doc comment for why the waste
-        // on the (here, common) `DO NOTHING` conflict path is both safe and
-        // cheap.
-        conn.execute("INSERT INTO projection_obligation_incarnations DEFAULT VALUES", [])?;
-        let fresh_incarnation = conn.last_insert_rowid();
-        conn.execute(
-            "DELETE FROM projection_obligation_incarnations WHERE id = ?1",
-            rusqlite::params![fresh_incarnation],
-        )?;
-        conn.execute(
-            "INSERT INTO projection_obligations
-                (group_id, path, invalidation_generation, state, attempt_count,
-                 next_attempt_at, created_at, updated_at, obligation_incarnation)
-             VALUES (?1, ?2, 1, 'pending', 0, ?3, ?3, ?3, ?4)
-             ON CONFLICT (group_id, path) DO NOTHING",
-            rusqlite::params![group_id, path, now_unix_nanos, fresh_incarnation],
-        )?;
-    }
-
-    conn.execute(
-        "INSERT INTO schema_migration_markers (name, completed_at) VALUES (?1, ?2)",
-        rusqlite::params![LEGACY_UNAPPLIED_CHANGES_BOOTSTRAP_MARKER, now_unix_nanos],
-    )?;
-    Ok(())
-}
-
-/// Group-scoped `changes.applied` compatibility sweep: `changes.applied`
-/// is compatibility/diagnostic state only -- nothing schedules off it --
-/// but it is still
-/// kept eventually-consistent so external tooling reading the column is
-/// not permanently misled. Individual obligation completion deliberately
-/// does NOT call this (or `dag_mark_applied`) per-path: a `Change` can
-/// touch several paths, so one path's obligation closing does not
-/// establish the whole `Change` projected, and reconstructing that
-/// accurately per-completion would need a path -> Change reverse lookup
-/// (and re-checking every OTHER path the same Change touches) on the hot
-/// completion path.
-///
-/// Instead, this marks every retained `applied = 0` Change in `group_id`
-/// `applied = 1` in one conditional, set-based statement -- but ONLY once
-/// the group has no `'pending'` `projection_obligations` row left
-/// (`'ignore_blocked'` rows do not block this: they are policy-settled,
-/// not outstanding work, matching how `dag_admitted_unapplied`-style
-/// accounting already treats them). Race-safe against a concurrent
-/// admission landing between the emptiness check and the update: both are
-/// one statement here (the `NOT EXISTS` subquery re-evaluates as part of
-/// the same `UPDATE`, not a separate prior read), and the caller is
-/// expected to run this inside a `write_immediate` transaction so a
-/// concurrent admission's own obligation-table insert either fully
-/// precedes or fully follows this statement, never interleaves with it.
-/// A later admission naturally inserts its own Change with `applied = 0`
-/// and creates/bumps its own obligation regardless of what this call did.
-pub fn reconcile_compatibility_applied_flag_for_group(
-    conn: &Connection,
-    group_id: &str,
-) -> Result<usize, SyncSqliteError> {
-    let affected = conn.execute(
-        "UPDATE changes
-            SET applied = 1
-          WHERE group_id = ?1
-            AND applied = 0
-            AND NOT EXISTS (
-                SELECT 1 FROM projection_obligations
-                 WHERE group_id = ?1 AND state = 'pending'
-            )",
-        rusqlite::params![group_id],
-    )?;
-    Ok(affected)
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn conn() -> Connection {
-        let c = Connection::open_in_memory().unwrap();
-        init_projection_obligations_schema(&c).unwrap();
-        c
-    }
-
-    #[test]
-    fn a_first_bump_creates_a_row_at_generation_one() {
-        let conn = conn();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 1000).unwrap();
-        let row = lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap();
-        assert_eq!(row.invalidation_generation, 1);
-        assert_eq!(row.state, "pending");
-    }
-
-    #[test]
-    fn a_second_bump_increments_the_existing_generation_rather_than_resetting_it() {
-        let conn = conn();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 1000).unwrap();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 2000).unwrap();
-        let row = lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap();
-        assert_eq!(row.invalidation_generation, 2);
-        assert_eq!(row.updated_at, 2000);
-    }
-
-    /// **Codex review finding on an earlier draft of the ABA fix**: the
-    /// incarnation allocator used to leave its `INSERT`ed row in place,
-    /// growing `projection_obligation_incarnations` by one permanent row
-    /// per touched-path event -- unbounded storage growth proportional to
-    /// total admitted mutations over a replica's lifetime, not to live
-    /// obligations. The allocator row is now deleted immediately after its
-    /// id is captured; this proves the table stays empty across many
-    /// bumps, and that incarnation values assigned to genuinely distinct
-    /// rows still never collide (`AUTOINCREMENT`'s `sqlite_sequence`
-    /// high-water mark is independent of which rows currently exist).
-    #[test]
-    fn the_incarnation_allocator_table_never_accumulates_rows() {
-        let conn = conn();
-        for i in 0..50 {
-            let path = format!("path-{i}.txt");
-            bump_projection_obligations_for_touched_paths(&conn, "g", &[&path], 1000).unwrap();
-            // A second bump of the SAME path (the common ON CONFLICT
-            // bump-in-place case) also allocates-and-discards an unused id.
-            bump_projection_obligations_for_touched_paths(&conn, "g", &[&path], 2000).unwrap();
-        }
-        let allocator_rows: i64 = conn
-            .query_row("SELECT COUNT(*) FROM projection_obligation_incarnations", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(
-            allocator_rows, 0,
-            "the allocator table must never accumulate rows regardless of how many paths were bumped"
-        );
-
-        // Every one of the 50 distinct rows must still have a genuinely
-        // unique incarnation -- deleting the allocator row must not have
-        // let any of them collide.
-        let mut incarnations = std::collections::HashSet::new();
-        for i in 0..50 {
-            let path = format!("path-{i}.txt");
-            let obligation = lookup_projection_obligation(&conn, "g", &path).unwrap().unwrap();
-            assert!(
-                incarnations.insert(obligation.obligation_incarnation),
-                "incarnation {} for {path} collided with an earlier path's incarnation",
-                obligation.obligation_incarnation
-            );
-        }
-    }
-
-    #[test]
-    fn bumping_one_path_never_touches_an_unrelated_path() {
-        let conn = conn();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 1000).unwrap();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["b.txt"], 1000).unwrap();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 2000).unwrap();
-        let a = lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap();
-        let b = lookup_projection_obligation(&conn, "g", "b.txt").unwrap().unwrap();
-        assert_eq!(a.invalidation_generation, 2, "a.txt was bumped twice");
-        assert_eq!(b.invalidation_generation, 1, "b.txt must be unaffected by a.txt's second bump");
-    }
-
-    #[test]
-    fn an_empty_touched_set_is_a_no_op() {
-        let conn = conn();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &[], 1000).unwrap();
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM projection_obligations", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 0);
-    }
-
-    #[test]
-    fn a_path_with_no_admission_ever_has_no_obligation() {
-        let conn = conn();
-        assert!(lookup_projection_obligation(&conn, "g", "never.txt").unwrap().is_none());
-    }
-
-    #[test]
-    fn claim_returns_every_pending_obligation_with_its_current_generation() {
-        let conn = conn();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt", "b.txt"], 1000)
-            .unwrap();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 2000).unwrap();
-        let claimed = claim_runnable_obligations(&conn, 10_000, 10, 10).unwrap();
-        assert_eq!(claimed.len(), 2);
-        let a = claimed.iter().find(|c| c.path == "a.txt").unwrap();
-        let b = claimed.iter().find(|c| c.path == "b.txt").unwrap();
-        assert_eq!(a.invalidation_generation, 2);
-        assert_eq!(b.invalidation_generation, 1);
-        assert_eq!(a.group_id, "g");
-    }
-
-    #[test]
-    fn claim_with_no_obligations_returns_empty() {
-        let conn = conn();
-        assert!(claim_runnable_obligations(&conn, 10_000, 10, 10).unwrap().is_empty());
-    }
-
-    #[test]
-    fn claim_respects_the_per_group_limit_taking_the_oldest_updated_first() {
-        let conn = conn();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 1000).unwrap();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["b.txt"], 2000).unwrap();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["c.txt"], 3000).unwrap();
-        let claimed = claim_runnable_obligations(&conn, 10_000, 2, 10).unwrap();
-        assert_eq!(claimed.len(), 2);
-        let paths: Vec<&str> = claimed.iter().map(|c| c.path.as_str()).collect();
-        assert_eq!(paths, vec!["a.txt", "b.txt"], "the two oldest-updated rows must win, in order");
-    }
-
-    #[test]
-    fn claim_respects_the_total_limit_across_groups() {
-        let conn = conn();
-        bump_projection_obligations_for_touched_paths(&conn, "g1", &["a.txt"], 1000).unwrap();
-        bump_projection_obligations_for_touched_paths(&conn, "g2", &["b.txt"], 1000).unwrap();
-        let claimed = claim_runnable_obligations(&conn, 10_000, 10, 1).unwrap();
-        assert_eq!(claimed.len(), 1);
-    }
-
-    #[test]
-    fn claim_gives_every_group_a_share_rather_than_letting_one_group_crowd_out_another() {
-        let conn = conn();
-        bump_projection_obligations_for_touched_paths(&conn, "heavy", &["1", "2", "3"], 1000)
-            .unwrap();
-        bump_projection_obligations_for_touched_paths(&conn, "light", &["only"], 1000).unwrap();
-        let claimed = claim_runnable_obligations(&conn, 10_000, 1, 10).unwrap();
-        let groups: std::collections::BTreeSet<&str> =
-            claimed.iter().map(|c| c.group_id.as_str()).collect();
-        assert!(groups.contains("heavy") && groups.contains("light"));
-    }
-
-    #[test]
-    fn a_fresh_obligation_has_zero_attempt_count_and_is_immediately_claimable() {
-        let conn = conn();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 1000).unwrap();
-        let row = lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap();
-        assert_eq!(row.attempt_count, 0);
-        assert_eq!(row.next_attempt_at, 1000);
-        let claimed = claim_runnable_obligations(&conn, 1000, 10, 10).unwrap();
-        assert_eq!(claimed.len(), 1);
-        assert_eq!(claimed[0].attempt_count, 0);
-    }
-
-    #[test]
-    fn a_failed_attempt_is_not_reclaimable_until_its_backoff_deadline_passes() {
-        let conn = conn();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 1000).unwrap();
-        let claimed = claim_runnable_obligations(&conn, 1000, 10, 10).unwrap();
-        let claimed_g = claimed[0].invalidation_generation;
-        let claimed_i = claimed[0].obligation_incarnation;
-
-        assert!(mark_obligation_attempt_failed(
-            &conn, "g", "a.txt", claimed_g, claimed_i, 5000, 1000
-        )
-        .unwrap());
-
-        assert!(
-            claim_runnable_obligations(&conn, 2000, 10, 10).unwrap().is_empty(),
-            "must not be reclaimable before its backoff deadline"
-        );
-        let reclaimed = claim_runnable_obligations(&conn, 5000, 10, 10).unwrap();
-        assert_eq!(reclaimed.len(), 1, "must be reclaimable once the backoff deadline passes");
-        assert_eq!(
-            reclaimed[0].attempt_count, 1,
-            "the failed attempt must have incremented the count"
-        );
-    }
-
-    #[test]
-    fn a_fresh_admission_resets_attempt_count_and_backoff_even_after_repeated_failures() {
-        let conn = conn();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 1000).unwrap();
-        let claimed = claim_runnable_obligations(&conn, 1000, 10, 10).unwrap();
-        let claimed_g = claimed[0].invalidation_generation;
-        let claimed_i = claimed[0].obligation_incarnation;
-        mark_obligation_attempt_failed(&conn, "g", "a.txt", claimed_g, claimed_i, 100_000, 1000)
-            .unwrap();
-
-        // A new DAG admission supersedes the old generation's backoff --
-        // the new desired state must be runnable immediately, not delayed
-        // by the old generation's failure history.
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 2000).unwrap();
-
-        let row = lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap();
-        assert_eq!(row.invalidation_generation, 2);
-        assert_eq!(row.attempt_count, 0, "a new generation must reset the attempt count");
-        assert_eq!(row.next_attempt_at, 2000, "a new generation must be immediately runnable");
-
-        let reclaimed = claim_runnable_obligations(&conn, 2000, 10, 10).unwrap();
-        assert_eq!(reclaimed.len(), 1);
-        assert_eq!(reclaimed[0].attempt_count, 0);
-    }
-
-    #[test]
-    fn a_stale_failure_report_at_a_superseded_generation_is_a_no_op() {
-        let conn = conn();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 1000).unwrap();
-        let claimed = claim_runnable_obligations(&conn, 1000, 10, 10).unwrap();
-        let stale_g = claimed[0].invalidation_generation;
-        let claimed_i = claimed[0].obligation_incarnation;
-
-        // A concurrent admission bumps the generation before this stale
-        // attempt's own failure report lands -- an ordinary bump-in-place,
-        // so the row's incarnation is unchanged; only its generation moves.
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 2000).unwrap();
-
-        assert!(
-            !mark_obligation_attempt_failed(&conn, "g", "a.txt", stale_g, claimed_i, 100_000, 3000)
-                .unwrap(),
-            "a failure report at a superseded generation must affect zero rows, even with the \
-             correct (unchanged) incarnation"
-        );
-        let row = lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap();
-        assert_eq!(
-            row.attempt_count, 0,
-            "the fresh generation's reset must survive the stale report"
-        );
-        assert_eq!(
-            row.next_attempt_at, 2000,
-            "the fresh generation must stay immediately runnable"
-        );
-    }
-
-    /// **Phase E finding (obligation row-incarnation ABA), fix verification**:
-    /// nothing in `mark_obligation_attempt_failed`'s WHERE clause used to
-    /// distinguish "the exact row incarnation this claim was issued
-    /// against" from "any current row that happens to carry the same
-    /// `(group_id, path, invalidation_generation)` key" -- it was a pure key
-    /// match, not a row identity match. `claim_runnable_obligations`'s own
-    /// doc comment already documents that two workers concurrently holding
-    /// a claim on the SAME still-outstanding obligation is expected,
-    /// tolerated behavior ("a performance question, never a correctness
-    /// one") -- but that reasoning implicitly assumed the row underneath
-    /// both claims stays the SAME row for the obligation's whole lifetime.
-    /// It does not: `complete_obligation_if_exact_proof_current` and the
-    /// `Placeholder`/`HazardHeld` arms of `complete_obligation_if_non_exact_
-    /// proof_current` all `DELETE` the row on success, and `bump_projection_
-    /// obligations_for_touched_paths` INSERTs a brand-new row at
-    /// `invalidation_generation = 1` (via `ON CONFLICT DO UPDATE`'s INSERT
-    /// arm) the next time ANY admission touches that path -- there is no
-    /// memory of what generation a deleted row was last at. A claimant
-    /// issued before the delete, still holding `G = 1` (the common case:
-    /// the very first admission for a path is always `G = 1`), could
-    /// therefore complete against a brand-new, entirely unrelated later
-    /// obligation for the same path that also happened to start at `G = 1`.
-    ///
-    /// Confirmed genuinely RED against the pre-fix API (positional 6-arg
-    /// `mark_obligation_attempt_failed` with no incarnation parameter): the
-    /// stale `mark_obligation_attempt_failed(old_claim.invalidation_
-    /// generation, /* no incarnation */)` call matched and corrupted the
-    /// reincarnated row. `obligation_incarnation` (assigned fresh, from an
-    /// `AUTOINCREMENT` sequence that never repeats a value, only on a
-    /// genuine `INSERT`, never on the `ON CONFLICT` bump-in-place arm) now
-    /// makes OLD's full claim token strictly stale the moment its own row
-    /// is deleted, regardless of what generation number a later, unrelated
-    /// incarnation happens to reuse.
-    #[test]
-    fn stale_claimant_cannot_corrupt_a_reincarnated_obligation_row() {
-        let conn = conn();
-
-        // OLD claims the obligation for a.txt at its first-ever generation
-        // and incarnation.
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 1000).unwrap();
-        let old_claim = claim_runnable_obligations(&conn, 1000, 10, 10)
-            .unwrap()
-            .into_iter()
-            .find(|c| c.path == "a.txt")
-            .unwrap();
-        assert_eq!(old_claim.invalidation_generation, 1);
-
-        // A DIFFERENT worker successfully completes that SAME obligation --
-        // standing in for a real `complete_obligation_if_exact_proof_current`
-        // success, which performs exactly this DELETE once its own proof
-        // check passes.
-        conn.execute(
-            "DELETE FROM projection_obligations
-              WHERE group_id = 'g' AND path = 'a.txt' AND invalidation_generation = 1",
-            [],
-        )
-        .unwrap();
-        assert!(lookup_projection_obligation(&conn, "g", "a.txt").unwrap().is_none());
-
-        // A genuinely NEW, unrelated DAG admission later touches the same
-        // path -- a fresh incarnation, starting at G = 1 again (identical to
-        // OLD's stale claim) since there is no surviving row to conflict
-        // against, but with a NEW `obligation_incarnation` value.
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 5000).unwrap();
-        let reincarnated = lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap();
-        assert_eq!(
-            reincarnated.invalidation_generation, 1,
-            "sanity: the new admission's row starts fresh at G=1, identical to OLD's stale claim"
-        );
-        assert_ne!(
-            reincarnated.obligation_incarnation, old_claim.obligation_incarnation,
-            "sanity: the reincarnated row must get a genuinely different incarnation than OLD's"
-        );
-
-        // OLD, still holding its now-stale claim from the deleted
-        // incarnation, reports a failed attempt against the generation AND
-        // incarnation it originally claimed.
-        let affected = mark_obligation_attempt_failed(
-            &conn,
-            "g",
-            "a.txt",
-            old_claim.invalidation_generation,
-            old_claim.obligation_incarnation,
-            99_999,
-            5000,
-        )
-        .unwrap();
-
-        // FIXED: OLD's stale attempt-failure report against a DELETED
-        // incarnation must affect zero rows, even though its generation
-        // number coincidentally matches the brand-new incarnation's own.
-        assert!(
-            !affected,
-            "OLD's stale claim against a deleted incarnation must not match the new incarnation, \
-             even at the same generation number"
-        );
-        let untouched = lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap();
-        assert_eq!(
-            untouched.attempt_count, 0,
-            "the new incarnation's attempt_count must be untouched by an attempt nobody made against it"
-        );
-        assert_eq!(
-            untouched.next_attempt_at, 5000,
-            "the new incarnation's backoff must be untouched by OLD's stale report"
-        );
-    }
-
-    #[test]
-    fn defer_without_penalty_delays_reclaim_but_never_increments_attempt_count() {
-        let conn = conn();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 1000).unwrap();
-        let claimed = claim_runnable_obligations(&conn, 1000, 10, 10).unwrap();
-        let claimed_g = claimed[0].invalidation_generation;
-        let claimed_i = claimed[0].obligation_incarnation;
-
-        assert!(defer_obligation_without_penalty(
-            &conn, "g", "a.txt", claimed_g, claimed_i, 1200, 1000
-        )
-        .unwrap());
-        assert!(claim_runnable_obligations(&conn, 1100, 10, 10).unwrap().is_empty());
-        let reclaimed = claim_runnable_obligations(&conn, 1200, 10, 10).unwrap();
-        assert_eq!(reclaimed.len(), 1);
-        assert_eq!(
-            reclaimed[0].attempt_count, 0,
-            "a no-trustworthy-audit reschedule must never count as a failed attempt"
-        );
-    }
-
-    #[test]
-    fn earliest_pending_next_attempt_at_ignores_already_runnable_rows() {
-        let conn = conn();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt", "b.txt"], 1000)
-            .unwrap();
-        let claimed = claim_runnable_obligations(&conn, 1000, 10, 10).unwrap();
-        let a = claimed.iter().find(|c| c.path == "a.txt").unwrap();
-        mark_obligation_attempt_failed(
-            &conn,
-            "g",
-            "a.txt",
-            a.invalidation_generation,
-            a.obligation_incarnation,
-            9000,
-            1000,
-        )
-        .unwrap();
-
-        // b.txt is still immediately runnable, so the earliest FUTURE
-        // deadline must not be confused with it.
-        assert_eq!(earliest_pending_next_attempt_at(&conn, 1000).unwrap(), Some(9000));
-    }
-
-    #[test]
-    fn earliest_pending_next_attempt_at_is_none_when_nothing_is_backed_off() {
-        let conn = conn();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 1000).unwrap();
-        assert_eq!(earliest_pending_next_attempt_at(&conn, 1000).unwrap(), None);
-    }
-
-    /// Nothing in this module ever moves a row's `state` out of `'pending'`
-    /// or otherwise marks it in-flight -- `claim_runnable_obligations` is a
-    /// plain `SELECT`, and a fresh admission's bump unconditionally resets
-    /// `state` back to `'pending'` regardless of what came before. A row a
-    /// worker never got to before a restart is therefore already sitting
-    /// exactly where a freshly claimable row needs to be: this is ordinary
-    /// durable SQLite state, not something that needs its own crash-
-    /// recovery primitive the way a scheduler with genuine in-flight states
-    /// (`Planning`/`Fetching`/`ReadyToCommit`) would. This test proves that
-    /// directly: it commits an admission, then closes and reopens the
-    /// SQLite connection with no claim or completion call in between --
-    /// simulating a daemon restart before any worker tick ever touched this
-    /// obligation -- and checks it survives with its generation intact and
-    /// is still claimable through the real claim entry point, not merely
-    /// visible to a diagnostic lookup.
-    ///
-    /// Confirmed genuinely RED by temporarily changing this module's
-    /// `CREATE TABLE IF NOT EXISTS projection_obligations` to `CREATE TEMP
-    /// TABLE IF NOT EXISTS projection_obligations`: a `TEMP` table is
-    /// scoped to the connection that created it, so the reopened connection
-    /// got a fresh, empty table and this test failed (`unwrap()` on `None`)
-    /// exactly as it should for genuinely lost state. Restored and
-    /// reconfirmed GREEN.
-    #[test]
-    fn an_obligation_survives_a_connection_restart_with_no_worker_tick_and_stays_claimable() {
-        let db_dir = tempfile::tempdir().unwrap();
-        let db_path = db_dir.path().join("projection_obligations.sqlite");
-
-        {
-            let conn = Connection::open(&db_path).unwrap();
-            init_projection_obligations_schema(&conn).unwrap();
-            bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 1000).unwrap();
-            bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 2000).unwrap();
-            // `conn` is dropped here, simulating the process exiting before
-            // any worker tick ever claims or completes this obligation.
-        }
-
-        // Simulated restart: a fresh connection to the same on-disk
-        // database, re-running schema init exactly as daemon startup does.
-        let conn = Connection::open(&db_path).unwrap();
-        init_projection_obligations_schema(&conn).unwrap();
-
-        let row = lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap();
-        assert_eq!(
-            row.invalidation_generation, 2,
-            "the pre-restart generation must survive the restart untouched"
-        );
-        assert_eq!(row.state, "pending");
-
-        let claimed = claim_runnable_obligations(&conn, 10_000, 10, 10).unwrap();
-        assert_eq!(claimed.len(), 1);
-        assert_eq!(claimed[0].path, "a.txt");
-        assert_eq!(claimed[0].invalidation_generation, 2);
-    }
-}
+mod tests;
 
 /// Direct, deterministic tests for the compound completion primitives, at
 /// the persistence/API level, before any production scheduling change
 /// wires them in.
 #[cfg(test)]
-mod completion_tests {
-    use super::*;
-    use crate::materialized_generation::{
-        bump_mutation_fence, init_materialized_generation_schema,
-        publish_materialized_generation_if_fence_current, snapshot_mutation_fence,
-        MaterializedObjectKind,
-    };
+mod completion_tests;
 
-    /// Full schema this module's tests need: DAG + projection_obligations
-    /// (via `init_dag_schema`), the fence/proof tables, and `files` (for
-    /// the non-exact-outcome tests) -- `yadorilink_sqlite_runtime::
-    /// init_schema` must run AFTER `init_dag_schema` (it assumes `changes`/
-    /// `pruned_changes` already exist, per its own doc comment), matching
-    /// the real production schema initialization order.
-    fn conn() -> Connection {
-        let c = Connection::open_in_memory().unwrap();
-        crate::dag_store::init_dag_schema(&c).unwrap();
-        init_materialized_generation_schema(&c).unwrap();
-        yadorilink_sqlite_runtime::init_schema(&c).unwrap();
-        c
-    }
-
-    /// Inserts a minimal, valid `files` row for `(group_id, path)` with the
-    /// given materialization/held state -- everything this module's
-    /// completion tests need, nothing `set_materialization_state`/
-    /// `set_held`'s own richer callers additionally track.
-    fn seed_file_row(
-        conn: &Connection,
-        group_id: &str,
-        path: &str,
-        materialization_state: &str,
-        held_reason: Option<&str>,
-    ) {
-        conn.execute(
-            "INSERT INTO files
-                (group_id, path, size, mtime_unix_nanos, blocks_json, materialization_state, held_reason)
-             VALUES (?1, ?2, 0, 0, '[]', ?3, ?4)",
-            rusqlite::params![group_id, path, materialization_state, held_reason],
-        )
-        .unwrap();
-    }
-
-    fn hash(byte: u8) -> [u8; 32] {
-        [byte; 32]
-    }
-
-    /// The headline case: a claimed generation whose exact proof is
-    /// current in every dimension (a), (b), (c) closes.
-    #[test]
-    fn exact_completion_closes_when_all_three_conditions_hold() {
-        let conn = conn();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 1000).unwrap();
-        let claimed_obligation =
-            lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap();
-        let claimed_g = claimed_obligation.invalidation_generation;
-        let claimed_i = claimed_obligation.obligation_incarnation;
-
-        let fence = bump_mutation_fence(&conn, "g", "a.txt", "materialize", 1000).unwrap();
-        let published = publish_materialized_generation_if_fence_current(
-            &conn,
-            "g",
-            "a.txt",
-            &[],
-            MaterializedObjectKind::RegularFile,
-            None,
-            None,
-            fence,
-            3000,
-        )
-        .unwrap()
-        .unwrap();
-
-        assert!(
-            complete_obligation_if_exact_proof_current(
-                &conn,
-                "g",
-                "a.txt",
-                claimed_g,
-                claimed_i,
-                &published.resolved_path_state_hash,
-            )
-            .unwrap(),
-            "all three conditions hold -- the completion must close"
-        );
-        assert!(
-            lookup_projection_obligation(&conn, "g", "a.txt").unwrap().is_none(),
-            "a closed obligation's row must be gone -- completion is represented by absence, not a status column"
-        );
-    }
-
-    /// (a) fails: an independent DAG admission bumped `invalidation_
-    /// generation` past the claimed value between claim and completion.
-    #[test]
-    fn exact_completion_fails_when_dag_side_generation_moved() {
-        let conn = conn();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 1000).unwrap();
-        let claimed_obligation =
-            lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap();
-        let claimed_g = claimed_obligation.invalidation_generation;
-        let claimed_i = claimed_obligation.obligation_incarnation;
-
-        let fence = bump_mutation_fence(&conn, "g", "a.txt", "materialize", 1000).unwrap();
-        let published = publish_materialized_generation_if_fence_current(
-            &conn,
-            "g",
-            "a.txt",
-            &[],
-            MaterializedObjectKind::RegularFile,
-            None,
-            None,
-            fence,
-            2000,
-        )
-        .unwrap()
-        .unwrap();
-
-        // An independent admission re-arms the obligation to G+1.
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 3000).unwrap();
-
-        assert!(!complete_obligation_if_exact_proof_current(
-            &conn,
-            "g",
-            "a.txt",
-            claimed_g,
-            claimed_i,
-            &published.resolved_path_state_hash,
-        )
-        .unwrap());
-        assert_eq!(
-            lookup_projection_obligation(&conn, "g", "a.txt")
-                .unwrap()
-                .unwrap()
-                .invalidation_generation,
-            claimed_g + 1,
-            "a failed completion must leave the re-armed obligation exactly as it was"
-        );
-    }
-
-    /// (b) fails: an independent mutator bumped the FILESYSTEM-side fence
-    /// (never touching the DAG at all) between publication and
-    /// completion. The proof row still exists and its content is
-    /// untouched, but it is no longer usable.
-    #[test]
-    fn exact_completion_fails_when_filesystem_side_fence_moved_even_though_dag_side_did_not() {
-        let conn = conn();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 1000).unwrap();
-        let claimed_obligation =
-            lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap();
-        let claimed_g = claimed_obligation.invalidation_generation;
-        let claimed_i = claimed_obligation.obligation_incarnation;
-
-        let fence = bump_mutation_fence(&conn, "g", "a.txt", "materialize", 1000).unwrap();
-        let published = publish_materialized_generation_if_fence_current(
-            &conn,
-            "g",
-            "a.txt",
-            &[],
-            MaterializedObjectKind::RegularFile,
-            None,
-            None,
-            fence,
-            2000,
-        )
-        .unwrap()
-        .unwrap();
-
-        // A DAG-invisible mutator (e.g. on-demand hydration/eviction, or a
-        // retirement pass for an unrelated reason) bumps the fence without
-        // ever touching projection_obligations.
-        bump_mutation_fence(&conn, "g", "a.txt", "some-other-mutator", 3000).unwrap();
-
-        assert!(
-            !complete_obligation_if_exact_proof_current(
-                &conn,
-                "g",
-                "a.txt",
-                claimed_g,
-                claimed_i,
-                &published.resolved_path_state_hash,
-            )
-            .unwrap(),
-            "a DAG-side-only completion must not close once the filesystem-side proof it points \
-             at has been invalidated by a mutator the DAG never saw"
-        );
-        assert_eq!(
-            lookup_projection_obligation(&conn, "g", "a.txt")
-                .unwrap()
-                .unwrap()
-                .invalidation_generation,
-            claimed_g,
-            "the obligation is left outstanding at the SAME generation, to be re-resolved -- it \
-             was never invalidated on the DAG side, only the fs-side proof was"
-        );
-    }
-
-    /// (c) fails: the proof row is usable ((a) and (b) both hold) but its
-    /// content is not what this attempt resolved -- currently redundant
-    /// with (b) under today's invariants, but checked anyway as defense
-    /// in depth.
-    #[test]
-    fn exact_completion_fails_when_the_usable_proofs_content_does_not_match_the_desired_hash() {
-        let conn = conn();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 1000).unwrap();
-        let claimed_obligation =
-            lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap();
-        let claimed_g = claimed_obligation.invalidation_generation;
-        let claimed_i = claimed_obligation.obligation_incarnation;
-
-        let fence = bump_mutation_fence(&conn, "g", "a.txt", "materialize", 1000).unwrap();
-        publish_materialized_generation_if_fence_current(
-            &conn,
-            "g",
-            "a.txt",
-            &[],
-            MaterializedObjectKind::RegularFile,
-            None,
-            None,
-            fence,
-            2000,
-        )
-        .unwrap();
-
-        // A completely different (wrong) desired hash -- not what the
-        // usable, current proof actually says.
-        assert!(!complete_obligation_if_exact_proof_current(
-            &conn,
-            "g",
-            "a.txt",
-            claimed_g,
-            claimed_i,
-            &hash(99)
-        )
-        .unwrap());
-        assert!(lookup_projection_obligation(&conn, "g", "a.txt").unwrap().is_some());
-    }
-
-    /// No proof at all: a claimed generation with nothing ever published
-    /// for this path must never close -- there is no `EXISTS` row to
-    /// satisfy (b)/(c) against.
-    #[test]
-    fn exact_completion_fails_when_no_proof_was_ever_published() {
-        let conn = conn();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 1000).unwrap();
-        let claimed_obligation =
-            lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap();
-        let claimed_g = claimed_obligation.invalidation_generation;
-        let claimed_i = claimed_obligation.obligation_incarnation;
-        assert!(!complete_obligation_if_exact_proof_current(
-            &conn,
-            "g",
-            "a.txt",
-            claimed_g,
-            claimed_i,
-            &hash(1)
-        )
-        .unwrap());
-    }
-
-    /// Non-exact: a Placeholder settlement closes while the path's
-    /// `files` row still genuinely reads `materialization_state =
-    /// 'placeholder'`.
-    #[test]
-    fn non_exact_placeholder_completion_closes_while_still_a_placeholder() {
-        let conn = conn();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["p.txt"], 1000).unwrap();
-        let claimed_obligation =
-            lookup_projection_obligation(&conn, "g", "p.txt").unwrap().unwrap();
-        let claimed_g = claimed_obligation.invalidation_generation;
-        let claimed_i = claimed_obligation.obligation_incarnation;
-        seed_file_row(&conn, "g", "p.txt", "placeholder", None);
-
-        assert!(complete_obligation_if_non_exact_proof_current(
-            &conn,
-            "g",
-            "p.txt",
-            claimed_g,
-            claimed_i,
-            NonExactProofKind::Placeholder,
-        )
-        .unwrap());
-        assert!(lookup_projection_obligation(&conn, "g", "p.txt").unwrap().is_none());
-    }
-
-    /// Non-exact: a Placeholder settlement must NOT close once the path
-    /// has since been hydrated -- the live, same-transaction re-read is
-    /// required even though this specific direction of staleness is
-    /// independently benign.
-    #[test]
-    fn non_exact_placeholder_completion_fails_once_hydrated_in_the_meantime() {
-        let conn = conn();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["p.txt"], 1000).unwrap();
-        let claimed_obligation =
-            lookup_projection_obligation(&conn, "g", "p.txt").unwrap().unwrap();
-        let claimed_g = claimed_obligation.invalidation_generation;
-        let claimed_i = claimed_obligation.obligation_incarnation;
-        seed_file_row(&conn, "g", "p.txt", "hydrated", None);
-
-        assert!(!complete_obligation_if_non_exact_proof_current(
-            &conn,
-            "g",
-            "p.txt",
-            claimed_g,
-            claimed_i,
-            NonExactProofKind::Placeholder,
-        )
-        .unwrap());
-        assert!(lookup_projection_obligation(&conn, "g", "p.txt").unwrap().is_some());
-    }
-
-    /// Non-exact: a HazardHeld settlement closes while `held_reason` is
-    /// still genuinely set.
-    #[test]
-    fn non_exact_hazard_held_completion_closes_while_still_held() {
-        let conn = conn();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["h.txt"], 1000).unwrap();
-        let claimed_obligation =
-            lookup_projection_obligation(&conn, "g", "h.txt").unwrap().unwrap();
-        let claimed_g = claimed_obligation.invalidation_generation;
-        let claimed_i = claimed_obligation.obligation_incarnation;
-        seed_file_row(&conn, "g", "h.txt", "hydrated", Some("case_collision"));
-
-        assert!(complete_obligation_if_non_exact_proof_current(
-            &conn,
-            "g",
-            "h.txt",
-            claimed_g,
-            claimed_i,
-            NonExactProofKind::HazardHeld,
-        )
-        .unwrap());
-        assert!(lookup_projection_obligation(&conn, "g", "h.txt").unwrap().is_none());
-    }
-
-    /// Non-exact: a HazardHeld settlement must NOT close once the hold has
-    /// been lifted in the meantime -- the HARMFUL staleness direction
-    /// (unlike the placeholder case above).
-    #[test]
-    fn non_exact_hazard_held_completion_fails_once_the_hold_is_lifted() {
-        let conn = conn();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["h.txt"], 1000).unwrap();
-        let claimed_obligation =
-            lookup_projection_obligation(&conn, "g", "h.txt").unwrap().unwrap();
-        let claimed_g = claimed_obligation.invalidation_generation;
-        let claimed_i = claimed_obligation.obligation_incarnation;
-        seed_file_row(&conn, "g", "h.txt", "hydrated", None);
-
-        assert!(!complete_obligation_if_non_exact_proof_current(
-            &conn,
-            "g",
-            "h.txt",
-            claimed_g,
-            claimed_i,
-            NonExactProofKind::HazardHeld,
-        )
-        .unwrap());
-        assert!(lookup_projection_obligation(&conn, "g", "h.txt").unwrap().is_some());
-    }
-
-    /// Non-exact: IgnoreExcluded has no durable proof row to re-check
-    /// (see `NonExactProofKind::IgnoreExcluded`'s own doc comment) -- its
-    /// completion checks (a) alone, so a claimed generation that is still
-    /// current closes regardless of `files` row state (there need not
-    /// even be one).
-    #[test]
-    fn non_exact_ignore_excluded_completion_parks_rather_than_deletes() {
-        let conn = conn();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["i.txt"], 1000).unwrap();
-        let claimed_obligation =
-            lookup_projection_obligation(&conn, "g", "i.txt").unwrap().unwrap();
-        let claimed_g = claimed_obligation.invalidation_generation;
-        let claimed_i = claimed_obligation.obligation_incarnation;
-
-        assert!(complete_obligation_if_non_exact_proof_current(
-            &conn,
-            "g",
-            "i.txt",
-            claimed_g,
-            claimed_i,
-            NonExactProofKind::IgnoreExcluded,
-        )
-        .unwrap());
-        let row = lookup_projection_obligation(&conn, "g", "i.txt").unwrap().unwrap();
-        assert_eq!(
-            row.state, "ignore_blocked",
-            "an ignore-excluded settlement must park the row, not delete it, so a later \
-             re-check sweep has a durable obligation to re-arm"
-        );
-        assert_eq!(row.invalidation_generation, claimed_g, "the generation must be left untouched");
-        assert!(
-            claim_runnable_obligations(&conn, 10_000, 10, 10).unwrap().is_empty(),
-            "a parked ignore_blocked row must not be reclaimable through the ordinary claim path"
-        );
-    }
-
-    #[test]
-    fn ignore_blocked_obligation_is_rearmed_and_becomes_claimable_again() {
-        let conn = conn();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["i.txt"], 1000).unwrap();
-        let claimed_obligation =
-            lookup_projection_obligation(&conn, "g", "i.txt").unwrap().unwrap();
-        let claimed_g = claimed_obligation.invalidation_generation;
-        let claimed_i = claimed_obligation.obligation_incarnation;
-        complete_obligation_if_non_exact_proof_current(
-            &conn,
-            "g",
-            "i.txt",
-            claimed_g,
-            claimed_i,
-            NonExactProofKind::IgnoreExcluded,
-        )
-        .unwrap();
-        assert_eq!(list_ignore_blocked_paths(&conn, "g").unwrap(), vec!["i.txt".to_string()]);
-
-        assert!(rearm_ignore_blocked_obligation(&conn, "g", "i.txt", 5000).unwrap());
-
-        let row = lookup_projection_obligation(&conn, "g", "i.txt").unwrap().unwrap();
-        assert_eq!(row.state, "pending");
-        assert_eq!(
-            row.invalidation_generation, claimed_g,
-            "re-arming must not bump the generation"
-        );
-        assert_eq!(row.next_attempt_at, 5000, "must be immediately claimable again");
-        assert!(list_ignore_blocked_paths(&conn, "g").unwrap().is_empty());
-
-        let reclaimed = claim_runnable_obligations(&conn, 5000, 10, 10).unwrap();
-        assert_eq!(reclaimed.len(), 1);
-        assert_eq!(reclaimed[0].path, "i.txt");
-    }
-
-    #[test]
-    fn a_fresh_admission_rearms_an_ignore_blocked_path_too() {
-        let conn = conn();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["i.txt"], 1000).unwrap();
-        let claimed_obligation =
-            lookup_projection_obligation(&conn, "g", "i.txt").unwrap().unwrap();
-        let claimed_g = claimed_obligation.invalidation_generation;
-        let claimed_i = claimed_obligation.obligation_incarnation;
-        complete_obligation_if_non_exact_proof_current(
-            &conn,
-            "g",
-            "i.txt",
-            claimed_g,
-            claimed_i,
-            NonExactProofKind::IgnoreExcluded,
-        )
-        .unwrap();
-
-        // A genuinely new DAG admission must re-arm the path regardless of
-        // whatever local scheduler state it was parked in.
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["i.txt"], 2000).unwrap();
-
-        let row = lookup_projection_obligation(&conn, "g", "i.txt").unwrap().unwrap();
-        assert_eq!(row.state, "pending");
-        assert_eq!(row.invalidation_generation, claimed_g + 1);
-        assert!(list_ignore_blocked_paths(&conn, "g").unwrap().is_empty());
-    }
-
-    /// Non-exact: IgnoreExcluded still fails closed on (a) -- a stale
-    /// claimed generation is rejected the same as the exact-outcome path.
-    #[test]
-    fn non_exact_ignore_excluded_completion_fails_when_generation_moved() {
-        let conn = conn();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["i.txt"], 1000).unwrap();
-        let claimed_obligation =
-            lookup_projection_obligation(&conn, "g", "i.txt").unwrap().unwrap();
-        let claimed_g = claimed_obligation.invalidation_generation;
-        let claimed_i = claimed_obligation.obligation_incarnation;
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["i.txt"], 2000).unwrap();
-
-        assert!(!complete_obligation_if_non_exact_proof_current(
-            &conn,
-            "g",
-            "i.txt",
-            claimed_g,
-            claimed_i,
-            NonExactProofKind::IgnoreExcluded,
-        )
-        .unwrap());
-    }
-
-    /// Two paths are independent: closing one's obligation must never
-    /// affect another's, exact or non-exact.
-    #[test]
-    fn completing_one_paths_obligation_never_touches_an_unrelated_path() {
-        let conn = conn();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt", "b.txt"], 1000)
-            .unwrap();
-        let obligation_a = lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap();
-        let g_a = obligation_a.invalidation_generation;
-        let i_a = obligation_a.obligation_incarnation;
-
-        let fence = bump_mutation_fence(&conn, "g", "a.txt", "materialize", 1000).unwrap();
-        let published = publish_materialized_generation_if_fence_current(
-            &conn,
-            "g",
-            "a.txt",
-            &[],
-            MaterializedObjectKind::RegularFile,
-            None,
-            None,
-            fence,
-            2000,
-        )
-        .unwrap()
-        .unwrap();
-
-        assert!(complete_obligation_if_exact_proof_current(
-            &conn,
-            "g",
-            "a.txt",
-            g_a,
-            i_a,
-            &published.resolved_path_state_hash,
-        )
-        .unwrap());
-
-        assert!(lookup_projection_obligation(&conn, "g", "a.txt").unwrap().is_none());
-        assert!(
-            lookup_projection_obligation(&conn, "g", "b.txt").unwrap().is_some(),
-            "b.txt's own obligation must be untouched by a.txt's completion"
-        );
-    }
-
-    /// `exact_completion_fails_when_dag_side_generation_moved` above already
-    /// proves the completion CAS itself rejects a stale claimed generation,
-    /// reading the re-armed row back with `lookup_projection_obligation`.
-    /// This test goes one step further and proves it through the ACTUAL
-    /// entry point a worker would reclaim through: after a concurrent,
-    /// independent admission bumps the same path mid-attempt,
-    /// `claim_runnable_obligations` itself -- not just a diagnostic lookup
-    /// -- must hand the re-armed obligation back at the new generation.
-    ///
-    /// Confirmed genuinely RED by temporarily dropping the `AND
-    /// invalidation_generation = ?3` predicate from
-    /// `complete_obligation_if_exact_proof_current`'s `DELETE` statement:
-    /// the completion then wrongly reported success and deleted the row,
-    /// so both the "completion affects zero rows" assertion and the
-    /// "still claimable at G+1" assertion failed together. Restored and
-    /// reconfirmed GREEN.
-    #[test]
-    fn a_concurrent_admissions_rearmed_obligation_is_independently_claimable_through_the_claim_api()
-    {
-        let conn = conn();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 1000).unwrap();
-        let claimed = claim_runnable_obligations(&conn, 10_000, 10, 10).unwrap();
-        assert_eq!(claimed.len(), 1);
-        let claimed_g = claimed[0].invalidation_generation;
-        let claimed_i = claimed[0].obligation_incarnation;
-
-        let fence = bump_mutation_fence(&conn, "g", "a.txt", "materialize", 1000).unwrap();
-        let published = publish_materialized_generation_if_fence_current(
-            &conn,
-            "g",
-            "a.txt",
-            &[],
-            MaterializedObjectKind::RegularFile,
-            None,
-            None,
-            fence,
-            2000,
-        )
-        .unwrap()
-        .unwrap();
-
-        // A concurrent, independent admission re-arms the obligation to
-        // G+1 between this worker's claim and its completion attempt.
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 3000).unwrap();
-
-        assert!(
-            !complete_obligation_if_exact_proof_current(
-                &conn,
-                "g",
-                "a.txt",
-                claimed_g,
-                claimed_i,
-                &published.resolved_path_state_hash,
-            )
-            .unwrap(),
-            "a completion attempt at the now-stale claimed generation must affect zero rows"
-        );
-
-        let reclaimed = claim_runnable_obligations(&conn, 10_000, 10, 10).unwrap();
-        assert_eq!(
-            reclaimed.len(),
-            1,
-            "the re-armed obligation must still be independently claimable, not just visible to a lookup"
-        );
-        assert_eq!(reclaimed[0].path, "a.txt");
-        assert_eq!(
-            reclaimed[0].invalidation_generation,
-            claimed_g + 1,
-            "reclaiming must observe the new generation the concurrent admission produced"
-        );
-    }
-
-    /// A content-identical verification's SNAPSHOT (never a bump) of the
-    /// fence still lets the exact completion close -- the snapshot value
-    /// is what the publish CASed on, so it is exactly as "current" as a
-    /// real bump's value for this purpose.
-    #[test]
-    fn exact_completion_closes_for_a_content_identical_verifications_snapshot_epoch() {
-        let conn = conn();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 1000).unwrap();
-        let claimed_obligation =
-            lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap();
-        let claimed_g = claimed_obligation.invalidation_generation;
-        let claimed_i = claimed_obligation.obligation_incarnation;
-
-        let snapshot = snapshot_mutation_fence(&conn, "g", "a.txt").unwrap();
-        assert_eq!(snapshot, 0, "sanity: nothing has mutated this path yet");
-        let published = publish_materialized_generation_if_fence_current(
-            &conn,
-            "g",
-            "a.txt",
-            &[],
-            MaterializedObjectKind::RegularFile,
-            None,
-            None,
-            snapshot,
-            2000,
-        )
-        .unwrap()
-        .unwrap();
-
-        assert!(complete_obligation_if_exact_proof_current(
-            &conn,
-            "g",
-            "a.txt",
-            claimed_g,
-            claimed_i,
-            &published.resolved_path_state_hash,
-        )
-        .unwrap());
-    }
-}
-
-/// Regression coverage for the one-time legacy-backlog bootstrap
-/// migration and the coarse `changes.
-/// applied` compatibility sweep that replaced the retired
-/// `reproject_unapplied_changes` executor.
+/// Regression coverage for the one-time legacy-backlog bootstrap migration
+/// and the coarse `changes.
 #[cfg(test)]
-mod legacy_scheduler_cutover_tests {
-    use super::*;
-    use crate::dag_store;
-    use ed25519_dalek::SigningKey;
-    use yadorilink_replica_domain::change::{ChangeAuth, Op};
-    use yadorilink_replica_domain::ids::{ChangeHash, SyncPath};
-
-    fn conn() -> Connection {
-        let c = Connection::open_in_memory().unwrap();
-        dag_store::init_dag_schema(&c).unwrap();
-        c
-    }
-
-    fn delete_op(path: &str) -> Op {
-        Op::Delete { path: SyncPath(path.to_string()) }
-    }
-
-    /// Deletes the obligation `emit_local_change`'s own admission just
-    /// created for `path`, simulating a database from before obligation
-    /// creation was complete on every durable-transition seam: a retained
-    /// `applied = 0` Change with no corresponding obligation row at all.
-    fn strip_obligation(conn: &Connection, group_id: &str, path: &str) {
-        conn.execute(
-            "DELETE FROM projection_obligations WHERE group_id = ?1 AND path = ?2",
-            rusqlite::params![group_id, path],
-        )
-        .unwrap();
-    }
-
-    /// `emit_local_change` marks its own Change `applied = 1` immediately
-    /// (a local emission's ops describe a write this device already made,
-    /// so there is no separate materialization step pending) -- forces it
-    /// back to `applied = 0` to simulate the "admitted but unapplied" state
-    /// these tests need, exactly as a real remote-origin admission
-    /// (`admit_change(.., applied: false)`) would have left it.
-    fn force_unapplied(conn: &Connection, hash: &ChangeHash) {
-        conn.execute("UPDATE changes SET applied = 0 WHERE change_hash = ?1", [&hash.0[..]])
-            .unwrap();
-    }
-
-    /// `conn()` already runs `init_dag_schema`, which itself calls
-    /// `bootstrap_obligations_from_legacy_unapplied_changes` once (finding
-    /// nothing to do yet, since no Changes exist at schema-init time, and
-    /// writing the marker regardless -- correct real-world behavior for a
-    /// brand-new database). These tests want to invoke the migration
-    /// AGAIN, deliberately, against state assembled after that first,
-    /// trivial run -- so they clear the marker first, isolating the
-    /// function's own backfill logic from its schema-init auto-run.
-    fn reset_migration_marker(conn: &Connection) {
-        conn.execute(
-            "DELETE FROM schema_migration_markers WHERE name = ?1",
-            rusqlite::params![LEGACY_UNAPPLIED_CHANGES_BOOTSTRAP_MARKER],
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn backfills_an_obligation_for_a_touched_path_with_none_existing() {
-        let conn = conn();
-        let em = dag_store::ChangeEmitter::new("device-a", SigningKey::from_bytes(&[1u8; 32]));
-        let change = dag_store::emit_local_change(
-            &conn,
-            "g",
-            vec![delete_op("a.txt")],
-            ChangeAuth::PLACEHOLDER,
-            &em,
-        )
-        .unwrap();
-        force_unapplied(&conn, &change.compute_hash());
-        strip_obligation(&conn, "g", "a.txt");
-        assert!(lookup_projection_obligation(&conn, "g", "a.txt").unwrap().is_none());
-        reset_migration_marker(&conn);
-
-        bootstrap_obligations_from_legacy_unapplied_changes(&conn, 5_000).unwrap();
-
-        let row = lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap();
-        assert_eq!(row.invalidation_generation, 1, "a freshly backfilled obligation starts at G=1");
-        assert_eq!(row.state, "pending");
-    }
-
-    #[test]
-    fn never_bumps_or_replaces_an_existing_obligation() {
-        let conn = conn();
-        let em = dag_store::ChangeEmitter::new("device-a", SigningKey::from_bytes(&[2u8; 32]));
-        let first = dag_store::emit_local_change(
-            &conn,
-            "g",
-            vec![delete_op("a.txt")],
-            ChangeAuth::PLACEHOLDER,
-            &em,
-        )
-        .unwrap();
-        // A second admission bumps the SAME path's obligation to G=2 --
-        // this row must survive the migration completely untouched, since
-        // `emit_local_change`'s own admission already created it correctly.
-        let second = dag_store::emit_local_change(
-            &conn,
-            "g",
-            vec![delete_op("a.txt")],
-            ChangeAuth::PLACEHOLDER,
-            &em,
-        )
-        .unwrap();
-        force_unapplied(&conn, &first.compute_hash());
-        force_unapplied(&conn, &second.compute_hash());
-        let before = lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap();
-        assert_eq!(
-            before.invalidation_generation, 2,
-            "test precondition: two admissions bump to G=2"
-        );
-        reset_migration_marker(&conn);
-
-        bootstrap_obligations_from_legacy_unapplied_changes(&conn, 5_000).unwrap();
-
-        let after = lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap();
-        assert_eq!(
-            after.invalidation_generation, before.invalidation_generation,
-            "migration must never bump an already-existing obligation's generation"
-        );
-        assert_eq!(after.obligation_incarnation, before.obligation_incarnation);
-    }
-
-    #[test]
-    fn creates_nothing_for_a_change_already_marked_applied() {
-        let conn = conn();
-        let em = dag_store::ChangeEmitter::new("device-a", SigningKey::from_bytes(&[3u8; 32]));
-        // Never forced unapplied -- `emit_local_change` already leaves it
-        // `applied = 1`, exactly the case this test needs.
-        dag_store::emit_local_change(
-            &conn,
-            "g",
-            vec![delete_op("a.txt")],
-            ChangeAuth::PLACEHOLDER,
-            &em,
-        )
-        .unwrap();
-        strip_obligation(&conn, "g", "a.txt");
-        reset_migration_marker(&conn);
-
-        bootstrap_obligations_from_legacy_unapplied_changes(&conn, 5_000).unwrap();
-
-        assert!(
-            lookup_projection_obligation(&conn, "g", "a.txt").unwrap().is_none(),
-            "an already-applied Change's path must not get a backfilled obligation"
-        );
-    }
-
-    #[test]
-    fn a_multi_path_change_backfills_every_distinct_touched_path() {
-        let conn = conn();
-        let em = dag_store::ChangeEmitter::new("device-a", SigningKey::from_bytes(&[4u8; 32]));
-        // One Change touching two distinct paths -- a plain multi-op
-        // Change is enough to exercise "every distinct touched path gets
-        // backfilled", without needing a real VersionHash for a Move.
-        let change = dag_store::emit_local_change(
-            &conn,
-            "g",
-            vec![delete_op("old.txt"), delete_op("new.txt")],
-            ChangeAuth::PLACEHOLDER,
-            &em,
-        )
-        .unwrap();
-        force_unapplied(&conn, &change.compute_hash());
-        strip_obligation(&conn, "g", "old.txt");
-        strip_obligation(&conn, "g", "new.txt");
-        reset_migration_marker(&conn);
-
-        bootstrap_obligations_from_legacy_unapplied_changes(&conn, 5_000).unwrap();
-
-        assert!(lookup_projection_obligation(&conn, "g", "old.txt").unwrap().is_some());
-        assert!(lookup_projection_obligation(&conn, "g", "new.txt").unwrap().is_some());
-    }
-
-    #[test]
-    fn a_second_invocation_performs_zero_work_and_never_re_arms_a_completed_path() {
-        let conn = conn();
-        let em = dag_store::ChangeEmitter::new("device-a", SigningKey::from_bytes(&[5u8; 32]));
-        let change = dag_store::emit_local_change(
-            &conn,
-            "g",
-            vec![delete_op("a.txt")],
-            ChangeAuth::PLACEHOLDER,
-            &em,
-        )
-        .unwrap();
-        force_unapplied(&conn, &change.compute_hash());
-        strip_obligation(&conn, "g", "a.txt");
-        reset_migration_marker(&conn);
-
-        bootstrap_obligations_from_legacy_unapplied_changes(&conn, 5_000).unwrap();
-        assert!(lookup_projection_obligation(&conn, "g", "a.txt").unwrap().is_some());
-
-        // Simulate the backfilled obligation completing normally (deleted,
-        // same as any other successful completion) while `applied` still
-        // reads 0 -- the exact upgrade-window gap this migration exists to
-        // close, but only ONCE.
-        strip_obligation(&conn, "g", "a.txt");
-
-        bootstrap_obligations_from_legacy_unapplied_changes(&conn, 9_000).unwrap();
-
-        assert!(
-            lookup_projection_obligation(&conn, "g", "a.txt").unwrap().is_none(),
-            "a second invocation must be a pure no-op -- it must NOT re-arm a path whose \
-             obligation already completed after the first (and only) real migration pass"
-        );
-    }
-
-    /// Exercises the REAL production entry point (`dag_store::
-    /// init_dag_schema`), not `bootstrap_obligations_from_legacy_
-    /// unapplied_changes` called directly -- every other test in this
-    /// module resets the migration marker and calls the helper itself,
-    /// which proves the helper's own logic but not that the daemon's
-    /// actual startup wiring reaches it, runs it inside its own
-    /// transaction (not the bare autocommit `conn`), and produces
-    /// identical results. Simulates a genuinely legacy-shaped database:
-    /// `conn()` already ran the migration once trivially (nothing to
-    /// backfill, marker set) as a side effect of setting up schema, so
-    /// this strips the marker back off before adding the legacy-shaped
-    /// row, mirroring a database whose migration has never actually run.
-    #[test]
-    fn init_dag_schema_backfills_a_legacy_database_on_a_real_restart() {
-        let conn = conn();
-        let em = dag_store::ChangeEmitter::new("device-a", SigningKey::from_bytes(&[9u8; 32]));
-        let change = dag_store::emit_local_change(
-            &conn,
-            "g",
-            vec![delete_op("a.txt")],
-            ChangeAuth::PLACEHOLDER,
-            &em,
-        )
-        .unwrap();
-        force_unapplied(&conn, &change.compute_hash());
-        strip_obligation(&conn, "g", "a.txt");
-        reset_migration_marker(&conn);
-        assert!(lookup_projection_obligation(&conn, "g", "a.txt").unwrap().is_none());
-
-        // The real startup/upgrade path -- not the helper called directly.
-        dag_store::init_dag_schema(&conn).unwrap();
-
-        let row = lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap();
-        assert_eq!(row.invalidation_generation, 1);
-        assert_eq!(row.state, "pending");
-
-        // A second `init_dag_schema` call (an ordinary subsequent daemon
-        // restart) must be a pure no-op through the same real wiring --
-        // not just through the helper called directly.
-        strip_obligation(&conn, "g", "a.txt");
-        dag_store::init_dag_schema(&conn).unwrap();
-        assert!(
-            lookup_projection_obligation(&conn, "g", "a.txt").unwrap().is_none(),
-            "a second real init_dag_schema call must not re-arm a path whose obligation \
-             already completed after the first restart's migration pass"
-        );
-    }
-
-    #[test]
-    fn compatibility_sweep_marks_applied_once_the_group_has_no_pending_obligation_left() {
-        let conn = conn();
-        let em = dag_store::ChangeEmitter::new("device-a", SigningKey::from_bytes(&[6u8; 32]));
-        let change = dag_store::emit_local_change(
-            &conn,
-            "g",
-            vec![delete_op("a.txt")],
-            ChangeAuth::PLACEHOLDER,
-            &em,
-        )
-        .unwrap();
-        force_unapplied(&conn, &change.compute_hash());
-        strip_obligation(&conn, "g", "a.txt");
-        let unapplied = dag_store::list_unapplied(&conn, "g").unwrap();
-        assert_eq!(unapplied.len(), 1, "test precondition: the change is still applied = 0");
-
-        let affected = reconcile_compatibility_applied_flag_for_group(&conn, "g").unwrap();
-
-        assert_eq!(affected, 1);
-        assert!(dag_store::list_unapplied(&conn, "g").unwrap().is_empty());
-    }
-
-    #[test]
-    fn compatibility_sweep_leaves_applied_flag_alone_while_any_pending_obligation_remains() {
-        let conn = conn();
-        let em = dag_store::ChangeEmitter::new("device-a", SigningKey::from_bytes(&[7u8; 32]));
-        // Two independent single-path changes in the same group -- only
-        // "a.txt"'s own obligation completes; "b.txt"'s stays pending.
-        let a = dag_store::emit_local_change(
-            &conn,
-            "g",
-            vec![delete_op("a.txt")],
-            ChangeAuth::PLACEHOLDER,
-            &em,
-        )
-        .unwrap();
-        let b = dag_store::emit_local_change(
-            &conn,
-            "g",
-            vec![delete_op("b.txt")],
-            ChangeAuth::PLACEHOLDER,
-            &em,
-        )
-        .unwrap();
-        force_unapplied(&conn, &a.compute_hash());
-        force_unapplied(&conn, &b.compute_hash());
-        strip_obligation(&conn, "g", "a.txt");
-
-        let affected = reconcile_compatibility_applied_flag_for_group(&conn, "g").unwrap();
-
-        assert_eq!(
-            affected, 0,
-            "the group still has b.txt's pending obligation outstanding, so NEITHER retained \
-             applied=0 Change may be marked applied yet -- this is a group-wide gate, not a \
-             per-path one"
-        );
-        assert_eq!(dag_store::list_unapplied(&conn, "g").unwrap().len(), 2);
-    }
-
-    #[test]
-    fn compatibility_sweep_treats_ignore_blocked_as_settled_not_outstanding() {
-        let conn = conn();
-        let em = dag_store::ChangeEmitter::new("device-a", SigningKey::from_bytes(&[8u8; 32]));
-        let change = dag_store::emit_local_change(
-            &conn,
-            "g",
-            vec![delete_op("a.txt")],
-            ChangeAuth::PLACEHOLDER,
-            &em,
-        )
-        .unwrap();
-        force_unapplied(&conn, &change.compute_hash());
-        // Park at `ignore_blocked` rather than deleting -- policy-settled,
-        // not outstanding work; must not block the sweep the way a genuine
-        // `pending` row does (see the previous test).
-        conn.execute(
-            "UPDATE projection_obligations SET state = 'ignore_blocked' \
-             WHERE group_id = 'g' AND path = 'a.txt'",
-            [],
-        )
-        .unwrap();
-
-        let affected = reconcile_compatibility_applied_flag_for_group(&conn, "g").unwrap();
-
-        assert_eq!(
-            affected, 1,
-            "an ignore_blocked obligation is policy-settled, not outstanding work, and must \
-             not permanently withhold the compatibility flag"
-        );
-    }
-}
+mod legacy_scheduler_cutover_tests;

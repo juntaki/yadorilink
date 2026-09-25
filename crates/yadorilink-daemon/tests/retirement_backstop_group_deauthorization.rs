@@ -4,9 +4,8 @@
 //! (`maintenance_coordinator::start` -> `convergence::engine::run`), which
 //! include an ephemeral-conflict-copy retirement loop with a periodic
 //! backstop (`RETIREMENT_BACKSTOP_INTERVAL`, `convergence/engine_wrapper.rs`
-//! -- currently 30s). `DaemonState::local_retirement_session` caches its
-//! constructed synthetic session per group, so the one thing that actually
-//! revokes authorization -- `NetmapChangeAuthenticator::new`'s
+//! -- currently 30s). The one thing that actually revokes authorization --
+//! `NetmapChangeAuthenticator::new`'s
 //! (`change_auth.rs`) eager `validate_linked_history_best_effort` ->
 //! `restore_group_sessions_if_currently_authorized` -- only ever runs ONCE
 //! per group per process, on the first retirement pass that reaches that
@@ -45,7 +44,7 @@
 //! loudly (it stops observing a tick within its own wait) instead of
 //! silently passing without ever exercising the regression again.
 //!
-//! `DaemonState::install_test_group_policy_bootstrap` plus
+//! `PeerAuthorityState::install_test_group_policy_bootstrap` plus
 //! `DaemonState::set_peer_group_writer` are the fix under test: without
 //! them, this test fails with `HydrationFailed` after every retry (verified
 //! live by temporarily removing both calls below); with them, the
@@ -59,13 +58,10 @@ use yadorilink_daemon::convergence::engine::retirement_backstop_interval_for_tes
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::hydration;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-use yadorilink_local_storage::{chunk_file, FsBlockStore};
+use yadorilink_local_storage::{chunk_file, SegmentBlockStore};
 use yadorilink_peer_session::peer_session::PeerSyncSession;
 use yadorilink_replica_domain::file::FileRecord;
 use yadorilink_replica_domain::session_state::MaterializationState;
-use yadorilink_transport::{
-    ConnectRole, DeviceSigningKeyPair, QuicPeerChannel, QuicPeerEndpoint, TransportHub,
-};
 
 const GROUP: &str = "retirement-backstop-repro-group";
 
@@ -78,24 +74,24 @@ const GROUP: &str = "retirement-backstop-repro-group";
 /// check that the wait was actually long enough in practice.
 const BACKSTOP_WAIT_MARGIN: Duration = Duration::from_secs(5);
 
-/// Polls `state.has_local_retirement_session(group_id)` until it becomes
-/// true or `deadline` passes -- the fix-independent signal that the
-/// retirement backstop's one-shot authorization check has actually run for
-/// this group (see this file's own module doc comment), as opposed to just
-/// having waited long enough on the assumption that it would.
+/// Polls the retirement backstop's own tick count until it moves or
+/// `deadline` passes -- the fix-independent signal that the backstop's
+/// one-shot authorization check has actually run (see this file's own module
+/// doc comment), as opposed to just having waited long enough on the
+/// assumption that it would.
 async fn retirement_backstop_ticked(
     state: &DaemonState,
-    group_id: &str,
+    _group_id: &str,
     deadline: Duration,
 ) -> bool {
     let started = tokio::time::Instant::now();
     while started.elapsed() < deadline {
-        if state.has_local_retirement_session(group_id) {
+        if state.retirement_backstop_ticks() > 0 {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    state.has_local_retirement_session(group_id)
+    state.retirement_backstop_ticks() > 0
 }
 
 fn tiny_content() -> Vec<u8> {
@@ -107,7 +103,7 @@ fn tiny_content() -> Vec<u8> {
 async fn manually_registered_session_survives_the_retirement_backstop() {
     let content = tiny_content();
     let source_dir = tempfile::tempdir().unwrap();
-    let source_store = Arc::new(FsBlockStore::new(source_dir.path()).unwrap());
+    let source_store = Arc::new(SegmentBlockStore::new(source_dir.path()).unwrap());
     let blocks = {
         let tmp_file = source_dir.path().join("source.bin");
         std::fs::write(&tmp_file, &content).unwrap();
@@ -115,7 +111,7 @@ async fn manually_registered_session_survives_the_retirement_backstop() {
     };
 
     let dest_dir = tempfile::tempdir().unwrap();
-    let dest_store = Arc::new(FsBlockStore::new(dest_dir.path()).unwrap());
+    let dest_store = Arc::new(SegmentBlockStore::new(dest_dir.path()).unwrap());
     let dest_sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
     let dest_root = tempfile::tempdir().unwrap();
     dest_sync_state.link_repository().add_link(&dest_root.path().to_string_lossy(), GROUP).unwrap();
@@ -152,31 +148,31 @@ async fn manually_registered_session_survives_the_retirement_backstop() {
     dest_state.install_test_root_commit_authority(GROUP);
     // The fix under test -- see this file's own module doc comment. Comment
     // out these two lines to reproduce the pre-fix `HydrationFailed`.
-    dest_state.install_test_group_policy_bootstrap(GROUP);
+    dest_state.authority.install_test_group_policy_bootstrap(GROUP);
     dest_state.set_peer_group_writer("device-source", GROUP, true);
 
-    let socket_source = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let socket_dest = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let addr_dest = socket_dest.local_addr().unwrap();
-
-    let key_source = DeviceSigningKeyPair::generate();
-    let key_dest = DeviceSigningKeyPair::generate();
-    let public_source = key_source.public_bytes();
-    let public_dest = key_dest.public_bytes();
-    let endpoint_source =
-        QuicPeerEndpoint::new(TransportHub::from_socket(socket_source), key_source).unwrap();
-    let endpoint_dest =
-        QuicPeerEndpoint::new(TransportHub::from_socket(socket_dest), key_dest).unwrap();
-    endpoint_source.authorize(public_dest);
-    endpoint_dest.authorize(public_source);
-    let accepting = {
-        let endpoint_dest = endpoint_dest.clone();
-        tokio::spawn(async move { endpoint_dest.accept(public_source).await })
+    // `SessionTransports` is a required `PeerSyncSession` constructor
+    // parameter now (A3/A4): a real substrate-backed pair, same fixture
+    // `yadorilink-lane-ports`' own tests and `yadorilink-peer-session`'s
+    // external integration crate use.
+    let book = yadorilink_lane_ports::testing::TestAddressBook::new();
+    let node_source =
+        yadorilink_lane_ports::testing::TestPeerNode::start("device-source", book.clone()).await;
+    let node_dest = yadorilink_lane_ports::testing::TestPeerNode::start("device-dest", book).await;
+    let transports_source = node_source.transports_for("device-dest");
+    let transports_dest = node_dest.transports_for("device-source");
+    let session_transports_source = yadorilink_peer_session::ports::SessionTransports {
+        blocks: transports_source.clone(),
+        service: transports_source.clone(),
+        prepared_snapshots: std::sync::Arc::new(yadorilink_lane_ports::PreparedSnapshots::new()),
+        snapshot_fetch: transports_source,
     };
-    let dialed = endpoint_source.connect(addr_dest, public_dest).await.unwrap();
-    let accepted = accepting.await.unwrap().unwrap();
-    let channel_source = QuicPeerChannel::new(dialed, ConnectRole::Dial);
-    let channel_dest = QuicPeerChannel::new(accepted, ConnectRole::Accept);
+    let session_transports_dest = yadorilink_peer_session::ports::SessionTransports {
+        blocks: transports_dest.clone(),
+        service: transports_dest.clone(),
+        prepared_snapshots: std::sync::Arc::new(yadorilink_lane_ports::PreparedSnapshots::new()),
+        snapshot_fetch: transports_dest,
+    };
 
     let source_sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
     source_sync_state
@@ -200,15 +196,24 @@ async fn manually_registered_session_survives_the_retirement_backstop() {
         .unwrap();
     let generation = source_sync_state.startup_readiness().begin_group_startup(GROUP);
     source_sync_state.startup_readiness().mark_group_ready(GROUP, generation);
-    let session_source = PeerSyncSession::new(
-        channel_source,
+    let replica_engine_source =
+        yadorilink_daemon::replica_coordinator::engine_ports::build_peer_replica_engine(
+            &source_sync_state,
+            source_store.clone(),
+        );
+    let session_source = PeerSyncSession::over_substrate(
         "device-source".into(),
         "device-dest".into(),
-        source_sync_state,
+        source_sync_state as Arc<dyn yadorilink_peer_session::ports::BlockServeAuthorizationPort>,
+        replica_engine_source,
         source_store,
         vec![GROUP.to_string()],
         std::collections::HashMap::from([(GROUP.to_string(), source_dir.path().to_path_buf())]),
+        session_transports_source,
+        None,
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::test_permissive(),
     );
+    node_source.serve_with("device-dest", session_source.clone());
     session_source.set_block_serve_engine(
         yadorilink_peer_session::block_serve::BlockServeEngine::new(
             u64::MAX,
@@ -217,24 +222,37 @@ async fn manually_registered_session_survives_the_retirement_backstop() {
             1_000,
         ),
     );
-    tokio::spawn(session_source.clone().run());
 
-    let session_dest = PeerSyncSession::new(
-        channel_dest,
+    let dest_peer_store = std::sync::Arc::new(
+        yadorilink_daemon::adapters::block_store_ports::BlockStorePortsAdapter::new(
+            dest_state.block_store.clone(),
+        ),
+    );
+    let replica_engine_dest =
+        yadorilink_daemon::replica_coordinator::engine_ports::build_peer_replica_engine(
+            &dest_sync_state,
+            dest_peer_store.clone(),
+        );
+    let session_dest = PeerSyncSession::over_substrate(
         "device-dest".into(),
         "device-source".into(),
-        dest_sync_state.clone(),
-        std::sync::Arc::new(
-            yadorilink_daemon::adapters::block_store_ports::BlockStorePortsAdapter::new(
-                dest_state.block_store.clone(),
-            ),
-        ),
+        dest_sync_state.clone()
+            as Arc<dyn yadorilink_peer_session::ports::BlockServeAuthorizationPort>,
+        replica_engine_dest,
+        dest_peer_store,
         vec![GROUP.to_string()],
         std::collections::HashMap::from([(GROUP.to_string(), dest_root.path().to_path_buf())]),
+        session_transports_dest,
+        None,
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::test_permissive(),
     );
+    node_dest.serve_with("device-source", session_dest.clone());
     session_dest.set_block_serve_engine(dest_state.block_serve_engine.clone());
-    tokio::spawn(session_dest.clone().run());
-    dest_state.peers.register_session("device-source".into(), session_dest);
+    dest_state.peers.register_session(
+        "device-source".into(),
+        session_dest,
+        dest_state.local_convergence(),
+    );
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 

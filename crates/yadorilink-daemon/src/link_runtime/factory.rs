@@ -119,23 +119,19 @@ impl LinkRuntimeFactory {
             }
         }
 
-        // Sync-root single-instance ownership (design doc §15: "hold/verify
-        // ownership for each linked root"). Acquired ONCE here, for the whole
-        // time this link stays watched -- not per scan/repair call, which would
-        // make this daemon's own concurrent operations over the same root
-        // serialize-or-fail against each other (see
-        // `yadorilink_sync_core::sync_root_lock`'s module doc). A conflict here
-        // drops the guard and publishes `Failed` for this group, which is the
-        // correct outcome -- a root already owned by another process must not be
-        // watched at all, let alone scanned.
-        //
-        // Held in a local binding, NOT registered into the registry yet: every
-        // remaining step in this function is fallible (`?`), and an early
-        // return must drop this and release the OS lock immediately so a
-        // retried `start_link_watch` call for the same root is not blocked by
-        // this same process's own abandoned attempt. It is moved into the
-        // registry only by the caller's own `link_slot_guard.publish(...)`,
-        // once this whole function has already succeeded.
+        // Sync-root single-instance ownership (design doc §15:
+        // "hold/verify ownership for each linked root"). A conflict here
+        // drops the guard and publishes `Failed` for this group, which is
+        // the correct outcome -- a root already owned by another process
+        // must not be watched at all, let alone scanned. Held in a local
+        // binding, NOT registered into the registry yet: every remaining
+        // step in this function is fallible (`?`), and an early return
+        // must drop this and release the OS lock immediately so a retried
+        // `start_link_watch` call for the same root is not blocked by this
+        // same process's own abandoned attempt. It is moved into the
+        // registry only by the caller's own
+        // `link_slot_guard.publish(...)`, once this whole function has
+        // already succeeded.
         let root_lock = yadorilink_root_authority::sync_root_lock::SyncRootLock::acquire(
             Path::new(&local_path),
         )?;
@@ -212,10 +208,14 @@ impl LinkRuntimeFactory {
                             local_path = %local_path,
                             reconstructed = report.reconstructed.len(),
                             demoted_to_placeholder = report.demoted_to_placeholder.len(),
+                            failed = report.failed.len(),
                             "repaired interrupted materializations found on startup"
                         );
                     }
-                    true
+                    // A path the pass could not finish defers this boot's
+                    // delete emission exactly as a failed pass does; the
+                    // pass only no longer stops at it.
+                    report.failed.is_empty()
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -228,7 +228,7 @@ impl LinkRuntimeFactory {
                 }
             }
         };
-        // M1-5: closes the crash window between `write_placeholder`'s
+        // Closes the crash window between `write_placeholder`'s
         // durable disk write and its separate `record_placeholder_
         // generation` commit -- see that function's own doc comment. Runs
         // here, still before this link's watcher starts (same ordering

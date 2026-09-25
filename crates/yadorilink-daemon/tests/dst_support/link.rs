@@ -29,7 +29,7 @@
 //! has any bearing on at all. A live production link's `LinkRuntime` holds a
 //! real `RootLease`, established by an actual `start_link_watch`; a bare
 //! `ReplicaCoordinator`/`PeerSyncSession` harness runs neither, and
-//! `PeerSyncSessionDeps::standalone()` defaults this field to a deny-by-default
+//! `yadorilink_peer_session::peer_session::PeerSyncSessionDeps::standalone()` defaults this field to a deny-by-default
 //! provider like every other one-time capability, so `root_lease_for` fails
 //! closed with "no live root-commit authority ... no established link, or no
 //! provider injected" the moment anything (`materialize` chief among them)
@@ -45,7 +45,7 @@
 //! `AlwaysValidRootCommitAuthorityProvider`, not reachable from outside that
 //! crate) -- every scenario building a `PeerSyncSessionDeps` needs
 //! `root_commit_authority_provider: Arc::new(TestRootCommitAuthorityProvider)`
-//! in its struct literal, not just `..PeerSyncSessionDeps::standalone()`.
+//! in its struct literal, not just `..yadorilink_peer_session::peer_session::PeerSyncSessionDeps::standalone()`.
 //! `link_and_start` cannot install this itself (it has no `PeerSyncSession` to
 //! install it on) -- unlike the startup gate and root marker above, this one
 //! is each scenario's own responsibility at session-construction time.
@@ -69,10 +69,10 @@ use yadorilink_root_authority::root_identity::VerifiedRoot;
 /// `install_test_root_commit_authority` (that one backs `DaemonState`'s own
 /// `RootCommitAuthorityProvider` impl, which none of these bare
 /// `ReplicaCoordinator`/`PeerSyncSession` scenarios construct at all).
-/// `yadorilink_peer_session::peer_session_impl::AlwaysValidRootCommitAuthorityProvider`
+/// `yadorilink_peer_session::peer_session::AlwaysValidRootCommitAuthorityProvider`
 /// is this crate's private equivalent, reachable through
 /// `PeerSyncSessionOneTimeDeps::test_permissive()` -- but that's the
-/// crate-internal constructor path, not `PeerSyncSessionDeps::standalone()`
+/// crate-internal constructor path, not `yadorilink_peer_session::peer_session::PeerSyncSessionDeps::standalone()`
 /// (which every scenario here actually builds sessions through), and
 /// `standalone()` defaults this field to a deny-by-default provider like
 /// every other one-time capability. Every scenario constructing a

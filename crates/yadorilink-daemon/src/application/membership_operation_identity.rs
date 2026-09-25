@@ -3,7 +3,7 @@
 //! (`GET /devices/membership-operations/:operationId`) reports back as
 //! `record.request` -- shared by every caller that needs to compare a
 //! journal row's identity against a remote record: the existing
-//! reconcilers in `replica_membership_service.rs`, and Phase 2.1-C2-B's
+//! reconcilers in `replica_membership_service.rs`, and the
 //! evidence-identity qualification (the recovery-diagnosis module). A single
 //! shared implementation means both stay in agreement by construction --
 //! two independently-maintained canonicalizations could silently drift

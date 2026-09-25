@@ -1,5 +1,6 @@
-//! Track Send: real two-device send/receive over the real QUIC transport,
-//! and a real crash-recovery test for `receive_transfer`'s resume logic.
+//! Track Send: real two-device send/receive over each daemon's own iroh
+//! endpoint (Track Send's ALPN), and a real crash-recovery test for
+//! `receive_transfer`'s resume logic.
 //!
 //! Deliberately does NOT call `link_eager`/`link_on_demand` on either
 //! device, and registers both with the coordination fake with an EMPTY
@@ -48,8 +49,7 @@ async fn wait_for_send_service(state: &Arc<DaemonState>) {
 }
 
 /// Pairs two nodes with the coordination fake using an EMPTY group list on
-/// both sides, waits for real QUIC connectivity, then starts Track Send on
-/// both. Returns the `FakeCoordination`, the two orchestrator runtimes, and
+/// both sides and starts Track Send on both. Returns the `FakeCoordination`, the two orchestrator runtimes, and
 /// both nodes' Track Send config-dir guards -- all of which must outlive
 /// the calling test.
 async fn stand_up_two_groupless_devices(
@@ -75,30 +75,52 @@ async fn stand_up_two_groupless_devices(
 
     let runtimes = [spawn_orchestrator(fake.addr(), &a), spawn_orchestrator(fake.addr(), &b)];
 
-    // Deliberately NOT `fully_connected` (a real sync-protocol
-    // `PeerSyncSession` handshake): two devices sharing no folder group are
-    // never added to each other's `desired_peers` in the first place, so
-    // `peer_orchestrator` never spawns a sync session between them at all --
-    // waiting for one here would wait forever, on every run, regardless of
-    // Track Send. That absence is exactly the point: Track Send's own
-    // connectivity (`dial_send`/`connect_send`, using a peer's key and
-    // candidates from a coordination-plane grant response, never from
-    // `desired_peers`) is deliberately independent of the sync engine's own
-    // connection-establishment machinery.
+    // Deliberately NOT `fully_connected`: two devices sharing no folder
+    // group are never each other's sync peers, so no sync session ever
+    // exists between them. That absence is the point: Track Send reaches
+    // the receiver on its own ALPN, admitted by the grant the coordination
+    // plane issues, with the receiver's iroh address taken from that grant.
     //
     // `wait_for_send_service` below is the readiness signal this scenario
-    // actually needs, and it already implies the netmap WebSocket
-    // subscription is live: `send_transfer::run` only publishes a
-    // `SendService` once `DaemonState::shared_quic_peer_endpoint` exists,
-    // and that is set from INSIDE netmap-push processing
-    // (`peer_orchestrator::ensure_quic_endpoint`'s call site), so it cannot
-    // become `Some` before at least one netmap message has round-tripped
-    // over that subscription.
+    // needs: `send_transfer::run` publishes a `SendService` only once the
+    // daemon's reconciliation stack -- and so its iroh endpoint -- exists.
+    // The receiver's substrate address must also be on the plane before a
+    // grant can carry it. The harness does not run the daemon's startup, so
+    // each node's address report -- the production route by which a
+    // device's iroh address reaches the plane -- is started here, and
+    // `wait_for_substrate_address` waits for it to land.
     let send_dirs = [start_send_transfer(&a), start_send_transfer(&b)];
     wait_for_send_service(&a.state).await;
     wait_for_send_service(&b.state).await;
+    for node in [&a, &b] {
+        report_endpoint(&fake, node);
+        wait_for_substrate_address(&fake, &node.device_id).await;
+    }
 
     (fake, a, b, runtimes, send_dirs)
+}
+
+/// Runs `node`'s real address reporter against the fake: whatever its iroh
+/// endpoint publishes (`local_substrate_reachability`) is reported to the
+/// plane, exactly as the daemon's startup does in production.
+fn report_endpoint(fake: &FakeCoordination, node: &TopologyNode) {
+    tokio::spawn(yadorilink_daemon::peer_connectivity_runtime::report_own_address(
+        fake.addr(),
+        yadorilink_fapi_client::test_support::offline_auth(),
+        node.device_id.clone(),
+        node.state.peer_connectivity.local_substrate_reachability.clone(),
+    ));
+}
+
+/// Waits until the coordination fake holds `device_id`'s iroh endpoint
+/// address -- what a Track Send grant hands the other side to dial.
+async fn wait_for_substrate_address(fake: &FakeCoordination, device_id: &str) {
+    wait_until_with_context(
+        || fake.substrate_reachability_of(device_id).is_some_and(|(direct, _)| !direct.is_empty()),
+        Duration::from_secs(30),
+        || format!("{device_id} never published an iroh address"),
+    )
+    .await;
 }
 
 fn shutdown_orchestrators(runtimes: [tokio::runtime::Runtime; 2]) {
@@ -189,7 +211,7 @@ async fn receive_resumes_after_a_simulated_crash_mid_transfer() {
     });
     tokio::time::timeout(Duration::from_secs(30), hit_three_chunks.notified())
         .await
-        .expect("3 chunks should confirm well within 30s over real loopback QUIC");
+        .expect("3 chunks should confirm well within 30s over a real loopback connection");
     in_flight.abort();
     let aborted_result = in_flight.await;
     assert!(aborted_result.is_err(), "the task must have been genuinely aborted, not raced");

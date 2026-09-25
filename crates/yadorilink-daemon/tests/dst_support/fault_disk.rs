@@ -1,46 +1,38 @@
 //! A deterministic, seed-driven disk-fault decorator for any `BlockStore`.
-//!
 //! Disk faults in DST scenarios used to be hand-wired per scenario: each
 //! scenario grew its own bespoke faulting store with an ad hoc schedule,
 //! which both duplicated code and made the fault behavior non-portable
 //! between scenarios. `FaultingBlockStore` is the shared, reusable seam:
-//! it wraps *any* `BlockStore` (an `Arc<FsBlockStore>` or an
-//! `Arc<dyn BlockStore + Send + Sync>`) and injects the storage-layer fault
-//! classes on a deterministic predicate over `(op, per-op sequence, seed)`
-//! — never wall-clock time and never a live RNG at apply time, so a run
-//! replays byte-for-byte from the serialized `DiskFaultPlan` alone.
-//!
-//! This mirrors the network-side decorator's discipline: a pure, fully
-//! unit-testable decision engine (`DiskFaultPlan::decide`) sits behind a
-//! thin wrapper that applies the decision at the real trait seam. Keeping
-//! the policy pure and the wrapping at the trait boundary is what lets the
-//! same plan drive a sync-core test today and a production-shaped fault
-//! injector later without touching the policy.
-//!
-//! The fault classes (from the shared IR's `DiskFault`) map as follows:
-//! - `Enospc`  -> `put` returns the crate's disk-full error
-//!   (`StorageError::DiskPressure`), before any bytes are written.
-//! - `Eio`     -> an I/O error on `put` or `get`.
-//! - `TornWrite` -> `put` reports success and returns the *correct* content
-//!   hash, but the block is persisted truncated/corrupted, so a later
-//!   `get` reads back short/wrong bytes (a `ChecksumMismatch` from the
-//!   verifying read, short bytes from `get_unchecked`). This is what
-//!   exercises the no-silent-corruption oracle.
-//! - `SlowIo`  -> a deterministic `tokio::time::sleep` before the op that
-//!   advances only the simulated clock. Because `BlockStore` is a
-//!   synchronous trait, a sync method cannot `.await`; the delay is applied
-//!   by the async wrappers (`put_faulted`/`get_faulted`), exactly as the
-//!   network decorator returns a `Delay` decision for its async caller to
-//!   apply. Through the plain synchronous trait a `SlowIo` decision
-//!   degrades to a transparent pass-through (documented on each method).
-//! - `FsyncFail` is intentionally NOT implemented here: the `BlockStore`
-//!   trait exposes no separate durability/flush/fsync step to fail (a
-//!   write is durable-or-erroring as one call), so there is no honest
-//!   surface for it at this layer. It is left to a future backend that
-//!   exposes an explicit sync point.
-//! - `SqliteBusy` / `SqliteLocked` are index-database faults, not
-//!   block-store faults; they belong to a future faulting `SyncState`
-//!   wrapper and are deliberately out of scope for this decorator.
+//! it wraps *any* `BlockStore` (an `Arc<SegmentBlockStore>` or an `Arc<dyn
+//! BlockStore + Send + Sync>`) and injects the storage-layer fault classes
+//! on a deterministic predicate over `(op, per-op sequence, seed)` — never
+//! wall-clock time and never a live RNG at apply time, so a run replays
+//! byte-for-byte from the serialized `DiskFaultPlan` alone. This mirrors
+//! the network-side decorator's discipline: a pure, fully unit-testable
+//! decision engine (`DiskFaultPlan::decide`) sits behind a thin wrapper
+//! that applies the decision at the real trait seam. The fault classes
+//! (from the shared IR's `DiskFault`) map as follows: - `Enospc` -> `put`
+//! returns the crate's disk-full error (`StorageError::DiskPressure`),
+//! before any bytes are written. - `Eio` -> an I/O error on `put` or
+//! `get`. - `TornWrite` -> `put` reports success and returns the *correct*
+//! content hash, but the block is persisted truncated/corrupted, so a
+//! later `get` reads back short/wrong bytes (a `ChecksumMismatch` from the
+//! verifying read, short bytes from `get_unchecked`). This is what
+//! exercises the no-silent-corruption oracle. - `SlowIo` -> a
+//! deterministic `tokio::time::sleep` before the op that advances only the
+//! simulated clock. Because `BlockStore` is a synchronous trait, a sync
+//! method cannot `.await`; the delay is applied by the async wrappers
+//! (`put_faulted`/`get_faulted`), exactly as the network decorator returns
+//! a `Delay` decision for its async caller to apply. Through the plain
+//! synchronous trait a `SlowIo` decision degrades to a transparent
+//! pass-through (documented on each method). - `FsyncFail` is
+//! intentionally NOT implemented here: the `BlockStore` trait exposes no
+//! separate durability/flush/fsync step to fail (a write is
+//! durable-or-erroring as one call), so there is no honest surface for it
+//! at this layer. It is left to a future backend that exposes an explicit
+//! sync point. - `SqliteBusy` / `SqliteLocked` are index-database faults,
+//! not block-store faults; they belong to a future faulting `SyncState`
+//! wrapper and are deliberately out of scope for this decorator.
 
 #![allow(dead_code)] // not every op/wrapper has a producer in every scenario
 
@@ -197,7 +189,7 @@ impl OpCounters {
 
 /// A `BlockStore` decorator that injects `DiskFaultPlan`'s faults onto a
 /// wrapped store. `S` is `?Sized` so the same type wraps both a concrete
-/// `Arc<FsBlockStore>` and a type-erased `Arc<dyn BlockStore + Send + Sync>`
+/// `Arc<SegmentBlockStore>` and a type-erased `Arc<dyn BlockStore + Send + Sync>`
 /// with no changes at the call site.
 ///
 /// Torn blocks live in an in-decorator overlay rather than the wrapped
@@ -379,11 +371,11 @@ impl<S: BlockStore + ?Sized> BlockStore for FaultingBlockStore<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yadorilink_local_storage::FsBlockStore;
+    use yadorilink_local_storage::SegmentBlockStore;
 
-    fn fs_store() -> (tempfile::TempDir, Arc<FsBlockStore>) {
+    fn fs_store() -> (tempfile::TempDir, Arc<SegmentBlockStore>) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(FsBlockStore::new(dir.path()).unwrap());
+        let store = Arc::new(SegmentBlockStore::new(dir.path()).unwrap());
         (dir, store)
     }
 
@@ -538,7 +530,7 @@ mod tests {
         // not just the concrete backend.
         let dir = tempfile::tempdir().unwrap();
         let inner: Arc<dyn BlockStore + Send + Sync> =
-            Arc::new(FsBlockStore::new(dir.path()).unwrap());
+            Arc::new(SegmentBlockStore::new(dir.path()).unwrap());
         let store = FaultingBlockStore::new(inner, DiskFaultPlan::default());
         let hash = store.put(b"erased").unwrap();
         assert_eq!(store.get(&hash).unwrap(), b"erased");
@@ -548,8 +540,7 @@ mod tests {
 
     #[test]
     fn slow_io_delays_the_op_on_the_simulated_clock() {
-        let rt = madsim::runtime::Runtime::with_seed_and_config(1, madsim::Config::default());
-        rt.block_on(async {
+        super::super::sim::block_on(1, || async {
             let (_dir, fs) = fs_store();
             let hash = fs.put(b"slow bytes").unwrap();
             let store = FaultingBlockStore::new(

@@ -58,7 +58,7 @@ use support::{
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::peer_orchestrator;
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 
 struct TestDevice {
     device_id: String,
@@ -75,7 +75,7 @@ struct TestDevice {
 fn spawn_orchestrator(coordination_addr: String, device_id: String, state: Arc<DaemonState>) {
     let config = peer_orchestrator::OrchestratorConfig {
         coordination_addr,
-        access_token: "test".to_string(),
+        auth: yadorilink_fapi_client::test_support::offline_auth(),
         device_id,
     };
     tokio::spawn(async move {
@@ -92,7 +92,7 @@ fn spawn_orchestrator(coordination_addr: String, device_id: String, state: Arc<D
 /// registration, so co-group devices discover and connect to this one.
 async fn setup_device(fake: &FakeCoordination, device_id: &str, groups: &[&str]) -> TestDevice {
     let store_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let (sync_state, index_dir) = open_file_backed_replica_coordinator();
     let sync_state = Arc::new(sync_state);
     let state = DaemonState::new(device_id.to_string(), sync_state, store);
@@ -129,12 +129,10 @@ async fn wait_for_mesh(devices: &[&TestDevice]) {
     wait_until(
         || {
             devices.iter().all(|d| {
-                devices.iter().filter(|o| o.device_id != d.device_id).all(|o| {
-                    d.state
-                        .peers
-                        .session(&o.device_id)
-                        .is_some_and(|session| session.peer_handshake_received())
-                })
+                devices
+                    .iter()
+                    .filter(|o| o.device_id != d.device_id)
+                    .all(|o| d.state.peers.session(&o.device_id).is_some())
             })
         },
         Duration::from_secs(30),
@@ -157,14 +155,23 @@ async fn n_synced_devices(
     }
     let refs: Vec<&TestDevice> = devices.iter().collect();
     wait_for_mesh(&refs).await;
+    // The mesh wait proves the legacy peer-session transport is up. The
+    // reconciliation substrate -- the only plane that carries DAG changes --
+    // is a different socket with a different ALPN, and these fixtures wire
+    // their own devices, so nobody learns where anybody's substrate answers.
+    // Without this, changes reach nothing and every row stalls.
+    let states: Vec<&std::sync::Arc<DaemonState>> =
+        devices.iter().map(|device| &device.state).collect();
+    support::advertise_substrate_between(&states).await;
     wait_until(
         || {
             devices.iter().all(|device| {
                 device
                     .state
+                    .authority
                     .group_policy_state(group_id)
                     .is_some_and(|policy| policy.current_seq == 0)
-                    && !device.state.is_group_policy_stale(group_id)
+                    && !device.state.authority.is_group_policy_stale(group_id)
             })
         },
         Duration::from_secs(30),
@@ -424,6 +431,14 @@ async fn run_taguchi_v2_row(
             // so rely on that generous wait rather than blocking here.
             let new_device =
                 setup_device(&fake, &format!("{row_name}-device-churn-join"), &[group_id]).await;
+            // The joiner arrives after `n_synced_devices` ran its
+            // advertisement, so nobody knows where its reconciliation
+            // substrate answers and it knows where nobody else's does.
+            // Re-including the existing devices is idempotent.
+            let mut states: Vec<&std::sync::Arc<DaemonState>> =
+                devices.iter().map(|device| &device.state).collect();
+            states.push(&new_device.state);
+            support::advertise_substrate_between(&states).await;
             tokio::time::sleep(Duration::from_millis(300)).await;
             joined_device = Some(new_device);
         }

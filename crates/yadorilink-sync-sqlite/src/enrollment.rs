@@ -6,18 +6,6 @@
 //! still-unconfirmed coordination-plane state, so it is the natural owner
 //! of the atomic transition, mirroring this codebase's own precedent of an
 //! orchestrating type reaching into what it protects.
-//!
-//! Moved here from `yadorilink-sync-core::repository::enrollment` (Phase
-//! 7D-9F, ninth pass): its own value types (`EnrollmentOperation`/
-//! `PendingEnrollment`/`EnrollmentOperationState`/`EnrollmentKind`/their two
-//! `*Scan`/`Invalid*` siblings) already moved to
-//! `yadorilink_replica_domain::session_state`, a crate this one already
-//! depends on (see that module's own doc comment for why the earlier
-//! "stays crate-local" reasoning for `EnrollmentKind` did not hold up); the
-//! only other blocker, `scan_all_enrollment_operations`'s own use of
-//! `crate::recovery::{InvalidRecoveryOperation, RecoveryDomain}`, was
-//! already resolved by the eighth pass's relocation of those two types to
-//! `yadorilink_replica_domain::recovery`.
 
 use std::sync::Arc;
 
@@ -30,7 +18,8 @@ use yadorilink_replica_domain::recovery::{
 };
 use yadorilink_replica_domain::session_state::{
     EnrollmentKind, EnrollmentOperation, EnrollmentOperationScan, EnrollmentOperationState,
-    InvalidEnrollmentOperation, InvalidPendingEnrollment, PendingEnrollment, PendingEnrollmentScan,
+    FolderLink, InvalidEnrollmentOperation, InvalidPendingEnrollment, LinkRowWrite,
+    MaterializationPolicy, PendingEnrollment, PendingEnrollmentScan,
 };
 use yadorilink_sqlite_runtime::SyncDatabase;
 
@@ -502,9 +491,9 @@ impl EnrollmentRepository {
         group_id: &str,
         marker: &PendingEnrollment,
         now_unix: i64,
-    ) -> Result<(), SyncSqliteError> {
+    ) -> Result<LinkRowWrite, SyncSqliteError> {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            crate::link::LinkRepository::insert_link_row(tx, local_path, group_id)?;
+            let write = crate::link::LinkRepository::insert_link_row(tx, local_path, group_id)?;
             tx.execute(
                 "INSERT OR REPLACE INTO pending_enrollments \
                  (operation_id, kind, group_id, device_id, local_path) \
@@ -553,11 +542,31 @@ impl EnrollmentRepository {
             if marker.kind == EnrollmentKind::Join {
                 crate::rewind_plan::record_local_history_floor_for_a_first_link(tx, group_id)?;
             }
+            // What the commit did to the link row goes into the journal row
+            // in this same transaction, so a recovery sweep that finds this
+            // operation stranded in `LocalSetupPending` (the daemon died
+            // mid-setup) can undo exactly that write -- see
+            // [`Self::rollback_local_setup_to_cancel_pending`].
+            let (write_kind, prior) = match &write {
+                LinkRowWrite::Inserted => ("inserted", None),
+                LinkRowWrite::Updated(prior) => ("updated", Some(prior)),
+            };
             let changed = tx.execute(
                 "UPDATE enrollment_operations SET state = 'local_setup_pending', group_id = ?1, \
-                    last_error = NULL, updated_at_unix = ?2 \
+                    last_error = NULL, updated_at_unix = ?2, link_row_write = ?4, \
+                    prior_link_paused = ?5, prior_link_orphaned = ?6, prior_link_policy = ?7, \
+                    prior_link_max_local_size_bytes = ?8 \
                  WHERE operation_id = ?3 AND state = 'prepared'",
-                rusqlite::params![group_id, now_unix, marker.operation_id],
+                rusqlite::params![
+                    group_id,
+                    now_unix,
+                    marker.operation_id,
+                    write_kind,
+                    prior.map(|p| i64::from(p.paused)),
+                    prior.map(|p| i64::from(p.orphaned)),
+                    prior.map(|p| p.materialization_policy.as_db_str()),
+                    prior.and_then(|p| p.max_local_size_bytes),
+                ],
             )?;
             if changed != 1 {
                 return Err(SyncSqliteError::CorruptState(format!(
@@ -566,7 +575,7 @@ impl EnrollmentRepository {
                     marker.operation_id
                 )));
             }
-            Ok(())
+            Ok(write)
         })
     }
 
@@ -598,19 +607,24 @@ impl EnrollmentRepository {
     /// Writes to `links` as well as its own enrollment tables in one
     /// transaction to preserve atomicity -- decomposing this into separate
     /// `LinkRepository`/`EnrollmentRepository` calls would reopen the exact
-    /// crash window the single transaction exists to close. A future
-    /// cross-repository "commit store" (Commit 14 candidate) may formalize
-    /// this; it is not a design flaw to fix now.
-    /// Rolls a `LocalSetupPending` link + pending marker back to
-    /// `CancelPending`, atomically. Used both by `link()`'s own post-commit
-    /// setup-failure rollback path, and by recovery when a row is found
-    /// still `LocalSetupPending` well past its age-gate (the daemon crashed
-    /// mid-setup). Deletes the link row and the pending marker, and returns
-    /// the enrollment_operations row to `CancelPending` so the
-    /// coordination-side Pending authorization is still cancelled durably.
-    /// If the transaction itself fails, the caller must leave the operation
-    /// exactly as it was (`LocalSetupPending`) rather than assume any of
-    /// this happened -- see the caller's own handling.
+    /// crash window the single transaction exists to close.
+    ///
+    /// Crash recovery's rollback of a `LocalSetupPending` operation (the
+    /// daemon died mid-setup): undoes the link-row write the operation's
+    /// own commit recorded beside it -- deletes a row it inserted, restores
+    /// a row it updated (a re-join of a folder whose row already existed,
+    /// root token and all) -- drops the pending marker, and returns the
+    /// operation to `CancelPending` so the coordination-side Pending
+    /// authorization is still cancelled durably. All in one transaction.
+    ///
+    /// Returns `Ok(false)` and changes nothing when the operation has no
+    /// recorded link write (or is no longer `LocalSetupPending` at
+    /// `local_path`): without the record there is no telling whether the
+    /// row at the path is this operation's or an earlier link's, and
+    /// deleting an earlier link's row destroys its adopted root token. The
+    /// caller blocks such a row for an operator instead. If the
+    /// transaction itself fails, the caller must leave the operation
+    /// exactly as it was.
     ///
     /// Deliberately does NOT undo the `group_local_history_floor` row a
     /// `Join` commit wrote. A floor is not link state: it says when this
@@ -627,24 +641,113 @@ impl EnrollmentRepository {
         operation_id: &str,
         detail: &str,
         now_unix: i64,
-    ) -> Result<(), SyncSqliteError> {
+    ) -> Result<bool, SyncSqliteError> {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            tx.execute("DELETE FROM links WHERE local_path = ?1", [local_path])?;
-            tx.execute("DELETE FROM pending_enrollments WHERE operation_id = ?1", [operation_id])?;
-            let changed = tx.execute(
-                "UPDATE enrollment_operations SET state = 'cancel_pending', last_error = ?1, \
-                    updated_at_unix = ?2 \
-                 WHERE operation_id = ?3 AND state = 'local_setup_pending'",
-                rusqlite::params![detail, now_unix, operation_id],
-            )?;
-            if changed != 1 {
-                return Err(SyncSqliteError::CorruptState(format!(
-                    "could not return local-setup-pending enrollment operation {operation_id} to \
-                     CancelPending"
-                )));
-            }
-            Ok(())
+            let Some(write) = Self::recorded_link_row_write_on_tx(tx, local_path, operation_id)?
+            else {
+                return Ok(false);
+            };
+            let (group_id, write) = write;
+            crate::link::LinkRepository::undo_link_row_on_tx(tx, local_path, &group_id, &write)?;
+            Self::return_local_setup_to_cancel_pending_on_tx(tx, operation_id, detail, now_unix)?;
+            Ok(true)
         })
+    }
+
+    /// The link-row write a `LocalSetupPending` operation's commit recorded,
+    /// with the group it was for; `None` when there is no complete record.
+    fn recorded_link_row_write_on_tx(
+        tx: &rusqlite::Transaction<'_>,
+        local_path: &str,
+        operation_id: &str,
+    ) -> Result<Option<(String, LinkRowWrite)>, SyncSqliteError> {
+        let recorded = tx
+            .query_row(
+                "SELECT group_id, link_row_write, prior_link_paused, prior_link_orphaned, \
+                        prior_link_policy, prior_link_max_local_size_bytes \
+                 FROM enrollment_operations \
+                 WHERE operation_id = ?1 AND local_path = ?2 AND state = 'local_setup_pending'",
+                rusqlite::params![operation_id, local_path],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<i64>>(2)?,
+                        r.get::<_, Option<i64>>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, Option<i64>>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((Some(group_id), Some(kind), paused, orphaned, policy, max_local_size_bytes)) =
+            recorded
+        else {
+            return Ok(None);
+        };
+        let write = match (kind.as_str(), paused, orphaned, policy) {
+            ("inserted", ..) => LinkRowWrite::Inserted,
+            ("updated", Some(paused), Some(orphaned), Some(policy)) => {
+                LinkRowWrite::Updated(FolderLink {
+                    local_path: local_path.to_string(),
+                    group_id: group_id.clone(),
+                    paused: paused != 0,
+                    materialization_policy: MaterializationPolicy::from_db_str(&policy),
+                    max_local_size_bytes,
+                    orphaned: orphaned != 0,
+                })
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some((group_id, write)))
+    }
+
+    /// [`Self::rollback_local_setup_to_cancel_pending`] for the caller that
+    /// committed the link itself and so knows what that commit did to the
+    /// `links` row: undoes exactly that write
+    /// ([`crate::link::LinkRepository::undo_link_row_on_tx`]) instead of
+    /// deleting whatever row sits at the path. A re-link of a folder that
+    /// was already linked updated its existing row; deleting it here would
+    /// destroy the earlier link and its adopted root token. Returns what the
+    /// link-row undo did, for the caller's log line.
+    pub fn rollback_local_setup_undoing_link_write(
+        &self,
+        local_path: &str,
+        group_id: &str,
+        write: &LinkRowWrite,
+        operation_id: &str,
+        detail: &str,
+        now_unix: i64,
+    ) -> Result<&'static str, SyncSqliteError> {
+        self.database.write_immediate::<_, SyncSqliteError>(|tx| {
+            let undone =
+                crate::link::LinkRepository::undo_link_row_on_tx(tx, local_path, group_id, write)?;
+            Self::return_local_setup_to_cancel_pending_on_tx(tx, operation_id, detail, now_unix)?;
+            Ok(undone)
+        })
+    }
+
+    /// The marker and journal half of both rollbacks.
+    fn return_local_setup_to_cancel_pending_on_tx(
+        tx: &rusqlite::Transaction<'_>,
+        operation_id: &str,
+        detail: &str,
+        now_unix: i64,
+    ) -> Result<(), SyncSqliteError> {
+        tx.execute("DELETE FROM pending_enrollments WHERE operation_id = ?1", [operation_id])?;
+        let changed = tx.execute(
+            "UPDATE enrollment_operations SET state = 'cancel_pending', last_error = ?1, \
+                updated_at_unix = ?2 \
+             WHERE operation_id = ?3 AND state = 'local_setup_pending'",
+            rusqlite::params![detail, now_unix, operation_id],
+        )?;
+        if changed != 1 {
+            return Err(SyncSqliteError::CorruptState(format!(
+                "could not return local-setup-pending enrollment operation {operation_id} to \
+                 CancelPending"
+            )));
+        }
+        Ok(())
     }
 
     /// Transfers a `pending_enrollments` marker whose local link is absent
@@ -742,15 +845,6 @@ impl EnrollmentRepository {
     }
 }
 
-// `pub`, not `pub(crate)`: `yadorilink-sync-core::repository::recovery_snapshot::
-// RecoverySnapshotReader` (genuinely cross-repository/cross-crate, staying
-// behind in that crate -- see its own doc comment) decodes an
-// `enrollment_operations`/`pending_enrollments` row itself inside its own
-// single consistent-read `Deferred` transaction, and must reuse the exact
-// same shape-validated decoder rather than duplicate
-// `validate_enrollment_operation`'s rules a second time -- same precedent as
-// `row_to_membership_operation`/`row_to_role_loss_operation_strict`'s own
-// `pub` bump (Phase 7D-9F, eighth pass).
 pub fn row_to_pending_enrollment(r: &rusqlite::Row<'_>) -> rusqlite::Result<PendingEnrollment> {
     let kind_raw: String = r.get(1)?;
     let kind = EnrollmentKind::try_from_db_str(&kind_raw)
@@ -870,269 +964,8 @@ pub fn row_to_enrollment_operation(r: &rusqlite::Row<'_>) -> rusqlite::Result<En
 /// then"), with `unavailable = 0` suppressing every hedge a renderer would
 /// otherwise show.
 #[cfg(test)]
-mod local_history_floor_tests {
-    use super::*;
-    use crate::rewind_plan::compute_rewind_plan;
-    use yadorilink_replica_domain::file::FileRecord;
-    use yadorilink_replica_domain::rewind::RewindPathAction;
+mod local_history_floor_tests;
 
-    const DEVICE: &str = "device-1";
-    const GROUP: &str = "group-1";
-    const LOCAL_PATH: &str = "/folders/shared";
-    /// The distance a preview like `--at 30d` asks about.
-    const THIRTY_DAYS_NANOS: i64 = 30 * 24 * 60 * 60 * 1_000_000_000;
-
-    /// Full schema, pooled exactly as production opens it -- DAG tables
-    /// first, since `yadorilink_sqlite_runtime::init_schema` assumes
-    /// `changes`/`pruned_changes` already exist. Mirrors
-    /// `rebootstrap_store`'s own `open_full_test_db`.
-    fn open_full_test_db() -> Arc<SyncDatabase> {
-        Arc::new(
-            SyncDatabase::open_in_memory(|conn| {
-                crate::dag_store::init_dag_schema(conn).map_err(|e| {
-                    yadorilink_sqlite_runtime::DatabaseError::CorruptSchema(e.to_string())
-                })?;
-                yadorilink_sqlite_runtime::init_schema(conn)
-            })
-            .expect("open in-memory db"),
-        )
-    }
-
-    /// Walks an enrollment through the real journal states and commits its
-    /// link through the real production entry point -- the same call the
-    /// daemon's own link adapter makes for both `share create` and
-    /// `share join`. Nothing here reaches around
-    /// [`EnrollmentRepository::add_link_with_pending_enrollment_and_begin_setup`].
-    fn commit_link_through_enrollment(db: &Arc<SyncDatabase>, kind: EnrollmentKind) {
-        let repository = EnrollmentRepository::new(db.clone());
-        let operation_id = "operation-1";
-        assert!(
-            repository
-                .try_insert_enrollment_operation(&EnrollmentOperation {
-                    operation_id: operation_id.to_string(),
-                    kind,
-                    group_id: Some(GROUP.to_string()),
-                    // Required of a `Create` row while it is still
-                    // `PreparePending`, and meaningless for a `Join`.
-                    group_name: matches!(kind, EnrollmentKind::Create)
-                        .then(|| "Shared".to_string()),
-                    device_id: DEVICE.to_string(),
-                    local_path: LOCAL_PATH.to_string(),
-                    storage_mode: "eager".to_string(),
-                    state: EnrollmentOperationState::PreparePending,
-                    last_error: None,
-                    attempts: 0,
-                    created_at_unix: 0,
-                    updated_at_unix: 0,
-                })
-                .unwrap(),
-            "the journal row must be inserted"
-        );
-        assert!(
-            repository.mark_enrollment_operation_prepared(operation_id, GROUP, 1).unwrap(),
-            "prepare must advance the row, or the commit below would refuse it"
-        );
-        repository
-            .add_link_with_pending_enrollment_and_begin_setup(
-                LOCAL_PATH,
-                GROUP,
-                &PendingEnrollment {
-                    operation_id: operation_id.to_string(),
-                    kind,
-                    group_id: GROUP.to_string(),
-                    device_id: DEVICE.to_string(),
-                    local_path: LOCAL_PATH.to_string(),
-                },
-                2,
-            )
-            .expect("the link commit must succeed");
-    }
-
-    /// Admits one file through the real file-index write chokepoint, the
-    /// way an incoming change from a peer does. `origin_device_id` is
-    /// another device precisely because this models a file the GROUP
-    /// already had -- but the row it produces still carries
-    /// `version_seq = 1`, which is the whole problem.
-    fn admit_file(db: &Arc<SyncDatabase>, path: &str, size: u64) {
-        db.write_immediate::<_, SyncSqliteError>(|tx| {
-            crate::file_index::upsert_file_in_tx(
-                tx,
-                GROUP,
-                &FileRecord {
-                    path: path.to_string(),
-                    size,
-                    mtime_unix_nanos: 0,
-                    blocks: Vec::new(),
-                    deleted: false,
-                },
-                "device-that-was-here-first",
-                None,
-            )
-        })
-        .expect("the file admission must succeed");
-    }
-
-    fn action_at(db: &Arc<SyncDatabase>, at_unix_nanos: i64, path: &str) -> RewindPathAction {
-        db.read::<_, SyncSqliteError>(|conn| compute_rewind_plan(conn, GROUP, at_unix_nanos))
-            .unwrap()
-            .entries
-            .into_iter()
-            .find(|entry| entry.path == path)
-            .unwrap_or_else(|| panic!("{path} must appear in the plan"))
-            .action
-    }
-
-    fn recorded_floor(db: &Arc<SyncDatabase>) -> Option<i64> {
-        db.read::<_, SyncSqliteError>(|conn| {
-            Ok(conn
-                .query_row(
-                    "SELECT floor_unix_nanos FROM group_local_history_floor WHERE group_id = ?1",
-                    [GROUP],
-                    |row| row.get(0),
-                )
-                .optional()?)
-        })
-        .unwrap()
-    }
-
-    /// The headline case. A file the group already held when this device
-    /// joined must not be reported as something a rewind would delete.
-    #[test]
-    fn a_file_inherited_at_a_join_is_unavailable_before_the_join_not_delete() {
-        let db = open_full_test_db();
-        let before_join = crate::file_index::now_unix_nanos_checked().unwrap();
-        commit_link_through_enrollment(&db, EnrollmentKind::Join);
-        // Everything the group already held syncs in after the join.
-        for path in ["notes.txt", "photos/trip.jpg", "budget.csv"] {
-            admit_file(&db, path, 10);
-        }
-
-        // The observable verdict first, so a regression reports what the
-        // user would actually be shown rather than a missing table row.
-        let a_month_ago = before_join - THIRTY_DAYS_NANOS;
-        let plan = db
-            .read::<_, SyncSqliteError>(|conn| compute_rewind_plan(conn, GROUP, a_month_ago))
-            .unwrap();
-        let counts = plan.action_counts();
-        assert_eq!(
-            counts.delete, 0,
-            "a folder this device inherited was not created since the target, so a preview must \
-             not offer to delete it: {counts:?}"
-        );
-        assert_eq!(
-            counts.unavailable, 3,
-            "every inherited path is unanswerable this far back, and `unavailable = 0` is what \
-             suppresses a renderer's own hedge: {counts:?}"
-        );
-
-        match action_at(&db, a_month_ago, "notes.txt") {
-            RewindPathAction::Unavailable { reason } => {
-                assert!(
-                    reason.contains("joined the group"),
-                    "the reason must name the join as a possible cause: {reason}"
-                );
-                assert!(
-                    !reason.contains("retention"),
-                    "retention cannot be the cause below the floor, and naming it would be a \
-                     confident wrong explanation: {reason}"
-                );
-            }
-            other => panic!("expected Unavailable before the join, got {other:?}"),
-        }
-
-        let floor = recorded_floor(&db).expect("a join must record this group's history floor");
-        assert!(floor >= before_join, "the floor must be the join instant, not something earlier");
-    }
-
-    /// The other half of the same boundary: the floor must not turn a
-    /// joined device into one that can never answer anything. At the floor
-    /// itself, and above it, ordinary classification resumes -- including
-    /// the `version_seq = 1` reading the floor suspends below itself.
-    #[test]
-    fn at_or_after_the_join_floor_paths_are_classified_normally() {
-        let db = open_full_test_db();
-        commit_link_through_enrollment(&db, EnrollmentKind::Join);
-        admit_file(&db, "notes.txt", 10);
-        let floor = recorded_floor(&db).expect("a join must record this group's history floor");
-
-        assert_eq!(
-            action_at(&db, floor, "notes.txt"),
-            RewindPathAction::Delete,
-            "at the floor the group's history is this device's own again, and this row really \
-             was admitted after the target"
-        );
-        assert_eq!(
-            action_at(&db, i64::MAX, "notes.txt"),
-            RewindPathAction::Unchanged,
-            "a target after the row's own admission is answered from the row itself"
-        );
-    }
-
-    /// The `Create` path must keep behaving exactly as it did. A folder
-    /// this device originated locally has no inherited history to guard
-    /// against: its `version_seq = 1` rows really are its own first
-    /// admissions, so a target before the folder existed is honestly
-    /// `Delete`, not `Unavailable`. This is the regression guard on the
-    /// fix's own blast radius.
-    #[test]
-    fn a_locally_created_folder_still_reports_delete_before_it_existed() {
-        let db = open_full_test_db();
-        let before_create = crate::file_index::now_unix_nanos_checked().unwrap();
-        commit_link_through_enrollment(&db, EnrollmentKind::Create);
-        admit_file(&db, "notes.txt", 10);
-
-        assert_eq!(
-            recorded_floor(&db),
-            None,
-            "creating a folder locally must record no history floor -- there is no inherited \
-             history to bound"
-        );
-        assert_eq!(
-            action_at(&db, before_create - THIRTY_DAYS_NANOS, "notes.txt"),
-            RewindPathAction::Delete,
-            "before this device created the folder, its files genuinely did not exist"
-        );
-    }
-
-    /// The floor is per group. One device's join of one group must not make
-    /// another group -- one it created itself -- unanswerable.
-    #[test]
-    fn a_join_floor_is_scoped_to_the_group_that_was_joined() {
-        let db = open_full_test_db();
-        let before_join = crate::file_index::now_unix_nanos_checked().unwrap();
-        commit_link_through_enrollment(&db, EnrollmentKind::Join);
-        admit_file(&db, "inherited.txt", 10);
-        db.write_immediate::<_, SyncSqliteError>(|tx| {
-            crate::file_index::upsert_file_in_tx(
-                tx,
-                "another-group",
-                &FileRecord {
-                    path: "mine.txt".to_string(),
-                    size: 10,
-                    mtime_unix_nanos: 0,
-                    blocks: Vec::new(),
-                    deleted: false,
-                },
-                DEVICE,
-                None,
-            )
-        })
-        .unwrap();
-
-        let a_month_ago = before_join - THIRTY_DAYS_NANOS;
-        assert!(matches!(
-            action_at(&db, a_month_ago, "inherited.txt"),
-            RewindPathAction::Unavailable { .. }
-        ));
-        let other = db
-            .read::<_, SyncSqliteError>(|conn| {
-                compute_rewind_plan(conn, "another-group", a_month_ago)
-            })
-            .unwrap();
-        assert_eq!(
-            other.entries.iter().find(|e| e.path == "mine.txt").unwrap().action,
-            RewindPathAction::Delete,
-            "a group with no floor of its own keeps the ordinary inference"
-        );
-    }
-}
+/// Crash recovery's rollback of a `LocalSetupPending` link commit.
+#[cfg(test)]
+mod recovery_rollback_tests;

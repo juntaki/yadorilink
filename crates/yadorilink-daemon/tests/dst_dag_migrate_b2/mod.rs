@@ -1,21 +1,17 @@
 //! Shared change-history-DAG propagation wiring for the DST scenarios that
 //! drive convergence over the real `run()` loop (HeadsAnnounce ->
-//! ChangeRequest -> ChangeBatch) instead of the direct index exchange.
-//!
-//! A scenario gives each device's `LocalChangeProcessor` a signed
+//! ChangeRequest -> ChangeBatch) instead of the direct index exchange. A
+//! scenario gives each device's `LocalChangeProcessor` a signed
 //! [`ChangeEmitter`] (so every accepted local mutation appends a signed
 //! change to the history DAG in the same transaction as its index write),
 //! pins every device's verifying key on every session via a
-//! [`PinnedAuthenticator`], and then propagates a committed edit by announcing
-//! the new heads rather than pushing an index update. The peer diffs the
-//! announced heads against its own store and pulls exactly the ancestry it is
-//! missing, materializing the same converged state on both sides.
-//!
-//! Lives in a `tests/` *subdirectory* so Cargo does not build it as its own
-//! integration-test binary (only top-level `tests/*.rs` are targets); each
-//! scenario pulls it in with `mod dst_dag_migrate_b2;`. It references only the
-//! `yadorilink-sync-core` public API and `ed25519-dalek`, never `dst_support`,
-//! so it compiles standalone in each binary that includes it.
+//! [`PinnedAuthenticator`], and then propagates a committed edit by
+//! announcing the new heads rather than pushing an index update. The peer
+//! diffs the announced heads against its own store and pulls exactly the
+//! ancestry it is missing, materializing the same converged state on both
+//! sides. Lives in a `tests/` *subdirectory* so Cargo does not build it as
+//! its own integration-test binary (only top-level `tests/*.rs` are
+//! targets); each scenario pulls it in with `mod dst_dag_migrate_b2;`.
 
 #![allow(dead_code)]
 
@@ -125,7 +121,7 @@ pub fn spawn_test_convergence_driver(
 /// closed), and the test convergence driver described above.
 ///
 /// The all-device pinned authenticator this used to install here too is now
-/// a `PeerSyncSessionDeps::change_authenticator` construction-only field
+/// a `yadorilink_peer_session::peer_session::PeerSyncSessionDeps::change_authenticator` construction-only field
 /// (`ChangeAuthenticator` is no longer settable after a session exists) --
 /// every caller must build its session via `PeerSyncSession::
 /// new_with_dependencies` with `PinnedAuthenticator::new(device_ids)`

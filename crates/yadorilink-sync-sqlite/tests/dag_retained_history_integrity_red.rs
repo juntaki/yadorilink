@@ -1,7 +1,8 @@
 use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
-use yadorilink_replica_domain::change::{Change, ChangeAuth, Op};
+use yadorilink_replica_domain::change::Op;
 use yadorilink_replica_domain::ids::{DeviceId, FolderGroupId, SyncPath};
+use yadorilink_replica_domain::test_authoring::create_signed_for_tests;
 use yadorilink_sync_sqlite::dag_store::init_dag_schema;
 use yadorilink_sync_sqlite::SyncSqliteError as SyncError;
 
@@ -15,7 +16,7 @@ fn signing_key() -> SigningKey {
     SigningKey::from_bytes(&[42u8; 32])
 }
 
-/// RED: startup repair currently decodes retained bytes but must also apply the
+/// Pins: startup repair decodes retained bytes and must also apply the
 /// same store-independent structural validation used at peer admission. A row
 /// can be perfectly self-consistent at the SQL/hash level while still carrying
 /// an unsafe path that should never be durable admitted history.
@@ -23,10 +24,9 @@ fn signing_key() -> SigningKey {
 fn schema_init_fails_closed_on_structurally_invalid_retained_change() {
     let conn = conn();
     let signing = signing_key();
-    let change = Change::create_signed(
+    let change = create_signed_for_tests(
         vec![],
         0,
-        ChangeAuth::PLACEHOLDER,
         DeviceId("device-a".into()),
         FolderGroupId("g".into()),
         vec![Op::Delete { path: SyncPath("../escape.bin".into()) }],
@@ -36,10 +36,12 @@ fn schema_init_fails_closed_on_structurally_invalid_retained_change() {
 
     conn.execute(
         "INSERT INTO changes \
-         (change_hash, group_id, device_id, lamport, encoded, applied, authenticated_header) \
-         VALUES (?1, 'g', 'device-a', ?2, ?3, 1, ?4)",
+         (change_hash, group_id, device_id, author_seq, lamport, encoded, \
+          authenticated_header) \
+         VALUES (?1, 'g', 'device-a', ?2, ?3, ?4, ?5)",
         rusqlite::params![
             &hash.0[..],
+            change.author_seq.get() as i64,
             change.lamport as i64,
             change.to_wire_bytes(),
             change.authenticated_header_encoding()
@@ -54,7 +56,7 @@ fn schema_init_fails_closed_on_structurally_invalid_retained_change() {
     assert!(matches!(error, SyncError::CorruptState(_)));
 }
 
-/// RED: startup repair verifies a retained change's storage key, row
+/// Pins: startup repair verifies a retained change's storage key, row
 /// metadata, structure, and `change_parents` edges against its own encoded
 /// body, but never the same cross-group-parent invariant peer admission
 /// enforces via `validate_present_parent_shape`. A row can be self-consistent
@@ -64,10 +66,9 @@ fn schema_init_fails_closed_on_structurally_invalid_retained_change() {
 fn schema_init_fails_closed_on_retained_change_with_a_cross_group_parent() {
     let conn = conn();
     let signing = signing_key();
-    let foreign_parent = Change::create_signed(
+    let foreign_parent = create_signed_for_tests(
         vec![],
         0,
-        ChangeAuth::PLACEHOLDER,
         DeviceId("device-a".into()),
         FolderGroupId("group-b".into()),
         vec![Op::Delete { path: SyncPath("b.bin".into()) }],
@@ -76,10 +77,12 @@ fn schema_init_fails_closed_on_retained_change_with_a_cross_group_parent() {
     let foreign_hash = foreign_parent.compute_hash();
     conn.execute(
         "INSERT INTO changes \
-         (change_hash, group_id, device_id, lamport, encoded, applied, authenticated_header) \
-         VALUES (?1, 'group-b', 'device-a', ?2, ?3, 1, ?4)",
+         (change_hash, group_id, device_id, author_seq, lamport, encoded, \
+          authenticated_header) \
+         VALUES (?1, 'group-b', 'device-a', ?2, ?3, ?4, ?5)",
         rusqlite::params![
             &foreign_hash.0[..],
+            foreign_parent.author_seq.get() as i64,
             foreign_parent.lamport as i64,
             foreign_parent.to_wire_bytes(),
             foreign_parent.authenticated_header_encoding(),
@@ -87,10 +90,9 @@ fn schema_init_fails_closed_on_retained_change_with_a_cross_group_parent() {
     )
     .unwrap();
 
-    let child = Change::create_signed(
+    let child = create_signed_for_tests(
         vec![foreign_hash],
         foreign_parent.lamport,
-        ChangeAuth::PLACEHOLDER,
         DeviceId("device-a".into()),
         FolderGroupId("group-a".into()),
         vec![Op::Delete { path: SyncPath("a.bin".into()) }],
@@ -99,10 +101,12 @@ fn schema_init_fails_closed_on_retained_change_with_a_cross_group_parent() {
     let child_hash = child.compute_hash();
     conn.execute(
         "INSERT INTO changes \
-         (change_hash, group_id, device_id, lamport, encoded, applied, authenticated_header) \
-         VALUES (?1, 'group-a', 'device-a', ?2, ?3, 1, ?4)",
+         (change_hash, group_id, device_id, author_seq, lamport, encoded, \
+          authenticated_header) \
+         VALUES (?1, 'group-a', 'device-a', ?2, ?3, ?4, ?5)",
         rusqlite::params![
             &child_hash.0[..],
+            child.author_seq.get() as i64,
             child.lamport as i64,
             child.to_wire_bytes(),
             child.authenticated_header_encoding(),
@@ -120,40 +124,7 @@ fn schema_init_fails_closed_on_retained_change_with_a_cross_group_parent() {
     assert!(matches!(error, SyncError::CorruptState(_)));
 }
 
-/// RED: `changes.applied` has no SQL constraint and startup repair never
-/// reads or validates it, but `list_unapplied` keys retry off `applied = 0`
-/// exactly and materialization-complete logic keys off `applied = 1`
-/// exactly. A third value is invisible to both and drops the row out of
-/// retry forever.
-#[test]
-fn schema_init_fails_closed_on_an_invalid_applied_value() {
-    let conn = conn();
-    let signing = signing_key();
-    let change = Change::create_signed(
-        vec![],
-        0,
-        ChangeAuth::PLACEHOLDER,
-        DeviceId("device-a".into()),
-        FolderGroupId("g".into()),
-        vec![Op::Delete { path: SyncPath("a.bin".into()) }],
-        &signing,
-    );
-    let hash = change.compute_hash();
-    conn.execute(
-        "INSERT INTO changes \
-         (change_hash, group_id, device_id, lamport, encoded, applied) \
-         VALUES (?1, 'g', 'device-a', ?2, ?3, 2)",
-        rusqlite::params![&hash.0[..], change.lamport as i64, change.to_wire_bytes()],
-    )
-    .unwrap();
-
-    let error = init_dag_schema(&conn).expect_err(
-        "an out-of-range applied value must fail closed rather than silently drop out of retry",
-    );
-    assert!(matches!(error, SyncError::CorruptState(_)));
-}
-
-/// RED: `changes.authenticated_header` is what a future prune hands straight
+/// Pins: `changes.authenticated_header` is what a future prune hands straight
 /// to a pruned change's `pruned_changes` tombstone with no re-derivation from
 /// `encoded` at prune time (see `pruned_changes`'s column comments). If it
 /// ever silently drifted from what the change's own signed bytes actually
@@ -164,10 +135,9 @@ fn schema_init_fails_closed_on_an_invalid_applied_value() {
 fn schema_init_fails_closed_on_an_authenticated_header_that_disagrees_with_its_encoded_change() {
     let conn = conn();
     let signing = signing_key();
-    let change = Change::create_signed(
+    let change = create_signed_for_tests(
         vec![],
         0,
-        ChangeAuth::PLACEHOLDER,
         DeviceId("device-a".into()),
         FolderGroupId("g".into()),
         vec![Op::Delete { path: SyncPath("a.bin".into()) }],
@@ -178,9 +148,16 @@ fn schema_init_fails_closed_on_an_authenticated_header_that_disagrees_with_its_e
     assert_ne!(wrong_header, change.authenticated_header_encoding());
     conn.execute(
         "INSERT INTO changes \
-         (change_hash, group_id, device_id, lamport, encoded, applied, authenticated_header) \
-         VALUES (?1, 'g', 'device-a', ?2, ?3, 1, ?4)",
-        rusqlite::params![&hash.0[..], change.lamport as i64, change.to_wire_bytes(), wrong_header],
+         (change_hash, group_id, device_id, author_seq, lamport, encoded, \
+          authenticated_header) \
+         VALUES (?1, 'g', 'device-a', ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            &hash.0[..],
+            change.author_seq.get() as i64,
+            change.lamport as i64,
+            change.to_wire_bytes(),
+            wrong_header
+        ],
     )
     .unwrap();
 

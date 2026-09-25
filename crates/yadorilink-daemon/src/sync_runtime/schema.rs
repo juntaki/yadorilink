@@ -29,6 +29,12 @@ pub fn pre_dag_schema(conn: &Connection) -> Result<(), yadorilink_sqlite_runtime
 pub fn post_dag_schema(conn: &Connection) -> Result<(), yadorilink_sqlite_runtime::DatabaseError> {
     yadorilink_sync_sqlite::rebootstrap_store::init_rebootstrap_schema(conn)
         .map_err(|e| schema_err(SyncError::from(e)))?;
+    // The verified-possession staging tables. They live in this same
+    // database and this same transaction domain deliberately: promotion has
+    // to be one atomic commit spanning staged and canonical state, which a
+    // second database file would make impossible.
+    yadorilink_sync_sqlite::verified_change_store::init_verified_change_schema(conn)
+        .map_err(|e| schema_err(SyncError::from(e)))?;
     Ok(())
 }
 

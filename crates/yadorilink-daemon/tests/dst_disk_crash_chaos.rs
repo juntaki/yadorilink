@@ -1,4 +1,8 @@
-#![cfg(madsim)]
+// Retired. This scenario was written for a simulator this project no longer
+// builds against, and it names APIs that have since been removed. It is kept,
+// never compiled, as the specification its turmoil re-expression has to meet;
+// delete it in the change that lands that replacement.
+#![cfg(any())]
 
 mod dst_support;
 
@@ -29,7 +33,7 @@ use yadorilink_filesystem_sync::watcher::{
 use yadorilink_local_capture::ports::LocalMutationStore;
 use yadorilink_local_capture::{LocalChangeOutcome, LocalChangeProcessor};
 use yadorilink_local_storage::{
-    BlockStore, ContentHash, FsBlockStore, GcReport, StorageError, StorageUsage,
+    BlockStore, ContentHash, GcReport, SegmentBlockStore, StorageError, StorageUsage,
 };
 use yadorilink_peer_session::peer_session::{
     ChangeAuthenticator, PeerSyncSession, PendingLocalChangeFlush, PendingLocalFlushOutcome,
@@ -90,7 +94,7 @@ struct FaultEvent {
 }
 
 struct FaultingBlockStore {
-    inner: FsBlockStore,
+    inner: SegmentBlockStore,
     root: PathBuf,
     active: AtomicBool,
     op_count: Mutex<u64>,
@@ -113,7 +117,7 @@ impl FaultingBlockStore {
         }
         events.sort_by_key(|e| e.op_after);
         Ok(Self {
-            inner: FsBlockStore::new(&root)?,
+            inner: SegmentBlockStore::new(&root)?,
             root,
             active: AtomicBool::new(false),
             op_count: Mutex::new(0),
@@ -158,18 +162,22 @@ impl FaultingBlockStore {
         hex::encode(hasher.finalize())
     }
 
-    fn path_for_hash(&self, hash: &str) -> PathBuf {
-        self.root.join(&hash[0..2]).join(&hash[2..4]).join(hash)
-    }
-
-    fn write_torn_final_block(&self, data: &[u8]) -> Result<String, StorageError> {
-        let hash = Self::hash_bytes(data);
-        let path = self.path_for_hash(&hash);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let cut = data.len().saturating_div(2).max(1).min(data.len());
-        std::fs::write(&path, &data[..cut])?;
+    /// A torn write, as the block store can actually experience one.
+    ///
+    /// This used to plant a half-written file at the block's
+    /// content-addressed path, because with one file per block that *was*
+    /// the failure: the partial bytes sat under the block's own name and
+    /// the next `exists` would believe them. The segment store cannot
+    /// reach that state -- a block's mapping is written only after its
+    /// bytes are fsynced, so a torn append leaves bytes that nothing
+    /// references and that recovery truncates. So the faithful injection
+    /// is now what a torn append actually produces for the caller: a
+    /// failed commit and no block, with nothing visible left behind.
+    ///
+    /// The store's own crash matrix (`segment_store::CommitPoint`) is
+    /// where the half-written record itself is exercised; this scenario is
+    /// about how the layers above handle the failure it surfaces.
+    fn refuse_torn_write(&self, _data: &[u8]) -> Result<String, StorageError> {
         Err(StorageError::Io(std::io::Error::new(
             std::io::ErrorKind::WriteZero,
             "dst injected torn block write",
@@ -196,7 +204,7 @@ impl BlockStore for FaultingBlockStore {
             Some(DiskFault::FsyncFail) => {
                 Err(Self::injected_error(std::io::ErrorKind::Other, "dst injected fsync failure"))
             }
-            Some(DiskFault::TornWrite) => self.write_torn_final_block(data),
+            Some(DiskFault::TornWrite) => self.refuse_torn_write(data),
             Some(DiskFault::SlowIo { millis }) => {
                 std::thread::sleep(Duration::from_millis(millis));
                 self.inner.put(data)
@@ -297,7 +305,7 @@ impl ChaosDevice {
         let changed = match outcome {
             LocalChangeOutcome::FileChanged(_) => true,
             LocalChangeOutcome::FilesChanged(ref records) => !records.is_empty(),
-            LocalChangeOutcome::None => false,
+            LocalChangeOutcome::None | LocalChangeOutcome::RetryLater => false,
         };
         if !changed {
             return;
@@ -469,7 +477,7 @@ async fn connect_sessions(
     let mut roots_a = HashMap::new();
     roots_a.insert(GROUP_ID.to_string(), device_a.root.clone());
     let (forward_tx_a, mut forward_rx_a) = tokio::sync::mpsc::unbounded_channel();
-    let session_a = PeerSyncSession::new_with_dependencies(
+    let session_a = PeerSyncSession::new(
         channel_a,
         device_a.device_id.clone(),
         device_b.device_id.clone(),
@@ -492,7 +500,7 @@ async fn connect_sessions(
     let mut roots_b = HashMap::new();
     roots_b.insert(GROUP_ID.to_string(), device_b.root.clone());
     let (forward_tx_b, mut forward_rx_b) = tokio::sync::mpsc::unbounded_channel();
-    let session_b = PeerSyncSession::new_with_dependencies(
+    let session_b = PeerSyncSession::new(
         channel_b,
         device_b.device_id.clone(),
         device_a.device_id.clone(),

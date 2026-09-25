@@ -78,7 +78,7 @@ powershell -ExecutionPolicy Bypass -File installer\windows\build-installer.ps1 `
 ```
 
 These variables contain only the identifier and public half of the offline
-update signing key. See `docs/UPDATE_SIGNING.md`; never copy the private key to
+update signing key; never copy the private key to
 the Windows build host.
 
 Release builds must be Authenticode-signed through an Inno Setup SignTool

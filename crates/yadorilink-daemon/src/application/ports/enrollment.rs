@@ -50,7 +50,7 @@ pub(crate) trait EnrollmentRepository: Send + Sync {
 
     fn operation(&self, operation_id: &str) -> Result<Option<EnrollmentOperation>, SyncError>;
 
-    // ===== EnrollmentRecoveryService only (Phase 2 Commit 3) =====
+    // ===== EnrollmentRecoveryService only =====
 
     /// Every `enrollment_operations` row not already `RecoveryBlocked` --
     /// the recovery sweep's own work list.
@@ -65,10 +65,6 @@ pub(crate) trait EnrollmentRepository: Send + Sync {
     /// again next sweep.
     fn settle_activated_and_close(&self, operation_id: &str) -> Result<(), SyncError>;
 
-    /// Transfers an absent-link marker into the durable `CancelPending`
-    /// journal state BEFORE any remote cancel is attempted -- see
-    /// `yadorilink_sync_core::index::SyncState::move_pending_enrollment_to_cancel_operation`'s
-    /// own doc comment for why the order matters.
     fn move_marker_to_cancel_operation(
         &self,
         marker: &PendingEnrollment,
@@ -78,15 +74,18 @@ pub(crate) trait EnrollmentRepository: Send + Sync {
     fn increment_attempts(&self, operation_id: &str, now_unix: i64) -> Result<i64, SyncError>;
 
     /// Rolls an incomplete `LocalSetupPending` row (the daemon crashed
-    /// mid-setup) back to `CancelPending`, atomically with removing the
-    /// link and its marker -- never left half-confirmed.
+    /// mid-setup) back to `CancelPending`, atomically with undoing the
+    /// link-row write its commit recorded (deleting a row it inserted,
+    /// restoring one it updated) and dropping its marker -- never left
+    /// half-confirmed. `Ok(false)`: the row has no recorded link write, so
+    /// nothing was touched; it must not be rolled back by guessing.
     fn rollback_local_setup_to_cancel_pending(
         &self,
         local_path: &str,
         operation_id: &str,
         detail: &str,
         now_unix: i64,
-    ) -> Result<(), SyncError>;
+    ) -> Result<bool, SyncError>;
 }
 
 /// The in-memory (never persisted) retry-visibility counter for a marker
@@ -204,10 +203,17 @@ pub(crate) struct EnrollmentLinkRequest {
 }
 
 pub(crate) trait EnrollmentLinkPort: Send + Sync {
+    /// Commits the link and its pending-enrollment marker, then starts it.
+    /// `Ok(LinkOutcome::AlreadyLinked)` means the folder was already linked
+    /// to this group and running: nothing was written, no marker exists for
+    /// this operation, and the operation's journal row is still `Prepared`.
     fn commit<'a>(
         &'a self,
         request: EnrollmentLinkRequest,
-    ) -> BoxFuture<'a, Result<(), crate::application::EnrollmentLinkError>>;
+    ) -> BoxFuture<
+        'a,
+        Result<crate::application::LinkOutcome, crate::application::EnrollmentLinkError>,
+    >;
 
     /// Undoes a link commit for a CONFIRMED-rejected activation (the
     /// coordination plane has nothing left to activate): orphans the link,

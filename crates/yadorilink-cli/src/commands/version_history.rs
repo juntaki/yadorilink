@@ -5,14 +5,11 @@
 //! pattern (pin/unpin/evict), since these commands resolve the same way over
 //! the same control socket.
 
-use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
-use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
+use yadorilink_client_core::ops::files;
 use yadorilink_ipc_proto::daemonctl::{
-    ConflictedFileInfo, FileVersionInfo, ListConflictsRequest, ListTrashRequest,
-    ListVersionsRequest, RestoreTrashRequest, RestoreVersionRequest, TrashedFileInfo,
+    ConflictReason, ConflictedFileInfo, EntryKind, FileVersionInfo, TrashedFileInfo,
 };
 
-use crate::control_client;
 use crate::error::CliError;
 
 /// Same "best-effort canonicalize, fall back to the given string"
@@ -30,28 +27,28 @@ fn absolute_path(local_path: &str) -> Result<String, CliError> {
 /// file").
 pub async fn versions(local_path: String) -> Result<(), CliError> {
     let absolute_path = absolute_path(&local_path)?;
-    let resp =
-        control_client::send(ReqPayload::ListVersions(ListVersionsRequest { absolute_path }))
-            .await?;
-    let Some(RespPayload::ListVersions(list)) = resp.payload else {
-        return Err(CliError::Other("unexpected daemon response".into()));
-    };
-    if list.versions.is_empty() {
+    let versions = files::list_versions(absolute_path).await?;
+    if versions.is_empty() {
         println!("No retained versions for {local_path}.");
         return Ok(());
     }
-    for version in &list.versions {
+    for version in &versions {
         println!("{}", version_line(version));
     }
     Ok(())
 }
 
 fn version_line(v: &FileVersionInfo) -> String {
+    // A directory version has no size or mtime of its own (both are
+    // canonically 0); the line names the kind in their place.
+    let content = if v.kind() == EntryKind::Directory {
+        "directory".to_string()
+    } else {
+        format!("{}  size={}", v.mtime_unix_nanos, v.size)
+    };
     format!(
-        "v{}  {}  size={}  origin={}  state={}  mode={}",
+        "v{}  {content}  origin={}  state={}  mode={}",
         v.version_seq,
-        v.mtime_unix_nanos,
-        v.size,
         if v.origin_device_id.is_empty() { "unknown" } else { &v.origin_device_id },
         v.state,
         // `-` for "no Unix permission info" (e.g. authored on Windows) --
@@ -64,7 +61,7 @@ fn version_line(v: &FileVersionInfo) -> String {
 /// `--version` resolves daemon-side to the most recent superseded version
 /// (spec "Restore without a version defaults to the most recent superseded
 /// version"). A missing-blocks failure (`SyncError::VersionContentUnavailable`)
-/// arrives here as an ordinary `CliError::Other` (`control_client::send`
+/// arrives here as an ordinary `CliError::Other` (the control-socket client
 /// maps every `RespPayload::Error` the same way) carrying that error's own
 /// specific message text — already distinguishable from a generic failure
 /// (see `error.rs`'s `VersionContentUnavailable` doc comment), so no
@@ -74,11 +71,7 @@ fn version_line(v: &FileVersionInfo) -> String {
 /// path every other daemon-reported failure already takes.
 pub async fn restore(local_path: String, version: Option<i64>) -> Result<(), CliError> {
     let absolute_path = absolute_path(&local_path)?;
-    control_client::send(ReqPayload::RestoreVersion(RestoreVersionRequest {
-        absolute_path,
-        version_seq: version,
-    }))
-    .await?;
+    files::restore_version(absolute_path, version).await?;
     println!(
         "Restored {local_path}{}",
         version.map(|v| format!(" to version {v}")).unwrap_or_default()
@@ -89,51 +82,72 @@ pub async fn restore(local_path: String, version: Option<i64>) -> Result<(), Cli
 /// `yadorilink trash list` — every deleted file still within its
 /// link's retention window.
 pub async fn trash_list() -> Result<(), CliError> {
-    let resp = control_client::send(ReqPayload::ListTrash(ListTrashRequest {})).await?;
-    let Some(RespPayload::ListTrash(list)) = resp.payload else {
-        return Err(CliError::Other("unexpected daemon response".into()));
-    };
-    if list.files.is_empty() {
+    let trashed = files::list_trash(None).await?;
+    if trashed.is_empty() {
         println!("Trash is empty.");
         return Ok(());
     }
-    for file in &list.files {
+    for file in &trashed {
         println!("{}", trashed_file_line(file));
     }
     Ok(())
 }
 
 fn trashed_file_line(f: &TrashedFileInfo) -> String {
-    format!(
-        "{}/{}  deleted_at={}  last_known_size={}  origin={}",
-        f.local_path,
-        f.path,
-        f.deleted_at_unix_nanos,
-        f.last_known_size,
-        if f.origin_device_id.is_empty() { "unknown" } else { &f.origin_device_id },
-    )
+    let origin = if f.origin_device_id.is_empty() { "unknown" } else { &f.origin_device_id };
+    let line = if f.kind() == EntryKind::Directory {
+        format!(
+            "{}/{}/  deleted_at={}  directory  origin={origin}",
+            f.local_path, f.path, f.deleted_at_unix_nanos,
+        )
+    } else {
+        format!(
+            "{}/{}  deleted_at={}  last_known_size={}  origin={origin}",
+            f.local_path, f.path, f.deleted_at_unix_nanos, f.last_known_size,
+        )
+    };
+    match folder_operation_label(&f.deleted_by_operation) {
+        Some(label) => format!("{line}  folder_operation={label}"),
+        None => line,
+    }
+}
+
+/// A short, stable label for the recursive operation that removed a
+/// trashed entry (`<author>:<hex id>` on the wire): the first eight hex
+/// digits of its id, enough to tell a folder's entries apart from another
+/// folder's in one listing.
+fn folder_operation_label(deleted_by_operation: &str) -> Option<&str> {
+    let (_, id) = deleted_by_operation.rsplit_once(':')?;
+    id.get(..8)
 }
 
 /// `yadorilink conflicts list` — every currently-live conflicted-copy
 /// file across every linked folder (the same files `yadorilink status`'s
 /// per-link `conflict_count` already tallies, listed here individually).
 pub async fn conflicts_list() -> Result<(), CliError> {
-    let resp = control_client::send(ReqPayload::ListConflicts(ListConflictsRequest {})).await?;
-    let Some(RespPayload::ListConflicts(list)) = resp.payload else {
-        return Err(CliError::Other("unexpected daemon response".into()));
-    };
-    if list.files.is_empty() {
+    let conflicts = files::list_conflicts(None).await?;
+    if conflicts.is_empty() {
         println!("No conflicted files.");
         return Ok(());
     }
-    for file in &list.files {
+    for file in &conflicts {
         println!("{}", conflicted_file_line(file));
     }
     Ok(())
 }
 
 fn conflicted_file_line(f: &ConflictedFileInfo) -> String {
-    format!("{}/{}  size={}  mtime={}", f.local_path, f.path, f.size, f.mtime_unix_nanos)
+    let line = if f.kind() == EntryKind::Directory {
+        format!("{}/{}/  directory", f.local_path, f.path)
+    } else {
+        format!("{}/{}  size={}  mtime={}", f.local_path, f.path, f.size, f.mtime_unix_nanos)
+    };
+    // A concurrent edit is what every copy used to mean, so only the other
+    // reason is spelled out.
+    if f.reason() == ConflictReason::FolderAtPath {
+        return format!("{line}  reason=folder_at_path");
+    }
+    line
 }
 
 /// `yadorilink trash restore <path>` — recovers a deleted file's
@@ -141,93 +155,42 @@ fn conflicted_file_line(f: &ConflictedFileInfo) -> String {
 /// live again.
 pub async fn trash_restore(local_path: String) -> Result<(), CliError> {
     let absolute_path = absolute_path(&local_path)?;
-    control_client::send(ReqPayload::RestoreTrash(RestoreTrashRequest { absolute_path })).await?;
+    files::restore_from_trash(absolute_path).await?;
     println!("Restored {local_path} from trash");
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `versions` output shape — one line per version, newest
-    /// first is the daemon's own ordering contract (`SyncState::list_versions`'s
-    /// doc comment), this just checks the per-line rendering.
-    #[test]
-    fn version_line_renders_every_field() {
-        let v = FileVersionInfo {
-            version_seq: 3,
-            size: 42,
-            mtime_unix_nanos: 12345,
-            state: "superseded".into(),
-            origin_device_id: "device-a".into(),
-            unix_mode: Some(0o755),
-        };
-        assert_eq!(
-            version_line(&v),
-            "v3  12345  size=42  origin=device-a  state=superseded  mode=0o755"
+/// `yadorilink trash restore --folder <path>` — recovers, together, every
+/// entry removed by the same recursive delete or directory rename that
+/// removed `<path>`.
+pub async fn trash_restore_folder(local_path: String) -> Result<(), CliError> {
+    let absolute_path = absolute_path(&local_path)?;
+    let outcome = files::restore_trash_operation(absolute_path).await?;
+    println!(
+        "Restored {} entr{} removed together with {local_path}",
+        outcome.restored_paths.len(),
+        if outcome.restored_paths.len() == 1 { "y" } else { "ies" }
+    );
+    for path in &outcome.restored_paths {
+        println!("  restored  {path}");
+    }
+    if outcome.partial {
+        println!(
+            "warning: part of that operation has not reached this device; entries it removed \
+             elsewhere in the folder were not restored"
         );
     }
-
-    /// An unknown origin (empty string, see `FileVersionInfo.origin_device_id`'s
-    /// own doc comment) renders as `unknown`, not a blank field a user
-    /// could mistake for a rendering bug.
-    #[test]
-    fn version_line_renders_unknown_origin() {
-        let v = FileVersionInfo {
-            version_seq: 1,
-            size: 0,
-            mtime_unix_nanos: 0,
-            state: "current".into(),
-            origin_device_id: String::new(),
-            unix_mode: Some(0o644),
-        };
-        assert!(version_line(&v).contains("origin=unknown"));
+    if outcome.failed.is_empty() {
+        return Ok(());
     }
-
-    /// No Unix permission info (a version authored on Windows) renders as
-    /// `-`, never a fabricated octal value.
-    #[test]
-    fn version_line_renders_absent_unix_mode() {
-        let v = FileVersionInfo {
-            version_seq: 1,
-            size: 0,
-            mtime_unix_nanos: 0,
-            state: "current".into(),
-            origin_device_id: "device-a".into(),
-            unix_mode: None,
-        };
-        assert!(version_line(&v).contains("mode=-"));
+    for failure in &outcome.failed {
+        eprintln!("  failed    {}: {}", failure.path, failure.error);
     }
-
-    #[test]
-    fn trashed_file_line_renders_every_field() {
-        let f = TrashedFileInfo {
-            local_path: "/tmp/photos".into(),
-            path: "vacation.jpg".into(),
-            version_seq: 2,
-            last_known_size: 1000,
-            origin_device_id: "device-b".into(),
-            deleted_at_unix_nanos: 999,
-        };
-        assert_eq!(
-            trashed_file_line(&f),
-            "/tmp/photos/vacation.jpg  deleted_at=999  last_known_size=1000  origin=device-b"
-        );
-    }
-
-    #[test]
-    fn conflicted_file_line_renders_every_field() {
-        let f = ConflictedFileInfo {
-            local_path: "/tmp/photos".into(),
-            path: "vacation (conflicted copy, 2026-01-01-000000, device-b).jpg".into(),
-            size: 1234,
-            mtime_unix_nanos: 5678,
-        };
-        assert_eq!(
-            conflicted_file_line(&f),
-            "/tmp/photos/vacation (conflicted copy, 2026-01-01-000000, device-b).jpg  size=1234  \
-             mtime=5678"
-        );
-    }
+    Err(CliError::Other(format!(
+        "{} of the folder's entries could not be restored",
+        outcome.failed.len()
+    )))
 }
+
+#[cfg(test)]
+mod tests;

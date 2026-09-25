@@ -1,15 +1,15 @@
 //! Runs the existing materialization engine together with the independent
 //! retroactive conflict-copy repair loop.
 //!
-//! Keeping the repair as a wrapper leaves `engine.rs` available for Stage 3 to
-//! evolve independently. If either essential loop exits, this wrapper exits and
+//! Keeping the repair as a wrapper leaves `engine.rs` free to evolve
+//! independently. If either essential loop exits, this wrapper exits and
 //! `DaemonState`'s existing `spawn_restarting` supervision restarts both.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
-use yadorilink_peer_session::peer_session::RetirementAttempt;
+use crate::local_convergence::types::RetirementAttempt;
 use yadorilink_replica_domain::ids::ChangeHash;
 use yadorilink_replica_domain::session_state::RetroactiveRepairOutcome;
 use yadorilink_root_authority::ignore_patterns::{
@@ -18,6 +18,8 @@ use yadorilink_root_authority::ignore_patterns::{
 use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
 
 use crate::daemon_state::DaemonState;
+
+pub use super::engine_impl::ConvergenceEngine;
 
 const REPAIR_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// The retirement loop's own backstop cadence, now that
@@ -68,8 +70,8 @@ fn eligible_rank_for_elapsed(elapsed: Duration) -> usize {
 /// `engine_impl` (this module's own sibling, `mod engine_impl` -- not
 /// `pub`) is otherwise unreachable from an external integration test.
 #[cfg(any(test, feature = "test-support"))]
-pub async fn run_once_for_test(state: &Arc<DaemonState>) -> bool {
-    super::engine_impl::run_once_for_test(state).await
+pub async fn run_once_for_test(engine: &ConvergenceEngine) -> bool {
+    super::engine_impl::run_once_for_test(engine).await
 }
 
 /// See `engine_impl::drive_obligations_once_for_test`'s own doc comment --
@@ -77,11 +79,11 @@ pub async fn run_once_for_test(state: &Arc<DaemonState>) -> bool {
 /// exposed the same way for the same reason.
 #[cfg(any(test, feature = "test-support"))]
 pub async fn drive_obligations_once_for_test(
-    state: &Arc<DaemonState>,
+    engine: &ConvergenceEngine,
     per_group_limit: u32,
     total_limit: u32,
 ) -> bool {
-    super::engine_impl::drive_obligations_once_for_test(state, per_group_limit, total_limit).await
+    super::engine_impl::drive_obligations_once_for_test(engine, per_group_limit, total_limit).await
 }
 
 /// See `engine_impl::BeforeCompletionHook`'s own doc comment -- re-exported
@@ -94,13 +96,13 @@ pub use super::engine_impl::BeforeCompletionHook;
 /// comment -- exposed the same way as [`drive_obligations_once_for_test`].
 #[cfg(any(test, feature = "test-support"))]
 pub async fn drive_obligations_once_for_test_with_hooks(
-    state: &Arc<DaemonState>,
+    engine: &ConvergenceEngine,
     per_group_limit: u32,
     total_limit: u32,
     hooks: &Arc<BeforeCompletionHook>,
 ) -> bool {
     super::engine_impl::drive_obligations_once_for_test_with_hooks(
-        state,
+        engine,
         per_group_limit,
         total_limit,
         hooks,
@@ -108,7 +110,8 @@ pub async fn drive_obligations_once_for_test_with_hooks(
     .await
 }
 
-pub async fn run(state: Arc<DaemonState>) {
+pub async fn run(engine: Arc<ConvergenceEngine>) {
+    let state = engine.state().clone();
     // Each loop is spawned as its own task rather than raced directly via
     // `tokio::select!` on the bare futures: `run_retroactive_repair_loop`
     // calls several synchronous, blocking `SyncState` methods; racing that
@@ -133,17 +136,14 @@ pub async fn run(state: Arc<DaemonState>) {
     // `spawn_restarting`'s subsequent restart would otherwise leave the old
     // survivors running undetached alongside a brand new set of tasks --
     // duplicate materialization engines or repair loops, compounding on
-    // every restart. `tokio::task::JoinSet` would give this same shape more
-    // directly, but is unavailable under `madsim-tokio`'s shim (no
-    // `JoinSet` at all), so this manual select-then-abort-and-await
-    // reproduces its exact "aborts every remaining task and awaits their
+    // every restart. This manual select-then-abort-and-await reproduces
+    // `tokio::task::JoinSet`'s "aborts every remaining task and awaits their
     // completion" contract explicitly -- this function never returns while
     // any of the five tasks is still alive.
-    let engine_state = state.clone();
     let retire_state = state.clone();
     let hazard_recheck_state = state.clone();
     let ignore_recheck_state = state.clone();
-    let mut engine_handle = tokio::spawn(super::engine_impl::run(engine_state));
+    let mut engine_handle = tokio::spawn(super::engine_impl::run(engine));
     let mut repair_handle = tokio::spawn(run_retroactive_repair_loop(state));
     let mut retire_handle = tokio::spawn(run_ephemeral_conflict_copy_retire_loop(retire_state));
     let mut hazard_recheck_handle = tokio::spawn(run_hazard_recheck_loop(hazard_recheck_state));
@@ -173,10 +173,9 @@ pub async fn run(state: Arc<DaemonState>) {
 /// forever while a device that first reconciles after the window closed
 /// never derives it: byte-identical DAGs, permanently different file sets
 /// (see `PeerSyncSession::retire_unjustified_ephemeral_conflict_copies`'s
-/// own doc comment). Confirmed live: `row14_strict_acceptance` stalled with
-/// one device (out of six, all on an identical three-head DAG frontier)
-/// holding a conflict copy every device's own `resolve_path_heads` agreed
-/// was no longer required.
+/// own doc comment). Without retirement, one device (of several, all on an
+/// identical multi-head DAG frontier) can keep holding a conflict copy
+/// every device's own `resolve_path_heads` agrees is no longer required.
 ///
 /// Primarily event-driven, not polled: `RetirementWake::mark_dirty` fires
 /// after exactly the two events that can change a copy's justification --
@@ -185,16 +184,14 @@ pub async fn run(state: Arc<DaemonState>) {
 /// loop reacts within one wake rather than waiting up to a whole poll
 /// interval. `RETIREMENT_BACKSTOP_INTERVAL` remains as a correctness
 /// backstop only, for a mark lost to a crash or a race with linking, not as
-/// the primary liveness path the way the old flat 1s poll was. Before this
-/// loop existed at all, this audit was reachable only through the legacy
-/// periodic materialization-repair sweep in `daemon_state.rs`; Stage 2's
-/// Convergence Engine (`engine.rs`) drives ordinary path reconciliation
-/// through `reconcile_paths_directly` instead, which never calls it. A
-/// group whose sweep interval is long -- or, as `row14_strict_acceptance`
-/// sets for its own strict acceptance bar, disabled for the whole run,
-/// specifically to prove the Convergence Engine's own mechanism converges
-/// without the legacy sweep's help -- then had no path left that ever
-/// retired a copy at all.
+/// the primary liveness path. This loop is needed because the Convergence
+/// Engine (`engine.rs`) drives ordinary path reconciliation through
+/// `reconcile_paths_directly`, which never calls this audit; the periodic
+/// materialization-repair sweep in `daemon_state.rs` does, but a group
+/// whose sweep interval is long -- or disabled for a whole run, as strict
+/// acceptance tests do to prove the Convergence Engine's own mechanism
+/// converges without it -- would otherwise have no path that ever retires
+/// a copy at all.
 async fn run_ephemeral_conflict_copy_retire_loop(state: Arc<DaemonState>) {
     loop {
         tokio::select! {
@@ -203,6 +200,11 @@ async fn run_ephemeral_conflict_copy_retire_loop(state: Arc<DaemonState>) {
                 run_retirement_pass(&state, pending).await;
             }
             _ = tokio::time::sleep(RETIREMENT_BACKSTOP_INTERVAL) => {
+                // Counted so a test waiting past this interval can check that
+                // the tick it is waiting for actually happened, rather than
+                // assume a long enough sleep implies one. Observation only;
+                // nothing reads it to decide anything.
+                state.note_retirement_backstop_tick();
                 if let Some(groups) = list_linked_groups_for_retirement(&state).await {
                     // Backstop recovery for a mark lost before this
                     // generation-tracked state existed for the group at
@@ -254,10 +256,9 @@ async fn list_linked_groups_for_retirement(state: &Arc<DaemonState>) -> Option<B
 
 /// Runs `ConvergenceRetirementService::reconcile_group` for each group in
 /// `pending` (group id -> the generation `RetirementWake::pending` reported
-/// for it) -- no live peer session involved (see
-/// `DaemonState::local_retirement_session`'s own doc comment for why
-/// retirement's own decision was never actually dependent on which, or
-/// any, peer happened to be connected). `RetirementWake::complete` is
+/// for it) -- no peer session involved, because retirement's decision never
+/// depended on which, or any, peer happened to be connected.
+/// `RetirementWake::complete` is
 /// called for a group ONLY when `settles_generation` says the outcome was
 /// `RetirementAttempt::Settled` -- see that function's and
 /// `RetirementAttempt`'s own doc comments for why `Busy` and
@@ -332,17 +333,17 @@ async fn run_hazard_recheck_loop(state: Arc<DaemonState>) {
 /// pending` reported for it), lists its currently-held paths and, if any,
 /// re-resolves them directly against this device's current DAG heads via
 /// `reconcile_paths_directly` -- the SAME entry point the Convergence
-/// Engine's own per-job completion oracle uses, run here against a session
-/// that is never actually peer-dependent for this decision: a held path's
-/// hazard status follows only local DAG/disk state (see `DaemonState::
-/// local_retirement_session`'s own doc comment). Prefers an already-live
-/// candidate session for the group when one exists, falling back to the
-/// synthetic local session (`DaemonState::local_retirement_session`) only
-/// when there are none -- identical to `process_group_via_obligations`'s
-/// own zero-work pre-check guard, and for the same reason: `local_
-/// retirement_session`'s first-ever construction for a group triggers
-/// `NetmapChangeAuthenticator::new` -> `validate_linked_history_best_effort`,
-/// which can transiently quarantine every OTHER already-connected session's
+/// Engine's own per-job completion oracle uses. A held path's hazard status
+/// follows only local DAG and disk state, so this decision is not
+/// peer-dependent at all. It still prefers an already-live candidate session
+/// when one exists, because a peer is what makes content the recheck may need
+/// obtainable; with none, the local executor runs the same pass and a path
+/// waiting on content it cannot get stays held.
+///
+/// What it no longer does is manufacture a session to run local work through.
+/// That used to trigger `NetmapChangeAuthenticator::new` ->
+/// `validate_linked_history_best_effort`, which can transiently quarantine
+/// every OTHER already-connected session's
 /// authorization for this group if that validation is briefly unavailable.
 /// This backstop pass runs on its own 30s timer, independent of peer-connect
 /// timing, so it is realistic for it to be the first caller to need a
@@ -357,11 +358,34 @@ async fn run_hazard_recheck_loop(state: Arc<DaemonState>) {
 async fn run_hazard_recheck_pass(state: &Arc<DaemonState>, pending: BTreeMap<String, u64>) {
     for (group_id, generation) in pending {
         let replica_coordinator_for_list = state.replica_coordinator.clone();
+        let local_for_list = state.local_convergence();
         let list_group_id = group_id.clone();
         let held_paths = match tokio::task::spawn_blocking(move || {
-            replica_coordinator_for_list
+            let held = replica_coordinator_for_list
                 .materialization_state_repository()
-                .list_held_paths(&list_group_id)
+                .list_held_paths(&list_group_id)?;
+            // A path held because its existing file is unreadable to its
+            // owner is re-examined only once something it was held against
+            // has changed: re-running it unchanged can only reach the same
+            // hold again. A failed check keeps the path in the pass.
+            Ok::<_, yadorilink_sync_sqlite::SyncSqliteError>(
+                held.into_iter()
+                    .filter(|path| {
+                        !local_for_list
+                            .metadata_unprovable_hold_unchanged(&list_group_id, path)
+                            .unwrap_or_else(|error| {
+                                tracing::debug!(
+                                    %error,
+                                    group_id = %list_group_id,
+                                    path = %path,
+                                    "could not tell whether a metadata hold is unchanged; \
+                                     re-examining it"
+                                );
+                                false
+                            })
+                    })
+                    .collect::<Vec<_>>(),
+            )
         })
         .await
         {
@@ -379,12 +403,38 @@ async fn run_hazard_recheck_pass(state: &Arc<DaemonState>, pending: BTreeMap<Str
             state.replica_coordinator.hazard_recheck_wake().complete(&group_id, generation);
             continue;
         }
-        let session = crate::hydration::candidate_sessions(state, &group_id)
+        let paths: std::collections::BTreeSet<String> = held_paths.into_iter().collect();
+        let peer = crate::hydration::candidate_sessions(state, &group_id)
             .into_iter()
             .min_by(|a, b| a.0.cmp(&b.0))
-            .map(|(_, session)| session)
-            .unwrap_or_else(|| state.local_retirement_session(&group_id));
-        match session.reconcile_paths_directly(&group_id, held_paths.into_iter().collect()).await {
+            .map(|(_, session)| session);
+        let outcome = match peer {
+            Some(session) => match state.peers.local_convergence(
+                yadorilink_peer_session::convergence_driver::ConvergenceDriver::peer_device_id(
+                    session.as_ref(),
+                ),
+            ) {
+                Some(local) => local
+                    .reconcile_paths_directly(
+                        &(session.clone()
+                            as std::sync::Arc<
+                                dyn yadorilink_peer_session::convergence_driver::ConvergenceDriver,
+                            >),
+                        &group_id,
+                        paths,
+                    )
+                    .await,
+                None => Ok(None),
+            },
+            // No peer is connected. The re-check still runs: a hazard resolves
+            // for purely local reasons -- the name that was in the way is gone,
+            // the conflicting row was retired -- and this device needs nobody's
+            // help to notice. What it cannot do alone is obtain content it does
+            // not hold, and a path waiting on that stays held, which is what
+            // being unable to reach anyone has always meant here.
+            None => state.local_convergence().reconcile_paths(&group_id, paths).await,
+        };
+        match outcome {
             Ok(Some(_)) => {
                 state.replica_coordinator.hazard_recheck_wake().complete(&group_id, generation);
             }
@@ -421,9 +471,9 @@ async fn run_hazard_recheck_pass(state: &Arc<DaemonState>, pending: BTreeMap<Str
 /// codebase already accepted for the hazard-recheck loop's own 30s
 /// backstop.
 ///
-/// Spawned for real from `run` (Phase C cutover), alongside the retirement
-/// and hazard-recheck loops: `process_group_via_obligations` is now the
-/// live claim source, so an `'ignore_blocked'` row is a real, live
+/// Spawned for real from `run`, alongside the retirement and
+/// hazard-recheck loops: `process_group_via_obligations` is the live
+/// claim source, so an `'ignore_blocked'` row is a real, live
 /// possibility, not merely a test-driven one.
 async fn run_ignore_recheck_loop(state: Arc<DaemonState>) {
     loop {
@@ -445,22 +495,18 @@ async fn run_ignore_recheck_loop(state: Arc<DaemonState>) {
 /// the real fetch/materialize/completion for it.
 ///
 /// This deliberately does NOT drive a reconcile attempt the way the
-/// hazard-recheck sweep does: an independent review caught a real
-/// permanent-stall bug in an earlier version of this function, which
-/// gated re-arm on `ProjectionAttempt::is_settled(path)` after calling
-/// `reconcile_paths_directly` through `local_retirement_session` --
-/// backed by a `LoopbackPeerMessageChannel` whose `open_block_stream`
-/// always returns `ChannelClosed`. A path whose content requires an
-/// actual block fetch (anything but the trivial empty-content case) can
-/// therefore never `is_settled` through that session, so it could never
+/// hazard-recheck sweep does: gating re-arm on
+/// `ProjectionAttempt::is_settled(path)` after running reconciliation
+/// with no way to obtain content at all would stall permanently. A path whose content
+/// requires an actual block fetch (anything but the trivial empty-content
+/// case) could never `is_settled` on such a pass, so it could never
 /// re-arm at all: an unignored file needing real content would stay
 /// `'ignore_blocked'` forever, invisible to the production scheduler
-/// (which only ever claims `'pending'` rows). The bug's own reproduction
-/// needs a `FileVersion` with a real (non-empty) block absent from the
-/// local store — the pre-existing regression test used `empty_version()`,
-/// which is trivially "materializable" with no blocks at all and so never
-/// exercised the ChannelClosed path. The fix here removes the dependency
-/// on full settlement entirely: whether a path is still ignored is a pure,
+/// (which only ever claims `'pending'` rows). Reproducing that needs a
+/// `FileVersion` with a real (non-empty) block absent from the local store
+/// -- `empty_version()` is trivially "materializable" with no blocks at
+/// all and so never exercises the ChannelClosed path. This function has
+/// no dependency on full settlement at all: whether a path is still ignored is a pure,
 /// local, synchronous policy question that has nothing to do with whether
 /// its content can currently be fetched.
 ///
@@ -511,9 +557,19 @@ async fn run_ignore_recheck_pass(state: &Arc<DaemonState>, group_id: &str) {
     });
     let mut any_rearmed = false;
     for path in &ignore_blocked_paths {
-        let still_ignored = ignore_set
-            .as_ref()
-            .is_some_and(|set| is_ignore_file_relative_path(path) || set.is_ignored(path, false));
+        // The same rule as `LocalConvergenceExecutor::is_locally_ignored`:
+        // a directory-only pattern covers a path the namespace places a
+        // directory at.
+        let still_ignored = ignore_set.as_ref().is_some_and(|set| {
+            is_ignore_file_relative_path(path)
+                || set.is_ignored(path, false)
+                || (set.is_ignored(path, true)
+                    && matches!(
+                        state.replica_coordinator.desired_path_state(group_id, path),
+                        Ok(yadorilink_sync_sqlite::desired_state::DesiredPathState::ExplicitDirectory { .. }
+                            | yadorilink_sync_sqlite::desired_state::DesiredPathState::StructuralDirectory)
+                    ))
+        });
         if still_ignored {
             continue;
         }
@@ -686,6 +742,19 @@ async fn run_retroactive_repair_loop(state: Arc<DaemonState>) {
                     observed_heads.insert(group_id.clone(), committed_frontier);
                     failover_frontiers.remove(&group_id);
                 }
+                RetroactiveRepairOutcome::PlanStale { reason } => {
+                    // Something the plan was built against moved while this
+                    // pass ran, and nothing was written. The next poll plans
+                    // against the state that actually exists now. Deliberately
+                    // not cached — caching the frontier here would suppress
+                    // exactly the re-plan this asks for, and for
+                    // `ObligationsChanged` that frontier has not even moved.
+                    tracing::debug!(
+                        %group_id,
+                        ?reason,
+                        "retroactive conflict-copy repair re-driving: the plan went stale"
+                    );
+                }
                 RetroactiveRepairOutcome::AwaitingFailover { local_rank, committed_frontier } => {
                     tracing::debug!(
                         %group_id,
@@ -715,8 +784,20 @@ async fn run_retroactive_repair_loop(state: Arc<DaemonState>) {
                     // regardless of this device's local materialization
                     // state, and a peer must learn of it immediately rather
                     // than only after the next periodic audit -- see
-                    // `announce_heads_to_group_peers`'s own doc comment.
-                    state.announce_heads_to_group_peers(&group_id).await;
+                    // `note_local_commit_for_group`'s own doc comment.
+                    //
+                    // Flush BEFORE announcing, for the identical reason
+                    // `broadcast_change` itself does -- this repair carrier
+                    // calls `note_local_commit_for_group` directly rather
+                    // than going through `broadcast_change`, so without this
+                    // it would get no checkpoint-flush trigger at all: the
+                    // repair Change would be announced but never Published,
+                    // a peer's fetch would find no evidence to serve, and
+                    // the carrier would silently never arrive (exercised by
+                    // every mesh chaos test whose conflict resolution routes
+                    // through this carrier path).
+                    state.flush_pending_checkpoint_for_group(&group_id).await;
+                    state.note_local_commit_for_group(&group_id).await;
                     failover_frontiers.remove(&group_id);
                 }
             }
@@ -727,88 +808,8 @@ async fn run_retroactive_repair_loop(state: Arc<DaemonState>) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn failover_unlocks_one_additional_rank_per_stable_frontier_window() {
-        assert_eq!(eligible_rank_for_elapsed(Duration::ZERO), 0);
-        assert_eq!(eligible_rank_for_elapsed(Duration::from_millis(4_999)), 0);
-        assert_eq!(eligible_rank_for_elapsed(Duration::from_secs(5)), 1);
-        assert_eq!(eligible_rank_for_elapsed(Duration::from_millis(14_999)), 2);
-        assert_eq!(eligible_rank_for_elapsed(Duration::from_secs(15)), 3);
-    }
-
-    #[test]
-    fn only_settled_settles_generation() {
-        assert!(settles_generation(&RetirementAttempt::Settled { retired: 0 }));
-        assert!(settles_generation(&RetirementAttempt::Settled { retired: 3 }));
-        assert!(!settles_generation(&RetirementAttempt::Busy));
-        assert!(!settles_generation(&RetirementAttempt::RetryRequired));
-    }
-
-    /// Guard-contention (`Busy`) failure injection: `RetirementWake::
-    /// complete` must not be called for the claimed generation, so the
-    /// group stays reported by `pending` for the next wake/backstop.
-    #[test]
-    fn busy_outcome_leaves_generation_pending() {
-        let wake = crate::sync_runtime::retirement_wake::RetirementWake::new();
-        wake.mark_dirty("g1");
-        let claimed = *wake.pending().get("g1").unwrap();
-        if settles_generation(&RetirementAttempt::Busy) {
-            wake.complete("g1", claimed);
-        }
-        assert_eq!(wake.pending().get("g1"), Some(&1));
-    }
-
-    /// Transient-retry failure injection: a `RetryRequired` outcome (a
-    /// copy's tombstone materialize hit a transient block/disk condition)
-    /// must equally not complete the claimed generation.
-    #[test]
-    fn retry_required_outcome_leaves_generation_pending() {
-        let wake = crate::sync_runtime::retirement_wake::RetirementWake::new();
-        wake.mark_dirty("g1");
-        let claimed = *wake.pending().get("g1").unwrap();
-        if settles_generation(&RetirementAttempt::RetryRequired) {
-            wake.complete("g1", claimed);
-        }
-        assert_eq!(wake.pending().get("g1"), Some(&1));
-    }
-
-    /// The core lost-wakeup regression test: an event landing WHILE a
-    /// pass is auditing generation 1 must not be swallowed by that pass's
-    /// own (successful) completion -- it must provoke exactly one
-    /// follow-up audit, which then settles cleanly with no event left
-    /// over.
-    #[test]
-    fn event_during_audit_provokes_exactly_one_follow_up_audit() {
-        let wake = crate::sync_runtime::retirement_wake::RetirementWake::new();
-        wake.mark_dirty("g1");
-        let claimed_generation_1 = *wake.pending().get("g1").unwrap();
-        assert_eq!(claimed_generation_1, 1);
-
-        // A DAG admission (or job completion) lands while the pass that
-        // claimed generation 1 is still auditing.
-        wake.mark_dirty("g1");
-
-        // That in-flight pass finishes and reports success for the
-        // generation it actually claimed, not the new one.
-        if settles_generation(&RetirementAttempt::Settled { retired: 1 }) {
-            wake.complete("g1", claimed_generation_1);
-        }
-
-        // Exactly one follow-up audit's worth of pending work remains --
-        // the mid-audit event was not lost.
-        let pending = wake.pending();
-        assert_eq!(pending.get("g1"), Some(&2));
-
-        let claimed_generation_2 = *pending.get("g1").unwrap();
-        if settles_generation(&RetirementAttempt::Settled { retired: 0 }) {
-            wake.complete("g1", claimed_generation_2);
-        }
-        assert!(wake.pending().is_empty());
-    }
-}
+#[path = "engine_wrapper/tests.rs"]
+mod tests;
 
 /// `run_hazard_recheck_pass`'s own regression coverage: proves a path
 /// marked `HazardHeld` gets re-examined and un-held by the sweep alone,
@@ -828,185 +829,8 @@ mod tests {
 /// reconciliation for a held path with no new incoming record of its own,
 /// which is exactly what this sweep exists to do.
 #[cfg(test)]
-mod hazard_recheck_tests {
-    use super::{run_hazard_recheck_pass, DaemonState};
-    use ed25519_dalek::SigningKey;
-    use std::sync::Arc;
-    use yadorilink_replica_domain::change::{Change, ChangeAuth, Op, PutOrigin};
-    use yadorilink_replica_domain::file::{FileMeta, FileVersion, RecordKind};
-    use yadorilink_replica_domain::ids::{DeviceId, FolderGroupId, SyncPath};
-    use yadorilink_root_authority::root_identity::VerifiedRoot;
-
-    const GROUP: &str = "hazard-recheck-group";
-
-    fn empty_version(mtime: i64) -> FileVersion {
-        FileVersion::new(
-            vec![],
-            0,
-            FileMeta {
-                mtime_unix_nanos: mtime,
-                unix_mode: None,
-                symlink_target: None,
-                record_kind: RecordKind::File,
-                xattrs: Vec::new(),
-            },
-        )
-    }
-
-    /// Same shape as `process_group_publication_tests::
-    /// build_state_with_adopted_group` (`engine.rs`), trimmed to what this
-    /// module needs: no candidate `PeerSyncSession` is registered, since
-    /// `DaemonState::local_retirement_session` builds its own synthetic
-    /// loopback session independently of `state.peers`.
-    async fn build_state_with_adopted_group() -> (Arc<DaemonState>, tempfile::TempDir) {
-        let root_dir = tempfile::tempdir().unwrap();
-        let store_dir = tempfile::tempdir().unwrap();
-        let root = root_dir.path().canonicalize().unwrap();
-        let replica_coordinator =
-            Arc::new(crate::replica_coordinator::ReplicaCoordinator::open_in_memory().unwrap());
-        let block_store =
-            Arc::new(yadorilink_local_storage::FsBlockStore::new(store_dir.path()).unwrap());
-
-        replica_coordinator.link_repository().add_link(&root.to_string_lossy(), GROUP).unwrap();
-        VerifiedRoot::open(&root, GROUP, replica_coordinator.as_ref()).unwrap();
-        let generation = replica_coordinator.startup_readiness().begin_group_startup(GROUP);
-        replica_coordinator.startup_readiness().mark_group_ready(GROUP, generation);
-
-        let build =
-            DaemonState::build("device-local".to_string(), replica_coordinator, block_store);
-        let state = build.state;
-        state.test_root_commit_authorities.lock().unwrap().insert(
-            GROUP.to_string(),
-            Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()),
-        );
-
-        (state, root_dir)
-    }
-
-    fn admit_change(
-        state: &DaemonState,
-        device: &str,
-        key: &SigningKey,
-        path: &str,
-        version: &FileVersion,
-    ) -> Change {
-        let change = Change::create_signed(
-            vec![],
-            0,
-            ChangeAuth::PLACEHOLDER,
-            DeviceId(device.to_string()),
-            FolderGroupId(GROUP.to_string()),
-            vec![Op::Put {
-                path: SyncPath(path.to_string()),
-                version: version.version_hash,
-                origin: PutOrigin::Direct,
-            }],
-            key,
-        );
-        state
-            .replica_coordinator
-            .change_history_repository()
-            .dag_admit_change_with_versions(&change, std::slice::from_ref(version), true)
-            .unwrap();
-        change
-    }
-
-    /// The core regression: a path manually marked held (standing in for
-    /// any real hazard reason) with an already-admitted, trivially-
-    /// materializable DAG version gets written to disk and un-held by
-    /// `run_hazard_recheck_pass` alone -- no new incoming record for this
-    /// exact path is ever admitted or announced. RED-confirmed by
-    /// commenting out the `reconcile_paths_directly` call inside `run_
-    /// hazard_recheck_pass` (leaving only the empty-listing early return):
-    /// the held path then never gets re-examined at all, exactly the gap
-    /// this closes.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_held_path_is_re_examined_and_cleared_by_the_sweep_alone() {
-        let (state, root_dir) = build_state_with_adopted_group().await;
-        let key = SigningKey::from_bytes(&[81u8; 32]);
-        let version = empty_version(1_700_000_000);
-        let change = admit_change(&state, "device-a", &key, "held.txt", &version);
-
-        // `set_held` is an UPDATE on an existing `files` row (see its own
-        // doc comment) -- production always reaches it through `hold_
-        // record`, which upserts the index row first. Mirrors that here
-        // directly rather than going through real hazard detection (see
-        // this test module's own doc comment for why); a DAG-backed row
-        // needs its authoring change attached (`upsert_file_with_origin_
-        // and_author`), or the schema's own constraint rejects it.
-        state
-            .replica_coordinator
-            .file_index_repository()
-            .upsert_file_with_origin_and_author(
-                GROUP,
-                &yadorilink_replica_domain::file::FileRecord {
-                    path: "held.txt".to_string(),
-                    size: 0,
-                    mtime_unix_nanos: 1_700_000_000,
-                    blocks: vec![],
-                    deleted: false,
-                },
-                "device-a",
-                &change.change_hash(),
-                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-            )
-            .unwrap();
-        state
-            .replica_coordinator
-            .materialization_state_repository()
-            .set_held(GROUP, "held.txt", "test_injected_hazard", 1_000)
-            .unwrap();
-        assert!(
-            state
-                .replica_coordinator
-                .materialization_state_repository()
-                .get_held_state(GROUP, "held.txt")
-                .unwrap()
-                .is_some(),
-            "sanity: the path must actually be held before the sweep runs"
-        );
-
-        state.replica_coordinator.hazard_recheck_wake().mark_dirty(GROUP);
-        let pending = state.replica_coordinator.hazard_recheck_wake().pending();
-        run_hazard_recheck_pass(&state, pending).await;
-
-        assert!(
-            state
-                .replica_coordinator
-                .materialization_state_repository()
-                .get_held_state(GROUP, "held.txt")
-                .unwrap()
-                .is_none(),
-            "the sweep must clear a hold whose hazard is already gone, with no fresh incoming \
-             record for this exact path"
-        );
-        assert!(
-            root_dir.path().join("held.txt").exists(),
-            "clearing the hold must come from a real, successful reconciliation -- the path \
-             must actually materialize to disk, not just have its hold bit flipped"
-        );
-    }
-
-    /// A group with nothing held at all must settle its generation on the
-    /// FIRST pass (the empty-listing early-return branch) -- otherwise a
-    /// busy group with no real hazards would spin `pending` forever.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_group_with_nothing_held_settles_immediately() {
-        let (state, _root_dir) = build_state_with_adopted_group().await;
-
-        state.replica_coordinator.hazard_recheck_wake().mark_dirty(GROUP);
-        let pending = state.replica_coordinator.hazard_recheck_wake().pending();
-        let generation = *pending.get(GROUP).unwrap();
-        run_hazard_recheck_pass(&state, pending).await;
-
-        assert_eq!(
-            state.replica_coordinator.hazard_recheck_wake().pending().get(GROUP),
-            None,
-            "settled generation must not still be reported pending"
-        );
-        let _ = generation;
-    }
-}
+#[path = "engine_wrapper/hazard_recheck_tests.rs"]
+mod hazard_recheck_tests;
 
 /// `run_ignore_recheck_pass`'s own regression coverage: proves the
 /// liveness gap the `IGNORE_SET_REFRESH_INTERVAL` cache-TTL fix alone left
@@ -1014,312 +838,5 @@ mod hazard_recheck_tests {
 /// closed -- a path parked `'ignore_blocked'` gets re-examined and re-armed
 /// by the sweep alone, with no fresh incoming record for that exact path.
 #[cfg(test)]
-mod ignore_recheck_tests {
-    use super::{run_ignore_recheck_pass, DaemonState};
-    use ed25519_dalek::SigningKey;
-    use std::collections::HashMap;
-    use std::sync::Arc;
-    use yadorilink_peer_session::peer_session::PeerSyncSession;
-    use yadorilink_peer_session::ports::{PeerBlockStream, PeerMessageChannel};
-    use yadorilink_replica_domain::change::{Change, ChangeAuth, Op, PutOrigin};
-    use yadorilink_replica_domain::file::{FileMeta, FileVersion, RecordKind};
-    use yadorilink_replica_domain::ids::{DeviceId, FolderGroupId, SyncPath};
-    use yadorilink_root_authority::root_identity::VerifiedRoot;
-    use yadorilink_sync_sqlite::projection_obligations::NonExactProofKind;
-    use yadorilink_transport::TransportError;
-
-    /// A channel with nothing on the far end -- registering a session
-    /// bound to this is enough to make this group's `candidate_sessions()`
-    /// non-empty, so `process_group_via_obligations` does not take its
-    /// "no live candidate" durable-backoff branch. `materialize()` never
-    /// needs a fetch for this module's own tests (every path is either
-    /// zero-block or deliberately unfetchable and never asserted to
-    /// converge through it), so `open_block_stream` returning
-    /// `ChannelClosed` is never actually exercised for real content.
-    struct NoopChannel;
-
-    #[async_trait::async_trait]
-    impl PeerMessageChannel for NoopChannel {
-        async fn send(&self, _payload: Vec<u8>) -> Result<(), TransportError> {
-            Ok(())
-        }
-        fn try_send(&self, _payload: Vec<u8>) -> bool {
-            true
-        }
-        async fn recv(&self) -> Option<Vec<u8>> {
-            std::future::pending().await
-        }
-        async fn open_block_stream(&self) -> Result<Box<dyn PeerBlockStream>, TransportError> {
-            Err(TransportError::ChannelClosed)
-        }
-        async fn accept_block_stream(&self) -> Option<Box<dyn PeerBlockStream>> {
-            std::future::pending().await
-        }
-    }
-
-    /// Registers a candidate session for `GROUP`, mirroring `convergence::
-    /// engine`'s own `build_state_with_adopted_group` -- needed only by
-    /// tests that go on to drive the real obligation scheduler
-    /// (`drive_obligations_once_for_test`) and expect it to actually
-    /// reconcile, not just back off for lack of any candidate.
-    fn register_candidate_session(state: &Arc<DaemonState>, root: &std::path::Path) {
-        let deps = crate::peer_orchestrator::peer_sync_session_deps(state);
-        let session = PeerSyncSession::new_with_dependencies(
-            Arc::new(NoopChannel),
-            "device-local".to_string(),
-            "device-peer".to_string(),
-            state.replica_coordinator.clone(),
-            Arc::new(crate::adapters::block_store_ports::BlockStorePortsAdapter::new(
-                state.block_store.clone(),
-            )),
-            vec![GROUP.to_string()],
-            HashMap::from([(GROUP.to_string(), root.to_path_buf())]),
-            Some(state.forward_tx.clone()),
-            deps,
-        );
-        state.peers.register_session("device-peer".to_string(), session);
-    }
-
-    const GROUP: &str = "ignore-recheck-group";
-
-    fn empty_version(mtime: i64) -> FileVersion {
-        FileVersion::new(
-            vec![],
-            0,
-            FileMeta {
-                mtime_unix_nanos: mtime,
-                unix_mode: None,
-                symlink_target: None,
-                record_kind: RecordKind::File,
-                xattrs: Vec::new(),
-            },
-        )
-    }
-
-    /// Same shape as `hazard_recheck_tests::build_state_with_adopted_group`.
-    async fn build_state_with_adopted_group() -> (Arc<DaemonState>, tempfile::TempDir) {
-        let root_dir = tempfile::tempdir().unwrap();
-        let store_dir = tempfile::tempdir().unwrap();
-        let root = root_dir.path().canonicalize().unwrap();
-        let replica_coordinator =
-            Arc::new(crate::replica_coordinator::ReplicaCoordinator::open_in_memory().unwrap());
-        let block_store =
-            Arc::new(yadorilink_local_storage::FsBlockStore::new(store_dir.path()).unwrap());
-
-        replica_coordinator.link_repository().add_link(&root.to_string_lossy(), GROUP).unwrap();
-        VerifiedRoot::open(&root, GROUP, replica_coordinator.as_ref()).unwrap();
-        let generation = replica_coordinator.startup_readiness().begin_group_startup(GROUP);
-        replica_coordinator.startup_readiness().mark_group_ready(GROUP, generation);
-
-        let build =
-            DaemonState::build("device-local".to_string(), replica_coordinator, block_store);
-        let state = build.state;
-        state.test_root_commit_authorities.lock().unwrap().insert(
-            GROUP.to_string(),
-            Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()),
-        );
-
-        (state, root_dir)
-    }
-
-    fn admit_change(
-        state: &DaemonState,
-        device: &str,
-        key: &SigningKey,
-        path: &str,
-        version: &FileVersion,
-    ) -> Change {
-        let change = Change::create_signed(
-            vec![],
-            0,
-            ChangeAuth::PLACEHOLDER,
-            DeviceId(device.to_string()),
-            FolderGroupId(GROUP.to_string()),
-            vec![Op::Put {
-                path: SyncPath(path.to_string()),
-                version: version.version_hash,
-                origin: PutOrigin::Direct,
-            }],
-            key,
-        );
-        state
-            .replica_coordinator
-            .change_history_repository()
-            .dag_admit_change_with_versions(&change, std::slice::from_ref(version), true)
-            .unwrap();
-        change
-    }
-
-    /// The core regression: a path parked `'ignore_blocked'` (standing in
-    /// for a real ignore-policy settlement -- see this module's own doc
-    /// comment for why a direct park, not real `.yadorilinkignore`
-    /// matching, is used here, mirroring `hazard_recheck_tests`' own
-    /// direct-`set_held` convention) with an already-admitted, trivially-
-    /// materializable DAG version is re-armed back to `'pending'` by
-    /// `run_ignore_recheck_pass` alone -- no new incoming record for this
-    /// exact path, and no `.yadorilinkignore` edit for the sweep to react
-    /// to -- and then converges for real once the ordinary obligation-
-    /// driven scheduler picks it up. RED-confirmed by commenting out the
-    /// re-arm loop inside `run_ignore_recheck_pass` (leaving only the
-    /// empty-listing early return): the parked path then never gets
-    /// re-examined at all, exactly the gap this closes.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_ignore_blocked_path_is_re_examined_and_rearmed_by_the_sweep_alone() {
-        let (state, root_dir) = build_state_with_adopted_group().await;
-        // No `local_retirement_session` pre-warm needed here (unlike
-        // `hazard_recheck_tests`' analogous setup): `run_ignore_recheck_
-        // pass` is a pure ignore-policy query now (Phase E finding) and
-        // never constructs any `PeerSyncSession` at all, so there is no
-        // first-construction-after-registration ordering hazard to avoid.
-        register_candidate_session(&state, &root_dir.path().canonicalize().unwrap());
-        let key = SigningKey::from_bytes(&[82u8; 32]);
-        admit_change(&state, "device-a", &key, "was-ignored.txt", &empty_version(1_700_000_000));
-
-        let obligation_before = state
-            .replica_coordinator
-            .sqlite()
-            .dag_lookup_projection_obligation(GROUP, "was-ignored.txt")
-            .unwrap()
-            .expect("admission must have created an obligation");
-        let claimed_g = obligation_before.invalidation_generation;
-        assert!(
-            state
-                .replica_coordinator
-                .sqlite()
-                .dag_complete_obligation_if_non_exact_proof_current(
-                    GROUP,
-                    "was-ignored.txt",
-                    claimed_g,
-                    obligation_before.obligation_incarnation,
-                    NonExactProofKind::IgnoreExcluded,
-                )
-                .unwrap(),
-            "sanity: parking the obligation as ignore_blocked must succeed"
-        );
-        assert_eq!(
-            state
-                .replica_coordinator
-                .sqlite()
-                .dag_lookup_projection_obligation(GROUP, "was-ignored.txt")
-                .unwrap()
-                .unwrap()
-                .state,
-            "ignore_blocked",
-            "sanity: the path must actually be parked before the sweep runs"
-        );
-
-        run_ignore_recheck_pass(&state, GROUP).await;
-
-        let obligation = state
-            .replica_coordinator
-            .sqlite()
-            .dag_lookup_projection_obligation(GROUP, "was-ignored.txt")
-            .unwrap()
-            .expect("re-arming must not delete the obligation");
-        assert_eq!(
-            obligation.state, "pending",
-            "the sweep must re-arm a path whose ignore-exclusion is already gone, with no \
-             fresh incoming record for this exact path"
-        );
-        assert_eq!(obligation.invalidation_generation, claimed_g, "re-arming must not bump G");
-
-        // The re-arm alone doesn't materialize anything -- it just hands
-        // the path back to the ordinary scheduler. Confirm that scheduler
-        // actually converges it, end to end.
-        assert!(
-            crate::convergence::engine::drive_obligations_once_for_test(&state, 128, 256).await
-        );
-        assert!(
-            root_dir.path().join("was-ignored.txt").exists(),
-            "the ordinary obligation-driven scheduler must materialize the re-armed path to disk"
-        );
-    }
-
-    /// The specific permanent-stall bug an independent review caught: the
-    /// PREVIOUS version of `run_ignore_recheck_pass` gated re-arm on
-    /// `ProjectionAttempt::is_settled(path)` after driving a reconcile
-    /// attempt through `local_retirement_session` -- backed by a
-    /// `LoopbackPeerMessageChannel` whose `open_block_stream` always
-    /// returns `ChannelClosed`. A path needing an actual block fetch could
-    /// therefore never `is_settled` through that session, so it could
-    /// never re-arm at all -- permanently stuck `'ignore_blocked'` even
-    /// after the user un-ignored it. This test's own `FileVersion` carries
-    /// a real, non-empty block that is never written to the local block
-    /// store, specifically so a reconcile/materialize attempt through the
-    /// local-only session would hit exactly that `ChannelClosed` failure
-    /// -- proving re-arm depends only on the ignore-policy verdict, never
-    /// on whether the content happens to be fetchable through whichever
-    /// session ran the check.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn unignoring_a_path_whose_content_cannot_be_locally_fetched_still_rearms_it() {
-        let (state, _root_dir) = build_state_with_adopted_group().await;
-        let key = SigningKey::from_bytes(&[83u8; 32]);
-        let version = FileVersion::new(
-            vec![yadorilink_replica_domain::file::VersionBlock {
-                hash: yadorilink_replica_domain::ids::BlockHash(vec![9u8; 32]),
-                size: 4096,
-            }],
-            4096,
-            FileMeta {
-                mtime_unix_nanos: 1_700_000_200,
-                unix_mode: None,
-                symlink_target: None,
-                record_kind: RecordKind::File,
-                xattrs: Vec::new(),
-            },
-        );
-        admit_change(&state, "device-a", &key, "needs-a-real-fetch.bin", &version);
-
-        let obligation_before = state
-            .replica_coordinator
-            .sqlite()
-            .dag_lookup_projection_obligation(GROUP, "needs-a-real-fetch.bin")
-            .unwrap()
-            .expect("admission must have created an obligation");
-        let claimed_g = obligation_before.invalidation_generation;
-        assert!(
-            state
-                .replica_coordinator
-                .sqlite()
-                .dag_complete_obligation_if_non_exact_proof_current(
-                    GROUP,
-                    "needs-a-real-fetch.bin",
-                    claimed_g,
-                    obligation_before.obligation_incarnation,
-                    NonExactProofKind::IgnoreExcluded,
-                )
-                .unwrap(),
-            "sanity: parking the obligation as ignore_blocked must succeed"
-        );
-
-        run_ignore_recheck_pass(&state, GROUP).await;
-
-        let obligation = state
-            .replica_coordinator
-            .sqlite()
-            .dag_lookup_projection_obligation(GROUP, "needs-a-real-fetch.bin")
-            .unwrap()
-            .expect("re-arming must not delete the obligation");
-        assert_eq!(
-            obligation.state, "pending",
-            "the sweep must re-arm a path whose ignore-exclusion is gone regardless of whether \
-             its content can be fetched through this sweep's own local-only session -- \
-             materialization is the ordinary scheduler's job, not this sweep's"
-        );
-        assert_eq!(obligation.invalidation_generation, claimed_g, "re-arming must not bump G");
-    }
-
-    /// A group with nothing parked at all must return immediately without
-    /// touching anything -- the empty-listing early-return branch.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_group_with_nothing_ignore_blocked_is_a_no_op() {
-        let (state, _root_dir) = build_state_with_adopted_group().await;
-        run_ignore_recheck_pass(&state, GROUP).await;
-        assert!(state
-            .replica_coordinator
-            .sqlite()
-            .dag_list_ignore_blocked_paths(GROUP)
-            .unwrap()
-            .is_empty());
-    }
-}
+#[path = "engine_wrapper/ignore_recheck_tests.rs"]
+mod ignore_recheck_tests;

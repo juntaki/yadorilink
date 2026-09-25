@@ -1,33 +1,31 @@
-//! Lets a `quinn` endpoint share this device's one UDP socket with STUN
-//! and the relay envelope, instead of binding a second port of its own.
+//! Lets a `quinn` endpoint run over this device's one UDP socket (the
+//! transport hub's), instead of binding a second port of its own.
 //!
 //! ## Why this exists at all
 //!
 //! `quinn::Endpoint::server`/`new` take a `std::net::UdpSocket` and own it
 //! end to end. That is what the bench-only bulk plane does, and it is why
 //! that plane binds a separate port. A separate port is not acceptable for
-//! the real mesh: a STUN-reflexive or port-mapped candidate is only
-//! meaningful because it describes *the exact socket data flows on*, so a
-//! second port would need its own mapping through every NAT and firewall in
-//! the path -- precisely what the single-socket design avoids.
+//! the real mesh: a second port would need its own mapping through every NAT
+//! and firewall in the path -- precisely what the single-socket design
+//! avoids.
 //!
 //! `Endpoint::new_with_abstract_socket` takes an `Arc<dyn AsyncUdpSocket>`
-//! instead, which is the seam this module fills. Candidate racing, STUN,
-//! port mapping, hole punching and relay demux all keep working unchanged
-//! because, as far as the operating system is concerned, nothing about the
-//! socket changed.
+//! instead, which is the seam this module fills. Candidate racing keeps
+//! working unchanged because, as far as the operating system is concerned,
+//! nothing about the socket changed.
 //!
 //! It pays for itself twice. A prior bulk-transport module (since removed)
 //! was excluded from simulation builds for exactly this reason: quinn
-//! drives raw UDP sockets below `tokio::net::UdpSocket`, outside what
-//! madsim's shim can intercept -- `quinn-udp` reaches past the runtime for
+//! drives raw UDP sockets below `tokio::net::UdpSocket`, outside what a
+//! simulator can intercept -- `quinn-udp` reaches past the runtime for
 //! GSO, GRO and `sendmmsg`. Driven
 //! through the hub, quinn never touches those paths, so every datagram goes
-//! out through an ordinary `tokio::net::UdpSocket` the simulator *does*
-//! intercept. The same bridge that preserves the NAT-candidate invariant is
+//! out through the hub's socket, which the simulation build swaps for a
+//! simulated one (see `sim_net.rs`). The same bridge that preserves the NAT-candidate invariant is
 //! what makes QUIC simulatable.
 
-#[cfg(madsim)]
+#[cfg(turmoil)]
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
@@ -44,18 +42,13 @@ use tokio::sync::mpsc;
 
 use crate::transport_hub::TransportHub;
 
-/// A `quinn::Runtime` built on whichever `tokio` this crate was compiled
-/// against: real tokio normally, the simulator's shim under `--cfg madsim`.
+/// A `quinn::Runtime` built on this crate's `tokio`, reading the clock
+/// through `tokio::time` so a simulated run's timeline is the one quinn's
+/// deadlines live on.
 ///
-/// quinn ships `TokioRuntime`, but it names the real `tokio` crate directly,
-/// so under simulation it would spawn onto a runtime that is not running and
-/// read a clock the simulator does not control -- the determinism the
-/// simulator exists to provide would be gone. Writing the same four methods
-/// against this crate's `tokio` alias gives one implementation that is
-/// equivalent to `TokioRuntime` natively and correct under simulation, which
-/// is the point: there must be no simulation-only QUIC stack, only a
-/// simulation-aware clock and spawner. quinn's own `Runtime::now` doc says
-/// as much -- "allows simulating the flow of time for testing".
+/// There must be no simulation-only QUIC stack, only a simulation-aware
+/// clock and spawner. quinn's own `Runtime::now` doc says as much --
+/// "allows simulating the flow of time for testing".
 #[derive(Debug)]
 pub struct HubQuinnRuntime;
 
@@ -87,37 +80,18 @@ impl Runtime for HubQuinnRuntime {
 
 /// The clock quinn should read, and the timeline its deadlines live on.
 ///
-/// These differ between the two builds in a way that is easy to get wrong
-/// silently. Real tokio has its own `Instant` newtype with `from_std`/
-/// `into_std`. The simulator instead re-exports `std::time::Instant`
-/// unchanged and does **not** intercept `Instant::now()` -- the simulated
-/// clock is only reachable through `TimeHandle`. Calling `Instant::now()`
-/// under simulation would therefore hand quinn the real wall clock while
-/// every timer fired on the virtual one, so its loss-detection and
-/// idle-timeout deadlines would sit at an arbitrary offset from the events
-/// they are meant to bound. That failure is silent: the handshake still
-/// completes, and only timing-dependent behavior goes wrong.
-#[cfg(not(madsim))]
+/// Read through `tokio::time::Instant` rather than `std::time::Instant::now()`
+/// so that a paused or simulated tokio clock is the one quinn sees. Reading
+/// the wall clock while every timer fired on another timeline would put its
+/// loss-detection and idle-timeout deadlines at an arbitrary offset from the
+/// events they are meant to bound. That failure is silent: the handshake
+/// still completes, and only timing-dependent behavior goes wrong.
 pub(crate) fn now_instant() -> std::time::Instant {
     tokio::time::Instant::now().into_std()
 }
 
-#[cfg(madsim)]
-pub(crate) fn now_instant() -> std::time::Instant {
-    madsim::time::TimeHandle::current().now_instant()
-}
-
-#[cfg(not(madsim))]
 fn to_timer_instant(t: std::time::Instant) -> tokio::time::Instant {
     tokio::time::Instant::from_std(t)
-}
-
-/// Identity under simulation: `tokio::time::Instant` *is*
-/// `std::time::Instant` there, and `sleep_until` reads it on the same
-/// virtual timeline [`now_instant`] returns.
-#[cfg(madsim)]
-fn to_timer_instant(t: std::time::Instant) -> tokio::time::Instant {
-    t
 }
 
 /// quinn's `AsyncTimer` over the aliased tokio's `Sleep`. Boxed-and-pinned
@@ -158,21 +132,21 @@ pub(crate) type QuicDatagram = (Vec<u8>, SocketAddr);
 /// at QUIC's packet size (a couple of hundred KiB, ~1200 bytes each), so a
 /// legitimate congestion-window burst passes and a runaway producer does
 /// not.
-#[cfg(madsim)]
+#[cfg(turmoil)]
 const SIMULATED_SEND_QUEUE_DEPTH: usize = 256;
 
 /// The simulated send path's queue and its write-readiness signal.
 ///
-/// Under simulation there is no synchronous send primitive at all -- madsim's
-/// `UdpSocket` exposes only `async fn send_to` -- so quinn's synchronous
-/// `try_send` has to hand the datagram to a writer task. That makes this
+/// Under simulation there is no usable synchronous send primitive -- the
+/// simulated `UdpSocket` has no `poll_send_ready` to pair a refusal with a
+/// wakeup -- so quinn's synchronous `try_send` has to hand the datagram to a
+/// writer task. That makes this
 /// queue the only place backpressure can come from, so it has to produce
 /// both halves of it: a refusal when full, and a wakeup when drained.
 ///
-/// madsim not offering `poll_send_ready` is beside the point. The queue's own
-/// capacity *is* the readiness signal, and it is the one quinn needs: it says
+/// The queue's own capacity *is* the readiness signal, and it is the one quinn needs: it says
 /// whether this device can accept another datagram right now.
-#[cfg(madsim)]
+#[cfg(turmoil)]
 struct SimulatedSendQueue {
     tx: mpsc::Sender<QuicDatagram>,
     /// Every blocked poller's waker, keyed by poller.
@@ -189,7 +163,7 @@ struct SimulatedSendQueue {
     wakers: StdMutex<HashMap<u64, std::task::Waker>>,
 }
 
-#[cfg(madsim)]
+#[cfg(turmoil)]
 impl SimulatedSendQueue {
     fn enqueue(&self, datagram: QuicDatagram) -> io::Result<()> {
         match self.tx.try_send(datagram) {
@@ -243,26 +217,116 @@ impl SimulatedSendQueue {
 
 /// The `AsyncUdpSocket` a `quinn::Endpoint` is built on so it shares the
 /// hub's socket. See this module's own doc comment for why.
+///
+/// ## The dual-stack boundary lives here, not in `TransportHub`
+///
+/// `quinn::Endpoint::new_with_abstract_socket` decides, ONCE, whether the
+/// endpoint it builds may dial IPv6 addresses at all -- from this type's own
+/// [`local_addr`](AsyncUdpSocket::local_addr): if that reports an IPv4
+/// address, `quinn` sets its internal `endpoint.ipv6 = false` and refuses
+/// every subsequent IPv6 dial with `InvalidRemoteAddress`, before ever
+/// reaching [`try_send`](AsyncUdpSocket::try_send) -- even though the hub
+/// underneath is fully capable of sending it (see [`TransportHub`]'s own
+/// dual-socket design). [`report_ipv6`] is this boundary's answer to that:
+/// when the hub has a bound IPv6 half, this reports the logical dual-stack
+/// address `[::]:port` instead of the hub's own (always-IPv4)
+/// [`TransportHub::local_addr`], which is deliberately left alone -- it
+/// backs logging call sites whose meaning must not change.
+///
+/// Reporting IPv6 upward has a real consequence downward, though: once
+/// `quinn` believes this endpoint is dual-stack, it normalizes every IPv4
+/// destination it hands to [`try_send`] into its IPv4-mapped IPv6 form
+/// (`::ffff:a.b.c.d`) -- see `quinn::Endpoint::connect_with`'s own
+/// `ensure_ipv6`. The hub's [`UdpEndpoint::socket_for`] picks a real v4 vs.
+/// v6 socket purely off `SocketAddr::is_ipv4()`, which a mapped address
+/// answers `false` to -- unmapped, every IPv4 send from a dual-stack-
+/// reporting endpoint would silently go out the v6-only socket instead,
+/// which cannot reach an IPv4-only peer at all. [`to_hub_addr`] undoes the
+/// mapping right at this boundary, before the hub ever sees the address, so
+/// the hub's own v4/v6 selection keeps working exactly as it did before this
+/// boundary reported IPv6 at all.
+///
+/// The receive path needs the identical normalization in the OTHER
+/// direction: a real IPv4 peer's datagram arrives on the hub's real v4
+/// socket carrying a plain IPv4 source address, but a `quinn` endpoint that
+/// believes itself dual-stack expects every address it sees -- outbound
+/// destinations and inbound sources alike -- in the same normalized shape,
+/// so that the SAME peer is never represented two different ways depending
+/// on which leg of the conversation produced the address. [`to_quinn_addr`]
+/// re-maps an inbound IPv4 source into its IPv4-mapped IPv6 form before
+/// [`poll_recv`](AsyncUdpSocket::poll_recv) hands it to `quinn`, mirroring
+/// [`to_hub_addr`] exactly.
+///
+/// Neither mapping does anything when [`report_ipv6`] is false (a host with
+/// no usable IPv6, or `TransportHub::from_socket`'s single-socket adoption):
+/// `quinn`'s own `endpoint.ipv6` is false in that case too, so it never
+/// produces a mapped address to begin with, and this boundary stays a
+/// byte-for-byte pass-through -- unchanged from this type's pre-dual-stack
+/// behavior.
 pub struct TransportHubQuicSocket {
     /// Native only: the send path there is the hub's own synchronous
     /// `try_send_datagram`, so the socket calls the hub directly. Under
     /// simulation the send path is the writer task, which holds its own
     /// handle, and this one would be dead weight.
-    #[cfg(not(madsim))]
+    #[cfg(not(turmoil))]
     hub: Arc<TransportHub>,
+    /// The address reported to `quinn` via `AsyncUdpSocket::local_addr` --
+    /// NOT necessarily `hub.local_addr()`. See this type's own doc comment.
     local_addr: SocketAddr,
+    /// Whether [`local_addr`] reports IPv6 (and both address-mapping
+    /// helpers are therefore active). Cached at construction rather than
+    /// re-derived from `local_addr.is_ipv6()` on every send/receive purely
+    /// to make the two questions ("what do I tell quinn" and "am I in
+    /// dual-stack mode") impossible to accidentally answer inconsistently
+    /// if one is ever changed without the other.
+    report_ipv6: bool,
     /// Datagrams the demux routed here. `Mutex` because `poll_recv` takes
     /// `&self` while the receiver needs `&mut`; quinn drives exactly one
     /// receive task per endpoint, so this is uncontended in practice.
     inbound: StdMutex<mpsc::Receiver<QuicDatagram>>,
     /// Simulation only -- see `try_send`.
-    #[cfg(madsim)]
+    #[cfg(turmoil)]
     outbound: Arc<SimulatedSendQueue>,
+}
+
+/// Undoes `quinn`'s IPv4-mapped-IPv6 normalization (`::ffff:a.b.c.d`) right
+/// before the hub picks a real socket by address family -- see
+/// [`TransportHubQuicSocket`]'s own doc comment for why this exists. A
+/// non-mapped address, or any IPv6 address that is not an IPv4 mapping,
+/// passes through unchanged.
+fn to_hub_addr(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+            Some(v4) => SocketAddr::new(std::net::IpAddr::V4(v4), v6.port()),
+            None => addr,
+        },
+        SocketAddr::V4(_) => addr,
+    }
+}
+
+/// The receive-path mirror of [`to_hub_addr`]: maps a real IPv4 source
+/// address into its IPv4-mapped IPv6 form before handing it to `quinn`, so
+/// an endpoint `quinn` believes is dual-stack never sees the same peer
+/// represented two different ways depending on which leg of the
+/// conversation produced the address. A no-op when `report_ipv6` is false.
+fn to_quinn_addr(addr: SocketAddr, report_ipv6: bool) -> SocketAddr {
+    if !report_ipv6 {
+        return addr;
+    }
+    match addr {
+        SocketAddr::V4(v4) => {
+            SocketAddr::new(std::net::IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port())
+        }
+        SocketAddr::V6(_) => addr,
+    }
 }
 
 impl fmt::Debug for TransportHubQuicSocket {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TransportHubQuicSocket").field("local_addr", &self.local_addr).finish()
+        f.debug_struct("TransportHubQuicSocket")
+            .field("local_addr", &self.local_addr)
+            .field("report_ipv6", &self.report_ipv6)
+            .finish()
     }
 }
 
@@ -274,15 +338,28 @@ impl TransportHubQuicSocket {
     /// allowed to replace the first -- see
     /// [`TransportHub::register_quic`](crate::TransportHub::register_quic).
     pub fn new(hub: Arc<TransportHub>) -> Result<Arc<Self>, crate::TransportError> {
-        let local_addr = hub.local_addr();
+        // The address reported to quinn is NOT necessarily the hub's own
+        // `local_addr()` -- see this type's own doc comment for the full
+        // reasoning. `hub.local_addr()`'s own meaning is left untouched for
+        // its other callers (logging).
+        let report_ipv6 = hub.has_ipv6();
+        let local_addr = if report_ipv6 {
+            SocketAddr::new(
+                std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+                hub.local_addr().port(),
+            )
+        } else {
+            hub.local_addr()
+        };
         let inbound = hub.register_quic()?;
 
-        #[cfg(madsim)]
+        #[cfg(turmoil)]
         let outbound = {
-            // The simulator's `UdpSocket` is async-only: it has no
-            // `try_send_to`, so there is no way to satisfy quinn's
-            // synchronous `try_send` directly. The datagram goes to a writer
-            // task through a BOUNDED queue, which is what makes the
+            // The simulated `UdpSocket` cannot satisfy quinn's synchronous
+            // `try_send` directly: it has a `try_send_to` but no
+            // `poll_send_ready`, so a refusal there could never be paired
+            // with a wakeup. The datagram goes to a writer task
+            // through a BOUNDED queue, and that queue is what makes the
             // simulated send path behave like the native one: refuse when
             // full, wake when drained. See `SIMULATED_SEND_QUEUE_DEPTH`.
             let (tx, mut rx) = mpsc::channel::<QuicDatagram>(SIMULATED_SEND_QUEUE_DEPTH);
@@ -311,11 +388,12 @@ impl TransportHubQuicSocket {
         };
 
         Ok(Arc::new(Self {
-            #[cfg(not(madsim))]
+            #[cfg(not(turmoil))]
             hub,
             local_addr,
+            report_ipv6,
             inbound: StdMutex::new(inbound),
-            #[cfg(madsim)]
+            #[cfg(turmoil)]
             outbound,
         }))
     }
@@ -339,13 +417,18 @@ impl AsyncUdpSocket for TransportHubQuicSocket {
     /// `None` to match. Losing ECN costs congestion-control precision, not
     /// correctness.
     fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
-        #[cfg(not(madsim))]
+        // Undo quinn's own IPv4-mapped-IPv6 normalization before the hub
+        // ever sees the address -- see this type's own doc comment. A no-op
+        // for a genuinely IPv6 destination, or when quinn was never told
+        // this endpoint is dual-stack in the first place.
+        let destination = to_hub_addr(transmit.destination);
+        #[cfg(not(turmoil))]
         {
-            self.hub.try_send_datagram(transmit.contents, transmit.destination)
+            self.hub.try_send_datagram(transmit.contents, destination)
         }
-        #[cfg(madsim)]
+        #[cfg(turmoil)]
         {
-            self.outbound.enqueue((transmit.contents.to_vec(), transmit.destination))
+            self.outbound.enqueue((transmit.contents.to_vec(), destination))
         }
     }
 
@@ -395,7 +478,10 @@ impl AsyncUdpSocket for TransportHubQuicSocket {
             meta[filled] = RecvMeta {
                 len: datagram.len(),
                 stride: datagram.len(),
-                addr: from,
+                // Mirrors `try_send`'s own mapping in the other direction --
+                // see this type's own doc comment. A no-op unless quinn was
+                // told this endpoint is dual-stack.
+                addr: to_quinn_addr(from, self.report_ipv6),
                 ecn: None,
                 dst_ip: None,
             };
@@ -429,20 +515,19 @@ impl AsyncUdpSocket for TransportHubQuicSocket {
 struct HubUdpPoller {
     socket: Arc<TransportHubQuicSocket>,
     /// This poller's own slot in whichever waker map it registers with: the
-    /// simulated send queue's, or -- natively -- the hub's relay control
+    /// simulated send queue's, or -- natively -- the hub's TURN send
     /// queue's. The kernel socket registers each poller's waker itself and
-    /// needs no id, but the queue in front of the relay carrier does, since
+    /// needs no id, but the queue in front of a TURN allocation does, since
     /// several pollers can be blocked on it at once.
     id: u64,
 }
 
 impl Drop for HubUdpPoller {
     fn drop(&mut self) {
-        #[cfg(not(madsim))]
-        {
-            self.socket.hub.forget_send_poller(self.id);
-        }
-        #[cfg(madsim)]
+        // Nothing to forget on the native path: the only waker map this hub
+        // ever had belonged to the TURN router, and the V4/V6 sockets register
+        // their own wakers through `poll_send_ready`.
+        #[cfg(turmoil)]
         {
             self.socket.outbound.forget(self.id);
         }
@@ -457,13 +542,16 @@ impl fmt::Debug for HubUdpPoller {
 
 impl UdpPoller for HubUdpPoller {
     fn poll_writable(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<io::Result<()>> {
-        #[cfg(not(madsim))]
+        #[cfg(not(turmoil))]
         {
             self.socket.hub.poll_quic_send_ready(self.id, _cx)
         }
-        #[cfg(madsim)]
+        #[cfg(turmoil)]
         {
             self.socket.outbound.poll_writable(self.id, _cx)
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

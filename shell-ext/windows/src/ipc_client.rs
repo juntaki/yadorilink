@@ -259,7 +259,7 @@ async fn hydrate_inner(path: &str) -> bool {
 /// failure or if the daemon isn't reachable — the cfapi host's caller is
 /// expected to just register nothing and retry on its own poll interval,
 /// matching this client's fail-soft-never-hang contract elsewhere.
-/// Discovers every OnDemand-linked folder group (M2-1: the reconciliation
+/// Discovers every OnDemand-linked folder group (the reconciliation
 /// input `cfapi_host`'s poll loop converges the CfAPI sync-root set
 /// against). Mirrors `shell-ext/macos/fileprovider-core/src/ipc_client.rs`'s
 /// `list_on_demand_folders` exactly, including its `None`/`Some(vec![])`
@@ -316,29 +316,100 @@ where
 /// `mtime_unix_nanos`, `materialization_state`) to create or update a
 /// cfapi placeholder per file. `local_path` must match a `local_path`
 /// this client already got back from `list_on_demand_folders`.
-pub fn list_folder_files(local_path: &str) -> Vec<FolderFileEntry> {
+///
+/// `None` on any failure to confirm the listing (unreachable daemon,
+/// timeout, malformed response, or an explicit `snapshot_available:
+/// false`), deliberately distinct from `Some(vec![])`, a confirmed empty
+/// folder -- same contract as `list_on_demand_folders` and as
+/// `shell-ext/macos/fileprovider-core`'s `list_folder_files`. The caller
+/// skips that folder's placeholder sync for the poll on `None`.
+pub fn list_folder_files(local_path: &str) -> Option<Vec<FolderFileEntry>> {
     runtime().block_on(async {
-        tokio::time::timeout(LIST_TIMEOUT, list_folder_files_inner(local_path))
-            .await
-            .unwrap_or_default()
+        tokio::time::timeout(LIST_TIMEOUT, list_folder_files_inner(local_path)).await.ok()?
     })
 }
 
-async fn list_folder_files_inner(local_path: &str) -> Vec<FolderFileEntry> {
-    let Ok(mut stream) = connect().await else { return Vec::new() };
+async fn list_folder_files_inner(local_path: &str) -> Option<Vec<FolderFileEntry>> {
+    let mut stream = connect().await.ok()?;
+    list_folder_files_over(&mut stream, local_path).await
+}
+
+/// The stream-generic core of `list_folder_files_inner`, split out (like
+/// `list_on_demand_folders_over`) so the `None`-vs-`Some(vec![])`
+/// distinction is testable against an in-memory duplex stream.
+async fn list_folder_files_over<S>(stream: &mut S, local_path: &str) -> Option<Vec<FolderFileEntry>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let msg = ShellIpcMessage {
         payload: Some(Payload::ListFolderFilesRequest(ListFolderFilesRequest {
             local_path: local_path.to_string(),
         })),
     };
-    if write_message(&mut stream, &msg).await.is_err() {
-        return Vec::new();
-    }
-    match read_message::<ShellIpcMessage>(&mut stream).await {
-        Ok(Some(ShellIpcMessage { payload: Some(Payload::ListFolderFilesResponse(r)) })) => {
-            r.entries
+    write_message(stream, &msg).await.ok()?;
+    match read_message::<ShellIpcMessage>(stream).await {
+        Ok(Some(ShellIpcMessage { payload: Some(Payload::ListFolderFilesResponse(r)) }))
+            if r.snapshot_available =>
+        {
+            Some(r.entries)
         }
-        _ => Vec::new(),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod list_folder_files_tests {
+    use super::*;
+
+    async fn respond_with(response: Option<ShellIpcMessage>) -> Option<Vec<FolderFileEntry>> {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            let _ = read_message::<ShellIpcMessage>(&mut server).await;
+            if let Some(response) = response {
+                let _ = write_message(&mut server, &response).await;
+            }
+        });
+        let result = list_folder_files_over(&mut client, "C:\\A").await;
+        server_task.await.unwrap();
+        result
+    }
+
+    fn response(relative_paths: &[&str], snapshot_available: bool) -> ShellIpcMessage {
+        ShellIpcMessage {
+            payload: Some(Payload::ListFolderFilesResponse(
+                yadorilink_ipc_proto::shellipc::ListFolderFilesResponse {
+                    entries: relative_paths
+                        .iter()
+                        .map(|p| FolderFileEntry {
+                            relative_path: p.to_string(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    snapshot_available,
+                },
+            )),
+        }
+    }
+
+    #[tokio::test]
+    async fn confirmed_listing_is_some() {
+        let result = respond_with(Some(response(&["a.txt"], true))).await;
+        assert_eq!(result.map(|e| e.len()), Some(1));
+    }
+
+    #[tokio::test]
+    async fn confirmed_empty_listing_is_some_empty() {
+        assert_eq!(respond_with(Some(response(&[], true))).await, Some(vec![]));
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_listing_is_none() {
+        assert_eq!(respond_with(Some(response(&[], false))).await, None);
+    }
+
+    #[tokio::test]
+    async fn connection_closed_without_a_response_is_none() {
+        assert_eq!(respond_with(None).await, None);
     }
 }
 

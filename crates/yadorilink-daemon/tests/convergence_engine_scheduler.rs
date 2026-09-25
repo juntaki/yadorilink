@@ -1,5 +1,5 @@
-//! Regression coverage for the Convergence Engine scheduler fix
-//! (Competitive Hardening C4 finding): `run`'s own loop used to sleep a
+//! Regression coverage for the Convergence Engine scheduler: `run`'s own
+//! loop used to sleep a
 //! full tick interval (or wait on the coarse `MaterializationWake`
 //! `Notify`) after every `run_once` call, REGARDLESS of whether that
 //! call's own group-processing attempts left a large, immediately-runnable
@@ -38,23 +38,33 @@ use support::{
     wait_until_with_context,
 };
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
-use yadorilink_daemon::convergence::engine::run_once_for_test;
+use yadorilink_daemon::convergence::engine::{run_once_for_test, ConvergenceEngine};
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-use yadorilink_local_storage::FsBlockStore;
-use yadorilink_replica_domain::change::{Change, ChangeAuth, Op, PutOrigin};
+use yadorilink_local_storage::SegmentBlockStore;
+use yadorilink_replica_domain::change::{Op, PutOrigin};
 use yadorilink_replica_domain::file::{FileMeta, FileVersion, RecordKind, VersionBlock};
 use yadorilink_replica_domain::ids::{BlockHash, DeviceId, FolderGroupId, SyncPath};
+use yadorilink_replica_domain::test_authoring::create_signed_for_tests;
 
 const GROUP: &str = "scheduler-test-group";
 
-fn new_device(device_id: &str) -> (Arc<DaemonState>, tempfile::TempDir) {
+/// A device, and a sync root that is ITS OWN DIRECTORY.
+///
+/// The block store gets a separate one. It used to be the same directory,
+/// which made every device's own `FORMAT`, `segments` and `index.sqlite3*`
+/// part of the folder under test: the scanner imported the store it was
+/// writing into, `real_entry_names` counted those artifacts towards the
+/// file total, and each device materialized the other's store files over
+/// its own. Every other fixture in this suite already keeps the two apart
+/// (`ondemand_adoption.rs`'s `setup_device`, for one).
+fn new_device(device_id: &str) -> (Arc<DaemonState>, tempfile::TempDir, tempfile::TempDir) {
     let store_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
     let state = DaemonState::new(device_id.to_string(), sync_state, store);
     ensure_device_signing_key(&state);
-    (state, store_dir)
+    (state, tempfile::tempdir().unwrap(), store_dir)
 }
 
 /// Deterministic, no background-engine race possible: a device with NO
@@ -80,7 +90,7 @@ fn new_device(device_id: &str) -> (Arc<DaemonState>, tempfile::TempDir) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn zero_progress_never_reports_an_immediate_backlog() {
     support::ensure_isolated_config_dir();
-    let (state, root) = new_device("sched-lonely");
+    let (state, root, _store_dir) = new_device("sched-lonely");
     let local_path = root.path().to_string_lossy().to_string();
     state.replica_coordinator.link_repository().add_link(&local_path, GROUP).unwrap();
     LinkRuntimeController::new(state.clone()).start(local_path, GROUP.to_string()).unwrap();
@@ -99,10 +109,9 @@ async fn zero_progress_never_reports_an_immediate_backlog() {
                 xattrs: Vec::new(),
             },
         );
-        let change = Change::create_signed(
+        let change = create_signed_for_tests(
             vec![],
             0,
-            ChangeAuth::PLACEHOLDER,
             DeviceId("sched-remote-ghost".to_string()),
             FolderGroupId(GROUP.to_string()),
             vec![Op::Put {
@@ -115,15 +124,16 @@ async fn zero_progress_never_reports_an_immediate_backlog() {
         state
             .replica_coordinator
             .change_history_repository()
-            .dag_admit_change_with_versions(&change, std::slice::from_ref(&version), true)
+            .dag_admit_change_with_versions(&change, std::slice::from_ref(&version))
             .unwrap();
     }
 
     // Several manual ticks, not just one -- proves this holds steadily,
     // not just on the very first call before anything has settled.
+    let engine = ConvergenceEngine::new(state.clone());
     for _ in 0..5 {
         assert!(
-            !run_once_for_test(&state).await,
+            !run_once_for_test(&engine).await,
             "a permanently unreachable backlog (no connected peer) must never report an \
              immediate backlog -- there is nothing an immediate re-drive could accomplish"
         );
@@ -154,12 +164,22 @@ async fn more_files_than_the_attempt_budget_converge_without_artificial_per_tick
     // the fix's own mechanism, not tuned to this environment's throughput.
     const OLD_BUG_MINIMUM_SLEEP_FLOOR: Duration = Duration::from_secs(2);
 
-    let (state_a, root_a) = new_device("sched-a");
-    let (state_b, root_b) = new_device("sched-b");
+    let (state_a, root_a, _store_a) = new_device("sched-a");
+    let (state_b, root_b, _store_b) = new_device("sched-b");
 
     for i in 0..FILE_COUNT {
         std::fs::write(root_a.path().join(format!("file-{i:03}.txt")), format!("content {i}"))
             .unwrap();
+    }
+
+    // A linked group with no policy is fail-closed: local emission is
+    // withheld and only the dirty-journal backstop (5s) re-drives it.
+    // `connect_two_daemons` installs the policy on the way past, which races
+    // A's initial scan; losing that race cost a full backstop interval on
+    // A's side before B had anything to fetch, which is not the scheduler
+    // latency this test measures. Install it before either watch starts.
+    for state in [&state_a, &state_b] {
+        support::install_bootstrap_policy(state, &[GROUP.to_string()]);
     }
 
     let local_path_a = root_a.path().to_string_lossy().to_string();

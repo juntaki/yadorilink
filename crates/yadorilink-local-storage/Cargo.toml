@@ -4,13 +4,6 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# Registers `madsim` as a known cfg (set via `RUSTFLAGS="--cfg madsim"`
-# for the deterministic-sim-testing test target only) so
-# `#[cfg(madsim)]`/`#[cfg(not(madsim))]` in source don't trip clippy's
-# `-D warnings` `unexpected_cfgs` lint during a normal (non-DST) build.
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(madsim)"] }
-
 [features]
 # Exposes `materialize_write::set_test_force_deferred_placeholder`
 # (normally `#[cfg(test)]`-only) to OTHER crates' test builds --
@@ -26,15 +19,22 @@ test-support = []
 [dependencies]
 yadorilink-replica-domain = { path = "../yadorilink-replica-domain" }
 # `fs_identity::bytes_to_target` for symlink-target byte<->OS-path
-# conversion in `materialize_write::materialize_symlink*` (Phase 7D-6). A
+# conversion in `materialize_write::materialize_symlink*`. A
 # pure leaf crate over `yadorilink-replica-domain` only -- no cycle risk.
 yadorilink-root-authority = { path = "../yadorilink-root-authority" }
+# The block store's persistent index is a SQLite database, opened through
+# the workspace's one SQLite runtime (pool, in-process writer gate, WAL +
+# `synchronous = FULL`) rather than a second, differently-configured one.
+# A leaf crate over `rusqlite`/`r2d2` only -- no cycle risk.
+yadorilink-sqlite-runtime = { path = "../yadorilink-sqlite-runtime" }
+# Needed directly for the index's own statements; the feature set (notably
+# `bundled`) comes from `yadorilink-sqlite-runtime`, which must stay the
+# single place that decides it.
+rusqlite = "0.31"
 thiserror.workspace = true
 sha2.workspace = true
 tracing.workspace = true
 hex = "0.4"
-# Content-defined chunking for `chunker::chunk_file_content_defined`
-# (Phase 7D-8.1, moved from `yadorilink-sync-core`).
 fastcdc = "4.0.1"
 # Portable free-space queries
 # (`available_space`/`total_space`) for the disk-headroom preflight check —
@@ -42,9 +42,8 @@ fastcdc = "4.0.1"
 # confirmed via search) exposed this; `std` has no stable cross-platform
 # API for it.
 fs2 = "0.4"
-# `link_preflight.rs`'s directory-scan preflight (moved here from
-# yadorilink-sync-core in Phase 7D-9B).
 walkdir = "2"
+tokio.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
@@ -54,7 +53,7 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 # `chunker::read_replicated_xattrs`'s raw `listxattr`/`getxattr` calls on
-# Linux (C1.2a) -- already a workspace dependency elsewhere (e.g.
+# Linux -- already a workspace dependency elsewhere (e.g.
 # yadorilink-filesystem-sync, yadorilink-root-authority), not a new one.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -65,9 +64,5 @@ tempfile = "3"
 # matters for boundary-finding behavior, unlike the fixed-size tests).
 rand = "0.10.2"
 
-# See yadorilink-sync-core/Cargo.toml's identical section for why.
-[target.'cfg(not(madsim))'.dependencies]
-tokio.workspace = true
-
-[target.'cfg(madsim)'.dependencies]
-tokio = { version = "0.2", package = "madsim-tokio", features = ["full"] }
+[lints]
+workspace = true

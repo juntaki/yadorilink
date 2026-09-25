@@ -10,14 +10,16 @@
 //! access, no clock): every function there is a pure transformation
 //! over caller-supplied data, which is what makes the privacy
 //! properties in `redact` and `schema::ReportEnvelope::validate`
-//! testable in isolation. `local_store` is the one exception among the
-//! non-`submission` modules — it does real filesystem I/O — but it has
-//! no daemon-specific coupling either, which is why it lives here rather
-//! than in `yadorilink-daemon`: both the CLI and the daemon can use it
-//! directly. The on-disk submission *queue* and usage *counters* still
-//! live in `yadorilink-daemon` (they're entangled with daemon-specific
-//! counting and scheduling), reusing `local_store::entry_store` as their
-//! storage engine.
+//! testable in isolation. `local_store` and `metrics_config` are the
+//! exceptions among the non-`submission` modules — they do real
+//! filesystem I/O — but they have no daemon-specific coupling either,
+//! which is why they live here rather than in `yadorilink-daemon`: both
+//! the CLI and the daemon can use them directly. `metrics_config` is the
+//! persisted opt-in toggle for the daemon's `/metrics` endpoint, which the
+//! CLI writes and the daemon reads at startup. The on-disk submission
+//! *queue* and usage *counters* still live in `yadorilink-daemon`
+//! (they're entangled with daemon-specific counting and scheduling),
+//! reusing `local_store::entry_store` as their storage engine.
 //!
 //! `submission` is the other exception: it's the optional HTTPS
 //! submission client, so it necessarily depends on a
@@ -30,6 +32,7 @@ pub mod builder;
 pub mod consent;
 pub mod diagnostics;
 pub mod local_store;
+pub mod metrics_config;
 pub mod queue;
 pub mod redact;
 pub mod schema;

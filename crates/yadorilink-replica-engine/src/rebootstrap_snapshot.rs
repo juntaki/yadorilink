@@ -1,33 +1,27 @@
-//! Canonical materialized-state snapshot used by history re-bootstrap.
-//!
-//! A checkpoint's `snapshot_hash` commits to the bytes produced here. The
-//! snapshot carries more than the current file index: retained version-history
-//! rows, the checkpoint-frontier `Change` bodies, every `FileVersion` those
-//! rows/frontier changes need, and the Lamport/authorization coordinates of
-//! direct parents removed by compaction. That last component lets
-//! startup/authenticated-history validation distinguish an intentional
-//! compacted boundary from a missing/corrupt parent without inventing causal or
-//! authorization coordinates.
-//!
-//! Causality is represented solely by retained signed changes, their frontier,
-//! compacted boundary authorization coordinates, and content-addressed
-//! `FileVersion`s — never by per-file counters. The domain tag below was
-//! advanced when the retired version-vector section was removed, so a snapshot
+//! Canonical materialized-state snapshot used by history re-bootstrap. A
+//! checkpoint's `snapshot_hash` commits to the bytes produced here. The
+//! snapshot carries more than the current file index: retained
+//! version-history rows, the checkpoint-frontier `Change` bodies, every
+//! `FileVersion` those rows/frontier changes need, and a
+//! [`PublishedChangeWitness`] for every authoring Change compaction pruned
+//! out of the frontier but whose content a retained [`SnapshotFile`] still
+//! depends on. That last component lets a receiver independently re-verify
+//! (`authorization_checkpoint:: verify_change_admission`) that every
+//! retained version is backed by real authorization evidence, not
+//! merely trust the outer manifest signer's word for it — see
+//! `SnapshotFile::authoring_change_hash`'s own doc comment. Causality is
+//! represented solely by retained signed changes, their frontier,
+//! published-change witnesses, and content-addressed `FileVersion`s —
+//! never by per-file counters. The domain tag below was advanced when
+//! the retired version-vector section was removed, so a snapshot
 //! written by any earlier build fails to decode rather than being
-//! misinterpreted. Advanced again (`\x02` -> `\x03`) when `SnapshotFile::
+//! misinterpreted.
+//! Advanced again (`\x02` -> `\x03`) when `SnapshotFile::
 //! symlink_target`'s encoding changed from a UTF-8 string (`put_opt_str`/
 //! `opt_string`, silently rejecting a real, non-UTF-8 symlink target) to a
 //! raw length-prefixed byte string (`put_opt_bytes`/`opt_bytes`) — see
-//! `change::FileMeta::symlink_target`'s doc for why a symlink target must be
-//! captured byte-exactly.
-//!
-//! # Move note (7D-9D)
-//!
-//! Moved verbatim out of `yadorilink-sync-core` after [`crate::compaction`]
-//! (its only sync-core-internal dependency, for `Checkpoint`) -- this
-//! module never touched `rusqlite`/`Connection` either, purely encode/
-//! decode/hash over already-derived values, so it belongs on this crate
-//! wholesale like `compaction`/`rebootstrap` before it.
+//! `change::FileMeta::symlink_target`'s doc for why a symlink target must
+//! be captured byte-exactly.
 
 use std::collections::BTreeSet;
 
@@ -35,22 +29,39 @@ use sha2::{Digest, Sha256};
 
 use crate::compaction::Checkpoint;
 use crate::error::ReplicaEngineError;
+use yadorilink_replica_domain::base_negotiation::{SummaryIdentity, SummaryIdentityBuilder};
 use yadorilink_replica_domain::change::Change;
 use yadorilink_replica_domain::file::FileVersion;
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord, RecordKind};
-use yadorilink_replica_domain::ids::{ChangeHash, FolderGroupId, VersionHash};
+use yadorilink_replica_domain::ids::{AuthorSeq, ChangeHash, FolderGroupId, VersionHash};
 
-// \x04 (Competitive Hardening C1.1): `unix_mode` widened from a single
+// \x04: `unix_mode` widened from a single
 // owner-exec bool byte to the full replicated-permission-bits encoding
 // (a flag byte plus an optional u32) -- see `FileMeta::encode_into`'s
-// identical shape for `unix_mode`. \x05 (Competitive Hardening C1.2a)
-// added `xattrs` (a count followed by sorted name/value pairs) -- see
-// `FileMeta::encode_into`'s identical shape for `xattrs`.
-const SNAPSHOT_DOMAIN: &[u8; 8] = b"YLNKsnp\x05";
+// identical shape for `unix_mode`. \x05 added `xattrs` (a count followed by sorted name/value
+// pairs) -- see
+// `FileMeta::encode_into`'s identical shape for `xattrs`. \x06 replaces `boundary_parent_auth`
+// (dead since Changes stopped carrying auth_seq/auth_epoch pins) with
+// `authoring_change_hash` per file and `published_change_witnesses`:
+// the checkpoint evidence for an authoring Change that was pruned by
+// compaction, so a version a compacted snapshot retains never loses its
+// block-serving justification for lack of evidence -- see
+// `SnapshotFile::authoring_change_hash`/`PublishedChangeWitness`'s own
+// doc comments.
+// \x07 carries the causal summary of the history the base replaces: each
+// retained author's `(watermark, tip)`, the causally maximal present entry
+// heads of every path, and the greatest Lamport the replaced history reached.
+// Together they are what makes an installed base a description of a
+// history rather than only of its files -- see [`SnapshotAuthorState`] and
+// [`SnapshotPathHead`].
+const SNAPSHOT_DOMAIN: &[u8; 8] = b"YLNKsnp\x07";
 const MAX_SNAPSHOT_FILES: usize = 1_000_000;
 const MAX_FRONTIER_CHANGES: usize = 4096;
 const MAX_FILE_VERSIONS: usize = 1_000_000;
+const MAX_WITNESSES: usize = 1_000_000;
 const MAX_BOUNDARY_EDGES: usize = 1_000_000;
+const MAX_AUTHOR_STATE: usize = 1_000_000;
+const MAX_PATH_HEADS: usize = 1_000_000;
 const MAX_STRING_BYTES: usize = 1024 * 1024;
 const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
 const MAX_BLOCKS_PER_FILE: usize = 1_000_000;
@@ -112,15 +123,202 @@ pub struct SnapshotFile {
     pub symlink_out_of_root: bool,
     pub unix_mode: Option<u32>,
     pub xattrs: Vec<(String, Vec<u8>)>,
+    /// The Change that authored this exact `(path, version_seq)` row --
+    /// `None` only for a pre-authorization-model row (see
+    /// `dag_store::published_view::published_file_at_path`'s doc comment
+    /// on the same NULL case). [`RebootstrapSnapshot::new`] requires every
+    /// row that names one to be justified: either that hash is itself
+    /// among `frontier_changes`, or a matching entry exists in
+    /// `published_change_witnesses` -- a row naming neither is exactly
+    /// "content compaction retained with no surviving evidence," which
+    /// this type must not be constructible with (design doc §3.7).
+    pub authoring_change_hash: Option<ChangeHash>,
 }
 
+/// Checkpoint evidence for one Change that compaction pruned from
+/// `frontier_changes` but whose content a retained [`SnapshotFile`] still
+/// depends on -- see that field's own doc comment. Carries exactly what
+/// [`crate::ports::ChangeEvidence`]/`dag_store::published_view::
+/// attach_authorization_evidence` already carry for a live Change's
+/// evidence (the checkpoint's own self-contained wire envelope plus this
+/// Change's Merkle inclusion proof under it), so a receiver can verify it
+/// with the SAME primitive (`authorization_checkpoint::
+/// verify_change_admission`) ordinary Change admission uses -- a pruned
+/// Change's evidence is not a weaker, second-class proof.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PublishedChangeWitness {
+    pub change_hash: ChangeHash,
+    pub checkpoint_hash: [u8; 32],
+    pub checkpoint_encoded: Vec<u8>,
+    pub checkpoint_signature: Vec<u8>,
+    pub author_signing_public_key: [u8; 32],
+    pub merkle_proof_encoded: Vec<u8>,
+}
+
+/// Why a [`PublishedChangeWitness`] does not verify.
+#[derive(Debug, thiserror::Error)]
+pub enum WitnessVerifyError {
+    #[error("the checkpoint signature is not 64 bytes")]
+    MalformedSignature,
+    #[error("the checkpoint envelope does not hash to the checkpoint hash it is carried under")]
+    CheckpointHashMismatch,
+    #[error("the checkpoint does not decode: {0:?}")]
+    UndecodableCheckpoint(
+        yadorilink_replica_domain::authorization_checkpoint::CheckpointDecodeError,
+    ),
+    #[error("the author signing key is not a valid key")]
+    MalformedAuthorKey,
+    #[error("the merkle proof does not decode: {0:?}")]
+    UndecodableProof(yadorilink_replica_domain::authorization_checkpoint::CheckpointDecodeError),
+    #[error("the checkpoint does not admit the change: {0:?}")]
+    NotAdmissible(yadorilink_replica_domain::authorization_checkpoint::CheckpointAdmissionError),
+}
+
+impl PublishedChangeWitness {
+    /// Verifies this witness as a received change's evidence is verified,
+    /// less the change's own signature, whose body a witness does not
+    /// carry: the envelope bound to its hash before it is decoded, then
+    /// `authorization_checkpoint::verify_change_admission` -- a checkpoint
+    /// for `expected_group_id` signed by the authority key
+    /// `resolve_authority_key` resolves from the caller's own verified
+    /// policy chain, bound to the carried author key, with a Merkle proof
+    /// of exactly this change hash.
+    ///
+    /// Returns the verified checkpoint, which names the change's author.
+    pub fn verify(
+        &self,
+        expected_group_id: &str,
+        resolve_authority_key: impl FnOnce(&[u8; 32], &[u8; 32]) -> Option<ed25519_dalek::VerifyingKey>,
+    ) -> Result<
+        yadorilink_replica_domain::authorization_checkpoint::AuthorizationCheckpoint,
+        WitnessVerifyError,
+    > {
+        use yadorilink_replica_domain::authorization_checkpoint::{
+            checkpoint_hash, decode_checkpoint, decode_merkle_proof, verify_change_admission,
+        };
+        let signature: [u8; 64] = self
+            .checkpoint_signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| WitnessVerifyError::MalformedSignature)?;
+        if checkpoint_hash(&self.checkpoint_encoded, &signature) != self.checkpoint_hash {
+            return Err(WitnessVerifyError::CheckpointHashMismatch);
+        }
+        let checkpoint = decode_checkpoint(&self.checkpoint_encoded)
+            .map_err(WitnessVerifyError::UndecodableCheckpoint)?;
+        let author_key = ed25519_dalek::VerifyingKey::from_bytes(&self.author_signing_public_key)
+            .map_err(|_| WitnessVerifyError::MalformedAuthorKey)?;
+        let proof = decode_merkle_proof(&self.merkle_proof_encoded)
+            .map_err(WitnessVerifyError::UndecodableProof)?;
+        verify_change_admission(
+            expected_group_id,
+            &checkpoint.device_id,
+            &author_key,
+            self.change_hash.0,
+            &proof,
+            &checkpoint,
+            &signature,
+            resolve_authority_key,
+        )
+        .map_err(WitnessVerifyError::NotAdmissible)?;
+        Ok(checkpoint)
+    }
+}
+
+/// A direct parent edge crossing the checkpoint boundary -- `parent_hash`
+/// is not itself among `frontier_changes` (compaction pruned its body),
+/// but `child_hash` (a live frontier member) still declares it as a
+/// parent. Purely a DAG-integrity record: it lets
+/// `retained_history_integrity::retained_parent_edges_match` distinguish
+/// an intentionally-pruned ancestor from a missing/corrupt one, and
+/// `parent_lamport` preserves the pruned ancestor's causal-clock value so
+/// lamport-ordering logic spanning the boundary does not need its full
+/// body. This is NOT an authorization mechanism (an earlier revision's
+/// now-removed `parent_auth_seq`/`parent_auth_epoch` fields were; proof-
+/// carrying-change replaced them with [`PublishedChangeWitness`], which is
+/// what a caller must consult to decide whether `parent_hash`'s content
+/// may be served to a peer).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct BoundaryParentAuth {
     pub child_hash: ChangeHash,
     pub parent_hash: ChangeHash,
     pub parent_lamport: u64,
-    pub parent_auth_seq: u64,
-    pub parent_auth_epoch: u64,
+}
+
+/// One author's position in the history this snapshot replaces: the
+/// highest sequence it reached, and the change that reached it.
+///
+/// Every author the replaced history retained appears here, whether or not
+/// it still holds a live head anywhere. That is the difference between a
+/// base that describes a history and one that only describes its files: an
+/// author whose every write was later superseded is invisible in the
+/// frontier and in the path heads, and a receiver that learned nothing
+/// about it would have no position to measure its next change against.
+/// Inventing one from that change — taking whatever sequence it happens to
+/// name — would let the author choose its own watermark, and everything
+/// below a watermark is treated as history already absorbed. The position
+/// therefore travels with the base, or the base is not installable.
+///
+/// `tip_change_hash` travels with the watermark for the same reason it is
+/// stored beside it locally: the number alone cannot tell a change that
+/// continues this author's chain from one that forks away at the same
+/// number. The tip settles it by name — a continuing change names the tip
+/// as its author's previous change — which is the only form that survives
+/// the install at all, since the change the tip refers to is routinely one
+/// the base replaced and no walk could reach.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SnapshotAuthorState {
+    pub device_id: String,
+    pub watermark: AuthorSeq,
+    pub tip_change_hash: ChangeHash,
+}
+
+/// One causally maximal present entry head of one path in the replaced
+/// history: a write of a file, a symlink or a directory that nothing
+/// later removed or rewrote. A structural directory, one that exists only
+/// to hold something below it, is derived from the tree and has no head.
+///
+/// Heads that landed the same content are *not* one head. Two devices that
+/// wrote identical bytes concurrently produced two writes, and a later
+/// delete that descends from only one of them removes only that one; a
+/// snapshot that had collapsed them into a single entry would have no way
+/// to say that the other survives, and the content would be lost. The set
+/// is therefore keyed by the change that wrote the head, never by
+/// `version_hash`.
+///
+/// Per path there is at most one head per author, which is a consequence
+/// of how a write to a path is formed rather than a policy. It is not the
+/// author chain that gives it: the chain links an author's writes to each
+/// other, and since an author's chain link is not a DAG parent, it orders
+/// nothing in the path's own history. What gives it is path-local DAG
+/// ordering. Every emission touching a path either refreshes that path's
+/// materialized basis to a head set that contains the emitted change, or
+/// invalidates that basis outright; and a local edit takes exactly the
+/// basis it was made against as its parents. So an author's second write
+/// to a path descends its first through the DAG itself, and the earlier
+/// one cannot still be maximal.
+///
+/// Two heads here from one author is therefore corrupt state, and
+/// [`RebootstrapSnapshot::new`] refuses to build such a snapshot. The
+/// basis property it rests on is kept by the local emission seam, which
+/// retires the basis of every path a change writes (derived conflict
+/// copies and a restore's not-yet-written target included), and by prune
+/// and base install, which drop every basis of the group. The refusal
+/// stays regardless: it is what catches a writer that ever breaks that.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SnapshotPathHead {
+    pub path: String,
+    pub change_hash: ChangeHash,
+    pub device_id: String,
+    pub author_seq: AuthorSeq,
+    pub lamport: u64,
+    pub version_hash: VersionHash,
+    /// The device whose name a conflict copy of this head's content would
+    /// carry — equal to `device_id` for an ordinary write, and the original
+    /// author for content carried forward on someone else's behalf. Same
+    /// distinction, and same reason, as the live path frontier's own
+    /// `naming_device_id`.
+    pub naming_device_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -129,16 +327,37 @@ pub struct RebootstrapSnapshot {
     pub files: Vec<SnapshotFile>,
     pub frontier_changes: Vec<Vec<u8>>,
     pub file_versions: Vec<Vec<u8>>,
+    pub published_change_witnesses: Vec<PublishedChangeWitness>,
     pub boundary_parent_auth: Vec<BoundaryParentAuth>,
+    /// `W`: every retained author's `(watermark, tip)`.
+    pub author_state: Vec<SnapshotAuthorState>,
+    /// `Gamma`: per path, the causally maximal present entry heads.
+    pub path_heads: Vec<SnapshotPathHead>,
+    /// The greatest Lamport any change in the replaced history reached,
+    /// head or not.
+    ///
+    /// A third component of the summary rather than an optimisation. Heads
+    /// are ranked by Lamport, so a base that forgot the ceiling would have
+    /// to restart the clock at its own root, and a restarted clock makes
+    /// the compaction observable in the order two replicas resolve a path
+    /// into. The head sets cannot supply it either: a change that removed
+    /// the path it wrote is nobody's content head and can still hold the
+    /// greatest Lamport.
+    pub lamport_ceiling: u64,
 }
 
 impl RebootstrapSnapshot {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         group_id: FolderGroupId,
         mut files: Vec<SnapshotFile>,
         frontier_changes: Vec<Vec<u8>>,
         file_versions: Vec<Vec<u8>>,
+        mut published_change_witnesses: Vec<PublishedChangeWitness>,
         mut boundary_parent_auth: Vec<BoundaryParentAuth>,
+        mut author_state: Vec<SnapshotAuthorState>,
+        mut path_heads: Vec<SnapshotPathHead>,
+        lamport_ceiling: u64,
     ) -> Result<Self, ReplicaEngineError> {
         files.sort_by(|a, b| {
             a.record
@@ -166,6 +385,8 @@ impl RebootstrapSnapshot {
         }
 
         let mut canonical_changes = Vec::with_capacity(frontier_changes.len());
+        let mut frontier_dots: Vec<(String, AuthorSeq, u64)> =
+            Vec::with_capacity(frontier_changes.len());
         for encoded in frontier_changes {
             let change = Change::from_wire_bytes(&encoded).map_err(|error| {
                 ReplicaEngineError::CorruptState(format!(
@@ -177,6 +398,11 @@ impl RebootstrapSnapshot {
                     "re-bootstrap snapshot frontier change belongs to another group".into(),
                 ));
             }
+            frontier_dots.push((
+                change.device_id.as_str().to_owned(),
+                change.author_seq,
+                change.lamport,
+            ));
             canonical_changes.push((change.compute_hash(), encoded));
         }
         canonical_changes.sort_by_key(|(hash, _)| *hash);
@@ -202,15 +428,161 @@ impl RebootstrapSnapshot {
             ));
         }
 
+        published_change_witnesses.sort();
+        published_change_witnesses.dedup();
+        if published_change_witnesses
+            .windows(2)
+            .any(|pair| pair[0].change_hash == pair[1].change_hash)
+        {
+            return Err(ReplicaEngineError::CorruptState(
+                "re-bootstrap snapshot contains two different witnesses for the same change".into(),
+            ));
+        }
+
+        let frontier_hashes: std::collections::HashSet<ChangeHash> =
+            canonical_changes.iter().map(|(hash, _)| *hash).collect();
+        let witness_hashes: std::collections::HashSet<ChangeHash> =
+            published_change_witnesses.iter().map(|w| w.change_hash).collect();
+        for file in &files {
+            let Some(authoring_change_hash) = file.authoring_change_hash else { continue };
+            if !frontier_hashes.contains(&authoring_change_hash)
+                && !witness_hashes.contains(&authoring_change_hash)
+            {
+                return Err(ReplicaEngineError::CorruptState(format!(
+                    "re-bootstrap snapshot retains {} (version_seq {}) authored by {} with no \
+                     frontier change or witness justifying it -- refusing to construct a \
+                     snapshot that could grant block-serving authorization with no evidence",
+                    file.record.path,
+                    file.version_seq,
+                    authoring_change_hash.to_hex(),
+                )));
+            }
+        }
+
         boundary_parent_auth.sort();
         boundary_parent_auth.dedup();
+
+        refuse_unstorable_lamports(lamport_ceiling, &boundary_parent_auth)?;
+
+        // The causal summary. Sorted so the canonical encoding is a
+        // function of the content rather than of the order a builder
+        // happened to produce it in, then checked for the things a
+        // receiver cannot check for itself once the snapshot is installed.
+        author_state.sort();
+        author_state.dedup();
+        if author_state.windows(2).any(|pair| pair[0].device_id == pair[1].device_id) {
+            return Err(ReplicaEngineError::CorruptState(
+                "re-bootstrap snapshot gives one author two different positions".into(),
+            ));
+        }
+        for author in &author_state {
+            if author.watermark.get() < 1 || author.watermark > AuthorSeq::MAX {
+                return Err(ReplicaEngineError::CorruptState(format!(
+                    "re-bootstrap snapshot gives author {} a watermark of {}, which is not a \
+                     position in any author chain",
+                    author.device_id, author.watermark
+                )));
+            }
+        }
+        let watermark_of: std::collections::HashMap<&str, AuthorSeq> =
+            author_state.iter().map(|a| (a.device_id.as_str(), a.watermark)).collect();
+
+        // Every author the snapshot carries history for must have a
+        // position in it. A frontier change whose author is missing here
+        // is precisely the state this summary exists to prevent: the
+        // receiver would install that change and still have no attested
+        // position for the device that wrote it.
+        for (device_id, author_seq, lamport) in &frontier_dots {
+            match watermark_of.get(device_id.as_str()) {
+                None => {
+                    return Err(ReplicaEngineError::CorruptState(format!(
+                        "re-bootstrap snapshot carries a frontier change by {device_id} but no \
+                         position for that author"
+                    )));
+                }
+                Some(watermark) if watermark < author_seq => {
+                    return Err(ReplicaEngineError::CorruptState(format!(
+                        "re-bootstrap snapshot puts author {device_id} at watermark {watermark} \
+                         while carrying a frontier change of that author at sequence {author_seq}"
+                    )));
+                }
+                Some(_) => {}
+            }
+            if *lamport > lamport_ceiling {
+                return Err(ReplicaEngineError::CorruptState(format!(
+                    "re-bootstrap snapshot claims a Lamport ceiling of {lamport_ceiling} while \
+                     carrying a frontier change at {lamport}"
+                )));
+            }
+        }
+
+        // Path heads. Deduplication is by `(path, change_hash)` and by
+        // nothing else: two heads that landed the same `version_hash` are
+        // two writes, and collapsing them would discard content the moment
+        // a delete descends from only one of them.
+        path_heads.sort();
+        path_heads.dedup();
+        if path_heads
+            .windows(2)
+            .any(|pair| pair[0].path == pair[1].path && pair[0].change_hash == pair[1].change_hash)
+        {
+            return Err(ReplicaEngineError::CorruptState(
+                "re-bootstrap snapshot lists one change twice as a head of one path".into(),
+            ));
+        }
+        let mut author_of_path_head: std::collections::HashSet<(&str, &str)> =
+            std::collections::HashSet::new();
+        for head in &path_heads {
+            // At most one head per author per path -- see
+            // `SnapshotPathHead`'s own doc comment for where that comes
+            // from. An author's second write to a path descends its first
+            // through the path's own basis, so the earlier one cannot be
+            // maximal beside the later; two here means the history this
+            // summary was built from was not a history.
+            if !author_of_path_head.insert((head.path.as_str(), head.device_id.as_str())) {
+                return Err(ReplicaEngineError::CorruptState(format!(
+                    "re-bootstrap snapshot lists two heads of {} by the same author {} -- one \
+                     author's second write to a path descends its first, so this is not a \
+                     summary of any history",
+                    head.path, head.device_id
+                )));
+            }
+            match watermark_of.get(head.device_id.as_str()) {
+                None => {
+                    return Err(ReplicaEngineError::CorruptState(format!(
+                        "re-bootstrap snapshot lists a head of {} by {} but no position for that \
+                         author",
+                        head.path, head.device_id
+                    )));
+                }
+                Some(watermark) if *watermark < head.author_seq => {
+                    return Err(ReplicaEngineError::CorruptState(format!(
+                        "re-bootstrap snapshot lists a head of {} at sequence {} by {}, above \
+                         that author's own watermark {watermark}",
+                        head.path, head.author_seq, head.device_id
+                    )));
+                }
+                Some(_) => {}
+            }
+            if head.lamport > lamport_ceiling {
+                return Err(ReplicaEngineError::CorruptState(format!(
+                    "re-bootstrap snapshot claims a Lamport ceiling of {lamport_ceiling} while \
+                     listing a head of {} at {}",
+                    head.path, head.lamport
+                )));
+            }
+        }
 
         let snapshot = Self {
             group_id,
             files,
             frontier_changes: canonical_changes.into_iter().map(|(_, bytes)| bytes).collect(),
             file_versions: canonical_versions.into_iter().map(|(_, bytes)| bytes).collect(),
+            published_change_witnesses,
             boundary_parent_auth,
+            author_state,
+            path_heads,
+            lamport_ceiling,
         };
         snapshot.validate_bounds()?;
         Ok(snapshot)
@@ -220,11 +592,41 @@ impl RebootstrapSnapshot {
         if self.files.len() > MAX_SNAPSHOT_FILES
             || self.frontier_changes.len() > MAX_FRONTIER_CHANGES
             || self.file_versions.len() > MAX_FILE_VERSIONS
+            || self.published_change_witnesses.len() > MAX_WITNESSES
             || self.boundary_parent_auth.len() > MAX_BOUNDARY_EDGES
+            || self.author_state.len() > MAX_AUTHOR_STATE
+            || self.path_heads.len() > MAX_PATH_HEADS
         {
             return Err(ReplicaEngineError::CorruptState(
                 "re-bootstrap snapshot exceeds a collection bound".into(),
             ));
+        }
+        for witness in &self.published_change_witnesses {
+            if witness.checkpoint_encoded.len() > MAX_BLOB_BYTES
+                || witness.checkpoint_signature.len() > MAX_BLOB_BYTES
+                || witness.merkle_proof_encoded.len() > MAX_BLOB_BYTES
+            {
+                return Err(ReplicaEngineError::CorruptState(
+                    "re-bootstrap snapshot witness exceeds a field bound".into(),
+                ));
+            }
+        }
+        for author in &self.author_state {
+            if author.device_id.len() > MAX_STRING_BYTES {
+                return Err(ReplicaEngineError::CorruptState(
+                    "re-bootstrap snapshot author state exceeds a field bound".into(),
+                ));
+            }
+        }
+        for head in &self.path_heads {
+            if head.path.len() > MAX_STRING_BYTES
+                || head.device_id.len() > MAX_STRING_BYTES
+                || head.naming_device_id.len() > MAX_STRING_BYTES
+            {
+                return Err(ReplicaEngineError::CorruptState(
+                    "re-bootstrap snapshot path head exceeds a field bound".into(),
+                ));
+            }
         }
         for file in &self.files {
             if file.version_seq < 0
@@ -297,6 +699,13 @@ impl RebootstrapSnapshot {
                 put_str(&mut out, name);
                 put_bytes(&mut out, value);
             }
+            match file.authoring_change_hash {
+                None => out.push(0),
+                Some(hash) => {
+                    out.push(1);
+                    out.extend_from_slice(&hash.0);
+                }
+            }
         }
 
         put_u32(&mut out, self.frontier_changes.len() as u32);
@@ -309,14 +718,42 @@ impl RebootstrapSnapshot {
             put_bytes(&mut out, encoded);
         }
 
+        put_u32(&mut out, self.published_change_witnesses.len() as u32);
+        for witness in &self.published_change_witnesses {
+            out.extend_from_slice(&witness.change_hash.0);
+            out.extend_from_slice(&witness.checkpoint_hash);
+            put_bytes(&mut out, &witness.checkpoint_encoded);
+            put_bytes(&mut out, &witness.checkpoint_signature);
+            out.extend_from_slice(&witness.author_signing_public_key);
+            put_bytes(&mut out, &witness.merkle_proof_encoded);
+        }
+
         put_u32(&mut out, self.boundary_parent_auth.len() as u32);
         for edge in &self.boundary_parent_auth {
-            out.extend_from_slice(edge.child_hash.as_bytes());
-            out.extend_from_slice(edge.parent_hash.as_bytes());
+            out.extend_from_slice(&edge.child_hash.0);
+            out.extend_from_slice(&edge.parent_hash.0);
             put_u64(&mut out, edge.parent_lamport);
-            put_u64(&mut out, edge.parent_auth_seq);
-            put_u64(&mut out, edge.parent_auth_epoch);
         }
+
+        put_u32(&mut out, self.author_state.len() as u32);
+        for author in &self.author_state {
+            put_str(&mut out, &author.device_id);
+            put_u64(&mut out, author.watermark.get());
+            out.extend_from_slice(&author.tip_change_hash.0);
+        }
+
+        put_u32(&mut out, self.path_heads.len() as u32);
+        for head in &self.path_heads {
+            put_str(&mut out, &head.path);
+            out.extend_from_slice(&head.change_hash.0);
+            put_str(&mut out, &head.device_id);
+            put_u64(&mut out, head.author_seq.get());
+            put_u64(&mut out, head.lamport);
+            out.extend_from_slice(&head.version_hash.0);
+            put_str(&mut out, &head.naming_device_id);
+        }
+
+        put_u64(&mut out, self.lamport_ceiling);
         out
     }
 
@@ -375,6 +812,16 @@ impl RebootstrapSnapshot {
                 xattrs.push((name, value));
             }
 
+            let authoring_change_hash = match reader.byte()? {
+                0 => None,
+                1 => Some(ChangeHash(reader.array32()?)),
+                _ => {
+                    return Err(ReplicaEngineError::CorruptState(
+                        "re-bootstrap snapshot has unknown authoring-change-hash flag".into(),
+                    ));
+                }
+            };
+
             files.push(SnapshotFile {
                 record: FileRecord { path, size, mtime_unix_nanos, blocks, deleted },
                 version_seq,
@@ -385,6 +832,7 @@ impl RebootstrapSnapshot {
                 symlink_out_of_root,
                 unix_mode,
                 xattrs,
+                authoring_change_hash,
             });
         }
 
@@ -400,6 +848,18 @@ impl RebootstrapSnapshot {
             file_versions.push(reader.bytes(MAX_BLOB_BYTES)?);
         }
 
+        let witness_count = reader.count(MAX_WITNESSES)?;
+        let mut published_change_witnesses = Vec::with_capacity(witness_count);
+        for _ in 0..witness_count {
+            published_change_witnesses.push(PublishedChangeWitness {
+                change_hash: ChangeHash(reader.array32()?),
+                checkpoint_hash: reader.array32()?,
+                checkpoint_encoded: reader.bytes(MAX_BLOB_BYTES)?,
+                checkpoint_signature: reader.bytes(MAX_BLOB_BYTES)?,
+                author_signing_public_key: reader.array32()?,
+                merkle_proof_encoded: reader.bytes(MAX_BLOB_BYTES)?,
+            });
+        }
         let boundary_count = reader.count(MAX_BOUNDARY_EDGES)?;
         let mut boundary_parent_auth = Vec::with_capacity(boundary_count);
         for _ in 0..boundary_count {
@@ -407,12 +867,49 @@ impl RebootstrapSnapshot {
                 child_hash: ChangeHash(reader.array32()?),
                 parent_hash: ChangeHash(reader.array32()?),
                 parent_lamport: reader.u64()?,
-                parent_auth_seq: reader.u64()?,
-                parent_auth_epoch: reader.u64()?,
             });
         }
+        let author_count = reader.count(MAX_AUTHOR_STATE)?;
+        let mut author_state = Vec::with_capacity(author_count);
+        for _ in 0..author_count {
+            author_state.push(SnapshotAuthorState {
+                device_id: reader.string(MAX_STRING_BYTES)?,
+                watermark: AuthorSeq(reader.u64()?),
+                tip_change_hash: ChangeHash(reader.array32()?),
+            });
+        }
+        let head_count = reader.count(MAX_PATH_HEADS)?;
+        let mut path_heads = Vec::with_capacity(head_count);
+        for _ in 0..head_count {
+            path_heads.push(SnapshotPathHead {
+                path: reader.string(MAX_STRING_BYTES)?,
+                change_hash: ChangeHash(reader.array32()?),
+                device_id: reader.string(MAX_STRING_BYTES)?,
+                author_seq: AuthorSeq(reader.u64()?),
+                lamport: reader.u64()?,
+                version_hash: VersionHash(reader.array32()?),
+                naming_device_id: reader.string(MAX_STRING_BYTES)?,
+            });
+        }
+        let lamport_ceiling = reader.u64()?;
         reader.finish()?;
-        Self::new(group_id, files, frontier_changes, file_versions, boundary_parent_auth)
+        Self::new(
+            group_id,
+            files,
+            frontier_changes,
+            file_versions,
+            published_change_witnesses,
+            boundary_parent_auth,
+            author_state,
+            path_heads,
+            lamport_ceiling,
+        )
+    }
+
+    /// The identity of the causal summary this snapshot carries, as a base
+    /// advertisement states it.
+    pub fn summary_identity(&self) -> SummaryIdentity {
+        summary_identity_of(&self.author_state, &self.path_heads, self.lamport_ceiling)
     }
 
     pub fn validate_against_checkpoint(
@@ -428,6 +925,18 @@ impl RebootstrapSnapshot {
             return Err(ReplicaEngineError::CorruptState(
                 "re-bootstrap snapshot hash does not match checkpoint".into(),
             ));
+        }
+        // A merged base is minted over the identity of the joined summary,
+        // not over these bytes, so the snapshot hash alone does not tie the
+        // summary it carries to the base: the identity has to match too.
+        if let Some(merged_from) = &checkpoint.merged_from {
+            if self.summary_identity() != merged_from.summary() {
+                return Err(ReplicaEngineError::CorruptState(
+                    "re-bootstrap snapshot does not carry the summary its merged checkpoint was \
+                     minted over"
+                        .into(),
+                ));
+            }
         }
 
         let snapshot_frontier: BTreeSet<ChangeHash> = self
@@ -486,6 +995,38 @@ impl RebootstrapSnapshot {
         }
         Ok(())
     }
+}
+
+/// The identity of the summary `(W, Gamma, L)`, over its canonical order:
+/// authors ascending by device id, heads ascending by path and then change
+/// hash.
+pub fn summary_identity_of(
+    author_state: &[SnapshotAuthorState],
+    path_heads: &[SnapshotPathHead],
+    lamport_ceiling: u64,
+) -> SummaryIdentity {
+    let mut authors: Vec<_> = author_state.iter().collect();
+    authors.sort_by(|a, b| a.device_id.cmp(&b.device_id));
+    let mut heads: Vec<_> = path_heads.iter().collect();
+    heads.sort_by(|a, b| (a.path.as_str(), a.change_hash).cmp(&(b.path.as_str(), b.change_hash)));
+
+    let mut builder = SummaryIdentityBuilder::new(authors.len());
+    for author in authors {
+        builder.author(&author.device_id, author.watermark.0, &author.tip_change_hash);
+    }
+    builder.begin_heads(heads.len());
+    for head in heads {
+        builder.head(
+            &head.path,
+            &head.change_hash,
+            &head.device_id,
+            head.author_seq.0,
+            head.lamport,
+            &head.version_hash.0,
+            &head.naming_device_id,
+        );
+    }
+    builder.finish(lamport_ceiling)
 }
 
 fn put_u32(out: &mut Vec<u8>, value: u32) {
@@ -647,123 +1188,32 @@ impl<'a> Reader<'a> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use ed25519_dalek::SigningKey;
-
-    use super::*;
-    use yadorilink_replica_domain::change::{ChangeAuth, Op, PutOrigin};
-    use yadorilink_replica_domain::file::{FileMeta, VersionBlock};
-    use yadorilink_replica_domain::ids::{DeviceId, SyncPath};
-
-    #[test]
-    fn v2_snapshot_round_trips_without_version_vector_payload() {
-        let group = FolderGroupId("g".into());
-        let version = FileVersion::new(
-            vec![VersionBlock {
-                hash: yadorilink_replica_domain::ids::BlockHash(vec![7; 32]),
-                size: 3,
-            }],
-            3,
-            FileMeta {
-                mtime_unix_nanos: 11,
-                record_kind: RecordKind::File,
-                symlink_target: None,
-                unix_mode: None,
-                xattrs: Vec::new(),
-            },
-        );
-        let change = Change::create_signed(
-            vec![],
-            0,
-            ChangeAuth::PLACEHOLDER,
-            DeviceId("d".into()),
-            group.clone(),
-            vec![Op::Put {
-                path: SyncPath("a".into()),
-                version: version.version_hash,
-                origin: PutOrigin::Direct,
-            }],
-            &SigningKey::from_bytes(&[3; 32]),
-        );
-        let snapshot = RebootstrapSnapshot::new(
-            group.clone(),
-            vec![SnapshotFile {
-                record: FileRecord {
-                    path: "a".into(),
-                    size: 3,
-                    mtime_unix_nanos: 11,
-                    blocks: vec![BlockInfo { hash: vec![7; 32], offset: 0, size: 3 }],
-                    deleted: false,
-                },
-                version_seq: 0,
-                state: SnapshotVersionState::Current,
-                origin_device_id: Some("d".into()),
-                record_kind: RecordKind::File,
-                symlink_target: None,
-                symlink_out_of_root: false,
-                unix_mode: None,
-                xattrs: Vec::new(),
-            }],
-            vec![change.to_wire_bytes()],
-            vec![version.canonical_encoding()],
-            vec![],
-        )
-        .unwrap();
-        let encoded = snapshot.canonical_encoding();
-        let decoded = RebootstrapSnapshot::decode(&encoded).unwrap();
-        assert_eq!(decoded, snapshot);
-        assert_eq!(decoded.snapshot_hash(), snapshot.snapshot_hash());
-        let checkpoint =
-            Checkpoint::new(group, vec![change.compute_hash()], snapshot.snapshot_hash());
-        decoded.validate_against_checkpoint(&checkpoint).unwrap();
+/// Refuses Lamport values a replica cannot store. They are stored as SQLite
+/// integers, and one past that range would be read back as damage by every
+/// admission on the installed epoch. Heads and frontier changes are bounded
+/// by the ceiling, so bounding the ceiling bounds them too.
+fn refuse_unstorable_lamports(
+    lamport_ceiling: u64,
+    boundary_parent_auth: &[BoundaryParentAuth],
+) -> Result<(), ReplicaEngineError> {
+    const MAX_STORABLE_LAMPORT: u64 = i64::MAX as u64;
+    if lamport_ceiling > MAX_STORABLE_LAMPORT {
+        return Err(ReplicaEngineError::CorruptState(format!(
+            "re-bootstrap snapshot claims a Lamport ceiling of {lamport_ceiling}, beyond the \
+             storable range"
+        )));
     }
-
-    /// Retained history is per *version*, not per path: a compacted snapshot
-    /// must be able to carry a superseded row and the current row for the same
-    /// path. This is independent of the removed version-vector section — it
-    /// pins the `(path, version_seq)` shape the store reads back.
-    #[test]
-    fn snapshot_can_retain_multiple_versions_for_one_path() {
-        let group = FolderGroupId("g".into());
-        let record = |mtime| FileRecord {
-            path: "a".into(),
-            size: 0,
-            mtime_unix_nanos: mtime,
-            blocks: vec![],
-            deleted: false,
-        };
-        let snapshot = RebootstrapSnapshot::new(
-            group,
-            vec![
-                SnapshotFile {
-                    record: record(1),
-                    version_seq: 1,
-                    state: SnapshotVersionState::Superseded,
-                    origin_device_id: None,
-                    record_kind: RecordKind::File,
-                    symlink_target: None,
-                    symlink_out_of_root: false,
-                    unix_mode: None,
-                    xattrs: Vec::new(),
-                },
-                SnapshotFile {
-                    record: record(2),
-                    version_seq: 2,
-                    state: SnapshotVersionState::Current,
-                    origin_device_id: None,
-                    record_kind: RecordKind::File,
-                    symlink_target: None,
-                    symlink_out_of_root: false,
-                    unix_mode: None,
-                    xattrs: Vec::new(),
-                },
-            ],
-            vec![],
-            vec![],
-            vec![],
-        )
-        .unwrap();
-        assert_eq!(snapshot.files.len(), 2);
+    if let Some(edge) =
+        boundary_parent_auth.iter().find(|edge| edge.parent_lamport > MAX_STORABLE_LAMPORT)
+    {
+        return Err(ReplicaEngineError::CorruptState(format!(
+            "re-bootstrap snapshot carries a boundary parent at Lamport {}, beyond the storable \
+             range",
+            edge.parent_lamport
+        )));
     }
+    Ok(())
 }
+
+#[cfg(test)]
+mod tests;

@@ -17,9 +17,16 @@ use crate::ipc_client;
 /// case at the share step rather than when adding another folder.
 pub async fn gather() -> Probe {
     Probe {
-        signed_in: yadorilink_cli::token_store::load_refresh_token().is_some(),
-        // The loopback+PKCE session does not expose the account email to this
-        // process, so no specific account label is available to show.
+        // `unwrap_or_default`, deliberately, and only here: this probe drives
+        // which screen the wizard opens on, and a credential store it cannot
+        // read is a wizard that should start at "sign in" rather than one that
+        // refuses to open. Every path that actually *uses* a credential
+        // reports the store's error instead.
+        signed_in: yadorilink_client_core::coordination::credential_store::installation()
+            .unwrap_or_default()
+            .is_some(),
+        // The enrolled credential does not carry the account email, so no
+        // specific account label is available to show.
         account: None,
         device_registered: ipc_client::is_device_registered(),
         has_links: has_links().await,

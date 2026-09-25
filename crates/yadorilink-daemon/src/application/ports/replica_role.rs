@@ -7,10 +7,13 @@
 
 use crate::sync_error::SyncError;
 use yadorilink_replica_domain::session_state::MaterializationPolicy;
-use yadorilink_replica_domain::session_state::{FolderLink, RoleLossAction};
+use yadorilink_replica_domain::session_state::{
+    FolderLink, RoleLossAction, RoleLossOperation, RoleLossOperationState,
+};
 
 use super::common::BoxFuture;
-use crate::application::model::RoleLossCommitOutcome;
+use crate::application::model::{RoleLossCommitOutcome, RoleLossCompensationOutcome};
+use crate::handoff_proof::StrongHandoffProof;
 
 /// The durable link-table reads/writes `ReplicaRoleService` needs.
 /// Deliberately narrow: only the specific atomic transitions the
@@ -85,11 +88,24 @@ pub(crate) trait RoleLossJournal: Send + Sync {
 
     fn settle_success(&self, operation_id: &str);
 
-    /// Reverts a role loss that committed coordination-side but whose
-    /// matching local change failed, back to `eager` -- never
-    /// force-completing the role loss once the local side is known to have
-    /// failed.
-    fn compensate<'a>(&'a self, operation_id: &'a str) -> BoxFuture<'a, Result<(), String>>;
+    fn get_operation(&self, operation_id: &str) -> Result<Option<RoleLossOperation>, String>;
+
+    fn list_operations_in_states(
+        &self,
+        states: &[RoleLossOperationState],
+    ) -> Result<Vec<RoleLossOperation>, String>;
+
+    /// Moves a row to `state`, stamping the current time.
+    fn advance_operation(
+        &self,
+        operation_id: &str,
+        state: RoleLossOperationState,
+    ) -> Result<(), String>;
+
+    /// Records one more compensation attempt and returns the new count.
+    fn increment_attempts(&self, operation_id: &str) -> Result<i64, String>;
+
+    fn delete_operation(&self, operation_id: &str) -> Result<(), String>;
 }
 
 /// Confirms another full replica is ready to take over a group, and obtains
@@ -98,13 +114,17 @@ pub(crate) trait RoleLossJournal: Send + Sync {
 pub(crate) trait HandoffReadinessPort: Send + Sync {
     fn is_local_full_replica(&self, group_id: &str) -> bool;
 
-    /// The confirmed root-set digest (and, when a real peer confirmed it,
-    /// that peer's device id -- `None` for the vacuously-ready empty-group
-    /// case) this device's durability set was checked against.
-    fn full_replica_handoff_ready_digest_and_peer<'a>(
+    /// Takes a fresh whole-group durability proof against one named peer.
+    ///
+    /// Deliberately returns the proof value rather than a digest/device-id
+    /// pair: a role-loss gate must be unable to satisfy itself with anything
+    /// it merely remembers, and the only way to hold a
+    /// [`StrongHandoffProof`] is to have just taken one. Cached background
+    /// custody evidence is a different type and is not accepted here.
+    fn full_replica_handoff_proof<'a>(
         &'a self,
         group_id: &'a str,
-    ) -> BoxFuture<'a, Option<([u8; 32], Option<String>)>>;
+    ) -> BoxFuture<'a, Option<StrongHandoffProof>>;
 
     /// `None` means no live lease could be obtained (peer unreachable,
     /// refused, or its attested root digest didn't match this device's
@@ -141,6 +161,19 @@ pub(crate) trait RoleLossCoordination: Send + Sync {
         device_id: &'a str,
         mode: &'a str,
     ) -> BoxFuture<'a, Result<(), String>>;
+
+    /// Reverts a committed role loss on the coordination plane, restoring
+    /// the source device's `eager` storage mode. Carries only identities,
+    /// the lease and the expected membership generation -- never any
+    /// digest, path or version content.
+    fn compensate_handoff_role_loss<'a>(
+        &'a self,
+        group_id: &'a str,
+        source_device_id: &'a str,
+        target_device_id: &'a str,
+        lease_id: &'a str,
+        expected_membership_generation: Option<i64>,
+    ) -> BoxFuture<'a, Result<RoleLossCompensationOutcome, String>>;
 }
 
 /// The local link-watcher runtime a duplicate-root recovery restart and an
@@ -151,18 +184,12 @@ pub(crate) trait LinkRuntimePort: Send + Sync {
     fn stop_link_watch<'a>(&'a self, local_path: &'a str) -> BoxFuture<'a, ()>;
 }
 
-/// Whether this build's on-demand (placeholder) materialization pipeline is
-/// actually connected end-to-end -- see `yadorilink_sync_core::
-/// placeholder_backend::on_demand_pipeline_is_connected`'s own doc comment
-/// for exactly what that requires and why it is unconditionally `false` in
-/// every real build today (no backend implemented anywhere yet). A port
-/// rather than calling that free function directly so a test can inject a
-/// fixed answer deterministically -- the free function's own `OverrideForTest`
-/// is a thread-local, which a multi-threaded Tokio integration test (this
-/// port's actual callers) cannot reliably rely on: the async task that
-/// calls `set_storage_mode` is not guaranteed to run on the same OS thread
-/// the test itself set the override from (Phase 7D-0's own investigation
-/// into `role_loss_saga`/`storage_mode_orchestration`'s workspace failures).
+/// A port rather than calling that free function directly so a test can
+/// inject a fixed answer deterministically -- the free function's own
+/// `OverrideForTest` is a thread-local, which a multi-threaded Tokio
+/// integration test (this port's actual callers) cannot reliably rely on:
+/// the async task that calls `set_storage_mode` is not guaranteed to run
+/// on the same OS thread the test itself set the override from.
 pub(crate) trait PlaceholderPipelineCapabilityPort: Send + Sync {
     fn is_connected(&self) -> bool;
 }

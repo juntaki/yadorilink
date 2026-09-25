@@ -80,7 +80,7 @@
 //!
 //! ## Causality reconstruction (no VVs)
 //!
-//! P0's two-device chaos driver advances a monotonic per-run round counter;
+//! The two-device chaos driver advances a monotonic per-run round counter;
 //! each round touches one path either *solo* (one op) or as a *race* (two
 //! concurrent ops on the same path in the same round). Two ops sharing a
 //! `(path, round)` are exactly the driver's genuine-concurrent race pair;
@@ -88,7 +88,7 @@
 //! signal this model needs, and it is derived from op *structure*, never
 //! from the implementation's observed version vectors.
 
-#![cfg(madsim)]
+#![cfg(turmoil)]
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, HashMap};
@@ -210,12 +210,12 @@ pub fn predict(ops: &[RefOp], now_nanos: i64) -> Prediction {
                 // (ties → larger device id), by the LWW spec `is_loser`
                 // encodes; every other write is preserved as a conflict copy.
                 // Structured as a linear "is anyone a strict winner over me?"
-                // fold so it generalizes past the 2-way case P0 produces.
+                // fold so it generalizes past the 2-way case the driver produces.
                 let write_idxs: Vec<usize> = (0..group.len())
                     .filter(|&i| matches!(group[i].kind, RefKind::Write { .. }))
                     .collect();
                 if write_idxs.is_empty() {
-                    // An all-delete race (not produced by P0's driver, which
+                    // An all-delete race (not produced by the driver, which
                     // always makes the pending `x` side a write): the path is
                     // deleted, no conflict copies.
                     live = None;
@@ -256,7 +256,7 @@ pub fn predict(ops: &[RefOp], now_nanos: i64) -> Prediction {
     Prediction { paths }
 }
 
-/// Flat (top-level) filename split into `(stem, ext)` — P0's candidate
+/// Flat (top-level) filename split into `(stem, ext)` — the driver's candidate
 /// paths and their conflict copies are all flat, no directories.
 fn split_stem_ext(name: &str) -> (&str, Option<&str>) {
     match name.rsplit_once('.') {
@@ -305,7 +305,7 @@ fn flat_snapshot(root: &Path) -> HashMap<String, String> {
 /// only at a quiescent point, after `check_convergence` passes); the real
 /// state is read from the first device, since by convergence every device
 /// agrees. Comparison is by content hash, so conflict-copy filenames'
-/// timestamp/device/hash8 fragments are ignored — a conflict copy is
+/// timestamp/device/hash fragments are ignored — a conflict copy is
 /// identified purely by "a `(conflicted copy...)` sibling holding these
 /// bytes".
 pub fn check_reference_model(

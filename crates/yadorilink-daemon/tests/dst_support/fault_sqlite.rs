@@ -38,7 +38,7 @@
 //! faulting ops followed by success, matching a `busy_timeout` that
 //! eventually clears, not a permanent hard failure.
 
-#![cfg(madsim)]
+#![cfg(turmoil)]
 #![allow(dead_code)] // not every scenario drives every op/kind yet
 
 use std::collections::HashMap;
@@ -250,9 +250,9 @@ pub fn is_transient_sqlite_error(err: &SyncError) -> bool {
 /// result. Models the caller-side retry loop that a `busy_timeout` +
 /// bounded-run fault schedule is designed to be recovered by: a scenario
 /// wraps its index writes in this and asserts the write still lands, so a
-/// transient fault run costs a retry but never silent data loss. Under
-/// `madsim` the (unused here) backoff is intentionally omitted — retries
-/// are deterministic and immediate, not clock-driven.
+/// transient fault run costs a retry but never silent data loss. Backoff
+/// is intentionally omitted — retries are deterministic and immediate, not
+/// clock-driven.
 pub fn retry_transient<T>(
     max_attempts: u32,
     mut op: impl FnMut() -> Result<T, SyncError>,

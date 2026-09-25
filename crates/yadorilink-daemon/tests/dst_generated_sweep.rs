@@ -1,57 +1,51 @@
 //! Generated seed-sweep capstone: the self-driving loop that ties the
-//! `dst_support` DST toolbox — generator, op-applier, fault schedule, oracle
-//! suite, reference model, shrinker, triage, corpus, and coverage — into one
-//! end-to-end run.
-//!
-//! For each seed in a bounded range it:
-//!   1. `generator::generate_case(seed)` (guarded by `validate_case`),
-//!   2. stands up a real 2-device sync-core harness (the device/session
-//!      machinery adapted from `dst_two_device_chaos.rs`),
-//!   3. drives the Case's workload in global `(virtual_ts, device)` order,
-//!      applying each `Op` through `op_applier::apply_op`, delivering the
-//!      resulting watcher event(s), and recording content-bearing ops into
-//!      the `GlobalOracle` and the independent `ReferenceModel` inputs,
-//!   4. (best-effort) fires the Case's `fault_schedule` via `run_schedule`,
-//!   5. settles to quiescence and runs the full oracle suite,
-//!   6. on a violation: triages product-bug vs harness-artifact, shrinks a
-//!      product bug to a minimal repro, and records the triaged case to a
-//!      corpus JSONL that is replayed on the next run, and
-//!   7. folds every run into a shared `coverage::CoverageAccumulator` and
-//!      prints/emits a coverage summary.
-//!
+//! `dst_support` DST toolbox — generator, op-applier, fault schedule,
+//! oracle suite, reference model, shrinker, triage, corpus, and coverage —
+//! into one end-to-end run. For each seed in a bounded range it: 1.
+//! `generator::generate_case(seed)` (guarded by `validate_case`), 2.
+//! drives the Case's workload in global `(virtual_ts, device)` order,
+//! applying each `Op` through `op_applier::apply_op`, delivering the
+//! resulting watcher event(s), and recording content-bearing ops into the
+//! `GlobalOracle` and the independent `ReferenceModel` inputs, 4.
+//! (best-effort) fires the Case's `fault_schedule` via `run_schedule`, 5.
+//! settles to quiescence and runs the full oracle suite, 6. on a
+//! violation: triages product-bug vs harness-artifact, shrinks a product
+//! bug to a minimal repro, and records the triaged case to a corpus JSONL
+//! that is replayed on the next run, and 7. folds every run into a shared
+//! `coverage::CoverageAccumulator` and prints/emits a coverage summary.
 //! Because the driver applies the global op order strictly sequentially,
 //! every op lands with a strictly-increasing mtime and a unique reference
 //! round, so the reference model's expected converged state is pure
 //! last-writer-wins by application order — which is exactly what a
 //! sequentially-applied 2-device mesh converges to. That keeps the
-//! wrong-winner oracle well-posed without fabricating spurious conflict-copy
-//! predictions.
-//!
-//! Scope of this cut (see the module-level report accompanying it):
-//!   - Every `Op` kind is applied to disk through `op_applier` (exercising the
-//!     full applier vocabulary), but only content ops (`Write`/`Edit`/`Delete`,
-//!     plus the two writes a `ConflictingConcurrent` hint expands into) are
-//!     delivered into the live watcher pipeline and recorded into the oracle /
-//!     reference-model. Delivering generated structural ops
-//!     (`Rename`/`Move`/`Mkdir`/`Rmdir`/`Chmod`) so the mesh reconverges is
-//!     deferred — the proven-faithful reference harness drives content ops
-//!     only, and so does the mesh-driving path here.
-//!   - `>2`-device generated topologies are folded onto the 2-device harness
-//!     by remapping `device_index % 2` (the true topology is still recorded
-//!     for coverage).
-//!   - `fault_schedule` entries are fired through `run_schedule` and their
-//!     activation trace surfaced, but the injector plans are NOT yet bound
-//!     into the live `PeerChannel`/`FsBlockStore`/`SyncState` — binding them
-//!     into the live transport/store is deferred as too invasive for this
-//!     cut; faults are therefore scheduled + traced, not injected into live
-//!     I/O.
-//!   - The sweep gates its pass/fail on `LikelyProductBug` verdicts only;
-//!     harness artifacts are recorded and surfaced but do not fail the run,
-//!     matching the triage design.
-//!
-//! `#![cfg(madsim)]`-gated like every DST scenario file.
+//! wrong-winner oracle well-posed without fabricating spurious
+//! conflict-copy predictions. Scope of this cut (see the module-level
+//! report accompanying it): - Every `Op` kind is applied to disk through
+//! `op_applier` (exercising the full applier vocabulary), but only content
+//! ops (`Write`/`Edit`/`Delete`, plus the two writes a
+//! `ConflictingConcurrent` hint expands into) are delivered into the live
+//! watcher pipeline and recorded into the oracle / reference-model.
+//! Delivering generated structural ops
+//! (`Rename`/`Move`/`Mkdir`/`Rmdir`/`Chmod`) so the mesh reconverges is
+//! deferred — the proven-faithful reference harness drives content ops
+//! only, and so does the mesh-driving path here. - `>2`-device generated
+//! topologies are folded onto the 2-device harness by remapping
+//! `device_index % 2` (the true topology is still recorded for coverage).
+//! - `fault_schedule` entries are fired through `run_schedule` and their
+//! activation trace surfaced, but the injector plans are NOT yet bound
+//! into the live `PeerChannel`/`SegmentBlockStore`/`SyncState` — binding
+//! them into the live transport/store is deferred as too invasive for this
+//! cut; faults are therefore scheduled + traced, not injected into live
+//! I/O. - The sweep gates its pass/fail on `LikelyProductBug` verdicts
+//! only; harness artifacts are recorded and surfaced but do not fail the
+//! run, matching the triage design. `#![cfg(madsim)]`-gated like every DST
+//! scenario file.
 
-#![cfg(madsim)]
+// Retired. This scenario was written for a simulator this project no longer
+// builds against, and it names APIs that have since been removed. It is kept,
+// never compiled, as the specification its turmoil re-expression has to meet;
+// delete it in the change that lands that replacement.
+#![cfg(any())]
 
 mod dst_dag_migrate_b2;
 mod dst_support;
@@ -82,7 +76,7 @@ use yadorilink_filesystem_sync::watcher::{
     FolderWatchSource, FsChangeEvent, FsChangeKind, SimulatedFolderWatchSource,
 };
 use yadorilink_local_capture::{LocalChangeOutcome, LocalChangeProcessor};
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 use yadorilink_peer_session::peer_session::{
     PeerSyncSession, PendingLocalChangeFlush, PendingLocalFlushOutcome,
 };
@@ -165,7 +159,7 @@ impl ChaosDevice {
         let changed = match outcome {
             LocalChangeOutcome::FileChanged(_) => true,
             LocalChangeOutcome::FilesChanged(ref records) => !records.is_empty(),
-            LocalChangeOutcome::None => false,
+            LocalChangeOutcome::None | LocalChangeOutcome::RetryLater => false,
         };
         if !changed {
             return;
@@ -298,7 +292,7 @@ fn setup_device(
     device_id: &str,
     root: PathBuf,
     sync_state: Arc<ReplicaCoordinator>,
-    store: Arc<FsBlockStore>,
+    store: Arc<SegmentBlockStore>,
 ) -> Arc<ChaosDevice> {
     let processor = Arc::new(
         LocalChangeProcessor::new(
@@ -368,10 +362,10 @@ async fn connect_sessions(
     rng: &mut StdRng,
     device_a: &Arc<ChaosDevice>,
     state_a: Arc<ReplicaCoordinator>,
-    store_a: Arc<FsBlockStore>,
+    store_a: Arc<SegmentBlockStore>,
     device_b: &Arc<ChaosDevice>,
     state_b: Arc<ReplicaCoordinator>,
-    store_b: Arc<FsBlockStore>,
+    store_b: Arc<SegmentBlockStore>,
 ) {
     let socket_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let socket_b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -380,7 +374,7 @@ async fn connect_sessions(
 
     // On the change-history DAG each device materializes the same conflict
     // copy locally from the shared change set, so the legacy conflict-copy
-    // forwarding channel (`new_with_forwarding` + a re-`send_index_update`
+    // forwarding channel (`PeerSyncSession::new` + a re-`send_index_update`
     // loop) is dropped: both devices run the plain session and converge by
     // pulling each other's announced heads.
     // Pin both devices' verifying keys -- moved ahead of session construction
@@ -391,7 +385,7 @@ async fn connect_sessions(
 
     let mut sync_roots_a = HashMap::new();
     sync_roots_a.insert(GROUP_ID.to_string(), device_a.root.clone());
-    let session_a = PeerSyncSession::new_with_dependencies(
+    let session_a = PeerSyncSession::new(
         channel_a,
         device_a.device_id.clone(),
         device_b.device_id.clone(),
@@ -412,7 +406,7 @@ async fn connect_sessions(
 
     let mut sync_roots_b = HashMap::new();
     sync_roots_b.insert(GROUP_ID.to_string(), device_b.root.clone());
-    let session_b = PeerSyncSession::new_with_dependencies(
+    let session_b = PeerSyncSession::new(
         channel_b,
         device_b.device_id.clone(),
         device_a.device_id.clone(),
@@ -524,7 +518,7 @@ async fn drive_case(case: &Case, profile: &HarnessProfile) -> Result<Vec<Violati
     let root_dir_a = tempfile::tempdir().map_err(|e| e.to_string())?;
     let root_a = root_dir_a.path().canonicalize().map_err(|e| e.to_string())?;
     let store_dir_a = tempfile::tempdir().map_err(|e| e.to_string())?;
-    let store_a = Arc::new(FsBlockStore::new(store_dir_a.path()).map_err(|e| e.to_string())?);
+    let store_a = Arc::new(SegmentBlockStore::new(store_dir_a.path()).map_err(|e| e.to_string())?);
     let recovery_store_a = store_a.clone();
     let state_a = Arc::new(ReplicaCoordinator::open_in_memory().map_err(|e| e.to_string())?);
     dst_support::link::link_and_start(&state_a, &root_a, GROUP_ID)?;
@@ -532,7 +526,7 @@ async fn drive_case(case: &Case, profile: &HarnessProfile) -> Result<Vec<Violati
     let root_dir_b = tempfile::tempdir().map_err(|e| e.to_string())?;
     let root_b = root_dir_b.path().canonicalize().map_err(|e| e.to_string())?;
     let store_dir_b = tempfile::tempdir().map_err(|e| e.to_string())?;
-    let store_b = Arc::new(FsBlockStore::new(store_dir_b.path()).map_err(|e| e.to_string())?);
+    let store_b = Arc::new(SegmentBlockStore::new(store_dir_b.path()).map_err(|e| e.to_string())?);
     let recovery_store_b = store_b.clone();
     let state_b = Arc::new(ReplicaCoordinator::open_in_memory().map_err(|e| e.to_string())?);
     dst_support::link::link_and_start(&state_b, &root_b, GROUP_ID)?;
@@ -544,8 +538,7 @@ async fn drive_case(case: &Case, profile: &HarnessProfile) -> Result<Vec<Violati
 
     // Startup gate: prove the handshake + first round trip is up before the
     // workload begins. A timeout here is a host-load-dependent startup stall
-    // (see dst_two_device_chaos.rs; the old WireGuard-livelock attribution
-    // was disproven -- issue #26), classified as a skip.
+    // (see dst_two_device_chaos.rs), classified as a skip.
     std::fs::write(root_a.join(CANARY_PATH), b"canary").map_err(|e| e.to_string())?;
     deliver_event(&device_a, root_a.join(CANARY_PATH), FsChangeKind::CreatedOrModified).await?;
     poll_until(Duration::from_secs(10), || {
@@ -1031,8 +1024,7 @@ fn dst_generated_sweep() {
     }
 
     // A seed can land on an infra skip (most commonly the startup canary's
-    // host-load-dependent startup stall -- the old WireGuard-livelock
-    // attribution was disproven, issue #26) independent of
+    // host-load-dependent startup stall) independent of
     // whether it would otherwise have exercised anything interesting -- that
     // is a property of the seed's RNG-derived timing draw, not of sync
     // correctness. A flat `0..variations` loop therefore made the sweep's

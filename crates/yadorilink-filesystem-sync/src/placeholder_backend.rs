@@ -78,14 +78,12 @@ impl PlaceholderCapability {
 ///    `chunker::write_placeholder` (an ordinary sparse file with none of the
 ///    above properties — see that function's own doc comment).
 ///
-/// This is still unconditionally `false` in production, but as of M2's
-/// Windows CfAPI work (M2-0 through M2-6, Pass 4 of the "windows-ondemand-
-/// complete" branch) that is no longer because none of the four conditions
-/// hold at all — it's because Windows satisfies some of them through a
-/// DIFFERENT mechanism than this doc originally envisioned (direct CfAPI
+/// This is unconditionally `false` in production. That is not because none
+/// of the four conditions hold — Windows CfAPI support satisfies some of
+/// them through a DIFFERENT mechanism than this doc originally envisioned (direct CfAPI
 /// calls and a daemon<->`cfapi-host.exe` cross-process split, not
-/// `PlaceholderBackend` trait dispatch), and the remaining ones are
-/// genuinely still open. Per-condition status, current as of Pass 4:
+/// `PlaceholderBackend` trait dispatch), and the remaining ones do not
+/// hold. Per-condition status:
 ///
 /// - **(1) persistent per-link session**: still NOT held as an explicit
 ///   object anywhere in the daemon — `cfapi-host.exe`, a separate
@@ -95,21 +93,21 @@ impl PlaceholderCapability {
 /// - **(2) persisted generation surviving restart**: MET for Windows.
 ///   `WINDOWS_CFAPI_GENERATION_PROVIDER_KIND` identities are persisted via
 ///   `record_placeholder_generation`/`record_placeholder_generation_
-///   if_absent` (M2-0/M2-2/M2-3a) and read back by
-///   `get_recorded_placeholder_identity` (M2-3b) — ordinary SQLite state,
+///   if_absent` and read back by
+///   `get_recorded_placeholder_identity` — ordinary SQLite state,
 ///   survives a daemon restart the same as every other index row.
 /// - **(3) dirty detection via a real provider query**: MET for Windows.
 ///   `local_change.rs`'s Windows branch of `untouched_placeholder_verdict`
 ///   calls `LocalMutationStore::inspect_windows_placeholder`, which on
 ///   Windows is a REAL `CfGetPlaceholderInfo` call
-///   (`placeholder_inspect_windows::inspect_placeholder`, M2-2) — not the
+///   (`placeholder_inspect_windows::inspect_placeholder`) — not the
 ///   size/mtime heuristic this condition was written to replace.
 /// - **(4) placeholder-create/hydrate/evict routed through `PlaceholderBackend`
 ///   trait methods**: NOT met in the literal sense this doc describes —
 ///   production never calls `PlaceholderBackend::{create,hydrate}` at all.
-///   Windows creation and eviction ARE real and OS-transparent (M2-3a's
-///   `create_or_defer_placeholder` + `cfapi-host`'s poll-driven
-///   `CfCreatePlaceholders`; M2-3b's `dehydrate_windows_placeholder` RPC
+///   Windows creation and eviction ARE real and OS-transparent
+///   (`create_or_defer_placeholder` + `cfapi-host`'s poll-driven
+///   `CfCreatePlaceholders`; the `dehydrate_windows_placeholder` RPC
 ///   to a real `CfDehydratePlaceholder` call), just through direct calls
 ///   and a cross-process split, not this trait. Windows hydration IS
 ///   OS-triggered (a real `CF_CALLBACK_TYPE_FETCH_DATA` callback,
@@ -125,8 +123,8 @@ impl PlaceholderCapability {
 /// hardware" section for the sharpest example). That verification, plus
 /// deciding what a genuinely accurate replacement gate should actually
 /// check now that the trait-routed model this function was written against
-/// isn't the architecture that got built, is real-hardware-acceptance work
-/// (M2-7), not something this function should be flipped ahead of.
+/// isn't the architecture that got built, is real-hardware-acceptance work,
+/// not something this function should be flipped ahead of.
 /// `yadorilink-daemon`'s `finish_link_setup` and `set_storage_mode` gate
 /// every `OnDemand` request on this function rather than on a platform
 /// check or a backend's own `probe`, so that decision is still the one
@@ -254,42 +252,4 @@ pub trait PlaceholderBackend: Send + Sync {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unsupported_never_reports_on_demand_support() {
-        assert!(!PlaceholderCapability::Unsupported.supports_on_demand());
-    }
-
-    #[test]
-    fn supported_reports_on_demand_support() {
-        assert!(PlaceholderCapability::Supported { name: "test" }.supports_on_demand());
-    }
-
-    #[test]
-    fn on_demand_pipeline_is_not_yet_connected() {
-        assert!(
-            !on_demand_pipeline_is_connected(),
-            "flip this only after real-Windows-hardware acceptance (M2-7) confirms every \
-             condition this function's own doc comment lists -- some are already met for \
-             Windows (persisted generation, real dirty detection), others still aren't (no \
-             persistent per-link session object; nothing routes through the \
-             PlaceholderBackend trait itself), and NONE of it has been verified against real \
-             hardware yet"
-        );
-    }
-
-    #[test]
-    fn override_for_test_is_scoped_to_its_own_lifetime() {
-        assert!(!on_demand_pipeline_is_connected());
-        {
-            let _override = OverrideForTest::enable();
-            assert!(on_demand_pipeline_is_connected());
-        }
-        assert!(
-            !on_demand_pipeline_is_connected(),
-            "the override must not outlive the guard that enabled it"
-        );
-    }
-}
+mod tests;

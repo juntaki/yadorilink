@@ -12,7 +12,7 @@ use crate::application::model::{
     MembershipOperationLookup, MembershipRemoteCommand,
 };
 use crate::application::ports::{BoxFuture, MembershipCoordination};
-use crate::coordination_client::RoleLossCommitOutcome;
+use crate::coordination_client::{RoleLossCommitOutcome, SendAuthorized};
 use crate::daemon_state::{CoordinationClientConfig, DaemonState};
 
 const NOT_CONFIGURED_DETAIL: &str = "local device identity is unavailable";
@@ -53,9 +53,8 @@ async fn classify_plain_remove_device(
     }
     let response = match reqwest::Client::new()
         .delete(format!("{}/devices/{device_id}", config.addr))
-        .bearer_auth(&config.access_token)
         .json(&Body { operation_id })
-        .send()
+        .send_authorized(&config.auth)
         .await
     {
         Ok(response) => response,
@@ -87,9 +86,8 @@ async fn classify_plain_revoke(
     }
     let response = match reqwest::Client::new()
         .post(format!("{}/shares/groups/{group_id}/revoke", config.addr))
-        .bearer_auth(&config.access_token)
         .json(&Body { device_id, operation_id })
-        .send()
+        .send_authorized(&config.auth)
         .await
     {
         Ok(response) => response,
@@ -139,9 +137,8 @@ async fn commit_multi_group_removal(
         .collect();
     let response = match reqwest::Client::new()
         .post(format!("{}/devices/{device_id}/handoff-remove", config.addr))
-        .bearer_auth(&config.access_token)
         .json(&Body { groups, operation_id })
-        .send()
+        .send_authorized(&config.auth)
         .await
     {
         Ok(response) => response,
@@ -179,8 +176,7 @@ impl MembershipCoordination for HttpMembershipCoordination {
             };
             let response = reqwest::Client::new()
                 .get(format!("{}/devices/{device_id}/eager-groups", config.addr))
-                .bearer_auth(&config.access_token)
-                .send()
+                .send_authorized(&config.auth)
                 .await
                 .map_err(|e| e.to_string())?;
             if !response.status().is_success() {
@@ -212,7 +208,7 @@ impl MembershipCoordination for HttpMembershipCoordination {
                 MembershipCommitMode::GuardedRevoke => {
                     match crate::coordination_client::commit_handoff_role_loss(
                         &config.addr,
-                        &config.access_token,
+                        &config.auth,
                         crate::coordination_client::RoleLossCommitRequest {
                             group_id: &command.group_ids[0],
                             source_device_id: &command.removed_device_id,
@@ -271,7 +267,7 @@ impl MembershipCoordination for HttpMembershipCoordination {
             };
             crate::coordination_client::query_membership_operation(
                 &config.addr,
-                &config.access_token,
+                &config.auth,
                 operation_id,
             )
             .await
@@ -286,8 +282,7 @@ impl MembershipCoordination for HttpMembershipCoordination {
             let Some(config) = self.config() else {
                 return Err(NOT_CONFIGURED_DETAIL.to_string());
             };
-            crate::coordination_client::resolve_edge(&config.addr, &config.access_token, edge_id)
-                .await
+            crate::coordination_client::resolve_edge(&config.addr, &config.auth, edge_id).await
         })
     }
 
@@ -302,7 +297,7 @@ impl MembershipCoordination for HttpMembershipCoordination {
             };
             crate::coordination_client::fetch_edge_state(
                 &config.addr,
-                &config.access_token,
+                &config.auth,
                 group_id,
                 device_id,
             )
@@ -328,9 +323,8 @@ impl MembershipCoordination for HttpMembershipCoordination {
             let action = format!("membership removal (excluded_device_id={target_device_id})");
             let request = reqwest::Client::new()
                 .post(format!("{}/audit/force-override", config.addr))
-                .bearer_auth(&config.access_token)
                 .json(&Body { device_id: local_device_id, action: &action, group_ids })
-                .send();
+                .send_authorized(&config.auth);
             if tokio::time::timeout(std::time::Duration::from_secs(5), request).await.is_err() {
                 tracing::warn!(target_device_id, "force-override audit request timed out");
             }

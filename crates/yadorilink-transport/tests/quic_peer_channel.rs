@@ -1,6 +1,5 @@
 //! Two devices, each with one `QuicPeerEndpoint` over its own transport hub,
-//! exchanging framed control messages on a single connection -- natively and
-//! under deterministic simulation.
+//! exchanging framed control messages on a single connection.
 //!
 //! This is the layer between the authenticated handshake
 //! (`quic_peer_identity.rs`) and a real sync session: it proves that the
@@ -8,9 +7,8 @@
 //! back that same connection, and that message boundaries survive a byte
 //! stream in both directions.
 //!
-//! Two entry points per test body, as in the sibling QUIC tests: the
-//! simulator runs the same real quinn/rustls stack as the native build,
-//! never a substitute.
+//! `turmoil_quic_peer_channel.rs` runs the same real quinn/rustls stack
+//! under simulation, never a substitute.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -36,7 +34,8 @@ struct Device {
 }
 
 async fn device(id: &'static str) -> Device {
-    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("bind loopback");
+    let socket =
+        yadorilink_transport::sim_net::UdpSocket::bind("127.0.0.1:0").await.expect("bind loopback");
     let hub = TransportHub::from_socket(socket);
     let addr = hub.local_addr();
     let signing = DeviceSigningKeyPair::generate();
@@ -122,17 +121,9 @@ async fn messages_round_trip_with_their_boundaries_intact() {
     assert_eq!(expect_recv(&channel_a, "the reply").await, reply);
 }
 
-#[cfg(not(madsim))]
 #[tokio::test]
 async fn a_quic_peer_channel_carries_messages_in_both_directions() {
     messages_round_trip_with_their_boundaries_intact().await;
-}
-
-#[cfg(madsim)]
-#[test]
-fn a_quic_peer_channel_carries_messages_in_both_directions() {
-    let rt = madsim::runtime::Runtime::with_seed_and_config(1, madsim::Config::default());
-    rt.block_on(messages_round_trip_with_their_boundaries_intact());
 }
 
 /// `recv` reports the end of the connection as `None` rather than hanging,
@@ -160,17 +151,9 @@ async fn a_closed_connection_ends_the_receive_side() {
     );
 }
 
-#[cfg(not(madsim))]
 #[tokio::test]
 async fn dropping_one_end_closes_the_others_receive_half() {
     a_closed_connection_ends_the_receive_side().await;
-}
-
-#[cfg(madsim)]
-#[test]
-fn dropping_one_end_closes_the_others_receive_half() {
-    let rt = madsim::runtime::Runtime::with_seed_and_config(1, madsim::Config::default());
-    rt.block_on(a_closed_connection_ends_the_receive_side());
 }
 
 /// A peer whose key was never authorized cannot open a channel at all: the
@@ -218,17 +201,9 @@ async fn an_unauthorized_peer_gets_no_channel() {
     );
 }
 
-#[cfg(not(madsim))]
 #[tokio::test]
 async fn an_unauthorized_dial_never_produces_an_accepted_connection() {
     an_unauthorized_peer_gets_no_channel().await;
-}
-
-#[cfg(madsim)]
-#[test]
-fn an_unauthorized_dial_never_produces_an_accepted_connection() {
-    let rt = madsim::runtime::Runtime::with_seed_and_config(1, madsim::Config::default());
-    rt.block_on(an_unauthorized_peer_gets_no_channel());
 }
 
 /// Revoking a peer must stop the traffic on the connection it ALREADY has,
@@ -278,17 +253,9 @@ async fn revocation_stops_traffic_on_a_live_connection() {
     );
 }
 
-#[cfg(not(madsim))]
 #[tokio::test]
 async fn revoking_a_peer_ends_its_live_session() {
     revocation_stops_traffic_on_a_live_connection().await;
-}
-
-#[cfg(madsim)]
-#[test]
-fn revoking_a_peer_ends_its_live_session() {
-    let rt = madsim::runtime::Runtime::with_seed_and_config(1, madsim::Config::default());
-    rt.block_on(revocation_stops_traffic_on_a_live_connection());
 }
 
 /// A revoked peer that comes straight back cannot get application bytes
@@ -325,17 +292,9 @@ async fn a_revoked_peer_cannot_reconnect_into_a_working_session() {
     assert!(queued.is_err(), "a revoked peer's reconnection must never reach the accepting side");
 }
 
-#[cfg(not(madsim))]
 #[tokio::test]
 async fn a_revoked_peer_gets_no_working_reconnection() {
     a_revoked_peer_cannot_reconnect_into_a_working_session().await;
-}
-
-#[cfg(madsim)]
-#[test]
-fn a_revoked_peer_gets_no_working_reconnection() {
-    let rt = madsim::runtime::Runtime::with_seed_and_config(1, madsim::Config::default());
-    rt.block_on(a_revoked_peer_cannot_reconnect_into_a_working_session());
 }
 
 /// One block request, one bidirectional stream, in both directions at once.
@@ -413,15 +372,7 @@ async fn block_streams_carry_a_request_and_its_body_both_ways() {
     assert_eq!(got_by_b, a_body, "B must read back exactly the body A wrote");
 }
 
-#[cfg(not(madsim))]
 #[tokio::test]
 async fn a_block_stream_carries_one_request_and_its_body() {
     block_streams_carry_a_request_and_its_body_both_ways().await;
-}
-
-#[cfg(madsim)]
-#[test]
-fn a_block_stream_carries_one_request_and_its_body() {
-    let rt = madsim::runtime::Runtime::with_seed_and_config(1, madsim::Config::default());
-    rt.block_on(block_streams_carry_a_request_and_its_body_both_ways());
 }

@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 
 /// Tests in this file share two process-global env vars
 /// (`YADORILINK_CONFIG_DIR`, `YADORILINK_CONTROL_SOCKET`) and so must not
@@ -21,7 +21,7 @@ static TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>) {
     let dir = tempfile::tempdir().unwrap();
     std::env::set_var("YADORILINK_CONFIG_DIR", dir.path());
-    let store = Arc::new(FsBlockStore::new(dir.path().join("blocks")).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(dir.path().join("blocks")).unwrap());
     let sync_state = Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
     let state = DaemonState::new("device-under-test".into(), sync_state, store);
 
@@ -67,7 +67,7 @@ async fn usage_preview_reflects_seeded_counters_exactly() {
     // `commands::report::usage` prints to stdout rather than returning
     // the JSON, so exercise the same underlying IPC call its preview
     // path uses and check the counters round-trip exactly.
-    let resp = yadorilink_cli::control_client::send(
+    let resp = yadorilink_client_core::daemon::control::send(
         yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload::GenerateUsageReport(
             yadorilink_ipc_proto::daemonctl::GenerateUsageReportRequest {},
         ),

@@ -1,17 +1,8 @@
 //! Proves a real `quinn` stack runs over `TransportHubQuicSocket` -- the
-//! same code, the same handshake and the same streams, natively and under
-//! deterministic simulation.
+//! same code, the same handshake and the same streams.
 //!
-//! This is the load-bearing check for sharing one UDP socket between QUIC,
-//! STUN and the relay envelope. A prior bulk-transport module (since
-//! removed) avoided the question by binding a second port, which the real
-//! mesh cannot do without asking every NAT in the path for a second
-//! mapping.
-//!
-//! Deliberately one test body with two entry points rather than two tests.
-//! A simulation-only substitute for QUIC would make the deterministic build
-//! green while proving nothing about the transport it is supposed to be
-//! exercising, so the simulator gets the genuine stack or nothing.
+//! This is the load-bearing check for driving QUIC over the hub's one UDP
+//! socket rather than a socket of its own.
 //!
 //! Peer authentication here is ordinary TLS server-certificate verification
 //! against a root store holding exactly the certificate the server presents
@@ -33,7 +24,8 @@ const PAYLOAD_LEN: usize = 64 * 1024;
 
 /// A hub bound on loopback, plus the QUIC socket sharing it.
 async fn hub_socket() -> (Arc<TransportHub>, Arc<TransportHubQuicSocket>, SocketAddr) {
-    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("bind loopback");
+    let socket =
+        yadorilink_transport::sim_net::UdpSocket::bind("127.0.0.1:0").await.expect("bind loopback");
     let hub = TransportHub::from_socket(socket);
     let addr = hub.local_addr();
     let quic = TransportHubQuicSocket::new(hub.clone()).expect("one QUIC endpoint per hub");
@@ -132,128 +124,9 @@ async fn stream_transfer_over_the_hub() {
     assert_eq!(served, PAYLOAD_LEN);
 }
 
-#[cfg(not(madsim))]
 #[tokio::test]
 async fn quic_completes_a_bidirectional_stream_transfer_over_the_transport_hub() {
     stream_transfer_over_the_hub().await;
-}
-
-#[cfg(madsim)]
-#[test]
-fn quic_completes_a_bidirectional_stream_transfer_over_the_transport_hub() {
-    let rt = madsim::runtime::Runtime::with_seed_and_config(1, madsim::Config::default());
-    rt.block_on(stream_transfer_over_the_hub());
-}
-
-/// The QUIC arm is last in the demux for a reason: it must take only the
-/// genuine remainder. If it could claim a STUN response or a relay
-/// envelope, NAT discovery and relayed traffic would break in a way that
-/// looks like packet loss rather than misrouting -- and, in the other
-/// direction, if STUN could claim a datagram on shape alone it would
-/// swallow the occasional QUIC packet that happens to carry STUN's magic
-/// cookie in the same position.
-async fn demux_classification() {
-    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("bind hub");
-    let hub = TransportHub::from_socket(socket);
-    let hub_addr = hub.local_addr();
-    let _stun_inbound = hub.register_stun();
-    let mut quic_inbound = hub.register_quic().expect("the first registration on a fresh hub");
-
-    let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("bind sender");
-    let sender_addr = sender.local_addr().expect("sender addr");
-    let send = |bytes: Vec<u8>| {
-        let sender = &sender;
-        async move {
-            #[cfg(not(madsim))]
-            sender.send_to(&bytes, hub_addr).await.expect("send");
-            #[cfg(madsim)]
-            sender.send_to(hub_addr, &bytes).await.expect("send");
-        }
-    };
-    let stun_response = |txn: [u8; 12]| {
-        let mut message = vec![0u8; 20];
-        message[0..2].copy_from_slice(&0x0101u16.to_be_bytes());
-        message[2..4].copy_from_slice(&0u16.to_be_bytes());
-        message[4..8].copy_from_slice(&0x2112A442u32.to_be_bytes());
-        message[8..20].copy_from_slice(&txn);
-        message
-    };
-
-    // A STUN response to a binding request this hub actually sent: claimed
-    // by the STUN arm, never offered to QUIC.
-    let pending_txn = [3u8; 12];
-    hub.register_stun_txn(pending_txn);
-    send(stun_response(pending_txn)).await;
-
-    // A relay envelope wrapping a QUIC packet. Its payload does reach the
-    // QUIC arm -- that is what relaying is for -- but under the synthetic
-    // address minted for that relay session, never under the address it
-    // physically arrived from, which belongs to the relaying device rather
-    // than to the peer.
-    let relayed_payload = [0xC0u8, 0x00, 0x00, 0x00, 0x01];
-    let mut relayed = vec![0x00, 0xFF, 0xFF, 0xFF];
-    relayed.extend_from_slice(&42u64.to_le_bytes());
-    relayed.extend_from_slice(&relayed_payload);
-    send(relayed).await;
-
-    let (received, from) =
-        tokio::time::timeout(std::time::Duration::from_secs(5), quic_inbound.recv())
-            .await
-            .expect("a relayed payload should reach the QUIC arm")
-            .expect("demux queue open");
-    assert_eq!(received, relayed_payload, "the envelope is stripped, the payload is not");
-    assert_ne!(
-        from, sender_addr,
-        "the relaying device's own address must never be presented as the peer's"
-    );
-    assert!(
-        yadorilink_transport::is_synthetic_relay_addr(from),
-        "a relayed payload must arrive under a synthetic relay address, got {from}"
-    );
-
-    // A QUIC long-header packet: the fixed bit 0x40 in byte 0 keeps it
-    // outside the relay envelope's marker (byte 0 `0x00`) and outside
-    // STUN's `byte0 & 0xC0 == 0`, so it belongs to the QUIC arm.
-    let quic_shaped = vec![0xC3, 0x00, 0x00, 0x00, 0x01, 0xAA, 0xBB, 0xCC];
-    send(quic_shaped.clone()).await;
-
-    let (received, from) =
-        tokio::time::timeout(std::time::Duration::from_secs(5), quic_inbound.recv())
-            .await
-            .expect("a QUIC-shaped datagram should reach the QUIC arm")
-            .expect("demux queue open");
-    assert_eq!(received, quic_shaped, "the QUIC arm received exactly the QUIC-shaped datagram");
-    assert_eq!(from, sender_addr, "source address preserved");
-    assert!(
-        quic_inbound.try_recv().is_err(),
-        "the answered STUN response must not reach the QUIC arm"
-    );
-
-    // The other direction: STUN's shape check is only two leading zero bits
-    // plus the magic cookie, which a genuine QUIC packet matches roughly
-    // once in 2^32. Such a datagram carries a transaction id this device
-    // never sent, so STUN must decline it and let it continue to QUIC --
-    // otherwise those packets would vanish as unexplained loss.
-    let unclaimed = stun_response([9u8; 12]);
-    send(unclaimed.clone()).await;
-    let (received, _) =
-        tokio::time::timeout(std::time::Duration::from_secs(5), quic_inbound.recv())
-            .await
-            .expect("a STUN-shaped datagram with an unknown transaction must not be swallowed")
-            .expect("demux queue open");
-    assert_eq!(received, unclaimed, "STUN declined it, so QUIC got it intact");
-}
-#[cfg(not(madsim))]
-#[tokio::test]
-async fn each_protocol_sharing_the_socket_claims_only_its_own_datagrams() {
-    demux_classification().await;
-}
-
-#[cfg(madsim)]
-#[test]
-fn each_protocol_sharing_the_socket_claims_only_its_own_datagrams() {
-    let rt = madsim::runtime::Runtime::with_seed_and_config(1, madsim::Config::default());
-    rt.block_on(demux_classification());
 }
 
 /// One endpoint per device is an architecture invariant, so a second
@@ -283,17 +156,9 @@ async fn a_hub_serves_exactly_one_quic_endpoint() {
     );
 }
 
-#[cfg(not(madsim))]
 #[tokio::test]
 async fn a_second_quic_endpoint_on_one_hub_is_refused() {
     a_hub_serves_exactly_one_quic_endpoint().await;
-}
-
-#[cfg(madsim)]
-#[test]
-fn a_second_quic_endpoint_on_one_hub_is_refused() {
-    let rt = madsim::runtime::Runtime::with_seed_and_config(1, madsim::Config::default());
-    rt.block_on(a_hub_serves_exactly_one_quic_endpoint());
 }
 
 /// Two blocked pollers both get woken when capacity returns.
@@ -312,7 +177,7 @@ fn a_second_quic_endpoint_on_one_hub_is_refused() {
 ///
 /// Simulation-only, because this backpressure is: natively, write readiness
 /// comes from the kernel socket, which registers each poller's waker itself.
-#[cfg(madsim)]
+#[cfg(turmoil)]
 async fn every_blocked_poller_is_woken_when_capacity_returns() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc as StdArc;
@@ -395,9 +260,14 @@ async fn every_blocked_poller_is_woken_when_capacity_returns() {
     drop(hub);
 }
 
-#[cfg(madsim)]
+#[cfg(turmoil)]
 #[test]
 fn a_freed_send_slot_wakes_every_blocked_poller() {
-    let rt = madsim::runtime::Runtime::with_seed_and_config(1, madsim::Config::default());
-    rt.block_on(every_blocked_poller_is_woken_when_capacity_returns());
+    let mut sim =
+        turmoil::Builder::new().simulation_duration(std::time::Duration::from_secs(60)).build();
+    sim.client("device", async {
+        every_blocked_poller_is_woken_when_capacity_returns().await;
+        Ok(())
+    });
+    sim.run().expect("the simulation runs to completion");
 }

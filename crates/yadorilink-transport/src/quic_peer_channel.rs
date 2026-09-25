@@ -1,10 +1,18 @@
 //! The control stream of one peer connection, as a message channel, and the
 //! block streams that run alongside it.
 //!
+//! Retained for tests only, pending a replacement control plane: no
+//! shipped code path carries sync content over this channel any more.
+//! Production peer connectivity is the iroh endpoint in
+//! `yadorilink-sync-substrate` (see this crate's own module doc). What
+//! follows describes the channel as the tests still exercise it, and the
+//! message names it mentions are the sync protocol's, not a claim that
+//! this channel still carries them.
+//!
 //! ## One long-lived bidirectional stream
 //!
-//! Everything the sync protocol *says* to a peer -- `ClusterConfig`,
-//! `HeadsAnnounce`, `ChangeRequest`, `ChangeBatch`, custody, relay
+//! Everything a session *says* to a peer here -- `HeadsAnnounce`,
+//! `ChangeRequest`, `ChangeBatch`, custody, relay
 //! open/data -- travels on a single bidirectional QUIC stream that lives as
 //! long as the connection does. It is long-lived rather than per-exchange
 //! because the protocol above is a conversation with ordering that matters
@@ -514,26 +522,5 @@ async fn read_frames(
             // again.
             break;
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The framing is a pure function of the payload, and the two halves
-    /// have to be exact inverses -- one runs on what this device emits, the
-    /// other on what it accepts from a peer.
-    fn frame(payload: &[u8]) -> Vec<u8> {
-        let mut framed = Vec::new();
-        framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-        framed.extend_from_slice(payload);
-        framed
-    }
-
-    #[test]
-    fn a_length_prefix_is_big_endian_and_four_bytes() {
-        assert_eq!(frame(b"abc")[..LENGTH_PREFIX_BYTES], [0, 0, 0, 3]);
-        assert_eq!(frame(&[0u8; 300])[..LENGTH_PREFIX_BYTES], [0, 0, 1, 44]);
     }
 }

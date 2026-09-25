@@ -48,8 +48,7 @@ jobs:
         run: cargo llvm-cov --no-fail-fast --workspace --exclude yadorilink-daemon --exclude yadorilink-desktop-app --no-report
       - name: Daemon coverage (serial)
         # Deliberately WITHOUT --no-fail-fast: see ci-full.yml's own Daemon
-        # E2E step for why -- 90 never-fully-run binaries with a large
-        # known-broken tail, tracked as its own separate triage effort.
+        # E2E step for why -- the same serial multi-binary suite.
         run: |
           cargo llvm-cov -p yadorilink-daemon --tests --no-report -- \
             --test-threads=1 \

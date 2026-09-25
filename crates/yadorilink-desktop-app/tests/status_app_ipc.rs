@@ -19,14 +19,14 @@ use yadorilink_desktop_app::{actions, ipc_client};
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
 use yadorilink_ipc_proto::daemonctl::{LinkRequest, PendingEnrollmentKind, StatusRequest};
-use yadorilink_local_storage::FsBlockStore;
+use yadorilink_local_storage::SegmentBlockStore;
 
 async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>) {
     let dir = tempfile::tempdir().unwrap();
     std::env::set_var("YADORILINK_CONFIG_DIR", dir.path());
     std::env::set_var("YADORILINK_UPDATE_MANIFEST_URL", "http://127.0.0.1:1/manifest.json");
 
-    let store = Arc::new(FsBlockStore::new(dir.path().join("blocks")).unwrap());
+    let store = Arc::new(SegmentBlockStore::new(dir.path().join("blocks")).unwrap());
     let sync_state = Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
     let state = DaemonState::new("device-under-test".into(), sync_state, store);
     // A registered (non-empty device_id) device with no signing key fails
@@ -72,9 +72,8 @@ async fn fetch_status() -> yadorilink_ipc_proto::daemonctl::StatusResponse {
     }
 }
 
-/// This crate's `ipc_client::send` (a deliberate duplicate of
-/// `yadorilink-cli`'s own connection code, see that module's doc comment)
-/// reaches a real daemon and round-trips a `Status` request correctly.
+/// This crate's `ipc_client::send` (the client layer's one control-socket
+/// client, with this app's error wording) reaches a real daemon and round-trips a `Status` request correctly.
 /// `overall_state` may legitimately read `"attention"` here instead of
 /// `"healthy"` — `DaemonState::new` always attempts an update check at
 /// startup against this file's deliberately-unreachable
