@@ -189,15 +189,14 @@ fn daemon_binary_path() -> PathBuf {
 mod tests {
     use super::*;
 
+    // A LaunchAgent is started through `/bin/launchctl` (see `launch_steps`),
+    // which is never absolute by Windows's own definition of the term
+    // (that needs a drive letter or UNC prefix), so this test's premise only
+    // holds on the platform the feature exists for.
+    #[cfg(unix)]
     #[test]
     fn start_daemon_launch_agent_never_uses_path() {
-        // Absolute on the host running the test: a drive-less `/usr/...` is
-        // not absolute on Windows and would be dropped like a bare name.
-        let fallback = if cfg!(windows) {
-            r"C:\yadorilink\yadorilink-daemon.exe"
-        } else {
-            "/usr/local/bin/yadorilink-daemon"
-        };
+        let fallback = "/usr/local/bin/yadorilink-daemon";
         let with_fallback = DaemonLaunch::LaunchAgent {
             label: "com.yadorilink.daemon".into(),
             fallback_binary: Some(fallback.into()),
