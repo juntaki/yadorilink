@@ -221,13 +221,7 @@ pub fn path_heads_at_frontier(
     path: &str,
     frontier: &[ChangeHash],
 ) -> Result<Vec<PathHead>, SyncSqliteError> {
-    path_heads_at_frontier_memoized(
-        conn,
-        group_id,
-        path,
-        frontier,
-        &mut FrontierWalkMemo::default(),
-    )
+    path_heads_at_frontier_indexed(conn, group_id, path, frontier)
 }
 
 /// Whether `frontier` is exactly the group's current head set.
@@ -254,116 +248,13 @@ fn frontier_is_current_group_heads(
     Ok(frontier.iter().all(|h| current.contains(&h.0)))
 }
 
-/// Whether any retained change in this group touches `path`, as one
-/// indexed lookup against the normalized path effects.
-///
-/// `change_path_effects`'s primary key leads with `(group_id, path)`, so
-/// this is a range probe that stops at the first row.
-fn group_has_touched_path(
-    conn: &Connection,
-    group_id: &str,
-    path: &str,
-) -> Result<bool, SyncSqliteError> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT 1 FROM change_path_effects WHERE group_id = ?1 AND path = ?2 LIMIT 1",
-    )?;
-    Ok(stmt.exists(rusqlite::params![group_id, path])?)
-}
-
-/// A cheap, order-insensitive fingerprint of one path, used only as a negative
-/// filter (see [`MemoizedChange`]).
-fn path_fingerprint(path: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    path.hash(&mut hasher);
-    hasher.finish()
-}
-
-/// One retained change, decoded once, plus the fingerprints of every path it
-/// touches.
-///
-/// The fingerprint set answers "could this change touch `path`?" in O(1). A
-/// miss is conclusive (the exact path was definitely not among its ops); a hit
-/// is re-checked exactly with [`change_touches_path`], so a fingerprint
-/// collision costs one extra scan and can never change the answer. Storing
-/// fingerprints rather than the path strings keeps the memo proportional to the
-/// op count (8 bytes/op) instead of duplicating every path already held in the
-/// decoded change.
-struct MemoizedChange {
-    change: Change,
-    touched_path_fingerprints: HashSet<u64>,
-}
-
-/// Decoded-change memo for ONE derivation, shared across every path that
-/// derivation resolves.
-///
-/// [`path_heads_at_frontier`] walks the frontier-reachable DAG once *per path*,
-/// and at each step fetches a change's stored encoding, decodes it, then scans
-/// all of its ops. [`derive_required_conflict_copy_ops`] drives that walk once per
-/// path the new change touches -- so a bulk emission (the one-shot initial
-/// import of an existing folder, a large offline diff, or the peer-side
-/// admission validation of either) re-walks the same handful of changes once
-/// for every one of its ops, re-decoding each of them every time.
-///
-/// That is quadratic in the emission's own size and it is not a small constant:
-/// measured on a 20k-file initial import, the resulting single write
-/// transaction held the process-wide writer gate for 124 seconds, during which
-/// every tokio worker in the daemon was parked waiting for that gate and the
-/// device's own QUIC sessions timed out. Extrapolated to ~100k files it is tens
-/// of minutes. Memoizing per call makes each reachable change cost one decode
-/// regardless of how many paths the emission touches, without changing which
-/// changes the walk visits or what it concludes.
-///
-/// Scoped to a single call on purpose: the frontier it is valid for is the
-/// caller's, and a memo outliving one derivation would serve a stale DAG.
-#[derive(Default)]
-struct FrontierWalkMemo {
-    /// `None` records a hash that is not retained (a compacted parent, i.e. a
-    /// traversal boundary), so it is not re-queried per path either.
-    changes: std::collections::HashMap<[u8; 32], Option<MemoizedChange>>,
-}
-
-impl FrontierWalkMemo {
-    fn get(
-        &mut self,
-        conn: &Connection,
-        hash: &ChangeHash,
-    ) -> Result<Option<&MemoizedChange>, SyncSqliteError> {
-        if let std::collections::hash_map::Entry::Vacant(e) = self.changes.entry(hash.0) {
-            let entry = match get_change(conn, hash)? {
-                Some(change) => {
-                    let mut touched_path_fingerprints = HashSet::with_capacity(change.ops.len());
-                    for op in &change.ops {
-                        match op {
-                            Op::Put { path, .. } | Op::Delete { path } => {
-                                touched_path_fingerprints.insert(path_fingerprint(path.as_str()));
-                            }
-                            Op::Move { from, to, .. } => {
-                                touched_path_fingerprints.insert(path_fingerprint(from.as_str()));
-                                touched_path_fingerprints.insert(path_fingerprint(to.as_str()));
-                            }
-                        }
-                    }
-                    Some(MemoizedChange { change, touched_path_fingerprints })
-                }
-                None => None,
-            };
-            e.insert(entry);
-        }
-        Ok(self.changes.get(&hash.0).and_then(|entry| entry.as_ref()))
-    }
-}
-
-/// [`path_heads_at_frontier`] against a caller-owned [`FrontierWalkMemo`], so
-/// several paths resolved against the SAME frontier share one decode of each
-/// change the walk passes. Visits exactly the changes the unmemoized walk
-/// visits and returns exactly what it returns.
-fn path_heads_at_frontier_memoized(
+/// [`path_heads_at_frontier`]'s body: resolves `path`'s heads at `frontier`
+/// from the changes indexed as touching it.
+fn path_heads_at_frontier_indexed(
     conn: &Connection,
     group_id: &str,
     path: &str,
     frontier: &[ChangeHash],
-    _memo: &mut FrontierWalkMemo,
 ) -> Result<Vec<PathHead>, SyncSqliteError> {
     // Start from what is known to touch this path, not from the frontier.
     //
@@ -437,7 +328,7 @@ fn path_heads_at_frontier_memoized(
     Ok(live)
 }
 
-/// Like [`path_heads_at_frontier_memoized`], but additionally recovers a
+/// Like [`path_heads_at_frontier_indexed`], but additionally recovers a
 /// "buried root": a genesis-shaped content touch for `path` (one with no
 /// ancestor, among the changes reachable from `frontier` that also touch
 /// `path`, that itself touches `path`) that a later, SINGLE-PARENT
@@ -454,7 +345,7 @@ fn path_heads_at_frontier_memoized(
 /// own write-timing stagger, not a hypothetical -- that device's change is
 /// authored with the peer's root as its sole DAG parent, and ordinary DAG
 /// ancestry then reads as "this change legitimately supersedes its parent."
-/// `path_heads_at_frontier_memoized`'s cheap is-ancestor supersession check
+/// `path_heads_at_frontier_indexed`'s cheap is-ancestor supersession check
 /// cannot distinguish that from a genuine sequential edit (a device reading
 /// and replacing content it actually observed) because the two are
 /// causally IDENTICAL in DAG-ancestry terms -- the only difference is
@@ -741,14 +632,6 @@ fn derive_required_conflict_copy_ops_with(
 ) -> Result<Vec<Op>, SyncSqliteError> {
     let touched_paths = decision::collect_touched_paths(direct_ops);
 
-    // One memo for the whole derivation: every path below resolves against the
-    // same `parents` frontier, so each change the walk passes is decoded once
-    // here instead of once per touched path (see `FrontierWalkMemo`).
-    // Unused (and never populated) when `include_buried_roots` selects the
-    // unmemoized, buried-root-aware walk instead -- see that walk's own doc
-    // comment for why it deliberately does not share this memo.
-    let mut memo = FrontierWalkMemo::default();
-
     // Resolved once for the whole derivation, not once per path.
     //
     // The walk below answers "what were this path's live heads at
@@ -777,19 +660,24 @@ fn derive_required_conflict_copy_ops_with(
     let frontier_is_current =
         !include_buried_roots && frontier_is_current_group_heads(conn, group_id, parents)?;
 
-    let heads_at = |conn: &Connection, path: &str, memo: &mut FrontierWalkMemo| {
+    // The fork a change closes by its parents is among the current epoch's
+    // heads alone: an installed base's head is no DAG node, so no parent
+    // set covers one, and a change supersedes it only by naming it. The
+    // live frontier's own reader also carries the base's unnamed heads,
+    // so the epoch's are read here -- exactly what the walks below see.
+    let heads_at = |conn: &Connection, path: &str| {
         if frontier_is_current {
-            return super::path_frontier::live_path_heads(conn, group_id, path);
+            return super::path_frontier::live_epoch_path_heads(conn, group_id, path);
         }
         if include_buried_roots {
             path_heads_at_frontier_including_buried_roots(conn, path, parents)
         } else {
-            path_heads_at_frontier_memoized(conn, group_id, path, parents, memo)
+            path_heads_at_frontier_indexed(conn, group_id, path, parents)
         }
     };
     let mut derived_ops = Vec::new();
     for path in touched_paths {
-        let heads = heads_at(conn, &path, &mut memo)?;
+        let heads = heads_at(conn, &path)?;
         let directories = directory_head_changes(conn, group_id, &path, &heads)?;
         for candidate in decision::conflict_copy_candidates(&path, &heads, |head| {
             directories.contains(&head.change_hash)
@@ -854,7 +742,7 @@ fn derive_required_conflict_copy_ops_with(
             // itself -- stays suppressed, by the identical-content check
             // below, which is the check that actually establishes the
             // content is preserved.
-            let target_heads = heads_at(conn, &candidate.target_path, &mut memo)?;
+            let target_heads = heads_at(conn, &candidate.target_path)?;
             // Fallible loop, not `.any(...).unwrap_or(false)`: a DB error or
             // corrupted ancestry index here must fail closed, not silently
             // read as "not already acted on" -- that would let this
@@ -1005,6 +893,8 @@ pub(crate) fn directory_head_changes(
 /// only field of it this check reads, and expressing it that way lets local
 /// emission run the check before the carrier has been signed. See
 /// [`validate_carrier_conflict_copy_ops_parts`].
+// One argument per field of the conflict-copy op being validated.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn validate_conflict_copy_origin(
     conn: &Connection,
     group_id: &str,

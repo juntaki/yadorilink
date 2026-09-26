@@ -6,18 +6,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use yadorilink_sync_substrate::testing::SharedAddressBook;
 use yadorilink_sync_substrate::{Lane, LaneStream, NetworkConfig, PeerLink, SubstrateNode};
 
-pub async fn spawn_node(
-    secret: iroh::SecretKey,
-) -> (SubstrateNode, tokio::sync::mpsc::Receiver<PeerLink>) {
-    spawn_node_in(secret, &SharedAddressBook::new()).await
-}
-
 /// A node that publishes into, and resolves out of, `book`.
 ///
 /// Two nodes sharing one book can find each other by endpoint id alone, which
 /// is how they are dialled now -- addresses are no longer passed to `connect`.
 /// A node given its own private book can still be dialled by anything that has
 /// already learnt where it is, and by nothing else.
+// Used by `substrate_gates` only; `in_process_relay` compiles this module too.
+#[allow(dead_code)]
 pub async fn spawn_node_in(
     secret: iroh::SecretKey,
     book: &SharedAddressBook,
@@ -47,6 +43,8 @@ pub fn serve_echo(link: PeerLink) -> tokio::task::JoinHandle<()> {
 /// Echo the reconciliation and bundle lanes; hold block streams open without
 /// ever reading a byte, standing in for a receiver whose storage writer is
 /// blocked.
+// Used by `substrate_gates` only; `in_process_relay` compiles this module too.
+#[allow(dead_code)]
 pub fn serve_with_stalled_block_lane(link: PeerLink) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Ok(lane) = link.accept_lane().await {

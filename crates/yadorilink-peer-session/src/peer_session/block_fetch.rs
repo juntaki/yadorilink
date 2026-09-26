@@ -513,70 +513,6 @@ impl PeerSyncSession {
             )
     }
 
-    /// The per-block-fetch timeout `materialize`'s bulk incoming-content
-    /// path uses instead of `FETCH_RESPONSE_TIMEOUT`.
-    ///
-    /// It has to exceed the transport's own worst case for "the peer has
-    /// stopped answering and nobody has noticed yet", or this layer gives
-    /// up on a fetch the transport is still recovering -- the failure this
-    /// constant exists to prevent, found when the 5s budget was several
-    /// times shorter than the transport's retry window. Under QUIC that
-    /// bound is the connection's idle timeout: a peer that has gone silent
-    /// is declared gone then, and until then loss recovery is still
-    /// running. Derived from `PEER_IDLE_TIMEOUT` rather than restated as a
-    /// number, so the two cannot drift apart.
-    ///
-    /// Deliberately NOT applied to `FETCH_RESPONSE_TIMEOUT`'s own two
-    /// other callers (`hydrate_file`'s on-access path, the Convergence
-    /// Engine's eager-rehydrate audit): each of THEIR outer budgets is
-    /// still `DEFAULT_HYDRATION_TIMEOUT` (30s, unchanged), and
-    /// lengthening only the per-block wait there without also lengthening
-    /// their outer budget would mean FEWER total block-attempts fit
-    /// inside the same 30s window than today, not more resilience -- a
-    /// real regression for those two paths this constant's own scoping
-    /// avoids by construction.
-    pub(crate) const BULK_FETCH_RESPONSE_TIMEOUT: std::time::Duration =
-        std::time::Duration::from_secs(yadorilink_transport::PEER_IDLE_TIMEOUT.as_secs() + 10);
-
-    /// How many distinct blocks a single burst-loss event is assumed able
-    /// to affect within one `materialize` attempt, for `BULK_MATERIALIZE_
-    /// TIMEOUT`'s own sizing below -- deliberately generous, not
-    /// precisely derived (real bursty loss typically affects a small,
-    /// bounded run of traffic, not every block in a file). 8 is a
-    /// deliberately round, generously-sized upper bound picked for this
-    /// purpose alone -- QUIC's own loss recovery operates below this
-    /// layer and exposes no equivalent per-block retry-count constant
-    /// this could instead be derived from.
-    const BULK_ATTEMPT_WORST_CASE_SLOW_BLOCKS: u64 = 8;
-
-    /// The outer per-attempt budget `materialize`'s bulk incoming-content
-    /// path uses instead of `DEFAULT_HYDRATION_TIMEOUT` for its
-    /// `tokio::time::timeout(..., self.ensure_blocks_present(...))` wrap.
-    /// `ensure_blocks_present` fetches blocks strictly sequentially
-    /// (never concurrently), so this must accommodate more than one
-    /// `BULK_FETCH_RESPONSE_TIMEOUT`-sized wait per attempt, not just one
-    /// -- `DEFAULT_HYDRATION_TIMEOUT` alone (30s) is already shorter than
-    /// a SINGLE `BULK_FETCH_RESPONSE_TIMEOUT` wait, let alone several.
-    ///
-    /// `BULK_ATTEMPT_WORST_CASE_SLOW_BLOCKS` blocks each needing the full
-    /// `BULK_FETCH_RESPONSE_TIMEOUT`, with no separate margin added for
-    /// the OTHER blocks this attempt also fetches (the common case: no
-    /// loss, no retry, each taking real milliseconds, negligible next to
-    /// this sum) -- comfortably inside this crate's own benchmark
-    /// harness's `OVERALL_TIMEOUT` (30 minutes, `yadorilink-bench`), so an
-    /// attempt that is genuinely stuck (not just working through bursty
-    /// loss) still fails within a bounded, if generous, window rather
-    /// than hanging forever.
-    ///
-    /// Deliberately narrow scope: a FIXED budget, not yet
-    /// scaled by `record.blocks.len()` or any other per-file signal. A
-    /// no-progress deadline instead of a flat wall-clock one is the natural
-    /// refinement if this fixed value proves the wrong shape for very large
-    /// files at 10 GiB+ scale.
-    pub(crate) const BULK_MATERIALIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
-        Self::BULK_FETCH_RESPONSE_TIMEOUT.as_secs() * Self::BULK_ATTEMPT_WORST_CASE_SLOW_BLOCKS,
-    );
-
     /// Counts one in-flight block fetch to this peer for as long as the
     /// returned guard lives, and reports how many are outstanding
     /// immediately after this one starts (so it counts itself: `1` means
@@ -722,30 +658,6 @@ impl PeerSyncSession {
     /// misbehaving or malicious peer cannot stall a fetch indefinitely by
     /// advertising an enormous `retry_after_ms`.
     const BUSY_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
-
-    /// How many fetched blocks may share one durability barrier, and how
-    /// many bytes they may total.
-    ///
-    /// Two bounds, for the same reason `SegmentBlockStore`'s own group
-    /// commit has two: the count is what collapses a tiny-file workload
-    /// (100,000 blocks of a few hundred bytes each) from 100,000 barriers
-    /// down to a few hundred, and the byte bound is what stops a
-    /// large-block file (8 MiB a block) from buffering hundreds of
-    /// megabytes of fetched content in memory waiting to reach a count
-    /// that, for that shape of file, it never should. For large blocks the
-    /// byte bound binds first and a batch holds one or two blocks -- which
-    /// is exactly right, since a file made of 8 MiB blocks was never
-    /// paying a meaningful barrier-per-byte cost in the first place.
-    pub(crate) const RECEIVE_COMMIT_BATCH_BLOCKS: usize = 256;
-
-    pub(crate) const RECEIVE_COMMIT_BATCH_BYTES: u64 = 16 * 1024 * 1024;
-
-    /// Commits in flight at once. Two, not one: a second commit can be
-    /// building (hashing, laying out) while the first is inside its fsync,
-    /// and `SegmentBlockStore`'s leader/follower group commit may even
-    /// merge the two into a single barrier. Not more than two, because
-    /// each one pins its whole batch's bytes in memory until it lands.
-    pub(crate) const MAX_COMMITS_IN_FLIGHT: usize = 2;
 
     /// Fetches, hash-verifies, and locally stores exactly one block --
     /// `ensure_blocks_present`'s own per-block body, factored out

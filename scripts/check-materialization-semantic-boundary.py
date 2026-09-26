@@ -405,7 +405,7 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     # origin protocol around a structural `mkdir` (intent, completion,
     # abandon), interrupted-intent recovery at startup and on the periodic
     # sweep, adoption of an explicit directory kept for live descendants,
-    # a rename's rekey, a removed directory's forget and retained-record
+    # a removed directory's forget and retained-record
     # clear, a retained directory's record and release, the fence bump
     # before any directory the namespace decides to remove, and the fence
     # snapshot a directory's settlement is valid under.
@@ -415,7 +415,6 @@ ALLOWLIST: dict[str, dict[str, int]] = {
         "dag_abandon_structural_intent": 1,
         "dag_drop_structural_intents_recording_lost_provenance": 1,
         "dag_adopt_structural_directory": 1,
-        "dag_rekey_structural_origin": 1,
         "dag_forget_structural_origin": 1,
         "record_retained_directory": 1,
         "clear_retained_directory": 2,
@@ -550,6 +549,14 @@ ALLOWLIST: dict[str, dict[str, int]] = {
         "set_materialization_state_in_tx": 1,
         "retire_unproven_actual_state_in_tx": 1,
     },
+    # A snapshot install's reconciliation that keeps a directory where an
+    # installed entry belongs moves the entry to its copy name, releases
+    # the path's hold and records the directory as retained in one
+    # transaction: a crash between the two would leave the directory
+    # unrecorded with nothing held to bring the path back (P9-C).
+    S + "snapshot_install_hold.rs": {
+        "record_retained_directory": 1,
+    },
     # A structural `mkdir` bumps the path's fence as it records its intent,
     # and the intent's completion refuses a fence that moved since; a
     # rename's rekey forgets the record at the old name.
@@ -610,7 +617,7 @@ ALLOWLIST: dict[str, dict[str, int]] = {
 #   O daemon/replica_coordinator/materialization_owner/hydration.rs 14
 #   O daemon/replica_coordinator/materialization_owner/lanes.rs 25
 #   O daemon/replica_coordinator/materialization_owner/repair.rs 16
-#   O daemon/replica_coordinator/materialization_owner/structural.rs 12
+#   O daemon/replica_coordinator/materialization_owner/structural.rs 11
 #   O daemon/replica_coordinator/peer_replica_state.rs          18
 #   R sync-sqlite/change_history.rs                              2
 #   R sync-sqlite/dag_store/mod.rs                               2
@@ -621,10 +628,11 @@ ALLOWLIST: dict[str, dict[str, int]] = {
 #   R sync-sqlite/rebootstrap_store.rs                           2
 #   R sync-sqlite/remote_admission.rs                            2
 #   R sync-sqlite/restore_operation.rs                           4
+#   R sync-sqlite/snapshot_install_hold.rs                       1
 #   R sync-sqlite/store.rs                                      12
 #   R sync-sqlite/structural_origin.rs                           3
 #   ------------------------------------------------------------
-#   total 248 = lane 63 + owner 113 + repository 72
+#   total 248 = lane 63 + owner 112 + repository 73
 EXPECTED_ALLOWED = 248
 
 # The in-family row mutators outside `FORBIDDEN`. Each also writes

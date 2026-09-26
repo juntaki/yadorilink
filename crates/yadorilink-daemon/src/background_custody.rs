@@ -403,7 +403,7 @@ pub(crate) async fn run_cycle(
 
     // A timed-out fan-out is treated exactly like "nobody corroborated" --
     // fail closed, matching every other unconfirmed outcome here.
-    let Some((peer_id, roots_digest_matched)) = settled.ok().and_then(|_| corroborating) else {
+    let Some((peer_id, roots_digest_matched)) = settled.ok().and(corroborating) else {
         return publish_negative(reason);
     };
 

@@ -435,6 +435,75 @@ impl HomeApp {
         }
     }
 
+    /// A folder card's title row: name, badges, peer count, and the buttons
+    /// that open its own windows.
+    fn folder_title_row(
+        &self,
+        ui: &mut egui::Ui,
+        link: &yadorilink_ipc_proto::daemonctl::LinkStatus,
+        folder: &FolderSummary,
+    ) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(&folder.name).strong());
+            ui.label(state_badge(folder.state));
+            ui.label(mode_badge(folder.mode));
+            if let Some(count) = self.peer_counts.get(&folder.group_id) {
+                ui.label(egui::RichText::new(format!("{count} peer(s)")).weak());
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Details…").clicked() {
+                    crate::actions::spawn_window_with_path("folder-status", &link.local_path);
+                }
+                if ui.button("Share…").clicked() {
+                    crate::actions::spawn_window_with_path("share", &link.local_path);
+                }
+            });
+        });
+    }
+
+    /// A folder card's pause and mode controls. Records a click in
+    /// `pause_clicked`/`mode_clicked` for `render_folders` to act on after
+    /// the loop.
+    fn folder_controls_row(
+        &self,
+        ui: &mut egui::Ui,
+        link: &yadorilink_ipc_proto::daemonctl::LinkStatus,
+        folder: &FolderSummary,
+        pause_clicked: &mut Option<(String, bool)>,
+        mode_clicked: &mut Option<(String, bool, String)>,
+    ) {
+        ui.horizontal(|ui| {
+            let pausing = self.pause_in_flight.contains(&link.local_path);
+            let pause_label = if folder.paused { "Resume" } else { "Pause" };
+            if ui.add_enabled(!pausing, egui::Button::new(pause_label)).clicked() {
+                *pause_clicked = Some((link.local_path.clone(), !folder.paused));
+            }
+            if pausing {
+                ui.spinner();
+            }
+
+            ui.add_space(12.0);
+            ui.label("Mode:");
+            let switching = self.mode_switch_in_flight.contains(&folder.group_id);
+            ui.add_enabled_ui(!switching, |ui| {
+                let mut mode = folder.mode;
+                if ui.radio_value(&mut mode, FolderMode::Synced, "Synced").clicked()
+                    && folder.mode != FolderMode::Synced
+                {
+                    *mode_clicked = Some((folder.group_id.clone(), false, folder.name.clone()));
+                }
+                if ui.radio_value(&mut mode, FolderMode::Selective, "Selective").clicked()
+                    && folder.mode != FolderMode::Selective
+                {
+                    *mode_clicked = Some((folder.group_id.clone(), true, folder.name.clone()));
+                }
+            });
+            if switching {
+                ui.spinner();
+            }
+        });
+    }
+
     fn render_folders(&mut self, ui: &mut egui::Ui) {
         ui.label(egui::RichText::new("Folders").strong());
         if self.status.is_some() && self.links().is_empty() {
@@ -453,25 +522,7 @@ impl HomeApp {
             let folder = FolderSummary::from(link);
             ui.add_space(6.0);
             egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(&folder.name).strong());
-                    ui.label(state_badge(folder.state));
-                    ui.label(mode_badge(folder.mode));
-                    if let Some(count) = self.peer_counts.get(&folder.group_id) {
-                        ui.label(egui::RichText::new(format!("{count} peer(s)")).weak());
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Details…").clicked() {
-                            crate::actions::spawn_window_with_path(
-                                "folder-status",
-                                &link.local_path,
-                            );
-                        }
-                        if ui.button("Share…").clicked() {
-                            crate::actions::spawn_window_with_path("share", &link.local_path);
-                        }
-                    });
-                });
+                self.folder_title_row(ui, link, &folder);
                 ui.label(egui::RichText::new(&folder.local_path).weak().small());
 
                 // Durability/health -- otherwise only visible by opening
@@ -497,38 +548,7 @@ impl HomeApp {
                     );
                 }
 
-                ui.horizontal(|ui| {
-                    let pausing = self.pause_in_flight.contains(&link.local_path);
-                    let pause_label = if folder.paused { "Resume" } else { "Pause" };
-                    if ui.add_enabled(!pausing, egui::Button::new(pause_label)).clicked() {
-                        pause_clicked = Some((link.local_path.clone(), !folder.paused));
-                    }
-                    if pausing {
-                        ui.spinner();
-                    }
-
-                    ui.add_space(12.0);
-                    ui.label("Mode:");
-                    let switching = self.mode_switch_in_flight.contains(&folder.group_id);
-                    ui.add_enabled_ui(!switching, |ui| {
-                        let mut mode = folder.mode;
-                        if ui.radio_value(&mut mode, FolderMode::Synced, "Synced").clicked()
-                            && folder.mode != FolderMode::Synced
-                        {
-                            mode_clicked =
-                                Some((folder.group_id.clone(), false, folder.name.clone()));
-                        }
-                        if ui.radio_value(&mut mode, FolderMode::Selective, "Selective").clicked()
-                            && folder.mode != FolderMode::Selective
-                        {
-                            mode_clicked =
-                                Some((folder.group_id.clone(), true, folder.name.clone()));
-                        }
-                    });
-                    if switching {
-                        ui.spinner();
-                    }
-                });
+                self.folder_controls_row(ui, link, &folder, &mut pause_clicked, &mut mode_clicked);
 
                 if folder.mode == FolderMode::Selective {
                     ui.label(

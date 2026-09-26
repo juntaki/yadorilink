@@ -479,11 +479,14 @@ pub fn plan_retroactive_merge(
 /// per-path walk directly, but still useful for the caller's own diagnostics
 /// and any future shared-decode optimization) narrows almost every call to
 /// zero candidate paths at O(reachable changes) total, not per path.
+/// Changes decoded along the way, keyed by change hash.
+type DecodedChanges = std::collections::HashMap<[u8; 32], Change>;
+
 fn paths_that_can_have_concurrent_heads(
     conn: &Connection,
     group_id: &str,
     frontier: &[ChangeHash],
-) -> Result<(Vec<String>, std::collections::HashMap<[u8; 32], Change>), SyncSqliteError> {
+) -> Result<(Vec<String>, DecodedChanges), SyncSqliteError> {
     // Fast, group-scoped, fully-indexed existence check: this function can
     // only ever find something if SOME change in this group's retained
     // history has more than one child (a fork from a common ancestor -- one

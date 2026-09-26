@@ -40,8 +40,17 @@ pub trait CheckpointSource: Send + Sync {
         request_id: &'a str,
         merkle_root: [u8; 32],
         leaf_count: u64,
-    ) -> Pin<Box<dyn Future<Output = Option<(AuthorizationCheckpoint, [u8; 64])>> + Send + 'a>>;
+    ) -> CheckpointFuture<'a>;
 }
+
+/// What [`CheckpointSource::request_authorization_checkpoint`] resolves to: the signed checkpoint and
+/// its signature, or `None` when none could be obtained.
+pub type CheckpointFuture<'a> =
+    Pin<Box<dyn Future<Output = Option<(AuthorizationCheckpoint, [u8; 64])>> + Send + 'a>>;
+
+/// Resolves the authority key for a checkpoint's `(key_id, policy_head)`.
+pub type AuthorityKeyResolver<'a> =
+    dyn Fn(&[u8; 32], &[u8; 32]) -> Option<VerifyingKey> + Send + Sync + 'a;
 
 /// The real [`CheckpointSource`] — a thin wrapper over
 /// `coordination_client::request_authorization_checkpoint`, holding plain
@@ -65,8 +74,7 @@ impl CheckpointSource for ProductionCheckpointSource {
         request_id: &'a str,
         merkle_root: [u8; 32],
         leaf_count: u64,
-    ) -> Pin<Box<dyn Future<Output = Option<(AuthorizationCheckpoint, [u8; 64])>> + Send + 'a>>
-    {
+    ) -> CheckpointFuture<'a> {
         Box::pin(async move {
             crate::coordination_client::request_authorization_checkpoint(
                 &self.coordination_addr,
@@ -210,7 +218,7 @@ pub async fn flush_pending_checkpoint(
     group_id: &str,
     device_id: &str,
     own_signing_public_key: &VerifyingKey,
-    resolve_authority_key: &(dyn Fn(&[u8; 32], &[u8; 32]) -> Option<VerifyingKey> + Send + Sync),
+    resolve_authority_key: &AuthorityKeyResolver<'_>,
 ) -> Result<FlushOutcome, FlushError> {
     let pending: Vec<ChangeHash> =
         db.read(|conn| published_view::pending_local_changes_for_group(conn, group_id, device_id))?;

@@ -125,6 +125,8 @@ pub struct PublishedEvidence<'a> {
 /// published Change re-attached under a DIFFERENT `checkpoint_hash` or
 /// `merkle_proof` is `CorruptState`, never a silent overwrite or a
 /// silent no-op that hides the mismatch.
+// One argument per stored checkpoint column; ~40 call sites use this shape.
+#[allow(clippy::too_many_arguments)]
 pub fn attach_authorization_evidence(
     conn: &Connection,
     checkpoint_hash: &[u8; 32],
@@ -159,6 +161,8 @@ pub fn attach_authorization_evidence(
 /// SQLite rejecting a nested `BEGIN`. The public function above is this
 /// plus its own transaction, for a caller (local checkpoint flush) that
 /// has nothing else to enlist it in.
+// Same parameter list as `attach_authorization_evidence`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn attach_authorization_evidence_on_conn(
     conn: &Connection,
     checkpoint_hash: &[u8; 32],
@@ -172,7 +176,9 @@ pub(crate) fn attach_authorization_evidence_on_conn(
 ) -> Result<(), SyncSqliteError> {
     let tx = conn;
 
-    let existing_checkpoint: Option<(String, String, i64, Vec<u8>, Vec<u8>, Vec<u8>)> = tx
+    /// `(group_id, device_id, checkpoint_seq, encoded, signature, author key)`.
+    type StoredCheckpoint = (String, String, i64, Vec<u8>, Vec<u8>, Vec<u8>);
+    let existing_checkpoint: Option<StoredCheckpoint> = tx
         .query_row(
             "SELECT group_id, device_id, checkpoint_seq, encoded, signature, \
              author_signing_public_key FROM authorization_checkpoints WHERE checkpoint_hash = ?1",
@@ -246,6 +252,13 @@ pub(crate) fn attach_authorization_evidence_on_conn(
     Ok(())
 }
 
+/// `(checkpoint_hash, merkle_proof)` -- see [`change_evidence`].
+pub type ChangeEvidenceRef = ([u8; 32], Vec<u8>);
+
+/// `(encoded, signature, author_signing_public_key)` -- see
+/// [`checkpoint_envelope`].
+pub type CheckpointEnvelope = (Vec<u8>, Vec<u8>, [u8; 32]);
+
 /// One published Change's evidence reference: which checkpoint covers it,
 /// and its own Merkle inclusion proof (opaque bytes -- see
 /// [`attach_authorization_evidence`]'s own doc comment on why this module
@@ -253,7 +266,7 @@ pub(crate) fn attach_authorization_evidence_on_conn(
 pub fn change_evidence(
     conn: &Connection,
     change_hash: &ChangeHash,
-) -> Result<Option<([u8; 32], Vec<u8>)>, SyncSqliteError> {
+) -> Result<Option<ChangeEvidenceRef>, SyncSqliteError> {
     let row: Option<(Vec<u8>, Vec<u8>)> = conn
         .query_row(
             "SELECT checkpoint_hash, merkle_proof FROM change_authorization WHERE change_hash = ?1",
@@ -277,7 +290,7 @@ pub fn change_evidence(
 pub fn checkpoint_envelope(
     conn: &Connection,
     checkpoint_hash: &[u8; 32],
-) -> Result<Option<(Vec<u8>, Vec<u8>, [u8; 32])>, SyncSqliteError> {
+) -> Result<Option<CheckpointEnvelope>, SyncSqliteError> {
     let row: Option<(Vec<u8>, Vec<u8>, Vec<u8>)> = conn
         .query_row(
             "SELECT encoded, signature, author_signing_public_key \
@@ -530,7 +543,13 @@ pub fn published_snapshot_files(
         })
     })?;
     let mut rows: Vec<SnapshotFile> = rows.collect::<Result<Vec<_>, _>>()?;
-    reproject_published_current_state(&mut rows);
+    let with_current: std::collections::HashSet<String> = {
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT path FROM files WHERE group_id = ?1 AND state = 'current'")?;
+        let paths = stmt.query_map([group_id], |row| row.get::<_, String>(0))?;
+        paths.collect::<Result<_, _>>()?
+    };
+    reproject_published_current_state(&mut rows, &with_current);
     Ok(rows)
 }
 
@@ -559,8 +578,17 @@ pub fn published_snapshot_files(
 /// case as well as the ordinary "was already raw-`superseded`" case
 /// identically, since both must read the same way once projected into
 /// the published-only world.
+///
+/// Only a path that has a current row at all has a current version to
+/// re-derive. A path in `with_current` has one, published or not. A path
+/// outside it holds history only -- a base install leaves that where the
+/// path's row moved away, a leaf relocated to its copy name when the path
+/// became a directory -- and nothing there is current in any world: its
+/// newest row stays history rather than coming back to life as the path's
+/// live row.
 fn reproject_published_current_state(
     rows: &mut [yadorilink_replica_engine::rebootstrap_snapshot::SnapshotFile],
+    with_current: &std::collections::HashSet<String>,
 ) {
     use yadorilink_replica_engine::rebootstrap_snapshot::SnapshotVersionState;
 
@@ -576,7 +604,11 @@ fn reproject_published_current_state(
             }
         }
         if rows[end].state != SnapshotVersionState::Trashed {
-            rows[end].state = SnapshotVersionState::Current;
+            rows[end].state = if with_current.contains(&rows[end].record.path) {
+                SnapshotVersionState::Current
+            } else {
+                SnapshotVersionState::Superseded
+            };
         }
         start = end + 1;
     }

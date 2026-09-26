@@ -891,7 +891,12 @@ async fn displacement_stopped_then_restarted(stage: Stage, stop: Stop) {
     let x = version_for(&h.state, &h.store, b"file a/x");
     h.admit("a/x", &x, &h.emitter);
     let heads = h.state.dag_group_heads(GROUP).unwrap();
-    let leaves = [h.root.path().join("a"), h.root.path().canonicalize().unwrap().join("a")];
+    // The pass may see the root under either spelling (macOS tempdirs sit
+    // behind the /var -> /private/var symlink). Where both are the same
+    // path, arming it twice would leave one stop armed after the pass
+    // fired the other, so arm each distinct path once.
+    let mut leaves = vec![h.root.path().join("a"), h.root.path().canonicalize().unwrap().join("a")];
+    leaves.dedup();
     for leaf in &leaves {
         displacement_crash::arm(leaf, stage, stop);
     }
@@ -965,6 +970,308 @@ async fn an_error_after_the_copy_is_written_converges_on_the_next_pass() {
 #[tokio::test]
 async fn an_error_after_the_unlink_converges_on_the_next_pass() {
     displacement_stopped_then_restarted(Stage::BeforeRowErase, Stop::Error).await;
+}
+
+// --- P9-C: directory materialization steps, stopped and restarted --------
+//
+// Every step of materializing the namespace's directories that writes the
+// disk and the index separately: making a structural container, adopting
+// a superseded directory entry's directory as structural, and removing a
+// directory made for descendants or one an entry supersedes. Each is
+// stopped right after its disk write -- by a crash that ends the pass (then
+// startup repair runs, as after a restart), or by an error the pass goes
+// on past -- and the passes after it must converge to the tree an
+// uninterrupted pass builds, authoring nothing, leaving no directory
+// record (structural or retained) for a directory that is gone and no
+// intent open.
+
+/// Stops the pass over `crashing` at `stage` on the path `at`, then runs
+/// startup repair and two passes over `restart`, each of which must settle
+/// every path. Returns a label for the stop.
+async fn namespace_step_stopped_then_restarted(
+    h: &Harness,
+    stage: Stage,
+    stop: Stop,
+    at: &str,
+    crashing: &[&str],
+    restart: &[&str],
+) -> String {
+    let what = format!("{stage:?} {stop:?} at {at}");
+    let heads = h.state.dag_group_heads(GROUP).unwrap();
+    let targets = [h.root.path().join(at), h.root.path().canonicalize().unwrap().join(at)];
+    for target in &targets {
+        displacement_crash::arm(target, stage, stop);
+    }
+    let convergence = h.convergence.clone();
+    let paths: std::collections::BTreeSet<String> =
+        crashing.iter().map(|path| path.to_string()).collect();
+    let stopped =
+        tokio::spawn(async move { convergence.reconcile_paths(GROUP, paths).await.map(|_| ()) })
+            .await;
+    let reached = targets.iter().any(|target| !displacement_crash::is_armed(target, stage));
+    for target in &targets {
+        displacement_crash::disarm(target, stage);
+    }
+    assert!(reached, "{what}: the pass never reached the stop: {:?}", h.tree());
+    if stop == Stop::Crash {
+        assert!(stopped.is_err(), "{what}: {stopped:?}");
+    }
+
+    yadorilink_filesystem_sync::materialization_repair::repair_interrupted_materializations(
+        h.state.as_ref(),
+        h.store.as_ref(),
+        h.root.path(),
+        GROUP,
+        yadorilink_filesystem_sync::materialization_repair::RepairMode::Startup,
+        &RootCommitPermit::for_tests(),
+    )
+    .unwrap();
+    let attempt = h.pass(restart).await;
+    assert!(attempt.retry.is_empty(), "{what}: {:?} {:?}", attempt.retry, h.tree());
+    let again = h.pass(restart).await;
+    assert!(again.retry.is_empty(), "{what}: {:?}", again.retry);
+    assert_eq!(h.state.dag_group_heads(GROUP).unwrap(), heads, "{what}: authored a change");
+    for path in crashing.iter().chain(restart) {
+        assert!(
+            !h.state
+                .materialization_intent_repository()
+                .has_materialization_intent(GROUP, path)
+                .unwrap(),
+            "{what}: an interrupted intent is still open at {path}"
+        );
+    }
+    what
+}
+
+/// No directory record -- structural origin or retained -- for `path`,
+/// which holds no directory any more.
+fn assert_no_directory_record(h: &Harness, path: &str, what: &str) {
+    assert!(
+        matches!(
+            h.state.sqlite().dag_structural_directory_origin(GROUP, path).unwrap(),
+            yadorilink_sync_sqlite::structural_origin::StructuralDirectoryOrigin::None
+        ),
+        "{what}: {path} holds no directory and is still recorded as structural"
+    );
+    assert_eq!(
+        h.state.sqlite().retained_directory_reason(GROUP, path).unwrap(),
+        None,
+        "{what}: {path} holds no directory and is still recorded as retained"
+    );
+}
+
+const STOPS: [Stop; 2] = [Stop::Crash, Stop::Error];
+
+/// Making the structural container File `a` leaves for `a/x`, stopped
+/// right after the `mkdir`: the container stays structural, and goes (with
+/// the file back at its name) once `a/x` is deleted.
+#[tokio::test]
+async fn a_structural_container_stopped_after_its_mkdir_converges() {
+    for stop in STOPS {
+        let h = Harness::new();
+        let a = version_for(&h.state, &h.store, b"file a");
+        h.admit("a", &a, &h.emitter);
+        assert!(h.pass(&["a"]).await.is_settled("a"));
+        let x = version_for(&h.state, &h.store, b"file a/x");
+        h.admit("a/x", &x, &h.emitter);
+
+        let what = namespace_step_stopped_then_restarted(
+            &h,
+            Stage::AfterStructuralMkdir,
+            stop,
+            "a",
+            &["a/x"],
+            &["a", "a/x"],
+        )
+        .await;
+
+        assert_eq!(
+            h.tree(),
+            vec![
+                ("a".to_string(), None),
+                (h.copies_of("a")[0].0.clone(), Some(b"file a".to_vec())),
+                ("a/x".to_string(), Some(b"file a/x".to_vec())),
+            ],
+            "{what}"
+        );
+        assert_eq!(h.structural_status("a"), StructuralOriginStatus::Structural, "{what}");
+
+        h.admit_delete("a/x", &h.emitter);
+        assert!(h.pass(&["a/x"]).await.retry.is_empty(), "{what}");
+        h.retire_copies().await;
+        assert_eq!(holding(&h, b"file a"), vec!["a".to_string()], "{what}: {:?}", h.tree());
+    }
+}
+
+/// A peer's `rm -rf`, stopped right after the deepest directory made for
+/// it is removed: the rest of the tree still goes, and no record of either
+/// directory is left.
+#[tokio::test]
+async fn a_structural_rmdir_stopped_before_its_record_is_forgotten_converges() {
+    for stop in STOPS {
+        let h = Harness::new();
+        let makefile = version_for(&h.state, &h.store, b"all:");
+        let setup = version_for(&h.state, &h.store, b"int main;");
+        h.admit_many(
+            vec![create_op("linux/Makefile", &makefile), create_op("linux/arch/setup.c", &setup)],
+            &[makefile.clone(), setup.clone()],
+        );
+        assert!(h.pass(&["linux/Makefile", "linux/arch/setup.c"]).await.retry.is_empty());
+        h.admit_many(vec![delete("linux/Makefile"), delete("linux/arch/setup.c")], &[]);
+
+        let paths = ["linux/Makefile", "linux/arch/setup.c"];
+        let what = namespace_step_stopped_then_restarted(
+            &h,
+            Stage::AfterStructuralRmdir,
+            stop,
+            "linux/arch",
+            &paths,
+            &paths,
+        )
+        .await;
+
+        assert!(h.tree().is_empty(), "{what}: left behind: {:?}", h.tree());
+        for path in ["linux", "linux/arch"] {
+            assert_no_directory_record(&h, path, &what);
+        }
+    }
+}
+
+/// A replicated directory replaced by a file, stopped right after the
+/// empty directory is removed: the file takes the name, and no record of
+/// the directory is left. `a` is an explicit entry here and never had a
+/// structural or retained record, so the last assertion only guards
+/// against one appearing; the retained record a stop can leave behind is
+/// the next test's.
+#[tokio::test]
+async fn a_superseded_directory_rmdir_stopped_before_its_record_is_forgotten_converges() {
+    for stop in STOPS {
+        let h = Harness::new();
+        let x = version_for(&h.state, &h.store, b"file a/x");
+        h.admit_many(
+            vec![create_op("a", &FileVersion::directory(None)), create_op("a/x", &x)],
+            &[FileVersion::directory(None), x.clone()],
+        );
+        assert!(h.pass(&["a", "a/x"]).await.retry.is_empty());
+        let file = version_for(&h.state, &h.store, b"now a file");
+        h.admit_many(vec![delete("a/x"), create_op("a", &file)], std::slice::from_ref(&file));
+
+        let what = namespace_step_stopped_then_restarted(
+            &h,
+            Stage::AfterSupersededRmdir,
+            stop,
+            "a",
+            &["a", "a/x"],
+            &["a", "a/x"],
+        )
+        .await;
+
+        assert_eq!(h.tree(), vec![("a".to_string(), Some(b"now a file".to_vec()))], "{what}");
+        assert!(h.copies_of("a").is_empty(), "{what}: {:?}", h.tree());
+        assert_no_directory_record(&h, "a", &what);
+    }
+}
+
+/// A replicated directory replaced by a file while the user's own file
+/// kept it on disk: it is retained, removable once empty, and the file
+/// waits at its copy name. Once the user's file is gone, the pass removes
+/// the directory and is stopped before the retained record is forgotten:
+/// the restart must forget it, the file takes the name and its copy
+/// retires.
+#[tokio::test]
+async fn a_retained_superseded_directory_rmdir_stopped_before_its_record_is_forgotten_converges() {
+    for stop in STOPS {
+        let h = Harness::new();
+        let x = version_for(&h.state, &h.store, b"file a/x");
+        h.admit_many(
+            vec![create_op("a", &FileVersion::directory(None)), create_op("a/x", &x)],
+            &[FileVersion::directory(None), x.clone()],
+        );
+        assert!(h.pass(&["a", "a/x"]).await.retry.is_empty());
+        std::fs::write(h.root.path().join("a/.DS_Store"), b"finder").unwrap();
+        let file = version_for(&h.state, &h.store, b"now a file");
+        h.admit_many(vec![delete("a/x"), create_op("a", &file)], std::slice::from_ref(&file));
+        assert!(h.pass(&["a", "a/x"]).await.retry.is_empty());
+        assert!(
+            h.state.sqlite().retained_directory_reason(GROUP, "a").unwrap().is_some(),
+            "{stop:?}: the directory the user's file keeps is not retained: {:?}",
+            h.tree()
+        );
+        assert_eq!(h.copies_of("a").len(), 1, "{stop:?}: {:?}", h.tree());
+
+        std::fs::remove_file(h.root.path().join("a/.DS_Store")).unwrap();
+        let what = namespace_step_stopped_then_restarted(
+            &h,
+            Stage::AfterSupersededRmdir,
+            stop,
+            "a",
+            &["a"],
+            &["a"],
+        )
+        .await;
+
+        h.retire_copies().await;
+        assert_eq!(holding(&h, b"now a file"), vec!["a".to_string()], "{what}: {:?}", h.tree());
+        assert_no_directory_record(&h, "a", &what);
+    }
+}
+
+/// A superseded explicit Directory entry kept for a concurrent child,
+/// stopped after its directory is adopted as structural and before the
+/// entry's row is erased: the next pass erases it, the directory stays
+/// structural, and it goes (with the file back) after the last child.
+#[tokio::test]
+async fn a_superseded_directory_entry_stopped_before_it_is_retired_converges() {
+    for stop in STOPS {
+        let h = Harness::new();
+        let x = version_for(&h.state, &h.store, b"file a/x");
+        let base = h.admit_many(
+            vec![create_op("a", &FileVersion::directory(None)), create_op("a/x", &x)],
+            &[FileVersion::directory(None), x.clone()],
+        );
+        assert!(h.pass(&["a", "a/x"]).await.retry.is_empty());
+        let file = version_for(&h.state, &h.store, b"now a file");
+        h.admit_many(vec![delete("a/x"), create_op("a", &file)], std::slice::from_ref(&file));
+        let peer = ChangeEmitter::new("device-peer", SigningKey::from_bytes(&[5u8; 32]));
+        let y = version_for(&h.state, &h.store, b"a concurrent child");
+        h.admit_onto(
+            vec![base.change_hash()],
+            vec![create_op("a/y", &y)],
+            std::slice::from_ref(&y),
+            &peer,
+        );
+
+        let paths = ["a", "a/x", "a/y"];
+        let what = namespace_step_stopped_then_restarted(
+            &h,
+            Stage::BeforeEntryRetired,
+            stop,
+            "a",
+            &paths,
+            &paths,
+        )
+        .await;
+
+        assert!(h.root.path().join("a").is_dir(), "{what}: {:?}", h.tree());
+        assert_eq!(std::fs::read(h.root.path().join("a/y")).unwrap(), b"a concurrent child");
+        assert_eq!(holding(&h, b"now a file").len(), 1, "{what}: {:?}", h.tree());
+        assert!(
+            h.state.get_file(GROUP, "a").unwrap().is_none_or(|row| row.deleted),
+            "{what}: the superseded Directory row is still live"
+        );
+        assert_eq!(h.structural_status("a"), StructuralOriginStatus::Structural, "{what}");
+
+        h.admit_delete("a/y", &h.emitter);
+        assert!(h.pass(&["a/y"]).await.retry.is_empty(), "{what}");
+        h.retire_copies().await;
+        assert_eq!(
+            std::fs::read(h.root.path().join("a")).unwrap(),
+            b"now a file",
+            "{what}: {:?}",
+            h.tree()
+        );
+        assert_no_directory_record(&h, "a", &what);
+    }
 }
 
 /// What sits at a conflict-copy name of `source` directly beside it:

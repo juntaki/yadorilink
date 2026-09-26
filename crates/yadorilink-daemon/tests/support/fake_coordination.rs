@@ -1049,7 +1049,7 @@ async fn serve_endpoint_report(
                         let mut candidates = req.candidates;
                         // Best first, matching what the real plane's
                         // `ORDER BY priority ASC` yields for a netmap read.
-                        candidates.sort_by(|a, b| b.priority.cmp(&a.priority));
+                        candidates.sort_by_key(|c| std::cmp::Reverse(c.priority));
                         let endpoints: Vec<String> =
                             candidates.into_iter().map(|c| c.address).collect();
                         let moved = device.endpoints != endpoints;

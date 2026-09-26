@@ -27,6 +27,7 @@ mod lanes;
 mod repair;
 mod structural;
 
+#[cfg(test)]
 pub(crate) use structural::STALE_STRUCTURAL_INTENT_AGE;
 
 #[cfg(test)]

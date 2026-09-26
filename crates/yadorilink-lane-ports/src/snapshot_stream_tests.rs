@@ -163,6 +163,34 @@ impl tokio::io::AsyncWrite for CountingSink {
     }
 }
 
+/// The far end of the responsiveness test: floods the history lane and
+/// echoes the reconciliation lane byte by byte.
+async fn serve_competing_lane(lane: &mut yadorilink_sync_substrate::LaneStream) {
+    match lane.lane() {
+        // Holds the snapshot stream open, sending slowly, exactly
+        // as a real one competing for the connection would.
+        Lane::History => {
+            let chunk = vec![0u8; 64 * 1024];
+            loop {
+                if lane.write_all(&chunk).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+        Lane::Reconciliation => {
+            let mut byte = [0u8; 1];
+            while lane.read_exact(&mut byte).await.is_ok() {
+                if lane.write_all(&byte).await.is_err() {
+                    return;
+                }
+                let _ = lane.flush().await;
+            }
+        }
+        _ => {}
+    }
+}
+
 /// The reason the history lane is a lane at all: a large snapshot in flight
 /// must not make reconciliation wait.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -174,31 +202,7 @@ async fn reconciliation_stays_responsive_while_a_snapshot_is_in_flight() {
     let serving = tokio::spawn(async move {
         let link = inbound.recv().await.unwrap();
         while let Ok(mut lane) = link.accept_lane().await {
-            tokio::spawn(async move {
-                match lane.lane() {
-                    // Holds the snapshot stream open, sending slowly, exactly
-                    // as a real one competing for the connection would.
-                    Lane::History => {
-                        let chunk = vec![0u8; 64 * 1024];
-                        loop {
-                            if lane.write_all(&chunk).await.is_err() {
-                                return;
-                            }
-                            tokio::time::sleep(Duration::from_millis(1)).await;
-                        }
-                    }
-                    Lane::Reconciliation => {
-                        let mut byte = [0u8; 1];
-                        while lane.read_exact(&mut byte).await.is_ok() {
-                            if lane.write_all(&byte).await.is_err() {
-                                return;
-                            }
-                            let _ = lane.flush().await;
-                        }
-                    }
-                    _ => {}
-                }
-            });
+            tokio::spawn(async move { serve_competing_lane(&mut lane).await });
         }
     });
 

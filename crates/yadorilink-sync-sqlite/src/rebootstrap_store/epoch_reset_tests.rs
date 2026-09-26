@@ -257,8 +257,8 @@ fn create_signed_for_tests_on_genesis(
 
 /// The first change an author writes above the seal names no predecessor,
 /// sits one past the position the base carries, is signed on the base and
-/// clocked from its ceiling -- and, with nothing of the old history left
-/// beside it, it alone is the path's head.
+/// clocked from its ceiling -- and, naming the head the base carried at the
+/// path it writes, it alone is the path's head.
 #[test]
 fn the_first_change_above_a_seal_opens_the_epoch_on_the_base() {
     let conn = open();
@@ -266,13 +266,19 @@ fn the_first_change_above_a_seal_opens_the_epoch_on_the_base() {
     let base = seal(&conn).history_base();
     store_versions(&conn);
 
-    let b3 = on_base(
-        base,
-        "device-b",
-        h.b2.author_seq.get() + 1,
-        None,
+    let b3 = Change::create_signed_observing(
+        Vec::new(),
         h.c1.lamport,
+        DeviceId("device-b".to_string()),
+        AuthorSeq(h.b2.author_seq.get() + 1),
+        None,
+        FolderGroupId(GROUP.to_string()),
+        HistoryEpoch::Base(base),
+        yadorilink_replica_domain::change::ChangePurpose::Ordinary,
+        None,
+        vec![h.c1.compute_hash()],
         vec![put("q", &version(5))],
+        &key("device-b"),
     );
     assert_eq!(b3.lamport, h.c1.lamport + 1);
     let outcome = crate::dag_store::admit_change(&conn, &b3).unwrap().outcome;
@@ -405,7 +411,7 @@ fn a_seal_interrupted_after_any_step_leaves_the_group_exactly_as_it_was() {
                     assert_every_author_anchored_on(&tx, base);
                     assert_eq!(retained, absorbed(&h).len(), "history retired too early");
                 }
-                EpochResetStep::HistoryRetired => {
+                EpochResetStep::HistoryRetired | EpochResetStep::WitnessesCollected => {
                     assert_eq!(history_base(&tx, GROUP).unwrap(), Some(base));
                     assert_eq!(retained, 0, "absorbed history still retained");
                     assert_eq!(group_rows(&tx, "changes"), 0);

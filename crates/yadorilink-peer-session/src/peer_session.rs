@@ -21,32 +21,21 @@
 //! boundary; causal ordering itself is cryptographically bound to DAG
 //! ancestry rather than a peer-asserted counter.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::io::Read as _;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex};
 
-use futures_util::stream::{FuturesUnordered, StreamExt};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use crate::adaptive_window::AdaptiveWindow;
 use crate::error::PeerSessionError;
-use crate::hazard;
 use crate::rate_limiter::RateLimiters;
-use yadorilink_local_storage::{
-    apply_unix_mode, apply_xattrs, reconstruct_file, verify_write_target_within_root,
-};
-use yadorilink_replica_domain::admission::ChangeOrdering;
-use yadorilink_replica_domain::file::FileVersion;
-use yadorilink_replica_domain::file::{BlockInfo, FileRecord, RecordKind};
+use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
 use yadorilink_replica_domain::ids::ChangeHash;
-use yadorilink_replica_domain::session_state::LinkGate;
-use yadorilink_replica_domain::session_state::{MaterializationPolicy, MaterializationState};
-use yadorilink_replica_engine::conflict::PathHead;
-use yadorilink_root_authority::root_commit::RootCommitPermit;
 
 mod block_fetch;
 mod block_serving;
@@ -271,22 +260,6 @@ pub fn set_test_clock_override(nanos: i64) {
     DETERMINISTIC_CLOCK_OVERRIDE
         .get_or_init(|| std::sync::atomic::AtomicI64::new(nanos))
         .store(nanos, std::sync::atomic::Ordering::SeqCst);
-}
-
-/// The current wall-clock time as
-/// `held_since_unix_nanos` — same shape as `resolve_and_apply_conflict`'s
-/// own `now_unix_nanos` need (kept as a small shared free function rather
-/// than duplicated further, since `hold_record`'s and `hydrate_file_with_
-/// timeout`'s hazard branches both need it too).
-pub(crate) fn now_unix_nanos() -> i64 {
-    #[cfg(turmoil)]
-    if let Some(override_nanos) = DETERMINISTIC_CLOCK_OVERRIDE.get() {
-        return override_nanos.load(std::sync::atomic::Ordering::SeqCst);
-    }
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0)
 }
 
 /// What [`spawn_blocking`] hands back: a real `JoinHandle` in production,
@@ -514,9 +487,6 @@ pub struct PeerSyncSession {
     /// other peer this device is connected to. `None` for callers (tests,
     /// mainly) that don't need multi-peer forwarding.
     forward_tx: Option<mpsc::UnboundedSender<(String, FileRecord)>>,
-    /// group_id -> cumulative blocks admitted to eager fetch
-    /// so far this session — see `MAX_EAGER_BLOCKS_PER_GROUP_PER_SESSION`.
-    eager_admission: StdMutex<HashMap<String, u64>>,
     /// This session's upload/
     /// download token buckets, gating `handle_block_request`'s outbound
     /// send and `fetch_block`'s inbound receive respectively. Starts
@@ -537,16 +507,6 @@ pub struct PeerSyncSession {
     /// reply); read by `fetch_window` — the daemon's multi-peer dispatcher
     /// consults this in place of the old fixed per-candidate lane count.
     adaptive_window: AdaptiveWindow,
-    /// This session's
-    /// caller-injected way to force-flush a path's pending local debounce
-    /// entry before reconciling it against a peer update — see
-    /// `PendingLocalChangeFlush`'s doc comment. Set once at construction
-    /// (`PeerSyncSessionDeps`); a caller with nothing real to inject
-    /// passes a no-op implementation, which makes `reconcile_one_file`'s
-    /// guard a no-op, i.e. the same behavior an absent handle used to
-    /// produce. Only `yadorilink-daemon`'s real construction site wires up
-    /// an actual handle.
-    pending_local_change_flush: Arc<dyn PendingLocalChangeFlush>,
     /// Kept so a session can be constructed with the same dependency set as
     /// before, and so the daemon has one place that resolves a group's
     /// authority key. Change verification itself no longer happens on this
@@ -568,7 +528,6 @@ pub struct PeerSyncSession {
     /// deny-by-default implementation, so an incoming `HandoffLeaseRequest`
     /// answers `granted = false` rather than panic or hang.
     handoff_lease_responder: Arc<dyn HandoffLeaseResponder>,
-    block_write_activity_provider: Arc<dyn BlockWriteActivityProvider>,
     /// This session's caller-injected bridge to the daemon's own
     /// removed-device-ticket machinery (`DaemonState::obtain_own_handoff_
     /// ticket`) -- see `HandoffTicketResponder`'s doc comment. Set once at
@@ -592,9 +551,6 @@ pub struct PeerSyncSession {
     /// registered device with no signing key.
     change_emitter: Option<Arc<yadorilink_replica_domain::admission::ChangeEmitter>>,
 }
-
-/// One `group_id`'s anti-entropy coalescing state for a single peer
-/// session -- see [`PeerSyncSession::drive_anti_entropy`].
 
 impl PeerSyncSession {
     /// A session with its peer: everything it sends and receives rides
@@ -620,7 +576,7 @@ impl PeerSyncSession {
         replica_engine: yadorilink_replica_engine::PeerReplicaEngine,
         store: Arc<dyn crate::ports::BlockContentStore>,
         shared_group_ids: Vec<String>,
-        sync_roots: HashMap<String, PathBuf>,
+        _sync_roots: HashMap<String, PathBuf>,
         transports: crate::ports::SessionTransports,
         forward_tx: Option<mpsc::UnboundedSender<(String, FileRecord)>>,
         deps: PeerSyncSessionDeps,
@@ -639,7 +595,6 @@ impl PeerSyncSession {
             in_flight_block_fetches: std::sync::atomic::AtomicUsize::new(0),
             content_bytes_received: std::sync::atomic::AtomicU64::new(0),
             forward_tx,
-            eager_admission: StdMutex::new(HashMap::new()),
             rate_limiters: StdMutex::new(deps.rate_limiters),
             adaptive_window: AdaptiveWindow::new(
                 ADAPTIVE_WINDOW_INITIAL,
@@ -647,11 +602,9 @@ impl PeerSyncSession {
                 MAX_IN_FLIGHT_MESSAGES_PER_PEER,
                 MAX_IN_FLIGHT_MESSAGES_PER_PEER,
             ),
-            pending_local_change_flush: deps.pending_local_change_flush,
             change_authenticator: deps.change_authenticator,
             transports,
             handoff_lease_responder: deps.handoff_lease_responder,
-            block_write_activity_provider: deps.block_write_activity_provider,
             handoff_ticket_responder: deps.handoff_ticket_responder,
             change_emitter: deps.change_emitter,
         })
@@ -740,10 +693,6 @@ impl PeerSyncSession {
         self.change_emitter.clone()
     }
 
-    pub(crate) fn block_write_activity_provider(&self) -> Arc<dyn BlockWriteActivityProvider> {
-        self.block_write_activity_provider.clone()
-    }
-
     /// Cumulative block body bytes received from this peer so far -- see
     /// `content_bytes_received`'s own field doc comment for why this is a
     /// materially tighter signal than a generic wire-byte counter for "has
@@ -751,14 +700,6 @@ impl PeerSyncSession {
     pub fn content_bytes_received(&self) -> u64 {
         self.content_bytes_received.load(std::sync::atomic::Ordering::Relaxed)
     }
-
-    /// Bounded batch size for `try_commit_ordinary_batch` -- matches
-    /// the Convergence Engine's own per-tick `MAX_PATHS_PER_RECONCILE_
-    /// ATTEMPT` (8), so a `reconcile_group_paths` call driven by the
-    /// backstop's larger (`REPROJECT_WINDOW_SIZE`-bounded) window still
-    /// commits ordinary candidates in Engine-sized chunks rather than one
-    /// unbounded transaction.
-    const ORDINARY_BATCH_MAX_PATHS: usize = 8;
 }
 
 fn block_data_matches(block: &BlockInfo, data: &[u8]) -> bool {

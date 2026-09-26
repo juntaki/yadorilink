@@ -29,7 +29,7 @@ const STEP: Duration = Duration::from_secs(10);
 struct Device {
     state: Arc<DaemonState>,
     stack: Arc<SyncStack>,
-    _dirs: (tempfile::TempDir, tempfile::TempDir),
+    _dirs: (crate::test_support::sync_stack_fixture::ReleasingDir, tempfile::TempDir),
 }
 
 impl Device {

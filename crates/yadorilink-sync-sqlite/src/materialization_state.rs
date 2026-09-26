@@ -202,7 +202,7 @@ impl MaterializationStateRepository {
         let affected = self.database.write::<_, SyncSqliteError>(|conn| {
             if let Some(expected_version) = expected_version {
                 let live = crate::read_canonical_current_row(conn, group_id, path)?;
-                if !live.as_ref().is_some_and(|row| row.version_hash() == *expected_version) {
+                if live.as_ref().is_none_or(|row| row.version_hash() != *expected_version) {
                     return Ok(0);
                 }
             }
@@ -1302,6 +1302,8 @@ impl MaterializationStateRepository {
     /// holds -- writes nothing at all, including leaving the caller's
     /// materialization intent open, since that intent is the only record
     /// that a write was ever in flight.
+    // Mirrors the free function's parameter list plus the root permit.
+    #[allow(clippy::too_many_arguments)]
     pub fn commit_internal_materialized_state_if_fence_current(
         &self,
         group_id: &str,

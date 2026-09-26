@@ -43,6 +43,7 @@ mod causal_basis;
 mod checkpoint_store;
 mod conflict_authoring;
 mod frontier_index;
+mod observed_base_heads;
 mod orphan_integrity;
 pub(crate) mod path_frontier;
 pub mod published_view;
@@ -65,6 +66,7 @@ pub use frontier_index::{
     get_device_frontier, group_heads, max_parent_lamport, remove_device_frontier,
     set_device_frontier,
 };
+pub use observed_base_heads::SeenVersions;
 pub use orphan_integrity::{promote_orphans, ORPHAN_BOUND};
 pub(crate) use path_frontier::record_admission as record_path_frontier_admission;
 /// `live_path_heads`/`rebuild_group_path_frontier` are public so the
@@ -523,6 +525,15 @@ pub fn init_dag_schema(conn: &Connection) -> Result<(), SyncSqliteError> {
     // Bumps the same per-path mutation fence the table above keeps, in the
     // same transaction, so it has to exist wherever that one does.
     crate::structural_origin::init_structural_origin_schema(conn)?;
+    // The history-base tables belong to the same call. Admission measures
+    // every incoming change against the base this group holds, so the row
+    // that says which base that is has to exist wherever the DAG exists --
+    // and reading it must not have to create it first, which on the
+    // admission path would turn a read into a write. Created before the
+    // repair passes below, which check the record of named base heads as
+    // part of the derived path state. Pure `CREATE ... IF NOT EXISTS`,
+    // idempotent with the re-bootstrap module's own calls.
+    crate::rebootstrap_store::init_rebootstrap_schema(conn)?;
     // Also reports any group whose stored path effects no longer match
     // the changes they were derived from -- checked inside that pass
     // because it is already decoding every retained change, so the extra
@@ -626,14 +637,6 @@ pub fn init_dag_schema(conn: &Connection) -> Result<(), SyncSqliteError> {
     // reads and writes it. Pure `CREATE TABLE/INDEX IF NOT EXISTS`, so this is
     // idempotent on both a fresh and an already-upgraded database.
     conn.execute_batch(crate::dag_store::CHECKPOINT_TABLE_MIGRATION)?;
-    // The history-base tables belong to the same call, for the same
-    // reason. Admission now measures every incoming change against the
-    // base this group holds, so the row that says which base that is has
-    // to exist wherever the DAG exists -- and reading it must not have to
-    // create it first, which on the admission path would turn a read into
-    // a write. Pure `CREATE ... IF NOT EXISTS`, idempotent with the
-    // re-bootstrap module's own calls.
-    crate::rebootstrap_store::init_rebootstrap_schema(conn)?;
     Ok(())
 }
 
@@ -873,6 +876,10 @@ pub enum InstallCanonicalOutcome {
     /// that refused the parent. Distinct from `ParentsNotPresent`, which
     /// is a stale plan to re-drive.
     RefusedBehindRejectedParent { parent: ChangeHash },
+    /// The Change names an observed base head this replica's base does not
+    /// carry at any path it touches. Final while the replica stays on its
+    /// base, like `RefusedForeignHistoryBase`. Nothing was written.
+    RefusedInvalidObservedBaseHead { local: HistoryEpoch, head: ChangeHash },
 }
 
 impl From<AdmissionRefusal> for InstallCanonicalOutcome {
@@ -884,6 +891,9 @@ impl From<AdmissionRefusal> for InstallCanonicalOutcome {
             }
             AdmissionRefusal::BehindRejectedParent { parent } => {
                 Self::RefusedBehindRejectedParent { parent }
+            }
+            AdmissionRefusal::InvalidObservedBaseHead { local, head } => {
+                Self::RefusedInvalidObservedBaseHead { local, head }
             }
         }
     }
@@ -956,8 +966,10 @@ fn record_final_refusal(
 ) -> Result<AdmissionRefusal, SyncSqliteError> {
     // A change from another history is foreign only relative to the history
     // this replica is on now, so that verdict is scoped to it.
+    // So is a name measured against its base.
     let refused_on = match &refusal {
-        AdmissionRefusal::ForeignHistoryBase { local, .. } => Some(*local),
+        AdmissionRefusal::ForeignHistoryBase { local, .. }
+        | AdmissionRefusal::InvalidObservedBaseHead { local, .. } => Some(*local),
         _ => None,
     };
     record_permanent_rejection(
@@ -1162,15 +1174,29 @@ fn foreign_history_base_verdict(
 
 /// The comparison half of [`foreign_history_base_verdict`], for a caller
 /// that has just established the change is not held here.
+///
+/// A change on this history is also measured against the base it names:
+/// every observed base head it names has to be one of that base's heads at
+/// a path it touches (see [`Change::observed_base_heads`]). Like the epoch
+/// itself this is decided from the change's signed bytes and the installed
+/// base alone -- not from which heads are still live here, so no delivery
+/// order changes it -- and it is asked at the same point, before anything
+/// about the change's ancestry.
 fn history_epoch_mismatch(
     conn: &Connection,
     change: &Change,
 ) -> Result<Option<AdmissionRefusal>, SyncSqliteError> {
     let local = crate::rebootstrap_store::current_history_epoch(conn, change.group_id.as_str())?;
-    if change.history_epoch == local {
-        return Ok(None);
+    if change.history_epoch != local {
+        return Ok(Some(AdmissionRefusal::ForeignHistoryBase {
+            local,
+            incoming: change.history_epoch,
+        }));
     }
-    Ok(Some(AdmissionRefusal::ForeignHistoryBase { local, incoming: change.history_epoch }))
+    if let Some(head) = observed_base_heads::invalid_observed_base_head(conn, change)? {
+        return Ok(Some(AdmissionRefusal::InvalidObservedBaseHead { local, head }));
+    }
+    Ok(None)
 }
 
 /// Refuses `change`, finally and durably, when it was written on a history
@@ -1700,6 +1726,25 @@ pub fn emit_local_change(
     ops: Vec<Op>,
     emitter: &ChangeEmitter,
 ) -> Result<Change, SyncSqliteError> {
+    let parents = plain_frontier_parents(conn, group_id)?;
+    emit_change_with_derived_conflict_copies(
+        conn,
+        group_id,
+        parents,
+        ops,
+        emitter,
+        ChangePurpose::Ordinary,
+        None,
+        None,
+    )
+}
+
+/// The group's current heads as the parents of a write onto the plain
+/// frontier, refusing an empty frontier over retained history.
+fn plain_frontier_parents(
+    conn: &Connection,
+    group_id: &str,
+) -> Result<Vec<ChangeHash>, SyncSqliteError> {
     let parents = frontier_index::group_heads(conn, group_id)?;
     if parents.is_empty() {
         // An empty frontier is only legitimate for a group with no retained
@@ -1720,15 +1765,7 @@ pub fn emit_local_change(
             )));
         }
     }
-    emit_change_with_derived_conflict_copies(
-        conn,
-        group_id,
-        parents,
-        ops,
-        emitter,
-        ChangePurpose::Ordinary,
-        None,
-    )
+    Ok(parents)
 }
 
 /// One emission with everything the database can settle already settled --
@@ -1775,6 +1812,10 @@ pub struct PreparedEmission {
     /// Set when this emission is one part of a recursive delete or
     /// directory rename, signed into the change unchanged.
     recursive_operation: Option<RecursiveOperation>,
+    /// The installed base's heads this emission supersedes, computed from
+    /// what its writer was shown (see [`Change::observed_base_heads`]) and
+    /// signed unchanged.
+    observed_base_heads: Vec<ChangeHash>,
     /// The author the sequence above was minted for. Kept so signing can
     /// refuse to stamp one author's position onto another author's
     /// signature: the two halves of an emission are separate calls, and a
@@ -1785,6 +1826,15 @@ pub struct PreparedEmission {
 /// Derives, validates and freezes everything about an emission that depends on
 /// the database, leaving only signing and appending for
 /// [`admit_prepared_emission`]. See [`PreparedEmission`].
+///
+/// `seen` is what the writer was shown at each path it writes: the
+/// installed base's heads among those, and only those, are superseded. With
+/// `None` it is read from the rows at the paths `ops` names -- the version
+/// each current row holds is the version shown there -- which is what an
+/// ordinary edit of a path means. A write that acts on a row at another
+/// path than the op's own (a write-through of a conflict copy to its
+/// source) passes what that row showed instead.
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_emission(
     conn: &Connection,
     group_id: &str,
@@ -1793,6 +1843,7 @@ pub fn prepare_emission(
     ops: Vec<Op>,
     purpose: ChangePurpose,
     recursive_operation: Option<RecursiveOperation>,
+    seen: Option<&SeenVersions>,
 ) -> Result<PreparedEmission, SyncSqliteError> {
     if recursive_operation.is_some() && !matches!(purpose, ChangePurpose::Ordinary) {
         return Err(SyncSqliteError::InvalidInput(format!(
@@ -1824,6 +1875,12 @@ pub fn prepare_emission(
         &ops,
         matches!(purpose, ChangePurpose::RetroactiveRepair { .. }),
     )?;
+    // Read before `ops` joins the derived copies: a derived copy's path is
+    // not one the writer acted on.
+    let shown_by_rows = match seen {
+        Some(_) => None,
+        None => Some(versions_shown_at_op_paths(conn, group_id, &ops)?),
+    };
     let mut all_ops = ops;
     all_ops.extend(derived_ops.iter().cloned());
 
@@ -1887,6 +1944,13 @@ pub fn prepare_emission(
     // demands only while author ordering was expressed as DAG ancestry.
     let (author_seq, author_prev) = author_chain::next_author_position(conn, group_id, device_id)?;
 
+    let observed_base_heads = observed_base_heads::observed_base_heads_for(
+        conn,
+        group_id,
+        &all_ops,
+        seen.or(shown_by_rows.as_ref()).unwrap_or(&SeenVersions::new()),
+    )?;
+
     Ok(PreparedEmission {
         group_id: group_id.to_string(),
         parents,
@@ -1897,8 +1961,76 @@ pub fn prepare_emission(
         author_prev,
         history_epoch,
         recursive_operation,
+        observed_base_heads,
         device_id: device_id.to_string(),
     })
+}
+
+/// What an ordinary write of `ops` was shown: at each path an op names,
+/// the change the path's current row holds the version of. A path with no
+/// live row with content -- never indexed, holding only the
+/// `version_seq = 0` scaffold a placement writes first, or a tombstone --
+/// showed no version there.
+///
+/// Nothing is read on the group's original history: it has no base, so
+/// there is no base head to name whatever a row shows.
+fn versions_shown_at_op_paths(
+    conn: &Connection,
+    group_id: &str,
+    ops: &[Op],
+) -> Result<SeenVersions, SyncSqliteError> {
+    let mut shown = SeenVersions::new();
+    if crate::rebootstrap_store::current_history_epoch(conn, group_id)? == HistoryEpoch::Genesis {
+        return Ok(shown);
+    }
+    for path in ops.iter().flat_map(op_touched_paths) {
+        if let Some(author) = content_shown_at(conn, group_id, path)? {
+            shown.entry(path.to_owned()).or_default().insert(author);
+        }
+    }
+    Ok(shown)
+}
+
+/// The change the current row at `path` names as its author, tombstone or
+/// not: the version -- or the removal -- this device has shown there.
+/// What an unseen cut measures a path's live heads against.
+pub(crate) fn version_shown_at(
+    conn: &Connection,
+    group_id: &str,
+    path: &str,
+) -> Result<Option<ChangeHash>, SyncSqliteError> {
+    row_author_at(conn, group_id, path, false)
+}
+
+/// The change whose content the current row at `path` holds, when the row
+/// holds live content. A tombstone shows no version, so it is never a
+/// reason to name a base head as seen (see [`Change::observed_base_heads`]).
+pub(crate) fn content_shown_at(
+    conn: &Connection,
+    group_id: &str,
+    path: &str,
+) -> Result<Option<ChangeHash>, SyncSqliteError> {
+    row_author_at(conn, group_id, path, true)
+}
+
+fn row_author_at(
+    conn: &Connection,
+    group_id: &str,
+    path: &str,
+    live_only: bool,
+) -> Result<Option<ChangeHash>, SyncSqliteError> {
+    let shown: Option<Option<Vec<u8>>> = conn
+        .prepare_cached(
+            "SELECT authoring_change_hash FROM files \
+              WHERE group_id = ?1 AND path = ?2 AND state = 'current' AND version_seq > 0 \
+                AND (?3 = 0 OR deleted = 0)",
+        )?
+        .query_row(rusqlite::params![group_id, path, live_only], |row| row.get(0))
+        .optional()?;
+    Ok(shown
+        .flatten()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
+        .map(ChangeHash))
 }
 
 /// Signs `prepared` and appends it with its companion rows.
@@ -1924,6 +2056,7 @@ pub fn admit_prepared_emission(
         author_prev,
         history_epoch,
         recursive_operation,
+        observed_base_heads,
         device_id,
     } = prepared;
     let group_id = group_id.as_str();
@@ -1935,43 +2068,20 @@ pub fn admit_prepared_emission(
         )));
     }
 
-    let change = match (purpose, recursive_operation) {
-        (ChangePurpose::Ordinary, Some(part)) => Change::create_recursive_part_signed(
-            parents,
-            clocked_from,
-            DeviceId(emitter.device_id().to_string()),
-            author_seq,
-            author_prev,
-            FolderGroupId(group_id.to_string()),
-            history_epoch,
-            part,
-            all_ops,
-            emitter.signing_key(),
-        ),
-        (ChangePurpose::Ordinary, None) => Change::create_signed(
-            parents,
-            clocked_from,
-            DeviceId(emitter.device_id().to_string()),
-            author_seq,
-            author_prev,
-            FolderGroupId(group_id.to_string()),
-            history_epoch,
-            all_ops,
-            emitter.signing_key(),
-        ),
-        (ChangePurpose::RetroactiveRepair { obligations }, _) => Change::create_repair_signed(
-            parents,
-            clocked_from,
-            DeviceId(emitter.device_id().to_string()),
-            author_seq,
-            author_prev,
-            FolderGroupId(group_id.to_string()),
-            history_epoch,
-            obligations,
-            all_ops,
-            emitter.signing_key(),
-        ),
-    };
+    let change = Change::create_signed_observing(
+        parents,
+        clocked_from,
+        DeviceId(emitter.device_id().to_string()),
+        author_seq,
+        author_prev,
+        FolderGroupId(group_id.to_string()),
+        history_epoch,
+        purpose,
+        recursive_operation,
+        observed_base_heads,
+        all_ops,
+        emitter.signing_key(),
+    );
     // The combined `all_ops` (direct + derived `ConflictCopy`) is never
     // validated by `Change::create_signed` itself -- an ordinary direct op
     // and a derived `ConflictCopy` op can legitimately target the SAME path
@@ -2015,6 +2125,16 @@ pub fn admit_prepared_emission(
     // history to propagate in the first place, not just refused by
     // peers after the fact.
     serving_authorization_index::validate_no_reserved_paths(&change)?;
+    // The same measure of the names against the installed base that
+    // admission applies to a peer's change, so this device never signs a
+    // change every other replica refuses.
+    if let Some(head) = observed_base_heads::invalid_observed_base_head(conn, &change)? {
+        return Err(SyncSqliteError::InvalidInput(format!(
+            "cannot emit local change for group {group_id}: it names {} as an observed base \
+             head, which the installed base carries at no path it touches",
+            head.to_hex()
+        )));
+    }
     // `validate_structure` bounds op count and shape, but not encoded byte
     // size -- derived `ConflictCopy` ops are added *after* the direct ops
     // this device was asked to emit, so a small direct edit on a path with
@@ -2126,7 +2246,46 @@ pub fn emit_local_change_onto(
         emitter,
         ChangePurpose::Ordinary,
         None,
+        None,
     )
+}
+
+/// [`emit_local_change_onto`] with what the writer was shown at each path
+/// stated rather than read from the rows at the paths `ops` names: the
+/// installed base's heads it supersedes are those among `seen` (see
+/// [`prepare_emission`]). For a write that acts on a row at another path
+/// than its op's own, and for a caller with no rows to read.
+pub fn emit_local_change_onto_seeing(
+    conn: &Connection,
+    group_id: &str,
+    parents: Vec<ChangeHash>,
+    ops: Vec<Op>,
+    seen: &SeenVersions,
+    emitter: &ChangeEmitter,
+) -> Result<Change, SyncSqliteError> {
+    emit_change_with_derived_conflict_copies(
+        conn,
+        group_id,
+        parents,
+        ops,
+        emitter,
+        ChangePurpose::Ordinary,
+        None,
+        Some(seen),
+    )
+}
+
+/// [`emit_local_change`] with what the writer was shown stated, as
+/// [`emit_local_change_onto_seeing`] states it.
+pub fn emit_local_change_seeing(
+    conn: &Connection,
+    group_id: &str,
+    ops: Vec<Op>,
+    seen: &SeenVersions,
+    emitter: &ChangeEmitter,
+) -> Result<Change, SyncSqliteError> {
+    let parents = plain_frontier_parents(conn, group_id)?;
+    emit_local_change_onto_seeing(conn, group_id, parents, ops, seen, emitter)
 }
 
 /// [`emit_local_change_onto`] for one part of a recursive delete or
@@ -2150,6 +2309,30 @@ pub fn emit_recursive_part_onto(
         emitter,
         ChangePurpose::Ordinary,
         Some(part),
+        None,
+    )
+}
+
+/// [`emit_recursive_part_onto`] with what the writer was shown stated, as
+/// [`emit_local_change_onto_seeing`] states it.
+pub fn emit_recursive_part_onto_seeing(
+    conn: &Connection,
+    group_id: &str,
+    parents: Vec<ChangeHash>,
+    ops: Vec<Op>,
+    part: RecursiveOperation,
+    seen: &SeenVersions,
+    emitter: &ChangeEmitter,
+) -> Result<Change, SyncSqliteError> {
+    emit_change_with_derived_conflict_copies(
+        conn,
+        group_id,
+        parents,
+        ops,
+        emitter,
+        ChangePurpose::Ordinary,
+        Some(part),
+        Some(seen),
     )
 }
 
@@ -2172,6 +2355,7 @@ pub fn emit_retroactive_repair(
         direct_ops,
         emitter,
         ChangePurpose::RetroactiveRepair { obligations },
+        None,
         None,
     )
 }
@@ -2204,6 +2388,7 @@ fn emit_change_with_derived_conflict_copies(
     emitter: &ChangeEmitter,
     purpose: ChangePurpose,
     recursive_operation: Option<RecursiveOperation>,
+    seen: Option<&SeenVersions>,
 ) -> Result<Change, SyncSqliteError> {
     let prepared = prepare_emission(
         conn,
@@ -2213,6 +2398,7 @@ fn emit_change_with_derived_conflict_copies(
         ops,
         purpose,
         recursive_operation,
+        seen,
     )?;
     admit_prepared_emission(conn, prepared, emitter)
 }

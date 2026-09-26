@@ -1,19 +1,13 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Condvar};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ed25519_dalek::SigningKey;
-use sha2::{Digest, Sha256};
-use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_filesystem_sync::watcher::{FsChangeEvent, FsChangeKind};
 use yadorilink_ipc_proto::sync as proto;
-use yadorilink_local_capture::{LocalChangeOutcome, LocalChangeProcessor};
-use yadorilink_local_storage::{BlockStore, SegmentBlockStore};
-use yadorilink_peer_session::peer_session::{
-    ChangeAuthenticator, PeerSyncSession, PeerSyncSessionDeps,
-};
+use yadorilink_local_storage::BlockStore;
+use yadorilink_peer_session::peer_session::PeerSyncSession;
 use yadorilink_peer_session::rate_limiter::RateLimiters;
-use yadorilink_replica_domain::session_state::{MaterializationPolicy, MaterializationState};
+use yadorilink_replica_domain::session_state::MaterializationState;
 use yadorilink_root_authority::root_commit::RootCommitPermit;
 
 // One block exchange is one bidirectional stream, so the response's outcome
@@ -26,7 +20,6 @@ use proto::block_response_header::Outcome as BlockOutcome;
 // `checkpointed_batch`, the raw block-request helpers -- lives in
 // `yadorilink-daemon`, next to the `ReplicaCoordinator` it is built on, and
 // is reached here through this crate's existing dev-dependency on it.
-use yadorilink_daemon::test_support::peer_session_fixture::dag_wire_support;
 use yadorilink_daemon::test_support::peer_session_fixture::*;
 
 /// An eager file whose bytes go missing under a row that still names the same
@@ -1171,12 +1164,10 @@ async fn a_block_response_is_sent_raw_when_compressing_it_would_inflate_it() {
 
 #[cfg(test)]
 mod reconcile_group_paths_flush_tests {
-    use crate::checkpointed_batch;
-    use crate::drive_materialization_for_test_impl;
     use ed25519_dalek::SigningKey;
     use std::collections::{BTreeSet, HashMap};
     use std::future::Future;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
     use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
@@ -1187,18 +1178,12 @@ mod reconcile_group_paths_flush_tests {
         ChangeAuthenticator, PeerSyncSession, PeerSyncSessionDeps, PendingLocalChangeFlush,
         PendingLocalFlushOutcome,
     };
-    use yadorilink_replica_domain::change::{Change, Op, PutOrigin};
-    use yadorilink_replica_domain::file::RecordKind;
-    use yadorilink_replica_domain::file::{FileMeta, FileVersion};
-    use yadorilink_replica_domain::ids::SyncPath;
-    use yadorilink_sync_sqlite::dag_store::{self, ChangeEmitter};
+
+    use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
 
     const GROUP: &str = "flush-guard-group";
     const REMOTE: &str = "device-remote";
     const LOCAL: &str = "device-local";
-    const P: &str = "p.txt";
-    const Q: &str = "q.txt";
-    const LOCAL_EDIT: &[u8] = b"device-local's genuine concurrent edit";
 
     fn remote_key() -> SigningKey {
         SigningKey::from_bytes(&[7u8; 32])
@@ -1225,55 +1210,6 @@ mod reconcile_group_paths_flush_tests {
                 == signer_key_id)
                 .then_some(key)
         }
-    }
-
-    /// Zero-block content: materialization writes an empty file with no block
-    /// fetch, so a remote change carrying only this version's metadata (never
-    /// its blocks, exactly like the real wire) always materializes.
-    fn empty_version() -> FileVersion {
-        FileVersion::new(
-            vec![],
-            0,
-            FileMeta {
-                mtime_unix_nanos: 0,
-                unix_mode: None,
-                symlink_target: None,
-                record_kind: RecordKind::File,
-                xattrs: Vec::new(),
-            },
-        )
-    }
-
-    /// The remote author's real, signed emission chain, built on a throwaway
-    /// sender store so each change carries the correct parents/lamports.
-    /// `ops_chain` is emitted oldest-first; each entry descends from the prior.
-    fn emit_remote_chain(version: &FileVersion, ops_chain: Vec<Vec<Op>>) -> Vec<Change> {
-        let sender = rusqlite::Connection::open_in_memory().unwrap();
-        dag_store::init_dag_schema(&sender).unwrap();
-        dag_store::put_file_version(&sender, GROUP, version).unwrap();
-        let emitter = ChangeEmitter::new(REMOTE, remote_key());
-        ops_chain
-            .into_iter()
-            .map(|ops| dag_store::emit_local_change(&sender, GROUP, ops, &emitter).unwrap())
-            .collect()
-    }
-
-    fn create_op(path: &str, version: &FileVersion) -> Op {
-        Op::Put {
-            path: SyncPath(path.into()),
-            version: version.version_hash,
-            origin: PutOrigin::Direct,
-        }
-    }
-    fn update_op(path: &str, version: &FileVersion) -> Op {
-        Op::Put {
-            path: SyncPath(path.into()),
-            version: version.version_hash,
-            origin: PutOrigin::Direct,
-        }
-    }
-    fn delete_op(path: &str) -> Op {
-        Op::Delete { path: SyncPath(path.into()) }
     }
 
     /// Stands in for the daemon's `LinkFlushHandle`: when asked to flush a path
@@ -1303,15 +1239,6 @@ mod reconcile_group_paths_flush_tests {
                 calls: Mutex::new(vec![]),
                 force_retry: std::sync::atomic::AtomicBool::new(false),
             }
-        }
-        fn mark_pending(&self, rel: &str) {
-            self.pending.lock().unwrap().insert(rel.to_string());
-        }
-        fn take_calls(&self) -> Vec<String> {
-            std::mem::take(&mut *self.calls.lock().unwrap())
-        }
-        fn set_force_retry(&self, force: bool) {
-            self.force_retry.store(force, std::sync::atomic::Ordering::SeqCst);
         }
     }
     impl PendingLocalChangeFlush for RecordingFlush {
@@ -1357,13 +1284,13 @@ mod reconcile_group_paths_flush_tests {
 
     struct Harness {
         session: Arc<PeerSyncSession>,
-        state: Arc<ReplicaCoordinator>,
-        sync_root: PathBuf,
+        _state: Arc<ReplicaCoordinator>,
+        _sync_root: PathBuf,
         /// Always wired in (see `setup`'s own doc comment): a test that never
         /// calls `flush.mark_pending` sees the exact same no-op behavior an
         /// absent handle used to produce, since `RecordingFlush` only ever
         /// dispatches a path it was told is pending.
-        flush: Arc<RecordingFlush>,
+        _flush: Arc<RecordingFlush>,
         _root_dir: tempfile::TempDir,
         _store_dir: tempfile::TempDir,
     }
@@ -1458,30 +1385,14 @@ mod reconcile_group_paths_flush_tests {
             },
         );
 
-        Harness { session, state, sync_root, flush, _root_dir: root_dir, _store_dir: store_dir }
-    }
-
-    fn conflict_copy_files(root: &Path) -> Vec<PathBuf> {
-        let mut out = vec![];
-        if let Ok(entries) = std::fs::read_dir(root) {
-            for e in entries.flatten() {
-                if e.file_name().to_string_lossy().contains("(conflicted copy") {
-                    out.push(e.path());
-                }
-            }
+        Harness {
+            session,
+            _state: state,
+            _sync_root: sync_root,
+            _flush: flush,
+            _root_dir: root_dir,
+            _store_dir: store_dir,
         }
-        out
-    }
-
-    /// The local edit survives if it is present either as live `p.txt` or as a
-    /// conflict-copy sibling — the two legitimate no-data-loss outcomes.
-    fn local_edit_present(root: &Path, expected: &[u8]) -> bool {
-        if std::fs::read(root.join(P)).map(|c| c == expected).unwrap_or(false) {
-            return true;
-        }
-        conflict_copy_files(root)
-            .iter()
-            .any(|p| std::fs::read(p).map(|c| c == expected).unwrap_or(false))
     }
 
     /// `change_emitter()` defaults to `None` -- the same safe, defined "no

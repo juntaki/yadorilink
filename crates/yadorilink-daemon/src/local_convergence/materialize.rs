@@ -1,6 +1,5 @@
 use std::path::Path;
 
-use yadorilink_local_storage::apply_file_metadata;
 use yadorilink_peer_session::PeerSessionError;
 use yadorilink_replica_domain::file::{FileRecord, RecordKind};
 use yadorilink_replica_domain::ids::ChangeHash;
@@ -77,6 +76,8 @@ impl super::LocalConvergenceExecutor {
     /// like on disk *before* the request went out -- so a local write that
     /// landed during the fetch is still caught. It is a staleness signal, not
     /// a licence to skip anything.
+    // Mirrors `materialize`'s inputs plus the demand path and prefetch evidence.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn materialize_local(
         &self,
         group_id: &str,

@@ -228,6 +228,7 @@ fn seed_owner_unreadable_file_needing_an_xattr(
     Some(out_path)
 }
 
+#[cfg(target_os = "linux")]
 fn metadata_unprovable_holds(state: &DaemonState) -> usize {
     state
         .replica_coordinator
@@ -236,6 +237,7 @@ fn metadata_unprovable_holds(state: &DaemonState) -> usize {
         .load(std::sync::atomic::Ordering::SeqCst)
 }
 
+#[cfg(target_os = "linux")]
 async fn run_one_recheck_pass(state: &Arc<DaemonState>) {
     state.replica_coordinator.hazard_recheck_wake().mark_dirty(GROUP);
     let pending = state.replica_coordinator.hazard_recheck_wake().pending();

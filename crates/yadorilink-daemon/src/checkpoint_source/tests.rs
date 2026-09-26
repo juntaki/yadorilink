@@ -217,7 +217,7 @@ async fn the_checkpoint_flush_produces_a_batch_that_actually_verifies() {
     // Reconstruct exactly what the source signed: same leaf order
     // flush_pending_checkpoint used (pending_local_changes_for_group's own
     // deterministic ORDER BY change_hash).
-    let pending_before = vec![a.compute_hash(), b.compute_hash()];
+    let pending_before = [a.compute_hash(), b.compute_hash()];
     let mut hash_arrays: Vec<[u8; 32]> = pending_before.iter().map(|h| h.0).collect();
     hash_arrays.sort();
     let root = merkle_root(&hash_arrays);

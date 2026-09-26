@@ -7,7 +7,6 @@
 //! carried beside the checkpoint envelope, which this device would index it
 //! under, agree with what the authority actually signed.
 
-use ed25519_dalek::VerifyingKey;
 use yadorilink_replica_domain::authorization_checkpoint::decode_merkle_proof;
 use yadorilink_replica_domain::ids::ChangeHash;
 use yadorilink_replica_domain::proof_carrying::{
@@ -47,7 +46,7 @@ pub enum BundleVerifyError {
 pub fn verify_bundle(
     bundle: &VerifiedChangeBundle,
     expected_group: &str,
-    resolve_authority_key: &(dyn Fn(&[u8; 32], &[u8; 32]) -> Option<VerifyingKey> + Send + Sync),
+    resolve_authority_key: &crate::checkpoint_source::AuthorityKeyResolver<'_>,
 ) -> Result<ChangeHash, BundleVerifyError> {
     let signature: [u8; 64] = bundle
         .checkpoint

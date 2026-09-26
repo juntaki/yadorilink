@@ -186,6 +186,11 @@ impl super::LocalConvergenceExecutor {
             Ok(_) => return Ok(MaterializeResult::RetryRequired),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 self.create_structural_directory_at(group_id, &out_path)?;
+                #[cfg(test)]
+                displacement_crash::stop_at(
+                    &out_path,
+                    displacement_crash::Stage::AfterStructuralMkdir,
+                )?;
             }
             Err(e) => return Err(PeerSessionError::from(e)),
         }
@@ -234,6 +239,8 @@ impl super::LocalConvergenceExecutor {
                 .adopt_as_structural_directory(group_id, path, identity)
                 .map_err(sqlite_error)?;
         }
+        #[cfg(test)]
+        displacement_crash::stop_at(out_path, displacement_crash::Stage::BeforeEntryRetired)?;
         let authority = self.root_lease_for(group_id)?;
         let authority_op = authority.begin_operation()?;
         let permit = authority_op.permit();
@@ -473,6 +480,7 @@ impl super::LocalConvergenceExecutor {
         let Ok(observed) =
             yadorilink_root_authority::fs_identity::FileIdentity::observe_path(&out_path)
         else {
+            self.forget_structural_record_of_a_removed_directory(group_id, path, &out_path)?;
             return Ok(None);
         };
         if self.origin_status(group_id, path, Some(&observed))?
@@ -491,6 +499,11 @@ impl super::LocalConvergenceExecutor {
             self.state.begin_directory_removal(group_id, path, "structural_directory_rmdir")?;
         Ok(match yadorilink_local_storage::remove_empty_dir(&out_path)? {
             EmptyDirectoryRemoval::Removed | EmptyDirectoryRemoval::Absent => {
+                #[cfg(test)]
+                displacement_crash::stop_at(
+                    &out_path,
+                    displacement_crash::Stage::AfterStructuralRmdir,
+                )?;
                 self.state.forget_removed_directory(group_id, path).map_err(sqlite_error)?;
                 tracing::debug!(
                     group_id,
@@ -501,6 +514,37 @@ impl super::LocalConvergenceExecutor {
             }
             EmptyDirectoryRemoval::NotEmpty | EmptyDirectoryRemoval::NotADirectory => None,
         })
+    }
+
+    /// Nothing is at `path` (`out_path`), yet a structural directory is
+    /// recorded there: one this device removed, stopped (a crash, an error)
+    /// before it forgot the record. The record names nothing any more and
+    /// nothing else would ever look at it, so it is forgotten now. A pending
+    /// `mkdir` intent is not a record of a removed directory, and stays.
+    ///
+    /// The caller holds `path`'s lock.
+    fn forget_structural_record_of_a_removed_directory(
+        &self,
+        group_id: &str,
+        path: &str,
+        out_path: &Path,
+    ) -> Result<(), PeerSessionError> {
+        use yadorilink_sync_sqlite::structural_origin::StructuralDirectoryOrigin;
+        if !matches!(
+            std::fs::symlink_metadata(out_path),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+        ) {
+            return Ok(());
+        }
+        let recorded = self
+            .state
+            .sqlite()
+            .dag_structural_directory_origin(group_id, path)
+            .map_err(sqlite_error)?;
+        if matches!(recorded, StructuralDirectoryOrigin::Recorded(_)) {
+            self.state.forget_removed_directory(group_id, path).map_err(sqlite_error)?;
+        }
+        Ok(())
     }
 
     /// One non-recursive `rmdir` of the replicated directory at `path`,
@@ -519,6 +563,11 @@ impl super::LocalConvergenceExecutor {
         self.state.begin_directory_removal(group_id, path, "superseded_directory_rmdir")?;
         Ok(match yadorilink_local_storage::remove_empty_dir(&out_path)? {
             EmptyDirectoryRemoval::Removed | EmptyDirectoryRemoval::Absent => {
+                #[cfg(test)]
+                displacement_crash::stop_at(
+                    &out_path,
+                    displacement_crash::Stage::AfterSupersededRmdir,
+                )?;
                 self.state.forget_removed_directory(group_id, path).map_err(sqlite_error)?;
                 true
             }
@@ -1099,6 +1148,19 @@ pub(crate) mod displacement_crash {
         BeforeUnlink,
         /// The leaf is unlinked; its index row is not erased yet.
         BeforeRowErase,
+        /// A structural container is created (and recorded by the `mkdir`
+        /// helper); its settlement is not committed yet. Keyed by the
+        /// container's path.
+        AfterStructuralMkdir,
+        /// A superseded explicit Directory entry's directory is adopted as
+        /// structural; the entry's row is not erased yet.
+        BeforeEntryRetired,
+        /// A directory made only for descendants is removed from disk; its
+        /// structural record is not forgotten yet.
+        AfterStructuralRmdir,
+        /// A replicated directory an entry supersedes is removed from disk;
+        /// its records are not forgotten yet.
+        AfterSupersededRmdir,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]

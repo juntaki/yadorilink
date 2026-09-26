@@ -1,32 +1,33 @@
 //! Reusable change-DAG producer support for over-the-wire integration
 //! scenarios. The `tests/dst_support/` module is gated on the simulation
 //! cfg, so a plain `cargo test` integration test cannot reuse it.
+//!
 //! 1. [`pinned_authenticator`] — a `ChangeAuthenticator` that pins one or
-//! more authors' Ed25519 verifying keys and treats each as a writer. It is
-//! what `PeerSyncSession::set_change_authenticator` accepts and what makes
-//! `handle_change_batch` admit those authors' signed changes. It mirrors
-//! the daemon's `NetmapChangeAuthenticator` (`change_auth.rs`) minus the
-//! netmap: that type answers `signing_key`/`is_writer` from
-//! `DaemonState`'s mirrored netmap; here the same answers are pinned
-//! directly. The permissive default `accepts_change_auth` (== `is_writer`,
-//! from the trait) accepts `ChangeAuth::PLACEHOLDER`, which is exactly
-//! what a bare `ReplicaCoordinator` emits (`local_emission_auth` returns
-//! `PLACEHOLDER` when no policy provider is wired). 2. [`DagProducer`] — a
-//! "commit a local edit into the DAG" routine that mirrors the daemon's
-//! FS-edit -> signed-Change producer. Its [`DagProducer::commit_create`]
-//! stores the content block and then calls
-//! `ReplicaCoordinator::upsert_file_emitting_change` — the *exact*
-//! function `LocalChangeProcessor::process_event` calls to sign a
-//! `Change`, persist the referenced `FileVersion`, advance the group's DAG
-//! head, and upsert the index row, all in one transaction. The caller then
-//! drives `PeerSyncSession::announce_local_commit` (what the daemon's
-//! `DaemonState::broadcast_change` does for a DAG-negotiated peer) so the
-//! peer's heads-announce carries the new commit. Every API used here is
-//! public `yadorilink_daemon::replica_coordinator`/
-//! `yadorilink_replica_domain` surface. The daemon only adds the netmap
-//! adapter and the broadcast wrapper on top, so the DAG producer is fully
-//! exercisable directly against a `ReplicaCoordinator` — which is why this
-//! support belongs at this layer and not inside the daemon crate itself.
+//!    more authors' Ed25519 verifying keys and treats each as a writer. It is
+//!    what `PeerSyncSession::set_change_authenticator` accepts and what makes
+//!    `handle_change_batch` admit those authors' signed changes. It mirrors the
+//!    daemon's `NetmapChangeAuthenticator` (`change_auth.rs`) minus the netmap:
+//!    that type answers `signing_key`/`is_writer` from `DaemonState`'s mirrored
+//!    netmap; here the same answers are pinned directly. The permissive default
+//!    `accepts_change_auth` (== `is_writer`, from the trait) accepts
+//!    `ChangeAuth::PLACEHOLDER`, which is exactly what a bare
+//!    `ReplicaCoordinator` emits (`local_emission_auth` returns `PLACEHOLDER`
+//!    when no policy provider is wired).
+//! 2. [`DagProducer`] — a "commit a local edit into the DAG" routine that
+//!    mirrors the daemon's FS-edit -> signed-Change producer. Its
+//!    [`DagProducer::commit_create`] stores the content block and then calls
+//!    `ReplicaCoordinator::upsert_file_emitting_change` — the *exact* function
+//!    `LocalChangeProcessor::process_event` calls to sign a `Change`, persist
+//!    the referenced `FileVersion`, advance the group's DAG head, and upsert the
+//!    index row, all in one transaction. The caller then drives
+//!    `PeerSyncSession::announce_local_commit` (what the daemon's
+//!    `DaemonState::broadcast_change` does for a DAG-negotiated peer) so the
+//!    peer's heads-announce carries the new commit. Every API used here is
+//!    public `yadorilink_daemon::replica_coordinator`/
+//!    `yadorilink_replica_domain` surface. The daemon only adds the netmap
+//!    adapter and the broadcast wrapper on top, so the DAG producer is fully
+//!    exercisable directly against a `ReplicaCoordinator` — which is why this
+//!    support belongs at this layer and not inside the daemon crate itself.
 
 #![allow(dead_code)] // reusable helper; not every scenario uses every method
 

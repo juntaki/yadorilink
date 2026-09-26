@@ -1892,6 +1892,25 @@ impl DaemonState {
         self.reconciliation.lock().unwrap_or_else(|p| p.into_inner()).take()
     }
 
+    /// Drops everything this state holds that holds this state back, so the
+    /// last `Arc` a test drops actually frees it.
+    ///
+    /// A registered `PeerSyncSession` reaches back to its `DaemonState`
+    /// through its deps, and an installed reconciliation driver through its
+    /// stack; either keeps the state -- and with it both databases and their
+    /// pool worker threads -- alive for the rest of the process. The daemon
+    /// builds one state per process, so that is only ever a test's problem,
+    /// but it is one: a test binary that builds hundreds of states ran out
+    /// of threads. For a fixture's teardown, after the test has finished
+    /// with the state.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn release_reference_cycles_for_tests(&self) {
+        drop(self.take_reconciliation_driver());
+        for (device_id, _) in self.peers.all_sessions() {
+            self.peers.remove(&device_id);
+        }
+    }
+
     pub fn reconciliation_driver(&self) -> Option<Arc<crate::sync_adapter::ReconciliationDriver>> {
         self.reconciliation.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }

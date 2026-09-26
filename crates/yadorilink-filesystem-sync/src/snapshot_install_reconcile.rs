@@ -205,7 +205,9 @@ fn reconcile_one(
     let node = installed_node(&installed, state.index_has_live_descendant(group_id, &hold.path)?);
     if node == InstalledNode::Absent && !object_at(&out_path)? && !object_at(&preimage)? {
         // Dropped, and nothing of it is on disk: nothing to take and
-        // nothing to place, so no parent to create for either.
+        // nothing to place, so no parent to create for either. A directory
+        // record left here names one a crashed pass removed.
+        state.forget_removed_directory(group_id, &hold.path)?;
         return release(state, root, group_id, hold, held, node, permit, None, None, report);
     }
     verify_write_target_within_root(&out_path, root, &ledger)?;
@@ -225,6 +227,14 @@ fn reconcile_one(
     let mut made_directory = None;
     let mut verdict = classify(&out_path, hold.prior.as_ref(), installed_placeholder_size)?;
     reached(ReconcileStepForTest::Classified, &out_path);
+    if verdict == DiskVerdict::Absent {
+        // Nothing is at the path. A structural or retained record for it
+        // names a directory a pass removed and crashed before forgetting;
+        // left, it would outlive the directory under whatever is placed
+        // here next. This pass holds the path's lock, and a held path has
+        // no other writer.
+        state.forget_removed_directory(group_id, &hold.path)?;
+    }
     let writes_placeholder = installed_placeholder_size.is_some()
         && matches!(verdict, DiskVerdict::Absent | DiskVerdict::Stale | DiskVerdict::Divergent);
     if writes_placeholder || matches!(verdict, DiskVerdict::Stale | DiskVerdict::Divergent) {
@@ -236,11 +246,14 @@ fn reconcile_one(
             // Whatever is at the path now may not be what was classified:
             // take that exact object first, then look at what was taken.
             if take_object(&out_path, &preimage)? {
+                reached(ReconcileStepForTest::ObjectTaken, &out_path);
                 settle_taken_object(root, &ledger, group_id, hold, &preimage, report)?;
             }
+            reached(ReconcileStepForTest::PathEmptied, &out_path);
         }
         DiskVerdict::Divergent => {
             preserve(root, &ledger, group_id, hold, &out_path, report)?;
+            reached(ReconcileStepForTest::PathEmptied, &out_path);
         }
     }
 
@@ -333,8 +346,23 @@ fn keep_directory_and_relocate_entry(
     permit: &RootCommitPermit,
     report: &mut SnapshotInstallReconcileReport,
 ) -> Result<(), MaterializationExecutionError> {
-    let Some(copy) =
-        state.relocate_held_entry_beside_directory(group_id, &hold.path, hold.generation)?
+    let observed = FileIdentity::observe_path(out_path).ok();
+    let made_here = match &observed {
+        Some(identity) if identity.object_kind == ObjectKind::Directory => {
+            placed_by_replaced_row_as_directory(hold)
+                || state.is_structural_directory(group_id, &hold.path, root, identity)?
+        }
+        _ => false,
+    };
+    // The directory's retained record commits with the relocation: once
+    // the hold is released nothing brings the path back, and an unrecorded
+    // directory there reads to capture as one the user made.
+    let Some(copy) = state.relocate_held_entry_beside_directory(
+        group_id,
+        &hold.path,
+        hold.generation,
+        observed.as_ref().filter(|_| made_here),
+    )?
     else {
         // An install renewed the hold: the release sees it and leaves the
         // path for the next pass.
@@ -351,19 +379,7 @@ fn keep_directory_and_relocate_entry(
             report,
         );
     };
-    let observed = FileIdentity::observe_path(out_path).ok();
-    let made_here = match &observed {
-        Some(identity) if identity.object_kind == ObjectKind::Directory => {
-            placed_by_replaced_row_as_directory(hold)
-                || state.is_structural_directory(group_id, &hold.path, root, identity)?
-        }
-        _ => false,
-    };
-    state.retain_directory_with_untracked_content(
-        group_id,
-        &hold.path,
-        observed.as_ref().filter(|_| made_here),
-    )?;
+    reached(ReconcileStepForTest::EntryRelocated, out_path);
     tracing::info!(
         group_id,
         path = %hold.path,
@@ -394,7 +410,9 @@ fn place_installed_placeholder(
     match verdict {
         DiskVerdict::InstalledPlaceholder => {
             // Already placed, by this pass before a crash. Record the
-            // identity it has unless one was recorded before the crash.
+            // identity it has unless one was recorded before the crash,
+            // and give it the row's mode, which the crash may have come
+            // before.
             let metadata = std::fs::symlink_metadata(out_path)?;
             if let Some(identity) = PlaceholderDiskIdentity::from_metadata(&metadata) {
                 state.record_placeholder_identity(
@@ -407,6 +425,7 @@ fn place_installed_placeholder(
                     permit,
                 )?;
             }
+            apply_unix_mode(out_path, installed.unix_mode)?;
             Ok(None)
         }
         DiskVerdict::Directory => Ok(None),
@@ -427,6 +446,7 @@ fn place_installed_placeholder(
                 _ => None,
             };
             state.record_placeholder_identity(group_id, &hold.path, outcome, permit)?;
+            reached(ReconcileStepForTest::PlaceholderRecorded, out_path);
             if !deferred {
                 apply_unix_mode(out_path, installed.unix_mode)?;
             }
@@ -522,6 +542,7 @@ fn settle_structural_directory(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let canonical_root = std::fs::canonicalize(root)?;
             create_dir_all_never_through_a_symlink(out_path, &canonical_root, out_path, ledger)?;
+            reached(ReconcileStepForTest::StructuralDirectoryMade, out_path);
             Ok(())
         }
         Err(e) => Err(e.into()),
@@ -587,6 +608,7 @@ fn remove_directory_at_held_path(
     state.begin_snapshot_install_disk_write(group_id, &hold.path)?;
     match remove_empty_dir(out_path)? {
         EmptyDirectoryRemoval::Removed | EmptyDirectoryRemoval::Absent => {
+            reached(ReconcileStepForTest::DirectoryRemoved, out_path);
             state.forget_removed_directory(group_id, &hold.path)?;
             Ok(true)
         }
@@ -716,6 +738,20 @@ fn prune_structural_ancestors(
             return Ok(true);
         }
         let dir = root.join(ancestor);
+        if !object_at(&dir)? {
+            // Already removed, by a pass that crashed before it forgot the
+            // record (see below): nothing is there for the record to name.
+            // Forgotten under the ancestor's lock, and the ancestors above
+            // are still this pass's to prune -- stopping here would leave
+            // them for good, since the hold that brings this path back is
+            // released next.
+            let path_lock = state.path_lock(group_id, ancestor);
+            let Ok(_guard) = path_lock.try_lock() else { return Ok(false) };
+            if !object_at(&dir)? {
+                state.forget_removed_directory(group_id, ancestor)?;
+            }
+            continue;
+        }
         let Ok(identity) = FileIdentity::observe_path(&dir) else { return Ok(true) };
         if identity.object_kind != ObjectKind::Directory
             || !state.is_structural_directory(group_id, ancestor, root, &identity)?
@@ -727,6 +763,7 @@ fn prune_structural_ancestors(
         state.begin_snapshot_install_disk_write(group_id, ancestor)?;
         match remove_empty_dir(&dir)? {
             EmptyDirectoryRemoval::Removed | EmptyDirectoryRemoval::Absent => {
+                reached(ReconcileStepForTest::AncestorRemoved, &dir);
                 state.forget_removed_directory(group_id, ancestor)?;
             }
             EmptyDirectoryRemoval::NotEmpty | EmptyDirectoryRemoval::NotADirectory => {
@@ -1070,9 +1107,11 @@ fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 
 /// A point inside one held path's reconciliation at which a test can act
-/// on the disk the way a concurrent user would. Nothing locks a user out of
-/// a held path, so every step after one of these must hold up against
-/// whatever such a write left there.
+/// on the disk the way a concurrent user would, or stop the pass the way a
+/// crash would (by panicking in the hook). Nothing locks a user out of a
+/// held path, so every step after one of these must hold up against
+/// whatever such a write left there; and every step is a boundary a crash
+/// can fall on, so the next pass must finish from what any of them left.
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReconcileStepForTest {
@@ -1080,8 +1119,11 @@ pub enum ReconcileStepForTest {
     Classified,
     /// The path is about to receive the installed row's placeholder.
     PlacingPlaceholder,
-    /// The installed row's placeholder is placed and its identity recorded;
-    /// the hold is not released yet.
+    /// The installed row's placeholder is created and its identity
+    /// recorded; its mode is not applied yet.
+    PlaceholderRecorded,
+    /// The installed row's placeholder is placed, with its mode, and its
+    /// identity recorded; the hold is not released yet.
     PlaceholderPlaced,
     /// The installed explicit directory is on disk with its mode; its proof
     /// is not committed yet.
@@ -1089,6 +1131,27 @@ pub enum ReconcileStepForTest {
     /// A dropped path is gone from disk; its structural ancestors are
     /// about to be pruned.
     PruningAncestors,
+    /// The object at the path was taken to its preimage name; it is not
+    /// settled (removed or preserved) yet.
+    ObjectTaken,
+    /// What the replaced row left at the path is removed or moved aside;
+    /// nothing is placed yet.
+    PathEmptied,
+    /// A structural directory the installed rows below need is created and
+    /// recorded; the hold is not released yet.
+    StructuralDirectoryMade,
+    /// A directory the install dropped (or one standing where an entry is
+    /// installed) is removed from disk; its structural record is not
+    /// forgotten yet. The path given is the directory's.
+    DirectoryRemoved,
+    /// A structural ancestor of a dropped path is removed from disk; its
+    /// structural record is not forgotten yet. The path given is the
+    /// ancestor's.
+    AncestorRemoved,
+    /// An installed entry's row is moved to its copy name beside a
+    /// directory this pass may not remove, and that directory recorded as
+    /// retained, in one transaction; the pass has not moved on yet.
+    EntryRelocated,
 }
 
 /// Where reconciliation takes the object at `rel_path` under `root` while
@@ -1144,9 +1207,16 @@ fn reached(step: ReconcileStepForTest, out_path: &Path) {
 enum ReconcileStepForTest {
     Classified,
     PlacingPlaceholder,
+    PlaceholderRecorded,
     PlaceholderPlaced,
     DirectoryPlaced,
     PruningAncestors,
+    ObjectTaken,
+    PathEmptied,
+    StructuralDirectoryMade,
+    DirectoryRemoved,
+    AncestorRemoved,
+    EntryRelocated,
 }
 
 #[cfg(not(any(test, feature = "test-support")))]

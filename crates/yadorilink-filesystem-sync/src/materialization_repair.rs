@@ -1548,6 +1548,10 @@ fn repair_one_interrupted_single_object(
     Ok(())
 }
 
+/// A journaled write's still-open materialization intent.
+type OpenIntent<'a> =
+    Box<dyn crate::materialization_execution::OpenMaterializationIntent + Send + 'a>;
+
 /// The symlink half of [`repair_one_interrupted_single_object`]'s rebuild:
 /// the write-policy check, then the journaled write of the recorded
 /// target. `None` when policy declines the write.
@@ -1559,10 +1563,7 @@ fn rebuild_interrupted_symlink<'a>(
     out_path: &Path,
     target: &[u8],
     permit: &'a RootCommitPermit<'a>,
-) -> Result<
-    Option<(i64, Box<dyn crate::materialization_execution::OpenMaterializationIntent + Send + 'a>)>,
-    MaterializationExecutionError,
-> {
+) -> Result<Option<(i64, OpenIntent<'a>)>, MaterializationExecutionError> {
     #[cfg(unix)]
     let write_eligible = true;
     #[cfg(windows)]

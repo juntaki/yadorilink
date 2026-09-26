@@ -5,10 +5,13 @@ use iroh::address_lookup::AddressLookup as _;
 use std::net::SocketAddr;
 use std::sync::Mutex;
 
+/// One recorded `publish` call: the peer, its direct addresses, its relays.
+type Published = (PeerId, Vec<SocketAddr>, Vec<String>);
+
 /// Records what was published and answers resolves from a fixed table.
 #[derive(Debug, Default)]
 struct Fake {
-    published: Mutex<Vec<(PeerId, Vec<SocketAddr>, Vec<String>)>>,
+    published: Mutex<Vec<Published>>,
     answer: Mutex<Option<(Vec<SocketAddr>, Vec<String>)>>,
 }
 

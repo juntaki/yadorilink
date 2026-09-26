@@ -779,8 +779,3 @@ mod tests;
 /// wires them in.
 #[cfg(test)]
 mod completion_tests;
-
-/// Regression coverage for the one-time legacy-backlog bootstrap migration
-/// and the coarse `changes.
-#[cfg(test)]
-mod legacy_scheduler_cutover_tests;

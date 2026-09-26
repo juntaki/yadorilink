@@ -5,6 +5,7 @@
 use super::base_install_tests::open;
 use super::*;
 use ed25519_dalek::SigningKey;
+use std::collections::BTreeSet;
 use yadorilink_replica_domain::admission::ChangeEmitter;
 use yadorilink_replica_domain::change::{Op, PutOrigin};
 use yadorilink_replica_domain::file::{
@@ -424,9 +425,10 @@ fn a_group_sealed_after_a_path_was_deleted_opens_again() {
 }
 
 /// A conflict copy stays a current row after the path it was copied from
-/// is rewritten, and its author -- the losing head -- is then no head of
-/// the path any more. A second seal that absorbs the rewrite still carries
-/// the copy, so the group opens again.
+/// is rewritten. The rewrite names only the version shown at the path, so
+/// the losing head -- the copy's author, which the rewrite was never shown
+/// there -- stays a head of the path beside it. A second seal that absorbs
+/// the rewrite carries both heads and the copy, so the group opens again.
 #[test]
 fn a_group_sealed_after_a_conflicted_path_was_rewritten_opens_again() {
     fn copy_author(conn: &Connection) -> Vec<u8> {
@@ -451,15 +453,16 @@ fn a_group_sealed_after_a_conflicted_path_was_rewritten_opens_again() {
 
     let sealed = seal(&conn);
 
-    let r_heads: Vec<ChangeHash> = sealed
+    let r_heads: BTreeSet<ChangeHash> = sealed
         .summary()
         .path_heads
         .iter()
         .filter(|head| head.path == "r")
         .map(|head| head.change_hash)
         .collect();
-    assert_eq!(r_heads, vec![a4.compute_hash()]);
     assert!([h.a3.compute_hash().0.to_vec(), h.b2.compute_hash().0.to_vec()].contains(&copied_by));
+    let loser = ChangeHash(copied_by.as_slice().try_into().unwrap());
+    assert_eq!(r_heads, BTreeSet::from([a4.compute_hash(), loser]));
     yadorilink_sqlite_runtime::init_schema(&conn).expect("the resealed group opens again");
 }
 
@@ -700,17 +703,25 @@ fn a_seal_refuses_a_retained_change_the_installed_base_does_not_carry() {
     );
 }
 
-/// A change above a base descends from the base as a whole, whatever its
-/// DAG parents say. A write to a path the base carried therefore replaces
-/// the head the base carried there, even when the write names no parent.
-/// Nothing of the sealed history is retained beside it: the write is the
-/// path's only live head, in the path frontier as in the summary.
+/// A change above a base supersedes a head the base carried only by naming
+/// it among its observed base heads, whatever its DAG parents say: a base
+/// head is no DAG node here. A write to a path the base carried that names
+/// nothing leaves the base's head live beside it, in the path frontier as
+/// in the summary; a later write that names it replaces it, and the next
+/// seal carries only that write.
 #[test]
-fn a_write_above_a_base_replaces_the_head_the_base_carried_even_without_naming_it() {
+fn a_write_above_a_base_replaces_the_head_the_base_carried_only_by_naming_it() {
     let conn = open();
     let h = build_history(&conn);
     let first = seal(&conn);
     store_versions(&conn);
+    let live_at_q = |conn: &Connection| -> BTreeSet<ChangeHash> {
+        crate::dag_store::live_path_heads(conn, GROUP, "q")
+            .unwrap()
+            .into_iter()
+            .map(|head| ChangeHash(head.change_hash))
+            .collect()
+    };
     let d1 = yadorilink_replica_domain::test_authoring::create_signed_on_base_for_tests(
         Vec::new(),
         h.c1.lamport,
@@ -722,12 +733,25 @@ fn a_write_above_a_base_replaces_the_head_the_base_carried_even_without_naming_i
     );
     let outcome = crate::dag_store::admit_change(&conn, &d1).unwrap().outcome;
     assert!(matches!(outcome, crate::dag_store::AdmitOutcome::Applied), "got {outcome:?}");
-    let live: Vec<ChangeHash> = crate::dag_store::live_path_heads(&conn, GROUP, "q")
-        .unwrap()
-        .into_iter()
-        .map(|head| ChangeHash(head.change_hash))
-        .collect();
-    assert_eq!(live, vec![d1.compute_hash()], "nothing of the sealed history stands beside D1");
+    assert_eq!(
+        live_at_q(&conn),
+        BTreeSet::from([h.c1.compute_hash(), d1.compute_hash()]),
+        "the head the base carried stands beside a write that did not name it"
+    );
+
+    let d2 = yadorilink_replica_domain::test_authoring::create_signed_observing_on_base_for_tests(
+        vec![d1.compute_hash()],
+        d1.lamport,
+        DeviceId("device-d".to_string()),
+        FolderGroupId(GROUP.to_string()),
+        HistoryEpoch::Base(first.history_base()),
+        vec![h.c1.compute_hash()],
+        vec![put("q", &version(9))],
+        &key("device-d"),
+    );
+    let outcome = crate::dag_store::admit_change(&conn, &d2).unwrap().outcome;
+    assert!(matches!(outcome, crate::dag_store::AdmitOutcome::Applied), "got {outcome:?}");
+    assert_eq!(live_at_q(&conn), BTreeSet::from([d2.compute_hash()]));
     publish_everything(&conn, 2);
     project(&conn);
 
@@ -740,7 +764,7 @@ fn a_write_above_a_base_replaces_the_head_the_base_carried_even_without_naming_i
         .filter(|head| head.path == "q")
         .map(|head| head.change_hash)
         .collect();
-    assert_eq!(q_heads, vec![d1.compute_hash()]);
+    assert_eq!(q_heads, vec![d2.compute_hash()]);
 }
 
 /// An author with nothing written above the installed base resumes from

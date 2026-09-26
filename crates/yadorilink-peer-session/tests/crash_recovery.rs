@@ -117,7 +117,8 @@ async fn spawn_session(device: &Device, peer_device_id: &str) -> Arc<PeerSyncSes
     let book = yadorilink_lane_ports::testing::TestAddressBook::new();
     let node_local =
         yadorilink_lane_ports::testing::TestPeerNode::start(&device.device_id, book.clone()).await;
-    let node_peer = yadorilink_lane_ports::testing::TestPeerNode::start(peer_device_id, book).await;
+    let _node_peer =
+        yadorilink_lane_ports::testing::TestPeerNode::start(peer_device_id, book).await;
     let transports_local = node_local.transports_for(peer_device_id);
     let transports = yadorilink_peer_session::ports::SessionTransports {
         blocks: transports_local.clone(),

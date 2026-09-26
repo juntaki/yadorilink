@@ -178,6 +178,8 @@ async fn connect_pair_with_bounded_concurrency(
 /// own doc comment for the production-side version of the identical
 /// reasoning), so the
 /// supervision lives here instead.
+// Everything the detached supervisor task owns, passed in once.
+#[allow(clippy::too_many_arguments)]
 fn spawn_pair_reconnect_supervisor(
     mesh: Arc<support::TestPeerMesh>,
     state_i: Arc<DaemonState>,

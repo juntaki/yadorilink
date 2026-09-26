@@ -1129,6 +1129,47 @@ async fn a_crash_before_the_structural_ancestor_is_pruned_is_finished_by_the_nex
     assert!(fx.holds().is_empty(), "{:?}", fx.holds());
 }
 
+/// A pass that crashes after it removed a structural ancestor of a dropped
+/// row, before it forgot that ancestor's record, leaves the row held. The
+/// next pass finds the ancestor already gone: it forgets its record and
+/// goes on to prune the ancestors above it, instead of stopping there and
+/// leaving them -- empty directories this device made -- behind for good,
+/// with the records of both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_crash_after_a_structural_ancestor_is_removed_is_finished_by_the_next_pass() {
+    use yadorilink_filesystem_sync::snapshot_install_reconcile::set_reconcile_step_hook_for_test;
+    use yadorilink_sync_sqlite::structural_origin::StructuralDirectoryOrigin;
+    let fx = Fixture::new();
+    fx.install(vec![fx.snapshot_row("a/b/x", NEW)]);
+    fx.repair();
+    fx.install(Vec::new());
+    {
+        let _hook = set_reconcile_step_hook_for_test(|step, _| {
+            if step == ReconcileStepForTest::AncestorRemoved {
+                panic!("crash after a/b is removed, before its record is forgotten");
+            }
+        });
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fx.repair()));
+        assert!(crashed.is_err());
+    }
+    assert!(std::fs::symlink_metadata(fx.root.join("a/b")).is_err());
+    assert_eq!(fx.holds(), vec!["a/b/x".to_string()]);
+
+    fx.repair();
+
+    assert!(std::fs::symlink_metadata(fx.root.join("a")).is_err(), "a outlived a/b/x");
+    for path in ["a", "a/b"] {
+        assert!(
+            matches!(
+                fx.state.sqlite().dag_structural_directory_origin(GROUP, path).unwrap(),
+                StructuralDirectoryOrigin::None
+            ),
+            "{path} is gone and still recorded as structural"
+        );
+    }
+    assert!(fx.holds().is_empty(), "{:?}", fx.holds());
+}
+
 /// A structural directory whose lock is busy when its last dropped row goes
 /// keeps that row held, and goes on the next pass.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1226,6 +1267,86 @@ async fn an_installed_entry_over_a_users_directory_goes_to_its_copy_name() {
     assert_eq!(fx.indexed_blocks("a"), None, "the index names a file where a directory is");
     assert_eq!(fx.indexed_blocks(&expected), Some(fx.blocks(NEW)));
     assert!(fx.is_placeholder_of(&expected, NEW.len()), "{:?}", fx.disk_entries());
+    assert!(fx.holds().is_empty(), "{:?}", fx.holds());
+}
+
+/// A pass that crashes right after it moved an installed entry's row to its
+/// copy name beside a directory of the user's -- the relocation and the
+/// release of the entry's hold commit together -- must not leave that
+/// directory unrecorded: nothing would ever bring the path back, and the
+/// offline scan would author the user's untracked directory as an explicit
+/// `Directory a` over the installed File `a`, which an uninterrupted pass
+/// never does. The directory's retained record commits with the relocation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_crash_right_after_an_entry_is_relocated_beside_a_users_directory_authors_nothing() {
+    use yadorilink_filesystem_sync::snapshot_install_reconcile::set_reconcile_step_hook_for_test;
+    let fx = Fixture::new();
+    std::fs::create_dir(fx.root.join("a")).unwrap();
+    std::fs::write(fx.root.join("a/mine"), b"the user's own").unwrap();
+    let (manifest, snapshot) =
+        fx.prepare_install_with_heads(vec![fx.snapshot_row("a", NEW)], &[("a", "device-original")]);
+    fx.state.install_base_for_tests(&manifest, &snapshot).unwrap();
+    {
+        let _hook = set_reconcile_step_hook_for_test(|step, _| {
+            if step == ReconcileStepForTest::EntryRelocated {
+                panic!("crash right after the relocation commits");
+            }
+        });
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fx.repair()));
+        assert!(crashed.is_err());
+    }
+    fx.repair();
+    fx.repair();
+
+    assert_eq!(
+        fx.state.sqlite().retained_directory_reason(GROUP, "a").unwrap().as_deref(),
+        Some(yadorilink_sync_sqlite::structural_origin::RETAINED_UNTRACKED_CONTENT),
+        "the user's directory holding the entry's name is not recorded as retained"
+    );
+    let minted: Vec<String> = fx
+        .authoring_processor()
+        .scan_existing_files(GROUP, &fx.root)
+        .unwrap()
+        .into_iter()
+        .map(|record| record.path)
+        .collect();
+    assert_eq!(minted, vec!["a/mine".to_string()], "only the user's own file is new content");
+    assert!(fx.holds().is_empty(), "{:?}", fx.holds());
+}
+
+/// A pass that crashes after it removed the structural directory an
+/// installed file replaces, before it forgot the directory's record: the
+/// next pass finds nothing at the path and places the file, and no record
+/// of the directory that is gone is left behind at the file's path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_crash_after_a_held_directory_is_removed_leaves_no_record_of_it() {
+    use yadorilink_filesystem_sync::snapshot_install_reconcile::set_reconcile_step_hook_for_test;
+    use yadorilink_sync_sqlite::structural_origin::StructuralDirectoryOrigin;
+    let fx = Fixture::new();
+    let child: &[u8] = b"the descendant that needed a as its directory
+";
+    fx.install(vec![fx.snapshot_row("a/x", child)]);
+    fx.repair();
+    fx.install(vec![fx.snapshot_row("a", NEW)]);
+    {
+        let _hook = set_reconcile_step_hook_for_test(|step, _| {
+            if step == ReconcileStepForTest::DirectoryRemoved {
+                panic!("crash after a is removed, before its record is forgotten");
+            }
+        });
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fx.repair()));
+        assert!(crashed.is_err());
+    }
+    fx.repair();
+
+    assert!(fx.is_placeholder_of("a", NEW.len()), "{:?}", fx.disk_entries());
+    assert!(
+        matches!(
+            fx.state.sqlite().dag_structural_directory_origin(GROUP, "a").unwrap(),
+            StructuralDirectoryOrigin::None
+        ),
+        "a is a file now and still recorded as a structural directory"
+    );
     assert!(fx.holds().is_empty(), "{:?}", fx.holds());
 }
 
@@ -1578,4 +1699,512 @@ async fn deleting_an_installed_authored_copy_deletes_the_copy_itself() {
     let ops = fx.own_ops();
     assert_eq!(ops.iter().map(op_path).collect::<Vec<_>>(), vec![copy.as_str()], "{ops:?}");
     assert!(matches!(ops[0], Op::Delete { .. }), "{ops:?}");
+}
+
+// --- P9-C: a crash at every step boundary of the reconciliation ----------
+//
+// An install commits its rows in one transaction; the disk under the paths
+// it holds is reconciled afterwards, one step at a time, and a crash can
+// fall between any two of them. For each scenario below, a reference run
+// records every step the reconciliation reaches until nothing is held.
+// Then, for every step and every time it is reached, a fresh run crashes
+// right there (a panic in the step hook ends the pass as a process exit
+// would, with whatever the steps before it left on disk and in the index),
+// and the startup repair runs again as a restart does, until nothing is
+// held. Wherever it crashed, the run must end exactly where the reference
+// run did: the same tree (file modes included), the same index rows --
+// deleted and superseded ones, materialization state and placeholder
+// identity included -- no hold left, no materialization intent left open,
+// the same published proofs, no preimage or other reserved artefact left
+// on disk, no structural or retained record for a directory that is gone,
+// and nothing for capture to author. Every step the reconciliation has is
+// reached by some scenario, so none goes unexercised. A
+// crash never costs the replaced row's bytes either: an uncaptured edit is
+// preserved exactly once.
+
+/// One node of the tree under the root: `(path, what is there)`. A
+/// conflict copy's name carries the time and digest of the object it
+/// preserves, which differ between two runs, so it is named by its source
+/// path only.
+type TreeNode = (String, String);
+
+#[derive(Debug, PartialEq, Eq)]
+struct Converged {
+    tree: Vec<TreeNode>,
+    /// Every live index row: `(path, size, block count)`, copy names
+    /// normalised as in `tree`.
+    index: Vec<(String, u64, usize)>,
+    /// Every index row, live, deleted or superseded: what it records about
+    /// the object and its materialization, and whether the placeholder
+    /// identity it records is the object on disk now.
+    rows: Vec<String>,
+    /// Every materialization intent (a repair rebuild's journal) still
+    /// open: one a crash left must be settled by the next pass.
+    intents: Vec<String>,
+    /// Every published materialized-generation proof: `(path, kind,
+    /// version, whether it binds an identity)`.
+    proofs: Vec<String>,
+    /// `(path, structural origin, retained reason)` for every path the
+    /// scenario ever touched or the tree holds: a record for a directory
+    /// that is gone is an orphan row.
+    records: Vec<(String, &'static str, Option<String>)>,
+    holds: Vec<String>,
+    /// What the offline scan would author.
+    minted: Vec<String>,
+}
+
+fn normalised(path: &str) -> String {
+    if yadorilink_replica_domain::conflict::is_conflict_copy_path(path) {
+        format!(
+            "<copy of {}>",
+            yadorilink_replica_domain::conflict::conflict_copy_source_path(path)
+        )
+    } else {
+        path.to_string()
+    }
+}
+
+impl Fixture {
+    fn tree(&self) -> Vec<TreeNode> {
+        fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<TreeNode>) {
+            use std::os::unix::fs::MetadataExt;
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                let rel = path.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                // The root marker and this device's own state; every
+                // versioned reserved artefact (a preimage, a stage file)
+                // is listed, since none may outlive the pass that made it.
+                if name.starts_with(".yadorilink") && !name.starts_with(".yadorilink-v1-") {
+                    continue;
+                }
+                let metadata = std::fs::symlink_metadata(&path).unwrap();
+                let what = if metadata.is_dir() {
+                    format!("dir {:o}", metadata.mode() & 0o777)
+                } else if metadata.file_type().is_symlink() {
+                    format!("symlink {:?}", std::fs::read_link(&path).unwrap())
+                } else if metadata.blocks() == 0 && metadata.len() > 0 {
+                    format!("placeholder {} {:o}", metadata.len(), metadata.mode() & 0o777)
+                } else {
+                    format!(
+                        "file {:?} {:o}",
+                        String::from_utf8_lossy(&std::fs::read(&path).unwrap()),
+                        metadata.mode() & 0o777
+                    )
+                };
+                out.push((normalised(&rel), what));
+                if metadata.is_dir() {
+                    walk(root, &path, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.root, &self.root, &mut out);
+        out.sort();
+        out
+    }
+
+    /// Where the replica has ended up. Authors whatever the offline scan
+    /// finds, so it is the last thing a run does.
+    fn converged(&self, touched: &[&str]) -> Converged {
+        use yadorilink_sync_sqlite::structural_origin::StructuralDirectoryOrigin;
+        let mut index: Vec<(String, u64, usize)> = self
+            .state
+            .file_index_repository()
+            .list_files(GROUP)
+            .unwrap()
+            .into_iter()
+            .filter(|row| !row.deleted)
+            .map(|row| (normalised(&row.path), row.size, row.blocks.len()))
+            .collect();
+        index.sort();
+        let mut paths: std::collections::BTreeSet<String> =
+            touched.iter().map(|path| path.to_string()).collect();
+        for (path, what) in self.tree() {
+            if what.starts_with("dir") && !path.starts_with('<') {
+                paths.insert(path);
+            }
+        }
+        let records = paths
+            .into_iter()
+            .map(|path| {
+                let sqlite = self.state.sqlite();
+                let origin = match sqlite.dag_structural_directory_origin(GROUP, &path).unwrap() {
+                    StructuralDirectoryOrigin::None => "none",
+                    StructuralDirectoryOrigin::IntentPending => "intent pending",
+                    StructuralDirectoryOrigin::Recorded(_) => "structural",
+                    StructuralDirectoryOrigin::ProvenanceLost(_) => "provenance lost",
+                };
+                let retained = sqlite.retained_directory_reason(GROUP, &path).unwrap();
+                (path, origin, retained)
+            })
+            .collect();
+        let (rows, intents, proofs) = self.recorded();
+        // Last, since it authors what it finds: a preserved edit is a new
+        // file, authored as this device authors on a group with a base.
+        let mut minted: Vec<String> = self
+            .authoring_processor()
+            .scan_existing_files(GROUP, &self.root)
+            .unwrap()
+            .into_iter()
+            .map(|record| normalised(&record.path))
+            .collect();
+        minted.sort();
+        let tree = self.tree();
+        Converged { tree, index, rows, intents, proofs, records, holds: self.holds(), minted }
+    }
+
+    /// What the index, the intent journal and the proof table record,
+    /// with what legitimately differs between two runs (fences, times,
+    /// inode numbers) left out.
+    fn recorded(&self) -> (Vec<String>, Vec<String>, Vec<String>) {
+        use std::os::unix::fs::MetadataExt;
+        type Row =
+            (String, String, bool, String, String, i64, i64, String, Option<i64>, Option<i64>);
+        let (rows, intents, proofs) = self
+            .state
+            .database()
+            .read::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+                let rows: Vec<Row> = conn
+                    .prepare(
+                        "SELECT path, state, deleted, record_kind, materialization_state, size, \
+                         unix_mode, blocks_json, placeholder_dev, placeholder_ino \
+                         FROM files WHERE group_id = ?1",
+                    )?
+                    .query_map([GROUP], |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                            row.get(8)?,
+                            row.get(9)?,
+                        ))
+                    })?
+                    .collect::<Result<_, _>>()?;
+                let intents: Vec<String> = conn
+                    .prepare("SELECT path FROM materialization_intents WHERE group_id = ?1")?
+                    .query_map([GROUP], |row| row.get(0))?
+                    .collect::<Result<_, _>>()?;
+                let proofs: Vec<(String, String, Option<Vec<u8>>, bool)> = conn
+                    .prepare(
+                        "SELECT path, object_kind, version_hash, filesystem_identity IS NOT NULL \
+                         FROM path_materialized_generations WHERE group_id = ?1",
+                    )?
+                    .query_map([GROUP], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                    })?
+                    .collect::<Result<_, _>>()?;
+                Ok((rows, intents, proofs))
+            })
+            .unwrap();
+        let mut rows: Vec<String> = rows
+            .into_iter()
+            .map(|(path, state, deleted, kind, materialization, size, mode, blocks, dev, ino)| {
+                let identity = match (dev, ino) {
+                    (Some(dev), Some(ino)) => {
+                        match std::fs::symlink_metadata(self.root.join(&path)) {
+                            Ok(disk) if disk.dev() as i64 == dev && disk.ino() as i64 == ino => {
+                                "identity of the object on disk"
+                            }
+                            _ => "identity of no object on disk",
+                        }
+                    }
+                    _ => "no identity",
+                };
+                format!(
+                    "{} {state} deleted={deleted} {kind} {materialization} size={size} \
+                     mode={mode} blocks={blocks} {identity}",
+                    normalised(&path)
+                )
+            })
+            .collect();
+        rows.sort();
+        let mut intents: Vec<String> = intents.iter().map(|path| normalised(path)).collect();
+        intents.sort();
+        let mut proofs: Vec<String> = proofs
+            .into_iter()
+            .map(|(path, kind, version, bound)| {
+                format!(
+                    "{} {kind} {} bound={bound}",
+                    normalised(&path),
+                    version.map(hex::encode).unwrap_or_default()
+                )
+            })
+            .collect();
+        proofs.sort();
+        (rows, intents, proofs)
+    }
+}
+
+/// A scenario: what the replica holds, and the install whose
+/// reconciliation is crashed. Everything before that install -- earlier
+/// installs included -- is reconciled without a crash.
+#[derive(Clone, Copy, Debug)]
+enum CrashScenario {
+    /// The replaced row's own bytes are at the path: they are removed and
+    /// the installed placeholder placed.
+    StaleFileReplaced,
+    /// An edit capture never saw is at the path: it is preserved beside
+    /// the path, exactly once, and the installed placeholder placed.
+    UncapturedEditPreserved,
+    /// An installed executable file where nothing stands: its placeholder
+    /// is placed with the row's mode.
+    InstalledExecutable,
+    /// An installed explicit directory, with its mode.
+    InstalledDirectory,
+    /// File `a` and `a/x` in one base: `a` becomes a structural directory
+    /// and the file sits at its copy name.
+    FileAndDescendant,
+    /// A structural tree whose rows an install drops: the rows go, and
+    /// the directories made for them go with the last one.
+    DroppedStructuralTree,
+    /// An explicit directory and the row below it, both dropped.
+    DroppedExplicitDirectory,
+    /// An installed entry where a directory of the user's stands: the
+    /// directory is kept and the entry goes to its copy name.
+    EntryOverUsersDirectory,
+    /// A directory an earlier install placed, replaced by a file: the
+    /// empty directory goes and the placeholder takes its name.
+    DirectoryReplacedByFile,
+    /// A structural directory an earlier install made for `a/x`, replaced
+    /// by a file `a` once `a/x` is dropped.
+    StructuralDirectoryReplacedByFile,
+    /// A file an earlier install placed at `a`, dropped by one that
+    /// installs `a/x`: the placeholder goes and a structural directory
+    /// takes its name.
+    FileReplacedByStructuralDirectory,
+}
+
+impl CrashScenario {
+    const ALL: [Self; 11] = [
+        Self::StaleFileReplaced,
+        Self::UncapturedEditPreserved,
+        Self::InstalledExecutable,
+        Self::InstalledDirectory,
+        Self::FileAndDescendant,
+        Self::DroppedStructuralTree,
+        Self::DroppedExplicitDirectory,
+        Self::EntryOverUsersDirectory,
+        Self::DirectoryReplacedByFile,
+        Self::StructuralDirectoryReplacedByFile,
+        Self::FileReplacedByStructuralDirectory,
+    ];
+
+    /// Every path the scenario writes, installs or drops.
+    fn touched(self) -> &'static [&'static str] {
+        match self {
+            Self::StaleFileReplaced | Self::UncapturedEditPreserved => &["doc.txt"],
+            Self::InstalledExecutable => &["run.sh"],
+            Self::InstalledDirectory => &["d"],
+            Self::FileAndDescendant => &["a", "a/x"],
+            Self::DroppedStructuralTree => &["a", "a/b", "a/b/x", "a/y"],
+            Self::DroppedExplicitDirectory => &["d", "d/f"],
+            Self::EntryOverUsersDirectory => &["a", "a/mine"],
+            Self::DirectoryReplacedByFile => &["d"],
+            Self::StructuralDirectoryReplacedByFile | Self::FileReplacedByStructuralDirectory => {
+                &["a", "a/x"]
+            }
+        }
+    }
+
+    /// Sets the replica up, reconciling every earlier install, and
+    /// performs the install whose reconciliation is under test.
+    async fn prepare(self, fx: &Fixture) {
+        let child: &[u8] = b"the descendant that needs a as its directory\n";
+        match self {
+            Self::StaleFileReplaced => {
+                fx.hydrated("doc.txt", OLD).await;
+                fx.install(vec![fx.snapshot_row("doc.txt", NEW)]);
+            }
+            Self::UncapturedEditPreserved => {
+                fx.hydrated("doc.txt", OLD).await;
+                std::fs::write(fx.root.join("doc.txt"), b"an edit nobody captured\n").unwrap();
+                fx.install(vec![fx.snapshot_row("doc.txt", NEW)]);
+            }
+            Self::InstalledExecutable => fx.install(vec![SnapshotFile {
+                unix_mode: Some(0o755),
+                ..fx.snapshot_row("run.sh", NEW)
+            }]),
+            Self::InstalledDirectory => fx.install(vec![fx.directory_row("d", Some(0o750))]),
+            Self::FileAndDescendant => {
+                fx.install(vec![fx.snapshot_row("a", NEW), fx.snapshot_row("a/x", child)])
+            }
+            Self::DroppedStructuralTree => {
+                fx.install(vec![fx.snapshot_row("a/b/x", NEW), fx.snapshot_row("a/y", NEW)]);
+                fx.converge_uninterrupted();
+                fx.install(Vec::new());
+            }
+            Self::DroppedExplicitDirectory => {
+                fx.install(vec![fx.directory_row("d", None), fx.snapshot_row("d/f", NEW)]);
+                fx.converge_uninterrupted();
+                fx.install(Vec::new());
+            }
+            Self::EntryOverUsersDirectory => {
+                std::fs::create_dir(fx.root.join("a")).unwrap();
+                std::fs::write(fx.root.join("a/mine"), b"the user's own").unwrap();
+                let (manifest, snapshot) = fx.prepare_install_with_heads(
+                    vec![fx.snapshot_row("a", NEW)],
+                    &[("a", "device-original")],
+                );
+                fx.state.install_base_for_tests(&manifest, &snapshot).unwrap();
+            }
+            Self::DirectoryReplacedByFile => {
+                fx.install(vec![fx.directory_row("d", None)]);
+                fx.converge_uninterrupted();
+                fx.install(vec![fx.snapshot_row("d", NEW)]);
+            }
+            Self::StructuralDirectoryReplacedByFile => {
+                fx.install(vec![fx.snapshot_row("a/x", child)]);
+                fx.converge_uninterrupted();
+                fx.install(vec![fx.snapshot_row("a", NEW)]);
+            }
+            Self::FileReplacedByStructuralDirectory => {
+                fx.install(vec![fx.snapshot_row("a", NEW)]);
+                fx.converge_uninterrupted();
+                fx.install(vec![fx.snapshot_row("a/x", child)]);
+            }
+        }
+    }
+}
+
+/// Passes a converging reconciliation may take: some paths wait for a
+/// held path below them for one pass.
+const MAX_PASSES: usize = 4;
+
+impl Fixture {
+    fn converge_uninterrupted(&self) {
+        for _ in 0..MAX_PASSES {
+            if self.holds().is_empty() {
+                return;
+            }
+            self.repair();
+        }
+        assert!(self.holds().is_empty(), "never converged: {:?}", self.holds());
+    }
+
+    /// Runs startup repair, as every restart does, until nothing is held,
+    /// crashing the pass at the `occurrence`-th time (from 0) it reaches
+    /// `step`, if it does. Returns whether it crashed.
+    fn converge_crashing_at(&self, crash: Option<(ReconcileStepForTest, usize)>) -> bool {
+        use yadorilink_filesystem_sync::snapshot_install_reconcile::set_reconcile_step_hook_for_test;
+        let mut seen = 0;
+        let _hook = set_reconcile_step_hook_for_test(move |reached, _| {
+            if let Some((step, occurrence)) = crash {
+                if reached == step {
+                    seen += 1;
+                    if seen == occurrence + 1 {
+                        panic!("crash after {step:?} #{occurrence}");
+                    }
+                }
+            }
+        });
+        let mut crashed = false;
+        for _ in 0..MAX_PASSES + 1 {
+            if self.holds().is_empty() {
+                break;
+            }
+            let pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.repair()));
+            crashed |= pass.is_err();
+        }
+        crashed
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_crash_at_any_reconciliation_step_converges_to_the_uninterrupted_result() {
+    use yadorilink_filesystem_sync::snapshot_install_reconcile::set_reconcile_step_hook_for_test;
+    let mut crash_points = 0;
+    let mut reached: std::collections::BTreeSet<String> = Default::default();
+    for scenario in CrashScenario::ALL {
+        let (reference, trace) = {
+            let fx = Fixture::new();
+            scenario.prepare(&fx).await;
+            let trace = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            {
+                let recorded = trace.clone();
+                let _hook = set_reconcile_step_hook_for_test(move |step, _| {
+                    recorded.borrow_mut().push(step);
+                });
+                fx.converge_uninterrupted();
+            }
+            let trace: Vec<ReconcileStepForTest> = trace.borrow().clone();
+            (fx.converged(scenario.touched()), trace)
+        };
+        assert!(reference.holds.is_empty(), "{scenario:?}: {reference:?}");
+        let expected_minted: Vec<String> = match scenario {
+            CrashScenario::UncapturedEditPreserved => vec!["<copy of doc.txt>".to_string()],
+            // The user's own file, never synced: new content like any other.
+            CrashScenario::EntryOverUsersDirectory => vec!["a/mine".to_string()],
+            _ => Vec::new(),
+        };
+        assert_eq!(reference.minted, expected_minted, "{scenario:?}: {reference:?}");
+        assert!(!trace.is_empty(), "{scenario:?}: no step was reached");
+        reached.extend(trace.iter().map(|step| format!("{step:?}")));
+
+        let mut occurrences: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut points = Vec::new();
+        for step in &trace {
+            let seen = occurrences.entry(format!("{step:?}")).or_default();
+            points.push((*step, *seen));
+            *seen += 1;
+        }
+        for (step, occurrence) in points {
+            let what = format!("{scenario:?}, crash after {step:?} #{occurrence}");
+            let fx = Fixture::new();
+            scenario.prepare(&fx).await;
+            assert!(fx.converge_crashing_at(Some((step, occurrence))), "{what}: never crashed");
+            assert_eq!(fx.converged(scenario.touched()), reference, "{what}");
+            crash_points += 1;
+        }
+    }
+    let unreached: Vec<String> = every_reconcile_step()
+        .iter()
+        .map(|step| format!("{step:?}"))
+        .filter(|step| !reached.contains(step))
+        .collect();
+    assert!(unreached.is_empty(), "no scenario crashes at {unreached:?}");
+    eprintln!("P9-C install reconciliation: {crash_points} crash points converged");
+}
+
+/// Every step the reconciliation has. The match is exhaustive, so a step
+/// added to the pass fails to compile here until it is listed -- and then
+/// fails the matrix until some scenario reaches it.
+fn every_reconcile_step() -> Vec<ReconcileStepForTest> {
+    use ReconcileStepForTest as S;
+    let every = [
+        S::Classified,
+        S::PlacingPlaceholder,
+        S::PlaceholderRecorded,
+        S::PlaceholderPlaced,
+        S::DirectoryPlaced,
+        S::PruningAncestors,
+        S::ObjectTaken,
+        S::PathEmptied,
+        S::StructuralDirectoryMade,
+        S::DirectoryRemoved,
+        S::AncestorRemoved,
+        S::EntryRelocated,
+    ];
+    for step in every {
+        match step {
+            S::Classified
+            | S::PlacingPlaceholder
+            | S::PlaceholderRecorded
+            | S::PlaceholderPlaced
+            | S::DirectoryPlaced
+            | S::PruningAncestors
+            | S::ObjectTaken
+            | S::PathEmptied
+            | S::StructuralDirectoryMade
+            | S::DirectoryRemoved
+            | S::AncestorRemoved
+            | S::EntryRelocated => {}
+        }
+    }
+    every.to_vec()
 }

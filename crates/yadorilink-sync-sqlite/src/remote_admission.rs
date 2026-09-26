@@ -133,6 +133,14 @@ pub enum AdmissionOutcome {
     /// can never be installed. Nothing was written for it, the staged
     /// bundle is gone, and the hash is recorded as permanently rejected.
     RefusedBehindRejectedParent { parent: ChangeHash },
+    /// The staged Change names an observed base head this replica's base
+    /// does not carry at any path it touches. Recorded and discarded like
+    /// `RefusedForeignHistoryBase`: no re-plan makes it installable while
+    /// the replica stays on its base.
+    RefusedInvalidObservedBaseHead {
+        local: yadorilink_replica_domain::rebootstrap::HistoryEpoch,
+        head: ChangeHash,
+    },
 }
 
 /// Build a promotion plan. Read-only: safe to run with no writer gate held.
@@ -348,6 +356,13 @@ pub fn commit_admission(
             // re-plan makes this installable.
             verified_change_store::discard_staged(conn, &plan.change_hash)?;
             return Ok(AdmissionOutcome::RefusedBehindRejectedParent { parent });
+        }
+        dag_store::InstallCanonicalOutcome::RefusedInvalidObservedBaseHead { local, head } => {
+            // The names are part of the Change's signed bytes and measured
+            // against the base this replica is on, so no re-plan changes
+            // the verdict while it stays there.
+            verified_change_store::discard_staged(conn, &plan.change_hash)?;
+            return Ok(AdmissionOutcome::RefusedInvalidObservedBaseHead { local, head });
         }
     }
 

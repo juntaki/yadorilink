@@ -521,10 +521,10 @@ impl DurabilityCoordinator {
 
     /// Steps (3)-(5): lay the records out, write them, one barrier per
     /// touched segment, one transaction.
-    fn append_and_record<'a>(
+    fn append_and_record(
         &self,
         writer: &mut WriterState,
-        to_write: &[([u8; RAW_HASH_LEN], &'a LocallyHashedBlock)],
+        to_write: &[([u8; RAW_HASH_LEN], &LocallyHashedBlock)],
         receipts: &mut HashMap<[u8; RAW_HASH_LEN], DurableReceipt>,
     ) -> Result<(), StorageError> {
         // `lay_out_and_commit` takes the open segment out of `writer` and

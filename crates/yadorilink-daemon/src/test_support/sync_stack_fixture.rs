@@ -96,10 +96,10 @@ impl ChangeAuthenticator for FixtureAuthenticator {
 /// A real device: coordinator, block store, state, signing key, policy
 /// bootstrap.
 ///
-/// The returned `TempDir` is the block store's, and dropping it takes the
-/// store's files with it -- so a caller has to hold it for as long as the
-/// device is expected to work.
-pub fn device(name: &str, key_byte: u8) -> (Arc<DaemonState>, tempfile::TempDir) {
+/// The returned [`ReleasingDir`] is the block store's directory, and dropping
+/// it takes the store's files with it -- so a caller has to hold it for as
+/// long as the device is expected to work.
+pub fn device(name: &str, key_byte: u8) -> (Arc<DaemonState>, ReleasingDir) {
     let store_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let coordinator = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
@@ -111,7 +111,44 @@ pub fn device(name: &str, key_byte: u8) -> (Arc<DaemonState>, tempfile::TempDir)
     // `Withhold` the moment a netmap names a writer for it, which is correct
     // production behaviour.
     state.authority.install_test_group_policy_bootstrap(GROUP);
-    (state, store_dir)
+    let store = ReleasingDir::new(store_dir, &state);
+    (state, store)
+}
+
+/// A temporary directory a test holds for as long as it uses `state`, which
+/// also frees `state` when it goes.
+///
+/// A state that ran a stack or held a peer session is part of a reference
+/// cycle back to itself (see
+/// [`DaemonState::release_reference_cycles_for_tests`]), so dropping every
+/// handle a test holds would not free it: its databases and their pool
+/// worker threads would outlive the test, and a test binary that builds
+/// hundreds of states exhausts the process's threads. A fixture's directory
+/// is what every caller already holds until it is done with the state, so
+/// its drop is where the cycle is broken.
+pub struct ReleasingDir {
+    dir: tempfile::TempDir,
+    state: Arc<DaemonState>,
+}
+
+impl ReleasingDir {
+    pub fn new(dir: tempfile::TempDir, state: &Arc<DaemonState>) -> Self {
+        Self { dir, state: state.clone() }
+    }
+}
+
+impl std::ops::Deref for ReleasingDir {
+    type Target = tempfile::TempDir;
+
+    fn deref(&self) -> &tempfile::TempDir {
+        &self.dir
+    }
+}
+
+impl Drop for ReleasingDir {
+    fn drop(&mut self) {
+        self.state.release_reference_cycles_for_tests();
+    }
 }
 
 /// The endpoint identity a device built with `key_byte` will have.
@@ -274,92 +311,6 @@ pub fn honest_bundle_carrying(change: Change, versions: Vec<FileVersion>) -> Ver
         },
         merkle_proof: encode_merkle_proof(&build_merkle_proof(&leaves, 0)),
         versions,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The agreement the whole module depends on: what the bundle builder
-    /// signs, the authenticator accepts -- checked through the real verifier,
-    /// not by comparing the two constants. Split across two modules this
-    /// held by coincidence; here it holds by test.
-    #[test]
-    fn a_bundle_this_module_builds_verifies_under_the_authenticator_it_ships_with() {
-        let bundle = honest_bundle(change_touching(&["a.txt"]));
-
-        let verified =
-            crate::sync_adapter::verify::verify_bundle(&bundle, GROUP, &|key_id, head| {
-                FixtureAuthenticator.resolve_authority_key(GROUP, key_id, head)
-            });
-
-        assert_eq!(
-            verified.expect("the fixture's own bundle must verify under its own authenticator"),
-            bundle.change.compute_hash()
-        );
-    }
-
-    /// And rejects anything else, so a scenario cannot pass on a bundle no
-    /// real policy chain would have authorized.
-    #[test]
-    fn the_authenticator_rejects_another_group_and_another_signer() {
-        let expected = fingerprint_signing_key(&authority_key().verifying_key());
-
-        assert_eq!(
-            FixtureAuthenticator.resolve_authority_key("another-group", &expected, &[0u8; 32]),
-            None
-        );
-        assert_eq!(
-            FixtureAuthenticator.resolve_authority_key(GROUP, &[0xAA; 32], &[0u8; 32]),
-            None
-        );
-    }
-
-    /// A device starts with nothing servable, so a scenario asserting that a
-    /// Change arrived is not reading a row the fixture planted.
-    // `device` builds a real `DaemonState`, which supervises tasks.
-    #[tokio::test]
-    async fn a_fresh_device_possesses_nothing() {
-        let (state, _dir) = device("device-fresh", 1);
-        init_staging_schema(&state);
-
-        assert!(possessed(&state, &FolderGroupId(GROUP.into())).is_empty());
-    }
-
-    /// Staging is what makes a Change servable, and the fixture's own
-    /// staging path is the one every scenario authors through.
-    // `device` builds a real `DaemonState`, which supervises tasks.
-    #[tokio::test]
-    async fn a_staged_bundle_becomes_servable() {
-        let (state, _dir) = device("device-author", 2);
-        init_staging_schema(&state);
-        let group = FolderGroupId(GROUP.into());
-
-        let version = file_version(4096, 0x11);
-        let change = change_putting("a.bin", &version);
-        let hash = change.compute_hash();
-        stage(&state, honest_bundle_carrying(change, vec![version]), 1);
-
-        assert!(possessed(&state, &group).contains(&hash));
-    }
-
-    /// The endpoint a scenario partitions is the endpoint the device will
-    /// actually have. If these ever diverge, a partition would be declared
-    /// against nothing, every network fault would silently do nothing, and
-    /// the scenario would pass by never being cut.
-    // `device` builds a real `DaemonState`, which supervises tasks.
-    #[tokio::test]
-    async fn the_predicted_endpoint_is_the_one_the_device_key_yields() {
-        let key_byte = 11u8;
-        let (state, _dir) = device("device-endpoint", key_byte);
-
-        let signing = state.device_signing_key().expect("the fixture set one");
-        assert_eq!(
-            endpoint_of(key_byte).as_bytes(),
-            &signing.verifying_key().to_bytes(),
-            "the endpoint a scenario cuts is not the one this device will bind"
-        );
     }
 }
 
@@ -806,4 +757,90 @@ fn watch_folder_over(
     });
 
     WatchedFolder { _root: owned_root, canonical, events, _flush_dependencies: flush_dependencies }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The agreement the whole module depends on: what the bundle builder
+    /// signs, the authenticator accepts -- checked through the real verifier,
+    /// not by comparing the two constants. Split across two modules this
+    /// held by coincidence; here it holds by test.
+    #[test]
+    fn a_bundle_this_module_builds_verifies_under_the_authenticator_it_ships_with() {
+        let bundle = honest_bundle(change_touching(&["a.txt"]));
+
+        let verified =
+            crate::sync_adapter::verify::verify_bundle(&bundle, GROUP, &|key_id, head| {
+                FixtureAuthenticator.resolve_authority_key(GROUP, key_id, head)
+            });
+
+        assert_eq!(
+            verified.expect("the fixture's own bundle must verify under its own authenticator"),
+            bundle.change.compute_hash()
+        );
+    }
+
+    /// And rejects anything else, so a scenario cannot pass on a bundle no
+    /// real policy chain would have authorized.
+    #[test]
+    fn the_authenticator_rejects_another_group_and_another_signer() {
+        let expected = fingerprint_signing_key(&authority_key().verifying_key());
+
+        assert_eq!(
+            FixtureAuthenticator.resolve_authority_key("another-group", &expected, &[0u8; 32]),
+            None
+        );
+        assert_eq!(
+            FixtureAuthenticator.resolve_authority_key(GROUP, &[0xAA; 32], &[0u8; 32]),
+            None
+        );
+    }
+
+    /// A device starts with nothing servable, so a scenario asserting that a
+    /// Change arrived is not reading a row the fixture planted.
+    // `device` builds a real `DaemonState`, which supervises tasks.
+    #[tokio::test]
+    async fn a_fresh_device_possesses_nothing() {
+        let (state, _dir) = device("device-fresh", 1);
+        init_staging_schema(&state);
+
+        assert!(possessed(&state, &FolderGroupId(GROUP.into())).is_empty());
+    }
+
+    /// Staging is what makes a Change servable, and the fixture's own
+    /// staging path is the one every scenario authors through.
+    // `device` builds a real `DaemonState`, which supervises tasks.
+    #[tokio::test]
+    async fn a_staged_bundle_becomes_servable() {
+        let (state, _dir) = device("device-author", 2);
+        init_staging_schema(&state);
+        let group = FolderGroupId(GROUP.into());
+
+        let version = file_version(4096, 0x11);
+        let change = change_putting("a.bin", &version);
+        let hash = change.compute_hash();
+        stage(&state, honest_bundle_carrying(change, vec![version]), 1);
+
+        assert!(possessed(&state, &group).contains(&hash));
+    }
+
+    /// The endpoint a scenario partitions is the endpoint the device will
+    /// actually have. If these ever diverge, a partition would be declared
+    /// against nothing, every network fault would silently do nothing, and
+    /// the scenario would pass by never being cut.
+    // `device` builds a real `DaemonState`, which supervises tasks.
+    #[tokio::test]
+    async fn the_predicted_endpoint_is_the_one_the_device_key_yields() {
+        let key_byte = 11u8;
+        let (state, _dir) = device("device-endpoint", key_byte);
+
+        let signing = state.device_signing_key().expect("the fixture set one");
+        assert_eq!(
+            endpoint_of(key_byte).as_bytes(),
+            &signing.verifying_key().to_bytes(),
+            "the endpoint a scenario cuts is not the one this device will bind"
+        );
+    }
 }

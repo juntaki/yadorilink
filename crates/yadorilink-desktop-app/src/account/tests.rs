@@ -121,8 +121,8 @@ fn requesting_devices_emits_load_effect_once() {
 
 #[test]
 fn removing_a_device_marks_it_busy_then_drops_it_from_the_list_on_success() {
-    let mut s = State::default();
-    s.devices = Some(vec![a_device("dev-1"), a_device("dev-2")]);
+    let s =
+        State { devices: Some(vec![a_device("dev-1"), a_device("dev-2")]), ..Default::default() };
     let (s, fx) = step(s, Event::RemoveDeviceRequested { device_id: "dev-1".to_string() });
     assert_eq!(fx, vec![Effect::RemoveDevice { device_id: "dev-1".to_string() }]);
     assert!(s.busy.contains("device:dev-1"));
@@ -136,8 +136,7 @@ fn removing_a_device_marks_it_busy_then_drops_it_from_the_list_on_success() {
 
 #[test]
 fn a_failed_device_removal_reports_the_error_and_clears_busy_without_touching_the_list() {
-    let mut s = State::default();
-    s.devices = Some(vec![a_device("dev-1")]);
+    let s = State { devices: Some(vec![a_device("dev-1")]), ..Default::default() };
     let s = step(s, Event::RemoveDeviceRequested { device_id: "dev-1".to_string() }).0;
     let s = step(
         s,
@@ -179,8 +178,10 @@ fn an_access_overview(edges: Vec<share::ShareEdgeInfo>) -> AccessOverview {
 
 #[test]
 fn revoking_an_edge_marks_it_busy_then_drops_it_from_the_listing_on_success() {
-    let mut s = State::default();
-    s.access = Some(an_access_overview(vec![an_edge("e1", "photos"), an_edge("e2", "docs")]));
+    let s = State {
+        access: Some(an_access_overview(vec![an_edge("e1", "photos"), an_edge("e2", "docs")])),
+        ..Default::default()
+    };
     let (s, fx) = step(s, Event::RevokeEdgeRequested { edge_id: "e1".to_string() });
     assert_eq!(fx, vec![Effect::RevokeEdge { edge_id: "e1".to_string() }]);
     assert!(s.busy.contains("edge:e1"));
@@ -203,12 +204,14 @@ fn a_request(group_id: &str, device_id: &str) -> share::PendingApproval {
 
 #[test]
 fn approving_a_request_removes_it_from_the_pending_listing_and_reports_the_outcome() {
-    let mut s = State::default();
-    s.access = Some(AccessOverview {
-        edges: Vec::new(),
-        pending: vec![a_request("group-1", "device-a")],
-        invites: Vec::new(),
-    });
+    let s = State {
+        access: Some(AccessOverview {
+            edges: Vec::new(),
+            pending: vec![a_request("group-1", "device-a")],
+            invites: Vec::new(),
+        }),
+        ..Default::default()
+    };
     let (s, fx) = step(
         s,
         Event::ApproveRequested {
@@ -243,12 +246,14 @@ fn approving_a_request_removes_it_from_the_pending_listing_and_reports_the_outco
 
 #[test]
 fn denying_a_request_removes_it_from_the_pending_listing() {
-    let mut s = State::default();
-    s.access = Some(AccessOverview {
-        edges: Vec::new(),
-        pending: vec![a_request("group-1", "device-a")],
-        invites: Vec::new(),
-    });
+    let s = State {
+        access: Some(AccessOverview {
+            edges: Vec::new(),
+            pending: vec![a_request("group-1", "device-a")],
+            invites: Vec::new(),
+        }),
+        ..Default::default()
+    };
     let (s, fx) = step(
         s,
         Event::DenyRequested {
@@ -287,12 +292,14 @@ fn an_invite(invite_id: &str, status: &str) -> share::PendingInviteInfo {
 
 #[test]
 fn cancelling_an_invite_drops_it_from_the_listing_on_success() {
-    let mut s = State::default();
-    s.access = Some(AccessOverview {
-        edges: Vec::new(),
-        pending: Vec::new(),
-        invites: vec![an_invite("inv-1", "pending")],
-    });
+    let s = State {
+        access: Some(AccessOverview {
+            edges: Vec::new(),
+            pending: Vec::new(),
+            invites: vec![an_invite("inv-1", "pending")],
+        }),
+        ..Default::default()
+    };
     let (s, fx) = step(s, Event::CancelInviteRequested { invite_id: "inv-1".to_string() });
     assert_eq!(fx, vec![Effect::CancelInvite { invite_id: "inv-1".to_string() }]);
     let s = step(s, Event::InviteCancelled { invite_id: "inv-1".to_string() }).0;
@@ -302,9 +309,11 @@ fn cancelling_an_invite_drops_it_from_the_listing_on_success() {
 
 #[test]
 fn a_failed_action_sets_action_error_without_disturbing_an_existing_success_notice() {
-    let mut s = State::default();
-    s.notice = Some("Removed device dev-0.".to_string());
-    s.access = Some(an_access_overview(vec![an_edge("e1", "photos")]));
+    let s = State {
+        notice: Some("Removed device dev-0.".to_string()),
+        access: Some(an_access_overview(vec![an_edge("e1", "photos")])),
+        ..Default::default()
+    };
     let s = step(s, Event::RevokeEdgeRequested { edge_id: "e1".to_string() }).0;
     let s =
         step(s, Event::RevokeEdgeFailed { edge_id: "e1".to_string(), msg: "not durable".into() }).0;

@@ -66,7 +66,31 @@ pub(crate) fn build_pool(
     // exactly the same reason `open`'s bootstrap step exists: fewer
     // concurrent openers is strictly safer than more, even once the
     // specific WAL-switch race is closed.
-    Ok(Pool::builder().min_idle(Some(1)).build(manager)?)
+    Ok(Pool::builder().min_idle(Some(1)).thread_pool(worker_pool()).build(manager)?)
+}
+
+/// The background workers of one pool: the same three named threads r2d2
+/// builds by default, but ones that exit as soon as the pool is dropped.
+///
+/// r2d2's default worker pool completes every pending *scheduled* job
+/// before its threads exit, and every pool always has one pending: the
+/// idle-connection reaper, rescheduled every 30 seconds. So each dropped
+/// pool kept its three threads alive for up to 30 seconds after the last
+/// handle went away. Nothing a dropped pool's workers could still do
+/// matters -- the reaper and any pending connection refill only act on
+/// the pool, and it is gone -- so discarding them loses nothing. It
+/// matters wherever many databases are opened and dropped in quick
+/// succession: the daemon's test binary opens several per test, and on
+/// macOS the lingering workers alone exceeded the per-process thread
+/// limit, failing every later thread spawn with `EAGAIN`.
+fn worker_pool() -> std::sync::Arc<scheduled_thread_pool::ScheduledThreadPool> {
+    std::sync::Arc::new(
+        scheduled_thread_pool::ScheduledThreadPool::builder()
+            .num_threads(3)
+            .thread_name_pattern("r2d2-worker-{}")
+            .on_drop_behavior(scheduled_thread_pool::OnPoolDropBehavior::DiscardPendingScheduled)
+            .build(),
+    )
 }
 
 /// The other half of the `SQLITE_LOCKED` fix (see

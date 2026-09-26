@@ -160,9 +160,46 @@ CREATE TABLE IF NOT EXISTS history_base_path_heads (
 );
 -- The file index checks a current row's authoring change against the heads
 -- the installed base carries, by change and not by path: a conflict copy's
--- row lives at another path than the head that wrote it.
-CREATE INDEX IF NOT EXISTS idx_history_base_path_heads_change
-    ON history_base_path_heads(group_id, change_hash);
+-- row lives at another path than the head that wrote it. That check runs
+-- for every row an install writes, and joins the installed base in, so the
+-- index carries `base_hash` too: with only `(group_id, change_hash)` the
+-- primary key's `(group_id, base_hash)` prefix looks as selective, and
+-- SQLite scans every head of the base for each row -- quadratic in the
+-- number of paths.
+DROP INDEX IF EXISTS idx_history_base_path_heads_change;
+CREATE INDEX IF NOT EXISTS idx_history_base_path_heads_change_base
+    ON history_base_path_heads(group_id, change_hash, base_hash);
+-- The heads of one path, as the live path frontier reads them beside its
+-- own (see `history_base_named_heads`).
+CREATE INDEX IF NOT EXISTS idx_history_base_path_heads_path
+    ON history_base_path_heads(group_id, path);
+
+-- The installed base's heads a change on the current epoch has superseded,
+-- per path: `(path, change_hash, naming_change)` is here exactly when the
+-- admitted change `naming_change`, on the current epoch, touches `path`
+-- and names `change_hash` among its signed observed base heads. A base
+-- head is not a DAG node, so ancestry never supersedes one; naming is the
+-- only thing that does, and a base head at a path the current epoch
+-- touched that nothing named is still one of that path's live heads.
+--
+-- Derived, and maintained in the transaction that admits each change.
+-- Rows are kept per naming change so the record can be checked and
+-- rebuilt: a retained change's rows are recomputed from its signed bytes,
+-- and the rows of a change a checkpoint pruned -- whose bytes are gone --
+-- are the only thing left that says what it named, so they are kept as
+-- long as its prune record is. Not keyed by base: a new base is installed
+-- only by the epoch reset, which empties this table for the group along
+-- with the rest of the replaced base's summary.
+CREATE TABLE IF NOT EXISTS history_base_named_heads (
+    group_id      TEXT NOT NULL,
+    path          TEXT NOT NULL,
+    change_hash   BLOB NOT NULL,
+    naming_change BLOB NOT NULL,
+    PRIMARY KEY (group_id, path, change_hash, naming_change)
+);
+-- What one change named, as the startup check compares it.
+CREATE INDEX IF NOT EXISTS idx_history_base_named_heads_naming
+    ON history_base_named_heads(group_id, naming_change);
 
 -- The authoring change of every file row the base carries. A row outlives
 -- the head that wrote it: a path's removal leaves a row authored by the
@@ -537,16 +574,25 @@ impl GroupHistorySummary {
 /// come from the live path frontier, which describes only what is retained
 /// here, and the base's own head sets supply the rest.
 ///
-/// The two are composed per path, and the rule is what makes the base a
-/// causal root rather than a second history. Every change on the current
-/// epoch descends from the base as a whole, whatever its DAG parents say,
-/// so a path the current epoch has touched -- written, deleted, or moved
-/// away -- has exactly the current epoch's maximal writes as its heads,
-/// and nothing the base carried for it survives. A path the current epoch
-/// has not touched has exactly the heads the base carried. A live head
-/// retained from an earlier epoch is part of what the base absorbed and is
-/// never read from the frontier, because the frontier cannot see that the
-/// base orders it below the current epoch.
+/// The two are composed per path:
+///
+/// ```text
+/// Gamma_p = { x in Gamma_base(p) | no retained change of the current epoch
+///                                   that touches p names x }
+///         ∪ { the current epoch's live content heads of p }
+/// ```
+///
+/// A change on the current epoch does not descend from the whole base: it
+/// supersedes exactly the base heads it names among its signed observed
+/// base heads, at the paths it touches (see
+/// `yadorilink_replica_domain::change::Change::observed_base_heads`). A base
+/// head it does not name stays a head beside it, whatever its DAG parents
+/// say -- they cannot say anything about a base head, which is not a DAG
+/// node. Naming only ever adds, so the result does not depend on the order
+/// changes were admitted in. A path the current epoch has not touched has
+/// exactly the heads the base carried. A live head retained from an
+/// earlier epoch is part of what the base absorbed and is never read from
+/// the frontier.
 ///
 /// `L` is the base's ceiling, or the greatest Lamport any retained change
 /// reached if that is higher.
@@ -568,28 +614,19 @@ pub fn build_group_history_summary(
     };
     let author_state = crate::dag_store::author_chain::all_author_state(conn, group_id)?;
 
-    // Which live heads were written on the current epoch, and so which
-    // paths the current epoch has touched.
+    // Which live heads were written on the current epoch.
     let mut epoch_of: HashMap<ChangeHash, HistoryEpoch> = HashMap::new();
-    let mut touched: HashSet<String> = HashSet::new();
     for (path, hash) in crate::dag_store::path_frontier::live_heads_for_group(conn, group_id)? {
-        let written_on = match epoch_of.get(&hash) {
-            Some(written_on) => *written_on,
-            None => {
-                let encoded = crate::dag_store::get_encoded(conn, &hash)?.ok_or_else(|| {
-                    SyncSqliteError::CorruptState(format!(
-                        "live head {} of {path:?} in group {group_id} is not a retained change",
-                        hash.to_hex()
-                    ))
-                })?;
-                let written_on = decode_stored_change(&encoded)?.history_epoch;
-                epoch_of.insert(hash, written_on);
-                written_on
-            }
-        };
-        if written_on == epoch {
-            touched.insert(path);
+        if epoch_of.contains_key(&hash) {
+            continue;
         }
+        let encoded = crate::dag_store::get_encoded(conn, &hash)?.ok_or_else(|| {
+            SyncSqliteError::CorruptState(format!(
+                "live head {} of {path:?} in group {group_id} is not a retained change",
+                hash.to_hex()
+            ))
+        })?;
+        epoch_of.insert(hash, decode_stored_change(&encoded)?.history_epoch);
     }
     let mut path_heads: Vec<SnapshotPathHead> =
         crate::dag_store::path_frontier::live_content_heads_for_group(conn, group_id)?
@@ -597,8 +634,13 @@ pub fn build_group_history_summary(
             .filter(|head| epoch_of.get(&head.change_hash) == Some(&epoch))
             .collect();
     if let Some(base) = &base {
-        path_heads
-            .extend(base.path_heads.iter().filter(|head| !touched.contains(&head.path)).cloned());
+        let named = named_base_heads(conn, group_id)?;
+        path_heads.extend(
+            base.path_heads
+                .iter()
+                .filter(|head| !named.contains(&(head.path.clone(), head.change_hash)))
+                .cloned(),
+        );
     }
 
     let retained_ceiling: i64 = conn.query_row(
@@ -615,6 +657,24 @@ pub fn build_group_history_summary(
     let lamport_ceiling =
         (retained_ceiling as u64).max(base.as_ref().map_or(0, |base| base.lamport_ceiling));
     Ok(GroupHistorySummary { author_state, path_heads, lamport_ceiling })
+}
+
+/// The installed base's heads the current epoch has named, as
+/// `(path, change)`: the ones no longer live at that path.
+fn named_base_heads(
+    conn: &Connection,
+    group_id: &str,
+) -> Result<HashSet<(String, ChangeHash)>, SyncSqliteError> {
+    let mut stmt =
+        conn.prepare("SELECT path, change_hash FROM history_base_named_heads WHERE group_id = ?1")?;
+    let rows = stmt
+        .query_map([group_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)))?;
+    let mut named = HashSet::new();
+    for row in rows {
+        let (path, hash) = row?;
+        named.insert((path, ChangeHash(hash_32(&hash, "history_base_named_heads.change_hash")?)));
+    }
+    Ok(named)
 }
 
 /// The causal summary the currently installed HistoryBase carries, or
@@ -916,6 +976,18 @@ pub fn build_compaction_snapshot(
     // frontier no longer shows -- see `SnapshotAuthorState`'s own doc
     // comment for what that costs.
     let summary = build_group_history_summary(conn, group_id)?;
+
+    // Every head's evidence travels with the base too, not only the
+    // evidence of a row's author. A head no row holds -- a directory that
+    // lost its path by rank, which is owed no copy -- is still content the
+    // base carries, and a later merge that leaves it the only head of its
+    // path has to write its row: without its witness on either side that
+    // merge is refused, and nothing that arrives later can supply it.
+    for head in &summary.path_heads {
+        if witnessed.insert(head.change_hash) {
+            published_change_witnesses.push(build_witness_for_change(conn, &head.change_hash)?);
+        }
+    }
 
     // At most one live head per author per path. The snapshot refuses more
     // outright; saying which author and path is the useful half of that.
@@ -1332,6 +1404,7 @@ fn persist_history_base_summary(
     for table in [
         "history_base_author_state",
         "history_base_path_heads",
+        "history_base_named_heads",
         "history_base_carried_authors",
         "history_base_meta",
     ] {
@@ -1405,6 +1478,31 @@ fn persist_history_base(
         ],
     )?;
     persist_history_base_summary(conn, checkpoint.group_id.as_str(), &history_base, snapshot)?;
+    // The snapshot of the base the group leaves goes with it. Only the
+    // installed base is ever served, verified or merged again, and each
+    // snapshot is a copy of every row the group held, so keeping them
+    // would grow the store by the whole file set per base.
+    conn.execute(
+        "DELETE FROM change_checkpoint_snapshots WHERE group_id = ?1 AND checkpoint_hash != ?2",
+        params![checkpoint.group_id.as_str(), &checkpoint_hash.0[..]],
+    )?;
+    // So does the header of the base the group leaves, unless a prune
+    // proof still names it. The installed header is the one advertised and
+    // the newest by sequence; nothing walks back to an older one (a merged
+    // base is trusted by its signer, not by its provenance), and every
+    // open re-verifies every header kept, so keeping one per base would
+    // make startup grow with the number of seals.
+    conn.execute(
+        "DELETE FROM change_checkpoints \
+         WHERE group_id = ?1 AND checkpoint_hash != ?2 \
+           AND NOT EXISTS (SELECT 1 FROM pruned_changes pc \
+                           WHERE pc.group_id = ?1 \
+                             AND pc.checkpoint_hash = change_checkpoints.checkpoint_hash) \
+           AND NOT EXISTS (SELECT 1 FROM pruned_change_parents pcp \
+                           WHERE pcp.group_id = ?1 \
+                             AND pcp.checkpoint_hash = change_checkpoints.checkpoint_hash)",
+        params![checkpoint.group_id.as_str(), &checkpoint_hash.0[..]],
+    )?;
     // Every author whose position here is the one this base carries now
     // resumes from the base: the change that attained that position is
     // absorbed into it, and the next change links to the base through its
@@ -1632,15 +1730,18 @@ fn replace_group_files_from_snapshot(
                 ))
             })?
             .collect::<Result<_, _>>()?;
+        // A set, not a scan of `files` per captured row: this runs over
+        // every current row of the group, and a scan per row made debug
+        // installs and merges quadratic in the group's size.
+        let live_current: std::collections::HashSet<&str> = files
+            .iter()
+            .filter(|f| f.state == SnapshotVersionState::Current && !f.record.deleted)
+            .map(|f| f.record.path.as_str())
+            .collect();
         for (path, (held_reason, held_since_unix_nanos, pinned, captured_deleted)) in
             &local_only_state
         {
-            let still_live_current = files.iter().any(|f| {
-                &f.record.path == path
-                    && f.state == SnapshotVersionState::Current
-                    && !f.record.deleted
-            });
-            if !still_live_current {
+            if !live_current.contains(path.as_str()) {
                 continue;
             }
             // A relocated row carries its local-only state to its copy name.
@@ -1728,6 +1829,23 @@ fn install_row_witnesses(
         &yadorilink_replica_engine::rebootstrap_snapshot::PublishedChangeWitness,
     > = snapshot.published_change_witnesses.iter().map(|w| (w.change_hash, w)).collect();
 
+    // The evidence of every head the base carries, whether or not a row
+    // holds it: the head is content still to be projected here, and the
+    // next base this replica seals or mints has to carry its witness on.
+    let mut heads: Vec<ChangeHash> =
+        snapshot.path_heads.iter().map(|head| head.change_hash).collect();
+    heads.sort();
+    heads.dedup();
+    for change in heads {
+        let Some(witness) = witnesses_by_hash.get(&change) else {
+            return Err(SyncSqliteError::CorruptState(format!(
+                "history base snapshot carries head {} with no witness",
+                change.to_hex(),
+            )));
+        };
+        attach_witness(tx, group_id, &change, witness)?;
+    }
+
     for file in &snapshot.files {
         let Some(authoring_change_hash) = file.authoring_change_hash else { continue };
         let Some(witness) = witnesses_by_hash.get(&authoring_change_hash) else {
@@ -1738,33 +1856,7 @@ fn install_row_witnesses(
             )));
         };
 
-        let checkpoint = yadorilink_replica_domain::authorization_checkpoint::decode_checkpoint(
-            &witness.checkpoint_encoded,
-        )
-        .map_err(|error| {
-            SyncSqliteError::CorruptState(format!(
-                "cannot install witness for {}: its checkpoint envelope is undecodable: {error:?}",
-                authoring_change_hash.to_hex()
-            ))
-        })?;
-        let checkpoint_signature: [u8; 64] =
-            witness.checkpoint_signature.as_slice().try_into().map_err(|_| {
-                SyncSqliteError::CorruptState(format!(
-                    "cannot install witness for {}: its checkpoint signature is not 64 bytes",
-                    authoring_change_hash.to_hex()
-                ))
-            })?;
-        crate::dag_store::published_view::attach_authorization_evidence_on_conn(
-            tx,
-            &witness.checkpoint_hash,
-            group_id,
-            checkpoint.device_id.as_str(),
-            checkpoint.checkpoint_seq,
-            &witness.checkpoint_encoded,
-            &checkpoint_signature,
-            &witness.author_signing_public_key,
-            &[(authoring_change_hash, witness.merkle_proof_encoded.clone())],
-        )?;
+        attach_witness(tx, group_id, &authoring_change_hash, witness)?;
 
         // One link per version, as a seal records them: any change whose
         // evidence authorized the version justifies serving it, and two
@@ -1797,6 +1889,42 @@ fn install_row_witnesses(
     Ok(())
 }
 
+/// Records `witness` as this replica's evidence for `change`.
+fn attach_witness(
+    tx: &rusqlite::Transaction<'_>,
+    group_id: &str,
+    change: &ChangeHash,
+    witness: &yadorilink_replica_engine::rebootstrap_snapshot::PublishedChangeWitness,
+) -> Result<(), SyncSqliteError> {
+    let checkpoint = yadorilink_replica_domain::authorization_checkpoint::decode_checkpoint(
+        &witness.checkpoint_encoded,
+    )
+    .map_err(|error| {
+        SyncSqliteError::CorruptState(format!(
+            "cannot install witness for {}: its checkpoint envelope is undecodable: {error:?}",
+            change.to_hex()
+        ))
+    })?;
+    let checkpoint_signature: [u8; 64] =
+        witness.checkpoint_signature.as_slice().try_into().map_err(|_| {
+            SyncSqliteError::CorruptState(format!(
+                "cannot install witness for {}: its checkpoint signature is not 64 bytes",
+                change.to_hex()
+            ))
+        })?;
+    crate::dag_store::published_view::attach_authorization_evidence_on_conn(
+        tx,
+        &witness.checkpoint_hash,
+        group_id,
+        checkpoint.device_id.as_str(),
+        checkpoint.checkpoint_seq,
+        &witness.checkpoint_encoded,
+        &checkpoint_signature,
+        &witness.author_signing_public_key,
+        &[(*change, witness.merkle_proof_encoded.clone())],
+    )
+}
+
 #[cfg(test)]
 mod summary_join_tests;
 
@@ -1805,6 +1933,11 @@ mod replace_group_files_from_snapshot_tests;
 
 #[cfg(test)]
 mod group_history_summary_tests;
+
+/// The named-base-heads record is derived: checked at startup, recomputed
+/// by a rebuild.
+#[cfg(test)]
+mod named_heads_rebuild_tests;
 
 /// Installing a base with the atomic epoch reset, and the fixtures the
 /// other install tests build on.
@@ -1848,3 +1981,14 @@ mod foreign_merge_tests;
 
 #[cfg(test)]
 mod merge_install_tests;
+
+/// What stays bounded across repeated seals and merges: every table's
+/// size depends on the files and the authors, never on how many changes,
+/// seals or merges the group has been through.
+#[cfg(test)]
+mod bounded_metadata_tests;
+
+/// What admission, a seal, an install and a merge cost as the group grows,
+/// counted in SQLite's own steps rather than timed.
+#[cfg(test)]
+mod scale_cost_tests;

@@ -287,6 +287,8 @@ pub(crate) enum Recapture {
 }
 
 impl LocalConvergenceExecutor {
+    // One argument per injected dependency of the executor.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         state: Arc<crate::replica_coordinator::ReplicaCoordinator>,
         local_device_id: String,
@@ -1038,9 +1040,7 @@ impl LocalConvergenceExecutor {
                 reason: reason.to_string(),
             }));
         }
-        return Ok(MaterializeResult::Settled(SettlementEvidence::ExactAbsent {
-            mutation_generation,
-        }));
+        Ok(MaterializeResult::Settled(SettlementEvidence::ExactAbsent { mutation_generation }))
     }
 
     /// Removes what a tombstone deletes at `out_path`: the file or symlink
@@ -1440,7 +1440,7 @@ impl LocalConvergenceExecutor {
         group_id: &str,
         path: &str,
     ) -> Result<Vec<PathHead>, PeerSessionError> {
-        Ok(self.state.dag_path_live_heads(group_id, path)?)
+        self.state.dag_path_live_heads(group_id, path)
     }
 
     /// The conflict-copy paths `path`'s own resolution derives right now.

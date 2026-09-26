@@ -9,8 +9,7 @@ use yadorilink_replica_domain::authorization_checkpoint::{
     AuthorizationCheckpoint,
 };
 use yadorilink_replica_domain::change::{Change, Op};
-use yadorilink_replica_domain::file::{FileMeta, FileVersion, RecordKind, VersionBlock};
-use yadorilink_replica_domain::ids::BlockHash;
+use yadorilink_replica_domain::file::FileVersion;
 use yadorilink_replica_domain::ids::{DeviceId, FolderGroupId, SyncPath};
 use yadorilink_replica_domain::test_authoring::create_signed_for_tests;
 use yadorilink_sqlite_runtime::SyncDatabase;

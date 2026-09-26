@@ -168,6 +168,39 @@ pub fn create_signed_on_base_for_tests(
     change
 }
 
+/// [`create_signed_on_base_for_tests`] for a change that names, among its
+/// observed base heads, the heads of the installed base it saw at the
+/// paths it writes -- the only base heads a change on a base supersedes.
+#[allow(clippy::too_many_arguments)]
+pub fn create_signed_observing_on_base_for_tests(
+    parents: Vec<ChangeHash>,
+    max_parent_lamport: u64,
+    device_id: DeviceId,
+    group_id: FolderGroupId,
+    history_epoch: HistoryEpoch,
+    observed_base_heads: Vec<ChangeHash>,
+    ops: Vec<Op>,
+    signing_key: &SigningKey,
+) -> Change {
+    let (author_seq, author_prev) = next_author_position(&group_id, &device_id);
+    let change = Change::create_signed_observing(
+        parents,
+        max_parent_lamport,
+        device_id.clone(),
+        author_seq,
+        author_prev,
+        group_id.clone(),
+        history_epoch,
+        crate::change::ChangePurpose::Ordinary,
+        None,
+        observed_base_heads,
+        ops,
+        signing_key,
+    );
+    record_author_tip(&group_id, &device_id, change.compute_hash());
+    change
+}
+
 /// [`Change::create_repair_signed`] with the author sequence allocated by
 /// [`next_author_seq`].
 pub fn create_repair_signed_for_tests(

@@ -383,6 +383,7 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         group_id: &str,
         path: &str,
         generation: i64,
+        removable: Option<&yadorilink_root_authority::fs_identity::FileIdentity>,
     ) -> Result<Option<String>, MaterializationExecutionError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -390,7 +391,7 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
             .unwrap_or(0);
         Ok(self
             .snapshot_install_hold_repository()
-            .relocate_held_entry_beside_directory(group_id, path, generation, now)
+            .relocate_held_entry_beside_directory(group_id, path, generation, removable, now)
             .map_err(SyncError::from)?)
     }
 

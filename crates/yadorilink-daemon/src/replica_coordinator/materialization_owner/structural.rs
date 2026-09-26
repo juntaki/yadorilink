@@ -12,7 +12,7 @@
 //! [`ReplicaCoordinator::abandon_structural_directory_intent`]; recovery,
 //! adoption, rekeying and forgetting are the operations below.
 
-use yadorilink_root_authority::fs_identity::{FileIdentity, TimestampGranularity};
+use yadorilink_root_authority::fs_identity::FileIdentity;
 use yadorilink_sync_sqlite::structural_origin::StructuralOriginCompletion;
 use yadorilink_sync_sqlite::SyncSqliteError;
 
@@ -190,23 +190,6 @@ impl ReplicaCoordinator {
         identity: &FileIdentity,
     ) -> Result<(), SyncSqliteError> {
         self.sqlite().dag_adopt_structural_directory(group_id, path, identity, now_unix_nanos())
-    }
-
-    /// Follows a structural directory a rename moved to `to_path`.
-    pub(crate) fn follow_renamed_structural_directory(
-        &self,
-        group_id: &str,
-        to_path: &str,
-        identity: &FileIdentity,
-        birth_time_granularity: TimestampGranularity,
-    ) -> Result<Option<String>, SyncSqliteError> {
-        self.sqlite().dag_rekey_structural_origin(
-            group_id,
-            to_path,
-            identity,
-            birth_time_granularity,
-            now_unix_nanos(),
-        )
     }
 
     /// Settles a directory removed from disk: nothing is structural or

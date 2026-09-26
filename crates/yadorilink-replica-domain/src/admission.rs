@@ -242,6 +242,15 @@ pub enum AdmissionRefusal {
     /// so nothing would ever wake it, and nothing would ask a peer for it
     /// again either.
     BehindRejectedParent { parent: ChangeHash },
+    /// The change is on this history and names, as a base head it
+    /// observed, a change that is not a head of this history's base at any
+    /// path it touches (see
+    /// [`crate::change::Change::observed_base_heads`]). Measured against
+    /// the base this replica is on, like a foreign history base, and final
+    /// for as long as the replica stays on it: a signed claim to have seen
+    /// something the base never carried there is not made true by any
+    /// later delivery.
+    InvalidObservedBaseHead { local: HistoryEpoch, head: ChangeHash },
 }
 
 impl std::fmt::Display for AdmissionRefusal {
@@ -257,6 +266,12 @@ impl std::fmt::Display for AdmissionRefusal {
                 "DAG parent {} is permanently refused here, so this change's ancestry can \
                  never be complete",
                 parent.to_hex()
+            ),
+            Self::InvalidObservedBaseHead { local, head } => write!(
+                f,
+                "change names {} as an observed base head, which {local} carries at no path the \
+                 change touches",
+                head.to_hex()
             ),
         }
     }
@@ -319,6 +334,10 @@ pub enum AdmitOutcome {
     /// [`AdmissionRefusal::BehindRejectedParent`]. Nothing was written for
     /// the change and nothing is held.
     RefusedBehindRejectedParent { parent: ChangeHash },
+    /// The change names an observed base head its base does not carry at
+    /// any path it touches; see [`AdmissionRefusal::InvalidObservedBaseHead`].
+    /// Nothing was written for the change and nothing is held.
+    RefusedInvalidObservedBaseHead { local: HistoryEpoch, head: ChangeHash },
 }
 
 impl AdmitOutcome {
@@ -334,6 +353,9 @@ impl AdmitOutcome {
             Self::RefusedBehindRejectedParent { parent } => {
                 Some(AdmissionRefusal::BehindRejectedParent { parent })
             }
+            Self::RefusedInvalidObservedBaseHead { local, head } => {
+                Some(AdmissionRefusal::InvalidObservedBaseHead { local, head })
+            }
         }
     }
 }
@@ -347,6 +369,9 @@ impl From<AdmissionRefusal> for AdmitOutcome {
             }
             AdmissionRefusal::BehindRejectedParent { parent } => {
                 Self::RefusedBehindRejectedParent { parent }
+            }
+            AdmissionRefusal::InvalidObservedBaseHead { local, head } => {
+                Self::RefusedInvalidObservedBaseHead { local, head }
             }
         }
     }

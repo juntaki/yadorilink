@@ -1414,6 +1414,12 @@ async fn hydrate_impl(
     result
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one on-access hydration attempt as a single ordered sequence whose steps \
+              share the attempt's locks, fences and timer; the inline comments justify \
+              that ordering step by step"
+)]
 async fn hydrate_inner(
     state: &Arc<DaemonState>,
     group_id: &str,
@@ -2426,6 +2432,12 @@ pub async fn restore_to_version_with_timeout(
         })
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one restore attempt as a single ordered sequence whose steps share the \
+              same fence and permit; splitting it would separate each step from the \
+              ordering argument written beside it"
+)]
 async fn restore_to_version_inner(
     state: &Arc<DaemonState>,
     group_id: &str,

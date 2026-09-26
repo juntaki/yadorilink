@@ -760,6 +760,11 @@ async fn unix_mode_set_on_brand_new_file_propagates_to_peer() {
 ///    check alone, which a bug that collapses every materialized exec bit
 ///    to the same wrong value would still satisfy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one end-to-end scenario read top to bottom: setup, divergence, reconnect, \
+              then the multiset assertion described above"
+)]
 async fn shared_history_unix_mode_only_divergence_converges_after_reconnect() {
     #[cfg(not(unix))]
     {

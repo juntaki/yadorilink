@@ -318,6 +318,18 @@ impl AdmissionCoordinator {
                             "discarded a staged Change whose DAG parent is permanently refused"
                         );
                     }
+                    // Not blocked: the names are the Change's own bytes,
+                    // measured against the base this device is on.
+                    AdmissionOutcome::RefusedInvalidObservedBaseHead { local, head } => {
+                        settled += 1;
+                        tracing::warn!(
+                            group = %group.0,
+                            change = %hex::encode(hash.0),
+                            local = %local,
+                            head = %hex::encode(head.0),
+                            "discarded a staged Change naming a base head its base does not carry"
+                        );
+                    }
                 }
             }
 

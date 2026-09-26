@@ -128,12 +128,24 @@ fn a_group_that_already_holds_an_installed_base_is_summarized_over_its_whole_his
         "nothing has been written above the base, so the summary is the base's own"
     );
 
-    // Rewriting p.txt above the base replaces the head the base carried
-    // for it; q.txt, untouched, keeps the base's.
+    // Rewriting p.txt above the base, shown the version the base carried
+    // there, names that head and replaces it; q.txt, untouched, keeps the
+    // base's.
     let v3 = version(3);
     crate::dag_store::put_file_version(&conn, GROUP, &v3).unwrap();
-    let a3 = crate::dag_store::emit_local_change(&conn, GROUP, vec![put("p.txt", &v3)], &emitter)
-        .unwrap();
+    let shown = crate::dag_store::SeenVersions::from([(
+        "p.txt".to_string(),
+        std::collections::BTreeSet::from([a1]),
+    )]);
+    let a3 = crate::dag_store::emit_local_change_seeing(
+        &conn,
+        GROUP,
+        vec![put("p.txt", &v3)],
+        &shown,
+        &emitter,
+    )
+    .unwrap();
+    assert_eq!(a3.observed_base_heads, vec![a1]);
     let after = build_group_history_summary(&conn, GROUP).unwrap();
     let heads_of = |path: &str| -> Vec<ChangeHash> {
         after

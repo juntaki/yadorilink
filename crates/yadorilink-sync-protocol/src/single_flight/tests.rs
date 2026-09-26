@@ -156,9 +156,7 @@ async fn a_burst_of_wakes_during_a_pass_costs_exactly_one_more_pass() {
                     let pass = runs.fetch_add(1, Ordering::SeqCst);
                     if pass == 0 {
                         // 50 arrivals land while the first pass runs.
-                        for _ in 0..50 {
-                            flight.wake(&"peer/group");
-                        }
+                        (0..50).for_each(|_| flight.wake(&"peer/group"));
                     }
                     Ok::<_, ()>(())
                 }
@@ -169,6 +167,16 @@ async fn a_burst_of_wakes_during_a_pass_costs_exactly_one_more_pass() {
 
     assert_eq!(outcome, Flight::Ran { passes: 2 });
     assert_eq!(runs.load(Ordering::SeqCst), 2, "50 wake-ups must not mean 50 passes");
+}
+
+/// Blocks until the test releases the first pass (only the first taker
+/// waits; later takers find the receiver gone).
+async fn wait_for_release(
+    release_rx: &tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+) {
+    if let Some(rx) = release_rx.lock().await.take() {
+        let _ = rx.await;
+    }
 }
 
 #[tokio::test]
@@ -189,9 +197,7 @@ async fn a_second_caller_for_the_same_key_does_not_start_a_second_reconciliation
                     let release_rx = release_rx.clone();
                     async move {
                         runs.fetch_add(1, Ordering::SeqCst);
-                        if let Some(rx) = release_rx.lock().await.take() {
-                            let _ = rx.await;
-                        }
+                        wait_for_release(&release_rx).await;
                         Ok::<_, ()>(())
                     }
                 })

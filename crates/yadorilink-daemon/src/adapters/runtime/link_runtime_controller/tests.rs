@@ -310,8 +310,11 @@ async fn start_watch_and_await_scan(state: &Arc<DaemonState>, root: &Path, group
             Arc::new(RealFolderWatchSource),
         )
         .expect("the watch must start");
+    // A bound on a hang, not a speed assertion: the backstop-sweep test
+    // scans 10,200 directories, which can take well over 10s on a loaded
+    // CI runner.
     tokio::time::timeout(
-        std::time::Duration::from_secs(10),
+        std::time::Duration::from_secs(60),
         state.replica_coordinator.wait_group_ready(group),
     )
     .await

@@ -1030,6 +1030,8 @@ pub(crate) fn terminal_object_is_a_regular_file(out_path: &Path) -> bool {
     std::fs::symlink_metadata(out_path).map(|m| m.file_type().is_file()).unwrap_or(false)
 }
 
+// Each argument is an independent input to one metadata-only update.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn try_apply_metadata_only_update(
     state: &crate::replica_coordinator::ReplicaCoordinator,
     root: &Path,
@@ -1236,53 +1238,6 @@ pub(crate) fn require_xattr_evidence(
         );
         PeerSessionError::ReplicatedXattrsNotExact(path.to_string())
     })
-}
-
-/// The `ExactObject` proof gate every path that constructs one after
-/// applying replicated extended attributes must pass through: a strict,
-/// on-disk reread (`yadorilink_local_storage::verify_replicated_xattrs_
-/// exact`) of what `path` actually holds right now, compared against
-/// what the desired version specifies. `FileVersion`'s content-addressed
-/// identity bakes replicated xattr bytes directly into `version_hash`
-/// (see `FileVersion::compute_hash`), so an `ExactObject` proof that
-/// disagrees with what disk can actually be confirmed to hold would be a
-/// false claim -- and `apply_xattrs` itself never surfaces a
-/// `fsetxattr`/`fremovexattr` failure as an `Err` (deliberately
-/// best-effort at the syscall layer), so nothing upstream of this check
-/// would otherwise ever catch one.
-///
-/// Both of `verify_replicated_xattrs_exact`'s failure outcomes -- a
-/// confirmed mismatch, and a real I/O failure enumerating or reading an
-/// attribute on the Linux backend that can actually attempt the
-/// comparison -- collapse to the same `ReplicatedXattrsNotExact` error
-/// on purpose: both mean the same thing to every caller here, which is
-/// "do not settle this as exact," never "the write itself failed." A
-/// caller's own error handling maps that, like any other
-/// materialize-time error, to leaving the obligation outstanding for
-/// retry. A backend with no replicated-xattr support at all never
-/// reaches this error path -- see `verify_replicated_xattrs_exact`'s
-/// own non-Linux arm, which treats xattrs as retained-only there
-/// (target projection contract, see `SettlementEvidence::ExactObject`'s
-/// own doc comment) rather than blocking completion on a field this
-/// target was never expected to physically reproduce.
-pub(crate) fn require_replicated_xattrs_exact(
-    path: &str,
-    out_path: &Path,
-    desired_xattrs: &[(String, Vec<u8>)],
-) -> Result<(), PeerSessionError> {
-    match yadorilink_local_storage::verify_replicated_xattrs_exact(out_path, desired_xattrs) {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(PeerSessionError::ReplicatedXattrsNotExact(path.to_string())),
-        Err(e) => {
-            tracing::debug!(
-                path,
-                error = %e,
-                "could not confirm replicated extended attributes exactly match the desired \
-                 version; refusing to settle as exact"
-            );
-            Err(PeerSessionError::ReplicatedXattrsNotExact(path.to_string()))
-        }
-    }
 }
 
 /// The `ExactObject` proof gate against a claimed object kind actually

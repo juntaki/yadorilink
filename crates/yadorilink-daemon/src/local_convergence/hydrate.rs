@@ -2,7 +2,6 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use yadorilink_local_storage::apply_file_metadata;
 use yadorilink_peer_session::PeerSessionError;
 use yadorilink_replica_domain::admission::ChangeOrdering;
 use yadorilink_replica_domain::file::FileVersion;
@@ -72,7 +71,7 @@ impl super::LocalConvergenceExecutor {
         // the "constructed once per call and threaded by reference through
         // every function that call touches" property this module's own doc
         // comment already claims.
-        let prefetched = self.obtain_missing_content(&driver, group_id, &paths, call_timer).await?;
+        let prefetched = self.obtain_missing_content(driver, group_id, &paths, call_timer).await?;
         self.reconcile_group_paths_guarded(
             group_id,
             paths,
@@ -226,6 +225,178 @@ impl super::LocalConvergenceExecutor {
                 *give_up = true;
             }
         }
+    }
+
+    /// Physically reapplies incoming wire metadata that diverged from an
+    /// equal-authoring local row, after `apply_locked_record` has already
+    /// written it to the index columns. `Some` ends that dispatch with the
+    /// returned outcome.
+    fn reapply_equal_authoring_metadata(
+        &self,
+        group_id: &str,
+        local: &FileRecord,
+        meta: &IncomingWireMeta,
+        incoming_author: &ChangeHash,
+        incoming_origin: &str,
+        root_commit_permit: &yadorilink_root_authority::root_commit::RootCommitPermit<'_>,
+    ) -> Result<Option<LockedRecordOutcome>, PeerSessionError> {
+        match meta.record_kind {
+            RecordKind::File => {
+                let root = self.sync_root(group_id)?;
+                let out_path = root.join(&local.path);
+                self.verify_write_target(group_id, &out_path)?;
+                // This was the one metadata-repair call site
+                // in this module that skipped the "bump before the
+                // first mutating syscall, no exceptions"
+                // fence discipline every other
+                // `apply_unix_mode`/`apply_xattrs` call site
+                // follows (see `try_apply_metadata_only_
+                // update`'s and the equivalent-content
+                // `Equal`-arm's own doc comments for the
+                // identical fix, mirrored here exactly).
+                // `apply_xattrs` unconditionally issues a
+                // real `fsetxattr`/`fremovexattr` for every
+                // desired name and silently swallows a
+                // syscall failure by its own documented
+                // contract -- without a preceding fence
+                // bump, a real write failure here leaves the
+                // live mutation fence unchanged, so an
+                // already-published stale proof for this
+                // path (published under the OLD fence
+                // value) stays wrongly "current" and a later
+                // consumer is told disk matches evidence it
+                // does not.
+                let mode_matches = yadorilink_local_storage::unix_mode_already_matches_disk(
+                    &out_path,
+                    meta.unix_mode,
+                )?;
+                let xattrs_match =
+                    yadorilink_local_storage::xattrs_already_match_disk(&out_path, &meta.xattrs)?;
+                // Asked before the bump, not after: a file
+                // its owner cannot read can have its
+                // attributes neither read back nor set, so
+                // the repair could only bump the fence and
+                // fail, on every pass. It is held instead,
+                // with nothing on disk touched.
+                if !xattrs_match && existing_file_is_owner_unreadable(&out_path)? {
+                    self.state.hold_metadata_unprovable(
+                        group_id,
+                        &local.path,
+                        &out_path,
+                        &MaterializationPayload::from_wire(local.clone(), meta)
+                            .version()
+                            .version_hash,
+                    )?;
+                    return Ok(Some(LockedRecordOutcome::Settled));
+                }
+                let metadata_already_matches_disk = mode_matches && xattrs_match;
+                let mutation_generation = if metadata_already_matches_disk {
+                    // A true zero-mutation verification --
+                    // no syscall below will change anything,
+                    // so this is a snapshot, never a bump.
+                    // The proof step below re-reads disk.
+                    self.state.dag_snapshot_mutation_fence(group_id, &local.path)?
+                } else {
+                    let fence = self.state.dag_bump_mutation_fence(
+                        group_id,
+                        &local.path,
+                        "equal_authoring_metadata_repair",
+                    )?;
+                    // Surfaces a real `fsetxattr`/`fremovexattr`
+                    // failure as a retriable error instead of
+                    // letting `apply_xattrs`'s own
+                    // silently-swallowed-failure contract
+                    // fold it into a false settle. Checked
+                    // inside the attempt, before the final
+                    // mode: a mode such as 0o200 makes the
+                    // attributes unreadable afterwards
+                    // without changing them.
+                    let applied = yadorilink_local_storage::apply_file_metadata_verified(
+                        &out_path,
+                        meta.unix_mode,
+                        &meta.xattrs,
+                    )?;
+                    require_xattr_evidence(
+                        &local.path,
+                        &out_path,
+                        &meta.xattrs,
+                        &XattrEvidence::from(applied),
+                    )?;
+                    fence
+                };
+                self.prove_equal_authoring_file_repair(
+                    group_id,
+                    local,
+                    meta,
+                    &out_path,
+                    incoming_author,
+                    mutation_generation,
+                    root_commit_permit,
+                )?;
+                self.state.clear_metadata_unprovable_hold(group_id, &local.path)?;
+            }
+            RecordKind::Symlink => {
+                let windows_opt_in = self.state.windows_symlink_opt_in_for_group(group_id)?;
+                // This call site used to discard
+                // `materialize_symlink_at`'s
+                // returned outcome entirely, unlike the
+                // ordinary `materialize()` symlink dispatch
+                // (see this crate's own `SymlinkMaterializeOutcome::
+                // PolicySkipped` handling there). A
+                // `PolicySkipped` outcome here left the row
+                // at whatever `materialization_state` it
+                // already had -- reachable via this Equal-
+                // authoring repair path independent of that
+                // other call site's own fix.
+                if matches!(
+                    materialize_symlink_at(
+                        SymlinkMaterialization {
+                            state: self.state.as_ref(),
+                            root: &self.sync_root(group_id)?,
+                            group_id,
+                            windows_opt_in,
+                            origin_device_id: incoming_origin,
+                            authoring_change_hash: Some(incoming_author),
+                            permit: root_commit_permit,
+                        },
+                        local,
+                        // The payload this repair arm is
+                        // applying: `local`'s content
+                        // (proven equal-authoring above)
+                        // plus the incoming wire metadata
+                        // this arm exists to reapply.
+                        //
+                        // NOT `tombstone(local)`, which
+                        // was here before and is wrong
+                        // now that the link target comes
+                        // from the version: `tombstone`
+                        // hardcodes `record_kind: File`
+                        // and `symlink_target: None`, so
+                        // this arm would have skipped
+                        // every symlink write as "no
+                        // target recorded" -- the repair
+                        // would have become a no-op that
+                        // demoted the row to
+                        // `Placeholder` forever.
+                        MaterializationPayload::from_wire(local.clone(), meta).version(),
+                    )?,
+                    SymlinkMaterializeOutcome::PolicySkipped
+                ) {
+                    self.state.set_materialization_state(
+                        group_id,
+                        &local.path,
+                        MaterializationState::Placeholder,
+                        root_commit_permit,
+                    )?;
+                }
+            }
+            // Nothing physical to reapply for a
+            // directory beyond the index columns
+            // `apply_incoming_wire_metadata` above
+            // already fixed.
+            RecordKind::Directory => {}
+        }
+        Ok(None)
     }
 
     pub async fn apply_locked_record(
@@ -392,168 +563,15 @@ impl super::LocalConvergenceExecutor {
                             &meta,
                             &root_commit_permit,
                         )?;
-                        match meta.record_kind {
-                            RecordKind::File => {
-                                let root = self.sync_root(group_id)?;
-                                let out_path = root.join(&local.path);
-                                self.verify_write_target(group_id, &out_path)?;
-                                // This was the one metadata-repair call site
-                                // in this module that skipped the "bump before the
-                                // first mutating syscall, no exceptions"
-                                // fence discipline every other
-                                // `apply_unix_mode`/`apply_xattrs` call site
-                                // follows (see `try_apply_metadata_only_
-                                // update`'s and the equivalent-content
-                                // `Equal`-arm's own doc comments for the
-                                // identical fix, mirrored here exactly).
-                                // `apply_xattrs` unconditionally issues a
-                                // real `fsetxattr`/`fremovexattr` for every
-                                // desired name and silently swallows a
-                                // syscall failure by its own documented
-                                // contract -- without a preceding fence
-                                // bump, a real write failure here leaves the
-                                // live mutation fence unchanged, so an
-                                // already-published stale proof for this
-                                // path (published under the OLD fence
-                                // value) stays wrongly "current" and a later
-                                // consumer is told disk matches evidence it
-                                // does not.
-                                let mode_matches =
-                                    yadorilink_local_storage::unix_mode_already_matches_disk(
-                                        &out_path,
-                                        meta.unix_mode,
-                                    )?;
-                                let xattrs_match =
-                                    yadorilink_local_storage::xattrs_already_match_disk(
-                                        &out_path,
-                                        &meta.xattrs,
-                                    )?;
-                                // Asked before the bump, not after: a file
-                                // its owner cannot read can have its
-                                // attributes neither read back nor set, so
-                                // the repair could only bump the fence and
-                                // fail, on every pass. It is held instead,
-                                // with nothing on disk touched.
-                                if !xattrs_match && existing_file_is_owner_unreadable(&out_path)? {
-                                    self.state.hold_metadata_unprovable(
-                                        group_id,
-                                        &local.path,
-                                        &out_path,
-                                        &MaterializationPayload::from_wire(local.clone(), &meta)
-                                            .version()
-                                            .version_hash,
-                                    )?;
-                                    return Ok(LockedRecordOutcome::Settled);
-                                }
-                                let metadata_already_matches_disk = mode_matches && xattrs_match;
-                                let mutation_generation = if metadata_already_matches_disk {
-                                    // A true zero-mutation verification --
-                                    // no syscall below will change anything,
-                                    // so this is a snapshot, never a bump.
-                                    // The proof step below re-reads disk.
-                                    self.state.dag_snapshot_mutation_fence(group_id, &local.path)?
-                                } else {
-                                    let fence = self.state.dag_bump_mutation_fence(
-                                        group_id,
-                                        &local.path,
-                                        "equal_authoring_metadata_repair",
-                                    )?;
-                                    // Surfaces a real `fsetxattr`/`fremovexattr`
-                                    // failure as a retriable error instead of
-                                    // letting `apply_xattrs`'s own
-                                    // silently-swallowed-failure contract
-                                    // fold it into a false settle. Checked
-                                    // inside the attempt, before the final
-                                    // mode: a mode such as 0o200 makes the
-                                    // attributes unreadable afterwards
-                                    // without changing them.
-                                    let applied =
-                                        yadorilink_local_storage::apply_file_metadata_verified(
-                                            &out_path,
-                                            meta.unix_mode,
-                                            &meta.xattrs,
-                                        )?;
-                                    require_xattr_evidence(
-                                        &local.path,
-                                        &out_path,
-                                        &meta.xattrs,
-                                        &XattrEvidence::from(applied),
-                                    )?;
-                                    fence
-                                };
-                                self.prove_equal_authoring_file_repair(
-                                    group_id,
-                                    &local,
-                                    &meta,
-                                    &out_path,
-                                    incoming_author,
-                                    mutation_generation,
-                                    &root_commit_permit,
-                                )?;
-                                self.state.clear_metadata_unprovable_hold(group_id, &local.path)?;
-                            }
-                            RecordKind::Symlink => {
-                                let windows_opt_in =
-                                    self.state.windows_symlink_opt_in_for_group(group_id)?;
-                                // This call site used to discard
-                                // `materialize_symlink_at`'s
-                                // returned outcome entirely, unlike the
-                                // ordinary `materialize()` symlink dispatch
-                                // (see this crate's own `SymlinkMaterializeOutcome::
-                                // PolicySkipped` handling there). A
-                                // `PolicySkipped` outcome here left the row
-                                // at whatever `materialization_state` it
-                                // already had -- reachable via this Equal-
-                                // authoring repair path independent of that
-                                // other call site's own fix.
-                                if matches!(
-                                    materialize_symlink_at(
-                                        SymlinkMaterialization {
-                                            state: self.state.as_ref(),
-                                            root: &self.sync_root(group_id)?,
-                                            group_id,
-                                            windows_opt_in,
-                                            origin_device_id: &incoming_origin,
-                                            authoring_change_hash: Some(incoming_author),
-                                            permit: &root_commit_permit,
-                                        },
-                                        &local,
-                                        // The payload this repair arm is
-                                        // applying: `local`'s content
-                                        // (proven equal-authoring above)
-                                        // plus the incoming wire metadata
-                                        // this arm exists to reapply.
-                                        //
-                                        // NOT `tombstone(local)`, which
-                                        // was here before and is wrong
-                                        // now that the link target comes
-                                        // from the version: `tombstone`
-                                        // hardcodes `record_kind: File`
-                                        // and `symlink_target: None`, so
-                                        // this arm would have skipped
-                                        // every symlink write as "no
-                                        // target recorded" -- the repair
-                                        // would have become a no-op that
-                                        // demoted the row to
-                                        // `Placeholder` forever.
-                                        MaterializationPayload::from_wire(local.clone(), &meta)
-                                            .version(),
-                                    )?,
-                                    SymlinkMaterializeOutcome::PolicySkipped
-                                ) {
-                                    self.state.set_materialization_state(
-                                        group_id,
-                                        &local.path,
-                                        MaterializationState::Placeholder,
-                                        &root_commit_permit,
-                                    )?;
-                                }
-                            }
-                            // Nothing physical to reapply for a
-                            // directory beyond the index columns
-                            // `apply_incoming_wire_metadata` above
-                            // already fixed.
-                            RecordKind::Directory => {}
+                        if let Some(outcome) = self.reapply_equal_authoring_metadata(
+                            group_id,
+                            &local,
+                            &meta,
+                            incoming_author,
+                            &incoming_origin,
+                            &root_commit_permit,
+                        )? {
+                            return Ok(outcome);
                         }
                     }
                 }
@@ -1093,8 +1111,7 @@ impl super::LocalConvergenceExecutor {
     /// metadata is applied describes a state the same attempt is about to
     /// change; and `apply_xattrs` swallows a `fsetxattr`/`fremovexattr`
     /// failure by its own documented contract, so without
-    /// `require_replicated_xattrs_exact` nothing upstream would ever see
-    /// one.
+    /// `require_xattr_evidence` nothing upstream would ever see one.
     ///
     /// Every value written comes from `version` -- the payload -- never
     /// from the row. Re-reading the row here would let a supersession

@@ -18,7 +18,7 @@ use crate::error::DatabaseError;
 /// Bump this whenever the created shape changes at all, since the previous
 /// shape becomes unopenable by this binary and unopenable is the intended
 /// outcome.
-pub const SCHEMA_VERSION: i32 = 60;
+pub const SCHEMA_VERSION: i32 = 62;
 
 /// Reads `PRAGMA user_version` and refuses anything that is not exactly
 /// this binary's [`SCHEMA_VERSION`], in either direction: a newer stamp is
@@ -852,18 +852,6 @@ pub fn table_exists(conn: &Connection, table: &str) -> Result<bool, DatabaseErro
         |r| r.get(0),
     )?;
     Ok(count > 0)
-}
-
-fn files_table_has_column(conn: &Connection, column: &str) -> Result<bool, DatabaseError> {
-    let mut stmt = conn.prepare("PRAGMA table_info(files)")?;
-    let mut rows = stmt.query([])?;
-    while let Some(row) = rows.next()? {
-        let name: String = row.get(1)?;
-        if name == column {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 #[cfg(test)]

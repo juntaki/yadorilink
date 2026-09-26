@@ -66,7 +66,12 @@ use crate::reserved_paths::{IGNORE_FILE_NAME, ROOT_MARKER_FILE_NAME};
 /// since v9 reads a recursive-operation discriminant where v8 wrote the
 /// parent count's leading byte, and every field after it at the wrong
 /// offset.
-pub const CHANGE_DOMAIN_TAG: &[u8; 8] = b"YLNKchg\x09";
+///
+/// Version 10 adds the signed [`Change::observed_base_heads`] directly
+/// after the recursive-operation grouping: the heads of the history base
+/// this change was written on that its author actually saw at the paths it
+/// touches, and so the only base heads it supersedes.
+pub const CHANGE_DOMAIN_TAG: &[u8; 8] = b"YLNKchg\x0a";
 
 /// The length of [`CHANGE_DOMAIN_TAG`]'s type-identifying prefix; the one
 /// byte after it is the encoding generation.
@@ -87,12 +92,21 @@ const CHANGE_DOMAIN_TAG_PREFIX_LEN: usize = 7;
 /// history still has to be able to name, exactly like the sequence;
 /// version 6 carries the recursive-operation grouping, matching
 /// `CHANGE_DOMAIN_TAG` v9, so a compacted part still says which operation
-/// it belonged to.
-const CHANGE_HEADER_DOMAIN_TAG: &[u8; 8] = b"YLNKchH\x06";
+/// it belonged to; version 7 carries the observed base heads, matching
+/// `CHANGE_DOMAIN_TAG` v10, since which base heads a change superseded is
+/// part of what it did.
+const CHANGE_HEADER_DOMAIN_TAG: &[u8; 8] = b"YLNKchH\x07";
 /// Version stamp for the header encoding a pruned causal stub retains
 /// (`dag_store`'s `pruned_changes.encoding_version`), bumped only if
 /// [`Change::authenticated_header_encoding`]'s layout changes.
-pub const PRUNED_STUB_ENCODING_VERSION: i32 = 6;
+pub const PRUNED_STUB_ENCODING_VERSION: i32 = 7;
+
+/// The most base heads one change may name in
+/// [`Change::observed_base_heads`]. The natural bound is the number of
+/// heads the base carries at the paths the change touches -- at most the
+/// number of authors per path -- so a change that names more than this is
+/// not describing anything a writer could have been shown.
+pub const MAX_OBSERVED_BASE_HEADS: usize = 4096;
 
 /// One operation within a change. `Move` is a rename *hint*, not a distinct
 /// identity operation: it is semantically exactly `Delete { from }` plus
@@ -287,6 +301,20 @@ pub struct Change {
     /// author-sequence adjacency or a shared path prefix. `None` for every
     /// other change. See [`crate::recursive_operation`].
     pub recursive_operation: Option<RecursiveOperation>,
+    /// The heads of the history base this change was written on that its
+    /// author actually saw -- shown at a path this change touches -- and
+    /// that it therefore supersedes there. Signed and hashed,
+    /// strictly ascending, at most [`MAX_OBSERVED_BASE_HEADS`], and always
+    /// empty on the group's original history.
+    ///
+    /// Supersession of a base head is decided by this set alone, never by
+    /// DAG ancestry: a base head is not a DAG node here, and a change on a
+    /// base does not descend from the whole base. A base head at a path
+    /// this change touches that it does not name stays live beside it,
+    /// exactly as a concurrent version stays live beside an edit on the
+    /// original history. Naming is not inherited: a descendant that
+    /// supersedes the same head at another path names it itself.
+    pub observed_base_heads: Vec<ChangeHash>,
     pub ops: Vec<Op>,
     pub signature: [u8; 64],
 }
@@ -373,6 +401,41 @@ fn read_recursive_operation(r: &mut Reader<'_>) -> Result<Option<RecursiveOperat
             Err(ChangeError::Encoding(format!("unknown recursive-operation discriminant {other}")))
         }
     }
+}
+
+fn put_observed_base_heads(buf: &mut Vec<u8>, heads: &[ChangeHash]) {
+    put_u32(buf, heads.len() as u32);
+    for head in heads {
+        buf.extend_from_slice(&head.0);
+    }
+}
+
+/// Reads the observed base heads, refusing a list that is not strictly
+/// ascending (unsorted or duplicated) or longer than
+/// [`MAX_OBSERVED_BASE_HEADS`]: one set has exactly one encoding.
+fn read_observed_base_heads(r: &mut Reader<'_>) -> Result<Vec<ChangeHash>, ChangeError> {
+    let count = r.u32()? as usize;
+    if count > MAX_OBSERVED_BASE_HEADS {
+        return Err(ChangeError::Encoding(format!(
+            "change names {count} observed base heads, more than {MAX_OBSERVED_BASE_HEADS}"
+        )));
+    }
+    if count > r.remaining() / 32 {
+        return Err(ChangeError::Encoding(format!(
+            "change names {count} observed base heads, more than its remaining bytes can hold"
+        )));
+    }
+    let mut heads: Vec<ChangeHash> = Vec::with_capacity(count);
+    for _ in 0..count {
+        let head = ChangeHash(r.array32()?);
+        if heads.last().is_some_and(|last| *last >= head) {
+            return Err(ChangeError::Encoding(
+                "observed base heads are not strictly ascending (unsorted or duplicated)".into(),
+            ));
+        }
+        heads.push(head);
+    }
+    Ok(heads)
 }
 
 /// Appends one op's canonical encoding — exactly the bytes a change's
@@ -580,6 +643,7 @@ impl Change {
             history_epoch,
             ChangePurpose::Ordinary,
             None,
+            Vec::new(),
             ops,
             signing_key,
         )
@@ -612,6 +676,7 @@ impl Change {
             history_epoch,
             ChangePurpose::Ordinary,
             Some(recursive_operation),
+            Vec::new(),
             ops,
             signing_key,
         )
@@ -641,6 +706,44 @@ impl Change {
             history_epoch,
             ChangePurpose::RetroactiveRepair { obligations },
             None,
+            Vec::new(),
+            ops,
+            signing_key,
+        )
+    }
+
+    /// Assembles and signs a change with every signed field the caller's
+    /// to choose: its purpose, its recursive-operation grouping and the
+    /// base heads its author observed (see [`Change::observed_base_heads`]).
+    /// The other constructors are this one with an ordinary purpose and no
+    /// observed heads. `observed_base_heads` need not be sorted or deduped
+    /// by the caller.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_signed_observing(
+        parents: Vec<ChangeHash>,
+        max_parent_lamport: u64,
+        device_id: DeviceId,
+        author_seq: AuthorSeq,
+        author_prev: Option<ChangeHash>,
+        group_id: FolderGroupId,
+        history_epoch: HistoryEpoch,
+        purpose: ChangePurpose,
+        recursive_operation: Option<RecursiveOperation>,
+        observed_base_heads: Vec<ChangeHash>,
+        ops: Vec<Op>,
+        signing_key: &SigningKey,
+    ) -> Self {
+        Self::create_signed_with_purpose(
+            parents,
+            max_parent_lamport,
+            device_id,
+            author_seq,
+            author_prev,
+            group_id,
+            history_epoch,
+            purpose,
+            recursive_operation,
+            observed_base_heads,
             ops,
             signing_key,
         )
@@ -657,11 +760,14 @@ impl Change {
         history_epoch: HistoryEpoch,
         mut purpose: ChangePurpose,
         recursive_operation: Option<RecursiveOperation>,
+        mut observed_base_heads: Vec<ChangeHash>,
         mut ops: Vec<Op>,
         signing_key: &SigningKey,
     ) -> Self {
         parents.sort();
         parents.dedup();
+        observed_base_heads.sort();
+        observed_base_heads.dedup();
         ops.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
         if let ChangePurpose::RetroactiveRepair { obligations } = &mut purpose {
             obligations.sort();
@@ -678,6 +784,7 @@ impl Change {
             lamport,
             purpose,
             recursive_operation,
+            observed_base_heads,
             ops,
             signature: [0u8; 64],
         };
@@ -710,6 +817,7 @@ impl Change {
             }
         }
         put_recursive_operation(&mut buf, self.recursive_operation.as_ref());
+        put_observed_base_heads(&mut buf, &self.observed_base_heads);
         put_u32(&mut buf, self.parents.len() as u32);
         for parent in &self.parents {
             buf.extend_from_slice(&parent.0);
@@ -760,6 +868,7 @@ impl Change {
             }
         }
         put_recursive_operation(&mut buf, self.recursive_operation.as_ref());
+        put_observed_base_heads(&mut buf, &self.observed_base_heads);
         put_u32(&mut buf, self.parents.len() as u32);
         for parent in &self.parents {
             buf.extend_from_slice(&parent.0);
@@ -858,6 +967,7 @@ impl Change {
             }
         };
         let recursive_operation = read_recursive_operation(&mut r)?;
+        let observed_base_heads = read_observed_base_heads(&mut r)?;
         // Each parent is a 32-byte hash; each op is at least 5 bytes (a
         // `Delete`: discriminant + empty-path length prefix). Bound both counts
         // before allocating.
@@ -886,6 +996,7 @@ impl Change {
             lamport,
             purpose,
             recursive_operation,
+            observed_base_heads,
             ops,
             signature,
         })
@@ -991,6 +1102,27 @@ impl Change {
         }
         if self.parents.iter().any(|p| p == self_hash) {
             return Err(ChangeError::Malformed("change references itself as a parent".into()));
+        }
+        if self.observed_base_heads.len() > MAX_OBSERVED_BASE_HEADS {
+            return Err(ChangeError::Malformed(format!(
+                "observed base head count {} exceeds {MAX_OBSERVED_BASE_HEADS}",
+                self.observed_base_heads.len()
+            )));
+        }
+        for pair in self.observed_base_heads.windows(2) {
+            if pair[0] >= pair[1] {
+                return Err(ChangeError::Malformed(
+                    "observed base heads are not strictly ascending (unsorted or duplicated)"
+                        .into(),
+                ));
+            }
+        }
+        // The group's original history has no base, so there is no base
+        // head to have seen. Decided from the bytes alone.
+        if self.history_epoch.base().is_none() && !self.observed_base_heads.is_empty() {
+            return Err(ChangeError::Malformed(
+                "change on the group's original history names observed base heads".into(),
+            ));
         }
 
         if self.ops.len() > MAX_OPS {
@@ -1527,6 +1659,94 @@ mod tests {
         assert!(matches!(
             Change::from_wire_bytes(&change.to_wire_bytes()),
             Err(ChangeError::Encoding(_))
+        ));
+    }
+
+    /// A change on a base, naming `observed` among the heads it saw.
+    fn observing(observed: Vec<ChangeHash>) -> Change {
+        Change::create_signed_observing(
+            vec![],
+            0,
+            DeviceId("author-a".into()),
+            AuthorSeq(4),
+            prev_for(AuthorSeq(4)),
+            FolderGroupId("group-a".into()),
+            HistoryEpoch::Base(HistoryBase([3u8; 32])),
+            ChangePurpose::Ordinary,
+            None,
+            observed,
+            vec![Op::Delete { path: SyncPath("note.txt".into()) }],
+            &signing_key(),
+        )
+    }
+
+    /// The base heads a change names are what it supersedes of its base,
+    /// so they are signed and hashed like every other field: a relay that
+    /// drops or adds one breaks the signature, and the set is canonical --
+    /// sorted and deduplicated -- whatever order the author listed it in.
+    #[test]
+    fn the_observed_base_heads_are_signed_canonical_and_round_trip() {
+        let (low, high) = (ChangeHash([1u8; 32]), ChangeHash([2u8; 32]));
+        let change = observing(vec![high, low, high]);
+        assert_eq!(change.observed_base_heads, vec![low, high]);
+        assert_eq!(Change::from_wire_bytes(&change.to_wire_bytes()).unwrap(), change);
+        change.validate_structure(&change.compute_hash()).unwrap();
+        assert_ne!(change.compute_hash(), observing(vec![low]).compute_hash());
+        assert_ne!(
+            change.authenticated_header_encoding(),
+            observing(vec![low]).authenticated_header_encoding()
+        );
+
+        let public_key = signing_key().verifying_key();
+        let mut dropped = change.clone();
+        dropped.observed_base_heads.pop();
+        assert_eq!(dropped.verify_signature(&public_key), Err(ChangeError::BadSignature));
+    }
+
+    /// One set has one encoding: bytes that list the names out of order,
+    /// twice, or more of them than any change may carry are refused as
+    /// damage rather than read as some other set.
+    #[test]
+    fn observed_base_heads_out_of_order_duplicated_or_past_the_bound_do_not_decode() {
+        let (low, high) = (ChangeHash([1u8; 32]), ChangeHash([2u8; 32]));
+        for listed in [
+            vec![high, low],
+            vec![low, low],
+            (0..=MAX_OBSERVED_BASE_HEADS as u32)
+                .map(|i| {
+                    let mut hash = [0u8; 32];
+                    hash[..4].copy_from_slice(&i.to_be_bytes());
+                    ChangeHash(hash)
+                })
+                .collect(),
+        ] {
+            let mut change = observing(Vec::new());
+            change.observed_base_heads = listed;
+            assert!(
+                matches!(
+                    Change::from_wire_bytes(&change.to_wire_bytes()),
+                    Err(ChangeError::Encoding(_))
+                ),
+                "{} names decoded",
+                change.observed_base_heads.len()
+            );
+            assert!(matches!(
+                change.validate_structure(&change.compute_hash()),
+                Err(ChangeError::Malformed(_))
+            ));
+        }
+    }
+
+    /// The group's original history has no base, so a change on it that
+    /// names a base head it saw is malformed from its bytes alone.
+    #[test]
+    fn a_change_on_the_original_history_naming_a_base_head_is_malformed() {
+        let mut change = observing(vec![ChangeHash([1u8; 32])]);
+        change.history_epoch = HistoryEpoch::Genesis;
+        change.sign(&signing_key());
+        assert!(matches!(
+            change.validate_structure(&change.compute_hash()),
+            Err(ChangeError::Malformed(_))
         ));
     }
 }

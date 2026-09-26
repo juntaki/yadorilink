@@ -450,6 +450,54 @@ impl SendApp {
         }
     }
 
+    /// One incoming transfer's card body: sender, files, and receive buttons.
+    fn render_inbox_transfer(&mut self, ui: &mut egui::Ui, transfer: &InboxTransfer) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(self.device_label(&transfer.sender_device_id)).strong());
+            ui.label(egui::RichText::new(format!("[{}]", transfer.status)).weak());
+        });
+        ui.label(format!(
+            "{} file(s), {}",
+            transfer.files.len(),
+            format_bytes(transfer.total_size)
+        ));
+        for file in &transfer.files {
+            ui.label(
+                egui::RichText::new(format!(
+                    "  {}  ({})",
+                    file.relative_path,
+                    format_bytes(file.size)
+                ))
+                .weak()
+                .small(),
+            );
+        }
+        let busy = self.receive_in_flight.contains(&transfer.transfer_id);
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!busy, egui::Button::new("Receive")).clicked() {
+                self.receive_in_flight.insert(transfer.transfer_id.clone());
+                self.last_receive_message = None;
+                spawn_receive(self.sink.clone(), transfer.transfer_id.clone(), None);
+            }
+            if ui.add_enabled(!busy, egui::Button::new("Receive to…")).clicked() {
+                if let Some(dir) =
+                    crate::actions::pick_folder_titled("Choose where to save this transfer")
+                {
+                    self.receive_in_flight.insert(transfer.transfer_id.clone());
+                    self.last_receive_message = None;
+                    spawn_receive(
+                        self.sink.clone(),
+                        transfer.transfer_id.clone(),
+                        Some(dir.to_string_lossy().to_string()),
+                    );
+                }
+            }
+            if busy {
+                ui.spinner();
+            }
+        });
+    }
+
     fn render_inbox_panel(&mut self, ui: &mut egui::Ui) {
         ui.label(egui::RichText::new("Inbox").strong());
         ui.add_space(4.0);
@@ -485,57 +533,7 @@ impl SendApp {
                 for transfer in &transfers {
                     ui.add_space(6.0);
                     egui::Frame::group(ui.style()).show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(self.device_label(&transfer.sender_device_id))
-                                    .strong(),
-                            );
-                            ui.label(egui::RichText::new(format!("[{}]", transfer.status)).weak());
-                        });
-                        ui.label(format!(
-                            "{} file(s), {}",
-                            transfer.files.len(),
-                            format_bytes(transfer.total_size)
-                        ));
-                        for file in &transfer.files {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "  {}  ({})",
-                                    file.relative_path,
-                                    format_bytes(file.size)
-                                ))
-                                .weak()
-                                .small(),
-                            );
-                        }
-                        let busy = self.receive_in_flight.contains(&transfer.transfer_id);
-                        ui.horizontal(|ui| {
-                            if ui.add_enabled(!busy, egui::Button::new("Receive")).clicked() {
-                                self.receive_in_flight.insert(transfer.transfer_id.clone());
-                                self.last_receive_message = None;
-                                spawn_receive(
-                                    self.sink.clone(),
-                                    transfer.transfer_id.clone(),
-                                    None,
-                                );
-                            }
-                            if ui.add_enabled(!busy, egui::Button::new("Receive to…")).clicked() {
-                                if let Some(dir) = crate::actions::pick_folder_titled(
-                                    "Choose where to save this transfer",
-                                ) {
-                                    self.receive_in_flight.insert(transfer.transfer_id.clone());
-                                    self.last_receive_message = None;
-                                    spawn_receive(
-                                        self.sink.clone(),
-                                        transfer.transfer_id.clone(),
-                                        Some(dir.to_string_lossy().to_string()),
-                                    );
-                                }
-                            }
-                            if busy {
-                                ui.spinner();
-                            }
-                        });
+                        self.render_inbox_transfer(ui, transfer);
                     });
                 }
             }

@@ -46,6 +46,8 @@ run_exact_ignored yadorilink-peer-session lib - \
 # without being pinned to one machine's speed.
 run_exact_ignored yadorilink-sync-sqlite lib - \
   retroactive_conflict::tests::plan_retroactive_merge_latency_vs_chain_depth
+run_exact_ignored yadorilink-sync-sqlite lib - \
+  rebootstrap_store::scale_cost_tests::seal_install_merge_and_admission_costs_stay_in_proportion_to_a_hundred_thousand_paths
 run_exact_ignored yadorilink-sync-sqlite test change_time_index_scale_benchmark \
   frontier_heads_at_or_before_scale_sweep
 run_exact_ignored yadorilink-sync-sqlite test change_time_index_scale_benchmark \

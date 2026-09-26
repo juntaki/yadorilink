@@ -54,6 +54,8 @@ pub struct InMemoryPeerChannel {
     /// stream a peer-side accept loop could actually read, not a disguised
     /// failure.
     outbound_service_streams: mpsc::Sender<InMemoryServiceStream>,
+    // Held, never read: it keeps the queue `open` sends into alive (see above).
+    #[allow(dead_code)]
     inbound_service_streams: Mutex<mpsc::Receiver<InMemoryServiceStream>>,
 }
 
@@ -197,8 +199,11 @@ impl ServiceStreamTransport for InMemoryPeerChannel {
 /// here rather than something that refuses to construct.
 #[derive(Default)]
 pub struct InMemorySnapshotShelf {
-    entries: StdMutex<HashMap<(String, [u8; 32]), Arc<Vec<u8>>>>,
+    entries: StdMutex<HashMap<ShelfKey, Arc<Vec<u8>>>>,
 }
+
+/// A prepared snapshot's `(group_id, snapshot_hash)`.
+type ShelfKey = (String, [u8; 32]);
 
 impl PreparedSnapshotStore for InMemorySnapshotShelf {
     fn prepare(&self, group_id: &str, snapshot_hash: [u8; 32], bytes: Arc<Vec<u8>>) {

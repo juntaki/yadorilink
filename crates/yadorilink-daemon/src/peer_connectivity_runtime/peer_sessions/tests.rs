@@ -35,7 +35,10 @@ async fn within(budget: Duration, mut check: impl FnMut() -> bool) -> bool {
 struct Pair {
     alice: Arc<DaemonState>,
     bob: Arc<DaemonState>,
-    _dirs: (tempfile::TempDir, tempfile::TempDir),
+    _dirs: (
+        crate::test_support::sync_stack_fixture::ReleasingDir,
+        crate::test_support::sync_stack_fixture::ReleasingDir,
+    ),
 }
 
 /// Two devices that pin each other, each with a running driver. When

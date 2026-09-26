@@ -37,7 +37,6 @@ struct Pair {
     b: std::sync::Arc<TestPeerNode>,
     a_id: iroh::EndpointId,
     b_id: iroh::EndpointId,
-    faults: SimFaultController,
 }
 
 async fn pair(network: &TestNetwork, faults: &SimFaultController) -> Pair {
@@ -46,7 +45,7 @@ async fn pair(network: &TestNetwork, faults: &SimFaultController) -> Pair {
         TestPeerNode::start_simulated_with_faults("device-a", book.clone(), network, faults).await;
     let (b, b_id) =
         TestPeerNode::start_simulated_with_faults("device-b", book, network, faults).await;
-    Pair { a, b, a_id, b_id, faults: faults.clone() }
+    Pair { a, b, a_id, b_id }
 }
 
 /// Serves block lanes on `node` until one exchange completes, answering with

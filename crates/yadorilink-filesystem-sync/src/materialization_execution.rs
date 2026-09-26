@@ -620,15 +620,19 @@ pub trait MaterializationExecutionPort: Send + Sync {
 
     /// Moves the installed File or Symlink row held at `path` to the copy
     /// name the namespace projection gives it beside a directory, holds the
-    /// copy name for the next reconciliation to place, and releases
-    /// `path`'s hold -- only while that hold is at `generation`. Returns
-    /// the copy name, or `None` when nothing moved. See
+    /// copy name for the next reconciliation to place, records the
+    /// directory at `path` as retained for its untracked content (see
+    /// [`Self::retain_directory_with_untracked_content`] for `removable`),
+    /// and releases `path`'s hold -- all in one transaction, and only while
+    /// that hold is at `generation`. Returns the copy name, or `None` when
+    /// nothing moved (and nothing was recorded). See
     /// `yadorilink_sync_sqlite::snapshot_install_hold`.
     fn relocate_held_entry_beside_directory(
         &self,
         group_id: &str,
         path: &str,
         generation: i64,
+        removable: Option<&yadorilink_root_authority::fs_identity::FileIdentity>,
     ) -> Result<Option<String>, MaterializationExecutionError>;
 
     fn list_placeholder_paths_missing_generation(

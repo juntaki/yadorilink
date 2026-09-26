@@ -53,6 +53,16 @@ exceptions = [
     # copyleft; using it as a dependency does not affect our source.
     { crate = "attohttpc", allow = ["MPL-2.0"] },
     { crate = "option-ext", allow = ["MPL-2.0"] },
+    # UniFFI (Mozilla) — MPL-2.0, same weak file-level copyleft; used
+    # unmodified as a dependency / build-time binding generator.
+    { crate = "uniffi", allow = ["MPL-2.0"] },
+    { crate = "uniffi_bindgen", allow = ["MPL-2.0"] },
+    { crate = "uniffi_core", allow = ["MPL-2.0"] },
+    { crate = "uniffi_internal_macros", allow = ["MPL-2.0"] },
+    { crate = "uniffi_macros", allow = ["MPL-2.0"] },
+    { crate = "uniffi_meta", allow = ["MPL-2.0"] },
+    { crate = "uniffi_pipeline", allow = ["MPL-2.0"] },
+    { crate = "uniffi_udl", allow = ["MPL-2.0"] },
     # Boost Software License — permissive, BSD-like.
     { crate = "clipboard-win", allow = ["BSL-1.0"] },
     { crate = "error-code", allow = ["BSL-1.0"] },

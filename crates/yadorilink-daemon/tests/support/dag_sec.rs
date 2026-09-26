@@ -412,10 +412,6 @@ impl<'a> Incremental<'a> {
         Self { dag, applied: BTreeSet::new(), buffer: Vec::new(), heads_by_path: BTreeMap::new() }
     }
 
-    pub fn applied(&self) -> &BTreeSet<usize> {
-        &self.applied
-    }
-
     fn parents_ready(&self, c: usize) -> bool {
         self.dag.changes[c].parents.iter().all(|p| self.applied.contains(p))
     }
@@ -518,7 +514,6 @@ const PATH_POOL: [&str; 4] = ["a.txt", "b.txt", "notes/c.txt", "notes/d.txt"];
 /// The result of one seeded simulation, after a final full-gossip
 /// quiescence phase that reconnects every device.
 pub struct Simulation {
-    pub seed: u64,
     pub topology: Topology,
     pub device_count: usize,
     pub dag: Dag,
@@ -621,7 +616,7 @@ pub fn simulate(seed: u64) -> Simulation {
     }
 
     let all_changes: BTreeSet<usize> = (0..dag.changes.len()).collect();
-    Simulation { seed, topology, device_count, dag, all_changes, held, state }
+    Simulation { topology, device_count, dag, all_changes, held, state }
 }
 
 fn random_op(
@@ -686,7 +681,7 @@ fn open_links(topology: Topology, n: usize, round: usize, rng: &mut StdRng) -> V
                 links.push((i, i + 1));
             }
             // Intermittent bridge between the halves.
-            if mid > 0 && mid < n && round % 3 == 0 {
+            if mid > 0 && mid < n && round.is_multiple_of(3) {
                 links.push((mid - 1, mid));
             }
         }

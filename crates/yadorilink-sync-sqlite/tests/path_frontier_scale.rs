@@ -513,13 +513,18 @@ fn catching_up_an_offline_branch_of_edits_to_existing_files_stays_bounded() {
         "catching up edits to existing files is getting more expensive as it goes: the last \
          {SAMPLE} took {last:?} against {first:?} for the first {SAMPLE}",
     );
-    assert!(
-        per_admission_us < 600.0,
-        "catching up an edit to an existing file costs {per_admission_us:.0}us per admission \
-         over {FILES} files. A cost that is flat but this high is what a walk through shared \
-         history looks like here, since editing files in creation order keeps the walk a \
-         constant length; it measured 3,780us when admission still walked",
-    );
+    // The absolute bound is a release-build figure (~45us there). A debug
+    // or coverage build measures the host's unoptimized codegen as much as
+    // the code, so there only the growth check above applies.
+    if !cfg!(debug_assertions) {
+        assert!(
+            per_admission_us < 600.0,
+            "catching up an edit to an existing file costs {per_admission_us:.0}us per \
+             admission over {FILES} files. A cost that is flat but this high is what a walk \
+             through shared history looks like here, since editing files in creation order \
+             keeps the walk a constant length; it measured 3,780us when admission still walked",
+        );
+    }
 }
 
 /// What verifying the effect projection costs at startup.
@@ -540,8 +545,8 @@ fn catching_up_an_offline_branch_of_edits_to_existing_files_stays_bounded() {
 /// host's codegen, not the code: debug builds on ordinary hardware land
 /// just around such a figure. The absolute kept below is the 600us its
 /// sibling `catching_up_an_offline_branch_of_edits_to_existing_files_stays_
-/// bounded` already uses, which catches an order of magnitude without
-/// pretending to know how fast anyone's debug build is.
+/// bounded` uses for a release build, which catches an order of magnitude
+/// without pretending to know how fast anyone's debug build is.
 #[test]
 fn verifying_the_effect_projection_at_startup_stays_cheap() {
     const CHANGES: usize = 10_000;

@@ -451,6 +451,9 @@ pub trait LocalMutationStore: Send + Sync {
 
     /// Batch upsert under a single DAG change, for a large initial scan that
     /// must emit history rather than write silently.
+    // Port of `FileIndexRepository::upsert_files_batch_emitting_change`,
+    // which carries the same allow.
+    #[allow(clippy::too_many_arguments)]
     fn upsert_files_batch_emitting_change(
         &self,
         group_id: &str,
