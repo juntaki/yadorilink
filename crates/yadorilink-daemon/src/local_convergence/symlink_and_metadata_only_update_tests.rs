@@ -539,17 +539,22 @@ fn metadata_only_fast_path_stamps_mtime_on_a_touch_only_change() {
     let root = tempfile::tempdir().unwrap();
     let state = linked_state(root.path());
 
+    // Multiples of 100ns: Windows' FILETIME, and therefore
+    // `std::fs::FileTimes`, only has 100ns resolution, so any other value
+    // would round-trip through `stamp_mtime_at_path` as a different number
+    // there and fail the exact-match assertion below for a reason that has
+    // nothing to do with what this test is checking.
     let mut local = file_record_with_block("touched.txt", 0xAB);
     local.blocks[0].hash = <sha2::Sha256 as sha2::Digest>::digest(b"hello").to_vec();
-    local.mtime_unix_nanos = 111;
+    local.mtime_unix_nanos = 100;
     seed_file(&state, &local);
 
     let out_path = root.path().join("touched.txt");
     std::fs::write(&out_path, b"hello").unwrap();
-    yadorilink_local_storage::stamp_mtime_at_path(&out_path, 111).unwrap();
+    yadorilink_local_storage::stamp_mtime_at_path(&out_path, 100).unwrap();
 
     let mut incoming = local.clone();
-    incoming.mtime_unix_nanos = 222;
+    incoming.mtime_unix_nanos = 200;
 
     let applied = try_apply_metadata_only_update(
         state.as_ref(),
@@ -570,7 +575,7 @@ fn metadata_only_fast_path_stamps_mtime_on_a_touch_only_change() {
          not snapshot it"
     );
     assert!(
-        yadorilink_local_storage::mtime_already_matches_disk(&out_path, 222).unwrap(),
+        yadorilink_local_storage::mtime_already_matches_disk(&out_path, 200).unwrap(),
         "the new mtime must actually be stamped onto disk, not merely recorded in the index"
     );
 }
