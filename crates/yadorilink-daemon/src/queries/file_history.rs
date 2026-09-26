@@ -30,6 +30,13 @@ pub(crate) struct ConflictedFileView {
     pub(crate) mtime_unix_nanos: i64,
     pub(crate) record_kind: yadorilink_replica_domain::file::RecordKind,
     pub(crate) reason: ConflictCopyReason,
+    /// The folder's history compaction is waiting for this conflict to be
+    /// resolved: the version this copy holds and another version of the
+    /// path it came from are by one device, which compaction cannot carry,
+    /// so it keeps the folder's history as it is until the user deletes or
+    /// edits one of them. False for a copy of any other version of that
+    /// path (a different device's), whose resolution leaves the hold.
+    pub(crate) holds_compaction: bool,
 }
 
 /// Why a conflict copy is kept under its own name.
@@ -93,10 +100,17 @@ impl FileHistoryQueryService {
     pub(crate) fn list_conflicts(&self) -> Result<Vec<ConflictedFileView>, SyncError> {
         let mut out = Vec::new();
         for link in self.sync_state.link_repository().list_links()? {
+            let rebootstrap = self.sync_state.rebootstrap_store_repository();
+            let held: std::collections::BTreeSet<String> =
+                rebootstrap.compaction_held_paths(&link.group_id)?.into_iter().collect();
             for file in
                 self.sync_state.file_index_repository().list_live_conflict_copies(&link.group_id)?
             {
                 let reason = self.conflict_copy_reason(&link.group_id, &file.path)?;
+                let holds_compaction = held.contains(
+                    &yadorilink_replica_domain::conflict::conflict_copy_source_path(&file.path),
+                ) && rebootstrap
+                    .conflict_copy_holds_compaction(&link.group_id, &file.path)?;
                 out.push(ConflictedFileView {
                     local_path: link.local_path.clone(),
                     path: file.path,
@@ -104,6 +118,7 @@ impl FileHistoryQueryService {
                     mtime_unix_nanos: file.mtime_unix_nanos,
                     record_kind: file.record_kind,
                     reason,
+                    holds_compaction,
                 });
             }
         }

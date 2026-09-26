@@ -330,6 +330,7 @@ mod tests {
             fault_schedule: Vec::new(),
             content_table,
             fault_plan: FaultPlan::default(),
+            history_steps: Vec::new(),
         }
     }
 

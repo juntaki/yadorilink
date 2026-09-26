@@ -119,7 +119,7 @@ extension YadoriLinkModel.ConflictReason {
 
 extension YadoriLinkModel.ConflictSummary {
     init(_ value: YadoriLinkFFI.ConflictSummary) {
-        self.init(localPath: value.localPath, path: value.path, size: value.size, modifiedAt: value.modifiedAt, currentPath: value.currentPath, loserDeviceId: value.loserDeviceId, conflictTimestamp: value.conflictTimestamp, kind: YadoriLinkModel.EntryKind(value.kind), reason: YadoriLinkModel.ConflictReason(value.reason))
+        self.init(localPath: value.localPath, path: value.path, size: value.size, modifiedAt: value.modifiedAt, currentPath: value.currentPath, loserDeviceId: value.loserDeviceId, conflictTimestamp: value.conflictTimestamp, kind: YadoriLinkModel.EntryKind(value.kind), reason: YadoriLinkModel.ConflictReason(value.reason), holdsCompaction: value.holdsCompaction)
     }
 }
 
@@ -909,7 +909,7 @@ extension YadoriLinkFFI.ConflictReason {
 
 extension YadoriLinkFFI.ConflictSummary {
     init(_ value: YadoriLinkModel.ConflictSummary) {
-        self.init(localPath: value.localPath, path: value.path, size: value.size, modifiedAt: value.modifiedAt, currentPath: value.currentPath, loserDeviceId: value.loserDeviceId, conflictTimestamp: value.conflictTimestamp, kind: YadoriLinkFFI.EntryKind(value.kind), reason: YadoriLinkFFI.ConflictReason(value.reason))
+        self.init(localPath: value.localPath, path: value.path, size: value.size, modifiedAt: value.modifiedAt, currentPath: value.currentPath, loserDeviceId: value.loserDeviceId, conflictTimestamp: value.conflictTimestamp, kind: YadoriLinkFFI.EntryKind(value.kind), reason: YadoriLinkFFI.ConflictReason(value.reason), holdsCompaction: value.holdsCompaction)
     }
 }
 

@@ -29,6 +29,7 @@ mod paused_items;
 mod record_builder;
 mod scan;
 
+pub use disk_observation::untouched_placeholder_verdict;
 pub(crate) use scan::ReconcileMode;
 
 #[cfg(any(test, feature = "test-support"))]

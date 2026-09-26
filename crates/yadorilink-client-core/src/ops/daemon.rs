@@ -191,9 +191,16 @@ mod tests {
 
     #[test]
     fn start_daemon_launch_agent_never_uses_path() {
+        // Absolute on the host running the test: a drive-less `/usr/...` is
+        // not absolute on Windows and would be dropped like a bare name.
+        let fallback = if cfg!(windows) {
+            r"C:\yadorilink\yadorilink-daemon.exe"
+        } else {
+            "/usr/local/bin/yadorilink-daemon"
+        };
         let with_fallback = DaemonLaunch::LaunchAgent {
             label: "com.yadorilink.daemon".into(),
-            fallback_binary: Some("/usr/local/bin/yadorilink-daemon".into()),
+            fallback_binary: Some(fallback.into()),
         };
         assert_eq!(
             launch_steps(&with_fallback, 501),
@@ -203,11 +210,7 @@ mod tests {
                     args: vec!["kickstart".into(), "gui/501/com.yadorilink.daemon".into()],
                     wait: true,
                 },
-                LaunchStep {
-                    program: "/usr/local/bin/yadorilink-daemon".into(),
-                    args: vec![],
-                    wait: false,
-                },
+                LaunchStep { program: fallback.into(), args: vec![], wait: false },
             ]
         );
         // A bare name would be a PATH lookup: it is dropped, not tried.

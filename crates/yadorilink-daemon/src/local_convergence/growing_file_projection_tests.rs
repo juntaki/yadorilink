@@ -140,6 +140,11 @@ impl Harness {
         let state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
         let local_path = root.to_string_lossy().to_string();
         state.link_repository().add_link(&local_path, GROUP).unwrap();
+        // Symlink materialization on Windows is per-link opt-in; without it
+        // every received symlink here would be a policy skip that never
+        // settles, so the symlink scenarios opt in to run the real write.
+        #[cfg(windows)]
+        state.link_repository().set_windows_symlink_opt_in(&local_path, true).unwrap();
         state
             .link_repository()
             .set_materialization_policy(&local_path, MaterializationPolicy::Eager)

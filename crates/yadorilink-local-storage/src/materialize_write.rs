@@ -471,7 +471,20 @@ fn stamp_mtime(file: &fs::File, mtime_unix_nanos: i64) {
 /// after already confirming the path exists, so an open failure at this
 /// point is a genuine anomaly, not an expected "this target can't do
 /// this" outcome.
+///
+/// The handle is opened for exactly what setting times needs. On Unix a
+/// read-only descriptor suffices (`futimens` checks ownership, not the open
+/// mode), and asking for write access would refuse a read-only file. On
+/// Windows `SetFileTime` needs `FILE_WRITE_ATTRIBUTES` on the handle, which a
+/// read-only open does not carry, so the stamp would always be refused there.
 pub fn stamp_mtime_at_path(path: &Path, mtime_unix_nanos: i64) -> Result<(), StorageError> {
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+        fs::OpenOptions::new().access_mode(FILE_WRITE_ATTRIBUTES).open(path)?
+    };
+    #[cfg(not(windows))]
     let file = fs::File::open(path)?;
     stamp_mtime(&file, mtime_unix_nanos);
     Ok(())

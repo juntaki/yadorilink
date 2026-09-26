@@ -379,10 +379,13 @@ public struct ConflictSummary: Sendable, Equatable, Hashable {
     public var conflictTimestamp: String?
     public var kind: EntryKind
     public var reason: ConflictReason
-    public init(localPath: String, path: String, size: UInt64, modifiedAt: Date?, currentPath: String, loserDeviceId: String?, conflictTimestamp: String?, kind: EntryKind, reason: ConflictReason) {
+    /// The folder's history compaction is waiting for this conflict to be
+    /// resolved; sync is unaffected.
+    public var holdsCompaction: Bool
+    public init(localPath: String, path: String, size: UInt64, modifiedAt: Date?, currentPath: String, loserDeviceId: String?, conflictTimestamp: String?, kind: EntryKind, reason: ConflictReason, holdsCompaction: Bool = false) {
         self.localPath = localPath; self.path = path; self.size = size; self.modifiedAt = modifiedAt
         self.currentPath = currentPath; self.loserDeviceId = loserDeviceId; self.conflictTimestamp = conflictTimestamp
-        self.kind = kind; self.reason = reason
+        self.kind = kind; self.reason = reason; self.holdsCompaction = holdsCompaction
     }
 }
 

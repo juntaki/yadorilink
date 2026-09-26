@@ -703,6 +703,7 @@ pub fn generate_case(seed: u64) -> Case {
         fault_schedule,
         content_table,
         fault_plan: FaultPlan::default(),
+        history_steps: Vec::new(),
     }
 }
 
@@ -757,6 +758,7 @@ pub fn generate_directory_case(seed: u64) -> Case {
         fault_schedule: Vec::new(),
         content_table,
         fault_plan: FaultPlan::default(),
+        history_steps: Vec::new(),
     }
 }
 
@@ -904,6 +906,7 @@ fn generate_focused_case(seed: u64, op: OpKind, fault: FaultKind, topo: Topology
         fault_schedule,
         content_table,
         fault_plan: FaultPlan::default(),
+        history_steps: Vec::new(),
     }
 }
 
@@ -1316,6 +1319,7 @@ mod tests {
                 fault_schedule: vec![],
                 content_table,
                 fault_plan: FaultPlan::default(),
+                history_steps: Vec::new(),
             }
         };
         let rejected = |ops: Vec<Op>| !validate_case(&case_of(ops)).is_empty();

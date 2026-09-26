@@ -128,3 +128,25 @@ fn file_and_symlink_version_hashes_are_unchanged() {
 const FILE_GOLDEN: &str = "cb2132993d85b504636f1e48645a3ff6b1c635c9aed2f5cb87533971b8dc91bc";
 const SYMLINK_GOLDEN: &str = "5f5db1b79a55588d8264de670fc8f0c36064d883e40ea28c0dc4cef44f616957";
 const EMPTY_FILE_GOLDEN: &str = "c10ddbaf561f091cfe250d0f83e0f7d41ebcd6c281a1d408a7260a92c5cd08ec";
+
+/// A directory's index row can still hold the blocks of the file that
+/// stood at its path before it (a path deleted as a file and made again as
+/// a directory). They describe no content of the directory, and a version
+/// minted from the row with them is malformed: a seal that carries it is
+/// refused as an invalid snapshot, and keeps being refused. The row mints
+/// the canonical directory version instead.
+#[test]
+fn a_directory_row_holding_a_former_files_blocks_mints_the_canonical_version() {
+    let leftover = vec![BlockInfo { hash: vec![0xab; 32], offset: 0, size: 4096 }];
+    let version = FileVersion::from_index_row(
+        leftover,
+        4096,
+        1_700_000_000_000_000_000,
+        RecordKind::Directory,
+        Some(0o755),
+        None,
+        Vec::new(),
+    );
+    version.verify_hash().expect("a version minted from a directory row is well formed");
+    assert_eq!(version, directory_row(0, 0, Some(0o755)));
+}

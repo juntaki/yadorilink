@@ -85,6 +85,11 @@ impl Harness {
         let state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
         let local_path = root.path().to_string_lossy().to_string();
         state.link_repository().add_link(&local_path, GROUP).unwrap();
+        // Symlink materialization on Windows is per-link opt-in; without it
+        // every received symlink here would be a policy skip that never
+        // settles, so the symlink scenarios opt in to run the real write.
+        #[cfg(windows)]
+        state.link_repository().set_windows_symlink_opt_in(&local_path, true).unwrap();
         state
             .link_repository()
             .set_materialization_policy(&local_path, MaterializationPolicy::Eager)
@@ -985,6 +990,9 @@ async fn content_identical_verification_snapshots_the_fence_rather_than_bumping_
 /// that returned `MaterializeResult::Settled(SettlementEvidence::
 /// ExactObject { .. })` unconditionally for every `Settled` outcome:
 /// that version made this test's `matches!` assertion fail.
+// Windows defers every on-demand placeholder to the CfAPI host and retries;
+// there is no synchronous placeholder settlement to classify there.
+#[cfg(not(windows))]
 #[tokio::test]
 async fn on_demand_placeholder_settlement_produces_policy_placeholder_evidence_not_an_exact_object()
 {

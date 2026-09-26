@@ -61,6 +61,10 @@ type LocalChangeAuthProvider =
 pub(crate) struct TestReplica {
     inner: Arc<ReplicaCoordinator>,
     local_change_auth_provider: Mutex<Option<Arc<LocalChangeAuthProvider>>>,
+    /// How many paths `record_dirty_paths_batch` has journaled -- every
+    /// path a flush (or a dirty-journal re-drive) takes up is journaled
+    /// there first, so a test can count re-processed paths.
+    journaled_dirty_batch_entries: std::sync::atomic::AtomicUsize,
     /// `inspect_windows_placeholder` is a live `CfGetPlaceholderInfo`
     /// call in production (`yadorilink-daemon::placeholder_inspect_windows`,
     /// Windows-only) -- nothing this crate's own `#[cfg(test)]` code can
@@ -79,6 +83,7 @@ impl TestReplica {
         Ok(Self {
             inner: Arc::new(ReplicaCoordinator::open_in_memory()?),
             local_change_auth_provider: Mutex::new(None),
+            journaled_dirty_batch_entries: std::sync::atomic::AtomicUsize::new(0),
             windows_placeholder_inspect_result: Mutex::new(
                 yadorilink_filesystem_sync::placeholder_backend::PlaceholderStatus::Unknown,
             ),
@@ -110,6 +115,11 @@ impl TestReplica {
 
     pub(crate) fn set_local_change_auth_provider(&self, provider: Arc<LocalChangeAuthProvider>) {
         *self.local_change_auth_provider.lock().unwrap_or_else(|p| p.into_inner()) = Some(provider);
+    }
+
+    /// Paths journaled through `record_dirty_paths_batch` so far.
+    pub(crate) fn journaled_dirty_batch_entries(&self) -> usize {
+        self.journaled_dirty_batch_entries.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn local_emission_auth(&self, group_id: &str) -> Result<(), PolicyUnavailable> {
@@ -607,6 +617,8 @@ impl LocalMutationStore for TestReplica {
         entries: &[(String, String, i64)],
         permit: &RootCommitPermit,
     ) -> Result<(), SyncSqliteError> {
+        self.journaled_dirty_batch_entries
+            .fetch_add(entries.len(), std::sync::atomic::Ordering::SeqCst);
         self.dirty_path_repository().record_dirty_paths_batch(group_id, entries, permit)
     }
 
@@ -627,6 +639,10 @@ impl LocalMutationStore for TestReplica {
         permit: &RootCommitPermit,
     ) -> Result<(), SyncSqliteError> {
         self.dirty_path_repository().clear_dirty_paths_conditional_batch(group_id, entries, permit)
+    }
+
+    fn local_emission_available(&self, group_id: &str) -> bool {
+        self.local_emission_auth(group_id).is_ok()
     }
 
     fn list_dirty_paths(&self, group_id: &str) -> Result<Vec<DirtyPath>, SyncSqliteError> {

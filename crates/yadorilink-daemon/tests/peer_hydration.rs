@@ -385,6 +385,99 @@ async fn hydrate_file_fetches_and_materializes_placeholder_content() {
     }
 }
 
+/// Convergence rehydration (`hydrate_file`, and the audit's `Equal`/`After`
+/// rehydrate arms that share its body) judges what it finds at the path
+/// when it starts, exactly as access hydration does: an edit written into
+/// this device's placeholder, or a delete of it, made before the attempt
+/// and not yet journalled by the watcher, is left for local capture rather
+/// than replaced by the remote content.
+///
+/// Its baseline re-check alone cannot see either: it samples the edit (or
+/// the absence) as its own baseline and finds it unchanged.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hydrate_file_leaves_a_local_change_made_before_it_started() {
+    for local_change in ["write", "rename_save", "delete"] {
+        let device_b = Device::new("device-b").await;
+        let root_b = device_b.root_path().to_string_lossy().to_string();
+        link_with_completed_startup(&device_b.state, &root_b);
+
+        // The row, its blocks, and this device's own placeholder for it,
+        // with the identity recorded exactly as the materialization lane
+        // records it.
+        let content = vec![0x77u8; 300_000];
+        device_b.producer().commit_create(GROUP, "report.pdf", &content, 0);
+        let out_path = device_b.root_path().join("report.pdf");
+        let _ = std::fs::remove_file(&out_path);
+        let identity =
+            yadorilink_local_storage::write_placeholder(&out_path, content.len() as u64, 0)
+                .unwrap()
+                .expect("a unix placeholder has an inode identity");
+        let permit = RootCommitPermit::for_tests();
+        let repo = device_b.state.materialization_state_repository();
+        repo.set_materialization_state(
+            GROUP,
+            "report.pdf",
+            MaterializationState::Placeholder,
+            &permit,
+        )
+        .unwrap();
+        repo.record_placeholder_generation(
+            GROUP,
+            "report.pdf",
+            identity,
+            yadorilink_local_storage::INTERNAL_INODE_PROVIDER_KIND,
+            &permit,
+        )
+        .unwrap();
+
+        let edit = b"a local edit the watcher has not journalled yet";
+        match local_change {
+            "write" => std::fs::write(&out_path, edit).unwrap(),
+            "rename_save" => {
+                let tmp = device_b.root_path().join(".report.pdf.save");
+                std::fs::write(&tmp, edit).unwrap();
+                std::fs::rename(&tmp, &out_path).unwrap();
+            }
+            _ => std::fs::remove_file(&out_path).unwrap(),
+        }
+
+        let session_b = spawn_session(&device_b, "device-a");
+        let result =
+            session_b.convergence.hydrate_file(&session_b.driver(), GROUP, "report.pdf").await;
+
+        assert!(
+            result.is_err(),
+            "{local_change}: hydration replaced a local change made before it started: {result:?}"
+        );
+        if local_change == "delete" {
+            assert!(
+                std::fs::symlink_metadata(&out_path).is_err(),
+                "{local_change}: hydration recreated a deleted placeholder"
+            );
+        } else {
+            assert_eq!(
+                std::fs::read(&out_path).unwrap(),
+                edit,
+                "{local_change}: hydration overwrote an edit made before it started"
+            );
+        }
+        assert_ne!(
+            device_b
+                .state
+                .materialization_state_repository()
+                .get_materialization_state(GROUP, "report.pdf")
+                .unwrap(),
+            Some(MaterializationState::Hydrated),
+            "{local_change}: the row claims Hydrated over a local change"
+        );
+        assert!(
+            device_b.state.dirty_path_repository().is_path_dirty(GROUP, "report.pdf").unwrap(),
+            "{local_change}: the refused change must be journalled for local capture"
+        );
+    }
+}
+
 /// **Phase E finding**: `hydrate_file_with_timeout_locked`'s physical write
 /// (`reconstruct_file_off_runtime`, `apply_unix_mode`, `apply_xattrs`) used
 /// to run with no mutation-fence bump at all -- unlike every sibling

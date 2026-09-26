@@ -642,3 +642,74 @@ fn an_empty_base_with_no_authors_installs_and_reads_back_empty() {
         "expected an empty summary, got {summary:?}"
     );
 }
+
+/// A row an installed base carries names a change the base absorbed: no
+/// longer retained, never pruned here, but carried by the base this group
+/// stands on. A peer on the same base offers that row with the same author
+/// when this device fetches its bytes, so the author has to read as a
+/// verified authoring identity -- one every later change on the base
+/// descends from. Otherwise a device that received a file only through a
+/// base can never hydrate it, and keeps a placeholder of it forever.
+#[test]
+fn an_installed_bases_authors_are_verified_authoring_identities() {
+    use crate::dag_store::ChangeOrdering;
+
+    const GROUP: &str = "group-base-authors";
+    let mut conn = open();
+    let author = base_author_change(GROUP);
+    let author_hash = author.compute_hash();
+    install_authored_by(
+        &mut conn,
+        &author,
+        vec![snapshot_row("doc.txt", 1, SnapshotVersionState::Current, false, 10)],
+    )
+    .expect("the base installs");
+    assert!(
+        !crate::dag_store::has_change_or_pruned(&conn, GROUP, &author_hash).unwrap(),
+        "the base absorbed the author, so this tests the base and not retained history"
+    );
+
+    assert!(crate::dag_store::is_verified_authoring_change(&conn, GROUP, &author_hash).unwrap());
+    assert_eq!(
+        crate::change_history::compare_authoring_on_conn(&conn, GROUP, &author_hash, &author_hash)
+            .unwrap(),
+        Some(ChangeOrdering::Equal),
+        "the same carried author on both sides is the same row"
+    );
+
+    let emitter = crate::dag_store::ChangeEmitter::new(
+        "device-after-install",
+        SigningKey::from_bytes(&[21u8; 32]),
+    );
+    let later = crate::dag_store::emit_local_change(
+        &conn,
+        GROUP,
+        vec![Op::Delete { path: SyncPath("doc.txt".to_string()) }],
+        &emitter,
+    )
+    .expect("a change on the installed base")
+    .compute_hash();
+    assert_eq!(
+        crate::change_history::compare_authoring_on_conn(&conn, GROUP, &author_hash, &later)
+            .unwrap(),
+        Some(ChangeOrdering::Before),
+        "every change written on a base descends from what the base carries"
+    );
+    assert_eq!(
+        crate::change_history::compare_authoring_on_conn(&conn, GROUP, &later, &author_hash)
+            .unwrap(),
+        Some(ChangeOrdering::After)
+    );
+
+    // A change the base does not carry stays unverified.
+    let stranger = ChangeHash([0x5a; 32]);
+    assert!(!crate::dag_store::is_verified_authoring_change(&conn, GROUP, &stranger).unwrap());
+    assert_eq!(
+        crate::change_history::compare_authoring_on_conn(&conn, GROUP, &author_hash, &stranger)
+            .unwrap(),
+        None
+    );
+    // Nor is a carried author verified for another group.
+    assert!(!crate::dag_store::is_verified_authoring_change(&conn, "another-group", &author_hash)
+        .unwrap());
+}

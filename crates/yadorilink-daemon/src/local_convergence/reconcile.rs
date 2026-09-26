@@ -177,6 +177,20 @@ impl super::LocalConvergenceExecutor {
         self.state.metadata_unprovable_hold_unchanged(group_id, path, &out_path, &version)
     }
 
+    /// The evidence for a path this attempt found already absent -- in the
+    /// index and on disk -- and so did not touch: no disk mutation occurred,
+    /// so its mutation fence is snapshotted, never bumped. One place for
+    /// every already-absent settle (a deleted row's tombstone already
+    /// reflected, and a path an installed base leaves with no head at all).
+    fn already_absent(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<SettlementEvidence, PeerSessionError> {
+        let mutation_generation = self.state.dag_snapshot_mutation_fence(group_id, path)?;
+        Ok(SettlementEvidence::ExactAbsent { mutation_generation })
+    }
+
     /// Bounded commit size for `try_commit_ordinary_batch`, matching the
     /// convergence engine's own per-tick path budget so a larger reconcile
     /// window still commits in engine-sized chunks rather than one unbounded
@@ -1231,12 +1245,8 @@ impl super::LocalConvergenceExecutor {
                                 &tombstone_author,
                             )?;
                         }
-                        // No disk mutation occurred here
-                        // (already not live) -- a snapshot, never a bump.
-                        let mutation_generation =
-                            self.state.dag_snapshot_mutation_fence(group_id, &path)?;
-                        settled
-                            .insert(path, SettlementEvidence::ExactAbsent { mutation_generation });
+                        let evidence = self.already_absent(group_id, &path)?;
+                        settled.insert(path, evidence);
                     }
                 }
             }
@@ -1548,6 +1558,22 @@ impl super::LocalConvergenceExecutor {
         call_timer: &crate::local_convergence::call_timer::ReconcileCallTimer,
     ) -> Result<ProjectionAttempt, PeerSessionError> {
         let call_started = std::time::Instant::now();
+        // A copy name with no head of its own is placed by its source's
+        // resolution -- a conflict copy of a losing head, or a leaf moved
+        // aside for a directory -- so it is decided with its source. Asked
+        // for alone (an installed base places rows at copy names, and
+        // releasing the install's hold on one raises its obligation), it
+        // would resolve from no heads and never settle.
+        let mut copy_sources = Vec::new();
+        for path in &seed_paths {
+            if yadorilink_replica_domain::conflict::is_conflict_copy_path(path)
+                && self.store_live_heads_for_path(group_id, path)?.is_empty()
+            {
+                copy_sources
+                    .push(yadorilink_replica_domain::conflict::conflict_copy_source_path(path));
+            }
+        }
+        seed_paths.extend(copy_sources);
         // The namespace closure. A path is decided with its ancestors: one
         // whose own heads name a File or Symlink has to move aside while
         // anything lives below it and comes back once nothing does, and
@@ -1898,6 +1924,15 @@ impl super::LocalConvergenceExecutor {
             let mut inputs = self.combined_heads(group_id, path, derived.get(path))?;
             call_timer.add_dag_resolution(dag_started.elapsed());
             if inputs.is_empty() {
+                // An installed base carries only present heads: a path the
+                // base and everything written on it leave absent has no head
+                // at all, where retained history would still hold the
+                // removal that ended it. Absent in the index and on disk,
+                // there is nothing left to do at it.
+                if self.absent_under_installed_base(group_id, path)? {
+                    settled.insert(path.clone(), self.already_absent(group_id, path)?);
+                    continue;
+                }
                 // No live heads at all for a path this call was asked to
                 // resolve — genuinely ambiguous (this device's own DAG
                 // state may simply be behind), not a positive proof of
@@ -2153,14 +2188,7 @@ impl super::LocalConvergenceExecutor {
                                 &tombstone_author,
                             )?;
                         }
-                        // No disk mutation occurred here
-                        // (already not live) -- a snapshot, never a bump.
-                        let mutation_generation =
-                            self.state.dag_snapshot_mutation_fence(group_id, path)?;
-                        settled.insert(
-                            path.clone(),
-                            SettlementEvidence::ExactAbsent { mutation_generation },
-                        );
+                        settled.insert(path.clone(), self.already_absent(group_id, path)?);
                     }
                 }
                 PathResolution::Present { winner, .. } => {

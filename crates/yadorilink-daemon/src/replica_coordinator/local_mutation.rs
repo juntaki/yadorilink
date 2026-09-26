@@ -586,6 +586,10 @@ impl LocalMutationStore for ReplicaCoordinator {
         self.dirty_path_repository().clear_dirty_paths_conditional_batch(group_id, entries, permit)
     }
 
+    fn local_emission_available(&self, group_id: &str) -> bool {
+        self.local_policy_head(group_id).is_ok()
+    }
+
     fn list_dirty_paths(&self, group_id: &str) -> Result<Vec<DirtyPath>, SyncSqliteError> {
         self.dirty_path_repository().list_dirty_paths(group_id)
     }

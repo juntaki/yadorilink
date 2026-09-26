@@ -1200,6 +1200,268 @@ async fn hydrate_applies_the_recorded_unix_mode_after_reconstruct() {
     );
 }
 
+/// A `Placeholder` row whose placeholder this device really wrote: the
+/// block is in the store, the sparse stand-in is on disk, and its
+/// identity is recorded exactly as the materialization lane records it.
+#[cfg(unix)]
+async fn setup_real_placeholder_doc(
+) -> (Arc<DaemonState>, Arc<ReplicaCoordinator>, tempfile::TempDir, &'static [u8]) {
+    let store = Arc::new(SegmentBlockStore::new(tempfile::tempdir().unwrap().keep()).unwrap());
+    let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
+    let root_dir = tempfile::tempdir().unwrap();
+    sync_state.link_repository().add_link(&root_dir.path().to_string_lossy(), "group-1").unwrap();
+    yadorilink_root_authority::root_identity::VerifiedRoot::open(
+        root_dir.path(),
+        "group-1",
+        sync_state.as_ref(),
+    )
+    .unwrap();
+
+    let indexed_content: &'static [u8] = b"the remote content this placeholder stands in for";
+    let hash = Sha256::digest(indexed_content).to_vec();
+    store.put(indexed_content).unwrap();
+    sync_state
+        .change_history_repository()
+        .record_group_block_provenance("group-1", std::slice::from_ref(&hash))
+        .unwrap();
+    let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+    sync_state
+        .file_index_repository()
+        .upsert_file(
+            "group-1",
+            &yadorilink_replica_domain::file::FileRecord {
+                path: "doc.txt".into(),
+                size: indexed_content.len() as u64,
+                mtime_unix_nanos: 0,
+                blocks: vec![BlockInfo { hash, offset: 0, size: indexed_content.len() as u32 }],
+                deleted: false,
+            },
+            &permit,
+        )
+        .unwrap();
+    let identity = yadorilink_local_storage::write_placeholder(
+        &root_dir.path().join("doc.txt"),
+        indexed_content.len() as u64,
+        0,
+    )
+    .unwrap()
+    .expect("a unix placeholder has an inode identity");
+    let repo = sync_state.materialization_state_repository();
+    repo.set_materialization_state(
+        "group-1",
+        "doc.txt",
+        MaterializationState::Placeholder,
+        &permit,
+    )
+    .unwrap();
+    repo.record_placeholder_generation(
+        "group-1",
+        "doc.txt",
+        identity,
+        yadorilink_local_storage::INTERNAL_INODE_PROVIDER_KIND,
+        &permit,
+    )
+    .unwrap();
+
+    let state = DaemonState::new("device-a".into(), sync_state.clone(), store);
+    state.install_test_root_commit_authority("group-1");
+    (state, sync_state, root_dir, indexed_content)
+}
+
+/// The positive control for the two tests below: a placeholder nobody has
+/// touched hydrates.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_untouched_placeholder_hydrates() {
+    let (state, sync_state, root_dir, content) = setup_real_placeholder_doc().await;
+
+    hydrate_inner(&state, "group-1", "doc.txt", Some(&test_stall())).await.unwrap();
+
+    assert_eq!(std::fs::read(root_dir.path().join("doc.txt")).unwrap(), content);
+    assert_eq!(
+        sync_state
+            .materialization_state_repository()
+            .get_materialization_state("group-1", "doc.txt")
+            .unwrap(),
+        Some(MaterializationState::Hydrated)
+    );
+}
+
+/// An edit written into a placeholder before a hydration attempt starts,
+/// and not yet journalled by the watcher, is not overwritten.
+///
+/// The attempt has nothing on disk to take as its baseline but the edit
+/// itself, so comparing disk against itself cannot protect it. What the
+/// attempt can compare against is the placeholder this device wrote: the
+/// identity it recorded, and the placeholder still being sparse. A file
+/// that is no longer that placeholder is an uncaptured local edit, so the
+/// attempt refuses and journals it for capture.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_edit_made_before_the_attempt_started_is_never_overwritten() {
+    for rename_save in [false, true] {
+        let (state, sync_state, root_dir, _content) = setup_real_placeholder_doc().await;
+        let out_path = root_dir.path().join("doc.txt");
+        let edit = b"a local edit the watcher has not journalled yet";
+        if rename_save {
+            let tmp = root_dir.path().join(".doc.txt.save");
+            std::fs::write(&tmp, edit).unwrap();
+            std::fs::rename(&tmp, &out_path).unwrap();
+        } else {
+            std::fs::write(&out_path, edit).unwrap();
+        }
+
+        let result = hydrate_inner(&state, "group-1", "doc.txt", Some(&test_stall())).await;
+
+        assert!(
+            result.is_err(),
+            "rename_save={rename_save}: hydration took a local edit as its baseline and \
+             reported success: {result:?}"
+        );
+        assert_eq!(
+            std::fs::read(&out_path).unwrap(),
+            edit,
+            "rename_save={rename_save}: hydration overwrote an edit made before it started"
+        );
+        assert_ne!(
+            sync_state
+                .materialization_state_repository()
+                .get_materialization_state("group-1", "doc.txt")
+                .unwrap(),
+            Some(MaterializationState::Hydrated),
+            "rename_save={rename_save}: the row claims Hydrated over a local edit"
+        );
+        assert!(
+            sync_state.dirty_path_repository().is_path_dirty("group-1", "doc.txt").unwrap(),
+            "rename_save={rename_save}: the refused edit must be journalled for local capture, \
+             or nothing stops a later attempt that samples it as its baseline"
+        );
+    }
+}
+
+/// A crash after an attempt renamed the hydrated file into place and before
+/// it committed leaves a `Placeholder` row over a file that is no longer the
+/// placeholder -- but whose bytes are exactly the ones the row names. That is
+/// not a local edit, and refusing it would refuse forever: the next attempt
+/// settles it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_crash_between_the_rename_and_the_commit_settles_on_the_next_attempt() {
+    let (state, sync_state, root_dir, content) = setup_real_placeholder_doc().await;
+    let out_path = root_dir.path().join("doc.txt");
+    // What the interrupted attempt left: the assembled file renamed over
+    // the placeholder, a new inode with real allocated bytes.
+    let tmp = root_dir.path().join(".doc.txt.hydrating");
+    std::fs::write(&tmp, content).unwrap();
+    std::fs::rename(&tmp, &out_path).unwrap();
+
+    hydrate_inner(&state, "group-1", "doc.txt", Some(&test_stall())).await.unwrap();
+
+    assert_eq!(std::fs::read(&out_path).unwrap(), content);
+    assert_eq!(
+        sync_state
+            .materialization_state_repository()
+            .get_materialization_state("group-1", "doc.txt")
+            .unwrap(),
+        Some(MaterializationState::Hydrated),
+        "the interrupted hydration must settle, not refuse forever"
+    );
+    assert!(
+        sync_state
+            .sqlite()
+            .dag_lookup_materialized_generation("group-1", "doc.txt")
+            .unwrap()
+            .is_some(),
+        "the settled claim must be backed by a usable proof"
+    );
+    assert!(
+        !sync_state.dirty_path_repository().is_path_dirty("group-1", "doc.txt").unwrap(),
+        "bytes the row already names are not a local edit"
+    );
+}
+
+/// A placeholder the user deleted before a hydration attempt started, and
+/// whose removal the watcher has not journalled yet, is not recreated.
+///
+/// This device recorded writing a placeholder there, so an empty path is
+/// a local delete, not a path that never had content: hydrating would put
+/// the file back, and the watcher's late remove event would then find it
+/// present and never tombstone it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_placeholder_deleted_before_the_attempt_started_is_not_recreated() {
+    let (state, sync_state, root_dir, _content) = setup_real_placeholder_doc().await;
+    let out_path = root_dir.path().join("doc.txt");
+    std::fs::remove_file(&out_path).unwrap();
+
+    let result = hydrate_inner(&state, "group-1", "doc.txt", Some(&test_stall())).await;
+
+    assert!(result.is_err(), "hydration recreated a deleted placeholder: {result:?}");
+    assert!(
+        std::fs::symlink_metadata(&out_path).is_err(),
+        "hydration undid a local delete by writing the file back"
+    );
+    assert_ne!(
+        sync_state
+            .materialization_state_repository()
+            .get_materialization_state("group-1", "doc.txt")
+            .unwrap(),
+        Some(MaterializationState::Hydrated),
+    );
+    assert!(
+        sync_state.dirty_path_repository().is_path_dirty("group-1", "doc.txt").unwrap(),
+        "the refused delete must be journalled for local capture"
+    );
+}
+
+/// The crash-recovery arm accepts a file whose bytes are the ones the row
+/// names only when its mode is too: an interrupted attempt's leftover that
+/// the user has since `chmod`ed carries a local change, and the attempt's
+/// own metadata apply would revert it. The control, a leftover whose mode
+/// still matches the row, settles as before.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_mode_change_on_a_crash_leftover_is_not_reverted() {
+    use std::os::unix::fs::PermissionsExt as _;
+    for chmodded in [false, true] {
+        let (state, sync_state, root_dir, content) = setup_real_placeholder_doc().await;
+        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+        sync_state
+            .file_index_repository()
+            .set_unix_mode("group-1", "doc.txt", Some(0o644), &permit)
+            .unwrap();
+        let out_path = root_dir.path().join("doc.txt");
+        let tmp = root_dir.path().join(".doc.txt.hydrating");
+        std::fs::write(&tmp, content).unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::rename(&tmp, &out_path).unwrap();
+        if chmodded {
+            std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let result = hydrate_inner(&state, "group-1", "doc.txt", Some(&test_stall())).await;
+
+        let mode = std::fs::metadata(&out_path).unwrap().permissions().mode() & 0o777;
+        let hydrated = sync_state
+            .materialization_state_repository()
+            .get_materialization_state("group-1", "doc.txt")
+            .unwrap()
+            == Some(MaterializationState::Hydrated);
+        let dirty = sync_state.dirty_path_repository().is_path_dirty("group-1", "doc.txt").unwrap();
+        if chmodded {
+            assert!(result.is_err(), "hydration settled over a local mode change: {result:?}");
+            assert_eq!(mode, 0o755, "hydration reverted a local chmod on a crash leftover");
+            assert!(!hydrated);
+            assert!(dirty, "the refused mode change must be journalled for local capture");
+        } else {
+            result.unwrap();
+            assert_eq!(mode, 0o644);
+            assert!(hydrated);
+            assert!(!dirty);
+        }
+    }
+}
+
 fn block_for_data(data: &[u8]) -> BlockInfo {
     BlockInfo { hash: Sha256::digest(data).to_vec(), offset: 0, size: data.len() as u32 }
 }

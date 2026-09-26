@@ -800,6 +800,8 @@ async fn a_delete_below_a_file_settles_as_absent() {
     assert_eq!(std::fs::read(h.root.path().join("a")).unwrap(), b"file a", "{:?}", h.tree());
 }
 
+/// A symlink version to `target`, recorded in the platform's own captured
+/// target encoding (UTF-16LE code units on Windows).
 fn symlink_to(target: &str) -> FileVersion {
     FileVersion::new(
         vec![],
@@ -807,7 +809,9 @@ fn symlink_to(target: &str) -> FileVersion {
         FileMeta {
             mtime_unix_nanos: 0,
             unix_mode: None,
-            symlink_target: Some(target.as_bytes().to_vec()),
+            symlink_target: Some(yadorilink_root_authority::fs_identity::target_to_bytes(
+                std::path::Path::new(target),
+            )),
             record_kind: RecordKind::Symlink,
             xattrs: Vec::new(),
         },
@@ -998,7 +1002,11 @@ async fn namespace_step_stopped_then_restarted(
 ) -> String {
     let what = format!("{stage:?} {stop:?} at {at}");
     let heads = h.state.dag_group_heads(GROUP).unwrap();
-    let targets = [h.root.path().join(at), h.root.path().canonicalize().unwrap().join(at)];
+    // As in `displacement_stopped_then_restarted`: where the root is already
+    // canonical (Linux tempdirs) both spellings are one path, and arming it
+    // twice would leave one stop armed after the pass fired the other.
+    let mut targets = vec![h.root.path().join(at), h.root.path().canonicalize().unwrap().join(at)];
+    targets.dedup();
     for target in &targets {
         displacement_crash::arm(target, stage, stop);
     }

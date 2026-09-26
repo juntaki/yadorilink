@@ -24,9 +24,11 @@ use yadorilink_sqlite_runtime::SyncDatabase;
 
 use crate::SyncSqliteError;
 
+mod compaction_hold;
 mod foreign_merge;
 mod merge_install;
 mod seal;
+pub use compaction_hold::{copy_holds_compaction, held_paths, seal_group_unless_held, SealAttempt};
 #[cfg(any(test, feature = "test-support"))]
 pub use foreign_merge::plan_summary_merge;
 pub use foreign_merge::{
@@ -75,6 +77,23 @@ impl RebootstrapStoreRepository {
         checkpoint_hash: &CheckpointHash,
     ) -> Result<Option<Vec<u8>>, SyncSqliteError> {
         self.database.read(|conn| checkpoint_snapshot(conn, checkpoint_hash))
+    }
+
+    /// The paths whose unresolved conflict `group_id`'s compaction is
+    /// waiting for (see [`held_paths`]). Empty when it is not held.
+    pub fn compaction_held_paths(&self, group_id: &str) -> Result<Vec<String>, SyncSqliteError> {
+        self.database.read(|conn| held_paths(conn, group_id))
+    }
+
+    /// Whether the conflict copy at `copy_path` carries a version whose
+    /// fork `group_id`'s compaction is waiting for (see
+    /// [`copy_holds_compaction`]).
+    pub fn conflict_copy_holds_compaction(
+        &self,
+        group_id: &str,
+        copy_path: &str,
+    ) -> Result<bool, SyncSqliteError> {
+        self.database.read(|conn| copy_holds_compaction(conn, group_id, copy_path))
     }
 
     /// Builds the exact snapshot a destructive compaction will commit. See
@@ -224,7 +243,46 @@ CREATE TABLE IF NOT EXISTS history_base_meta (
     lamport_ceiling INTEGER NOT NULL,
     PRIMARY KEY (group_id, base_hash)
 );
+
+-- A group whose compaction is held (see `compaction_hold`): the last seal
+-- was refused because these paths each held two live heads of one author,
+-- a conflict only the user can resolve. `live_heads` is the path's live
+-- heads then, their sorted change hashes laid end to end; the seal is not
+-- tried again until one recorded path's heads differ. Local status, never
+-- replicated, and not part of any summary.
+CREATE TABLE IF NOT EXISTS compaction_holds (
+    group_id   TEXT NOT NULL,
+    path       TEXT NOT NULL,
+    live_heads BLOB NOT NULL,
+    PRIMARY KEY (group_id, path)
+);
 "#;
+
+/// Whether the history base `group_id` stands on carries `change` as a
+/// head of its `Gamma` or as the author of a row it installed. The summary
+/// tables hold the installed base's rows only (every install replaces
+/// them), so a base the group has left answers nothing.
+pub(crate) fn installed_base_carries_author(
+    conn: &Connection,
+    group_id: &str,
+    change: &ChangeHash,
+) -> Result<bool, SyncSqliteError> {
+    init_rebootstrap_schema(conn)?;
+    let carried: Option<i64> = conn
+        .prepare_cached(
+            "SELECT 1 FROM group_history_bases b \
+              WHERE b.group_id = ?1 AND ( \
+                EXISTS (SELECT 1 FROM history_base_path_heads h \
+                         WHERE h.group_id = b.group_id AND h.change_hash = ?2 \
+                           AND h.base_hash = b.history_base) \
+                OR EXISTS (SELECT 1 FROM history_base_carried_authors a \
+                            WHERE a.group_id = b.group_id AND a.change_hash = ?2 \
+                              AND a.base_hash = b.history_base))",
+        )?
+        .query_row(params![group_id, &change.0[..]], |row| row.get(0))
+        .optional()?;
+    Ok(carried.is_some())
+}
 
 pub fn init_rebootstrap_schema(conn: &Connection) -> Result<(), SyncSqliteError> {
     conn.execute_batch(REBOOTSTRAP_SCHEMA)?;

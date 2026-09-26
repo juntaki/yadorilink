@@ -573,6 +573,8 @@ async fn conflicts_endpoint_returns_real_per_file_detail() {
     assert_eq!(rows[0]["kind"], "ENTRY_KIND_FILE");
     // Why the copy is kept, the same reason the CLI and apps show.
     assert_eq!(rows[0]["reason"], "CONFLICT_REASON_CONCURRENT_EDIT");
+    // No compaction is waiting on it.
+    assert_eq!(rows[0]["holds_compaction"], false);
 }
 
 /// Seeds a live explicit-directory row at `path`: a canonical `size=0`,

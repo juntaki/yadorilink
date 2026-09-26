@@ -278,6 +278,38 @@ fn an_edit_over_a_projected_peer_edit_descends_from_it() {
     assert_eq!(live_heads(&db), vec![l.0]);
 }
 
+/// A local write signed concurrent with a peer's unprojected edit leaves
+/// that edit a live head, and publishes the proof of the bytes it wrote.
+/// That proof's basis is what the user's next edit of those bytes is
+/// signed onto, so it must name only the write -- not the frontier, which
+/// still holds the peer's edit. Otherwise the second edit descends from a
+/// version the user never saw and supersedes it with no conflict copy.
+/// Found by the history-epoch DST scenario (seed 41: bob's partition-time
+/// write to `f0` gone from every device).
+#[test]
+fn an_edit_after_a_write_concurrent_with_an_unprojected_peer_edit_still_does_not_claim_it() {
+    let db = open_full_test_db();
+    let repo = FileIndexRepository::new(db.clone());
+
+    let a = write_unbatched(&repo, 1);
+    let r = admit_peer_edit_on(&db, a, 2);
+    let l1 = write_unbatched(&repo, 3);
+    assert_concurrent_with_the_unseen_edit(&db, &a, &r, &l1);
+    assert!(has_basis(&db), "sanity: the observed write published its basis");
+
+    let l2 = write_batched(&repo, 4);
+
+    assert!(
+        !is_ancestor(&db, &r, &l2),
+        "the second edit was signed onto a basis naming the peer's unprojected edit, so it \
+         supersedes a version this device never showed"
+    );
+    assert!(is_ancestor(&db, &l1, &l2), "the second edit must descend from the first");
+    let heads = live_heads(&db);
+    assert!(heads.contains(&r.0), "the peer's edit must stay a live head");
+    assert!(heads.contains(&l2.0), "the second edit must be a live head");
+}
+
 fn put_at(path: &str, version: &FileVersion) -> Op {
     Op::Put {
         path: SyncPath(path.to_string()),

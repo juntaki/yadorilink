@@ -71,6 +71,7 @@ use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeCo
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::peer_orchestrator;
 use yadorilink_local_storage::SegmentBlockStore;
+use yadorilink_replica_domain::session_state::MaterializationState;
 
 struct TestDevice {
     device_id: String,
@@ -235,6 +236,170 @@ fn recursive_snapshot(root: &Path) -> HashMap<String, String> {
     let mut out = HashMap::new();
     walk(root, root, &mut out);
     out
+}
+
+/// One device's view of whether it still has sync work in flight.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SyncWorkState {
+    /// The device's DAG frontier, sorted.
+    heads: Vec<String>,
+    /// Every path the device holds that is not hydrated, sorted.
+    unhydrated: Vec<String>,
+    /// Projection obligations still pending.
+    pending_obligations: u64,
+}
+
+fn sync_work_state(device: &TestDevice, group_id: &str) -> SyncWorkState {
+    let coordinator = &device.state.replica_coordinator;
+    let mut heads: Vec<String> = coordinator
+        .sqlite()
+        .dag_group_heads(group_id)
+        .unwrap()
+        .iter()
+        .map(|head| head.to_hex())
+        .collect();
+    heads.sort();
+    let mut unhydrated: Vec<String> = coordinator
+        .materialization_state_repository()
+        .list_materialization_states(group_id)
+        .unwrap()
+        .into_iter()
+        .filter(|(_, state)| *state != MaterializationState::Hydrated)
+        .map(|(path, _)| path)
+        .collect();
+    unhydrated.sort();
+    let pending_obligations =
+        coordinator.sqlite().dag_count_pending_projection_obligations(group_id).unwrap();
+    SyncWorkState { heads, unhydrated, pending_obligations }
+}
+
+/// Whether `device` still owes a retroactive conflict-copy repair at its
+/// current frontier, planned the same way its repair loop plans it
+/// (`plan_retroactive_merge`, read-only, in one snapshot).
+///
+/// The repair loop's own progress is invisible to the other checks here:
+/// while it plans, and while a lower rank's failover window runs (5s per
+/// rank), the frontier does not move and no counter changes. Asking the
+/// planner directly does not depend on how long either of those takes.
+/// Returns the frontier the plan was built against, and whether that plan
+/// has anything left to author. A path whose obligation can never fit in
+/// one carrier counts as settled, as the repair loop treats it.
+fn owes_retroactive_repair(device: &TestDevice, group_id: &str) -> (Vec<String>, bool) {
+    use yadorilink_sync_sqlite::retroactive_conflict::{
+        plan_retroactive_merge, RetroactiveMergeOutcome,
+    };
+    let outcome = device
+        .state
+        .replica_coordinator
+        .database()
+        .read_snapshot::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+            plan_retroactive_merge(conn, group_id)
+        })
+        .unwrap();
+    let (frontier, owes) = match &outcome {
+        RetroactiveMergeOutcome::Plan(plan) => (plan.frontier.heads(), !plan.direct_ops.is_empty()),
+        RetroactiveMergeOutcome::PathObligationTooLarge(blocked) => {
+            (blocked.frontier().heads(), false)
+        }
+    };
+    let mut frontier: Vec<String> = frontier.iter().map(|head| head.to_hex()).collect();
+    frontier.sort();
+    (frontier, owes)
+}
+
+/// How long every device must hold one unchanged, shared frontier with no
+/// outstanding work before the tree counts as settled. The retroactive
+/// repair is checked separately (see [`owes_retroactive_repair`]), so this
+/// only has to outlast a hydration or projection that has not started yet.
+const QUIESCENCE_WINDOW: Duration = Duration::from_secs(3);
+
+/// Waits until the devices have stopped moving: every device reports the same
+/// DAG frontier, nothing fetchable is left unhydrated or unprojected, that has
+/// held unchanged for [`QUIESCENCE_WINDOW`], and no device's planner still
+/// owes a retroactive repair at that frontier.
+///
+/// Equal on-disk snapshots are not enough to call a row converged. Two
+/// states pass that check on the way there:
+/// - a not-yet-hydrated file is a placeholder of the right size and all zero
+///   bytes, so devices that all still hold a placeholder at a path hash
+///   equal, and each fills in its bytes at its own time afterwards;
+/// - after the per-path resolution lands, a retroactive repair carrier can
+///   still follow (`authored retroactive conflict-copy merge resolution`),
+///   adding conflict copies of versions that were concurrent earlier in the
+///   DAG. Before it arrives the devices can already agree on a smaller tree.
+///
+/// Either one let the snapshot wait pass on an intermediate tree, and the
+/// final comparison then caught devices part-way to the real end state.
+///
+/// `revoked_device` is true when a device was revoked mid-row. Content only
+/// the revoked device ever held can no longer be fetched from anyone, so
+/// every remaining device keeps that file as a placeholder, with its
+/// projection obligation pending, for good (row 15). Those rows tolerate
+/// a path left unhydrated only when no remaining device holds it hydrated,
+/// so nobody left could serve it. Anything some remaining device does hold
+/// must still hydrate everywhere, the same as in any other row.
+async fn wait_for_quiescence(
+    devices: &[&TestDevice],
+    group_id: &str,
+    timeout: Duration,
+    revoked_device: bool,
+) {
+    let started = tokio::time::Instant::now();
+    let mut stable: Option<(Vec<SyncWorkState>, tokio::time::Instant)> = None;
+    loop {
+        let states: Vec<SyncWorkState> =
+            devices.iter().map(|d| sync_work_state(d, group_id)).collect();
+        let reference_heads = &states[0].heads;
+        let same_frontier = states.iter().all(|state| &state.heads == reference_heads);
+        let nothing_fetchable_outstanding = if revoked_device {
+            // A path unhydrated anywhere must be unhydrated everywhere: if
+            // some remaining device holds it hydrated, the rest can still
+            // fetch it and will change underneath the snapshot.
+            states.iter().all(|state| {
+                state.unhydrated.iter().all(|path| {
+                    states.iter().all(|other| other.unhydrated.binary_search(path).is_ok())
+                })
+            })
+        } else {
+            states.iter().all(|state| state.unhydrated.is_empty() && state.pending_obligations == 0)
+        };
+        if same_frontier && nothing_fetchable_outstanding {
+            match &stable {
+                Some((held, since)) if held == &states => {
+                    if since.elapsed() >= QUIESCENCE_WINDOW {
+                        let plans: Vec<_> =
+                            devices.iter().map(|d| owes_retroactive_repair(d, group_id)).collect();
+                        if plans.iter().all(|(frontier, owes)| frontier == reference_heads && !owes)
+                        {
+                            return;
+                        }
+                        // Settled-looking, but a repair carrier is still
+                        // owed at this frontier. Start the window over.
+                        stable = Some((states.clone(), tokio::time::Instant::now()));
+                    }
+                }
+                _ => stable = Some((states.clone(), tokio::time::Instant::now())),
+            }
+        } else {
+            stable = None;
+        }
+        if started.elapsed() > timeout {
+            let detail = devices
+                .iter()
+                .zip(states.iter())
+                .map(|(d, state)| {
+                    let (plan_frontier, owes_repair) = owes_retroactive_repair(d, group_id);
+                    format!(
+                        "{}: {state:?} plan_frontier={plan_frontier:?} owes_repair={owes_repair}",
+                        d.device_id
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            panic!("devices never quiesced within {timeout:?}: {detail}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 fn is_conflict_copy(name: &str) -> bool {
@@ -619,6 +784,14 @@ async fn run_taguchi_v3_row(
     // full-index resync). Give it matching headroom.
     let timeout =
         if churn_level == 3 { Duration::from_secs(200) } else { Duration::from_secs(150) };
+
+    // Not for path_level 4 yet. Row 13 was seen holding two different DAG
+    // frontiers, with work still outstanding, for the whole 150s budget
+    // (not yet root-caused). Until that is understood, the
+    // case-fold rows keep only their own, looser check below.
+    if path_level != 4 {
+        wait_for_quiescence(&active_refs, group_id, timeout, excluded_idx.is_some()).await;
+    }
 
     // path_level 4 (case-fold) is deliberately excluded from the strict
     // full-snapshot convergence check below: per `hazard.rs`'s "hold"

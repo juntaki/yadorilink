@@ -781,15 +781,15 @@ impl SqliteSyncStore {
         })
     }
 
-    /// Whether anything strictly below `path` holds a live content head --
-    /// [`crate::dag_store::has_live_descendant`].
+    /// Whether anything strictly below `path` holds a live content head in
+    /// `Gamma` -- [`crate::dag_store::gamma_has_live_descendant`].
     pub fn dag_has_live_descendant(
         &self,
         group_id: &str,
         path: &str,
     ) -> Result<bool, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            crate::dag_store::has_live_descendant(conn, group_id, path)
+            crate::dag_store::gamma_has_live_descendant(conn, group_id, path)
         })
     }
 

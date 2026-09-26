@@ -546,6 +546,30 @@ pub fn has_change_or_pruned(
     Ok(retained.is_some() || is_pruned_change(conn, group_id, hash)?)
 }
 
+/// Whether `hash` is a verified authoring identity in this group: a change
+/// [`has_change_or_pruned`] vouches for, or one the history base this group
+/// stands on carries -- a head of its `Gamma`, or the author of a row it
+/// installed.
+///
+/// A base absorbs the changes it summarises: they are neither retained nor
+/// pruned here afterwards, yet the rows they wrote are the rows this group
+/// holds, and a peer on the same base offers them with the same authors.
+/// The base was verified when it was installed, so what it carries is as
+/// verified as retained history. Only the installed base counts: a base
+/// this group has left carries nothing any more.
+///
+/// Deliberately narrower than admission: a change's parents are checked
+/// with [`has_change_or_pruned`], because a base's heads are never
+/// parents of a change on it.
+pub fn is_verified_authoring_change(
+    conn: &Connection,
+    group_id: &str,
+    hash: &ChangeHash,
+) -> Result<bool, SyncSqliteError> {
+    Ok(has_change_or_pruned(conn, group_id, hash)?
+        || crate::rebootstrap_store::installed_base_carries_author(conn, group_id, hash)?)
+}
+
 /// Whether `ancestor` is a strict ancestor of `descendant` — reachable by
 /// walking retained parent edges upward from `descendant`, never equal to it.
 ///
