@@ -268,9 +268,18 @@ async fn editor_granted_devices_local_edit_succeeds_and_syncs_normally() {
 
     std::fs::write(root_b.path().join("editor-edit.txt"), b"editor edits sync normally").unwrap();
 
-    wait_until(|| root_a.path().join("editor-edit.txt").exists(), Duration::from_secs(40)).await;
+    // Waits for the content, not merely for the path to exist: materializing
+    // a synced file can create it before its bytes land (a placeholder, or a
+    // create-then-write sequence), and a bare `.exists()` wait races that
+    // window -- caught as a flake reading back all zeros instead of content.
+    let target = root_a.path().join("editor-edit.txt");
+    wait_until(
+        || std::fs::read(&target).ok().as_deref() == Some(b"editor edits sync normally".as_slice()),
+        Duration::from_secs(40),
+    )
+    .await;
     assert_eq!(
-        std::fs::read(root_a.path().join("editor-edit.txt")).unwrap(),
+        std::fs::read(&target).unwrap(),
         b"editor edits sync normally",
         "an Editor-granted device's local edit must sync to a peer with unchanged content"
     );
@@ -324,10 +333,16 @@ async fn pre_existing_content_initial_import_scenario(role: WriterRole, expect_s
     wait_for_group_policy_seq(&daemon_b.state, &group_id, 1).await;
 
     if expect_synced {
-        wait_until(|| root_a.path().join("pre-existing.txt").exists(), Duration::from_secs(40))
-            .await;
+        // See `editor_granted_devices_local_edit_succeeds_and_syncs_normally`
+        // on why this waits for content, not merely for the path to exist.
+        let target = root_a.path().join("pre-existing.txt");
+        wait_until(
+            || std::fs::read(&target).ok().as_deref() == Some(b"already on disk before link".as_slice()),
+            Duration::from_secs(40),
+        )
+        .await;
         assert_eq!(
-            std::fs::read(root_a.path().join("pre-existing.txt")).unwrap(),
+            std::fs::read(&target).unwrap(),
             b"already on disk before link",
             "an Editor-granted device's pre-existing content must import and sync to a peer with \
              unchanged content"
@@ -439,10 +454,19 @@ async fn editor_downgraded_to_viewer_mid_session_cannot_author_accepted_changes_
     // anyway".
     std::fs::write(root_b.path().join("before-downgrade.txt"), b"editor edit, pre-downgrade")
         .unwrap();
-    wait_until(|| root_a.path().join("before-downgrade.txt").exists(), Duration::from_secs(40))
-        .await;
+    // See `editor_granted_devices_local_edit_succeeds_and_syncs_normally` on
+    // why this waits for content, not merely for the path to exist.
+    let before_downgrade_target = root_a.path().join("before-downgrade.txt");
+    wait_until(
+        || {
+            std::fs::read(&before_downgrade_target).ok().as_deref()
+                == Some(b"editor edit, pre-downgrade".as_slice())
+        },
+        Duration::from_secs(40),
+    )
+    .await;
     assert_eq!(
-        std::fs::read(root_a.path().join("before-downgrade.txt")).unwrap(),
+        std::fs::read(&before_downgrade_target).unwrap(),
         b"editor edit, pre-downgrade"
     );
 
@@ -541,15 +565,15 @@ async fn downgraded_devices_pre_downgrade_history_remains_valid_retained_history
     // quarantine.
     std::fs::write(root_b.path().join("legitimate-before-downgrade.txt"), b"legitimately authored")
         .unwrap();
+    // See `editor_granted_devices_local_edit_succeeds_and_syncs_normally` on
+    // why this waits for content, not merely for the path to exist.
+    let legitimate_target = root_a.path().join("legitimate-before-downgrade.txt");
     wait_until(
-        || root_a.path().join("legitimate-before-downgrade.txt").exists(),
+        || std::fs::read(&legitimate_target).ok().as_deref() == Some(b"legitimately authored".as_slice()),
         Duration::from_secs(40),
     )
     .await;
-    assert_eq!(
-        std::fs::read(root_a.path().join("legitimate-before-downgrade.txt")).unwrap(),
-        b"legitimately authored"
-    );
+    assert_eq!(std::fs::read(&legitimate_target).unwrap(), b"legitimately authored");
 
     fake.downgrade_role(device_b_id, group_id, WriterRole::Viewer);
     wait_for_group_policy_epoch(&daemon_a.state, group_id, 1).await;
@@ -638,10 +662,16 @@ async fn a_downgraded_authors_pre_downgrade_history_still_reaches_a_newly_joined
     // is the legitimate history the fix must keep deliverable.
     std::fs::write(root_author.path().join("pre-downgrade.txt"), b"authored while an editor")
         .unwrap();
-    wait_until(|| root_relay.path().join("pre-downgrade.txt").exists(), Duration::from_secs(40))
-        .await;
+    // See `editor_granted_devices_local_edit_succeeds_and_syncs_normally` on
+    // why this waits for content, not merely for the path to exist.
+    let relay_target = root_relay.path().join("pre-downgrade.txt");
+    wait_until(
+        || std::fs::read(&relay_target).ok().as_deref() == Some(b"authored while an editor".as_slice()),
+        Duration::from_secs(40),
+    )
+    .await;
     assert_eq!(
-        std::fs::read(root_relay.path().join("pre-downgrade.txt")).unwrap(),
+        std::fs::read(&relay_target).unwrap(),
         b"authored while an editor",
         "the relaying peer must genuinely hold the author's pre-downgrade content before the \
          downgrade -- otherwise there is nothing for it to relay and this scenario proves nothing"
@@ -693,11 +723,17 @@ async fn a_downgraded_authors_pre_downgrade_history_still_reaches_a_newly_joined
     // keeps the failure mode legible.
     wait_for_group_policy_seq(&daemon_relay.state, group_id, 4).await;
 
-    // The assertion this whole scenario exists for.
-    wait_until(|| root_joiner.path().join("pre-downgrade.txt").exists(), Duration::from_secs(60))
-        .await;
+    // The assertion this whole scenario exists for. See
+    // `editor_granted_devices_local_edit_succeeds_and_syncs_normally` on why
+    // this waits for content, not merely for the path to exist.
+    let joiner_target = root_joiner.path().join("pre-downgrade.txt");
+    wait_until(
+        || std::fs::read(&joiner_target).ok().as_deref() == Some(b"authored while an editor".as_slice()),
+        Duration::from_secs(60),
+    )
+    .await;
     assert_eq!(
-        std::fs::read(root_joiner.path().join("pre-downgrade.txt")).unwrap(),
+        std::fs::read(&joiner_target).unwrap(),
         b"authored while an editor",
         "a newly-joined device must converge on a since-downgraded author's legitimately \
          pre-downgrade history, relayed by a current-writer peer -- without the relay exemption \
