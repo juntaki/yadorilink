@@ -1272,6 +1272,23 @@ struct CountingBlockStore {
     batches: Mutex<Vec<usize>>,
     /// Fails every bulk flush once armed, for the fail-closed test.
     fail_batches: AtomicBool,
+    /// Fails every bulk flush with the exact `StorageError::Io(NotFound)`
+    /// shape `SegmentBlockStore::commit_batch`'s own headroom preflight
+    /// (`check_headroom` -> `free_space::classify_volume`, which stats the
+    /// block-store root) produces when that root has been deleted or its
+    /// volume unmounted -- see `record_builder.rs`'s own doc on why this
+    /// exact error shape, not merely any `Err`, is what the regression
+    /// this fault feeds needs to distinguish from a vanished SOURCE path.
+    /// A real deleted store root reproduces the identical shape on Unix,
+    /// but deleting a directory a live handle (this store's own open
+    /// sqlite index) is still inside is refused outright on Windows, so
+    /// this double is what the regression itself runs against on every
+    /// platform. (A companion Unix-only test that reproduced the real
+    /// fault directly against `SegmentBlockStore` was tried and dropped:
+    /// `remove_dir_all` racing the store's own background sqlite/WAL
+    /// activity flaked with `DirectoryNotEmpty` under load, which would
+    /// have swapped one platform's flake for another's.)
+    fail_batches_not_found: AtomicBool,
     /// Fails a bulk flush carrying more than this many bytes; `0`
     /// disables it. A *content*-based discriminator, on purpose: it
     /// makes "the big file fails and the small ones succeed"
@@ -1288,6 +1305,7 @@ impl CountingBlockStore {
             single_commits: std::sync::atomic::AtomicUsize::new(0),
             batches: Mutex::new(Vec::new()),
             fail_batches: AtomicBool::new(false),
+            fail_batches_not_found: AtomicBool::new(false),
             refuse_over_bytes: AtomicU64::new(0),
         }
     }
@@ -1307,6 +1325,13 @@ impl CountingBlockStore {
 
     fn fail_every_batch(&self) {
         self.fail_batches.store(true, Ordering::SeqCst);
+    }
+
+    /// See `fail_batches_not_found`'s own doc for why this exact shape,
+    /// not `fail_every_batch`'s generic refusal, is what the block-store
+    /// NotFound regression needs.
+    fn fail_every_batch_with_not_found(&self) {
+        self.fail_batches_not_found.store(true, Ordering::SeqCst);
     }
 
     /// Refuses any bulk flush carrying more than `bytes`.
@@ -1346,6 +1371,11 @@ impl yadorilink_local_storage::BlockStore for CountingBlockStore {
             return Err(yadorilink_local_storage::StorageError::Chunking(
                 "bulk flush refused by the test double".into(),
             ));
+        }
+        if self.fail_batches_not_found.load(Ordering::SeqCst) {
+            return Err(yadorilink_local_storage::StorageError::Io(std::io::Error::from(
+                std::io::ErrorKind::NotFound,
+            )));
         }
         let limit = self.refuse_over_bytes.load(Ordering::SeqCst);
         let batch_bytes: u64 = prepared.iter().map(|b| b.bytes().len() as u64).sum();
@@ -4012,30 +4042,18 @@ async fn source_path_renamed_away_between_lstat_and_chunk_resolves_cleanly() {
 /// neighbours and the durability property it pins is worth it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_block_store_not_found_while_the_source_file_still_exists_stays_dirty() {
-    use yadorilink_local_storage::BlockStore as _;
-
-    let store_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
-    let state = Arc::new(TestReplica::open_in_memory().unwrap());
-    let root_dir = tempfile::tempdir().unwrap();
-    let proc = LocalChangeProcessor::new(
-        state.clone(),
-        store.clone(),
-        "device-a".into(),
-        std::sync::Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()),
-    );
+    let (proc, state, store, _store_dir, root_dir) = processor_with_counting_store();
     let root = canonical_root(&root_dir);
     adopt_root(&state, "group-1", &root);
 
     // At or above `CDC_SIZE_THRESHOLD`, so the chunk attempt takes the
-    // bulk-ingest batch path whose headroom preflight stats the store
-    // root first.
+    // bulk-ingest batch path this double's `fail_every_batch_with_not_found`
+    // targets.
     let source = root.join("big.bin");
     let size = yadorilink_local_storage::CDC_SIZE_THRESHOLD as usize + 1;
     std::fs::write(&source, vec![0xABu8; size]).unwrap();
 
-    store.set_headroom_enforced(true);
-    std::fs::remove_dir_all(store_dir.path()).unwrap();
+    store.fail_every_batch_with_not_found();
 
     let flush = yadorilink_filesystem_sync::debounce::DebounceFlush::Paths(vec![(
         source.clone(),

@@ -79,6 +79,16 @@ const TEST_SWEEP_INTERVAL: Duration = Duration::from_secs(3);
 /// itself a starvation bug, fixed alongside this one).
 const CONVERGENCE_BOUND: Duration = Duration::from_secs(60);
 
+// This scenario forces eviction with `set_test_placeholder_pipeline_connected`,
+// which satisfies `hydration::evict`'s own pipeline-connected gate, but not
+// `evict_to_placeholder`'s Windows-only requirement (materialization_eviction.rs)
+// of a recorded CfAPI placeholder identity and a real cfapi-host dehydration --
+// there is no fake for either here, so eviction fails closed with
+// `EvictionRejected` before this scenario's actual property (known-unobtainable
+// content converges to `AtRisk`) is ever exercised. That fail-closed behavior is
+// the correct production answer on Windows and must not be weakened to pass
+// this test; giving it a real CfAPI double is future work, not attempted here.
+#[cfg_attr(windows, ignore = "needs a CfAPI placeholder-identity test double; see the comment above")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn unobtainable_content_converges_to_at_risk_not_stuck_protecting() {
     init_tracing();
