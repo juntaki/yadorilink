@@ -21,7 +21,6 @@ use yadorilink_replica_domain::file::{FileRecord, FileVersion, RecordKind};
 use yadorilink_replica_domain::ids::ChangeHash;
 use yadorilink_replica_domain::session_state::{
     CurrentVersionRecord, HeldState, LinkGate, MaterializationPolicy, MaterializationState,
-    StartupFailed,
 };
 use yadorilink_root_authority::root_commit::RootCommitPermit;
 

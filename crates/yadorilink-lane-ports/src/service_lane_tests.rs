@@ -137,7 +137,7 @@ async fn an_oversized_message_is_refused_before_allocating() {
 /// rather than where it is read.
 #[test]
 fn the_lane_ceiling_is_enforced_on_the_way_out_too() {
-    assert!(MAX_SERVICE_MESSAGE_BYTES < yadorilink_sync_protocol::wire::MAX_BUNDLE_BYTES);
+    const { assert!(MAX_SERVICE_MESSAGE_BYTES < yadorilink_sync_protocol::wire::MAX_BUNDLE_BYTES) };
 }
 
 /// The version-present RPC, end to end on the service lane, answered from a

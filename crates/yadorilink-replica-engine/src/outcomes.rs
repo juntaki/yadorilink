@@ -64,6 +64,11 @@ pub enum ChangeAdmissionRejection {
     /// Change can never have its ancestry. Permanent for as long as that
     /// parent's refusal stands.
     BehindRejectedParent { reason: String },
+    /// The Change names an observed base head this replica's history base
+    /// does not carry at any path the Change touches: a signed claim to have
+    /// seen something that was never shown there. Permanent while this
+    /// replica stays on that base.
+    InvalidObservedBaseHead { reason: String },
 }
 
 /// `PeerReplicaEngine::holds_version_durably`'s result. Every non-`present`

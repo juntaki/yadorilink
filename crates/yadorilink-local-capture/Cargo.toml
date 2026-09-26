@@ -77,6 +77,10 @@ yadorilink-daemon = { path = "../yadorilink-daemon", features = ["test-support"]
 # names `yadorilink_sqlite_runtime::DatabaseError` in
 # `ReplicaCoordinator::open_in_memory`/`open`'s own `Result` type directly.
 yadorilink-sqlite-runtime = { path = "../yadorilink-sqlite-runtime" }
+# `snapshot_install_disk_safety`'s crash matrix compares the index rows,
+# open intents and published proofs a reconciliation leaves, table by
+# table. The same version the daemon builds, so nothing new is compiled.
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 [lints]
 workspace = true

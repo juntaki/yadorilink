@@ -307,48 +307,49 @@ impl TestPeerNode {
         &self.device_id
     }
 
+    /// Routes every lane `link` opens to the session serving its peer, or to
+    /// `unclaimed` when none does.
+    async fn serve_link(self: Arc<Self>, link: PeerLink) {
+        let peer = link.peer();
+        while let Ok(mut stream) = link.accept_lane().await {
+            let Ok(group) = yadorilink_sync_protocol::session::accept_lane(&mut stream).await
+            else {
+                continue;
+            };
+            let session = self.sessions.lock().expect("sessions poisoned").get(&peer).cloned();
+            let Some(session) = session else {
+                // Nobody here serves this peer, so a test is playing it. See
+                // `unclaimed`.
+                let _ = self.unclaimed.send((group.as_str().to_string(), stream));
+                continue;
+            };
+            tokio::spawn(serve_lane(session, group, stream));
+        }
+    }
+
     fn serve(self: Arc<Self>, mut inbound: tokio::sync::mpsc::Receiver<PeerLink>) {
         tokio::spawn(async move {
             while let Some(link) = inbound.recv().await {
-                let node = self.clone();
-                tokio::spawn(async move {
-                    let peer = link.peer();
-                    while let Ok(mut stream) = link.accept_lane().await {
-                        let Ok(group) =
-                            yadorilink_sync_protocol::session::accept_lane(&mut stream).await
-                        else {
-                            continue;
-                        };
-                        let session =
-                            node.sessions.lock().expect("sessions poisoned").get(&peer).cloned();
-                        let Some(session) = session else {
-                            // Nobody here serves this peer, so a test is
-                            // playing it. See `unclaimed`.
-                            let _ = node.unclaimed.send((group.as_str().to_string(), stream));
-                            continue;
-                        };
-                        tokio::spawn(async move {
-                            match stream.lane() {
-                                Lane::Block => {
-                                    session
-                                        .serve_block_stream(Box::new(LaneBlockStream::new(stream)))
-                                        .await
-                                }
-                                Lane::Service => {
-                                    session
-                                        .serve_service_stream(
-                                            group.as_str(),
-                                            Box::new(LaneServiceStream::new(stream)),
-                                        )
-                                        .await
-                                }
-                                _ => {}
-                            }
-                        });
-                    }
-                });
+                tokio::spawn(self.clone().serve_link(link));
             }
         });
+    }
+}
+
+/// Hands one accepted lane to the session serving its peer.
+async fn serve_lane(
+    session: Arc<PeerSyncSession>,
+    group: yadorilink_sync_protocol::GroupId,
+    stream: yadorilink_sync_substrate::LaneStream,
+) {
+    match stream.lane() {
+        Lane::Block => session.serve_block_stream(Box::new(LaneBlockStream::new(stream))).await,
+        Lane::Service => {
+            session
+                .serve_service_stream(group.as_str(), Box::new(LaneServiceStream::new(stream)))
+                .await
+        }
+        _ => {}
     }
 }
 

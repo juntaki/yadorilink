@@ -174,7 +174,7 @@ pub fn install_base_for_tests(
 /// Refused, before anything is written, when the base carries no author
 /// positions while claiming heads or a non-zero Lamport ceiling, when it
 /// does not carry every author this replica holds at least as far as it
-/// holds it, or when it carries a row with no witness.
+/// holds it, or when it carries a row or a head with no witness.
 fn install_base_by_reset(
     tx: &rusqlite::Transaction<'_>,
     checkpoint: &Checkpoint,
@@ -225,6 +225,13 @@ fn install_base_by_reset(
             .into());
         }
     }
+    if let Some(head) = snapshot.path_heads.iter().find(|h| !witnessed.contains(&h.change_hash)) {
+        return Err(ForeignMergeRefusal::EvidenceNotCarried {
+            path: head.path.clone(),
+            change: head.change_hash,
+        }
+        .into());
+    }
     let absorbed = super::seal::retained_change_hashes(tx, group_id)?;
     let previous_checkpoint_hash: Option<[u8; 32]> = tx
         .query_row(
@@ -265,8 +272,9 @@ fn install_base_by_reset(
     super::retire_absorbed_history(tx, group_id, &base, &absorbed, snapshot)?;
     tx.execute("DELETE FROM pruned_published_change_versions WHERE group_id = ?1", [group_id])?;
     super::install_row_witnesses(tx, group_id, snapshot)?;
-    crate::authorization_witness_gc::collect_authorization_witnesses(tx, group_id)?;
     reached(EpochResetStep::HistoryRetired)?;
+    crate::authorization_witness_gc::collect_authorization_witnesses(tx, group_id)?;
+    reached(EpochResetStep::WitnessesCollected)?;
 
     for author in crate::dag_store::author_chain::all_author_state(tx, group_id)? {
         let anchored_on =
@@ -297,9 +305,10 @@ fn install_base_by_reset(
 ///
 /// The rows are the namespace projection of the joined `Gamma` (see the
 /// module documentation), checked with the same comparison a seal checks
-/// its own rows with. Every row's authorization evidence travels as a
-/// witness one of the two sides carries; the snapshot carries no frontier
-/// changes. The result is the same whichever side is this replica's.
+/// its own rows with. The authorization evidence of every row and every
+/// head travels as a witness one of the two sides carries; the snapshot
+/// carries no frontier changes. The result is the same whichever side is
+/// this replica's.
 fn build_merged_snapshot(
     current: &VerifiedBaseSummary,
     returning: &VerifiedBaseSummary,
@@ -398,10 +407,16 @@ fn build_merged_snapshot(
     for path in paths {
         let in_first = first_rows.get(path).map(Vec::as_slice).unwrap_or_default();
         let in_second = second_rows.get(path).map(Vec::as_slice).unwrap_or_default();
+        // A path below one the join places as a file or symlink can hold
+        // nothing live: the joined tree has no directory there.
+        let below_leaf = std::iter::successors(path.rsplit_once('/').map(|(p, _)| p), |p| {
+            p.rsplit_once('/').map(|(parent, _)| parent)
+        })
+        .any(|ancestor| matches!(joined.get(ancestor), Some(PhysicalNode::Entry(_))));
         let chosen = choose_current(
             path,
             placed.get(path),
-            structural.contains(path),
+            structural.contains(path) || below_leaf,
             (in_first, &own_first),
             (in_second, &own_second),
             &versions,
@@ -419,6 +434,20 @@ fn build_merged_snapshot(
             ForeignMergeRefusal::EvidenceNotCarried { path: file.record.path.clone(), change }
         })?;
         carried_witnesses.insert(change, witness.clone());
+    }
+    // Every head of the join carries its evidence on, as every base does:
+    // each head is a head of one side, which carried it.
+    for head in &merge.summary.path_heads {
+        if carried_witnesses.contains_key(&head.change_hash) {
+            continue;
+        }
+        let witness = witnesses.get(&head.change_hash).ok_or_else(|| {
+            ForeignMergeRefusal::EvidenceNotCarried {
+                path: head.path.clone(),
+                change: head.change_hash,
+            }
+        })?;
+        carried_witnesses.insert(head.change_hash, witness.clone());
     }
 
     let mut file_versions: BTreeMap<VersionHash, Vec<u8>> = BTreeMap::new();
@@ -481,10 +510,13 @@ enum Chosen {
     None,
 }
 
+/// The row current at `path` in the merged base. `holds_nothing` says the
+/// joined tree has nothing at `path` of its own: a structural directory,
+/// or a path below one the join places as a file or symlink.
 fn choose_current(
     path: &str,
     placed: Option<&(VersionHash, Vec<&SnapshotPathHead>)>,
-    structural: bool,
+    holds_nothing: bool,
     (first, own_first): (&[SnapshotFile], &NamespaceProjection),
     (second, own_second): (&[SnapshotFile], &NamespaceProjection),
     versions: &BTreeMap<VersionHash, FileVersion>,
@@ -507,7 +539,7 @@ fn choose_current(
         let head = heads[0];
         return Chosen::Fresh(fresh_row(path, &versions[version], head));
     }
-    if structural {
+    if holds_nothing {
         return Chosen::None;
     }
     // A live row the join does not place survives unless it materialized
@@ -607,7 +639,7 @@ fn merge_path_rows(
     // as the current one. The numbering side's current row keeps its
     // number unless the other side's history now follows it.
     if let Some(mut row) = chosen_row {
-        if !(chosen_primary && !appended) {
+        if !chosen_primary || appended {
             row.version_seq = next_seq;
         }
         row.state = SnapshotVersionState::Current;

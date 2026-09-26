@@ -32,6 +32,9 @@ rand = "0.10.2"
 
 [dev-dependencies]
 tempfile = "3"
+# `hooks` for the progress handler the scale tests count SQLite's work
+# with: a count, unlike a timing, does not move with machine load.
+rusqlite = { version = "0.31", features = ["bundled", "hooks"] }
 # `dag_store`'s own test fixtures sign changes directly.
 ed25519-dalek = "3"
 # Feature-unifies with the `[dependencies]` entry above to enable

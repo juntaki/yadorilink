@@ -111,6 +111,20 @@ pub(super) fn current_row(conn: &Connection, path: &str) -> Option<(VersionHash,
     Some((row.version_hash(), deleted.unwrap_or(false)))
 }
 
+/// The change that authored the current row at `path`.
+fn authoring_change(conn: &Connection, path: &str) -> Option<[u8; 32]> {
+    conn.query_row(
+        "SELECT authoring_change_hash FROM files \
+         WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
+        [GROUP, path],
+        |row| row.get::<_, Option<Vec<u8>>>(0),
+    )
+    .optional()
+    .unwrap()
+    .flatten()
+    .map(|bytes| bytes.try_into().expect("a 32-byte change hash"))
+}
+
 fn write_row(
     tx: &rusqlite::Transaction<'_>,
     path: &str,
@@ -185,7 +199,7 @@ pub(super) fn project_tree(conn: &Connection) {
         crate::dag_store::get_file_version(conn, GROUP, &VersionHash(*hash)).unwrap().unwrap()
     };
     let tx = conn.unchecked_transaction().unwrap();
-    for (name, node) in projection.nodes() {
+    for node in projection.nodes().values() {
         if let PhysicalNode::Entry(entry) = node {
             if entry.placement == Placement::Relocated
                 && current_row(&tx, &entry.source) == Some((VersionHash(entry.version_hash), false))
@@ -202,10 +216,14 @@ pub(super) fn project_tree(conn: &Connection) {
             }
             PhysicalNode::Directory(DirectoryNode::Structural) => continue,
         };
-        if current_row(&tx, name) == Some((VersionHash(version_hash), false)) {
+        let head = writer_of(&heads, source, &version_hash);
+        // The materializer rewrites a row whose bytes a newer head repeats:
+        // it keeps a row only when that exact change already authored it.
+        if current_row(&tx, name) == Some((VersionHash(version_hash), false))
+            && authoring_change(&tx, name) == Some(head.change_hash)
+        {
             continue;
         }
-        let head = writer_of(&heads, source, &version_hash);
         write_row(&tx, name, &version(&version_hash), &head.change_hash, &head.device_id, false);
     }
     for (path, path_heads) in &heads {

@@ -1283,13 +1283,6 @@ impl SqliteSyncStore {
     }
 }
 
-fn hash_from_blob(v: Vec<u8>) -> Result<ChangeHash, SyncSqliteError> {
-    let array: [u8; 32] = v
-        .try_into()
-        .map_err(|_| SyncSqliteError::NotFound("change hash column is not 32 bytes".into()))?;
-    Ok(ChangeHash(array))
-}
-
 fn retained_version_state_from_db_str(s: &str) -> Result<RetainedVersionState, SyncSqliteError> {
     match s {
         "current" => Ok(RetainedVersionState::Current),

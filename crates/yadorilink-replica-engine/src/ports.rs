@@ -117,6 +117,12 @@ pub enum AdmissionStoreOutcome {
     RefusedBehindRejectedParent {
         reason: String,
     },
+    /// The store refused the Change because it names, as a base head it
+    /// observed, one this replica's history base does not carry at any path
+    /// it touches. Final for as long as the replica stays on that base.
+    RefusedInvalidObservedBaseHead {
+        reason: String,
+    },
 }
 
 /// Records a peer's (or this device's own) acknowledged frontier for a

@@ -70,7 +70,10 @@ struct Established {
     /// Every connection Alice's endpoint accepted, as Alice holds it.
     accepted_by_alice: Arc<Mutex<Vec<PeerLink>>>,
     next_seq: i64,
-    _dirs: (tempfile::TempDir, tempfile::TempDir),
+    _dirs: (
+        crate::test_support::sync_stack_fixture::ReleasingDir,
+        crate::test_support::sync_stack_fixture::ReleasingDir,
+    ),
     _bob: Arc<DaemonState>,
 }
 

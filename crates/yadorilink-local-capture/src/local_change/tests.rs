@@ -642,6 +642,11 @@ async fn build_toctou_fixture() -> (
 /// legitimately passed it earlier stays protected all the way to its
 /// own chunk's commit (that is what the sibling test below proves).
 #[tokio::test]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "the scan-hook slot guard serializes the tests sharing the process-wide \
+              scan hook; holding it across awaits is the point"
+)]
 async fn live_rescan_does_not_tombstone_a_path_that_completed_materializing_during_the_walk() {
     let _hook_slot = hold_scan_hook_slot();
     let (processor, state, root, ignore_set, _store_dir, _root_dir, content) =
@@ -750,6 +755,11 @@ async fn live_rescan_does_not_tombstone_a_path_that_completed_materializing_duri
 /// way through this chunk's actual commit, so nothing can race it a
 /// second time.
 #[tokio::test]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "the scan-hook slot guard serializes the tests sharing the process-wide \
+              scan hook; holding it across awaits is the point"
+)]
 async fn live_rescan_does_not_tombstone_a_path_materialized_between_its_candidacy_check_and_its_own_chunk_commit(
 ) {
     let _hook_slot = hold_scan_hook_slot();
@@ -886,6 +896,11 @@ fn overwrite_in_place_preserving_size_and_mtime(path: &std::path::Path, bytes: &
 ///
 /// Returns the replica and the root, for the caller to read back what
 /// the commit published.
+#[allow(
+    clippy::await_holding_lock,
+    reason = "the scan-hook slot guard serializes the tests sharing the process-wide \
+              scan hook; holding it across awaits is the point"
+)]
 async fn run_commit_gap_swap(
     original: &[u8],
     replacement: Vec<u8>,
@@ -4424,7 +4439,7 @@ async fn a_dag_only_peer_admission_between_capture_and_emit_is_not_the_local_edi
     let group = "group-1";
     adopt_root(&state, group, &root);
     let ignore_set = EffectiveIgnoreSet::from_user_patterns("");
-    let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+    let _permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
 
     let path = root.join("doc.txt");
     let event = |p: &std::path::Path| FsChangeEvent {
@@ -8074,7 +8089,9 @@ fn a_scan_with_no_emitter_still_commits_each_row_with_the_metadata_it_observed()
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
-    let at_commit: Arc<Mutex<Vec<(String, Option<u32>)>>> = Arc::new(Mutex::new(Vec::new()));
+    /// `(path, unix_mode)` as each index-only commit recorded it.
+    type ModesAtCommit = Vec<(String, Option<u32>)>;
+    let at_commit: Arc<Mutex<ModesAtCommit>> = Arc::new(Mutex::new(Vec::new()));
     let _hook_slot = hold_scan_hook_slot();
     {
         let at_commit = at_commit.clone();

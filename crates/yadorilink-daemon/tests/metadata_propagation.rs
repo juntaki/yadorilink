@@ -253,7 +253,7 @@ async fn a_mode_only_change_reaches_the_peers_real_file_without_disturbing_conte
     pair(&device_a, &device_b).await;
 
     std::fs::write(device_a.path("script.sh"), b"#!/bin/sh\n").unwrap();
-    std::fs::set_permissions(&device_a.path("script.sh"), std::fs::Permissions::from_mode(0o644))
+    std::fs::set_permissions(device_a.path("script.sh"), std::fs::Permissions::from_mode(0o644))
         .unwrap();
     wait_until_with_context(
         || device_b.path("script.sh").exists(),
@@ -262,7 +262,7 @@ async fn a_mode_only_change_reaches_the_peers_real_file_without_disturbing_conte
     )
     .await;
 
-    std::fs::set_permissions(&device_a.path("script.sh"), std::fs::Permissions::from_mode(0o755))
+    std::fs::set_permissions(device_a.path("script.sh"), std::fs::Permissions::from_mode(0o755))
         .unwrap();
     wait_until_with_context(
         || {

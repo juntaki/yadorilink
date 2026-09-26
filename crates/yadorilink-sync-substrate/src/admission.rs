@@ -97,6 +97,9 @@ impl<F> AdmitWhen<F>
 where
     F: Fn(&PeerId) -> bool + Send + Sync + 'static,
 {
+    // Callers only ever want the type-erased policy handle; returning it
+    // directly keeps every call site a one-liner.
+    #[allow(clippy::new_ret_no_self)]
     pub fn new(predicate: F) -> Arc<dyn PeerAdmission> {
         Arc::new(Self(predicate))
     }

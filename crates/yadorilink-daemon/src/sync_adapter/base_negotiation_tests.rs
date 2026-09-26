@@ -102,7 +102,10 @@ struct Pair {
     bob: Arc<DaemonState>,
     alice_stack: Arc<SyncStack>,
     bob_stack: Arc<SyncStack>,
-    _dirs: (tempfile::TempDir, tempfile::TempDir),
+    _dirs: (
+        crate::test_support::sync_stack_fixture::ReleasingDir,
+        crate::test_support::sync_stack_fixture::ReleasingDir,
+    ),
 }
 
 async fn pair() -> Pair {

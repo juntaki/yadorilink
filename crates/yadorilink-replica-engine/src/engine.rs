@@ -338,6 +338,13 @@ impl PeerReplicaEngine {
                             reason: ChangeAdmissionRejection::BehindRejectedParent { reason },
                         }
                     }
+                    // Not `Orphaned`: the names are the Change's own signed
+                    // bytes, measured against the base this replica is on.
+                    AdmissionStoreOutcome::RefusedInvalidObservedBaseHead { reason } => {
+                        ChangeAdmissionOutcome::Rejected {
+                            reason: ChangeAdmissionRejection::InvalidObservedBaseHead { reason },
+                        }
+                    }
                 },
             };
             outcomes.push(outcome);

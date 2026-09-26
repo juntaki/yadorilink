@@ -1153,6 +1153,11 @@ async fn fresh_grant(
 /// round trips. Each section announces itself and asserts its own refusal code,
 /// so a failure names the leg that broke.
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one test by design (see above): each refusal case is a short section \
+              sharing one registered client"
+)]
 async fn the_authorization_server_refuses_every_request_that_is_wrong_in_exactly_one_way() {
     let addr = worker_addr_or_skip!(
         "the_authorization_server_refuses_every_request_that_is_wrong_in_exactly_one_way"

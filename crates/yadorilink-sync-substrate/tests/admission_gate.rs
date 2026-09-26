@@ -116,10 +116,7 @@ async fn a_peer_that_authenticates_but_is_not_pinned_gets_no_lane() {
         "an unpinned device completed a handshake and was given a working lane"
     );
     assert!(
-        matches!(
-            tokio::time::timeout(std::time::Duration::from_millis(500), inbound.recv()).await,
-            Err(_)
-        ),
+        tokio::time::timeout(std::time::Duration::from_millis(500), inbound.recv()).await.is_err(),
         "a refused connection must never surface as an inbound link"
     );
 }

@@ -31,8 +31,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use yadorilink_replica_domain::ids::{ChangeHash, FolderGroupId};
-use yadorilink_sync_sqlite::dag_store::published_view;
+use yadorilink_replica_domain::ids::FolderGroupId;
 use yadorilink_sync_sqlite::{verified_change_store, SyncSqliteError};
 
 use super::driver::ReconciliationDriver;
@@ -42,57 +41,6 @@ use crate::test_support::sync_stack_fixture::{
     change_putting, device, file_version, honest_bundle_carrying, init_staging_schema, pin,
     possessed, FixtureAuthenticator, GROUP,
 };
-
-/// Everything a device durably holds about one admitted Change.
-///
-/// Compared field by field rather than by "is it there": a carrier that
-/// resolved a checkpoint envelope differently, or assembled a bundle that
-/// merely happened to verify, would leave a Change that is present on both
-/// sides and backed by different evidence on each.
-#[derive(Debug, PartialEq, Eq)]
-struct AdmittedState {
-    published: bool,
-    encoded_change: Option<Vec<u8>>,
-    checkpoint_hash: Option<[u8; 32]>,
-    merkle_proof: Option<Vec<u8>>,
-    checkpoint_encoded: Option<Vec<u8>>,
-    checkpoint_signature: Option<Vec<u8>>,
-    author_signing_public_key: Option<[u8; 32]>,
-}
-
-fn admitted_state(state: &DaemonState, hash: &ChangeHash) -> AdmittedState {
-    state
-        .replica_coordinator
-        .database()
-        .read::<_, SyncSqliteError>(|conn| {
-            let published = published_view::is_published(conn, hash)?;
-            let encoded_change = published_view::published_encoded_change(conn, hash)?;
-            let (checkpoint_hash, merkle_proof) = match published_view::change_evidence(conn, hash)?
-            {
-                Some((checkpoint_hash, proof)) => (Some(checkpoint_hash), Some(proof)),
-                None => (None, None),
-            };
-            let envelope = match checkpoint_hash {
-                Some(hash) => published_view::checkpoint_envelope(conn, &hash)?,
-                None => None,
-            };
-            let (checkpoint_encoded, checkpoint_signature, author_signing_public_key) =
-                match envelope {
-                    Some((encoded, signature, key)) => (Some(encoded), Some(signature), Some(key)),
-                    None => (None, None, None),
-                };
-            Ok(AdmittedState {
-                published,
-                encoded_change,
-                checkpoint_hash,
-                merkle_proof,
-                checkpoint_encoded,
-                checkpoint_signature,
-                author_signing_public_key,
-            })
-        })
-        .expect("reading admitted state must not fail")
-}
 
 async fn within(seconds: u64, mut check: impl FnMut() -> bool) -> bool {
     tokio::time::timeout(Duration::from_secs(seconds), async {
@@ -105,24 +53,6 @@ async fn within(seconds: u64, mut check: impl FnMut() -> bool) -> bool {
     })
     .await
     .unwrap_or(false)
-}
-
-/// Waits for `stack` to have a relay in its own address, which is what a peer
-/// needs in order to reach it through one. Registration with the relay
-/// happens after the endpoint binds.
-async fn relayed_address_of(stack: &SyncStack) -> Vec<String> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        let relays: Vec<String> = stack.local_address().relay_urls().map(str::to_string).collect();
-        if !relays.is_empty() {
-            return relays;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "a relay-capable node never registered with the relay"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
 }
 
 /// The substrate reachability field, as the coordination plane reports it.

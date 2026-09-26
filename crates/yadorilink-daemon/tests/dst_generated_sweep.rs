@@ -19,27 +19,30 @@
 //! last-writer-wins by application order — which is exactly what a
 //! sequentially-applied 2-device mesh converges to. That keeps the
 //! wrong-winner oracle well-posed without fabricating spurious
-//! conflict-copy predictions. Scope of this cut (see the module-level
-//! report accompanying it): - Every `Op` kind is applied to disk through
-//! `op_applier` (exercising the full applier vocabulary), but only content
-//! ops (`Write`/`Edit`/`Delete`, plus the two writes a
-//! `ConflictingConcurrent` hint expands into) are delivered into the live
-//! watcher pipeline and recorded into the oracle / reference-model.
-//! Delivering generated structural ops
-//! (`Rename`/`Move`/`Mkdir`/`Rmdir`/`Chmod`) so the mesh reconverges is
-//! deferred — the proven-faithful reference harness drives content ops
-//! only, and so does the mesh-driving path here. - `>2`-device generated
-//! topologies are folded onto the 2-device harness by remapping
-//! `device_index % 2` (the true topology is still recorded for coverage).
+//! conflict-copy predictions.
+//!
+//! Scope of this cut (see the module-level report accompanying it):
+//!
+//! - Every `Op` kind is applied to disk through `op_applier` (exercising
+//!   the full applier vocabulary), but only content ops
+//!   (`Write`/`Edit`/`Delete`, plus the two writes a `ConflictingConcurrent`
+//!   hint expands into) are delivered into the live watcher pipeline and
+//!   recorded into the oracle / reference-model. Delivering generated
+//!   structural ops (`Rename`/`Move`/`Mkdir`/`Rmdir`/`Chmod`) so the mesh
+//!   reconverges is deferred — the proven-faithful reference harness drives
+//!   content ops only, and so does the mesh-driving path here.
+//! - `>2`-device generated topologies are folded onto the 2-device harness
+//!   by remapping `device_index % 2` (the true topology is still recorded for
+//!   coverage).
 //! - `fault_schedule` entries are fired through `run_schedule` and their
-//! activation trace surfaced, but the injector plans are NOT yet bound
-//! into the live `PeerChannel`/`SegmentBlockStore`/`SyncState` — binding
-//! them into the live transport/store is deferred as too invasive for this
-//! cut; faults are therefore scheduled + traced, not injected into live
-//! I/O. - The sweep gates its pass/fail on `LikelyProductBug` verdicts
-//! only; harness artifacts are recorded and surfaced but do not fail the
-//! run, matching the triage design. `#![cfg(madsim)]`-gated like every DST
-//! scenario file.
+//!   activation trace surfaced, but the injector plans are NOT yet bound into
+//!   the live `PeerChannel`/`SegmentBlockStore`/`SyncState` — binding them
+//!   into the live transport/store is deferred as too invasive for this cut;
+//!   faults are therefore scheduled + traced, not injected into live I/O.
+//! - The sweep gates its pass/fail on `LikelyProductBug` verdicts only;
+//!   harness artifacts are recorded and surfaced but do not fail the run,
+//!   matching the triage design. `#![cfg(madsim)]`-gated like every DST
+//!   scenario file.
 
 // Retired. This scenario was written for a simulator this project no longer
 // builds against, and it names APIs that have since been removed. It is kept,

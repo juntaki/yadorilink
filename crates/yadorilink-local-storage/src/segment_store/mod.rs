@@ -441,19 +441,16 @@ impl SegmentBlockStore {
                 cursor = page.last().map(|(_, location)| location.record_offset);
                 for (raw, location) in page {
                     let hex_hash = hex::encode(raw);
-                    match found.remove(&raw) {
-                        Some((offset, payload_len))
-                            if offset == location.record_offset
-                                && payload_len == location.length =>
-                        {
-                            if verify_payloads {
-                                match read_record_payload(&file, &location, &raw) {
-                                    Ok(payload) if hash_block_bytes(&payload) == hex_hash => {}
-                                    _ => report.corrupt_records.push(hex_hash),
-                                }
-                            }
-                        }
-                        _ => report.unbacked_mappings.push(hex_hash),
+                    let backed = found.remove(&raw).is_some_and(|(offset, payload_len)| {
+                        offset == location.record_offset && payload_len == location.length
+                    });
+                    if !backed {
+                        report.unbacked_mappings.push(hex_hash);
+                    } else if verify_payloads
+                        && !read_record_payload(&file, &location, &raw)
+                            .is_ok_and(|payload| hash_block_bytes(&payload) == hex_hash)
+                    {
+                        report.corrupt_records.push(hex_hash);
                     }
                 }
             }

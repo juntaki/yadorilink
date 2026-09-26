@@ -285,12 +285,7 @@ impl StorageApp {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(&folder.name).strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Manage files…").clicked() {
-                            crate::actions::spawn_window_with_path(
-                                "folder-status",
-                                &link.local_path,
-                            );
-                        }
+                        manage_files_button(ui, &link.local_path);
                     });
                 });
                 ui.label(
@@ -308,6 +303,13 @@ impl StorageApp {
                 }
             });
         }
+    }
+}
+
+/// Opens the folder's own status window, where its files are managed.
+fn manage_files_button(ui: &mut egui::Ui, local_path: &str) {
+    if ui.button("Manage files…").clicked() {
+        crate::actions::spawn_window_with_path("folder-status", local_path);
     }
 }
 

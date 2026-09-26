@@ -72,12 +72,11 @@ impl InProcessRelay {
 /// reach them.
 #[derive(Debug, Default, Clone)]
 pub struct SharedAddressBook {
-    entries: std::sync::Arc<
-        std::sync::Mutex<
-            std::collections::HashMap<[u8; 32], (Vec<std::net::SocketAddr>, Vec<String>)>,
-        >,
-    >,
+    entries: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<[u8; 32], AddressEntry>>>,
 }
+
+/// One node's published direct addresses and relay URLs.
+type AddressEntry = (Vec<std::net::SocketAddr>, Vec<String>);
 
 impl SharedAddressBook {
     pub fn new() -> Self {

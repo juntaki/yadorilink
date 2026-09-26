@@ -57,7 +57,7 @@ tracing-subscriber.workspace = true
 # platforms), matching this workspace's existing "no Linux desktop target"
 # scope (shell-ext/ is macOS+Windows only too).
 tray-icon = "0.24.2"
-tao = "0.36"
+tao = "0.37"
 # Cross-platform "reveal this path in the native file manager" helper for
 # the Open Folder / reveal-diagnostics-bundle actions -- avoids
 # hand-rolling `open`/`explorer.exe` invocations per platform.
@@ -78,7 +78,7 @@ yadorilink-local-storage = { path = "../yadorilink-local-storage" }
 # machine. `rfd` provides the cross-platform native folder picker/dialogs,
 # replacing the macOS-only `osascript` path.
 eframe = "0.29"
-rfd = "0.15"
+rfd = "0.17"
 # The share window's on-screen QR code. Same version and same
 # `default-features = false` as `yadorilink-cli`'s own dependency (which
 # renders the terminal QR for `share invite`) -- the dropped `image`/`svg`/

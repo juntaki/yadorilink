@@ -22,7 +22,7 @@ async fn convergence_starts_without_an_environment_variable_selecting_it() {
     let db_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let coordinator = Arc::new(ReplicaCoordinator::open(db_dir.path().join("index.db")).unwrap());
-    let state = DaemonState::new("device-under-test".into(), coordinator, store);
+    let state = TestState(DaemonState::new("device-under-test".into(), coordinator, store));
     state.set_device_signing_key(yadorilink_transport::DeviceSigningKeyPair::generate().signing);
 
     start_reconciliation_with(&state, yadorilink_sync_substrate::NetworkConfig::direct_only())
@@ -45,7 +45,7 @@ async fn starting_convergence_again_keeps_the_stack_already_running() {
     let db_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let coordinator = Arc::new(ReplicaCoordinator::open(db_dir.path().join("index.db")).unwrap());
-    let state = DaemonState::new("device-under-test".into(), coordinator, store);
+    let state = TestState(DaemonState::new("device-under-test".into(), coordinator, store));
     state.set_device_signing_key(yadorilink_transport::DeviceSigningKeyPair::generate().signing);
 
     let config = || yadorilink_sync_substrate::NetworkConfig::direct_only();
@@ -81,7 +81,7 @@ async fn session_transports_for_is_none_before_a_stack_exists_and_some_after() {
     let db_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let coordinator = Arc::new(ReplicaCoordinator::open(db_dir.path().join("index.db")).unwrap());
-    let state = DaemonState::new("device-under-test".into(), coordinator, store);
+    let state = TestState(DaemonState::new("device-under-test".into(), coordinator, store));
     state.set_device_signing_key(yadorilink_transport::DeviceSigningKeyPair::generate().signing);
 
     assert!(
@@ -113,7 +113,7 @@ async fn convergence_startup_retries_until_it_succeeds_and_then_stops() {
     let db_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let coordinator = Arc::new(ReplicaCoordinator::open(db_dir.path().join("index.db")).unwrap());
-    let state = DaemonState::new("device-under-test".into(), coordinator, store);
+    let state = TestState(DaemonState::new("device-under-test".into(), coordinator, store));
     state.set_device_signing_key(yadorilink_transport::DeviceSigningKeyPair::generate().signing);
 
     // Two failures, then a start that takes. Standing in for a transient
@@ -256,10 +256,32 @@ fn ws_netmap_url_handles_an_ipv6_loopback_literal() {
 // spawns its actor without blocking on completing a handshake with a
 // live peer, so no second device is needed.
 
-fn test_state() -> Arc<DaemonState> {
+fn test_state() -> TestState {
     let store = Arc::new(SegmentBlockStore::new(tempfile::tempdir().unwrap().keep()).unwrap());
     let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
-    DaemonState::new("local-device".into(), sync_state, store)
+    TestState(DaemonState::new("local-device".into(), sync_state, store))
+}
+
+/// A test's state, freed when the test lets go of it.
+///
+/// Registering a session or starting convergence ties the state into a
+/// reference cycle with itself (see
+/// [`DaemonState::release_reference_cycles_for_tests`]), which would keep its
+/// databases and their worker threads alive for the rest of the test binary.
+struct TestState(Arc<DaemonState>);
+
+impl std::ops::Deref for TestState {
+    type Target = Arc<DaemonState>;
+
+    fn deref(&self) -> &Arc<DaemonState> {
+        &self.0
+    }
+}
+
+impl Drop for TestState {
+    fn drop(&mut self) {
+        self.0.release_reference_cycles_for_tests();
+    }
 }
 
 /// An orphaned link is never handed back as a sync root -- an incoming
@@ -778,7 +800,7 @@ async fn run_task_stops_retrying_once_its_own_task_is_aborted() {
         device_id: "local-device".into(),
     };
 
-    let handle = tokio::spawn(run(config, state));
+    let handle = tokio::spawn(run(config, Arc::clone(&state)));
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while accept_count.load(Ordering::SeqCst) == 0 {
@@ -849,7 +871,7 @@ async fn run_resubscribes_repeatedly_after_a_simulated_drop() {
         device_id: "local-device".into(),
     };
 
-    let handle = tokio::spawn(run(config, state));
+    let handle = tokio::spawn(run(config, Arc::clone(&state)));
 
     let first_batch_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while accept_count.load(Ordering::SeqCst) == 0 {

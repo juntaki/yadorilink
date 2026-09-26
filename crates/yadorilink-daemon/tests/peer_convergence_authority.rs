@@ -10,9 +10,7 @@ use yadorilink_daemon::test_support::peer_session_fixture::*;
 #[cfg(test)]
 mod dag_convergence_authority_tests {
 
-    use yadorilink_peer_session::peer_session::{
-        ChangeAuthenticator, PeerSyncSession, PeerSyncSessionDeps,
-    };
+    use yadorilink_peer_session::peer_session::{PeerSyncSession, PeerSyncSessionDeps};
     use yadorilink_replica_domain::test_authoring::create_signed_for_tests;
 
     use ed25519_dalek::SigningKey;
@@ -20,11 +18,11 @@ mod dag_convergence_authority_tests {
     use std::sync::Arc;
     use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
     use yadorilink_local_storage::SegmentBlockStore;
-    use yadorilink_replica_domain::change::{Change, Op, PutOrigin};
+    use yadorilink_replica_domain::change::{Op, PutOrigin};
     use yadorilink_replica_domain::file::{FileMeta, FileVersion};
     use yadorilink_replica_domain::file::{FileRecord, RecordKind};
     use yadorilink_replica_domain::ids::SyncPath;
-    use yadorilink_sync_sqlite::dag_store::{self, ChangeEmitter};
+    use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
 
     const GROUP: &str = "shared-group";
     const OLD_MTIME: i64 = 1_000; // lamport WINNER carries the OLDER mtime …
@@ -510,6 +508,7 @@ mod dag_convergence_authority_tests {
     /// published by the materialize that wrote it, names the row's 0o644
     /// version and stands under the live fence. `disk_bytes` is what is
     /// on disk. Returns the incoming record and wire metadata to apply.
+    #[cfg(unix)]
     fn seed_hydrated_row_with_drifted_mode(
         h: &Harness,
         content: &[u8],
@@ -520,6 +519,7 @@ mod dag_convergence_authority_tests {
 
     /// As [`seed_hydrated_row_with_drifted_mode`], with the admitted
     /// version's mode `version_mode` instead of 0o755.
+    #[cfg(unix)]
     fn seed_hydrated_row_with_drifted_mode_to(
         h: &Harness,
         content: &[u8],
@@ -635,6 +635,7 @@ mod dag_convergence_authority_tests {
         (record, meta)
     }
 
+    #[cfg(unix)]
     async fn apply_equal_authoring_repair(
         h: &Harness,
         incoming: FileRecord,
@@ -3344,30 +3345,6 @@ mod dag_convergence_authority_tests {
         );
     }
 
-    // ---- CORE: DAG-decided winner is order-independent and the gate keeps the
-    // legacy mtime path from overriding it. ----
-
-    struct MultiAuthenticator {
-        keys: HashMap<String, [u8; 32]>,
-    }
-    impl ChangeAuthenticator for MultiAuthenticator {
-        fn resolve_authority_key(
-            &self,
-            _group_id: &str,
-            signer_key_id: &[u8; 32],
-            _policy_head: &[u8; 32],
-        ) -> Option<ed25519_dalek::VerifyingKey> {
-            self.keys.values().find_map(|bytes| {
-                let key =
-                    yadorilink_replica_domain::change::verifying_key_from_bytes(bytes).ok()?;
-                (&yadorilink_replica_domain::authorization_checkpoint::fingerprint_signing_key(
-                    &key,
-                ) == signer_key_id)
-                    .then_some(key)
-            })
-        }
-    }
-
     fn empty_version(mtime: i64) -> FileVersion {
         FileVersion::new(
             vec![],
@@ -3380,66 +3357,5 @@ mod dag_convergence_authority_tests {
                 xattrs: Vec::new(),
             },
         )
-    }
-
-    fn create_op(path: &str, version: &FileVersion) -> Op {
-        Op::Put {
-            path: SyncPath(path.into()),
-            version: version.version_hash,
-            origin: PutOrigin::Direct,
-        }
-    }
-
-    /// Two genuinely concurrent Create-`file.bin` changes with mtime INVERTED
-    /// against lamport: device-a's change carries the higher lamport (a warm-up
-    /// change raises its clock) but the OLDER mtime, device-b's carries the
-    /// lower lamport but the NEWER mtime. The DAG winner is therefore device-a
-    /// (higher lamport) while the mtime resolver would pick device-b.
-    fn concurrent_changes() -> (Change, Change, Change, FileVersion, FileVersion, FileVersion) {
-        let key_a = SigningKey::from_bytes(&[7u8; 32]);
-        let key_b = SigningKey::from_bytes(&[8u8; 32]);
-        let warm_v = empty_version(500);
-        let va = empty_version(OLD_MTIME);
-        let vb = empty_version(NEW_MTIME);
-
-        let conn_a = rusqlite::Connection::open_in_memory().unwrap();
-        dag_store::init_dag_schema(&conn_a).unwrap();
-        dag_store::put_file_version(&conn_a, GROUP, &warm_v).unwrap();
-        dag_store::put_file_version(&conn_a, GROUP, &va).unwrap();
-        let emitter_a = ChangeEmitter::new("device-a", key_a);
-        let warm = dag_store::emit_local_change(
-            &conn_a,
-            GROUP,
-            vec![create_op("warmup.txt", &warm_v)],
-            &emitter_a,
-        )
-        .unwrap();
-        let change_a = dag_store::emit_local_change(
-            &conn_a,
-            GROUP,
-            vec![create_op("file.bin", &va)],
-            &emitter_a,
-        )
-        .unwrap();
-
-        let conn_b = rusqlite::Connection::open_in_memory().unwrap();
-        dag_store::init_dag_schema(&conn_b).unwrap();
-        dag_store::put_file_version(&conn_b, GROUP, &vb).unwrap();
-        let emitter_b = ChangeEmitter::new("device-b", key_b);
-        let change_b = dag_store::emit_local_change(
-            &conn_b,
-            GROUP,
-            vec![create_op("file.bin", &vb)],
-            &emitter_b,
-        )
-        .unwrap();
-
-        assert!(
-            change_a.lamport > change_b.lamport,
-            "test setup: device-a's change must carry the higher lamport ({} vs {})",
-            change_a.lamport,
-            change_b.lamport
-        );
-        (warm, change_a, change_b, warm_v, va, vb)
     }
 }

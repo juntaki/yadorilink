@@ -78,7 +78,7 @@ pub(crate) fn candidates(
         .filter(|row| row.state == SegmentState::Sealed)
         .filter(|row| row.dead_bytes() >= min_dead_bytes && row.dead_ratio() >= dead_ratio)
         .collect();
-    rows.sort_by(|a, b| b.dead_bytes().cmp(&a.dead_bytes()));
+    rows.sort_by_key(|row| std::cmp::Reverse(row.dead_bytes()));
     Ok(rows)
 }
 

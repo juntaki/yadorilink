@@ -72,6 +72,11 @@ rustc --version
 
 SDK="$(xcrun --sdk macosx --show-sdk-path)"
 echo "SDK: $SDK"
+# Resolve swiftc to the toolchain binary once and call it directly. /usr/bin/xcrun
+# is SIP-protected, so the dynamic loader strips DYLD_INSERT_LIBRARIES from
+# anything launched through it and build tracers (CodeQL) see no compile.
+SWIFTC="$(xcrun -f swiftc)"
+echo "swiftc: $SWIFTC"
 
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
@@ -108,7 +113,7 @@ mkdir -p "$APPEX_BUNDLE/Contents/MacOS"
 mkdir -p "$APPEX_BUNDLE/Contents/Resources"
 
 # shellcheck disable=SC2086
-xcrun swiftc \
+"$SWIFTC" \
     -sdk "$SDK" \
     -target "$SWIFT_TARGET" \
     -import-objc-header "$EXT_DIR/YadoriLinkFinderSync-Bridging-Header.h" \
@@ -149,7 +154,7 @@ mkdir -p "$APP_BUNDLE/Contents/Resources"
 mkdir -p "$APP_BUNDLE/Contents/PlugIns"
 
 # shellcheck disable=SC2086
-xcrun swiftc \
+"$SWIFTC" \
     -sdk "$SDK" \
     -target "$HOST_SWIFT_TARGET" \
     -import-objc-header "$HOST_DIR/YadoriLinkFinderSyncHost-Bridging-Header.h" \

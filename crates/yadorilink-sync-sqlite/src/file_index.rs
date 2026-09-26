@@ -398,6 +398,9 @@ impl FileIndexRepository {
     /// `auth` is the already-resolved authorization stamp for `group_id` --
     /// see [`Self::upsert_file_emitting_change`]'s doc comment for why it is
     /// a parameter here rather than resolved internally.
+    // The batch counterpart of `upsert_file_emitting_change`, which carries
+    // the same allow; a params struct is out of scope for a lint cleanup.
+    #[allow(clippy::too_many_arguments)]
     pub fn upsert_files_batch_emitting_change(
         &self,
         group_id: &str,
@@ -947,12 +950,14 @@ impl FileIndexRepository {
                     part_count,
                     effect_set_hash,
                 };
-                let change = dag_store::emit_recursive_part_onto(
+                let seen = versions_shown_to_mutations(tx, group_id, members)?;
+                let change = dag_store::emit_recursive_part_onto_seeing(
                     tx,
                     group_id,
                     parents,
                     members.iter().map(|m| m.op().clone()).collect(),
                     part,
+                    &seen,
                     emission.emitter,
                 )?;
                 let change_hash = change.compute_hash();
@@ -2339,10 +2344,6 @@ impl FileIndexRepository {
         now_unix_nanos: i64,
         pinned: &HashSet<(String, i64)>,
     ) -> Result<usize, SyncSqliteError> {
-        const NANOS_PER_DAY: i64 = 86_400 * 1_000_000_000;
-        let age_cutoff_unix_nanos =
-            now_unix_nanos.saturating_sub(RETENTION_MAX_AGE_DAYS.saturating_mul(NANOS_PER_DAY));
-
         // Opens its own DEFERRED transaction (rather than going through
         // `write_immediate`, which is always IMMEDIATE) on purpose: this
         // sweep is read-heavy (the whole candidate SELECT below) before its
@@ -2352,114 +2353,66 @@ impl FileIndexRepository {
         // choice here, preserved unchanged by this conversion.
         self.database.write::<_, SyncSqliteError>(|conn| {
             let tx = conn.transaction()?;
-            let candidates: Vec<(String, i64)> = {
-                // `rnk = 1` is the most recently superseded/trashed row for a
-                // given path; the newest `RETENTION_MAX_VERSIONS` rows survive on
-                // the count axis alone. A row is deleted only when it is beyond
-                // both the count bound and the age bound.
-                let mut stmt = tx.prepare(
-                    "SELECT path, version_seq FROM (
-                    SELECT path, version_seq, mtime_unix_nanos,
-                           ROW_NUMBER() OVER (PARTITION BY path ORDER BY version_seq DESC) AS rnk
-                    FROM files WHERE group_id = ?1 AND state IN ('superseded', 'trashed')
-                 )
-                 WHERE rnk > ?2 AND mtime_unix_nanos < ?3",
-                )?;
-                let rows = stmt.query_map(
-                    rusqlite::params![group_id, RETENTION_MAX_VERSIONS, age_cutoff_unix_nanos],
-                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
-                )?;
-                rows.collect::<Result<Vec<_>, _>>()?
-                    .into_iter()
-                    // A leased row is retained past both bounds until the lease is
-                    // confirmed/released/expires -- see `pinned`'s own doc note
-                    // above for why the time check (not merely `state`) is what
-                    // actually matters.
-                    .filter(|key| !pinned.contains(key))
-                    .collect()
-            };
-            for (path, version_seq) in &candidates {
-                tx.execute(
-                    "DELETE FROM files WHERE group_id = ?1 AND path = ?2 AND version_seq = ?3",
-                    rusqlite::params![group_id, path, version_seq],
-                )?;
-            }
+            let expired = expire_superseded_and_trashed_versions_in_tx(
+                &tx,
+                group_id,
+                now_unix_nanos,
+                pinned,
+            )?;
             tx.commit()?;
-            Ok(candidates.len())
+            Ok(expired)
         })
     }
 }
 
-/// The shared version-retaining write
-/// path behind `SyncState::upsert_file_with_origin` and
-/// `SyncState::upsert_files_batch` — see `upsert_file_with_origin`'s doc
-/// comment for the full semantics. Takes an open `Transaction` rather than
-/// checking out its own pooled connection so a batch caller can commit
-/// once for many records (mirroring the pre-existing `upsert_files_batch`
-/// shape) while a single-record caller still gets the same atomicity via
-/// its own one-record transaction — see `new_immediate_write_transaction`'s
-/// doc comment for why that transaction must be opened `IMMEDIATE`, not
-/// rusqlite's default `DEFERRED`.
-///
-/// sync-performance: `upsert_file_with_origin` is the hot path for every
-/// local edit and every peer-adopted change, so this is written for two
-/// SQLite round trips, not the more obvious three (a `SELECT` to find the
-/// current row, an `INSERT` for the new one, an `UPDATE` to flip the old
-/// one). An earlier draft chased this down to a *single* round trip with
-/// an `AFTER INSERT` trigger; that turned out not to be the actual
-/// bottleneck (see `new_immediate_write_transaction`) and introduced its
-/// own correctness risk (a trigger recursing into the same table its own
-/// statement is still executing over), so it was reverted in favor of this
-/// plainer two-statement version.
-///
-/// The first round trip below is an `UPDATE... RETURNING`: it flips
-/// whatever row is currently `state = 'current'` (if any) to
-/// `superseded`/`trashed` per 's rule *and* returns everything
-/// needed to build the new current row, so no separate up-front `SELECT`
-/// is needed before it.
-///
-/// Every row this function writes -- all three branches -- is stamped with
-/// `admitted_at_unix_nanos`, this device's own local clock read at the
-/// moment of the write. Captured inside this function rather than passed
-/// in, so no caller can supply it and no caller site needed to change.
-/// Never `record.mtime_unix_nanos` -- see that column's own migration
-/// comment in `yadorilink-sqlite-runtime`'s schema for why a replicated
-/// filesystem timestamp is untrusted input here.
-///
-/// # The stamping invariant
-///
-/// This function is the ordinary per-path version write path, but it is
-/// deliberately NOT the only writer of `files` rows, and the correctness of
-/// everything reading `admitted_at_unix_nanos` rests on the whole set
-/// agreeing. The invariant, stated once here because it is easy to break by
-/// adding a fourth writer without noticing:
-///
-/// > **Every statement anywhere that inserts a `files` row stamps
-/// > `admitted_at_unix_nanos` from this device's own clock at the moment of
-/// > that write. A NULL means only "this row predates the column".**
-///
-/// The complete set of writers, all of which do:
-///
-/// * this function (three branches: new path, `version_seq = 0` scaffold
-///   promotion, and superseding version bump),
-/// * [`FileIndexRepository::ensure_bootstrap_row_for_metadata`] and
-///   [`ensure_bootstrap_row_for_metadata_in_tx`], which insert the
-///   `version_seq = 0` metadata scaffold, and
-/// * `rebootstrap_store::replace_group_files_from_snapshot`, which replaces
-///   a whole group's rows from an installed HistoryBase snapshot.
-///
-/// Two consequences follow, and both are load-bearing rather than
-/// incidental:
-///
-/// * Because every writer stamps, a NULL genuinely does mean "written
-///   before the column existed" -- so `crate::rewind_plan` is entitled to
-///   treat NULL rows as a prefix of a path's history and to report the
-///   affected path as unanswerable rather than guessing.
-/// * Several rows for one path can share a stamp, because the snapshot
-///   replace above writes a path's whole retained history in one pass. The
-///   reader's `version_seq DESC` tie-break is what resolves that to the
-///   path's current row, so a rebootstrapped group reports real per-path
-///   values rather than a blanket "unavailable".
+/// The body of [`FileIndexRepository::expire_superseded_and_trashed_versions`],
+/// in the caller's transaction: the same rule, the same rows deleted, the
+/// number deleted returned.
+pub(crate) fn expire_superseded_and_trashed_versions_in_tx(
+    tx: &Connection,
+    group_id: &str,
+    now_unix_nanos: i64,
+    pinned: &HashSet<(String, i64)>,
+) -> Result<usize, SyncSqliteError> {
+    const NANOS_PER_DAY: i64 = 86_400 * 1_000_000_000;
+    let age_cutoff_unix_nanos =
+        now_unix_nanos.saturating_sub(RETENTION_MAX_AGE_DAYS.saturating_mul(NANOS_PER_DAY));
+    let candidates: Vec<(String, i64)> = {
+        // `rnk = 1` is the most recently superseded/trashed row for a
+        // given path; the newest `RETENTION_MAX_VERSIONS` rows survive on
+        // the count axis alone. A row is deleted only when it is beyond
+        // both the count bound and the age bound.
+        let mut stmt = tx.prepare(
+            "SELECT path, version_seq FROM (
+            SELECT path, version_seq, mtime_unix_nanos,
+                   ROW_NUMBER() OVER (PARTITION BY path ORDER BY version_seq DESC) AS rnk
+            FROM files WHERE group_id = ?1 AND state IN ('superseded', 'trashed')
+         )
+         WHERE rnk > ?2 AND mtime_unix_nanos < ?3",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![group_id, RETENTION_MAX_VERSIONS, age_cutoff_unix_nanos],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            // A leased row is retained past both bounds until the lease is
+            // confirmed/released/expires -- see the `pinned` note on
+            // `FileIndexRepository::expire_superseded_and_trashed_versions`
+            // for why the time check (not merely `state`) is what actually
+            // matters.
+            .filter(|key| !pinned.contains(key))
+            .collect()
+    };
+    for (path, version_seq) in &candidates {
+        tx.execute(
+            "DELETE FROM files WHERE group_id = ?1 AND path = ?2 AND version_seq = ?3",
+            rusqlite::params![group_id, path, version_seq],
+        )?;
+    }
+    Ok(candidates.len())
+}
+
 /// The parents a LOCAL filesystem edit at `path` must be signed onto.
 ///
 /// A local edit is a statement about bytes the user actually had on disk,
@@ -2602,6 +2555,31 @@ fn apply_local_mutation_in_tx(
         }
     }
     Ok(())
+}
+
+/// What the writer of `mutations` was shown at each path their ops write:
+/// the version the row each mutation acts on holds, at every path its op
+/// names. The row and the op are at one path except for a write through a
+/// conflict copy to its source, where the copy's row is what was shown at
+/// the source -- and only that: the source's own row shows another entry.
+/// The installed base's heads a write supersedes are the ones among these
+/// (see [`dag_store::SeenVersions`]).
+fn versions_shown_to_mutations(
+    tx: &rusqlite::Transaction,
+    group_id: &str,
+    mutations: &[PreparedLocalMutation],
+) -> Result<dag_store::SeenVersions, SyncSqliteError> {
+    let mut seen = dag_store::SeenVersions::new();
+    for mutation in mutations {
+        let Some(shown) = dag_store::content_shown_at(tx, group_id, &mutation.record().path)?
+        else {
+            continue;
+        };
+        for path in dag_store::op_touched_paths(mutation.op()) {
+            seen.entry(path.to_owned()).or_default().insert(shown);
+        }
+    }
+    Ok(seen)
 }
 
 /// The parents of one part of a recursive operation that touches `paths`:
@@ -2755,6 +2733,10 @@ fn emit_write_through(
 /// [`emit_local_write_onto_frontier`] with the version shown read from the
 /// row at `row_path` and the unseen heads cut at `op_path` (the same path
 /// but for a write-through).
+///
+/// The installed base's heads the write supersedes at `op_path` are the
+/// same one version: for a write-through, the head the copy's row holds,
+/// and never the entry the source's own row shows beside it.
 fn emit_onto_frontier_without_unseen(
     tx: &rusqlite::Transaction,
     group_id: &str,
@@ -2763,27 +2745,29 @@ fn emit_onto_frontier_without_unseen(
     ops: Vec<Op>,
     emitter: &ChangeEmitter,
 ) -> Result<Change, SyncSqliteError> {
-    let shown: Option<Option<Vec<u8>>> = tx
-        .query_row(
-            "SELECT authoring_change_hash FROM files \
-              WHERE group_id = ?1 AND path = ?2 AND state = 'current' AND version_seq > 0",
-            rusqlite::params![group_id, row_path],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let seen = shown
-        .flatten()
-        .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
-        .map(ChangeHash);
-    if let Some(parents) = dag_store::path_frontier::frontier_without_unseen_path_heads(
+    let seen = dag_store::version_shown_at(tx, group_id, row_path)?;
+    let cut = dag_store::path_frontier::frontier_without_unseen_path_heads(
         tx,
         group_id,
         op_path,
         seen.as_ref(),
-    )? {
-        return dag_store::emit_local_change_onto(tx, group_id, parents, ops, emitter);
+    )?;
+    if row_path == op_path {
+        return match cut {
+            Some(parents) => dag_store::emit_local_change_onto(tx, group_id, parents, ops, emitter),
+            None => dag_store::emit_local_change(tx, group_id, ops, emitter),
+        };
     }
-    dag_store::emit_local_change(tx, group_id, ops, emitter)
+    let mut shown = dag_store::SeenVersions::new();
+    if let Some(content) = dag_store::content_shown_at(tx, group_id, row_path)? {
+        shown.entry(op_path.to_owned()).or_default().insert(content);
+    }
+    match cut {
+        Some(parents) => {
+            dag_store::emit_local_change_onto_seeing(tx, group_id, parents, ops, &shown, emitter)
+        }
+        None => dag_store::emit_local_change_seeing(tx, group_id, ops, &shown, emitter),
+    }
 }
 
 /// The actual query behind [`FileIndexRepository::list_unauthored_current_paths`]
@@ -2915,6 +2899,76 @@ fn stamp_trashed_row_operation(
     Ok(())
 }
 
+/// The shared version-retaining write
+/// path behind `SyncState::upsert_file_with_origin` and
+/// `SyncState::upsert_files_batch` — see `upsert_file_with_origin`'s doc
+/// comment for the full semantics. Takes an open `Transaction` rather than
+/// checking out its own pooled connection so a batch caller can commit
+/// once for many records (mirroring the pre-existing `upsert_files_batch`
+/// shape) while a single-record caller still gets the same atomicity via
+/// its own one-record transaction — see `new_immediate_write_transaction`'s
+/// doc comment for why that transaction must be opened `IMMEDIATE`, not
+/// rusqlite's default `DEFERRED`.
+///
+/// sync-performance: `upsert_file_with_origin` is the hot path for every
+/// local edit and every peer-adopted change, so this is written for two
+/// SQLite round trips, not the more obvious three (a `SELECT` to find the
+/// current row, an `INSERT` for the new one, an `UPDATE` to flip the old
+/// one). An earlier draft chased this down to a *single* round trip with
+/// an `AFTER INSERT` trigger; that turned out not to be the actual
+/// bottleneck (see `new_immediate_write_transaction`) and introduced its
+/// own correctness risk (a trigger recursing into the same table its own
+/// statement is still executing over), so it was reverted in favor of this
+/// plainer two-statement version.
+///
+/// The first round trip below is an `UPDATE... RETURNING`: it flips
+/// whatever row is currently `state = 'current'` (if any) to
+/// `superseded`/`trashed` per 's rule *and* returns everything
+/// needed to build the new current row, so no separate up-front `SELECT`
+/// is needed before it.
+///
+/// Every row this function writes -- all three branches -- is stamped with
+/// `admitted_at_unix_nanos`, this device's own local clock read at the
+/// moment of the write. Captured inside this function rather than passed
+/// in, so no caller can supply it and no caller site needed to change.
+/// Never `record.mtime_unix_nanos` -- see that column's own migration
+/// comment in `yadorilink-sqlite-runtime`'s schema for why a replicated
+/// filesystem timestamp is untrusted input here.
+///
+/// # The stamping invariant
+///
+/// This function is the ordinary per-path version write path, but it is
+/// deliberately NOT the only writer of `files` rows, and the correctness of
+/// everything reading `admitted_at_unix_nanos` rests on the whole set
+/// agreeing. The invariant, stated once here because it is easy to break by
+/// adding a fourth writer without noticing:
+///
+/// > **Every statement anywhere that inserts a `files` row stamps
+/// > `admitted_at_unix_nanos` from this device's own clock at the moment of
+/// > that write. A NULL means only "this row predates the column".**
+///
+/// The complete set of writers, all of which do:
+///
+/// * this function (three branches: new path, `version_seq = 0` scaffold
+///   promotion, and superseding version bump),
+/// * [`FileIndexRepository::ensure_bootstrap_row_for_metadata`] and
+///   [`ensure_bootstrap_row_for_metadata_in_tx`], which insert the
+///   `version_seq = 0` metadata scaffold, and
+/// * `rebootstrap_store::replace_group_files_from_snapshot`, which replaces
+///   a whole group's rows from an installed HistoryBase snapshot.
+///
+/// Two consequences follow, and both are load-bearing rather than
+/// incidental:
+///
+/// * Because every writer stamps, a NULL genuinely does mean "written
+///   before the column existed" -- so `crate::rewind_plan` is entitled to
+///   treat NULL rows as a prefix of a path's history and to report the
+///   affected path as unanswerable rather than guessing.
+/// * Several rows for one path can share a stamp, because the snapshot
+///   replace above writes a path's whole retained history in one pass. The
+///   reader's `version_seq DESC` tie-break is what resolves that to the
+///   path's current row, so a rebootstrapped group reports real per-path
+///   values rather than a blanket "unavailable".
 pub fn upsert_file_in_tx(
     tx: &rusqlite::Transaction,
     group_id: &str,
@@ -2979,10 +3033,18 @@ pub fn upsert_file_in_tx(
 
     match flipped {
         None => {
-            // Brand new path.
+            // No current row: a brand new path, or one whose rows are all
+            // history. A base install leaves the latter where the path's
+            // row moved away -- a leaf relocated to its copy name when the
+            // path became a directory, or a row the base keeps only as
+            // history -- so the new version is numbered after whatever the
+            // path already has, never as its first.
             tx.execute(
                 "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json, deleted, version_seq, state, origin_device_id, authoring_change_hash, admitted_at_unix_nanos)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, 'current', ?7, ?8, ?9)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6,
+                         (SELECT COALESCE(MAX(version_seq), 0) + 1 FROM files
+                           WHERE group_id = ?1 AND path = ?2),
+                         'current', ?7, ?8, ?9)",
                 rusqlite::params![
                     group_id,
                     record.path,
@@ -3005,12 +3067,19 @@ pub fn upsert_file_in_tx(
         // whatever `record_kind`/`symlink_target`/`unix_mode`/etc. its own
         // setters already wrote onto it survives untouched) instead of
         // leaving a spurious empty first version in this path's history.
+        // The scaffold exists exactly when the path has no current row,
+        // which includes a path that holds only history (a merged base
+        // that made it structural, a relocation's source): the promoted
+        // row is numbered after that history, never as version 1.
         // Rare (a scaffold row exists for at most the moment between its
         // own creation and this call), so the extra round trip here
         // doesn't cost the common case anything.
         Some((0, ..)) => {
             tx.execute(
-                "UPDATE files SET size = ?1, mtime_unix_nanos = ?2, blocks_json = ?3, deleted = ?4, version_seq = 1, state = 'current', origin_device_id = ?5, authoring_change_hash = ?6, admitted_at_unix_nanos = ?7
+                "UPDATE files SET size = ?1, mtime_unix_nanos = ?2, blocks_json = ?3, deleted = ?4,
+                        version_seq = (SELECT COALESCE(MAX(version_seq), 0) + 1 FROM files
+                                        WHERE group_id = ?8 AND path = ?9),
+                        state = 'current', origin_device_id = ?5, authoring_change_hash = ?6, admitted_at_unix_nanos = ?7
                  WHERE group_id = ?8 AND path = ?9 AND version_seq = 0",
                 rusqlite::params![
                     record.size,

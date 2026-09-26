@@ -24,7 +24,7 @@ use yadorilink_replica_engine::rebootstrap::SnapshotManifest;
 /// authorization checkpoint numbered `seq`. The same changes published
 /// under the same number on two replicas carry the same evidence, as one
 /// author's checkpoint does wherever it travels.
-fn publish(conn: &Connection, seq: u64) {
+pub(super) fn publish(conn: &Connection, seq: u64) {
     let leaves: Vec<[u8; 32]> = {
         let mut stmt = conn
             .prepare(
@@ -36,6 +36,14 @@ fn publish(conn: &Connection, seq: u64) {
         let rows = stmt.query_map([GROUP], |row| row.get::<_, Vec<u8>>(0)).unwrap();
         rows.map(|row| row.unwrap().try_into().unwrap()).collect()
     };
+    publish_leaves(conn, seq, leaves);
+}
+
+/// Publishes exactly `leaves` under one authorization checkpoint numbered
+/// `seq`: the same set under the same number carries the same evidence on
+/// every replica that publishes it.
+pub(super) fn publish_leaves(conn: &Connection, seq: u64, mut leaves: Vec<[u8; 32]>) {
+    leaves.sort();
     let checkpoint = AuthorizationCheckpoint {
         group_id: GROUP.to_string(),
         device_id: "device-a".to_string(),
@@ -110,7 +118,7 @@ fn writers(group_id: &str, signer: &str, signing_key: &[u8; 32]) -> bool {
 
 /// `conn`'s installed base as a peer receives it: signed by `signer`,
 /// checked before anything of it is believed.
-fn as_returning(conn: &Connection, signer: &str) -> VerifiedBaseSummary {
+pub(super) fn as_returning(conn: &Connection, signer: &str) -> VerifiedBaseSummary {
     let side = verify_current_base(conn, GROUP).unwrap();
     let manifest = SnapshotManifest::new_signed(
         side.checkpoint().clone(),
@@ -124,7 +132,7 @@ fn as_returning(conn: &Connection, signer: &str) -> VerifiedBaseSummary {
         .unwrap()
 }
 
-fn merge(conn: &Connection, returning: &VerifiedBaseSummary) -> CommittedMerge {
+pub(super) fn merge(conn: &Connection, returning: &VerifiedBaseSummary) -> CommittedMerge {
     let tx = conn.unchecked_transaction().unwrap();
     let merged = commit_foreign_merge(&tx, returning).unwrap();
     tx.commit().unwrap();
@@ -511,6 +519,67 @@ fn a_row_whose_evidence_no_side_carries_refuses_the_merge() {
         "got {error:?}"
     );
     assert_eq!(history_base(&left, GROUP).unwrap(), before);
+}
+
+/// A head the base carries is evidence it has to carry too, even when no
+/// row names it. A base
+/// missing that witness is refused as evidence not carried, before
+/// anything is written, not left to fail later inside the install.
+#[test]
+fn a_head_whose_evidence_the_base_does_not_carry_refuses_the_install() {
+    let sealed = sealed_replica(|conn, prefix| {
+        admit(conn, "device-e", &[&prefix.b1], vec![put("t", &version(6))]);
+    });
+    let side = verify_current_base(&sealed, GROUP).unwrap();
+    let head = side
+        .snapshot()
+        .path_heads
+        .iter()
+        .find(|head| head.path == "t")
+        .cloned()
+        .expect("t's writer is its head");
+    // `t`'s row names the same change; a row that names no
+    // author leaves the head as the only thing that needs its witness, so
+    // the row check cannot answer for the head check.
+    let mut parts = side.snapshot().clone();
+    for file in &mut parts.files {
+        if file.authoring_change_hash == Some(head.change_hash) {
+            file.authoring_change_hash = None;
+        }
+    }
+    parts.published_change_witnesses.retain(|witness| witness.change_hash != head.change_hash);
+    let stripped = RebootstrapSnapshot::new(
+        parts.group_id,
+        parts.files,
+        parts.frontier_changes,
+        parts.file_versions,
+        parts.published_change_witnesses,
+        parts.boundary_parent_auth,
+        parts.author_state,
+        parts.path_heads,
+        parts.lamport_ceiling,
+    )
+    .unwrap();
+    let checkpoint = Checkpoint::new(
+        side.checkpoint().group_id.clone(),
+        side.checkpoint().frontier.clone(),
+        stripped.snapshot_hash(),
+    );
+    let fresh = open();
+    let tx = fresh.unchecked_transaction().unwrap();
+
+    let error = install_base_for_tests(&tx, &checkpoint, &stripped).expect_err("refused");
+
+    assert!(
+        matches!(
+            error,
+            ForeignMergeError::Refused(ForeignMergeRefusal::EvidenceNotCarried { ref path, change })
+                if path == "t" && change == head.change_hash
+        ),
+        "got {error:?}"
+    );
+    drop(tx);
+    assert_eq!(history_base(&fresh, GROUP).unwrap(), None);
 }
 
 /// `snapshot` re-signed by `signer` under a checkpoint that commits to it,

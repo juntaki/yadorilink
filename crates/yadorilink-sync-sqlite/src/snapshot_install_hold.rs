@@ -200,10 +200,17 @@ pub(crate) fn relocate_rows_displaced_by_descendants(
 
 /// Moves the live File or Symlink row at `path` to the copy name the
 /// namespace projection gives it when a directory holds its name, holds
-/// the copy name for the reconciliation pass to place, and releases
-/// `path`'s hold -- all only while that hold is still at `generation`.
-/// Returns the copy name, or `None` when the hold moved (an install renewed
-/// it) or `path` has no live File or Symlink row to move.
+/// the copy name for the reconciliation pass to place, records the
+/// directory at `path` as retained for its untracked content (`removable`:
+/// the identity of a directory this device made there, which may go once
+/// it is empty; `None` keeps it for good), and releases `path`'s hold --
+/// all only while that hold is still at `generation`. Returns the copy
+/// name, or `None` when the hold moved (an install renewed it) or `path`
+/// has no live File or Symlink row to move; nothing is written then.
+///
+/// One transaction, because nothing brings `path` back once its hold is
+/// released: a directory left unrecorded there would read to capture as
+/// one the user made, and be authored over the installed entry.
 ///
 /// For the reconciliation pass, when a directory it may not remove (the
 /// user's, or one holding content this device does not replicate) sits
@@ -216,6 +223,7 @@ pub(crate) fn relocate_held_entry_beside_directory_in_tx(
     group_id: &str,
     path: &str,
     generation: i64,
+    removable: Option<&yadorilink_root_authority::fs_identity::FileIdentity>,
     now_unix_nanos: i64,
 ) -> Result<Option<String>, SyncSqliteError> {
     let held_at: Option<i64> = conn
@@ -242,6 +250,14 @@ pub(crate) fn relocate_held_entry_beside_directory_in_tx(
     };
     move_current_rows(conn, group_id, &[(path.to_owned(), to.clone())])?;
     hold_in_tx(conn, group_id, &to, None, now_unix_nanos)?;
+    crate::structural_origin::record_retained_directory(
+        conn,
+        group_id,
+        path,
+        crate::structural_origin::RETAINED_UNTRACKED_CONTENT,
+        removable,
+        now_unix_nanos,
+    )?;
     conn.execute(
         "DELETE FROM snapshot_install_holds WHERE group_id = ?1 AND path = ?2 AND generation = ?3",
         params![group_id, path, generation],
@@ -702,6 +718,7 @@ impl SnapshotInstallHoldRepository {
         group_id: &str,
         path: &str,
         generation: i64,
+        removable: Option<&yadorilink_root_authority::fs_identity::FileIdentity>,
         now_unix_nanos: i64,
     ) -> Result<Option<String>, SyncSqliteError> {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
@@ -710,6 +727,7 @@ impl SnapshotInstallHoldRepository {
                 group_id,
                 path,
                 generation,
+                removable,
                 now_unix_nanos,
             )
         })

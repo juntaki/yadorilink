@@ -48,8 +48,10 @@ fn device_status_label_shows_last_seen_for_an_offline_device() {
 fn data_protection_badge_shows_the_risk_wording() {
     use yadorilink_ipc_proto::daemonctl::{GroupDurabilityStatus, LinkStatus};
 
-    let mut link = LinkStatus::default();
-    link.durability_status = GroupDurabilityStatus::AtRisk as i32;
+    let mut link = LinkStatus {
+        durability_status: GroupDurabilityStatus::AtRisk as i32,
+        ..Default::default()
+    };
     assert_eq!(data_protection_badge(&link).text(), "Data protection: At risk");
 
     link.durability_status = GroupDurabilityStatus::Protected as i32;

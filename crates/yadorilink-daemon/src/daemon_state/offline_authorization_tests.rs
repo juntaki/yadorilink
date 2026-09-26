@@ -72,7 +72,7 @@ impl Device {
     /// peers, it knows from disk.
     fn start(&self) -> Arc<DaemonState> {
         let coordinator =
-            Arc::new(ReplicaCoordinator::open(&self.database.path().join("sync.sqlite3")).unwrap());
+            Arc::new(ReplicaCoordinator::open(self.database.path().join("sync.sqlite3")).unwrap());
         let blocks = Arc::new(SegmentBlockStore::new(self.blocks.path()).unwrap());
         DaemonState::new("device-a".into(), coordinator, blocks)
     }
@@ -325,7 +325,7 @@ async fn deleting_the_offline_authorization_wakes_the_peer_change_subscribers() 
     let state = device.start();
     authorize(&state, PEER, PEER_KEY);
 
-    let mut changes = state.authority.subscribe_to_peer_changes();
+    let changes = state.authority.subscribe_to_peer_changes();
     // A fresh receiver has already seen the current state, so anything it
     // reports from here is this deletion.
     assert!(!changes.has_changed().unwrap(), "sanity check: nothing pending before the deletion");

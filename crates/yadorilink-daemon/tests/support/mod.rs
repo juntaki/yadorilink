@@ -38,6 +38,8 @@ pub mod control_socket_client;
 /// and `dst_support` is gated `#![cfg(turmoil)]` for the modules that do.
 /// Keeping it here lets the property suite run on every plain `cargo test`.
 /// It takes about a second.
+// Only `dst_sec_convergence` uses it; every other binary compiles it unused.
+#[allow(dead_code)]
 pub mod dag_sec;
 pub mod fake_coordination;
 pub mod topology;
@@ -764,6 +766,7 @@ pub async fn ensure_reconciliation_between(
 /// address for a peer cannot dial it, exactly as in production; nothing is
 /// disabled, and re-pairing restores it (`connect_two_daemons` calls
 /// `ensure_reconciliation_between` again).
+#[allow(dead_code)]
 pub async fn sever_reconciliation(state_a: &Arc<DaemonState>, state_b: &Arc<DaemonState>) {
     // Forgetting where the peer's substrate answers, which is what the
     // substrate consults -- see `ensure_reconciliation_between`.
@@ -1030,7 +1033,7 @@ pub fn keep_substrate_advertised(states: &[&Arc<DaemonState>]) {
     let owned: Vec<Arc<DaemonState>> = states.iter().map(|state| (*state).clone()).collect();
     for (index, source) in owned.iter().enumerate() {
         let Some(driver) = source.reconciliation_driver() else { continue };
-        let mut addresses = driver.stack().watch_local_address();
+        let addresses = driver.stack().watch_local_address();
         let targets: Vec<std::sync::Weak<DaemonState>> = owned
             .iter()
             .enumerate()
@@ -1208,6 +1211,7 @@ impl SubstrateDevices for DaemonSubstrateDevices<'_> {
 ///
 /// Every device must be passed in one call. Registering a device with a
 /// second fake later is the island-bridging case above and cannot work.
+#[allow(dead_code)]
 pub async fn shared_checkpoint_authority(
     devices: &[(&str, &Arc<DaemonState>)],
     group_ids: &[String],

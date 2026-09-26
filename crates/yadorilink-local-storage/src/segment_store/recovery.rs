@@ -148,7 +148,7 @@ pub(crate) fn recover(root: &Path, index: &BlockIndex) -> Result<RecoveredStore,
     // A segment file no committed transaction ever mentioned cannot be
     // referenced by anything, so it is removable without further proof.
     let known: std::collections::HashSet<u64> = rows.iter().map(|row| row.segment_id).collect();
-    for (&segment_id, _) in &on_disk {
+    for &segment_id in on_disk.keys() {
         if known.contains(&segment_id) {
             continue;
         }

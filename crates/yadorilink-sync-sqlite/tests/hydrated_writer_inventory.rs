@@ -90,10 +90,11 @@ fn production_sources(root: &Path) -> Vec<PathBuf> {
                     continue;
                 }
                 stack.push(path);
-            } else if name.ends_with(".rs") && !name.contains("test_support") {
-                if path.components().any(|c| c.as_os_str() == "src") {
-                    out.push(path);
-                }
+            } else if name.ends_with(".rs")
+                && !name.contains("test_support")
+                && path.components().any(|c| c.as_os_str() == "src")
+            {
+                out.push(path);
             }
         }
     }

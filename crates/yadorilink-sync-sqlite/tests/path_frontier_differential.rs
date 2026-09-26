@@ -280,7 +280,10 @@ fn all_paths(conn: &Connection, group_id: &str) -> Vec<String> {
     out
 }
 
-fn normalize(mut heads: Vec<PathHead>) -> Vec<(String, u64, String, String, Option<[u8; 32]>)> {
+/// One head reduced to the fields the two derivations must agree on.
+type NormalizedHead = (String, u64, String, String, Option<[u8; 32]>);
+
+fn normalize(mut heads: Vec<PathHead>) -> Vec<NormalizedHead> {
     heads.sort_by_key(|h| h.change_hash);
     heads
         .into_iter()

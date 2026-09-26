@@ -33,7 +33,10 @@ struct Pair {
     bob: Arc<DaemonState>,
     alice_stack: SyncStack,
     bob_stack: SyncStack,
-    _dirs: (tempfile::TempDir, tempfile::TempDir),
+    _dirs: (
+        crate::test_support::sync_stack_fixture::ReleasingDir,
+        crate::test_support::sync_stack_fixture::ReleasingDir,
+    ),
 }
 
 /// Two devices that pin each other, with endpoints bound under `alice_config`

@@ -29,11 +29,7 @@ mod driver_tests;
 #[cfg(test)]
 mod planner_tests;
 #[cfg(test)]
-mod relay_block_transfer_tests;
-#[cfg(test)]
 mod relay_equivalence_tests;
-#[cfg(test)]
-mod relay_to_direct_path_evolution_tests;
 
 /// The stack on a simulated carrier, under a partition. Only built for the
 /// turmoil simulation cfg, which is the only build that has a carrier to cut.

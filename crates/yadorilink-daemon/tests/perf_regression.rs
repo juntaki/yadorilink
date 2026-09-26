@@ -139,6 +139,11 @@ async fn large_file_scan_does_not_block_concurrent_async_work() {
 /// in `fetch_blocks_from_sessions`'s worker loop): hydrating a large file
 /// must not delay an unrelated, concurrently-scheduled async task either.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one end-to-end measurement read top to bottom; splitting it would only \
+              move the setup away from the timing it bounds"
+)]
 async fn large_file_hydration_does_not_block_concurrent_async_work() {
     let content = hydration_content();
     let source_dir = tempfile::tempdir().unwrap();

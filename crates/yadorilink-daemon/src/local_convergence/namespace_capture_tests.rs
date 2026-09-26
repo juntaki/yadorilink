@@ -228,7 +228,10 @@ fn write_leaf(h: &Harness, rel: &str, leaf: Leaf, body: &str) {
     let _ = std::fs::remove_file(&path);
     match leaf {
         Leaf::File => std::fs::write(&path, body).unwrap(),
+        #[cfg(unix)]
         Leaf::Symlink => std::os::unix::fs::symlink(body, &path).unwrap(),
+        #[cfg(windows)]
+        Leaf::Symlink => std::os::windows::fs::symlink_file(body, &path).unwrap(),
     }
 }
 

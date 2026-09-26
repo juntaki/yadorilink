@@ -35,7 +35,7 @@ thiserror.workspace = true
 sha2.workspace = true
 tracing.workspace = true
 hex = "0.4"
-fastcdc = "4.0.1"
+fastcdc = "5.0.0"
 # Portable free-space queries
 # (`available_space`/`total_space`) for the disk-headroom preflight check —
 # no existing dependency in this crate (or anywhere else in the workspace,

@@ -190,36 +190,14 @@ impl ChangeHistoryRepository {
             for ops in batches {
                 let change = dag_store::emit_local_change(tx, group_id, ops.clone(), emitter)?;
                 let hash = change.compute_hash();
-                for op in ops {
-                    for path in op_paths(op) {
-                        set_authoring_change_hash_in_tx(tx, group_id, path, &hash)?;
-                        // Same transaction as the change that put this
-                        // path into history: the proof and the history it
-                        // proves can never disagree across a crash,
-                        // because there is no moment where one exists
-                        // without the other.
-                        if binding_now.contains(path) {
-                            // A row this transaction binds was read off
-                            // this device's disk by the scan whose emission
-                            // this import is, so the change is a capture of
-                            // that disk -- whether or not the import could
-                            // still prove what the disk holds. A row another
-                            // writer bound first carries that writer's own
-                            // record, and is left to it.
-                            crate::local_capture_provenance::record_local_capture_in_tx(
-                                tx, group_id, path, &hash,
-                            )?;
-                            if let Some(observed) = actual_state.get(path) {
-                                crate::file_index::adopt_local_capture_actual_state(
-                                    tx,
-                                    group_id,
-                                    path,
-                                    observed.record_kind,
-                                    &observed.version_hash,
-                                    &observed.filesystem_identity,
-                                )?;
-                            }
-                        }
+                for path in ops.iter().flat_map(op_paths) {
+                    set_authoring_change_hash_in_tx(tx, group_id, path, &hash)?;
+                    // Same transaction as the change that put this path
+                    // into history: the proof and the history it proves
+                    // can never disagree across a crash, because there is
+                    // no moment where one exists without the other.
+                    if binding_now.contains(path) {
+                        record_import_capture(tx, group_id, path, &hash, actual_state)?;
                     }
                 }
                 appended += 1;
@@ -693,29 +671,8 @@ impl ChangeHistoryRepository {
                         return Err(e);
                     }
                 }
-                match dag_store::admit_change(tx, item.change) {
-                    Ok(admitted) => {
-                        if let Some(evidence) = item.evidence {
-                            let hash = item.change.compute_hash();
-                            if let Err(e) =
-                                dag_store::published_view::attach_authorization_evidence_on_conn(
-                                    tx,
-                                    &evidence.checkpoint_hash,
-                                    item.change.group_id.as_str(),
-                                    item.change.device_id.as_str(),
-                                    evidence.checkpoint_seq,
-                                    &evidence.checkpoint_encoded,
-                                    &evidence.checkpoint_signature,
-                                    &evidence.author_signing_public_key,
-                                    &[(hash, evidence.merkle_proof_encoded.clone())],
-                                )
-                            {
-                                item_failure.set(true);
-                                return Err(e);
-                            }
-                        }
-                        chunk_results.push(admitted)
-                    }
+                match admit_with_evidence(tx, item) {
+                    Ok(admitted) => chunk_results.push(admitted),
                     Err(e) => {
                         item_failure.set(true);
                         return Err(e);
@@ -786,6 +743,59 @@ impl ChangeHistoryRepository {
             .into_iter()
             .next())
     }
+}
+
+/// Records that the import change `hash` captured `path` off this device's
+/// disk, adopting the caller's observed actual state for it when one exists.
+///
+/// Only for a row this transaction binds: such a row was read off this
+/// device's disk by the scan whose emission this import is, so the change is
+/// a capture of that disk -- whether or not the import could still prove what
+/// the disk holds. A row another writer bound first carries that writer's own
+/// record, and is left to it.
+fn record_import_capture(
+    tx: &rusqlite::Transaction<'_>,
+    group_id: &str,
+    path: &str,
+    hash: &ChangeHash,
+    actual_state: &std::collections::HashMap<String, crate::file_index::ImportedActualState>,
+) -> Result<(), SyncSqliteError> {
+    crate::local_capture_provenance::record_local_capture_in_tx(tx, group_id, path, hash)?;
+    if let Some(observed) = actual_state.get(path) {
+        crate::file_index::adopt_local_capture_actual_state(
+            tx,
+            group_id,
+            path,
+            observed.record_kind,
+            &observed.version_hash,
+            &observed.filesystem_identity,
+        )?;
+    }
+    Ok(())
+}
+
+/// Admits one item's change and, for a remotely-verified one, attaches its
+/// authorization evidence in the same transaction.
+fn admit_with_evidence(
+    tx: &rusqlite::Transaction<'_>,
+    item: &PendingAdmission<'_>,
+) -> Result<dag_store::AdmitResult, SyncSqliteError> {
+    let admitted = dag_store::admit_change(tx, item.change)?;
+    if let Some(evidence) = item.evidence {
+        let hash = item.change.compute_hash();
+        dag_store::published_view::attach_authorization_evidence_on_conn(
+            tx,
+            &evidence.checkpoint_hash,
+            item.change.group_id.as_str(),
+            item.change.device_id.as_str(),
+            evidence.checkpoint_seq,
+            &evidence.checkpoint_encoded,
+            &evidence.checkpoint_signature,
+            &evidence.author_signing_public_key,
+            &[(hash, evidence.merkle_proof_encoded.clone())],
+        )?;
+    }
+    Ok(admitted)
 }
 
 /// Every path one `Op` touches -- both ends of a `Move`, deduplicated when

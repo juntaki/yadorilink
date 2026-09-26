@@ -1097,10 +1097,14 @@ pub(crate) fn repair(conn: &Connection) -> Result<Vec<String>, SyncSqliteError> 
         // catches the corruption no structural check can see -- an effect
         // row and its live head lost together, leaving an index that is
         // perfectly self-consistent and simply missing a file.
-        if !super::path_frontier::effects_match_change(&tx, &stored_group, &change)? {
-            if !effect_mismatches.contains(&stored_group) {
-                effect_mismatches.push(stored_group.clone());
-            }
+        // Likewise the record of which base heads it names: a lost row
+        // makes a superseded base head live again, a spurious one buries a
+        // live one.
+        if (!super::path_frontier::effects_match_change(&tx, &stored_group, &change)?
+            || !super::observed_base_heads::naming_matches_change(&tx, &change)?)
+            && !effect_mismatches.contains(&stored_group)
+        {
+            effect_mismatches.push(stored_group.clone());
         }
         verify_retained_change_identity(
             &change,

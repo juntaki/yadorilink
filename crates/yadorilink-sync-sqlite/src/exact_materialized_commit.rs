@@ -228,6 +228,9 @@ pub enum InternalMaterializedCommit {
 /// `expected_authoring`, when supplied, must still hold or nothing is
 /// written -- see [`ExpectedAuthoring`]. It is checked first, so a
 /// superseded attempt leaves the row exactly as it found it.
+// Each argument is an independent input to one fenced commit; bundling them
+// would only move the list into a single-use struct.
+#[allow(clippy::too_many_arguments)]
 pub fn commit_internal_materialized_state_if_fence_current(
     tx: &Transaction<'_>,
     group_id: &str,

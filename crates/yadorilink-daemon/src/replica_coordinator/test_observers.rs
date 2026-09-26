@@ -80,9 +80,11 @@ pub(crate) struct TestObservers {
     /// Nothing a test can do to a file the batch has just renamed into
     /// place makes the owner's own `chmod` fail, and the class of the
     /// error (path-local or batch-wide) is what the assertion is about.
-    pub ordinary_batch_metadata_fault:
-        Mutex<Option<(String, String, fn() -> yadorilink_peer_session::PeerSessionError)>>,
+    pub ordinary_batch_metadata_fault: Mutex<Option<BatchMetadataFault>>,
 }
+
+/// `(group_id, path, error)` -- see `TestObservers::ordinary_batch_metadata_fault`.
+pub type BatchMetadataFault = (String, String, fn() -> yadorilink_peer_session::PeerSessionError);
 
 impl TestObservers {
     pub fn note_apply_incoming_metadata_atomic(&self) {

@@ -39,7 +39,7 @@ fn version_for(
     let hash = hex::decode(store.put(content).unwrap()).unwrap();
     state
         .change_history_repository()
-        .record_group_block_provenance(GROUP, &[hash.clone()])
+        .record_group_block_provenance(GROUP, std::slice::from_ref(&hash))
         .unwrap();
     FileVersion::new(
         vec![VersionBlock { hash: BlockHash(hash), size: content.len() as u32 }],
@@ -60,7 +60,7 @@ fn version_for(
 /// `PreparedProjectedUpsert`'s own doc comment), so neither can be
 /// faked away.
 struct Harness {
-    session: Arc<PeerSyncSession>,
+    _session: Arc<PeerSyncSession>,
     convergence: Arc<super::LocalConvergenceExecutor>,
     /// The activity provider the executor was built with, which the
     /// session used to hand back through a private accessor of its own.
@@ -129,7 +129,7 @@ impl Harness {
         dag_store::init_dag_schema(&sender_db).unwrap();
         let emitter = ChangeEmitter::new("device-remote", SigningKey::from_bytes(&[9u8; 32]));
         Self {
-            session,
+            _session: session,
             convergence,
             activity_provider: deps.block_write_activity_provider.clone(),
             state,
@@ -257,7 +257,7 @@ async fn a_batched_upserts_metadata_is_applied_atomically_with_its_row() {
         hex::decode(h.store.put(b"content with real metadata to carry through").unwrap()).unwrap();
     h.state
         .change_history_repository()
-        .record_group_block_provenance(GROUP, &[hash.clone()])
+        .record_group_block_provenance(GROUP, std::slice::from_ref(&hash))
         .unwrap();
     let version = FileVersion::new(
         vec![VersionBlock { hash: BlockHash(hash), size: 44 }],
@@ -1026,7 +1026,7 @@ async fn a_disk_only_metadata_drift_is_repaired_with_zero_db_writes() {
     let hash = hex::decode(h.store.put(content).unwrap()).unwrap();
     h.state
         .change_history_repository()
-        .record_group_block_provenance(GROUP, &[hash.clone()])
+        .record_group_block_provenance(GROUP, std::slice::from_ref(&hash))
         .unwrap();
     let version = FileVersion::new(
         vec![VersionBlock { hash: BlockHash(hash), size: content.len() as u32 }],
@@ -1486,7 +1486,7 @@ async fn a_fresh_write_to_an_owner_unreadable_mode_lands_its_xattr_and_settles_e
     let hash = hex::decode(h.store.put(content).unwrap()).unwrap();
     h.state
         .change_history_repository()
-        .record_group_block_provenance(GROUP, &[hash.clone()])
+        .record_group_block_provenance(GROUP, std::slice::from_ref(&hash))
         .unwrap();
     let xattrs = vec![("user.test".to_string(), b"value".to_vec())];
     let version = FileVersion::new(
@@ -1544,7 +1544,7 @@ async fn a_batched_upsert_to_an_owner_unreadable_mode_lands_its_xattr_and_settle
     let hash = hex::decode(h.store.put(content).unwrap()).unwrap();
     h.state
         .change_history_repository()
-        .record_group_block_provenance(GROUP, &[hash.clone()])
+        .record_group_block_provenance(GROUP, std::slice::from_ref(&hash))
         .unwrap();
     let xattrs = vec![("user.test".to_string(), b"value".to_vec())];
     let version = FileVersion::new(
@@ -1603,7 +1603,7 @@ async fn write_only_file_then_an_xattr_change(
     let hash = hex::decode(h.store.put(content).unwrap()).unwrap();
     h.state
         .change_history_repository()
-        .record_group_block_provenance(GROUP, &[hash.clone()])
+        .record_group_block_provenance(GROUP, std::slice::from_ref(&hash))
         .unwrap();
     let version_with = |value: &[u8]| {
         FileVersion::new(
@@ -1801,7 +1801,7 @@ async fn a_metadata_repair_to_an_owner_unreadable_mode_settles_with_its_mtime() 
     let hash = hex::decode(h.store.put(content).unwrap()).unwrap();
     h.state
         .change_history_repository()
-        .record_group_block_provenance(GROUP, &[hash.clone()])
+        .record_group_block_provenance(GROUP, std::slice::from_ref(&hash))
         .unwrap();
     let version_with = |unix_mode: u32, mtime_unix_nanos: i64, xattrs: Vec<(String, Vec<u8>)>| {
         FileVersion::new(
@@ -1883,7 +1883,7 @@ async fn a_metadata_only_update_to_an_owner_unreadable_mode_settles_with_its_mti
     let hash = hex::decode(h.store.put(content).unwrap()).unwrap();
     h.state
         .change_history_repository()
-        .record_group_block_provenance(GROUP, &[hash.clone()])
+        .record_group_block_provenance(GROUP, std::slice::from_ref(&hash))
         .unwrap();
     let version_with = |unix_mode: u32, mtime_unix_nanos: i64, xattrs: Vec<(String, Vec<u8>)>| {
         FileVersion::new(

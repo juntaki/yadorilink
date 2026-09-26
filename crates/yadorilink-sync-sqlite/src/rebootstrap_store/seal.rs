@@ -377,7 +377,26 @@ fn seal_group_until(
     // The absorbed history's evidence goes with it, except what a row, a
     // version or the summary the base carries still names.
     crate::authorization_witness_gc::collect_authorization_witnesses(tx, group_id)?;
+    interrupt_if_reached(interrupt_after, EpochResetStep::WitnessesCollected, || {
+        format!("the seal of group {group_id}")
+    })?;
     Ok(seal)
+}
+
+/// Stops the caller's reset with an error when `step` is the one it is to
+/// be interrupted after, as a crash right there would stop it.
+pub(super) fn interrupt_if_reached(
+    interrupt_after: Option<EpochResetStep>,
+    step: EpochResetStep,
+    what: impl FnOnce() -> String,
+) -> Result<(), SyncSqliteError> {
+    if interrupt_after == Some(step) {
+        return Err(SyncSqliteError::Io(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            format!("{} was interrupted after {step:?}", what()),
+        )));
+    }
+    Ok(())
 }
 
 /// Refuses a seal while history compaction is not ready to run.
@@ -405,11 +424,15 @@ pub enum EpochResetStep {
     BaseSwitched,
     /// The absorbed history and everything derived from it are gone.
     HistoryRetired,
+    /// The authorization witnesses nothing retained still needs are
+    /// collected (P7); the reset has not committed yet.
+    WitnessesCollected,
 }
 
 impl EpochResetStep {
     /// Every step, in the order a seal passes them.
-    pub const ALL: [Self; 3] = [Self::SummaryRecorded, Self::BaseSwitched, Self::HistoryRetired];
+    pub const ALL: [Self; 4] =
+        [Self::SummaryRecorded, Self::BaseSwitched, Self::HistoryRetired, Self::WitnessesCollected];
 }
 
 /// [`seal_group`], stopped with an error right after `step`, as a crash
@@ -810,11 +833,13 @@ pub(super) fn check_namespace(
 /// frontier the builder reads.
 ///
 /// `W` is the positions [`author_positions`] derived. `L` is the base's
-/// ceiling or the greatest retained Lamport. `Gamma` for a path the current
-/// epoch touched is its maximal writes there, by DAG ancestry among the
-/// current epoch's changes; every change on the current epoch descends
-/// from the base, so nothing the base carried for such a path survives.
-/// A path the current epoch did not touch keeps the base's heads.
+/// ceiling or the greatest retained Lamport. `Gamma` for a path is the
+/// current epoch's maximal writes there, by DAG ancestry among the current
+/// epoch's changes, together with every head the base carried there that
+/// no change of the current epoch touching the path names among its
+/// observed base heads. A change on the current epoch supersedes a base
+/// head only by naming it; a path the current epoch did not touch keeps
+/// all of the base's heads.
 fn recompute_summary(history: &AbsorbedHistory) -> Result<GroupHistorySummary, SyncSqliteError> {
     let group_id = history.group_id.as_str();
     let retained: HashSet<ChangeHash> = history.changes.iter().map(|(hash, _)| *hash).collect();
@@ -826,6 +851,7 @@ fn recompute_summary(history: &AbsorbedHistory) -> Result<GroupHistorySummary, S
         .collect();
 
     let mut effects: BTreeMap<String, Vec<(ChangeHash, PathHead)>> = BTreeMap::new();
+    let mut named: HashSet<(String, ChangeHash)> = HashSet::new();
     for (hash, change) in &current {
         for parent in &change.parents {
             if !retained.contains(parent) {
@@ -833,6 +859,9 @@ fn recompute_summary(history: &AbsorbedHistory) -> Result<GroupHistorySummary, S
             }
         }
         for (path, head) in path_effects_of_change(change) {
+            for observed in &change.observed_base_heads {
+                named.insert((path.clone(), *observed));
+            }
             effects.entry(path).or_default().push((*hash, head));
         }
     }
@@ -859,7 +888,10 @@ fn recompute_summary(history: &AbsorbedHistory) -> Result<GroupHistorySummary, S
     }
     if let Some(base) = &history.base {
         path_heads.extend(
-            base.path_heads.iter().filter(|head| !effects.contains_key(&head.path)).cloned(),
+            base.path_heads
+                .iter()
+                .filter(|head| !named.contains(&(head.path.clone(), head.change_hash)))
+                .cloned(),
         );
     }
 

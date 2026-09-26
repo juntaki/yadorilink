@@ -148,6 +148,11 @@ fn custody_block_reads() -> u64 {
 
 /// A/B/G in one process, in order, with the counters reset between phases.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "the guard serializes this binary's measuring tests for their whole run; \
+              holding it across awaits is the point"
+)]
 async fn a_background_cycle_costs_the_same_whatever_the_group_holds() {
     let _measuring = MEASURING.lock().unwrap_or_else(|p| p.into_inner());
     support::ensure_isolated_config_dir();
@@ -246,6 +251,11 @@ async fn a_background_cycle_costs_the_same_whatever_the_group_holds() {
 /// `P x R` is 200/800/1600 against a `P` of 1/4/8, so the two shapes cannot
 /// be confused for each other by any amount of noise.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "the guard serializes this binary's measuring tests for their whole run; \
+              holding it across awaits is the point"
+)]
 async fn the_cycle_costs_one_rpc_per_peer_and_none_per_root() {
     let _measuring = MEASURING.lock().unwrap_or_else(|p| p.into_inner());
     const ROOTS_FOR_PEER_SCALING: usize = 200;

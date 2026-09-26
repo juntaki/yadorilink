@@ -146,6 +146,13 @@ impl ChangeAdmissionPort for ReplicaCoordinator {
                                     .to_string(),
                             }
                         }
+                        AdmitOutcome::RefusedInvalidObservedBaseHead { local, head } => {
+                            AdmissionStoreOutcome::RefusedInvalidObservedBaseHead {
+                                reason: yadorilink_replica_domain::admission::AdmissionRefusal::
+                                    InvalidObservedBaseHead { local, head }
+                                    .to_string(),
+                            }
+                        }
                         AdmitOutcome::RefusedPath(PathRefusal::ReservedNamespaceCollision {
                             path,
                         }) => return Err(AdmissionStoreError::ReservedNamespaceCollision { path }),

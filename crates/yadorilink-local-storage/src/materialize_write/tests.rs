@@ -27,13 +27,16 @@ enum LedgerCall {
 
 /// A ledger that records every call, against a root it can look at, and
 /// can be told to act or fail at a chosen call.
+/// A hook run inside `record_intent` for one path.
+type IntentHook = Box<dyn Fn(&Path) + Send + Sync>;
+
 #[derive(Default)]
 struct RecordingLedger {
     root: Option<std::path::PathBuf>,
     calls: Mutex<Vec<LedgerCall>>,
     /// Runs inside `record_intent` for this path, after the call is
     /// recorded: what a user's `mkdir` racing the materializer's does.
-    on_intent: Option<(String, Box<dyn Fn(&Path) + Send + Sync>)>,
+    on_intent: Option<(String, IntentHook)>,
     fail_intent_for: Option<String>,
     fail_complete_for: Option<String>,
 }

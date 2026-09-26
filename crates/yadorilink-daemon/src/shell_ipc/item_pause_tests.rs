@@ -51,7 +51,7 @@ struct Fixture {
     context: ShellContext,
     root: std::path::PathBuf,
     local_path: String,
-    _root_dir: tempfile::TempDir,
+    _root_dir: crate::test_support::sync_stack_fixture::ReleasingDir,
 }
 
 async fn fixture() -> Fixture {
@@ -81,7 +81,8 @@ async fn fixture() -> Fixture {
     register_candidate_session(&state, &root).await;
 
     let context = ShellContext::from_state(state.clone());
-    Fixture { state, context, root, local_path, _root_dir: root_dir }
+    let _root_dir = crate::test_support::sync_stack_fixture::ReleasingDir::new(root_dir, &state);
+    Fixture { state, context, root, local_path, _root_dir }
 }
 
 async fn register_candidate_session(state: &Arc<DaemonState>, root: &Path) {

@@ -104,7 +104,7 @@ pub fn is_within_offline_horizon(captured_at_unix: i64, now: i64) -> bool {
     /// Ordinary clock drift and NTP correction, not an attack.
     const CLOCK_SLACK_SECS: i64 = 60 * 60;
     let age = now.saturating_sub(captured_at_unix);
-    age <= OFFLINE_AUTHORIZATION_HORIZON_SECS && age >= -CLOCK_SLACK_SECS
+    (-CLOCK_SLACK_SECS..=OFFLINE_AUTHORIZATION_HORIZON_SECS).contains(&age)
 }
 
 /// Where the peer authorization a running daemon is acting on came from.

@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 use yadorilink_local_storage::check_disk_headroom;
 use yadorilink_local_storage::{
-    apply_file_metadata, verify_write_target_within_canonical_root, verify_write_target_within_root,
+    verify_write_target_within_canonical_root, verify_write_target_within_root,
 };
 use yadorilink_peer_session::hazard;
 use yadorilink_peer_session::PeerSessionError;
@@ -109,8 +109,7 @@ impl super::LocalConvergenceExecutor {
         let observed_disk = self
             .local_file_path(group_id, path)
             .ok()
-            .and_then(|out_path| Some(disk_race_fingerprint(&out_path)))
-            .flatten();
+            .and_then(|out_path| disk_race_fingerprint(&out_path));
         Ok(Some(BlockRequirement {
             path: path.to_string(),
             demand_path: demand_path.to_string(),
@@ -998,6 +997,34 @@ impl super::LocalConvergenceExecutor {
         Ok((settled, retry))
     }
 
+    /// Diagnostic-only: correlates a conflict-copy output back to the seed
+    /// path that produced it and the losing change it carries, so an
+    /// intermittently stalled conflict-copy obligation can be traced to its
+    /// seed. Silent for an output the fixpoint had `already_derived`.
+    fn trace_conflict_copy_discovered(
+        &self,
+        group_id: &str,
+        audit_attempt_id: u64,
+        derived_from_path: &str,
+        resolved_output_path: &str,
+        loser: &PathHead,
+        already_derived: bool,
+    ) {
+        if already_derived {
+            return;
+        }
+        tracing::debug!(
+            local_device_id = %self.local_device_id,
+            group_id,
+            audit_attempt_id,
+            derived_from_path = %derived_from_path,
+            resolved_output_path = %resolved_output_path,
+            conflict_loser_change_hash = %hex::encode(loser.change_hash),
+            conflict_loser_device_id = %loser.device_id,
+            "conflict-copy output discovered by resolution fixpoint"
+        );
+    }
+
     /// Commits a bounded batch of ordinary upserts/deletes (each
     /// already classified as batch-eligible by the per-path loop in
     /// `reconcile_group_paths`) with just two `write_immediate` DB
@@ -1020,6 +1047,12 @@ impl super::LocalConvergenceExecutor {
     /// Every item in `items` lands in exactly one of the two returned sets
     /// -- same invariant `reconcile_group_paths` itself keeps for every
     /// path it examines.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the batch's lock, revalidate, commit, publish and finalize phases share \
+              one lock set and must keep the crash orderings documented above; they \
+              are kept in one body so that ordering stays reviewable in one place"
+    )]
     pub(crate) async fn try_commit_ordinary_batch(
         &self,
         group_id: &str,
@@ -1321,7 +1354,7 @@ impl super::LocalConvergenceExecutor {
                     // write produced -- so it is built from the same values,
                     // not re-derived later.
                     let version_hash = match &evidence {
-                        SettlementEvidence::ExactObject { version, .. } => version.clone(),
+                        SettlementEvidence::ExactObject { version, .. } => *version,
                         other => {
                             return Err(PeerSessionError::CorruptState(format!(
                                 "{}: an ordinary batch write produced non-exact settlement \
@@ -1382,7 +1415,6 @@ impl super::LocalConvergenceExecutor {
         // reverse order a directory's deleted children are gone before the
         // directory's own `rmdir` runs, and an `rm -rf` arriving as point
         // deletes empties each directory before removing it.
-        let mut candidate_deletes = candidate_deletes;
         candidate_deletes.sort_by(|(a, _), (b, _)| b.cmp(a));
         for (path, tombstone_author) in candidate_deletes {
             let out_path = self.local_file_path(group_id, &path)?;
@@ -1491,6 +1523,12 @@ impl super::LocalConvergenceExecutor {
     /// losing version hash), then a single pass materializes each path's result:
     /// *absent* → a deletion (the no-resurrection guarantee), *present* → the
     /// winning content head via the session's block-fetch machinery.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the conflict-copy fixpoint and the single materialize pass that consumes \
+              it share every map the fixpoint builds; the fold mirrors the property \
+              suite's `fold_materialize` and is kept whole so the two can be compared"
+    )]
     async fn reconcile_group_paths(
         &self,
         group_id: &str,
@@ -1640,23 +1678,14 @@ impl super::LocalConvergenceExecutor {
                     let conflict_copies =
                         self.leaf_conflict_copies(group_id, &inputs, conflict_copies)?;
                     for cc in conflict_copies {
-                        if !derived.contains_key(&cc.path) {
-                            // Diagnostic-only: correlates a conflict-copy
-                            // output back to the seed path that produced it
-                            // and the losing change it carries, so an
-                            // intermittently stalled conflict-copy
-                            // obligation can be traced to its seed.
-                            tracing::debug!(
-                                local_device_id = %self.local_device_id,
-                                group_id,
-                                audit_attempt_id,
-                                derived_from_path = %path,
-                                resolved_output_path = %cc.path,
-                                conflict_loser_change_hash = %hex::encode(inputs[cc.head].change_hash),
-                                conflict_loser_device_id = %inputs[cc.head].device_id,
-                                "conflict-copy output discovered by resolution fixpoint"
-                            );
-                        }
+                        self.trace_conflict_copy_discovered(
+                            group_id,
+                            audit_attempt_id,
+                            path,
+                            &cc.path,
+                            &inputs[cc.head],
+                            derived.contains_key(&cc.path),
+                        );
                         let demand = demand_of.get(path).cloned().unwrap_or_else(|| path.clone());
                         demand_of.entry(cc.path.clone()).or_insert(demand);
                         next.insert(cc.path.clone(), inputs[cc.head].clone());
@@ -2374,6 +2403,8 @@ impl super::LocalConvergenceExecutor {
     /// (canonical encoding v2), so the built `FileRecord`'s blocks carry real
     /// sizes and prefix-sum offsets and block fetch validates by both size and
     /// content hash before materialization.
+    // One argument per input of a head's projection; see `_under`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn materialize_dag_content_head(
         &self,
         group_id: &str,
@@ -2452,6 +2483,11 @@ impl super::LocalConvergenceExecutor {
     // The public entry point's parameters plus the recapture rule it runs
     // under; bundling them would only rename the same list.
     #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one DAG head's projection, from version lookup through recapture to \
+              the proof, as a single ordered sequence sharing one permit"
+    )]
     async fn materialize_dag_content_head_under(
         &self,
         group_id: &str,
@@ -2774,8 +2810,8 @@ impl super::LocalConvergenceExecutor {
                         &ChangeHash(effective_head.change_hash),
                     )?;
                 let content_matches = content_matches
-                    && !(own_capture
-                        && !mode_and_xattrs_match_disk(
+                    && (!own_capture
+                        || mode_and_xattrs_match_disk(
                             &self.sync_root(group_id)?.join(target_path),
                             &version,
                         )?);

@@ -83,21 +83,22 @@ pub(crate) fn track_send_admission(state: &Arc<DaemonState>) -> Arc<dyn PeerAdmi
     })
 }
 
+/// Weak, for the same reason as [`track_send_admission`]: the state owns
+/// the `SendService` this directory is handed to, so a strong reference back
+/// would keep the state alive for as long as the service is.
 struct DaemonDeviceDirectory {
-    state: Arc<DaemonState>,
+    state: std::sync::Weak<DaemonState>,
 }
 
 #[async_trait::async_trait]
 impl DeviceDirectory for DaemonDeviceDirectory {
     fn resolve(&self, device_query: &str) -> Option<ResolvedDevice> {
-        if let Some(signing_key) = self.state.authority.peer_signing_key(device_query) {
+        let state = self.state.upgrade()?;
+        if let Some(signing_key) = state.authority.peer_signing_key(device_query) {
             // Where its iroh endpoint answers, as the coordination plane
             // last reported it; the endpoint's own lookup knows the same.
-            let reachability = self
-                .state
-                .peer_connectivity
-                .substrate_reachability(device_query)
-                .unwrap_or_default();
+            let reachability =
+                state.peer_connectivity.substrate_reachability(device_query).unwrap_or_default();
             return Some(ResolvedDevice {
                 device_id: device_query.to_string(),
                 signing_key,
@@ -112,7 +113,7 @@ impl DeviceDirectory for DaemonDeviceDirectory {
         // resolve a grant-based sender: `handle_offer` recorded it here
         // (via `consume_grant`, keyed by the authenticated peer key) the
         // moment it accepted that sender's offer.
-        let grant_peer = self.state.send_grant_peer_by_device_id(device_query)?;
+        let grant_peer = state.send_grant_peer_by_device_id(device_query)?;
         Some(ResolvedDevice {
             device_id: grant_peer.device_id,
             signing_key: grant_peer.signing_key,
@@ -122,18 +123,20 @@ impl DeviceDirectory for DaemonDeviceDirectory {
     }
 
     fn device_id_for_key(&self, signing_key: &[u8; 32]) -> Option<String> {
-        self.state
+        let state = self.state.upgrade()?;
+        state
             .authority
             .device_id_for_signing_key(signing_key)
-            .or_else(|| self.state.send_grant_peer_by_key(signing_key).map(|p| p.device_id))
+            .or_else(|| state.send_grant_peer_by_key(signing_key).map(|p| p.device_id))
     }
 
     async fn request_grant(&self, receiver_device_query: &str) -> Option<GrantedDevice> {
-        let config = self.state.coordination_client_config()?.clone();
+        let state = self.state.upgrade()?;
+        let config = state.coordination_client_config()?.clone();
         let grant = crate::coordination_client::request_send_authorization(
             &config.addr,
             &config.auth,
-            &self.state.device_id,
+            &state.device_id,
             receiver_device_query,
         )
         .await
@@ -151,7 +154,7 @@ impl DeviceDirectory for DaemonDeviceDirectory {
         // long as this record lives -- and `device_id_for_key`/`resolve`
         // fall back to this same cache for any later grant-scoped lookup
         // naming the receiver.
-        self.state.record_send_grant_peer(SendGrantPeer {
+        state.record_send_grant_peer(SendGrantPeer {
             device_id: grant.receiver_device_id.clone(),
             signing_key: grant.receiver_signing_key,
             reachability: grant.receiver_reachability.clone(),
@@ -184,7 +187,9 @@ impl DeviceDirectory for DaemonDeviceDirectory {
         // -- never from
         // anything the offer's own envelope claims. See `consume_grant`'s
         // own trait doc comment.
-        let pending = self.state.send_grant_peer_by_key(peer_key).ok_or_else(|| {
+        let state =
+            self.state.upgrade().ok_or_else(|| "the daemon is shutting down".to_string())?;
+        let pending = state.send_grant_peer_by_key(peer_key).ok_or_else(|| {
             "no pending Track Send authorization for this connection's authenticated key"
                 .to_string()
         })?;
@@ -194,8 +199,7 @@ impl DeviceDirectory for DaemonDeviceDirectory {
         if pending.grant_id != grant_id || pending.nonce != grant_nonce {
             return Err("send authorization is invalid, expired, or already used".to_string());
         }
-        let config = self
-            .state
+        let config = state
             .coordination_client_config()
             .ok_or_else(|| "not connected to the coordination plane".to_string())?
             .clone();
@@ -205,7 +209,7 @@ impl DeviceDirectory for DaemonDeviceDirectory {
             grant_id,
             grant_nonce,
             &pending.device_id,
-            &self.state.device_id,
+            &state.device_id,
         )
         .await?;
         Ok(())
@@ -252,7 +256,7 @@ pub async fn run(
     let block_store_root = base_dir.join("blocks");
     let default_inbox_dir = base_dir.join("inbox");
     let directory: Arc<dyn DeviceDirectory> =
-        Arc::new(DaemonDeviceDirectory { state: state.clone() });
+        Arc::new(DaemonDeviceDirectory { state: Arc::downgrade(&state) });
 
     let service = Arc::new(SendService::new(
         node,

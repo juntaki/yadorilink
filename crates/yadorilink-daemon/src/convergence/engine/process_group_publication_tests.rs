@@ -42,7 +42,7 @@ fn empty_version(mtime: i64) -> FileVersion {
 /// here starts), plus one registered candidate `PeerSyncSession` so
 /// `process_group` has somewhere to route its reconcile attempt.
 async fn build_state_with_adopted_group(
-) -> (Arc<DaemonState>, tempfile::TempDir, std::path::PathBuf) {
+) -> (Arc<DaemonState>, crate::test_support::sync_stack_fixture::ReleasingDir, std::path::PathBuf) {
     let root_dir = tempfile::tempdir().unwrap();
     let root = root_dir.path().canonicalize().unwrap();
     let replica_coordinator =
@@ -102,6 +102,7 @@ async fn build_state_with_adopted_group(
     );
     state.peers.register_session("device-peer".to_string(), session, state.local_convergence());
 
+    let root_dir = crate::test_support::sync_stack_fixture::ReleasingDir::new(root_dir, &state);
     (state, root_dir, root)
 }
 

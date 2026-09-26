@@ -215,7 +215,43 @@ pub(crate) fn init_path_frontier_schema(conn: &Connection) -> Result<(), SyncSql
 /// One indexed lookup per table, returning as many rows as the path has
 /// live heads -- normally one. No change is decoded, no ancestry is
 /// walked, and nothing here is proportional to the group's history.
+///
+/// Above an installed history base, a path the current epoch has touched
+/// also has the base's heads there that no change of the epoch named (see
+/// `observed_base_heads`): they are live beside the epoch's own until one
+/// is named. A path the epoch has not touched reads as it always has --
+/// no live head -- and its heads are the base's, which the rows the base
+/// installed already project.
 pub fn live_path_heads(
+    conn: &Connection,
+    group_id: &str,
+    path: &str,
+) -> Result<Vec<PathHead>, SyncSqliteError> {
+    let mut heads = live_epoch_path_heads(conn, group_id, path)?;
+    if !heads.is_empty() {
+        let base = super::observed_base_heads::unnamed_base_heads_at(conn, group_id, path)?;
+        extend_with_base_heads(&mut heads, base);
+    }
+    Ok(heads)
+}
+
+/// Adds the base heads in `base` that `heads` does not already hold.
+fn extend_with_base_heads(heads: &mut Vec<PathHead>, base: Vec<PathHead>) {
+    for head in base {
+        if !heads.iter().any(|held| held.change_hash == head.change_hash) {
+            heads.push(head);
+        }
+    }
+}
+
+/// The live heads of `path` written on the current epoch (and, on the
+/// group's original history, every live head): the causally maximal
+/// changes touching it, without the installed base's heads.
+///
+/// What a question about the DAG itself reads -- which parents a write
+/// cuts, which heads a change closes over by ancestry. A base head is no
+/// DAG node, so it has no place in either.
+pub(crate) fn live_epoch_path_heads(
     conn: &Connection,
     group_id: &str,
     path: &str,
@@ -264,6 +300,15 @@ pub fn live_heads_by_path(
         let (path, head) = live_head_from_row(row, group_id)?;
         out.entry(path).or_default().push(head);
     }
+    // The installed base's unnamed heads at every touched path, as
+    // `live_path_heads` reads them.
+    for (path, head) in
+        super::observed_base_heads::unnamed_base_heads_in_range(conn, group_id, "", None)?
+    {
+        if let Some(heads) = out.get_mut(&path) {
+            extend_with_base_heads(heads, vec![head]);
+        }
+    }
     Ok(out)
 }
 
@@ -304,17 +349,30 @@ pub fn live_heads_at_level(
     let mut rows = stmt.query(rusqlite::params![group_id, lower, upper])?;
     let mut children: BTreeMap<String, Vec<PathHead>> = BTreeMap::new();
     let mut with_live_descendant = std::collections::BTreeSet::new();
-    while let Some(row) = rows.next()? {
-        let (path, head) = live_head_from_row(row, group_id)?;
+    let mut place = |path: String, head: PathHead| {
         let rest = &path[lower.len()..];
         match rest.split_once('/') {
-            None => children.entry(path).or_default().push(head),
+            None => extend_with_base_heads(children.entry(path).or_default(), vec![head]),
             Some((child, _)) => {
                 if head.content.is_some() {
                     with_live_descendant.insert(format!("{lower}{child}"));
                 }
             }
         }
+    };
+    while let Some(row) = rows.next()? {
+        let (path, head) = live_head_from_row(row, group_id)?;
+        place(path, head);
+    }
+    // The installed base's unnamed heads at the touched paths of the
+    // subtree, as `live_path_heads` reads them.
+    for (path, head) in super::observed_base_heads::unnamed_base_heads_in_range(
+        conn,
+        group_id,
+        &lower,
+        upper.as_deref(),
+    )? {
+        place(path, head);
     }
     Ok((children, with_live_descendant))
 }
@@ -410,6 +468,30 @@ pub fn live_descendant_paths(
             out.push(descendant);
         }
     }
+    // A touched path below can also hold content only through a base head
+    // no change of the current epoch named. Both lists are in path order,
+    // so the first `limit` of their union is among the first `limit` of
+    // each.
+    let mut base_paths: Vec<String> = Vec::new();
+    for (descendant, _) in super::observed_base_heads::unnamed_base_heads_in_range(
+        conn,
+        group_id,
+        &lower,
+        Some(&upper),
+    )? {
+        if base_paths.last() != Some(&descendant) {
+            if base_paths.len() == limit {
+                break;
+            }
+            base_paths.push(descendant);
+        }
+    }
+    if !base_paths.is_empty() {
+        out.extend(base_paths);
+        out.sort();
+        out.dedup();
+        out.truncate(limit);
+    }
     Ok(out)
 }
 
@@ -482,7 +564,10 @@ pub(crate) fn frontier_without_unseen_heads_of_paths(
 ) -> Result<Option<Vec<ChangeHash>>, SyncSqliteError> {
     let mut heads = Vec::new();
     for (path, seen) in paths {
-        'heads: for head in live_path_heads(conn, group_id, path)? {
+        // The current epoch's heads only: a base head is no DAG node, so
+        // it is never cut from a write's parents. Whether a write
+        // supersedes one is decided by whether it names it.
+        'heads: for head in live_epoch_path_heads(conn, group_id, path)? {
             let head = ChangeHash(head.change_hash);
             for seen in seen.iter() {
                 if head == *seen || is_ancestor_bounded(conn, &head, seen)? {
@@ -709,7 +794,9 @@ pub(crate) fn effects_match_change(
             row.get::<_, String>(5)?,
         ))
     })?;
-    let mut stored: HashMap<String, (i64, Option<Vec<u8>>, i64, String, String)> = HashMap::new();
+    /// `(effect_kind, version_hash, lamport, device_id, naming_device_id)`.
+    type StoredEffect = (i64, Option<Vec<u8>>, i64, String, String);
+    let mut stored: HashMap<String, StoredEffect> = HashMap::new();
     for row in rows {
         let (path, kind, version, lamport, device, naming) = row?;
         stored.insert(path, (kind, version, lamport, device, naming));
@@ -880,6 +967,10 @@ pub(crate) fn record_admission(
             parent_spine_ord,
         )?;
     }
+    // The installed base's heads leave the live frontier only by being
+    // named, never by ancestry: `advance_path_frontier` sees the current
+    // epoch's heads alone.
+    super::observed_base_heads::record_naming(conn, change)?;
     Ok(())
 }
 
@@ -1248,6 +1339,7 @@ pub fn rebuild_group(conn: &Connection, group_id: &str) -> Result<(), SyncSqlite
         "DELETE FROM group_admission_ord WHERE group_id = ?1",
         rusqlite::params![group_id],
     )?;
+    super::observed_base_heads::clear_derived_naming(conn, group_id)?;
 
     let ordered = retained_changes_in_topological_order(conn, group_id)?;
 
@@ -1297,6 +1389,10 @@ pub fn rebuild_group(conn: &Connection, group_id: &str) -> Result<(), SyncSqlite
                 parent_spine_ord,
             )?;
         }
+        // Recorded afresh: the record was cleared above except for the
+        // names pruned changes recorded, which still supersede their base
+        // heads and go with the base when the next epoch reset replaces it.
+        super::observed_base_heads::record_naming(conn, change)?;
     }
 
     conn.execute(
@@ -1362,6 +1458,12 @@ fn retained_changes_in_topological_order(
 ///    query only for paths recording more than one head, which is the
 ///    conflicted minority; a path at the usual width of one costs
 ///    nothing.
+/// 8. **A named base head no change accounts for.** A row in
+///    `history_base_named_heads` whose naming change is neither retained
+///    nor pruned, or that names a head the installed base does not carry
+///    at its path, buries a live base head for good. (Whether each
+///    retained change's rows match its signed names is checked with its
+///    path effects, in the pass that already decodes it.)
 ///
 /// Check 2 is the one that matters most and the one an earlier version of
 /// this function got wrong. It anchored on `group_heads` instead --
@@ -1390,7 +1492,7 @@ fn retained_changes_in_topological_order(
 /// canonical history is both simpler and the only answer certainly right.
 pub(crate) fn groups_needing_rebuild(conn: &Connection) -> Result<Vec<String>, SyncSqliteError> {
     let mut groups: Vec<String> = Vec::new();
-    let mut note = |group_id: String, groups: &mut Vec<String>| {
+    let note = |group_id: String, groups: &mut Vec<String>| {
         if !groups.contains(&group_id) {
             groups.push(group_id);
         }
@@ -1426,6 +1528,8 @@ pub(crate) fn groups_needing_rebuild(conn: &Connection) -> Result<Vec<String>, S
         "SELECT DISTINCT o.group_id FROM change_causal_order o \
          WHERE o.admission_ord >= COALESCE( \
              (SELECT g.next_ord FROM group_admission_ord g WHERE g.group_id = o.group_id), 0)",
+        // 8. A named base head no retained or pruned change accounts for.
+        super::observed_base_heads::UNACCOUNTED_NAMING_SQL,
     ] {
         let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;

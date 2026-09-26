@@ -458,30 +458,8 @@ impl BlockIndex {
                             ],
                         )?;
                     }
-                    let mut inserted_blocks = 0i64;
-                    let mut inserted_payload = 0i64;
-                    let mut inserted_record = 0i64;
-                    {
-                        let mut stmt = tx.prepare_cached(
-                            "INSERT OR IGNORE INTO blocks (hash, segment_id, record_offset, \
-                             payload_len, record_len, added_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                        )?;
-                        for block in &append.blocks {
-                            let changed = stmt.execute(rusqlite::params![
-                                &block.hash[..],
-                                append.segment_id as i64,
-                                block.record_offset as i64,
-                                block.payload_len as i64,
-                                block.record_len as i64,
-                                block.added_at_nanos,
-                            ])?;
-                            if changed == 1 {
-                                inserted_blocks += 1;
-                                inserted_payload += i64::from(block.payload_len);
-                                inserted_record += block.record_len as i64;
-                            }
-                        }
-                    }
+                    let (inserted_blocks, inserted_payload, inserted_record) =
+                        Self::insert_new_blocks(tx, append)?;
                     tx.execute(
                         "UPDATE segments SET durable_end = ?2, \
                          live_blocks = live_blocks + ?3, \
@@ -508,6 +486,86 @@ impl BlockIndex {
                 Ok(())
             })
             .map_err(to_storage)
+    }
+
+    /// Inserts one append's block rows, returning how many blocks and
+    /// payload/record bytes actually inserted (an already-mapped hash keeps
+    /// its existing location and is not counted).
+    fn insert_new_blocks(
+        tx: &rusqlite::Transaction<'_>,
+        append: &SegmentAppend,
+    ) -> rusqlite::Result<(i64, i64, i64)> {
+        let mut inserted_blocks = 0i64;
+        let mut inserted_payload = 0i64;
+        let mut inserted_record = 0i64;
+        let mut stmt = tx.prepare_cached(
+            "INSERT OR IGNORE INTO blocks (hash, segment_id, record_offset, \
+             payload_len, record_len, added_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        for block in &append.blocks {
+            let changed = stmt.execute(rusqlite::params![
+                &block.hash[..],
+                append.segment_id as i64,
+                block.record_offset as i64,
+                block.payload_len as i64,
+                block.record_len as i64,
+                block.added_at_nanos,
+            ])?;
+            if changed == 1 {
+                inserted_blocks += 1;
+                inserted_payload += i64::from(block.payload_len);
+                inserted_record += block.record_len as i64;
+            }
+        }
+        Ok((inserted_blocks, inserted_payload, inserted_record))
+    }
+
+    /// Re-points one relocation append's hashes at their new copies and
+    /// debits each source segment, returning how many blocks and
+    /// payload/record bytes actually moved.
+    fn repoint_relocated_blocks(
+        tx: &rusqlite::Transaction<'_>,
+        append: &SegmentAppend,
+    ) -> rusqlite::Result<(i64, i64, i64)> {
+        let mut moved_blocks = 0i64;
+        let mut moved_payload = 0i64;
+        let mut moved_record = 0i64;
+        let mut debit = tx.prepare_cached(
+            "UPDATE segments SET live_blocks = live_blocks - 1, \
+             live_payload_bytes = live_payload_bytes - ?2, \
+             live_record_bytes = live_record_bytes - ?3 WHERE segment_id = ?1",
+        )?;
+        let mut repoint = tx.prepare_cached(
+            "UPDATE blocks SET segment_id = ?2, record_offset = ?3 \
+             WHERE hash = ?1 AND segment_id = ?4",
+        )?;
+        let mut source_of = tx.prepare_cached("SELECT segment_id FROM blocks WHERE hash = ?1")?;
+        for block in &append.blocks {
+            // Re-read the source under this transaction rather than trusting
+            // the snapshot the copy was planned from: a delete that landed in
+            // between must win, and moving a mapping that no longer exists
+            // must be a no-op, not a resurrection.
+            let source: Option<i64> =
+                source_of.query_row([&block.hash[..]], |row| row.get(0)).optional()?;
+            let Some(source) = source else { continue };
+            let changed = repoint.execute(rusqlite::params![
+                &block.hash[..],
+                append.segment_id as i64,
+                block.record_offset as i64,
+                source,
+            ])?;
+            if changed == 1 {
+                debit.execute(rusqlite::params![
+                    source,
+                    i64::from(block.payload_len),
+                    block.record_len as i64,
+                ])?;
+                moved_blocks += 1;
+                moved_payload += i64::from(block.payload_len);
+                moved_record += block.record_len as i64;
+            }
+        }
+        Ok((moved_blocks, moved_payload, moved_record))
     }
 
     /// Re-points a set of hashes at freshly appended copies, and debits the
@@ -549,50 +607,8 @@ impl BlockIndex {
                             ],
                         )?;
                     }
-                    let mut moved_blocks = 0i64;
-                    let mut moved_payload = 0i64;
-                    let mut moved_record = 0i64;
-                    {
-                        let mut debit = tx.prepare_cached(
-                            "UPDATE segments SET live_blocks = live_blocks - 1, \
-                             live_payload_bytes = live_payload_bytes - ?2, \
-                             live_record_bytes = live_record_bytes - ?3 WHERE segment_id = ?1",
-                        )?;
-                        let mut repoint = tx.prepare_cached(
-                            "UPDATE blocks SET segment_id = ?2, record_offset = ?3 \
-                             WHERE hash = ?1 AND segment_id = ?4",
-                        )?;
-                        let mut source_of =
-                            tx.prepare_cached("SELECT segment_id FROM blocks WHERE hash = ?1")?;
-                        for block in &append.blocks {
-                            // Re-read the source under this transaction
-                            // rather than trusting the snapshot the copy
-                            // was planned from: a delete that landed in
-                            // between must win, and moving a mapping that
-                            // no longer exists must be a no-op, not a
-                            // resurrection.
-                            let source: Option<i64> = source_of
-                                .query_row([&block.hash[..]], |row| row.get(0))
-                                .optional()?;
-                            let Some(source) = source else { continue };
-                            let changed = repoint.execute(rusqlite::params![
-                                &block.hash[..],
-                                append.segment_id as i64,
-                                block.record_offset as i64,
-                                source,
-                            ])?;
-                            if changed == 1 {
-                                debit.execute(rusqlite::params![
-                                    source,
-                                    i64::from(block.payload_len),
-                                    block.record_len as i64,
-                                ])?;
-                                moved_blocks += 1;
-                                moved_payload += i64::from(block.payload_len);
-                                moved_record += block.record_len as i64;
-                            }
-                        }
-                    }
+                    let (moved_blocks, moved_payload, moved_record) =
+                        Self::repoint_relocated_blocks(tx, append)?;
                     tx.execute(
                         "UPDATE segments SET durable_end = ?2, \
                          live_blocks = live_blocks + ?3, \
@@ -768,7 +784,7 @@ impl BlockIndex {
                 Ok::<_, DatabaseError>(rows)
             })
             .map_err(to_storage)?;
-        Ok(rows.into_iter().map(|raw| hex::encode(raw)).collect())
+        Ok(rows.into_iter().map(hex::encode).collect())
     }
 
     /// Aggregate accounting, computed from the segment rows -- `O(number

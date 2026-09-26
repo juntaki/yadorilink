@@ -178,18 +178,15 @@ pub struct TransportHub {
     local_addr: SocketAddr,
     registry: Arc<DemuxRegistry>,
     recv_tasks: Vec<tokio::task::JoinHandle<()>>,
-    /// Raw UDP payload byte counters for this hub's bound socket(s) —
-    /// every datagram this hub sends or receives, regardless of whether the
-    /// demux ultimately routes it to a channel or drops it. Exists for a
-    /// benchmark harness's "wire bytes" metric, which needs a ground truth
-    /// the harness cannot observe itself; nothing in production reads
-    /// these today.
+    /// Raw UDP payload byte counter for this hub's bound socket(s) --
+    /// every datagram this hub sends. Exists for a benchmark harness's
+    /// "wire bytes" metric, which needs a ground truth the harness cannot
+    /// observe itself; nothing in production reads it today. The receive
+    /// side's counterparts are owned by the recv tasks.
     tx_bytes: Arc<AtomicU64>,
-    rx_bytes: Arc<AtomicU64>,
-    /// Datagram counts alongside the byte counters above, for a
+    /// Datagram count alongside the byte counter above, for a
     /// packets/sec metric.
     tx_packets: Arc<AtomicU64>,
-    rx_packets: Arc<AtomicU64>,
     /// Which carriers most recently refused a datagram -- see the `CARRIER_*`
     /// bits.
     ///
@@ -315,9 +312,7 @@ impl TransportHub {
             registry,
             recv_tasks,
             tx_bytes,
-            rx_bytes,
             tx_packets,
-            rx_packets,
             #[cfg(not(turmoil))]
             blocked_carriers: AtomicU8::new(0),
         })

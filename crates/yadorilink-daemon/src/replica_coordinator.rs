@@ -49,6 +49,8 @@ pub(crate) use materialization_execution::set_test_windows_dehydrate_confirmed_f
 // directly, without its entry CAS, to simulate an attempt in flight.
 #[cfg(test)]
 pub(crate) use materialization_owner::AccessHydration;
+// Test-only: the ordinary-batch directory-lane tests age an intent past it.
+#[cfg(test)]
 pub(crate) use materialization_owner::STALE_STRUCTURAL_INTENT_AGE;
 
 use std::sync::{Arc, Mutex};

@@ -67,9 +67,12 @@ async fn test_peer_mesh_unifies_every_historical_member_onto_one_authority() {
     let mesh = support::TestPeerMesh::new().await;
     // Two "separate" pairs, then a bridge -- all on the SAME mesh, so there
     // is only ever one authority to begin with.
-    mesh.connect(&a.state, &a.device_id, &b.state, &b.device_id, &[group_id.clone()]).await;
-    mesh.connect(&c.state, &c.device_id, &d.state, &d.device_id, &[group_id.clone()]).await;
-    mesh.connect(&b.state, &b.device_id, &c.state, &c.device_id, &[group_id.clone()]).await;
+    mesh.connect(&a.state, &a.device_id, &b.state, &b.device_id, std::slice::from_ref(&group_id))
+        .await;
+    mesh.connect(&c.state, &c.device_id, &d.state, &d.device_id, std::slice::from_ref(&group_id))
+        .await;
+    mesh.connect(&b.state, &b.device_id, &c.state, &c.device_id, std::slice::from_ref(&group_id))
+        .await;
 
     let addr_a = a.state.coordination_client_config().unwrap().addr.clone();
     let addr_b = b.state.coordination_client_config().unwrap().addr.clone();
@@ -127,7 +130,7 @@ async fn bridging_two_pairs_via_raw_connect_two_daemons_fails_loud() {
         &a.device_id,
         &b.state,
         &b.device_id,
-        &[group_id.clone()],
+        std::slice::from_ref(&group_id),
     )
     .await;
     support::connect_two_daemons(
@@ -135,7 +138,7 @@ async fn bridging_two_pairs_via_raw_connect_two_daemons_fails_loud() {
         &c.device_id,
         &d.state,
         &d.device_id,
-        &[group_id.clone()],
+        std::slice::from_ref(&group_id),
     )
     .await;
     // Bridging call -- must panic rather than silently mis-wire B and C.
