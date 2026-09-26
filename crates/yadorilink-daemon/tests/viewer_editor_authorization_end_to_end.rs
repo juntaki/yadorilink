@@ -337,7 +337,10 @@ async fn pre_existing_content_initial_import_scenario(role: WriterRole, expect_s
         // on why this waits for content, not merely for the path to exist.
         let target = root_a.path().join("pre-existing.txt");
         wait_until(
-            || std::fs::read(&target).ok().as_deref() == Some(b"already on disk before link".as_slice()),
+            || {
+                std::fs::read(&target).ok().as_deref()
+                    == Some(b"already on disk before link".as_slice())
+            },
             Duration::from_secs(40),
         )
         .await;
@@ -465,10 +468,7 @@ async fn editor_downgraded_to_viewer_mid_session_cannot_author_accepted_changes_
         Duration::from_secs(40),
     )
     .await;
-    assert_eq!(
-        std::fs::read(&before_downgrade_target).unwrap(),
-        b"editor edit, pre-downgrade"
-    );
+    assert_eq!(std::fs::read(&before_downgrade_target).unwrap(), b"editor edit, pre-downgrade");
 
     // Snapshot both directions' session objects before the downgrade, to
     // later prove neither daemon reconnected because of it.
@@ -569,7 +569,10 @@ async fn downgraded_devices_pre_downgrade_history_remains_valid_retained_history
     // why this waits for content, not merely for the path to exist.
     let legitimate_target = root_a.path().join("legitimate-before-downgrade.txt");
     wait_until(
-        || std::fs::read(&legitimate_target).ok().as_deref() == Some(b"legitimately authored".as_slice()),
+        || {
+            std::fs::read(&legitimate_target).ok().as_deref()
+                == Some(b"legitimately authored".as_slice())
+        },
         Duration::from_secs(40),
     )
     .await;
@@ -666,7 +669,10 @@ async fn a_downgraded_authors_pre_downgrade_history_still_reaches_a_newly_joined
     // why this waits for content, not merely for the path to exist.
     let relay_target = root_relay.path().join("pre-downgrade.txt");
     wait_until(
-        || std::fs::read(&relay_target).ok().as_deref() == Some(b"authored while an editor".as_slice()),
+        || {
+            std::fs::read(&relay_target).ok().as_deref()
+                == Some(b"authored while an editor".as_slice())
+        },
         Duration::from_secs(40),
     )
     .await;
@@ -728,7 +734,10 @@ async fn a_downgraded_authors_pre_downgrade_history_still_reaches_a_newly_joined
     // this waits for content, not merely for the path to exist.
     let joiner_target = root_joiner.path().join("pre-downgrade.txt");
     wait_until(
-        || std::fs::read(&joiner_target).ok().as_deref() == Some(b"authored while an editor".as_slice()),
+        || {
+            std::fs::read(&joiner_target).ok().as_deref()
+                == Some(b"authored while an editor".as_slice())
+        },
         Duration::from_secs(60),
     )
     .await;

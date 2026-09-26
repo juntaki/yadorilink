@@ -491,7 +491,12 @@ fn stamp_mtime_at_path_actually_changes_disk_mtime() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("f.txt");
     fs::write(&path, b"content").unwrap();
-    let desired = 1_700_000_123_456_789i64;
+    // A multiple of 100: Windows' FILETIME, and therefore `std::fs::
+    // FileTimes`, only has 100ns resolution, so any other value would
+    // round-trip through `stamp_mtime_at_path` as a different number there
+    // and fail the exact-match assertion below for a reason unrelated to
+    // what this test checks.
+    let desired = 1_700_000_123_456_700i64;
 
     assert!(!mtime_already_matches_disk(&path, desired).unwrap());
     stamp_mtime_at_path(&path, desired).unwrap();
