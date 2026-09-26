@@ -47,8 +47,32 @@ async fn start_watch_and_await_scan(state: &Arc<DaemonState>, root: &Path, group
     .expect("the initial scan must succeed");
 }
 
+/// The initial scan this test corrupts the schema under has already
+/// finished (`start_watch_and_await_scan` awaited it), but the watcher it
+/// started keeps running and can still hold a write connection open for a
+/// moment. A DDL statement needs the schema lock exclusively, so it is
+/// retried a few times rather than failing on that ordinary race.
 fn corrupt_schema(state: &Arc<DaemonState>, sql: &str) {
-    state.replica_coordinator.database().pool_for_test().get().unwrap().execute_batch(sql).unwrap();
+    let database = state.replica_coordinator.database();
+    let pool = database.pool_for_test();
+    let mut attempt = 0;
+    loop {
+        let result = pool.get().unwrap().execute_batch(sql);
+        match result {
+            Ok(()) => return,
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if attempt < 20
+                    && matches!(
+                        e.code,
+                        rusqlite::ErrorCode::DatabaseLocked | rusqlite::ErrorCode::DatabaseBusy
+                    ) =>
+            {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => panic!("corrupt_schema: {e}"),
+        }
+    }
 }
 
 async fn list_folder_files(state: &Arc<DaemonState>, local_path: &str) -> ListFolderFilesResponse {
