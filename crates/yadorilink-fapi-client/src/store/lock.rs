@@ -71,6 +71,27 @@ impl Drop for CredentialLock {
     }
 }
 
+/// On Windows, `fs2` reports a contended lock as the raw `ERROR_LOCK_VIOLATION`
+/// (33) OS error rather than as `io::ErrorKind::WouldBlock` -- std's Windows
+/// error-code mapping does not classify it as `WouldBlock`, so it otherwise
+/// reads as a real I/O failure. Recognizing it here is what makes the retry
+/// loop below retry on Windows instead of bailing out on the first
+/// collision with another process, which is the ordinary case this lock
+/// exists to handle.
+#[cfg(windows)]
+const ERROR_LOCK_VIOLATION: i32 = 33;
+
+fn is_contended(e: &std::io::Error) -> bool {
+    if e.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+    #[cfg(windows)]
+    if e.raw_os_error() == Some(ERROR_LOCK_VIOLATION) {
+        return true;
+    }
+    false
+}
+
 pub(super) async fn acquire(path: &Path, timeout: Duration) -> StoreResult<CredentialLock> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)
@@ -81,7 +102,7 @@ pub(super) async fn acquire(path: &Path, timeout: Duration) -> StoreResult<Crede
     loop {
         match file.try_lock_exclusive() {
             Ok(()) => return Ok(CredentialLock { file, path: path.to_path_buf() }),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) if is_contended(&e) => {}
             Err(source) => return Err(StoreError::Io { path: path.to_path_buf(), source }),
         }
         if Instant::now() >= deadline {
