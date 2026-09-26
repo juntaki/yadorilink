@@ -88,7 +88,10 @@ const CONVERGENCE_BOUND: Duration = Duration::from_secs(60);
 // content converges to `AtRisk`) is ever exercised. That fail-closed behavior is
 // the correct production answer on Windows and must not be weakened to pass
 // this test; giving it a real CfAPI double is future work, not attempted here.
-#[cfg_attr(windows, ignore = "needs a CfAPI placeholder-identity test double; see the comment above")]
+#[cfg_attr(
+    windows,
+    ignore = "needs a CfAPI placeholder-identity test double; see the comment above"
+)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn unobtainable_content_converges_to_at_risk_not_stuck_protecting() {
     init_tracing();
