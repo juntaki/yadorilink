@@ -564,7 +564,7 @@ def ignored_runner_dead_entries(runner_text: str) -> list[str]:
         # A leading environment assignment is part of the convention
         # (`RUSTFLAGS="--cfg turmoil" run_exact_ignored ...`), and an entry
         # carrying one must not slip past this check unread.
-        r"^\s*(?:\w+=(?:\"[^\"]*\"|'[^']*'|\S*)\s+)*"
+        r"^\s*(?:\w+=(?:\"[^\"]*\"|'[^']*'|[^\s\"']*)\s+)*"
         r"run_exact_ignored\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)",
         joined,
         re.MULTILINE,
