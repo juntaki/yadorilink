@@ -562,7 +562,11 @@ impl FileIdentity {
             generation_or_usn,
             birth_or_creation_time,
             observed_size: metadata.len(),
-            metadata_fingerprint: fingerprint_windows(metadata, object_kind),
+            metadata_fingerprint: fingerprint_windows(
+                metadata,
+                object_kind,
+                platform_fields.change_time,
+            ),
             // `platform_fields` came from a single `GetFileInformationByHandle`
             // call that either populated every field it reports or failed
             // outright (see [`win_identity::query_path`]/[`query_handle`]) —
@@ -1381,8 +1385,19 @@ fn fingerprint_unix(metadata: &Metadata, object_kind: ObjectKind) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// `change_time` is `win_identity::IdentityFields::change_time` -- see its
+/// own doc for why it is folded in here (the race-freshness fingerprint)
+/// and nowhere near `FileIdentity::compare`. Bumped into the fingerprint
+/// as a `v2` domain tag: a `v1`-fingerprinted observation and a
+/// `v2`-fingerprinted re-observation of the identical, untouched file must
+/// still compare unequal, or a build straddling this change would silently
+/// treat every untouched file as "raced" on its first re-check.
 #[cfg(windows)]
-fn fingerprint_windows(metadata: &Metadata, object_kind: ObjectKind) -> [u8; 32] {
+fn fingerprint_windows(
+    metadata: &Metadata,
+    object_kind: ObjectKind,
+    change_time: Option<i64>,
+) -> [u8; 32] {
     use std::os::windows::fs::MetadataExt;
 
     let mut hasher = Sha256::new();
@@ -1391,17 +1406,31 @@ fn fingerprint_windows(metadata: &Metadata, object_kind: ObjectKind) -> [u8; 32]
         // entries, not the directory itself. Its attributes are what is
         // left of its own state. (The object id is compared separately by
         // `FileIdentity::compare`; `std` exposes no stable file index to
-        // fold in here.)
-        hasher.update(b"yadorilink-fs-identity-directory-fingerprint-v1");
+        // fold in here.) `change_time` is excluded for the same reason:
+        // NTFS bumps a directory's own `ChangeTime` when an entry inside
+        // it is added, removed or renamed, exactly the child traffic this
+        // branch already excludes `last_write_time` to avoid.
+        hasher.update(b"yadorilink-fs-identity-directory-fingerprint-v2");
         hasher.update([u8_repr(object_kind)]);
         hasher.update(metadata.file_attributes().to_le_bytes());
         return hasher.finalize().into();
     }
-    hasher.update(b"yadorilink-fs-identity-fingerprint-v1");
+    hasher.update(b"yadorilink-fs-identity-fingerprint-v2");
     hasher.update([u8_repr(object_kind)]);
     hasher.update(metadata.len().to_le_bytes());
     hasher.update(metadata.file_attributes().to_le_bytes());
     hasher.update(metadata.last_write_time().to_le_bytes());
+    // `None` (the query failed) is its own distinct byte pattern, not
+    // silently folded into value `0` -- an `i64::from(0)` is a real,
+    // reachable `ChangeTime` (1601-01-01) that must not collide with "this
+    // build could not read one".
+    match change_time {
+        Some(value) => {
+            hasher.update([1u8]);
+            hasher.update(value.to_le_bytes());
+        }
+        None => hasher.update([0u8]),
+    }
     hasher.finalize().into()
 }
 
@@ -1467,6 +1496,25 @@ mod win_identity {
         file_id: [u8; 16],
     }
 
+    /// Layout-compatible with Win32's `FILE_BASIC_INFO`, the payload
+    /// `GetFileInformationByHandleEx` fills when called with the
+    /// `FileBasicInfo` class (`0x0`). `change_time` is the field this
+    /// struct exists for: NTFS bumps it on every metadata-affecting
+    /// change to the file, INCLUDING an in-place content overwrite that
+    /// otherwise restores `last_write_time` exactly -- the same role
+    /// Unix `ctime` plays for [`fingerprint_unix`](super::fingerprint_unix),
+    /// and unlike `last_write_time`, which `SetFileTime` lets a writer put
+    /// back. All four times are `i64` 100ns-since-1601 FILETIMEs, not the
+    /// two-`u32`-halves `FileTime` layout `ByHandleFileInformation` uses.
+    #[repr(C)]
+    struct FileBasicInfo {
+        creation_time: i64,
+        last_access_time: i64,
+        last_write_time: i64,
+        change_time: i64,
+        file_attributes: u32,
+    }
+
     #[link(name = "kernel32")]
     extern "system" {
         fn CreateFileW(
@@ -1519,6 +1567,8 @@ mod win_identity {
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     /// `FILE_INFO_BY_HANDLE_CLASS::FileIdInfo`.
     const FILE_ID_INFO_CLASS: u32 = 0x12;
+    /// `FILE_INFO_BY_HANDLE_CLASS::FileBasicInfo`.
+    const FILE_BASIC_INFO_CLASS: u32 = 0x0;
 
     /// The object-id half of a `GetFileInformationByHandle`(`Ex`) query,
     /// kept as an enum rather than an `Option<[u8; 16]>` bolted onto a flat
@@ -1563,6 +1613,14 @@ mod win_identity {
     pub(super) struct IdentityFields {
         pub(super) object_id: ObjectIdFields,
         pub(super) number_of_links: u32,
+        /// The raw `FILE_BASIC_INFO::ChangeTime` FILETIME, or `None` when
+        /// that query itself failed -- unlike `object_id`/`number_of_links`,
+        /// this does not fail the whole observation: it feeds only the
+        /// race-freshness fingerprint (`fingerprint_windows`), never
+        /// `FileIdentity::compare`'s reuse-safety judgment, so degrading to
+        /// "this observation cannot see a same-mtime in-place overwrite"
+        /// is the right failure mode, not losing the observation outright.
+        pub(super) change_time: Option<i64>,
     }
 
     /// Deliberately NOT cached, even keyed by `FILE_ID_INFO::
@@ -1739,7 +1797,27 @@ mod win_identity {
             }
         };
 
-        Ok(IdentityFields { object_id, number_of_links })
+        // Best-effort, on the same already-open handle those two calls
+        // above already paid for: a third `GetFileInformationByHandleEx`
+        // class, `FileBasicInfo`, for `ChangeTime` alone. Its failure
+        // (unsupported filesystem, or any other reason) degrades to
+        // `None` rather than failing this observation -- see `change_time`'s
+        // own doc on why.
+        let mut basic_info: FileBasicInfo = unsafe { std::mem::zeroed() };
+        // SAFETY: `handle` is the same valid, open file handle as above;
+        // `basic_info` is a valid out-parameter matching `FILE_BASIC_INFO`'s
+        // layout and size for the `FileBasicInfo` information class.
+        let basic_ok = unsafe {
+            GetFileInformationByHandleEx(
+                handle,
+                FILE_BASIC_INFO_CLASS,
+                (&mut basic_info as *mut FileBasicInfo).cast::<c_void>(),
+                std::mem::size_of::<FileBasicInfo>() as u32,
+            )
+        };
+        let change_time = (basic_ok != 0).then_some(basic_info.change_time);
+
+        Ok(IdentityFields { object_id, number_of_links, change_time })
     }
 
     /// Queries identity fields from an already-open handle. Preferred
