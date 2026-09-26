@@ -1125,6 +1125,13 @@ public struct ConflictSummary: Equatable, Hashable {
     public var conflictTimestamp: String?
     public var kind: EntryKind
     public var reason: ConflictReason
+    /**
+     * The folder's history compaction is waiting for this conflict to be
+     * resolved. The copy and the file it conflicts with hold two versions
+     * written by one device, which compaction cannot carry; sync goes on,
+     * and deleting or editing the copy resolves it.
+     */
+    public var holdsCompaction: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -1137,7 +1144,13 @@ public struct ConflictSummary: Equatable, Hashable {
          */path: String, size: UInt64, modifiedAt: Date?, 
         /**
          * The file the copy conflicts with, relative to the root.
-         */currentPath: String, loserDeviceId: String?, conflictTimestamp: String?, kind: EntryKind, reason: ConflictReason) {
+         */currentPath: String, loserDeviceId: String?, conflictTimestamp: String?, kind: EntryKind, reason: ConflictReason, 
+        /**
+         * The folder's history compaction is waiting for this conflict to be
+         * resolved. The copy and the file it conflicts with hold two versions
+         * written by one device, which compaction cannot carry; sync goes on,
+         * and deleting or editing the copy resolves it.
+         */holdsCompaction: Bool) {
         self.localPath = localPath
         self.path = path
         self.size = size
@@ -1147,6 +1160,7 @@ public struct ConflictSummary: Equatable, Hashable {
         self.conflictTimestamp = conflictTimestamp
         self.kind = kind
         self.reason = reason
+        self.holdsCompaction = holdsCompaction
     }
 
     
@@ -1173,7 +1187,8 @@ public struct FfiConverterTypeConflictSummary: FfiConverterRustBuffer {
                 loserDeviceId: FfiConverterOptionString.read(from: &buf), 
                 conflictTimestamp: FfiConverterOptionString.read(from: &buf), 
                 kind: FfiConverterTypeEntryKind.read(from: &buf), 
-                reason: FfiConverterTypeConflictReason.read(from: &buf)
+                reason: FfiConverterTypeConflictReason.read(from: &buf), 
+                holdsCompaction: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -1187,6 +1202,7 @@ public struct FfiConverterTypeConflictSummary: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.conflictTimestamp, into: &buf)
         FfiConverterTypeEntryKind.write(value.kind, into: &buf)
         FfiConverterTypeConflictReason.write(value.reason, into: &buf)
+        FfiConverterBool.write(value.holdsCompaction, into: &buf)
     }
 }
 

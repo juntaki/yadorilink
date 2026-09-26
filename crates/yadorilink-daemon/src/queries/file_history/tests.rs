@@ -62,3 +62,38 @@ fn a_conflict_copy_names_a_folder_at_its_source_path() {
     )));
     assert_eq!(reasons.len(), 3, "{reasons:?}");
 }
+
+/// A copy says the folder's compaction waits for it only when the version
+/// it holds is one of two live versions by one device at its source path
+/// (`rebootstrap_store::copy_holds_compaction`, which the sync-sqlite
+/// reference-model tests drive through a real fork). A hold recorded for a
+/// path whose fork is gone -- here, a path with no live heads at all --
+/// marks none of its copies.
+#[test]
+fn a_hold_whose_fork_is_gone_marks_no_conflict_copy() {
+    let coordinator = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
+    coordinator.link_repository().add_link("/home/alice/Photos", "group-1").unwrap();
+    upsert(&coordinator, "notes.txt");
+    upsert(&coordinator, "notes (conflicted copy, 2026-01-01-000000, device-b).txt");
+    upsert(&coordinator, "plan.txt");
+    upsert(&coordinator, "plan (conflicted copy, 2026-01-01-000000, device-b).txt");
+    coordinator
+        .database()
+        .write::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+            conn.execute(
+                "INSERT INTO compaction_holds (group_id, path, live_heads) \
+                 VALUES ('group-1', 'notes.txt', x'')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let service = FileHistoryQueryService::new(
+        coordinator.clone(),
+        Arc::new(LinkedPathResolver::new(coordinator.clone())),
+    );
+    let conflicts = service.list_conflicts().unwrap();
+    assert_eq!(conflicts.len(), 2, "{conflicts:?}");
+    assert!(conflicts.iter().all(|c| !c.holds_compaction), "{conflicts:?}");
+}

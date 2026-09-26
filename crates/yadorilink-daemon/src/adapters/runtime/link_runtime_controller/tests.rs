@@ -614,19 +614,21 @@ async fn an_ambiguous_group_is_refused_a_watcher_while_healthy_groups_still_star
 /// enormous (thousands of reschedules vs. essentially none) regardless
 /// of host OS, CPU speed, or machine load.
 ///
-/// The fixture is directories, not files, deliberately. The link's initial
-/// scan captures each directory as an explicit entry of its own, so the
-/// add-only backstop skips every one as already indexed and the whole tree
-/// walk is work that stays on the caller: `local_change.rs`'s own
-/// `run_capture_pass_off_worker` covers the per-file chunk/verify passes,
-/// which a directory never reaches, so a file-based fixture would measure
-/// that offload rather than this one.
+/// The fixture is directories, not files, deliberately:
+/// `local_change.rs`'s own `run_capture_pass_off_worker` covers the
+/// per-file chunk/verify passes, which a directory never reaches, so a
+/// file-based fixture would measure that offload rather than this one.
 ///
-/// The group has a policy so those directory entries commit in the
-/// initial scan. Without one, the scan withholds all of them into the
-/// dirty journal, whose 5-second re-drive then re-captures every one of
-/// them on this same single worker, starving the counter whether or not
-/// the sweep is offloaded.
+/// The group has no policy, so the initial scan withholds every directory
+/// entry into the dirty journal and the sweep finds all 10,200 of them
+/// unindexed. The dirty journal's periodic re-drive must leave those rows
+/// alone while the policy is unavailable: re-capturing every one of them on
+/// this same single worker would starve the counter whether or not the
+/// sweep is offloaded. This test does not wait for a re-drive tick, so it
+/// only catches a regression there when a tick lands inside the measured
+/// sweep; the deterministic guard for that gate is
+/// `redrive_leaves_withheld_paths_untouched_until_the_policy_arrives` in
+/// `yadorilink-local-capture`'s `local_change` tests.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn the_disk_reconcile_backstop_sweep_does_not_hold_the_worker_that_polls_it() {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -634,7 +636,6 @@ async fn the_disk_reconcile_backstop_sweep_does_not_hold_the_worker_that_polls_i
     let state = test_state();
     let root = tempfile::tempdir().unwrap();
     let group = "group-1";
-    state.authority.install_test_group_policy_bootstrap(group);
     for outer in 0..200 {
         let dir = root.path().join(format!("d{outer}"));
         std::fs::create_dir(&dir).unwrap();

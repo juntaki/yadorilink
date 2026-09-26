@@ -225,6 +225,10 @@ mod frontier_freshness_tests;
 /// `IGNORE_SET_REFRESH_INTERVAL`, so this stays fast and deterministic.
 #[cfg(test)]
 mod ignore_set_liveness_tests;
+/// Settling what an installed base leaves at a path with no head in
+/// `Gamma` (P9-B).
+#[cfg(test)]
+mod installed_base_settle_tests;
 mod namespace_steps;
 mod reconcile;
 
@@ -397,6 +401,31 @@ impl LocalConvergenceExecutor {
         let canonical = std::fs::canonicalize(raw_root).ok()?;
         cache.insert(group_id.to_string(), (raw_root.to_path_buf(), canonical.clone()));
         Some(canonical)
+    }
+
+    /// Whether `path`, which has no head in `Gamma`, is settled absent: the
+    /// group stands on an installed base, the index holds no live row at
+    /// the path, and nothing is on disk there. Without a base, no heads
+    /// means this device's history may simply be behind, and nothing is
+    /// claimed.
+    pub(crate) fn absent_under_installed_base(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<bool, PeerSessionError> {
+        let base = self
+            .state
+            .rebootstrap_store_repository()
+            .history_base(group_id)
+            .map_err(crate::sync_error::SyncError::from)
+            .map_err(PeerSessionError::from)?;
+        if base.is_none() {
+            return Ok(false);
+        }
+        if self.state.get_file(group_id, path)?.is_some_and(|row| !row.deleted) {
+            return Ok(false);
+        }
+        self.observably_absent_on_disk(group_id, path)
     }
 
     /// Where `path` lives on this device's disk for `group_id`.
@@ -1440,7 +1469,10 @@ impl LocalConvergenceExecutor {
         group_id: &str,
         path: &str,
     ) -> Result<Vec<PathHead>, PeerSessionError> {
-        self.state.dag_path_live_heads(group_id, path)
+        // `Gamma`'s heads, not the path frontier's alone: after an epoch
+        // reset a path nothing on the new base has touched is carried only
+        // by the installed base, and its row is that base's.
+        self.state.dag_path_gamma_heads(group_id, path)
     }
 
     /// The conflict-copy paths `path`'s own resolution derives right now.

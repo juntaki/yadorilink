@@ -65,6 +65,29 @@ pub struct Case {
     /// entries deserialize unchanged (serde default) and replay identically.
     #[serde(default)]
     pub fault_plan: FaultPlan,
+    /// History-epoch steps (seal, foreign-base merge) as `(round, step)`, in
+    /// the same round counter as `DeviceTimeline::ops`. Not an `Op`: neither
+    /// is a filesystem action, and every `Op` consumer (applier, models,
+    /// generators) would otherwise need an arm for something it cannot
+    /// perform. Empty for every scenario that does not drive history
+    /// compaction, so older corpus entries deserialize unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history_steps: Vec<(u64, HistoryStep)>,
+}
+
+/// A history-compaction step a scenario drives explicitly.
+///
+/// Compaction is not scheduled in production yet
+/// (`COMPACTION_SCHEDULING_READY` is false), so nothing seals or merges on
+/// its own: a scenario that wants an epoch reset has to ask for one, at a
+/// point the `Case` records.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HistoryStep {
+    /// `device` seals its group's history into a new history base.
+    Seal { device: usize },
+    /// `into` merges the base `from` stands on into its own history, sealing
+    /// either side that holds history above its base first.
+    Merge { into: usize, from: usize },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -294,6 +317,7 @@ mod tests {
             fault_schedule: Vec::new(),
             content_table,
             fault_plan: FaultPlan::default(),
+            history_steps: Vec::new(),
         };
 
         let json = serde_json::to_string(&case).unwrap();
@@ -317,5 +341,26 @@ mod tests {
         }"#;
         let restored: Case = serde_json::from_str(json).unwrap();
         assert_eq!(restored.fault_plan, FaultPlan::default());
+        assert!(restored.history_steps.is_empty());
+    }
+
+    /// History steps survive a round trip, and a case without any leaves the
+    /// key out, so a scenario that never seals writes the corpus line it
+    /// wrote before the field existed.
+    #[test]
+    fn history_steps_round_trip_and_stay_out_of_cases_without_them() {
+        let mut case: Case = serde_json::from_str(
+            r#"{"seed": 7, "topology": {"device_count": 2, "links": []}, "workload": [],
+                "fault_schedule": [], "content_table": {"entries": {}}}"#,
+        )
+        .unwrap();
+        assert!(!serde_json::to_string(&case).unwrap().contains("history_steps"));
+
+        case.history_steps = vec![
+            (3, HistoryStep::Seal { device: 1 }),
+            (5, HistoryStep::Merge { into: 0, from: 1 }),
+        ];
+        let restored: Case = serde_json::from_str(&serde_json::to_string(&case).unwrap()).unwrap();
+        assert_eq!(restored.history_steps, case.history_steps);
     }
 }

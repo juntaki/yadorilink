@@ -107,6 +107,7 @@ pub async fn conflicts(State(state): State<AppState>) -> Result<Json<Value>, Api
                 "mtime_unix_nanos": f.mtime_unix_nanos,
                 "kind": f.kind().as_str_name(),
                 "reason": f.reason().as_str_name(),
+                "holds_compaction": f.holds_compaction,
             })
         })
         .collect();

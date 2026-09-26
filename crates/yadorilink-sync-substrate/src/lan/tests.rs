@@ -9,8 +9,6 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use iroh::address_lookup::AddressLookup as _;
-
 use super::*;
 use crate::directory::DirectoryLookup;
 use crate::testing::SharedAddressBook;

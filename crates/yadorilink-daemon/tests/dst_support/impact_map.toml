@@ -260,3 +260,11 @@ dst_directory_move_edit_race = { oracles = [], first_divergence = false }
 # catch-up. Drives its own terminal convergence assertion rather than a `check_*`
 # oracle, so no ViolationKind is listed.
 dst_dag_catchup_chaos = { oracles = [], first_divergence = false }
+# Three full stacks on a simulated carrier: seals and foreign-base merges
+# driven by the harness while devices are partitioned, with directory ops
+# (rm -rf, directory rename, shape conflicts, write-through of a relocated
+# copy). Oracles are its own (see the scenario's module doc): one base, one
+# Gamma, one tree, disk == project(Gamma), no content loss under the
+# observed-supersession rule, no corruption, bounded metadata after a final
+# seal, no stuck seal or install hold.
+dst_history_epoch_chaos = { oracles = ["Convergence", "NoLoss", "Corruption"], first_divergence = false }

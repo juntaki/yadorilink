@@ -68,6 +68,30 @@ jobs:
           build-mode: manual
       - name: Build FinderSync host app + extension
         run: DEVELOPER_DIR="$(xcode-select -p)" ./shell-ext/macos/YadoriLinkFinderSync/build.sh
+      # The tracer does reach the Swift extractor for both swiftc compiles (it
+      # writes one diagnostics file per failing extraction), but finalize then
+      # reports that nothing was extracted, and the failed-run SARIF it uploads
+      # cannot be downloaded. Print what the extractor said, so a failure here
+      # names its cause in the job log.
+      - name: Show Swift extractor diagnostics
+        if: always()
+        env:
+          DB: ${{ runner.temp }}/codeql_databases/swift
+        run: |
+          for f in "$DB"/diagnostic/extractors/swift/extractor/*.jsonl; do
+            [ -f "$f" ] || continue
+            echo "::group::$f"
+            head -c 20000 "$f"
+            echo
+            echo "::endgroup::"
+          done
+          if [ -d "$DB/log" ]; then
+            find "$DB/log" -type f -print0 | while IFS= read -r -d '' f; do
+              echo "::group::$f"
+              grep -iE 'error|fatal|unsupported|fail' "$f" | head -n 200 || true
+              echo "::endgroup::"
+            done
+          fi
       - uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
         with:
           category: "/language:swift"

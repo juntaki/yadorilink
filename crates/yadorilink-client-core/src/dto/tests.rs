@@ -343,9 +343,11 @@ fn conflict_summary_names_the_file_it_conflicts_with() {
         mtime_unix_nanos: 0,
         kind: 0,
         reason: 0,
+        holds_compaction: false,
     });
     assert_eq!(summary.current_path, "notes.txt");
     assert_eq!(summary.reason, ConflictReason::ConcurrentEdit);
+    assert!(!summary.holds_compaction);
     assert_eq!(summary.size, 0);
     assert_eq!(summary.modified_at, None);
     assert_eq!(summary.loser_device_id, None);
@@ -766,4 +768,20 @@ fn conflict_summary_says_when_a_folder_took_the_name() {
     });
     assert_eq!(summary.current_path, "album");
     assert_eq!(summary.reason, ConflictReason::FolderAtPath);
+}
+
+/// A conflict the folder's history compaction is waiting on says so, and
+/// is otherwise an ordinary conflict: no separate kind of entry, no
+/// different reason.
+#[test]
+fn conflict_summary_says_when_compaction_waits_for_it() {
+    let summary = conflict_summary(&ConflictedFileInfo {
+        local_path: "/f/Docs".into(),
+        path: "notes (conflicted copy, 2026-01-01-000000, device-b).txt".into(),
+        holds_compaction: true,
+        ..Default::default()
+    });
+    assert_eq!(summary.current_path, "notes.txt");
+    assert_eq!(summary.reason, ConflictReason::ConcurrentEdit);
+    assert!(summary.holds_compaction);
 }

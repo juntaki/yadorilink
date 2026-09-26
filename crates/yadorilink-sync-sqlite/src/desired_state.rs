@@ -25,7 +25,8 @@ use yadorilink_replica_engine::namespace::{
 };
 
 use crate::dag_store::{
-    get_file_version, has_live_descendant, live_heads_at_level, live_heads_by_path, live_path_heads,
+    gamma_has_live_descendant, gamma_heads_at_level, gamma_heads_by_path, get_file_version,
+    path_gamma_heads,
 };
 use crate::error::SyncSqliteError;
 use crate::materialized_generation::{compute_resolved_path_state_hash, MaterializedObjectKind};
@@ -168,9 +169,10 @@ impl DesiredPathState {
     }
 }
 
-/// What `path` is required to be on its own account, read from the
-/// current path frontier: its live heads, and whether anything strictly
-/// below it holds a live content head.
+/// What `path` is required to be on its own account, read from `Gamma`
+/// (the path frontier, and the installed base's heads of every path nothing
+/// written on the base has touched): its heads, and whether anything
+/// strictly below it holds a live content head.
 ///
 /// Own account only: a path that is only the copy name of another path's
 /// relocated or conflict-copy entry reads [`DesiredPathState::Absent`]
@@ -195,7 +197,7 @@ pub fn desired_path_state(
     group_id: &str,
     path: &str,
 ) -> Result<DesiredPathState, SyncSqliteError> {
-    let heads = live_path_heads(conn, group_id, path)?;
+    let heads = path_gamma_heads(conn, group_id, path)?;
     let mut kinds: HashMap<[u8; 32], RecordKind> = HashMap::new();
     for content in heads.iter().filter_map(|head| head.content.as_ref()) {
         if kinds.contains_key(&content.version_hash) {
@@ -210,15 +212,15 @@ pub fn desired_path_state(
         })?;
         kinds.insert(content.version_hash, version.meta.record_kind);
     }
-    let descendant = has_live_descendant(conn, group_id, path)?;
+    let descendant = gamma_has_live_descendant(conn, group_id, path)?;
     let node = project_own_node(path, &heads, descendant, |version| kinds.get(version).copied())
         .map_err(|error| SyncSqliteError::CorruptState(error.to_string()))?;
     Ok(DesiredPathState::of_node(node.as_ref()))
 }
 
 /// The group's whole desired physical tree, computed with
-/// [`yadorilink_replica_engine::namespace::project`] from the current
-/// path frontier: every path's own node, and every relocated and
+/// [`yadorilink_replica_engine::namespace::project`] from `Gamma`: every
+/// path's own node, and every relocated and
 /// conflict-copy entry at the copy name it takes.
 ///
 /// Fails closed with [`SyncSqliteError::NotFound`] when any live content
@@ -230,7 +232,7 @@ pub fn desired_namespace_projection(
     conn: &Connection,
     group_id: &str,
 ) -> Result<NamespaceProjection, SyncSqliteError> {
-    let heads = live_heads_by_path(conn, group_id)?;
+    let heads = gamma_heads_by_path(conn, group_id)?;
     let mut kinds: HashMap<[u8; 32], RecordKind> = HashMap::new();
     for (path, path_heads) in &heads {
         for content in path_heads.iter().filter_map(|head| head.content.as_ref()) {
@@ -265,7 +267,7 @@ pub fn desired_level_projection(
     group_id: &str,
     parent: &str,
 ) -> Result<NamespaceProjection, SyncSqliteError> {
-    let (children, with_live_descendant) = live_heads_at_level(conn, group_id, parent)?;
+    let (children, with_live_descendant) = gamma_heads_at_level(conn, group_id, parent)?;
     let mut kinds: HashMap<[u8; 32], RecordKind> = HashMap::new();
     for (path, path_heads) in &children {
         for content in path_heads.iter().filter_map(|head| head.content.as_ref()) {

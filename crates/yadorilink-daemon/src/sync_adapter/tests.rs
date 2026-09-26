@@ -1186,6 +1186,11 @@ async fn a_live_executor_flush_that_authors_nothing_still_settles_the_capture_ba
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("root");
     std::fs::create_dir_all(&root).unwrap();
+    // The executor relativizes every flushed path against its canonical root,
+    // as the watcher delivers them. On macOS the temp dir sits behind the
+    // `/var` -> `/private/var` symlink, so a path built on the raw temp path
+    // is outside that root and the setup flush would index nothing.
+    let root = root.canonicalize().unwrap();
 
     let db = db_at(&tmp.path().join("sync.db"));
     let replica_coordinator =

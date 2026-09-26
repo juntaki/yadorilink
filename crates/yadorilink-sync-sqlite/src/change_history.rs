@@ -319,6 +319,18 @@ impl ChangeHistoryRepository {
         })
     }
 
+    /// Whether `hash` is a verified authoring identity for a row of this
+    /// group ([`dag_store::is_verified_authoring_change`]).
+    pub fn dag_is_verified_authoring_change(
+        &self,
+        group_id: &str,
+        hash: &ChangeHash,
+    ) -> Result<bool, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            dag_store::is_verified_authoring_change(conn, group_id, hash)
+        })
+    }
+
     /// Compares two authoring identities using one checked-out connection.
     /// `None` means at least one hash is not verified retained/pruned history
     /// for this group. Keeping existence checks and both ancestry walks on one
@@ -511,6 +523,16 @@ impl ChangeHistoryRepository {
     ) -> Result<Vec<PathHead>, SyncSqliteError> {
         self.database
             .read::<_, SyncSqliteError>(|conn| dag_store::live_path_heads(conn, group_id, path))
+    }
+
+    /// The heads `path` resolves from ([`dag_store::path_gamma_heads`]).
+    pub fn dag_path_gamma_heads(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Vec<PathHead>, SyncSqliteError> {
+        self.database
+            .read::<_, SyncSqliteError>(|conn| dag_store::path_gamma_heads(conn, group_id, path))
     }
 
     /// Admits a verified peer change transactionally: applies it (and
@@ -834,13 +856,28 @@ pub(crate) fn compare_authoring_on_conn(
     local: &ChangeHash,
     incoming: &ChangeHash,
 ) -> Result<Option<ChangeOrdering>, SyncSqliteError> {
-    if !dag_store::has_change_or_pruned(conn, group_id, local)?
-        || !dag_store::has_change_or_pruned(conn, group_id, incoming)?
-    {
+    // A change the installed base carries is behind every change written
+    // on the base: after the epoch reset that installed it, retained and
+    // pruned history are exactly the changes written on it.
+    let carried_by_base = |hash: &ChangeHash| -> Result<Option<bool>, SyncSqliteError> {
+        if dag_store::has_change_or_pruned(conn, group_id, hash)? {
+            return Ok(Some(false));
+        }
+        Ok(dag_store::is_verified_authoring_change(conn, group_id, hash)?.then_some(true))
+    };
+    let (Some(local_in_base), Some(incoming_in_base)) =
+        (carried_by_base(local)?, carried_by_base(incoming)?)
+    else {
         return Ok(None);
-    }
+    };
     if local == incoming {
         return Ok(Some(ChangeOrdering::Equal));
+    }
+    match (local_in_base, incoming_in_base) {
+        (true, true) => return Ok(Some(ChangeOrdering::Concurrent)),
+        (true, false) => return Ok(Some(ChangeOrdering::Before)),
+        (false, true) => return Ok(Some(ChangeOrdering::After)),
+        (false, false) => {}
     }
     if dag_store::is_ancestor(conn, local, incoming)? {
         return Ok(Some(ChangeOrdering::Before));

@@ -97,7 +97,9 @@ fn an_import_writes_no_proof_when_an_overwrite_left_size_and_mtime_unchanged() {
     // and the mtime put back. Nothing about the file's metadata now
     // says it was touched.
     std::fs::write(&abs, b"BBBBBBBB").unwrap();
-    let restored = std::fs::File::open(&abs).unwrap();
+    // Opened for writing: Windows refuses to set times through a read-only
+    // handle.
+    let restored = std::fs::File::options().write(true).open(&abs).unwrap();
     restored
         .set_times(
             std::fs::FileTimes::new()

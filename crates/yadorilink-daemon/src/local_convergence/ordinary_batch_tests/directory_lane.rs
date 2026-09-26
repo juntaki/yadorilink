@@ -379,14 +379,21 @@ async fn cfapi_placeholder_parent_directory_records_structural_origin() {
 
     let attempt = h.reconcile(&["deep/er/f.txt"]).await;
 
-    assert!(
-        matches!(
-            attempt.evidence_for("deep/er/f.txt"),
-            Some(SettlementEvidence::PolicyPlaceholder)
-        ),
-        "got {:?}",
-        attempt.evidence_for("deep/er/f.txt")
-    );
+    // Windows has no synchronous placeholder: every one is deferred to the
+    // CfAPI host, so the pass settles nothing there and the parents are all
+    // this assertion block can check.
+    if cfg!(windows) {
+        assert!(attempt.evidence_for("deep/er/f.txt").is_none());
+    } else {
+        assert!(
+            matches!(
+                attempt.evidence_for("deep/er/f.txt"),
+                Some(SettlementEvidence::PolicyPlaceholder)
+            ),
+            "got {:?}",
+            attempt.evidence_for("deep/er/f.txt")
+        );
+    }
     assert_eq!(h.origin_status("deep"), StructuralOriginStatus::Structural);
     assert_eq!(h.origin_status("deep/er"), StructuralOriginStatus::Structural);
 

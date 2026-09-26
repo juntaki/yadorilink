@@ -913,6 +913,11 @@ impl FileIndexRepository {
             let written = crate::write_through::write_recursive_operation_through(
                 tx, group_id, &kind, mutations,
             )?;
+            let absorbed: Vec<bool> = written.iter().map(|w| w.absorbed).collect();
+            let evidence: Vec<Option<&LocalCaptureActualStateEvidence>> =
+                written.iter().map(|w| evidence.get(w.index).and_then(|e| e.as_ref())).collect();
+            let written: Vec<PreparedLocalMutation> =
+                written.into_iter().map(|w| w.mutation).collect();
             let mutations = written.as_slice();
             for mutation in mutations {
                 if let Op::Put { path, .. } | Op::Delete { path } = mutation.op() {
@@ -925,7 +930,7 @@ impl FileIndexRepository {
                     }
                 }
             }
-            let parts = recursive_operation_parts(mutations);
+            let parts = recursive_operation_parts(mutations, &absorbed);
             let part_count = u32::try_from(parts.len())
                 .ok()
                 .filter(|count| *count <= MAX_RECURSIVE_OPERATION_PARTS)
@@ -937,12 +942,16 @@ impl FileIndexRepository {
                         parts.len()
                     ))
                 })?;
-            let effect_set_hash = EffectSetHash::of_effects(mutations.iter().map(|m| m.op()));
+            // A copy's delete folded into its source's carries no op of
+            // its own (see `WrittenMutation::absorbed`).
+            let authored = |range: std::ops::Range<usize>| {
+                range.filter(|index| !absorbed[*index]).map(|index| mutations[index].op())
+            };
+            let effect_set_hash = EffectSetHash::of_effects(authored(0..mutations.len()));
             let mut hashes = Vec::with_capacity(parts.len());
             for (part_index, range) in parts.iter().enumerate() {
                 let members = &mutations[range.clone()];
-                let paths: Vec<&str> = members.iter().map(|m| m.record().path.as_str()).collect();
-                let parents = recursive_part_parents_in_tx(tx, group_id, &paths)?;
+                let parents = recursive_part_parents_in_tx(tx, group_id, members)?;
                 let part = RecursiveOperation {
                     operation_id,
                     kind: kind.clone(),
@@ -955,14 +964,14 @@ impl FileIndexRepository {
                     tx,
                     group_id,
                     parents,
-                    members.iter().map(|m| m.op().clone()).collect(),
+                    authored(range.clone()).cloned().collect(),
                     part,
                     &seen,
                     emission.emitter,
                 )?;
                 let change_hash = change.compute_hash();
                 for (offset, mutation) in members.iter().enumerate() {
-                    let this_evidence = evidence.get(range.start + offset).and_then(|e| e.as_ref());
+                    let this_evidence = evidence[range.start + offset];
                     apply_local_mutation_in_tx(
                         tx,
                         group_id,
@@ -2467,20 +2476,30 @@ pub const RECURSIVE_PART_OP_BYTES: usize = MAX_CHANGE_OP_BYTES / 2;
 /// Cuts `mutations` into the index ranges of a recursive operation's
 /// parts, in order: each at most [`RECURSIVE_PART_OP_LIMIT`] ops and
 /// [`RECURSIVE_PART_OP_BYTES`] encoded bytes (a single op larger than that
-/// still gets a part of its own).
-fn recursive_operation_parts(mutations: &[PreparedLocalMutation]) -> Vec<std::ops::Range<usize>> {
+/// still gets a part of its own). A mutation `absorbed` into the one
+/// before it carries no op and stays in that one's part.
+fn recursive_operation_parts(
+    mutations: &[PreparedLocalMutation],
+    absorbed: &[bool],
+) -> Vec<std::ops::Range<usize>> {
     let mut parts = Vec::new();
     let mut start = 0;
+    let mut ops = 0;
     let mut bytes = 0;
     for (index, mutation) in mutations.iter().enumerate() {
+        if absorbed[index] {
+            continue;
+        }
         let len = encoded_op_len(mutation.op());
         if index > start
-            && (index - start >= RECURSIVE_PART_OP_LIMIT || bytes + len > RECURSIVE_PART_OP_BYTES)
+            && (ops >= RECURSIVE_PART_OP_LIMIT || bytes + len > RECURSIVE_PART_OP_BYTES)
         {
             parts.push(start..index);
             start = index;
+            ops = 0;
             bytes = 0;
         }
+        ops += 1;
         bytes += len;
     }
     parts.push(start..mutations.len());
@@ -2590,21 +2609,30 @@ fn versions_shown_to_mutations(
 /// all of them at once, so no path's unseen head is claimed as causal past
 /// through another path's parents.
 ///
-/// A path's seen versions are its basis when it has one, and otherwise the
-/// version its index row names.
+/// A row's seen versions are its basis when it has one, and otherwise the
+/// version it names. They are seen at the path the mutation's op writes:
+/// a copy's delete written through to its source saw the copy's version
+/// at the source.
 fn recursive_part_parents_in_tx(
     tx: &rusqlite::Transaction,
     group_id: &str,
-    paths: &[&str],
+    members: &[PreparedLocalMutation],
 ) -> Result<Vec<ChangeHash>, SyncSqliteError> {
     let mut parents: std::collections::BTreeSet<ChangeHash> = std::collections::BTreeSet::new();
-    let mut seen_by_path: Vec<(&str, Vec<ChangeHash>)> = Vec::with_capacity(paths.len());
+    let mut seen_by_path: std::collections::BTreeMap<&str, Vec<ChangeHash>> =
+        std::collections::BTreeMap::new();
     let mut any_unknown = false;
-    for path in paths {
+    for member in members {
+        let path = member.record().path.as_str();
+        let op_path = match member.op() {
+            Op::Put { path, .. } | Op::Delete { path } => path.as_str(),
+            Op::Move { .. } => path,
+        };
+        let seen = seen_by_path.entry(op_path).or_default();
         match local_edit_parents_in_tx(tx, group_id, path)? {
             Some(basis) if !basis.is_empty() => {
                 parents.extend(basis.iter().copied());
-                seen_by_path.push((path, basis));
+                seen.extend(basis);
             }
             _ => {
                 any_unknown = true;
@@ -2617,11 +2645,12 @@ fn recursive_part_parents_in_tx(
                         |row| row.get(0),
                     )
                     .optional()?;
-                let seen = shown
-                    .flatten()
-                    .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
-                    .map(ChangeHash);
-                seen_by_path.push((path, seen.into_iter().collect()));
+                seen.extend(
+                    shown
+                        .flatten()
+                        .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
+                        .map(ChangeHash),
+                );
             }
         }
     }
@@ -3294,12 +3323,9 @@ pub enum LocalCaptureActualStateEvidence {
 /// mutator's bump-then-mutate-then-CAS ordering, and the external-writer
 /// consistency boundary this proof is exact relative to).
 ///
-/// `causal_basis` is read fresh from `tx` (the group's actual current
-/// heads, AFTER this call's own just-emitted change has been admitted),
-/// never assumed -- today's local-emission path always chains onto the
-/// group's prior head, producing a basis of exactly `[change_hash]`, but
-/// this reads the real thing rather than hard-coding that shape, so it
-/// stays correct if that ever changes.
+/// `causal_basis` is the change that authored the row these bytes are --
+/// see [`local_capture_causal_basis`]: never the whole frontier, which can
+/// hold a peer's version of the path this device never showed.
 ///
 /// `object_kind`/`version` describe a PRESENT object; there is no
 /// `Absent` case here -- a locally observed deletion is a structurally
@@ -3386,7 +3412,7 @@ pub fn adopt_local_capture_actual_state(
         RecordKind::Directory => MaterializedObjectKind::Directory,
         RecordKind::Symlink => MaterializedObjectKind::Symlink,
     };
-    let causal_basis = dag_store::group_heads(tx, group_id)?;
+    let causal_basis = local_capture_causal_basis(tx, group_id, path)?;
     crate::materialized_generation::adopt_observed_actual_generation_in_tx(
         tx,
         group_id,
@@ -3557,12 +3583,46 @@ fn settle_obligation_against_local_presence_in_tx(
     Ok(())
 }
 
+/// The causal basis of what a local capture just observed at `path`: the
+/// change that authored the path's current row, which this same
+/// transaction has just written.
+///
+/// That basis is also the parent set the user's next edit of those bytes
+/// is signed onto ([`local_edit_parents_in_tx`]), so it may name only what
+/// the bytes came from. The group's heads after the emission are not
+/// that: a local write is signed onto the frontier less every version of
+/// the path this device never showed, so a peer's version admitted but not
+/// projected stays a live head beside it. Taken as the basis, the next edit
+/// would descend from that version and supersede it -- the peer's bytes
+/// gone from every replica, with no copy, although the user never saw
+/// them. The authoring change descends from everything the bytes did come
+/// from. A row with no authoring change (none is written without one here)
+/// falls back to the frontier.
+fn local_capture_causal_basis(
+    tx: &rusqlite::Transaction,
+    group_id: &str,
+    path: &str,
+) -> Result<Vec<ChangeHash>, SyncSqliteError> {
+    let authoring: Option<Option<Vec<u8>>> = tx
+        .query_row(
+            "SELECT authoring_change_hash FROM files \
+             WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
+            rusqlite::params![group_id, path],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match authoring.flatten().and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok()) {
+        Some(hash) => Ok(vec![ChangeHash(hash)]),
+        None => dag_store::group_heads(tx, group_id),
+    }
+}
+
 fn adopt_local_capture_absent_state(
     tx: &rusqlite::Transaction,
     group_id: &str,
     path: &str,
 ) -> Result<(), SyncSqliteError> {
-    let causal_basis = dag_store::group_heads(tx, group_id)?;
+    let causal_basis = local_capture_causal_basis(tx, group_id, path)?;
     crate::materialized_generation::adopt_observed_actual_generation_in_tx(
         tx,
         group_id,

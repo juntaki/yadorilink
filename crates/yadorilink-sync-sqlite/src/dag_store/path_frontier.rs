@@ -210,6 +210,139 @@ pub(crate) fn init_path_frontier_schema(conn: &Connection) -> Result<(), SyncSql
     Ok(())
 }
 
+/// The heads a path resolves from: `Gamma`'s heads of `path` -- the path
+/// frontier's live heads, or the installed base's heads when nothing
+/// written on the base has touched the path.
+pub fn path_gamma_heads(
+    conn: &Connection,
+    group_id: &str,
+    path: &str,
+) -> Result<Vec<PathHead>, SyncSqliteError> {
+    let live = live_path_heads(conn, group_id, path)?;
+    if !live.is_empty() {
+        return Ok(live);
+    }
+    Ok(untouched_base_heads(conn, group_id, BaseHeadRange::Exact(path), None)?
+        .into_iter()
+        .map(|(_, head)| head)
+        .collect())
+}
+
+/// Which of the installed base's heads [`untouched_base_heads`] reads.
+enum BaseHeadRange<'a> {
+    Exact(&'a str),
+    /// Strictly below `lower`, which ends in `/`; everything for `""`.
+    Below(&'a str),
+}
+
+/// The installed base's heads, as `(path, head)`, of the paths in `range`
+/// that nothing written on the base has touched -- the part of `Gamma` the
+/// base still decides. A path the frontier holds any head for, a removal
+/// included, is decided by the frontier alone. The summary tables hold
+/// only the installed base's rows: every install replaces them.
+fn untouched_base_heads(
+    conn: &Connection,
+    group_id: &str,
+    range: BaseHeadRange<'_>,
+    limit: Option<usize>,
+) -> Result<Vec<(String, PathHead)>, SyncSqliteError> {
+    let (lower, upper, exact) = match range {
+        BaseHeadRange::Exact(path) => (path.to_owned(), None, true),
+        BaseHeadRange::Below(lower) => {
+            let upper = lower.strip_suffix('/').map(|dir| format!("{dir}0"));
+            (lower.to_owned(), upper, false)
+        }
+    };
+    let mut stmt = conn.prepare_cached(
+        "SELECT b.path, b.change_hash, b.device_id, b.lamport, b.version_hash, \
+                b.naming_device_id \
+         FROM history_base_path_heads b \
+         WHERE b.group_id = ?1 \
+           AND (CASE WHEN ?4 THEN b.path = ?2 ELSE b.path > ?2 AND (?3 IS NULL OR b.path < ?3) END) \
+           AND NOT EXISTS (SELECT 1 FROM path_live_heads h \
+                           WHERE h.group_id = b.group_id AND h.path = b.path) \
+         ORDER BY b.path, b.change_hash \
+         LIMIT ?5",
+    )?;
+    let limit = limit.map_or(-1, |limit| i64::try_from(limit).unwrap_or(i64::MAX));
+    let rows = stmt.query_map(rusqlite::params![group_id, lower, upper, exact, limit], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, Vec<u8>>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, i64>(3)?,
+            r.get::<_, Vec<u8>>(4)?,
+            r.get::<_, String>(5)?,
+        ))
+    })?;
+    let mut heads = Vec::new();
+    for row in rows {
+        let (path, change_hash, device_id, lamport, version_hash, naming_device_id) = row?;
+        heads.push((
+            path,
+            PathHead {
+                change_hash: hash_32(&change_hash, "history_base_path_heads.change_hash")?,
+                lamport: u64::try_from(lamport).unwrap_or(0),
+                device_id,
+                naming_device_id,
+                content: Some(PathHeadContent {
+                    version_hash: hash_32(&version_hash, "history_base_path_heads.version_hash")?,
+                    mtime_unix_nanos: 0,
+                }),
+            },
+        ));
+    }
+    Ok(heads)
+}
+
+/// [`live_heads_by_path`] over `Gamma`: every path's heads, the installed
+/// base's where nothing written on the base has touched the path.
+pub fn gamma_heads_by_path(
+    conn: &Connection,
+    group_id: &str,
+) -> Result<BTreeMap<String, Vec<PathHead>>, SyncSqliteError> {
+    let mut out = live_heads_by_path(conn, group_id)?;
+    for (path, head) in untouched_base_heads(conn, group_id, BaseHeadRange::Below(""), None)? {
+        out.entry(path).or_default().push(head);
+    }
+    Ok(out)
+}
+
+/// [`live_heads_at_level`] over `Gamma`.
+#[allow(clippy::type_complexity)]
+pub fn gamma_heads_at_level(
+    conn: &Connection,
+    group_id: &str,
+    parent: &str,
+) -> Result<(BTreeMap<String, Vec<PathHead>>, std::collections::BTreeSet<String>), SyncSqliteError>
+{
+    let (mut children, mut with_live_descendant) = live_heads_at_level(conn, group_id, parent)?;
+    let lower = if parent.is_empty() { String::new() } else { format!("{parent}/") };
+    for (path, head) in untouched_base_heads(conn, group_id, BaseHeadRange::Below(&lower), None)? {
+        match path[lower.len()..].split_once('/') {
+            None => children.entry(path).or_default().push(head),
+            // Every head a base carries is a content head.
+            Some((child, _)) => {
+                with_live_descendant.insert(format!("{lower}{child}"));
+            }
+        }
+    }
+    Ok((children, with_live_descendant))
+}
+
+/// [`has_live_descendant`] over `Gamma`.
+pub fn gamma_has_live_descendant(
+    conn: &Connection,
+    group_id: &str,
+    path: &str,
+) -> Result<bool, SyncSqliteError> {
+    if has_live_descendant(conn, group_id, path)? {
+        return Ok(true);
+    }
+    Ok(!untouched_base_heads(conn, group_id, BaseHeadRange::Below(&format!("{path}/")), Some(1))?
+        .is_empty())
+}
+
 /// The live heads of `path`, ready to hand to `resolve_path_heads`.
 ///
 /// One indexed lookup per table, returning as many rows as the path has

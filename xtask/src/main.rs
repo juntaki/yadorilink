@@ -202,6 +202,8 @@ struct EntryPoint {
 fn single_seed_entry_point(scenario: &str) -> Result<EntryPoint, String> {
     let test_name = match scenario {
         "dst_watcher_debounce" => "single_seed_smoke",
+        // Reads `DST_SEED` and runs that one generated seed.
+        "dst_history_epoch_chaos" => "single_seed",
         // These scenarios' own test functions run a fixed, hardcoded set of
         // seeds/orderings with no env-var seed selection at all -- there is
         // no single-seed entry point to target, and no `--exact` filter

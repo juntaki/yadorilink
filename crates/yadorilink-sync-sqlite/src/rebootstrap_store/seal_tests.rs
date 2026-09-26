@@ -914,3 +914,81 @@ fn a_seal_is_refused_while_history_compaction_is_not_ready() {
     ));
     assert!(seal::require_compaction_ready(true).is_ok());
 }
+
+/// A path the installed base carries and nothing written on the base has
+/// touched resolves from the heads the base carries: they are its `Gamma`
+/// heads, and its current row is theirs. Resolving it from the path
+/// frontier alone -- empty after the epoch reset -- finds nothing, so a
+/// projection obligation for the path (every row an install places gets
+/// one when its hold is released) can never settle, and the next seal
+/// waits on it forever. Once a change on the base touches the path, that
+/// change is what the path resolves from.
+#[test]
+fn a_path_only_the_installed_base_carries_resolves_from_the_heads_it_carries() {
+    let conn = open();
+    let h = build_history(&conn);
+    seal(&conn);
+    let heads = |path: &str| {
+        let mut heads: Vec<ChangeHash> = crate::dag_store::path_gamma_heads(&conn, GROUP, path)
+            .unwrap()
+            .into_iter()
+            .map(|head| ChangeHash(head.change_hash))
+            .collect();
+        heads.sort();
+        heads
+    };
+    assert!(
+        crate::dag_store::live_path_heads(&conn, GROUP, "p").unwrap().is_empty(),
+        "the epoch reset leaves the path frontier empty, so this tests the base"
+    );
+    assert_eq!(heads("p"), vec![h.b1.compute_hash()]);
+    let mut concurrent = vec![h.a3.compute_hash(), h.b2.compute_hash()];
+    concurrent.sort();
+    assert_eq!(heads("r"), concurrent, "concurrent heads the base carries stay two heads");
+
+    store_versions(&conn);
+    let next = emit(&conn, "device-a", vec![put("p", &version(5))]);
+    assert_eq!(heads("p"), vec![next.compute_hash()]);
+}
+
+/// A seal is not observable in the desired namespace. The tree the
+/// projection is driven to -- each path's own node, every level's nodes,
+/// and the whole group's -- is the same the moment after a seal as the
+/// moment before: after the epoch reset the path frontier is empty, and
+/// the heads the base carries are what the namespace is made of. Read from
+/// the frontier alone, the namespace of a sealed group is empty, and every
+/// installed file whose shape depends on another path (a file relocated
+/// beside a directory, a directory held for a descendant) is placed wrong.
+#[test]
+fn the_desired_namespace_is_the_same_after_a_seal_as_before_it() {
+    use crate::desired_state::{
+        desired_level_projection, desired_namespace_projection, desired_path_state,
+    };
+
+    let conn = open();
+    let h = build_history(&conn);
+    admit(&conn, "device-d", &[&h.c1], vec![put("d/x", &version(5))]);
+    publish_everything(&conn, 2);
+    project(&conn);
+    let paths = ["p", "q", "r", "d", "d/x", "absent"];
+    let snapshot = |conn: &Connection| {
+        let whole = desired_namespace_projection(conn, GROUP).unwrap().nodes().clone();
+        let levels: Vec<_> = ["", "d"]
+            .iter()
+            .map(|parent| desired_level_projection(conn, GROUP, parent).unwrap().nodes().clone())
+            .collect();
+        let own: Vec<_> =
+            paths.iter().map(|path| desired_path_state(conn, GROUP, path).unwrap()).collect();
+        (whole, levels, own)
+    };
+    let before = snapshot(&conn);
+    assert!(before.0.contains_key("d/x"), "the fixture places d/x before the seal");
+
+    seal(&conn);
+    assert!(
+        crate::dag_store::live_heads_by_path(&conn, GROUP).unwrap().is_empty(),
+        "the epoch reset empties the path frontier, so this tests the base"
+    );
+
+    assert_eq!(snapshot(&conn), before);
+}

@@ -486,8 +486,10 @@ impl FileVersion {
     /// with — never a separate, ad hoc hash over a subset of these fields.
     ///
     /// For a directory row, the stored `size` and `mtime_unix_nanos` are
-    /// filesystem observations and are replaced by the canonical 0 (see
-    /// [`Self::directory`]); every other field is taken as stored, so a row
+    /// filesystem observations and are replaced by the canonical 0, and any
+    /// blocks it still holds from a file that stood at the path before are
+    /// dropped (see [`Self::directory`]); every other field is taken as
+    /// stored, so a row
     /// that is malformed in another way still yields a version that
     /// validation refuses.
     #[allow(clippy::too_many_arguments)]
@@ -500,12 +502,14 @@ impl FileVersion {
         symlink_target: Option<Vec<u8>>,
         xattrs: Vec<(String, Vec<u8>)>,
     ) -> FileVersion {
-        let blocks = blocks
+        // A directory's row can still hold what the file before it at the
+        // same path held; none of it is state of the directory.
+        let directory = record_kind == RecordKind::Directory;
+        let blocks = if directory { Vec::new() } else { blocks }
             .into_iter()
             .map(|b| VersionBlock { hash: BlockHash(b.hash), size: b.size })
             .collect();
-        let (size, mtime_unix_nanos) =
-            if record_kind == RecordKind::Directory { (0, 0) } else { (size, mtime_unix_nanos) };
+        let (size, mtime_unix_nanos) = if directory { (0, 0) } else { (size, mtime_unix_nanos) };
         let meta = FileMeta { mtime_unix_nanos, unix_mode, symlink_target, record_kind, xattrs };
         FileVersion::new(blocks, size, meta)
     }

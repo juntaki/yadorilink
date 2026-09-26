@@ -586,6 +586,14 @@ pub trait LocalMutationStore: Send + Sync {
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), SyncSqliteError>;
 
+    /// Whether a change-emitting write for `group_id` would currently pass
+    /// its policy precondition -- `false` exactly when every emitting
+    /// method above would refuse with `SyncSqliteError::PolicyUnavailable`.
+    /// A read of the same gate, never an authorization decision of its own:
+    /// the dirty-journal re-drive asks it so it does not re-process every
+    /// withheld path only to have each one refused again.
+    fn local_emission_available(&self, group_id: &str) -> bool;
+
     /// Every currently journaled dirty path for `group_id`, oldest-first —
     /// the startup rescan worklist that re-drives edits a crash interrupted.
     fn list_dirty_paths(&self, group_id: &str) -> Result<Vec<DirtyPath>, SyncSqliteError>;

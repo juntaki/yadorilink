@@ -526,6 +526,11 @@ pub struct ConflictSummary {
     pub conflict_timestamp: Option<String>,
     pub kind: EntryKind,
     pub reason: ConflictReason,
+    /// The folder's history compaction is waiting for this conflict to be
+    /// resolved. The copy and the file it conflicts with hold two versions
+    /// written by one device, which compaction cannot carry; sync goes on,
+    /// and deleting or editing the copy resolves it.
+    pub holds_compaction: bool,
 }
 
 /// Why a conflict copy is kept under its own name.

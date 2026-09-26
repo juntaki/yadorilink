@@ -245,10 +245,12 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     D + "local_convergence/materialize.rs": {
         "clear_held": 1,
     },
-    # Batched projected upsert/delete, already-absent settle, and the
+    # Batched projected upsert/delete, the one already-absent settle
+    # (`already_absent`: a reflected tombstone, and a path an installed base
+    # leaves absent with no head in Gamma), and the
     # materialize_dag_content_head metadata fast path.
     D + "local_convergence/reconcile.rs": {
-        "dag_snapshot_mutation_fence": 3,
+        "dag_snapshot_mutation_fence": 2,
         "open_projected_upserts_batch": 1,
         "dag_bump_mutation_fence": 3,
         "finalize_projected_mutations_batch": 1,
@@ -600,7 +602,7 @@ ALLOWLIST: dict[str, dict[str, int]] = {
 #   L daemon/local_convergence/materialize/eager.rs              3
 #   L daemon/local_convergence/materialize/placeholder.rs        1
 #   L daemon/local_convergence/materialize/symlink.rs            1
-#   L daemon/local_convergence/reconcile.rs                      8
+#   L daemon/local_convergence/reconcile.rs                      7
 #   L daemon/local_convergence/types.rs                          3
 #   L daemon/materialization_intent.rs                           2
 #   L daemon/sync_adapter/admission.rs                           2
@@ -632,8 +634,8 @@ ALLOWLIST: dict[str, dict[str, int]] = {
 #   R sync-sqlite/store.rs                                      12
 #   R sync-sqlite/structural_origin.rs                           3
 #   ------------------------------------------------------------
-#   total 248 = lane 63 + owner 112 + repository 73
-EXPECTED_ALLOWED = 248
+#   total 247 = lane 62 + owner 112 + repository 73
+EXPECTED_ALLOWED = 247
 
 # The in-family row mutators outside `FORBIDDEN`. Each also writes
 # materialization-relevant columns (a peer row's version and authoring, the

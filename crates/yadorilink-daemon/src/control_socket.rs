@@ -1465,6 +1465,7 @@ fn conflicted_file_view_to_proto(
                 yadorilink_ipc_proto::daemonctl::ConflictReason::FolderAtPath
             }
         } as i32,
+        holds_compaction: view.holds_compaction,
     }
 }
 

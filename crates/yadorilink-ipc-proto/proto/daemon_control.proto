@@ -619,6 +619,11 @@ message ConflictedFileInfo {
   EntryKind kind = 5;
   // Why the copy is kept under its own name now.
   ConflictReason reason = 6;
+  // The folder's history compaction is waiting for this conflict to be
+  // resolved: the copy and the path it came from hold two versions written
+  // by one device, which compaction cannot carry. Sync is unaffected;
+  // deleting or editing the copy resolves it.
+  bool holds_compaction = 7;
 }
 
 // Why a conflict copy is kept beside the path it came from.

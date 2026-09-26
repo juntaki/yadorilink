@@ -144,8 +144,13 @@ fn conflicted_file_line(f: &ConflictedFileInfo) -> String {
     };
     // A concurrent edit is what every copy used to mean, so only the other
     // reason is spelled out.
-    if f.reason() == ConflictReason::FolderAtPath {
-        return format!("{line}  reason=folder_at_path");
+    let line = if f.reason() == ConflictReason::FolderAtPath {
+        format!("{line}  reason=folder_at_path")
+    } else {
+        line
+    };
+    if f.holds_compaction {
+        return format!("{line}  compaction=waiting_for_resolution");
     }
     line
 }

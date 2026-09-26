@@ -62,8 +62,10 @@ fn trashed_and_conflicted_protos_carry_record_kind() {
             mtime_unix_nanos: 5,
             record_kind: RecordKind::Symlink,
             reason: crate::queries::file_history::ConflictCopyReason::ConcurrentEdit,
+            holds_compaction: true,
         });
     assert_eq!(conflicted.kind(), EntryKind::Symlink);
+    assert!(conflicted.holds_compaction);
 }
 
 /// A trashed entry names the recursive operation that removed it, so a

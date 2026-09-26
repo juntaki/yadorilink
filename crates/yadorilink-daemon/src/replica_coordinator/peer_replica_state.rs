@@ -698,6 +698,17 @@ impl ReplicaCoordinator {
             .map_err(PeerSessionError::from)
     }
 
+    pub fn dag_is_verified_authoring_change(
+        &self,
+        group_id: &str,
+        hash: &ChangeHash,
+    ) -> Result<bool, PeerSessionError> {
+        self.change_history_repository()
+            .dag_is_verified_authoring_change(group_id, hash)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
+    }
+
     /// Reads the current row's author and compares it against an incoming
     /// change's author on one connection — the large-index reconcile
     /// prefilter's hot-path check.
@@ -782,6 +793,19 @@ impl ReplicaCoordinator {
     ) -> Result<Vec<yadorilink_replica_engine::conflict::PathHead>, PeerSessionError> {
         self.change_history_repository()
             .dag_path_live_heads(group_id, path)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
+    }
+
+    /// The heads `path` resolves from: the path frontier's, or the
+    /// installed base's where nothing written on the base touched it.
+    pub fn dag_path_gamma_heads(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Vec<yadorilink_replica_engine::conflict::PathHead>, PeerSessionError> {
+        self.change_history_repository()
+            .dag_path_gamma_heads(group_id, path)
             .map_err(SyncError::from)
             .map_err(PeerSessionError::from)
     }

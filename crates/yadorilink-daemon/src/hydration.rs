@@ -212,13 +212,16 @@ const WORKER_IDLE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from
 /// user space, so that residual needs a coarse-ctime filesystem. Closing it
 /// would mean hashing the file at every re-check, a full read of it each
 /// time.
-type DiskIdentity =
+pub(crate) type DiskIdentity =
     Option<(yadorilink_root_authority::fs_identity::DiskRaceFingerprint, Option<(u64, u64)>)>;
 
-fn disk_identity(path: &std::path::Path) -> Result<DiskIdentity, SyncError> {
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return Ok(None);
-    };
+pub(crate) fn disk_identity(path: &std::path::Path) -> Result<DiskIdentity, SyncError> {
+    Ok(std::fs::symlink_metadata(path).ok().as_ref().map(disk_identity_of))
+}
+
+pub(crate) fn disk_identity_of(
+    meta: &std::fs::Metadata,
+) -> (yadorilink_root_authority::fs_identity::DiskRaceFingerprint, Option<(u64, u64)>) {
     #[cfg(unix)]
     let file_id = {
         use std::os::unix::fs::MetadataExt as _;
@@ -226,7 +229,7 @@ fn disk_identity(path: &std::path::Path) -> Result<DiskIdentity, SyncError> {
     };
     #[cfg(not(unix))]
     let file_id = None;
-    Ok(Some((yadorilink_root_authority::fs_identity::disk_race_fingerprint_of(&meta), file_id)))
+    (yadorilink_root_authority::fs_identity::disk_race_fingerprint_of(meta), file_id)
 }
 
 /// Journals `path` dirty when the file on disk is no longer the one the
@@ -255,15 +258,12 @@ fn journal_local_edit_seen_by_hydration(
     if now == baseline {
         return Ok(false);
     }
-    let dirty = state.replica_coordinator.dirty_path_repository();
-    if !dirty.is_path_dirty(group_id, path)? {
-        let observed_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as i64)
-            .unwrap_or(0);
-        let kind = if now.is_some() { "created_or_modified" } else { "removed" };
-        dirty.record_dirty_path(group_id, path, kind, observed_at, permit)?;
-    }
+    state.replica_coordinator.journal_uncaptured_local_edit(
+        group_id,
+        path,
+        now.is_some(),
+        permit,
+    )?;
     Ok(true)
 }
 
@@ -1571,7 +1571,8 @@ async fn hydrate_inner(
     // editing the file in between would have its edit adopted as the
     // baseline and then overwritten. `path_lock` does not serialize an
     // external writer -- an editor writing to the file never takes it.
-    let initial_disk_identity = disk_identity(&out_path)?;
+    let initial_lstat = std::fs::symlink_metadata(&out_path).ok();
+    let initial_disk_identity = initial_lstat.as_ref().map(disk_identity_of);
     // Idempotent fast path: `hydrate` must be safe to call on a path that is
     // already materialized. Its only production caller (the shell IPC
     // `HydrateRequest` handler) tracks no per-path hydration state and has no
@@ -1729,6 +1730,28 @@ async fn hydrate_inner(
         // instead would be the cheaper lie, and refusing would wedge the
         // path: nothing else in the daemon repairs a metadata divergence
         // under a `Hydrated` row.
+    }
+    // Any other starting state: the file is supposed to be this device's
+    // placeholder, and the attempt may only replace it if it still is. See
+    // `admit_hydration_start`, which the convergence lane shares.
+    else if !run_blocking_sweep_offloaded(|| {
+        state.replica_coordinator.admit_hydration_start(
+            group_id,
+            path,
+            &out_path,
+            initial_lstat.as_ref(),
+            &current,
+            canonical.snapshot.unix_mode,
+            &canonical.snapshot.xattrs,
+            &root_commit_permit,
+        )
+    })? {
+        tracing::warn!(
+            %path,
+            "the file is no longer the placeholder this device wrote; leaving the local \
+             change for local capture and hydrating nothing"
+        );
+        return Err(SyncError::HydrationFailed(path.to_string()));
     }
     // From the same read as `target_version`, not a second one -- see
     // `AccessHydration`'s own doc comment for why its revert-on-drop

@@ -43,7 +43,7 @@ mod causal_basis;
 mod checkpoint_store;
 mod conflict_authoring;
 mod frontier_index;
-mod observed_base_heads;
+pub(crate) mod observed_base_heads;
 mod orphan_integrity;
 pub(crate) mod path_frontier;
 pub mod published_view;
@@ -77,8 +77,9 @@ pub(crate) use path_frontier::record_admission as record_path_frontier_admission
 /// admission transaction, after that transaction has updated
 /// `group_heads`.
 pub use path_frontier::{
-    has_live_descendant, live_descendant_paths, live_heads_at_level, live_heads_by_path,
-    live_path_heads, rebuild_group as rebuild_group_path_frontier,
+    gamma_has_live_descendant, gamma_heads_at_level, gamma_heads_by_path, has_live_descendant,
+    live_descendant_paths, live_heads_at_level, live_heads_by_path, live_path_heads,
+    path_gamma_heads, rebuild_group as rebuild_group_path_frontier,
 };
 pub use recursive_operations::{
     check_recursive_operation_part, init_recursive_operations_schema,
@@ -94,7 +95,7 @@ pub(crate) use rejected_changes::{
 };
 pub use retained_history_integrity::{
     frontier_heads_at_or_before, get_encoded, group_history_paths, has_all_parents, has_change,
-    has_change_or_pruned, is_ancestor, lamport_of, parents_of,
+    has_change_or_pruned, is_ancestor, is_verified_authoring_change, lamport_of, parents_of,
 };
 pub use retention_roots::{
     full_payload_retained_block_hashes, full_payload_retained_block_hashes_all_groups,

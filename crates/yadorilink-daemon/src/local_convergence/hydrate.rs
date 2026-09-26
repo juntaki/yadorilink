@@ -12,7 +12,7 @@ use yadorilink_replica_domain::session_state::{MaterializationPolicy, Materializ
 
 use super::types::*;
 use yadorilink_peer_session::peer_session::*;
-use yadorilink_root_authority::fs_identity::disk_race_fingerprint;
+use yadorilink_root_authority::fs_identity::{disk_race_fingerprint, disk_race_fingerprint_of};
 
 impl super::LocalConvergenceExecutor {
     pub async fn reconcile_paths_directly(
@@ -416,7 +416,7 @@ impl super::LocalConvergenceExecutor {
         let root_commit_authority = self.root_lease_for(group_id)?;
         let root_commit_authority_op = root_commit_authority.begin_operation()?;
         let root_commit_permit = root_commit_authority_op.permit();
-        if !self.state.dag_has_change_or_pruned(group_id, incoming_author)? {
+        if !self.state.dag_is_verified_authoring_change(group_id, incoming_author)? {
             return Err(PeerSessionError::InvalidInput(format!(
                 "incoming record {group_id}/{} references an unverified authoring change",
                 incoming.path
@@ -1281,7 +1281,13 @@ impl super::LocalConvergenceExecutor {
         // only the bytes on disk have). Re-checked just before
         // `reconstruct_file` below; a mismatch means this attempt must
         // not overwrite what's now on disk.
-        let initial_disk_identity = disk_race_fingerprint(&out_path);
+        //
+        // The same `lstat` is what the attempt's starting point is judged
+        // from: that re-check only proves the file did not change DURING
+        // the attempt, and an edit made before it started (or a delete)
+        // would otherwise be the baseline itself.
+        let initial_lstat = std::fs::symlink_metadata(&out_path).ok();
+        let initial_disk_identity = initial_lstat.as_ref().map(disk_race_fingerprint_of);
         let root_commit_authority = self.root_lease_for(group_id)?;
         let root_commit_authority_op = root_commit_authority.begin_operation()?;
         let root_commit_permit = root_commit_authority_op.permit();
@@ -1310,6 +1316,39 @@ impl super::LocalConvergenceExecutor {
         // remembering to revert and others not. Its revert target is
         // exactly what the CAS moved away from, so an abandoned attempt
         // leaves the row as it found it.
+        // Anything but a `Hydrated` row: the file is supposed to be this
+        // device's placeholder, and the attempt may only replace it if it
+        // still is -- the judgement access hydration makes too, see
+        // `admit_hydration_start`. Before the entry CAS, which moves the row
+        // off `Placeholder` and with it the recorded placeholder identity
+        // the judgement reads. Not under a filename hazard: what answers
+        // to `out_path` there may be a case-folding sibling, which is
+        // neither this row's placeholder nor a local change to it, and the
+        // hazard exit after the fetch writes nothing there anyway.
+        if current.materialization_state != Some(MaterializationState::Hydrated)
+            && self.hazard_reason_for(group_id, &record)?.is_none()
+            && !crate::daemon_state::run_blocking_sweep_offloaded(|| {
+                self.state.admit_hydration_start(
+                    group_id,
+                    path,
+                    &out_path,
+                    initial_lstat.as_ref(),
+                    &current.record,
+                    current.unix_mode,
+                    &current.xattrs,
+                    &root_commit_permit,
+                )
+            })
+            .map_err(PeerSessionError::from)?
+        {
+            tracing::warn!(
+                %path,
+                group_id,
+                "the file is no longer the placeholder this device wrote; leaving the local \
+                 change for local capture and hydrating nothing"
+            );
+            return Err(PeerSessionError::HydrationFailed(path.to_string()));
+        }
         let Some(mut hydrating_guard) = self.state.begin_convergence_hydration(
             group_id,
             path,

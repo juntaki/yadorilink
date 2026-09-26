@@ -83,6 +83,7 @@ fn conflicted_file_line_renders_every_field() {
         mtime_unix_nanos: 5678,
         kind: EntryKind::File as i32,
         reason: 0,
+        holds_compaction: false,
     };
     assert_eq!(
         conflicted_file_line(&f),
@@ -134,6 +135,7 @@ fn conflicted_directory_line_does_not_print_size() {
         mtime_unix_nanos: 0,
         kind: EntryKind::Directory as i32,
         reason: 0,
+        holds_compaction: false,
     };
     assert_eq!(
         conflicted_file_line(&f),
@@ -171,10 +173,30 @@ fn conflicted_file_line_names_a_folder_at_its_path() {
         mtime_unix_nanos: 4,
         kind: EntryKind::File as i32,
         reason: yadorilink_ipc_proto::daemonctl::ConflictReason::FolderAtPath as i32,
+        holds_compaction: false,
     };
     assert_eq!(
         conflicted_file_line(&f),
         "/tmp/photos/album (conflicted copy, 2026-01-01-000000, device-b)  size=3  mtime=4  \
          reason=folder_at_path"
+    );
+}
+
+/// A conflict the folder's history compaction is waiting on says so.
+#[test]
+fn conflicted_file_line_says_when_compaction_waits_for_it() {
+    let f = ConflictedFileInfo {
+        local_path: "/tmp/photos".into(),
+        path: "notes (conflicted copy, 2026-01-01-000000, device-b).txt".into(),
+        size: 3,
+        mtime_unix_nanos: 4,
+        kind: EntryKind::File as i32,
+        reason: 0,
+        holds_compaction: true,
+    };
+    assert_eq!(
+        conflicted_file_line(&f),
+        "/tmp/photos/notes (conflicted copy, 2026-01-01-000000, device-b).txt  size=3  mtime=4  \
+         compaction=waiting_for_resolution"
     );
 }

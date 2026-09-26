@@ -5,7 +5,9 @@
 //! guard types: they differ in whether an intent is opened, in hazard and
 //! held handling, and in whether the entry CAS runs under a permit. Both
 //! downgrade their revert target to `Placeholder` once they bumped the
-//! fence. Nothing here is shared between them.
+//! fence. The one thing they share is the judgement of what an attempt
+//! found at its path when it started (`admit_hydration_start`), so the two
+//! lanes cannot disagree about what counts as an uncaptured local edit.
 //!
 //! Each guard is armed by the entry CAS to `Hydrating` and reverts the row
 //! on drop unless its commit published. The lane keeps every fetch, check
@@ -508,3 +510,99 @@ impl ReplicaCoordinator {
 
 #[cfg(test)]
 mod convergence_guard_tests;
+
+impl ReplicaCoordinator {
+    /// Whether a hydration attempt may replace what it found at `out_path`
+    /// when it started, `lstat` (`None`: nothing there). When it may not,
+    /// the path is journalled dirty for local capture before this returns
+    /// `false`, and the attempt must fail without touching it.
+    ///
+    /// Shared by both hydration lanes. The baseline each attempt re-checks
+    /// before its write only proves the file did not change DURING the
+    /// attempt. It says nothing about what the file was when the attempt
+    /// started: an edit written into the placeholder before that, and not
+    /// yet journalled by the watcher, would be sampled as the baseline
+    /// itself, found unchanged, and replaced. So the starting point is
+    /// judged against what this device knows it put there -- the
+    /// placeholder identity recorded when it was written, and the
+    /// placeholder still being unallocated -- with the same verdict local
+    /// capture uses to decide whether a placeholder was edited.
+    ///
+    /// A regular file passes when it is that untouched placeholder, or when
+    /// it is already exactly the version the row names: bytes, mode and
+    /// replicated xattrs, under a disk identity unchanged from `lstat`
+    /// across the comparison. The second is the recovery for an attempt
+    /// interrupted between its rename and its commit, which leaves a
+    /// placeholder row over the indexed content; refusing it would refuse
+    /// on every attempt. The metadata has to match too, or a mode or xattr
+    /// change made locally to that leftover would be reverted by the
+    /// attempt's own metadata apply.
+    ///
+    /// Nothing on disk passes only when no placeholder was ever recorded
+    /// for the row. A recorded one that is gone was removed locally, and
+    /// hydrating would put the file back and undo the delete before local
+    /// capture has turned it into a tombstone.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn admit_hydration_start(
+        &self,
+        group_id: &str,
+        path: &str,
+        out_path: &std::path::Path,
+        lstat: Option<&std::fs::Metadata>,
+        record: &yadorilink_replica_domain::file::FileRecord,
+        unix_mode: Option<u32>,
+        xattrs: &[(String, Vec<u8>)],
+        permit: &RootCommitPermit<'_>,
+    ) -> Result<bool, SyncError> {
+        let generation =
+            self.materialization_state_repository().get_placeholder_generation(group_id, path)?;
+        let may_replace = match lstat {
+            None => generation.is_none(),
+            Some(lstat) if !lstat.is_file() => false,
+            Some(lstat) => {
+                yadorilink_local_capture::local_change::untouched_placeholder_verdict(
+                    self,
+                    out_path,
+                    lstat,
+                    Some(record),
+                    generation.as_ref(),
+                ) || (yadorilink_local_storage::disk_bytes_match_indexed_blocks(
+                    out_path,
+                    &record.blocks,
+                )? && yadorilink_local_storage::unix_mode_already_matches_disk(
+                    out_path, unix_mode,
+                )? && matches!(
+                    yadorilink_local_storage::verify_replicated_xattrs_exact(out_path, xattrs),
+                    Ok(true)
+                ) && crate::hydration::disk_identity(out_path)?
+                    == Some(crate::hydration::disk_identity_of(lstat)))
+            }
+        };
+        if !may_replace {
+            self.journal_uncaptured_local_edit(group_id, path, lstat.is_some(), permit)?;
+        }
+        Ok(may_replace)
+    }
+
+    /// Records `path` in the dirty journal as holding a local change local
+    /// capture has not taken yet, unless it is already there. `present`
+    /// says whether something is on disk at the path now.
+    pub(crate) fn journal_uncaptured_local_edit(
+        &self,
+        group_id: &str,
+        path: &str,
+        present: bool,
+        permit: &RootCommitPermit<'_>,
+    ) -> Result<(), SyncError> {
+        let dirty = self.dirty_path_repository();
+        if !dirty.is_path_dirty(group_id, path)? {
+            let observed_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as i64)
+                .unwrap_or(0);
+            let kind = if present { "created_or_modified" } else { "removed" };
+            dirty.record_dirty_path(group_id, path, kind, observed_at, permit)?;
+        }
+        Ok(())
+    }
+}

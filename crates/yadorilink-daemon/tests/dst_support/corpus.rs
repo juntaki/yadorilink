@@ -339,6 +339,7 @@ mod tests {
             fault_schedule: Vec::new(),
             content_table: ContentTable::default(),
             fault_plan: FaultPlan::default(),
+            history_steps: Vec::new(),
         }
     }
 
@@ -360,6 +361,7 @@ mod tests {
             fault_schedule: Vec::new(),
             content_table: ContentTable::default(),
             fault_plan: FaultPlan::default(),
+            history_steps: Vec::new(),
         }
     }
 

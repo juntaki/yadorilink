@@ -373,6 +373,7 @@ pub fn conflict_summary(file: &ConflictedFileInfo) -> ConflictSummary {
             view::ConflictReason::ConcurrentEdit => ConflictReason::ConcurrentEdit,
             view::ConflictReason::FolderAtPath => ConflictReason::FolderAtPath,
         },
+        holds_compaction: file.holds_compaction,
     }
 }
 

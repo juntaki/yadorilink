@@ -126,8 +126,12 @@ pub(super) fn closed_disk_observation_if_unraced(
 /// identity check exists to close. Requiring both keeps the union of what
 /// each signal alone catches: identity closes the atomic-rename gap,
 /// sparseness closes the in-place-edit gap.
+///
+/// Also the check an on-demand hydration asks before it starts: an attempt
+/// may only replace the file if it is still this placeholder, so that local
+/// capture and hydration agree on what counts as an uncaptured edit.
 #[cfg(unix)]
-pub(super) fn untouched_placeholder_verdict(
+pub fn untouched_placeholder_verdict(
     _store: &dyn crate::ports::LocalMutationStore,
     _path: &Path,
     lstat: &std::fs::Metadata,
@@ -193,7 +197,7 @@ pub(super) fn untouched_placeholder_verdict(
 ///   doesn't decode, the API call itself failed) is deliberately treated
 ///   exactly like `Dirty`, never like a confirmed match.
 #[cfg(windows)]
-pub(super) fn untouched_placeholder_verdict(
+pub fn untouched_placeholder_verdict(
     store: &dyn crate::ports::LocalMutationStore,
     path: &Path,
     _lstat: &std::fs::Metadata,

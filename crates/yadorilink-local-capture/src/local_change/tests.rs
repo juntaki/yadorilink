@@ -6681,6 +6681,61 @@ async fn healed_policy_reemits_the_withheld_edit_with_real_auth_and_clears_the_j
     assert!(state.dirty_path_repository().list_dirty_paths(group).unwrap().is_empty());
 }
 
+/// While the group's policy stays unavailable, re-driving the dirty
+/// journal must not take up the withheld paths at all: each would only be
+/// re-read and refused again, and the periodic backstop would repeat that
+/// for every withheld path on every tick (a large directory tree captured
+/// before its policy arrives puts thousands of rows in the journal). The
+/// rows stay journaled, and once the policy arrives the next re-drive
+/// captures every one of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redrive_leaves_withheld_paths_untouched_until_the_policy_arrives() {
+    use std::sync::atomic::Ordering;
+
+    const WITHHELD: usize = 40;
+    let (proc, state, policy_healthy, _store_dir, root_dir) = processor_with_toggleable_policy();
+    let root = canonical_root(&root_dir);
+    let group = "group-1";
+    adopt_root(&state, group, &root);
+    let paths: Vec<_> = (0..WITHHELD)
+        .map(|i| {
+            let path = root.join(format!("f{i}.txt"));
+            std::fs::write(&path, format!("content {i}")).unwrap();
+            (path, FsChangeKind::CreatedOrModified, 1_000 + i as i64)
+        })
+        .collect();
+    proc.process_flush(
+        group,
+        &root,
+        yadorilink_filesystem_sync::debounce::DebounceFlush::Paths(paths),
+    )
+    .await
+    .unwrap();
+    assert_eq!(state.dirty_path_repository().list_dirty_paths(group).unwrap().len(), WITHHELD);
+
+    let journaled_before = state.journaled_dirty_batch_entries();
+    for _ in 0..3 {
+        let outcome = proc.redrive_dirty_journal(group, &root).await.unwrap();
+        assert!(outcome.records.is_empty(), "nothing can be emitted without a policy");
+    }
+    assert_eq!(
+        state.journaled_dirty_batch_entries() - journaled_before,
+        0,
+        "a re-drive without a policy must not re-process any withheld path"
+    );
+    assert_eq!(
+        state.dirty_path_repository().list_dirty_paths(group).unwrap().len(),
+        WITHHELD,
+        "every withheld path stays journaled"
+    );
+    assert!(state.sqlite().dag_group_heads(group).unwrap().is_empty());
+
+    policy_healthy.store(true, Ordering::SeqCst);
+    let redriven = proc.redrive_dirty_journal(group, &root).await.unwrap();
+    assert_eq!(redriven.records.len(), WITHHELD, "the policy's arrival captures every path");
+    assert!(state.dirty_path_repository().list_dirty_paths(group).unwrap().is_empty());
+}
+
 /// A restart reconciliation scan that detects an offline edit while the
 /// group's policy is stale must NOT fall back to a DAG-silent index write.
 /// The historical fallback wrote the batch through the non-emitting

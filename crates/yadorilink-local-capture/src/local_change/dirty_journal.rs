@@ -79,6 +79,14 @@ impl LocalChangeProcessor {
     /// can't be processed stays journaled for the next attempt. Returns the
     /// produced records so the caller can announce them exactly as a live
     /// flush would.
+    ///
+    /// Nothing is re-driven while the group's policy is unavailable: every
+    /// emitting write would refuse with `PolicyUnavailable`, so each path
+    /// would only be re-read and journaled again, and the periodic backstop
+    /// would repeat that for the whole journal on every tick (a directory
+    /// tree captured before its policy arrives journals one row per
+    /// directory). The rows stay in place and the first re-drive after the
+    /// policy arrives captures them.
     pub async fn redrive_dirty_journal(
         &self,
         group_id: &str,
@@ -86,6 +94,14 @@ impl LocalChangeProcessor {
     ) -> Result<FlushOutcome, LocalCaptureError> {
         let dirty = self.state.list_dirty_paths(group_id)?;
         if dirty.is_empty() {
+            return Ok(FlushOutcome::default());
+        }
+        if !self.state.local_emission_available(group_id) {
+            tracing::debug!(
+                group_id,
+                count = dirty.len(),
+                "group policy unavailable; leaving journaled local dirty paths for a later re-drive"
+            );
             return Ok(FlushOutcome::default());
         }
         tracing::info!(

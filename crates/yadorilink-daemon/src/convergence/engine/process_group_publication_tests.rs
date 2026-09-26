@@ -647,14 +647,19 @@ fn seed_projected_row(state: &DaemonState, path: &str, version: &FileVersion, au
         .unwrap();
 }
 
-fn symlink_version(mtime: i64, target: &[u8]) -> FileVersion {
+/// A symlink version whose recorded target is `target` in the platform's
+/// own captured encoding (UTF-16LE code units on Windows), the bytes a
+/// real capture of that link would record and materialization decodes.
+fn symlink_version(mtime: i64, target: &str) -> FileVersion {
     FileVersion::new(
         vec![],
         0,
         FileMeta {
             mtime_unix_nanos: mtime,
             unix_mode: None,
-            symlink_target: Some(target.to_vec()),
+            symlink_target: Some(yadorilink_root_authority::fs_identity::target_to_bytes(
+                std::path::Path::new(target),
+            )),
             record_kind: RecordKind::Symlink,
             xattrs: Vec::new(),
         },
@@ -686,7 +691,7 @@ async fn zero_work_close_performs_no_physical_work() {
     let (state, _root_dir, root) = build_state_with_adopted_group().await;
     let engine = ConvergenceEngine::new(state.clone());
     let key = SigningKey::from_bytes(&[91u8; 32]);
-    let version = symlink_version(1_700_000_300, b"target-content");
+    let version = symlink_version(1_700_000_300, "target-content");
     let author = admit_change(&state, "device-a", &key, "already-correct-link", &version);
     seed_projected_row(&state, "already-correct-link", &version, &author);
 
@@ -1003,7 +1008,7 @@ async fn zero_work_revalidation_raced_by_mutator_cannot_close() {
     let (state, _root_dir, root) = build_state_with_adopted_group().await;
     let engine = Arc::new(ConvergenceEngine::new(state.clone()));
     let key = SigningKey::from_bytes(&[95u8; 32]);
-    let version = symlink_version(1_700_000_700, b"original-target");
+    let version = symlink_version(1_700_000_700, "original-target");
     let author = admit_change(&state, "device-a", &key, "raced-zero-work-link", &version);
     seed_projected_row(&state, "raced-zero-work-link", &version, &author);
 
@@ -1183,7 +1188,7 @@ async fn desired_state_cycling_back_after_a_crash_mid_mutation_does_not_close_wi
     let out_path = root.join(path);
 
     // A materializes and closes normally.
-    let version_a = symlink_version(1_700_000_800, b"content-a");
+    let version_a = symlink_version(1_700_000_800, "content-a");
     let change_a = admit_change(&state, "device-a", &key, path, &version_a);
     assert!(drive_obligations_once_for_test(&engine, 128, 256).await);
     assert!(
@@ -1205,7 +1210,7 @@ async fn desired_state_cycling_back_after_a_crash_mid_mutation_does_not_close_wi
 
     // A second admission, causally descending from the first, makes B
     // desired. Deliberately never ticked.
-    let version_b = symlink_version(1_700_000_801, b"content-b");
+    let version_b = symlink_version(1_700_000_801, "content-b");
     let change_b = create_signed_for_tests(
         vec![change_a.change_hash()],
         change_a.lamport,
