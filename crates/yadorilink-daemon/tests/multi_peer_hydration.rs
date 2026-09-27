@@ -1196,6 +1196,12 @@ async fn corrupt_local_block_is_refetched_when_peer_exists() {
 /// readable while completely offline — every block it needs is still in
 /// the local block store even though the on-disk file itself is now a
 /// placeholder marker, and no peer is reachable to re-fetch anything from.
+#[cfg_attr(
+    windows,
+    ignore = "eviction requires a real CfAPI placeholder identity and cfapi-host dehydration; \
+              this pure-Rust fixture provides neither -- same gap as \
+              durability_unobtainable_content.rs's own Windows-ignored test"
+)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn retained_last_local_copy_remains_user_accessible_offline() {
     let content = big_content();
