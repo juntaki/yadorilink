@@ -261,6 +261,45 @@ fn frontier_index_disk_probe(devices: &[TestDevice], group_id: &str) -> String {
     format!("{per_device}\n  expected_want={expected_want:?}")
 }
 
+/// Two independent bits for every conflict-copy-shaped path in `device`'s
+/// index, distinguishing the three ways an unjustified copy can still be
+/// standing (`retire_unjustified_ephemeral_conflict_copies`'s own doc
+/// comment on `local_convergence.rs` names all three):
+///
+/// - `history_contains=true` -> some Change formally carries this path, so
+///   retirement deliberately preserves it forever, durable-history side.
+///   The bug (if it is one) is in conflict-copy derivation/repair minting a
+///   change for a copy that should not exist, not in retirement.
+/// - `history_contains=false`, `resolver_justifies=true` -> the CURRENT
+///   per-path resolver still derives this exact copy right now
+///   (`LocalConvergenceExecutor::conflict_copy_paths_for`, the same call
+///   retirement itself makes) -- the resolver's own conflict-copy set is
+///   wrong, not merely stale bookkeeping.
+/// - both false -> retirement should have already removed this path and
+///   didn't; the bug is in retirement's own wake/audit path, not in what it
+///   would decide if run.
+fn conflict_copy_justification_probe(device: &TestDevice, group_id: &str, path: &str) -> String {
+    let history_contains = device
+        .state
+        .replica_coordinator
+        .dag_group_history_paths(group_id)
+        .map(|paths| paths.contains(path))
+        .map(|b| b.to_string())
+        .unwrap_or_else(|e| format!("err({e})"));
+    let source_path = yadorilink_replica_domain::conflict::conflict_copy_source_path(path);
+    let resolver_justifies = device
+        .state
+        .local_convergence()
+        .conflict_copy_paths_for(group_id, &source_path)
+        .map(|copies| copies.iter().any(|c| c == path))
+        .map(|b| b.to_string())
+        .unwrap_or_else(|e| format!("err({e})"));
+    format!(
+        "{path}: history_contains={history_contains} resolver_justifies={resolver_justifies} \
+         source_path={source_path:?}"
+    )
+}
+
 async fn n_synced_devices(n: usize, test_name: &str) -> (Vec<TestDevice>, String) {
     let coordination_addr = support::start_coordination_server().await;
     let account =
@@ -397,11 +436,26 @@ async fn run_multiway_row(
                 ConvergedShape::EveryWriterSurvives
                     if agreed && reference.len() != device_count =>
                 {
+                    // Device 0 stands in for all of them here -- `agreed`
+                    // already established every device's index/disk state
+                    // is identical at this point, so there is nothing a
+                    // second device's copy of the same lookup could show
+                    // that this one doesn't.
+                    let justifications = reference
+                        .keys()
+                        .filter(|name| {
+                            yadorilink_replica_domain::conflict::is_conflict_copy_path(name)
+                        })
+                        .map(|name| {
+                            conflict_copy_justification_probe(&devices_ref[0], &group_id, name)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n    ");
                     format!(
                         "STABLE WRONG CONVERGENCE SHAPE: every device already agrees, \
                          permanently, on {} entries -- expected exactly {device_count} \
                          (one winner + one conflict copy per loser). This will not change \
-                         with a longer timeout.\n  ",
+                         with a longer timeout.\n    {justifications}\n  ",
                         reference.len()
                     )
                 }
