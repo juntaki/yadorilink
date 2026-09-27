@@ -313,16 +313,26 @@ fn cmd_lane0(_args: &[String]) -> Result<(), String> {
     // run through the cheapest scenario binary.
     eprintln!("dst-lane0: harness lints + watcher conformance (plain build)");
     let mut lints = Command::new(cargo());
-    lints
-        .arg("test")
-        .arg("-p")
-        .arg(DAEMON)
-        .arg("--test")
-        .arg("dst_runbook_freshness_lint")
-        .arg("--test")
-        .arg("dst_fidelity_lint")
-        .arg("--test")
-        .arg("watcher_decompose_conformance");
+    lints.arg("test").arg("-p").arg(DAEMON);
+    // `dst_runbook_freshness_lint` checks `tests/dst_support/AGENT.md`, this
+    // repo's private agent runbook -- both are excluded from the public
+    // projection (`.public-tree.toml`), so this file is absent there. This
+    // binary (`xtask`) is itself shipped to both trees unmodified, so it
+    // must run either way: skip the one `--test` this tree cannot have,
+    // rather than asking cargo to resolve a target that was never
+    // projected.
+    if workspace_root()
+        .join("crates/yadorilink-daemon/tests/dst_runbook_freshness_lint.rs")
+        .is_file()
+    {
+        lints.arg("--test").arg("dst_runbook_freshness_lint");
+    } else {
+        eprintln!(
+            "dst-lane0: skipping dst_runbook_freshness_lint -- its own subject \
+             (tests/dst_support/AGENT.md) is private-only and not present in this tree"
+        );
+    }
+    lints.arg("--test").arg("dst_fidelity_lint").arg("--test").arg("watcher_decompose_conformance");
     run(lints)?;
 
     eprintln!("dst-lane0: dst_support unit tests (turmoil)");
