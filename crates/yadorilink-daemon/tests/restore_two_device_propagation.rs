@@ -232,10 +232,17 @@ async fn a_restore_racing_a_concurrent_edit_converges_deterministically() {
     wait_for_current_version(&b, group_id, "doc.txt", 2).await;
 
     // Disconnect -- each side now authors its own change with no way for
-    // the other to see or adopt it yet, a real causal fork.
+    // the other to see or adopt it yet, a real causal fork. Aborting the
+    // `PeerSyncSession` handles alone does not achieve that under the
+    // iroh-only reconciliation stack: changes converge over the
+    // reconciliation substrate now, independent of those sessions, so
+    // `sever_reconciliation` is required too (see its own doc comment) --
+    // without it A's restore reaches B before B ever authors its own
+    // edit, and the two changes never actually race.
     for handle in handles {
         handle.abort();
     }
+    support::sever_reconciliation(&a.state, &b.state).await;
 
     hydration::restore_to_version(&a.state, group_id, "doc.txt", 1).await.unwrap();
     wait_for_current_version(&a, group_id, "doc.txt", 3).await;
