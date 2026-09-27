@@ -53,9 +53,9 @@
 //!    admission, since checkpoint issuance requires a live
 //!    coordination-plane round trip) --
 //!    `chaos_coordination_unreachable.rs::published_data_plane_survives_coordination_outage_and_pending_edits_converge_on_recovery`
-//! 9. ReconnectCoordinator survives simultaneous multi-peer flapping,
-//!    mid-sync revocation, a whole daemon generation restarting, and a
-//!    pathological peer without starving healthy ones -- `reconnect_coordinator_scenarios.rs::{ten_peers_flap_simultaneously, twenty_peers_lose_connection_simultaneously, reconnect_during_active_sync, reconnect_after_daemon_generation_restart, pathological_peer_does_not_starve_healthy_peers}`
+//! 9. Peer reconnection survives simultaneous multi-peer flapping, mid-sync
+//!    revocation, and a whole daemon generation restarting --
+//!    `reconnect_coordinator_scenarios.rs::{ten_peers_flap_simultaneously, twenty_peers_lose_connection_simultaneously, reconnect_during_active_sync, reconnect_after_daemon_generation_restart}`
 //!
 //! ## Randomized / soak lane (separate)
 //!
