@@ -60,7 +60,13 @@ jobs:
     # the diagnostics-dumping step that dead end produced). xcodebuild is
     # not merely a workaround for that -- it is also the CI job that was
     # never actually analyzing the shipping app's own Swift sources.
-    runs-on: macos-latest
+    # `macos-latest` can still resolve to an Intel runner (measured: this
+    # job's own first attempt landed on one, "My Mac doesn't support any of
+    # YadoriLink.app's architectures" -- project.yml locks the whole app to
+    # ARCHS=arm64, Apple silicon only, since every linked Rust library is
+    # built for aarch64-apple-darwin alone). Pinned to a concrete
+    # Apple-silicon-only label instead of trusting the alias.
+    runs-on: macos-15
     timeout-minutes: 30
     permissions:
       security-events: write
