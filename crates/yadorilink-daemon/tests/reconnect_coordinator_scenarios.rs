@@ -1,8 +1,16 @@
-//! Acceptance tests for the `ReconnectCoordinator` (a single global
-//! semaphore bounding how many peer supervisors may be mid-handshake-attempt
-//! at once, see `peer_orchestrator::NetmapDiffState::reconnect_semaphore`)
+//! Acceptance tests for peer reconnection: simultaneous multi-peer churn,
+//! reconnecting mid-sync, and a daemon generation restarting entirely --
 //! plus the ABA-race fix to `NetmapDiffState::channels`'s natural-session-end
 //! cleanup (`remove_channel_if_current`).
+//!
+//! Formerly also covered a `ReconnectCoordinator` global semaphore bounding
+//! concurrent mid-handshake supervisors (`peer_orchestrator::NetmapDiffState::
+//! reconnect_semaphore`) against one permanently-failing peer starving the
+//! rest. That mechanism no longer exists in production -- reconnection is
+//! iroh-only now, with no shared handshake-concurrency bottleneck for one
+//! bad peer to hog -- so its dedicated scenario
+//! (`pathological_peer_does_not_starve_healthy_peers`) was deleted rather
+//! than kept green against a mechanism that is no longer there to test.
 //!
 //! Drives the real production stack exactly like `reconnect_handshake_stress.
 //! rs` and `chaos_coordination_unreachable.rs` (real `DaemonState` +
@@ -10,10 +18,9 @@
 //! `FakeCoordination`), star-topology rather than full mesh: a hub device
 //! plus N leaves, each leaf sharing a group with the hub ONLY (never with
 //! each other) -- keeps connection count and this file's own runtime cost at
-//! O(N), not O(N^2), which is exactly the N-to-1 fan-in shape the
-//! ReconnectCoordinator bounds, and is also the shape a real "many peers reconnecting to
-//! one already-established machine" event actually has (a laptop waking from
-//! sleep, a Wi-Fi roam, a network flap).
+//! O(N), not O(N^2), the N-to-1 fan-in shape a real "many peers reconnecting
+//! to one already-established machine" event actually has (a laptop waking
+//! from sleep, a Wi-Fi roam, a network flap).
 //!
 //! **What "simultaneous" means here:** `FakeCoordination::revoke` and
 //! `register_device` are plain synchronous methods (no `.await` inside their
@@ -379,6 +386,12 @@ async fn reconnect_after_daemon_generation_restart() {
     let leaf_runtime =
         spawn_orchestrator_on_own_runtime(fake.addr(), leaf.device_id.clone(), leaf.state.clone());
 
+    // See `advertise_substrate`'s own doc comment: a registered session
+    // (what the wait below checks) is not the same plane this scenario's
+    // reconnect actually needs -- unlike `spawn_star_mesh`, this file's own
+    // two-device fixture below has no other call site for this.
+    advertise_substrate(&[&hub.state, &leaf.state]).await;
+
     wait_until_with_context(
         || hub.state.peers.session(&leaf.device_id).is_some(),
         Duration::from_secs(60),
@@ -506,6 +519,12 @@ async fn reconnect_after_daemon_generation_restart() {
     let _new_leaf_handle =
         spawn_orchestrator(fake.addr(), leaf.device_id.clone(), leaf.state.clone());
 
+    // The restarted leaf is a genuinely new `DaemonState` with a fresh iroh
+    // endpoint -- the pre-restart advertisement above tracked the OLD
+    // leaf's address and was dropped along with it, so the hub needs this
+    // new generation's address distributed again before it can dial it.
+    advertise_substrate(&[&hub.state, &leaf.state]).await;
+
     wait_until_with_context(
         || hub.state.peers.session(&leaf.device_id).is_some(),
         Duration::from_secs(60),
@@ -548,118 +567,4 @@ async fn reconnect_after_daemon_generation_restart() {
         Some(pre_restart_leaf_key),
         "the hub's current netmap metadata for the leaf must still carry the pre-restart key"
     );
-}
-
-// --- scenario: one permanently-failing peer must not starve the rest ----
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn pathological_peer_does_not_starve_healthy_peers() {
-    support::ensure_isolated_config_dir();
-    let fake = FakeCoordination::start().await;
-    fake.enable_signed_policy();
-
-    const N_HEALTHY: usize = 5;
-    let healthy_groups: Vec<String> =
-        (0..N_HEALTHY).map(|i| format!("healthy-group-{i}")).collect();
-    let pathological_group = "pathological-group";
-
-    // Namespaced device IDs -- see `spawn_star_mesh`'s own doc comment for
-    // why: the signing-key pin store (`signing_keys.json`) is shared process-wide across
-    // every scenario in this one test binary.
-    let hub = new_test_daemon("pathological-hub");
-    let mut hub_groups: Vec<&str> = healthy_groups.iter().map(String::as_str).collect();
-    hub_groups.push(pathological_group);
-    register_with_fake(&fake, &hub.state, &hub.device_id, &hub_groups).await;
-
-    let mut hub_roots = Vec::with_capacity(N_HEALTHY + 1);
-    for group in &healthy_groups {
-        let root = tempfile::tempdir().unwrap();
-        link(&hub.state, root.path(), group);
-        hub_roots.push(root);
-    }
-    let pathological_root = tempfile::tempdir().unwrap();
-    link(&hub.state, pathological_root.path(), pathological_group);
-    hub_roots.push(pathological_root);
-
-    let mut healthy_leaves = Vec::with_capacity(N_HEALTHY);
-    for (i, group) in healthy_groups.iter().enumerate() {
-        let leaf = new_test_daemon(&format!("healthy-leaf-{i}"));
-        register_with_fake(&fake, &leaf.state, &leaf.device_id, &[group.as_str()]).await;
-        link(&leaf.state, leaf._root.path(), group);
-        healthy_leaves.push(leaf);
-    }
-
-    // The pathological peers: registered with the fake so the hub's netmap
-    // carries them as desired peers, but each pointed at its own real,
-    // bound, and deliberately never-read UDP socket -- every handshake
-    // initiation the hub sends any of them vanishes into genuine silence
-    // (not a closed port, which can resolve faster via an ICMP unreachable
-    // and would understate truly silent peers). No orchestrator is spawned
-    // for any of them: they exist purely as permanently-failing targets
-    // that the hub's own supervisors retry forever, repeatedly acquiring
-    // and releasing the ReconnectCoordinator's global permits.
-    //
-    // Deliberately MORE pathological peers than
-    // `RECONNECT_HANDSHAKE_CONCURRENCY` (4): with only one, 3 of the 4 global permits are always free no
-    // matter what, so the healthy leaves below can connect trivially
-    // regardless of whether the coordinator's fairness/bound is correct at
-    // all -- such a test could not fail even if the semaphore were deleted
-    // entirely. With enough
-    // pathological peers to legitimately consume every permit at once, the
-    // healthy leaves' progress genuinely depends on permits being returned
-    // and fairly redistributed, not merely on some being left over.
-    // `peer_orchestrator::RECONNECT_HANDSHAKE_CONCURRENCY` is private to
-    // that module (not `pub`), so this is hardcoded rather than imported --
-    // kept deliberately above it (+2), not merely equal to it, so the
-    // healthy leaves' fair share doesn't depend on this test's own exact
-    // value tracking production's constant precisely.
-    const N_PATHOLOGICAL: usize = 4 + 2;
-    for i in 0..N_PATHOLOGICAL {
-        // Leaked deliberately: each socket must stay bound (and unread) for
-        // the whole test so the hub's initiations keep vanishing into it,
-        // not get rebound/reused once this scope's local drops.
-        let pathological_socket: &'static std::net::UdpSocket =
-            Box::leak(Box::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap()));
-        // A distinct key per pathological peer, so each is its own device
-        // as far as the netmap is concerned.
-        let pathological_key = yadorilink_transport::DeviceSigningKeyPair::generate();
-        fake.register_device(
-            &format!("pathological-peer-{i}"),
-            pathological_key.public_bytes(),
-            pathological_socket.local_addr().unwrap().to_string(),
-            &[pathological_group],
-        );
-    }
-
-    spawn_orchestrator(fake.addr(), hub.device_id.clone(), hub.state.clone());
-    for leaf in &healthy_leaves {
-        spawn_orchestrator(fake.addr(), leaf.device_id.clone(), leaf.state.clone());
-    }
-
-    wait_until_with_context(
-        || healthy_leaves.iter().all(|leaf| hub.state.peers.session(&leaf.device_id).is_some()),
-        Duration::from_secs(60),
-        || {
-            format!(
-                "healthy leaves did not all connect despite the pathological peer's continuous \
-                 failing retries -- possible ReconnectCoordinator starvation\nhub: {}",
-                daemon_status_summary(&hub.state)
-            )
-        },
-    )
-    .await;
-
-    // `has_session` alone isn't the right check here: a `PeerSyncSession` is
-    // registered as soon as `PeerChannel::connect` succeeds STRUCTURALLY
-    // (channel object created), before any real handshake completes on the
-    // wire -- so it's always true almost immediately regardless of whether
-    // the peer ever actually answers. The real sanity signal is that the
-    // handshake itself never completes.
-    for i in 0..N_PATHOLOGICAL {
-        assert!(
-            hub.state.peers.session(&format!("pathological-peer-{i}")).is_none(),
-            "sanity: pathological-peer-{i} must genuinely never complete a handshake -- \
-             otherwise this test isn't exercising what it claims to"
-        );
-    }
 }
