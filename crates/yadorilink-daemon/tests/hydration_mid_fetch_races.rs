@@ -37,6 +37,24 @@
 //! edit then races the assemble instead of the fetch. The supersession case
 //! is still synchronized on the row reaching `Hydrating`: its outcome is
 //! asserted on the index and holds wherever in the attempt it lands.
+//!
+//! Windows: every test in this file is `#[ignore]`d there, same reason and
+//! same precedent as `peer_hydration.rs`'s own Windows-ignored tests. On
+//! Windows, `publish_and_adopt`'s readiness check (`materialization_state ==
+//! Placeholder` plus the right indexed size) proves only that the DB ROW is
+//! ready -- on this platform a real placeholder is a distinct, OS-managed
+//! object (`CfCreatePlaceholders`/`CfGetPlaceholderInfo`) that this pure-Rust
+//! harness never creates; that's deferred to a separate `yadorilink-cfapi-
+//! host.exe` process this test never runs. `admit_hydration_start`'s Windows
+//! branch (`untouched_placeholder_verdict` / `inspect_windows_placeholder` in
+//! `disk_observation.rs`) is correctly fail-closed against exactly this: a
+//! recorded placeholder generation with no real placeholder object backing
+//! it on disk reads as "the user may have deleted this," and hydration
+//! refuses before ever touching the block store -- hence `store.fired() ==
+//! false` on every one of this file's Windows failures, not a timing race.
+//! No amount of retrying or waiting fixes a fixture gap; only a real CfAPI
+//! double would. This file's cross-platform hydration-race logic is still
+//! exercised on macOS/Linux CI.
 
 mod support;
 
@@ -332,6 +350,7 @@ async fn hydrate_with_an_edit_during_the_assemble(
 /// rather than on either one. Disabling one leaves it green; disabling both
 /// makes hydration commit over the edit and report `Hydrated`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(windows, ignore = "needs a real CfAPI placeholder; see this file's module doc")]
 async fn a_local_edit_during_a_fetch_is_never_overwritten() {
     let _provider = placeholder_provider_present();
     let device_a = setup_device("device-a");
@@ -372,6 +391,7 @@ async fn a_local_edit_during_a_fetch_is_never_overwritten() {
 /// before the rename, or an edit landing in that window is silently lost
 /// under a row reporting `Hydrated`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(windows, ignore = "needs a real CfAPI placeholder; see this file's module doc")]
 async fn a_local_edit_while_the_file_is_assembled_is_never_overwritten() {
     let _provider = placeholder_provider_present();
     let device_a = setup_device("device-a");
@@ -415,6 +435,7 @@ async fn a_local_edit_while_the_file_is_assembled_is_never_overwritten() {
 /// So the retry here is made immediately, with the fetched blocks already
 /// local so it goes straight to the commit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(windows, ignore = "needs a real CfAPI placeholder; see this file's module doc")]
 async fn a_retry_right_after_a_refused_assemble_does_not_overwrite_the_edit() {
     let _provider = placeholder_provider_present();
     let device_a = setup_device("device-a");
@@ -451,6 +472,7 @@ async fn a_retry_right_after_a_refused_assemble_does_not_overwrite_the_edit() {
 /// The same, for an edit that lands mid-fetch and is refused at the commit
 /// decision rather than after the assemble.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(windows, ignore = "needs a real CfAPI placeholder; see this file's module doc")]
 async fn a_retry_right_after_a_refused_fetch_does_not_overwrite_the_edit() {
     let _provider = placeholder_provider_present();
     let device_a = setup_device("device-a");
@@ -487,6 +509,7 @@ async fn a_retry_right_after_a_refused_fetch_does_not_overwrite_the_edit() {
 
 /// A newer version landing mid-fetch is not reported as hydrated.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(windows, ignore = "needs a real CfAPI placeholder; see this file's module doc")]
 async fn a_version_superseded_during_a_fetch_is_never_reported_hydrated() {
     let _provider = placeholder_provider_present();
     let device_a = setup_device("device-a");
