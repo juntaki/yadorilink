@@ -58,9 +58,10 @@ pub use checkpoint_store::latest_checkpoint;
 pub(crate) use conflict_authoring::directory_head_changes;
 pub use conflict_authoring::record_conflict_copy_ops_provenance;
 pub use conflict_authoring::{
-    derive_required_conflict_copy_ops, derive_required_conflict_copy_ops_including_buried_roots,
-    init_conflict_copy_provenance_schema, path_heads_at_frontier,
-    path_heads_at_frontier_including_buried_roots, validate_carrier_conflict_copy_ops,
+    conflict_copy_provenance_by_target_path, derive_required_conflict_copy_ops,
+    derive_required_conflict_copy_ops_including_buried_roots, init_conflict_copy_provenance_schema,
+    path_heads_at_frontier, path_heads_at_frontier_including_buried_roots,
+    validate_carrier_conflict_copy_ops,
 };
 pub use frontier_index::{
     get_device_frontier, group_heads, max_parent_lamport, remove_device_frontier,
