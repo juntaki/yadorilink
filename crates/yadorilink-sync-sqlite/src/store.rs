@@ -461,6 +461,21 @@ impl SqliteSyncStore {
         self.group_heads(&FolderGroupId(group_id.to_string()))
     }
 
+    /// This path's `projection_obligations` row, if one exists -- the
+    /// Convergence Engine's own live claim source (see that module's own
+    /// doc comment). `None` distinguishes "never obliged" from "obliged
+    /// but not yet run", which a caller diagnosing a stalled projection
+    /// needs to tell apart.
+    pub fn dag_projection_obligation(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<crate::projection_obligations::ProjectionObligation>, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            crate::projection_obligations::lookup_projection_obligation(conn, group_id, path)
+        })
+    }
+
     /// [`Self::dag_group_heads`], restricted to the published subgraph --
     /// see [`Self::published_group_heads`].
     pub fn dag_published_group_heads(

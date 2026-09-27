@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use support::fake_coordination::FakeCoordination;
-use support::{register_with_fake, wait_until};
+use support::{daemon_status_summary, register_with_fake, wait_until, wait_until_with_context};
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::peer_orchestrator;
@@ -204,8 +204,30 @@ async fn device_remove_while_peer_offline_is_reflected_on_its_next_subscribe() {
     spawn_orchestrator(fake.addr(), device_a_id.to_string(), daemon_a.state.clone());
     spawn_orchestrator(fake.addr(), device_c_id.to_string(), daemon_c.state.clone());
 
+    // A `PeerSyncSession` only ever forms over the iroh reconciliation
+    // substrate now (`peer_connectivity_runtime/peer_sessions.rs`), which
+    // resolves a peer's address from the substrate's own address
+    // directory -- production carries that over the coordination plane's
+    // netmap fan-out; this bare `spawn_orchestrator` fixture does not, so
+    // without this call A and C never learn where each other's substrate
+    // answers and the positive control below never connects at all. See
+    // `share_revoke_mid_session...`'s own identical call earlier in this
+    // file.
+    support::advertise_substrate_between(&[&daemon_a.state, &daemon_c.state]).await;
+
     // Positive control: A connects normally to the still-authorized peer C.
-    wait_until(|| daemon_a.state.peers.has_session(device_c_id), Duration::from_secs(40)).await;
+    wait_until_with_context(
+        || daemon_a.state.peers.has_session(device_c_id),
+        Duration::from_secs(40),
+        || {
+            format!(
+                "A never connected to still-authorized C\n  a: {}\n  c: {}",
+                daemon_status_summary(&daemon_a.state),
+                daemon_status_summary(&daemon_c.state),
+            )
+        },
+    )
+    .await;
 
     // A must never establish a session to the removed device.
     tokio::time::sleep(Duration::from_secs(3)).await;

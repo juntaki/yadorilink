@@ -136,8 +136,13 @@ async fn connect_mesh(devices: &[TestDevice], group_id: &str) {
 ///   reached this device at all (a propagation problem, upstream of repair).
 /// - frontier equal but the conflict-copy row is absent -> the carrier is in
 ///   this device's DAG, yet no repair pass ever turned it into an index row.
-/// - row present but the name is missing from disk -> it was applied and
-///   only materialization never ran.
+/// - row present but the name is missing from disk -> either materialization
+///   never ran, or it ran and something re-armed the path without the
+///   Convergence Engine ever re-claiming it. `missing_from_disk_obligations`
+///   below settles which: each such path's `projection_obligations` row
+///   (the engine's own live claim source -- `materialization_jobs` is
+///   retired) names its `state`, retry/backoff position and which of the
+///   four admission seams last bumped it, or reports no row at all.
 fn frontier_index_disk_probe(devices: &[TestDevice], group_id: &str) -> String {
     // What reconciliation is obliged to produce, computed from the sets it
     // actually compares. For every ordered pair, `holder.servable -
@@ -214,11 +219,41 @@ fn frontier_index_disk_probe(devices: &[TestDevice], group_id: &str) -> String {
                 .dag_servable_hashes(group_id)
                 .map(|h| h.iter().map(|x| hex::encode(x.0)[..8].to_string()).collect::<Vec<_>>())
                 .unwrap_or_else(|e| vec![format!("err({e})")]);
+            let disk_names = real_entry_names(device.root.path());
+            // The fourth candidate mechanism `frontier`/`index`/`disk` alone
+            // cannot distinguish: a row present but the name missing from
+            // disk could be "materialization never ran" OR "materialization
+            // ran, but the Convergence Engine never re-armed to run it" --
+            // `projection_obligations` is the engine's own live claim
+            // source (`materialization_jobs` is retired, see that module's
+            // own doc comment), so a missing path's obligation row settles
+            // which. Only computed for paths actually missing from disk,
+            // matching this whole probe's "cost nothing until the run has
+            // already failed" discipline.
+            let missing_from_disk: Vec<String> = index_rows
+                .iter()
+                .filter(|path| !disk_names.contains(*path))
+                .map(|path| match coordinator.sqlite().dag_projection_obligation(group_id, path) {
+                    Ok(Some(o)) => format!(
+                        "{path}: state={:?} invalidation_generation={} \
+                             obligation_incarnation={} attempt_count={} next_attempt_at={} \
+                             origin={:?}",
+                        o.state,
+                        o.invalidation_generation,
+                        o.obligation_incarnation,
+                        o.attempt_count,
+                        o.next_attempt_at,
+                        o.origin,
+                    ),
+                    Ok(None) => format!("{path}: no projection_obligations row"),
+                    Err(error) => format!("{path}: obligation-lookup-error({error})"),
+                })
+                .collect();
             format!(
                 "device-{i}({}): canonical_heads={frontier:?} staged={staged:?} \
-                 servable={servable:?} index={index_rows:?} disk={:?}",
+                 servable={servable:?} index={index_rows:?} disk={disk_names:?} \
+                 missing_from_disk_obligations={missing_from_disk:?}",
                 device.device_id,
-                real_entry_names(device.root.path())
             )
         })
         .collect::<Vec<_>>()
@@ -348,8 +383,32 @@ async fn run_multiway_row(
         CONVERGENCE_ABSOLUTE_TIMEOUT,
         CONVERGENCE_STALL_TIMEOUT,
         || {
+            // Distinguishes "still converging, just slowly" from a shape
+            // that will NEVER change no matter how long this waits: every
+            // device already agrees with every other, on a snapshot that is
+            // permanently the wrong size. A flat "convergence stalled"
+            // reads as a timeout that a longer budget might fix; this
+            // classification, computed from the exact same agreement check
+            // the wait condition above already uses, rules that out
+            // explicitly whenever it applies.
+            let reference = snapshot(devices_ref[0].root.path());
+            let agreed = devices_ref[1..].iter().all(|d| snapshot(d.root.path()) == reference);
+            let shape_note = match shape {
+                ConvergedShape::EveryWriterSurvives
+                    if agreed && reference.len() != device_count =>
+                {
+                    format!(
+                        "STABLE WRONG CONVERGENCE SHAPE: every device already agrees, \
+                         permanently, on {} entries -- expected exactly {device_count} \
+                         (one winner + one conflict copy per loser). This will not change \
+                         with a longer timeout.\n  ",
+                        reference.len()
+                    )
+                }
+                _ => String::new(),
+            };
             format!(
-                "{}\n  {}",
+                "{shape_note}{}\n  {}",
                 devices_ref
                     .iter()
                     .enumerate()
