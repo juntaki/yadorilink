@@ -60,12 +60,8 @@ jobs:
     # the diagnostics-dumping step that dead end produced). xcodebuild is
     # not merely a workaround for that -- it is also the CI job that was
     # never actually analyzing the shipping app's own Swift sources.
-    # `macos-latest` can still resolve to an Intel runner (measured: this
-    # job's own first attempt landed on one, "My Mac doesn't support any of
-    # YadoriLink.app's architectures" -- project.yml locks the whole app to
-    # ARCHS=arm64, Apple silicon only, since every linked Rust library is
-    # built for aarch64-apple-darwin alone). Pinned to a concrete
-    # Apple-silicon-only label instead of trusting the alias.
+    # Pinned to a concrete label rather than `-latest`, for the usual
+    # reproducibility reasons.
     runs-on: macos-15
     timeout-minutes: 30
     permissions:
@@ -94,6 +90,16 @@ jobs:
       # the compile cache and integrated driver are disabled because
       # CodeQL's tracer needs to observe the real compiler invocations
       # (GitHub's own Swift-analysis docs give this exact combination).
+      #
+      # `generic/platform=macOS`, not a concrete `platform=macOS,arch=arm64`
+      # device destination -- measured on a genuinely Apple-silicon runner
+      # image (`macos-15-arm64`) that xcodebuild still resolved that device
+      # destination against a stale "My Mac" entry reporting arch=x86_64,
+      # refusing the build outright ("My Mac doesn't support any of
+      # YadoriLink.app's architectures"). The generic platform destination
+      # sidesteps that device-matching step entirely; `ARCHS=arm64` below
+      # (already the only value project.yml's build settings allow) still
+      # decides what actually gets built.
       - name: Build the YadoriLink app + extensions
         working-directory: shell-ext/macos/YadoriLinkFinderSync
         run: |
@@ -101,7 +107,7 @@ jobs:
             -project YadoriLinkFinderSync.xcodeproj \
             -scheme YadoriLink \
             -configuration Debug \
-            -destination 'platform=macOS,arch=arm64' \
+            -destination 'generic/platform=macOS' \
             ARCHS=arm64 \
             ONLY_ACTIVE_ARCH=YES \
             CODE_SIGNING_REQUIRED=NO \
