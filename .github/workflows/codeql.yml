@@ -47,19 +47,21 @@ jobs:
           category: "/language:rust"
 
   swift:
-    # The FinderSync/FileProvider shell extension has no .xcodeproj (see
-    # shell-ext/macos/YadoriLinkFinderSync/build.sh's header for why); its
-    # embedded Rust core links via `swiftc` directly, so this needs the
-    # same manual build as that script, on a real Xcode-equipped runner.
+    # Analyzes the actual shipping app (project.yml's `YadoriLink` scheme --
+    # a SwiftUI menu bar app, plus its FinderSync and FileProvider
+    # extensions), built the standard, CodeQL-documented way for an Xcode
+    # project: `xcodegen generate` then `xcodebuild`. `build.sh`'s
+    # standalone `swiftc` invocation (see its own header for why it exists
+    # at all -- a dev-machine constraint, not a CI one) builds a DIFFERENT,
+    # non-shipping legacy host app, and CodeQL's manual-build tracer could
+    # not extract anything usable from it: `database finalize` reported
+    # zero Swift files processed despite the compiler tracer visibly
+    # reaching every `swiftc` invocation (see this job's own history for
+    # the diagnostics-dumping step that dead end produced). xcodebuild is
+    # not merely a workaround for that -- it is also the CI job that was
+    # never actually analyzing the shipping app's own Swift sources.
     runs-on: macos-latest
-    # The FinderSync extension link (Rust staticlib + bridging header) is
-    # the expensive step and finishes in ~10min; but the second, much
-    # simpler swiftc invocation for the trivial host-app main.swift has
-    # been observed hanging past 19min under CodeQL's DYLD_INSERT_LIBRARIES
-    # tracer specifically (no such issue building outside CodeQL). Generous
-    # timeout is a diagnostic, not a fix -- if this still doesn't complete,
-    # the tracer/swiftc interaction needs its own investigation.
-    timeout-minutes: 60
+    timeout-minutes: 30
     permissions:
       security-events: write
     steps:
@@ -72,36 +74,36 @@ jobs:
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master @ 2026-06-30
         with:
           toolchain: stable
+          targets: aarch64-apple-darwin
+      - name: Install xcodegen
+        run: brew install xcodegen
+      - name: Generate the Xcode project
+        working-directory: shell-ext/macos/YadoriLinkFinderSync
+        run: xcodegen generate
       - uses: github/codeql-action/init@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
         with:
           languages: swift
           build-mode: manual
-      - name: Build FinderSync host app + extension
-        run: DEVELOPER_DIR="$(xcode-select -p)" ./shell-ext/macos/YadoriLinkFinderSync/build.sh
-      # The tracer does reach the Swift extractor for both swiftc compiles (it
-      # writes one diagnostics file per failing extraction), but finalize then
-      # reports that nothing was extracted, and the failed-run SARIF it uploads
-      # cannot be downloaded. Print what the extractor said, so a failure here
-      # names its cause in the job log.
-      - name: Show Swift extractor diagnostics
-        if: always()
-        env:
-          DB: ${{ runner.temp }}/codeql_databases/swift
+      # No signing on a CI runner with no team's certificates installed;
+      # the compile cache and integrated driver are disabled because
+      # CodeQL's tracer needs to observe the real compiler invocations
+      # (GitHub's own Swift-analysis docs give this exact combination).
+      - name: Build the YadoriLink app + extensions
+        working-directory: shell-ext/macos/YadoriLinkFinderSync
         run: |
-          for f in "$DB"/diagnostic/extractors/swift/extractor/*.jsonl; do
-            [ -f "$f" ] || continue
-            echo "::group::$f"
-            head -c 20000 "$f"
-            echo
-            echo "::endgroup::"
-          done
-          if [ -d "$DB/log" ]; then
-            find "$DB/log" -type f -print0 | while IFS= read -r -d '' f; do
-              echo "::group::$f"
-              grep -iE 'error|fatal|unsupported|fail' "$f" | head -n 200 || true
-              echo "::endgroup::"
-            done
-          fi
+          xcodebuild \
+            -project YadoriLinkFinderSync.xcodeproj \
+            -scheme YadoriLink \
+            -configuration Debug \
+            -destination 'platform=macOS,arch=arm64' \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            COMPILATION_CACHE_ENABLE_CACHING=NO \
+            SWIFT_ENABLE_COMPILE_CACHE=NO \
+            SWIFT_USE_INTEGRATED_DRIVER=NO \
+            build
       - uses: github/codeql-action/analyze@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
         with:
           category: "/language:swift"
