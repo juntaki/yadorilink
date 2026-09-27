@@ -166,16 +166,20 @@ async fn n_synced_devices(
     for i in 0..n {
         devices.push(setup_device(fake, &format!("{device_prefix}-device-{i}"), &[group_id]).await);
     }
-    let refs: Vec<&TestDevice> = devices.iter().collect();
-    wait_for_mesh(&refs).await;
-    // The mesh wait proves the legacy peer-session transport is up. The
-    // reconciliation substrate -- the only plane that carries DAG changes --
-    // is a different socket with a different ALPN, and these fixtures wire
-    // their own devices, so nobody learns where anybody's substrate answers.
-    // Without this, changes reach nothing and every row stalls.
+    // Before the mesh wait, not after: a `PeerSyncSession` only forms once
+    // `SyncStack::link_to` resolves the peer's address from the
+    // reconciliation substrate's own address directory -- the only plane
+    // that carries DAG changes, a different socket with a different ALPN
+    // from whatever the session itself connects over, and these fixtures
+    // wire their own devices, so nobody learns where anybody's substrate
+    // answers without this call. Waiting for sessions first is circular:
+    // it waits on the exact connection this line is what makes possible.
+    // See taguchi_collision_matrix_v2.rs's identical fix for the same bug.
     let states: Vec<&std::sync::Arc<DaemonState>> =
         devices.iter().map(|device| &device.state).collect();
     support::advertise_substrate_between(&states).await;
+    let refs: Vec<&TestDevice> = devices.iter().collect();
+    wait_for_mesh(&refs).await;
     wait_until(
         || {
             devices.iter().all(|device| {
