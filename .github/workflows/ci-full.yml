@@ -38,7 +38,14 @@ jobs:
         with:
           key: linux-full
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Every step below runs even if an earlier one failed
+      # (`if: always()` + `continue-on-error: true`), and the final
+      # "Report step failures" step fails the job overall if any of them
+      # did -- so a single push surfaces every lane's failures, not just
+      # the first one this job happens to reach.
       - name: Full workspace
+        id: full_workspace
+        continue-on-error: true
         # Daemon integration tests own real watcher/SQLite/network runtimes and
         # run in the single-threaded lane below. Running them here as well makes
         # several independent multi-daemon scenarios contend in parallel.
@@ -58,6 +65,9 @@ jobs:
           --skip rotation_child
           --skip a_process_stays_authenticated_across_the_five_minute_access_token_lifetime
       - name: Path-frontier scale bounds (release)
+        id: path_frontier_scale
+        if: always()
+        continue-on-error: true
         # The absolute per-admission bound in this file is a release-build
         # figure; the debug run above checks only that the cost stays flat.
         run: cargo test --release -p yadorilink-sync-sqlite --test path_frontier_scale
@@ -65,11 +75,16 @@ jobs:
       # which needs the cryptography package. setup-python gives a Python
       # that pip may install into (the runner images' own may not allow it).
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        if: always()
         with:
           python-version: "3.12"
       - name: Python cryptography for the release manifest chain test
+        if: always()
         run: python3 -m pip install --quiet --disable-pip-version-check cryptography
       - name: Daemon E2E
+        id: daemon_e2e
+        if: always()
+        continue-on-error: true
         # The two monkey-chaos cases are long-running seed/soak coverage and
         # are skipped here; every ordinary daemon integration test runs in
         # this serial correctness lane.
@@ -84,15 +99,43 @@ jobs:
           --skip random_concurrent_operations_converge_to_an_identical_file_set
           --skip replay_known_failing_seeds
       - name: Wire integration
+        id: wire_integration
+        if: always()
+        continue-on-error: true
         run: |
           cargo test --no-fail-fast -p yadorilink-peer-session --test peer_session --test crash_recovery -- --test-threads=1
           cargo test --no-fail-fast -p yadorilink-daemon --test watcher_decompose_conformance -- --test-threads=1
       - name: DST lanes 0 and 1
+        id: dst_lanes
+        if: always()
+        continue-on-error: true
         run: |
           cargo run -p xtask -- dst-lane0
           cargo run -p xtask -- dst-lane1
       - name: Unsigned Linux installer build-health
+        id: installer_build_health
+        if: always()
+        continue-on-error: true
         run: ./installer/linux/build-deb.sh
+      - name: Report step failures
+        if: always()
+        run: |
+          failed=0
+          for outcome in \
+            "${{ steps.full_workspace.outcome }}" \
+            "${{ steps.path_frontier_scale.outcome }}" \
+            "${{ steps.daemon_e2e.outcome }}" \
+            "${{ steps.wire_integration.outcome }}" \
+            "${{ steps.dst_lanes.outcome }}" \
+            "${{ steps.installer_build_health.outcome }}"; do
+            if [ "$outcome" = "failure" ]; then
+              failed=1
+            fi
+          done
+          if [ "$failed" = "1" ]; then
+            echo "one or more steps in this job failed; see above for which"
+            exit 1
+          fi
 
   platform-e2e:
     strategy:

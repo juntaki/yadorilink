@@ -40,13 +40,25 @@ jobs:
       - name: Install cargo-llvm-cov
         run: cargo install --locked --version 0.8.7 cargo-llvm-cov
       - run: cargo llvm-cov clean --workspace
+      # Every test step below runs even if an earlier one failed
+      # (`if: always()` + `continue-on-error: true`), and the final
+      # "Report step failures" step fails the job overall if any of them
+      # did -- so a single push surfaces every lane's failures, not just
+      # the first one this job happens to reach. The report/upload steps
+      # still run on a partial pass: partial coverage data is more useful
+      # than none.
       - name: Workspace coverage
+        id: workspace_coverage
+        continue-on-error: true
         # --no-fail-fast: surface every failing crate's tests in one run
         # rather than stopping at the first one, so a fix doesn't have to
         # be discovered and landed one crate at a time across repeated CI
         # round-trips.
         run: cargo llvm-cov --no-fail-fast --workspace --exclude yadorilink-daemon --exclude yadorilink-desktop-app --no-report
       - name: Daemon coverage (serial)
+        id: daemon_coverage
+        if: always()
+        continue-on-error: true
         # Deliberately WITHOUT --no-fail-fast: see ci-full.yml's own Daemon
         # E2E step for why -- the same serial multi-binary suite.
         run: |
@@ -55,10 +67,25 @@ jobs:
             --skip random_concurrent_operations_converge_to_an_identical_file_set \
             --skip replay_known_failing_seeds
       - name: Generate LCOV report
+        if: always()
         run: cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload coverage
+        if: always()
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
           files: ./lcov.info
           disable_search: true
           fail_ci_if_error: true
+      - name: Report step failures
+        if: always()
+        run: |
+          failed=0
+          for outcome in "${{ steps.workspace_coverage.outcome }}" "${{ steps.daemon_coverage.outcome }}"; do
+            if [ "$outcome" = "failure" ]; then
+              failed=1
+            fi
+          done
+          if [ "$failed" = "1" ]; then
+            echo "one or more test steps in this job failed; see above for which"
+            exit 1
+          fi
