@@ -169,6 +169,36 @@ fn conflict_copy_provisioned_and_reachable(
     Ok(false)
 }
 
+/// The provenance row recorded for `target_path` -- the same table
+/// [`conflict_copy_already_provisioned`] and [`conflict_copy_provisioned_and_
+/// reachable`] look up by `(source_path, losing_change)`, keyed the other
+/// way around for a caller that only has the conflict-copy path itself (a
+/// diagnostic asking "what produced this specific copy", not "has this
+/// specific obligation already been discharged"). `target_path` is not part
+/// of the table's primary key, so this is a plain scan, not an index
+/// lookup -- fine for the diagnostic call sites this exists for, wrong for
+/// anything on a hot path.
+pub fn conflict_copy_provenance_by_target_path(
+    conn: &Connection,
+    group_id: &str,
+    target_path: &str,
+) -> Result<Option<(String, ChangeHash, ChangeHash)>, SyncSqliteError> {
+    let row: Option<(String, Vec<u8>, Vec<u8>)> = conn
+        .query_row(
+            "SELECT source_path, losing_change_hash, carrier_change_hash \
+             FROM conflict_copy_provenance WHERE group_id = ?1 AND target_path = ?2",
+            rusqlite::params![group_id, target_path],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let Some((source_path, losing_blob, carrier_blob)) = row else { return Ok(None) };
+    Ok(Some((
+        source_path,
+        retained_history_integrity::hash_from_blob(losing_blob)?,
+        retained_history_integrity::hash_from_blob(carrier_blob)?,
+    )))
+}
+
 /// Records provenance for every `ConflictCopy`-origin `Put` in `change`'s own
 /// ops, keyed by `(group_id, source_path, losing_change)` -- idempotent
 /// (`INSERT OR IGNORE`), so calling this more than once for the same change

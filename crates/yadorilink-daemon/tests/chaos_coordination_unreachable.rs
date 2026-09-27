@@ -171,9 +171,12 @@ async fn published_data_plane_survives_coordination_outage_and_pending_edits_con
         Duration::from_secs(30),
         || {
             format!(
-                "initial sync failed\ndaemon-a: {}\ndaemon-b: {}",
+                "initial sync failed\ndaemon-a: {}\ndaemon-b: {}\n  a/before-outage.txt: {}\n  \
+                 b/before-outage.txt: {}",
                 daemon_status_summary(&daemon_a.state),
-                daemon_status_summary(&daemon_b.state)
+                daemon_status_summary(&daemon_b.state),
+                describe_index_state(&daemon_a.state, group_id, "before-outage.txt"),
+                describe_index_state(&daemon_b.state, group_id, "before-outage.txt"),
             )
         },
     )

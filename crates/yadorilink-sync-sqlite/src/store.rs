@@ -476,6 +476,20 @@ impl SqliteSyncStore {
         })
     }
 
+    /// The `(source_path, losing_change, carrier_change)` this conflict-copy
+    /// `target_path` was durably minted from, if any -- see
+    /// [`crate::dag_store::conflict_copy_provenance_by_target_path`]'s own
+    /// doc comment for why this is the reverse lookup, diagnostic-only.
+    pub fn dag_conflict_copy_provenance_by_target_path(
+        &self,
+        group_id: &str,
+        target_path: &str,
+    ) -> Result<Option<(String, ChangeHash, ChangeHash)>, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            crate::dag_store::conflict_copy_provenance_by_target_path(conn, group_id, target_path)
+        })
+    }
+
     /// [`Self::dag_group_heads`], restricted to the published subgraph --
     /// see [`Self::published_group_heads`].
     pub fn dag_published_group_heads(

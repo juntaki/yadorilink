@@ -294,9 +294,77 @@ fn conflict_copy_justification_probe(device: &TestDevice, group_id: &str, path: 
         .map(|copies| copies.iter().any(|c| c == path))
         .map(|b| b.to_string())
         .unwrap_or_else(|e| format!("err({e})"));
+    // The provenance row this copy was durably minted from, if any -- the
+    // author of its CARRIER change (the repair/derivation that put this
+    // path into history) versus the NAMING device of the LOSING head it
+    // carries (`change.rs`'s own `PutOrigin::Reasserted` doc comment: these
+    // two diverge exactly when a retroactive-repair carrier re-asserts
+    // content it did not itself write, and a path's converged name must
+    // stay on the original author even though the carrier's `device_id` is
+    // the repairer). Two identical-content copies at different target paths
+    // with the same `losing_change` but different `carrier_change` would be
+    // the double-carrier race; different `losing_change` values for the
+    // same content hash would instead point at the resolver treating one
+    // physical edit as two distinct logical ones.
+    let provenance = device
+        .state
+        .replica_coordinator
+        .sqlite()
+        .dag_conflict_copy_provenance_by_target_path(group_id, path)
+        .unwrap_or_else(|e| {
+            tracing::warn!(path, error = %e, "conflict-copy provenance lookup failed");
+            None
+        });
+    let provenance_detail = match provenance {
+        None => "no conflict_copy_provenance row".to_string(),
+        Some((prov_source_path, losing_change, carrier_change)) => {
+            let sqlite = device.state.replica_coordinator.sqlite();
+            let carrier_author = sqlite
+                .dag_get_change(&carrier_change)
+                .map(|c| c.map(|c| c.device_id.0))
+                .unwrap_or_else(|e| Some(format!("err({e})")));
+            let version_hash =
+                sqlite.dag_get_change(&carrier_change).ok().flatten().and_then(|change| {
+                    change.ops.iter().find_map(|op| match op {
+                        yadorilink_replica_domain::change::Op::Put { path: p, version, .. }
+                            if p.as_str() == path =>
+                        {
+                            Some(format!("{version:?}"))
+                        }
+                        _ => None,
+                    })
+                });
+            let (naming_device_id, losing_change_device_id) =
+                match sqlite.dag_get_change(&losing_change).ok().flatten() {
+                    Some(losing) => {
+                        let naming = losing.ops.iter().find_map(|op| match op {
+                            yadorilink_replica_domain::change::Op::Put {
+                                path: p,
+                                origin:
+                                    yadorilink_replica_domain::change::PutOrigin::Reasserted {
+                                        naming_device_id,
+                                        ..
+                                    },
+                                ..
+                            } if p.as_str() == prov_source_path => Some(naming_device_id.0.clone()),
+                            _ => None,
+                        });
+                        (naming.unwrap_or_else(|| losing.device_id.0.clone()), losing.device_id.0)
+                    }
+                    None => ("unknown (losing_change not retained)".to_string(), "?".to_string()),
+                };
+            format!(
+                "losing_change={} carrier_change={} version_hash={version_hash:?} \
+                 carrier_author={carrier_author:?} losing_change_device_id={losing_change_device_id} \
+                 naming_device_id={naming_device_id}",
+                losing_change.to_hex(),
+                carrier_change.to_hex(),
+            )
+        }
+    };
     format!(
         "{path}: history_contains={history_contains} resolver_justifies={resolver_justifies} \
-         source_path={source_path:?}"
+         source_path={source_path:?} {provenance_detail}"
     )
 }
 
