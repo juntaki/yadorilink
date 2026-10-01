@@ -40,7 +40,7 @@ qrcode = { version = "0.14", default-features = false }
 [dev-dependencies]
 # The wire-contract harness decodes JWT-shaped values and parses redirect
 # URLs while playing the browser.
-base64 = { version = "0.22" }
+base64 = { version = "0.23" }
 url = { version = "2" }
 # Integration tests wire a registered test device's change-signing key.
 yadorilink-transport = { path = "../yadorilink-transport" }

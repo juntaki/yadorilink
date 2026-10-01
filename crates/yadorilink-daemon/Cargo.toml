@@ -150,7 +150,7 @@ ed25519-dalek = { version = "3", features = ["rand_core"] }
 # — already present in Cargo.lock as a transitive dependency
 # elsewhere in the workspace; this is its first direct use.
 semver = "1"
-base64 = "0.22"
+base64 = "0.23"
 rand = "0.10.2"
 # WebSocket client for the coordination plane's `/netmap/subscribe` route,
 # the sole netmap subscription transport. rustls-tls-webpki-roots to match

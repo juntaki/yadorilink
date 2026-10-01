@@ -50,7 +50,7 @@ p256 = { version = "=0.14.0", default-features = false, features = [
 # other member crate.
 sha2 = { workspace = true }
 # base64url, unpadded, for every JOSE segment. Already resolved at 0.22.1.
-base64 = "0.22"
+base64 = "0.23"
 serde = { workspace = true }
 serde_json = "1"
 # The PKCE verifier's entropy. Already resolved at 0.4.3.

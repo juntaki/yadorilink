@@ -9112,7 +9112,7 @@ dependencies = [
 name = "yadorilink-cli"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "clap",
  "ed25519-dalek",
  "hex",
@@ -9143,7 +9143,7 @@ dependencies = [
 name = "yadorilink-client-core"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "libc",
  "reqwest 0.12.28",
  "serde",
@@ -9169,7 +9169,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "ed25519-dalek",
  "fs2",
@@ -9260,7 +9260,7 @@ dependencies = [
 name = "yadorilink-fapi-client"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "fs2",
  "getrandom 0.4.3",
  "keyring",
