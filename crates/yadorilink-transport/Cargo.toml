@@ -34,7 +34,7 @@ quinn = { version = "=0.11.11", default-features = false, features = ["runtime-t
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 # Certificate generation for TLS handshake tests. `ring` crypto backend,
 # matching the rest of this dependency set.
-rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 tokio.workspace = true
 
 [dev-dependencies]
