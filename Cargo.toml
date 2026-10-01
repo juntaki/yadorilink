@@ -80,7 +80,7 @@ zstd = "0.13"
 # The Swift binding for the macOS app. One exact version: the generated Swift
 # checks the library's API checksums at load time, so the bindgen and the
 # scaffolding must come from the same release.
-uniffi = "=0.32.1"
+uniffi = "=0.32.2"
 
 # Profiling build: release-level optimization with debug symbols/line info
 # retained, so `perf`/`samply`/Instruments can resolve stacks to source
