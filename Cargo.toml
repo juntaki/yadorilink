@@ -76,7 +76,7 @@ sha2 = "0.11"
 # Negotiated zstd compression for sync-protocol block/index payloads —
 # scoped to `yadorilink-peer-session` only, not a dependency of any other
 # crate.
-zstd = "0.13"
+zstd = "0.14"
 # The Swift binding for the macOS app. One exact version: the generated Swift
 # checks the library's API checksums at load time, so the bindgen and the
 # scaffolding must come from the same release.
