@@ -330,7 +330,7 @@ mod cfapi_placeholder_untouched_windows_tests {
         let metadata = metadata_for(4096);
         let legacy = RecordedPlaceholderGeneration {
             identity: PlaceholderDiskIdentity { dev: 0, ino: 7 },
-            provider_kind: yadorilink_local_storage::INTERNAL_INODE_PROVIDER_KIND.to_string(),
+            provider_kind: "internal-inode".to_string(),
         };
         assert!(!cfapi_placeholder_untouched(
             &replica,
