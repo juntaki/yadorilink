@@ -108,6 +108,7 @@ fn reset_peak_live() -> usize {
 
 /// `struct rusage` of 64-bit macOS and Linux: two `timeval`s (16 bytes
 /// each) followed by fourteen `long`s, the first of which is `ru_maxrss`.
+#[cfg(unix)]
 #[repr(C)]
 struct RUsage {
     utime: [i64; 2],
@@ -116,11 +117,20 @@ struct RUsage {
     rest: [i64; 13],
 }
 
+#[cfg(unix)]
 extern "C" {
     fn getrusage(who: i32, usage: *mut RUsage) -> i32;
 }
 
+/// The peak resident set size of this process so far, in bytes (0 where it
+/// is not measured).
+#[cfg(not(unix))]
+pub fn peak_rss_bytes() -> u64 {
+    0
+}
+
 /// The peak resident set size of this process so far, in bytes.
+#[cfg(unix)]
 pub fn peak_rss_bytes() -> u64 {
     let mut usage = RUsage { utime: [0; 2], stime: [0; 2], maxrss: 0, rest: [0; 13] };
     // SAFETY: `usage` is a valid, writable `struct rusage` for this target
