@@ -185,5 +185,5 @@ pub(crate) fn ingest(
     Err(IngestError::Rejected("provider writes need a Unix daemon".into()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;
