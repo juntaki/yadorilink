@@ -288,7 +288,12 @@ mod ladder_tests {
             drop(waiter);
             flag.store(true, Ordering::SeqCst);
         });
-        std::thread::sleep(Duration::from_millis(250));
+        // Wait for the ladder to repeat rather than for a fixed time: a loaded
+        // machine can start the waiter thread late.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while warnings.lock().unwrap().len() < 2 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(!returned.load(Ordering::SeqCst), "the wait gave up before the job ended");
         {
             let seen = warnings.lock().unwrap();
