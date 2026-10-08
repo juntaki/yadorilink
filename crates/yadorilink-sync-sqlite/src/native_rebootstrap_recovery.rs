@@ -262,7 +262,9 @@ pub(crate) mod test_hooks {
     pub fn maybe_corrupt(path: &Path, bytes: &[u8]) -> Vec<u8> {
         let mut out = bytes.to_vec();
         let hit = CORRUPT_PATH_CONTAINING.with(|text| {
-            text.borrow().as_deref().is_some_and(|t| path.to_string_lossy().contains(t))
+            text.borrow()
+                .as_deref()
+                .is_some_and(|t| path.to_string_lossy().replace('\\', "/").contains(t))
         });
         if hit {
             match out.first_mut() {
@@ -278,7 +280,10 @@ fn fsync_file(file: &fs::File, path: &Path) -> io::Result<()> {
     #[cfg(test)]
     {
         let fail = test_hooks::FAIL_FILE_SYNC_CONTAINING.with(|text| {
-            let hit = text.borrow().as_deref().is_some_and(|t| path.to_string_lossy().contains(t));
+            let hit = text
+                .borrow()
+                .as_deref()
+                .is_some_and(|t| path.to_string_lossy().replace('\\', "/").contains(t));
             if hit {
                 *text.borrow_mut() = None;
             }
