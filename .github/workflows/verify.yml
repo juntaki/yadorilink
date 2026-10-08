@@ -1,0 +1,276 @@
+name: Verify
+
+# Deterministic correctness of one SHA. Runs unchanged on pull requests and on
+# main. Anything time- or probability-dependent belongs in nightly.yml.
+#
+# Inside a job, every step after the first uses `if: always()`, so one run
+# reports every failure in that job instead of stopping at the first.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["docs/**"]
+  pull_request:
+    paths-ignore: ["docs/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: quality
+          components: rustfmt, clippy
+          token: ${{ github.token }}
+      - run: cargo fmt --all -- --check
+      - if: always()
+        run: cargo clippy --workspace --exclude yadorilink-desktop-app --all-targets -- -D warnings
+      - name: Architecture and invariant checks
+        if: always()
+        run: |
+          set -e
+          python3 scripts/check-architecture.py --self-test
+          python3 scripts/check-architecture.py
+          python3 scripts/check-block-commit-boundary.py
+          python3 scripts/check-block-deletion-boundary.py
+          python3 scripts/check-daemon-composition-root.py
+          python3 scripts/check-data-durability-model.py
+          python3 scripts/check-index-read-fail-closed.py
+          python3 scripts/check-link-enumeration-fail-closed.py
+          python3 scripts/check-link-group-uniqueness.py
+          python3 scripts/check-link-runtime-ownership.py
+          python3 scripts/check-maintenance-ownership.py
+          python3 scripts/check-materialization-journal.py
+          python3 scripts/check-mutation-boundary.py
+          python3 scripts/check-materialization-semantic-boundary.py
+          python3 scripts/check-materialization-semantic-boundary.py --self-test
+          python3 scripts/check-stored-blocklist-fail-closed.py
+          python3 scripts/check-pre-release-compatibility-debt.py
+          bash scripts/check_removed_features.sh --self-test
+          bash scripts/check_removed_features.sh
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        if: always()
+        with:
+          tool: cargo-audit,cargo-deny
+      - if: always()
+        run: cargo audit
+      - if: always()
+        run: cargo deny check
+
+  # Platform-independent logic is verified once, on Linux, split into lanes
+  # that run in parallel. Lanes that measure wall clock or bind real sockets
+  # run single-threaded on their own runner so they never share a machine with
+  # a multi-threaded suite.
+  linux:
+    name: linux (${{ matrix.lane }})
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: workspace
+            timeout: 45
+            run: >-
+              cargo test --no-fail-fast --workspace --exclude yadorilink-daemon --exclude yadorilink-desktop-app
+              --exclude yadorilink-transport --exclude yadorilink-lane-ports
+              --exclude yadorilink-sync-substrate --exclude yadorilink-sync-sqlite
+              --exclude yadorilink-http-api
+              --
+              --skip rotation_without_the_lock_destroys_the_grant
+              --skip rotation_under_the_lock_keeps_the_grant_alive
+              --skip rotation_child
+              --skip a_process_stays_authenticated_across_the_five_minute_access_token_lifetime
+          - lane: daemon lib
+            timeout: 45
+            run: cargo test --no-fail-fast -p yadorilink-daemon --lib -- --test-threads=1
+          - lane: daemon integration
+            timeout: 90
+            python: true
+            run: >-
+              cargo test -p yadorilink-daemon --test '*' --
+              --test-threads=1
+              --skip random_concurrent_operations_converge_to_an_identical_file_set
+              --skip replay_known_failing_seeds
+          - lane: wire
+            timeout: 30
+            run: >-
+              cargo test --no-fail-fast -p yadorilink-peer-session
+              --test peer_session --test crash_recovery -- --test-threads=1
+          - lane: transport
+            timeout: 45
+            run: cargo test --no-fail-fast -p yadorilink-transport --tests -- --test-threads=1
+          - lane: lane-ports
+            timeout: 45
+            run: cargo test --no-fail-fast -p yadorilink-lane-ports --tests -- --test-threads=1
+          - lane: sync-substrate
+            timeout: 45
+            run: cargo test --no-fail-fast -p yadorilink-sync-substrate --tests -- --test-threads=1
+          - lane: http-api
+            timeout: 45
+            run: cargo test --no-fail-fast -p yadorilink-http-api --tests -- --test-threads=1
+          - lane: sync-sqlite lib
+            timeout: 60
+            run: cargo test --no-fail-fast -p yadorilink-sync-sqlite --lib -- --test-threads=1
+          - lane: sync-sqlite integration
+            timeout: 60
+            run: cargo test --no-fail-fast -p yadorilink-sync-sqlite --test '*' -- --test-threads=1
+          # The two runtime proofs about the Coordination credential. One
+          # spends 320s of real wall clock crossing the 300s access-token
+          # lifetime; the other forks two real processes. Keep both `--test`
+          # arguments: dropping one silently drops a security proof.
+          - lane: auth runtime
+            timeout: 25
+            run: >-
+              cargo test -p yadorilink-fapi-client
+              --test cross_process_rotation --test five_minute_boundary
+              -- --test-threads=1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: linux-${{ matrix.lane }}
+          token: ${{ github.token }}
+      # tests/release_manifest_chain.rs drives the Python manifest verifier.
+      - if: matrix.python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - if: matrix.python
+        run: python3 -m pip install --quiet --disable-pip-version-check cryptography
+      - run: ${{ matrix.run }}
+
+  # Deterministic simulation: one seed per scenario. Multi-seed sweeps are
+  # nightly.
+  linux-simulation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: linux-simulation
+          token: ${{ github.token }}
+      - name: Turmoil scenarios, one seed
+        env:
+          RUSTFLAGS: --cfg turmoil
+          DST_SEEDS: "1"
+        run: >-
+          cargo test --no-fail-fast -p yadorilink-daemon
+          --test dst_turmoil_substrate_case --test dst_turmoil_stack_case
+          -- --test-threads=1
+      - if: always()
+        run: cargo run -p xtask -- dst-lane0
+      - if: always()
+        run: cargo run -p xtask -- dst-lane1
+      # The absolute per-admission bound is a release-build figure.
+      - if: always()
+        run: cargo test --release -p yadorilink-sync-sqlite --test path_frontier_scale
+
+  linux-installer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: linux-installer
+          token: ${{ github.token }}
+      - name: Unsigned installer builds
+        run: ./installer/linux/build-deb.sh
+
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: macos
+          token: ${{ github.token }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: python3 -m pip install --quiet --disable-pip-version-check cryptography
+      - run: cargo build --workspace --all-targets
+      - name: Workspace tests
+        if: always()
+        run: >-
+          cargo test --no-fail-fast --workspace --exclude yadorilink-daemon --exclude yadorilink-desktop-app
+          --
+          --skip rotation_without_the_lock_destroys_the_grant
+          --skip rotation_under_the_lock_keeps_the_grant_alive
+          --skip rotation_child
+          --skip a_process_stays_authenticated_across_the_five_minute_access_token_lifetime
+      - name: Daemon filesystem and runtime tests
+        if: always()
+        run: >-
+          cargo test -p yadorilink-daemon --tests --
+          --test-threads=1
+          --skip random_concurrent_operations_converge_to_an_identical_file_set
+          --skip replay_known_failing_seeds
+      - name: Shell extensions
+        if: always()
+        run: |
+          cargo build --release --manifest-path shell-ext/macos/core/Cargo.toml
+          cargo build --release --manifest-path shell-ext/macos/fileprovider-core/Cargo.toml
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: windows
+          token: ${{ github.token }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: python3 -m pip install --quiet --disable-pip-version-check cryptography
+      - run: cargo build --workspace --all-targets
+      - name: Workspace tests
+        if: always()
+        run: >-
+          cargo test --no-fail-fast --workspace --exclude yadorilink-daemon --exclude yadorilink-desktop-app
+          -- --test-threads=4
+          --skip rotation_without_the_lock_destroys_the_grant
+          --skip rotation_under_the_lock_keeps_the_grant_alive
+          --skip rotation_child
+          --skip a_process_stays_authenticated_across_the_five_minute_access_token_lifetime
+      - name: Daemon filesystem and runtime tests
+        if: always()
+        run: >-
+          cargo test -p yadorilink-daemon --tests --
+          --test-threads=1
+          --skip random_concurrent_operations_converge_to_an_identical_file_set
+          --skip replay_known_failing_seeds
+      - name: Shell extension
+        if: always()
+        working-directory: shell-ext/windows
+        run: cargo build --release
