@@ -504,6 +504,9 @@ async fn an_unconsumed_handoff_file_is_swept_after_its_lifetime() {
 
 /// A restart removes what a crashed run left: every staging file and the stale handoff files,
 /// while a fresh handoff file (a response that just went out) is kept.
+// TODO(checkpoint B): the handoff sweep is macOS/Unix-specific (handoff time is the Unix ctime).
+// Windows does not use this handoff; decide the Windows expectation in checkpoint B.
+#[cfg(unix)]
 #[test]
 fn a_restart_sweeps_leftovers_of_a_crashed_run() {
     let dir = tempfile::tempdir().unwrap();
@@ -733,6 +736,9 @@ async fn a_directory_sync_failure_after_the_rename_leaves_no_handoff_file() {
 /// The startup sweep ages a handoff file by when it entered `handoff/`, never by the replicated
 /// modification time it carries: an old mtime on a fresh file and a future mtime on a stale one
 /// are both judged by the handoff time.
+// TODO(checkpoint B): the handoff sweep is macOS/Unix-specific (handoff time is the Unix ctime).
+// Windows does not use this handoff; decide the Windows expectation in checkpoint B.
+#[cfg(unix)]
 #[test]
 fn the_startup_sweep_ignores_the_replicated_mtime() {
     let dir = tempfile::tempdir().unwrap();
