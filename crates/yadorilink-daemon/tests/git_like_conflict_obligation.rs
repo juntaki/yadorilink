@@ -485,15 +485,28 @@ async fn late_clone_after_rename_and_recreate_keeps_the_old_conflict_copy() {
     )
     .await;
     let conflicted = settle_pair(a, b, "module conflict", |state| state.len() == 2).await;
-    let (conflict_name, conflict_content) = single_conflict(&conflicted);
+    let (_, conflict_content) = single_conflict(&conflicted);
 
     std::fs::rename(a.root.path().join("module.rs"), a.root.path().join("module-old.rs")).unwrap();
     write_file(a.root.path(), "module.rs", "new post-rebase generation");
 
+    // The old loser stays a live head. Which of {loser, new generation} keeps
+    // `module.rs` is decided by the version hash (it includes the mtime), and
+    // the surviving copy may be renamed, so assert the pair, not the
+    // assignment.
     let expected = settle_pair(a, b, "rename and recreate", |state| {
-        state.get("module.rs").map(String::as_str) == Some("new post-rebase generation")
-            && state.contains_key("module-old.rs")
-            && state.get(&conflict_name) == Some(&conflict_content)
+        let copies: Vec<&String> = state
+            .iter()
+            .filter(|(name, _)| name.starts_with("module (") && is_conflict_copy(name))
+            .map(|(_, content)| content)
+            .collect();
+        let (Some(at_path), [at_copy]) = (state.get("module.rs"), copies.as_slice()) else {
+            return false;
+        };
+        let new_generation = "new post-rebase generation";
+        state.contains_key("module-old.rs")
+            && ((at_path == &conflict_content && *at_copy == new_generation)
+                || (at_path == new_generation && *at_copy == &conflict_content))
     })
     .await;
 
@@ -614,14 +627,39 @@ async fn multi_file_checkout_rewrite_preserves_every_loser_for_late_clones() {
         .find(|(name, _)| name.starts_with("src-lib ("))
         .map(|(name, content)| (name.clone(), content.clone()))
         .expect("a copy of the other src-lib.rs version");
+    // The rewritten paths keep their losing version as a live head. Which of
+    // {loser, rewrite} keeps the original name is decided by the version hash
+    // (it includes the mtime), and the surviving conflict copy may be renamed.
+    // So assert the pair, not the assignment: exactly one copy of the path
+    // exists, and the path and that copy hold the loser and the rewrite, in
+    // either order.
+    let loser_of = |prefix: &str| {
+        preserved
+            .iter()
+            .find(|(name, _)| name.starts_with(prefix))
+            .map(|(_, content)| content.clone())
+            .expect("a conflict copy for the rewritten path")
+    };
+    let lock_loser = loser_of("Cargo (");
+    let readme_loser = loser_of("README (");
+    let pair_is = |state: &Snapshot, path: &str, prefix: &str, loser: &str, rewrite: &str| {
+        let copies: Vec<&String> = state
+            .iter()
+            .filter(|(name, _)| name.starts_with(prefix) && is_conflict_copy(name))
+            .map(|(_, content)| content)
+            .collect();
+        let (Some(at_path), [at_copy]) = (state.get(path), copies.as_slice()) else {
+            return false;
+        };
+        (at_path == loser && *at_copy == rewrite) || (at_path == rewrite && *at_copy == loser)
+    };
     let expected = settle_pair(a, b, "multi-file checkout rewrite", |state| {
         state.get("src-core.rs") == Some(&lib_shown)
             && !state.contains_key("src-lib.rs")
             && state.get(&lib_copy) == Some(&lib_other)
-            && state.get("Cargo.lock").map(String::as_str) == Some("lock after rebase")
-            && state.get("README.md").map(String::as_str) == Some("readme after squash")
+            && pair_is(state, "Cargo.lock", "Cargo (", &lock_loser, "lock after rebase")
+            && pair_is(state, "README.md", "README (", &readme_loser, "readme after squash")
             && state.get("CHANGELOG.md").map(String::as_str) == Some("release candidate")
-            && preserved.iter().all(|(name, content)| state.get(name) == Some(content))
     })
     .await;
 
