@@ -238,19 +238,10 @@ fn is_loopback_host(url: &url::Url) -> bool {
 /// netmap frame is guaranteed to have been read) or if this device has
 /// no signing key configured at all. Neither is an error: both resolve
 /// themselves on the next reconnect once the netmap catches up.
-fn spawn_flush_pending_checkpoints_on_reconnect(
-    config: &OrchestratorConfig,
-    state: &Arc<DaemonState>,
-) {
-    let Some(signing_key) = state.device_signing_key() else { return };
-    let own_signing_public_key = signing_key.verifying_key();
-    let coordination_addr = config.coordination_addr.clone();
-    let access_token = config.auth.clone();
-    let device_id = config.device_id.clone();
+fn spawn_flush_pending_checkpoints_on_reconnect(state: &Arc<DaemonState>) {
     let state = Arc::clone(state);
 
     spawn_one_shot("checkpoint-flush-on-reconnect", async move {
-        let source = ProductionCheckpointSource::new(coordination_addr, access_token);
         let links = match state.replica_coordinator.link_repository().list_links() {
             Ok(links) => links,
             Err(e) => {
@@ -266,88 +257,9 @@ fn spawn_flush_pending_checkpoints_on_reconnect(
         group_ids.sort();
         group_ids.dedup();
 
-        let db = state.replica_coordinator.database();
+        // Publish each group's pending native deltas on reconnect.
         for group_id in group_ids {
-            // This task is spawned the instant the netmap WebSocket
-            // connects -- often before that same connection's first
-            // netmap frame has been read and verified, which is what
-            // actually populates `group_policy_state`. A single
-            // point-in-time check here would then permanently miss this
-            // connection's flush window (this function's own doc
-            // comment used to say "resolves itself on the very next
-            // reconnect", but a device's FIRST ever connection has no
-            // earlier reconnect to have caught it, so pending content
-            // linked before that first connect would never flush at all
-            // during a long-lived healthy session). Poll briefly instead
-            // of a single check -- still bounded, still spawned off the
-            // netmap message loop, so it cannot delay `run_netmap_
-            // attempt`'s own reads either way.
-            let mut policy = state.authority.group_policy_state(&group_id);
-            if policy.is_none() {
-                for _ in 0..50 {
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                    policy = state.authority.group_policy_state(&group_id);
-                    if policy.is_some() {
-                        break;
-                    }
-                }
-            }
-            let Some(policy) = policy else {
-                tracing::debug!(group_id, "checkpoint flush: no verified policy state yet");
-                continue;
-            };
-            let resolve_authority_key = |key_id: &[u8; 32], policy_head: &[u8; 32]| {
-                policy.resolve_authority_key(key_id, policy_head)
-            };
-            // Shared with `DaemonState::flush_pending_checkpoint_for_
-            // group` (the `broadcast_change` trigger) -- see that
-            // field's own doc comment for why a flush must never race
-            // its OTHER trigger for the same device.
-            let _flush_guard = state.flush_lock.lock().await;
-            match flush_pending_checkpoint(
-                &db,
-                &source,
-                &group_id,
-                &device_id,
-                &own_signing_public_key,
-                &resolve_authority_key,
-            )
-            .await
-            {
-                Ok(FlushOutcome::NothingPending) => {}
-                Ok(FlushOutcome::Flushed { batch_size, checkpoint_seq }) => {
-                    tracing::info!(
-                        group_id,
-                        batch_size,
-                        checkpoint_seq,
-                        "checkpoint flush: published pending batch"
-                    );
-                    // A session's own reconcile/handshake already ran
-                    // (or is running concurrently) against whatever
-                    // heads existed BEFORE this flush attached evidence
-                    // -- this Change becoming Published just now has no
-                    // OTHER trigger telling an already-connected peer
-                    // session to look again. `broadcast_change`'s own
-                    // doc comment covers the identical reasoning for the
-                    // local-mutation trigger; this is the reconnect
-                    // trigger's side of the same fix.
-                    state.note_local_commit_for_group(&group_id).await;
-                }
-                Ok(FlushOutcome::Refused) => {
-                    tracing::debug!(
-                        group_id,
-                        "checkpoint flush: refused (not currently a writer, or unreachable)"
-                    );
-                }
-                Err(e) => {
-                    // A verification failure here means the coordination
-                    // plane returned a checkpoint that does not verify
-                    // against the Changes it claims to cover -- worth a
-                    // real warning, not a swallowed debug line, per
-                    // FlushError::CheckpointDidNotVerify's own doc comment.
-                    tracing::warn!(group_id, error = %e, "checkpoint flush failed");
-                }
-            }
+            state.flush_pending_native_checkpoint_for_group(&group_id).await;
         }
         Ok(())
     });
@@ -409,7 +321,7 @@ pub(super) async fn run_netmap_attempt(
     // (uncheckpointed) Changes -- spawned so a slow or stuck
     // checkpoint request can never delay this netmap loop from
     // reading its own inbound messages.
-    spawn_flush_pending_checkpoints_on_reconnect(config, state);
+    spawn_flush_pending_checkpoints_on_reconnect(state);
 
     let mut session = NetmapSessionState {
         config,
@@ -748,45 +660,6 @@ impl NetmapSessionState<'_> {
             for group_id in update.peers.iter().flat_map(|peer| peer.shared_group_ids.iter()) {
                 self.state.mark_group_policy_stale(group_id);
             }
-            return;
-        }
-        // The startup scan may have advanced the index while its
-        // initial DAG import was withheld waiting for this policy.
-        // Retry immediately on the admission edge; the periodic
-        // audit remains the crash/loss backstop, not the primary
-        // path (its 90s cadence exceeds convergence timeouts).
-        for policy_log in &update.group_policy_logs {
-            let repair_state = self.state.clone();
-            let group_id = policy_log.group_id.clone();
-            crate::supervise::spawn_one_shot("policy-admission-history-backfill", async move {
-                // `backfill_missing_change_history` itself
-                // silently skips (deferring to startup, "the
-                // audit's first append... permanently closes
-                // the fast path" -- see its own doc comment)
-                // whenever this group's startup scan is
-                // still `Starting` at the instant this runs.
-                // This netmap-driven trigger fires the
-                // moment policy verifies, which can race
-                // AHEAD of startup's own (short, no-backoff)
-                // retry loop finishing -- a skip here then
-                // has no OTHER near-term trigger before the
-                // periodic audit's 90s backstop (confirmed
-                // by a real flaky end-to-end failure, not a
-                // hypothetical). Calling this again is
-                // always safe (idempotent: `NothingMissing`
-                // once nothing is left to repair), so retry
-                // a few times with a short delay instead of
-                // once -- enough for startup's own retries
-                // (bounded, no artificial delay of their
-                // own) to finish one way or the other.
-                for attempt in 0..5 {
-                    repair_state.backfill_missing_change_history(&group_id).await;
-                    if attempt < 4 {
-                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                    }
-                }
-                Ok(())
-            });
         }
     }
 

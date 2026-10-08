@@ -39,6 +39,7 @@ impl EnrollmentCoordination for HttpEnrollmentCoordination {
         operation_id: &'a str,
         group_name: &'a str,
         device_id: &'a str,
+        storage_mode: &'a str,
     ) -> BoxFuture<'a, EnrollmentPrepareResult> {
         Box::pin(async move {
             let Some(config) = self.state.coordination_client_config() else {
@@ -52,6 +53,7 @@ impl EnrollmentCoordination for HttpEnrollmentCoordination {
                 operation_id,
                 group_name,
                 device_id,
+                storage_mode,
             )
             .await;
             prepare_result(outcome)

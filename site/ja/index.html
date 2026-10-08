@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>YadoriLink — クラウドの便利さを、ファイルを預けずに。</title>
+<meta name="description" content="YadoriLink は Mac・Windows・Linux の間でフォルダーを直接同期します。アカウント、共有、アクセス権は YadoriLink が管理。ファイルそのものは、あなたのデバイスに残ります。オープンソース、1.0 未満のベータ版。">
+<link rel="canonical" href="https://yadori.link/ja/">
+<link rel="alternate" hreflang="en" href="https://yadori.link/">
+<link rel="alternate" hreflang="ja" href="https://yadori.link/ja/">
+<link rel="alternate" hreflang="x-default" href="https://yadori.link/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="YadoriLink">
+<meta property="og:title" content="YadoriLink — クラウドの便利さを、ファイルを預けずに。">
+<meta property="og:description" content="YadoriLink は Mac・Windows・Linux の間でフォルダーを直接同期します。アカウント、共有、アクセス権は YadoriLink が管理。ファイルそのものは、あなたのデバイスに残ります。オープンソース、1.0 未満のベータ版。">
+<meta property="og:url" content="https://yadori.link/ja/">
+<meta property="og:image" content="https://yadori.link/assets/og-image-ja.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:locale" content="ja_JP">
+<meta property="og:locale:alternate" content="en_US">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="YadoriLink — クラウドの便利さを、ファイルを預けずに。">
+<meta name="twitter:description" content="YadoriLink は Mac・Windows・Linux の間でフォルダーを直接同期します。アカウント、共有、アクセス権は YadoriLink が管理。ファイルそのものは、あなたのデバイスに残ります。オープンソース、1.0 未満のベータ版。">
+<meta name="twitter:image" content="https://yadori.link/assets/og-image-ja.png">
+<link rel="icon" href="/assets/favicon.ico" sizes="any">
+<link rel="icon" type="image/webp" sizes="64x64" href="/assets/logo-64.webp">
+<link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
+<meta name="theme-color" content="#f5f9ff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#060d1f" media="(prefers-color-scheme: dark)">
+<link rel="stylesheet" href="/assets/site.css">
+</head>
+<body>
+<a class="skip" href="#content">本文へスキップ</a>
+<div class="wrap">
+<header class="site-header">
+  <a class="brand" href="/ja/" aria-label="YadoriLink ホーム">
+    <img src="/assets/logo-64.webp" srcset="/assets/logo-128.webp 2x" width="36" height="36" alt="">
+    <span>YadoriLink</span>
+  </a>
+  <nav aria-label="サイト">
+    <a href="/ja/#architecture">信頼モデル</a><a href="/ja/#why">特長</a><a href="/ja/#install">はじめる</a>
+  </nav>
+  <a class="lang" href="/" lang="en" hreflang="en">English</a>
+</header>
+
+<main id="content">
+<div class="hero">
+  <img class="hero-mark" src="/assets/logo-128.webp" srcset="/assets/logo-256.webp 2x" width="72" height="72" alt="">
+  <p class="eyebrow">P2P フォルダー同期 · オープンソース</p>
+  <h1>クラウドの便利さを、<span class="grad">ファイルを預けずに。</span></h1>
+  <p class="lede">YadoriLink は Mac・Windows・Linux の間でフォルダーを直接同期します。アカウント、共有、アクセス権は YadoriLink が管理。ファイルそのものは、あなたのデバイスに残ります。</p>
+  <div class="cta">
+    <a class="btn primary" href="https://github.com/juntaki/yadorilink/releases">ダウンロード</a>
+    <a class="btn ghost" href="#architecture">しくみを見る</a>
+  </div>
+  <ul class="hero-strip"><li>P2P 同期</li><li>クラウドにファイルを置かない</li><li>オープンソース</li></ul>
+</div>
+
+<section id="architecture" class="trust">
+  <h2>YadoriLink を信頼してファイルを預ける必要はありません。</h2>
+  <p class="sub">管理は中央、データは P2P。</p>
+  <figure class="arch-fig">
+    <div class="arch-grid">
+      <div class="arch-panel arch-conv"><h3>従来のクラウド同期</h3>
+      <svg class="arch-svg" viewBox="0 0 360 250" role="img" aria-labelledby="t-conv d-conv">
+      <title id="t-conv">従来のクラウド同期</title><desc id="d-conv">デバイスがファイルをクラウドストレージに送り、クラウドがファイルを保管し、別のデバイスがそこからダウンロードします。</desc>
+      <path class="a-cloud" d="M128 138 C96 138 92 94 124 90 C122 50 168 36 188 60 C202 24 258 32 254 80 C282 82 284 138 246 138 Z"/>
+      <path class="a-file" d="M177 66 h10 l6 6 v16 h-16 z"/><path class="a-file" d="M185 62 h10 l6 6 v16 h-16 z"/><path class="a-file" d="M193 70 h10 l6 6 v16 h-16 z"/>
+      <text class="a-t" x="190" y="110" text-anchor="middle">クラウドストレージ</text>
+      <text class="a-s" x="190" y="127" text-anchor="middle">ファイルを保管</text>
+      <path class="a-line a-line-plain" d="M62 146 C62 126 74 114 92 114"/><path class="a-arrow a-arrow-plain" d="M102 114 l-10 -5.5 v11 z"/>
+      <path class="a-line a-line-plain" d="M282 114 C292 114 298 124 298 136"/><path class="a-arrow a-arrow-plain" d="M298 146 l-5.5 -10 h11 z"/>
+      <rect class="a-box" x="26" y="152" width="72" height="46" rx="6"/><rect class="a-screen" x="32" y="158" width="60" height="34" rx="2"/>
+      <path class="a-base" d="M16 202 h92 a4 4 0 0 1 -4 5 h-84 a4 4 0 0 1 -4 -5 z"/>
+      <path class="a-file" d="M55 166 h9 l5 5 v13 h-14 z"/>
+      <text class="a-t" x="62" y="232" text-anchor="middle">デバイス</text>
+      <rect class="a-box" x="262" y="152" width="72" height="46" rx="6"/><rect class="a-screen" x="268" y="158" width="60" height="34" rx="2"/>
+      <path class="a-base" d="M252 202 h92 a4 4 0 0 1 -4 5 h-84 a4 4 0 0 1 -4 -5 z"/>
+      <path class="a-file" d="M291 166 h9 l5 5 v13 h-14 z"/>
+      <text class="a-t" x="298" y="232" text-anchor="middle">デバイス</text>
+    </svg></div>
+      <div class="arch-panel arch-yl"><h3>YadoriLink</h3>
+      <svg class="arch-svg" viewBox="0 0 360 250" role="img" aria-labelledby="t-yl d-yl">
+      <title id="t-yl">YadoriLink</title><desc id="d-yl">2 台のデバイスが暗号化された接続でファイルを直接やり取りします。上にある調整サービスはアカウント、デバイス、共有、権限を管理し、各デバイスとは識別情報だけでつながります。</desc>
+      <defs><linearGradient id="yl-grad" gradientUnits="userSpaceOnUse" x1="104" y1="0" x2="256" y2="0"><stop offset="0" stop-color="#0a4bff"/><stop offset="0.5" stop-color="#0a8cff"/><stop offset="1" stop-color="#1fc8f0"/></linearGradient></defs>
+      <g>
+      <rect class="a-coord" x="30" y="14" width="300" height="72" rx="16"/>
+      <text class="a-t" x="180" y="45" text-anchor="middle">YadoriLink 調整サービス</text>
+      <text class="a-s" x="180" y="66" text-anchor="middle">アカウント · デバイス · 共有 · 権限</text>
+      <path class="a-dash" d="M96 86 L62 146"/><path class="a-dash" d="M264 86 L298 146"/>
+      <circle class="a-badge" cx="79" cy="116" r="11"/><circle class="a-glyph" cx="75.5" cy="119.5" r="3"/><path class="a-glyph" d="M77.7 117.3 l6 -6 M81.7 113.3 l2 2"/>
+      <circle class="a-badge" cx="281" cy="116" r="11"/><circle class="a-glyph" cx="277.5" cy="119.5" r="3"/><path class="a-glyph" d="M279.7 117.3 l6 -6 M283.7 113.3 l2 2"/>
+      <text class="a-s" x="96" y="120">識別情報のみ</text>
+      <text class="a-s" x="264" y="120" text-anchor="end">識別情報のみ</text>
+      <rect class="a-dev" x="26" y="152" width="72" height="46" rx="6"/><rect class="a-screen" x="32" y="158" width="60" height="34" rx="2"/>
+      <path class="a-dev-base" d="M16 202 h92 a4 4 0 0 1 -4 5 h-84 a4 4 0 0 1 -4 -5 z"/>
+      <path class="a-file-brand" d="M55 166 h9 l5 5 v13 h-14 z"/>
+      <text class="a-t" x="62" y="232" text-anchor="middle">デバイス</text>
+      <rect class="a-dev" x="262" y="152" width="72" height="46" rx="6"/><rect class="a-screen" x="268" y="158" width="60" height="34" rx="2"/>
+      <path class="a-dev-base" d="M252 202 h92 a4 4 0 0 1 -4 5 h-84 a4 4 0 0 1 -4 -5 z"/>
+      <path class="a-file-brand" d="M291 166 h9 l5 5 v13 h-14 z"/>
+      <text class="a-t" x="298" y="232" text-anchor="middle">デバイス</text>
+      <path class="a-line a-line-brand" d="M114 175 H246"/>
+      <path class="a-arrow a-arrow-brand" d="M104 175 l11 -6 v12 z"/><path class="a-arrow a-arrow-brand-end" d="M256 175 l-11 -6 v12 z"/>
+      <circle class="a-badge-brand" cx="180" cy="175" r="15"/>
+      <rect class="a-glyph-brand" x="173.5" y="173" width="13" height="9.5" rx="2"/><path class="a-glyph-brand" d="M176.5 173 v-2.8 a3.5 3.5 0 0 1 7 0 V173"/>
+      <text class="a-s a-brand" x="180" y="214" text-anchor="middle">暗号化・直接</text>
+      </g>
+    </svg></div>
+    </div>
+  </figure>
+  <div class="trust-cols">
+    <div class="trust-col trust-knows"><h3>YadoriLink のサービスが知っていること</h3><ul><li><strong>アカウント</strong>：Google アカウント ID とメールアドレス</li><li><strong>デバイス</strong>：名前、公開鍵、最終接続時刻、デバイス同士が見つけ合うために報告するネットワークアドレス</li><li><strong>共有フォルダーグループ</strong>：グループ名、メンバー、役割</li><li><strong>アクセス権</strong>：どのデバイスがどのグループを同期できるか</li></ul></div>
+    <div class="trust-col trust-never"><h3>受け取らないもの</h3><ul><li>ファイルの中身</li><li>ファイル名</li><li>フォルダーのパス</li><li>中にある文書や写真</li><li>ローカルのフォルダー構造</li></ul></div>
+  </div>
+  <ul class="trust-three"><li><span class="ico" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="10.5" width="14" height="10" rx="2.5"/><path d="M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5"/><path d="M12 14.5v2"/></svg></span><h3>暗号化された接続</h3><p>デバイス間の通信は暗号化されます。リレーは暗号化されたパケットを転送するだけです。</p></li><li><span class="ico" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="15.5" r="4"/><path d="m10.9 12.6 8.6-8.6M16.5 7l2.5 2.5M14 9.5l2 2"/></svg></span><h3>暗号によるデバイス識別</h3><p>各デバイスは自身の鍵で識別されます。秘密鍵はデバイスの外に出ません。</p></li><li><span class="ico" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="9.5" cy="8" r="3.8"/><path d="M2.8 20.5a6.7 6.7 0 0 1 13.4 0"/><path d="M16.5 11.5h5"/></svg></span><h3>取り消せるアクセス</h3><p>デバイスやメンバーを削除すれば、そのアクセスは失われます。</p></li></ul>
+  <p class="trust-note">デバイスは可能なら直接つながります。つなげない場合は、暗号化された通信が公開リレー（YadoriLink ではなく iroh プロジェクトが運営）を経由します。リレーは IP アドレス、デバイス識別子、通信のタイミングと量を観測できますが、ファイルの中身は見えません。広告、解析、Cookie、トラッカーはなく、このサイトは第三者へリクエストを送りません。</p>
+  <p class="trust-links"><a href="/ja/privacy/">プライバシーポリシー</a> &middot; <a href="/ja/terms/">利用規約</a></p>
+</section>
+
+<!-- Screenshots slot: add real product screenshots here (see site/assets/shots/). Nothing is shown until genuine images exist. -->
+
+<section id="why">
+  <h2>特長</h2>
+  <div class="grid why-grid">
+    <div class="card"><h3>P2P 同期を、クラウドのような管理で</h3><p>P2P ツールのデータ所有と、クラウドサービスのアカウント・共有管理をあわせ持ちます。サインインしてデバイスを追加し、オーナー・編集者・閲覧者の役割を付けてフォルダーを共有できます。</p></div>
+    <div class="card"><h3>全部持つか、開いたものだけ持つか</h3><p>すべてのファイルをデバイスに置くことも、開いたときに取得するオンデマンドのプレースホルダーにすることもできます（容量が必要なら解放可能）。macOS（File Provider）と Windows（Cloud Files）にネイティブ対応。</p></div>
+    <div class="card"><h3>macOS・Windows・Linux を一つのエンジンで</h3><p>Rust 製の同じ同期エンジンがすべての OS で動きます。デスクトップアプリからも、スクリプトに組み込めるコマンドラインからも操作できます。</p></div>
+  </div>
+  <p class="why-note">中央にコピーを置かないため、同期にはあなたのほかのデバイスが少なくとも 1 台オンラインである必要があります。</p>
+</section>
+
+<section id="install" class="alt start">
+  <p class="eyebrow">1.0 未満 · 開発中</p>
+  <h2>はじめる</h2>
+  <ol class="flow"><li>サインイン</li><li>フォルダーを共有</li><li>別のデバイスから参加</li></ol>
+  <div class="start-grid">
+    <ul class="plat">
+      <li><h3>macOS</h3><code>yadorilink-macos.pkg</code><span class="note">署名・公証済み。macOS 11 以降。</span></li>
+      <li><h3>Windows</h3><code>yadorilink-setup-unsigned.exe</code><span class="note">Windows 10 / 11（x64）。現在は未署名のため、実行前に SHA-256 チェックサムを確認してください。</span></li>
+      <li><h3>Linux</h3><code>yadorilink-linux-amd64.deb</code><span class="note">Debian / Ubuntu 向け。</span></li>
+    </ul>
+    <div class="term">
+      <h3>ターミナルから使うなら</h3>
+      <pre><code>yadorilink login
+yadorilink device register --name "my-device"
+yadorilink share create my-share --path ~/some/folder
+yadorilink status</code></pre>
+    </div>
+  </div>
+  <div class="cta">
+    <a class="btn primary" href="https://github.com/juntaki/yadorilink/releases">ダウンロード</a>
+    <a class="btn ghost" href="https://github.com/juntaki/yadorilink">GitHub でソースを見る</a>
+  </div>
+  <p class="start-meta">すべてのデバイスを同じリリースにそろえ、失うと困るデータはバックアップしてください。ライセンスは AGPL-3.0-only。<a href="https://github.com/juntaki/yadorilink#readme">開発状況 →</a></p>
+</section>
+</main>
+
+<footer class="site-footer">
+  <div class="foot-top"><img src="/assets/logo-64.webp" width="28" height="28" alt=""><span>YadoriLink</span></div>
+  <p>クラウドの便利さを、ファイルを預けずに。</p>
+  <div class="cols">
+    <a href="/ja/privacy/">プライバシー</a> <a href="/ja/terms/">利用規約</a> <a href="https://github.com/juntaki/yadorilink">GitHub</a> <a href="https://github.com/juntaki/yadorilink/blob/main/SECURITY.md">セキュリティ</a> <a href="mailto:me@juntaki.com">お問い合わせ</a>
+    <a href="/" lang="en" hreflang="en">English</a>
+    <span>AGPL-3.0-only</span>
+  </div>
+</footer>
+</div>
+</body>
+</html>

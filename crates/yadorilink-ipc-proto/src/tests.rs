@@ -73,6 +73,8 @@ fn high_level_enrollment_command_round_trips() {
             local_path: "/tmp/documents".into(),
             on_demand: false,
             acknowledge_risks: true,
+            provider_display_name: String::new(),
+            request_token: String::new(),
         })),
         protocol_version: crate::daemonctl::CONTROL_PROTOCOL_VERSION,
     };
@@ -91,6 +93,7 @@ fn high_level_enrollment_command_round_trips() {
                         // cross-account invite acceptance ever sets it.
                         awaiting_approval: false,
                         already_linked: false,
+                        provider_root_id: String::new(),
                     },
                 )),
             },
@@ -102,4 +105,48 @@ fn high_level_enrollment_command_round_trips() {
         decoded.payload,
         Some(daemon_control_response::Payload::CreateAndLinkCommand(_))
     ));
+}
+
+/// The shell and control wires carry two independent facts per path; the one
+/// derived word is built from them, and an absent state is never "current".
+#[test]
+fn local_state_words_come_from_the_two_facts() {
+    use crate::daemonctl::{local_state_word, LocalState, LocalTransition};
+    let state = |object, current, transition: LocalTransition| LocalState {
+        local_object_present: object,
+        current_content_present: current,
+        transition: transition as i32,
+    };
+    assert_eq!(local_state_word(None), "unknown");
+    assert_eq!(local_state_word(Some(&state(false, false, LocalTransition::None))), "remote");
+    assert_eq!(local_state_word(Some(&state(true, false, LocalTransition::None))), "local-stale");
+    assert_eq!(local_state_word(Some(&state(true, true, LocalTransition::None))), "local-current");
+    assert_eq!(
+        local_state_word(Some(&state(false, false, LocalTransition::Hydrating))),
+        "hydrating"
+    );
+    assert_eq!(local_state_word(Some(&state(true, false, LocalTransition::Evicting))), "evicting");
+}
+
+/// The new shell message decodes back to the same two facts, and a message
+/// without it decodes as unknown, not as "current".
+#[test]
+fn shell_status_response_round_trips_the_two_facts() {
+    use crate::shellipc::{LocalState, LocalTransition, StatusResponse};
+    let sent = StatusResponse {
+        path: "/x".into(),
+        local_state: Some(LocalState {
+            local_object_present: true,
+            current_content_present: false,
+            transition: LocalTransition::None as i32,
+        }),
+        ..Default::default()
+    };
+    let got = StatusResponse::decode(sent.encode_to_vec().as_slice()).unwrap();
+    let local = got.local_state.expect("local_state survives the wire");
+    assert!(local.local_object_present);
+    assert!(!local.current_content_present);
+    let bare =
+        StatusResponse::decode(StatusResponse::default().encode_to_vec().as_slice()).unwrap();
+    assert!(bare.local_state.is_none());
 }

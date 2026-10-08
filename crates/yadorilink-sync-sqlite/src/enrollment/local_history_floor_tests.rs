@@ -11,14 +11,12 @@ const LOCAL_PATH: &str = "/folders/shared";
 /// The distance a preview like `--at 30d` asks about.
 const THIRTY_DAYS_NANOS: i64 = 30 * 24 * 60 * 60 * 1_000_000_000;
 
-/// Full schema, pooled exactly as production opens it -- DAG tables
-/// first, since `yadorilink_sqlite_runtime::init_schema` assumes
-/// `changes`/`pruned_changes` already exist. Mirrors
-/// `rebootstrap_store`'s own `open_full_test_db`.
+/// Full schema, pooled exactly as production opens it -- the replica
+/// tables first, then `yadorilink_sqlite_runtime::init_schema`.
 fn open_full_test_db() -> Arc<SyncDatabase> {
     Arc::new(
         SyncDatabase::open_in_memory(|conn| {
-            crate::dag_store::init_dag_schema(conn).map_err(|e| {
+            crate::replica_tables::init_for_tests(conn).map_err(|e| {
                 yadorilink_sqlite_runtime::DatabaseError::CorruptSchema(e.to_string())
             })?;
             yadorilink_sqlite_runtime::init_schema(conn)
@@ -72,6 +70,7 @@ fn commit_link_through_enrollment(db: &Arc<SyncDatabase>, kind: EnrollmentKind) 
                 local_path: LOCAL_PATH.to_string(),
             },
             2,
+            None,
         )
         .expect("the link commit must succeed");
 }
@@ -94,7 +93,6 @@ fn admit_file(db: &Arc<SyncDatabase>, path: &str, size: u64) {
                 deleted: false,
             },
             "device-that-was-here-first",
-            None,
         )
     })
     .expect("the file admission must succeed");
@@ -242,7 +240,6 @@ fn a_join_floor_is_scoped_to_the_group_that_was_joined() {
                 deleted: false,
             },
             DEVICE,
-            None,
         )
     })
     .unwrap();

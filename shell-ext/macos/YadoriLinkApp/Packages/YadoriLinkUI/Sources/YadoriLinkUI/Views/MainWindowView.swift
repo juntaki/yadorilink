@@ -198,8 +198,10 @@ struct FolderOptionsMenu: View {
                 }
             }
             .pickerStyle(.inline)
-            Divider()
-            Button("Show in Finder") { context.revealInFinder(folder.localPath) }
+            if !folder.provider {
+                Divider()
+                Button("Show in Finder") { context.revealInFinder(folder.localPath) }
+            }
         } label: {
             Image(systemName: "ellipsis.circle")
         }

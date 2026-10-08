@@ -35,10 +35,7 @@ pub fn dst_trace_path(path: &str, msg: impl FnOnce() -> String) {
     }
 }
 
-/// Where a scenario's simulated runtime is constructed. Compiles on both
-/// substrates by design — it is the seam that hides which one is running.
-pub mod sim;
-
+/// Two product-stack devices and the database state scenarios assert on.
 // Every support module. None of them names a simulator: the Case IR, the
 // oracle, the corpus, the generators, the fault injectors and their
 // scheduler are the layer worth keeping, and swapping the execution
@@ -72,6 +69,9 @@ pub mod reference_model;
 pub mod settle;
 pub mod shrinker;
 pub mod signature;
+/// Where a scenario's simulated runtime is constructed. Compiles on both
+/// substrates by design — it is the seam that hides which one is running.
+pub mod sim;
 pub mod sweep;
 pub mod triage;
 

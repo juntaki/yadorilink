@@ -55,7 +55,7 @@ pub fn resolve_group_and_rel_path(
     let mut matches: Vec<(&yadorilink_replica_domain::session_state::FolderLink, PathBuf)> = links
         .iter()
         .filter(|l| !l.orphaned)
-        .map(|l| (l, canonicalize_best_effort(Path::new(&l.local_path))))
+        .filter_map(|l| Some((l, canonicalize_best_effort(Path::new(l.folder_path()?)))))
         .filter(|(_, root)| canonical_query.starts_with(root))
         .collect();
     matches.sort_by_key(|(_, root)| std::cmp::Reverse(root.components().count()));
@@ -63,8 +63,7 @@ pub fn resolve_group_and_rel_path(
     let best_depth = canonical_root.components().count();
     if matches.iter().skip(1).any(|(_, root)| root.components().count() == best_depth) {
         tracing::warn!(
-            absolute_path,
-            "path resolves equally well to multiple linked roots; refusing to choose a sync group"
+            "a path resolves equally well to multiple linked roots; refusing to choose a sync group"
         );
         return None;
     }
@@ -72,6 +71,36 @@ pub fn resolve_group_and_rel_path(
     let rel_path = canonical_query.strip_prefix(canonical_root).ok()?;
     let rel_path = rel_path.to_string_lossy().replace('\\', "/");
     Some((link.group_id.clone(), rel_path))
+}
+
+/// Resolves a path inside a macOS File Provider location to `(group_id, relative_path)`.
+///
+/// A provider root has no directory of its own (and no filesystem authority): the OS shows it at
+/// `<home>/Library/CloudStorage/<extension name>-<display name>`, so the root is found by the
+/// display name that ends that first component, never by comparing against a stored path. A
+/// display name that two roots could both claim (one is a suffix of the other) is refused.
+pub fn resolve_provider_group_and_rel_path(
+    sync_state: &ReplicaCoordinator,
+    absolute_path: &str,
+) -> Option<(String, String)> {
+    let path = Path::new(absolute_path);
+    let mut components = path.components();
+    components.find(|c| c.as_os_str() == "CloudStorage")?;
+    let location = components.next()?.as_os_str().to_string_lossy().into_owned();
+    let rel_path: Vec<String> =
+        components.map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+    let roots = sync_state.provider_repository().list_declared_roots().ok()?;
+    let mut claimed = roots.iter().filter(|root| {
+        location.strip_suffix(root.display_name.as_str()).is_some_and(|p| p.ends_with('-'))
+    });
+    let root = claimed.next()?;
+    if claimed.next().is_some() {
+        tracing::warn!(
+            "a path names more than one provider folder; refusing to choose a sync group"
+        );
+        return None;
+    }
+    Some((root.group_id.clone(), rel_path.join("/")))
 }
 
 /// A path's sync status, with the reason the path is in that state when
@@ -159,10 +188,47 @@ fn aggregate_status(
     }
 }
 
+/// Whether the object at `absolute_path` holds the content of the version its
+/// row names now: anything but a regular file is, and a regular file is only
+/// where a usable proof names the current version. `false` for a path that is
+/// not under a linked folder.
+pub fn resolve_content_is_current(sync_state: &ReplicaCoordinator, absolute_path: &str) -> bool {
+    let Some((group_id, rel_path)) = resolve_group_and_rel_path(sync_state, absolute_path) else {
+        return false;
+    };
+    let kind = sync_state
+        .file_index_repository()
+        .get_record_kind(&group_id, &rel_path)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    kind != yadorilink_replica_domain::file::RecordKind::File
+        || sync_state.local_copy_names_current_version(&group_id, &rel_path).unwrap_or(false)
+}
+
+/// What stands on this device for a path with this row state: the one place
+/// the two facts the wire carries are derived. `exact` is whether a usable
+/// proof names the version the row holds now; callers that could not read the
+/// evidence pass `false`, so an unreadable proof is never "current".
+pub(crate) fn local_presence(
+    state: Option<yadorilink_replica_domain::session_state::MaterializationState>,
+    exact: bool,
+) -> Option<crate::application::ports::LocalPresence> {
+    use crate::application::ports::{LocalPresence, LocalTransition};
+    use yadorilink_replica_domain::session_state::MaterializationState as Row;
+    let (object_present, current_content_present, transition) = match state? {
+        Row::Remote => (false, false, LocalTransition::None),
+        Row::Present => (true, exact, LocalTransition::None),
+        Row::Hydrating => (false, false, LocalTransition::Hydrating),
+        Row::Evicting => (true, false, LocalTransition::Evicting),
+    };
+    Some(LocalPresence { object_present, current_content_present, transition })
+}
+
 /// Resolves `absolute_path`'s materialization state (`on-demand-sync`
 /// ) for the shell extension's placeholder/hydrated/hydrating
 /// badge — `None` if the path isn't under any linked folder or isn't
-/// indexed at all (e.g. an `Eager` folder's files are always `Hydrated`
+/// indexed at all (e.g. an `Eager` folder's files are always `Present`
 /// in practice, but report `None` rather than a state if never indexed).
 pub fn resolve_materialization_state(
     sync_state: &ReplicaCoordinator,

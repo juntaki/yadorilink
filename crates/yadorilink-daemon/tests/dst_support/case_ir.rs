@@ -1,5 +1,5 @@
 //! The unified, serializable Case IR every DST scenario (e.g.,
-//! `dst_two_device_chaos`, `monkey_chaos`, and the full-stack daemon)
+//! the retired two-device scenario, `monkey_chaos`, and the full-stack daemon)
 //! is retrofitted onto, replacing bespoke per-scenario event
 //! bookkeeping with one shared shape that survives generator evolution (a
 //! serialized `Case` persists to the corpus verbatim -- a bare seed only

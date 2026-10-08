@@ -4,6 +4,7 @@ use super::*;
 use crate::background_custody::NotCorroboratedReason;
 use crate::replica_coordinator::ReplicaCoordinator;
 use yadorilink_local_storage::SegmentBlockStore;
+use yadorilink_replica_domain::file::FileRecord;
 
 /// `YADORILINK_CONFIG_DIR` is a process-global env var (same pattern
 /// used by `tests/reporting_ipc.rs` and `yadorilink-cli`'s
@@ -1137,24 +1138,20 @@ async fn forced_durability_unknown_latch_survives_daemon_restart() {
 // never had any policy at all, rather than falling back to the
 // placeholder (all-zero) policy_head for both.
 
-/// Under checkpoint-based admission a local Change carries no
-/// authorization stamp at all (it stays Pending until
-/// `flush_pending_checkpoint` obtains one), but committing it to the
-/// DAG at all while this device cannot yet vouch for its own policy
-/// view is still wrong: the resulting Pending Change can never
-/// legitimately obtain a checkpoint if this device turns out not to be
-/// a writer, so it must never be journaled as if authorship were
-/// settled. "Never had policy" and "policy not loaded by this process
-/// yet" must therefore take different branches: the latter withholds
-/// the change instead of landing it in the DAG.
+/// Under checkpoint-based admission a local delta carries no
+/// authorization stamp at all (it stays Pending until the native checkpoint
+/// flush obtains one), but committing it to native state at all while this
+/// device cannot yet vouch for its own policy view is still wrong: the
+/// resulting Pending delta can never legitimately obtain a checkpoint if
+/// this device turns out not to be a writer, so it must never be journaled
+/// as if authorship were settled. "Never had policy" and "policy not loaded
+/// by this process yet" must therefore take different branches: the latter
+/// withholds the edit instead of landing it in native state.
 #[tokio::test]
 async fn local_edit_before_policy_load_must_not_enter_the_dag_with_a_placeholder_stamp_for_an_already_linked_group(
 ) {
-    use yadorilink_replica_domain::change::{Op, PutOrigin};
     use yadorilink_replica_domain::file::FileMeta;
     use yadorilink_replica_domain::file::RecordKind;
-    use yadorilink_replica_domain::ids::SyncPath;
-    use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
 
     let state = test_state();
     let group = "group-1";
@@ -1177,7 +1174,12 @@ async fn local_edit_before_policy_load_must_not_enter_the_dag_with_a_placeholder
     // A local edit races ahead of that fetch, through the daemon's real
     // local-emission auth provider (the one `DaemonState::new` registers
     // on `sync_state`), exactly as a live watcher callback would drive it.
-    let emitter = ChangeEmitter::new("device-a", ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]));
+    let emitter = crate::test_support::local_seam::replica_author_key(
+        &state.replica_coordinator,
+        "device-a",
+        ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]),
+    )
+    .unwrap();
     let version = yadorilink_replica_domain::file::FileVersion::new(
         vec![],
         0,
@@ -1198,21 +1200,15 @@ async fn local_edit_before_policy_load_must_not_enter_the_dag_with_a_placeholder
     };
 
     let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
-    let result = state.replica_coordinator.upsert_file_emitting_change(
+    let result = crate::test_support::local_seam::commit_local_upsert(
+        &state.replica_coordinator,
         group,
         &record,
         "device-a",
-        yadorilink_replica_domain::session_state::ChangeContent {
-            ops: vec![Op::Put {
-                path: SyncPath("note.txt".into()),
-                version: version.version_hash,
-                origin: PutOrigin::Direct,
-            }],
-            versions: &[version],
-        },
+        &version,
         None,
-        None,
-        crate::replica_coordinator::ReplicaChangeEmission { emitter: &emitter, permit: &permit },
+        &emitter,
+        &permit,
     );
 
     // An already-linked group's policy merely being unresolved
@@ -1225,14 +1221,14 @@ async fn local_edit_before_policy_load_must_not_enter_the_dag_with_a_placeholder
     // the group's real policy loads, rather than landing a placeholder
     // stamp every valid-policy peer rejects.
     assert!(
-        matches!(result, Err(crate::sync_error::SyncError::PolicyUnavailable)),
+        matches!(result, Err(yadorilink_sync_sqlite::SyncSqliteError::PolicyUnavailable)),
         "local emission for an already-linked, policy-not-yet-loaded group must withhold \
          (PolicyUnavailable), not stamp a placeholder-auth change; got {result:?}"
     );
     assert!(
-        state.replica_coordinator.sqlite().dag_group_heads(group).unwrap().is_empty(),
+        state.replica_coordinator.sqlite().native_group_heads(group).unwrap().is_empty(),
         "an already-linked group whose policy state has not loaded yet this run must not get \
-         a placeholder-auth change committed to its DAG"
+         a placeholder-auth delta committed to its native state"
     );
 }
 

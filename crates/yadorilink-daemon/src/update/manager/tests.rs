@@ -194,6 +194,52 @@ async fn a_running_daemon_rejects_a_tampered_manifest() {
     );
 }
 
+/// Serves `status` for every manifest request, runs `check_now`, and returns
+/// its result with the persisted policy.
+async fn serve_status_and_check(
+    status: u16,
+    config_dir: &Path,
+) -> (Result<Applicability, UpdateError>, UpdatePolicy) {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _guard = MANIFEST_URL_ENV_MUTEX.lock().await;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/manifest.json"))
+        .respond_with(ResponseTemplate::new(status))
+        .mount(&server)
+        .await;
+    std::env::set_var("YADORILINK_UPDATE_MANIFEST_URL", format!("{}/manifest.json", server.uri()));
+    let mgr = manager(config_dir);
+    let result = mgr.check_now().await;
+    std::env::remove_var("YADORILINK_UPDATE_MANIFEST_URL");
+    (result, mgr.policy.load_or_default())
+}
+
+/// Before any release publishes a manifest for a channel the server answers
+/// 404. That is "nothing to update to", not a failed check: it must not leave
+/// an error category for `status` to raise attention about.
+#[tokio::test]
+async fn a_channel_with_no_published_manifest_is_up_to_date_not_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (result, policy) = serve_status_and_check(404, dir.path()).await;
+    assert!(matches!(result, Ok(Applicability::UpToDate)), "{result:?}");
+    assert_eq!(policy.state, UpdateState::UpToDate);
+    assert_eq!(policy.last_error_category, None);
+    assert!(policy.last_check_unix.is_some());
+}
+
+/// Only 404 means "no manifest yet"; a server error is still a failed check.
+#[tokio::test]
+async fn a_server_error_while_fetching_the_manifest_is_still_a_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let (result, policy) = serve_status_and_check(500, dir.path()).await;
+    assert!(matches!(result, Err(UpdateError::Fetch(_))), "{result:?}");
+    assert_eq!(policy.state, UpdateState::Failed);
+    assert_eq!(policy.last_error_category.as_deref(), Some("update_manifest_fetch_failed"));
+}
+
 /// a policy left in `Downloading` with a stray
 /// `.partial` file on disk is cleaned up and reset to `Failed`, never
 /// left pointing at a trusted artifact.

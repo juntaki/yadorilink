@@ -72,20 +72,20 @@ fn put_and_record(daemon: &Daemon, data: &[u8]) -> Vec<u8> {
     daemon
         .state
         .replica_coordinator
-        .change_history_repository()
-        .record_group_block_provenance(GROUP, std::slice::from_ref(&hash_bytes))
+        .record_block_provenance(GROUP, std::slice::from_ref(&hash_bytes))
         .unwrap();
     hash_bytes
 }
 
 /// Indexes `record` and marks it materialized.
 ///
-/// `upsert_file` leaves a row `Placeholder`, which is correct — the row
-/// exists as soon as its change is projected, before the content behind it
-/// has been fetched. A test that wants a device to look like one holding the
-/// content has to say so, which is the same distinction the background
-/// summary carries.
-fn index_hydrated(daemon: &Daemon, record: &FileRecord) {
+/// `upsert_file` leaves a row `Remote`, which is correct — the row exists as
+/// soon as its change is projected, before the content behind it has been
+/// fetched. A test that wants a device to look like one holding the content
+/// has to say so, which is the same distinction the background summary
+/// carries: an object on disk under a proof that names the row's version
+/// (`Present` alone says only that some object exists).
+fn index_hydrated(daemon: &Daemon, record: &FileRecord, content: &[u8]) {
     let permit = RootCommitPermit::for_tests();
     daemon
         .state
@@ -93,12 +93,15 @@ fn index_hydrated(daemon: &Daemon, record: &FileRecord) {
         .file_index_repository()
         .upsert_file(GROUP, record, &permit)
         .unwrap();
-    daemon
-        .state
-        .replica_coordinator
-        .materialization_state_repository()
-        .set_materialization_state(GROUP, &record.path, MaterializationState::Hydrated, &permit)
-        .unwrap();
+    let on_disk = daemon._root.path().join(&record.path);
+    std::fs::write(&on_disk, content).unwrap();
+    yadorilink_daemon::test_support::seed_prior_cycle_proof(
+        &daemon.state.replica_coordinator,
+        GROUP,
+        &record.path,
+        &on_disk,
+        &permit,
+    );
 }
 
 /// Two daemons sharing one file, both holding its bytes, connected, with `b`
@@ -112,15 +115,14 @@ async fn two_daemons_holding_one_file() -> (Daemon, Daemon, FileRecord) {
     let content = b"the only file in this group";
     let hash = put_and_record(&a, content);
     let record = record_referencing("only.bin", hash.clone(), content.len() as u64);
-    index_hydrated(&a, &record);
-    index_hydrated(&b, &record);
+    index_hydrated(&a, &record, content);
+    index_hydrated(&b, &record, content);
     // `b` holds the bytes too, so it is a genuine second replica rather than
     // a device that merely lists the file.
     let b_hash_hex = b.state.block_store.put(content).unwrap();
     b.state
         .replica_coordinator
-        .change_history_repository()
-        .record_group_block_provenance(GROUP, &[hex::decode(&b_hash_hex).unwrap()])
+        .record_block_provenance(GROUP, &[hex::decode(&b_hash_hex).unwrap()])
         .unwrap();
 
     connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
@@ -198,7 +200,7 @@ async fn a_peer_whose_current_state_differs_does_not_corroborate() {
     // Only `a` learns about a second file, so the two current sets diverge.
     let extra = b"a file only device-a knows about";
     let hash = put_and_record(&a, extra);
-    index_hydrated(&a, &record_referencing("extra.bin", hash, extra.len() as u64));
+    index_hydrated(&a, &record_referencing("extra.bin", hash, extra.len() as u64), extra);
 
     assert_eq!(
         b.state.refresh_custody_confirmation(GROUP).await,
@@ -222,7 +224,7 @@ async fn a_peer_with_the_changes_but_not_the_content_does_not_corroborate() {
         .set_materialization_state(
             GROUP,
             &record.path,
-            MaterializationState::Placeholder,
+            MaterializationState::Remote,
             &RootCommitPermit::for_tests(),
         )
         .unwrap();
@@ -256,21 +258,24 @@ async fn a_peer_retaining_extra_history_still_corroborates() {
     // of a peer whose retention sweep has not yet caught up with this one's.
     let interim = b"an edit device-b never saw";
     let interim_hash = put_and_record(&a, interim);
-    index_hydrated(&a, &record_referencing("only.bin", interim_hash, interim.len() as u64));
+    index_hydrated(
+        &a,
+        &record_referencing("only.bin", interim_hash, interim.len() as u64),
+        interim,
+    );
 
     // Then an edit both devices do see, so their CURRENT state agrees again
     // while `a` retains one superseded version more than `b` does.
     let revised = b"the only file in this group, revised";
     let hash = put_and_record(&a, revised);
     let revised_record = record_referencing("only.bin", hash.clone(), revised.len() as u64);
-    index_hydrated(&a, &revised_record);
+    index_hydrated(&a, &revised_record, revised);
     let b_hash_hex = b.state.block_store.put(revised).unwrap();
     b.state
         .replica_coordinator
-        .change_history_repository()
-        .record_group_block_provenance(GROUP, &[hex::decode(&b_hash_hex).unwrap()])
+        .record_block_provenance(GROUP, &[hex::decode(&b_hash_hex).unwrap()])
         .unwrap();
-    index_hydrated(&b, &revised_record);
+    index_hydrated(&b, &revised_record, revised);
 
     let a_summary = a.state.local_root_set_summary(GROUP).unwrap();
     let b_summary = b.state.local_root_set_summary(GROUP).unwrap();
@@ -334,7 +339,11 @@ async fn a_local_content_change_invalidates_evidence() {
 
     let new_content = b"a file that arrived after the corroboration";
     let hash = put_and_record(&b, new_content);
-    index_hydrated(&b, &record_referencing("later.bin", hash, new_content.len() as u64));
+    index_hydrated(
+        &b,
+        &record_referencing("later.bin", hash, new_content.len() as u64),
+        new_content,
+    );
 
     assert_ne!(
         b.state.group_durability_status(GROUP),
@@ -388,7 +397,7 @@ async fn no_candidate_peer_is_reported_not_worked_around() {
     let solo = new_daemon("device-solo");
     let content = b"nobody else has this";
     let hash = put_and_record(&solo, content);
-    index_hydrated(&solo, &record_referencing("alone.bin", hash, content.len() as u64));
+    index_hydrated(&solo, &record_referencing("alone.bin", hash, content.len() as u64), content);
 
     assert_eq!(
         solo.state.refresh_custody_confirmation(GROUP).await,

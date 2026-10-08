@@ -2,13 +2,9 @@
 
 use super::{run_ignore_recheck_pass, DaemonState};
 use ed25519_dalek::SigningKey;
-use std::collections::HashMap;
 use std::sync::Arc;
 use yadorilink_peer_session::peer_session::PeerSyncSession;
-use yadorilink_replica_domain::change::{Change, Op, PutOrigin};
 use yadorilink_replica_domain::file::{FileMeta, FileVersion, RecordKind};
-use yadorilink_replica_domain::ids::{DeviceId, FolderGroupId, SyncPath};
-use yadorilink_replica_domain::test_authoring::create_signed_for_tests;
 use yadorilink_root_authority::root_identity::VerifiedRoot;
 use yadorilink_sync_sqlite::projection_obligations::NonExactProofKind;
 
@@ -17,7 +13,7 @@ use yadorilink_sync_sqlite::projection_obligations::NonExactProofKind;
 /// tests that go on to drive the real obligation scheduler
 /// (`drive_obligations_once_for_test`) and expect it to actually
 /// reconcile, not just back off for lack of any candidate.
-async fn register_candidate_session(state: &Arc<DaemonState>, root: &std::path::Path) {
+async fn register_candidate_session(state: &Arc<DaemonState>) {
     let deps = crate::peer_orchestrator::peer_sync_session_deps(state);
     let (transports, _peer_transports) =
         crate::test_support::session_transports_pair("device-local", "device-peer").await;
@@ -36,9 +32,7 @@ async fn register_candidate_session(state: &Arc<DaemonState>, root: &std::path::
         replica_engine,
         peer_store,
         vec![GROUP.to_string()],
-        HashMap::from([(GROUP.to_string(), root.to_path_buf())]),
         transports,
-        Some(state.forward_tx.clone()),
         deps,
     );
     state.peers.register_session("device-peer".to_string(), session, state.local_convergence());
@@ -76,8 +70,7 @@ async fn build_state_with_adopted_group() -> (Arc<DaemonState>, tempfile::TempDi
     let generation = replica_coordinator.startup_readiness().begin_group_startup(GROUP);
     replica_coordinator.startup_readiness().mark_group_ready(GROUP, generation);
 
-    let build = DaemonState::build("device-local".to_string(), replica_coordinator, block_store);
-    let state = build.state;
+    let state = DaemonState::build("device-local".to_string(), replica_coordinator, block_store);
     state.test_root_commit_authorities.lock().unwrap().insert(
         GROUP.to_string(),
         Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()),
@@ -89,28 +82,21 @@ async fn build_state_with_adopted_group() -> (Arc<DaemonState>, tempfile::TempDi
 fn admit_change(
     state: &DaemonState,
     device: &str,
-    key: &SigningKey,
+    _key: &SigningKey,
     path: &str,
     version: &FileVersion,
-) -> Change {
-    let change = create_signed_for_tests(
-        vec![],
-        0,
-        DeviceId(device.to_string()),
-        FolderGroupId(GROUP.to_string()),
-        vec![Op::Put {
-            path: SyncPath(path.to_string()),
-            version: version.version_hash,
-            origin: PutOrigin::Direct,
-        }],
-        key,
-    );
-    state
-        .replica_coordinator
-        .change_history_repository()
-        .dag_admit_change_with_versions(&change, std::slice::from_ref(version))
-        .unwrap();
-    change
+) -> yadorilink_replica_domain::signed_delta::NativeDelta {
+    crate::test_support::remote_admission_fixture::admit_remote(
+        &state.replica_coordinator,
+        GROUP,
+        device,
+        vec![crate::test_support::remote_admission_fixture::put(
+            path,
+            version.version_hash,
+            vec![],
+        )],
+        std::slice::from_ref(version),
+    )
 }
 
 /// The core regression: a path parked `'ignore_blocked'` (standing in
@@ -118,7 +104,7 @@ fn admit_change(
 /// comment for why a direct park, not real `.yadorilinkignore`
 /// matching, is used here, mirroring `hazard_recheck_tests`' own
 /// direct-`set_held` convention) with an already-admitted, trivially-
-/// materializable DAG version is re-armed back to `'pending'` by
+/// materializable native version is re-armed back to `'pending'` by
 /// `run_ignore_recheck_pass` alone -- no new incoming record for this
 /// exact path, and no `.yadorilinkignore` edit for the sweep to react
 /// to -- and then converges for real once the ordinary obligation-
@@ -134,7 +120,7 @@ async fn an_ignore_blocked_path_is_re_examined_and_rearmed_by_the_sweep_alone() 
     // pass` is a pure ignore-policy query and
     // never constructs any `PeerSyncSession` at all, so there is no
     // first-construction-after-registration ordering hazard to avoid.
-    register_candidate_session(&state, &root_dir.path().canonicalize().unwrap()).await;
+    register_candidate_session(&state).await;
     let key = SigningKey::from_bytes(&[82u8; 32]);
     admit_change(&state, "device-a", &key, "was-ignored.txt", &empty_version(1_700_000_000));
 

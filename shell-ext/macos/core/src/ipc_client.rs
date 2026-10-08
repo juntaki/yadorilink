@@ -22,7 +22,7 @@ use tokio::runtime::Runtime;
 use yadorilink_ipc_proto::framing::{read_message, write_message};
 use yadorilink_ipc_proto::shellipc::shell_ipc_message::Payload;
 use yadorilink_ipc_proto::shellipc::{
-    ContextAction, ContextActionRequest, MaterializationState, ShellIpcMessage, StatusQuery,
+    ContextAction, ContextActionRequest, LocalState, ShellIpcMessage, StatusQuery,
     SyncState,
 };
 
@@ -128,19 +128,19 @@ async fn connect() -> std::io::Result<UnixStream> {
 }
 
 /// Both signals a badge needs — `SyncState` (convergence with peers) and
-/// `MaterializationState` (on-demand-sync's placeholder/hydrated/hydrating,
-/// independent of sync convergence per shellipc.proto's comment on
-/// `MaterializationState`). Fetched together over one connection rather
+/// `LocalState` (whether an object stands and whether the current version's
+/// content is usable, independent of sync convergence per shellipc.proto's
+/// comment on `LocalState`; `None` is unknown). Fetched together over one connection rather
 /// than two round trips, since `menu(for:)`/badge rendering needs both.
 pub struct StatusInfo {
     pub sync_state: SyncState,
-    pub materialization_state: MaterializationState,
+    pub local_state: Option<LocalState>,
 }
 
 impl StatusInfo {
     const UNSPECIFIED: StatusInfo = StatusInfo {
         sync_state: SyncState::Unspecified,
-        materialization_state: MaterializationState::Unspecified,
+        local_state: None,
     };
 }
 
@@ -168,8 +168,7 @@ async fn query_status_inner(path: &str) -> StatusInfo {
     match read_message::<ShellIpcMessage>(&mut stream).await {
         Ok(Some(ShellIpcMessage { payload: Some(Payload::StatusResponse(r)) })) => StatusInfo {
             sync_state: SyncState::try_from(r.state).unwrap_or(SyncState::Unspecified),
-            materialization_state: MaterializationState::try_from(r.materialization_state)
-                .unwrap_or(MaterializationState::Unspecified),
+            local_state: r.local_state,
         },
         _ => StatusInfo::UNSPECIFIED,
     }

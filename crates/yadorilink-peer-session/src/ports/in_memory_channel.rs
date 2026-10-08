@@ -9,8 +9,7 @@
 //! here is a bounded queue and a message copy, so a simulated run that uses
 //! it is reproducible from its seed alone.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 
 use tokio::io::DuplexStream;
 use tokio::sync::{mpsc, Mutex};
@@ -18,8 +17,8 @@ use yadorilink_transport::block_stream::{read_length_prefixed, write_length_pref
 use yadorilink_transport::TransportError;
 
 use super::{
-    BlockStreamTransport, PeerBlockStream, PeerServiceStream, PreparedSnapshotStore,
-    ServiceStreamTransport, SessionTransports, SnapshotFetch,
+    BlockStreamTransport, PeerBlockStream, PeerServiceStream, ServiceStreamTransport,
+    SessionTransports,
 };
 
 /// How many opened-but-not-yet-accepted streams one end may queue.
@@ -193,59 +192,10 @@ impl ServiceStreamTransport for InMemoryPeerChannel {
     }
 }
 
-/// Where a re-bootstrap snapshot this crate's own unit tests never actually
-/// prepare would live, if one did. See [`in_memory_transports`]'s own doc
-/// comment for why an unshared, always-empty shelf is the right default
-/// here rather than something that refuses to construct.
-#[derive(Default)]
-pub struct InMemorySnapshotShelf {
-    entries: StdMutex<HashMap<ShelfKey, Arc<Vec<u8>>>>,
-}
-
-/// A prepared snapshot's `(group_id, snapshot_hash)`.
-type ShelfKey = (String, [u8; 32]);
-
-impl PreparedSnapshotStore for InMemorySnapshotShelf {
-    fn prepare(&self, group_id: &str, snapshot_hash: [u8; 32], bytes: Arc<Vec<u8>>) {
-        self.entries
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert((group_id.to_string(), snapshot_hash), bytes);
-    }
-
-    fn take_for(&self, group_id: &str, snapshot_hash: &[u8; 32]) -> Option<Arc<Vec<u8>>> {
-        self.entries
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&(group_id.to_string(), *snapshot_hash))
-    }
-}
-
-/// Collects a snapshot from a peer's [`InMemorySnapshotShelf`] -- the
-/// in-memory analogue of `yadorilink-lane-ports`'s real `SnapshotFetch`,
-/// reading the OTHER end's shelf rather than a real wire round trip.
-pub struct InMemorySnapshotFetch {
-    peer_shelf: Arc<InMemorySnapshotShelf>,
-}
-
-#[async_trait::async_trait]
-impl SnapshotFetch for InMemorySnapshotFetch {
-    async fn fetch(
-        &self,
-        group_id: &str,
-        snapshot_hash: [u8; 32],
-    ) -> Result<Vec<u8>, TransportError> {
-        self.peer_shelf
-            .take_for(group_id, &snapshot_hash)
-            .map(|bytes| (*bytes).clone())
-            .ok_or_else(|| TransportError::NoRoute("no such prepared snapshot".to_string()))
-    }
-}
-
 /// This crate's own `SessionTransports` fixture: a real block-stream and
 /// service-stream port backed by `channel`'s own connected-pair queues (so
 /// a stream opened through it really is something the far end could
-/// accept), plus a fresh, unshared snapshot shelf.
+/// accept).
 ///
 /// `yadorilink-lane-ports`'s `testing::TestPeerNode` is the *real*
 /// substrate-backed fixture other crates use, and this crate's own
@@ -260,23 +210,10 @@ impl SnapshotFetch for InMemorySnapshotFetch {
 /// external integration binary) uses this instead.
 ///
 /// Not a null/deny stub: `blocks`/`service` are real in-memory pipes, so a
-/// test that DOES exercise `fetch_block` or a
-/// service RPC through a session built this way gets a stream a peer-side
-/// accept loop could genuinely read. `prepared_snapshots`/`snapshot_fetch`
-/// are the one part that is unshared/answers empty by construction: no
-/// unit test in this crate exercises re-bootstrap today (that machinery's
-/// real, substrate-backed coverage is `service_rpc_wire_tests` in
-/// `tests/peer_session.rs`), so an unshared shelf just means a fetch here
-/// answers `NotFound`, exactly what a peer that never prepared anything
-/// would answer over the real wire -- never a construction-time failure.
+/// test that exercises `fetch_block` or a service RPC through a session
+/// built this way gets a stream a peer-side accept loop could genuinely read.
 pub fn in_memory_transports(channel: &Arc<InMemoryPeerChannel>) -> SessionTransports {
-    let shelf = Arc::new(InMemorySnapshotShelf::default());
-    SessionTransports {
-        blocks: channel.clone(),
-        service: channel.clone(),
-        prepared_snapshots: shelf.clone(),
-        snapshot_fetch: Arc::new(InMemorySnapshotFetch { peer_shelf: shelf }),
-    }
+    SessionTransports { blocks: channel.clone(), service: channel.clone() }
 }
 
 impl InMemoryPeerChannel {

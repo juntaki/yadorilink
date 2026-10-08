@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
-use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
+use yadorilink_replica_domain::file::BlockInfo;
 
 use crate::error::PeerSessionError;
 
@@ -72,10 +72,6 @@ pub trait ConvergenceDriver: Send + Sync {
     /// The peer this work arrived from. Used for tracing, and as the
     /// origin a record falls back to when it carries none of its own.
     fn peer_device_id(&self) -> &str;
-
-    /// Hands a record this device has adopted or resolved to the
-    /// session's forwarding channel, if it has one.
-    fn forward(&self, group_id: &str, record: &FileRecord);
 
     /// Obtains one block this device does not have.
     ///

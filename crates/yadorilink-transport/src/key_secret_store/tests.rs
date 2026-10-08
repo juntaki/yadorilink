@@ -242,3 +242,45 @@ fn creates_missing_parent_directories() {
     assert_eq!(read_secret(&path), Some(secret));
     assert!(temp_leftovers(dir.path().join("nested/deeper").as_path()).is_empty());
 }
+
+#[test]
+fn only_the_literal_one_disables_the_keyring() {
+    assert!(disables_keyring(Some("1")));
+    for off in [None, Some(""), Some("0"), Some("true")] {
+        assert!(!disables_keyring(off), "{off:?} must leave the keyring on");
+    }
+}
+
+#[test]
+fn disabled_keyring_is_never_read_or_written_and_the_file_still_works() {
+    test_keyring::reset();
+    test_keyring::set_available(true); // a keyring that WOULD work
+    test_keyring::set_disabled(true);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("k");
+    let secret = sample_secret();
+
+    persist_new_secret(&path, &secret).unwrap();
+    let loaded = load_persisted_secret(&path).unwrap().unwrap();
+    assert_eq!(loaded.as_slice(), &secret);
+    // A lost file cannot be recovered from a keyring that is switched off.
+    std::fs::remove_file(&path).unwrap();
+    assert!(load_persisted_secret(&path).unwrap().is_none());
+
+    assert_eq!(test_keyring::calls(), 0, "the switch must prevent every keyring operation");
+    test_keyring::set_disabled(false);
+    assert!(keyring_load(&path).is_none(), "nothing was mirrored while disabled");
+    test_keyring::reset();
+}
+
+#[test]
+fn enabled_keyring_is_still_used() {
+    test_keyring::reset();
+    test_keyring::set_available(true);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("k");
+    persist_new_secret(&path, &sample_secret()).unwrap();
+    assert!(test_keyring::calls() > 0);
+    assert_eq!(keyring_load(&path).unwrap().as_slice(), &sample_secret());
+    test_keyring::reset();
+}

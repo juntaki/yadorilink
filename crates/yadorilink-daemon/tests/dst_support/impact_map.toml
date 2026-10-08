@@ -26,87 +26,49 @@ schema_version = 1
 [modules]
 # The indexing/state core is touched by every scenario.
 index = [
-    "dst_two_device_chaos",
-    "dst_three_device_mesh_chaos",
-    "dst_network_fault_chaos",
     "dst_directory_chaos",
-    "dst_disk_crash_chaos",
     "dst_peer_reconcile_race",
     "dst_hydration_under_fault_chaos",
     "dst_watcher_debounce",
 ]
 local_change = [
-    "dst_two_device_chaos",
-    "dst_three_device_mesh_chaos",
-    "dst_network_fault_chaos",
     "dst_directory_chaos",
-    "dst_disk_crash_chaos",
     "dst_peer_reconcile_race",
     "dst_watcher_debounce",
 ]
 watcher = [
     "dst_watcher_debounce",
     "dst_directory_chaos",
-    "dst_two_device_chaos",
-    "dst_three_device_mesh_chaos",
-    "dst_network_fault_chaos",
-    "dst_disk_crash_chaos",
     "dst_peer_reconcile_race",
 ]
 debounce = [
     "dst_watcher_debounce",
-    "dst_two_device_chaos",
-    "dst_three_device_mesh_chaos",
-    "dst_network_fault_chaos",
     "dst_directory_chaos",
-    "dst_disk_crash_chaos",
     "dst_peer_reconcile_race",
 ]
 ignore_patterns = [
     "dst_watcher_debounce",
-    "dst_two_device_chaos",
-    "dst_three_device_mesh_chaos",
-    "dst_network_fault_chaos",
     "dst_directory_chaos",
-    "dst_disk_crash_chaos",
     "dst_peer_reconcile_race",
 ]
 # The complete-dependency public wrapper over `peer_session`. Any scenario
 # that drives a real session goes through it, so it carries the same list.
 peer_session_public = [
-    "dst_two_device_chaos",
-    "dst_three_device_mesh_chaos",
-    "dst_network_fault_chaos",
     "dst_peer_reconcile_race",
-    "dst_disk_crash_chaos",
     "dst_directory_chaos",
 ]
 peer_session = [
-    "dst_two_device_chaos",
-    "dst_three_device_mesh_chaos",
-    "dst_network_fault_chaos",
     "dst_peer_reconcile_race",
-    "dst_disk_crash_chaos",
     "dst_directory_chaos",
 ]
 conflict = [
-    "dst_two_device_chaos",
-    "dst_three_device_mesh_chaos",
     "dst_directory_chaos",
-    "dst_network_fault_chaos",
-    "dst_disk_crash_chaos",
 ]
 materialization = [
     "dst_hydration_under_fault_chaos",
-    "dst_disk_crash_chaos",
-    "dst_network_fault_chaos",
-    "dst_two_device_chaos",
-    "dst_three_device_mesh_chaos",
     "dst_directory_chaos",
 ]
 types = [
-    "dst_disk_crash_chaos",
-    "dst_three_device_mesh_chaos",
 ]
 # The reserved-artefact predicate sits on every path-consuming entry point --
 # watcher ingestion and directory registration, the shared exclusion choke
@@ -114,11 +76,7 @@ types = [
 # so a change here can alter what any scenario sees on disk or admits into
 # history. Scoped to the scenarios that actually drive those paths.
 reserved_namespace = [
-    "dst_two_device_chaos",
-    "dst_three_device_mesh_chaos",
-    "dst_network_fault_chaos",
     "dst_directory_chaos",
-    "dst_disk_crash_chaos",
     "dst_peer_reconcile_race",
     "dst_watcher_debounce",
 ]
@@ -158,7 +116,7 @@ early_physical_recovery = []
 # path's winner while a projection is in flight, since that is the
 # staleness this loop exists to detect.
 plan_driver = []
-# Custody transfer (design §8.1 `CustodyTransferred`, §12): moves a
+# Custody transfer (`CustodyTransferred`): moves a
 # commit's displaced preimage into retained custody by same-filesystem
 # rename.
 retained_obligation = []
@@ -177,7 +135,7 @@ dag_import = []
 hazard = []
 error = []
 rate_limiter = []
-# Work-class scheduling primitive (design §15.1/§22.2): weighted-fair-queuing
+# Work-class scheduling primitive: weighted-fair-queuing
 # admission control across the six work classes, one instance per bounded
 # resource. Pure admission-control logic exercised only by its own unit
 # tests so far; no DST scenario drives it under simulated fault/contention
@@ -185,12 +143,12 @@ rate_limiter = []
 # gating retained-preimage classification -- yet either).
 work_class_queue = []
 rebootstrap = []
-rebootstrap_snapshot = []
-# Single-pass preimage classification pipeline (design §11.2): exercised
+native_snapshot = []
+# Single-pass preimage classification pipeline: exercised
 # only by its own unit tests so far; no DST scenario drives captured-change
 # authoring from a retained preimage yet.
 single_pass_capture = []
-# Captured authoring (design §11.2): turns a retained preimage's
+# Captured authoring: turns a retained preimage's
 # single-pass classification into one signed change, in one SQLite
 # transaction, parented on the displaced generation's causal basis, under
 # the block liveness gate.
@@ -204,13 +162,9 @@ captured_authoring = []
 sync_root_lock = []
 block_serve = [
     "dst_hydration_under_fault_chaos",
-    "dst_network_fault_chaos",
-    "dst_two_device_chaos",
-    "dst_three_device_mesh_chaos",
 ]
 materialization_jobs = [
     "dst_dag_catchup_chaos",
-    "dst_disk_crash_chaos",
     "dst_hydration_under_fault_chaos",
 ]
 # No DST scenario drives the retroactive conflict-copy repair loop
@@ -237,18 +191,11 @@ root_commit = []
 # is true once the scenario routes failures through the first-divergence
 # observer; currently pending the
 # triage-replay integration, so all are false. See INTEGRATION.md.
-dst_two_device_chaos = { oracles = ["Convergence", "NoLoss", "Corruption", "ConflictCopyAccounting", "StructuralIndexDiskMismatch", "StructuralOrphanIndexRow", "SlowConvergence"], first_divergence = false }
-# The self-driving generated seed-sweep: generate_case -> op_applier -> full
-# oracle suite (gates on Convergence + Corruption; the rest run advisory).
-dst_generated_sweep = { oracles = ["Convergence", "NoLoss", "Corruption", "ConflictCopyAccounting", "StructuralIndexDiskMismatch", "StructuralOrphanIndexRow", "StructuralMaterializationMismatch", "ConvergedToWrongWinner"], first_divergence = false }
 # Strong-eventual-consistency suite for the change-history DAG reference model:
 # convergence, no resurrection, deterministic conflict-copy naming, and
 # store-and-forward semantics.
 dst_sec_convergence = { oracles = ["Convergence", "ConflictCopyAccounting"], first_divergence = false }
-dst_three_device_mesh_chaos = { oracles = ["Convergence", "NoLoss", "Corruption", "ConflictCopyAccounting", "StructuralIndexDiskMismatch", "StructuralOrphanIndexRow", "SlowConvergence"], first_divergence = false }
-dst_network_fault_chaos = { oracles = ["Convergence", "NoLoss", "Corruption", "ConflictCopyAccounting", "StructuralIndexDiskMismatch", "StructuralOrphanIndexRow", "SlowConvergence"], first_divergence = false }
 dst_directory_chaos = { oracles = ["Convergence", "NoLoss", "Corruption", "ConflictCopyAccounting", "StructuralIndexDiskMismatch", "StructuralOrphanIndexRow", "SlowConvergence"], first_divergence = false }
-dst_disk_crash_chaos = { oracles = ["Convergence", "NoLoss", "Corruption", "ConflictCopyAccounting", "StructuralIndexDiskMismatch", "StructuralOrphanIndexRow"], first_divergence = false }
 dst_hydration_under_fault_chaos = { oracles = ["Convergence", "NoLoss", "Corruption", "StructuralIndexDiskMismatch", "StructuralOrphanIndexRow"], first_divergence = false }
 dst_peer_reconcile_race = { oracles = ["NoLoss"], first_divergence = false }
 dst_watcher_debounce = { oracles = ["NoLoss"], first_divergence = false }
@@ -260,6 +207,11 @@ dst_directory_move_edit_race = { oracles = [], first_divergence = false }
 # catch-up. Drives its own terminal convergence assertion rather than a `check_*`
 # oracle, so no ViolationKind is listed.
 dst_dag_catchup_chaos = { oracles = [], first_divergence = false }
+# Recursive delete and directory rename concurrent with a peer's write inside
+# the directory, on two product-stack devices. Asserts its own database-state
+# oracle (unobserved heads survive, observed versions are removed, the devices
+# converge) rather than a `check_*` oracle, so no ViolationKind is listed.
+dst_turmoil_dcf_directory = { oracles = [], first_divergence = false }
 # Three full stacks on a simulated carrier: seals and foreign-base merges
 # driven by the harness while devices are partitioned, with directory ops
 # (rm -rf, directory rename, shape conflicts, write-through of a relocated

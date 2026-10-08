@@ -7,7 +7,7 @@ directory durability barriers. All of that goes through `fs_ops.rs`, so an
 audit of "where does this crate unlink, rename, or flush a directory?" has
 exactly one place to look. This guard pins that seam:
 
-  * `fs_ops.rs` holds exactly one of each primitive; and
+  * `fs_ops.rs` holds exactly one of each primitive (and no hard-link one); and
   * no other module in the crate calls a raw `fs::hard_link`, `fs::rename`,
     `fs::remove_file`, `fs::remove_dir` or `fs::remove_dir_all`.
 
@@ -53,7 +53,9 @@ def main() -> int:
     violations: list[str] = []
 
     expected_counts = {
-        r"\bfs::hard_link\(": (1, "publish-if-absent primitive"),
+        # Retired: publication is a replacing rename, so the seam holds no
+        # hard-link primitive and must not grow one back.
+        r"\bfs::hard_link\(": (0, "hard-link publication primitive (retired)"),
         r"\bfs::remove_file\(": (1, "physical removal primitive"),
         r"\bfs::rename\(": (1, "atomic replace primitive"),
         r"fs::File::open\(path\)\?\.sync_all\(": (1, "Unix directory durability sync"),

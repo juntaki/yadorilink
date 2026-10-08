@@ -298,8 +298,8 @@ pub fn known_prefix(
 
 /// True when the caller wants a fast, targeted run with no corpus replay --
 /// either the dedicated `DST_SKIP_CORPUS_REPLAY` flag, or an explicit
-/// `DST_BASE_SEED`. The latter matches the convention `dst_two_device_chaos.rs`
-/// and `dst_generated_sweep.rs` already established before this function
+/// `DST_BASE_SEED`. The latter matches the convention the retired two-device and
+/// generated-sweep scenarios already established before this function
 /// existed: a caller pinning down one specific seed (the documented
 /// `DST_BASE_SEED=<seed> DST_VARIATIONS=1` reproduction recipe) has already
 /// opted into "just this seed", and paying to replay an ever-growing

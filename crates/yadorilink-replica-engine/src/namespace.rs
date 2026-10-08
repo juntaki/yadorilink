@@ -63,14 +63,6 @@
 //! device-local layer after this projection; this function is what seals
 //! and summaries are compared against, so it must give every device the
 //! same answer.
-//!
-//! # Plans
-//!
-//! [`plan_transition`] turns two projections into an ordered list of
-//! filesystem steps that is valid under POSIX rules at every intermediate
-//! point: leaf removals, then directory removals deepest first, then
-//! relocations, then directory creations shallowest first, then entry
-//! writes shallowest first.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -164,6 +156,21 @@ impl NamespaceProjection {
         &self.nodes
     }
 
+    /// Overwrites (or inserts) the node at `path`. For a caller-side
+    /// post-processing layer ONLY (e.g. stable projection binding)
+    /// -- this pure module's own `project`/`place`/`project_own_node`
+    /// never call it; they stay pure, current-head-set-only functions with
+    /// no memory of anything not in their own input.
+    pub fn set(&mut self, path: impl Into<String>, node: PhysicalNode) {
+        self.nodes.insert(path.into(), node);
+    }
+
+    /// Removes the node at `path`, if any. See [`Self::set`]'s doc: for a
+    /// caller-side post-processing layer only.
+    pub fn remove(&mut self, path: &str) -> Option<PhysicalNode> {
+        self.nodes.remove(path)
+    }
+
     #[must_use]
     pub fn get(&self, path: &str) -> Option<&PhysicalNode> {
         self.nodes.get(path)
@@ -199,49 +206,6 @@ pub fn project(
             needs_directory.insert(path);
         }
         needs_directory.extend(proper_ancestors(path));
-    }
-    place(&classes, &needs_directory, &kind_of)
-}
-
-/// [`project`] restricted to one directory level: the nodes whose parent
-/// is the parent of every path in `children`.
-///
-/// `children` holds the live heads of each path at that level (every key
-/// must have the same parent); `with_live_descendant` names the paths at
-/// that level that have a live content head strictly below them. That is
-/// everything that decides the level: a node is a path's own account plus
-/// the copies of its siblings, and a copy is always named beside its
-/// source, so no path deeper or elsewhere can take a name here. The
-/// result equals [`project`]'s nodes at this level, for a caller that
-/// holds a store of per-path heads and must not read the whole group to
-/// learn where one relocated file lives.
-pub fn project_level(
-    children: &BTreeMap<String, Vec<PathHead>>,
-    with_live_descendant: &BTreeSet<String>,
-    kind_of: impl Fn(&[u8; 32]) -> Option<RecordKind>,
-) -> Result<NamespaceProjection, ProjectionError> {
-    debug_assert!(
-        children
-            .keys()
-            .chain(with_live_descendant.iter())
-            .map(|path| parent_of(path))
-            .collect::<BTreeSet<_>>()
-            .len()
-            <= 1,
-        "a level's paths share one parent"
-    );
-    let mut classes: BTreeMap<&str, PathClasses<'_>> = BTreeMap::new();
-    for (path, path_heads) in children {
-        if let Some(path_classes) = classify_path(path, path_heads, &kind_of)? {
-            classes.insert(path, path_classes);
-        }
-    }
-    let mut needs_directory: BTreeSet<&str> =
-        with_live_descendant.iter().map(String::as_str).collect();
-    for (path, path_classes) in &classes {
-        if path_classes.best_directory.is_some() {
-            needs_directory.insert(path);
-        }
     }
     place(&classes, &needs_directory, &kind_of)
 }
@@ -444,7 +408,7 @@ fn content_of(head: &PathHead) -> &PathHeadContent {
 }
 
 fn ranks_below(a: &PathHead, b: &PathHead) -> bool {
-    dag_conflict_loser_is_a(a.lamport, &a.change_hash, b.lamport, &b.change_hash)
+    dag_conflict_loser_is_a(a.rank, &a.change_hash, b.rank, &b.change_hash)
 }
 
 fn kind_of_head(
@@ -475,14 +439,6 @@ fn conflict_copy_name(path: &str, head: &PathHead, attempt: Option<u32>) -> Stri
     )
 }
 
-/// The name [`project`] gives `head`'s content when it has to leave
-/// `path` (relocated, or a conflict copy) and nothing else has taken that
-/// name: its conflict-copy sibling, before any numbered disambiguator.
-#[must_use]
-pub fn first_copy_name(path: &str, head: &PathHead) -> String {
-    conflict_copy_name(path, head, None)
-}
-
 /// Every proper ancestor of `path`, nearest first.
 fn proper_ancestors(path: &str) -> impl Iterator<Item = &str> {
     std::iter::successors(parent_of(path), |p| parent_of(p))
@@ -490,185 +446,6 @@ fn proper_ancestors(path: &str) -> impl Iterator<Item = &str> {
 
 fn parent_of(path: &str) -> Option<&str> {
     path.rsplit_once('/').map(|(parent, _)| parent)
-}
-
-/// Number of components; the unit plans order by.
-fn depth(path: &str) -> usize {
-    path.bytes().filter(|b| *b == b'/').count() + 1
-}
-
-/// One filesystem step of a transition between two projections.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PlanStep {
-    /// Unlink the File or Symlink at `path`.
-    RemoveEntry { path: String },
-    /// Remove the directory at `path`, never recursively.
-    ///
-    /// Every tracked descendant has been removed or moved out by an earlier
-    /// step, so anything still inside when this runs is content the
-    /// replicated state does not know about. The materializer must then
-    /// keep the directory and settle it as retained; it must not delete
-    /// that content and must not retry forever.
-    RemoveDirectory { path: String },
-    /// Rename the entry at `from` to `to` (a relocation, or its reverse).
-    /// Both ends share a parent directory.
-    Move { from: String, to: String, entry: PlacedEntry },
-    /// Create a directory that did not exist.
-    CreateDirectory { path: String, node: DirectoryNode },
-    /// A directory that stays a directory but changes how it is held
-    /// (explicit ↔ structural, or a different explicit version). Never an
-    /// rmdir.
-    UpdateDirectory { path: String, node: DirectoryNode },
-    /// Write `entry` at `path`, replacing any leaf already there.
-    WriteEntry { path: String, entry: PlacedEntry },
-}
-
-/// Orders the filesystem steps that turn `prev` into `next`.
-///
-/// Steps describe the filesystem only. A leaf that keeps its name and
-/// content while its [`Placement`] changes (a conflict copy that becomes
-/// the displaced winner, or the reverse) needs no step; the caller reads
-/// placement from `next`.
-pub fn plan_transition(prev: &NamespaceProjection, next: &NamespaceProjection) -> Vec<PlanStep> {
-    // A leaf's identity across the two trees: the same content of the
-    // same source path (the version fixes the kind). Found at two
-    // different places, it moved.
-    let key_of = |entry: &PlacedEntry| (entry.source.clone(), entry.version_hash);
-    let leaves = |projection: &NamespaceProjection| -> BTreeMap<_, String> {
-        projection
-            .nodes
-            .iter()
-            .filter_map(|(path, node)| match node {
-                PhysicalNode::Entry(entry) => Some((key_of(entry), path.clone())),
-                PhysicalNode::Directory(_) => None,
-            })
-            .collect()
-    };
-    let (prev_leaves, next_leaves) = (leaves(prev), leaves(next));
-
-    let mut moves: Vec<(String, String, PlacedEntry)> = Vec::new();
-    let mut move_destinations: BTreeSet<&str> = BTreeSet::new();
-    for (key, from) in &prev_leaves {
-        if let Some(to) = next_leaves.get(key).filter(|to| *to != from) {
-            let Some(PhysicalNode::Entry(entry)) = next.nodes.get(to) else {
-                unreachable!("next_leaves only indexes entries")
-            };
-            moves.push((from.clone(), to.clone(), entry.clone()));
-            move_destinations.insert(to);
-        }
-    }
-
-    let mut remove_entries: Vec<&str> = Vec::new();
-    let mut remove_directories: Vec<&str> = Vec::new();
-    for (path, node) in &prev.nodes {
-        let after = next.nodes.get(path);
-        match node {
-            PhysicalNode::Entry(entry) => {
-                if next_leaves.contains_key(&key_of(entry)) {
-                    continue; // stays, or moves
-                }
-                // A leaf written in place replaces this one; anything else
-                // arriving here needs the name free first.
-                let replaced_in_place = matches!(after, Some(PhysicalNode::Entry(_)))
-                    && !move_destinations.contains(path.as_str());
-                if !replaced_in_place {
-                    remove_entries.push(path);
-                }
-            }
-            PhysicalNode::Directory(_) => {
-                if !after.is_some_and(PhysicalNode::is_directory) {
-                    remove_directories.push(path);
-                }
-            }
-        }
-    }
-    let deepest_first = |a: &&str, b: &&str| depth(b).cmp(&depth(a)).then_with(|| b.cmp(a));
-    remove_entries.sort_by(deepest_first);
-    remove_directories.sort_by(deepest_first);
-
-    let mut steps: Vec<PlanStep> = Vec::new();
-    steps
-        .extend(remove_entries.iter().map(|path| PlanStep::RemoveEntry { path: path.to_string() }));
-    steps.extend(
-        remove_directories.iter().map(|path| PlanStep::RemoveDirectory { path: path.to_string() }),
-    );
-
-    // Moves, each only once its destination is free. A cycle of moves
-    // (never produced by distinct copy names in practice) is broken by
-    // unlinking one source and writing its content afresh at the end;
-    // the content is addressed by version, so nothing is lost.
-    //
-    // Always the smallest `(from, to)` move that is ready, and when none
-    // is, the cycle is broken at the smallest remaining move. Sources are
-    // distinct, and so are destinations, so freeing a source readies at
-    // most the one move that targets it.
-    let mut late_writes: Vec<(String, PlacedEntry)> = Vec::new();
-    moves.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
-    let source_index: BTreeMap<&str, usize> =
-        moves.iter().enumerate().map(|(i, m)| (m.0.as_str(), i)).collect();
-    let destination_index: BTreeMap<&str, usize> =
-        moves.iter().enumerate().map(|(i, m)| (m.1.as_str(), i)).collect();
-    let mut remaining: BTreeSet<usize> = (0..moves.len()).collect();
-    let mut ready: BTreeSet<usize> =
-        (0..moves.len()).filter(|&i| !source_index.contains_key(moves[i].1.as_str())).collect();
-    let mut move_steps: Vec<PlanStep> = Vec::with_capacity(moves.len());
-    while let Some(&first) = remaining.first() {
-        let (index, is_ready) = match ready.pop_first() {
-            Some(index) => (index, true),
-            None => (first, false),
-        };
-        remaining.remove(&index);
-        let (from, to, entry) = &moves[index];
-        if let Some(&unblocked) = destination_index.get(from.as_str()) {
-            if remaining.contains(&unblocked) {
-                ready.insert(unblocked);
-            }
-        }
-        if is_ready {
-            move_steps.push(PlanStep::Move {
-                from: from.clone(),
-                to: to.clone(),
-                entry: entry.clone(),
-            });
-        } else {
-            move_steps.push(PlanStep::RemoveEntry { path: from.clone() });
-            late_writes.push((to.clone(), entry.clone()));
-        }
-    }
-    steps.extend(move_steps);
-
-    let mut directories: Vec<(&str, DirectoryNode, bool)> = Vec::new();
-    let mut writes: Vec<(String, PlacedEntry)> = late_writes;
-    for (path, node) in &next.nodes {
-        let before = prev.nodes.get(path);
-        match node {
-            PhysicalNode::Directory(directory) => match before {
-                Some(PhysicalNode::Directory(existing)) if existing == directory => {}
-                Some(PhysicalNode::Directory(_)) => directories.push((path, *directory, false)),
-                _ => directories.push((path, *directory, true)),
-            },
-            PhysicalNode::Entry(entry) => {
-                let key = key_of(entry);
-                let stays = prev_leaves.get(&key) == Some(path);
-                let moved_here = prev_leaves.contains_key(&key);
-                if !stays && !moved_here {
-                    writes.push((path.clone(), entry.clone()));
-                }
-            }
-        }
-    }
-    directories.sort_by(|a, b| depth(a.0).cmp(&depth(b.0)).then_with(|| a.0.cmp(b.0)));
-    writes.sort_by(|a, b| depth(&a.0).cmp(&depth(&b.0)).then_with(|| a.0.cmp(&b.0)));
-    steps.extend(directories.into_iter().map(|(path, node, create)| {
-        let path = path.to_string();
-        if create {
-            PlanStep::CreateDirectory { path, node }
-        } else {
-            PlanStep::UpdateDirectory { path, node }
-        }
-    }));
-    steps.extend(writes.into_iter().map(|(path, entry)| PlanStep::WriteEntry { path, entry }));
-    steps
 }
 
 #[cfg(test)]

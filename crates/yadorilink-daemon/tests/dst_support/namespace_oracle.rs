@@ -842,7 +842,7 @@ mod tests {
         change_hash[0] = change;
         PathHead {
             change_hash,
-            lamport,
+            rank: lamport,
             device_id: format!("dev-{change}"),
             naming_device_id: format!("dev-{change}"),
             content: content

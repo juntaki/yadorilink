@@ -34,7 +34,7 @@ pub struct ReconcileCallTimer {
     provenance_flush_ns: AtomicU64,
     /// Writer-gate wait vs. actual SQLite transaction/fsync time, summed
     /// across every SQLite write this call's commit path made (provenance
-    /// flush, `open_projected_upserts_batch`, `finalize_projected_
+    /// flush, `finalize_projected_
     /// mutations_batch`) -- see `add_sqlite_write`'s own doc comment for
     /// how the split is derived.
     writer_gate_wait_ns: AtomicU64,
@@ -43,6 +43,13 @@ pub struct ReconcileCallTimer {
     blocks_fetched: AtomicU64,
     block_fetch_wait_ns: AtomicU64,
     store_put_ns: AtomicU64,
+    /// The window timeline's phases (`receive_diag`): only written while the
+    /// receive budget is armed.
+    window_fetch_ns: AtomicU64,
+    window_plan_ns: AtomicU64,
+    window_settle_ns: AtomicU64,
+    collector_wait_ns: [AtomicU64; 3],
+    collector_flush_ns: [AtomicU64; 3],
 }
 
 impl ReconcileCallTimer {
@@ -58,33 +65,48 @@ impl ReconcileCallTimer {
             blocks_fetched: AtomicU64::new(0),
             block_fetch_wait_ns: AtomicU64::new(0),
             store_put_ns: AtomicU64::new(0),
+            window_fetch_ns: AtomicU64::new(0),
+            window_plan_ns: AtomicU64::new(0),
+            window_settle_ns: AtomicU64::new(0),
+            collector_wait_ns: [const { AtomicU64::new(0) }; 3],
+            collector_flush_ns: [const { AtomicU64::new(0) }; 3],
         }
     }
 
-    /// Read back what this timer actually recorded. Exists so a test can
-    /// assert on the SAME timer instance a call reports from, rather than
-    /// on a separate one that merely would have recorded the same thing --
-    /// the distinction this accessor is here to make testable is exactly
-    /// the defect it was added for (a second, throwaway timer collecting
-    /// the block-fetch numbers while the reported one stayed at zero).
-    #[cfg(test)]
-    pub(crate) fn blocks_fetched(&self) -> u64 {
-        self.blocks_fetched.load(Ordering::Relaxed)
+    /// The whole of the attempt's content-obtaining step (not just the wire
+    /// waits [`Self::add_block_fetch_wait`] sums).
+    pub fn add_window_fetch(&self, elapsed: Duration) {
+        self.window_fetch_ns.fetch_add(ns(elapsed), Ordering::Relaxed);
     }
-    #[cfg(test)]
-    pub(crate) fn block_fetch_wait_ns(&self) -> u64 {
-        self.block_fetch_wait_ns.load(Ordering::Relaxed)
+    /// Planning every level and building the work, up to the first settle.
+    pub fn add_window_plan(&self, elapsed: Duration) {
+        self.window_plan_ns.fetch_add(ns(elapsed), Ordering::Relaxed);
     }
-    #[cfg(test)]
-    pub(crate) fn store_put_ns(&self) -> u64 {
-        self.store_put_ns.load(Ordering::Relaxed)
+    /// Settling the planned entries (the runs and the barriers), start to end.
+    pub fn add_window_settle(&self, elapsed: Duration) {
+        self.window_settle_ns.fetch_add(ns(elapsed), Ordering::Relaxed);
+    }
+    /// One run's collector times, as summed by its `CompletionWindow`.
+    pub(crate) fn add_collectors(&self, waits: [u64; 3], flushes: [u64; 3]) {
+        for index in 0..3 {
+            self.collector_wait_ns[index].fetch_add(waits[index], Ordering::Relaxed);
+            self.collector_flush_ns[index].fetch_add(flushes[index], Ordering::Relaxed);
+        }
+    }
+    /// What this attempt spent per phase, for the window timeline.
+    pub(crate) fn window_phases(&self) -> crate::receive_diag::WindowPhases {
+        let load = |slot: &AtomicU64| Duration::from_nanos(slot.load(Ordering::Relaxed));
+        crate::receive_diag::WindowPhases {
+            fetch: load(&self.window_fetch_ns),
+            plan: load(&self.window_plan_ns),
+            settle: load(&self.window_settle_ns),
+            queue_wait: std::array::from_fn(|index| load(&self.collector_wait_ns[index])),
+            flush: std::array::from_fn(|index| load(&self.collector_flush_ns[index])),
+        }
     }
 
     pub fn add_dag_resolution(&self, elapsed: Duration) {
         self.dag_resolution_ns.fetch_add(ns(elapsed), Ordering::Relaxed);
-    }
-    pub fn add_ensure_blocks_present(&self, elapsed: Duration) {
-        self.ensure_blocks_present_ns.fetch_add(ns(elapsed), Ordering::Relaxed);
     }
     pub fn add_provenance_flush(&self, elapsed: Duration) {
         self.provenance_flush_ns.fetch_add(ns(elapsed), Ordering::Relaxed);
@@ -113,9 +135,6 @@ impl ReconcileCallTimer {
         let sqlite_txn = total_elapsed.saturating_sub(gate_wait);
         self.add_writer_gate_wait(gate_wait);
         self.add_sqlite_transaction(sqlite_txn);
-    }
-    pub fn add_ordinary_commit(&self, elapsed: Duration) {
-        self.ordinary_commit_ns.fetch_add(ns(elapsed), Ordering::Relaxed);
     }
     /// `elapsed` is the requester-observed `fetch_block_raw` round trip for
     /// ONE ATTEMPT at fetching a block (wire wait, from just before the

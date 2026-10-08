@@ -379,13 +379,17 @@ impl PeerConnectivityRuntime {
         });
 
         let (track_send_tx, track_send_inbound) = mpsc::channel(TRACK_SEND_QUEUE);
+        // Native replication is offered to exactly the devices that may sync
+        // with this one: the same admission, asked again on revocation.
+        let (native_replication_tx, native_replication_inbound) = mpsc::channel(TRACK_SEND_QUEUE);
         let (node, mut accepted) = SubstrateNode::spawn_as_device(
             signing_key,
             config
                 .with_directory(directory.clone())
                 .with_lan_peers(lan_peers)
                 .with_link_observer(observer)
-                .with_track_send(track_send.clone(), track_send_tx),
+                .with_track_send(track_send.clone(), track_send_tx)
+                .with_native_replication(peer_admission.clone(), native_replication_tx),
             peer_admission,
         )
         .await?;
@@ -400,6 +404,7 @@ impl PeerConnectivityRuntime {
             links: Mutex::new(Vec::new()),
             track_send,
             track_send_connections: node.track_send_connections(),
+            native_replication_connections: node.native_replication_connections(),
         });
         self.endpoints.lock().unwrap_or_else(|p| p.into_inner()).push(Arc::downgrade(&open));
         let (inbound_tx, inbound) = mpsc::channel(ACCEPTED_QUEUE);
@@ -434,9 +439,10 @@ impl PeerConnectivityRuntime {
                 node,
                 directory,
                 authority: authority.clone(),
-                links: tokio::sync::Mutex::new(HashMap::new()),
+                links: Mutex::new(HashMap::new()),
                 open,
                 track_send_inbound: Mutex::new(Some(track_send_inbound)),
+                native_replication_inbound: Mutex::new(Some(native_replication_inbound)),
             },
             inbound,
         ))
@@ -465,7 +471,7 @@ impl PeerConnectivityRuntime {
     /// Records the substrate reachability the coordination plane reports for
     /// `device_id`, and returns whether the recorded value changed.
     ///
-    /// Never calls out: waking the reconciliation driver is the caller's job
+    /// Never calls out: waking the peer session driver is the caller's job
     /// (`DaemonState::record_peer_substrate_reachability`), done after this
     /// lock is released.
     pub(crate) fn record_peer_substrate_reachability(
@@ -554,6 +560,9 @@ struct OpenConnections {
     track_send: Arc<dyn PeerAdmission>,
     /// The Track Send connections this endpoint dialled or accepted.
     track_send_connections: TrackSendConnections,
+    /// The native replication connections this endpoint dialled or
+    /// accepted, closed when the device is no longer admitted.
+    native_replication_connections: yadorilink_sync_substrate::NativeReplicationConnections,
 }
 
 impl OpenConnections {
@@ -592,6 +601,9 @@ impl OpenConnections {
             if !self.track_send.admit(&peer) {
                 self.track_send_connections.close_to(&peer);
             }
+            if !self.admits(&peer) {
+                self.native_replication_connections.close_to(&peer);
+            }
         }
         let mut links = self.links.lock().unwrap_or_else(|p| p.into_inner());
         links.retain(|link| {
@@ -607,6 +619,10 @@ impl OpenConnections {
     }
 }
 
+/// One device's cached connection. Its lock is held across that device's
+/// dial and nothing else's.
+type LinkSlot = Arc<tokio::sync::Mutex<Option<Arc<PeerLink>>>>;
+
 /// One bound iroh endpoint and router, and everything whose lifetime is that
 /// endpoint's: who it admits, where it looks peers up, and the links it holds
 /// open.
@@ -621,7 +637,7 @@ pub struct IrohEndpoint {
     /// Resolved per call rather than held open forever: a link that has gone
     /// away is redialled, and the flow-control separation between lanes only
     /// means anything if they are lanes of the *same* connection.
-    links: tokio::sync::Mutex<HashMap<String, Arc<PeerLink>>>,
+    links: Mutex<HashMap<String, LinkSlot>>,
     /// Every connection this endpoint holds, dialled into `links` or
     /// accepted, for [`PeerConnectivityRuntime::revoke_device`] to close.
     open: Arc<OpenConnections>,
@@ -629,6 +645,8 @@ pub struct IrohEndpoint {
     /// service takes the queue. Kept apart from every sync structure above:
     /// they are never cached, observed for reachability, or served as lanes.
     track_send_inbound: Mutex<Option<mpsc::Receiver<TrackSendConnection>>>,
+    native_replication_inbound:
+        Mutex<Option<mpsc::Receiver<yadorilink_sync_substrate::NativeReplicationConnection>>>,
 }
 
 impl IrohEndpoint {
@@ -679,8 +697,10 @@ impl IrohEndpoint {
     ///
     /// `dial` is the caller's, so a dial made for the link cache is seen by
     /// the same observers as every other dial the reconciliation runtime
-    /// makes. The cache lock is held across it, so concurrent callers for one
-    /// peer share one connection rather than racing two.
+    /// makes. Each device has its own slot, held across its dial, so
+    /// concurrent callers for one peer share one connection rather than
+    /// racing two, while a peer whose dial runs to its deadline holds up
+    /// nobody else's link. The map of slots is locked only to find or add one.
     pub(crate) async fn link_to<E, Fut>(
         &self,
         device_id: &str,
@@ -689,21 +709,28 @@ impl IrohEndpoint {
     where
         Fut: Future<Output = Result<PeerLink, E>>,
     {
-        let mut links = self.links.lock().await;
+        let slot = self
+            .links
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(device_id.to_string())
+            .or_default()
+            .clone();
+        let mut cached = slot.lock().await;
         // Who the device is, asked before the cache: a cached connection to a
         // device the netmap no longer pins is not one to hand out, however
         // alive it looks.
         let Some(peer) = self.peer_id_of(device_id) else {
-            if let Some(stale) = links.remove(device_id) {
+            if let Some(stale) = cached.take() {
                 stale.close();
             }
             return Ok(None);
         };
-        if let Some(link) = links.get(device_id) {
+        if let Some(link) = cached.as_ref() {
             if link.is_alive() && link.peer() == peer {
                 return Ok(Some(link.clone()));
             }
-            links.remove(device_id);
+            *cached = None;
         }
         let link = dial(peer).await?;
         // A revocation can land while the dial is in flight. Held first and
@@ -713,7 +740,7 @@ impl IrohEndpoint {
             return Ok(None);
         }
         let link = Arc::new(link);
-        links.insert(device_id.to_string(), link.clone());
+        *cached = Some(link.clone());
         Ok(Some(link))
     }
 
@@ -721,6 +748,30 @@ impl IrohEndpoint {
     /// call: the queue has exactly one consumer, the Track Send service.
     pub(crate) fn take_track_send_inbound(&self) -> Option<mpsc::Receiver<TrackSendConnection>> {
         self.track_send_inbound.lock().unwrap_or_else(|p| p.into_inner()).take()
+    }
+
+    /// The queue of admitted native replication connections. `None` after the
+    /// first call: the queue has exactly one consumer.
+    pub(crate) fn take_native_replication_inbound(
+        &self,
+    ) -> Option<mpsc::Receiver<yadorilink_sync_substrate::NativeReplicationConnection>> {
+        self.native_replication_inbound.lock().unwrap_or_else(|p| p.into_inner()).take()
+    }
+
+    /// Dial `peer` on the native replication ALPN.
+    pub(crate) async fn connect_native_replication(
+        &self,
+        peer: PeerId,
+    ) -> Result<
+        yadorilink_sync_substrate::NativeReplicationConnection,
+        yadorilink_sync_substrate::SubstrateError,
+    > {
+        use yadorilink_sync_substrate::AddressDirectory;
+        let mut address = yadorilink_sync_substrate::PeerAddress::new(peer);
+        if let Some((direct, relays)) = self.directory.resolve(peer) {
+            address = address.with_direct(direct).with_relays(relays);
+        }
+        self.node.connect_native_replication(&address).await
     }
 
     /// Close the endpoint and every connection on it.
@@ -734,6 +785,9 @@ impl IrohEndpoint {
 
 #[cfg(test)]
 mod iroh_reachability_tests;
+
+#[cfg(test)]
+mod link_cache_tests;
 
 #[cfg(test)]
 mod tests {

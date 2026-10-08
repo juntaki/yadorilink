@@ -147,24 +147,36 @@ async fn a_path_one_device_ignores_still_reaches_the_peers_behind_it() {
     );
 
     // The relay half, stated on B directly as well as through C: ignoring a
-    // path must not drop its Change from this device's DAG. Without it, B
+    // path must not drop what authored it from this device. Without it, B
     // would be a hole in the group rather than a device with a local
     // preference.
-    let ignored_change = device_c
-        .state
-        .replica_coordinator
-        .file_index_repository()
-        .get_authoring_change_hash(GROUP, "secret.log")
-        .unwrap()
-        .expect("the far end must have an authoring identity for the relayed path");
-    assert!(
-        device_b
+    assert_relayed(&device_b, &device_c, "secret.log");
+}
+
+/// `path`, which `relay` ignores, still reaches `far_end` through it: the far
+/// end's row names what authored it, and the relay still holds that authoring
+/// (a DCF change, or the native head) although it projects nothing.
+fn assert_relayed(relay: &TestDevice, far_end: &TestDevice, path: &str) {
+    let heads_on = |device: &TestDevice| {
+        device
             .state
             .replica_coordinator
-            .change_history_repository()
-            .dag_has_change(&ignored_change)
-            .unwrap(),
-        "the ignored path's Change must stay in the relaying device's DAG"
+            .database()
+            .write(|conn| {
+                yadorilink_sync_sqlite::native_store::native_heads_at(
+                    conn,
+                    &yadorilink_replica_domain::ids::FolderGroupId(GROUP.to_owned()),
+                    &yadorilink_replica_domain::ids::SyncPath(path.to_owned()),
+                )
+            })
+            .unwrap()
+    };
+    let (relayed, held) = (heads_on(far_end), heads_on(relay));
+    assert!(!relayed.is_empty(), "the far end must hold a native head for the relayed {path}");
+    assert_eq!(
+        held.iter().map(|head| head.payload.provenance).collect::<Vec<_>>(),
+        relayed.iter().map(|head| head.payload.provenance).collect::<Vec<_>>(),
+        "{path}'s head must stay in the relaying device's native state"
     );
 }
 
@@ -211,20 +223,5 @@ async fn incoming_explicit_directory_on_locally_ignored_path_follows_file_rule()
         "the ignored directory must not be projected onto the ignoring device's disk"
     );
     assert!(!device_b.indexed("build"), "the ignored directory must stay out of B's index");
-    let relayed = device_c
-        .state
-        .replica_coordinator
-        .file_index_repository()
-        .get_authoring_change_hash(GROUP, "build")
-        .unwrap()
-        .expect("the far end must have an authoring identity for the relayed directory");
-    assert!(
-        device_b
-            .state
-            .replica_coordinator
-            .change_history_repository()
-            .dag_has_change(&relayed)
-            .unwrap(),
-        "the ignored directory's Change must stay in the relaying device's DAG"
-    );
+    assert_relayed(&device_b, &device_c, "build");
 }

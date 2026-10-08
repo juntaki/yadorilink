@@ -8,37 +8,19 @@
 //!     ├─ IrohEndpoint              iroh, identified by the device signing key,
 //!     │                            bound by PeerConnectivityRuntime; also
 //!     │                            answers Track Send, served elsewhere
-//!     ├─ SqliteReplicaPort         verification, possession, disclosure
-//!     ├─ AdmissionCoordinator      promotion, event-driven
-//!     └─ AsyncReplicaStore         bounded threads in front of SQLite
+//!     └─ SyncRuntime               dials peers, routes inbound lane streams
 //! ```
-//!
-//! Nothing here is new policy. The authority resolver is the same
-//! `NetmapChangeAuthenticator` the existing receive path uses, so both paths
-//! resolve checkpoint signers identically — which is what makes comparing
-//! them meaningful rather than a comparison of two policies.
 
 use std::sync::Arc;
 
-use yadorilink_peer_session::peer_session::ChangeAuthenticator;
-use yadorilink_replica_domain::ids::FolderGroupId;
-use yadorilink_sync_protocol::ports::GroupId;
-use yadorilink_sync_runtime::{SyncOutcome, SyncRuntime, SyncSummary};
-use yadorilink_sync_substrate::{
-    HistoryStreamKind, Lane, NetworkConfig, PeerAddress, PeerId, PeerLink,
-};
+use yadorilink_sync_runtime::SyncRuntime;
+use yadorilink_sync_substrate::{Lane, NetworkConfig, PeerAddress, PeerId, PeerLink};
 
 use crate::daemon_state::DaemonState;
 use crate::peer_connectivity_runtime::IrohEndpoint;
 
-use super::admission::AdmissionCoordinator;
-use super::async_store::{AsyncReplicaStore, StoreLimits};
-use super::daemon_directory::DaemonPeerDirectory;
-use super::foreign_base::ForeignBaseClaims;
-use super::replica_port::SqliteReplicaPort;
 use yadorilink_lane_ports::LaneBlockStream;
 use yadorilink_lane_ports::LaneServiceStream;
-use yadorilink_lane_ports::PreparedSnapshots;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SyncStackError {
@@ -57,67 +39,14 @@ pub enum SyncStackError {
 
 /// The reconciliation stack, running.
 pub struct SyncStack {
-    runtime: Arc<SyncRuntime<SqliteReplicaPort<DaemonPeerDirectory>>>,
-    store: AsyncReplicaStore,
-    possession: Arc<std::sync::Mutex<Option<super::replica_port::PossessionObserver>>>,
-    /// Peers whose last negotiation found them on another history base.
-    foreign_bases: Arc<ForeignBaseClaims>,
+    runtime: Arc<SyncRuntime>,
     /// This device's iroh endpoint: admission, address lookup, the per-peer
     /// link cache and endpoint-id resolution. Bound by the connectivity
     /// runtime and held here so the endpoint lives exactly as long as the
     /// stack that drives it.
     endpoint: IrohEndpoint,
-    /// Snapshots this device has signed a manifest against and is willing to
-    /// hand over. Owned here because it is per-daemon and per-connection
-    /// state, and deliberately not durable.
-    prepared: Arc<PreparedSnapshots>,
-    admission: Arc<AdmissionCoordinator>,
     state: Arc<DaemonState>,
     serving: yadorilink_sync_runtime::ServeHandle,
-}
-
-/// What one `sync_with` call actually did.
-///
-/// These were previously all `Ok(None)`, which made two very different
-/// conditions indistinguishable to the caller: "this node holds no address
-/// for that peer, so nothing was attempted and nothing ever will be until
-/// the netmap changes" and "a flight for this pair is already in progress".
-/// The caller's arm for `Ok(None)` was empty, so a permanently unreachable
-/// peer looked exactly like healthy coalescing.
-#[derive(Debug)]
-pub enum SyncAttempt {
-    /// No pinned address/signing key for this peer -- nothing was attempted.
-    NoAddress,
-    /// A flight for this exact (peer, group) was already running.
-    Coalesced,
-    /// A reconciliation ran to completion.
-    Ran(SyncSummary),
-    /// The peer stands on a different history base. Nothing was exchanged
-    /// and nothing about this device's base changed; the peer's claim is
-    /// recorded in [`SyncStack::foreign_bases`] for a merge to act on.
-    MergeRequired,
-}
-
-impl SyncAttempt {
-    /// The summary of a reconciliation that actually ran, or a panic naming
-    /// which of the two non-running outcomes occurred instead. For tests
-    /// that require a real reconciliation; the point of this enum is that
-    /// those two are no longer interchangeable.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn expect_ran(self, message: &str) -> SyncSummary {
-        match self {
-            SyncAttempt::Ran(summary) => summary,
-            SyncAttempt::Coalesced => {
-                panic!("{message}: coalesced into a flight already running for this pair")
-            }
-            SyncAttempt::NoAddress => {
-                panic!("{message}: no address for this peer, so nothing was attempted")
-            }
-            SyncAttempt::MergeRequired => {
-                panic!("{message}: the peer stands on a different history base")
-            }
-        }
-    }
 }
 
 impl SyncStack {
@@ -128,7 +57,6 @@ impl SyncStack {
     /// `SubstrateNode::spawn_as_device`.
     pub async fn spawn(
         state: Arc<DaemonState>,
-        authenticator: Arc<dyn ChangeAuthenticator>,
         config: NetworkConfig,
     ) -> Result<Self, SyncStackError> {
         let signing_key = state.device_signing_key().ok_or(SyncStackError::NoDeviceIdentity)?;
@@ -146,53 +74,18 @@ impl SyncStack {
             )
             .await?;
 
-        let store =
-            AsyncReplicaStore::new(state.replica_coordinator.database(), StoreLimits::default());
-        let metrics_store = store.clone();
-        // What promotion has to wake. These are the same three the legacy
-        // admission path raised the moment it admitted a batch; each has its
-        // own periodic backstop, so their absence would not break
-        // convergence, only delay it by that backstop's interval.
-        //
-        // Weak, because the driver that owns this stack is itself owned by
-        // `DaemonState`.
-        let waiting = Arc::downgrade(&state);
-        let admission = Arc::new(AdmissionCoordinator::new(store.clone()).notifying(Arc::new(
-            move |group: &FolderGroupId| {
-                let Some(state) = waiting.upgrade() else {
-                    return;
-                };
-                state.replica_coordinator.notify_materialization_wake();
-                state.replica_coordinator.notify_retirement_wake(&group.0);
-                state.replica_coordinator.notify_hazard_recheck_wake(&group.0);
-            },
-        )));
+        // Native replication connections the endpoint accepts.
+        if let Some(native_inbound) = endpoint.take_native_replication_inbound() {
+            crate::native_replication_runtime::spawn_inbound(
+                Arc::downgrade(&state),
+                native_inbound,
+            );
+        }
 
-        let port = SqliteReplicaPort::new(
-            store,
-            Arc::new(DaemonPeerDirectory::new(state.clone())),
-            Arc::new(move |group: &str, key_id: &[u8; 32], policy_head: &[u8; 32]| {
-                authenticator.resolve_authority_key(group, key_id, policy_head)
-            }),
-        )
-        .waking(admission.clone());
-        let possession = port.possession_slot();
-        let foreign_bases = port.foreign_bases();
-
-        let runtime = Arc::new(SyncRuntime::new(endpoint.node(), Arc::new(port)));
+        let runtime = Arc::new(SyncRuntime::new(endpoint.node()));
         let serving = runtime.serve(inbound);
 
-        Ok(Self {
-            runtime,
-            store: metrics_store,
-            possession,
-            foreign_bases,
-            endpoint,
-            prepared: Arc::new(PreparedSnapshots::new()),
-            admission,
-            state,
-            serving,
-        })
+        Ok(Self { runtime, endpoint, state, serving })
     }
 
     /// This device's transport identity, which is also its signing key's
@@ -223,25 +116,6 @@ impl SyncStack {
         &self.endpoint
     }
 
-    /// How hard this device's storage boundary has been pushed -- chiefly
-    /// the high-water mark of concurrent blocking calls, which is what says
-    /// whether the permit bounds are doing anything.
-    pub fn store_metrics(&self) -> super::async_store::StoreMetrics {
-        self.store.metrics()
-    }
-
-    /// Peers whose last negotiation found them on another history base --
-    /// the merge-required state. Claims only; see
-    /// [`ForeignBaseClaims`] for what they may and may not be used for.
-    pub fn foreign_bases(&self) -> &Arc<ForeignBaseClaims> {
-        &self.foreign_bases
-    }
-
-    /// Promote whatever is promotable in `group`, to a fixed point.
-    pub fn admission(&self) -> &Arc<AdmissionCoordinator> {
-        &self.admission
-    }
-
     /// Where to reach `device_id`, from the netmap.
     ///
     /// `None` when the netmap has not pinned that device's signing key.
@@ -260,26 +134,7 @@ impl SyncStack {
         self.endpoint.peer_id_of(device_id)
     }
 
-    /// Reconcile with one peer for one group, then fetch what is missing.
-    ///
-    /// `None` means the call was coalesced into a reconciliation already
-    /// running for this peer and group.
-    pub async fn sync_with(
-        &self,
-        device_id: &str,
-        group: &FolderGroupId,
-    ) -> Result<SyncAttempt, SyncStackError> {
-        let Some(peer) = self.peer_id_of(device_id) else {
-            return Ok(SyncAttempt::NoAddress);
-        };
-        Ok(match self.runtime.sync_with(peer, &GroupId(group.0.clone())).await? {
-            Some(SyncOutcome::Synced(summary)) => SyncAttempt::Ran(summary),
-            Some(SyncOutcome::MergeRequired) => SyncAttempt::MergeRequired,
-            None => SyncAttempt::Coalesced,
-        })
-    }
-
-    /// Route inbound block, service and snapshot streams to the session that
+    /// Route inbound block and service streams to the session that
     /// owns that peer.
     ///
     /// The peer is resolved from its endpoint identity through the netmap on
@@ -287,10 +142,7 @@ impl SyncStack {
     /// opened: a device unpinned since then resolves to nothing and is served
     /// nothing.
     pub fn serve_peer_lanes(self: &Arc<Self>) {
-        let prepared = self.prepared.clone();
         let stack = Arc::downgrade(self);
-        let for_history = stack.clone();
-        let prepared_for_history = prepared.clone();
 
         self.runtime.when_lane_stream(Arc::new(move |peer, group, lane, stream| {
             let stack = stack.clone();
@@ -312,27 +164,7 @@ impl SyncStack {
                             )
                             .await
                     }
-                    _ => {}
                 }
-            })
-        }));
-
-        self.runtime.when_history_stream(Arc::new(move |peer, group, kind, stream| {
-            let stack = for_history.clone();
-            let prepared = prepared_for_history.clone();
-            Box::pin(async move {
-                let Some(stack) = stack.upgrade() else { return };
-                if kind != HistoryStreamKind::RebootstrapSnapshot {
-                    return;
-                }
-                yadorilink_lane_ports::serve_snapshot_stream(
-                    stream,
-                    peer.as_bytes(),
-                    group.as_str(),
-                    &DaemonPeerDirectory::new(stack.state.clone()),
-                    prepared.as_ref(),
-                )
-                .await;
             })
         }));
     }
@@ -358,8 +190,6 @@ impl SyncStack {
         yadorilink_peer_session::ports::SessionTransports {
             blocks: transports.clone(),
             service: transports.clone(),
-            prepared_snapshots: self.prepared.clone(),
-            snapshot_fetch: transports,
         }
     }
 
@@ -371,13 +201,6 @@ impl SyncStack {
     ) -> Option<Arc<yadorilink_peer_session::peer_session::PeerSyncSession>> {
         let device = self.state.authority.device_id_for_signing_key(peer.as_bytes())?;
         self.state.peers.session(&device)
-    }
-
-    /// Say what to do when a peer's reconciliation reveals that *this*
-    /// device is the one that is behind -- see
-    /// `SyncRuntime::when_behind`.
-    pub fn when_behind(&self, hook: yadorilink_sync_runtime::BehindHook) {
-        self.runtime.when_behind(hook);
     }
 
     /// Say who sees each link a reconciliation dials, before it carries
@@ -394,12 +217,6 @@ impl SyncStack {
         self.runtime.when_link_accepted(hook);
     }
 
-    /// Say who sees every connect attempt against a peer, whether or not it
-    /// succeeds. See `yadorilink_sync_runtime::DialAttemptHook`.
-    pub fn when_dial_attempted(&self, hook: yadorilink_sync_runtime::DialAttemptHook) {
-        self.runtime.when_dial_attempted(hook);
-    }
-
     /// Test-only: shortens THIS stack's own reconciliation connect deadline,
     /// so a test with a genuinely unreachable peer does not have to wait out
     /// the full production budget. Per-instance -- see
@@ -408,11 +225,6 @@ impl SyncStack {
     #[cfg(any(test, feature = "test-support"))]
     pub fn set_connect_deadline_for_tests(&self, deadline: std::time::Duration) {
         self.runtime.set_connect_deadline_for_tests(deadline);
-    }
-
-    /// Say what to do when this device's possession of a group grows.
-    pub fn when_possession_grows(&self, observer: super::replica_port::PossessionObserver) {
-        *self.possession.lock().expect("possession observer poisoned") = Some(observer);
     }
 
     /// Stop serving and close the substrate endpoint.
@@ -443,6 +255,13 @@ impl SyncStack {
             })
             .await?
             .ok_or_else(|| SyncStackError::Unreachable(device_id.to_string()))
+    }
+
+    /// Test-only: the runtime dials go through, for a test that has to
+    /// count or hold a dial of its own.
+    #[cfg(test)]
+    pub(crate) fn runtime_for_tests(&self) -> &Arc<SyncRuntime> {
+        &self.runtime
     }
 
     /// Test-only: teach two stacks where the other's substrate answers.
@@ -481,12 +300,6 @@ impl SyncStack {
     /// The device this endpoint identity belongs to, per the netmap.
     pub fn device_for_peer(&self, peer: &PeerId) -> Option<String> {
         self.endpoint.device_for_peer(peer)
-    }
-
-    /// Note that local possession of `group` changed, so connected peers are
-    /// worth reconciling with again.
-    pub fn note_local_change(&self, peer: PeerId, group: &FolderGroupId) {
-        self.runtime.note_local_change(peer, &GroupId(group.0.clone()));
     }
 }
 

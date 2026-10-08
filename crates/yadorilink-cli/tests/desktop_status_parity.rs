@@ -223,7 +223,6 @@ async fn paused_link_still_reports_healthy_over_the_real_socket() {
         local_path: folder.to_string_lossy().to_string(),
         group_id: "group-1".into(),
         on_demand: false,
-        max_local_size_bytes: None,
         acknowledge_risks: true,
         pending_enrollment_operation_id: String::new(),
         pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,

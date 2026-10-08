@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use yadorilink_local_storage::check_disk_headroom;
 use yadorilink_local_storage::{
@@ -9,97 +10,26 @@ use yadorilink_peer_session::hazard;
 use yadorilink_peer_session::PeerSessionError;
 use yadorilink_replica_domain::file::FileVersion;
 use yadorilink_replica_domain::file::{FileRecord, RecordKind};
-use yadorilink_replica_domain::ids::{ChangeHash, VersionHash};
 use yadorilink_replica_domain::session_state::LinkGate;
 use yadorilink_replica_domain::session_state::MaterializationPolicy;
-use yadorilink_replica_engine::conflict::{resolve_path_heads, PathHead, PathResolution};
 
 use super::types::*;
-use super::{mode_and_xattrs_match_disk, OwnCaptureOnDisk, OwnCaptureRule, Recapture};
+use super::{mode_and_xattrs_match_disk, Election, OwnCaptureOnDisk, OwnCaptureRule, Recapture};
 use yadorilink_peer_session::peer_session::*;
+use yadorilink_replica_domain::native_plan::{
+    NativeLocatedHead, NativePlannedNode, NativeRowIdentity,
+};
 use yadorilink_root_authority::fs_identity::disk_race_fingerprint;
 
 impl super::LocalConvergenceExecutor {
-    /// Which of `paths` name content this device does not hold.
-    ///
-    /// The one question in convergence whose answer is not on this device, and
-    /// it is asked once for a whole pass rather than per path in the middle of
-    /// one. Advisory: a driver with a peer obtains these and runs the pass;
-    /// the pass then re-resolves everything itself, so a plan that has gone
-    /// stale by then costs a wasted fetch, never a wrong write.
-    ///
-    /// A device with no peer never calls this. Its obligations simply stay
-    /// open until an explicit wake, which is what "unavailable" has always
-    /// meant here.
-    pub fn content_missing_locally(
-        &self,
-        group_id: &str,
-        paths: &std::collections::BTreeSet<String>,
-    ) -> Result<Vec<BlockRequirement>, PeerSessionError> {
-        let mut missing = Vec::new();
-        for path in paths {
-            let heads = self.combined_heads(group_id, path, None)?;
-            let heads: &[PathHead] = &heads;
-            let resolution = resolve_path_heads(path, heads);
-            let PathResolution::Present { winner, conflict_copies, .. } = resolution else {
-                continue;
-            };
-            if let Some(requirement) =
-                self.block_requirement_for(group_id, path, path, &heads[winner])?
-            {
-                missing.push(requirement);
-            }
-            // A conflict copy is DERIVED, at a name that is not in `paths`
-            // and that only the resolution above knows. Nothing else can
-            // obtain its content: the pass that materializes it runs after
-            // this prefetch, and when it finds blocks missing it reports
-            // `RetryRequired` without ever reaching for the transport. The
-            // engine then keeps the SOURCE path outstanding -- correctly,
-            // since the copy derived from it is unresolved -- and re-drives
-            // with that source path again, prefetching the winner's content
-            // for the n-th time and the copy's never.
-            //
-            // The result was a livelock with no lock and no park: unbounded
-            // work, zero possible progress, and a copy that existed on
-            // exactly one device -- the author of the losing content, the
-            // only one already holding those blocks.
-            for copy in &conflict_copies {
-                // Demand is INHERITED from the source path, not from the
-                // copy's own name: nobody pins a conflict copy, and an
-                // on-demand folder that refused it would leave the source
-                // path unresolvable for as long as the loser stays live.
-                if let Some(requirement) =
-                    self.block_requirement_for(group_id, &copy.path, path, &heads[copy.head])?
-                {
-                    missing.push(requirement);
-                }
-            }
-        }
-        Ok(missing)
-    }
-
-    /// What `path` would need fetched to materialize `head`'s content, or
-    /// `None` if there is nothing to fetch -- no content, no known version,
-    /// a deletion, or blocks this device already holds.
-    ///
-    /// Shared by the winner and by each derived conflict copy, so the two
-    /// cannot drift into asking different questions about the same thing.
-    fn block_requirement_for(
+    /// [`Self::block_requirement_for`] once the version is in hand.
+    fn block_requirement_for_version(
         &self,
         group_id: &str,
         path: &str,
-        demand_path: &str,
-        head: &PathHead,
+        version: &FileVersion,
     ) -> Result<Option<BlockRequirement>, PeerSessionError> {
-        let Some(content) = head.content.as_ref() else {
-            return Ok(None);
-        };
-        let Some(version) =
-            self.state.dag_get_file_version(group_id, &VersionHash(content.version_hash))?
-        else {
-            return Ok(None);
-        };
-        let record = file_record_from_version(path, &version);
+        let record = file_record_from_version(path, version);
         if record.deleted || !self.blocks_missing_locally(group_id, &record)? {
             return Ok(None);
         }
@@ -112,17 +42,91 @@ impl super::LocalConvergenceExecutor {
             .and_then(|out_path| disk_race_fingerprint(&out_path));
         Ok(Some(BlockRequirement {
             path: path.to_string(),
-            demand_path: demand_path.to_string(),
             version_hash: version.version_hash,
             record,
             observed_disk,
         }))
     }
 
+    /// The content this device is missing locally, from native's
+    /// materialization plan: what prefetch acts on.
+    ///
+    /// Each requirement is keyed by its PHYSICAL path (a copy's own name,
+    /// which is where the pass will look for it) and demanded by its
+    /// SOURCE path (the head's logical path). A version native cannot resolve is not "nothing to fetch": the
+    /// plan cannot be made and the error is the answer.
+    pub fn content_missing_locally_from_native(
+        &self,
+        group_id: &str,
+        paths: &std::collections::BTreeSet<String>,
+    ) -> Result<Vec<BlockRequirement>, PeerSessionError> {
+        Ok(self
+            .planned_missing_content(group_id, paths)?
+            .into_iter()
+            .map(|planned| planned.requirement)
+            .collect())
+    }
+
+    /// [`Self::content_missing_locally_from_native`], each requirement
+    /// paired with the source path whose head demanded it -- what the
+    /// prefetch needs to notice that a plan went stale before it asks a
+    /// peer for anything.
+    pub(crate) fn planned_missing_content(
+        &self,
+        group_id: &str,
+        paths: &std::collections::BTreeSet<String>,
+    ) -> Result<Vec<PlannedRequirement>, PeerSessionError> {
+        use yadorilink_replica_domain::native_plan::NativePlannedNode;
+        let mut parents: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+            std::collections::BTreeMap::new();
+        for path in paths {
+            parents
+                .entry(super::namespace_steps::parent_of(path).to_owned())
+                .or_default()
+                .insert(path.clone());
+        }
+        let mut missing = Vec::new();
+        for (parent, on_level) in parents {
+            let plan = self
+                .state
+                .native_plan_for_names(group_id, &parent, &on_level)
+                .map_err(crate::sync_error::SyncError::from)
+                .map_err(PeerSessionError::from)?;
+            for (physical, node) in &plan.nodes {
+                let NativePlannedNode::Entry { head, .. } = node else { continue };
+                if !paths.contains(head.source_path.as_str()) && !paths.contains(physical.as_str())
+                {
+                    continue;
+                }
+                let version = self
+                    .state
+                    .dag_get_file_version(group_id, &head.version())?
+                    .ok_or_else(|| {
+                        PeerSessionError::from(crate::sync_error::SyncError::from(
+                            yadorilink_sync_sqlite::SyncSqliteError::NotFound(format!(
+                                "native plan names version {} at {} that is not stored",
+                                head.version().to_hex(),
+                                physical.as_str()
+                            )),
+                        ))
+                    })?;
+                if let Some(requirement) =
+                    self.block_requirement_for_version(group_id, physical.as_str(), &version)?
+                {
+                    missing.push(PlannedRequirement {
+                        source_path: head.source_path.clone(),
+                        requirement,
+                    });
+                }
+            }
+        }
+        Ok(missing)
+    }
+
     /// Reconcile `paths` using only what this device already holds.
     ///
     /// The whole of convergence except obtaining content: everything here is
-    /// decided from this device's own disk, index and DAG. A path whose
+    /// decided from this device's own disk, index and native state. A path whose
     /// content is absent records a retriable placeholder and stays open.
     pub async fn reconcile_paths(
         &self,
@@ -140,6 +144,7 @@ impl super::LocalConvergenceExecutor {
             paths,
             &self.local_device_id,
             &HashMap::new(),
+            None,
             audit_attempt_id,
             &call_timer,
         )
@@ -165,37 +170,15 @@ impl super::LocalConvergenceExecutor {
         if !held_for_metadata {
             return Ok(false);
         }
-        let heads = self.combined_heads(group_id, path, None)?;
-        let version = match resolve_path_heads(path, &heads) {
-            PathResolution::Present { winner, .. } => match heads[winner].content.as_ref() {
-                Some(content) => VersionHash(content.version_hash),
-                None => return Ok(false),
-            },
-            PathResolution::Absent => return Ok(false),
+        let Some(NativePlannedNode::Entry { head, .. }) =
+            self.native_planned_node(group_id, path)?
+        else {
+            return Ok(false);
         };
+        let version = head.version();
         let out_path = self.sync_root(group_id)?.join(path);
         self.state.metadata_unprovable_hold_unchanged(group_id, path, &out_path, &version)
     }
-
-    /// The evidence for a path this attempt found already absent -- in the
-    /// index and on disk -- and so did not touch: no disk mutation occurred,
-    /// so its mutation fence is snapshotted, never bumped. One place for
-    /// every already-absent settle (a deleted row's tombstone already
-    /// reflected, and a path an installed base leaves with no head at all).
-    fn already_absent(
-        &self,
-        group_id: &str,
-        path: &str,
-    ) -> Result<SettlementEvidence, PeerSessionError> {
-        let mutation_generation = self.state.dag_snapshot_mutation_fence(group_id, path)?;
-        Ok(SettlementEvidence::ExactAbsent { mutation_generation })
-    }
-
-    /// Bounded commit size for `try_commit_ordinary_batch`, matching the
-    /// convergence engine's own per-tick path budget so a larger reconcile
-    /// window still commits in engine-sized chunks rather than one unbounded
-    /// transaction.
-    const ORDINARY_BATCH_MAX_PATHS: usize = 8;
 
     fn block_write_activity_provider(
         &self,
@@ -393,67 +376,6 @@ impl super::LocalConvergenceExecutor {
         )
     }
 
-    /// Re-validates one [`yadorilink_peer_session::ports::PreparedProjectedUpsert`]
-    /// under `try_commit_ordinary_batch`'s already-acquired path lock, and
-    /// reports whether it still survives to publish. `false` means the
-    /// caller must treat this path as `retry`, never `settled` -- nothing
-    /// was committed for it. Purely read-only: no `writer_gate`
-    /// acquisition of its own. `prepared.metadata` is applied later, as
-    /// part of `open_projected_upserts_batch`'s own transaction, not here
-    /// -- it is kept out of this per-candidate revalidation step (calling
-    /// `apply_incoming_wire_metadata` individually per candidate would
-    /// defeat the batch's own "2 transactions total" design) so a batch's metadata writes commit atomically with its rows/
-    /// intents instead of one `writer_gate` hit per candidate.
-    ///
-    /// Returns the path's own resolved frontier on success -- the basis
-    /// this candidate's physical write will realize, captured here under
-    /// the batch's path lock rather than re-derived from the group's heads
-    /// later. `None` is the `retry` verdict.
-    async fn revalidate_ordinary_upsert(
-        &self,
-        group_id: &str,
-        prepared: &yadorilink_peer_session::ports::PreparedProjectedUpsert,
-        call_timer: &crate::local_convergence::call_timer::ReconcileCallTimer,
-    ) -> Result<Option<Vec<ChangeHash>>, PeerSessionError> {
-        // CONV-7-equivalent recheck, now safely under this batch's lock:
-        // re-resolve the path's current winner and confirm it is still the
-        // exact change this candidate was prepared against. A path that
-        // now resolves to a different winner (or to Absent) is dropped --
-        // simpler than `materialize_dag_content_head`'s in-place upgrade,
-        // and just as correct: the dropped candidate's own change re-drives
-        // through the ordinary retry path next reconcile pass.
-        let dag_started = std::time::Instant::now();
-        let fresh =
-            self.combined_heads(group_id, &prepared.rel_path, prepared.derived_head.as_ref())?;
-        call_timer.add_dag_resolution(dag_started.elapsed());
-        let still_current = match resolve_path_heads(&prepared.rel_path, &fresh) {
-            PathResolution::Present { winner, .. } => {
-                Some(ChangeHash(fresh[winner].change_hash)) == prepared.authoring_change_hash
-            }
-            PathResolution::Absent => false,
-        };
-        if !still_current {
-            return Ok(None);
-        }
-        if self.hazard_reason_for(group_id, &prepared.record)?.is_some() {
-            return Ok(None);
-        }
-        // Same divergence guard `materialize()`'s own eager-write branch
-        // runs immediately before it would overwrite existing content: an
-        // unauthored local edit that landed on disk after this candidate's
-        // blocks were fetched (in the unlocked prepare step) must not be
-        // silently destroyed by this batch's publish.
-        if self.disk_holds_uncaptured_local_bytes(
-            group_id,
-            &prepared.rel_path,
-            &prepared.out_path,
-            Some(&prepared.record.blocks),
-        )? {
-            return Ok(None);
-        }
-        Ok(Some(fresh.iter().map(|head| ChangeHash(head.change_hash)).collect()))
-    }
-
     /// Thin wrapper over `hold_record`
     /// (see that free function's doc comment) using this session's own
     /// `SyncState`.
@@ -463,7 +385,8 @@ impl super::LocalConvergenceExecutor {
         record: &FileRecord,
         reason: &str,
         origin_device_id: &str,
-        authoring_change_hash: Option<&ChangeHash>,
+        authoring: Option<&yadorilink_replica_domain::native_plan::NativeRowIdentity>,
+        meta: &yadorilink_replica_domain::session_state::LocalFileMetaColumns,
     ) -> Result<(), PeerSessionError> {
         let authority = self.root_lease_for(group_id)?;
         let authority_op = authority.begin_operation()?;
@@ -474,7 +397,8 @@ impl super::LocalConvergenceExecutor {
             record,
             reason,
             origin_device_id,
-            authoring_change_hash,
+            authoring,
+            meta,
             &permit,
         )
     }
@@ -567,42 +491,6 @@ impl super::LocalConvergenceExecutor {
         }))
     }
 
-    /// The ordinary batch's per-path finish after its rename: the mode and
-    /// xattrs from `written_version` (the payload the bytes came from, not
-    /// the row, which a concurrent supersession can move), then the exact
-    /// evidence for them. `None` is `exact_object_evidence_after_write`'s:
-    /// the row has moved off that version.
-    fn finish_ordinary_batch_write(
-        &self,
-        group_id: &str,
-        prepared: &yadorilink_peer_session::ports::PreparedProjectedUpsert,
-        kind: RecordKind,
-        mutation_generation: i64,
-    ) -> Result<Option<SettlementEvidence>, PeerSessionError> {
-        #[cfg(test)]
-        if let Some(e) = self
-            .state
-            .test_observers
-            .take_ordinary_batch_metadata_fault(group_id, &prepared.rel_path)
-        {
-            return Err(e);
-        }
-        let applied = yadorilink_local_storage::apply_file_metadata_verified(
-            &prepared.out_path,
-            prepared.written_version.meta.unix_mode,
-            &prepared.written_version.meta.xattrs,
-        )?;
-        let xattrs = XattrEvidence::from(applied);
-        self.exact_object_evidence_after_write(
-            group_id,
-            &prepared.rel_path,
-            kind,
-            &prepared.written_version,
-            mutation_generation,
-            &xattrs,
-        )
-    }
-
     /// Does this device hold every block `record` names, *as this group*?
     ///
     /// Both halves matter. A block present in the store but with no provenance
@@ -659,7 +547,7 @@ impl super::LocalConvergenceExecutor {
     /// changing anything a bare `canonicalize`/containment check can see
     /// — a replaced mountpoint's path still resolves and still contains
     /// `out_path` lexically. Since this function already runs immediately
-    /// before every physical write in every `materialize`/`hydrate_file_
+    /// before every physical write in every `materialize`/`hydration::hydrate_inner`
     /// with_timeout` branch, re-verifying identity here (not just
     /// containment) closes that window at its narrowest point, for both
     /// callers, in one place — cheap enough to run unconditionally: one
@@ -723,26 +611,184 @@ impl super::LocalConvergenceExecutor {
     /// before a hydration fetch or a materialize-to-temp-and-rename write
     /// begins, scoped to the volume hosting `group_id`'s local sync root —
     /// called from both of this session's write paths that reach
-    /// `reconstruct_file` (`hydrate_file_with_timeout`'s single-session
+    /// `reconstruct_file` (`hydration::hydrate_inner`'s single-session
     /// hydration, and `materialize`'s eager-fetch branch). A no-op (fast
     /// path, no filesystem query) when `headroom_enforced` hasn't been
     /// turned on — see that field's doc comment for why a bare/test session
     /// doesn't enforce this by default.
+    ///
+    /// The bytes it admits stay reserved until the returned guard is dropped,
+    /// and every later preflight sees the volume's free space less what is
+    /// reserved: files that each fit but together do not are refused, not
+    /// left to run out of space mid-write.
     pub(crate) fn preflight_disk_headroom(
         &self,
         group_id: &str,
         target_path: &Path,
         additional_bytes: u64,
-    ) -> Result<(), PeerSessionError> {
+    ) -> Result<HeadroomReservation, PeerSessionError> {
         if !self.headroom_enforced() {
-            return Ok(());
+            return Ok(HeadroomReservation { held: None });
         }
-        Ok(check_disk_headroom(
-            &self.sync_root(group_id)?,
-            target_path,
-            additional_bytes,
-            self.headroom_override_bytes(),
-        )?)
+        let root = self.sync_root(group_id)?;
+        let volume_key = volume_key(&root);
+        #[cfg(any(test, feature = "test-support"))]
+        let volume_key = self
+            .volume_key_override
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .unwrap_or(volume_key);
+        let volume = headroom_ledger_for(&volume_key);
+        let override_bytes = self.headroom_override_bytes();
+        reserve_on_volume(&volume, additional_bytes, |wanted| {
+            #[cfg(any(test, feature = "test-support"))]
+            {
+                let probe = self.free_space_probe.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                if let Some(probe) = probe {
+                    probe();
+                }
+                let fake = *self.fake_available_bytes.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(available_bytes) = fake {
+                    let space = yadorilink_local_storage::VolumeFreeSpace {
+                        available_bytes,
+                        total_bytes: available_bytes,
+                        headroom_bytes: override_bytes.unwrap_or(0),
+                    };
+                    return if space.would_breach(wanted) {
+                        Err(yadorilink_local_storage::StorageError::DiskPressure {
+                            path: target_path.to_path_buf(),
+                            volume: root.clone(),
+                            available_bytes: space.available_bytes,
+                            headroom_bytes: space.headroom_bytes,
+                        })
+                    } else {
+                        Ok(())
+                    };
+                }
+            }
+            check_disk_headroom(&root, target_path, wanted, override_bytes)
+        })
+        .map_err(Into::into)
+    }
+}
+
+/// Reserves `additional_bytes` of the free space of the volume holding
+/// `root`, for a write outside any executor (the daemon's own hydration and
+/// restore): the same shared account, the same guard.
+pub(crate) fn reserve_volume_headroom(
+    root: &Path,
+    target_path: &Path,
+    additional_bytes: u64,
+    override_bytes: Option<u64>,
+) -> Result<HeadroomReservation, yadorilink_local_storage::StorageError> {
+    let volume = headroom_ledger_for(&volume_key(root));
+    reserve_on_volume(&volume, additional_bytes, |wanted| {
+        check_disk_headroom(root, target_path, wanted, override_bytes)
+    })
+}
+
+/// Check-and-reserve on one volume's account. Only this volume's admissions
+/// are serialised, and the map lock is not held: a free-space query that
+/// hangs (an unresponsive network mount) holds up this volume's preflights
+/// and nobody else's, and never the release of a reservation, which is an
+/// atomic. `check` gets the bytes the new write would add to those already
+/// reserved.
+fn reserve_on_volume<E>(
+    volume: &Arc<VolumeLedger>,
+    additional_bytes: u64,
+    check: impl FnOnce(u64) -> Result<(), E>,
+) -> Result<HeadroomReservation, E> {
+    let _admitting = volume.admit.lock().unwrap_or_else(|p| p.into_inner());
+    let wanted = additional_bytes.saturating_add(volume.reserved.load(Ordering::SeqCst));
+    check(wanted)?;
+    volume.reserved.fetch_add(additional_bytes, Ordering::SeqCst);
+    Ok(HeadroomReservation { held: Some((volume.clone(), additional_bytes)) })
+}
+
+/// What identifies the volume holding `root`, so links on one volume share
+/// one account of reserved space.
+///
+/// Known limitation: the key is the device id (Unix) or the drive component
+/// (elsewhere), so two mappings of one network share can get separate
+/// accounts and each admit writes against the same free space. Aliasing them
+/// is out of scope; the failure is the pre-reservation behaviour, not worse.
+fn volume_key(root: &Path) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(meta) = std::fs::metadata(root) {
+            return format!("dev:{}", meta.dev());
+        }
+    }
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    format!(
+        "path:{}",
+        canonical
+            .components()
+            .next()
+            .map_or(String::new(), |c| { c.as_os_str().to_string_lossy().into_owned() })
+    )
+}
+
+/// One volume's account of reserved space.
+#[derive(Default)]
+pub(crate) struct VolumeLedger {
+    reserved: AtomicU64,
+    /// Serialises a preflight's check-and-reserve on this volume.
+    admit: std::sync::Mutex<()>,
+}
+
+/// The account of `volume`, shared by every link and peer session of the
+/// process. The map lock is held only to fetch or create the entry; entries
+/// stay (one small value per volume ever written to).
+fn headroom_ledger_for(volume: &str) -> Arc<VolumeLedger> {
+    static LEDGERS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Arc<VolumeLedger>>>> =
+        std::sync::OnceLock::new();
+    LEDGERS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .entry(volume.to_owned())
+        .or_default()
+        .clone()
+}
+
+/// Bytes reserved on the volume under `volume` right now.
+#[cfg(test)]
+pub(crate) fn reserved_on(volume: &str) -> u64 {
+    headroom_ledger_for(volume).reserved.load(Ordering::SeqCst)
+}
+
+/// Bytes of free space an active write has claimed; released on drop. Shared
+/// (`Arc`) by the awaiting write and its blocking assembly, so the space is
+/// released only when the last of them is done with it.
+pub(crate) struct HeadroomReservation {
+    held: Option<(Arc<VolumeLedger>, u64)>,
+}
+
+impl HeadroomReservation {
+    #[cfg(test)]
+    pub(crate) fn for_tests(volume: &str, bytes: u64) -> Self {
+        let ledger = headroom_ledger_for(volume);
+        ledger.reserved.fetch_add(bytes, Ordering::SeqCst);
+        Self { held: Some((ledger, bytes)) }
+    }
+}
+
+impl std::fmt::Debug for HeadroomReservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeadroomReservation")
+            .field("bytes", &self.held.as_ref().map(|(_, bytes)| *bytes))
+            .finish()
+    }
+}
+
+impl Drop for HeadroomReservation {
+    fn drop(&mut self) {
+        if let Some((ledger, bytes)) = self.held.take() {
+            ledger.reserved.fetch_sub(bytes, Ordering::SeqCst);
+        }
     }
 }
 
@@ -756,1720 +802,154 @@ impl super::LocalConvergenceExecutor {
     /// flight) or the group is not `LinkGate::Live` — the caller decides
     /// what "could not run this attempt right now" means for its own
     /// retry/backoff.
+    // Each argument is an independent input to one attempt; the claim is the
+    // obligation engine's, carried to the lane that may close it.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn reconcile_group_paths_guarded(
         &self,
         group_id: &str,
         paths: std::collections::BTreeSet<String>,
         origin_device_id: &str,
         prefetched: &HashMap<String, BlockRequirement>,
+        claims: Option<&super::obligation_claims::ObligationClaims>,
         audit_attempt_id: u64,
         call_timer: &crate::local_convergence::call_timer::ReconcileCallTimer,
     ) -> Result<Option<ProjectionAttempt>, PeerSessionError> {
-        if !matches!(self.state.link_gate_for_group(group_id)?, LinkGate::Live { .. }) {
+        if !matches!(
+            self.state.directory_link_gate_for_group(group_id)?,
+            Some(LinkGate::Live { .. })
+        ) {
             return Ok(None);
         }
         let Some(_guard) = MaterializationAuditGuard::try_acquire(&self.state, group_id) else {
             return Ok(None);
         };
+        let _ = audit_attempt_id;
         Ok(Some(
-            self.reconcile_group_paths(
+            self.reconcile_group_paths_native(
                 group_id,
                 paths,
                 origin_device_id,
                 prefetched,
-                audit_attempt_id,
+                claims,
                 call_timer,
             )
             .await?,
         ))
     }
 
-    /// Best-effort, lock-free preparation of an "ordinary" content
-    /// upsert (a plain regular file: not a symlink, not hazardous, eager-
-    /// admitted, every block fetchable, and not already content-identical
-    /// to what's indexed) for batched publish via [`Self::
-    /// try_commit_ordinary_batch`]. Returns `Ok(None)` for every other
-    /// shape -- the caller falls back to the unbatched, per-path
-    /// `materialize_dag_content_head` for those, completely unchanged.
-    ///
-    /// This function's classification is advisory, not authoritative: it
-    /// runs with no path lock held (so its slow block-fetch/reconstruct
-    /// work never blocks, or is blocked by, any other path), and
-    /// `try_commit_ordinary_batch` re-validates every candidate fresh
-    /// under its batch's locks before actually committing anything --
-    /// exactly mirroring `materialize_dag_content_head`'s own CONV-7
-    /// freshness re-resolution, just deferred to the batched commit step
-    /// instead of running inline here.
-    // ~10 call sites across this module and its tests; grouping these into
-    // a params struct is out of scope for a lint cleanup.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn prepare_ordinary_projected_upsert<'a>(
+    /// Captures what `target_path` holds now, for an own captured head the
+    /// disk has moved on from, and says whether that superseded `head`.
+    /// Called without the path lock, which capture takes itself.
+    /// Projects the node native's plan puts at `target_path`: the native
+    /// counterpart of [`Self::materialize_dag_content_head`]. `planned` is
+    /// compared with a fresh plan under the path lock, and anything other
+    /// than the same node declines.
+    pub(crate) async fn materialize_native_entry(
         &self,
         group_id: &str,
         target_path: &str,
-        demand_path: &str,
-        head: &PathHead,
+        planned: &NativePlannedNode,
         policy: MaterializationPolicy,
-        derived_head: Option<&PathHead>,
-        activity_provider: &'a dyn BlockWriteActivityProvider,
-        reconcile_batch: &ReconcileProvenanceBatch,
-        call_timer: &crate::local_convergence::call_timer::ReconcileCallTimer,
-    ) -> Result<
-        Option<(Box<dyn Send + 'a>, yadorilink_peer_session::ports::PreparedProjectedUpsert)>,
-        PeerSessionError,
-    > {
-        let Some(content) = head.content.as_ref() else {
-            return Ok(None);
-        };
-        // Same ordering `materialize_dag_content_head` uses before its own
-        // path-lock acquisition: force a same-path (or case-fold sibling)
-        // pending local edit to become visible in the DAG now, so `try_
-        // commit_ordinary_batch`'s later under-lock re-resolution can
-        // actually see it and correctly drop a candidate this flush
-        // superseded, rather than racing an edit this call itself could
-        // have surfaced.
-        //
-        // A local edit the guard could not capture disqualifies this
-        // candidate; the per-path fallback runs the same guard again and
-        // declines the write there.
-        if self.flush_local_changes_before_reconcile(group_id, target_path).await
-            == PendingLocalFlushOutcome::RetryRequired
-        {
-            return Ok(None);
-        }
-        // This device's own capture of the path is never an ordinary write:
-        // whether it may touch the disk at all is decided in one place,
-        // `materialize_dag_content_head` (see `own_capture_on_disk`).
-        if head.device_id == self.local_device_id
-            && self.state.is_local_capture(group_id, target_path, &ChangeHash(head.change_hash))?
-        {
-            return Ok(None);
-        }
-
-        let version_hash = VersionHash(content.version_hash);
-        let Some(version) = self.state.dag_get_file_version(group_id, &version_hash)? else {
-            return Ok(None);
-        };
-        let record = file_record_from_version(target_path, &version);
-        if record.deleted {
-            return Ok(None);
-        }
-
-        // Content-identical fast path: if this exact block list is already
-        // what's indexed, this is (at most) a cheap metadata-only update --
-        // not worth batching, and not safe to decide unlocked (it can
-        // itself write). Fall back and let the existing per-path code
-        // handle it under its own lock, exactly as today.
-        if let Some(local) = self.state.get_file(group_id, target_path)? {
-            let same_content = !local.deleted
-                && local.blocks.len() == record.blocks.len()
-                && local.blocks.iter().zip(&record.blocks).all(|(b, vb)| b.hash == vb.hash);
-            if same_content {
-                return Ok(None);
-            }
-        }
-
-        if self.hazard_reason_for(group_id, &record)?.is_some() {
-            return Ok(None);
-        }
-        // The INCOMING version's own kind, not the index's current
-        // `get_record_kind` -- for a path this device has never indexed
-        // before, the index has no kind recorded yet (defaults away from
-        // `Symlink`) until `apply_incoming_wire_metadata` writes one, which
-        // in the unbatched path always runs before `materialize()`'s own
-        // (index-based) symlink check, but which this batched path defers
-        // to `revalidate_ordinary_upsert`. Checking the wire-carried kind
-        // directly here is the correct check regardless of index state.
-        // Only a regular file is ever an ordinary batch write: a symlink or
-        // a directory has no content to reconstruct and takes its own lane.
-        if version.meta.record_kind != RecordKind::File {
-            return Ok(None);
-        }
-
-        // The path that DEMANDS this content, not the path it lands at --
-        // see `materialize_dag_content_head`'s own check.
-        let pinned = self.state.is_pinned(group_id, demand_path)?;
-        let eager_admitted = pinned
-            || (policy == MaterializationPolicy::Eager
-                && self.admit_eager_blocks(group_id, record.blocks.len() as u64));
-        if !eager_admitted {
-            return Ok(None);
-        }
-
-        // From here on this candidate WILL fetch/reconstruct blocks unless
-        // something below still disqualifies it (a genuinely transient
-        // condition -- an unreachable peer, a timeout) -- only now is it
-        // correct to enter the block-write-activity gate.
-        // `materialize_dag_content_head` enters this same gate at its own
-        // very top and holds it across its WHOLE call, including the
-        // eventual row commit; this split-phase path preserves that exact
-        // "one guard, held from before the fetch through the commit" shape
-        // by having the caller (`reconcile_group_paths`) own the activity-
-        // provider reference for its whole call and threading the SAME
-        // guard returned here all the way to `try_commit_ordinary_batch`'s
-        // own commit step, rather than taking a second, independent guard
-        // there. Entering it any earlier than this would call it even for
-        // a candidate this function is about to reject as not "ordinary"
-        // at all (e.g. an on-demand, non-pinned policy) -- which falls
-        // back to the unbatched `materialize_dag_content_head`, which
-        // would then enter the SAME gate a second time for the same path.
-        let write_activity = activity_provider.begin_block_write_activity();
-
-        let ensure_blocks_started = std::time::Instant::now();
-        // Is this candidate's content already here? Preparation does not
-        // obtain it: acquiring a block is the one part of convergence that
-        // needs a peer, and it happens before this pass runs, once, for every
-        // path the pass is about to consider. A candidate whose content did
-        // not arrive is simply not an ordinary candidate this pass -- it falls
-        // back to the per-path route, which records a retriable placeholder
-        // and leaves the obligation open for an explicit wake.
-        let all_present =
-            !self.blocks_missing_locally_in_batch(group_id, &record, Some(reconcile_batch))?;
-        let newly_fetched_block_hashes: Vec<Vec<u8>> = Vec::new();
-        let ensure_blocks_elapsed = ensure_blocks_started.elapsed();
-        call_timer.add_ensure_blocks_present(ensure_blocks_elapsed);
-        if !all_present {
-            return Ok(None);
-        }
-
-        let out_path = self.local_file_path(group_id, target_path)?;
-        self.verify_write_target(group_id, &out_path)?;
-        self.preflight_disk_headroom(group_id, &out_path, record.size)?;
-        let intent_target_hash = yadorilink_local_storage::intent_target_hash(&record.blocks);
-        let tmp_path = reconstruct_file_to_temp_off_runtime(
-            self.store.clone(),
-            &out_path,
-            &record.blocks,
-            record.mtime_unix_nanos,
-        )
-        .await?;
-        let metadata = yadorilink_replica_domain::session_state::LocalFileMetaColumns {
-            record_kind: version.meta.record_kind,
-            symlink_target: version.meta.symlink_target.clone(),
-            symlink_out_of_root: false,
-            unix_mode: version.meta.unix_mode,
-            xattrs: version.meta.xattrs.clone(),
-        };
-        Ok(Some((
-            write_activity,
-            yadorilink_peer_session::ports::PreparedProjectedUpsert {
-                rel_path: target_path.to_string(),
-                tmp_path,
-                out_path,
-                record,
-                origin_device_id: head.device_id.clone(),
-                authoring_change_hash: Some(ChangeHash(head.change_hash)),
-                target_version_hash: intent_target_hash,
-                metadata,
-                derived_head: derived_head.cloned(),
-                newly_fetched_block_hashes,
-                // The version the temp file was reconstructed from, a few
-                // lines above -- `record` itself is derived from it.
-                written_version: version.clone(),
-                // Filled in by `revalidate_ordinary_upsert`, under the
-                // committing batch's own path lock. Nothing resolved here
-                // would still be the frontier by then: this prepare step
-                // runs unlocked, before the fetch.
-                realized_causal_basis: Vec::new(),
-            },
-        )))
-    }
-
-    /// Commits `pending` in chunks of at most `ORDINARY_BATCH_MAX_PATHS`
-    /// -- bounded the same way the Convergence Engine's own direct per-tick
-    /// reconcile is, whatever the size of the pass that deferred them.
-    async fn commit_pending_batch(
-        &self,
-        group_id: &str,
-        origin_device_id: &str,
-        pending: Vec<OrdinaryBatchItem<'_>>,
-        call_timer: &crate::local_convergence::call_timer::ReconcileCallTimer,
-    ) -> Result<
-        (
-            std::collections::BTreeMap<String, SettlementEvidence>,
-            std::collections::BTreeSet<String>,
-        ),
-        PeerSessionError,
-    > {
-        let mut settled = std::collections::BTreeMap::new();
-        let mut retry = std::collections::BTreeSet::new();
-        let mut pending = pending.into_iter();
-        loop {
-            let chunk: Vec<OrdinaryBatchItem> =
-                (&mut pending).take(Self::ORDINARY_BATCH_MAX_PATHS).collect();
-            if chunk.is_empty() {
-                break;
-            }
-            let commit_started = std::time::Instant::now();
-            let (chunk_settled, chunk_retry) = self
-                .try_commit_ordinary_batch(group_id, origin_device_id, chunk, call_timer)
-                .await?;
-            call_timer.add_ordinary_commit(commit_started.elapsed());
-            settled.extend(chunk_settled);
-            retry.extend(chunk_retry);
-        }
-        Ok((settled, retry))
-    }
-
-    /// Diagnostic-only: correlates a conflict-copy output back to the seed
-    /// path that produced it and the losing change it carries, so an
-    /// intermittently stalled conflict-copy obligation can be traced to its
-    /// seed. Silent for an output the fixpoint had `already_derived`.
-    fn trace_conflict_copy_discovered(
-        &self,
-        group_id: &str,
-        audit_attempt_id: u64,
-        derived_from_path: &str,
-        resolved_output_path: &str,
-        loser: &PathHead,
-        already_derived: bool,
-    ) {
-        if already_derived {
-            return;
-        }
-        tracing::debug!(
-            local_device_id = %self.local_device_id,
-            group_id,
-            audit_attempt_id,
-            derived_from_path = %derived_from_path,
-            resolved_output_path = %resolved_output_path,
-            conflict_loser_change_hash = %hex::encode(loser.change_hash),
-            conflict_loser_device_id = %loser.device_id,
-            "conflict-copy output discovered by resolution fixpoint"
-        );
-    }
-
-    /// Commits a bounded batch of ordinary upserts/deletes (each
-    /// already classified as batch-eligible by the per-path loop in
-    /// `reconcile_group_paths`) with just two `write_immediate` DB
-    /// transactions total, instead of one per path per DB write. Acquires
-    /// every item's path lock up front (canonical, sorted order -- the
-    /// same discipline every other multi-path lock site in this crate
-    /// uses), re-validates each candidate fresh under those locks (see
-    /// `revalidate_ordinary_upsert`/the inline delete check below),
-    /// commits the surviving upserts' rows/intents in one transaction
-    /// (`open_projected_upserts_batch`), publishes each survivor's already-
-    /// prepared temp file (or removes a delete's target) per path, then
-    /// commits every survivor's completion (fingerprint/intent-clear for
-    /// upserts, tombstone row/held-clear for deletes) in one final
-    /// transaction (`finalize_projected_mutations_batch`) -- preserving
-    /// the exact row-before-file (intent-protected) and disk-first-for-
-    /// deletes crash orderings a single unbatched `materialize()` call
-    /// already guarantees, just batched across up to
-    /// `ORDINARY_BATCH_MAX_PATHS` paths at once.
-    ///
-    /// Every item in `items` lands in exactly one of the two returned sets
-    /// -- same invariant `reconcile_group_paths` itself keeps for every
-    /// path it examines.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the batch's lock, revalidate, commit, publish and finalize phases share \
-              one lock set and must keep the crash orderings documented above; they \
-              are kept in one body so that ordering stays reviewable in one place"
-    )]
-    pub(crate) async fn try_commit_ordinary_batch(
-        &self,
-        group_id: &str,
-        origin_device_id: &str,
-        items: Vec<OrdinaryBatchItem<'_>>,
-        call_timer: &crate::local_convergence::call_timer::ReconcileCallTimer,
-    ) -> Result<
-        (
-            std::collections::BTreeMap<String, SettlementEvidence>,
-            std::collections::BTreeSet<String>,
-        ),
-        PeerSessionError,
-    > {
-        let mut settled = std::collections::BTreeMap::new();
-        let mut retry = std::collections::BTreeSet::new();
-        if items.is_empty() {
-            return Ok((settled, retry));
-        }
-
-        let mut sorted = items;
-        sorted.sort_by(|a, b| a.path().cmp(b.path()));
-        let mut _guards = Vec::with_capacity(sorted.len());
-        // Index-based, not `for item in &sorted`: a borrowing iterator over
-        // `OrdinaryBatchItem` would need `OrdinaryBatchItem: Sync` to stay
-        // `Send` across the `.await` below, and the `Box<dyn Send + '_>`
-        // activity guard it carries is (correctly) not `Sync`.
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..sorted.len() {
-            let path_lock = self.state.path_lock(group_id, sorted[i].path());
-            _guards.push(path_lock.lock_owned().await);
-        }
-
-        let authority = self.root_lease_for(group_id)?;
-        let authority_op = authority.begin_operation()?;
-        let permit = authority_op.permit();
-
-        // Kept alive (never inspected) until this whole batch's commit
-        // work below finishes -- each is the SAME per-candidate block-
-        // write-activity guard `prepare_ordinary_projected_upsert` already
-        // acquired, so dropping it only now (rather than per-candidate,
-        // right after its own commit) still satisfies "held from before
-        // the fetch through the commit" and errs toward holding slightly
-        // longer, never shorter.
-        let mut _upsert_activity_guards: Vec<Box<dyn Send + '_>> = Vec::new();
-        let mut candidate_upserts: Vec<yadorilink_peer_session::ports::PreparedProjectedUpsert> =
-            Vec::new();
-        let mut candidate_deletes: Vec<(String, ChangeHash)> = Vec::new();
-        // Cross-file provenance batching: every hash ANY Upsert
-        // candidate in this bounded chunk newly fetched, deduplicated --
-        // collected regardless of whether that candidate survives
-        // revalidation below, since its blocks are already durably
-        // `store.put` either way and deserve provenance whether or not
-        // THIS particular row ends up published this round.
-        let mut pending_provenance_hashes: std::collections::HashSet<Vec<u8>> =
-            std::collections::HashSet::new();
-        for item in sorted {
-            match item {
-                OrdinaryBatchItem::Upsert(write_activity, prepared) => {
-                    _upsert_activity_guards.push(write_activity);
-                    pending_provenance_hashes
-                        .extend(prepared.newly_fetched_block_hashes.iter().cloned());
-                    if let Some(basis) =
-                        self.revalidate_ordinary_upsert(group_id, &prepared, call_timer).await?
-                    {
-                        let mut prepared = *prepared;
-                        prepared.realized_causal_basis = basis;
-                        candidate_upserts.push(prepared);
-                    } else {
-                        // A rejected candidate's
-                        // already-assembled temp file is otherwise never
-                        // cleaned up (`reconstruct_file_to_temp` only
-                        // removes it on an assembly failure, not on a
-                        // caller later deciding not to publish it) --
-                        // repeated staleness races would leak full-size
-                        // temp files into the sync directory indefinitely.
-                        let _ = std::fs::remove_file(&prepared.tmp_path);
-                        retry.insert(prepared.rel_path);
-                    }
-                }
-                OrdinaryBatchItem::Delete(path, _stale_tombstone_author, derived_head) => {
-                    // Re-resolve fresh, now under this
-                    // batch's lock, instead of trusting `stale_tombstone_
-                    // author` or treating "a live row still exists" as
-                    // proof the tombstone still wins. The unbatched Absent
-                    // branch's own safety comes from holding the lock
-                    // CONTINUOUSLY from its resolution through its delete
-                    // (a near-zero window) -- deferring into a batch
-                    // reopens that window to however long this batch spent
-                    // preparing its OTHER candidates, during which a
-                    // concurrent local create or a newer peer change can
-                    // supersede this tombstone. `still_live` alone cannot
-                    // detect that: a racing create also leaves the row
-                    // live, so checking only liveness (not who currently
-                    // wins) would delete the new content just as readily
-                    // as the genuinely-still-deleted case. Mirrors
-                    // `revalidate_ordinary_upsert`'s identical reasoning
-                    // for the upsert side.
-                    let dag_started = std::time::Instant::now();
-                    let fresh = self.combined_heads(group_id, &path, derived_head.as_ref())?;
-                    call_timer.add_dag_resolution(dag_started.elapsed());
-                    if fresh.is_empty() {
-                        retry.insert(path);
-                        continue;
-                    }
-                    let tombstone_author = match resolve_path_heads(&path, &fresh) {
-                        PathResolution::Present { .. } => {
-                            // Superseded by new content since the unlocked
-                            // classification pass -- must not delete;
-                            // retry so the next pass resolves it as
-                            // Present and materializes the real winner.
-                            retry.insert(path);
-                            continue;
-                        }
-                        PathResolution::Absent => ChangeHash(
-                            fresh
-                                .iter()
-                                .map(|h| h.change_hash)
-                                .max()
-                                .expect("Absent resolution has at least one head"),
-                        ),
-                    };
-                    let record = FileRecord {
-                        path: path.clone(),
-                        size: 0,
-                        mtime_unix_nanos: 0,
-                        blocks: Vec::new(),
-                        deleted: true,
-                    };
-                    if self.hazard_reason_for(group_id, &record)?.is_some() {
-                        // Extremely rare (hazard appearing between this
-                        // path's unlocked classification and this locked
-                        // recheck): simplest safe response is to retry --
-                        // the next reconcile pass's own unlocked
-                        // classification will see the hazard and route it
-                        // through the existing serial `materialize()` call,
-                        // which handles holding it correctly.
-                        retry.insert(path);
-                        continue;
-                    }
-                    let still_live =
-                        self.state.get_file(group_id, &path)?.map(|r| !r.deleted).unwrap_or(false);
-                    if still_live {
-                        candidate_deletes.push((path, tombstone_author));
-                    } else if let Some(evidence) =
-                        self.settle_directory_at_deleted_path(group_id, &path)?
-                    {
-                        // A directory still stands at an already-deleted
-                        // path. Decided now, never retried: see
-                        // `settle_directory_at_deleted_path`.
-                        settled.insert(path, evidence);
-                    } else if !self.observably_absent_on_disk(group_id, &path)? {
-                        // The row says deleted, but something is at this
-                        // name. This attempt has observed no absence and
-                        // may not claim one. Not deleted here either:
-                        // those bytes may be a local edit nobody has
-                        // indexed yet, and deciding that is local
-                        // capture's job.
-                        retry.insert(path);
-                    } else {
-                        // A genuinely already-settled tombstone
-                        // (row exists, already deleted, authoring hash
-                        // already this exact tombstone) must cost zero
-                        // writer_gate acquisitions, same principle as the
-                        // content-identical fast path -- an
-                        // unconditional `set_authoring_change_hash` here
-                        // re-examines every re-driven tombstone's change
-                        // (roughly 2x per path across a storm) into a real
-                        // write even when nothing differs.
-                        if self.state.get_file(group_id, &path)?.is_some()
-                            && self.state.get_authoring_change_hash(group_id, &path)?.as_ref()
-                                != Some(&tombstone_author)
-                        {
-                            self.state.set_authoring_change_hash(
-                                group_id,
-                                &path,
-                                &tombstone_author,
-                            )?;
-                        }
-                        let evidence = self.already_absent(group_id, &path)?;
-                        settled.insert(path, evidence);
-                    }
-                }
-            }
-        }
-
-        // Cross-file provenance batching: ONE `record_group_block_
-        // provenance` call for this whole bounded commit chunk, BEFORE any
-        // publish below -- crash-ordering requirement: fetch -> verify ->
-        // store.put durable -> provenance batch durable -> publish. A
-        // failure here fails every surviving upsert candidate in this
-        // chunk closed (never published/settled this round, cleaned up
-        // and left for retry) -- deletes in the same chunk are unaffected,
-        // since they never depended on block provenance.
-        if !pending_provenance_hashes.is_empty() {
-            let hashes: Vec<Vec<u8>> = pending_provenance_hashes.into_iter().collect();
-            if let Err(e) = self.flush_provenance_hashes(group_id, hashes, Some(call_timer)).await {
-                tracing::warn!(
-                    group_id,
-                    error = %e,
-                    "ordinary-batch cross-file provenance flush failed; leaving every \
-                     surviving upsert in this chunk unapplied for retry"
-                );
-                for prepared in candidate_upserts.drain(..) {
-                    let _ = std::fs::remove_file(&prepared.tmp_path);
-                    retry.insert(prepared.rel_path);
-                }
-            }
-        }
-
-        if !candidate_upserts.is_empty() {
-            let open_batch_started = std::time::Instant::now();
-            let gate_before = yadorilink_sqlite_runtime::writer_gate_stats::stats().1;
-            self.state.open_projected_upserts_batch(group_id, &candidate_upserts, &permit)?;
-            let open_batch_elapsed = open_batch_started.elapsed();
-            let gate_wait =
-                yadorilink_sqlite_runtime::writer_gate_stats::stats().1.saturating_sub(gate_before);
-            call_timer.add_sqlite_write(open_batch_elapsed, gate_wait);
-        }
-
-        // No batch-wide basis is read here any more. Each candidate
-        // carries the frontier its own revalidation resolved, captured
-        // under that path's lock immediately before this loop writes it --
-        // which is the frontier the write realizes. One shared read taken
-        // here would instead name the group's frontier at the moment the
-        // first path in the batch started, for every path in it.
-        let mut finished_upserts = Vec::with_capacity(candidate_upserts.len());
-        for prepared in &candidate_upserts {
-            // This is a mutator in its own right: this batched path
-            // bypasses `materialize()` entirely, writing real content
-            // directly -- `path_lock` is held for every path in this
-            // batch via `_guards`, acquired above. Bump before the real
-            // write below.
-            // The version this publish is about comes from the payload it
-            // is publishing, fixed when the temp file was built. Reading
-            // it from the row -- even before the write -- would ask about
-            // the row instead of about the bytes, and a supersession that
-            // keeps the authoring identity moves the row's version
-            // without moving anything this write can see.
-            let mutation_generation = self.state.dag_bump_mutation_fence(
-                group_id,
-                &prepared.rel_path,
-                "ordinary_batch_upsert_write",
-            )?;
-            let persist_result =
-                persist_reconstructed_file_off_runtime(&prepared.tmp_path, &prepared.out_path)
-                    .await;
-            match persist_result {
-                Ok(()) => {
-                    // From `written_version`, the same payload version
-                    // the proof below names and the temp file above was
-                    // built from -- not from the row, which this batch
-                    // has already upserted and which a concurrent
-                    // supersession can move out from under this loop
-                    // between one candidate and the next.
-                    let kind = prepared.written_version.meta.record_kind;
-                    let evidence = match self.finish_ordinary_batch_write(
-                        group_id,
-                        prepared,
-                        kind,
-                        mutation_generation,
-                    ) {
-                        Ok(Some(evidence)) => evidence,
-                        // Superseded while this batch was writing. The
-                        // finalizer's own guard would refuse it too; not
-                        // adding it to `finished_upserts` keeps the two
-                        // decisions from disagreeing, and not adding it to
-                        // `settled` keeps evidence for a version this path
-                        // has left from reaching the engine at all.
-                        Ok(None) => {
-                            retry.insert(prepared.rel_path.clone());
-                            continue;
-                        }
-                        // This path's own file could not take its metadata
-                        // or prove what it is. That is this path's problem:
-                        // it keeps its intent open (repair or the retry
-                        // reconstructs it, as after a failed rename above),
-                        // and the rest of the batch still finalizes. A
-                        // database, invariant or root failure is not, and
-                        // still aborts the whole batch below.
-                        Err(e) if ordinary_batch_error_is_path_local(&e) => {
-                            tracing::warn!(
-                                group_id,
-                                path = %prepared.rel_path,
-                                error = %e,
-                                "ordinary-batch metadata or evidence failed for one path; \
-                                 leaving its intent open and its change unapplied for retry"
-                            );
-                            retry.insert(prepared.rel_path.clone());
-                            continue;
-                        }
-                        Err(e) => return Err(e),
-                    };
-                    // The finalizer publishes the proof for exactly what
-                    // this evidence claims, under exactly the epoch this
-                    // write produced -- so it is built from the same values,
-                    // not re-derived later.
-                    let version_hash = match &evidence {
-                        SettlementEvidence::ExactObject { version, .. } => *version,
-                        other => {
-                            return Err(PeerSessionError::CorruptState(format!(
-                                "{}: an ordinary batch write produced non-exact settlement \
-                                 evidence: {other:?}",
-                                prepared.rel_path
-                            )))
-                        }
-                    };
-                    finished_upserts.push(
-                        yadorilink_peer_session::ports::FinishedProjectedUpsert {
-                            rel_path: prepared.rel_path.clone(),
-                            kind,
-                            version_hash,
-                            mutation_generation,
-                            observed_identity:
-                                yadorilink_root_authority::fs_identity::FileIdentity::observe_path(
-                                    &prepared.out_path,
-                                )
-                                .ok(),
-                            causal_basis: prepared.realized_causal_basis.clone(),
-                            // What the row must still look like for this
-                            // write's proof to be the truth about it: the
-                            // authoring identity this candidate was
-                            // revalidated against, and the state the
-                            // open-batch transaction left it in.
-                            expected_authoring: prepared.authoring_change_hash,
-                            expected_state:
-                                yadorilink_peer_session::ports::MATERIALIZATION_IN_FLIGHT_STATE,
-                        },
-                    );
-                    settled.insert(prepared.rel_path.clone(), evidence);
-                }
-                Err(e) => {
-                    // The row+intent were already committed above -- a
-                    // publish failure here is safe to just retry: the
-                    // intent is still open, so restart/periodic repair
-                    // reconstructs from the locally-present blocks exactly
-                    // as an unbatched crash-after-intent-open would.
-                    tracing::warn!(
-                        group_id,
-                        path = %prepared.rel_path,
-                        error = %e,
-                        "ordinary-batch disk publish failed; leaving its intent open for \
-                         repair and its change unapplied for retry"
-                    );
-                    retry.insert(prepared.rel_path.clone());
-                }
-            }
-        }
-
-        let mut finished_deletes = Vec::with_capacity(candidate_deletes.len());
-        let mut retained_directories: Vec<(
-            String,
-            &'static str,
-            Option<Box<yadorilink_root_authority::fs_identity::FileIdentity>>,
-        )> = Vec::new();
-        // Deepest first: every descendant of a path sorts after it, so in
-        // reverse order a directory's deleted children are gone before the
-        // directory's own `rmdir` runs, and an `rm -rf` arriving as point
-        // deletes empties each directory before removing it.
-        candidate_deletes.sort_by(|(a, _), (b, _)| b.cmp(a));
-        for (path, tombstone_author) in candidate_deletes {
-            let out_path = self.local_file_path(group_id, &path)?;
-            if let Err(e) = self.verify_delete_target(group_id, &out_path) {
-                tracing::warn!(
-                    group_id, path = %path, error = %e,
-                    "ordinary-batch delete target verification failed; leaving unapplied \
-                     for retry"
-                );
-                retry.insert(path);
-                continue;
-            }
-            // Bump before the real delete syscall below (same mutator
-            // reasoning as the upsert side above).
-            let mutation_generation =
-                self.state.dag_bump_mutation_fence(group_id, &path, "ordinary_batch_delete")?;
-            let removal = match self.remove_for_tombstone(group_id, &path, &out_path) {
-                Ok(removal) => removal,
-                Err(e) => {
-                    tracing::warn!(
-                        group_id, path = %path, error = %e,
-                        "ordinary-batch delete failed; leaving unapplied for retry"
-                    );
-                    retry.insert(path);
-                    continue;
-                }
-            };
-            let record = FileRecord {
-                path: path.clone(),
-                size: 0,
-                mtime_unix_nanos: 0,
-                blocks: Vec::new(),
-                deleted: true,
-            };
-            finished_deletes.push(yadorilink_peer_session::ports::PreparedProjectedDelete {
-                rel_path: path.clone(),
-                out_path,
-                record,
-                origin_device_id: origin_device_id.to_string(),
-                authoring_change_hash: Some(tombstone_author),
-            });
-            match removal {
-                super::types::TombstoneRemoval::Removed => {
-                    settled.insert(path, SettlementEvidence::ExactAbsent { mutation_generation });
-                }
-                super::types::TombstoneRemoval::Retained { reason, removable } => {
-                    retained_directories.push((path.clone(), reason, removable));
-                    settled
-                        .insert(path, SettlementEvidence::Retained { reason: reason.to_string() });
-                }
-            }
-        }
-
-        if !finished_upserts.is_empty() || !finished_deletes.is_empty() {
-            let finalize_started = std::time::Instant::now();
-            let gate_before = yadorilink_sqlite_runtime::writer_gate_stats::stats().1;
-            let published = self.state.finalize_projected_mutations_batch(
-                group_id,
-                &finished_upserts,
-                &finished_deletes,
-                &permit,
-            )?;
-            // A candidate the finalizer refused published nothing, so it
-            // is not settled either. Its evidence names the version this
-            // write realized, and the path has since moved off it --
-            // leaving it in `settled` hands that evidence to the engine,
-            // which publishes CASing only on the fence and would land the
-            // very proof the finalizer just declined to write.
-            for upsert in &finished_upserts {
-                if !published.contains(&upsert.rel_path) {
-                    settled.remove(&upsert.rel_path);
-                    retry.insert(upsert.rel_path.clone());
-                }
-            }
-            // Recorded once the deletes are: the record is what a retained
-            // settlement closes against, and it must not outlive a finalize
-            // that failed.
-            for (path, reason, removable) in &retained_directories {
-                self.keep_directory_a_delete_found_not_empty(
-                    group_id,
-                    path,
-                    reason,
-                    removable.as_deref(),
-                )?;
-            }
-            let finalize_elapsed = finalize_started.elapsed();
-            let gate_wait =
-                yadorilink_sqlite_runtime::writer_gate_stats::stats().1.saturating_sub(gate_before);
-            call_timer.add_sqlite_write(finalize_elapsed, gate_wait);
-        }
-
-        Ok((settled, retry))
-    }
-
-    /// Projects a set of touched paths into the materialized index through one
-    /// conflict-copy-aware fixpoint fold — the engine's counterpart to the
-    /// property suite's `fold_materialize`, so the two cannot disagree on
-    /// nested-overlap corners.
-    ///
-    /// A conflict copy is content the *losing* change materializes at a derived
-    /// path; that path is first-class, so it is folded together with any change
-    /// that directly touches it (with cross-supersession), and it is only
-    /// (re)materialized if it survives — a delete of a conflict copy sticks, and
-    /// a conflict-copy path independently edited resolves as an ordinary path.
-    /// The fixpoint discovers derived copy paths (bounded: copy names embed the
-    /// losing version hash), then a single pass materializes each path's result:
-    /// *absent* → a deletion (the no-resurrection guarantee), *present* → the
-    /// winning content head via the session's block-fetch machinery.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the conflict-copy fixpoint and the single materialize pass that consumes \
-              it share every map the fixpoint builds; the fold mirrors the property \
-              suite's `fold_materialize` and is kept whole so the two can be compared"
-    )]
-    async fn reconcile_group_paths(
-        &self,
-        group_id: &str,
-        mut seed_paths: std::collections::BTreeSet<String>,
-        // Who to attribute an adopted record to. Genuinely a peer's identity
-        // when a peer drove this pass, and this device's own when nothing but
-        // this device did.
-        origin_device_id: &str,
-        // What the pre-pass observed for each path whose content it went and
-        // obtained, by path. A path with no entry was never asked for.
-        prefetched: &HashMap<String, BlockRequirement>,
-        audit_attempt_id: u64,
-        // The whole attempt's timer, owned by the caller. Not created here:
-        // an attempt that obtains content does that BEFORE this function is
-        // entered, so a timer created here can never see this attempt's
-        // block fetching -- see `reconcile_paths_directly`'s own comment.
-        call_timer: &crate::local_convergence::call_timer::ReconcileCallTimer,
-    ) -> Result<ProjectionAttempt, PeerSessionError> {
-        let call_started = std::time::Instant::now();
-        // A copy name with no head of its own is placed by its source's
-        // resolution -- a conflict copy of a losing head, or a leaf moved
-        // aside for a directory -- so it is decided with its source. Asked
-        // for alone (an installed base places rows at copy names, and
-        // releasing the install's hold on one raises its obligation), it
-        // would resolve from no heads and never settle.
-        let mut copy_sources = Vec::new();
-        for path in &seed_paths {
-            if yadorilink_replica_domain::conflict::is_conflict_copy_path(path)
-                && self.store_live_heads_for_path(group_id, path)?.is_empty()
-            {
-                copy_sources
-                    .push(yadorilink_replica_domain::conflict::conflict_copy_source_path(path));
-            }
-        }
-        seed_paths.extend(copy_sources);
-        // The namespace closure. A path is decided with its ancestors: one
-        // whose own heads name a File or Symlink has to move aside while
-        // anything lives below it and comes back once nothing does, and
-        // only a pass over a descendant ever learns either. Ancestors with
-        // no leaf of their own are directories or nothing; the mkdir of a
-        // write and the prune after a delete decide those.
-        //
-        // On a volume that folds names, an ancestor the tree needs as a
-        // directory can have its name held by a tracked file spelled
-        // differently (`A` for `a`): that file has to step aside on this
-        // device alone, so it joins the pass too. And an entry held aside
-        // that way joins every pass over its level, so it takes its name
-        // back once the directory is gone.
-        let mut ancestors_with_leaves = std::collections::BTreeSet::new();
-        let mut folded_leaves = std::collections::BTreeSet::new();
-        let held_beside_folded = self
-            .state
-            .entries_held_beside_folded_directories(group_id)
-            .map_err(crate::sync_error::SyncError::from)?;
-        let mut held_aside = std::collections::BTreeSet::new();
-        for path in &seed_paths {
-            if self.is_locally_ignored(group_id, path) {
-                continue;
-            }
-            for ancestor in self.ancestors_holding_leaves(group_id, path)? {
-                if !self.is_locally_ignored(group_id, &ancestor) {
-                    ancestors_with_leaves.insert(ancestor);
-                }
-            }
-            for ancestor in super::namespace_steps::proper_ancestors(path) {
-                let Some(leaf) = self.folded_leaf_in_the_way(group_id, ancestor)? else {
-                    continue;
-                };
-                if self.is_locally_ignored(group_id, &leaf)
-                    || !self.namespace_needs_directory(group_id, ancestor)?
-                {
-                    continue;
-                }
-                folded_leaves.insert(leaf);
-            }
-            for level_mate in
-                std::iter::once(path.as_str()).chain(super::namespace_steps::proper_ancestors(path))
-            {
-                let level = super::namespace_steps::parent_of(level_mate);
-                held_aside.extend(
-                    held_beside_folded
-                        .iter()
-                        .filter(|held| super::namespace_steps::parent_of(held) == level)
-                        .filter(|held| !self.is_locally_ignored(group_id, held))
-                        .cloned(),
-                );
-            }
-        }
-        seed_paths.extend(ancestors_with_leaves);
-        seed_paths.extend(folded_leaves.iter().cloned());
-        seed_paths.extend(held_aside);
-        let fixpoint_started = std::time::Instant::now();
-        // What the namespace requires of each path on its own account, read
-        // once. `None` when it cannot be decided locally yet (a live
-        // version this replica does not hold): the path then takes its
-        // per-path resolution, and materializing it fails closed on the
-        // same missing version.
-        let mut desired_of: std::collections::BTreeMap<
-            String,
-            Option<yadorilink_sync_sqlite::desired_state::DesiredPathState>,
-        > = std::collections::BTreeMap::new();
-        // path -> the copy names its relocated File or Symlink winner takes
-        // because the path has to be a directory.
-        let mut relocations: std::collections::BTreeMap<String, Vec<String>> =
-            std::collections::BTreeMap::new();
-        // copy_path -> the losing content head that materializes there.
-        let mut derived: std::collections::BTreeMap<String, PathHead> =
-            std::collections::BTreeMap::new();
-        // copy_path -> the path whose resolution DEMANDS that copy's content.
-        //
-        // A conflict copy is never something anyone asks for by name: it
-        // exists only because resolving a source path produced it, at a name
-        // only the resolution knows. Every gate that asks "did something
-        // request this content" has to ask about the source, or an on-demand
-        // folder refuses the copy forever and the source can never settle.
-        // Inherited transitively, so a copy derived from a copy still names
-        // the seed path that ultimately demanded it.
-        let mut demand_of: std::collections::BTreeMap<String, String> =
-            std::collections::BTreeMap::new();
-        loop {
-            let mut next = derived.clone();
-            let paths: std::collections::BTreeSet<String> =
-                seed_paths.iter().cloned().chain(derived.keys().cloned()).collect();
-            for path in &paths {
-                // Derive nothing from a path this device ignores. A conflict
-                // copy carries the losing head's content to a *different* name
-                // (it embeds the version hash), and that derived name will not
-                // generally match the pattern that excluded the original — a
-                // literal `secret.log` rule does not match
-                // `secret (conflict …).log`. Resolving an ignored path here
-                // would therefore launder its content past the user's own
-                // filter under a name they never wrote a rule for. Skipping it
-                // in the fixpoint is what keeps the exclusion airtight; the
-                // materialize pass below re-checks each derived name on its own
-                // merits, so a copy path that is itself ignored is dropped too.
-                if self.is_locally_ignored(group_id, path) {
-                    continue;
-                }
-                let dag_started = std::time::Instant::now();
-                let inputs = self.combined_heads(group_id, path, derived.get(path))?;
-                call_timer.add_dag_resolution(dag_started.elapsed());
-                if inputs.is_empty() {
-                    continue;
-                }
-                if let PathResolution::Present { winner, conflict_copies } =
-                    resolve_path_heads(path, &inputs)
-                {
-                    if !derived.contains_key(path) && !desired_of.contains_key(path) {
-                        let (desired, relocated) =
-                            self.namespace_relocation(group_id, path, &inputs[winner])?;
-                        desired_of.insert(path.clone(), desired);
-                        let copies = relocated.clone().unwrap_or_default();
-                        let demand = demand_of.get(path).cloned().unwrap_or_else(|| path.clone());
-                        next.extend(
-                            copies.iter().map(|copy| (copy.clone(), inputs[winner].clone())),
-                        );
-                        demand_of.extend(copies.iter().map(|copy| (copy.clone(), demand.clone())));
-                        relocations.extend(relocated.map(|copies| (path.clone(), copies)));
-                    }
-                    // A Directory loses its metadata to the winning
-                    // directory's and is owed no copy: an empty directory
-                    // beside the path carries nothing.
-                    let conflict_copies =
-                        self.leaf_conflict_copies(group_id, &inputs, conflict_copies)?;
-                    for cc in conflict_copies {
-                        self.trace_conflict_copy_discovered(
-                            group_id,
-                            audit_attempt_id,
-                            path,
-                            &cc.path,
-                            &inputs[cc.head],
-                            derived.contains_key(&cc.path),
-                        );
-                        let demand = demand_of.get(path).cloned().unwrap_or_else(|| path.clone());
-                        demand_of.entry(cc.path.clone()).or_insert(demand);
-                        next.insert(cc.path.clone(), inputs[cc.head].clone());
-                    }
-                }
-            }
-            // `derived` only ever grows, so a stable size means a fixpoint.
-            if next.len() == derived.len() {
-                break;
-            }
-            derived = next;
-        }
-        let fixpoint_elapsed = fixpoint_started.elapsed();
-        if fixpoint_elapsed > std::time::Duration::from_secs(1) {
-            tracing::warn!(
-                group_id,
-                audit_attempt_id,
-                elapsed_ms = fixpoint_elapsed.as_millis(),
-                seed_path_count = seed_paths.len(),
-                derived_path_count = derived.len(),
-                "reconcile_group_paths conflict-copy fixpoint took unusually long"
-            );
-        }
-        // Permanent guard against an unbounded `MaterializationAuditGuard`
-        // hold (the reason every caller of this function is bounded to
-        // a small seed-path window in the first place, most notably the
-        // Convergence Engine's own `MAX_PATHS_PER_RECONCILE_ATTEMPT`-bounded
-        // `reconcile_paths_directly`): a small seed-path window can still
-        // expand into a much larger materialize workload below if its
-        // paths happen to have many concurrent conflict-copy losers, since
-        // this fixpoint's own derived-path discovery has no independent
-        // bound. Confirmed NOT the cause of that incident (the actual call
-        // logged `seed_path_count=993, derived_path_count=0`), so not
-        // truncated/deferred here -- doing that safely would need to
-        // preserve `resolve_path_heads`'s per-path winner/loser
-        // classification, which needs every live head for a path in view
-        // at once, and warrants its own careful design if this ever fires
-        // for real. Logged so a real occurrence is visible rather than
-        // silently repeating that incident via a different path.
-        if derived.len() > UNUSUALLY_LARGE_CONFLICT_COPY_FIXPOINT_THRESHOLD {
-            tracing::warn!(
-                group_id,
-                audit_attempt_id,
-                seed_path_count = seed_paths.len(),
-                derived_path_count = derived.len(),
-                "reconcile_group_paths: conflict-copy fixpoint derived significantly more paths \
-                 than this call's own seed-path window bound; the materialize step below may \
-                 still take a long time while holding MaterializationAuditGuard"
-            );
-        }
-        let materialize_started = std::time::Instant::now();
-
-        let paths: std::collections::BTreeSet<String> =
-            seed_paths.iter().cloned().chain(derived.keys().cloned()).collect();
-        // Fail closed on the link table rather than defaulting the policy: a
-        // missing row used to resolve to `Eager`, so an unlinked folder was the
-        // *most* aggressive materialization target in the system.
-        //
-        // Report every path as unprojected rather than returning "none failed":
-        // this function's result is the set the caller must NOT mark applied, so
-        // an empty set here would record the batch as projected into a folder
-        // that was never written to, and a later relink would never re-project
-        // it.
-        let LinkGate::Live { policy, .. } = self.state.link_gate_for_group(group_id)? else {
-            return Ok(ProjectionAttempt { settled: Default::default(), retry: paths });
-        };
-        // A path under a paused item is not written while the pause lasts.
-        // The projection scheduler already leaves such a path unclaimed;
-        // this covers every other way into this pass (the hazard recheck,
-        // an attempt claimed just before the pause landed). `retry`, never
-        // `settled`: the change stays outstanding, and resume re-arms it.
-        //
-        // A path a snapshot install holds is held back the same way: its
-        // disk still carries what the replaced row placed, or an uncaptured
-        // edit of it, and projecting over that would destroy it unexamined.
-        // Releasing the hold schedules the projection again.
-        let mut paused = self
-            .state
-            .paused_item_repository()
-            .list(group_id)
-            .map_err(crate::sync_error::SyncError::from)
-            .map_err(PeerSessionError::from)?;
-        paused.extend(
-            self.state
-                .snapshot_install_hold_repository()
-                .held_paths(group_id)
-                .map_err(crate::sync_error::SyncError::from)
-                .map_err(PeerSessionError::from)?,
-        );
-        // Every path this call resolves lands in exactly one of these two
-        // sets by the end of the loop below — see `ProjectionAttempt`'s own
-        // doc comment for why that invariant matters. A per-path write
-        // failure (disk-full, missing block, I/O, materialize error) goes to
-        // `retry` and the sweep continues, rather than `?`-aborting the
-        // whole batch: the caller marks only changes whose paths are ALL in
-        // `settled` as applied, and the rest re-project later.
-        // Non-path-specific errors (a DAG/DB read failing) still propagate
-        // via `?`, since they are not attributable to one path and mean
-        // nothing projected reliably.
-        let mut settled: std::collections::BTreeMap<String, SettlementEvidence> =
-            std::collections::BTreeMap::new();
-        let mut retry: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        // Paths classified as batch-eligible ("ordinary": no hazard,
-        // no symlink, eager-admitted, every block fetchable) below are
-        // accumulated here instead of materializing immediately one at a
-        // time -- committed in bounded chunks via `try_commit_ordinary_
-        // batch` after this loop. Every other path (including every
-        // classification failure) still materializes immediately, inline,
-        // exactly as before this batching existed.
-        //
-        // Declared once, here, so every batched candidate's block-write-
-        // activity guard (acquired in `prepare_ordinary_projected_upsert`)
-        // borrows from this SAME long-lived reference and can be kept alive
-        // all the way to `try_commit_ordinary_batch`'s own commit step --
-        // see that guard's own doc comment.
-        let activity_provider = self.block_write_activity_provider();
-        // Cross-file provenance batching: see `ReconcileProvenance
-        // Batch`'s own doc comment. One instance for this whole call's
-        // per-path preparation loop (so dedup evidence is visible across
-        // every ordinary candidate this call prepares), but the actual SQL
-        // flush stays bounded to `try_commit_ordinary_batch`'s own
-        // ORDINARY_BATCH_MAX_PATHS-sized commit chunks, not this call's
-        // (potentially conflict-copy-expanded) full `paths` set.
-        let reconcile_provenance_batch = ReconcileProvenanceBatch::new();
-        let mut pending_batch: Vec<OrdinaryBatchItem<'_>> = Vec::new();
-        // Plan order: every removal first, deepest first, so a directory is
-        // emptied before anything is decided about its own name; then
-        // everything else shallowest first, so a directory exists before
-        // anything is written into it, and a relocated file's copy is
-        // written before the name it leaves is turned into a directory.
-        let (order, phase_two_start) =
-            self.namespace_order(group_id, &paths, &derived, &desired_of)?;
-        // Paths the namespace could not shape in this pass and that are not
-        // a directory on disk. Nothing below one is written until a later
-        // pass shapes it: writing a descendant would create the directory
-        // itself, under a name whose index row may still claim the leaf that
-        // was being moved aside -- which repair then reads as a directory
-        // standing where a tracked file belongs, and moves aside.
-        let mut unshaped: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for (index, path) in order.iter().enumerate() {
-            if index == phase_two_start {
-                // The removals are done before anything is written: commit
-                // them, and prune the directories they emptied.
-                let (removed, failed) = self
-                    .commit_pending_batch(
-                        group_id,
-                        origin_device_id,
-                        std::mem::take(&mut pending_batch),
-                        call_timer,
-                    )
-                    .await?;
-                settled.extend(removed);
-                retry.extend(failed);
-                self.remove_emptied_retained_ancestors(
-                    group_id,
-                    settled
-                        .iter()
-                        .filter(|(_, evidence)| {
-                            matches!(evidence, SettlementEvidence::ExactAbsent { .. })
-                        })
-                        .map(|(path, _)| path),
-                )
-                .await;
-            }
-            // Without this the DAG path — which every pair of
-            // current-build peers negotiates — writes and indexes a peer's
-            // file that matches this device's `.yadorilinkignore`.
-            // Deliberately NOT added to `failed`: `failed` means "retry
-            // this", and an ignored path is a decision, not a fault.
-            // Recording it as a failure would hold its change unprojected
-            // forever, so the reprojection backstop would re-drive it
-            // every cycle and the change would never retire. Skipping as a
-            // *success* lets the change mark applied and this device's
-            // heads advance past it — so the next heads exchange shows the
-            // peer we already hold it and it is never re-sent. The DAG
-            // settles; the bytes just never land. Uniform across Present
-            // and Absent (tombstone) alike, matching the legacy filter,
-            // which dropped the record before ever reading its `deleted`
-            // flag: an ignored path is simply not a path this device
-            // accepts peer decisions about, in either direction. A
-            // tombstone for a path ignored from the start is a no-op
-            // anyway (nothing was ever indexed to delete); for a path
-            // materialized *before* it became ignored, declining the
-            // delete leaves the user's local copy intact, which is the
-            // safe half of an unavoidable ambiguity — the ignore set is
-            // device-local, so no peer can know to stop sending, and
-            // honoring a remote delete against a locally-excluded path
-            // would let a purely local config edit turn into
-            // remote-triggered data loss. Nothing is evicted here for the
-            // same reason: an already- materialized file that later
-            // becomes ignored keeps its bytes and its index row (they
-            // agree — the file really is on disk), so it never takes the
-            // "index row for a file the user does not have" shape that
-            // gets misread as an offline delete.
-            if self.is_locally_ignored(group_id, path) {
-                tracing::debug!(
-                    group_id,
-                    path = %path,
-                    "not projecting a change-DAG path matching this device's ignore patterns"
-                );
-                settled.insert(path.clone(), SettlementEvidence::IgnoreExcluded);
-                continue;
-            }
-            if yadorilink_sync_sqlite::paused_items::path_is_covered(&paused, path) {
-                tracing::debug!(group_id, path = %path, "not projecting a path under a paused item or an unreconciled snapshot install");
-                retry.insert(path.clone());
-                continue;
-            }
-            let dag_started = std::time::Instant::now();
-            let mut inputs = self.combined_heads(group_id, path, derived.get(path))?;
-            call_timer.add_dag_resolution(dag_started.elapsed());
-            if inputs.is_empty() {
-                // An installed base carries only present heads: a path the
-                // base and everything written on it leave absent has no head
-                // at all, where retained history would still hold the
-                // removal that ended it. Absent in the index and on disk,
-                // there is nothing left to do at it.
-                if self.absent_under_installed_base(group_id, path)? {
-                    settled.insert(path.clone(), self.already_absent(group_id, path)?);
-                    continue;
-                }
-                // No live heads at all for a path this call was asked to
-                // resolve — genuinely ambiguous (this device's own DAG
-                // state may simply be behind), not a positive proof of
-                // anything. Fail closed: `retry`, never `settled` (see
-                // `ProjectionAttempt`'s own doc comment).
-                retry.insert(path.clone());
-                continue;
-            }
-            let mut resolution = resolve_path_heads(path, &inputs);
-            if matches!(resolution, PathResolution::Absent) {
-                // A path resolves Absent only when every live head is a
-                // tombstone (no content head survives). Before acting on that
-                // as a delete, capture any local edit to this path that is
-                // still sitting undispatched in this link's debounce
-                // accumulator. The admission loop in `handle_change_batch`
-                // flushes only the paths in the *triggering* change's own ops;
-                // a path folded into this projection by a promoted orphan
-                // (whose parent touched a different path) is never flushed
-                // there. Left unflushed, a genuine concurrent local edit is
-                // invisible to the resolution above, which then reads the path
-                // as Absent and deletes it — losing the edit with no conflict
-                // copy. Flush it now (before any delete and before any path
-                // lock — the flush dispatches through the ordinary local-change
-                // path, which takes the path lock itself, and this branch holds
-                // no lock here, so there is no deadlock), then re-resolve. The
-                // now-live local content head turns the resolution into
-                // Present, so the file is kept instead of deleted — exactly the
-                // same flush `materialize_dag_content_head` performs for the
-                // Present branch, hoisted ahead of the resolution so it can
-                // still flip a delete decision. (Because Absent means there was
-                // no content head at all, a flushed edit adds exactly one, so
-                // the re-resolution never yields a conflict copy here.)
-                if self.flush_local_changes_before_reconcile(group_id, path).await
-                    == PendingLocalFlushOutcome::RetryRequired
-                {
-                    // A local edit to this path could not be captured, so
-                    // the Absent verdict may be missing it: never delete
-                    // on it. Leave the obligation for a later pass.
-                    retry.insert(path.clone());
-                    continue;
-                }
-                let dag_started = std::time::Instant::now();
-                inputs = self.combined_heads(group_id, path, derived.get(path))?;
-                call_timer.add_dag_resolution(dag_started.elapsed());
-                if inputs.is_empty() {
-                    // Same reasoning as the first `inputs.is_empty()` check
-                    // above: ambiguous, not a positive proof — `retry`.
-                    retry.insert(path.clone());
-                    continue;
-                }
-                resolution = resolve_path_heads(path, &inputs);
-            }
-            yadorilink_peer_session::dst_trace(path, || {
-                let heads: Vec<String> = inputs
-                    .iter()
-                    .map(|h| {
-                        format!(
-                            "{}@{}{}",
-                            hex::encode(&h.change_hash[..4]),
-                            h.device_id,
-                            if h.content.is_some() { "" } else { ":tomb" }
-                        )
-                    })
-                    .collect();
-                let outcome = match &resolution {
-                    PathResolution::Absent => "Absent".to_string(),
-                    PathResolution::Present { winner, conflict_copies } => format!(
-                        "Present winner={} copies={}",
-                        hex::encode(&inputs[*winner].change_hash[..4]),
-                        conflict_copies.len()
-                    ),
-                };
-                format!("reconcile on {}: heads={heads:?} -> {outcome}", self.local_device_id)
-            });
-            match resolution {
-                PathResolution::Absent => {
-                    let tombstone_author = ChangeHash(
-                        inputs
-                            .iter()
-                            .map(|head| head.change_hash)
-                            .max()
-                            .expect("Absent resolution has at least one head"),
-                    );
-                    // Every live head removed the path — materialize the deletion
-                    // if the index still shows it live. A stale content change
-                    // that is an ancestor of the tombstone never reaches the live
-                    // set, so this can never resurrect a deleted file.
-                    //
-                    // Held across the still-live check AND the materialize call
-                    // below, matching `materialize_dag_content_head`'s identical
-                    // discipline for the Present branch (see its own comment on
-                    // why). Without this, a concurrent local write to this same
-                    // path -- e.g. the filename being reused by a brand-new
-                    // local create shortly after this device's own earlier
-                    // delete, which `local_change.rs`'s own commit path takes
-                    // this same lock for -- can interleave between the check and
-                    // the previously-unlocked materialize() below: the new
-                    // create's content and index row land first, then this
-                    // stale tombstone's materialize() removes that brand-new
-                    // file and overwrites its live index row with `deleted:
-                    // true` -- an index-says-deleted/disk-had-content mismatch
-                    // that no later re-resolution can detect, since every
-                    // device involved already believes it is consistent.
-                    // Confirmed as the actual cause of a real, reproduced
-                    // divergence: four devices with byte-identical DAG heads
-                    // each ended up with their own un-merged local tombstone
-                    // for the same repeatedly-recreated path.
-                    //
-                    // An ordinary (non-hazardous) delete needs none of
-                    // `materialize()`'s slow work -- defer it into the
-                    // bounded batch below instead of taking this path's lock
-                    // and materializing immediately. `try_commit_ordinary_
-                    // batch` re-resolves this path's DAG heads fresh (and
-                    // reruns the hazard check) under its own lock before
-                    // acting -- not just a `still_live` recheck, which
-                    // cannot by itself distinguish a genuinely-still-deleted
-                    // path from one a concurrent local recreate revived in
-                    // the window this deferral reopens (see its own doc
-                    // comment).
-                    // A hazardous tombstone is NOT deferred: its
-                    // hold-handling stays on the existing serial path below,
-                    // matching every other hazard case's scoping.
-                    let synthetic_tombstone_for_hazard_check = FileRecord {
-                        path: path.clone(),
-                        size: 0,
-                        mtime_unix_nanos: 0,
-                        blocks: Vec::new(),
-                        deleted: true,
-                    };
-                    if self
-                        .hazard_reason_for(group_id, &synthetic_tombstone_for_hazard_check)?
-                        .is_none()
-                    {
-                        pending_batch.push(OrdinaryBatchItem::Delete(
-                            path.clone(),
-                            tombstone_author,
-                            derived.get(path).cloned(),
-                        ));
-                        continue;
-                    }
-                    let lock_wait_started = std::time::Instant::now();
-                    let path_lock = self.state.path_lock(group_id, path);
-                    let _guard = path_lock.lock().await;
-                    let lock_wait_elapsed = lock_wait_started.elapsed();
-                    if lock_wait_elapsed > std::time::Duration::from_secs(1) {
-                        tracing::warn!(
-                            group_id,
-                            path = %path,
-                            lock_wait_elapsed_ms = lock_wait_elapsed.as_millis(),
-                            "absent-branch path-lock wait took unusually long"
-                        );
-                    }
-                    let still_live =
-                        self.state.get_file(group_id, path)?.map(|r| !r.deleted).unwrap_or(false);
-                    if !still_live && !self.observably_absent_on_disk(group_id, path)? {
-                        // Same as the batch lane: a tombstoned row is not
-                        // an observation of absence, and this attempt has
-                        // made none.
-                        retry.insert(path.clone());
-                        continue;
-                    }
-                    if still_live {
-                        let record = FileRecord {
-                            path: path.clone(),
-                            size: 0,
-                            mtime_unix_nanos: 0,
-                            blocks: Vec::new(),
-                            deleted: true,
-                        };
-                        // A DAG tombstone is a materialization operation, not
-                        // merely an index update.  Going straight to
-                        // `upsert_file` leaves the old bytes on disk while the
-                        // index says they are deleted; route through the same
-                        // removal path as legacy peer reconciliation so an I/O
-                        // failure keeps the change unapplied for retry.
-                        let materialize_started = std::time::Instant::now();
-                        // A tombstone names no content, so this can only
-                        // conclude -- it has nothing to ask a peer for.
-                        // A tombstone names no content, so its payload
-                        // version is simply the one this empty record
-                        // derives -- there is nothing on disk for it to
-                        // disagree with.
-                        let payload = MaterializationPayload::tombstone(record.clone());
-                        let materialize_result = self
-                            .materialize_local(
-                                group_id,
-                                &payload,
-                                &record.path,
-                                policy,
-                                origin_device_id,
-                                Some(&tombstone_author),
-                                None,
-                            )
-                            .await
-                            .map(|outcome| match outcome {
-                                LocalMaterializeOutcome::Concluded(result) => result,
-                                LocalMaterializeOutcome::NeedBlocks(_) => {
-                                    MaterializeResult::RetryRequired
-                                }
-                            });
-                        let materialize_elapsed = materialize_started.elapsed();
-                        if materialize_elapsed > std::time::Duration::from_secs(1) {
-                            tracing::warn!(
-                                group_id,
-                                path = %path,
-                                elapsed_ms = materialize_elapsed.as_millis(),
-                                "absent-branch materialize() call took unusually long"
-                            );
-                        }
-                        match materialize_result {
-                            Ok(MaterializeResult::Settled(evidence)) => {
-                                settled.insert(path.clone(), evidence);
-                            }
-                            // Matches the `Present` branch's identical
-                            // distinction just below: a hazard-collision
-                            // tombstone that dropped without applying
-                            // anything reports `RetryRequired`, and this
-                            // branch must not fold that into `settled` --
-                            // this was the only caller of `materialize` for
-                            // a deletion that collapsed every `Ok(_)` into
-                            // "done", silently discarding the distinction
-                            // `MaterializeResult` exists to preserve.
-                            Ok(MaterializeResult::RetryRequired) => {
-                                retry.insert(path.clone());
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    group_id,
-                                    path = %path,
-                                    error = %e,
-                                    "failed to project a deletion; leaving its change(s) unapplied"
-                                );
-                                retry.insert(path.clone());
-                            }
-                        }
-                    } else {
-                        // Already not live -- the deletion is already
-                        // reflected, nothing to do this attempt.
-                        //
-                        // Same principle as the ordinary batch
-                        // delete branch's identical fix -- an unconditional
-                        // `set_authoring_change_hash` here costs a
-                        // writer_gate acquisition on every re-drive of an
-                        // already-fully-settled tombstone, even when the
-                        // authoring hash already matches exactly.
-                        if self.state.get_file(group_id, path)?.is_some()
-                            && self.state.get_authoring_change_hash(group_id, path)?.as_ref()
-                                != Some(&tombstone_author)
-                        {
-                            self.state.set_authoring_change_hash(
-                                group_id,
-                                path,
-                                &tombstone_author,
-                            )?;
-                        }
-                        settled.insert(path.clone(), self.already_absent(group_id, path)?);
-                    }
-                }
-                PathResolution::Present { winner, .. } => {
-                    if super::namespace_steps::proper_ancestors(path)
-                        .any(|ancestor| unshaped.contains(ancestor))
-                    {
-                        tracing::debug!(
-                            group_id,
-                            path = %path,
-                            "an ancestor did not take the shape its namespace requires in this \
-                             pass; not writing below it yet"
-                        );
-                        retry.insert(path.clone());
-                        continue;
-                    }
-                    // The namespace first: a path a live descendant needs
-                    // is a directory whatever its own heads say, and an
-                    // entry cannot take a name a directory holds.
-                    if !derived.contains_key(path) {
-                        match self
-                            .namespace_step(
-                                group_id,
-                                path,
-                                demand_of.get(path).map_or(path.as_str(), String::as_str),
-                                &inputs,
-                                winner,
-                                desired_of.get(path).cloned().flatten(),
-                                &derived,
-                                &settled,
-                                folded_leaves.contains(path),
-                                policy,
-                                prefetched.get(path.as_str()),
-                            )
-                            .await
-                        {
-                            Ok(None) => {}
-                            Ok(Some(MaterializeResult::Settled(evidence))) => {
-                                settled.insert(path.clone(), evidence);
-                                continue;
-                            }
-                            Ok(Some(MaterializeResult::RetryRequired)) => {
-                                unshaped.extend(
-                                    (!self.directory_on_disk(group_id, path)).then(|| path.clone()),
-                                );
-                                retry.insert(path.clone());
-                                continue;
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    group_id,
-                                    path = %path,
-                                    error = %e,
-                                    "failed to give a path the shape its namespace requires; \
-                                     leaving its change(s) unapplied for retry"
-                                );
-                                unshaped.extend(
-                                    (!self.directory_on_disk(group_id, path)).then(|| path.clone()),
-                                );
-                                retry.insert(path.clone());
-                                continue;
-                            }
-                        }
-                    }
-                    // A relocated file's copy is written unbatched: the
-                    // name it leaves becomes a directory later in this same
-                    // pass, and only once the copy is known to be in place.
-                    let relocated_copy = relocations.values().flatten().any(|copy| copy == path);
-                    // Best-effort, lock-free classification of this
-                    // path as an "ordinary" content upsert -- see `prepare_
-                    // ordinary_projected_upsert`'s own doc comment for
-                    // exactly what qualifies. A `None` (any hazard/symlink/
-                    // placeholder/content-identical/not-eager-admitted
-                    // shape, or a classification error) falls straight
-                    // through to the exact same unbatched `materialize_dag_
-                    // content_head` call this branch has always made --
-                    // nothing below this `if let` changes for that case.
-                    let prepare_result = if relocated_copy {
-                        Ok(None)
-                    } else {
-                        self.prepare_ordinary_projected_upsert(
-                            group_id,
-                            path,
-                            demand_of.get(path).map_or(path.as_str(), String::as_str),
-                            &inputs[winner],
-                            policy,
-                            derived.get(path),
-                            activity_provider.as_ref(),
-                            &reconcile_provenance_batch,
-                            call_timer,
-                        )
-                        .await
-                    };
-                    match prepare_result {
-                        Ok(Some((write_activity, prepared))) => {
-                            pending_batch.push(OrdinaryBatchItem::Upsert(
-                                write_activity,
-                                Box::new(prepared),
-                            ));
-                            continue;
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            tracing::debug!(
-                                group_id,
-                                path = %path,
-                                error = %e,
-                                "ordinary-upsert classification failed; falling back to \
-                                 the unbatched materialize path for this attempt"
-                            );
-                        }
-                    }
-                    let head_started = std::time::Instant::now();
-                    let head_result = self
-                        .materialize_dag_content_head(
-                            group_id,
-                            path,
-                            demand_of.get(path).map_or(path.as_str(), String::as_str),
-                            &inputs[winner],
-                            policy,
-                            derived.get(path),
-                            prefetched.get(path.as_str()),
-                        )
-                        .await;
-                    let head_elapsed = head_started.elapsed();
-                    if head_elapsed > std::time::Duration::from_secs(1) {
-                        tracing::warn!(
-                            group_id,
-                            path = %path,
-                            elapsed_ms = head_elapsed.as_millis(),
-                            "materialize_dag_content_head call took unusually long"
-                        );
-                    }
-                    match head_result {
-                        Ok(MaterializeResult::Settled(evidence)) => {
-                            settled.insert(path.clone(), evidence);
-                        }
-                        Ok(MaterializeResult::RetryRequired) => {
-                            retry.insert(path.clone());
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                group_id,
-                                path = %path,
-                                error = %e,
-                                "failed to project a path; leaving its change(s) unapplied for retry"
-                            );
-                            retry.insert(path.clone());
-                        }
-                    }
-                }
-            }
-        }
-        // Commit every path deferred into `pending_batch` above, in
-        // chunks of at most `ORDINARY_BATCH_MAX_PATHS` -- bounded the same
-        // way the Convergence Engine's own direct per-tick reconcile is,
-        // regardless of whether this call's own `paths` came from an 8-path
-        // engine call or a larger backstop window.
-        let (committed, failed) = self
-            .commit_pending_batch(group_id, origin_device_id, pending_batch, call_timer)
-            .await?;
-        settled.extend(committed);
-        retry.extend(failed);
-        // A directory whose delete ran before its last child's was retained
-        // and is never reconciled again on its own: re-examine the retained
-        // directories above every path this pass removed. No path lock is
-        // held here.
-        self.remove_emptied_retained_ancestors(
-            group_id,
-            settled
-                .iter()
-                .filter(|(_, evidence)| matches!(evidence, SettlementEvidence::ExactAbsent { .. }))
-                .map(|(path, _)| path),
-        )
-        .await;
-        // Every path examined above must land in exactly one of the two
-        // sets — see `ProjectionAttempt`'s own doc comment. This should be
-        // unreachable given the match above is exhaustive and every arm
-        // inserts into one set or the other; kept as a loud, visible signal
-        // (not a silent "treat as settled") in case a future edit
-        // reintroduces a branch that forgets to record an outcome.
-        for path in &paths {
-            if !settled.contains_key(path) && !retry.contains(path) {
-                tracing::error!(
-                    local_device_id = %self.local_device_id,
-                    group_id,
-                    audit_attempt_id,
-                    path = %path,
-                    "reconcile_group_paths examined a path but recorded neither settled nor retry \
-                     for it; treating as retry, never as an accidental success"
-                );
-                retry.insert(path.clone());
-            }
-        }
-        if !retry.is_empty() {
-            // Diagnostic-only: splits `retry` into direct (a raw seed path)
-            // vs. derived (a synthetic conflict-copy path), for diagnosing
-            // intermittently stalled obligations.
-            let retry_direct: Vec<&String> =
-                retry.iter().filter(|p| seed_paths.contains(*p)).collect();
-            let retry_derived: Vec<&String> =
-                retry.iter().filter(|p| !seed_paths.contains(*p)).collect();
-            tracing::debug!(
-                local_device_id = %self.local_device_id,
-                group_id,
-                audit_attempt_id,
-                retry_direct = ?retry_direct,
-                retry_derived = ?retry_derived,
-                "reconcile_group_paths finished with unresolved paths this attempt"
-            );
-        }
-        let materialize_elapsed = materialize_started.elapsed();
-        if materialize_elapsed > std::time::Duration::from_secs(1) {
-            tracing::warn!(
-                group_id,
-                audit_attempt_id,
-                elapsed_ms = materialize_elapsed.as_millis(),
-                path_count = paths.len(),
-                settled_count = settled.len(),
-                retry_count = retry.len(),
-                "reconcile_group_paths materialization loop took unusually long"
-            );
-        }
-        call_timer.finish(
-            group_id,
-            paths.len(),
-            settled.len(),
-            retry.len(),
-            call_started.elapsed(),
-        );
-        Ok(ProjectionAttempt { settled, retry })
-    }
-
-    /// Materializes one resolved content head at `target_path`: resolves its
-    /// version hash to the stored `FileVersion`, builds a `FileRecord` from the
-    /// version's block list/size/metadata, persists the record's kind/symlink/
-    /// exec metadata (so `materialize`'s symlink dispatch and metadata-only
-    /// fast path see it), then hands the record to `materialize`.
-    ///
-    /// The `FileVersion` records each block's content hash and real size
-    /// (canonical encoding v2), so the built `FileRecord`'s blocks carry real
-    /// sizes and prefix-sum offsets and block fetch validates by both size and
-    /// content hash before materialization.
-    // One argument per input of a head's projection; see `_under`.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn materialize_dag_content_head(
-        &self,
-        group_id: &str,
-        target_path: &str,
-        demand_path: &str,
-        head: &PathHead,
-        policy: MaterializationPolicy,
-        derived: Option<&PathHead>,
         satisfied: Option<&BlockRequirement>,
+        claim: Option<super::obligation_claims::PathClaim<'_>>,
     ) -> Result<MaterializeResult, PeerSessionError> {
-        self.materialize_dag_content_head_under(
+        if !matches!(
+            planned,
+            NativePlannedNode::Entry { .. } | NativePlannedNode::ExplicitDirectory { .. }
+        ) {
+            return Ok(MaterializeResult::RetryRequired);
+        }
+        self.materialize_head_under(
             group_id,
             target_path,
-            demand_path,
-            head,
+            &Election::Native { expected: planned },
             policy,
-            derived,
             satisfied,
+            claim,
             OwnCaptureRule::RecaptureFirst,
         )
         .await
     }
 
-    /// Captures what `target_path` holds now, for an own captured head the
-    /// disk has moved on from, and says whether that superseded `head`.
-    /// Called without the path lock, which capture takes itself.
+    /// [`Self::materialize_native_entry`] for a head the reconciler writes at a
+    /// name of its own choosing (see [`Election::NativeHold`]).
+    pub(crate) async fn materialize_native_hold(
+        &self,
+        group_id: &str,
+        hold_path: &str,
+        head: &NativeLocatedHead,
+        policy: MaterializationPolicy,
+    ) -> Result<MaterializeResult, PeerSessionError> {
+        self.materialize_head_under(
+            group_id,
+            hold_path,
+            &Election::NativeHold { head },
+            policy,
+            None,
+            // A hold is written at a name of the reconciler's own choosing,
+            // not at the claimed path.
+            None,
+            OwnCaptureRule::RecaptureFirst,
+        )
+        .await
+    }
+
+    /// The node native's plan puts at `target_path` now, when there is one.
+    pub(crate) fn native_planned_node(
+        &self,
+        group_id: &str,
+        target_path: &str,
+    ) -> Result<Option<NativePlannedNode>, PeerSessionError> {
+        // Only the node at the path: a directory of thousands of siblings is not re-planned for
+        // each of them. The plan is still computed now, from the database, under the caller's
+        // path lock.
+        self.state
+            .native_plan_node(group_id, target_path)
+            .map_err(crate::sync_error::SyncError::from)
+            .map_err(PeerSessionError::from)
+    }
+
+    /// The re-election under the path lock: the
+    /// plan is recomputed and `expected` is projected only when the plan still
+    /// puts exactly that node at `target_path`. A different node -- another
+    /// head, another placement, another source, so another demand and another
+    /// prefetch -- is not this call's to write; the next pass plans it whole.
+    fn elect_native_under_lock(
+        &self,
+        group_id: &str,
+        target_path: &str,
+        expected: &NativePlannedNode,
+    ) -> Result<Option<Head>, PeerSessionError> {
+        let fresh = self.native_planned_node(group_id, target_path)?;
+        if fresh.as_ref() != Some(expected) {
+            yadorilink_peer_session::dst_trace(target_path, || {
+                format!(
+                    "stale native materialize declined on {}: the plan no longer puts this node here",
+                    self.local_device_id
+                )
+            });
+            return Ok(None);
+        }
+        let (NativePlannedNode::Entry { head, .. } | NativePlannedNode::ExplicitDirectory { head }) =
+            expected
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Head::of_native(head)))
+    }
+
     async fn recapture_instead_of_projecting(
         &self,
         group_id: &str,
         target_path: &str,
-        head: &PathHead,
-        derived: Option<&PathHead>,
+        head: &Head,
+        election: &Election<'_>,
     ) -> Result<Recapture, PeerSessionError> {
         yadorilink_peer_session::dst_trace(target_path, || {
             format!(
                 "own capture {} not written back on {}: disk moved on, recapturing",
-                hex::encode(&head.change_hash[..4]),
+                head.short_identity(),
                 self.local_device_id,
             )
         });
@@ -2484,16 +964,20 @@ impl super::LocalConvergenceExecutor {
             );
             return Ok(Recapture::StillChanging);
         }
-        let fresh = self.combined_heads(group_id, target_path, derived)?;
-        let still_elected = matches!(
-            resolve_path_heads(target_path, &fresh),
-            PathResolution::Present { winner, .. } if fresh[winner].change_hash == head.change_hash
-        );
+        let still_elected = match election {
+            Election::Native { .. } | Election::NativeHold { .. } => {
+                matches!(
+                    self.native_planned_node(group_id, target_path)?,
+                    Some(NativePlannedNode::Entry { head: entry, .. } | NativePlannedNode::ExplicitDirectory { head: entry })
+                        if NativeRowIdentity::of(&entry) == head.identity
+                )
+            }
+        };
         if still_elected {
             tracing::warn!(
                 group_id,
                 path = target_path,
-                head = %hex::encode(&head.change_hash[..4]),
+                head = %head.short_identity(),
                 "disk no longer holds this device's own captured change, but capturing the path \
                  authored nothing newer: capture finds no local state it has not recorded"
             );
@@ -2513,37 +997,25 @@ impl super::LocalConvergenceExecutor {
     #[allow(clippy::too_many_arguments)]
     #[allow(
         clippy::too_many_lines,
-        reason = "one DAG head's projection, from version lookup through recapture to \
+        reason = "one native head's projection, from version lookup through recapture to \
               the proof, as a single ordered sequence sharing one permit"
     )]
-    async fn materialize_dag_content_head_under(
+    async fn materialize_head_under(
         &self,
         group_id: &str,
         target_path: &str,
-        demand_path: &str,
-        head: &PathHead,
+        election: &Election<'_>,
         policy: MaterializationPolicy,
-        derived: Option<&PathHead>,
         satisfied: Option<&BlockRequirement>,
+        claim: Option<super::obligation_claims::PathClaim<'_>>,
         own_capture_rule: OwnCaptureRule,
     ) -> Result<MaterializeResult, PeerSessionError> {
         let activity_provider = self.block_write_activity_provider();
         let _write_activity = activity_provider.begin_block_write_activity();
-        // A removing head (tombstone / move-away source) lands no content; only
-        // content heads reach here, but guard defensively. This reports
-        // `RetryRequired`, never `Settled` -- this branch verifies nothing
-        // about the path's actual state (no write, no fence observation), so
-        // it must not report a settlement the publication step could ever be asked to
-        // publish evidence for; a caller reaching here at all is already
-        // outside this function's own documented contract, and the safe
-        // response to an unexpected state is to defer, not to claim success.
-        let Some(_) = head.content.as_ref() else {
-            return Ok(MaterializeResult::RetryRequired);
-        };
         // Flush any same-path (and case-fold sibling) local edit still sitting
         // in this link's debounce accumulator *before* taking the path lock —
         // the same ordering the legacy reconcile relies on so a not-yet-indexed
-        // local write is captured (into the index and the DAG) rather than
+        // local write is captured (into the index and native state) rather than
         // silently overwritten by this materialize.
         let flush_started = std::time::Instant::now();
         let flushed = self.flush_local_changes_before_reconcile(group_id, target_path).await;
@@ -2567,7 +1039,7 @@ impl super::LocalConvergenceExecutor {
         // path does.
         let lock_wait_started = std::time::Instant::now();
         let path_lock = self.state.path_lock(group_id, target_path);
-        let _guard = path_lock.lock().await;
+        let _guard = crate::receive_diag::lock_path(&path_lock).await;
         let lock_wait_elapsed = lock_wait_started.elapsed();
         if flush_elapsed > std::time::Duration::from_secs(1)
             || lock_wait_elapsed > std::time::Duration::from_secs(1)
@@ -2580,7 +1052,7 @@ impl super::LocalConvergenceExecutor {
                 "materialize_dag_content_head flush/lock-wait took unusually long"
             );
         }
-        // CONV-7's freshness principle applied INSIDE the path lock: the
+        // The freshness principle applied INSIDE the path lock: the
         // resolution that elected `head` ran before this lock was acquired,
         // and a newer change for this path can land in between — most
         // dangerously this device's OWN local tombstone (a user deleting or
@@ -2593,7 +1065,7 @@ impl super::LocalConvergenceExecutor {
         // mesh chaos seed 1000005) as a deterministic terminal divergence:
         // the device that authored a rename's tombstone re-materialized the
         // pre-rename winner an instant later and kept, forever, a live file
-        // every peer had deleted, under byte-identical DAG heads. Re-resolve
+        // every peer had deleted, under byte-identical native heads. Re-resolve
         // under the lock (with the caller's derived-copy context, so a
         // fixpoint-derived conflict copy re-validates against the same
         // inputs that elected it) and decline a head that is no longer the
@@ -2601,63 +1073,23 @@ impl super::LocalConvergenceExecutor {
         // the path as settled on the strength of a write that did not
         // happen, and whichever change superseded `head` drives (or already
         // drove) the path's real projection through its own admission.
-        let fresh = self.combined_heads(group_id, target_path, derived)?;
-        let elected = self.namespace_winner(group_id, target_path, &fresh, derived.is_some())?;
-        let effective_head = match elected {
-            Some(winner) if fresh[winner].change_hash == head.change_hash => head.clone(),
-            Some(winner) => {
-                // The winner moved to a NEWER content head while this call
-                // waited for the lock. Rather than declining and paying a
-                // whole retry round-trip (decline → caller marks retry →
-                // next audit re-resolves → re-materializes — measurable
-                // churn under exactly the contention that produces these
-                // races), upgrade in place: this call already holds the
-                // path lock, so materializing the fresh winner here is the
-                // same write the retry would eventually perform, minus the
-                // window in which the path sits stale.
-                yadorilink_peer_session::dst_trace(target_path, || {
-                    format!(
-                        "stale materialize upgraded on {}: head {} superseded by winner {}",
-                        self.local_device_id,
-                        hex::encode(&head.change_hash[..4]),
-                        hex::encode(&fresh[winner].change_hash[..4]),
-                    )
-                });
-                tracing::debug!(
-                    local_device_id = %self.local_device_id,
-                    group_id,
-                    path = %target_path,
-                    stale_head = %hex::encode(&head.change_hash[..4]),
-                    fresh_head = %hex::encode(&fresh[winner].change_hash[..4]),
-                    "materialize upgraded under the path lock to the current winner"
-                );
-                fresh[winner].clone()
+        let projected = match election {
+            Election::Native { expected } => {
+                match self.elect_native_under_lock(group_id, target_path, expected)? {
+                    Some(projected) => projected,
+                    None => return Ok(MaterializeResult::RetryRequired),
+                }
             }
-            None => {
-                yadorilink_peer_session::dst_trace(target_path, || {
-                    format!(
-                        "stale materialize declined on {}: head {} is now fully removed",
-                        self.local_device_id,
-                        hex::encode(&head.change_hash[..4]),
-                    )
-                });
-                tracing::debug!(
-                    local_device_id = %self.local_device_id,
-                    group_id,
-                    path = %target_path,
-                    stale_head = %hex::encode(&head.change_hash[..4]),
-                    "declining a materialize whose path a newer tombstone removed before \
-                     the path lock was acquired"
-                );
-                return Ok(MaterializeResult::RetryRequired);
+            Election::NativeHold { head } => {
+                let planned = self.native_planned_node(group_id, head.source_path.as_str())?;
+                if !matches!(&planned, Some(NativePlannedNode::Entry { head: fresh, .. }) if fresh == *head)
+                {
+                    return Ok(MaterializeResult::RetryRequired);
+                }
+                Head::of_native(head)
             }
         };
-        // Same reclassification and reasoning as the analogous guard above:
-        // this branch verifies nothing about the path's actual state.
-        let Some(content) = effective_head.content.as_ref() else {
-            return Ok(MaterializeResult::RetryRequired);
-        };
-        let version_hash = VersionHash(content.version_hash);
+        let version_hash = projected.version_hash;
         let Some(version) = self.state.dag_get_file_version(group_id, &version_hash)? else {
             // Admission gated on the version being present, so this only
             // happens if it was pruned in between — skip; a later heads
@@ -2674,17 +1106,15 @@ impl super::LocalConvergenceExecutor {
             return Ok(MaterializeResult::RetryRequired);
         };
         let record = file_record_from_version(target_path, &version);
-        let meta = IncomingWireMeta {
+        let projected_authoring = Some(projected.authoring().clone());
+        let columns = yadorilink_replica_domain::session_state::LocalFileMetaColumns {
             record_kind: version.meta.record_kind,
             symlink_target: version.meta.symlink_target.clone(),
             // A version does not carry the out-of-root flag (it is advisory,
-            // never gated on); default it, matching a legacy record whose
-            // sender predates the field.
+            // never gated on), so it is recorded as false.
             symlink_out_of_root: false,
             unix_mode: version.meta.unix_mode,
             xattrs: version.meta.xattrs.clone(),
-            origin_device_id: Some(effective_head.device_id.clone()),
-            authoring_change_hash: Some(ChangeHash(effective_head.change_hash)),
         };
         // If this path already holds exactly this version's content, there is
         // nothing to fetch or rewrite. Skipping here matters beyond saving
@@ -2742,8 +1172,9 @@ impl super::LocalConvergenceExecutor {
                 group_id,
                 &record,
                 &reason,
-                &effective_head.device_id,
-                meta.authoring_change_hash.as_ref(),
+                &projected.device_id,
+                projected_authoring.as_ref(),
+                &columns,
                 &permit,
             )?;
             // Durable: `hold_record` upserts the incoming record with its
@@ -2831,12 +1262,8 @@ impl super::LocalConvergenceExecutor {
                 // over a newer local edit, which capture records as one. It
                 // is left to the recapture below, like a content change.
                 let own_capture = own_capture_rule == OwnCaptureRule::RecaptureFirst
-                    && effective_head.device_id == self.local_device_id
-                    && self.state.is_local_capture(
-                        group_id,
-                        target_path,
-                        &ChangeHash(effective_head.change_hash),
-                    )?;
+                    && projected.device_id == self.local_device_id
+                    && self.state.is_local_capture_head(group_id, target_path, &projected)?;
                 let content_matches = content_matches
                     && (!own_capture
                         || mode_and_xattrs_match_disk(
@@ -2849,35 +1276,26 @@ impl super::LocalConvergenceExecutor {
                     // describes -- equal to `version_hash` iff every column
                     // `FileVersion` identity covers (blocks/size/mtime/
                     // record_kind/symlink_target/unix_mode/xattrs) already
-                    // agrees. `authoring_change_hash`/`origin_device_id`/
+                    // agrees. The native authoring identity, `origin_device_id` and
                     // `symlink_out_of_root` are not part of that identity,
                     // so they need their own checks to rule out a truly
                     // no-op DB write.
                     let index_fully_matches = current.to_file_version().version_hash
                         == version_hash
-                        && self.state.get_authoring_change_hash(group_id, target_path)?
-                            == meta.authoring_change_hash
+                        && self.state.row_authoring(group_id, target_path)? == projected_authoring
                         && self.state.get_origin_device_id(group_id, target_path)?.as_deref()
-                            == Some(effective_head.device_id.as_str())
+                            == Some(projected.device_id.as_str())
                         && self.state.get_symlink_out_of_root(group_id, target_path)?
-                            == meta.symlink_out_of_root;
+                            == columns.symlink_out_of_root;
                     if !index_fully_matches {
-                        let columns =
-                            yadorilink_replica_domain::session_state::LocalFileMetaColumns {
-                                record_kind: meta.record_kind,
-                                symlink_target: meta.symlink_target.clone(),
-                                symlink_out_of_root: meta.symlink_out_of_root,
-                                unix_mode: meta.unix_mode,
-                                xattrs: meta.xattrs.clone(),
-                            };
                         let authority = self.root_lease_for(group_id)?;
                         let authority_op = authority.begin_operation()?;
                         let permit = authority_op.permit();
                         self.state.apply_projected_row_atomic(
                             group_id,
                             &record,
-                            &effective_head.device_id,
-                            meta.authoring_change_hash.as_ref(),
+                            &projected.device_id,
+                            projected_authoring.as_ref(),
                             &columns,
                             &permit,
                         )?;
@@ -3008,7 +1426,7 @@ impl super::LocalConvergenceExecutor {
             // which can lag behind an incoming remote materialize attempt
             // that runs in the meantime. Trusting a stale index here would
             // silently skip the real write, permanently leaving the wrong
-            // bytes on disk with the index and DAG both agreeing the path is
+            // bytes on disk with the index and native state both agreeing the path is
             // "done" — nothing else would ever re-examine it. Verify actual
             // disk bytes hash-match the winner's blocks before trusting this
             // fast path; skip the check only for record kinds with no
@@ -3026,18 +1444,18 @@ impl super::LocalConvergenceExecutor {
             if same_content {
                 // Content equality does not imply version equality: exec-bit,
                 // symlink, or mtime-only changes are part of FileVersion
-                // identity, so the DAG winner's metadata still has to be
+                // identity, so native state winner's metadata still has to be
                 // applied here. Returning without this step leaves replicas
                 // with the same bytes but permanently divergent permissions.
                 let metadata_record = record.clone();
                 let authority = self.root_lease_for(group_id)?;
                 let authority_op = authority.begin_operation()?;
                 let permit = authority_op.permit();
-                apply_incoming_wire_metadata(
+                apply_projected_metadata(
                     self.state.as_ref(),
                     group_id,
                     &metadata_record,
-                    &meta,
+                    &columns,
                     &permit,
                 )?;
                 // The version is already known here -- it came from the
@@ -3049,8 +1467,8 @@ impl super::LocalConvergenceExecutor {
                     &self.sync_root(group_id)?,
                     group_id,
                     &metadata_record,
-                    &effective_head.device_id,
-                    meta.authoring_change_hash.as_ref(),
+                    &projected.device_id,
+                    projected_authoring.as_ref(),
                     // The projection's own resolved version -- the same
                     // one this metadata came from.
                     &version,
@@ -3113,25 +1531,24 @@ impl super::LocalConvergenceExecutor {
         // make, so it waits for the watcher's own capture of it.
         let on_disk = match own_capture_rule {
             OwnCaptureRule::RecaptureFirst => {
-                self.own_capture_on_disk(group_id, target_path, &effective_head, &version)?
+                self.own_capture_on_disk(group_id, target_path, &projected, &version)?
             }
             OwnCaptureRule::ProjectAsBefore => OwnCaptureOnDisk::NotACapture,
         };
         if on_disk.superseded() {
             drop(_guard);
             return match self
-                .recapture_instead_of_projecting(group_id, target_path, &effective_head, derived)
+                .recapture_instead_of_projecting(group_id, target_path, &projected, election)
                 .await?
             {
                 Recapture::NothingNewer if on_disk != OwnCaptureOnDisk::Removed => {
-                    Box::pin(self.materialize_dag_content_head_under(
+                    Box::pin(self.materialize_head_under(
                         group_id,
                         target_path,
-                        demand_path,
-                        head,
+                        election,
                         policy,
-                        derived,
                         satisfied,
+                        claim,
                         OwnCaptureRule::ProjectAsBefore,
                     ))
                     .await
@@ -3139,11 +1556,68 @@ impl super::LocalConvergenceExecutor {
                 _ => Ok(MaterializeResult::RetryRequired),
             };
         }
+        // The target as it is before the metadata step, which may wait for a
+        // batch with the path lock held: the write's baseline (see
+        // `eager::PRE_STEP_BASELINE`).
+        let pre_step_baseline = self.observe_target_baseline(group_id, target_path)?;
         {
             let authority = self.root_lease_for(group_id)?;
             let authority_op = authority.begin_operation()?;
             let permit = authority_op.permit();
-            apply_incoming_wire_metadata(self.state.as_ref(), group_id, &record, &meta, &permit)?;
+            match super::completion_window::current_for_metadata() {
+                // Queued with the run's other files and applied with them in
+                // one transaction. This future keeps the path lock taken
+                // above and its root operation until the outcome comes back:
+                // for a path that already has a row, the row's mode and
+                // xattrs change under the queued item, and only the lock keeps
+                // a capture from authoring the disk's old ones as a local edit
+                // in the meantime. The apply therefore never runs before the
+                // lock, and never for a file that no longer holds it.
+                Some(participant) => {
+                    participant
+                        .submit_metadata(
+                            &self.state,
+                            crate::replica_coordinator::MetadataApplyItem {
+                                group_id: group_id.to_owned(),
+                                path: record.path.clone(),
+                                columns: columns.clone(),
+                                root_check: permit.owned_check(),
+                            },
+                        )
+                        .await?;
+                }
+                None => {
+                    apply_projected_metadata(
+                        self.state.as_ref(),
+                        group_id,
+                        &record,
+                        &columns,
+                        &permit,
+                    )?;
+                }
+            }
+            // The user may have edited the file's mode or xattrs while the
+            // step waited (the path lock only keeps out this daemon's own
+            // writers). The write must not replace that edit: the observation
+            // and the dirty mark are compared with those taken BEFORE the
+            // step, here, still under the lock. The file is retried once the
+            // lock is free, after the capture of the edit.
+            let after = self.observe_target_baseline(group_id, target_path)?;
+            if pre_step_baseline.moved_by_someone_else(&after) {
+                self.state.journal_uncaptured_local_edit(
+                    group_id,
+                    target_path,
+                    after.exists(),
+                    &permit,
+                )?;
+                tracing::info!(
+                    group_id,
+                    path = %target_path,
+                    "the target changed on disk while its metadata step waited; leaving it for \
+                     retry so the local edit is captured first"
+                );
+                return Ok(MaterializeResult::RetryRequired);
+            }
         }
         // Return `materialize`'s own result unchanged: it reports
         // `RetryRequired` for every "not done yet" shape (blocks not
@@ -3171,63 +1645,23 @@ impl super::LocalConvergenceExecutor {
         // the record above is derived from it. Nothing here reads the row
         // to find out what is being written.
         let payload = MaterializationPayload::from_version(target_path, version.clone());
-        match self
-            .materialize_local(
+        match Self::with_pre_step_baseline(
+            target_path,
+            pre_step_baseline,
+            self.materialize_local(
                 group_id,
                 &payload,
-                demand_path,
                 policy,
-                &effective_head.device_id,
-                meta.authoring_change_hash.as_ref(),
+                &projected.device_id,
+                projected_authoring.as_ref(),
                 satisfied,
-            )
-            .await?
+                claim,
+            ),
+        )
+        .await?
         {
             LocalMaterializeOutcome::Concluded(result) => Ok(result),
             LocalMaterializeOutcome::NeedBlocks(_) => Ok(MaterializeResult::RetryRequired),
         }
-    }
-}
-
-/// Whether an error from one ordinary-batch path's post-rename finish
-/// belongs to that path alone, so the batch may retry that path and
-/// finalize the rest: its file could not be opened, chmodded or observed
-/// (`apply_unix_mode`/`apply_xattrs` fail as `Storage`), it does not
-/// hold the xattrs or the kind its version claims, or its existing file is
-/// not readable by its owner.
-/// Everything else aborts the batch: `CorruptState` (a database or
-/// invariant failure), disk pressure, a lost root, a transport or engine
-/// error -- and also the bare `Io` and `NotFound`, which is how a SQLite
-/// I/O or not-found error arrives here, so they cannot be told from a
-/// database failure.
-///
-/// `PathEscapesRoot` is batch-wide too. `sync_root` reports a group with
-/// no live link that way, and a storage-level escape is converted into the
-/// same variant, so a lost root cannot be told from one escaping path;
-/// treating it as path-local would retry every path in turn while the rest
-/// of the batch finalized against a root that is gone.
-fn ordinary_batch_error_is_path_local(error: &PeerSessionError) -> bool {
-    use yadorilink_local_storage::StorageError as S;
-    match error {
-        PeerSessionError::ReplicatedXattrsNotExact(_)
-        | PeerSessionError::PhysicalKindMismatch(_)
-        | PeerSessionError::MetadataUnprovable(_) => true,
-        PeerSessionError::Storage(storage) => {
-            matches!(storage, S::Io(_) | S::InvalidPath(_) | S::PathEscapesRoot(_))
-        }
-        PeerSessionError::PathEscapesRoot(_)
-        | PeerSessionError::Io(_)
-        | PeerSessionError::NotFound(_)
-        | PeerSessionError::CorruptState(_)
-        | PeerSessionError::InvalidInput(_)
-        | PeerSessionError::HydrationFailed(_)
-        | PeerSessionError::ReservedNamespaceCollision(_)
-        | PeerSessionError::NonPortablePath(_)
-        | PeerSessionError::DiskPressure { .. }
-        | PeerSessionError::Hex(_)
-        | PeerSessionError::Transport(_)
-        | PeerSessionError::RootAuthority(_)
-        | PeerSessionError::ReplicaEngine(_)
-        | PeerSessionError::Decode(_) => false,
     }
 }

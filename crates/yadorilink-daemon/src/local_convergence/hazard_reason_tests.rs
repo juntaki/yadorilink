@@ -140,6 +140,7 @@ fn hold_record_upserts_and_marks_held_without_touching_disk() {
         "invalid_name: reserved device name 'CON'",
         "device-a",
         None,
+        &plain_file_columns(),
         &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
     )
     .unwrap();
@@ -157,11 +158,11 @@ fn hold_record_upserts_and_marks_held_without_touching_disk() {
 
 /// Reachable on every platform (not
 /// just via Windows symlink policy): a brand-new held row is left at
-/// `materialization_state`'s schema default of `Hydrated`, even though
+/// `materialization_state`'s schema default of `Present`, even though
 /// nothing is ever written to disk for it (the assertion just above --
 /// `!root.path().join("CON.txt").exists()` -- is unconditionally true
 /// for every held record, by this function's own contract). A
-/// `Hydrated` row with nothing on disk and no materialization intent is
+/// `Present` row with nothing on disk and no materialization intent is
 /// exactly what the periodic repair sweep reads as an offline deletion,
 /// and the always-running dirty-journal redrive turns that into a real,
 /// signed, group-wide propagating tombstone Change for a path that was
@@ -179,13 +180,14 @@ fn hold_record_demotes_to_placeholder_so_repair_never_reads_it_as_an_offline_del
         "invalid_name: reserved device name 'CON'",
         "device-a",
         None,
+        &plain_file_columns(),
         &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
     )
     .unwrap();
 
     assert_eq!(
         state.get_materialization_state("group-1", "CON.txt").unwrap(),
-        Some(yadorilink_replica_domain::session_state::MaterializationState::Placeholder),
+        Some(yadorilink_replica_domain::session_state::MaterializationState::Remote),
         "a held row must never be left at the schema-default Hydrated state"
     );
 }
@@ -234,6 +236,7 @@ fn hold_record_never_writes_under_any_alternate_name() {
         &reason,
         "device-a",
         None,
+        &plain_file_columns(),
         &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
     )
     .unwrap();
@@ -249,4 +252,14 @@ fn hold_record_never_writes_under_any_alternate_name() {
         "no alternate/renamed variant of the held file may ever appear on disk"
     );
     assert_eq!(std::fs::read(root.path().join("Photo.jpg")).unwrap(), b"original");
+}
+
+fn plain_file_columns() -> yadorilink_replica_domain::session_state::LocalFileMetaColumns {
+    yadorilink_replica_domain::session_state::LocalFileMetaColumns {
+        record_kind: yadorilink_replica_domain::file::RecordKind::File,
+        symlink_target: None,
+        symlink_out_of_root: false,
+        unix_mode: None,
+        xattrs: Vec::new(),
+    }
 }

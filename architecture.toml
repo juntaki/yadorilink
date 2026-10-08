@@ -90,7 +90,9 @@ crates = [
   "yadorilink-replica-domain",
   "yadorilink-root-authority",
   "yadorilink-replica-engine",
-  "yadorilink-rbsr",
+  "yadorilink-dcf-kernel",
+  "yadorilink-namespace",
+  "yadorilink-dcf-oracle",
 ]
 
 [layer.platform]
@@ -213,11 +215,27 @@ so it can be reasoned about and tested without a runtime.
 """
 workspace_dependencies = ["yadorilink-replica-domain"]
 
-[crate."yadorilink-rbsr"]
+[crate."yadorilink-dcf-kernel"]
 reason = """
-Range-based set reconciliation is a pure algorithm over an identifier set. It
-depends on no workspace crate, so the protocol above it can be tested against
-it without any runtime or replica state.
+Research asset: the transition, join and author-side rules of signed
+per-path bases, generic over the change type. Pure and dependency-free. No
+production crate depends on it; it is kept as the reference the native
+causal state was derived from.
+"""
+workspace_dependencies = []
+
+[crate."yadorilink-namespace"]
+reason = """
+The authenticated namespace trie and its node digests. Pure over a caller's
+node store; it reads only the identity types of the domain model.
+"""
+workspace_dependencies = ["yadorilink-replica-domain"]
+
+[crate."yadorilink-dcf-oracle"]
+reason = """
+Research asset: a reference oracle the native causal state's differential
+tests compare against. It depends on no workspace crate, so it cannot share
+a bug with the code it checks. Test-only: no production crate depends on it.
 """
 workspace_dependencies = []
 
@@ -251,15 +269,14 @@ Reconciliation and bundle transfer over the reconciliation algorithm only. It
 knows neither the substrate that carries its bytes nor the replica it
 reconciles.
 """
-workspace_dependencies = ["yadorilink-rbsr"]
+workspace_dependencies = []
 
 [crate."yadorilink-sync-runtime"]
 reason = """
-Where the substrate and the protocol meet: one reconciliation per peer and
-group. It composes exactly those two and the algorithm beneath them.
+Where the substrate and the protocol meet: it owns the endpoint, dials peers and
+routes inbound lane streams. It composes exactly those two.
 """
 workspace_dependencies = [
-  "yadorilink-rbsr",
   "yadorilink-sync-protocol",
   "yadorilink-sync-substrate",
 ]
@@ -301,6 +318,7 @@ codec: persistence is driven by those, never the reverse.
 """
 workspace_dependencies = [
   "yadorilink-local-storage",
+  "yadorilink-namespace",
   "yadorilink-replica-domain",
   "yadorilink-replica-engine",
   "yadorilink-root-authority",
@@ -684,8 +702,6 @@ keeps it out of three files it used to live in.
 [[forbidden_symbol]]
 name = "turmoil_scenarios_own_no_legacy_transport"
 paths = [
-  "crates/yadorilink-daemon/src/sync_adapter/turmoil_partition_tests.rs",
-  "crates/yadorilink-daemon/tests/dst_turmoil_stack_case.rs",
   "crates/yadorilink-daemon/tests/dst_turmoil_substrate_case.rs",
 ]
 symbols = [

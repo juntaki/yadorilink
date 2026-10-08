@@ -10,6 +10,10 @@ options:
 packages:
   YadoriLinkUI:
     path: ../YadoriLinkApp/Packages/YadoriLinkUI
+  # The File Provider extension's logic without the framework: the daemon's version token, the
+  # provider-root client and the operation log (`swift test` in that directory).
+  FileProviderCore:
+    path: ../FileProviderCore
 
 settings:
   base:
@@ -54,18 +58,15 @@ targets:
       - path: ../YadoriLinkApp/App
         excludes:
           - Info.plist
-      - path: HostApp/DomainRegistration.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.juntaki.yadorilink
         INFOPLIST_FILE: ../YadoriLinkApp/App/Info.plist
         PRODUCT_NAME: YadoriLink
         SWIFT_VERSION: "6.0"
-        # HostApp/DomainRegistration.swift needs the
-        # fileprovider-core FFI (yadorilink_fp_list_on_demand_folders) to
-        # discover which OnDemand folder groups to register as File
-        # Provider domains, and the FileProvider.framework for
-        # NSFileProviderManager/NSFileProviderDomain themselves.
+        # ProviderHostService needs the fileprovider-core FFI (the provider
+        # folder list and the persistent host connection) and the
+        # FileProvider.framework for NSFileProviderManager/NSFileProviderDomain.
         SWIFT_OBJC_BRIDGING_HEADER: HostApp/YadoriLinkFinderSyncHost-Bridging-Header.h
         # The live client imports YadoriLinkFFI, whose generated Swift
         # imports the C modules declared here.
@@ -105,6 +106,7 @@ targets:
         embed: true
       - package: YadoriLinkUI
         product: YadoriLinkUI
+      - package: FileProviderCore
       - package: YadoriLinkUI
         product: YadoriLinkModel
       - package: YadoriLinkUI
@@ -164,9 +166,6 @@ targets:
     sources:
       - path: ../YadoriLinkApp/Tests/YadoriLinkAppTests
       - path: ../YadoriLinkApp/App/Live
-      # The File Provider extension's pure catalog tree (Foundation only),
-      # compiled in directly so its tests run without the extension.
-      - path: ../YadoriLinkFileProvider/Extension/FileProviderCatalogTree.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.juntaki.yadorilink.apptests
@@ -240,11 +239,12 @@ targets:
       # fileprovider-core's own sibling-of-core layout. All paths below
       # are relative to this project.yml's location, per xcodegen's
       # convention.
-      - path: ../YadoriLinkFileProvider/Extension/FileProviderCatalogTree.swift
-      - path: ../YadoriLinkFileProvider/Extension/FileProviderModel.swift
-      - path: ../YadoriLinkFileProvider/Extension/FileProviderItem.swift
-      - path: ../YadoriLinkFileProvider/Extension/FileProviderEnumerator.swift
       - path: ../YadoriLinkFileProvider/Extension/FileProviderExtension.swift
+      - path: ../YadoriLinkFileProvider/Extension/ProviderEnumerators.swift
+      - path: ../YadoriLinkFileProvider/Extension/ProviderItem.swift
+      - path: ../YadoriLinkFileProvider/Extension/ProviderTransport.swift
+    dependencies:
+      - package: FileProviderCore
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.juntaki.yadorilink.FileProvider

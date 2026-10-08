@@ -174,18 +174,17 @@ async fn demoting_setup(server: &MockServer) -> (Daemon, Daemon, std::path::Path
     // write/settle/compensate ordering) -- none of them are about the
     // on-demand pipeline's own real-vs-fake state, so unconditionally
     // connect the fake here rather than per test. See `DaemonState::
-    // set_test_placeholder_pipeline_connected`'s own doc comment for why a
+    // set_test_on_demand_allowed`'s own doc comment for why a
     // daemon integration test needs this instead of the production probe
     // (unconditionally `false`) or the free function's thread-local
-    // `OverrideForTest` (unreliable across this multi-threaded runtime).
-    b.state.set_test_placeholder_pipeline_connected(true);
+    // a thread-local override (unreliable across this multi-threaded runtime).
+    b.state.set_test_on_demand_allowed(true);
 
     let content = b"the file device-a confirms holding";
     let hash = a.state.block_store.put(content).unwrap();
     a.state
         .replica_coordinator
-        .change_history_repository()
-        .record_group_block_provenance(GROUP, &[hex::decode(hash.as_str()).unwrap()])
+        .record_block_provenance(GROUP, &[hex::decode(hash.as_str()).unwrap()])
         .unwrap();
     b.state.block_store.put(content).unwrap();
     let bytes = hex::decode(hash.as_str()).unwrap();
@@ -198,8 +197,7 @@ async fn demoting_setup(server: &MockServer) -> (Daemon, Daemon, std::path::Path
     // lease is ever issued, regardless of the mocked Worker endpoint below.
     b.state
         .replica_coordinator
-        .change_history_repository()
-        .record_group_block_provenance(GROUP, std::slice::from_ref(&bytes))
+        .record_block_provenance(GROUP, std::slice::from_ref(&bytes))
         .unwrap();
     let record = record_referencing("only.bin", "device-b", bytes, content.len() as u64);
     a.state

@@ -108,8 +108,7 @@ fn give_file(daemon: &Daemon, file_name: &str, content: &[u8], author: &str) {
     daemon
         .state
         .replica_coordinator
-        .change_history_repository()
-        .record_group_block_provenance(GROUP, std::slice::from_ref(&bytes))
+        .record_block_provenance(GROUP, std::slice::from_ref(&bytes))
         .unwrap();
     let record = record_referencing(file_name, author, bytes, content.len() as u64);
     daemon

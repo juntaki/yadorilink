@@ -34,7 +34,7 @@
 //!
 //! # The invariant this type must not break
 //!
-//! **No `FileRecord` and no DAG `Change` may become authoritative before
+//! **No `FileRecord` and no native delta may become authoritative before
 //! every block it references is durable.** Staging is what makes that
 //! violable — a staged block is not durable, and the record describing it
 //! is sitting in the scan's `prepared` set looking exactly as ready to

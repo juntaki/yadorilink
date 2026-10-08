@@ -27,7 +27,7 @@
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSHumanReadableCopyright</key>
-	<string>MIT OR Apache-2.0</string>
+	<string>Copyright © 2026 Jumpei Takiyasu</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 </dict>

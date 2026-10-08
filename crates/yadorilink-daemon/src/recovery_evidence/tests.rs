@@ -392,6 +392,45 @@ async fn membership_lookup_a_committed_revoke_is_found_with_its_full_request() {
     assert_eq!(record.request.groups[0].group_id, "group-1");
 }
 
+/// An approved removal that has not finished is reported as `removal-pending`:
+/// neither a final outcome nor an unknown status. It stays unresolved
+/// (`Unavailable`), in its own category, so the caller retries the same
+/// operation id instead of reading it as rejected or as a newer Worker.
+#[tokio::test]
+async fn membership_lookup_a_removal_pending_status_is_unavailable_pending() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/devices/membership-operations/op-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "operationId": "op-1",
+            "status": "removal-pending",
+            "action": "remove-device",
+            "removedDeviceId": "device-a",
+            "requestFingerprint": "fp-1",
+            "request": {
+                "userId": "user-1",
+                "action": "remove-device",
+                "removedDeviceId": "device-a",
+                "mode": "plain",
+                "groups": [],
+            },
+            "result": null,
+            "rejectionCode": null,
+            "rejectionDetail": null,
+        })))
+        .mount(&server)
+        .await;
+    let addr = server.uri();
+    let auth = test_auth();
+    let source = WorkerEvidenceSource::new(&addr, &auth);
+
+    let evidence = source.lookup_membership(&key(RecoveryDomain::Membership, "op-1")).await;
+    assert!(matches!(
+        evidence,
+        RemoteEvidence::Unavailable { category: RemoteEvidenceErrorCategory::Pending }
+    ));
+}
+
 #[tokio::test]
 async fn role_loss_lookup_a_404_is_record_not_found() {
     let server = MockServer::start().await;

@@ -113,18 +113,6 @@ impl BackoffConfig {
     pub const UPDATE_CHECK_RETRY: BackoffConfig =
         BackoffConfig { initial: Duration::from_secs(60), max: Duration::from_secs(3600) };
 
-    /// Backoff for a `(peer, group)` reconciliation pair whose last attempt
-    /// failed — see `sync_adapter::driver::PairBackoff`'s own doc comment
-    /// for the abandoned-full-replica-group scenario this exists to stop
-    /// from starving a healthy pair sharing the same bounded concurrency.
-    /// Long max on purpose: a pair this stale is not expected to start
-    /// working again on any short timescale, and a genuine reason to try
-    /// sooner (a local edit, a fresh netmap grant) reaches the pump through
-    /// `Wake::Group`/`Wake::Peer`/`Wake::PeerGroup`, which bypass this
-    /// backoff entirely rather than waiting it out.
-    pub const DEAD_RECONCILIATION_PAIR: BackoffConfig =
-        BackoffConfig { initial: Duration::from_secs(30), max: Duration::from_secs(600) };
-
     /// Made `pub` (was private, used only by `spawn_restarting` below) so
     /// `daemon_state`'s Degraded-link re-check scheduling can reuse this
     /// exact doubling+jitter+cap schedule instead of a second, independent
@@ -190,10 +178,15 @@ where
     F: Fn() -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let mut attempt: u32 = 0;
         loop {
-            let result = tokio::spawn(make_task()).await;
+            let mut running = tokio::spawn(make_task());
+            // Aborting the supervisor must stop the task it supervises too;
+            // a detached inner task would keep running with nothing left to
+            // restart or stop it.
+            let _stop_with_supervisor = AbortOnDrop(running.abort_handle());
+            let result = (&mut running).await;
             match result {
                 Ok(()) => {
                     tracing::warn!(task = name, attempt, "supervised task exited; restarting");
@@ -214,7 +207,47 @@ where
             tokio::time::sleep(delay).await;
             attempt = attempt.saturating_add(1);
         }
-    })
+    });
+    register_spawned(&handle);
+    handle
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static SPAWN_SINK: std::cell::RefCell<Option<Vec<tokio::task::AbortHandle>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` and returns what it returned with an abort handle for every
+/// supervised task it spawned on this thread. A harness that replaces a
+/// `DaemonState` over the same database uses it to stop the old state's
+/// background tasks, which otherwise run on for as long as they hold it.
+#[cfg(any(test, feature = "test-support"))]
+pub fn collect_spawned_tasks<R>(f: impl FnOnce() -> R) -> (R, Vec<tokio::task::AbortHandle>) {
+    SPAWN_SINK.with(|sink| *sink.borrow_mut() = Some(Vec::new()));
+    let result = f();
+    let handles = SPAWN_SINK.with(|sink| sink.borrow_mut().take()).unwrap_or_default();
+    (result, handles)
+}
+
+fn register_spawned(handle: &JoinHandle<()>) {
+    #[cfg(any(test, feature = "test-support"))]
+    SPAWN_SINK.with(|sink| {
+        if let Some(handles) = sink.borrow_mut().as_mut() {
+            handles.push(handle.abort_handle());
+        }
+    });
+    #[cfg(not(any(test, feature = "test-support")))]
+    let _ = handle;
+}
+
+/// Aborts the task behind `0` when dropped.
+pub(crate) struct AbortOnDrop(pub(crate) tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Spawns a one-shot essential task: logs at `error` if it exits with an
@@ -229,12 +262,14 @@ pub fn spawn_logged<Fut>(name: &'static str, task: Fut) -> JoinHandle<()>
 where
     Fut: Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + 'static,
 {
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         match task.await {
             Ok(()) => tracing::warn!(task = name, "essential task exited"),
             Err(e) => tracing::error!(task = name, error = %e, "essential task failed"),
         }
-    })
+    });
+    register_spawned(&handle);
+    handle
 }
 
 /// Spawns a task that is MEANT to finish: a one-shot job fired by some

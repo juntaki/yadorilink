@@ -14,6 +14,7 @@ pub(crate) use enrollment_recovery_service::EnrollmentRecoveryService;
 pub(crate) use enrollment_service::{
     AcceptInviteCommand, CreateAndLinkCommand, EnrollmentError, EnrollmentKind,
     EnrollmentLinkError, EnrollmentOutcome, EnrollmentService, JoinAndLinkCommand,
+    ProviderCreation,
 };
 #[allow(unused_imports)]
 pub(crate) use link_lifecycle_service::LinkLifecycleService;

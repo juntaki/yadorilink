@@ -256,6 +256,29 @@ async fn raw_offer(
     grant_id: &str,
     grant_nonce: &str,
 ) -> SendManifestAck {
+    raw_offer_manifest(
+        dialer,
+        target,
+        SendManifest {
+            transfer_id: transfer_id.to_string(),
+            files: vec![],
+            total_size: 0,
+            offered_at_unix_nanos: 0,
+        },
+        grant_id,
+        grant_nonce,
+    )
+    .await
+}
+
+/// [`raw_offer`] presenting the given manifest as it stands.
+async fn raw_offer_manifest(
+    dialer: &TestEndpoint,
+    target: &TestEndpoint,
+    manifest: SendManifest,
+    grant_id: &str,
+    grant_nonce: &str,
+) -> SendManifestAck {
     let connection =
         dialer.node.connect_track_send(&target.resolved("target").address()).await.expect(
             "a Track Send dial completes -- transport-layer admission is not this test's \
@@ -265,12 +288,7 @@ async fn raw_offer(
     write_message(
         &mut send,
         &SendEnvelope {
-            payload: Some(send_envelope::Payload::Manifest(SendManifest {
-                transfer_id: transfer_id.to_string(),
-                files: vec![],
-                total_size: 0,
-                offered_at_unix_nanos: 0,
-            })),
+            payload: Some(send_envelope::Payload::Manifest(manifest)),
             grant_id: grant_id.to_string(),
             grant_nonce: grant_nonce.to_string(),
         },
@@ -938,4 +956,61 @@ async fn a_receiver_can_pull_immediately_after_accepting_the_offer() {
     let outcome = racer.await.expect("the racing pull task must not panic");
     assert_eq!(outcome.bytes_received, content.len() as u64);
     assert_eq!(outcome.files_received, vec!["race.txt".to_string()]);
+}
+
+/// A granted sender's manifest is still its own claim: one whose chunk size or
+/// totals do not add up is rejected before it is recorded, so the pull never
+/// sizes an allocation (a 4 GiB chunk) from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_granted_offer_with_an_inconsistent_manifest_is_rejected_and_not_recorded() {
+    let dialer = raw_endpoint().await;
+    let acceptor = raw_endpoint().await;
+    acceptor.admit(dialer.key);
+
+    let grants = Arc::new(FakeGrantStore::default());
+    let directory: Arc<dyn DeviceDirectory> = Arc::new(TestDirectory {
+        grants: Some(grants.clone()),
+        device_labels: HashMap::from([(dialer.key, "sender-device".to_string())]),
+    });
+    let (service, _dir_guard) = serving_service(&acceptor, directory);
+
+    let entry = |chunk_size: u32, size: u64, hashes: usize| SendFileEntry {
+        relative_path: "f.bin".into(),
+        size,
+        chunk_size,
+        chunk_hashes: vec![vec![7u8; 32]; hashes],
+    };
+    let manifest = |entry: SendFileEntry, total: u64| SendManifest {
+        transfer_id: format!("bad-{}", entry.chunk_size),
+        files: vec![entry],
+        total_size: total,
+        offered_at_unix_nanos: 0,
+    };
+    let mut bad_hash = entry(1024, 2048, 2);
+    bad_hash.chunk_hashes[1] = vec![1u8; 5];
+    let cases = [
+        manifest(entry(u32::MAX, u64::from(u32::MAX), 1), u64::from(u32::MAX)),
+        manifest(entry(0, 10, 1), 10),
+        manifest(entry(1024, 2048, 3), 2048),
+        manifest(bad_hash, 2048),
+        manifest(entry(1024, 2048, 2), 1),
+    ];
+    for (n, case) in cases.into_iter().enumerate() {
+        let (grant_id, nonce) = (format!("grant-{n}"), format!("nonce-{n}"));
+        grants.issue(&grant_id, &nonce, dialer.key);
+        let ack = raw_offer_manifest(&dialer, &acceptor, case, &grant_id, &nonce).await;
+        assert!(!ack.accepted, "case {n} must be rejected");
+        assert!(!ack.reason.is_empty());
+    }
+    assert!(service.list_inbox().unwrap().is_empty(), "a rejected manifest leaves no trace");
+
+    grants.issue("grant-ok", "nonce-ok", dialer.key);
+    let good = SendManifest {
+        transfer_id: "good".into(),
+        files: vec![entry(1024, 2048, 2)],
+        total_size: 2048,
+        offered_at_unix_nanos: 0,
+    };
+    let ack = raw_offer_manifest(&dialer, &acceptor, good, "grant-ok", "nonce-ok").await;
+    assert!(ack.accepted, "a consistent manifest is still accepted: {}", ack.reason);
 }

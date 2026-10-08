@@ -62,6 +62,27 @@ async fn daemon_bundle_redacts_a_real_linked_folder_path() {
     assert!(resp.bundle_json.contains("link:001"));
 }
 
+/// The bundle's link paths are opaque tokens, never redacted-but-partial
+/// real paths: a folder name that survives pattern redaction (spaces, an
+/// unusual root) must not reach a support engineer.
+#[tokio::test]
+async fn daemon_bundle_replaces_link_paths_with_opaque_tokens() {
+    let state = test_state();
+    state
+        .replica_coordinator
+        .link_repository()
+        .add_link("/Volumes/Work Drive/Acme Merger/Tax Returns", "group-a")
+        .unwrap();
+
+    let resp = build_bundle(&test_bundle_service(&state)).await;
+
+    for leaked in ["Volumes", "Work", "Acme", "Merger", "Tax", "Returns"] {
+        assert!(!resp.bundle_json.contains(leaked), "{leaked} leaked into the bundle");
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&resp.bundle_json).unwrap();
+    assert_eq!(parsed["links"][0]["path"], "path:001");
+}
+
 /// Bundle generation is bounded -- even if the underlying
 /// sub-collection work is stuck (simulated here with a `thread::sleep`
 /// well longer than the timeout, standing in for e.g. an unexpectedly

@@ -79,7 +79,12 @@ impl ControlClient {
                 .security_qos_flags(SECURITY_IDENTIFICATION)
                 .open(&self.pipe_name)
             {
-                Ok(client) => return Ok(client),
+                Ok(client) => {
+                    // Any local user can create this pipe first; only talk to the
+                    // daemon running as this user.
+                    yadorilink_ipc_proto::pipe_peer::verify_pipe_server_is_current_user(&client)?;
+                    return Ok(client);
+                }
                 Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) && attempt < MAX_ATTEMPTS => {
                     attempt += 1;
                     tokio::time::sleep(RETRY_DELAY).await;

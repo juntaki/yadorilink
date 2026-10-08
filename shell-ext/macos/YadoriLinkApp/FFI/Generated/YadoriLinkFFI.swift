@@ -627,6 +627,8 @@ public protocol ClientCoreProtocol: AnyObject, Sendable {
     
     func createGroupAndLink(groupName: String, localPath: String, mode: FolderMode, acknowledgeRisks: Bool) async throws  -> LinkOutcome
     
+    func createProviderFolder(groupName: String, displayName: String, mode: FolderMode) async throws  -> ProviderFolderOutcome
+    
     func denyRequest(groupId: String, deviceId: String) async throws  -> MembershipOutcome
     
     func evictFile(absolutePath: String) async throws  -> EvictOutcome
@@ -649,6 +651,8 @@ public protocol ClientCoreProtocol: AnyObject, Sendable {
     func installUpdate() async throws  -> UpdateInstallOutcome
     
     func joinGroupAndLink(groupId: String, groupName: String, localPath: String, mode: FolderMode, acknowledgeRisks: Bool) async throws  -> LinkOutcome
+    
+    func joinProviderFolder(groupId: String, groupName: String, displayName: String, mode: FolderMode) async throws  -> ProviderFolderOutcome
     
     func linkFolder(localPath: String, groupId: String, mode: FolderMode, acknowledgeRisks: Bool) async throws  -> LinkOutcome
     
@@ -686,8 +690,6 @@ public protocol ClientCoreProtocol: AnyObject, Sendable {
     func pauseAll() async throws 
     
     func pauseFolder(localPath: String) async throws 
-    
-    func pinFile(absolutePath: String) async throws 
     
     func receiveTransfer(transferId: String, destinationDir: String?) async throws  -> ReceivedTransfer
     
@@ -735,8 +737,6 @@ public protocol ClientCoreProtocol: AnyObject, Sendable {
     func stopDaemon() async throws 
     
     func unlinkFolder(localPath: String, force: Bool) async throws  -> UnlinkOutcome
-    
-    func unpinFile(absolutePath: String) async throws 
     
     func updateStatus() async throws  -> UpdateStatus
     
@@ -997,6 +997,22 @@ open func createGroupAndLink(groupName: String, localPath: String, mode: FolderM
         )
 }
     
+open func createProviderFolder(groupName: String, displayName: String, mode: FolderMode)async throws  -> ProviderFolderOutcome  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_yadorilink_apple_ffi_fn_method_clientcore_create_provider_folder(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(groupName),FfiConverterString.lower(displayName),FfiConverterTypeFolderMode_lower(mode)
+                )
+            },
+            pollFunc: ffi_yadorilink_apple_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_yadorilink_apple_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_yadorilink_apple_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeProviderFolderOutcome_lift,
+            errorHandler: FfiConverterTypeDesktopError_lift
+        )
+}
+    
 open func denyRequest(groupId: String, deviceId: String)async throws  -> MembershipOutcome  {
     return
         try  await uniffiRustCallAsync(
@@ -1156,6 +1172,22 @@ open func joinGroupAndLink(groupId: String, groupName: String, localPath: String
             completeFunc: ffi_yadorilink_apple_ffi_rust_future_complete_rust_buffer,
             freeFunc: ffi_yadorilink_apple_ffi_rust_future_free_rust_buffer,
             liftFunc: FfiConverterTypeLinkOutcome_lift,
+            errorHandler: FfiConverterTypeDesktopError_lift
+        )
+}
+    
+open func joinProviderFolder(groupId: String, groupName: String, displayName: String, mode: FolderMode)async throws  -> ProviderFolderOutcome  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_yadorilink_apple_ffi_fn_method_clientcore_join_provider_folder(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(groupId),FfiConverterString.lower(groupName),FfiConverterString.lower(displayName),FfiConverterTypeFolderMode_lower(mode)
+                )
+            },
+            pollFunc: ffi_yadorilink_apple_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_yadorilink_apple_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_yadorilink_apple_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeProviderFolderOutcome_lift,
             errorHandler: FfiConverterTypeDesktopError_lift
         )
 }
@@ -1419,22 +1451,6 @@ open func pauseFolder(localPath: String)async throws   {
             rustFutureFunc: {
                 uniffi_yadorilink_apple_ffi_fn_method_clientcore_pause_folder(
                         self.uniffiCloneHandle(),FfiConverterString.lower(localPath)
-                )
-            },
-            pollFunc: ffi_yadorilink_apple_ffi_rust_future_poll_void,
-            completeFunc: ffi_yadorilink_apple_ffi_rust_future_complete_void,
-            freeFunc: ffi_yadorilink_apple_ffi_rust_future_free_void,
-            liftFunc: { $0 },
-            errorHandler: FfiConverterTypeDesktopError_lift
-        )
-}
-    
-open func pinFile(absolutePath: String)async throws   {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_yadorilink_apple_ffi_fn_method_clientcore_pin_file(
-                        self.uniffiCloneHandle(),FfiConverterString.lower(absolutePath)
                 )
             },
             pollFunc: ffi_yadorilink_apple_ffi_rust_future_poll_void,
@@ -1796,22 +1812,6 @@ open func unlinkFolder(localPath: String, force: Bool)async throws  -> UnlinkOut
             completeFunc: ffi_yadorilink_apple_ffi_rust_future_complete_rust_buffer,
             freeFunc: ffi_yadorilink_apple_ffi_rust_future_free_rust_buffer,
             liftFunc: FfiConverterTypeUnlinkOutcome_lift,
-            errorHandler: FfiConverterTypeDesktopError_lift
-        )
-}
-    
-open func unpinFile(absolutePath: String)async throws   {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_yadorilink_apple_ffi_fn_method_clientcore_unpin_file(
-                        self.uniffiCloneHandle(),FfiConverterString.lower(absolutePath)
-                )
-            },
-            pollFunc: ffi_yadorilink_apple_ffi_rust_future_poll_void,
-            completeFunc: ffi_yadorilink_apple_ffi_rust_future_complete_void,
-            freeFunc: ffi_yadorilink_apple_ffi_rust_future_free_void,
-            liftFunc: { $0 },
             errorHandler: FfiConverterTypeDesktopError_lift
         )
 }
@@ -2829,6 +2829,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_yadorilink_apple_ffi_checksum_method_clientcore_create_group_and_link() != 39935) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_yadorilink_apple_ffi_checksum_method_clientcore_create_provider_folder() != 15376) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_yadorilink_apple_ffi_checksum_method_clientcore_deny_request() != 39558) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -2857,6 +2860,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_yadorilink_apple_ffi_checksum_method_clientcore_join_group_and_link() != 26761) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_yadorilink_apple_ffi_checksum_method_clientcore_join_provider_folder() != 34406) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_yadorilink_apple_ffi_checksum_method_clientcore_link_folder() != 11697) {
@@ -2908,9 +2914,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_yadorilink_apple_ffi_checksum_method_clientcore_pause_folder() != 53533) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_yadorilink_apple_ffi_checksum_method_clientcore_pin_file() != 40893) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_yadorilink_apple_ffi_checksum_method_clientcore_receive_transfer() != 34393) {
@@ -2977,9 +2980,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_yadorilink_apple_ffi_checksum_method_clientcore_unlink_folder() != 9391) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_yadorilink_apple_ffi_checksum_method_clientcore_unpin_file() != 13776) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_yadorilink_apple_ffi_checksum_method_clientcore_update_status() != 55643) {

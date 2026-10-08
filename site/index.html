@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>YadoriLink — Cloud convenience, without handing over your files</title>
+<meta name="description" content="YadoriLink syncs folders directly between your Mac, Windows and Linux devices. YadoriLink manages accounts, sharing and permissions; the files themselves stay on your devices. Open source, pre-1.0 beta.">
+<link rel="canonical" href="https://yadori.link/">
+<link rel="alternate" hreflang="en" href="https://yadori.link/">
+<link rel="alternate" hreflang="ja" href="https://yadori.link/ja/">
+<link rel="alternate" hreflang="x-default" href="https://yadori.link/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="YadoriLink">
+<meta property="og:title" content="YadoriLink — Cloud convenience, without handing over your files">
+<meta property="og:description" content="YadoriLink syncs folders directly between your Mac, Windows and Linux devices. YadoriLink manages accounts, sharing and permissions; the files themselves stay on your devices. Open source, pre-1.0 beta.">
+<meta property="og:url" content="https://yadori.link/">
+<meta property="og:image" content="https://yadori.link/assets/og-image.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:locale" content="en_US">
+<meta property="og:locale:alternate" content="ja_JP">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="YadoriLink — Cloud convenience, without handing over your files">
+<meta name="twitter:description" content="YadoriLink syncs folders directly between your Mac, Windows and Linux devices. YadoriLink manages accounts, sharing and permissions; the files themselves stay on your devices. Open source, pre-1.0 beta.">
+<meta name="twitter:image" content="https://yadori.link/assets/og-image.png">
+<link rel="icon" href="/assets/favicon.ico" sizes="any">
+<link rel="icon" type="image/webp" sizes="64x64" href="/assets/logo-64.webp">
+<link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
+<meta name="theme-color" content="#f5f9ff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#060d1f" media="(prefers-color-scheme: dark)">
+<link rel="stylesheet" href="/assets/site.css">
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+<div class="wrap">
+<header class="site-header">
+  <a class="brand" href="/" aria-label="YadoriLink home">
+    <img src="/assets/logo-64.webp" srcset="/assets/logo-128.webp 2x" width="36" height="36" alt="">
+    <span>YadoriLink</span>
+  </a>
+  <nav aria-label="Site">
+    <a href="/#architecture">Trust model</a><a href="/#why">Why YadoriLink</a><a href="/#install">Get started</a>
+  </nav>
+  <a class="lang" href="/ja/" lang="ja" hreflang="ja">日本語</a>
+</header>
+
+<main id="content">
+<div class="hero">
+  <img class="hero-mark" src="/assets/logo-128.webp" srcset="/assets/logo-256.webp 2x" width="72" height="72" alt="">
+  <p class="eyebrow">Peer-to-peer folder sync · open source</p>
+  <h1>Cloud convenience, <span class="grad">without handing over your files.</span></h1>
+  <p class="lede">YadoriLink syncs folders directly between your Mac, Windows and Linux devices. YadoriLink manages accounts, sharing and permissions; the files themselves stay on your devices.</p>
+  <div class="cta">
+    <a class="btn primary" href="https://github.com/juntaki/yadorilink/releases">Download</a>
+    <a class="btn ghost" href="#architecture">See how it works</a>
+  </div>
+  <ul class="hero-strip"><li>P2P sync</li><li>No cloud file storage</li><li>Open source</li></ul>
+</div>
+
+<section id="architecture" class="trust">
+  <h2>You don’t have to trust YadoriLink with your files.</h2>
+  <p class="sub">The control plane is centralised. The data plane is peer-to-peer.</p>
+  <figure class="arch-fig">
+    <div class="arch-grid">
+      <div class="arch-panel arch-conv"><h3>Conventional cloud sync</h3>
+      <svg class="arch-svg" viewBox="0 0 360 250" role="img" aria-labelledby="t-conv d-conv">
+      <title id="t-conv">Conventional cloud sync</title><desc id="d-conv">A device sends files to cloud storage, which holds the files, and another device downloads them from there.</desc>
+      <path class="a-cloud" d="M128 138 C96 138 92 94 124 90 C122 50 168 36 188 60 C202 24 258 32 254 80 C282 82 284 138 246 138 Z"/>
+      <path class="a-file" d="M177 66 h10 l6 6 v16 h-16 z"/><path class="a-file" d="M185 62 h10 l6 6 v16 h-16 z"/><path class="a-file" d="M193 70 h10 l6 6 v16 h-16 z"/>
+      <text class="a-t" x="190" y="110" text-anchor="middle">Cloud storage</text>
+      <text class="a-s" x="190" y="127" text-anchor="middle">holds your files</text>
+      <path class="a-line a-line-plain" d="M62 146 C62 126 74 114 92 114"/><path class="a-arrow a-arrow-plain" d="M102 114 l-10 -5.5 v11 z"/>
+      <path class="a-line a-line-plain" d="M282 114 C292 114 298 124 298 136"/><path class="a-arrow a-arrow-plain" d="M298 146 l-5.5 -10 h11 z"/>
+      <rect class="a-box" x="26" y="152" width="72" height="46" rx="6"/><rect class="a-screen" x="32" y="158" width="60" height="34" rx="2"/>
+      <path class="a-base" d="M16 202 h92 a4 4 0 0 1 -4 5 h-84 a4 4 0 0 1 -4 -5 z"/>
+      <path class="a-file" d="M55 166 h9 l5 5 v13 h-14 z"/>
+      <text class="a-t" x="62" y="232" text-anchor="middle">Device</text>
+      <rect class="a-box" x="262" y="152" width="72" height="46" rx="6"/><rect class="a-screen" x="268" y="158" width="60" height="34" rx="2"/>
+      <path class="a-base" d="M252 202 h92 a4 4 0 0 1 -4 5 h-84 a4 4 0 0 1 -4 -5 z"/>
+      <path class="a-file" d="M291 166 h9 l5 5 v13 h-14 z"/>
+      <text class="a-t" x="298" y="232" text-anchor="middle">Device</text>
+    </svg></div>
+      <div class="arch-panel arch-yl"><h3>YadoriLink</h3>
+      <svg class="arch-svg" viewBox="0 0 360 250" role="img" aria-labelledby="t-yl d-yl">
+      <title id="t-yl">YadoriLink</title><desc id="d-yl">Two devices exchange files directly over an encrypted connection. A coordination service above them handles accounts, devices, sharing and permissions, and connects to each device by identity information only.</desc>
+      <defs><linearGradient id="yl-grad" gradientUnits="userSpaceOnUse" x1="104" y1="0" x2="256" y2="0"><stop offset="0" stop-color="#0a4bff"/><stop offset="0.5" stop-color="#0a8cff"/><stop offset="1" stop-color="#1fc8f0"/></linearGradient></defs>
+      <g>
+      <rect class="a-coord" x="30" y="14" width="300" height="72" rx="16"/>
+      <text class="a-t" x="180" y="45" text-anchor="middle">YadoriLink coordination service</text>
+      <text class="a-s" x="180" y="66" text-anchor="middle">accounts · devices · sharing · permissions</text>
+      <path class="a-dash" d="M96 86 L62 146"/><path class="a-dash" d="M264 86 L298 146"/>
+      <circle class="a-badge" cx="79" cy="116" r="11"/><circle class="a-glyph" cx="75.5" cy="119.5" r="3"/><path class="a-glyph" d="M77.7 117.3 l6 -6 M81.7 113.3 l2 2"/>
+      <circle class="a-badge" cx="281" cy="116" r="11"/><circle class="a-glyph" cx="277.5" cy="119.5" r="3"/><path class="a-glyph" d="M279.7 117.3 l6 -6 M283.7 113.3 l2 2"/>
+      <text class="a-s" x="96" y="120">identity only</text>
+      <text class="a-s" x="264" y="120" text-anchor="end">identity only</text>
+      <rect class="a-dev" x="26" y="152" width="72" height="46" rx="6"/><rect class="a-screen" x="32" y="158" width="60" height="34" rx="2"/>
+      <path class="a-dev-base" d="M16 202 h92 a4 4 0 0 1 -4 5 h-84 a4 4 0 0 1 -4 -5 z"/>
+      <path class="a-file-brand" d="M55 166 h9 l5 5 v13 h-14 z"/>
+      <text class="a-t" x="62" y="232" text-anchor="middle">Device</text>
+      <rect class="a-dev" x="262" y="152" width="72" height="46" rx="6"/><rect class="a-screen" x="268" y="158" width="60" height="34" rx="2"/>
+      <path class="a-dev-base" d="M252 202 h92 a4 4 0 0 1 -4 5 h-84 a4 4 0 0 1 -4 -5 z"/>
+      <path class="a-file-brand" d="M291 166 h9 l5 5 v13 h-14 z"/>
+      <text class="a-t" x="298" y="232" text-anchor="middle">Device</text>
+      <path class="a-line a-line-brand" d="M114 175 H246"/>
+      <path class="a-arrow a-arrow-brand" d="M104 175 l11 -6 v12 z"/><path class="a-arrow a-arrow-brand-end" d="M256 175 l-11 -6 v12 z"/>
+      <circle class="a-badge-brand" cx="180" cy="175" r="15"/>
+      <rect class="a-glyph-brand" x="173.5" y="173" width="13" height="9.5" rx="2"/><path class="a-glyph-brand" d="M176.5 173 v-2.8 a3.5 3.5 0 0 1 7 0 V173"/>
+      <text class="a-s a-brand" x="180" y="214" text-anchor="middle">encrypted, direct</text>
+      </g>
+    </svg></div>
+    </div>
+  </figure>
+  <div class="trust-cols">
+    <div class="trust-col trust-knows"><h3>What the YadoriLink service knows</h3><ul><li><strong>Account</strong>: your Google account ID and email address</li><li><strong>Devices</strong>: name, public key, last-seen time, and the network addresses devices report so they can find each other</li><li><strong>Shared folder groups</strong>: group name, members and roles</li><li><strong>Access rights</strong>: which devices may sync which group</li></ul></div>
+    <div class="trust-col trust-never"><h3>What it never receives</h3><ul><li>File contents</li><li>File names</li><li>Folder paths</li><li>The documents and photos inside</li><li>Your local folder structure</li></ul></div>
+  </div>
+  <ul class="trust-three"><li><span class="ico" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="10.5" width="14" height="10" rx="2.5"/><path d="M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5"/><path d="M12 14.5v2"/></svg></span><h3>Encrypted connections</h3><p>Device-to-device traffic is encrypted. Relays only forward encrypted packets.</p></li><li><span class="ico" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="15.5" r="4"/><path d="m10.9 12.6 8.6-8.6M16.5 7l2.5 2.5M14 9.5l2 2"/></svg></span><h3>Cryptographic device identity</h3><p>Each device is identified by its own key. Private keys never leave the device.</p></li><li><span class="ico" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="9.5" cy="8" r="3.8"/><path d="M2.8 20.5a6.7 6.7 0 0 1 13.4 0"/><path d="M16.5 11.5h5"/></svg></span><h3>Revocable access</h3><p>Remove a device or a member and it loses access.</p></li></ul>
+  <p class="trust-note">Devices connect directly when they can. Otherwise, encrypted traffic passes through public relays run by the iroh project, not by YadoriLink. Relays can observe IP addresses, device identifiers, timing and traffic volume, but not file contents. No ads, analytics, cookies or trackers; this website makes no requests to third parties.</p>
+  <p class="trust-links"><a href="/privacy/">Privacy policy</a> &middot; <a href="/terms/">Terms</a></p>
+</section>
+
+<!-- Screenshots slot: add real product screenshots here (see site/assets/shots/). Nothing is shown until genuine images exist. -->
+
+<section id="why">
+  <h2>Why YadoriLink</h2>
+  <div class="grid why-grid">
+    <div class="card"><h3>Peer-to-peer sync, cloud-style management</h3><p>The data ownership of a peer-to-peer tool with the account and sharing management of a cloud service. Sign in, add devices and share folders with roles: owner, editor or viewer.</p></div>
+    <div class="card"><h3>Store everything, or only what you open</h3><p>Keep every file on a device, or use on-demand placeholders that download when opened and can be evicted to free space. Native on macOS (File Provider) and Windows (Cloud Files).</p></div>
+    <div class="card"><h3>macOS, Windows and Linux, one engine</h3><p>The same sync engine, written in Rust, on every platform, driven by a desktop app or a command-line tool you can script.</p></div>
+  </div>
+  <p class="why-note">Because there is no central copy, a sync needs at least one other of your devices to be online.</p>
+</section>
+
+<section id="install" class="alt start">
+  <p class="eyebrow">Pre-1.0 · active development</p>
+  <h2>Get started</h2>
+  <ol class="flow"><li>Sign in</li><li>Share a folder</li><li>Join from another device</li></ol>
+  <div class="start-grid">
+    <ul class="plat">
+      <li><h3>macOS</h3><code>yadorilink-macos.pkg</code><span class="note">Signed and notarized. macOS 11 or later.</span></li>
+      <li><h3>Windows</h3><code>yadorilink-setup-unsigned.exe</code><span class="note">Windows 10 or 11, x64. Currently unsigned: verify the SHA-256 checksum before running.</span></li>
+      <li><h3>Linux</h3><code>yadorilink-linux-amd64.deb</code><span class="note">Debian and Ubuntu.</span></li>
+    </ul>
+    <div class="term">
+      <h3>Prefer the terminal?</h3>
+      <pre><code>yadorilink login
+yadorilink device register --name "my-device"
+yadorilink share create my-share --path ~/some/folder
+yadorilink status</code></pre>
+    </div>
+  </div>
+  <div class="cta">
+    <a class="btn primary" href="https://github.com/juntaki/yadorilink/releases">Download</a>
+    <a class="btn ghost" href="https://github.com/juntaki/yadorilink">Source on GitHub</a>
+  </div>
+  <p class="start-meta">Keep every device on the same release and back up anything you cannot afford to lose. Licensed under AGPL-3.0-only. <a href="https://github.com/juntaki/yadorilink#readme">Development status →</a></p>
+</section>
+</main>
+
+<footer class="site-footer">
+  <div class="foot-top"><img src="/assets/logo-64.webp" width="28" height="28" alt=""><span>YadoriLink</span></div>
+  <p>Cloud convenience, without handing over your files.</p>
+  <div class="cols">
+    <a href="/privacy/">Privacy</a> <a href="/terms/">Terms</a> <a href="https://github.com/juntaki/yadorilink">GitHub</a> <a href="https://github.com/juntaki/yadorilink/blob/main/SECURITY.md">Security</a> <a href="mailto:me@juntaki.com">Contact</a>
+    <a href="/ja/" lang="ja" hreflang="ja">日本語</a>
+    <span>AGPL-3.0-only</span>
+  </div>
+</footer>
+</div>
+</body>
+</html>

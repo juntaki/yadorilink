@@ -14,24 +14,6 @@ impl super::LocalConvergenceExecutor {
         *self.headroom_override_bytes.lock().unwrap_or_else(|p| p.into_inner()) = headroom_bytes;
     }
 
-    /// Arms this executor's one-shot post-hold-clear hydration failure.
-    ///
-    /// Scoped to the executor the arming test drives, so a concurrently
-    /// running test's hydration cannot consume it. See the fields' own doc
-    /// comment for what the global version of this cost.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn arm_hydration_failure_after_hold_cleared(&self) {
-        self.force_hydration_failure_after_hold_cleared
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    /// Arms this executor's one-shot metadata-apply hydration failure.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn arm_hydration_failure_during_metadata_apply(&self) {
-        self.force_hydration_failure_during_metadata_apply
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-
     /// Turns the materialize-time disk-headroom preflight on or off for this
     /// executor. Test-only: production decides this once, at construction.
     #[cfg(any(test, feature = "test-support"))]

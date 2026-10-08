@@ -23,11 +23,13 @@ use crate::queries::QueryServices;
 pub struct ControlContext {
     pub(crate) application: Arc<ApplicationServices>,
     pub(crate) queries: Arc<QueryServices>,
+    /// The provider roots' lines of `status`, filled in by the shell side.
+    pub(crate) provider_status: Arc<crate::provider_status::ProviderStatusSource>,
 }
 
 impl ControlContext {
     pub(crate) fn new(application: Arc<ApplicationServices>, queries: Arc<QueryServices>) -> Self {
-        Self { application, queries }
+        Self { application, queries, provider_status: Arc::default() }
     }
 
     /// Builds both from a real `Arc<DaemonState>`, matching the exact

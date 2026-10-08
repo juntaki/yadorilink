@@ -69,5 +69,16 @@ cargo build --release
 
 ## Licensing
 
-By contributing, you agree that your contribution is licensed under the same
-dual MIT or Apache-2.0 terms as the project.
+The project is licensed under AGPL-3.0-only (see `LICENSE`).
+
+Contributions are accepted under the terms in [CLA.md](CLA.md): your
+contribution is licensed to everyone under AGPL-3.0-only, you keep your
+copyright, and you grant the project maintainer a perpetual, worldwide,
+non-exclusive, royalty-free, irrevocable licence to use, modify, distribute
+and sublicense it under AGPL-3.0-only or any other licence terms the
+maintainer chooses.
+
+You must explicitly agree to those terms before a pull request can be merged:
+the contributor licence check comments on your first pull request with the
+sentence to reply with. The agreement is recorded once per GitHub account.
+Maintainers and automation accounts are exempt.

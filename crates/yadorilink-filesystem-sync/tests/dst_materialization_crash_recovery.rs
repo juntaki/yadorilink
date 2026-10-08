@@ -17,7 +17,7 @@
 //! sync-protocol-critical file, for a benefit this scenario doesn't
 //! need), the fault is injected the way a real crash actually manifests:
 //! by directly constructing the *on-disk and index state* a crash would
-//! leave behind (an index row already marked `Hydrated` -- matching
+//! leave behind (an index row already marked `Present` -- matching
 //! `peer_session.rs::materialize`'s real ordering, where the index is
 //! updated as part of the same operation as the disk write -- but the
 //! file itself missing or a stale temp file left over), then asserting
@@ -105,7 +105,7 @@ fn run_scenario(seed: u64) -> Result<(), String> {
         .set_materialization_state(
             GROUP_ID,
             PATH,
-            MaterializationState::Hydrated,
+            MaterializationState::Present,
             &RootCommitPermit::for_tests(),
         )
         .map_err(|e| e.to_string())?;

@@ -1,11 +1,21 @@
 //! What `VersionRestoreService` needs from `hydration`'s restore engine --
 //! a distinct port from `MaterializationPort`: restoring a specific
 //! retained version (or the most recent trashed one) is a different use
-//! case from hydrate/pin/unpin/evict, not a variation of it.
+//! case from hydrate/evict, not a variation of it.
 
 use crate::sync_error::SyncError;
 
 use super::common::BoxFuture;
+
+/// What a folder restore did: the trashed entries it put back, the ones
+/// it could not (with why), and whether the recursive operation it
+/// restores is only partly known here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrashOperationRestore {
+    pub restored: Vec<String>,
+    pub failed: Vec<(String, String)>,
+    pub partial: bool,
+}
 
 pub(crate) trait VersionRestorePort: Send + Sync {
     /// `Ok(None)` when no superseded version exists to restore to --
@@ -35,5 +45,5 @@ pub(crate) trait VersionRestorePort: Send + Sync {
         &'a self,
         group_id: &'a str,
         path: &'a str,
-    ) -> BoxFuture<'a, Result<crate::hydration::TrashOperationRestore, SyncError>>;
+    ) -> BoxFuture<'a, Result<TrashOperationRestore, SyncError>>;
 }

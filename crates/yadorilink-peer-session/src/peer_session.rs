@@ -1,41 +1,37 @@
-//! The peer-to-peer sync protocol driver: exchanges blocks and service
+//! The per-peer transport session: exchanges content blocks and service
 //! requests directly with one peer device over that peer's stream lanes
-//! (`SessionTransports`), with no central server involved. One `PeerSyncSession` per connected peer (a peer
-//! being offline only affects its own session, never blocks sync with
-//! other reachable peers).
+//! (`SessionTransports`), with no central server involved. One
+//! `PeerSyncSession` per connected peer (a peer being offline only affects its
+//! own session, never blocks sync with other reachable peers). Metadata
+//! convergence is not carried here: signed deltas travel on the native
+//! replication lane, and this session moves the blocks those deltas' versions
+//! name (fetch for hydration and repair, serve to authorized peers) plus the
+//! service RPCs.
 //!
 //! ## Trust boundary: an authorized peer is not necessarily benign
 //!
-//! Every function in this module that handles data from the peer
-//! treats the connected peer as **authorized but untrusted**: it has
-//! passed coordination-plane auth and its blocks pass the existing
-//! hash+size check (`block_data_matches`), but its *choices* — what to
-//! advertise in an index, what authoring hash or `mtime_unix_nanos` to
-//! claim, what path to name — are adversarial input, not trusted metadata.
-//! Authoring hashes are accepted only when present in this group's verified
-//! retained/pruned DAG history; `reconcile_files_if_authorized` bounds
-//! incoming-index cardinality; `resolve_and_apply_conflict` bounds `mtime`
-//! skew; `materialize`/
-//! `hydrate_file_with_timeout` re-verify the resolved write target stays
-//! under the sync root. See `conflict.rs` for the remaining wall-clock trust
-//! boundary; causal ordering itself is cryptographically bound to DAG
-//! ancestry rather than a peer-asserted counter.
+//! Every function in this module that handles data from the peer treats the
+//! connected peer as **authorized but untrusted**: it has passed
+//! coordination-plane auth and its blocks pass the hash+size check
+//! (`block_data_matches`), but its *choices* -- which blocks it asks for,
+//! what path it names -- are adversarial input, not trusted metadata. A
+//! request is served only for a block the requested file's live record or a
+//! live native head of an authorized group references, and `materialize`/`hydrate_file_with_timeout`
+//! re-verify the resolved write target stays under the sync root. Causal
+//! ordering is carried by native provenance, never by a peer-asserted
+//! counter or wall clock.
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::io::Read as _;
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use sha2::{Digest, Sha256};
-use tokio::sync::mpsc;
 
 use crate::adaptive_window::AdaptiveWindow;
 use crate::error::PeerSessionError;
 use crate::rate_limiter::RateLimiters;
-use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
-use yadorilink_replica_domain::ids::ChangeHash;
+use yadorilink_replica_domain::file::BlockInfo;
 
 mod block_fetch;
 mod block_serving;
@@ -44,7 +40,7 @@ mod service;
 
 use self::block_fetch::BlockFetchOutcome;
 pub use self::deps::{
-    BlockWriteActivityProvider, ChangeAuthenticator, HandoffLeaseResponder, HandoffTicketResponder,
+    BlockWriteActivityProvider, HandoffLeaseResponder, HandoffTicketResponder,
     PeerHandoffLeaseGrant, PeerHandoffTicketGrant, PeerSyncSessionDeps, PendingLocalChangeFlush,
     PendingLocalFlushOutcome, RootCommitAuthorityProvider,
 };
@@ -64,14 +60,20 @@ const MAX_BLOCK_SIZE: usize = yadorilink_replica_domain::limits::MAX_BLOCK_SIZE_
 /// approaching this is a sign something bulk has been misclassified onto it.
 const SERVICE_RPC_MAX_BYTES: usize = 1 << 20;
 
+/// How long one outgoing service RPC (open, request, single answer) may take
+/// before it is abandoned as unanswered. Every service RPC fails closed on no
+/// answer, so a peer that accepts the stream and never replies costs the caller
+/// this long, not forever.
+const SERVICE_RPC_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
 const MAX_IN_FLIGHT_MESSAGES_PER_PEER: usize = 64;
 
 // `BlockRequest` deliberately shares neither this semaphore nor a FIFO
 // permit pool of its own for its actual SERVICE: it is spawned immediately
 // on arrival (see `run`'s recv loop, the `Payload::BlockRequest` arm's own
 // doc comment) rather than queued behind a local permit pool, for two
-// reasons in combination -- (1) CONV-5: a `BlockRequest` handler can
-// genuinely block for a long time (stage 2's `handle_block_request_with_
+// reasons in combination -- (1) a `BlockRequest` handler can
+// genuinely block for a long time (`handle_block_request_with_
 // credit` awaits a possibly-gated disk read), and a local permit pool
 // shared with control/metadata messages would let a flood of those starve
 // this session's control traffic; (2) real concurrency control and
@@ -320,7 +322,7 @@ where
 pub const DEFAULT_HYDRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Neutral cadence shared by low-frequency convergence maintenance: a
-/// session periodically re-announces its signed DAG frontier, while the
+/// session periodically re-announces its signed native frontier, while the
 /// daemon's disk-reconcile backstop performs its independent add-only root
 /// walk. Ninety seconds bounds recovery latency without making either
 /// maintenance scan/chatty enough to dominate normal synchronization.
@@ -371,9 +373,13 @@ impl LiveGroupAuthorization {
             .insert(group_id.to_string());
     }
 
-    fn set(&self, group_ids: impl IntoIterator<Item = String>) {
-        *self.groups.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            group_ids.into_iter().collect();
+    /// Replaces the set; returns whether it differed from the one it replaced.
+    fn set(&self, group_ids: impl IntoIterator<Item = String>) -> bool {
+        let new: std::collections::HashSet<String> = group_ids.into_iter().collect();
+        let mut groups = self.groups.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let changed = *groups != new;
+        *groups = new;
+        changed
     }
 }
 
@@ -400,7 +406,7 @@ pub struct PeerSyncSession {
     // forward into, so this field only ever needs `get`/`put`/
     // `present_blocks`.
     store: Arc<dyn crate::ports::BlockContentStore>,
-    /// DAG/index-mutation logic that is true regardless of which peer sent
+    /// native state/index-mutation logic that is true regardless of which peer sent
     /// the message, extracted out of this file's own handlers one handler
     /// at a time into `yadorilink-replica-engine` -- see that crate's own
     /// doc comment. Built by the caller (the daemon's own composition
@@ -410,23 +416,12 @@ pub struct PeerSyncSession {
     /// does not assemble its own dependencies out of a bigger state
     /// object, so there is nothing here to build lazily.
     pub replica_engine: yadorilink_replica_engine::PeerReplicaEngine,
-    /// Folder groups both this device and the peer are authorized for
+    /// The folder groups both this device and the peer are authorized for
     /// (determined by the caller from the coordination plane's ACLs —
-    /// this crate has no concept of authorization itself).
-    /// The construction-time snapshot. Read only through
-    /// `live_authorized_groups`, which is derived from it and is what every
-    /// authorization decision consults; retained because that derivation
-    /// happens at construction and the snapshot is what it was derived from.
-    #[allow(dead_code)]
-    shared_group_ids: Vec<String>,
-    /// The session's live,
-    /// mutable-after-construction view of peer authorization, consulted by
-    /// `shares_group` (and therefore by every per-request authorization
-    /// check that calls it — `handle_block_request`,
-    /// `reconcile_files_if_authorized`) instead
-    /// of `shared_group_ids` above. See `LiveGroupAuthorization`'s doc
-    /// comment for why this is a separate field rather than a replacement
-    /// for `shared_group_ids`.
+    /// this crate has no concept of authorization itself): seeded at
+    /// construction and mutable afterwards. Consulted by `shares_group`
+    /// (and therefore by every per-request authorization check that calls
+    /// it — `handle_block_request`).
     live_authorized_groups: LiveGroupAuthorization,
     /// This session's shared, device-wide block-serving credit/coalescing
     /// engine, set once by `DaemonState` after construction (see
@@ -480,13 +475,9 @@ pub struct PeerSyncSession {
     /// nothing content-identifying (a running byte count only), so it costs
     /// nothing to leave wired in production.
     content_bytes_received: std::sync::atomic::AtomicU64,
-    /// Records this session adopted or resolved from *this* peer, handed
-    /// off here so the caller can forward them on to this device's *other*
-    /// peer sessions — full mesh propagation needs this explicit forwarding
-    /// step; a record arriving from one peer does not otherwise reach any
-    /// other peer this device is connected to. `None` for callers (tests,
-    /// mainly) that don't need multi-peer forwarding.
-    forward_tx: Option<mpsc::UnboundedSender<(String, FileRecord)>>,
+    /// [`SERVICE_RPC_DEADLINE`] in milliseconds, per session so a test that
+    /// shortens it cannot affect another session in the same process.
+    service_rpc_deadline_ms: std::sync::atomic::AtomicU64,
     /// This session's upload/
     /// download token buckets, gating `handle_block_request`'s outbound
     /// send and `fetch_block`'s inbound receive respectively. Starts
@@ -507,15 +498,8 @@ pub struct PeerSyncSession {
     /// reply); read by `fetch_window` — the daemon's multi-peer dispatcher
     /// consults this in place of the old fixed per-candidate lane count.
     adaptive_window: AdaptiveWindow,
-    /// Kept so a session can be constructed with the same dependency set as
-    /// before, and so the daemon has one place that resolves a group's
-    /// authority key. Change verification itself no longer happens on this
-    /// session: Changes converge over reconciliation, which resolves signers
-    /// through the very same `NetmapChangeAuthenticator`.
-    #[allow(dead_code)]
-    change_authenticator: Arc<dyn ChangeAuthenticator>,
     /// Everything this session needs to reach its peer: block streams,
-    /// service RPC streams, and where a re-bootstrap snapshot is
+    /// service RPC streams, and where a bootstrap snapshot is
     /// published/collected. A REQUIRED constructor parameter -- see
     /// `SessionTransports`'s own doc comment. Not behind a `StdMutex`
     /// like the fields it replaced: it is set once, at construction, and
@@ -535,21 +519,6 @@ pub struct PeerSyncSession {
     /// deny-by-default implementation, so an incoming `HandoffTicketRequest`
     /// answers `granted = false` rather than panic or hang.
     handoff_ticket_responder: Arc<dyn HandoffTicketResponder>,
-    /// Set once at construction (unlike the other 6 one-time capabilities,
-    /// this one genuinely has no universal non-`None` default: a device
-    /// with no signing key yet has no substitute to fall back to). `None`
-    /// for every existing test/call site that has not wired a key (mirrors
-    /// `change_authenticator`'s own old default exactly — that field
-    /// verifies what arrives, this one signs what this device originates,
-    /// and both start absent). A device that has not wired a key here MUST
-    /// retain and leave the content unauthored rather than proceed as if
-    /// the write happened; it must never fall back to signing with some
-    /// other key or skipping the signature. `change_emitter()` returning
-    /// `None` is that signal, and every future caller is required to treat
-    /// it as "not yet safe to author," the same fail-closed contract
-    /// `link_manager::ensure_initial_change_history` already applies to a
-    /// registered device with no signing key.
-    change_emitter: Option<Arc<yadorilink_replica_domain::admission::ChangeEmitter>>,
 }
 
 impl PeerSyncSession {
@@ -562,10 +531,9 @@ impl PeerSyncSession {
     /// nothing this session does for its peer needs a second connection. It
     /// has no loop of its own; its lifetime is its owner's.
     ///
-    /// `forward_tx` receives every record this session adopts or resolves
-    /// from its peer as `(group_id, record)` (see `forward_tx`'s doc
-    /// comment); `deps` carries the capability injections (see
-    /// [`PeerSyncSessionDeps`]). `replica_engine` and
+    /// `shared_group_ids` seeds the live authorization view; `deps` carries
+    /// the capability injections (see [`PeerSyncSessionDeps`]).
+    /// `replica_engine` and
     /// `block_serve_authorizer` come already built: the caller owns replica
     /// state, so it builds the narrow ports this session depends on.
     #[allow(clippy::too_many_arguments)]
@@ -576,9 +544,7 @@ impl PeerSyncSession {
         replica_engine: yadorilink_replica_engine::PeerReplicaEngine,
         store: Arc<dyn crate::ports::BlockContentStore>,
         shared_group_ids: Vec<String>,
-        _sync_roots: HashMap<String, PathBuf>,
         transports: crate::ports::SessionTransports,
-        forward_tx: Option<mpsc::UnboundedSender<(String, FileRecord)>>,
         deps: PeerSyncSessionDeps,
     ) -> Arc<Self> {
         let live_authorized_groups = LiveGroupAuthorization::new(&shared_group_ids);
@@ -589,12 +555,13 @@ impl PeerSyncSession {
             block_serve_authorizer,
             store,
             replica_engine,
-            shared_group_ids,
             live_authorized_groups,
             block_serve_engine: std::sync::Mutex::new(deps.block_serve_engine),
             in_flight_block_fetches: std::sync::atomic::AtomicUsize::new(0),
             content_bytes_received: std::sync::atomic::AtomicU64::new(0),
-            forward_tx,
+            service_rpc_deadline_ms: std::sync::atomic::AtomicU64::new(
+                SERVICE_RPC_DEADLINE.as_millis() as u64,
+            ),
             rate_limiters: StdMutex::new(deps.rate_limiters),
             adaptive_window: AdaptiveWindow::new(
                 ADAPTIVE_WINDOW_INITIAL,
@@ -602,11 +569,9 @@ impl PeerSyncSession {
                 MAX_IN_FLIGHT_MESSAGES_PER_PEER,
                 MAX_IN_FLIGHT_MESSAGES_PER_PEER,
             ),
-            change_authenticator: deps.change_authenticator,
             transports,
             handoff_lease_responder: deps.handoff_lease_responder,
             handoff_ticket_responder: deps.handoff_ticket_responder,
-            change_emitter: deps.change_emitter,
         })
     }
 
@@ -632,9 +597,9 @@ impl PeerSyncSession {
     ///
     /// sync-engine spec "Block Requests Are Authorized Against Actual Group
     /// Membership":
-    /// reads `live_authorized_groups`, not the `shared_group_ids` snapshot
-    /// captured once at session construction — every caller of this method
-    /// (`handle_block_request`, `reconcile_files_if_authorized`) already
+    /// reads `live_authorized_groups`, seeded at session construction and
+    /// updated as authorization changes — every caller of this method
+    /// (`handle_block_request`) already
     /// calls it fresh on every single
     /// incoming request/message, so re-pointing its data source at a
     /// live-updatable set is what turns "checked once at session start"
@@ -672,25 +637,9 @@ impl PeerSyncSession {
     /// Replaces the entire live-authorized-group set at once — useful when
     /// the caller already has the full, current list of groups this peer
     /// shares (e.g. recomputed from a fresh netmap) rather than a single
-    /// added/removed edge.
-    pub fn set_authorized_groups(&self, group_ids: impl IntoIterator<Item = String>) {
-        self.live_authorized_groups.set(group_ids);
-    }
-
-    /// This session's real signing capability, or `None` if it was never
-    /// wired (every pre-authoring test/call site, and a production session
-    /// for a device with no signing key yet — see the `change_emitter`
-    /// field's own doc comment). A future caller authoring a captured
-    /// change during materialize MUST treat `None` as "retain, do not
-    /// author" — never substitute a different key, and never proceed as
-    /// though the write happened. It is exercised by
-    /// `change_emitter_defaults_to_none_and_set_change_emitter_
-    /// installs_one` below.
-    #[allow(dead_code)]
-    pub fn change_emitter(
-        &self,
-    ) -> Option<Arc<yadorilink_replica_domain::admission::ChangeEmitter>> {
-        self.change_emitter.clone()
+    /// added/removed edge. Returns whether the set actually changed.
+    pub fn set_authorized_groups(&self, group_ids: impl IntoIterator<Item = String>) -> bool {
+        self.live_authorized_groups.set(group_ids)
     }
 
     /// Cumulative block body bytes received from this peer so far -- see
@@ -709,19 +658,6 @@ fn block_data_matches(block: &BlockInfo, data: &[u8]) -> bool {
     let digest = Sha256::digest(data);
     digest[..] == block.hash[..]
 }
-
-/// The inverse of `change_hash_from_wire`.
-pub fn change_hash_to_wire(hash: &ChangeHash) -> Vec<u8> {
-    hash.0.to_vec()
-}
-
-// `change_touches_path`, `PathHead`, `PathHeadContent`, `ConflictCopy`,
-// `PathResolution`, `resolve_path_heads`, and `path_head_from_change` moved to
-// `crate::conflict` (see `fix/conflict-copy-convergence-obligation-20260723`):
-// they are pure functions of a `Change`/DAG state with no
-// `PeerSyncSession`-specific dependency, and `dag_store`'s new conflict-copy
-// authoring/validation code (which cannot depend on this module) needs them
-// too.
 
 /// a peer
 /// could return data for a block that doesn't actually match what was
@@ -750,47 +686,6 @@ mod compression_benchmark;
 #[cfg(test)]
 mod dag_resolution_tests;
 
-/// Reproduces, at the wire-negotiation layer, the restart bug
-/// `local_change.rs`'s `offline_edit_after_existing_dag_history_must_
-/// append_new_head_on_restart` proves at the index/DAG layer: a change-
-/// history-aware peer only ever learns about a remote edit through the
-/// Changes it holds (never a full-index resync). If the local device's
-/// restart sequence updates its index for an offline edit without appending
-/// a matching DAG change (see `dag_import`'s module doc on why
-/// `ensure_initial_import` is a no-op once a group already has history), the
-/// Change set it then reconciles is identical to what it held before the
-/// edit — so a peer that already holds that pre-edit history has nothing to
-/// request and never converges,
-/// even though the announcer's own on-disk file and local index have moved
-/// on.
-///
-/// No real two-way network round trip is needed to prove this: a peer's
-/// only DAG-negotiated route to new content is `handle_heads_announce`
-/// computing which of the announced heads it doesn't already have
-/// (`peer_session.rs`'s own `handle_heads_announce`, called directly here)
-/// and requesting exactly those — so an announce carrying only already-known
-/// heads is observable proof the peer was never told about the edit,
-/// without depending on any live send/receive timing.
-///
-/// Convergence coverage for the single-authority property the DAG engine now
-/// holds outright: a concurrent edit resolves to the same winner regardless of
-/// arrival order, and the materialization-audit backstop keeps repairing
-/// missing on-disk content without ever resolving a concurrency. All in-process
-/// and deterministic: the sessions run over a live-but-unreachable loopback
-/// channel and are driven by direct `handle_message` / `handle_change_batch`
-/// calls, never real datagram delivery, so nothing depends on network timing.
-///
-/// Admission-time enforcement that a change's pinned authorization coordinate
-/// is non-decreasing along causal order. Without it, a device revoked at
-/// policy seq N (still holding its signing key) could craft a new change,
-/// stamp an OLDER grant seq M < N it once held, sign it, and have any current
-/// member relay it — honest receivers would admit it because the policy replay
-/// behind `accepts_change_auth` is bounded by the author-chosen `auth_seq`, so
-/// the later revoke is never consulted. Requiring `auth_seq >= max(parent
-/// auth_seq)` at admission closes that: to be causally newer than its own
-/// revoke the attacker must build on post-revoke heads (which pin seq >= N),
-/// and the older stamp then loses to the parent floor.
-///
 #[cfg(all(test, unix))]
 mod disk_race_fingerprint_tests {
     use yadorilink_root_authority::fs_identity::disk_race_fingerprint;
@@ -866,8 +761,8 @@ mod disk_race_fingerprint_tests {
     /// (`peer_session.rs`,
     /// gated on `local_row` — see the `locally_hydrated` check ahead of
     /// its `disk_bytes_match_indexed_blocks` call) only runs when the
-    /// path's materialization state is already `Hydrated`. For
-    /// `Placeholder`/`Hydrating`/`Evicting` — states whose whole point is
+    /// path's materialization state is already `Present`. For
+    /// `Remote`/`Hydrating`/`Evicting` — states whose whole point is
     /// to disagree with what's on disk — neither guard catches a
     /// same-tick, same-length overwrite with a restored mtime on a
     /// coarse-ctime filesystem. That window is covered by atomic preimage
@@ -985,12 +880,6 @@ mod disk_race_fingerprint_tests {
 impl crate::convergence_driver::ConvergenceDriver for PeerSyncSession {
     fn peer_device_id(&self) -> &str {
         &self.peer_device_id
-    }
-
-    fn forward(&self, group_id: &str, record: &FileRecord) {
-        if let Some(tx) = &self.forward_tx {
-            let _ = tx.send((group_id.to_string(), record.clone()));
-        }
     }
 
     fn fetch_block<'a>(

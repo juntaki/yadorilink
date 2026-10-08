@@ -3,8 +3,8 @@
 use super::{about, existing_directory, offering_force, ClientCore};
 use crate::dto::{
     self, ConflictSummary, EvictOutcome, FileAvailability, FileVersion, FolderMode,
-    FolderRestoreOutcome, LinkOutcome, PreflightResult, StorageModeOutcome, TrashedFile,
-    UnlinkOutcome,
+    FolderRestoreOutcome, LinkOutcome, PreflightResult, ProviderFolderOutcome, StorageModeOutcome,
+    TrashedFile, UnlinkOutcome,
 };
 use crate::error::DesktopError;
 use crate::ops;
@@ -152,18 +152,6 @@ impl ClientCore {
 
     /// # Errors
     /// Daemon failures.
-    pub async fn pin_file(&self, absolute_path: String) -> Result<(), DesktopError> {
-        Ok(ops::files::pin_file(absolute_path).await?)
-    }
-
-    /// # Errors
-    /// Daemon failures.
-    pub async fn unpin_file(&self, absolute_path: String) -> Result<(), DesktopError> {
-        Ok(ops::files::unpin_file(absolute_path).await?)
-    }
-
-    /// # Errors
-    /// Daemon failures.
     pub async fn hydrate_file(&self, absolute_path: String) -> Result<(), DesktopError> {
         Ok(ops::files::hydrate_file(absolute_path).await?)
     }
@@ -211,6 +199,57 @@ impl ClientCore {
             ops::shares::create_and_link(group_name, absolute, on_demand(mode), acknowledge_risks)
                 .await?;
         Ok(LinkOutcome { group_id, local_path, mode })
+    }
+
+    /// Creates a NEW group and a provider-backed folder (macOS File Provider): no directory is
+    /// linked, the OS-managed domain is the folder. `request_token` is the retry identity: the same
+    /// request, even after a restart, is answered with the folder it already made.
+    ///
+    /// # Errors
+    /// Daemon failures, including a refusal when provider folders are not available.
+    pub async fn create_provider_folder(
+        &self,
+        group_name: String,
+        display_name: String,
+        mode: FolderMode,
+    ) -> Result<ProviderFolderOutcome, DesktopError> {
+        let created =
+            ops::shares::create_provider_folder(group_name, display_name.clone(), on_demand(mode))
+                .await?;
+        Ok(ProviderFolderOutcome {
+            group_id: created.group_id,
+            root_id: created.root_id,
+            display_name,
+            mode,
+            already_existed: created.already_existed,
+        })
+    }
+
+    /// Joins an existing group as a provider-backed folder.
+    ///
+    /// # Errors
+    /// As [`ClientCore::create_provider_folder`].
+    pub async fn join_provider_folder(
+        &self,
+        group_id: String,
+        group_name: String,
+        display_name: String,
+        mode: FolderMode,
+    ) -> Result<ProviderFolderOutcome, DesktopError> {
+        let created = ops::shares::join_provider_folder(
+            group_id,
+            group_name,
+            display_name.clone(),
+            on_demand(mode),
+        )
+        .await?;
+        Ok(ProviderFolderOutcome {
+            group_id: created.group_id,
+            root_id: created.root_id,
+            display_name,
+            mode,
+            already_existed: created.already_existed,
+        })
     }
 
     /// Joins a group this account owns and links it at `local_path`.

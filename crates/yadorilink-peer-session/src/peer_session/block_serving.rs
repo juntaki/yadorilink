@@ -27,14 +27,14 @@ struct BlockExaminationPermits {
 /// doc comment for why that single semantic check is run as one offloaded
 /// unit instead of the storage reads it used to be assembled from here.
 enum BlockRequestCheckOutcome {
-    /// Referenced by this device's own record of the file (or the DAG/
+    /// Referenced by this device's own record of the file (or native state/
     /// retained-version fallback), and the peer has verified provenance --
     /// the request may proceed to dispatch/serve. `declared_size` is the
     /// block's own declared size when cheaply known, `None` when it must
     /// fall back to a pessimistic estimate -- see `authorize_block_serve`'s
     /// own doc comment.
     Ok { declared_size: Option<u32> },
-    /// Not referenced by the requested file's live record, DAG history, or
+    /// Not referenced by the requested file's live record, native heads, or
     /// retained versions. Answered `dont_have`, not `rejected` -- see the
     /// call site's own comment on why a retry may still succeed.
     NotReferenced,
@@ -42,6 +42,11 @@ enum BlockRequestCheckOutcome {
     /// Answered `rejected` with `NO_VERIFIED_PROVENANCE_REASON`.
     NoProvenance,
 }
+
+/// How long a block stream may take to deliver its request header before it
+/// is dropped. The device-wide examination budget is taken only after the
+/// header arrives, so a peer that never sends one costs a task, not a permit.
+const BLOCK_REQUEST_HEADER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl PeerSyncSession {
     /// Installs this session's device-wide block-serve engine, set once by
@@ -67,18 +72,40 @@ impl PeerSyncSession {
     /// accepted stream); cross-peer fairness and device-wide admission live
     /// in the shared `BlockServeEngine`, which every session funnels into.
     ///
-    /// Takes the same device-wide examination budget any other request
-    /// takes, and answers `Busy` the same way when it cannot: the budget
-    /// bounds this device's work, so it cannot depend on which transport
-    /// the request came in on.
+    /// Reads the request header under [`BLOCK_REQUEST_HEADER_DEADLINE`] first
+    /// and only then takes the device-wide examination budget any other
+    /// request takes, answering `Busy` the same way when it cannot: the budget
+    /// bounds this device's work, so it cannot depend on which transport the
+    /// request came in on. Taking it before the header would let a peer that
+    /// opens streams and never sends a header hold every permit.
     pub async fn serve_block_stream(
         self: Arc<Self>,
         stream: Box<dyn crate::ports::PeerBlockStream>,
     ) {
+        let mut stream = stream;
+        let read = tokio::time::timeout(
+            BLOCK_REQUEST_HEADER_DEADLINE,
+            stream.recv_message(yadorilink_transport::MAX_BLOCK_STREAM_HEADER_BYTES),
+        )
+        .await;
+        let header = match read {
+            Ok(Ok(header)) => header,
+            Ok(Err(error)) => {
+                // A requester that opened a stream and then went away
+                // before saying what it wanted. Nothing to answer, and
+                // nothing to record: this is what an abandoned fetch
+                // looks like from here.
+                tracing::debug!(%error, peer = %self.peer_device_id, "block stream ended before its request header");
+                return;
+            }
+            Err(_) => {
+                tracing::debug!(peer = %self.peer_device_id, "block stream sent no request header in time");
+                return;
+            }
+        };
         match self.begin_block_examination() {
-            Ok(permits) => self.serve_one_block_stream(stream, permits).await,
+            Ok(permits) => self.serve_one_block_stream(stream, header, permits).await,
             Err(busy) => {
-                let mut stream = stream;
                 let _ = self
                     .respond_to_block_request(
                         &mut *stream,
@@ -113,26 +140,13 @@ impl PeerSyncSession {
         }
     }
 
-    /// Reads one block request off `stream` and answers it there.
+    /// Decodes the already-read request `header` and answers it on `stream`.
     async fn serve_one_block_stream(
         &self,
         mut stream: Box<dyn crate::ports::PeerBlockStream>,
+        header: Vec<u8>,
         examination_permits: BlockExaminationPermits,
     ) {
-        let header = match stream
-            .recv_message(yadorilink_transport::MAX_BLOCK_STREAM_HEADER_BYTES)
-            .await
-        {
-            Ok(header) => header,
-            Err(error) => {
-                // A requester that opened a stream and then went away
-                // before saying what it wanted. Nothing to answer, and
-                // nothing to record: this is what an abandoned fetch
-                // looks like from here.
-                tracing::debug!(%error, peer = %self.peer_device_id, "block stream ended before its request header");
-                return;
-            }
-        };
         let req = match self.codec.decode_block_request_header(&header) {
             Ok(req) => req,
             Err(error) => {
@@ -331,7 +345,7 @@ impl PeerSyncSession {
     /// already read by `authorize_block_serve`) when it's cheaply known
     /// from the live `FileRecord` -- the common case -- falling back to
     /// `MAX_BLOCK_SIZE` as a pessimistic worst-case reservation only when
-    /// it isn't (the reference was established via the DAG/retained-
+    /// it isn't (the reference was established via native state/retained-
     /// version path instead, which exposes no size without a real read).
     /// Reserving the theoretical maximum for EVERY request regardless of
     /// real size would make a device's own advertised byte budgets
@@ -440,7 +454,7 @@ impl PeerSyncSession {
         // declared size (the common case) -- the stored bytes must match
         // it EXACTLY, since a hash commits to specific bytes of a specific
         // length. `None` when this request fell back to `MAX_BLOCK_SIZE`
-        // (the DAG/retained-version path, which exposes no exact size) --
+        // (native state/retained-version path, which exposes no exact size) --
         // there the stored bytes only need to fit under that pessimistic
         // reservation, not match it exactly.
         let expected_size = declared_size.map(u64::from);

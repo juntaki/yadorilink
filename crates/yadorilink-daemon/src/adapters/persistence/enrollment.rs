@@ -65,6 +65,10 @@ impl EnrollmentRepository for SyncStateEnrollmentRepository {
         self.state.link_repository().list_links().map_err(SyncError::from)
     }
 
+    fn creation_digest(&self, locator: &str) -> Result<Option<String>, SyncError> {
+        self.state.link_repository().creation_digest(locator).map_err(SyncError::from)
+    }
+
     fn scan_pending(&self) -> Result<PendingEnrollmentScan, SyncError> {
         self.state.enrollment_repository().scan_pending_enrollments().map_err(SyncError::from)
     }

@@ -20,7 +20,7 @@ use crate::daemon_state::DaemonState;
 use crate::peer_registry::{PeerReachability, UnreachableCategory};
 use crate::route::RouteKind;
 use crate::sync_adapter::sync_stack::SyncStack;
-use crate::test_support::sync_stack_fixture::{device, pin, FixtureAuthenticator};
+use crate::test_support::sync_stack_fixture::{device, pin};
 
 const ALICE: &str = "device-alice";
 const BOB: &str = "device-bob";
@@ -46,12 +46,9 @@ async fn pair(alice_config: NetworkConfig, bob_config: NetworkConfig) -> Pair {
     let (bob, bob_dir) = device(BOB, 22);
     pin(&alice, BOB, 22);
     pin(&bob, ALICE, 11);
-    let alice_stack = SyncStack::spawn(alice.clone(), Arc::new(FixtureAuthenticator), alice_config)
-        .await
-        .expect("alice's stack starts");
-    let bob_stack = SyncStack::spawn(bob.clone(), Arc::new(FixtureAuthenticator), bob_config)
-        .await
-        .expect("bob's stack starts");
+    let alice_stack =
+        SyncStack::spawn(alice.clone(), alice_config).await.expect("alice's stack starts");
+    let bob_stack = SyncStack::spawn(bob.clone(), bob_config).await.expect("bob's stack starts");
     Pair { alice, bob, alice_stack, bob_stack, _dirs: (alice_dir, bob_dir) }
 }
 

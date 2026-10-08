@@ -6,6 +6,7 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::Connection;
 
 use crate::error::{DatabaseError, SqlOperationError};
+use crate::job_fence::JobFence;
 use crate::pool::{
     build_pool, checkout, retry_on_database_locked, ConnectionPool, BUSY_TIMEOUT,
     STATEMENT_CACHE_CAPACITY,
@@ -75,6 +76,7 @@ pub mod writer_gate_stats {
         GATE_WAIT_NANOS.store(0, Ordering::Relaxed);
         call_sites().lock().unwrap_or_else(|p| p.into_inner()).clear();
         hold_sites().lock().unwrap_or_else(|p| p.into_inner()).clear();
+        reset_split();
     }
 
     // Per-call-site attribution. It costs a `#[track_caller]` plus one
@@ -145,18 +147,108 @@ pub mod writer_gate_stats {
         v
     }
 
-    /// Every distinct `write`/`write_immediate` call site seen since
-    /// process start or the last [`reset`], with its own acquisition
-    /// count, sorted by count descending -- answers "who is actually
-    /// calling `SyncDatabase::write*` this many times" directly instead of
-    /// by inference.
-    pub fn call_site_stats() -> Vec<(String, u64)> {
-        let sites = call_sites().lock().unwrap_or_else(|p| p.into_inner());
-        let mut v: Vec<(String, u64)> =
-            sites.iter().map(|((file, line), n)| (format!("{file}:{line}"), *n)).collect();
-        v.sort_by_key(|a| std::cmp::Reverse(a.1));
+    // Body/commit split per call site. Off unless armed (see
+    // `set_split_enabled`): an armed `write_immediate` costs two extra
+    // `Instant::now()` and one map update inside the gate it already
+    // holds; a disarmed one costs a single relaxed load.
+    static SPLIT_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static BODY_HIST: crate::diag_hist::Log2Hist = crate::diag_hist::Log2Hist::new();
+    static COMMIT_HIST: crate::diag_hist::Log2Hist = crate::diag_hist::Log2Hist::new();
+
+    /// Totals for one write call site, split into the statements the
+    /// caller's closure ran (`body`) and the explicit `COMMIT` that follows
+    /// (`commit`: WAL append plus its fsync under `synchronous = FULL`).
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub struct SplitSiteStat {
+        pub site: String,
+        pub calls: u64,
+        pub body_nanos: u128,
+        /// Calls that had an explicit commit to time. `write` closures run
+        /// autocommit statements, so their commit cost is inside `body`
+        /// and they add to `calls` but not here.
+        pub commit_calls: u64,
+        pub commit_nanos: u128,
+        pub commit_max_nanos: u64,
+    }
+
+    pub fn set_split_enabled(on: bool) {
+        SPLIT_ENABLED.store(on, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn split_enabled() -> bool {
+        SPLIT_ENABLED.load(Ordering::Relaxed)
+    }
+
+    fn split_sites() -> &'static std::sync::Mutex<std::collections::HashMap<SiteKey, SplitSiteStat>>
+    {
+        static SITES: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<SiteKey, SplitSiteStat>>,
+        > = std::sync::OnceLock::new();
+        SITES.get_or_init(Default::default)
+    }
+
+    pub(crate) fn record_split(
+        location: &'static std::panic::Location<'static>,
+        body: Duration,
+        commit: Option<Duration>,
+    ) {
+        let body_nanos = body.as_nanos().min(u64::MAX as u128) as u64;
+        BODY_HIST.record(body_nanos);
+        let commit_nanos = commit.map(|c| c.as_nanos().min(u64::MAX as u128) as u64);
+        if let Some(nanos) = commit_nanos {
+            COMMIT_HIST.record(nanos);
+        }
+        let mut sites = split_sites().lock().unwrap_or_else(|p| p.into_inner());
+        let entry = sites.entry((location.file(), location.line())).or_default();
+        entry.calls += 1;
+        entry.body_nanos += body_nanos as u128;
+        if let Some(nanos) = commit_nanos {
+            entry.commit_calls += 1;
+            entry.commit_nanos += nanos as u128;
+            entry.commit_max_nanos = entry.commit_max_nanos.max(nanos);
+        }
+    }
+
+    /// Every call site that recorded a split, longest total (body plus
+    /// commit) first.
+    pub fn split_site_stats() -> Vec<SplitSiteStat> {
+        let sites = split_sites().lock().unwrap_or_else(|p| p.into_inner());
+        let mut v: Vec<SplitSiteStat> = sites
+            .iter()
+            .map(|((file, line), stat)| SplitSiteStat {
+                site: format!("{file}:{line}"),
+                ..stat.clone()
+            })
+            .collect();
+        v.sort_by_key(|s| std::cmp::Reverse(s.body_nanos + s.commit_nanos));
         v
     }
+
+    /// `(body, commit)` latency percentile (bucket floor, nanoseconds)
+    /// across every armed write transaction.
+    pub fn split_percentile_nanos(q: f64) -> (u64, u64) {
+        (BODY_HIST.percentile(q), COMMIT_HIST.percentile(q))
+    }
+
+    pub fn reset_split() {
+        split_sites().lock().unwrap_or_else(|p| p.into_inner()).clear();
+        BODY_HIST.reset();
+        COMMIT_HIST.reset();
+    }
+}
+
+thread_local! {
+    /// Set while this thread is inside a write transaction (it holds the
+    /// writer gate, or runs under a holder of it on the same thread).
+    static IN_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the calling thread is inside a write transaction of any
+/// `SyncDatabase`, i.e. holds a writer gate. Waiting for another thread's
+/// database job from such a thread can deadlock on the gate it holds.
+pub fn current_thread_in_write_transaction() -> bool {
+    IN_WRITE.with(|f| f.get())
 }
 
 pub struct SyncDatabase {
@@ -184,6 +276,12 @@ pub struct SyncDatabase {
     /// and so also counts every other database's writes. See
     /// [`Self::write_transaction_count`].
     write_transactions: AtomicU64,
+    /// Whether this database carries the provider tables, so every write TRANSACTION reconciles
+    /// provider item liveness before it commits (a connection-level autocommit write only records
+    /// the changed paths, atomically with the change; provider reads settle them first; see
+    /// [`crate::schema::reconcile_provider_liveness`]). Decided once, after the schema
+    /// bootstrap.
+    provider_liveness: bool,
 }
 
 impl SyncDatabase {
@@ -221,13 +319,14 @@ impl SyncDatabase {
     /// pool-startup fan-out. `schema_init` is the caller's complete
     /// schema-bootstrap step, run on the bootstrap connection before
     /// `open` returns -- the sole place schema initialization happens.
-    /// This crate knows no domain-specific name (DAG, filesystem
+    /// This crate knows no domain-specific name (native state, filesystem
     /// transaction, materialization job, ...) here or anywhere else.
     pub fn open(
         path: impl AsRef<Path>,
         schema_init: impl FnOnce(&Connection) -> Result<(), DatabaseError>,
     ) -> Result<Self, DatabaseError> {
         let path = path.as_ref();
+        let provider_liveness;
         {
             let conn = Connection::open(path)?;
             conn.busy_timeout(BUSY_TIMEOUT)?;
@@ -255,6 +354,7 @@ impl SyncDatabase {
             // stamping existed. Each owner now declares its own generation
             // in its `schema_init`.
             schema_init(&conn)?;
+            provider_liveness = crate::schema::has_provider_liveness(&conn)?;
         }
         let manager = SqliteConnectionManager::file(path).with_init(|conn| {
             conn.busy_timeout(BUSY_TIMEOUT)?;
@@ -267,7 +367,12 @@ impl SyncDatabase {
             Ok(())
         });
         let pool = build_pool(manager)?;
-        Ok(Self { pool, writer_gate: Mutex::new(()), write_transactions: AtomicU64::new(0) })
+        Ok(Self {
+            pool,
+            writer_gate: Mutex::new(()),
+            write_transactions: AtomicU64::new(0),
+            provider_liveness,
+        })
     }
 
     /// Opens an in-memory database, pooled just like the file-backed case.
@@ -307,8 +412,14 @@ impl SyncDatabase {
         // `check_schema_version_supported`'s own doc comment for why.
         crate::schema::check_schema_version_supported(&conn)?;
         schema_init(&conn)?;
+        let provider_liveness = crate::schema::has_provider_liveness(&conn)?;
         drop(conn);
-        Ok(Self { pool, writer_gate: Mutex::new(()), write_transactions: AtomicU64::new(0) })
+        Ok(Self {
+            pool,
+            writer_gate: Mutex::new(()),
+            write_transactions: AtomicU64::new(0),
+            provider_liveness,
+        })
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -395,7 +506,13 @@ impl SyncDatabase {
         writer_gate_stats::record_call_site(caller);
         self.locked_write(caller, || {
             let mut conn = checkout::<E>(&self.pool)?;
-            operation(&mut conn)
+            if !writer_gate_stats::split_enabled() {
+                return operation(&mut conn);
+            }
+            let started = std::time::Instant::now();
+            let result = operation(&mut conn);
+            writer_gate_stats::record_split(caller, started.elapsed(), None);
+            result
         })
     }
 
@@ -406,15 +523,85 @@ impl SyncDatabase {
     #[track_caller]
     pub fn write_immediate<T, E: SqlOperationError>(
         &self,
+        operation: impl FnMut(&rusqlite::Transaction<'_>) -> Result<T, E>,
+    ) -> Result<T, E> {
+        self.write_immediate_at(std::panic::Location::caller(), operation)
+    }
+
+    /// [`Self::write_immediate`] on the blocking pool, so the calling task
+    /// keeps polling while the commit (the writer gate, the statements, the
+    /// fsync) runs on another thread.
+    ///
+    /// The returned future owns a [`JobFence`] wait: if it is dropped before
+    /// the job has finished (the awaiting task was cancelled), its `Drop`
+    /// blocks until the job has committed or rolled back, so whatever the
+    /// caller's frames still hold for this write (path locks, root
+    /// operations, claims) is released only after the outcome is decided. The
+    /// job itself needs nothing from the dropper: it owns its closure and
+    /// takes only the writer gate, which no dropping side holds (a drop on a
+    /// thread that is itself inside a write transaction does not wait, since
+    /// waiting there could deadlock on the gate).
+    ///
+    /// A panic in `operation` rolls the transaction back, signals the fence
+    /// and is re-raised in the awaiting task, as the inline call would.
+    #[track_caller]
+    pub fn write_immediate_offloaded<T, E>(
+        self: &std::sync::Arc<Self>,
+        operation: impl FnMut(&rusqlite::Transaction<'_>) -> Result<T, E> + Send + 'static,
+    ) -> impl std::future::Future<Output = Result<T, E>> + Send
+    where
+        T: Send + 'static,
+        E: SqlOperationError + Send + 'static,
+    {
+        let caller = std::panic::Location::caller();
+        let database = std::sync::Arc::clone(self);
+        async move {
+            let fence = JobFence::new();
+            let completion = fence.completion();
+            let handle = tokio::task::spawn_blocking(move || {
+                let _completion = completion;
+                let _scope = _completion.enter();
+                database.write_immediate_at(caller, operation)
+            });
+            let _wait = fence.waiter();
+            match handle.await {
+                Ok(result) => result,
+                Err(join) => match join.try_into_panic() {
+                    Ok(payload) => std::panic::resume_unwind(payload),
+                    Err(_) => Err(E::from(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT),
+                        Some("the commit job was cancelled before it ran".to_owned()),
+                    ))),
+                },
+            }
+        }
+    }
+
+    fn write_immediate_at<T, E: SqlOperationError>(
+        &self,
+        caller: &'static std::panic::Location<'static>,
         mut operation: impl FnMut(&rusqlite::Transaction<'_>) -> Result<T, E>,
     ) -> Result<T, E> {
-        let caller = std::panic::Location::caller();
         writer_gate_stats::record_call_site(caller);
         self.locked_write(caller, || {
             let mut conn = checkout::<E>(&self.pool)?;
             let tx = new_immediate_write_transaction(&mut conn)?;
+            let body_started = writer_gate_stats::split_enabled().then(std::time::Instant::now);
             let result = operation(&tx)?;
+            // After the COMPLETE semantic mutation, before the commit: liveness reads the
+            // final state, never an intermediate one.
+            if self.provider_liveness {
+                crate::schema::reconcile_provider_liveness(&tx).map_err(E::from)?;
+            }
+            let commit_started = body_started.map(|body| (body, std::time::Instant::now()));
             tx.commit().map_err(E::from)?;
+            if let Some((body_started, commit_started)) = commit_started {
+                writer_gate_stats::record_split(
+                    caller,
+                    commit_started.duration_since(body_started),
+                    Some(commit_started.elapsed()),
+                );
+            }
             Ok(result)
         })
     }
@@ -436,9 +623,6 @@ impl SyncDatabase {
         caller_location: &'static std::panic::Location<'static>,
         op: impl FnMut() -> Result<T, E>,
     ) -> Result<T, E> {
-        thread_local! {
-            static IN_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-        }
         struct Reset;
         impl Drop for Reset {
             fn drop(&mut self) {
@@ -461,6 +645,7 @@ impl SyncDatabase {
         let _gate = self.writer_gate.lock().unwrap_or_else(|p| p.into_inner());
         let gate_wait_elapsed = gate_wait_started.elapsed();
         writer_gate_stats::record_gate_acquisition(gate_wait_elapsed);
+        crate::job_fence::mark_running_current();
         self.write_transactions.fetch_add(1, Ordering::Relaxed);
         IN_WRITE.with(|f| f.set(true));
         let _reset = Reset;

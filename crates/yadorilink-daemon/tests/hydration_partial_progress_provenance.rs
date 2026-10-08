@@ -200,33 +200,23 @@ async fn seed_published_serving_placeholder(
         .state
         .device_signing_key()
         .expect("the checkpoint authority assigns every device a signing key");
-    let emitter = yadorilink_sync_sqlite::dag_store::ChangeEmitter::new(
-        device.device_id.clone(),
+    let emitter = yadorilink_daemon::test_support::local_seam::replica_author_key(
+        &device.state.replica_coordinator,
+        &device.device_id,
         signing_key,
-    );
-    device
-        .state
-        .replica_coordinator
-        .upsert_file_emitting_change(
-            GROUP,
-            &record,
-            &device.device_id,
-            yadorilink_replica_domain::session_state::ChangeContent {
-                ops: vec![yadorilink_replica_domain::change::Op::Put {
-                    path: yadorilink_replica_domain::ids::SyncPath(PATH.to_string()),
-                    version: version.version_hash,
-                    origin: yadorilink_replica_domain::change::PutOrigin::Direct,
-                }],
-                versions: std::slice::from_ref(&version),
-            },
-            None,
-            None,
-            yadorilink_daemon::replica_coordinator::ReplicaChangeEmission {
-                emitter: &emitter,
-                permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-            },
-        )
-        .unwrap();
+    )
+    .unwrap();
+    yadorilink_daemon::test_support::local_seam::commit_local_upsert(
+        &device.state.replica_coordinator,
+        GROUP,
+        &record,
+        &device.device_id,
+        &version,
+        None,
+        &emitter,
+        &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+    )
+    .unwrap();
     // Pending is not servable, and this fixture runs neither of production's
     // flush triggers (a new local mutation's broadcast, or a reconnect).
     device.state.flush_pending_checkpoint_for_group_for_test(GROUP).await;
@@ -273,7 +263,7 @@ fn seed_placeholder(
         .set_materialization_state(
             GROUP,
             PATH,
-            MaterializationState::Placeholder,
+            MaterializationState::Remote,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
@@ -306,8 +296,7 @@ fn give_blocks(
         device
             .state
             .replica_coordinator
-            .change_history_repository()
-            .record_group_block_provenance(GROUP, std::slice::from_ref(&block.hash))
+            .record_block_provenance(GROUP, std::slice::from_ref(&block.hash))
             .unwrap();
     }
 }
@@ -339,15 +328,11 @@ async fn connect_as_peer(hydrating: &TestDevice, peer: &TestDevice) {
         replica_engine_to_peer,
         hydrating_peer_store,
         vec![GROUP.to_string()],
-        HashMap::from([(GROUP.to_string(), hydrating.root.path().to_path_buf())]),
         yadorilink_peer_session::ports::SessionTransports {
             blocks: transports_to_peer.clone(),
             service: transports_to_peer.clone(),
-            prepared_snapshots: Arc::new(yadorilink_lane_ports::PreparedSnapshots::new()),
-            snapshot_fetch: transports_to_peer,
         },
-        None,
-        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::test_permissive(),
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::denied(),
     );
     session_to_peer.set_block_serve_engine(hydrating.state.block_serve_engine.clone());
     node_hydrating.serve_with(&peer.device_id, session_to_peer.clone());
@@ -374,15 +359,11 @@ async fn connect_as_peer(hydrating: &TestDevice, peer: &TestDevice) {
         replica_engine_from_hydrating,
         peer_peer_store,
         vec![GROUP.to_string()],
-        HashMap::from([(GROUP.to_string(), peer.root.path().to_path_buf())]),
         yadorilink_peer_session::ports::SessionTransports {
             blocks: transports_from_hydrating.clone(),
             service: transports_from_hydrating.clone(),
-            prepared_snapshots: Arc::new(yadorilink_lane_ports::PreparedSnapshots::new()),
-            snapshot_fetch: transports_from_hydrating,
         },
-        None,
-        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::test_permissive(),
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::denied(),
     );
     session_from_hydrating.set_block_serve_engine(peer.state.block_serve_engine.clone());
     node_peer.serve_with(&hydrating.device_id, session_from_hydrating.clone());

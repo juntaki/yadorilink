@@ -1,6 +1,5 @@
-//! Source-side shared block serving (stage 2 of
-//! `replace-inline-hydration-with-durable-convergence-engine`): fair
-//! in-flight-byte credit across peers/groups/the whole device (CONV-6), and
+//! Source-side shared block serving: fair
+//! in-flight-byte credit across peers/groups/the whole device, and
 //! disk-read/hash-verify/compression coalescing so concurrent requesters for
 //! the identical block share one read instead of each paying for their own.
 //!
@@ -62,7 +61,7 @@ struct ScopeUsage {
     requests: u32,
 }
 
-/// Enforces CONV-6 (per-peer, per-group, and global in-flight-byte budgets,
+/// Enforces per-peer, per-group, and global in-flight-byte budgets,
 /// simultaneously -- none alone sufficient) by admission control: a request
 /// is either admitted in full against all three budgets at once, or denied
 /// with [`ServeBusy`]. There is no queueing or reordering here -- "fair
@@ -635,7 +634,7 @@ impl BlockServeEngine {
     /// spawned task itself) that unavoidably happens BEFORE a request ever
     /// reaches `acquire_dispatch_turn`. Without this, an authorized peer
     /// that simply sends `BlockRequest`s faster than this device can
-    /// examine them grows that unbounded work — spawned tasks, SQLite/DAG
+    /// examine them grows that unbounded work — spawned tasks, SQLite/native-state
     /// lookups, per-task future state — with no cap at all, even though
     /// `acquire_dispatch_turn`'s own queue-full rejection (`Err` at `max_
     /// active * MAX_WAITING_MULTIPLE` waiters) looks like a bound from the
@@ -697,7 +696,7 @@ impl BlockServeEngine {
     }
 
     /// Attempts to admit `bytes` of serving for `(peer_id, group_id)` against
-    /// all three CONV-6 budgets at once. On success, returns a guard that
+    /// all three budgets at once. On success, returns a guard that
     /// releases all three when the caller is done (drop it once the reply
     /// has actually been sent, not merely once the bytes are read, so a slow
     /// send still counts against the budget it's consuming network capacity

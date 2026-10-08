@@ -82,6 +82,14 @@ fn start_watching(device: &TestDevice, group_id: &str) {
 
 async fn setup_four_devices(prefix: &str) -> (Vec<TestDevice>, String) {
     support::ensure_isolated_config_dir();
+    // Captured per test and printed on failure; `RUST_LOG` widens it.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_test_writer()
+        .try_init();
     let group_id = format!("{prefix}-group");
     let devices = (0..4).map(|i| setup_device(&format!("{prefix}-device-{i}"))).collect::<Vec<_>>();
     for device in &devices {
@@ -267,12 +275,113 @@ async fn connect_late_observers(
     );
 }
 
+/// Everything needed to tell, from one failure, whether two devices disagree
+/// on the tree, the native heads, the recorded placements or a row's native
+/// identity.
+fn diagnostic_dump(expected: &Snapshot, devices: &[&TestDevice], group_id: &str) -> String {
+    use yadorilink_replica_domain::ids::FolderGroupId;
+    let group = FolderGroupId(group_id.to_string());
+    let mut out = String::new();
+    for device in devices {
+        let tree = snapshot(device.root.path());
+        out.push_str(&format!("=== {}\n", device.device_id));
+        let held: Vec<String> = device
+            .state
+            .replica_coordinator
+            .database()
+            .read::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT b.author || '#' || b.seq || CASE WHEN a.delta_hash IS NULL THEN ' unpublished' ELSE '' END \
+                     FROM native_delta_bodies b LEFT JOIN native_delta_authorization a ON a.delta_hash = b.delta_hash \
+                     WHERE b.group_id = ?1 ORDER BY b.author, b.seq",
+                )?;
+                let rows = stmt.query_map([group_id], |row| row.get::<_, String>(0))?;
+                Ok(rows.collect::<Result<_, _>>()?)
+            })
+            .unwrap();
+        out.push_str(&format!("  deltas held: {held:?}\n"));
+        let obligations: Vec<String> = device
+            .state
+            .replica_coordinator
+            .database()
+            .read::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT path || ' ' || state || ' attempts=' || attempt_count || ' origin=' || origin FROM projection_obligations WHERE group_id = ?1",
+                )?;
+                let rows = stmt.query_map([group_id], |row| row.get::<_, String>(0))?;
+                Ok(rows.collect::<Result<_, _>>()?)
+            })
+            .unwrap();
+        out.push_str(&format!("  obligations: {obligations:?}\n"));
+        for (path, content) in expected {
+            match tree.get(path) {
+                None => out.push_str(&format!("  missing  {path} = {content:?}\n")),
+                Some(actual) if actual != content => {
+                    out.push_str(&format!("  differs  {path}: want {content:?} got {actual:?}\n"))
+                }
+                Some(_) => {}
+            }
+        }
+        for (path, content) in &tree {
+            if !expected.contains_key(path) {
+                out.push_str(&format!("  extra    {path} = {content:?}\n"));
+            }
+        }
+        let dump = device.state.replica_coordinator.database().read(
+            |conn| -> Result<String, yadorilink_sync_sqlite::SyncSqliteError> {
+                let mut text = String::new();
+                let (heads, _) =
+                    yadorilink_sync_sqlite::native_store::native_heads_at_level(conn, &group, "")?;
+                for (path, path_heads) in &heads {
+                    text.push_str(&format!("  heads {}:\n", path.as_str()));
+                    for (dot, payload) in path_heads {
+                        text.push_str(&format!(
+                            "    {}/{}#{} v={} prov={}\n",
+                            dot.author.device.0,
+                            hex::encode(&dot.author.incarnation.0[..4]),
+                            dot.seq.get(),
+                            payload.version.to_hex(),
+                            hex::encode(payload.provenance.0)
+                        ));
+                    }
+                }
+                for row in yadorilink_sync_sqlite::stable_projection_binding::native_placements(
+                    conn, group_id,
+                )? {
+                    text.push_str(&format!("  placement {row:?}\n"));
+                }
+                let mut stmt = conn.prepare(
+                    "SELECT path, deleted, hex(native_authoring_identity) FROM files \
+                 WHERE group_id = ?1 AND state = 'current' ORDER BY path",
+                )?;
+                let rows = stmt.query_map([group_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, bool>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (path, deleted, identity) = row?;
+                    text.push_str(&format!(
+                        "  row {path} deleted={deleted} native_id={identity:?}\n"
+                    ));
+                }
+                Ok(text)
+            },
+        );
+        out.push_str(&dump.unwrap_or_else(|error| format!("  dump failed: {error}\n")));
+    }
+    out
+}
+
 async fn assert_late_observers_match(
     expected: &Snapshot,
     source_a: &TestDevice,
     source_b: &TestDevice,
     late_a: &TestDevice,
     late_b: &TestDevice,
+    group_id: &str,
 ) {
     let devices = [source_a, source_b, late_a, late_b];
     wait_until_or_stalled(
@@ -284,7 +393,13 @@ async fn assert_late_observers_match(
         || devices.iter().map(|d| snapshot(d.root.path())).collect::<Vec<_>>(),
         LATE_OBSERVER_ABSOLUTE_TIMEOUT,
         LATE_OBSERVER_STALL_TIMEOUT,
-        || snapshots_summary(&devices),
+        || {
+            format!(
+                "{}\n{}",
+                snapshots_summary(&devices),
+                diagnostic_dump(expected, &devices, group_id)
+            )
+        },
     )
     .await;
     tokio::time::sleep(STABILITY_WINDOW).await;
@@ -333,7 +448,7 @@ async fn late_clone_after_merge_edit_preserves_the_pre_merge_loser() {
     .await;
 
     connect_late_observers(a, b, late_a, late_b, &group_id).await;
-    assert_late_observers_match(&expected, a, b, late_a, late_b).await;
+    assert_late_observers_match(&expected, a, b, late_a, late_b, &group_id).await;
 }
 
 /// Models a checkout/rebase that renames the resolved file and immediately
@@ -367,7 +482,7 @@ async fn late_clone_after_rename_and_recreate_keeps_the_old_conflict_copy() {
     .await;
 
     connect_late_observers(a, b, late_a, late_b, &group_id).await;
-    assert_late_observers_match(&expected, a, b, late_a, late_b).await;
+    assert_late_observers_match(&expected, a, b, late_a, late_b, &group_id).await;
 }
 
 /// A user may deliberately delete a generated conflict copy before making a
@@ -406,7 +521,7 @@ async fn deleted_conflict_copy_does_not_resurrect_on_a_late_clone() {
     .await;
 
     connect_late_observers(a, b, late_a, late_b, &group_id).await;
-    assert_late_observers_match(&expected, a, b, late_a, late_b).await;
+    assert_late_observers_match(&expected, a, b, late_a, late_b, &group_id).await;
     assert!(
         !expected.keys().any(|name| is_conflict_copy(name)),
         "the explicitly deleted conflict copy was resurrected: {expected:?}"
@@ -469,9 +584,24 @@ async fn multi_file_checkout_rewrite_preserves_every_loser_for_late_clones() {
     write_file(a.root.path(), "README.md", "readme after squash");
     write_file(a.root.path(), "CHANGELOG.md", "release candidate");
 
+    // The rename moves the version A showed at `src-lib.rs` and supersedes
+    // only that head. The other head there, shown as its conflict copy, was
+    // never in the rename's basis, so it stays a head of `src-lib.rs`. Alone,
+    // it keeps its copy name under native authority (the rename's author saw
+    // the copy and declares it kept, so a late clone that never saw the
+    // contest agrees), and takes the name under DCF's older resolution. The
+    // two other copies stay copies: the rewrite and the delete/recreate
+    // superseded only the shown heads.
+    let lib_shown = conflicted["src-lib.rs"].clone();
+    let (lib_copy, lib_other) = preserved
+        .iter()
+        .find(|(name, _)| name.starts_with("src-lib ("))
+        .map(|(name, content)| (name.clone(), content.clone()))
+        .expect("a copy of the other src-lib.rs version");
     let expected = settle_pair(a, b, "multi-file checkout rewrite", |state| {
-        !state.contains_key("src-lib.rs")
-            && state.contains_key("src-core.rs")
+        state.get("src-core.rs") == Some(&lib_shown)
+            && !state.contains_key("src-lib.rs")
+            && state.get(&lib_copy) == Some(&lib_other)
             && state.get("Cargo.lock").map(String::as_str) == Some("lock after rebase")
             && state.get("README.md").map(String::as_str) == Some("readme after squash")
             && state.get("CHANGELOG.md").map(String::as_str) == Some("release candidate")
@@ -480,5 +610,5 @@ async fn multi_file_checkout_rewrite_preserves_every_loser_for_late_clones() {
     .await;
 
     connect_late_observers(a, b, late_a, late_b, &group_id).await;
-    assert_late_observers_match(&expected, a, b, late_a, late_b).await;
+    assert_late_observers_match(&expected, a, b, late_a, late_b, &group_id).await;
 }

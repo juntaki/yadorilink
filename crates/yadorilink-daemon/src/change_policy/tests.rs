@@ -852,3 +852,87 @@ fn role_carrying_grant_signing_bytes_match_the_cross_implementation_golden_vecto
 
     assert_eq!(hex(&signing_bytes("g", &record)), expected);
 }
+
+fn rotated_chain() -> (GroupPolicyState, SigningKey, [u8; HASH_LEN], [u8; HASH_LEN]) {
+    let old_key = service_key();
+    let new_key = SigningKey::from_bytes(&[8u8; 32]);
+    let grant = grant_record(
+        &old_key,
+        "group",
+        1,
+        ZERO_HASH,
+        "device-a",
+        [9u8; HASH_LEN],
+        WriterRole::Editor,
+    );
+    let grant_hash = hash_of(&grant);
+    let rotate =
+        rotate_record(&old_key, "group", 2, grant_hash, new_key.verifying_key().to_bytes());
+    let rotate_hash = hash_of(&rotate);
+    let log = GroupPolicyLog {
+        group_id: "group".to_string(),
+        current_seq: 2,
+        current_epoch: 0,
+        policy_head: rotate_hash.to_vec(),
+        records: vec![grant, rotate],
+    };
+    let policy = verify_group_policy_log(&old_key.verifying_key().to_bytes(), &log).unwrap();
+    (policy, old_key, grant_hash, rotate_hash)
+}
+
+#[test]
+fn a_retired_key_does_not_resolve_at_the_empty_chain_point_after_a_rotation() {
+    let (policy, old_key, grant_hash, _) = rotated_chain();
+    let old_id: [u8; HASH_LEN] = Sha256::digest(old_key.verifying_key().to_bytes()).into();
+    assert!(
+        policy.resolve_authority_key(&old_id, &ZERO_HASH).is_none(),
+        "the retired key must not vouch for a checkpoint pinned at the empty chain"
+    );
+    // A real pre-rotation point still resolves: checkpoints issued before the rotation stay valid.
+    assert!(policy.resolve_authority_key(&old_id, &grant_hash).is_some());
+}
+
+#[test]
+fn a_checkpoint_policy_point_must_be_on_the_chain_and_name_a_writer_there() {
+    let (policy, _, grant_hash, rotate_hash) = rotated_chain();
+    let fp = [9u8; HASH_LEN];
+    assert!(policy.writer_at_policy_point("device-a", &fp, 1, &grant_hash));
+    assert!(policy.writer_at_policy_point("device-a", &fp, 2, &rotate_hash));
+    // A head that is not the chain's record at that sequence.
+    assert!(!policy.writer_at_policy_point("device-a", &fp, 1, &rotate_hash));
+    assert!(!policy.writer_at_policy_point("device-a", &fp, 3, &rotate_hash));
+    // A device that held no grant, or another key, at that point.
+    assert!(!policy.writer_at_policy_point("device-b", &fp, 1, &grant_hash));
+    assert!(!policy.writer_at_policy_point("device-a", &[1u8; HASH_LEN], 1, &grant_hash));
+    // The empty chain's point holds no grants and is closed once the authority rotated.
+    assert!(!policy.writer_at_policy_point("device-a", &fp, 0, &ZERO_HASH));
+}
+
+#[test]
+fn a_viewer_or_a_later_revoked_device_is_judged_at_the_pinned_point() {
+    let key = service_key();
+    let fp = [9u8; HASH_LEN];
+    let viewer = grant_record(&key, "group", 1, ZERO_HASH, "viewer", fp, WriterRole::Viewer);
+    let h1 = hash_of(&viewer);
+    let editor = grant_record(&key, "group", 2, h1, "editor", fp, WriterRole::Editor);
+    let h2 = hash_of(&editor);
+    let revoke = revoke_record(&key, "group", 3, h2, "editor");
+    let h3 = hash_of(&revoke);
+    let log = GroupPolicyLog {
+        group_id: "group".to_string(),
+        current_seq: 3,
+        current_epoch: 1,
+        policy_head: h3.to_vec(),
+        records: vec![viewer, editor, revoke],
+    };
+    let policy = verify_group_policy_log(&key.verifying_key().to_bytes(), &log).unwrap();
+    assert!(!policy.writer_at_policy_point("viewer", &fp, 1, &h1), "a viewer does not write");
+    assert!(
+        policy.writer_at_policy_point("editor", &fp, 2, &h2),
+        "a delta published before the revoke stays admissible"
+    );
+    assert!(!policy.writer_at_policy_point("editor", &fp, 3, &h3), "revoked at that point");
+    // Before any rotation the empty-chain point is valid for its own head only.
+    assert!(policy.writer_at_policy_point("anyone", &fp, 0, &ZERO_HASH));
+    assert!(!policy.writer_at_policy_point("anyone", &fp, 0, &h1));
+}

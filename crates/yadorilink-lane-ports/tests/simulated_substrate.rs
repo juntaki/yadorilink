@@ -13,7 +13,7 @@
 //! This is the third option. iroh's custom-transport seam replaces the
 //! bottom-most datagram carrier and nothing else. Everything above it --
 //! iroh's QUIC, TLS and stream multiplexing, `PeerLink`, `PeerTransports`,
-//! the lane streams, `PreparedSnapshots` -- is the code a shipped daemon
+//! the lane streams -- is the code a shipped daemon
 //! runs. The carrier and its address lookup both come from upstream's own
 //! `TestNetwork`; this crate reimplements neither.
 //!
@@ -22,22 +22,16 @@
 
 #![cfg(feature = "test-support")]
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use iroh::test_utils::test_transport::TestNetwork;
-use sha2::{Digest, Sha256};
-use tokio::io::AsyncReadExt;
 use yadorilink_lane_ports::block_lane::LaneBlockStream;
-use yadorilink_lane_ports::directory::StaticPeerDirectory;
-use yadorilink_lane_ports::prepared_snapshots::PreparedSnapshots;
 use yadorilink_lane_ports::service_lane::LaneServiceStream;
-use yadorilink_lane_ports::snapshot_service::serve_snapshot_stream;
 use yadorilink_lane_ports::testing::{TestAddressBook, TestPeerNode};
 use yadorilink_peer_session::ports::{
-    BlockStreamTransport, PeerBlockStream, PeerServiceStream, ServiceStreamTransport, SnapshotFetch,
+    BlockStreamTransport, PeerBlockStream, PeerServiceStream, ServiceStreamTransport,
 };
-use yadorilink_sync_substrate::{HistoryStreamKind, Lane};
+use yadorilink_sync_substrate::Lane;
 
 /// Generous, and only a backstop: every exchange below is one round trip
 /// between two endpoints in the same process.
@@ -78,28 +72,16 @@ async fn every_lane_a_session_needs_crosses_a_simulated_carrier() {
     // Larger than one datagram, so the block exchange genuinely reassembles a
     // QUIC byte stream rather than riding a single packet.
     let block_body: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
-    // Past a single stream's first window: a snapshot is the largest thing
-    // this substrate carries, and a carrier that managed small messages while
-    // stalling on megabytes would leave the case that matters unproven.
-    let snapshot: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
-    let snapshot_hash: [u8; 32] = Sha256::digest(&snapshot).into();
-
     // B answers each lane the way production answers it.
-    let prepared = PreparedSnapshots::new();
-    prepared.prepare(GROUP, snapshot_hash, Arc::new(snapshot.clone()));
-    let mut directory = StaticPeerDirectory::new();
-    let peer_endpoint = *a.address().peer().as_bytes();
-    directory.bind_endpoint(peer_endpoint, "device-a");
-    directory.authorize("device-a", GROUP);
 
     let serving_body = block_body.clone();
     let serving = tokio::spawn(async move {
         let mut served: Vec<(&'static str, Vec<u8>)> = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..2 {
             // The group the lane was opened for, not the peer: a lane is
             // per-group, and the peer is already authenticated by the QUIC
             // handshake that carried it.
-            let (group, mut stream) =
+            let (group, stream) =
                 b.accept_unclaimed_lane().await.expect("an inbound lane must arrive");
             assert_eq!(group, GROUP, "a lane arrived for a group it was not opened for");
             match stream.lane() {
@@ -116,29 +98,6 @@ async fn every_lane_a_session_needs_crosses_a_simulated_carrier() {
                     lane.send_response(b"pong").await.expect("the service response");
                     served.push(("service", request));
                 }
-                Lane::History => {
-                    // The kind byte first, exactly as production's history
-                    // dispatch reads it before handing the rest on. Reading
-                    // it here is not ceremony: `serve_snapshot_stream` starts
-                    // at the requested hash, so a serving side that skipped
-                    // the tag would take its first byte from the wrong place
-                    // and silently answer "no such snapshot".
-                    let mut tag = [0u8; 1];
-                    stream.read_exact(&mut tag).await.expect("the history kind byte");
-                    assert_eq!(
-                        HistoryStreamKind::from_tag(tag[0]),
-                        Some(HistoryStreamKind::RebootstrapSnapshot),
-                        "the fetch opened a history stream of an unexpected kind"
-                    );
-                    // The real collection path, authorization and all -- not a
-                    // hand-written responder. A snapshot that crossed some
-                    // other way would say nothing about the one production
-                    // uses.
-                    serve_snapshot_stream(stream, &peer_endpoint, GROUP, &directory, &prepared)
-                        .await;
-                    served.push(("history", Vec::new()));
-                }
-                other => panic!("unexpected lane {other:?}"),
             }
         }
         served
@@ -183,17 +142,6 @@ async fn every_lane_a_session_needs_crosses_a_simulated_carrier() {
         .expect("the service response must read");
     assert_eq!(response, b"pong", "the service response did not survive the carrier");
 
-    // (7) Snapshot: prepared on B, collected by A's own `SnapshotFetch`.
-    let fetched = tokio::time::timeout(
-        STEP_TIMEOUT,
-        SnapshotFetch::fetch(transports.as_ref(), GROUP, snapshot_hash),
-    )
-    .await
-    .expect("the snapshot fetch must resolve")
-    .unwrap_or_else(|e| panic!("the snapshot fetch must succeed: {e:?}"));
-    assert_eq!(fetched.len(), snapshot.len(), "the snapshot was truncated crossing the carrier");
-    assert_eq!(fetched, snapshot, "the snapshot's bytes did not survive the carrier");
-
     let served = tokio::time::timeout(STEP_TIMEOUT, serving)
         .await
         .expect("the serving side must finish")
@@ -201,7 +149,6 @@ async fn every_lane_a_session_needs_crosses_a_simulated_carrier() {
     let kinds: Vec<&str> = served.iter().map(|(kind, _)| *kind).collect();
     assert!(kinds.contains(&"block"), "no block lane reached the far side: {kinds:?}");
     assert!(kinds.contains(&"service"), "no service lane reached the far side: {kinds:?}");
-    assert!(kinds.contains(&"history"), "no history lane reached the far side: {kinds:?}");
     for (kind, request) in &served {
         match *kind {
             "block" => assert_eq!(request, b"want", "the block request did not survive"),

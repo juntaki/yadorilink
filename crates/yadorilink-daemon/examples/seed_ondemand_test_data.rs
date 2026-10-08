@@ -61,7 +61,7 @@ fn main() {
         .set_materialization_state(
             group_id,
             relative_file,
-            MaterializationState::Placeholder,
+            MaterializationState::Remote,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();

@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
-use yadorilink_replica_engine::repair_election::AuthorizedWriter;
+use yadorilink_replica_engine::authorized_writer::AuthorizedWriter;
 use yadorilink_sync_sqlite::policy_watermark::PolicyWatermark;
 
 /// A group's signed policy log as delivered by the coordination plane in a
@@ -247,9 +247,7 @@ impl GroupPolicyState {
 
     /// The authorized writer set as of a specific `auth_seq`. Sorted by
     /// `device_id` so any two devices that replay the same verified chain up
-    /// to the same seq compute the identical `Vec` — the shared input
-    /// `yadorilink_replica_engine::repair_election::rank_writers_for_obligation`
-    /// depends on to produce the same ranking on every replica.
+    /// to the same seq compute the identical `Vec`.
     ///
     /// Fails closed rather than silently substituting a different set:
     /// `auth_seq` beyond `self.current_seq` asks for a policy point this
@@ -313,8 +311,27 @@ impl GroupPolicyState {
     /// own doc comment gives: any two devices that replay the same verified
     /// chain up to the same seq compute the identical `Vec`.
     pub fn current_members(&self) -> Vec<GroupMember> {
+        self.members_up_to(self.current_seq)
+    }
+
+    /// The full group membership, with roles, as of `auth_seq`; refused on the
+    /// same terms as [`Self::writers_at`].
+    pub fn members_at(&self, auth_seq: u64) -> Result<Vec<GroupMember>, WriterSnapshotError> {
+        if auth_seq > self.current_seq {
+            return Err(WriterSnapshotError::FutureSequence {
+                requested: auth_seq,
+                current: self.current_seq,
+            });
+        }
+        if auth_seq >= 1 && !self.records.contains_key(&auth_seq) {
+            return Err(WriterSnapshotError::MissingSequence { requested: auth_seq });
+        }
+        Ok(self.members_up_to(auth_seq))
+    }
+
+    fn members_up_to(&self, auth_seq: u64) -> Vec<GroupMember> {
         let mut grants: BTreeMap<&str, ([u8; HASH_LEN], WriterRole)> = BTreeMap::new();
-        for record in self.records.range(..=self.current_seq).map(|(_, record)| record) {
+        for record in self.records.range(..=auth_seq).map(|(_, record)| record) {
             match &record.action {
                 PolicyAction::Grant { device_id, signing_key_fingerprint, role, .. } => {
                     grants.insert(device_id.as_str(), (*signing_key_fingerprint, *role));
@@ -347,7 +364,7 @@ impl GroupPolicyState {
 
     /// The `resolve_authority_key` callback
     /// `authorization_checkpoint::verify_change_admission` (and
-    /// `checkpoint_source::flush_pending_checkpoint`, which locally
+    /// the native checkpoint flush, which locally
     /// re-verifies a checkpoint the coordination plane just issued) needs:
     /// given a checkpoint's claimed `signer_key_id` and the specific
     /// historical `policy_head` it was issued against, returns the raw
@@ -369,12 +386,49 @@ impl GroupPolicyState {
         signer_key_id: &[u8; HASH_LEN],
         policy_head: &[u8; HASH_LEN],
     ) -> Option<VerifyingKey> {
+        // The empty-chain point names the key the group started with. Once the
+        // authority has rotated, that key is retired: nothing a checkpoint
+        // pins at the empty chain can be vouched for any more, so a leaked
+        // retired key cannot sign one naming any device it likes.
+        if *policy_head == ZERO_HASH && self.authority_generation > 0 {
+            return None;
+        }
         let raw_key = self.authority_key_history.get(policy_head)?;
         let fingerprint: [u8; HASH_LEN] = Sha256::digest(raw_key).into();
         if &fingerprint != signer_key_id {
             return None;
         }
         VerifyingKey::from_bytes(raw_key).ok()
+    }
+
+    /// Whether a checkpoint pinned at policy point (`seq`, `head`) may vouch
+    /// for `device_id` signing under `signing_key_fingerprint`: the verified
+    /// chain must hold exactly `head` at `seq`, and the device must have been
+    /// a writer under that key at `seq`. A delta published before a later
+    /// revoke stays admissible, because the device was a writer at the point
+    /// the checkpoint pins. The empty-chain point (`seq == 0`) carries no
+    /// grants, so it is valid only for its own head and only while the
+    /// authority has not rotated.
+    pub fn writer_at_policy_point(
+        &self,
+        device_id: &str,
+        signing_key_fingerprint: &[u8; HASH_LEN],
+        seq: u64,
+        head: &[u8; HASH_LEN],
+    ) -> bool {
+        if seq == 0 {
+            return *head == ZERO_HASH && self.authority_generation == 0;
+        }
+        if self.record_head_at(seq) != Some(*head) {
+            return false;
+        }
+        self.members_at(seq).is_ok_and(|members| {
+            members.iter().any(|member| {
+                member.device_id == device_id
+                    && member.signing_key_fingerprint == *signing_key_fingerprint
+                    && member.role.is_writer()
+            })
+        })
     }
 
     /// This state's rollback watermark coordinates: the highest verified
@@ -395,7 +449,7 @@ impl GroupPolicyState {
     /// A snapshot verified with `base = None` (as after a daemon restart, when
     /// the coordination plane resends the full chain) carries every record
     /// from seq 1, so this resolves any `seq` up to `current_seq`.
-    fn record_head_at(&self, seq: u64) -> Option<[u8; HASH_LEN]> {
+    pub(crate) fn record_head_at(&self, seq: u64) -> Option<[u8; HASH_LEN]> {
         self.records.get(&seq).map(|record| record.record_hash)
     }
 
@@ -918,7 +972,7 @@ pub mod policy_signing {
 
     // See `revoke_record`'s own `#[allow(dead_code)]` comment just above.
     #[allow(dead_code)]
-    pub(super) fn rotate_record(
+    pub(crate) fn rotate_record(
         key: &SigningKey,
         group_id: &str,
         seq: u64,

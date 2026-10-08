@@ -73,7 +73,7 @@ async fn a_relay_only_node_reaches_its_peer_through_the_relay() {
     });
 
     let link = client.connect(server_address.peer()).await.expect("connect through the relay");
-    let mut lane = link.open_lane(Lane::Reconciliation).await.expect("lane");
+    let mut lane = link.open_lane(Lane::Service).await.expect("lane");
     round_trip(&mut lane, b"carried by the relay").await;
 
     assert_eq!(
@@ -147,7 +147,7 @@ async fn a_node_that_can_go_direct_does_not_stay_on_the_relay() {
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
-        let mut lane = link.open_lane(Lane::Reconciliation).await.expect("lane");
+        let mut lane = link.open_lane(Lane::Service).await.expect("lane");
         round_trip(&mut lane, b"looking for a direct path").await;
         if link.has_direct_path() {
             break;
@@ -186,7 +186,7 @@ async fn a_relayed_transfer_is_not_reported_as_direct() {
     // witness that starts after the transfer cannot see what already moved.
     let watcher = link.watch_paths();
 
-    let mut lane = link.open_lane(Lane::Reconciliation).await.expect("lane");
+    let mut lane = link.open_lane(Lane::Service).await.expect("lane");
     round_trip(&mut lane, &vec![0xA5u8; 256 * 1024]).await;
 
     // The verdict is taken when the TRANSFER ends, with the connection still
@@ -234,7 +234,7 @@ async fn a_path_closing_at_the_last_moment_is_not_lost() {
     let link = client.connect(server_addr.peer()).await.expect("connect through the relay");
     let watcher = link.watch_paths();
 
-    let mut lane = link.open_lane(Lane::Reconciliation).await.expect("lane");
+    let mut lane = link.open_lane(Lane::Service).await.expect("lane");
     round_trip(&mut lane, &vec![0x3Cu8; 128 * 1024]).await;
 
     // Tear the connection down so its paths close, then ask immediately. The

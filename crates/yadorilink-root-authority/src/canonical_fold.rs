@@ -2,6 +2,20 @@
 //! names collide under on a volume that is simultaneously case-insensitive
 //! AND normalization-insensitive (the macOS default, both HFS+ and APFS).
 
+/// Folds `path` to the case-insensitive comparison key two names collide
+/// under on a case-insensitive volume (Unicode case folding, not the
+/// lowercase mapping).
+pub fn case_fold(path: &str) -> String {
+    caseless::default_case_fold_str(path)
+}
+
+/// `path` in Unicode Normalization Form C: the key two names collide under on
+/// a normalization-insensitive volume.
+pub fn nfc(path: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    path.nfc().collect()
+}
+
 /// Folds `path` to the case-and-normalization-insensitive key two
 /// differently-encoded names collapse to on such a volume: NFC-normalize,
 /// then case-fold (`caseless::default_case_fold_str`, not

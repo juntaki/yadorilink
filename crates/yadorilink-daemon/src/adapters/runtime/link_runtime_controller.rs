@@ -35,7 +35,6 @@ use yadorilink_filesystem_sync::watcher::{FolderWatchSource, RealFolderWatchSour
 #[cfg(test)]
 use yadorilink_root_authority::ignore_patterns::EffectiveIgnoreSet;
 
-use crate::daemon_state::run_blocking_sweep_offloaded;
 use crate::daemon_state::DaemonState;
 use crate::error::DaemonError;
 use crate::link_registry::LinkRegistry;
@@ -46,7 +45,7 @@ use crate::link_runtime::startup::GroupStartupReadyGuard;
 /// How often each link's
 /// background task re-runs `materialization::repair_interrupted_
 /// materializations` during live operation, not just at daemon startup —
-/// defense-in-depth against whatever bug might leave a `Hydrated` index
+/// defense-in-depth against whatever bug might leave a `Present` index
 /// record disagreeing with what's actually on disk (the direct fixes are
 /// in `try_apply_metadata_only_update` and this module's debounce-batch
 /// executor; this is a coarse, low-frequency safety net on top of those,
@@ -97,7 +96,7 @@ impl LinkRuntimeController {
     /// materialization intent -> reconstruct) from an offline user delete (missing
     /// target, no intent -> tombstone). When repair ERRORED for this link's group,
     /// its disambiguation input is unavailable, so the initial reconcile scan must
-    /// not classify a `Hydrated`-but-missing file as a deletion. Passing
+    /// not classify a `Present`-but-missing file as a deletion. Passing
     /// `emit_tombstones = false` then defers this scan's delete emission to a later
     /// boot on which repair succeeds — fail-closed. See
     /// `LocalChangeProcessor::scan_existing_files_with_ignore_gated`.
@@ -188,8 +187,15 @@ impl LinkRuntimeController {
                 MATERIALIZATION_REPAIR_INTERVAL,
             );
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // A base install's holds are reconciled by this pass: an install
+            // wakes it early (the interval is the backstop), including one
+            // that landed while the previous pass was running.
+            let mut installs = repair_state.replica_coordinator.subscribe_held_path();
             loop {
-                ticker.tick().await;
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    Ok(()) = installs.changed() => {}
+                }
                 let replica_coordinator = repair_state.replica_coordinator.clone();
                 let block_store = repair_state.block_store.clone();
                 let root = repair_root.clone();
@@ -265,6 +271,34 @@ impl LinkRuntimeController {
         // logging "no live root lease for this link" on every tick.
         let repair_abort_handle = repair_handle.abort_handle();
 
+        // Fail-closed for a link whose policy is already `OnDemand` from a previous run: a plain
+        // (direct-filesystem) root has no on-demand mechanism, so a row committed OnDemand must not
+        // silently start watching and materializing anyway. Decided here, where the daemon state owns the
+        // per-root capability; a provider root never reaches this runtime at all.
+        match state
+            .replica_coordinator
+            .link_repository()
+            .materialization_policy_for_group(&group_id)
+        {
+            Ok(Some(yadorilink_replica_domain::session_state::MaterializationPolicy::OnDemand))
+                if !state.root_allows_on_demand(&group_id) =>
+            {
+                repair_abort_handle.abort();
+                return Err(DaemonError::Config(format!(
+                    "link {local_path} (group {group_id}) is configured OnDemand, but this build has \
+                     no connected placeholder provider; refusing to start it fail-closed -- migrate \
+                     it to eager (full-copy) mode to resume syncing"
+                )));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                repair_abort_handle.abort();
+                return Err(DaemonError::Config(format!(
+                    "cannot verify materialization policy for group {group_id}: {e}"
+                )));
+            }
+        }
+
         let runtime = match LinkRuntimeFactory::new(deps).build(
             local_path.clone(),
             group_id.clone(),
@@ -287,6 +321,9 @@ impl LinkRuntimeController {
         // for why the slot was reserved as `Starting` back at this function's
         // very start rather than appearing from nothing right here.
         link_slot_guard.publish(Arc::new(runtime));
+        // A rebootstrap the journal records is continued now that the folder is watched
+        // again; for a group with none this reads the journal and returns.
+        crate::native_rebootstrap::spawn_resume(state.clone(), group_id);
         Ok(())
     }
 
@@ -299,7 +336,7 @@ impl LinkRuntimeController {
     /// (see `start`'s own comment on why), and a blocking closure
     /// already running on Tokio's blocking thread pool cannot be interrupted
     /// mid-execution by `abort()` -- it keeps running to completion regardless,
-    /// still reading/chunking files and committing index/DAG writes against
+    /// still reading/chunking files and committing index/native state writes against
     /// this root. Without awaiting the handle afterward, `stop`
     /// used to return (and the caller could immediately re-link/hand the root
     /// to another process) while that scan was still physically running,
@@ -389,12 +426,18 @@ impl LinkRuntimeController {
         // its normal clean-shutdown path; only a genuinely persistent
         // failure (a real bug elsewhere holding the Arc across an await,
         // which retrying cannot fix) falls through to the same graceful
-        // degraded fallback `app.rs::graceful_shutdown` already
-        // establishes as correct for an unexpectedly-shared Arc here --
-        // log loudly and abort tasks directly rather than panic the
-        // whole link-stop caller over what is, in that case, still a
-        // real anomaly worth knowing about but not worth taking the
+        // degraded fallback `app.rs::graceful_shutdown` uses for an
+        // unexpectedly-shared Arc here -- log loudly, abort the tasks and
+        // drain the lease in place (`LinkRuntime::drain_shared`) rather
+        // than panic the whole link-stop caller over what is, in that case,
+        // still a real anomaly worth knowing about but not worth taking the
         // daemon down for.
+        //
+        // Admission is closed before the first attempt, not after the last: a
+        // holder that is mid-operation then finds `begin_operation` refusing
+        // it, finishes sooner, and lets go of its `Arc` -- and if it never
+        // does, nothing it starts from here on can commit.
+        runtime.root_lease().begin_stopping();
         const MAX_UNWRAP_RETRIES: u32 = 20;
         const UNWRAP_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(5);
         let mut candidate = runtime;
@@ -413,9 +456,9 @@ impl LinkRuntimeController {
                         refs = Arc::strong_count(&shared),
                         attempts = attempt,
                         "stop: Arc<LinkRuntime> still shared after removal from link_runtimes \
-                         and every retry; falling back to abort-only teardown"
+                         and every retry; draining it in place"
                     );
-                    shared.abort_tasks();
+                    shared.drain_shared().await;
                     return;
                 }
             }
@@ -426,16 +469,14 @@ impl LinkRuntimeController {
         runtime.shutdown().await;
     }
 
-    /// Resumes a paused link and re-broadcasts its currently-indexed files to
-    /// connected peers. Unpausing alone only lifts the gate on *future*
-    /// propagation — any change indexed *while* paused was queued locally
-    /// (guarantee: `SyncState` itself is the backlog) but never
-    /// actually sent, since `announce_local_change` only ever checks the
-    /// pause flag once, at the moment each change is first processed. Resume
-    /// must therefore flush that backlog itself, not just flip the flag.
-    /// Peers that are already fully caught up simply see `ChangeOrdering::Equal`
-    /// for everything and no-op — re-sending the whole current index is
-    /// simple and correct, just not the cheapest possible resume.
+    /// Resumes a paused link and re-raises the group's commit follow-up so
+    /// connected peers catch up. Unpausing alone only lifts the gate on
+    /// *future* propagation — any change indexed *while* paused was queued
+    /// locally (guarantee: `SyncState` itself is the backlog) but never
+    /// followed up, since `announce_local_change` only ever checks the pause
+    /// flag once, at the moment each change is first processed. Resume must
+    /// therefore re-raise that follow-up itself, not just flip the flag.
+    /// Peers that are already fully caught up find nothing to transfer.
     pub async fn resume(&self, local_path: &str) -> Result<(), crate::sync_error::SyncError> {
         let state = &self.state;
         let link = state
@@ -443,7 +484,7 @@ impl LinkRuntimeController {
             .link_repository()
             .list_links()?
             .into_iter()
-            .find(|l| l.local_path == local_path)
+            .find(|l| l.key() == local_path)
             .ok_or_else(|| crate::sync_error::SyncError::NotFound(format!("link {local_path}")))?;
         if link.orphaned {
             return Err(crate::sync_error::SyncError::InvalidInput(format!(
@@ -464,19 +505,17 @@ impl LinkRuntimeController {
                 )))
             }
         }
-        // Closes the gap this
-        // fn's own doc comment doesn't cover -- a change still sitting
-        // undispatched in the debounce accumulator (not yet even in
-        // `SyncState`) at the moment of resume isn't part of the backlog
-        // `list_files` below can see at all. Force it into the index first,
-        // so the snapshot broadcast a few lines down reflects this link's true
-        // current state rather than racing whatever quiet-period window that
+        // Closes the gap this fn's own doc comment doesn't cover -- a change
+        // still sitting undispatched in the debounce accumulator (not yet
+        // even in `SyncState`) at the moment of resume isn't part of the
+        // backlog the follow-up below can see at all. Force it into the
+        // index first, so the follow-up reflects this link's true current
+        // state rather than racing whatever quiet-period window that
         // change's own debounce window happened to still be in.
         if let Some(runtime) = state.links.runtime(local_path) {
             runtime.flush_pending_local_changes(&group_id).await;
         }
-        let records = state.replica_coordinator.file_index_repository().list_files(&group_id)?;
-        state.broadcast_change(&group_id, records).await;
+        state.on_local_native_commit(&group_id).await;
         Ok(())
     }
 
@@ -524,7 +563,7 @@ impl LinkRuntimeController {
                 Ok(expired_count) if expired_count > 0 => {
                     tracing::debug!(
                         group_id = %link.group_id,
-                        local_path = %link.local_path,
+                        local_path = %link.key(),
                         expired_count,
                         "retention-expiry sweep removed aged-out superseded/trashed versions"
                     );
@@ -534,7 +573,7 @@ impl LinkRuntimeController {
                     tracing::warn!(
                         error = %e,
                         group_id = %link.group_id,
-                        local_path = %link.local_path,
+                        local_path = %link.key(),
                         "retention-expiry sweep failed for this link"
                     );
                 }
@@ -597,65 +636,126 @@ impl LinkRuntimeController {
                 return;
             }
         };
+        // One task per link, so one link's whole-folder walk (arbitrarily
+        // long: a stalled volume, a huge unindexed tree) never delays the
+        // others' recovery. A pass that is still running when the next sweep
+        // comes round is not stacked on: that link is skipped until it
+        // finishes, and this sweep stops waiting for it after
+        // `SWEEP_TIME_BUDGET` instead of holding every later tick behind it.
+        let mut passes = Vec::new();
         for link in links {
             if link.paused || link.orphaned {
                 continue;
             }
-            let Some(runtime) = state.links.runtime(&link.local_path) else { continue };
-            // Held for this whole sweep pass so `stop`'s
-            // `wait_drained` genuinely waits for it -- see `RootLease`'s own
-            // doc; this is the second of the two call sites (`LinkFlushHandle`'s
-            // own methods are the other) that used to let a write land after
-            // the root lock had already been handed to a new owner (K15).
-            // `reconcile_added_files_from_disk` itself refuses admission (and
-            // returns `None`) once `stop` has called
-            // `begin_stopping` for this link.
-            let _write_activity = deps.begin_write_activity();
-            // `reconcile_added_files_from_disk` is synchronous and open-ended:
-            // it loads the link's ignore set from disk, reads the group's whole
-            // index out of SQLite, then `walkdir`s the entire link folder and,
-            // for every path with no index row, reads/chunks/SHA-256s the file
-            // and writes its blocks. That is exactly the work the *initial*
-            // scan already offloads (`link_runtime/tasks.rs`'s `spawn_blocking`
-            // around `scan_existing_files_with_ignore_gated`), and the case
-            // this backstop exists for -- a watcher that never bound, or lost
-            // its events -- is precisely the case where the whole folder is
-            // unindexed, so a single sweep can be arbitrarily long. Run
-            // directly from this task it would hold the polling worker for that
-            // entire pass, per link, every sweep tick.
-            //
-            // The call is plain synchronous (no future to drive), so it needs
-            // no `Handle::block_on` bridge the way `tasks.rs`'s `async`
-            // `process_flush_with_ignore` does -- the shared
-            // `run_blocking_sweep_offloaded` guard is enough, and it carries
-            // the current-thread-runtime fallback with it.
-            let reconciled = run_blocking_sweep_offloaded(|| {
-                runtime.reconcile_added_files_from_disk(&link.group_id)
-            });
-            let Some(result) = reconciled else {
+            let Some(folder) = link.folder_path() else { continue };
+            let Some(runtime) = state.links.runtime(folder) else { continue };
+            let Some(claim) = state.begin_backstop_pass(folder) else {
+                tracing::debug!(
+                    local_path = %link.key(),
+                    "disk-reconcile-backstop: the previous pass for this link is still running"
+                );
                 continue;
             };
-            match result {
-                Ok(records) if !records.is_empty() => {
-                    tracing::info!(
-                        group_id = %link.group_id,
-                        local_path = %link.local_path,
-                        count = records.len(),
-                        "disk-reconcile-backstop recovered file(s) never delivered by the local \
-                         filesystem watcher"
-                    );
-                    announce_local_change(&deps, &link.local_path, &link.group_id, records).await;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        group_id = %link.group_id,
-                        local_path = %link.local_path,
-                        "disk-reconcile-backstop failed for this link"
-                    );
-                }
+            let deps = deps.clone();
+            passes.push(tokio::spawn(async move {
+                let _claim = claim;
+                sweep_one_link(deps, runtime, link).await;
+            }));
+        }
+        let _ =
+            tokio::time::timeout(SWEEP_TIME_BUDGET, futures_util::future::join_all(passes)).await;
+    }
+}
+
+/// How long one backstop sweep waits for the per-link passes it started
+/// before it returns and leaves the unfinished ones running.
+#[cfg(not(test))]
+const SWEEP_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(test)]
+const SWEEP_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Test-only: called at the start of each link's blocking reconcile with the
+/// link's local path; may block.
+#[cfg(test)]
+type BackstopProbe = Arc<dyn Fn(&str) + Send + Sync>;
+#[cfg(test)]
+static BACKSTOP_PROBE: std::sync::Mutex<Option<BackstopProbe>> = std::sync::Mutex::new(None);
+
+/// One link's backstop pass: the add-only reconcile, then the announcement of
+/// whatever it recovered.
+async fn sweep_one_link(
+    deps: Arc<crate::link_runtime::dependencies::LinkRuntimeDependencies>,
+    runtime: Arc<crate::link_runtime::LinkRuntime>,
+    link: yadorilink_replica_domain::session_state::FolderLink,
+) {
+    // Held for this whole pass so `stop`'s
+    // `wait_drained` genuinely waits for it -- see `RootLease`'s own
+    // doc; this is the second of the two call sites (`LinkFlushHandle`'s
+    // own methods are the other) that used to let a write land after
+    // the root lock had already been handed to a new owner (K15).
+    // `reconcile_added_files_from_disk` itself refuses admission (and
+    // returns `None`) once `stop` has called
+    // `begin_stopping` for this link.
+    let _write_activity = deps.begin_write_activity();
+    // `reconcile_added_files_from_disk` is synchronous and open-ended:
+    // it loads the link's ignore set from disk, reads the group's whole
+    // index out of SQLite, then `walkdir`s the entire link folder and,
+    // for every path with no index row, reads/chunks/SHA-256s the file
+    // and writes its blocks. That is exactly the work the *initial*
+    // scan already offloads (`link_runtime/tasks.rs`'s `spawn_blocking`
+    // around `scan_existing_files_with_ignore_gated`), and the case
+    // this backstop exists for -- a watcher that never bound, or lost
+    // its events -- is precisely the case where the whole folder is
+    // unindexed, so a single pass can be arbitrarily long. It runs on the
+    // blocking pool, so neither the worker that polls the sweep nor
+    // another link's pass waits for it.
+    let group_id = link.group_id.clone();
+    #[cfg(test)]
+    let probed_path = link.key().to_string();
+    let reconciled = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        {
+            let probe = BACKSTOP_PROBE.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            if let Some(probe) = probe {
+                probe(&probed_path);
             }
+        }
+        runtime.reconcile_added_files_from_disk(&group_id)
+    })
+    .await;
+    let reconciled = match reconciled {
+        Ok(reconciled) => reconciled,
+        Err(join_error) => {
+            tracing::warn!(
+                error = %join_error,
+                local_path = %link.key(),
+                "disk-reconcile-backstop pass panicked for this link"
+            );
+            return;
+        }
+    };
+    let Some(result) = reconciled else {
+        return;
+    };
+    match result {
+        Ok(records) if !records.is_empty() => {
+            tracing::info!(
+                group_id = %link.group_id,
+                local_path = %link.key(),
+                count = records.len(),
+                "disk-reconcile-backstop recovered file(s) never delivered by the local \
+                 filesystem watcher"
+            );
+            announce_local_change(&deps, link.key(), &link.group_id, records).await;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                group_id = %link.group_id,
+                local_path = %link.key(),
+                "disk-reconcile-backstop failed for this link"
+            );
         }
     }
 }

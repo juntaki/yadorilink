@@ -29,7 +29,7 @@ pub struct MaterializationIntentGuard<'a> {
 impl<'a> MaterializationIntentGuard<'a> {
     /// Opens (durably writes) the materialization intent for `(group_id,
     /// path)` targeting `target_version_hash`'s content. MUST be called
-    /// before the bytes are written and before any `Hydrated` row is
+    /// before the bytes are written and before any `Present` row is
     /// committed for this path.
     pub fn open(
         state: &'a crate::replica_coordinator::ReplicaCoordinator,
@@ -44,11 +44,22 @@ impl<'a> MaterializationIntentGuard<'a> {
             target_version_hash,
             permit,
         )?;
-        Ok(Self { state, group_id, path, permit })
+        Ok(Self::opened(state, group_id, path, permit))
+    }
+
+    /// The guard of an intent the caller has already committed for `(group_id,
+    /// path)`, in a transaction of its own that also wrote other facts.
+    pub(crate) fn opened(
+        state: &'a crate::replica_coordinator::ReplicaCoordinator,
+        group_id: &'a str,
+        path: &'a str,
+        permit: &'a RootCommitPermit<'a>,
+    ) -> Self {
+        Self { state, group_id, path, permit }
     }
 
     /// Clears the intent. Call ONLY after the temp-write-then-rename is
-    /// durable, or when the write has been abandoned to a `Placeholder`.
+    /// durable, or when the write has been abandoned to a `Remote`.
     pub fn clear(self) -> Result<(), yadorilink_sync_sqlite::SyncSqliteError> {
         self.state.materialization_intent_repository().clear_materialization_intent(
             self.group_id,

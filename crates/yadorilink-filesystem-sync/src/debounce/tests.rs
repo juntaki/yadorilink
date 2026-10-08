@@ -177,7 +177,7 @@ async fn flush_path_request_hands_back_and_removes_a_pending_entry_immediately()
 /// materializes it over the local write on disk — after which
 /// `process_flush` re-reads the path, sees the remote bytes already
 /// matching the index, and suppresses the whole thing as a self-echo.
-/// This is the unit-level form of the `dst_network_fault_chaos`
+/// This is the unit-level form of the retired network-fault scenario's
 /// `[NoLoss]` violation on seeds 3298840576/3298840578.
 ///
 /// No sleep here on purpose: the guarantee under test is precisely
@@ -336,7 +336,7 @@ async fn flush_all_request_drains_every_pending_entry_at_once() {
         .await
         .unwrap();
     events_tx
-        .send(FsChangeEvent { path: "b.txt".into(), kind: FsChangeKind::Removed })
+        .send(FsChangeEvent { path: "b.txt".into(), kind: FsChangeKind::ObservedRemoval })
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -351,7 +351,7 @@ async fn flush_all_request_drains_every_pending_entry_at_once() {
         drained.into_iter().map(|(path, kind, _at)| (path, kind)).collect::<Vec<_>>(),
         vec![
             (PathBuf::from("a.txt"), FsChangeKind::CreatedOrModified),
-            (PathBuf::from("b.txt"), FsChangeKind::Removed),
+            (PathBuf::from("b.txt"), FsChangeKind::ObservedRemoval),
         ]
     );
     assert!(
@@ -404,7 +404,7 @@ async fn repeated_events_for_the_same_path_coalesce_to_the_latest_kind() {
         .await
         .unwrap();
     events_tx
-        .send(FsChangeEvent { path: "a.txt".into(), kind: FsChangeKind::Removed })
+        .send(FsChangeEvent { path: "a.txt".into(), kind: FsChangeKind::ObservedRemoval })
         .await
         .unwrap();
 
@@ -413,7 +413,7 @@ async fn repeated_events_for_the_same_path_coalesce_to_the_latest_kind() {
         .expect("timed out waiting for flush")
         .unwrap();
     let paths = expect_paths(flush);
-    assert_eq!(paths, vec![(PathBuf::from("a.txt"), FsChangeKind::Removed)]);
+    assert_eq!(paths, vec![(PathBuf::from("a.txt"), FsChangeKind::ObservedRemoval)]);
 }
 
 /// Events for different paths within one window all land in the same
@@ -482,12 +482,12 @@ async fn events_split_across_two_windows_flush_separately() {
     );
 
     events_tx
-        .send(FsChangeEvent { path: "a.txt".into(), kind: FsChangeKind::Removed })
+        .send(FsChangeEvent { path: "a.txt".into(), kind: FsChangeKind::ObservedRemoval })
         .await
         .unwrap();
     let second =
         tokio::time::timeout(Duration::from_secs(2), flush_rx.recv()).await.unwrap().unwrap();
-    assert_eq!(expect_paths(second), vec![(PathBuf::from("a.txt"), FsChangeKind::Removed)]);
+    assert_eq!(expect_paths(second), vec![(PathBuf::from("a.txt"), FsChangeKind::ObservedRemoval)]);
 }
 
 /// A continuously-busy path (a new event arrives before every quiet

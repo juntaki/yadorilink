@@ -1,5 +1,5 @@
 //! The daemon-process side of Windows CfAPI dirty detection --
-//! `local_change.rs`'s ONLY way to prove a `Placeholder`-state path is
+//! `local_change.rs`'s ONLY way to prove a `Remote`-state path is
 //! still untouched on Windows (see `ports::LocalMutationStore::
 //! inspect_windows_placeholder`'s own doc for the exact contract this
 //! module fulfils).
@@ -47,7 +47,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 
-use yadorilink_filesystem_sync::placeholder_backend::PlaceholderStatus;
+use yadorilink_local_capture::ports::PlaceholderStatus;
 
 /// The generation-identity wire format `shell-ext/windows/src/cfapi.rs`'s
 /// `encode_generation_identity` writes as a placeholder's `FileIdentity`,
@@ -107,12 +107,8 @@ fn open_reparse_handle_read_attributes(
 
 /// Reads back the `FileIdentity` bytes the placeholder at `handle`
 /// currently carries, via `CfGetPlaceholderInfo(CF_PLACEHOLDER_INFO_
-/// BASIC)`. `None` on any failure -- mirrors `placeholder_backend_
-/// windows.rs`'s own `read_placeholder_identity` exactly (same headroom
-/// reasoning), duplicated rather than shared since that module's own
-/// `WindowsCfApiBackend` additionally requires a live `CfConnectSyncRoot`
-/// connection this read-only query deliberately does not hold (see this
-/// module's own top-level doc for why).
+/// BASIC)`. `None` on any failure. Holds no `CfConnectSyncRoot`
+/// connection of its own (see this module's top-level doc for why).
 fn read_placeholder_identity(handle: windows_sys::Win32::Foundation::HANDLE) -> Option<Vec<u8>> {
     const IDENTITY_HEADROOM: usize = 64;
     let mut buf = vec![0u8; std::mem::size_of::<CF_PLACEHOLDER_BASIC_INFO>() + IDENTITY_HEADROOM];

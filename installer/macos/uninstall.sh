@@ -18,7 +18,7 @@
 # What this does NOT remove (deliberately — this is uninstalling the
 # *application*, not the user's data):
 #  - ~/Library/Application Support/yadorilink (sync state DB, block store,
-#  WireGuard key, device.json)
+#  device key, device.json)
 #  - ~/Library/Group Containers/group.com.juntaki.yadorilink.shared (shell IPC
 #  socket dir)
 #  - Keychain items (service name "yadorilink") holding access/refresh

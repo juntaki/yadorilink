@@ -263,14 +263,12 @@ extension AttentionCategory {
 // MARK: - File actions
 
 public enum FileAction: CaseIterable, Sendable, Equatable {
-    case download, freeUpSpace, keepOnDevice, stopKeeping
+    case download, freeUpSpace
 
     public var title: String {
         switch self {
         case .download: "Download now"
         case .freeUpSpace: "Free up space"
-        case .keepOnDevice: "Always keep on this device"
-        case .stopKeeping: "Stop always keeping"
         }
     }
 
@@ -278,20 +276,16 @@ public enum FileAction: CaseIterable, Sendable, Equatable {
         switch self {
         case .download: "icloud.and.arrow.down"
         case .freeUpSpace: "icloud"
-        case .keepOnDevice: "pin"
-        case .stopKeeping: "pin.slash"
         }
     }
 
     /// Only the actions that make sense for the file's current state.
     public static func available(for availability: FileAvailability) -> [FileAction] {
         guard availability.tracked else { return [] }
-        if availability.pinned { return [.stopKeeping] }
         switch availability.state {
-        case .placeholder: return [.download, .keepOnDevice]
-        case .hydrated: return [.freeUpSpace, .keepOnDevice]
-        case .hydrating: return [.keepOnDevice]
-        case .evicting, .unknown: return []
+        case .placeholder: return [.download]
+        case .hydrated: return [.freeUpSpace]
+        case .hydrating, .evicting, .unknown: return []
         }
     }
 }

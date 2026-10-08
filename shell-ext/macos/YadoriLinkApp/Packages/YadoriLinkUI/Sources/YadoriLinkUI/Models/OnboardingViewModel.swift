@@ -68,7 +68,17 @@ public final class OnboardingViewModel {
     /// Called when the user completes setup with Done.
     @ObservationIgnored public var onFinished: (() -> Void)?
 
-    public init(client: any YadoriLinkClient, mode: Flow, loginItem: LoginItemModel, openURL: @escaping (URL) -> Void) {
+    /// Whether the folder can also be created as a File Provider folder (no directory). Off until the
+    /// build offers it: the daemon refuses the request otherwise, and the option must not be shown.
+    public let providerFoldersAvailable: Bool
+    /// The folder being set up is a File Provider folder: nothing was chosen on disk.
+    public private(set) var useProviderFolder = false
+    /// The name the folder shows under the File Provider location.
+    public var providerDisplayName = ""
+    /// What was linked, in words: the folder's name (a provider folder has no path to name it by).
+    public private(set) var linkedName: String?
+    public init(client: any YadoriLinkClient, mode: Flow, loginItem: LoginItemModel, openURL: @escaping (URL) -> Void, providerFoldersAvailable: Bool = false) {
+        self.providerFoldersAvailable = providerFoldersAvailable
         self.flow = mode
         self.client = client
         self.loginItem = loginItem
@@ -122,7 +132,18 @@ public final class OnboardingViewModel {
 
     // MARK: Choosing and reviewing
 
+    /// Skips choosing a folder on disk: the folder is created as a File Provider folder instead.
+    public func chooseProviderFolder() {
+        guard providerFoldersAvailable else { return }
+        useProviderFolder = true
+        folderPath = nil
+        preflight = nil
+        acknowledgedRisks = false
+        step = .review
+    }
+
     public func chooseFolder(_ path: String) async {
+        useProviderFolder = false
         isWorking = true
         defer { isWorking = false }
         folderPath = path
@@ -182,13 +203,45 @@ public final class OnboardingViewModel {
     private var destination: Destination? { destinations.first { $0.id == destinationId } }
 
     public var canLink: Bool {
+        if useProviderFolder {
+            return !isWorking && destination != nil && !providerDisplayName.trimmingCharacters(in: .whitespaces).isEmpty
+        }
         guard preflight != nil, folderPath != nil, !isWorking, let destination else { return false }
         if needsAcknowledgement && !acknowledgedRisks { return false }
         if destination.kind == .newSharedFolder && newFolderName.trimmingCharacters(in: .whitespaces).isEmpty { return false }
         return true
     }
 
+    private func linkProviderFolder(destination: Destination) async {
+        isWorking = true
+        defer { isWorking = false }
+        let name = providerDisplayName.trimmingCharacters(in: .whitespaces)
+        let groupName = newFolderName.trimmingCharacters(in: .whitespaces).isEmpty ? name : newFolderName.trimmingCharacters(in: .whitespaces)
+        do {
+            let outcome: ProviderFolderOutcome
+            switch destination.kind {
+            case .newSharedFolder:
+                outcome = try await client.createProviderFolder(groupName: groupName, displayName: name, mode: folderMode)
+            case .existing(let group):
+                outcome = try await client.joinProviderFolder(groupId: group.groupId, groupName: group.name, displayName: name, mode: folderMode)
+            }
+            linkedName = outcome.displayName
+            let result = LinkOutcome(groupId: outcome.groupId, localPath: "", mode: outcome.mode)
+            linked = result
+            notice = nil
+            onLinked?(result)
+            if flow == .firstRun { next() } else { isFinished = true }
+        } catch {
+            notice = .failure(error)
+        }
+    }
+
     public func link() async {
+        if useProviderFolder {
+            guard canLink, let destination else { return }
+            await linkProviderFolder(destination: destination)
+            return
+        }
         guard canLink, let path = folderPath, let destination else { return }
         isWorking = true
         defer { isWorking = false }
@@ -201,6 +254,7 @@ public final class OnboardingViewModel {
                 outcome = try await client.joinGroupAndLink(groupId: group.groupId, groupName: group.name, localPath: path, mode: folderMode, acknowledgeRisks: acknowledgedRisks)
             }
             linked = outcome
+            linkedName = (outcome.localPath as NSString).lastPathComponent
             notice = nil
             onLinked?(outcome)
             if flow == .firstRun { next() } else { isFinished = true }

@@ -9,7 +9,7 @@
 //! documented in `ipc_client`, and must never let a panic unwind across
 //! the FFI boundary (undefined behavior in a staticlib).
 //!
-//! Lists (folder discovery, per-folder file enumeration) cross the FFI
+//! Lists (folder discovery, provider-root requests and replies) cross the FFI
 //! boundary as a single heap-allocated, NUL-terminated JSON C string
 //! rather than a C array-of-structs — see Cargo.toml's doc comment for
 //! why. Every function that returns `*mut c_char` transfers ownership of
@@ -18,7 +18,9 @@
 //! the allocation was made by Rust's global allocator via `CString`,
 //! which is not guaranteed to be `libc`'s `malloc` on every target).
 
+mod host_client;
 mod ipc_client;
+mod provider_client;
 
 use std::ffi::{c_char, CStr, CString};
 use std::panic::catch_unwind;
@@ -77,10 +79,11 @@ pub extern "C" fn yadorilink_fp_real_home_dir() -> *mut c_char {
     }
 }
 
-/// Lists every OnDemand-linked folder group known to the daemon, as a
-/// JSON array of `{"local_path":..., "group_id":...}` objects — the
+/// Lists every provider-backed root known to the daemon, as a JSON array of
+/// `{"root_id", "group_id", "display_name", "hydration_policy", "registration_ready"}`
+/// objects (`root_id` is the domain identifier; no local path) — the
 /// authoritative desired-registration-state snapshot domain reconciliation
-/// reconciles against (see `ipc_client::list_on_demand_folders`'s own doc
+/// reconciles against (see `ipc_client::list_provider_folders`'s own doc
 /// comment). Returns NULL, deliberately distinct from a valid `"[]"` JSON
 /// string, when the daemon could not be reached or the call otherwise
 /// failed/panicked — the caller MUST treat NULL as "cannot currently
@@ -90,140 +93,81 @@ pub extern "C" fn yadorilink_fp_real_home_dir() -> *mut c_char {
 /// snapshot-based reconciliation must not make: a transient daemon
 /// hiccup must never be read as "remove every registered domain." Caller
 /// must free a non-NULL result with `yadorilink_fp_free_string`.
+///
+/// `app_group_container` is the app group container path the OS gave this process (NULL or empty: none);
+/// the daemon adopts it once as the place of its provider temp root.
+///
+/// # Safety
+/// `app_group_container` must be a valid, null-terminated C string, or NULL.
 #[no_mangle]
-pub extern "C" fn yadorilink_fp_list_on_demand_folders() -> *mut c_char {
-    let result = catch_unwind(ipc_client::list_on_demand_folders);
+pub unsafe extern "C" fn yadorilink_fp_list_provider_folders(
+    app_group_container: *const c_char,
+) -> *mut c_char {
+    let container = path_from_c_str(app_group_container).unwrap_or_default();
+    let result = catch_unwind(|| ipc_client::list_provider_folders(&container));
     match result {
-        Ok(Some(folders)) => to_c_json(&folders, "[]"),
+        Ok(Some(snapshot)) => to_c_json(&snapshot, "{}"),
         Ok(None) | Err(_) => std::ptr::null_mut(),
     }
 }
 
-/// Lists every (non-deleted) file in the folder group rooted at
-/// `local_path`, as a JSON array of `{"relative_path", "size",
-/// "mtime_unix_nanos", "materialization_state"}` objects (used as the
-/// `NSFileProviderEnumerator` data source). Returns NULL, deliberately
-/// distinct from a valid `"[]"` (a confirmed empty folder), on a null path
-/// or when the listing could not be confirmed (daemon unreachable,
-/// timeout, `snapshot_available: false`, panic) — the caller MUST end the
-/// enumeration with an error on NULL, never report an empty folder. Caller
-/// must free a non-NULL result with `yadorilink_fp_free_string`.
+/// One request of the provider-root protocol (JSON in, JSON out; see `provider_client`). Returns
+/// NULL on any transport failure (unreachable daemon, timeout, malformed request or reply), which
+/// the caller must treat as `.serverUnreachable`, never as an empty result. Free a non-NULL result
+/// with `yadorilink_fp_free_string`.
 ///
 /// # Safety
-/// `local_path` must be a valid, null-terminated C string, or NULL.
+/// `request_json` must be a valid, null-terminated C string, or NULL.
 #[no_mangle]
-pub unsafe extern "C" fn yadorilink_fp_list_folder_files(local_path: *const c_char) -> *mut c_char {
-    let Some(local_path) = path_from_c_str(local_path) else {
-        return std::ptr::null_mut();
-    };
-    let result = catch_unwind(|| ipc_client::list_folder_files(&local_path));
-    match result {
-        // Not `to_c_json`: its `"[]"` fallback on an encode failure would
-        // itself be an authoritative empty listing.
-        Ok(Some(entries)) => serde_json::to_string(&entries)
-            .ok()
-            .and_then(|json| CString::new(json).ok())
-            .map_or(std::ptr::null_mut(), CString::into_raw),
-        Ok(None) | Err(_) => std::ptr::null_mut(),
+pub unsafe extern "C" fn yadorilink_fp_provider_call(request_json: *const c_char) -> *mut c_char {
+    let Some(request) = path_from_c_str(request_json) else { return std::ptr::null_mut() };
+    match catch_unwind(|| provider_client::call(&request)) {
+        Ok(Some(json)) => CString::new(json).map_or(std::ptr::null_mut(), CString::into_raw),
+        _ => std::ptr::null_mut(),
     }
 }
 
-/// Queries combined sync/materialization status for `path`, as a JSON
-/// object `{"sync_state", "materialization_state"}` (the `item(for:request:
-/// completionHandler:)` data source). Falls back to all-"unspecified"
-/// JSON on a null path or any failure. Caller must free with
-/// `yadorilink_fp_free_string`.
+/// Opens the host app's persistent connection to the daemon (see `host_client`). Events arrive as
+/// JSON text through `callback` on the connection's own thread, with `context` passed back verbatim;
+/// the text is valid only for the duration of the call. NULL when the daemon cannot be reached.
+/// Close with `yadorilink_fp_host_close`.
 ///
 /// # Safety
-/// `path` must be a valid, null-terminated C string, or NULL.
+/// `context` must be usable from any thread until the host is closed and the last event delivered.
 #[no_mangle]
-pub unsafe extern "C" fn yadorilink_fp_query_status(path: *const c_char) -> *mut c_char {
-    const FALLBACK: &str = r#"{"sync_state":"unspecified","materialization_state":"unspecified"}"#;
-    let Some(path) = path_from_c_str(path) else {
-        return CString::new(FALLBACK).unwrap().into_raw();
-    };
-    let result = catch_unwind(|| ipc_client::query_status(&path));
-    match result {
-        Ok(info) => to_c_json(&info, FALLBACK),
-        Err(_) => CString::new(FALLBACK).unwrap().into_raw(),
+pub unsafe extern "C" fn yadorilink_fp_host_open(
+    callback: host_client::EventCallback,
+    context: *mut std::ffi::c_void,
+) -> *mut host_client::Host {
+    match catch_unwind(|| host_client::Host::open(callback, context)) {
+        Ok(Some(host)) => Box::into_raw(Box::new(host)),
+        _ => std::ptr::null_mut(),
     }
 }
 
-/// Requests hydration of `path` from the daemon (backs
-/// `fetchContents(for:version:request:completionHandler:)`), blocking
-/// the calling thread up to `ipc_client`'s `HYDRATION_TIMEOUT` (35s,
-/// a bounded-timeout decision). Returns `true` only on a
-/// confirmed `HydrateResponse{ok: true}`; `false` for a null path,
-/// timeout, unreachable daemon, or a daemon-reported hydration failure —
-/// the Swift caller is expected to complete the OS callback with an
-/// `NSFileProviderError` (e.g. `.serverUnreachable`) on `false`, never
-/// hang the opening application.
+/// Queues one command (JSON) on the host connection. `false`: malformed, or the connection ended.
 ///
 /// # Safety
-/// `path` must be a valid, null-terminated C string, or NULL.
+/// `host` must come from `yadorilink_fp_host_open` and not be closed; `command_json` a valid C string.
 #[no_mangle]
-pub unsafe extern "C" fn yadorilink_fp_hydrate(path: *const c_char) -> bool {
-    let Some(path) = path_from_c_str(path) else { return false };
-    catch_unwind(|| ipc_client::hydrate(&path)).unwrap_or(false)
-}
-
-/// The specific reason the most recent `yadorilink_fp_hydrate` call on
-/// this thread returned `false`, if any (e.g. "the daemon reported a
-/// hydration failure: no peer currently holds this content" vs. "timed
-/// out waiting for the daemon" vs. "could not reach the daemon: ...") --
-/// see `ipc_client::last_hydrate_error`'s own doc comment for the exact
-/// P0-A/P0-B gap this closes (a `fetchContents` failure and a
-/// peer-unavailable failure used to look identical to Explorer/Finder).
-/// Empty string if the most recent call on this thread succeeded, or no
-/// call has been made yet.
-///
-/// Deliberately NOT called anywhere in `FileProviderExtension.swift` yet:
-/// this crate's Swift side has no working build/test path today (no
-/// `.xcodeproj`, no build script producing the File Provider extension
-/// target -- see this repo's P0-B investigation), so wiring
-/// `fetchContents`'s completion handler to actually surface this detail
-/// is left for whoever first stands up that build, rather than guessing
-/// at Swift changes with no way to verify them compile or behave
-/// correctly. Caller must free a non-NULL result with
-/// `yadorilink_fp_free_string`.
-#[no_mangle]
-pub extern "C" fn yadorilink_fp_last_hydrate_error() -> *mut c_char {
-    let result = catch_unwind(ipc_client::last_hydrate_error);
-    match result {
-        Ok(Some(msg)) => CString::new(msg).unwrap_or_else(|_| CString::new("").unwrap()).into_raw(),
-        _ => CString::new("").unwrap().into_raw(),
-    }
-}
-
-/// Notifies the daemon of a local write (backs `createItem`/`modifyItem`
-/// via `kind == 0`, `deleteItem` via `kind == 1`) already landed on disk
-/// at `local_path`/`relative_path` -- see `ipc_client::notify_local_write`'s
-/// own doc comment. Blocks the calling thread up to `ipc_client`'s
-/// `WRITE_NOTIFY_TIMEOUT` (10s). Returns `true` only on a confirmed
-/// `LocalWriteResponse{ok: true}`; `false` for a null/empty argument, an
-/// unrecognized `kind`, timeout, unreachable daemon, or a daemon-reported
-/// admission failure -- the Swift caller is expected to complete the OS
-/// callback with an `NSFileProviderError`, never report success for a
-/// write the daemon never actually admitted.
-///
-/// # Safety
-/// `local_path` and `relative_path` must each be a valid, null-terminated
-/// C string, or NULL.
-#[no_mangle]
-pub unsafe extern "C" fn yadorilink_fp_notify_local_write(
-    local_path: *const c_char,
-    relative_path: *const c_char,
-    kind: i32,
+pub unsafe extern "C" fn yadorilink_fp_host_send(
+    host: *mut host_client::Host,
+    command_json: *const c_char,
 ) -> bool {
-    let Some(local_path) = path_from_c_str(local_path) else { return false };
-    let Some(relative_path) = path_from_c_str(relative_path) else { return false };
-    let Some(kind) = (match kind {
-        0 => Some(ipc_client::LocalWriteKind::CreatedOrModified),
-        1 => Some(ipc_client::LocalWriteKind::Deleted),
-        _ => None,
-    }) else {
+    let Some(command) = path_from_c_str(command_json) else { return false };
+    if host.is_null() {
         return false;
-    };
-    catch_unwind(|| ipc_client::notify_local_write(&local_path, &relative_path, kind))
-        .unwrap_or(false)
+    }
+    catch_unwind(|| (*host).send(&command)).unwrap_or(false)
+}
+
+/// Releases the host handle (the connection thread ends once its command queue is dropped).
+///
+/// # Safety
+/// `host` must come from `yadorilink_fp_host_open` and not be used afterwards.
+#[no_mangle]
+pub unsafe extern "C" fn yadorilink_fp_host_close(host: *mut host_client::Host) {
+    if !host.is_null() {
+        drop(Box::from_raw(host));
+    }
 }

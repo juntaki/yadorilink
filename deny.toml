@@ -34,6 +34,8 @@ ignore = [
 version = 2
 # Globally-accepted permissive licenses.
 allow = [
+    # This workspace's own licence (every first-party crate declares it).
+    "AGPL-3.0-only",
     "MIT",
     "Apache-2.0",
     "BSD-2-Clause",
@@ -47,7 +49,8 @@ confidence-threshold = 0.8
 # Per-crate exceptions: these licenses are accepted ONLY for the specific crate
 # that carries them, rather than being added to the global allow-list above.
 # All are permissive or weak (file-level) copyleft and acceptable as
-# dependencies of an MIT/Apache-2.0 project; none impose copyleft on our code.
+# dependencies of an AGPL-3.0-only project (MPL-2.0 names AGPL-3.0 as a
+# permitted secondary licence); none impose additional restrictions on our code.
 exceptions = [
     # Weak, file-level copyleft (MPL-2.0) — only the crate's own files are
     # copyleft; using it as a dependency does not affect our source.

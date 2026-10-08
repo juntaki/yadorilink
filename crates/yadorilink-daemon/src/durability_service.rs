@@ -155,7 +155,7 @@ pub enum DurabilityEvidence {
 /// counts type directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MaterializationHealth {
-    /// Every current file is `Hydrated` locally.
+    /// Every current file is `Present` locally.
     FullyLocal,
     /// At least one current file is still a placeholder or hydrating.
     Partial,
@@ -234,7 +234,7 @@ pub struct DurabilityFacts {
     /// cannot tell "still trying, may yet succeed" apart from "genuinely,
     /// permanently gone". Computed by `DaemonState::group_durability_
     /// status` from real evidence for each locally-required (repair-
-    /// candidate) path: (1) it is still DAG-justified and (2) missing
+    /// candidate) path: (1) it is still justified by a live native head and (2) missing
     /// locally -- both implied by being a repair candidate at all; (3) its
     /// origin device is no longer a netmap-authorized writer for this
     /// group (a real membership departure, not mere offline-ness); and
@@ -283,13 +283,7 @@ pub struct DurabilityFacts {
 /// update this function (and its table-driven tests below) to match, not
 /// the other way around.
 pub fn classify(facts: &DurabilityFacts) -> GroupDurabilityStatus {
-    if facts.latch_load_failed
-        || facts.scope_unknown
-        || facts.recovery_blocked
-        || facts.latched_unknown
-        || facts.group_policy_stale
-        || facts.materialization.is_err()
-    {
+    if evidence_distrusted(facts) {
         return GroupDurabilityStatus::Unknown;
     }
     if facts.peer_confirmed_custody {
@@ -310,6 +304,25 @@ pub fn classify(facts: &DurabilityFacts) -> GroupDurabilityStatus {
         return GroupDurabilityStatus::Protecting;
     }
     GroupDurabilityStatus::Unknown
+}
+
+/// Any daemon-wide/latched "cannot currently confirm" fact, or an unreadable
+/// materialization read: `classify`'s first, outright `Unknown`.
+fn evidence_distrusted(facts: &DurabilityFacts) -> bool {
+    facts.latch_load_failed
+        || facts.scope_unknown
+        || facts.recovery_blocked
+        || facts.latched_unknown
+        || facts.group_policy_stale
+        || facts.materialization.is_err()
+}
+
+/// Whether `classify` answers `Unknown` only because this daemon has not run
+/// its first custody check for the group yet: no fact makes the evidence
+/// untrustworthy, nothing has confirmed custody, and no check round has
+/// happened. Transient by construction -- the first round clears it.
+pub fn first_check_pending(facts: &DurabilityFacts) -> bool {
+    !evidence_distrusted(facts) && !facts.peer_confirmed_custody && !facts.ever_confirmation_swept
 }
 
 /// Confirms whether a full replica durably holds an exact file version — bound

@@ -82,6 +82,11 @@ public struct OnboardingView: View {
                 Text("Pick a folder on this Mac. You'll review it before anything is shared.")
                     .foregroundStyle(.secondary)
                 Button("Choose Folder…") { picksFolder = true }
+                if model.providerFoldersAvailable {
+                    Button("Create a File Provider folder instead…") { model.chooseProviderFolder() }
+                    Text("It appears in Finder under Locations and keeps nothing in a folder of your choosing.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 if model.isWorking { LoadingRow("Checking the folder…") }
             }
         case .review:
@@ -90,7 +95,7 @@ public struct OnboardingView: View {
             VStack(alignment: .leading, spacing: 14) {
                 Text("You're all set").font(.title.weight(.semibold))
                 if let linked = model.linked {
-                    Text("\((linked.localPath as NSString).lastPathComponent) now syncs as \(linked.mode.title).")
+                    Text("\(model.linkedName ?? "The folder") now syncs as \(linked.mode.title).")
                         .foregroundStyle(.secondary)
                 }
                 if let extensions, !finderExtensionEnabled {
@@ -112,9 +117,13 @@ public struct OnboardingView: View {
     private var review: some View {
         Form {
             Section("Before linking") {
-                LabeledContent("Folder") {
-                    Text(model.folderPath.map { ($0 as NSString).lastPathComponent } ?? "")
-                        .help(model.folderPath ?? "")
+                if model.useProviderFolder {
+                    TextField("Name in Finder", text: $model.providerDisplayName)
+                } else {
+                    LabeledContent("Folder") {
+                        Text(model.folderPath.map { ($0 as NSString).lastPathComponent } ?? "")
+                            .help(model.folderPath ?? "")
+                    }
                 }
                 if let summary = model.summaryLine {
                     Text(summary).foregroundStyle(.secondary)

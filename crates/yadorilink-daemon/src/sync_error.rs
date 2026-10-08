@@ -5,7 +5,7 @@
 //! `yadorilink-transport`, ...) and needs one error type to `?`-propagate
 //! from whichever subsystem failed at its own call sites -- the same
 //! composition-root shape that already justified hosting
-//! `ReplicaCoordinator` and `dag_import.rs` here. Nearly every variant
+//! `ReplicaCoordinator` here. Nearly every variant
 //! already has a narrower, subsystem-owned equivalent (`SyncSqliteError`,
 //! `RootAuthorityError`, `MaterializationExecutionError`, ...); this type
 //! is the union those narrower types feed into at the one place that
@@ -78,7 +78,7 @@ pub enum SyncError {
     /// Two or more live links share one `group_id`. The index is group-scoped
     /// and path-relative but every scan is root-scoped and authoritative, so
     /// each root's scan reads the other root's files as missing and tombstones
-    /// them — signed changes that then ride the change-DAG to every device.
+    /// them — signed deltas that then replicate to every device.
     /// Refused per-group, loudly, at every seam that would otherwise have to
     /// pick a root. Never guess a root: the two folders are not
     /// interchangeable, and choosing wrong deletes the other one's files
@@ -151,6 +151,19 @@ pub enum SyncError {
     )]
     VersionContentUnavailable(String),
 
+    /// A restore declined because the path holds local state capture has not
+    /// recorded, or changed on disk while the restore was being prepared.
+    /// Nothing was written over it; the path is journaled so capture takes
+    /// it, after which the restore can be asked again.
+    #[error("not restoring {0:?}: it holds local changes that have not been captured yet")]
+    PathChangedLocally(String),
+
+    /// The direct-filesystem pipeline was asked to act on a provider-backed root (or one with
+    /// inconsistent provider state, "rebootstrap required"): refused, never read as a plain
+    /// directory.
+    #[error("{0}")]
+    NotFilesystemRoot(String),
+
     /// on-demand-sync spec "Pinned files cannot be evicted".
     #[error("cannot evict {0:?}: it is pinned")]
     EvictionRejected(String),
@@ -212,13 +225,13 @@ pub enum SyncError {
     /// because the group's policy is unavailable: its most recent policy
     /// snapshot failed verification, so the group is *stale* and change
     /// admission for it fails closed. Emitting a placeholder-auth change in
-    /// that window would create a local DAG head every valid-policy peer
+    /// that window would create a local native head every valid-policy peer
     /// rejects, stranding an un-replicable branch, so the local emit path
     /// returns this instead of emitting. It is a *transient, expected*
     /// condition, not a failure: the caller leaves the path journaled dirty so
     /// a startup/backstop re-drive re-emits it — with a real stamp — once a
     /// valid policy snapshot is admitted. See
-    /// [`yadorilink_replica_domain::change::PolicyUnavailable`].
+    /// [`yadorilink_replica_domain::local_op::PolicyUnavailable`].
     #[error(
         "group policy is unavailable (stale or failed verification); withholding the local \
          change until a valid policy snapshot is admitted"
@@ -226,8 +239,8 @@ pub enum SyncError {
     PolicyUnavailable,
 
     /// A path names a component reserved for transaction artefacts (see
-    /// `yadorilink_root_authority::reserved_namespace`) somewhere it must not: a peer change
-    /// naming one before DAG admission, a collision detected at artefact
+    /// `yadorilink_root_authority::reserved_namespace`) somewhere it must not: a peer delta
+    /// naming one before native admission, a collision detected at artefact
     /// creation, or one found unexpectedly at startup. Fail-closed and
     /// carries the exact path — the offending path is never admitted,
     /// materialized or deleted; see `reserved_namespace`'s module doc
@@ -256,8 +269,8 @@ pub enum SyncError {
     NonPortablePath(String),
 }
 
-impl From<yadorilink_replica_domain::change::PolicyUnavailable> for SyncError {
-    fn from(_: yadorilink_replica_domain::change::PolicyUnavailable) -> Self {
+impl From<yadorilink_replica_domain::local_op::PolicyUnavailable> for SyncError {
+    fn from(_: yadorilink_replica_domain::local_op::PolicyUnavailable) -> Self {
         SyncError::PolicyUnavailable
     }
 }
@@ -302,7 +315,9 @@ impl SyncError {
             SyncError::CorruptState(_) => "storage",
             SyncError::HydrationFailed(_) => "peer_unreachable",
             SyncError::VersionContentUnavailable(_) => "peer_unreachable",
+            SyncError::PathChangedLocally(_) => "conflict",
             SyncError::EvictionRejected(_) => "policy",
+            SyncError::NotFilesystemRoot(_) => "policy",
             SyncError::EvictionOutcomeAmbiguous(_) => "policy",
             SyncError::PathEscapesRoot(_) => "permission",
             SyncError::DiskPressure { .. } => "disk_pressure",
@@ -368,31 +383,46 @@ impl From<yadorilink_sync_sqlite::SyncSqliteError> for SyncError {
             yadorilink_sync_sqlite::SyncSqliteError::AmbiguousLink { group_id, local_paths } => {
                 SyncError::AmbiguousLink { group_id, local_paths }
             }
+            yadorilink_sync_sqlite::SyncSqliteError::NotFilesystemRoot(group) => {
+                SyncError::NotFilesystemRoot(group)
+            }
             // A change-emitting write's `local_emission_auth` pre-check --
             // see `SyncSqliteError::PolicyUnavailable`'s own doc comment.
             yadorilink_sync_sqlite::SyncSqliteError::PolicyUnavailable => {
                 SyncError::PolicyUnavailable
             }
-            // A history base that does not carry every author held here --
-            // see `SyncSqliteError::HistoryBaseInstallDoesNotCarryAuthor`.
-            // Flattened to a message: nothing above this matches on the
-            // variant, it only reports it.
-            error @ yadorilink_sync_sqlite::SyncSqliteError::HistoryBaseInstallDoesNotCarryAuthor {
-                ..
-            } => SyncError::CorruptState(error.to_string()),
-            // A local authoring refused because a snapshot install has not
-            // reconciled the path's disk yet -- see
-            // `SyncSqliteError::PathAwaitingSnapshotInstallReconciliation`.
+            // A local authoring refused because the path's disk state has not
+            // been reconciled yet -- see
+            // `SyncSqliteError::PathAwaitingHeldPathReconciliation`.
             // Nothing is written; the edit is refused as an operation this
             // path cannot take right now, and flattened to a message for
             // the same reason as the arms around it.
-            error @ yadorilink_sync_sqlite::SyncSqliteError::PathAwaitingSnapshotInstallReconciliation {
+            error @ yadorilink_sync_sqlite::SyncSqliteError::PathAwaitingHeldPathReconciliation {
                 ..
             } => SyncError::InvalidInput(error.to_string()),
-            // A seal refused because one of its preconditions does not
-            // hold -- see `SyncSqliteError::SealRefused`. Nothing was
-            // written; flattened to a message for the same reason.
-            error @ yadorilink_sync_sqlite::SyncSqliteError::SealRefused { .. } => {
+            // A write or delta refused because a rebootstrap froze the group -- see
+            // `SyncSqliteError::GroupFrozen`. Nothing is written; the work is deferred
+            // and the edit is captured again once the freeze ends. Flattened to a
+            // message for the same reason as the arms around it.
+            error @ yadorilink_sync_sqlite::SyncSqliteError::ClosureRefused(_) => {
+                SyncError::InvalidInput(error.to_string())
+            }
+            error @ yadorilink_sync_sqlite::SyncSqliteError::GroupFrozen { .. } => {
+                SyncError::InvalidInput(error.to_string())
+            }
+            // A local write whose row changed between capture and commit --
+            // see `SyncSqliteError::LocalWriteCaptureStale`. Nothing was
+            // written; the path is captured again. Flattened to a message
+            // for the same reason as the arms around it.
+            error @ yadorilink_sync_sqlite::SyncSqliteError::LocalWriteCaptureStale { .. } => {
+                SyncError::InvalidInput(error.to_string())
+            }
+            // A local authoring refused by an authoring rule
+            // -- see `SyncSqliteError::AuthoringRefused`. Nothing was
+            // written. Flattened to a message for the same reason as the
+            // arms around it; the author-rotation reaction matches the
+            // store error before it reaches this conversion.
+            error @ yadorilink_sync_sqlite::SyncSqliteError::AuthoringRefused { .. } => {
                 SyncError::InvalidInput(error.to_string())
             }
         }
@@ -432,7 +462,7 @@ impl From<yadorilink_replica_domain::codec::ChangeError> for SyncError {
     }
 }
 
-/// `compaction`/`rebootstrap`/`rebootstrap_snapshot` moved to
+/// `native_snapshot` lives in
 /// `yadorilink-replica-engine` -- callers in this crate
 /// (`ReplicaCoordinator`'s own `SyncError`-returning methods) need this at
 /// their own `?`-propagation sites. `ReplicaEngineError::Storage` has no

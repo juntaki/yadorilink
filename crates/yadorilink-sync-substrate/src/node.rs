@@ -19,6 +19,7 @@
 //! So the substrate is iroh: QUIC, NAT traversal, relay, address lookup, and
 //! `Router`-dispatched ALPN handlers.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use iroh::protocol::Router;
@@ -165,6 +166,11 @@ pub struct NetworkConfig {
     /// Track Send's ALPN, when this node answers it at all. See
     /// `track_send`.
     track_send: Option<crate::track_send::TrackSendAccept>,
+    /// The native-replication protocol's ALPN, when this node answers it at all.
+    /// Fail-closed/default-off: absent unless explicitly configured via
+    /// [`NetworkConfig::with_native_replication`], exactly as `track_send` is.
+    /// See `native_replication_transport`.
+    native_replication: Option<crate::native_replication_transport::NativeReplicationAccept>,
 }
 
 /// Where this node falls back to when a direct path cannot be established.
@@ -257,6 +263,31 @@ impl NetworkConfig {
         self
     }
 
+    /// Also answer the native-replication protocol's ALPN on this node's router.
+    ///
+    /// Fail-closed/default-off: a `NetworkConfig` that never calls this
+    /// method never dials, never accepts, and never spawns anything for
+    /// the native-replication protocol -- `SubstrateNode::spawn`'s behavior for
+    /// every OTHER protocol (the sync ALPN, Track Send) is byte-for-byte
+    /// identical whether or not this method was ever called. `admission`
+    /// decides who may open a native-replication connection and is the only
+    /// policy asked for one -- the sync admission is never consulted for
+    /// it, though callers are expected to configure the SAME policy in
+    /// this generation (same peers, same revocation). Admitted connections
+    /// are delivered to `inbound`, which the caller drains.
+    pub fn with_native_replication(
+        mut self,
+        admission: Arc<dyn crate::PeerAdmission>,
+        inbound: mpsc::Sender<crate::NativeReplicationConnection>,
+    ) -> Self {
+        self.native_replication =
+            Some(crate::native_replication_transport::NativeReplicationAccept {
+                admission,
+                inbound,
+            });
+        self
+    }
+
     /// Turns LAN lookup on with `source` standing in for mDNS. The
     /// authorization filter in front of it is the production one.
     #[cfg(feature = "test-support")]
@@ -291,6 +322,7 @@ impl NetworkConfig {
             #[cfg(feature = "test-support")]
             lan_source_for_tests: None,
             track_send: None,
+            native_replication: None,
         }
     }
 
@@ -482,6 +514,11 @@ pub struct SubstrateNode {
     /// Every Track Send connection this node dialled or accepted; the
     /// Track Send handler holds its own clone.
     track_send_open: crate::TrackSendConnections,
+    /// Every native-replication connection this node dialled or accepted; the
+    /// native-replication handler holds its own clone. Independent of
+    /// `track_send_open` and of the sync protocol's own connection
+    /// lifecycle -- see `native_replication_transport`'s module doc.
+    native_replication_open: crate::NativeReplicationConnections,
 }
 
 impl SubstrateNode {
@@ -567,6 +604,7 @@ impl SubstrateNode {
                 inbound: Arc::new(inbound_tx),
                 admission,
                 observer: config.link_observer.clone(),
+                connections: Arc::default(),
             },
         );
         let track_send_open = crate::TrackSendConnections::default();
@@ -576,11 +614,30 @@ impl SubstrateNode {
                 crate::track_send::TrackSendHandler { accept, open: track_send_open.clone() },
             );
         }
+        let native_replication_open = crate::NativeReplicationConnections::default();
+        if let Some(accept) = config.native_replication.clone() {
+            router = router.accept(
+                crate::YADORI_NATIVE_REPLICATION_ALPN,
+                crate::native_replication_transport::NativeReplicationHandler {
+                    accept,
+                    open: native_replication_open.clone(),
+                },
+            );
+        }
         let router = router.spawn();
 
         let address = spawn_address_watch(router_endpoint_of(&router));
 
-        Ok((Self { router, address, observer: config.link_observer, track_send_open }, inbound_rx))
+        Ok((
+            Self {
+                router,
+                address,
+                observer: config.link_observer,
+                track_send_open,
+                native_replication_open,
+            },
+            inbound_rx,
+        ))
     }
 
     /// This node's transport identity.
@@ -642,6 +699,30 @@ impl SubstrateNode {
     /// withdrawn device already has open.
     pub fn track_send_connections(&self) -> crate::TrackSendConnections {
         self.track_send_open.clone()
+    }
+
+    /// Dial `address` on the native-replication protocol's ALPN.
+    ///
+    /// Not reported to the link observer: a native-replication connection is
+    /// not a sync link and says nothing about the peer's sync
+    /// reachability. A failure here must never be treated as a sync
+    /// failure by the caller.
+    pub async fn connect_native_replication(
+        &self,
+        address: &PeerAddress,
+    ) -> Result<crate::NativeReplicationConnection, SubstrateError> {
+        crate::native_replication_transport::connect(
+            self.router.endpoint(),
+            &self.native_replication_open,
+            address,
+        )
+        .await
+    }
+
+    /// Every native-replication connection this node holds, for closing the
+    /// ones a withdrawn device already has open.
+    pub fn native_replication_connections(&self) -> crate::NativeReplicationConnections {
+        self.native_replication_open.clone()
     }
 
     /// Shut the substrate down, closing the endpoint and all connections.
@@ -723,11 +804,59 @@ fn peer_address_of(endpoint: &iroh::Endpoint) -> PeerAddress {
 /// "not authorized" from "gone away" and back off accordingly.
 const REFUSED_UNAUTHORIZED: u32 = 1;
 
+/// Close code for a connection beyond the per-peer cap.
+const REFUSED_TOO_MANY_CONNECTIONS: u32 = 2;
+
+/// Most inbound connections one authenticated peer may hold open at once. A
+/// peer normally holds one; a few more cover a redial that overlaps the
+/// connection it replaces and both sides dialling at once. Without a cap a
+/// peer could multiply its per-connection stream and lane budgets by opening
+/// connections.
+const MAX_INBOUND_CONNECTIONS_PER_PEER: usize = 4;
+
+/// How many inbound connections each peer currently holds open.
+#[derive(Debug, Default)]
+struct InboundConnectionCounts {
+    open: std::sync::Mutex<HashMap<PeerId, usize>>,
+}
+
+/// One counted inbound connection; dropping it frees the slot.
+struct InboundConnectionSlot {
+    counts: Arc<InboundConnectionCounts>,
+    peer: PeerId,
+}
+
+impl InboundConnectionCounts {
+    /// A slot for a new connection from `peer`, or `None` at the cap.
+    fn try_acquire(self: &Arc<Self>, peer: PeerId) -> Option<InboundConnectionSlot> {
+        let mut open = self.open.lock().unwrap_or_else(|p| p.into_inner());
+        let held = open.entry(peer).or_insert(0);
+        if *held >= MAX_INBOUND_CONNECTIONS_PER_PEER {
+            return None;
+        }
+        *held += 1;
+        Some(InboundConnectionSlot { counts: Arc::clone(self), peer })
+    }
+}
+
+impl Drop for InboundConnectionSlot {
+    fn drop(&mut self) {
+        let mut open = self.counts.open.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(held) = open.get_mut(&self.peer) {
+            *held -= 1;
+            if *held == 0 {
+                open.remove(&self.peer);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct YadoriProtocolHandler {
     inbound: Arc<mpsc::Sender<PeerLink>>,
     admission: Arc<dyn crate::PeerAdmission>,
     observer: Option<crate::observe::LinkObserver>,
+    connections: Arc<InboundConnectionCounts>,
 }
 
 impl iroh::protocol::ProtocolHandler for YadoriProtocolHandler {
@@ -753,6 +882,12 @@ impl iroh::protocol::ProtocolHandler for YadoriProtocolHandler {
             return Ok(());
         }
 
+        let Some(_slot) = self.connections.try_acquire(peer) else {
+            connection.close(REFUSED_TOO_MANY_CONNECTIONS.into(), b"too many connections");
+            tracing::debug!(?peer, "refused an inbound sync connection beyond the per-peer cap");
+            return Ok(());
+        };
+
         let link = PeerLink::new(peer, connection.clone());
         if let Some(observer) = &self.observer {
             observer.notify(crate::observe::LinkEvent::Accepted(&link));
@@ -773,3 +908,26 @@ impl iroh::protocol::ProtocolHandler for YadoriProtocolHandler {
 
 #[cfg(test)]
 mod relay_config_tests;
+
+#[cfg(test)]
+mod connection_cap_tests {
+    use super::*;
+
+    fn peer(byte: u8) -> PeerId {
+        PeerId::from_bytes([byte; 32])
+    }
+
+    /// One peer cannot hold more than the cap; another peer is unaffected, and
+    /// a closed connection frees its slot.
+    #[test]
+    fn a_peer_cannot_hold_more_inbound_connections_than_the_cap() {
+        let counts = Arc::new(InboundConnectionCounts::default());
+        let held: Vec<_> = (0..MAX_INBOUND_CONNECTIONS_PER_PEER)
+            .map(|_| counts.try_acquire(peer(1)).expect("within the cap"))
+            .collect();
+        assert!(counts.try_acquire(peer(1)).is_none(), "the next one is over the cap");
+        assert!(counts.try_acquire(peer(2)).is_some(), "another peer has its own allowance");
+        drop(held);
+        assert!(counts.try_acquire(peer(1)).is_some(), "closed connections free their slots");
+    }
+}

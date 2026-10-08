@@ -81,7 +81,7 @@ async fn protected_and_available_now_reflect_a_confirmed_remote_holder_not_local
         || "W never saw shared.bin's DAG record".to_string(),
     )
     .await;
-    // A `Placeholder` row is a real on-disk artifact too (a placeholder
+    // A `Remote` row is a real on-disk artifact too (a placeholder
     // marker file under this path's exact name, in this non-OS-native
     // test environment) -- `std::fs::exists` alone can never distinguish
     // "placeholder" from "hydrated"; only `materialization_state` can.
@@ -91,7 +91,7 @@ async fn protected_and_available_now_reflect_a_confirmed_remote_holder_not_local
             .materialization_state_repository()
             .get_materialization_state(group_id, "shared.bin")
             .unwrap(),
-        Some(yadorilink_replica_domain::session_state::MaterializationState::Placeholder),
+        Some(yadorilink_replica_domain::session_state::MaterializationState::Remote),
         "W must not have materialized this file locally before durability/availability are even \
          checked -- a pre-existing local copy would make this test unable to distinguish \
          confirmed-remote-holder evidence from mere local presence"
@@ -116,14 +116,14 @@ async fn protected_and_available_now_reflect_a_confirmed_remote_holder_not_local
 
     // Read-model truthfulness through the REAL wire boundary, from W's
     // own control socket -- not `DaemonState` internals -- while W's
-    // record is STILL a `Placeholder`, not `Hydrated`.
+    // record is STILL a `Remote`, not `Present`.
     assert_eq!(
         w.state
             .replica_coordinator
             .materialization_state_repository()
             .get_materialization_state(group_id, "shared.bin")
             .unwrap(),
-        Some(yadorilink_replica_domain::session_state::MaterializationState::Placeholder),
+        Some(yadorilink_replica_domain::session_state::MaterializationState::Remote),
         "W must still be unhydrated at the moment fetch_availability is asserted"
     );
     let w_link = support::control_socket_client::query_link_status(w.state.clone(), group_id).await;

@@ -3,15 +3,6 @@
 use super::*;
 
 #[test]
-fn failover_unlocks_one_additional_rank_per_stable_frontier_window() {
-    assert_eq!(eligible_rank_for_elapsed(Duration::ZERO), 0);
-    assert_eq!(eligible_rank_for_elapsed(Duration::from_millis(4_999)), 0);
-    assert_eq!(eligible_rank_for_elapsed(Duration::from_secs(5)), 1);
-    assert_eq!(eligible_rank_for_elapsed(Duration::from_millis(14_999)), 2);
-    assert_eq!(eligible_rank_for_elapsed(Duration::from_secs(15)), 3);
-}
-
-#[test]
 fn only_settled_settles_generation() {
     assert!(settles_generation(&RetirementAttempt::Settled { retired: 0 }));
     assert!(settles_generation(&RetirementAttempt::Settled { retired: 3 }));
@@ -59,7 +50,7 @@ fn event_during_audit_provokes_exactly_one_follow_up_audit() {
     let claimed_generation_1 = *wake.pending().get("g1").unwrap();
     assert_eq!(claimed_generation_1, 1);
 
-    // A DAG admission (or job completion) lands while the pass that
+    // A native admission (or job completion) lands while the pass that
     // claimed generation 1 is still auditing.
     wake.mark_dirty("g1");
 

@@ -21,7 +21,7 @@ fn test_state() -> Arc<DaemonState> {
     let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
     let state = DaemonState::new("device-a".into(), sync_state, store);
     // A registered device with no signing key fails closed (see
-    // `ensure_initial_change_history`'s doc comment) --
+    // `open_group_author`) --
     // any test driving a link watch start needs one wired.
     state.set_device_signing_key(ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]));
     state
@@ -88,7 +88,6 @@ async fn link_rolls_back_the_link_and_marker_when_a_post_commit_step_fails() {
         local_path: dir.path().to_string_lossy().to_string(),
         group_id: "group-1".to_string(),
         on_demand: false,
-        max_local_size_bytes: None,
         acknowledge_risks: true,
         pending_enrollment_operation_id: "op-1".to_string(),
         pending_enrollment_kind: PendingEnrollmentKind::Create as i32,
@@ -774,7 +773,6 @@ fn link_request(local_path: &str, group_id: &str, acknowledge_risks: bool) -> Li
         local_path: local_path.to_string(),
         group_id: group_id.to_string(),
         on_demand: false,
-        max_local_size_bytes: None,
         acknowledge_risks,
         pending_enrollment_operation_id: String::new(),
         pending_enrollment_kind: 0,
@@ -816,7 +814,109 @@ async fn a_second_link_is_refused_even_with_acknowledge_risks() {
     );
     let links = state.replica_coordinator.link_repository().list_links().unwrap();
     assert_eq!(links.len(), 1, "the refusal must not add or delete a link");
-    assert_eq!(links[0].local_path, a.path().to_string_lossy());
+    assert_eq!(links[0].key(), a.path().to_string_lossy());
+}
+
+/// Links `first` to `group-1`, then tries `second` under `group_two`, with and
+/// without the risk acknowledgement; both attempts must be refused naming the
+/// existing link, and nothing may be added.
+async fn assert_topology_refused(first: &str, second: &str, group_two: &str) {
+    let state = test_state();
+    let link_lifecycle = test_link_lifecycle(&state);
+    link_lifecycle
+        .link(super::decode_link_command(link_request(first, "group-1", false)).unwrap())
+        .await
+        .unwrap();
+    for acknowledge in [false, true] {
+        let err = link_lifecycle
+            .link(super::decode_link_command(link_request(second, group_two, acknowledge)).unwrap())
+            .await
+            .expect_err("an unsupported topology must be refused at every confirmation level");
+        let message = err.to_string();
+        assert!(
+            message.contains("unsupported link topology") && message.contains(first),
+            "the refusal must name the conflicting link {first}, got {message} \
+             (acknowledge={acknowledge})"
+        );
+    }
+    let links = state.replica_coordinator.link_repository().list_links().unwrap();
+    assert_eq!(links.len(), 1, "a refusal must not add or delete a link");
+}
+
+#[tokio::test]
+async fn a_link_nested_inside_another_is_refused_even_with_acknowledge_risks() {
+    let parent = tempfile::tempdir().unwrap();
+    let child = parent.path().join("child");
+    std::fs::create_dir(&child).unwrap();
+    assert_topology_refused(&parent.path().to_string_lossy(), &child.to_string_lossy(), "group-2")
+        .await;
+}
+
+#[tokio::test]
+async fn a_link_containing_another_is_refused_even_with_acknowledge_risks() {
+    let parent = tempfile::tempdir().unwrap();
+    let child = parent.path().join("child");
+    std::fs::create_dir(&child).unwrap();
+    assert_topology_refused(&child.to_string_lossy(), &parent.path().to_string_lossy(), "group-2")
+        .await;
+}
+
+#[tokio::test]
+async fn the_same_path_linked_to_another_group_is_refused_even_with_acknowledge_risks() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_string_lossy().to_string();
+    assert_topology_refused(&path, &path, "group-2").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn the_same_folder_through_a_symlink_is_refused_even_with_acknowledge_risks() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let alias = dir.path().join("alias");
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    assert_topology_refused(&real.to_string_lossy(), &alias.to_string_lossy(), "group-2").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_nested_folder_reached_through_a_symlink_is_refused_even_with_acknowledge_risks() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    let inner = real.join("inner");
+    std::fs::create_dir_all(&inner).unwrap();
+    let alias = dir.path().join("alias");
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    assert_topology_refused(
+        &real.to_string_lossy(),
+        &alias.join("inner").to_string_lossy(),
+        "group-2",
+    )
+    .await;
+}
+
+/// Sibling folders of different groups stay linkable: only containment is
+/// refused.
+#[tokio::test]
+async fn sibling_links_of_different_groups_are_allowed() {
+    let state = test_state();
+    let parent = tempfile::tempdir().unwrap();
+    let a = parent.path().join("a");
+    let b = parent.path().join("b");
+    std::fs::create_dir(&a).unwrap();
+    std::fs::create_dir(&b).unwrap();
+    let link_lifecycle = test_link_lifecycle(&state);
+    for (path, group) in [(&a, "group-1"), (&b, "group-2")] {
+        link_lifecycle
+            .link(
+                super::decode_link_command(link_request(&path.to_string_lossy(), group, false))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(state.replica_coordinator.link_repository().list_links().unwrap().len(), 2);
 }
 
 /// Re-linking the SAME folder to the same group is idempotent and must stay

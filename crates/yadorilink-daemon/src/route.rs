@@ -2,7 +2,7 @@
 //!
 //! **Standing invariant: `Durability != Connectivity`.** A session being
 //! reachable is not evidence the data moving over it landed durably anywhere
-//! -- that is exactly what the change-DAG/materialization layer, not
+//! -- that is exactly what the native admission/materialization layer, not
 //! connectivity, is responsible for proving. `RouteKind` and full-replica
 //! status (`PeerAuthorityState::peer_group_is_full_replica`) are independent
 //! axes, never inferred from one another. A relayed peer is as connected as a

@@ -10,13 +10,12 @@ const LOCAL_PATH: &str = "/folders/shared";
 /// The distance a preview like `--at 30d` asks about.
 const THIRTY_DAYS_NANOS: i64 = 30 * 24 * 60 * 60 * 1_000_000_000;
 
-/// Full schema, pooled exactly as production opens it -- DAG tables
-/// first, since `yadorilink_sqlite_runtime::init_schema` assumes
-/// `changes`/`pruned_changes` already exist.
+/// Full schema, pooled exactly as production opens it -- the replica
+/// tables first, then `yadorilink_sqlite_runtime::init_schema`.
 fn open_full_test_db() -> Arc<SyncDatabase> {
     Arc::new(
         SyncDatabase::open_in_memory(|conn| {
-            crate::dag_store::init_dag_schema(conn).map_err(|e| {
+            crate::replica_tables::init_for_tests(conn).map_err(|e| {
                 yadorilink_sqlite_runtime::DatabaseError::CorruptSchema(e.to_string())
             })?;
             yadorilink_sqlite_runtime::init_schema(conn)
@@ -41,7 +40,6 @@ fn admit_file(db: &Arc<SyncDatabase>, path: &str) {
                 deleted: false,
             },
             "device-that-was-here-first",
-            None,
         )
     })
     .expect("the file admission must succeed");
@@ -132,4 +130,17 @@ fn re_linking_a_group_this_device_already_indexed_leaves_the_floor_alone() {
         RewindPathAction::Unchanged,
         "history from before the re-link stays answerable"
     );
+}
+
+/// Removing a path no link is recorded at reports that nothing was removed,
+/// so a caller cannot mistake a misspelled path for a completed unlink.
+#[test]
+fn remove_link_reports_whether_a_row_was_deleted() {
+    let db = open_full_test_db();
+    let links = LinkRepository::new(db);
+    links.add_link(LOCAL_PATH, GROUP).unwrap();
+
+    assert!(!links.remove_link("/some/other/path").unwrap());
+    assert!(links.remove_link(LOCAL_PATH).unwrap());
+    assert!(!links.remove_link(LOCAL_PATH).unwrap());
 }

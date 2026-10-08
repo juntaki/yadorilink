@@ -29,7 +29,7 @@ impl DirtyPathRepository {
     }
 
     /// Records `path` as a detected-but-not-yet-processed local edit for
-    /// `group_id`, *before* the read/blockify/put/index+DAG step runs. Keeps
+    /// `group_id`, *before* the read/blockify/put/index+delta step runs. Keeps
     /// the earliest `first_seen_unix_nanos` across repeated events for the same
     /// path (so `INSERT ... ON CONFLICT` updates only the kind/observation
     /// time), and resets `attempts`/`last_error` since a fresh event is a fresh
@@ -47,7 +47,7 @@ impl DirtyPathRepository {
     ) -> Result<(), SyncSqliteError> {
         let now = now_unix_nanos();
         // This row is the only durable record of the edit until the real
-        // index+DAG write commits (see this fn's own doc comment) -- a
+        // index+delta write commits (see this fn's own doc comment) -- a
         // transient `SQLITE_LOCKED`/`SQLITE_BUSY` here, previously
         // unretried, meant the journal itself could silently never be
         // written for an edit that also then failed its real write for the
@@ -125,25 +125,6 @@ impl DirtyPathRepository {
                 "UPDATE local_dirty_paths SET attempts = attempts + 1, last_error = ?3 \
                  WHERE group_id = ?1 AND path = ?2",
                 rusqlite::params![group_id, path, last_error],
-            )?;
-            Ok(())
-        })
-    }
-
-    /// Clears `path` from the dirty journal once its read/blockify/put/index+DAG
-    /// step has committed. Not an error if the path wasn't recorded — mirrors
-    /// `clear_held`'s "callers don't need to check first" contract.
-    pub fn clear_dirty_path(
-        &self,
-        group_id: &str,
-        path: &str,
-        permit: &RootCommitPermit,
-    ) -> Result<(), SyncSqliteError> {
-        permit.verify()?;
-        self.database.write::<_, SyncSqliteError>(|conn| {
-            conn.execute(
-                "DELETE FROM local_dirty_paths WHERE group_id = ?1 AND path = ?2",
-                rusqlite::params![group_id, path],
             )?;
             Ok(())
         })

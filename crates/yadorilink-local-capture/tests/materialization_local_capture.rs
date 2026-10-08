@@ -39,7 +39,7 @@ fn record_with_blocks(path: &str, content: &[u8], hash: Vec<u8>) -> FileRecord {
     }
 }
 
-/// Indexes `path` as a `Hydrated` executable whose blocks are all in the
+/// Indexes `path` as a `Present` executable whose blocks are all in the
 /// store but whose file is missing, with the materialization intent a crash
 /// mid-write leaves behind — the exact state repair reconstructs from.
 fn crashed_executable(
@@ -61,20 +61,20 @@ fn crashed_executable(
         .file_index_repository()
         .set_unix_mode("group-1", path, Some(0o755), &RootCommitPermit::for_tests())
         .unwrap();
-    // A fresh `upsert_file` row defaults to `Placeholder` (schema v25's
+    // A fresh `upsert_file` row defaults to `Remote` (schema v25's
     // fail-closed default -- see `upsert_file_in_tx`'s own doc comment), not
-    // `Hydrated`. This fixture simulates a device that had already
+    // `Present`. This fixture simulates a device that had already
     // materialized the file before crashing mid-rewrite, so it must stamp
-    // `Hydrated` explicitly; without this, `repair_interrupted_
+    // `Present` explicitly; without this, `repair_interrupted_
     // materializations_inner`'s candidate loop skips the row entirely
-    // (it only considers rows snapshotted as `Hydrated`) and repair never
+    // (it only considers rows snapshotted as `Present`) and repair never
     // sees "tool.sh" at all.
     state
         .materialization_state_repository()
         .set_materialization_state(
             "group-1",
             path,
-            MaterializationState::Hydrated,
+            MaterializationState::Present,
             &RootCommitPermit::for_tests(),
         )
         .unwrap();

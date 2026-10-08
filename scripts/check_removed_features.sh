@@ -115,7 +115,7 @@ IMPL_REMOVED=(
 )
 
 # Each entry: "<label>|<symbols>". These are the types deleted when the
-# bespoke reliability, framing, WireGuard and bulk-selector layers were
+# bespoke reliability, framing, tunnel and bulk-selector layers were
 # replaced by QUIC. Reintroducing one means reintroducing a state machine
 # QUIC already implements.
 TRANSPORT_REMOVED=(
@@ -146,8 +146,7 @@ TRANSPORT_REMOVED=(
 )
 
 # Each entry: "<label>|<symbols>". Rejected storage-backend prototypes --
-# evaluated and explicitly turned down (see docs/archive/sync-core/
-# phase-c-packstore-characterization.md's own "Recommendation" section),
+# evaluated and explicitly turned down (see the pack-store characterization in git history),
 # never shipped, no fallback/shim/feature-flag retained on removal (Phase
 # D1R). Reintroducing one of these symbols without new evidence re-opens
 # a question this project already closed.

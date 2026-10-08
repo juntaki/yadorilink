@@ -14,14 +14,11 @@
 use rusqlite::Connection;
 use yadorilink_sqlite_runtime::init_schema;
 
-/// The DAG tables `init_schema`'s own triggers reference. `init_schema`
+/// The admission tables `init_schema`'s own triggers reference. `init_schema`
 /// documents that its caller creates these first.
 fn dag_tables(conn: &Connection) {
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS changes (
-             group_id TEXT NOT NULL, change_hash BLOB NOT NULL
-         );
-         CREATE TABLE IF NOT EXISTS pruned_changes (
+        "CREATE TABLE IF NOT EXISTS admitted_changes (
              group_id TEXT NOT NULL, change_hash BLOB NOT NULL
          );
          CREATE TABLE IF NOT EXISTS group_history_bases (
@@ -32,7 +29,10 @@ fn dag_tables(conn: &Connection) {
          );
          CREATE TABLE IF NOT EXISTS history_base_carried_authors (
              group_id TEXT NOT NULL, base_hash BLOB NOT NULL, change_hash BLOB NOT NULL
-         );",
+         );
+         CREATE TABLE IF NOT EXISTS native_authoring_witness (group_id TEXT NOT NULL, identity BLOB NOT NULL);
+         CREATE TABLE IF NOT EXISTS published_evidence (change_hash BLOB NOT NULL, checkpoint_hash BLOB NOT NULL);
+         CREATE TABLE IF NOT EXISTS authorization_checkpoints (checkpoint_hash BLOB NOT NULL, group_id TEXT NOT NULL);",
     )
     .unwrap();
 }

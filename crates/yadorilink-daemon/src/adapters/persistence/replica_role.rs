@@ -27,11 +27,11 @@ impl ReplicaRoleRepository for SyncStateReplicaRoleRepository {
         self.state.replica_coordinator.link_repository().list_links().map_err(SyncError::from)
     }
 
-    fn live_link_local_path_for_group(&self, group_id: &str) -> Result<Option<String>, SyncError> {
+    fn live_link_key_for_group(&self, group_id: &str) -> Result<Option<String>, SyncError> {
         self.state
             .replica_coordinator
             .link_repository()
-            .live_link_local_path_for_group(group_id)
+            .live_link_key_for_group(group_id)
             .map_err(SyncError::from)
     }
 
@@ -82,7 +82,7 @@ impl ReplicaRoleRepository for SyncStateReplicaRoleRepository {
         // it loudly rather than swallowing it, since a stale window is a
         // real (if bounded) truthfulness gap.
         let group_id = match self.state.replica_coordinator.link_repository().list_links() {
-            Ok(links) => links.into_iter().find(|l| l.local_path == local_path).map(|l| l.group_id),
+            Ok(links) => links.into_iter().find(|l| l.key() == local_path).map(|l| l.group_id),
             Err(e) => {
                 tracing::warn!(
                     local_path,

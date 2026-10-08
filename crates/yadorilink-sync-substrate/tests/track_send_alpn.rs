@@ -147,8 +147,7 @@ async fn a_track_send_peer_is_refused_on_the_sync_alpn_and_never_reaches_sync_la
     // never asked on the sync ALPN.
     let refused = async {
         let link = a.node.connect(b_id).await.ok()?;
-        let mut lane =
-            link.open_lane(yadorilink_sync_substrate::Lane::Reconciliation).await.ok()?;
+        let mut lane = link.open_lane(yadorilink_sync_substrate::Lane::Service).await.ok()?;
         lane.write_all(b"ping").await.ok()?;
         let mut buf = [0u8; 4];
         lane.read_exact(&mut buf).await.ok()?;

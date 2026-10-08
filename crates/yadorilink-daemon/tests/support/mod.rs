@@ -204,7 +204,7 @@ pub async fn register_device(_account: &TestAccount, name: &str, _public_key: [u
 }
 
 /// Sets two process-wide backstop-interval defaults to 1s, once per test
-/// process, BEFORE the first `DaemonState`/`ReconciliationDriver` this
+/// process, BEFORE the first `DaemonState`/`PeerSessionDriver` this
 /// process constructs.
 ///
 /// Both setters below only take effect on their own task's *next* sleep —
@@ -247,21 +247,6 @@ fn ensure_fast_convergence_backstops_for_tests() {
         yadorilink_daemon::daemon_state::set_default_materialization_repair_sweep_interval_for_tests(
             std::time::Duration::from_secs(1),
         );
-        yadorilink_daemon::sync_adapter::driver::set_default_reconciliation_backstop_interval_for_tests(
-            std::time::Duration::from_secs(1),
-        );
-        // NOT shrinking `engine::REPAIR_FAILOVER_RANK_INTERVAL` here, despite
-        // that override existing (added, then deliberately left at its
-        // production 5s default, while investigating this exact stall):
-        // measured making it materially faster (200ms) rather than fixing
-        // the multi-device staggered rows made them WORSE, including
-        // regressing `three_devices_staggered` from passing to losing a
-        // second device's content outright. The interval's whole job is
-        // giving rank 0's single repair attempt time to actually land and
-        // propagate before rank 1 also considers itself eligible; shrinking
-        // it defeats that on a fast loopback test just as it would in
-        // production, producing MORE concurrent racing authors for the same
-        // obligation, not faster correct convergence.
     });
 }
 
@@ -641,7 +626,7 @@ async fn connect_two_daemons_with_shared_fake(
     install_bootstrap_policies(state_b, shared_group_ids, service_key);
     // Either device may already hold Pending Changes captured BEFORE this
     // pairing ever ran (e.g. a test that deliberately connects two ALREADY-
-    // diverged devices) -- `broadcast_change`'s own checkpoint-flush hook
+    // diverged devices) -- `on_local_native_commit`'s own checkpoint-flush hook
     // only fires on a NEW local mutation, and this lightweight pairing never
     // runs a real `peer_orchestrator::run` netmap loop to provide the OTHER
     // production trigger (reconnect). Flush explicitly here so pre-existing
@@ -650,6 +635,8 @@ async fn connect_two_daemons_with_shared_fake(
     for group_id in shared_group_ids {
         state_a.flush_pending_checkpoint_for_group_for_test(group_id).await;
         state_b.flush_pending_checkpoint_for_group_for_test(group_id).await;
+        state_a.flush_pending_native_checkpoint_for_group_for_test(group_id).await;
+        state_b.flush_pending_native_checkpoint_for_group_for_test(group_id).await;
     }
     // Reconciliation is how Changes converge, so a paired device needs its
     // stack up and reachable before anything expects convergence.
@@ -688,6 +675,12 @@ async fn connect_two_daemons_with_shared_fake(
         verifying_a,
     );
 
+    // Native replication rides beside the sync session, as a session keeper
+    // starts it: the dialing side (the smaller endpoint id) opens it, the
+    // other accepts. Peers' keys are pinned by now.
+    state_a.dial_native_replication_for_test(device_b_id).await;
+    state_b.dial_native_replication_for_test(device_a_id).await;
+
     ([handle_a, handle_b], [channel_a, channel_b])
 }
 
@@ -700,24 +693,22 @@ async fn connect_two_daemons_with_shared_fake(
 pub async fn ensure_reconciliation(
     state: &Arc<DaemonState>,
 ) -> Arc<yadorilink_daemon::sync_adapter::SyncStack> {
-    if let Some(driver) = state.reconciliation_driver() {
+    if let Some(driver) = state.peer_session_driver() {
         return driver.stack().clone();
     }
 
-    let authenticator =
-        yadorilink_daemon::change_auth::NetmapChangeAuthenticator::new(state.clone());
     let stack = Arc::new(
         yadorilink_daemon::sync_adapter::SyncStack::spawn(
             state.clone(),
-            authenticator,
             yadorilink_sync_substrate::NetworkConfig::direct_only(),
         )
         .await
         .expect("a test device must be able to start its reconciliation stack"),
     );
-    state.install_reconciliation_driver(
-        yadorilink_daemon::sync_adapter::ReconciliationDriver::start(state.clone(), stack.clone()),
-    );
+    state.install_peer_session_driver(yadorilink_daemon::sync_adapter::PeerSessionDriver::start(
+        state.clone(),
+        stack.clone(),
+    ));
     stack
 }
 
@@ -771,7 +762,7 @@ pub async fn sever_reconciliation(state_a: &Arc<DaemonState>, state_b: &Arc<Daem
     // Forgetting where the peer's substrate answers, which is what the
     // substrate consults -- see `ensure_reconciliation_between`.
     if let (Some(driver_a), Some(driver_b)) =
-        (state_a.reconciliation_driver(), state_b.reconciliation_driver())
+        (state_a.peer_session_driver(), state_b.peer_session_driver())
     {
         let peer_a = driver_a.stack().local_address().peer();
         let peer_b = driver_b.stack().local_address().peer();
@@ -790,8 +781,10 @@ pub async fn sever_reconciliation(state_a: &Arc<DaemonState>, state_b: &Arc<Daem
     // what actually makes the peer unreachable. `connect_two_daemons` builds
     // a fresh one on the way back, at a new address, the way a device
     // returning from a real outage would.
-    drop(state_a.take_reconciliation_driver());
-    drop(state_b.take_reconciliation_driver());
+    state_a.sever_native_replication_for_test();
+    state_b.sever_native_replication_for_test();
+    drop(state_a.take_peer_session_driver());
+    drop(state_b.take_peer_session_driver());
 }
 
 /// Installs the empty, verified bootstrap policy snapshot `connect_two_
@@ -853,6 +846,14 @@ static DEVICE_CHECKPOINT_FAKES: std::sync::OnceLock<
 /// detects the unsafe case (two already-registered devices found on two
 /// different fakes) and panics with that guidance rather than silently
 /// producing a split-brain authority.
+/// The coordination fake `state` was paired through, if it was paired.
+#[allow(dead_code)] // not every test binary that includes this module asks
+pub fn checkpoint_fake_of(state: &Arc<DaemonState>) -> Option<FakeCoordination> {
+    let registry = DEVICE_CHECKPOINT_FAKES.get()?;
+    let key = Arc::as_ptr(state) as usize;
+    registry.lock().unwrap().get(&key).cloned()
+}
+
 async fn checkpoint_fake_for(
     state_a: &Arc<DaemonState>,
     state_b: &Arc<DaemonState>,
@@ -1032,7 +1033,7 @@ pub fn keep_substrate_advertised(states: &[&Arc<DaemonState>]) {
 
     let owned: Vec<Arc<DaemonState>> = states.iter().map(|state| (*state).clone()).collect();
     for (index, source) in owned.iter().enumerate() {
-        let Some(driver) = source.reconciliation_driver() else { continue };
+        let Some(driver) = source.peer_session_driver() else { continue };
         let addresses = driver.stack().watch_local_address();
         let targets: Vec<std::sync::Weak<DaemonState>> = owned
             .iter()
@@ -1043,7 +1044,7 @@ pub fn keep_substrate_advertised(states: &[&Arc<DaemonState>]) {
         let handle = tokio::spawn(republish_on_change(addresses, move |address| {
             for target in &targets {
                 let Some(target) = target.upgrade() else { continue };
-                let Some(driver) = target.reconciliation_driver() else { continue };
+                let Some(driver) = target.peer_session_driver() else { continue };
                 driver.stack().address_directory().record(
                     address.0,
                     address.1.clone(),
@@ -1164,7 +1165,7 @@ pub async fn republish_on_change<R>(
 }
 
 /// The real devices: daemons whose substrate address comes from their
-/// reconciliation driver's stack.
+/// peer session driver's stack.
 struct DaemonSubstrateDevices<'a>(&'a [&'a Arc<DaemonState>]);
 
 impl SubstrateDevices for DaemonSubstrateDevices<'_> {
@@ -1173,7 +1174,7 @@ impl SubstrateDevices for DaemonSubstrateDevices<'_> {
     }
 
     fn serving_address(&self, index: usize) -> Option<SubstrateAddress> {
-        let driver = self.0[index].reconciliation_driver()?;
+        let driver = self.0[index].peer_session_driver()?;
         let address = driver.stack().local_address();
         let direct: Vec<std::net::SocketAddr> = address.direct_addrs().copied().collect();
         let relays: Vec<String> = address.relay_urls().map(ToString::to_string).collect();
@@ -1185,7 +1186,7 @@ impl SubstrateDevices for DaemonSubstrateDevices<'_> {
 
     fn record(&self, target: usize, (peer, direct, relays): &SubstrateAddress) {
         self.0[target]
-            .reconciliation_driver()
+            .peer_session_driver()
             .expect("every device was proven to be serving in the phase above")
             .stack()
             .address_directory()
@@ -1579,33 +1580,17 @@ pub fn spawn_paired_session(
         replica_engine,
         peer_store,
         shared_group_ids.to_vec(),
-        sync_roots.clone(),
         transports,
-        Some(state.forward_tx.clone()),
-        // Mirrors production's `peer_orchestrator.rs` wiring for these 4
-        // one-time capabilities so a test pairing built with this helper
-        // answers exactly like a real daemon would: `handoff_lease_
-        // responder`/`handoff_ticket_responder` are subject to `state`
-        // itself having coordination-plane config recorded (see
+        // Mirrors production's `peer_orchestrator.rs` wiring for these 2
+        // capabilities so a test pairing built with this helper answers
+        // exactly like a real daemon would: `handoff_lease_responder`/
+        // `handoff_ticket_responder` are subject to `state` itself having
+        // coordination-plane config recorded (see
         // `DaemonState::request_handoff_lease`'s doc comment for when they
         // still decline).
         PeerSyncSessionDeps {
-            pending_local_change_flush: state.clone(),
-            change_authenticator: yadorilink_daemon::change_auth::NetmapChangeAuthenticator::new(
-                state.clone(),
-            ),
             handoff_lease_responder: state.clone(),
             handoff_ticket_responder: state.clone(),
-            // Mirrors production's `peer_orchestrator.rs` wiring for this
-            // one-time capability too -- `DaemonState` implements
-            // `RootCommitAuthorityProvider` directly. Missing this left every
-            // caller of this helper on `yadorilink_peer_session::peer_session::PeerSyncSessionDeps::standalone()`'s
-            // deny-by-default provider, so every unapplied-change projection
-            // attempt failed closed with "no live root-commit authority ...
-            // no provider injected" forever, no matter how long the test
-            // waited -- not a convergence bug, a construction gap in this
-            // helper alone.
-            root_commit_authority_provider: state.clone(),
             ..yadorilink_peer_session::peer_session::PeerSyncSessionDeps::standalone()
         },
     );
@@ -1613,7 +1598,7 @@ pub fn spawn_paired_session(
     // Mirrors production's `peer_orchestrator.rs` wiring: without this, a
     // test pairing built with this helper never advertises
     // `supports_block_serve_credit` and always falls back to the legacy
-    // `BlockResponse` path, silently never exercising stage 2's
+    // `BlockResponse` path, silently never exercising the
     // credit-gated/coalesced serving at all.
     session.set_block_serve_engine(state.block_serve_engine.clone());
     // Same rationale, for the daemon-level (not per-session) materialization-
@@ -1669,9 +1654,122 @@ fn sync_roots_for_groups(
     if let Ok(links) = state.replica_coordinator.link_repository().list_links() {
         for link in links {
             if group_ids.contains(&link.group_id) {
-                roots.insert(link.group_id, PathBuf::from(link.local_path));
+                roots.insert(link.group_id.clone(), PathBuf::from(link.key()));
             }
         }
     }
     roots
+}
+
+// --- Native state, as the tests read it --------------------------------------------------
+
+/// The live native heads at `path`, in the shape the DCF resolver takes: the
+/// identity is the head's delta provenance, the content its version.
+#[allow(dead_code)]
+pub fn native_path_heads(
+    state: &yadorilink_daemon::daemon_state::DaemonState,
+    group_id: &str,
+    path: &str,
+) -> Vec<yadorilink_replica_engine::conflict::PathHead> {
+    state
+        .replica_coordinator
+        .database()
+        .read::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+            yadorilink_sync_sqlite::native_store::native_heads_at(
+                conn,
+                &yadorilink_replica_domain::ids::FolderGroupId(group_id.to_owned()),
+                &yadorilink_replica_domain::ids::SyncPath(path.to_owned()),
+            )
+        })
+        .unwrap()
+        .into_iter()
+        .map(|head| yadorilink_replica_engine::conflict::PathHead {
+            change_hash: head.payload.provenance.0,
+            rank: u64::from_be_bytes(head.payload.version.0[..8].try_into().unwrap()),
+            device_id: head.dot.author.device.0.clone(),
+            naming_device_id: head.dot.author.device.0.clone(),
+            content: Some(yadorilink_replica_engine::conflict::PathHeadContent {
+                version_hash: head.payload.version.0,
+                mtime_unix_nanos: 0,
+            }),
+        })
+        .collect()
+}
+
+/// The provenance of every live native head of the group, sorted: the set two
+/// devices' states differ by exactly when they differ at all.
+#[allow(dead_code)]
+pub fn native_group_head_set(
+    state: &yadorilink_daemon::daemon_state::DaemonState,
+    group_id: &str,
+) -> Vec<yadorilink_replica_domain::ids::DeltaHash> {
+    let mut heads: Vec<Vec<u8>> = state
+        .replica_coordinator
+        .database()
+        .read::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+            let mut stmt =
+                conn.prepare("SELECT DISTINCT provenance FROM native_heads WHERE group_id = ?1")?;
+            let rows = stmt.query_map([group_id], |row| row.get::<_, Vec<u8>>(0))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .unwrap();
+    heads.sort();
+    heads
+        .into_iter()
+        .map(|bytes| yadorilink_replica_domain::ids::DeltaHash(bytes.try_into().unwrap()))
+        .collect()
+}
+
+/// Whether a held native delta removed the head that showed `shown_version` at
+/// `path` and put nothing there.
+#[allow(dead_code)]
+pub fn native_path_removed(
+    state: &yadorilink_daemon::daemon_state::DaemonState,
+    group_id: &str,
+    path: &str,
+) -> bool {
+    let bodies: Vec<Vec<u8>> = state
+        .replica_coordinator
+        .database()
+        .read::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+            let mut stmt =
+                conn.prepare("SELECT encoded_delta FROM native_delta_bodies WHERE group_id = ?1")?;
+            let rows = stmt.query_map([group_id], |row| row.get::<_, Vec<u8>>(0))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .unwrap();
+    bodies.iter().any(|body| {
+        yadorilink_replica_domain::signed_delta::NativeDelta::from_wire_bytes(body)
+            .unwrap()
+            .ops
+            .iter()
+            .any(|op| op.path.as_str() == path && op.put.is_none() && !op.removes.is_empty())
+    })
+}
+
+/// Every native delta `state` holds for `group_id`, in author then sequence
+/// order.
+#[allow(dead_code)]
+pub fn native_deltas(
+    state: &yadorilink_daemon::daemon_state::DaemonState,
+    group_id: &str,
+) -> Vec<yadorilink_replica_domain::signed_delta::NativeDelta> {
+    let bodies: Vec<Vec<u8>> = state
+        .replica_coordinator
+        .database()
+        .read::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT encoded_delta FROM native_delta_bodies WHERE group_id = ?1 \
+                 ORDER BY author, seq",
+            )?;
+            let rows = stmt.query_map([group_id], |row| row.get::<_, Vec<u8>>(0))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .unwrap();
+    bodies
+        .iter()
+        .map(|body| {
+            yadorilink_replica_domain::signed_delta::NativeDelta::from_wire_bytes(body).unwrap()
+        })
+        .collect()
 }

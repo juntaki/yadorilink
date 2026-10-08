@@ -100,6 +100,13 @@ impl EnrollmentRepository for FakeRepository {
         Ok(true)
     }
 
+    fn creation_digest(
+        &self,
+        _locator: &str,
+    ) -> Result<Option<String>, crate::sync_error::SyncError> {
+        Ok(None)
+    }
+
     fn list_links(&self) -> Result<Vec<FolderLink>, crate::sync_error::SyncError> {
         if self.fail_list_links.load(Ordering::SeqCst) {
             return Err(std::io::Error::other("fake list_links failure").into());
@@ -227,6 +234,7 @@ impl EnrollmentCoordination for FakeCoordination {
         _operation_id: &'a str,
         _group_name: &'a str,
         _device_id: &'a str,
+        _storage_mode: &'a str,
     ) -> crate::application::ports::BoxFuture<'a, EnrollmentPrepareResult> {
         Box::pin(
             async move { self.prepare.lock().unwrap().pop_front().expect("missing fake prepare") },
@@ -377,7 +385,6 @@ impl EnrollmentLinkPort for FakeLinkPort {
         _group_id: &'a str,
         _absolute_path: &'a std::path::Path,
         _on_demand: bool,
-        _acknowledge_risks: bool,
     ) -> crate::application::ports::BoxFuture<'a, Result<(), EnrollmentLinkError>> {
         Box::pin(async move { unimplemented!("recovery never commits a plain link") })
     }
@@ -423,11 +430,12 @@ fn marker(operation_id: &str, group_id: &str) -> PendingEnrollment {
 
 fn link(group_id: &str) -> FolderLink {
     FolderLink {
-        local_path: "/home/alice/Photos".to_string(),
+        location: yadorilink_replica_domain::session_state::LinkLocation::Folder(
+            "/home/alice/Photos".to_string(),
+        ),
         group_id: group_id.to_string(),
         paused: false,
         materialization_policy: MaterializationPolicy::Eager,
-        max_local_size_bytes: None,
         orphaned: false,
     }
 }

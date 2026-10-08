@@ -2,7 +2,7 @@
 //!
 //! Most methods here are thin delegates onto `ReplicaCoordinator`'s own
 //! repository accessors (`file_index_repository()`,
-//! `materialization_state_repository()`, `change_history_repository()`,
+//! `materialization_state_repository()`,
 //! `sqlite()`, etc.), translating each accessor's own error type into
 //! `PeerSessionError` via `SyncError`. `open_materialization_intent_guard`
 //! is the one method whose body is more than a straight accessor call: it
@@ -16,9 +16,7 @@ use std::sync::Arc;
 use crate::sync_error::SyncError;
 use yadorilink_peer_session::ports::{BlockServeAuthorization, CurrentRowSnapshot};
 use yadorilink_peer_session::PeerSessionError;
-use yadorilink_replica_domain::admission::{AdmitResult, ChangeOrdering};
 use yadorilink_replica_domain::file::{FileRecord, FileVersion, RecordKind};
-use yadorilink_replica_domain::ids::ChangeHash;
 use yadorilink_replica_domain::session_state::{
     CurrentVersionRecord, HeldState, LinkGate, MaterializationPolicy, MaterializationState,
 };
@@ -116,6 +114,21 @@ impl ReplicaCoordinator {
             .map_err(PeerSessionError::from)
     }
 
+    /// [`Self::link_gate_for_group`] for a caller that works on a directory: `None` for a provider
+    /// root, which has no directory (its content lives with the OS, so there is nothing to
+    /// project, repair or retire into). A caller treats `None` as "nothing to do", never as an
+    /// error.
+    pub fn directory_link_gate_for_group(
+        &self,
+        group_id: &str,
+    ) -> Result<Option<LinkGate>, PeerSessionError> {
+        match self.link_repository().link_gate_for_group(group_id) {
+            Ok(gate) => Ok(Some(gate)),
+            Err(yadorilink_sync_sqlite::SyncSqliteError::NotFilesystemRoot(_)) => Ok(None),
+            Err(error) => Err(PeerSessionError::from(SyncError::from(error))),
+        }
+    }
+
     /// The group's configured on-demand-sync materialization policy, used to
     /// decide whether an incoming file should be hydrated eagerly or left a
     /// placeholder.
@@ -123,6 +136,16 @@ impl ReplicaCoordinator {
         &self,
         group_id: &str,
     ) -> Result<Option<MaterializationPolicy>, PeerSessionError> {
+        // A provider root never materializes into a directory, eager or not: the OS owns the
+        // local copy. For every decision made here its policy is OnDemand; whether an Eager
+        // root also asks the OS to download is the Eager driver's business, not this one's.
+        // A declaration that cannot be read counts as a provider root (fail closed).
+        if !matches!(
+            self.provider_repository().declaration_for_group(group_id),
+            Ok(yadorilink_sync_sqlite::provider::ProviderDeclaration::Plain)
+        ) {
+            return Ok(Some(MaterializationPolicy::OnDemand));
+        }
         self.link_repository()
             .materialization_policy_for_group(group_id)
             .map_err(SyncError::from)
@@ -224,7 +247,6 @@ impl ReplicaCoordinator {
                 unix_mode: snapshot.unix_mode,
                 xattrs: snapshot.xattrs,
                 origin_device_id: row.origin_device_id,
-                authoring_change_hash: row.authoring_change_hash,
                 materialization_state: row.materialization_state,
             }
         }))
@@ -301,29 +323,15 @@ impl ReplicaCoordinator {
             .map_err(PeerSessionError::from)
     }
 
-    pub fn get_authoring_change_hash(
+    /// The native head the current row at `path` shows, if any.
+    pub fn row_authoring(
         &self,
         group_id: &str,
         path: &str,
-    ) -> Result<Option<ChangeHash>, PeerSessionError> {
+    ) -> Result<Option<yadorilink_replica_domain::native_plan::NativeRowIdentity>, PeerSessionError>
+    {
         self.file_index_repository()
-            .get_authoring_change_hash(group_id, path)
-            .map_err(SyncError::from)
-            .map_err(PeerSessionError::from)
-    }
-
-    /// Attaches verified DAG authorship to the current row once reconcile
-    /// has admitted the change that produced it.
-    pub fn set_authoring_change_hash(
-        &self,
-        group_id: &str,
-        path: &str,
-        hash: &ChangeHash,
-    ) -> Result<(), PeerSessionError> {
-        #[cfg(test)]
-        self.test_observers.note_set_authoring_change_hash();
-        self.file_index_repository()
-            .set_authoring_change_hash(group_id, path, hash)
+            .row_authoring(group_id, path)
             .map_err(SyncError::from)
             .map_err(PeerSessionError::from)
     }
@@ -348,59 +356,6 @@ impl ReplicaCoordinator {
     ) -> Result<(), PeerSessionError> {
         self.materialization_state_repository()
             .set_materialization_state(group_id, path, state, permit)
-            .map_err(SyncError::from)
-            .map_err(PeerSessionError::from)
-    }
-
-    /// Version-and-authoring-guarded materialization-state transition, used
-    /// by the hydration cleanup path so a stale attempt cannot roll back a
-    /// newer version's state.
-    /// `expected_version`, when supplied, must also still hold: the row
-    /// must still derive that exact version. Authoring identity alone is
-    /// not version identity -- a supersession can keep the authoring hash
-    /// while moving the content columns -- so a guard bounding an attempt
-    /// that was about ONE version passes it.
-    ///
-    /// `expected` is exact, `None` meaning the column must still be NULL
-    /// -- not "any state". A caller that observed the row takes its
-    /// state from that same observation.
-    pub(in crate::replica_coordinator) fn transition_materialization_state_if_same_authoring(
-        &self,
-        group_id: &str,
-        path: &str,
-        expected: Option<MaterializationState>,
-        expected_authoring_hash: Option<&ChangeHash>,
-        expected_version: Option<&yadorilink_replica_domain::ids::VersionHash>,
-        next: MaterializationState,
-    ) -> Result<bool, PeerSessionError> {
-        self.materialization_state_repository()
-            .transition_materialization_state_if_same_authoring(
-                group_id,
-                path,
-                expected,
-                expected_authoring_hash,
-                expected_version,
-                next,
-            )
-            .map_err(SyncError::from)
-            .map_err(PeerSessionError::from)
-    }
-
-    pub fn is_pinned(&self, group_id: &str, path: &str) -> Result<bool, PeerSessionError> {
-        self.file_index_repository()
-            .is_pinned(group_id, path)
-            .map_err(SyncError::from)
-            .map_err(PeerSessionError::from)
-    }
-
-    pub fn touch_last_accessed(
-        &self,
-        group_id: &str,
-        path: &str,
-        unix_ts: i64,
-    ) -> Result<(), PeerSessionError> {
-        self.file_index_repository()
-            .touch_last_accessed(group_id, path, unix_ts)
             .map_err(SyncError::from)
             .map_err(PeerSessionError::from)
     }
@@ -455,30 +410,6 @@ impl ReplicaCoordinator {
         self.materialization_wake().notify_materialization_wake()
     }
 
-    /// Marks `group_id` dirty for the ephemeral conflict-copy retirement
-    /// loop and wakes it promptly, instead of waiting for its own periodic
-    /// backstop poll. Callers: an admitted batch that actually advanced
-    /// this device's frontier, and a materialization job reaching
-    /// `Completed` -- see `RetirementWake`'s own doc comment for why those
-    /// two are exactly the events after which a conflict copy can become
-    /// unjustified.
-    pub fn notify_retirement_wake(&self, group_id: &str) {
-        self.retirement_wake().mark_dirty(group_id)
-    }
-
-    /// Marks `group_id` dirty for the `HazardHeld` re-check sweep and wakes
-    /// it promptly, instead of waiting for its own periodic backstop poll.
-    /// Same two callers as `notify_retirement_wake`, for the same reason:
-    /// an admitted batch that actually advanced this device's frontier, or
-    /// a materialization job reaching `Completed`, are exactly the events
-    /// after which a SIBLING path's change could clear a held path's
-    /// hazard -- see `MaterializationStateRepository::list_held_paths`'s
-    /// own doc comment for why nothing else ever re-visits a held path on
-    /// its own.
-    pub fn notify_hazard_recheck_wake(&self, group_id: &str) {
-        self.hazard_recheck_wake().mark_dirty(group_id)
-    }
-
     pub fn is_path_dirty(&self, group_id: &str, path: &str) -> Result<bool, PeerSessionError> {
         self.dirty_path_repository()
             .is_path_dirty(group_id, path)
@@ -488,7 +419,7 @@ impl ReplicaCoordinator {
 
     /// Commits a peer-originated version onto the index, recording the
     /// sending peer as origin. The plain (non-authoring) form, used when no
-    /// verified DAG change accompanies the write.
+    /// verified native delta accompanies the write.
     pub fn upsert_file_with_origin(
         &self,
         group_id: &str,
@@ -507,50 +438,46 @@ impl ReplicaCoordinator {
         Ok(())
     }
 
-    /// Same as `upsert_file_with_origin`, but additionally attaches the
-    /// already-admitted DAG change that authored this projection, in one
-    /// transaction.
-    pub fn upsert_file_with_origin_and_author(
+    /// [`Self::upsert_file_with_origin`] plus the identity the row is
+    /// produced under: the NativeState head it shows, or none.
+    pub fn upsert_file_with_origin_and_authoring(
         &self,
         group_id: &str,
         record: &FileRecord,
         origin_device_id: &str,
-        authoring_change_hash: &ChangeHash,
+        authoring: Option<&yadorilink_replica_domain::native_plan::NativeRowIdentity>,
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), PeerSessionError> {
         self.file_index_repository()
-            .upsert_file_with_origin_and_author(
+            .upsert_file_with_origin_and_authoring(
                 group_id,
                 record,
                 origin_device_id,
-                authoring_change_hash,
+                authoring,
                 permit,
             )
             .map_err(SyncError::from)
             .map_err(PeerSessionError::from)?;
-        // After the row has landed: the supersession is inside this
-        // materialization's own window, not before it started.
         #[cfg(test)]
         self.test_observers.fire_armed_upsert_supersession(group_id, &record.path);
         Ok(())
     }
 
-    /// Erases `path`'s index row entirely -- not a tombstone, no
-    /// `authoring_change_hash` recorded, nothing published as a DAG fact.
-    /// For a path this device's index tracks with NO admitted change ever
-    /// having touched it (a pure local artifact, e.g. an ephemeral
-    /// conflict-copy the old projection fixpoint materialized before a
+    /// Erases `path`'s index row entirely -- not a tombstone, nothing
+    /// published as a replicated fact. For a path this device's index
+    /// tracks with NO admitted delta ever having touched it (a pure local
+    /// artifact, e.g. an ephemeral conflict-copy materialized before a
     /// durable carrier existed for it): the schema's `files_require_
     /// authoring_identity_on_*` triggers require every 'current' row to
-    /// carry a verified authoring change once the group has ANY DAG
-    /// history, so upserting a tombstone here (which `materialize_
+    /// carry a verified native authoring identity once the group has ANY
+    /// native history, so upserting a tombstone here (which `materialize_
     /// tombstone` would, via `upsert_file_with_origin`) is rejected outright
-    /// -- there is no change to attribute it to, and there never was one.
+    /// -- there is no head to attribute it to, and there never was one.
     /// Erasing the row instead of asserting a tombstone fact is correct
-    /// specifically because nothing about this path was ever a DAG fact to
-    /// begin with. See `yadorilink_sync_sqlite::file_index::
-    /// FileIndexRepository::remove_file`'s own doc comment (its existing,
-    /// pre-DAG-history use is the ignore sweep) for the identical "erasure,
+    /// specifically because nothing about this path was ever a replicated
+    /// fact to begin with. See `yadorilink_sync_sqlite::file_index::
+    /// FileIndexRepository::remove_file`'s own doc comment (its existing
+    /// use is the ignore sweep) for the identical "erasure,
     /// not a tombstone" semantics reused here.
     pub fn erase_local_only_file(
         &self,
@@ -605,8 +532,7 @@ impl ReplicaCoordinator {
         }
         #[cfg(test)]
         self.test_observers.note_provenance_batch(block_hashes);
-        self.change_history_repository()
-            .record_group_block_provenance(group_id, block_hashes)
+        self.record_block_provenance(group_id, block_hashes)
             .map_err(SyncError::from)
             .map_err(PeerSessionError::from)
     }
@@ -668,58 +594,36 @@ impl ReplicaCoordinator {
             .map_err(PeerSessionError::from)
     }
 
-    pub fn dag_group_heads(&self, group_id: &str) -> Result<Vec<ChangeHash>, PeerSessionError> {
-        self.sqlite()
-            .dag_group_heads(group_id)
+    /// The group's authenticated author frontier: where each author's chain
+    /// stands. It moves exactly when a causal fact is admitted, never when a
+    /// physical placement changes.
+    pub fn native_author_frontier(
+        &self,
+        group_id: &str,
+    ) -> Result<yadorilink_replica_domain::native_frontier::NativeAuthorFrontier, PeerSessionError>
+    {
+        self.database()
+            .read::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+                yadorilink_sync_sqlite::native_store::load_frontier(
+                    conn,
+                    &yadorilink_replica_domain::ids::FolderGroupId(group_id.to_owned()),
+                )
+            })
             .map_err(SyncError::from)
             .map_err(PeerSessionError::from)
     }
 
-    /// Paths represented anywhere in this group's retained history — used to
-    /// decide whether an incoming path is genuinely new.
-    pub fn dag_group_history_paths(
-        &self,
-        group_id: &str,
-    ) -> Result<HashSet<String>, PeerSessionError> {
-        self.change_history_repository()
-            .dag_group_history_paths(group_id)
-            .map_err(SyncError::from)
-            .map_err(PeerSessionError::from)
-    }
-
-    pub fn dag_has_change_or_pruned(
-        &self,
-        group_id: &str,
-        hash: &ChangeHash,
-    ) -> Result<bool, PeerSessionError> {
-        self.change_history_repository()
-            .dag_has_change_or_pruned(group_id, hash)
-            .map_err(SyncError::from)
-            .map_err(PeerSessionError::from)
-    }
-
-    pub fn dag_is_verified_authoring_change(
-        &self,
-        group_id: &str,
-        hash: &ChangeHash,
-    ) -> Result<bool, PeerSessionError> {
-        self.change_history_repository()
-            .dag_is_verified_authoring_change(group_id, hash)
-            .map_err(SyncError::from)
-            .map_err(PeerSessionError::from)
-    }
-
-    /// Reads the current row's author and compares it against an incoming
-    /// change's author on one connection — the large-index reconcile
-    /// prefilter's hot-path check.
-    pub fn current_authoring_relation(
-        &self,
-        group_id: &str,
-        path: &str,
-        incoming: &ChangeHash,
-    ) -> Result<Option<ChangeOrdering>, PeerSessionError> {
-        self.change_history_repository()
-            .current_authoring_relation(group_id, path, incoming)
+    /// Paths that hold a live native head on their own account: an entry some
+    /// delta authored at that very name, as opposed to a name only a placement
+    /// gives out.
+    pub fn native_head_paths(&self, group_id: &str) -> Result<HashSet<String>, PeerSessionError> {
+        self.database()
+            .read::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+                let mut stmt =
+                    conn.prepare("SELECT DISTINCT path FROM native_heads WHERE group_id = ?1")?;
+                let paths = stmt.query_map([group_id], |row| row.get::<_, String>(0))?;
+                Ok(paths.collect::<Result<HashSet<_>, _>>()?)
+            })
             .map_err(SyncError::from)
             .map_err(PeerSessionError::from)
     }
@@ -735,114 +639,30 @@ impl ReplicaCoordinator {
             .map_err(PeerSessionError::from)
     }
 
-    /// Whether `change_hash` is the change local capture last emitted for
-    /// `path`: authored by reading this device's own disk, not in order to
-    /// change it. See `yadorilink_sync_sqlite::local_capture_provenance`.
-    pub fn is_local_capture(
+    /// Whether `head` is the head local capture last authored for `path`:
+    /// authored by reading this device's own disk, not in order to change it.
+    /// See `yadorilink_sync_sqlite::local_capture_provenance`.
+    pub fn is_local_capture_head(
         &self,
         group_id: &str,
         path: &str,
-        change_hash: &ChangeHash,
+        head: &crate::local_convergence::types::Head,
     ) -> Result<bool, PeerSessionError> {
         self.database()
             .read(|conn| {
-                yadorilink_sync_sqlite::local_capture_provenance::is_local_capture(
+                yadorilink_sync_sqlite::local_capture_provenance::is_native_local_capture(
                     conn,
                     group_id,
                     path,
-                    change_hash,
+                    &head.identity,
                 )
             })
             .map_err(SyncError::from)
             .map_err(PeerSessionError::from)
     }
 
-    pub fn dag_is_ancestor(
-        &self,
-        ancestor: &ChangeHash,
-        descendant: &ChangeHash,
-    ) -> Result<bool, PeerSessionError> {
-        self.change_history_repository()
-            .dag_is_ancestor(ancestor, descendant)
-            .map_err(SyncError::from)
-            .map_err(PeerSessionError::from)
-    }
-
-    /// `path`'s live heads: the changes touching it that are causally
-    /// maximal in the currently admitted DAG.
-    ///
-    /// A read of a derived index maintained in the same transaction that
-    /// admits a change. It answers with as many heads as the path
-    /// genuinely has -- normally one -- and it neither decodes a change
-    /// nor walks ancestry to do it.
-    ///
-    /// This replaced a backward walk from the group's heads that decoded
-    /// every visited change and scanned its ops, discarding the ones that
-    /// turned out not to touch `path`: a cost proportional to the length
-    /// of the group's history rather than to how often `path` was
-    /// written, measured on a 10k one-op-per-change import at ~12,400
-    /// decodes and op-scans per single path resolved.
-    ///
-    /// Unlike that walk, the result needs no further filtering. Deciding
-    /// which touchers are still live happens once, when a change is
-    /// admitted, rather than again on every resolution.
-    pub fn dag_path_live_heads(
-        &self,
-        group_id: &str,
-        path: &str,
-    ) -> Result<Vec<yadorilink_replica_engine::conflict::PathHead>, PeerSessionError> {
-        self.change_history_repository()
-            .dag_path_live_heads(group_id, path)
-            .map_err(SyncError::from)
-            .map_err(PeerSessionError::from)
-    }
-
-    /// The heads `path` resolves from: the path frontier's, or the
-    /// installed base's where nothing written on the base touched it.
-    pub fn dag_path_gamma_heads(
-        &self,
-        group_id: &str,
-        path: &str,
-    ) -> Result<Vec<yadorilink_replica_engine::conflict::PathHead>, PeerSessionError> {
-        self.change_history_repository()
-            .dag_path_gamma_heads(group_id, path)
-            .map_err(SyncError::from)
-            .map_err(PeerSessionError::from)
-    }
-
-    /// Admits every item in `items`, in order, returning one result per
-    /// item -- see `yadorilink_sync_sqlite::ChangeHistoryRepository::
-    /// dag_admit_change_batch_with_versions`'s own doc comment for the
-    /// exact per-item guarantees an implementation must preserve
-    /// (atomicity, failure isolation, ordering).
-    ///
-    /// Required, not defaulted. The default this used to carry looped a
-    /// single-item admission that only the fake ever reached, which is
-    /// what kept that single-item method on this port at all; an
-    /// implementor that batches by admitting one at a time cannot offer
-    /// the atomicity the contract above asks for, so saying so is the
-    /// implementor's job.
-    pub fn dag_admit_change_batch_with_versions(
-        &self,
-        items: &[yadorilink_peer_session::ports::DagAdmission<'_>],
-    ) -> Vec<Result<AdmitResult, PeerSessionError>> {
-        let pending: Vec<yadorilink_sync_sqlite::PendingAdmission<'_>> = items
-            .iter()
-            .map(|item| yadorilink_sync_sqlite::PendingAdmission {
-                change: item.change,
-                versions: item.versions,
-                evidence: Some(&item.evidence),
-            })
-            .collect();
-        self.change_history_repository()
-            .dag_admit_change_batch_with_versions(&pending)
-            .into_iter()
-            .map(|r| r.map_err(SyncError::from).map_err(PeerSessionError::from))
-            .collect()
-    }
-
     /// Durably bumps `(group_id, path)`'s
-    /// filesystem-side mutation fence (independent of the DAG-side
+    /// filesystem-side mutation fence (independent of the native-side
     /// `invalidation_generation`) and returns the new value. A single
     /// atomic statement, never a read followed by a write, so two
     /// concurrent callers always receive two distinct values -- this is a
@@ -912,7 +732,6 @@ impl ReplicaCoordinator {
         &self,
         group_id: &str,
         path: &str,
-        causal_basis: &[ChangeHash],
         state: yadorilink_peer_session::ports::ExactActualState,
         expected_mutation_generation: i64,
         permit: &RootCommitPermit,
@@ -945,7 +764,7 @@ impl ReplicaCoordinator {
             .database
             .write_immediate::<_, yadorilink_sync_sqlite::SyncSqliteError>(|tx| {
                 // The fence alone is not enough for a proof that names a
-                // version. A DAG-side supersession moves the row's version
+                // version. A native-side supersession moves the row's version
                 // without touching the mutation fence -- that is stated
                 // outright on `ExpectedAuthoring::expected_version`, and it
                 // is why every lane that captures its version in an earlier
@@ -986,7 +805,7 @@ impl ReplicaCoordinator {
                     // it needs checking rather than waving through: with
                     // no version to compare, a version-only guard skipped
                     // it entirely, so a stale `Absent` could be published
-                    // over a path a DAG-side recreation had brought back.
+                    // over a path a native-side recreation had brought back.
                     // A supersession moves the row without moving the
                     // fence, so the fence CAS sees nothing wrong.
                     //
@@ -1005,7 +824,6 @@ impl ReplicaCoordinator {
                     tx,
                     group_id,
                     path,
-                    causal_basis,
                     sync_kind,
                     version.as_ref(),
                     filesystem_identity.as_ref(),
@@ -1030,7 +848,7 @@ impl ReplicaCoordinator {
 
     /// Everything an internal physical mutation proved, committed as one
     /// durable step: the versioned generation published under
-    /// `expected_mutation_generation`, the row stamped `Hydrated`, and the
+    /// `expected_mutation_generation`, the row stamped `Present`, and the
     /// materialization intent cleared.
     ///
     /// For a writer that controls when the mutation happens -- it bumped
@@ -1046,7 +864,7 @@ impl ReplicaCoordinator {
     /// write was ever in flight. It covers two refusals this `bool` does
     /// not distinguish: the fence had moved past
     /// `expected_mutation_generation`, or `expected_authoring` no longer
-    /// held (the row's state, authoring hash or version had been
+    /// held (the row's state or version had been
     /// superseded). Not an error: the caller must re-drive its work either
     /// way.
     ///
@@ -1059,10 +877,10 @@ impl ReplicaCoordinator {
     /// can no longer pick it up by mistake.
     ///
     /// `expected_authoring`, when supplied, must also still hold: the row
-    /// must be in that state carrying that authoring hash. A writer whose
-    /// attempt was bound to one authored version passes it so the
+    /// must be in that state and, when named, derive that version. A writer
+    /// whose attempt was bound to one version passes it so the
     /// re-check and the commit are one step -- otherwise a supersession
-    /// landing in between would let it stamp `Hydrated` for a version it
+    /// landing in between would let it stamp `Present` for a version it
     /// never materialized.
     ///
     /// The permit is re-verified inside the commit's own transaction, the
@@ -1095,7 +913,6 @@ impl ReplicaCoordinator {
         let guard = expected_authoring.map(|g| {
             yadorilink_sync_sqlite::exact_materialized_commit::ExpectedAuthoring {
                 state: g.state,
-                authoring_change_hash: g.authoring_change_hash,
                 expected_version: g.expected_version,
             }
         });
@@ -1134,11 +951,6 @@ impl ReplicaCoordinator {
             .commit_internal_materialized_state_if_fence_current(
                 group_id,
                 path,
-                // Derived inside the commit's own transaction: every
-                // writer on this lane realizes whatever the path
-                // currently resolves to, so the group's heads there are
-                // its honest basis. See the port's own doc comment.
-                None,
                 &exact,
                 expected_mutation_generation,
                 guard,
@@ -1182,7 +994,7 @@ impl ReplicaCoordinator {
     /// unconditionally.
     ///
     /// Exposed separately so a caller can ask the cheap question FIRST. The
-    /// settlement check's own inputs (a path's resolved DAG heads) cost an
+    /// settlement check's own inputs (a path's resolved native heads) cost an
     /// ancestry walk to compute, and on a device that has materialized
     /// nothing for a path yet -- every path on a replica catching up to a
     /// bulk import -- that walk is provably wasted: the O(1) lookup that
@@ -1209,7 +1021,7 @@ impl ReplicaCoordinator {
 
     /// Whether the proof standing for `(group_id, path)` is a proof about
     /// the version the ROW currently names -- the whole of what a
-    /// `Hydrated` stamp claims, rather than the existence of some proof.
+    /// `Present` stamp claims, rather than the existence of some proof.
     ///
     /// Deliberately a different question from
     /// [`Self::dag_has_usable_materialized_generation`], which is the
@@ -1230,6 +1042,78 @@ impl ReplicaCoordinator {
     ) -> Result<bool, PeerSessionError> {
         self.sqlite()
             .dag_usable_proof_names_current_version(group_id, path)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
+    }
+
+    /// Opens the durable write intent of one in-place hydration, before the
+    /// path's mutation fence is bumped, so a crash after the bump leaves the
+    /// old bytes readable as the pre-image of an unfinished write.
+    pub(crate) fn open_hydration_write_intent<'a>(
+        &'a self,
+        group_id: &'a str,
+        path: &'a str,
+        target: &[u8],
+        permit: &'a RootCommitPermit<'a>,
+    ) -> Result<crate::materialization_intent::MaterializationIntentGuard<'a>, SyncError> {
+        Ok(crate::materialization_intent::MaterializationIntentGuard::open(
+            self, group_id, path, target, permit,
+        )?)
+    }
+
+    /// Records, inside the caller's open write transaction, the blocks it has
+    /// just stored from a recovered version, so they are served like any
+    /// other block this device holds through the group.
+    pub(crate) fn record_recovered_block_provenance_in_tx(
+        conn: &rusqlite::Connection,
+        group_id: &str,
+        block_hashes: &[Vec<u8>],
+    ) -> Result<(), yadorilink_sync_sqlite::SyncSqliteError> {
+        yadorilink_sync_sqlite::dag_store::record_group_block_provenance(
+            conn,
+            group_id,
+            block_hashes,
+        )
+    }
+
+    /// Whether a usable proof names the version this path's row holds now:
+    /// the read-only question status and listing lanes ask, answered here so
+    /// they do not reach for the raw proof lookup themselves.
+    pub(crate) fn local_copy_names_current_version(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<bool, SyncError> {
+        Ok(self.sqlite().dag_usable_proof_names_current_version(group_id, path)?)
+    }
+
+    /// `SqliteSyncStore::dag_disk_is_untouched_proven_write`
+    /// for a path under this group's live root. Fail-closed: a group with no
+    /// live link, or any error, is `false`.
+    pub fn dag_disk_is_untouched_proven_write(
+        &self,
+        group_id: &str,
+        path: &str,
+        out_path: &Path,
+    ) -> Result<bool, PeerSessionError> {
+        let sync_root = match self
+            .link_repository()
+            .link_gate_for_group(group_id)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)?
+        {
+            LinkGate::Live { local_path, .. } | LinkGate::Paused { local_path } => {
+                std::path::PathBuf::from(local_path)
+            }
+            LinkGate::NoLiveLink => return Ok(false),
+        };
+        self.sqlite()
+            .dag_disk_is_untouched_proven_write(
+                group_id,
+                path,
+                out_path,
+                cached_birth_time_granularity(&sync_root),
+            )
             .map_err(SyncError::from)
             .map_err(PeerSessionError::from)
     }
@@ -1273,12 +1157,15 @@ impl ReplicaCoordinator {
         // What the namespace requires at the path, not only its own heads:
         // a proof that `a` holds File `a` says nothing once a live `a/x`
         // needs `a` to be a directory. Heads and descendants are read in
-        // one transaction.
-        let desired_hash = self
-            .sqlite()
-            .dag_desired_projected_path_state_hash(group_id, path)
-            .map_err(SyncError::from)
-            .map_err(PeerSessionError::from)?;
+        // one transaction. Under native authority the requirement is
+        // native's own; a path native cannot decide yet (a live version this
+        // replica does not hold) is never confirmed current.
+        let desired_hash =
+            match self.sqlite().native_desired_projected_path_state_hash(group_id, path) {
+                Ok(hash) => hash,
+                Err(yadorilink_sync_sqlite::SyncSqliteError::NotFound(_)) => return Ok(None),
+                Err(error) => return Err(PeerSessionError::from(SyncError::from(error))),
+            };
         let Some(basis) = self
             .sqlite()
             .dag_lookup_materialized_generation(group_id, path)
@@ -1368,7 +1255,7 @@ impl ReplicaCoordinator {
 
     /// Opens the single sanctioned materialization-intent seam for
     /// `(group_id, path)` before a peer-driven materialize commits a fresh
-    /// `Hydrated` row and writes the file's bytes. See
+    /// `Present` row and writes the file's bytes. See
     /// [`crate::materialization::MaterializationIntentGuard::open`]. Added
     /// as a narrow delegate (rather than exposing `&SyncState` itself)
     /// because `MaterializationIntentGuard<'a>` borrows a concrete
@@ -1395,98 +1282,13 @@ impl ReplicaCoordinator {
         Ok(Box::new(guard))
     }
 
-    /// Commits a bounded batch of [`PreparedProjectedUpsert`]s'
-    /// optimistic (not-yet-on-disk) rows in ONE transaction -- opening each
-    /// one's materialization intent, upserting its `Hydrated` row, and
-    /// clearing any prior held state, for every upsert in the batch. MUST
-    /// run, and its transaction MUST commit, before ANY of these upserts'
-    /// `tmp_path` is published to `out_path` -- see `PreparedProjectedUpsert`'s
-    /// own doc comment for the crash-ordering invariant this preserves, and
-    /// [`Self::finalize_projected_mutations_batch`] for the matching
-    /// after-publish half.
-    pub fn open_projected_upserts_batch(
-        &self,
-        group_id: &str,
-        upserts: &[yadorilink_peer_session::ports::PreparedProjectedUpsert],
-        permit: &RootCommitPermit<'_>,
-    ) -> Result<(), PeerSessionError> {
-        if upserts.is_empty() {
-            return Ok(());
-        }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as i64)
-            .unwrap_or(0);
-        self.database()
-            .write_immediate::<_, yadorilink_sync_sqlite::SyncSqliteError>(|tx| {
-                for u in upserts {
-                    yadorilink_sync_sqlite::MaterializationIntentRepository::begin_materialization_intent_in_tx(
-                        tx,
-                        group_id,
-                        &u.rel_path,
-                        &u.target_version_hash,
-                        now,
-                    )?;
-                    yadorilink_sync_sqlite::file_index::upsert_file_in_tx(
-                        tx,
-                        group_id,
-                        &u.record,
-                        &u.origin_device_id,
-                        u.authoring_change_hash.as_ref(),
-                    )?;
-                    // Explicit, not the schema's own column default
-                    // (`Placeholder` as of v25 -- see `SCHEMA_VERSION`'s
-                    // doc comment), and explicitly NOT `Hydrated`. This
-                    // batch's crash-recovery design needs the row to read
-                    // as a materialization in flight with the intent above
-                    // still open, so a crash before the disk publish below
-                    // is disambiguated from a genuine offline deletion by
-                    // that intent. It does not need, and must not make,
-                    // the exact claim: the bytes are still in a temp file,
-                    // and this batch may publish a great many of them
-                    // before the finalizer runs. The state that CAN be
-                    // claimed is stamped by the commit that proves it.
-                    if !u.record.deleted {
-                        yadorilink_sync_sqlite::MaterializationStateRepository::set_materialization_state_in_tx(
-                            tx,
-                            group_id,
-                            &u.rel_path,
-                            yadorilink_peer_session::ports::MATERIALIZATION_IN_FLIGHT_STATE,
-                        )?;
-                    }
-                    // Applied here, in the SAME transaction as the
-                    // row/intent above, not by `revalidate_ordinary_
-                    // upsert` calling `apply_incoming_wire_metadata`
-                    // per-candidate (its own separate `writer_gate` hit,
-                    // which would defeat this batch's "2 transactions total"
-                    // design). Must run strictly after `upsert_file_in_tx`
-                    // -- see `apply_local_meta_columns_in_tx`'s own doc
-                    // comment -- which this loop already guarantees.
-                    yadorilink_sync_sqlite::file_index::apply_local_meta_columns_in_tx(
-                        tx,
-                        group_id,
-                        &u.rel_path,
-                        &u.metadata,
-                    )?;
-                    yadorilink_sync_sqlite::MaterializationStateRepository::clear_held_in_tx(
-                        tx, group_id, &u.rel_path,
-                    )?;
-                }
-                permit.verify()?;
-                Ok(())
-            })
-            .map_err(SyncError::from)
-            .map_err(PeerSessionError::from)
-    }
-
     /// After every upsert in `finished_upserts` has had its temp file
     /// published to its final path (and every delete in `deletes` has had
     /// its `out_path` removed from disk), commits ALL of the following in
     /// ONE transaction: each finished upsert's fingerprint + intent-clear,
-    /// and each delete's tombstone row + held-state clear. See
-    /// [`Self::open_projected_upserts_batch`] for the matching before-
-    /// publish half and the crash-ordering invariant both together
-    /// preserve.
+    /// and each delete's tombstone row + held-state clear. The row
+    /// and intent were committed before the publish, so a crash in between is
+    /// resolved by repair.
     ///
     /// Each upsert carries its OWN causal basis, captured at its own
     /// revalidation -- never re-read here, and no longer one basis shared
@@ -1538,7 +1340,7 @@ impl ReplicaCoordinator {
                     // re-materialized forever.
                     //
                     // One primitive commits all three of the proof, the
-                    // `Hydrated` stamp and the intent clear, under exactly
+                    // `Present` stamp and the intent clear, under exactly
                     // the epoch this write produced and only while the row
                     // is still the one that was written for. Each of those
                     // three alone is a state nothing can read correctly,
@@ -1548,9 +1350,6 @@ impl ReplicaCoordinator {
                         tx,
                         group_id,
                         &u.rel_path,
-                        // This candidate's own realized frontier, not the
-                        // group's at some moment near the batch.
-                        Some(&u.causal_basis),
                         &yadorilink_sync_sqlite::exact_materialized_commit::ExactMaterializedState::Object {
                             kind: u.kind,
                             version: u.version_hash,
@@ -1559,7 +1358,6 @@ impl ReplicaCoordinator {
                         u.mutation_generation,
                         Some(yadorilink_sync_sqlite::exact_materialized_commit::ExpectedAuthoring {
                             state: u.expected_state,
-                            authoring_change_hash: u.expected_authoring.as_ref(),
                             expected_version: Some(&u.version_hash),
                         }),
                         std::time::SystemTime::now()
@@ -1611,7 +1409,6 @@ impl ReplicaCoordinator {
                         group_id,
                         &d.record,
                         &d.origin_device_id,
-                        d.authoring_change_hash.as_ref(),
                     )?;
                 }
                 permit.verify()?;
@@ -1638,9 +1435,8 @@ impl ReplicaCoordinator {
             .map_err(PeerSessionError::from)
     }
 
-    /// Every currently indexed file row for `group_id`, used by the
-    /// filename-hazard checks (case-fold / normalization collisions)
-    /// before a peer-driven write lands.
+    /// Every currently indexed file row for `group_id`. Not for the
+    /// per-file filename-hazard check, which is [`Self::name_fold_matches`].
     pub fn list_files(&self, group_id: &str) -> Result<Vec<FileRecord>, PeerSessionError> {
         self.file_index_repository()
             .list_files(group_id)
@@ -1648,17 +1444,49 @@ impl ReplicaCoordinator {
             .map_err(PeerSessionError::from)
     }
 
-    /// Compares two authoring identities against this group's retained DAG
-    /// history. `None` means at least one hash is not verified
-    /// retained/pruned history for this group.
-    pub fn dag_compare_authoring(
+    /// The live rows that could be conflict copies (see
+    /// `FileIndexRepository::list_live_conflict_copy_candidates`).
+    pub fn list_live_conflict_copy_candidates(
         &self,
         group_id: &str,
-        local: &ChangeHash,
-        incoming: &ChangeHash,
-    ) -> Result<Option<ChangeOrdering>, PeerSessionError> {
-        self.change_history_repository()
-            .dag_compare_authoring(group_id, local, incoming)
+    ) -> Result<Vec<FileRecord>, PeerSessionError> {
+        self.file_index_repository()
+            .list_live_conflict_copy_candidates(group_id)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
+    }
+
+    /// Whether any native head is recorded at exactly `path` in `group_id`.
+    pub fn native_path_has_heads(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<bool, PeerSessionError> {
+        self.database()
+            .read::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+                Ok(!yadorilink_sync_sqlite::native_store::native_heads_at(
+                    conn,
+                    &yadorilink_replica_domain::ids::FolderGroupId(group_id.to_owned()),
+                    &yadorilink_replica_domain::ids::SyncPath(path.to_owned()),
+                )?
+                .is_empty())
+            })
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
+    }
+
+    /// The live indexed paths of `group_id`, other than `path`, whose stored
+    /// name key equals `folded` (see [`yadorilink_sync_sqlite::file_index::
+    /// NameFoldKey`]). An index lookup, for the per-file hazard check.
+    pub fn name_fold_matches(
+        &self,
+        group_id: &str,
+        key: yadorilink_sync_sqlite::file_index::NameFoldKey,
+        folded: &str,
+        path: &str,
+    ) -> Result<Vec<String>, PeerSessionError> {
+        self.file_index_repository()
+            .name_fold_matches(group_id, key, folded, path)
             .map_err(SyncError::from)
             .map_err(PeerSessionError::from)
     }
@@ -1696,7 +1524,7 @@ impl ReplicaCoordinator {
     /// of the up to 6 separate `writer_gate` acquisitions calling
     /// `ensure_bootstrap_row_for_metadata` + the 5 setters above
     /// individually costs. The single sanctioned entry point for
-    /// `peer_session.rs`'s `apply_incoming_wire_metadata` hot path; the
+    /// `peer_session.rs`'s `apply_projected_metadata` hot path; the
     /// individual setters above stay for any other caller that genuinely
     /// only needs one field.
     pub fn apply_incoming_metadata_atomic(
@@ -1714,30 +1542,96 @@ impl ReplicaCoordinator {
             .map_err(PeerSessionError::from)
     }
 
+    /// [`Self::apply_incoming_metadata_atomic`] for several files in ONE
+    /// transaction (see
+    /// `yadorilink_sync_sqlite::file_index::FileIndexRepository::apply_incoming_metadata_atomic_batch`):
+    /// each item has the same statements and its own savepoint and
+    /// root-identity check. One item's failure is that item's outcome; the
+    /// outer result is an error only when the transaction failed or a root
+    /// stopped being this link's, in which case nothing was written.
+    ///
+    /// The caller owns the guards of every item (its path lock, its root
+    /// operation) and holds them until the item's outcome has been handed
+    /// back.
+    pub(crate) fn apply_incoming_metadata_batch(
+        &self,
+        items: &[&MetadataApplyItem],
+    ) -> Result<Vec<Result<(), PeerSessionError>>, PeerSessionError> {
+        use yadorilink_sync_sqlite::file_index::IncomingMetadataRequest;
+        #[cfg(test)]
+        {
+            let gate = self
+                .test_observers
+                .metadata_batch_gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            if let Some(gate) = gate {
+                gate();
+            }
+        }
+        let requests: Vec<IncomingMetadataRequest<'_>> = items
+            .iter()
+            .map(|item| IncomingMetadataRequest {
+                group_id: &item.group_id,
+                path: &item.path,
+                columns: &item.columns,
+            })
+            .collect();
+        let outcomes = self
+            .file_index_repository()
+            .apply_incoming_metadata_atomic_batch(&requests, |index| {
+                #[cfg(test)]
+                if self
+                    .test_observers
+                    .metadata_batch_fails_before_commit
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    && index + 1 == items.len()
+                {
+                    return Err(yadorilink_sync_sqlite::SyncSqliteError::CorruptState(
+                        "injected failure before the batch commits".into(),
+                    ));
+                }
+                items[index].root_check.verify().map_err(Into::into)
+            })
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)?;
+        #[cfg(test)]
+        self.test_observers
+            .metadata_batch_sizes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(items.len());
+        Ok(outcomes
+            .into_iter()
+            .map(|outcome| outcome.map_err(SyncError::from).map_err(PeerSessionError::from))
+            .collect())
+    }
+
     /// The full row (blocks/size/mtime/deleted/origin/
     /// authoring identity) plus every metadata column, in ONE
     /// transaction -- for a peer-projection candidate whose content
     /// already matches what's on disk and in the index, but whose row/
     /// metadata/authoring/origin still needs updating. Replaces two
-    /// separate `writer_gate` acquisitions (`upsert_file_with_origin[_
-    /// and_author]` + `apply_incoming_metadata_atomic`) with one.
+    /// separate `writer_gate` acquisitions (`upsert_file_with_origin_and_
+    /// authoring` + `apply_incoming_metadata_atomic`) with one.
     pub fn apply_projected_row_atomic(
         &self,
         group_id: &str,
         record: &FileRecord,
         origin_device_id: &str,
-        authoring_change_hash: Option<&ChangeHash>,
+        authoring: Option<&yadorilink_replica_domain::native_plan::NativeRowIdentity>,
         meta: &yadorilink_replica_domain::session_state::LocalFileMetaColumns,
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), PeerSessionError> {
         #[cfg(test)]
         self.test_observers.note_apply_projected_row_atomic();
         self.file_index_repository()
-            .apply_projected_row_atomic(
+            .apply_projected_row_with_authoring_atomic(
                 group_id,
                 record,
                 origin_device_id,
-                authoring_change_hash,
+                authoring,
                 meta,
                 permit,
             )
@@ -1753,23 +1647,10 @@ impl yadorilink_peer_session::ports::BlockServeAuthorizationPort for ReplicaCoor
         path: &str,
         block_hash: &[u8],
     ) -> Result<BlockServeAuthorization, PeerSessionError> {
-        let referenced = match self
-            .file_index_repository()
-            .published_file_at_path(group_id, path)
+        let referenced = self
+            .published_group_file_version_references_block(group_id, block_hash)
             .map_err(SyncError::from)
-            .map_err(PeerSessionError::from)?
-        {
-            Some(record)
-                if !record.deleted && record.blocks.iter().any(|b| b.hash == block_hash) =>
-            {
-                true
-            }
-            _ => self
-                .change_history_repository()
-                .dag_published_group_file_version_references_block(group_id, block_hash)
-                .map_err(SyncError::from)
-                .map_err(PeerSessionError::from)?,
-        };
+            .map_err(PeerSessionError::from)?;
         if !referenced {
             return Ok(BlockServeAuthorization::NotReferenced);
         }
@@ -1794,3 +1675,15 @@ impl yadorilink_peer_session::ports::BlockServeAuthorizationPort for ReplicaCoor
 
 #[cfg(test)]
 mod tests;
+
+/// One file's metadata step, owned, so it can wait in a window's queue while
+/// the file's task keeps its guards: see
+/// [`ReplicaCoordinator::apply_incoming_metadata_batch`].
+pub(crate) struct MetadataApplyItem {
+    pub(crate) group_id: String,
+    pub(crate) path: String,
+    pub(crate) columns: yadorilink_replica_domain::session_state::LocalFileMetaColumns,
+    /// The file's own root permit, as the check the single-file apply runs
+    /// inside its transaction.
+    pub(crate) root_check: yadorilink_root_authority::root_commit::OwnedPermitCheck,
+}

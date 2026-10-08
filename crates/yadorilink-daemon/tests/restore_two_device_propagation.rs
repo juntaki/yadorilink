@@ -110,6 +110,20 @@ async fn wait_for_current_version(
     .await;
 }
 
+/// The `version_seq` of `path`'s current version on `device`.
+fn current_version_seq(device: &TestDevice, group_id: &str, path: &str) -> i64 {
+    device
+        .state
+        .replica_coordinator
+        .sqlite()
+        .dag_list_versions(group_id, path)
+        .unwrap()
+        .iter()
+        .find(|v| v.state == VersionState::Current)
+        .map(|v| v.version_seq)
+        .expect("a current version")
+}
+
 /// N1 (restore, real second peer): A authors a restore back to an old
 /// version; B, a connected real peer, must converge on that restored
 /// content over the actual P2P protocol -- never previously exercised
@@ -229,7 +243,10 @@ async fn a_restore_racing_a_concurrent_edit_converges_deterministically() {
         || format!("B never converged on A's second write: {:?}", real_entry_names(b.root.path())),
     )
     .await;
-    wait_for_current_version(&b, group_id, "doc.txt", 2).await;
+    // B may have received only the latest of A's writes, so its own numbering of
+    // the path's versions is its own: what it has to author next is one above
+    // wherever it stands.
+    let b_seq = current_version_seq(&b, group_id, "doc.txt");
 
     // Disconnect -- each side now authors its own change with no way for
     // the other to see or adopt it yet, a real causal fork. Aborting the
@@ -242,13 +259,16 @@ async fn a_restore_racing_a_concurrent_edit_converges_deterministically() {
     for handle in handles {
         handle.abort();
     }
+    // The sessions are not the only link: reconciliation runs on its own
+    // stack, and left up it delivers A's restore to B before B's edit is
+    // captured, so the race below would not be concurrent at all.
     support::sever_reconciliation(&a.state, &b.state).await;
 
     hydration::restore_to_version(&a.state, group_id, "doc.txt", 1).await.unwrap();
     wait_for_current_version(&a, group_id, "doc.txt", 3).await;
 
     std::fs::write(b.root.path().join("doc.txt"), "concurrent edit from b").unwrap();
-    wait_for_current_version(&b, group_id, "doc.txt", 3).await;
+    wait_for_current_version(&b, group_id, "doc.txt", b_seq + 1).await;
 
     // Reconnect -- only now do the two independently-authored histories
     // actually meet, forcing genuine conflict resolution.

@@ -27,7 +27,7 @@
 //! Losing either ends the session. A device the netmap withdraws loses its
 //! key (the per-peer keeper is stopped and removes its session) and its
 //! connections (closed by `PeerConnectivityRuntime::revoke_device`, which
-//! ends the keeper's wait on its own). Dropping the reconciliation driver --
+//! ends the keeper's wait on its own). Dropping the peer session driver --
 //! how a device stops answering peers -- stops every keeper, and each one
 //! removes the session it registered.
 //!
@@ -53,7 +53,7 @@ const HEALTHY_CONNECTION: Duration = Duration::from_secs(3);
 ///
 /// Aborting the returned task stops every per-peer keeper, and each keeper
 /// removes the session it registered as it stops -- so the holder of this
-/// handle (the reconciliation driver) decides how long sessions over its
+/// handle (the peer session driver) decides how long sessions over its
 /// endpoint can exist.
 pub(crate) fn keep_peer_sessions(
     state: &Arc<DaemonState>,
@@ -113,7 +113,8 @@ impl Drop for Keepers {
 /// Connects to `device`, holds a session for it while the connection lives,
 /// and reconnects with backoff when it ends -- until stopped.
 async fn keep_session(state: Weak<DaemonState>, stack: Weak<SyncStack>, device: String) {
-    let mut registered = Registered { state: state.clone(), device: device.clone(), session: None };
+    let mut registered =
+        Registered { state: state.clone(), device: device.clone(), session: None, native: None };
     let mut attempt: u32 = 0;
     loop {
         let started = tokio::time::Instant::now();
@@ -129,6 +130,10 @@ async fn keep_session(state: Weak<DaemonState>, stack: Weak<SyncStack>, device: 
                     return;
                 };
                 registered.session = open_session(&state, &linked_stack, &device);
+                if registered.session.is_some() {
+                    registered.native =
+                        Some(start_native_replication(&state, &linked_stack, &device));
+                }
                 // Followed through a handle that does not keep the connection
                 // open: the endpoint's link cache owns it, and a revocation or
                 // the peer going away must be able to end it.
@@ -148,6 +153,10 @@ async fn keep_session(state: Weak<DaemonState>, stack: Weak<SyncStack>, device: 
                     if connected {
                         let Some(stack) = stack.upgrade() else { return };
                         registered.session = open_session(&state, &stack, &device);
+                        if registered.session.is_some() {
+                            registered.native =
+                                Some(start_native_replication(&state, &stack, &device));
+                        }
                     }
                 }
                 if connected {
@@ -167,6 +176,21 @@ async fn keep_session(state: Weak<DaemonState>, stack: Weak<SyncStack>, device: 
     }
 }
 
+/// Keeps native replication with `device` up beside its sync session: the
+/// dialing side keeps a connection dialled, the other accepts. Ends with the
+/// session, and is aborted when the keeper lets go of it.
+fn start_native_replication(
+    state: &Weak<DaemonState>,
+    stack: &Arc<SyncStack>,
+    device: &str,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(crate::native_replication_runtime::keep_dialed(
+        state.clone(),
+        stack.clone(),
+        device.to_string(),
+    ))
+}
+
 /// The session a keeper registered, removed when the keeper lets go of it
 /// or is stopped -- and only if it is still the registered one, so a keeper
 /// never removes a session somebody else put there.
@@ -174,12 +198,23 @@ struct Registered {
     state: Weak<DaemonState>,
     device: String,
     session: Option<Arc<PeerSyncSession>>,
+    /// The task keeping native replication dialled beside `session`.
+    native: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Registered {
     fn release(&mut self) {
+        if let Some(native) = self.native.take() {
+            native.abort();
+        }
         if let (Some(session), Some(state)) = (self.session.take(), self.state.upgrade()) {
             state.peers.remove_if_current(&self.device, &session);
+            // Only when nobody has registered a session since: a successor's
+            // native connection is its own, and an old one dies with its
+            // carrier.
+            if !state.peers.has_session(&self.device) {
+                state.native_replication.detach(&self.device);
+            }
         }
     }
 }
@@ -231,9 +266,7 @@ fn open_session(
         replica_engine,
         store,
         groups,
-        sync_roots.clone(),
         stack.transports_for(device),
-        Some(state.forward_tx.clone()),
         crate::peer_orchestrator::peer_sync_session_deps(&state),
     );
     if !state.register_peer_session_if_absent(device, session.clone(), sync_roots) {
@@ -245,6 +278,8 @@ fn open_session(
     // the session up to date with it. One that runs after this point finds
     // the session and updates it itself.
     session.set_authorized_groups(servable_groups(&state.authority, device));
+    // A first session for this peer: its groups just went from none to its servable set.
+    state.native_replication.wake_reconcile();
     if state.authority.peer_signing_key(device).is_none() {
         state.peers.remove_if_current(device, &session);
         return None;

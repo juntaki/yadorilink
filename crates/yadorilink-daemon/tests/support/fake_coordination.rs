@@ -269,6 +269,27 @@ impl FakeCoordination {
         self.inner.lock().unwrap().netmap_frames_built.get(device_id).copied().unwrap_or(0)
     }
 
+    /// The signed policy log this fake distributes for `group_id` now: its
+    /// grant chain up to the latest record (an empty log before the first).
+    pub fn group_policy_log(
+        &self,
+        group_id: &str,
+    ) -> yadorilink_daemon::change_policy::GroupPolicyLog {
+        let inner = self.inner.lock().unwrap();
+        let chain = inner.group_policy_chains.get(group_id).cloned().unwrap_or_default();
+        let (current_seq, current_epoch, policy_head) = match chain.last() {
+            Some(head) => (head.seq, head.epoch, head.record_hash.clone()),
+            None => (0, 0, vec![0u8; 32]),
+        };
+        yadorilink_daemon::change_policy::GroupPolicyLog {
+            group_id: group_id.to_string(),
+            current_seq,
+            current_epoch,
+            policy_head,
+            records: chain,
+        }
+    }
+
     /// Grants `device_id` a specific writer role for `group_id` by appending
     /// a real, signed `ACTION_GRANT_WITH_ROLE` record to that group's policy
     /// chain and pushing a fresh netmap update -- the fake-coordination

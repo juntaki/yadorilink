@@ -8,6 +8,8 @@ use super::*;
 fn base_link() -> LinkStatus {
     LinkStatus {
         local_path: "/tmp/photos".into(),
+        provider_root_id: String::new(),
+        provider_display_name: String::new(),
         group_id: "group-1".into(),
         paused: false,
         conflict_count: 0,
@@ -28,6 +30,7 @@ fn base_link() -> LinkStatus {
         transfer_eta_seconds: 0,
         durability_status: 0,
         durability_evidence: 0,
+        durability_check_pending: false,
         policy_stale: false,
         ambiguous: false,
         ambiguous_local_paths: Vec::new(),
@@ -99,6 +102,29 @@ fn risky_report_without_yes_or_a_terminal_is_rejected() {
     let report = risky_report();
     let result = acknowledge_if_risky(&report, false);
     assert!(result.is_err(), "expected risky link without --yes to be rejected");
+}
+
+/// A nested link is an unsupported topology, not a risk: `--yes` must not
+/// accept it, and the refusal names the conflicting link.
+#[test]
+fn nested_links_are_refused_with_and_without_yes() {
+    let parent = tempfile::tempdir().unwrap();
+    let child = parent.path().join("child");
+    std::fs::create_dir(&child).unwrap();
+    let parent_path = parent.path().to_string_lossy().to_string();
+    let child_path = child.to_string_lossy().to_string();
+
+    // Linking inside an existing link, and linking a folder that contains one.
+    let inside = link_preflight::run_preflight(&child, std::slice::from_ref(&parent_path), Some(0));
+    let containing =
+        link_preflight::run_preflight(parent.path(), std::slice::from_ref(&child_path), Some(0));
+    for (report, other) in [(inside, &parent_path), (containing, &child_path)] {
+        for yes in [false, true] {
+            let err = acknowledge_if_risky(&report, yes)
+                .expect_err("a nested link must be refused whatever the flag");
+            assert!(err.to_string().contains(other.as_str()), "must name {other}: {err}");
+        }
+    }
 }
 
 /// The interactive confirmation prompt itself: "y"/"yes" (any case)

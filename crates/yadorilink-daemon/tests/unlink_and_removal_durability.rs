@@ -201,8 +201,7 @@ async fn exclude_target_readiness_false_when_only_ready_replica_is_the_excluded_
     // the block as never having been obtained through the group.
     a.state
         .replica_coordinator
-        .change_history_repository()
-        .record_group_block_provenance(GROUP, std::slice::from_ref(&bytes))
+        .record_block_provenance(GROUP, std::slice::from_ref(&bytes))
         .unwrap();
     let record = record_referencing("held.bin", bytes, content.len() as u64);
     a.state
@@ -269,15 +268,10 @@ async fn exclude_target_readiness_true_when_a_different_replica_is_ready() {
     a.state.block_store.put(content).unwrap();
     a.state
         .replica_coordinator
-        .change_history_repository()
-        .record_group_block_provenance(GROUP, std::slice::from_ref(&block_hash))
+        .record_block_provenance(GROUP, std::slice::from_ref(&block_hash))
         .unwrap();
     c.state.block_store.put(content).unwrap();
-    c.state
-        .replica_coordinator
-        .change_history_repository()
-        .record_group_block_provenance(GROUP, &[block_hash])
-        .unwrap();
+    c.state.replica_coordinator.record_block_provenance(GROUP, &[block_hash]).unwrap();
 
     connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
     connect_two_daemons(&c.state, "device-c", &b.state, "device-b", &[GROUP.to_string()]).await;
@@ -327,8 +321,7 @@ async fn unlink_setup(
     // the block as never having been obtained through the group.
     a.state
         .replica_coordinator
-        .change_history_repository()
-        .record_group_block_provenance(GROUP, std::slice::from_ref(&bytes))
+        .record_block_provenance(GROUP, std::slice::from_ref(&bytes))
         .unwrap();
     // Device-b needs the same provenance record as device-a: device-a's own
     // mandatory lease issuance re-verifies ITS OWN readiness by querying
@@ -336,8 +329,7 @@ async fn unlink_setup(
     // group block provenance on the ANSWERING side too.
     b.state
         .replica_coordinator
-        .change_history_repository()
-        .record_group_block_provenance(GROUP, std::slice::from_ref(&bytes))
+        .record_block_provenance(GROUP, std::slice::from_ref(&bytes))
         .unwrap();
     let record = record_referencing("only.bin", bytes, content.len() as u64);
     for daemon in [&a, &b] {
@@ -348,11 +340,13 @@ async fn unlink_setup(
             .file_index_repository()
             .upsert_file(GROUP, &record, &permit)
             .unwrap();
-        // `upsert_file` leaves a row `Placeholder`, which is what a row
-        // looks like between its change being projected and its content
-        // being fetched. Both devices here are meant to be holding the
-        // content -- they have the blocks and the group provenance a few
-        // lines up -- so they have to say so.
+        // `upsert_file` leaves a row `Remote`, which is what a row looks like
+        // between its change being projected and its content being fetched.
+        // Both devices here are meant to be holding the content -- they have
+        // the blocks and the group provenance a few lines up -- so they have
+        // to say so, and `Present` alone says nothing about which version the
+        // object is: the proof is what a device's claim to hold the version
+        // stands on.
         //
         // This used not to matter: the background custody check ran the
         // action-time proof, which asks the peer's BLOCK STORE. The
@@ -361,17 +355,15 @@ async fn unlink_setup(
         // not taken custody yet -- deliberately, because that is exactly
         // what a device still doing its first sync looks like. The fixture
         // has to be specific about which of the two it is modelling.
-        daemon
-            .state
-            .replica_coordinator
-            .materialization_state_repository()
-            .set_materialization_state(
-                GROUP,
-                &record.path,
-                yadorilink_replica_domain::session_state::MaterializationState::Hydrated,
-                &permit,
-            )
-            .unwrap();
+        let on_disk = daemon.root.path().join(&record.path);
+        std::fs::write(&on_disk, content).unwrap();
+        yadorilink_daemon::test_support::seed_prior_cycle_proof(
+            &daemon.state.replica_coordinator,
+            GROUP,
+            &record.path,
+            &on_disk,
+            &permit,
+        );
     }
 
     // Must win the race against `connect_two_daemons`'s own coordination-

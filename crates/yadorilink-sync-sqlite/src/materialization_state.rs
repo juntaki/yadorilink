@@ -13,8 +13,6 @@ use rusqlite::OptionalExtension;
 
 use crate::error::SyncSqliteError;
 use yadorilink_replica_domain::file::{BlockInfo, RecordKind};
-use yadorilink_replica_domain::ids::ChangeHash;
-use yadorilink_replica_domain::session_state::EvictableFile;
 use yadorilink_replica_domain::session_state::{HeldState, MaterializationState};
 use yadorilink_root_authority::root_commit::RootCommitPermit;
 use yadorilink_sqlite_runtime::SyncDatabase;
@@ -81,11 +79,11 @@ impl MaterializationStateRepository {
             Ok([
                 MaterializationState::Hydrating,
                 MaterializationState::Evicting,
-                MaterializationState::Placeholder,
+                MaterializationState::Remote,
             ]
             .into_iter()
             .find(|state| states.contains(state))
-            .unwrap_or(MaterializationState::Hydrated))
+            .unwrap_or(MaterializationState::Present))
         })
     }
 
@@ -113,11 +111,10 @@ impl MaterializationStateRepository {
     /// `_in_tx` counterpart of [`Self::set_materialization_state`], for a
     /// caller that already holds an open transaction spanning more writes
     /// than just this one (bounded batching of receiver-side
-    /// materialization commits) -- see `open_projected_upserts_batch`'s own
-    /// call site for why it needs this: the row it just upserted no longer
-    /// gets `Hydrated` from the schema's own column default (v25 changed
-    /// that default to `Placeholder` -- see `SCHEMA_VERSION`'s doc comment),
-    /// so a caller that deliberately wants `Hydrated`-with-an-open-intent
+    /// materialization commits): the row such a caller just upserted no longer
+    /// gets `Present` from the schema's own column default (v25 changed
+    /// that default to `Remote` -- see `SCHEMA_VERSION`'s doc comment),
+    /// so a caller that deliberately wants `Present`-with-an-open-intent
     /// (the established crash-recoverable shape for a batched candidate
     /// whose disk publish has not landed yet) must say so explicitly now,
     /// same as every other caller of this pattern. Does not error on zero
@@ -130,11 +127,11 @@ impl MaterializationStateRepository {
         path: &str,
         state: MaterializationState,
     ) -> Result<(), SyncSqliteError> {
-        tx.execute(
+        tx.prepare_cached(
             "UPDATE files SET materialization_state = ?1 \
              WHERE group_id = ?2 AND path = ?3 AND state = 'current'",
-            rusqlite::params![state.as_db_str(), group_id, path],
-        )?;
+        )?
+        .execute(rusqlite::params![state.as_db_str(), group_id, path])?;
         Ok(())
     }
 
@@ -161,21 +158,16 @@ impl MaterializationStateRepository {
         Ok(affected == 1)
     }
 
-    /// Like `transition_materialization_state`, but also requires the
-    /// `current` row's `authoring_change_hash` to still match
-    /// `expected_authoring_hash`, and — when the caller supplies one —
-    /// the version the row derives to still be `expected_version`.
+    /// Like `transition_materialization_state`, but, when the caller supplies
+    /// one, also requires the version the row derives to still be
+    /// `expected_version`.
     ///
     /// A plain state-only CAS cannot tell "this row is still the same
     /// version this caller started working on, just still `Hydrating`"
     /// apart from "a NEWER version of this path became `current` and
     /// happened to also land in `Hydrating` before this caller's cleanup
-    /// ran". The authoring hash narrows that, and for a long time was
-    /// treated as sufficient — but authoring identity is not version
-    /// identity: a supersession can keep the authoring hash while moving
-    /// the content columns the version is derived from, which is the
-    /// whole premise of the payload-provenance work. A guard bounding an
-    /// attempt that was about ONE version has to say so.
+    /// ran". A guard bounding an attempt that was about ONE version has to
+    /// say so.
     ///
     /// `expected_version` is checked against
     /// [`crate::read_canonical_current_row`] inside this same
@@ -183,12 +175,11 @@ impl MaterializationStateRepository {
     /// first and then updating would be two statements with nothing
     /// holding the row between them, which is the defect this parameter
     /// exists to close.
-    pub fn transition_materialization_state_if_same_authoring(
+    pub fn transition_materialization_state_if_same_version(
         &self,
         group_id: &str,
         path: &str,
         expected: Option<MaterializationState>,
-        expected_authoring_hash: Option<&ChangeHash>,
         expected_version: Option<&yadorilink_replica_domain::ids::VersionHash>,
         next: MaterializationState,
     ) -> Result<bool, SyncSqliteError> {
@@ -206,30 +197,14 @@ impl MaterializationStateRepository {
                     return Ok(0);
                 }
             }
-            Ok(match expected_authoring_hash {
-                Some(hash) => conn.execute(
-                    &format!(
-                        "UPDATE files SET materialization_state = ?1 \
-                         WHERE group_id = ?2 AND path = ?3 AND state = 'current' \
-                           AND {expected_state_sql} AND authoring_change_hash = ?5"
-                    ),
-                    rusqlite::params![
-                        next.as_db_str(),
-                        group_id,
-                        path,
-                        expected_state_param,
-                        &hash.0[..],
-                    ],
-                )?,
-                None => conn.execute(
-                    &format!(
-                        "UPDATE files SET materialization_state = ?1 \
-                         WHERE group_id = ?2 AND path = ?3 AND state = 'current' \
-                           AND {expected_state_sql} AND authoring_change_hash IS NULL"
-                    ),
-                    rusqlite::params![next.as_db_str(), group_id, path, expected_state_param],
-                )?,
-            })
+            Ok(conn.execute(
+                &format!(
+                    "UPDATE files SET materialization_state = ?1 \
+                     WHERE group_id = ?2 AND path = ?3 AND state = 'current' \
+                       AND {expected_state_sql}"
+                ),
+                rusqlite::params![next.as_db_str(), group_id, path, expected_state_param],
+            )?)
         })?;
         Ok(affected == 1)
     }
@@ -246,11 +221,11 @@ impl MaterializationStateRepository {
     /// daemon startup (never mid-run, since a live daemon's own
     /// `Hydrating` rows are legitimately in progress) to move every
     /// stale `Hydrating` row, across every group, out of that state. The
-    /// name says `Placeholder`, the default resolution -- safe because
-    /// `Placeholder` just means "not fetched yet," and a startup is
+    /// name says `Remote`, the default resolution -- safe because
+    /// `Remote` just means "not fetched yet," and a startup is
     /// definitionally after any hydration that was running crashed with
     /// it -- but it is not the only one: a row over a standing proof goes
-    /// back to `Hydrated` (below), and a row repair will take keeps
+    /// back to `Present` (below), and a row repair will take keeps
     /// `Hydrating` (next paragraph).
     ///
     /// Except for a row that startup repair will take instead. A
@@ -260,7 +235,7 @@ impl MaterializationStateRepository {
     /// the shape the projected-upserts batch leaves behind between its two
     /// transactions. Repair can finish or redo those from blocks that are
     /// already local. Demoting them here first would hand them to the
-    /// ordinary startup scan instead, which sees a `Placeholder` over
+    /// ordinary startup scan instead, which sees a `Remote` over
     /// bytes that do not match the row, has no way to tell a half-finished
     /// materialization from an edit made while the daemon was down, and
     /// republishes the stale bytes as a new local version.
@@ -275,38 +250,41 @@ impl MaterializationStateRepository {
     /// will never look at it leaves it wedged in that state for good,
     /// rather than merely until the next restart.
     ///
-    /// And except for a row the attempt found `Hydrated`. Access
-    /// hydration and convergence rehydration both enter from `Hydrated`
+    /// And except for a row the attempt found `Present`. Access
+    /// hydration and convergence rehydration both enter from `Present`
     /// (a proof about a version the row has moved off), CAS the row to
     /// `Hydrating` with no intent, and bump the mutation fence only right
     /// before they touch disk. A crash before that bump leaves `Hydrating`
     /// over a present-file proof that still stands against the path's
     /// fence -- and a standing proof means no physical write has happened
     /// since it was published, so disk holds what it vouches for or an
-    /// edit nobody has journalled yet. `Placeholder` is the one claim
+    /// edit nobody has journalled yet. `Remote` is the one claim
     /// access hydration reconstructs over without asking, so demoting
     /// such a row hands a user's offline edit to the next fetch or pin to
-    /// overwrite. It goes back to `Hydrated` instead: what the attempt's
+    /// overwrite. It goes back to `Present` instead: what the attempt's
     /// own guard reverts to on failure, the state under which hydrate
     /// refuses to overwrite bytes the proof does not describe, and a
     /// repair candidate that startup repair re-proves or quarantines
     /// before anything else can touch the path. A fence moved past the
     /// proof (an eviction, or an attempt that crashed after its own bump)
-    /// proves nothing about disk and still resets to `Placeholder`. That
+    /// proves nothing about disk and still resets to `Remote`. That
     /// includes an attempt that crashed after its own bump and before its
     /// write landed: a moved fence cannot be told from an evicted row's.
     /// A row with an intent stays with the carve-out above.
-    /// The row does not record its entry state, so a `Placeholder` entry
+    /// The row does not record its entry state, so a `Remote` entry
     /// whose superseded proof still stands (a version admitted over a
-    /// `Hydrated` row strips the claim without moving the fence) comes
-    /// back `Hydrated` too; the same argument makes that claim true of its
+    /// `Present` row strips the claim without moving the fence) comes
+    /// back `Present` too; the same argument makes that claim true of its
     /// disk, and repair, not a blind reconstruct, is what then decides it.
     /// Both updates share one transaction; the count is every row moved
     /// out of `Hydrating`.
-    pub fn reset_stale_hydrating_to_placeholder(&self) -> Result<usize, SyncSqliteError> {
-        self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            let restored = tx.execute(
-                "UPDATE files SET materialization_state = ?1 \
+    pub fn reset_stale_hydrating(&self) -> Result<usize, SyncSqliteError> {
+        self.database.write_immediate::<_, SyncSqliteError>(|tx| Self::reset_hydrating_in(tx))
+    }
+
+    fn reset_hydrating_in(tx: &rusqlite::Connection) -> Result<usize, SyncSqliteError> {
+        let restored = tx.execute(
+            "UPDATE files SET materialization_state = ?1 \
                  WHERE materialization_state = ?2 AND state = 'current' AND deleted = 0 \
                    AND COALESCE(record_kind, ?3) = ?3 \
                    AND NOT EXISTS ( \
@@ -322,14 +300,14 @@ impl MaterializationStateRepository {
                           AND g.object_kind = 'regular_file' \
                           AND g.version_hash IS NOT NULL \
                    )",
-                rusqlite::params![
-                    MaterializationState::Hydrated.as_db_str(),
-                    MaterializationState::Hydrating.as_db_str(),
-                    RecordKind::File.as_db_str(),
-                ],
-            )?;
-            let demoted = tx.execute(
-                "UPDATE files SET materialization_state = ?1 \
+            rusqlite::params![
+                MaterializationState::Present.as_db_str(),
+                MaterializationState::Hydrating.as_db_str(),
+                RecordKind::File.as_db_str(),
+            ],
+        )?;
+        let demoted = tx.execute(
+            "UPDATE files SET materialization_state = ?1 \
                  WHERE materialization_state = ?2 AND state = 'current' \
                    AND NOT ( \
                        EXISTS ( \
@@ -345,121 +323,133 @@ impl MaterializationStateRepository {
                            ) \
                        ) \
                    )",
-                rusqlite::params![
-                    MaterializationState::Placeholder.as_db_str(),
-                    MaterializationState::Hydrating.as_db_str(),
-                    RecordKind::Symlink.as_db_str(),
-                    // Repair reads a missing kind as `File`, so this
-                    // comparison has to as well, or a row with no recorded
-                    // kind would be reset here AND walked there.
-                    RecordKind::File.as_db_str(),
-                    RecordKind::Directory.as_db_str(),
-                ],
-            )?;
-            Ok(restored + demoted)
-        })
+            rusqlite::params![
+                MaterializationState::Remote.as_db_str(),
+                MaterializationState::Hydrating.as_db_str(),
+                RecordKind::Symlink.as_db_str(),
+                // Repair reads a missing kind as `File`, so this
+                // comparison has to as well, or a row with no recorded
+                // kind would be reset here AND walked there.
+                RecordKind::File.as_db_str(),
+                RecordKind::Directory.as_db_str(),
+            ],
+        )?;
+        Ok(restored + demoted)
     }
 
     /// `Evicting` is set right before eviction writes the placeholder and is
-    /// cleared to `Placeholder` only once that placeholder is committed
+    /// cleared to `Remote` only once that placeholder is committed
     /// (`materialization_eviction::evict_file`). A crash in that window
-    /// leaves the row `Evicting` forever: `reset_stale_hydrating_to_placeholder`
+    /// leaves the row `Evicting` forever: `reset_stale_hydrating`
     /// above touches only `Hydrating` rows, `repair_interrupted_materializations`
-    /// skips every non-`Hydrated` row, and nothing else reconciles it — so
+    /// skips every non-`Present` row, and nothing else reconciles it — so
     /// the file is permanently wedged (status even miscounts it as
     /// hydrating). No blocks are ever lost: physical block reclamation
     /// happens only *after* the row has already transitioned to
-    /// `Placeholder`, so an `Evicting` row is guaranteed to still have every
+    /// `Remote`, so an `Evicting` row is guaranteed to still have every
     /// block retained. Called once at daemon startup (never mid-run, since a
     /// live daemon's own `Evicting` rows are legitimately an eviction in
-    /// progress) to reset every stale `Evicting` row back to `Placeholder`
+    /// progress) to reset every stale `Evicting` row back to `Remote`
     /// — the same target, and the same blanket-UPDATE discipline, as the
     /// `Hydrating` reset above, chosen because it is safe for both
     /// interrupted-eviction disk states:
     ///
     /// - If the placeholder was already written before the crash, the row is
-    ///   now `Placeholder` over a placeholder file on disk — identical to a
+    ///   now `Remote` over a placeholder file on disk — identical to a
     ///   normally completed eviction (blocks retained), which every other path
     ///   already handles.
     /// - If the crash landed *before* the placeholder write, the real content
-    ///   is still fully on disk under a `Placeholder` row. This is the safe
-    ///   direction of divergence: `Placeholder` means "re-fetch/verify before
+    ///   is still fully on disk under a `Remote` row. This is the safe
+    ///   direction of divergence: `Remote` means "re-fetch/verify before
     ///   trusting", so the content is preserved untouched on disk and the
     ///   ordinary hydrate/read path reconciles it later (peer-free, since the
     ///   blocks are retained) — no data loss and no spurious conflict copy.
     ///
-    /// Resetting to `Hydrated` instead would be unsafe: for the first sub-case,
-    /// `repair_interrupted_materializations` would see a `Hydrated` row whose
+    /// Resetting to `Present` instead would be unsafe: for the first sub-case,
+    /// `repair_interrupted_materializations` would see a `Present` row whose
     /// on-disk bytes (the zero-filled placeholder) do not match the indexed
     /// blocks, quarantine that placeholder as a divergent "user edit", and
     /// journal it as a new local path — fabricating a zero-filled conflict copy.
-    pub fn reset_stale_evicting_to_placeholder(&self) -> Result<usize, SyncSqliteError> {
-        self.database.write::<_, SyncSqliteError>(|conn| {
-            Ok(conn.execute(
-                "UPDATE files SET materialization_state = ?1 \
-                 WHERE materialization_state = ?2 AND state = 'current'",
-                rusqlite::params![
-                    MaterializationState::Placeholder.as_db_str(),
-                    MaterializationState::Evicting.as_db_str()
-                ],
-            )?)
+    pub fn reset_stale_evicting(&self) -> Result<usize, SyncSqliteError> {
+        self.database.write::<_, SyncSqliteError>(|conn| Self::reset_evicting_in(conn))
+    }
+
+    fn reset_evicting_in(conn: &rusqlite::Connection) -> Result<usize, SyncSqliteError> {
+        Ok(conn.execute(
+            "UPDATE files SET materialization_state = ?1 \
+             WHERE materialization_state = ?2 AND state = 'current'",
+            rusqlite::params![
+                MaterializationState::Remote.as_db_str(),
+                MaterializationState::Evicting.as_db_str()
+            ],
+        )?)
+    }
+
+    /// Both startup resets in ONE transaction, except for the rows in `keep`,
+    /// which stay exactly as they are (a row whose quarantined object could
+    /// not be confirmed recovered keeps its `Evicting` marker, and a row whose
+    /// object cannot be inspected is not guessed about). Rows in `promote`
+    /// (their object still stands) are `Present` afterwards instead of
+    /// `Remote`. Returns the hydrating and evicting counts.
+    pub fn reset_stale_transients(
+        &self,
+        keep: &[(String, String)],
+        promote: &[(String, String)],
+    ) -> Result<(usize, usize), SyncSqliteError> {
+        self.database.write_immediate::<_, SyncSqliteError>(|tx| {
+            let mut kept_states = Vec::with_capacity(keep.len());
+            for (group_id, path) in keep {
+                let state: Option<String> = tx
+                    .query_row(
+                        "SELECT materialization_state FROM files \
+                         WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
+                        rusqlite::params![group_id, path],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                kept_states.push(state);
+            }
+            let hydrating = Self::reset_hydrating_in(tx)?;
+            let evicting = Self::reset_evicting_in(tx)?;
+            for ((group_id, path), state) in keep.iter().zip(kept_states) {
+                if let Some(state) = state {
+                    tx.execute(
+                        "UPDATE files SET materialization_state = ?1 \
+                         WHERE group_id = ?2 AND path = ?3 AND state = 'current'",
+                        rusqlite::params![state, group_id, path],
+                    )?;
+                }
+            }
+            for (group_id, path) in promote {
+                tx.execute(
+                    "UPDATE files SET materialization_state = ?1 \
+                     WHERE group_id = ?2 AND path = ?3 AND state = 'current' \
+                       AND materialization_state = ?4",
+                    rusqlite::params![
+                        MaterializationState::Present.as_db_str(),
+                        group_id,
+                        path,
+                        MaterializationState::Remote.as_db_str(),
+                    ],
+                )?;
+            }
+            Ok((hydrating, evicting))
         })
     }
 
-    /// Hydrated, unpinned, non-deleted files for `group_id`, ordered
-    /// least-recently-accessed first (files never accessed sort before
-    /// any that have been, per `NULLS FIRST`) — the automatic eviction
-    /// sweep's candidate list, in eviction order.
-    pub fn list_evictable_files(
-        &self,
-        group_id: &str,
-    ) -> Result<Vec<EvictableFile>, SyncSqliteError> {
+    /// Every non-deleted row currently `Hydrating` or `Evicting`, as
+    /// `(group_id, path)`: the rows a crash can have stranded. Read before the
+    /// startup resets so that what they demote can be reconciled with disk.
+    pub fn list_transient_rows(&self) -> Result<Vec<(String, String)>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            // A file below a pinned directory is pinned too.
-            let mut stmt = conn.prepare(&format!(
-                "SELECT f.path, f.size, f.last_accessed_unix FROM files f
-                 WHERE f.group_id = ?1 AND f.state = 'current' AND f.deleted = 0 AND f.pinned = 0
-                    AND f.materialization_state = 'hydrated'
-                    AND NOT EXISTS (SELECT 1 FROM pinned_directories p
-                                    WHERE p.group_id = f.group_id AND {})
-                 ORDER BY f.last_accessed_unix ASC NULLS FIRST",
-                crate::file_index::pinned_directory_covers_sql(
-                    "f.path",
-                    "f.record_kind = 'directory'"
-                )
-            ))?;
-            let rows = stmt.query_map([group_id], |r| {
-                Ok(EvictableFile {
-                    path: r.get(0)?,
-                    size: r.get(1)?,
-                    last_accessed_unix: r.get(2)?,
-                })
-            })?;
+            let mut stmt = conn.prepare(
+                "SELECT group_id, path FROM files \
+                 WHERE state = 'current' AND deleted = 0 \
+                   AND materialization_state IN ('hydrating', 'evicting')",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
             Ok(rows.collect::<Result<_, _>>()?)
         })
-    }
-
-    /// Total on-disk size of every hydrated, non-deleted file in
-    /// `group_id`, pinned or not. `list_evictable_files` above
-    /// deliberately excludes pinned files since they're never eviction
-    /// *candidates* — but a pinned-and-hydrated file still occupies real
-    /// disk space, so summing only `list_evictable_files`' sizes to
-    /// gauge current usage against a folder's disk-usage cap
-    /// systematically undercounts it, letting the sweep stop early and
-    /// leave usage above the configured cap. Use this for the usage
-    /// figure; keep using `list_evictable_files` for which files may
-    /// actually be evicted.
-    pub fn hydrated_usage_bytes(&self, group_id: &str) -> Result<u64, SyncSqliteError> {
-        let total: Option<i64> = self.database.read::<_, SyncSqliteError>(|conn| {
-            Ok(conn.query_row(
-                "SELECT SUM(size) FROM files
-                 WHERE group_id = ?1 AND state = 'current' AND deleted = 0
-                    AND materialization_state = 'hydrated'",
-                [group_id],
-                |r| r.get(0),
-            )?)
-        })?;
-        Ok(total.unwrap_or(0).max(0) as u64)
     }
 
     /// Counts of non-deleted files in `group_id` by materialization state
@@ -489,8 +479,8 @@ impl MaterializationStateRepository {
             for row in rows {
                 let (state, count) = row?;
                 match MaterializationState::from_db_str(&state) {
-                    MaterializationState::Hydrated => counts.hydrated = count,
-                    MaterializationState::Placeholder => counts.placeholder = count,
+                    MaterializationState::Present => counts.hydrated = count,
+                    MaterializationState::Remote => counts.placeholder = count,
                     MaterializationState::Hydrating => counts.hydrating = count,
                     MaterializationState::Evicting => counts.hydrating += count,
                 }
@@ -550,8 +540,9 @@ impl MaterializationStateRepository {
         })
     }
 
-    /// Paths whose own index row already admits it has no bytes: an eager or
-    /// pinned `placeholder`, or a `hydrating` row abandoned mid-fetch.
+    /// Paths whose own index row already admits it has no bytes: an eager
+    /// `placeholder`, or a `hydrating` row abandoned mid-fetch. An on-demand
+    /// `placeholder` is Remote, its steady state, and is owed nothing.
     /// `peer_session::reconcile_local_materialization_audit` re-drives exactly
     /// these through an ordinary peer fetch.
     ///
@@ -560,7 +551,7 @@ impl MaterializationStateRepository {
     /// not repairable from here, because two causes produce a byte-identical
     /// index row —
     ///
-    ///   * a crash between the durable `Hydrated` commit and the
+    ///   * a crash between the durable `Present` commit and the
     ///     temp-write-then-rename that was meant to follow it, which should be
     ///     reconstructed; and
     ///   * the user deleting or renaming the file away while the daemon was
@@ -569,7 +560,7 @@ impl MaterializationStateRepository {
     /// The only thing separating them is the durable `materialization_intents`
     /// journal: the crash leaves an intent open, the offline delete does not
     /// (the intent seam in `peer_session`'s `materialize` carries a
-    /// `debug_assert!` that no `Hydrated` row is ever committed for a
+    /// `debug_assert!` that no `Present` row is ever committed for a
     /// not-yet-written file without one, which is what makes the journal's
     /// absence meaningful rather than merely unproven). Joining that journal in
     /// here would not rescue the query either: every path returned is fed
@@ -603,11 +594,8 @@ impl MaterializationStateRepository {
             // orphaned link's coordination-side authorization is permanently
             // gone, so none of its files are ever repair-eligible. The daemon
             // scheduler already filters orphaned links before calling this, but
-            // the core query must not depend on that to stay correct. A
-            // placeholder below a pinned directory is owed its bytes like one
-            // pinned on its own -- including one that arrived after the pin;
-            // a directory entry has none to fetch.
-            let mut stmt = conn.prepare(&format!(
+            // the core query must not depend on that to stay correct.
+            let mut stmt = conn.prepare(
                 "SELECT f.path FROM files f \
                  JOIN links l ON l.group_id = f.group_id \
                  WHERE f.group_id = ?1 \
@@ -615,21 +603,12 @@ impl MaterializationStateRepository {
                    AND f.deleted = 0 \
                    AND f.state = 'current' \
                    AND ( \
-                     (f.materialization_state = 'placeholder' AND l.materialization_policy = \
+                     (f.materialization_state = 'remote' AND l.materialization_policy = \
                       'eager') \
-                     OR (f.materialization_state = 'placeholder' AND f.pinned = 1) \
-                     OR (f.materialization_state = 'placeholder' \
-                         AND f.record_kind <> 'directory' \
-                         AND EXISTS (SELECT 1 FROM pinned_directories p \
-                                     WHERE p.group_id = f.group_id AND {})) \
                      OR f.materialization_state = 'hydrating' \
                    ) \
                  ORDER BY f.path",
-                crate::file_index::pinned_directory_covers_sql(
-                    "f.path",
-                    "f.record_kind = 'directory'"
-                )
-            ))?;
+            )?;
             let rows = stmt.query_map([group_id], |r| r.get::<_, String>(0))?;
             let mut out = Vec::new();
             for row in rows {
@@ -730,50 +709,38 @@ impl MaterializationStateRepository {
         })
     }
 
-    /// Bare `files`-table live set, with no `dag_retention_roots`
+    /// Bare `files`-table live set, with no native-head
     /// contribution — kept for callers (this module's own tests, an
     /// explicit per-group check) that want exactly that.
     pub fn live_block_hashes(&self) -> Result<HashSet<ContentHash>, SyncSqliteError> {
         self.live_block_hashes_with_extra_roots(std::iter::empty())
     }
 
-    /// [`live_block_hashes`](Self::live_block_hashes), plus every block a
-    /// `full_payload` [`crate::dag_store::register_retention_root`] entry
-    /// requires kept for `group_id` -- the shared-retention-root extension
-    /// point [`live_block_hashes_with_extra_roots`](Self::live_block_hashes_with_extra_roots)'s
-    /// own doc comment names. Single-group form, for a caller that already
-    /// scopes its own work to one group; physical block-store GC sweeps the
-    /// one block store shared by every group in one pass and should use
-    /// [`live_block_hashes_including_all_dag_retention_roots`](Self::live_block_hashes_including_all_dag_retention_roots)
-    /// instead.
-    pub fn live_block_hashes_including_dag_retention_roots(
+    /// The live set every physical block-store GC sweep must use (recovery-item blocks included):
+    /// [`live_block_hashes`](Self::live_block_hashes) unioned with the blocks
+    /// of every live native head in *any* group. `yadorilink-daemon`'s sweep
+    /// (`gc::run_sweep_sync`) is the one production caller -- it deletes
+    /// content-addressed block bytes daemon-wide, not per group, so it needs
+    /// the union across every group in one query.
+    ///
+    /// Both halves are read from ONE snapshot. Read separately, a block could
+    /// be referenced continuously and still be missed by both: a retained
+    /// `files` row holds it while the heads are read, a head then takes it
+    /// over and retention drops the row, and the rows are read after that.
+    pub fn live_block_hashes_including_native_heads(
         &self,
-        group_id: &str,
     ) -> Result<HashSet<ContentHash>, SyncSqliteError> {
-        let extra_roots = self
-            .database
-            .read(|conn| crate::dag_store::full_payload_retained_block_hashes(conn, group_id))?;
-        self.live_block_hashes_with_extra_roots(extra_roots)
+        self.live_block_hashes_including_native_heads_between(|| {})
     }
 
-    /// The live set every physical block-store GC sweep must use:
-    /// [`live_block_hashes`](Self::live_block_hashes) unioned with every
-    /// `full_payload` [`crate::dag_store::register_retention_root`] entry
-    /// registered in *any* group. `yadorilink-daemon`'s sweep
-    /// (`gc::run_sweep_sync`) is the one production caller — it deletes
-    /// content-addressed block bytes daemon-wide, not per group, so it needs
-    /// the union across every group in one query rather than iterating
-    /// `live_block_hashes_including_dag_retention_roots` once per link:
-    /// iterating links would also miss a group whose retention root outlived
-    /// its link (an orphaned or already-removed link must not silently drop
-    /// protection for a root some other subsystem is still holding).
-    pub fn live_block_hashes_including_all_dag_retention_roots(
+    /// [`live_block_hashes_including_native_heads`](Self::live_block_hashes_including_native_heads)
+    /// with a hook run between its two reads, so a test can change the
+    /// database at exactly the point an unsnapshotted read would be exposed.
+    fn live_block_hashes_including_native_heads_between(
         &self,
+        between_reads: impl Fn(),
     ) -> Result<HashSet<ContentHash>, SyncSqliteError> {
-        let extra_roots = self.database.read::<_, SyncSqliteError>(
-            crate::dag_store::full_payload_retained_block_hashes_all_groups,
-        )?;
-        self.live_block_hashes_with_extra_roots(extra_roots)
+        self.database.read_snapshot::<_, SyncSqliteError>(|conn| live_set(conn, &between_reads))
     }
 
     /// Computes the GC live set from one SQLite snapshot and appends
@@ -800,24 +767,11 @@ impl MaterializationStateRepository {
         &self,
         extra_roots: impl IntoIterator<Item = ContentHash>,
     ) -> Result<HashSet<ContentHash>, SyncSqliteError> {
-        // Read-only multi-statement snapshot -- see
-        // `RecoverySnapshotReader::recovery_local_snapshot`'s doc comment for
-        // why `unchecked_transaction` (built from `read`'s plain `&Connection`)
-        // is the right tool here instead of `write`/`write_immediate`: nothing
-        // in this scan ever mutates `files`.
+        // Read-only: nothing in this scan ever mutates `files`.
         let extra_roots: Vec<ContentHash> = extra_roots.into_iter().collect();
-        self.database.read::<_, SyncSqliteError>(|conn| {
-            let tx = conn.unchecked_transaction()?;
+        self.database.read_snapshot::<_, SyncSqliteError>(|conn| {
             let mut live: HashSet<ContentHash> = extra_roots.iter().cloned().collect();
-            {
-                let mut stmt = tx.prepare("SELECT blocks_json FROM files WHERE deleted = 0")?;
-                let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-                for row in rows {
-                    let blocks: Vec<BlockInfo> = serde_json::from_str(&row?)?;
-                    live.extend(blocks.into_iter().map(|block| hex::encode(block.hash)));
-                }
-            }
-            tx.commit()?;
+            live.extend(files_block_hashes(conn)?);
             Ok(live)
         })
     }
@@ -983,7 +937,7 @@ impl MaterializationStateRepository {
 
     /// Records the identity of the exact on-disk object a `write_placeholder`
     /// call just created for `group_id`/`path` — always paired with
-    /// that same call's `Placeholder` state transition, never called on its
+    /// that same call's `Remote` state transition, never called on its
     /// own. `dev`/`ino` round-trip losslessly through SQLite's signed
     /// 64-bit `INTEGER` via a bit-pattern cast (`as i64`/`as u64`); the
     /// value is an opaque identity token, never interpreted as a signed
@@ -1090,7 +1044,7 @@ impl MaterializationStateRepository {
     /// (no identity capturable on this platform — see that function's own
     /// doc comment) must not leave a PRIOR call's identity behind to be
     /// wrongly trusted against the new placeholder's bytes, and a
-    /// transition out of `Placeholder` (hydrate, or a confirmed local
+    /// transition out of `Remote` (hydrate, or a confirmed local
     /// edit) leaves a stale identity with nothing left to identify.
     pub fn clear_placeholder_generation(
         &self,
@@ -1118,9 +1072,9 @@ impl MaterializationStateRepository {
     /// confirmed match. See `crate::local_change`'s (yadorilink-local-capture)
     /// own dirty-detection doc comment for why.
     ///
-    /// Deliberately filtered to `materialization_state = 'placeholder'`,
+    /// Deliberately filtered to `materialization_state = 'remote'`,
     /// not merely `placeholder_dev IS NOT NULL`: no production call site
-    /// clears a row's identity on every transition OUT of `Placeholder`
+    /// clears a row's identity on every transition OUT of `Remote`
     /// today (only `write_placeholder` returning `None` clears it, when a
     /// fresh placeholder write captured no identity). Without this filter, a file hydrated after
     /// being
@@ -1143,7 +1097,7 @@ impl MaterializationStateRepository {
                     "SELECT placeholder_dev, placeholder_ino, placeholder_provider_kind \
                      FROM files \
                      WHERE group_id = ?1 AND path = ?2 AND state = 'current' \
-                       AND materialization_state = 'placeholder'",
+                       AND materialization_state = 'remote'",
                     rusqlite::params![group_id, path],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
@@ -1164,14 +1118,14 @@ impl MaterializationStateRepository {
     }
 
     /// Unlike [`Self::get_placeholder_generation`], NOT gated on
-    /// `materialization_state = 'placeholder'` -- returns whatever identity
+    /// `materialization_state = 'remote'` -- returns whatever identity
     /// is currently on the row regardless of state. No production call site
     /// clears `placeholder_dev`/`placeholder_ino`/`placeholder_provider_kind`
-    /// on the `Placeholder` -> `Hydrated` transition (only an explicit
-    /// [`Self::clear_placeholder_generation`] call does), so a `Hydrated`
+    /// on the `Remote` -> `Present` transition (only an explicit
+    /// [`Self::clear_placeholder_generation`] call does), so a `Present`
     /// row still exposes the generation its placeholder identity was minted
     /// under here. The Windows eviction path uses this -- reading a
-    /// `Hydrated` file's own still-recorded generation as the expected
+    /// `Present` file's own still-recorded generation as the expected
     /// identity for the native dehydrate call's defense-in-depth check --
     /// which is exactly the "now-meaningless prior identity" scenario
     /// [`Self::get_placeholder_generation`]'s own doc comment warns a
@@ -1213,7 +1167,7 @@ impl MaterializationStateRepository {
     /// for the same reason: `LocalChangeProcessor::scan_existing_files`
     /// must not pay one query per file to decide whether an on-disk entry
     /// is still its own untouched placeholder. Filtered to
-    /// `materialization_state = 'placeholder'` for the same reason as
+    /// `materialization_state = 'remote'` for the same reason as
     /// [`get_placeholder_generation`](Self::get_placeholder_generation).
     pub fn list_placeholder_generations(
         &self,
@@ -1225,7 +1179,7 @@ impl MaterializationStateRepository {
                 "SELECT path, placeholder_dev, placeholder_ino, placeholder_provider_kind \
                  FROM files \
                  WHERE group_id = ?1 AND deleted = 0 AND state = 'current' \
-                   AND materialization_state = 'placeholder' \
+                   AND materialization_state = 'remote' \
                    AND placeholder_dev IS NOT NULL AND placeholder_ino IS NOT NULL \
                    AND placeholder_provider_kind IS NOT NULL",
             )?;
@@ -1255,33 +1209,6 @@ impl MaterializationStateRepository {
         })
     }
 
-    /// Every non-deleted, still-`Placeholder` path in `group_id` with NO
-    /// recorded identity -- the exact crash window the eviction call
-    /// sites cannot close atomically: `write_placeholder` durably
-    /// writes the sparse file, then a SEPARATE commit records its
-    /// identity; a crash between the two leaves a row exactly like this.
-    /// A caller (`materialization_repair::backfill_placeholder_
-    /// generations`) uses this list to re-derive an identity for each
-    /// path from its still-on-disk state at startup, before any watcher
-    /// gets a chance to observe the row and (with no generation to
-    /// compare against) fall through to treating the placeholder's own
-    /// sparse bytes as a genuine local edit.
-    pub fn list_placeholder_paths_missing_generation(
-        &self,
-        group_id: &str,
-    ) -> Result<Vec<String>, SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT path FROM files \
-                 WHERE group_id = ?1 AND deleted = 0 AND state = 'current' \
-                   AND materialization_state = 'placeholder' \
-                   AND placeholder_dev IS NULL",
-            )?;
-            let rows = stmt.query_map([group_id], |r| r.get::<_, String>(0))?;
-            Ok(rows.collect::<Result<_, _>>()?)
-        })
-    }
-
     /// The internal-mutator commit: publishes the actual-state generation
     /// for a write this device just performed, stamps the state that
     /// vouches for it, and clears the materialization intent -- all in one
@@ -1308,7 +1235,6 @@ impl MaterializationStateRepository {
         &self,
         group_id: &str,
         path: &str,
-        causal_basis: Option<&[yadorilink_replica_domain::ids::ChangeHash]>,
         exact_state: &crate::exact_materialized_commit::ExactMaterializedState,
         expected_mutation_generation: i64,
         expected_authoring: Option<crate::exact_materialized_commit::ExpectedAuthoring<'_>>,
@@ -1324,7 +1250,6 @@ impl MaterializationStateRepository {
                     tx,
                     group_id,
                     path,
-                    causal_basis,
                     exact_state,
                     expected_mutation_generation,
                     expected_authoring,
@@ -1359,6 +1284,37 @@ pub struct RecordedPlaceholderGeneration {
 /// exercise the version binding directly at the repository layer (deterministic, no
 /// topology/network involved) rather than only via the much heavier
 /// full-daemon integration test.
+/// The blocks of every `files` row with `deleted = 0` (see
+/// [`MaterializationStateRepository::live_block_hashes_with_extra_roots`] for
+/// why no row state is excluded).
+/// The one computation of what a block-store sweep must keep: the blocks of every native head,
+/// of every recovery item (held blocks, even of an item whose version is incomplete), and of every retained `files` row. `between_reads` runs between the
+/// head read and the row read so a test can change the database where an unsnapshotted read
+/// would be exposed.
+pub(crate) fn live_set(
+    conn: &rusqlite::Connection,
+    between_reads: impl Fn(),
+) -> Result<HashSet<ContentHash>, SyncSqliteError> {
+    let mut live = crate::dag_store::native_head_retained_block_hashes_all_groups(conn)?;
+    live.extend(crate::native_recovery_items::retained_block_hashes_all_groups(conn)?);
+    between_reads();
+    live.extend(files_block_hashes(conn)?);
+    Ok(live)
+}
+
+fn files_block_hashes(
+    conn: &rusqlite::Connection,
+) -> Result<HashSet<ContentHash>, SyncSqliteError> {
+    let mut live = HashSet::new();
+    let mut stmt = conn.prepare("SELECT blocks_json FROM files WHERE deleted = 0")?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    for row in rows {
+        let blocks: Vec<BlockInfo> = serde_json::from_str(&row?)?;
+        live.extend(blocks.into_iter().map(|block| hex::encode(block.hash)));
+    }
+    Ok(live)
+}
+
 #[cfg(test)]
 mod block_fetch_refusal_tests;
 
@@ -1374,7 +1330,7 @@ mod held_state_tests;
 /// tells them apart.
 ///
 /// An abandoned block fetch is `Hydrating` with nothing else: the reset
-/// owns it, and `Placeholder` is exactly right, because nothing was
+/// owns it, and `Remote` is exactly right, because nothing was
 /// written and the ordinary hydrate path will redo it.
 ///
 /// A batch interrupted between its index commit and its finalizer is
@@ -1382,7 +1338,7 @@ mod held_state_tests;
 /// durable journal entry saying a write for it was in flight, and on-disk
 /// bytes that may still be the old ones. Startup repair owns that, and can
 /// finish or redo it from blocks that are already local. Demoting it first
-/// hands it instead to the ordinary scan, which sees a `Placeholder` over
+/// hands it instead to the ordinary scan, which sees a `Remote` over
 /// bytes that do not match the row and cannot tell a half-finished
 /// materialization from an edit made while the daemon was down -- so it
 /// republishes the stale bytes as a new local version.
@@ -1392,3 +1348,10 @@ mod stale_hydrating_reset_tests;
 /// `materialization_counts` summarizes files, not directories.
 #[cfg(test)]
 mod counts_tests;
+
+/// What the repair pass owes bytes to, per materialization policy.
+#[cfg(test)]
+mod repair_candidates_tests;
+
+#[cfg(test)]
+mod live_set_tests;

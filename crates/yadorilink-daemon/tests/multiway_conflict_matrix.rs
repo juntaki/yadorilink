@@ -136,51 +136,15 @@ async fn connect_mesh(devices: &[TestDevice], group_id: &str) {
 ///   reached this device at all (a propagation problem, upstream of repair).
 /// - frontier equal but the conflict-copy row is absent -> the carrier is in
 ///   this device's DAG, yet no repair pass ever turned it into an index row.
-/// - row present but the name is missing from disk -> either materialization
-///   never ran, or it ran and something re-armed the path without the
-///   Convergence Engine ever re-claiming it. `missing_from_disk_obligations`
-///   below settles which: each such path's `projection_obligations` row
-///   (the engine's own live claim source -- `materialization_jobs` is
-///   retired) names its `state`, retry/backoff position and which of the
-///   four admission seams last bumped it, or reports no row at all.
+/// - row present but the name is missing from disk -> it was applied and
+///   only materialization never ran.
 fn frontier_index_disk_probe(devices: &[TestDevice], group_id: &str) -> String {
-    // What reconciliation is obliged to produce, computed from the sets it
-    // actually compares. For every ordered pair, `holder.servable -
-    // lagging.servable` is exactly what `Reconciler` turns into `want` on
-    // receiving the holder's items. Non-empty at the stall means the
-    // difference was discoverable and delivery did not act on it; empty
-    // while the devices plainly disagree means the difference never reached
-    // the compared set at all, and the fault is upstream of RBSR.
-    let servable_sets: Vec<std::collections::BTreeSet<String>> = devices
-        .iter()
-        .map(|d| {
-            d.state
-                .replica_coordinator
-                .sqlite()
-                .dag_servable_hashes(group_id)
-                .map(|h| h.iter().map(|x| hex::encode(x.0)[..8].to_string()).collect())
-                .unwrap_or_default()
-        })
-        .collect();
-    let mut expected_want: Vec<String> = Vec::new();
-    for (i, mine) in servable_sets.iter().enumerate() {
-        for (j, theirs) in servable_sets.iter().enumerate() {
-            if i == j {
-                continue;
-            }
-            let missing: Vec<&String> = theirs.difference(mine).collect();
-            if !missing.is_empty() {
-                expected_want.push(format!("device-{i}<-device-{j}:{missing:?}"));
-            }
-        }
-    }
-
     let per_device = devices
         .iter()
         .enumerate()
         .map(|(i, device)| {
             let coordinator = &device.state.replica_coordinator;
-            let frontier = match coordinator.sqlite().dag_group_heads(group_id) {
+            let frontier = match coordinator.sqlite().native_group_heads(group_id) {
                 Ok(mut heads) => {
                     heads.sort();
                     heads
@@ -198,174 +162,16 @@ fn frontier_index_disk_probe(devices: &[TestDevice], group_id: &str) -> String {
                 }
                 Err(error) => vec![format!("index-error({error})")],
             };
-            // Three sets per device, each read from the table that actually
-            // holds it. Two earlier versions of this were vacuous: one walked
-            // ancestry from canonical heads (complete by construction), and
-            // one filtered the canonical `changes` table for "not canonical".
-            // Both could only ever report empty.
-            //
-            // `servable` is the set reconciliation genuinely compares --
-            // staged unioned with AUTHORIZED canonical -- so a canonical
-            // Change lacking authorization evidence is absent from it. That
-            // makes it a different question from `canonical_heads`, and it is
-            // the one that decides what a peer will be told this device needs.
-            let staged = coordinator
-                .sqlite()
-                .dag_staged_hashes(group_id)
-                .map(|h| h.iter().map(|x| hex::encode(x.0)[..8].to_string()).collect::<Vec<_>>())
-                .unwrap_or_else(|e| vec![format!("err({e})")]);
-            let servable = coordinator
-                .sqlite()
-                .dag_servable_hashes(group_id)
-                .map(|h| h.iter().map(|x| hex::encode(x.0)[..8].to_string()).collect::<Vec<_>>())
-                .unwrap_or_else(|e| vec![format!("err({e})")]);
-            let disk_names = real_entry_names(device.root.path());
-            // The fourth candidate mechanism `frontier`/`index`/`disk` alone
-            // cannot distinguish: a row present but the name missing from
-            // disk could be "materialization never ran" OR "materialization
-            // ran, but the Convergence Engine never re-armed to run it" --
-            // `projection_obligations` is the engine's own live claim
-            // source (`materialization_jobs` is retired, see that module's
-            // own doc comment), so a missing path's obligation row settles
-            // which. Only computed for paths actually missing from disk,
-            // matching this whole probe's "cost nothing until the run has
-            // already failed" discipline.
-            let missing_from_disk: Vec<String> = index_rows
-                .iter()
-                .filter(|path| !disk_names.contains(*path))
-                .map(|path| match coordinator.sqlite().dag_projection_obligation(group_id, path) {
-                    Ok(Some(o)) => format!(
-                        "{path}: state={:?} invalidation_generation={} \
-                             obligation_incarnation={} attempt_count={} next_attempt_at={} \
-                             origin={:?}",
-                        o.state,
-                        o.invalidation_generation,
-                        o.obligation_incarnation,
-                        o.attempt_count,
-                        o.next_attempt_at,
-                        o.origin,
-                    ),
-                    Ok(None) => format!("{path}: no projection_obligations row"),
-                    Err(error) => format!("{path}: obligation-lookup-error({error})"),
-                })
-                .collect();
             format!(
-                "device-{i}({}): canonical_heads={frontier:?} staged={staged:?} \
-                 servable={servable:?} index={index_rows:?} disk={disk_names:?} \
-                 missing_from_disk_obligations={missing_from_disk:?}",
+                "device-{i}({}): canonical_heads={frontier:?} \
+                 index={index_rows:?} disk={:?}",
                 device.device_id,
+                real_entry_names(device.root.path())
             )
         })
         .collect::<Vec<_>>()
         .join("\n  ");
-    format!("{per_device}\n  expected_want={expected_want:?}")
-}
-
-/// Two independent bits for every conflict-copy-shaped path in `device`'s
-/// index, distinguishing the three ways an unjustified copy can still be
-/// standing (`retire_unjustified_ephemeral_conflict_copies`'s own doc
-/// comment on `local_convergence.rs` names all three):
-///
-/// - `history_contains=true` -> some Change formally carries this path, so
-///   retirement deliberately preserves it forever, durable-history side.
-///   The bug (if it is one) is in conflict-copy derivation/repair minting a
-///   change for a copy that should not exist, not in retirement.
-/// - `history_contains=false`, `resolver_justifies=true` -> the CURRENT
-///   per-path resolver still derives this exact copy right now
-///   (`LocalConvergenceExecutor::conflict_copy_paths_for`, the same call
-///   retirement itself makes) -- the resolver's own conflict-copy set is
-///   wrong, not merely stale bookkeeping.
-/// - both false -> retirement should have already removed this path and
-///   didn't; the bug is in retirement's own wake/audit path, not in what it
-///   would decide if run.
-fn conflict_copy_justification_probe(device: &TestDevice, group_id: &str, path: &str) -> String {
-    let history_contains = device
-        .state
-        .replica_coordinator
-        .dag_group_history_paths(group_id)
-        .map(|paths| paths.contains(path))
-        .map(|b| b.to_string())
-        .unwrap_or_else(|e| format!("err({e})"));
-    let source_path = yadorilink_replica_domain::conflict::conflict_copy_source_path(path);
-    let resolver_justifies = device
-        .state
-        .local_convergence()
-        .conflict_copy_paths_for(group_id, &source_path)
-        .map(|copies| copies.iter().any(|c| c == path))
-        .map(|b| b.to_string())
-        .unwrap_or_else(|e| format!("err({e})"));
-    // The provenance row this copy was durably minted from, if any -- the
-    // author of its CARRIER change (the repair/derivation that put this
-    // path into history) versus the NAMING device of the LOSING head it
-    // carries (`change.rs`'s own `PutOrigin::Reasserted` doc comment: these
-    // two diverge exactly when a retroactive-repair carrier re-asserts
-    // content it did not itself write, and a path's converged name must
-    // stay on the original author even though the carrier's `device_id` is
-    // the repairer). Two identical-content copies at different target paths
-    // with the same `losing_change` but different `carrier_change` would be
-    // the double-carrier race; different `losing_change` values for the
-    // same content hash would instead point at the resolver treating one
-    // physical edit as two distinct logical ones.
-    let provenance = device
-        .state
-        .replica_coordinator
-        .sqlite()
-        .dag_conflict_copy_provenance_by_target_path(group_id, path)
-        .unwrap_or_else(|e| {
-            tracing::warn!(path, error = %e, "conflict-copy provenance lookup failed");
-            None
-        });
-    let provenance_detail = match provenance {
-        None => "no conflict_copy_provenance row".to_string(),
-        Some((prov_source_path, losing_change, carrier_change)) => {
-            let sqlite = device.state.replica_coordinator.sqlite();
-            let carrier_author = sqlite
-                .dag_get_change(&carrier_change)
-                .map(|c| c.map(|c| c.device_id.0))
-                .unwrap_or_else(|e| Some(format!("err({e})")));
-            let version_hash =
-                sqlite.dag_get_change(&carrier_change).ok().flatten().and_then(|change| {
-                    change.ops.iter().find_map(|op| match op {
-                        yadorilink_replica_domain::change::Op::Put { path: p, version, .. }
-                            if p.as_str() == path =>
-                        {
-                            Some(format!("{version:?}"))
-                        }
-                        _ => None,
-                    })
-                });
-            let (naming_device_id, losing_change_device_id) =
-                match sqlite.dag_get_change(&losing_change).ok().flatten() {
-                    Some(losing) => {
-                        let naming = losing.ops.iter().find_map(|op| match op {
-                            yadorilink_replica_domain::change::Op::Put {
-                                path: p,
-                                origin:
-                                    yadorilink_replica_domain::change::PutOrigin::Reasserted {
-                                        naming_device_id,
-                                        ..
-                                    },
-                                ..
-                            } if p.as_str() == prov_source_path => Some(naming_device_id.0.clone()),
-                            _ => None,
-                        });
-                        (naming.unwrap_or_else(|| losing.device_id.0.clone()), losing.device_id.0)
-                    }
-                    None => ("unknown (losing_change not retained)".to_string(), "?".to_string()),
-                };
-            format!(
-                "losing_change={} carrier_change={} version_hash={version_hash:?} \
-                 carrier_author={carrier_author:?} losing_change_device_id={losing_change_device_id} \
-                 naming_device_id={naming_device_id}",
-                losing_change.to_hex(),
-                carrier_change.to_hex(),
-            )
-        }
-    };
-    format!(
-        "{path}: history_contains={history_contains} resolver_justifies={resolver_justifies} \
-         source_path={source_path:?} {provenance_detail}"
-    )
+    per_device
 }
 
 async fn n_synced_devices(n: usize, test_name: &str) -> (Vec<TestDevice>, String) {
@@ -490,47 +296,8 @@ async fn run_multiway_row(
         CONVERGENCE_ABSOLUTE_TIMEOUT,
         CONVERGENCE_STALL_TIMEOUT,
         || {
-            // Distinguishes "still converging, just slowly" from a shape
-            // that will NEVER change no matter how long this waits: every
-            // device already agrees with every other, on a snapshot that is
-            // permanently the wrong size. A flat "convergence stalled"
-            // reads as a timeout that a longer budget might fix; this
-            // classification, computed from the exact same agreement check
-            // the wait condition above already uses, rules that out
-            // explicitly whenever it applies.
-            let reference = snapshot(devices_ref[0].root.path());
-            let agreed = devices_ref[1..].iter().all(|d| snapshot(d.root.path()) == reference);
-            let shape_note = match shape {
-                ConvergedShape::EveryWriterSurvives
-                    if agreed && reference.len() != device_count =>
-                {
-                    // Device 0 stands in for all of them here -- `agreed`
-                    // already established every device's index/disk state
-                    // is identical at this point, so there is nothing a
-                    // second device's copy of the same lookup could show
-                    // that this one doesn't.
-                    let justifications = reference
-                        .keys()
-                        .filter(|name| {
-                            yadorilink_replica_domain::conflict::is_conflict_copy_path(name)
-                        })
-                        .map(|name| {
-                            conflict_copy_justification_probe(&devices_ref[0], &group_id, name)
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n    ");
-                    format!(
-                        "STABLE WRONG CONVERGENCE SHAPE: every device already agrees, \
-                         permanently, on {} entries -- expected exactly {device_count} \
-                         (one winner + one conflict copy per loser). This will not change \
-                         with a longer timeout.\n    {justifications}\n  ",
-                        reference.len()
-                    )
-                }
-                _ => String::new(),
-            };
             format!(
-                "{shape_note}{}\n  {}",
+                "{}\n  {}",
                 devices_ref
                     .iter()
                     .enumerate()

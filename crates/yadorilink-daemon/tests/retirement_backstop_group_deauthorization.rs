@@ -140,7 +140,7 @@ async fn manually_registered_session_survives_the_retirement_backstop() {
         .set_materialization_state(
             GROUP,
             "tiny.bin",
-            MaterializationState::Placeholder,
+            MaterializationState::Remote,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
@@ -164,14 +164,10 @@ async fn manually_registered_session_survives_the_retirement_backstop() {
     let session_transports_source = yadorilink_peer_session::ports::SessionTransports {
         blocks: transports_source.clone(),
         service: transports_source.clone(),
-        prepared_snapshots: std::sync::Arc::new(yadorilink_lane_ports::PreparedSnapshots::new()),
-        snapshot_fetch: transports_source,
     };
     let session_transports_dest = yadorilink_peer_session::ports::SessionTransports {
         blocks: transports_dest.clone(),
         service: transports_dest.clone(),
-        prepared_snapshots: std::sync::Arc::new(yadorilink_lane_ports::PreparedSnapshots::new()),
-        snapshot_fetch: transports_dest,
     };
 
     let source_sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
@@ -190,10 +186,7 @@ async fn manually_registered_session_survives_the_retirement_backstop() {
         )
         .unwrap();
     let block_hashes: Vec<Vec<u8>> = blocks.iter().map(|block| block.hash.clone()).collect();
-    source_sync_state
-        .change_history_repository()
-        .record_group_block_provenance(GROUP, &block_hashes)
-        .unwrap();
+    source_sync_state.record_block_provenance(GROUP, &block_hashes).unwrap();
     let generation = source_sync_state.startup_readiness().begin_group_startup(GROUP);
     source_sync_state.startup_readiness().mark_group_ready(GROUP, generation);
     let replica_engine_source =
@@ -208,10 +201,8 @@ async fn manually_registered_session_survives_the_retirement_backstop() {
         replica_engine_source,
         source_store,
         vec![GROUP.to_string()],
-        std::collections::HashMap::from([(GROUP.to_string(), source_dir.path().to_path_buf())]),
         session_transports_source,
-        None,
-        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::test_permissive(),
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::denied(),
     );
     node_source.serve_with("device-dest", session_source.clone());
     session_source.set_block_serve_engine(
@@ -241,10 +232,8 @@ async fn manually_registered_session_survives_the_retirement_backstop() {
         replica_engine_dest,
         dest_peer_store,
         vec![GROUP.to_string()],
-        std::collections::HashMap::from([(GROUP.to_string(), dest_root.path().to_path_buf())]),
         session_transports_dest,
-        None,
-        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::test_permissive(),
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::denied(),
     );
     node_dest.serve_with("device-source", session_dest.clone());
     session_dest.set_block_serve_engine(dest_state.block_serve_engine.clone());

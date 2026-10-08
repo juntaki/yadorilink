@@ -336,12 +336,15 @@ fn build_menu(status: Option<&StatusResponse>) -> Menu {
                 // submenu offering both "Open" and a guarded "Remove…" (unlink)
                 // — CLI-free folder removal from the tray.
                 let per_folder = Submenu::new(status_model::folder_menu_label(link), true);
-                let _ = per_folder.append(&MenuItem::with_id(
-                    format!("open_folder:{}", link.local_path),
-                    "Open Folder",
-                    true,
-                    None,
-                ));
+                // A provider folder has no directory to open.
+                if link.provider_display_name.is_empty() {
+                    let _ = per_folder.append(&MenuItem::with_id(
+                        format!("open_folder:{}", link.local_path),
+                        "Open Folder",
+                        true,
+                        None,
+                    ));
+                }
                 // Opens the per-folder Data protection / This
                 // device / Availability / Complete copies / Connection
                 // detail window.

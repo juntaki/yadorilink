@@ -23,11 +23,14 @@ use std::path::Path;
 use crate::error::LocalCaptureError;
 use crate::ports::CapturedDirectory;
 use yadorilink_local_storage::{read_replicated_xattrs, unix_mode_from_metadata};
-use yadorilink_replica_domain::change::{Op, PutOrigin};
 use yadorilink_replica_domain::file::{FileRecord, FileVersion, RecordKind};
 use yadorilink_replica_domain::ids::SyncPath;
+use yadorilink_replica_domain::local_op::Op;
+use yadorilink_replica_domain::native_state::NativeCaptureWitness;
 use yadorilink_replica_domain::recursive_operation::is_ancestor_or_self;
-use yadorilink_replica_domain::session_state::{LocalFileMetaColumns, PreparedLocalMutation};
+use yadorilink_replica_domain::session_state::{
+    LocalFileMetaColumns, MaterializationState, PreparedLocalMutation,
+};
 use yadorilink_root_authority::fs_identity::{
     disk_race_fingerprint, FileIdentity, IdentityComparison,
 };
@@ -42,12 +45,14 @@ use yadorilink_sync_sqlite::CanonicalCurrentRow;
 
 use super::disk_observation::{
     closed_disk_observation_if_unraced, exact_leaf_exists_as_directory,
-    exact_leaf_exists_as_file_or_symlink,
+    exact_leaf_exists_as_file_or_symlink, is_confirmed_absent,
 };
+use super::flush::path_lock_order;
 use super::path_policy::{
     is_excluded_from_sync, path_to_wire_relative_string, skip_reason_for_inadmissible_wire_path,
 };
 use super::record_builder::metadata_columns_for;
+use super::semantic_delete::Removal;
 use super::{now_unix_nanos, LocalChangeOutcome, LocalChangeProcessor};
 
 /// What capture does with a directory it finds on disk.
@@ -75,11 +80,7 @@ pub(super) fn directory_entry(
         deleted: false,
     };
     let version = FileVersion::directory(unix_mode);
-    let op = Op::Put {
-        path: SyncPath(rel_path.to_string()),
-        version: version.version_hash,
-        origin: PutOrigin::Direct,
-    };
+    let op = Op::Put { path: SyncPath(rel_path.to_string()), version: version.version_hash };
     let meta = LocalFileMetaColumns {
         record_kind: RecordKind::Directory,
         symlink_target: None,
@@ -105,9 +106,16 @@ fn permission_bits_changed(_recorded: &FileIdentity, _lstat: &std::fs::Metadata)
 
 /// What [`LocalChangeProcessor::lock_observed_subtree`] found: the locks
 /// it holds and the observed entries, parent before child.
-struct ObservedSubtree {
+pub(super) struct ObservedSubtree {
     guards: Vec<tokio::sync::OwnedMutexGuard<()>>,
-    entries: Vec<(String, CanonicalCurrentRow)>,
+    entries: Vec<(String, CanonicalCurrentRow, NativeCaptureWitness)>,
+}
+
+#[cfg(test)]
+impl ObservedSubtree {
+    pub(super) fn entries(&self) -> Vec<&str> {
+        self.entries.iter().map(|(path, ..)| path.as_str()).collect()
+    }
 }
 
 /// The tombstone of the live `row` at `path`, deleted at `observed_at`.
@@ -125,9 +133,16 @@ fn tombstone_of(
     }
 }
 
-fn delete_mutation(record: FileRecord) -> PreparedLocalMutation {
+/// The delete of the live `row` at `path`, deleted at `observed_at`.
+fn delete_mutation(
+    path: String,
+    row: &CanonicalCurrentRow,
+    native_witness: NativeCaptureWitness,
+    observed_at_unix_nanos: i64,
+) -> PreparedLocalMutation {
+    let record = tombstone_of(path, row, observed_at_unix_nanos);
     let op = Op::Delete { path: SyncPath(record.path.clone()) };
-    PreparedLocalMutation::Delete { record, op }
+    PreparedLocalMutation::Delete { record, op, native_witness: Some(native_witness) }
 }
 
 impl LocalChangeProcessor {
@@ -335,10 +350,12 @@ impl LocalChangeProcessor {
         // then a new entry at the name it was made under.
         if let Some(emitter) = self.change_emitter.as_deref() {
             if let Some(source) = self.state.write_through_source(group_id, rel_path)? {
+                let native_witness = self.state.native_capture_witness(group_id, rel_path)?;
                 self.state.commit_write_through_deletion(
                     group_id,
                     rel_path,
                     &source,
+                    Some(native_witness),
                     &self.device_id,
                     now_unix_nanos(),
                     emitter,
@@ -390,17 +407,22 @@ impl LocalChangeProcessor {
     /// is an entry under a paused item, nor one whose delete is already in
     /// `pending_deletes` (the same flush's batch).
     ///
-    /// "Was on disk here" is read from those vetoes, not from a
-    /// materialized generation: a placeholder is on disk with none, and
-    /// every other live row this device has not yet written carries an
-    /// intent or an unsettled obligation until it settles.
-    async fn lock_observed_subtree(
+    /// "Was on disk here" is a `Present` object that the vetoes above do not
+    /// contradict: a `Remote` entry has no object, a `Hydrating` one is
+    /// producing it and an `Evicting` one is removing it, so none of them
+    /// was deleted by whoever removed the directory. That is for a physical
+    /// removal that was merely observed. A [`Removal::Semantic`] delete of the
+    /// directory deletes the logical namespace the user saw, so entries
+    /// without a local object go with it -- but only the versions the delete
+    /// saw (the other vetoes stand).
+    pub(super) async fn lock_observed_subtree(
         &self,
         group_id: &str,
         root: &Path,
         rel_path: &str,
         pending_deletes: &[String],
         rename_to: Option<&str>,
+        removal: Removal<'_>,
     ) -> Result<ObservedSubtree, LocalCaptureError> {
         let prefix = format!("{rel_path}/");
         let paused = self.paused_items(group_id)?;
@@ -420,38 +442,52 @@ impl LocalChangeProcessor {
         if candidates.is_empty() && rename_to.is_none() {
             return Ok(ObservedSubtree { guards: Vec::new(), entries: Vec::new() });
         }
-        // One canonical order for every lock taken: sorted, parent before
-        // child, as every path-lock holder takes them.
-        let mut to_lock: std::collections::BTreeSet<String> = candidates.clone();
+        // One canonical order for every lock taken: parent before child, by
+        // the lock key (see `path_lock_order`) -- `Photos` and `photos` are
+        // one lock, and taking it twice would wait on itself.
+        let mut to_lock: Vec<String> = candidates.iter().cloned().collect();
         match rename_to {
             None => {
-                to_lock.remove(rel_path);
+                // The caller holds this one.
+                let held = yadorilink_root_authority::canonical_fold::canonical_fold(rel_path);
+                to_lock.retain(|path| {
+                    yadorilink_root_authority::canonical_fold::canonical_fold(path) != held
+                });
             }
             Some(to) => {
-                to_lock.insert(rel_path.to_string());
-                to_lock.insert(to.to_string());
+                to_lock.push(rel_path.to_string());
+                to_lock.push(to.to_string());
                 to_lock.extend(
                     candidates.iter().map(|path| format!("{to}{}", &path[rel_path.len()..])),
                 );
             }
         }
         let mut guards = Vec::with_capacity(to_lock.len());
-        for path in &to_lock {
+        for path in path_lock_order(&to_lock) {
             guards.push(self.state.path_lock(group_id, path).lock_owned().await);
         }
         let mut entries = Vec::with_capacity(candidates.len());
         for path in candidates {
+            // Native's witness before the row it accompanies.
+            let native_witness = self.state.native_capture_witness(group_id, &path)?;
             let Some(row) = self.state.canonical_current_row(group_id, &path)? else { continue };
             if row.snapshot.deleted
                 || (path == rel_path && row.snapshot.record_kind != RecordKind::Directory)
                 || self.state.has_materialization_intent(group_id, &path)?
                 || self.state.has_unsettled_projection_obligation(group_id, &path)?
                 || self.state.is_held(group_id, &path)?
-                || std::fs::symlink_metadata(root.join(&path)).is_ok()
+                || match removal {
+                    Removal::Observed => {
+                        self.state.get_materialization_state(group_id, &path)?
+                            != Some(MaterializationState::Present)
+                    }
+                    Removal::Semantic(delete) => !delete.names_current_version(&path, Some(&row)),
+                }
+                || !is_confirmed_absent(&root.join(&path))
             {
                 continue;
             }
-            entries.push((path, row));
+            entries.push((path, row, native_witness));
         }
         Ok(ObservedSubtree { guards, entries })
     }
@@ -474,12 +510,16 @@ impl LocalChangeProcessor {
         rel_path: &str,
         pending_deletes: &[String],
         observed_at_unix_nanos: i64,
+        removal: Removal<'_>,
     ) -> Result<LocalChangeOutcome, LocalCaptureError> {
-        let ObservedSubtree { guards, entries } =
-            self.lock_observed_subtree(group_id, root, rel_path, pending_deletes, None).await?;
-        let mut tombstones: Vec<FileRecord> = entries
+        let ObservedSubtree { guards, entries } = self
+            .lock_observed_subtree(group_id, root, rel_path, pending_deletes, None, removal)
+            .await?;
+        let mut tombstones: Vec<PreparedLocalMutation> = entries
             .into_iter()
-            .map(|(path, row)| tombstone_of(path, &row, observed_at_unix_nanos))
+            .map(|(path, row, witness)| {
+                delete_mutation(path, &row, witness, observed_at_unix_nanos)
+            })
             .collect();
         if tombstones.is_empty() {
             return Ok(LocalChangeOutcome::None);
@@ -496,7 +536,7 @@ impl LocalChangeProcessor {
             &self.begin_operation()?.permit(),
         )?;
         drop(guards);
-        self.records_now_at(group_id, tombstones.iter().map(|t| t.path.as_str()))
+        self.records_now_at(group_id, tombstones.iter().map(|t| t.record().path.as_str()))
     }
 
     /// Captures the rename of the directory `from` to `to` (both relative,
@@ -540,8 +580,9 @@ impl LocalChangeProcessor {
             return Ok(LocalChangeOutcome::None);
         }
         let dest_of = |path: &str| format!("{to}{}", &path[from.len()..]);
-        let ObservedSubtree { guards, entries } =
-            self.lock_observed_subtree(group_id, root, from, &[], Some(to)).await?;
+        let ObservedSubtree { guards, entries } = self
+            .lock_observed_subtree(group_id, root, from, &[], Some(to), Removal::Observed)
+            .await?;
         if self.is_paused(group_id, from)? || self.is_paused(group_id, to)? {
             return Ok(LocalChangeOutcome::None);
         }
@@ -549,12 +590,13 @@ impl LocalChangeProcessor {
         let mut mutations: Vec<PreparedLocalMutation> = Vec::with_capacity(entries.len() * 2);
         let mut evidence: Vec<Option<LocalCaptureActualStateEvidence>> =
             Vec::with_capacity(entries.len() * 2);
-        for (path, row) in &entries {
-            mutations.push(delete_mutation(tombstone_of(
+        for (path, row, witness) in &entries {
+            mutations.push(delete_mutation(
                 path.clone(),
                 row,
+                witness.clone(),
                 observed_at_unix_nanos,
-            )));
+            ));
             evidence.push(Some(LocalCaptureActualStateEvidence::Absent));
             if let Some((put, proof)) =
                 self.prepare_moved_entry(group_id, root, &dest_of(path), row, ignore_set)?
@@ -572,12 +614,12 @@ impl LocalChangeProcessor {
                 &evidence,
                 &self.device_id,
                 crate::ports::LocalChangeEmission {
-                    emitter,
+                    author: emitter,
                     permit: &self.begin_operation()?.permit(),
                 },
             )?;
         }
-        if !entries.iter().any(|(path, _)| path == from) {
+        if !entries.iter().any(|(path, _, _)| path == from) {
             // A structural (or never captured) directory: nothing to move
             // for it, but its record follows it so it is still recognized
             // as the container this device made. Only once the operation
@@ -604,7 +646,9 @@ impl LocalChangeProcessor {
     }
 
     /// The put of an entry a rename moved to `dest`, prepared from what is
-    /// on disk at `dest` now, with the proof of what the put leaves there;
+    /// on disk at `dest` now, with the proof of what the put leaves there.
+    /// `dest` has no live row (or it is not prepared), so the put was shown
+    /// nothing there;
     /// `None` when `dest` cannot be captured as the moved entry here and
     /// now (see [`Self::capture_directory_rename`]).
     fn prepare_moved_entry(
@@ -620,6 +664,8 @@ impl LocalChangeProcessor {
     > {
         let dest_abs = root.join(dest);
         let Ok(lstat) = std::fs::symlink_metadata(&dest_abs) else { return Ok(None) };
+        // Native's witness of `dest` before its row is read below.
+        let native_witness = self.state.native_capture_witness(group_id, dest)?;
         // Whatever the ordinary capture of `dest` would leave unauthored is
         // left unauthored here too: an ignored or unrepresentable name
         // (which would also fail the whole operation's commit), the ignore
@@ -658,7 +704,13 @@ impl LocalChangeProcessor {
                     filesystem_identity,
                 });
             return Ok(Some((
-                PreparedLocalMutation::Upsert { record, op, version, meta: Some(meta) },
+                PreparedLocalMutation::Upsert {
+                    record,
+                    op,
+                    version,
+                    meta: Some(meta),
+                    native_witness: Some(native_witness),
+                },
                 proof,
             )));
         }
@@ -701,7 +753,16 @@ impl LocalChangeProcessor {
                     filesystem_identity: observation.identity,
                 }
             });
-        Ok(Some((PreparedLocalMutation::Upsert { record, op, version, meta: Some(meta) }, proof)))
+        Ok(Some((
+            PreparedLocalMutation::Upsert {
+                record,
+                op,
+                version,
+                meta: Some(meta),
+                native_witness: Some(native_witness),
+            },
+            proof,
+        )))
     }
 
     /// The recursive half of one debounced flush, run before its paths are
@@ -885,7 +946,15 @@ impl LocalChangeProcessor {
                     if self.is_paused(group_id, &from)? {
                         continue;
                     }
-                    self.delete_vanished_directory(group_id, &root, &from, &[], observed_at).await?
+                    self.delete_vanished_directory(
+                        group_id,
+                        &root,
+                        &from,
+                        &[],
+                        observed_at,
+                        Removal::Observed,
+                    )
+                    .await?
                 }
             };
             match outcome {

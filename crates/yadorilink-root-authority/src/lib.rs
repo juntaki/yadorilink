@@ -1,5 +1,5 @@
 //! The root-mutation capability every daemon-originated local
-//! filesystem/index/DAG/materialization-state write must hold
+//! filesystem/index/native state/materialization-state write must hold
 //! ([`root_commit::RootLease`]/[`root_commit::RootCommitPermit`]), backed
 //! by an OS-level advisory exclusive lock on the sync root
 //! ([`sync_root_lock::SyncRootLock`]), the filesystem-identity comparisons
@@ -7,7 +7,7 @@
 //! ([`fs_identity`]), the OS filesystem-capability probes and reserved
 //! on-disk artefact naming that back atomic-commit safety decisions
 //! elsewhere in the sync engine ([`fs_capabilities`],
-//! [`reserved_namespace`]). Unlike the DAG admission-outcome types in
+//! [`reserved_namespace`]). Unlike the native admission-outcome types in
 //! `yadorilink-replica-domain`, this is not a pure value type: `RootLease` wraps a real, live
 //! `SyncRootLock`, so it could not simply move into
 //! `yadorilink-replica-domain`. No SQLite, no daemon-specific coupling: a

@@ -23,15 +23,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // register a File Provider domain for
-        // every OnDemand-linked folder group the daemon currently knows
-        // about, every launch (see DomainRegistration.swift's doc
-        // comment for why this runs from the host app rather than the
-        // extension, and why "every launch" rather than a persistent
-        // background watch — this app has no persistent presence of its
-        // own by design).
-        DomainRegistration.registerOnDemandDomains()
-
         let text = """
         YadoriLink FinderSync
 

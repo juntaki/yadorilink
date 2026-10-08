@@ -224,7 +224,7 @@ fn login_event(event: ops::auth::LoginEvent) -> Option<LoginEvent> {
         },
         Step::WaitingForApproval { expires_in } => LoginEvent::WaitingForApproval { expires_in },
         Step::WaitingForAuthorization => LoginEvent::WaitingForAuthorization,
-        Step::ShowDeviceCode { verification_uri, user_code } => {
+        Step::ShowDeviceCode { verification_uri, user_code, .. } => {
             LoginEvent::ShowDeviceCode { verification_uri, user_code }
         }
         Step::SignedIn { .. } => return None,

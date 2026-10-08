@@ -333,6 +333,9 @@ pub struct FolderSummary {
     /// Diagnostic text for a tooltip.
     pub degraded_reason: Option<String>,
     pub volume: Option<VolumeSummary>,
+    /// A provider-backed folder: it has no directory, so `local_path` is only its identity key and
+    /// nothing may reveal, open or restore into it as a path.
+    pub provider: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -526,11 +529,6 @@ pub struct ConflictSummary {
     pub conflict_timestamp: Option<String>,
     pub kind: EntryKind,
     pub reason: ConflictReason,
-    /// The folder's history compaction is waiting for this conflict to be
-    /// resolved. The copy and the file it conflicts with hold two versions
-    /// written by one device, which compaction cannot carry; sync goes on,
-    /// and deleting or editing the copy resolves it.
-    pub holds_compaction: bool,
 }
 
 /// Why a conflict copy is kept under its own name.
@@ -621,7 +619,6 @@ pub enum MaterializationState {
 pub struct FileAvailability {
     pub tracked: bool,
     pub state: MaterializationState,
-    pub pinned: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -882,6 +879,18 @@ pub struct LinkOutcome {
     pub group_id: String,
     pub local_path: String,
     pub mode: FolderMode,
+}
+
+/// A provider-backed folder just created: it has no local path, the File Provider domain is the folder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Record))]
+pub struct ProviderFolderOutcome {
+    pub group_id: String,
+    pub root_id: String,
+    pub display_name: String,
+    pub mode: FolderMode,
+    /// The request was a retry of one that had already completed.
+    pub already_existed: bool,
 }
 
 // ---- send and receive, storage, settings, updates ---------------------------------

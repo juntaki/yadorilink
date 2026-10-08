@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -26,7 +25,7 @@ use yadorilink_daemon::test_support::peer_session_fixture::*;
 /// version must be restored by the repair audit, not left as a hole.
 ///
 /// This is the interrupted-materialization shape, not a user deleting a file:
-/// the row says `Placeholder` for a version this device already holds, and
+/// the row says `Remote` for a version this device already holds, and
 /// nothing else will ever re-drive it. The audit is the only thing that
 /// notices.
 ///
@@ -52,7 +51,7 @@ async fn same_version_resync_rehydrates_a_missing_eager_file() {
         .set_materialization_state(
             GROUP,
             file_name,
-            MaterializationState::Placeholder,
+            MaterializationState::Remote,
             &RootCommitPermit::for_tests(),
         )
         .unwrap();
@@ -62,7 +61,7 @@ async fn same_version_resync_rehydrates_a_missing_eager_file() {
     // `Hydrating -> Hydrated` transition last: `reconstruct_file` (fsync,
     // rename, parent-dir fsync), then the materialized-fingerprint write,
     // then `apply_unix_mode`, and only then
-    // `transition_materialization_state_if_same_authoring`. Breaking out
+    // `transition_materialization_state_if_same_version`. Breaking out
     // of this loop on the disk bytes and then asserting the state column
     // was reading the two ends of that window in the wrong order.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -73,7 +72,7 @@ async fn same_version_resync_rehydrates_a_missing_eager_file() {
             .materialization_state_repository()
             .get_materialization_state(GROUP, file_name)
             .unwrap()
-            == Some(MaterializationState::Hydrated)
+            == Some(MaterializationState::Present)
         {
             break;
         }
@@ -117,15 +116,11 @@ async fn session_construction_never_creates_a_missing_sync_root() {
         replica_engine,
         device_b.store.clone(),
         vec![GROUP.to_string()],
-        HashMap::from([(GROUP.to_string(), missing_root.clone())]),
         yadorilink_peer_session::ports::SessionTransports {
             blocks: peer_transports.clone(),
             service: peer_transports.clone(),
-            prepared_snapshots: device_b.prepared_snapshots.clone(),
-            snapshot_fetch: peer_transports,
         },
-        None,
-        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::test_permissive(),
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::denied(),
     );
 
     assert!(
@@ -182,7 +177,7 @@ async fn unauthorized_group_id_in_incoming_message_is_ignored() {
 
 /// Security regression test: unlike every other group-scoped inbound
 /// handler in this file (`handle_change_request`, `handle_change_batch`,
-/// `handle_heads_announce`, `handle_block_request`, the handoff/rebootstrap
+/// `handle_heads_announce`, `handle_block_request`, the handoff
 /// handlers), `handle_version_present_query` used to skip the
 /// `shares_group` re-check entirely and answer straight from
 /// `holds_version_durably` -- which performs no caller authorization of
@@ -231,11 +226,7 @@ async fn version_present_query_for_an_unauthorized_group_is_refused_not_answered
     let retained = device_b.state.sqlite().dag_list_versions(GROUP, "a.bin").unwrap();
     assert_eq!(retained.len(), 1, "sanity: the single upsert retains exactly one version");
     let version_hash = yadorilink_replica_domain::ids::VersionHash(retained[0].version_hash.0);
-    device_b
-        .state
-        .change_history_repository()
-        .record_group_block_provenance(GROUP, std::slice::from_ref(&hash_bytes))
-        .unwrap();
+    device_b.state.record_block_provenance(GROUP, std::slice::from_ref(&hash_bytes)).unwrap();
     let blocks = vec![VersionBlock { hash: BlockHash(hash_bytes), size: content.len() as u32 }];
 
     // Authorized control FIRST, same durable-version setup: proves the
@@ -647,7 +638,7 @@ async fn examination_permit_is_released_before_reply_when_block_is_not_reference
     let (engine, held_permits) = engine_with_one_free_examination_slot();
     session_a.session.set_block_serve_engine(engine);
 
-    // Neither hash is referenced by any file record, in the DAG, or as a
+    // Neither hash is referenced by any file record, in native state, or as a
     // retained version -- `block_request_is_referenced` returns false for
     // both, with nothing seeded in device-a's state at all.
     let hash_1 = sha256_bytes(b"first unreferenced hash");
@@ -890,7 +881,7 @@ async fn credit_guard_is_released_only_after_the_reply_finishes_sending() {
     let requester = device_a.fake_peer("device-b").await;
     let session_a = spawn_session(&device_a, "device-b");
     // Exactly enough budget for ONE of these blocks at a time, on every one
-    // of the three CONV-6 budgets `try_admit` checks at once -- so a
+    // of the three budgets `try_admit` checks at once -- so a
     // second, concurrently-requested block of the same size can only be
     // admitted if the first's `ServeCreditGuard` has already released its
     // share. Dispatch/examination capacity is left generous (4): this test
@@ -1162,300 +1153,7 @@ async fn a_block_response_is_sent_raw_when_compressing_it_would_inflate_it() {
     );
 }
 
-#[cfg(test)]
-mod reconcile_group_paths_flush_tests {
-    use ed25519_dalek::SigningKey;
-    use std::collections::{BTreeSet, HashMap};
-    use std::future::Future;
-    use std::path::PathBuf;
-    use std::pin::Pin;
-    use std::sync::{Arc, Mutex};
-    use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-    use yadorilink_filesystem_sync::watcher::{FsChangeEvent, FsChangeKind};
-    use yadorilink_local_capture::LocalChangeProcessor;
-    use yadorilink_local_storage::SegmentBlockStore;
-    use yadorilink_peer_session::peer_session::{
-        ChangeAuthenticator, PeerSyncSession, PeerSyncSessionDeps, PendingLocalChangeFlush,
-        PendingLocalFlushOutcome,
-    };
-
-    use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
-
-    const GROUP: &str = "flush-guard-group";
-    const REMOTE: &str = "device-remote";
-    const LOCAL: &str = "device-local";
-
-    fn remote_key() -> SigningKey {
-        SigningKey::from_bytes(&[7u8; 32])
-    }
-    fn local_key() -> SigningKey {
-        SigningKey::from_bytes(&[8u8; 32])
-    }
-
-    struct TestAuthenticator {
-        author_verifying_key: [u8; 32],
-    }
-    impl ChangeAuthenticator for TestAuthenticator {
-        fn resolve_authority_key(
-            &self,
-            _group_id: &str,
-            signer_key_id: &[u8; 32],
-            _policy_head: &[u8; 32],
-        ) -> Option<ed25519_dalek::VerifyingKey> {
-            let key = yadorilink_replica_domain::change::verifying_key_from_bytes(
-                &self.author_verifying_key,
-            )
-            .ok()?;
-            (&yadorilink_replica_domain::authorization_checkpoint::fingerprint_signing_key(&key)
-                == signer_key_id)
-                .then_some(key)
-        }
-    }
-
-    /// Stands in for the daemon's `LinkFlushHandle`: when asked to flush a path
-    /// that is marked pending, it dispatches the on-disk edit through the real
-    /// `LocalChangeProcessor` emission path (index + DAG), exactly as a real
-    /// debounce flush would. `pending` models what is sitting undispatched in
-    /// the accumulator; `calls` records every path the session asked to flush,
-    /// so a test can witness that the reconcile-site guard actually fired.
-    struct RecordingFlush {
-        processor: Arc<LocalChangeProcessor>,
-        root: PathBuf,
-        pending: Mutex<BTreeSet<String>>,
-        calls: Mutex<Vec<String>>,
-        /// When set, every call returns `RetryRequired` immediately instead
-        /// of running its normal body -- simulates the targeted-flush
-        /// channel staying permanently saturated (see
-        /// `handle_change_batch_does_not_park_when_local_flush_is_saturated`),
-        /// without needing a real bounded mpsc channel in this harness.
-        force_retry: std::sync::atomic::AtomicBool,
-    }
-    impl RecordingFlush {
-        fn new(processor: Arc<LocalChangeProcessor>, root: PathBuf) -> Self {
-            Self {
-                processor,
-                root,
-                pending: Mutex::new(BTreeSet::new()),
-                calls: Mutex::new(vec![]),
-                force_retry: std::sync::atomic::AtomicBool::new(false),
-            }
-        }
-    }
-    impl PendingLocalChangeFlush for RecordingFlush {
-        fn flush_pending_local_change<'a>(
-            &'a self,
-            group_id: &'a str,
-            rel_path: &'a str,
-        ) -> Pin<Box<dyn Future<Output = PendingLocalFlushOutcome> + Send + 'a>> {
-            Box::pin(async move {
-                self.calls.lock().unwrap().push(rel_path.to_string());
-                if self.force_retry.load(std::sync::atomic::Ordering::SeqCst) {
-                    return PendingLocalFlushOutcome::RetryRequired;
-                }
-                // Drop the guard before the await below.
-                let is_pending = self.pending.lock().unwrap().remove(rel_path);
-                if is_pending {
-                    let event = FsChangeEvent {
-                        path: self.root.join(rel_path),
-                        kind: FsChangeKind::CreatedOrModified,
-                    };
-                    let _ = self.processor.process_event(group_id, &self.root, &event).await;
-                }
-                PendingLocalFlushOutcome::Settled
-            })
-        }
-        fn flush_case_fold_sibling<'a>(
-            &'a self,
-            _group_id: &'a str,
-            rel_path: &'a str,
-        ) -> Pin<Box<dyn Future<Output = PendingLocalFlushOutcome> + Send + 'a>> {
-            // On a case-insensitive filesystem (e.g. the macOS test host) the
-            // session also probes for a colliding sibling; this scenario stages
-            // no case-fold sibling, so it is a recorded no-op.
-            Box::pin(async move {
-                self.calls.lock().unwrap().push(format!("casefold:{rel_path}"));
-                if self.force_retry.load(std::sync::atomic::Ordering::SeqCst) {
-                    return PendingLocalFlushOutcome::RetryRequired;
-                }
-                PendingLocalFlushOutcome::Settled
-            })
-        }
-    }
-
-    struct Harness {
-        session: Arc<PeerSyncSession>,
-        _state: Arc<ReplicaCoordinator>,
-        _sync_root: PathBuf,
-        /// Always wired in (see `setup`'s own doc comment): a test that never
-        /// calls `flush.mark_pending` sees the exact same no-op behavior an
-        /// absent handle used to produce, since `RecordingFlush` only ever
-        /// dispatches a path it was told is pending.
-        _flush: Arc<RecordingFlush>,
-        _root_dir: tempfile::TempDir,
-        _store_dir: tempfile::TempDir,
-    }
-
-    /// Builds a session with `TestAuthenticator` wired as its change
-    /// authenticator (every test in this module needs to admit REMOTE's
-    /// signed changes) and a `RecordingFlush` wired as its pending-local-
-    /// change-flush handle, keyed to the harness's own `local_processor`/
-    /// `sync_root`. The flush handle is installed unconditionally rather
-    /// than only for the handful of tests that call `flush.mark_pending` --
-    /// with nothing marked pending it never dispatches anything, so this is
-    /// behaviorally identical to the deny-by-default no-op every other
-    /// caller of `PeerSyncSessionDeps::test_permissive` gets, and
-    /// lets a test install a genuinely pending edit mid-test just by calling
-    /// `h.flush.mark_pending(path)` without needing the session constructed
-    /// any differently.
-    async fn setup() -> Harness {
-        let root_dir = tempfile::tempdir().unwrap();
-        let store_dir = tempfile::tempdir().unwrap();
-        let sync_root = root_dir.path().canonicalize().unwrap();
-        // Kept as a concrete `Arc<SegmentBlockStore>` alongside its
-        // `Arc<dyn BlockContentStore>` coercion: both `LocalChangeProcessor`
-        // below and `PeerSyncSession` now take the same port trait, and a
-        // concrete, still-Sized `BlockStore` implementor unsize-coerces
-        // straight to it (see `yadorilink_local_storage::content_ports`'s module doc).
-        let fs_store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
-        let store: Arc<dyn yadorilink_local_storage::BlockContentStore> = fs_store.clone();
-        let state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
-        state.link_repository().add_link(&sync_root.to_string_lossy(), GROUP).unwrap();
-        yadorilink_root_authority::root_identity::VerifiedRoot::open(
-            &sync_root,
-            GROUP,
-            state.as_ref(),
-        )
-        .unwrap();
-        // A live link always reaches Ready in a real daemon: app::run starts a
-        // watcher for every link at boot, and add_link starts one immediately.
-        // Peer apply for a live link that never registered a gate defers, so a
-        // test that skipped this would be exercising a state the daemon does
-        // not produce.
-        let generation = state.startup_readiness().begin_group_startup(GROUP);
-        state.startup_readiness().mark_group_ready(GROUP, generation);
-        let sync_roots = HashMap::from([(GROUP.to_string(), sync_root.clone())]);
-
-        // The local-edit emitter shares the session's state AND block store, so
-        // a flushed local edit is a live DAG head the reconcile reads and its
-        // content is fetchable when materialized. Built before the session
-        // (which used to be unnecessary when the flush handle was wired in
-        // after the fact) since the session now needs it at construction.
-        let local_processor = Arc::new(
-            LocalChangeProcessor::new(
-                state.clone(),
-                fs_store.clone(),
-                LOCAL.to_string(),
-                std::sync::Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()),
-            )
-            .with_change_emitter(Arc::new(ChangeEmitter::new(LOCAL, local_key()))),
-        );
-        let flush = Arc::new(RecordingFlush::new(local_processor.clone(), sync_root.clone()));
-
-        let book = yadorilink_lane_ports::testing::TestAddressBook::new();
-        let node_local =
-            yadorilink_lane_ports::testing::TestPeerNode::start(LOCAL, book.clone()).await;
-        let _node_remote = yadorilink_lane_ports::testing::TestPeerNode::start(REMOTE, book).await;
-        let peer_transports = node_local.transports_for(REMOTE);
-        let replica_engine =
-            yadorilink_daemon::replica_coordinator::engine_ports::build_peer_replica_engine(
-                &state,
-                store.clone(),
-            );
-        let session = PeerSyncSession::over_substrate(
-            LOCAL.to_string(),
-            REMOTE.to_string(),
-            state.clone() as Arc<dyn yadorilink_peer_session::ports::BlockServeAuthorizationPort>,
-            replica_engine,
-            store.clone(),
-            vec![GROUP.to_string()],
-            sync_roots,
-            yadorilink_peer_session::ports::SessionTransports {
-                blocks: peer_transports.clone(),
-                service: peer_transports.clone(),
-                prepared_snapshots: Arc::new(yadorilink_lane_ports::PreparedSnapshots::new()),
-                snapshot_fetch: peer_transports,
-            },
-            None,
-            PeerSyncSessionDeps {
-                change_authenticator: Arc::new(TestAuthenticator {
-                    author_verifying_key: remote_key().verifying_key().to_bytes(),
-                }),
-                pending_local_change_flush: flush.clone(),
-                ..PeerSyncSessionDeps::test_permissive()
-            },
-        );
-
-        Harness {
-            session,
-            _state: state,
-            _sync_root: sync_root,
-            _flush: flush,
-            _root_dir: root_dir,
-            _store_dir: store_dir,
-        }
-    }
-
-    /// `change_emitter()` defaults to `None` -- the same safe, defined "no
-    /// signing capability yet" state a session with no real change
-    /// authenticator has for `change_authenticator()` -- for a session
-    /// constructed with no emitter, and is `Some`, keyed to this device's
-    /// own id and key, for one constructed with one wired in via
-    /// `PeerSyncSessionDeps::change_emitter`.
-    #[tokio::test]
-    async fn change_emitter_defaults_to_none_and_is_wired_in_at_construction() {
-        let h = setup().await;
-        assert!(
-            h.session.change_emitter().is_none(),
-            "a session constructed with no emitter must have no signing capability wired"
-        );
-
-        let emitter = Arc::new(ChangeEmitter::new(LOCAL, local_key()));
-        let root_dir = tempfile::tempdir().unwrap();
-        let store_dir = tempfile::tempdir().unwrap();
-        let sync_root = root_dir.path().canonicalize().unwrap();
-        let store: Arc<dyn yadorilink_local_storage::BlockContentStore> =
-            Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
-        let book = yadorilink_lane_ports::testing::TestAddressBook::new();
-        let node_local =
-            yadorilink_lane_ports::testing::TestPeerNode::start(LOCAL, book.clone()).await;
-        let _node_remote = yadorilink_lane_ports::testing::TestPeerNode::start(REMOTE, book).await;
-        let peer_transports = node_local.transports_for(REMOTE);
-        let with_emitter_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
-        let with_emitter_engine =
-            yadorilink_daemon::replica_coordinator::engine_ports::build_peer_replica_engine(
-                &with_emitter_state,
-                store.clone(),
-            );
-        let with_emitter = PeerSyncSession::over_substrate(
-            LOCAL.to_string(),
-            REMOTE.to_string(),
-            with_emitter_state
-                as Arc<dyn yadorilink_peer_session::ports::BlockServeAuthorizationPort>,
-            with_emitter_engine,
-            store,
-            vec![GROUP.to_string()],
-            HashMap::from([(GROUP.to_string(), sync_root)]),
-            yadorilink_peer_session::ports::SessionTransports {
-                blocks: peer_transports.clone(),
-                service: peer_transports.clone(),
-                prepared_snapshots: Arc::new(yadorilink_lane_ports::PreparedSnapshots::new()),
-                snapshot_fetch: peer_transports,
-            },
-            None,
-            PeerSyncSessionDeps {
-                change_emitter: Some(emitter.clone()),
-                ..PeerSyncSessionDeps::test_permissive()
-            },
-        );
-
-        let installed = with_emitter
-            .change_emitter()
-            .expect("must be Some for a session constructed with an emitter");
-        assert_eq!(installed.device_id(), LOCAL, "the installed emitter must be this device's own");
-    }
-}
-
-/// The handoff-lease/handoff-ticket/re-bootstrap peer-to-peer exchange, over
+/// The handoff-lease/handoff-ticket peer-to-peer exchange, over
 /// the real service RPC lane (`yadorilink-peer-session::service_rpc`) this
 /// track's Option-A cutover replaced the old shared-channel/request-id wire
 /// frames with. Unlike the deleted mechanism-only unit tests these retarget
@@ -1511,14 +1209,10 @@ mod service_rpc_wire_tests {
             replica_engine,
             device.store.clone(),
             vec![GROUP.to_string()],
-            HashMap::new(),
             yadorilink_peer_session::ports::SessionTransports {
                 blocks: transports.clone(),
                 service: transports.clone(),
-                prepared_snapshots: device.prepared_snapshots.clone(),
-                snapshot_fetch: transports,
             },
-            None,
             deps,
         );
         device.node.serve_with(peer_device_id, session.clone());
@@ -1752,4 +1446,73 @@ mod service_rpc_wire_tests {
              installed responder would otherwise answer"
         );
     }
+}
+
+/// A peer that opens block streams and never sends a request header must not
+/// hold the device-wide examination budget: the budget is taken only once the
+/// header has arrived, so another peer's request is still served.
+#[tokio::test]
+async fn streams_that_never_send_a_header_do_not_exhaust_the_examination_budget() {
+    use yadorilink_peer_session::ports::BlockStreamTransport as _;
+    let device_a = Device::new("device-a").await;
+    let data = b"served while another peer stalls".to_vec();
+    let hash = seed_referenced_block(&device_a, "stall.bin", &data);
+
+    let stalled_peer = device_a.fake_peer("device-c").await;
+    let requester = device_a.fake_peer("device-b").await;
+    let _session_c = spawn_session(&device_a, "device-c");
+    let session_b = spawn_session(&device_a, "device-b");
+    // One active slot: the examination budget is 8 permits.
+    let engine = yadorilink_peer_session::block_serve::BlockServeEngine::new(
+        u64::MAX,
+        u64::MAX,
+        u64::MAX,
+        1,
+    );
+    session_b.session.set_block_serve_engine(engine.clone());
+    _session_c.session.set_block_serve_engine(engine);
+
+    let mut stalled = Vec::new();
+    // One stream per examination permit: the opener's own block lane budget is the same size.
+    for _ in 0..8 {
+        stalled.push(
+            stalled_peer
+                .transports_for("device-a")
+                .open(GROUP)
+                .await
+                .expect("a block stream must open"),
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let (response, body) = request_block(&requester, "device-a", "stall.bin", &hash).await;
+    assert!(
+        matches!(response.outcome, Some(BlockOutcome::Found(_))),
+        "stalled header-less streams must not make another peer's request Busy, got {:?}",
+        response.outcome
+    );
+    assert_eq!(body, data);
+    drop(stalled);
+}
+
+/// A peer that takes a service stream and never answers must cost the caller
+/// the service RPC deadline, not forever: the RPC resolves to "no answer".
+#[tokio::test]
+async fn a_service_rpc_to_a_silent_peer_gives_up_at_its_deadline() {
+    let device_b = Device::new("device-b").await;
+    // A real endpoint in device_b's world that never serves a service stream.
+    let _silent_peer = device_b.fake_peer("device-a").await;
+    let session_b = spawn_session_without_convergence_driver(&device_b, "device-a");
+    session_b.session.set_service_rpc_deadline_for_tests(Duration::from_millis(300));
+
+    let started = Instant::now();
+    let grant = tokio::time::timeout(
+        Duration::from_secs(10),
+        session_b.session.request_handoff_lease_from_peer(GROUP),
+    )
+    .await
+    .expect("a service RPC to a silent peer must not hang past its deadline");
+
+    assert!(grant.is_none(), "no answer is no lease");
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
 }

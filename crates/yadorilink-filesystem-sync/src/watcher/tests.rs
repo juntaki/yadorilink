@@ -539,3 +539,50 @@ fn only_a_directory_not_seen_before_is_rereported_under_a_recursive_watch() {
     assert!(newly_known_directories(&mut watched, &root, &[root.join("moved-in")], &ignore_set)
         .is_empty());
 }
+
+/// A directory is recorded as watched only once its registration has
+/// succeeded. Recorded before, a failed `watch` left it skipped by every
+/// later pass as already watched, and edits to files already in it were
+/// never reported again.
+#[test]
+fn a_directory_whose_registration_failed_is_registered_by_a_later_pass() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("a/b")).unwrap();
+    let ignore_set = EffectiveIgnoreSet::defaults_only();
+    let mut watched = BTreeSet::new();
+    let failing = root.path().join("a/b");
+
+    let first = record_non_ignored_directories(
+        &mut watched,
+        root.path(),
+        root.path(),
+        &ignore_set,
+        |dir| {
+            if dir == failing {
+                Err(WatcherError::from(std::io::Error::other("watch refused")))
+            } else {
+                Ok(())
+            }
+        },
+    );
+
+    assert!(first.is_err(), "the failure is reported");
+    assert!(!watched.contains(&failing), "a directory that was not watched is not recorded");
+
+    let second =
+        record_non_ignored_directories(&mut watched, root.path(), root.path(), &ignore_set, |_| {
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(second, vec![failing.clone()], "the next pass registers exactly the failed one");
+    assert!(watched.contains(&failing));
+}
+
+#[test]
+fn registration_retries_back_off_up_to_a_cap() {
+    assert_eq!(registration_retry_delay(1), Duration::from_millis(100));
+    assert_eq!(registration_retry_delay(2), Duration::from_millis(200));
+    assert_eq!(registration_retry_delay(3), Duration::from_millis(400));
+    assert_eq!(registration_retry_delay(40), Duration::from_secs(30));
+}

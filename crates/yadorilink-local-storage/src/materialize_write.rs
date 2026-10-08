@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::content_ports::BlockContentStore;
 use crate::error::StorageError;
-use crate::fs_ops::{link_if_absent, remove_path, rename_path};
+use crate::fs_ops::{remove_path, rename_path};
 use yadorilink_replica_domain::file::BlockInfo;
 
 fn unique_tmp_path(path: &Path) -> PathBuf {
@@ -583,6 +583,16 @@ pub fn reconstruct_file_to_temp(
 ) -> Result<PathBuf, StorageError> {
     require_parent_directory(out_path)?;
     let tmp_path = unique_tmp_path(out_path);
+    // Removes the temp file on every way out but success, a panic included.
+    struct RemoveUnlessKept(PathBuf, bool);
+    impl Drop for RemoveUnlessKept {
+        fn drop(&mut self) {
+            if !self.1 {
+                let _ = remove_path(&self.0);
+            }
+        }
+    }
+    let mut cleanup = RemoveUnlessKept(tmp_path.clone(), false);
     let assemble = || -> Result<(), StorageError> {
         // Straight-line and synchronous, so the guard covers exactly these
         // reads and nothing else.
@@ -609,15 +619,13 @@ pub fn reconstruct_file_to_temp(
         // Closing a file only releases the handle; it does not make its data
         // durable across power loss. Persist the complete temp before the
         // rename can publish it under the user-visible path.
-        out.sync_all()?;
+        crate::io_diag::time(crate::io_diag::Op::FileFsync, 0, || out.sync_all())?;
         tracing::debug!("phase T_recv_fsync_done: final-file fsync complete");
         Ok(())
         // `out` is dropped (closed) here, before the rename below.
     };
-    if let Err(e) = assemble() {
-        let _ = remove_path(&tmp_path);
-        return Err(e);
-    }
+    assemble()?;
+    cleanup.1 = true;
     Ok(tmp_path)
 }
 
@@ -633,7 +641,7 @@ pub fn reconstruct_file_to_temp(
 /// returns, whether it succeeds or fails.
 pub fn persist_reconstructed_file(tmp_path: &Path, out_path: &Path) -> Result<(), StorageError> {
     let publish = || -> Result<(), StorageError> {
-        rename_path(tmp_path, out_path)?;
+        crate::io_diag::time(crate::io_diag::Op::Rename, 0, || rename_path(tmp_path, out_path))?;
         tracing::debug!("phase T_recv_rename_done: temp-file-to-final-path rename complete");
         sync_parent_directory(out_path)?;
         // On Unix this is a real parent-directory fsync (see `sync_parent_
@@ -656,7 +664,10 @@ pub fn persist_reconstructed_file(tmp_path: &Path, out_path: &Path) -> Result<()
 #[cfg(unix)]
 fn sync_parent_directory(path: &Path) -> Result<(), StorageError> {
     if let Some(parent) = path.parent() {
-        fs::File::open(parent)?.sync_all()?;
+        crate::io_diag::note_dir_fsync(parent);
+        crate::io_diag::time(crate::io_diag::Op::DirFsync, 0, || {
+            fs::File::open(parent)?.sync_all()
+        })?;
     }
     Ok(())
 }
@@ -671,37 +682,15 @@ fn sync_parent_directory(_path: &Path) -> Result<(), StorageError> {
     Ok(())
 }
 
-/// Identity of the exact on-disk object [`write_placeholder`] just created,
-/// captured from the still-open temp-file handle before this crate's own
-/// rename into place -- a rename within the same filesystem preserves the
-/// inode, so this is exactly what `out_path` carries once that rename
-/// succeeds, without the TOCTOU window a later path-based `stat` on
-/// `out_path` itself would have (something else touching `out_path`
-/// between the rename and that stat).
-///
-/// Never derived from size/mtime -- those are exactly the signals this
-/// identity exists to stop relying on alone (see
-/// `yadorilink-filesystem-sync::placeholder_backend`'s doc comment on
-/// `PlaceholderGeneration`). `dev`/`ino` are the OS-assigned filesystem
-/// identity, so an atomic-rename save by an editor (a new inode) is
-/// distinguishable from an untouched placeholder even when it happens to
-/// land on the placeholder's exact size and mtime -- the residual gap
-/// `local_change.rs`'s own doc comment documents for the size/mtime-only
-/// heuristic.
+/// The `(dev, ino)`-shaped token a native provider's placeholder is recorded
+/// under. On Windows the `dev` half is always `0` (an unused sentinel) and
+/// `ino` carries the opaque CfAPI generation; see
+/// [`WINDOWS_CFAPI_GENERATION_PROVIDER_KIND`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlaceholderDiskIdentity {
     pub dev: u64,
     pub ino: u64,
 }
-
-/// The `provider_kind` string every [`write_placeholder`] caller should
-/// persist alongside a `Some` [`PlaceholderDiskIdentity`] -- the single
-/// identity scheme this crate implements today. A single named constant
-/// (rather than each of the several call sites spelling the literal) so a
-/// future real OS provider's own kind string can't accidentally collide
-/// with this one, and so every persisted row this scheme ever wrote stays
-/// grep-able under one name.
-pub const INTERNAL_INODE_PROVIDER_KIND: &str = "internal-inode";
 
 /// The `provider_kind` string the Windows CfAPI generation-identity
 /// scheme persists alongside a `PlaceholderDiskIdentity` -- reusing this
@@ -717,14 +706,8 @@ pub const INTERNAL_INODE_PROVIDER_KIND: &str = "internal-inode";
 pub const WINDOWS_CFAPI_GENERATION_PROVIDER_KIND: &str = "windows-cfapi-generation";
 
 impl PlaceholderDiskIdentity {
-    /// Extracts this identity from an already-fetched [`fs::Metadata`] --
-    /// the read side of the same scheme [`write_placeholder`] mints on the
-    /// write side. Used both here (via an open file handle's `metadata()`)
-    /// and by `yadorilink-local-capture`'s dirty-detection, which already
-    /// has an `lstat`-equivalent `Metadata` in hand and must not pay for a
-    /// second stat just to compare identities. `None` on non-Unix builds,
-    /// same as [`write_placeholder`]'s own return -- see that function's
-    /// doc comment.
+    /// Extracts the identity from an already-fetched [`fs::Metadata`].
+    /// `None` on non-Unix builds.
     #[cfg(unix)]
     pub fn from_metadata(metadata: &fs::Metadata) -> Option<Self> {
         use std::os::unix::fs::MetadataExt;
@@ -737,158 +720,22 @@ impl PlaceholderDiskIdentity {
     }
 }
 
-fn disk_identity_of(file: &fs::File) -> Option<PlaceholderDiskIdentity> {
-    file.metadata().ok().and_then(|m| PlaceholderDiskIdentity::from_metadata(&m))
-}
-
-/// Writes a placeholder at `out_path`: a sparse file of `size` bytes with
-/// no real content, so `stat`/`ls` report the file's correct size and
-/// modification time without its bytes occupying disk space or requiring
-/// a block fetch.
+/// What a provider-object creation call site must persist once
+/// [`create_or_defer_placeholder`] returns, and HOW:
 ///
-/// Content-addressed dedup means this never collides with a genuine empty
-/// file: a placeholder is never chunked/indexed as content.
-///
-/// Returns the new placeholder's [`PlaceholderDiskIdentity`] when this
-/// platform can capture one (see [`disk_identity_of`]) -- callers should
-/// persist it (`MaterializationStateRepository::record_placeholder_generation`)
-/// alongside the `Placeholder` state transition this call is always paired
-/// with, and clear any prior identity for the same path when it comes back
-/// `None`, so a stale identity from a previous placeholder never survives
-/// under a row this call could not identify.
-pub fn write_placeholder(
-    out_path: &Path,
-    size: u64,
-    mtime_unix_nanos: i64,
-) -> Result<Option<PlaceholderDiskIdentity>, StorageError> {
-    write_placeholder_publishing(out_path, size, mtime_unix_nanos, Publish::Replacing)
-}
-
-/// [`write_placeholder`], except that it never replaces an object already
-/// at `out_path`: when one is there it fails with
-/// [`std::io::ErrorKind::AlreadyExists`] and leaves it untouched. For a
-/// caller that decided `out_path` was empty without being able to stop a
-/// user from creating something there since.
-pub fn write_placeholder_if_absent(
-    out_path: &Path,
-    size: u64,
-    mtime_unix_nanos: i64,
-) -> Result<Option<PlaceholderDiskIdentity>, StorageError> {
-    write_placeholder_publishing(out_path, size, mtime_unix_nanos, Publish::IfAbsent)
-}
-
-#[derive(Clone, Copy)]
-enum Publish {
-    Replacing,
-    IfAbsent,
-}
-
-fn write_placeholder_publishing(
-    out_path: &Path,
-    size: u64,
-    mtime_unix_nanos: i64,
-    publish: Publish,
-) -> Result<Option<PlaceholderDiskIdentity>, StorageError> {
-    require_parent_directory(out_path)?;
-    let tmp_path = unique_tmp_path(out_path);
-    let mut identity: Option<PlaceholderDiskIdentity> = None;
-    let mut prepare = || -> Result<(), StorageError> {
-        let file = fs::File::create(&tmp_path)?;
-        write_placeholder_contents(&file, size, mtime_unix_nanos)?;
-        identity = disk_identity_of(&file);
-        Ok(())
-    };
-    let published = prepare().and_then(|()| match publish {
-        Publish::Replacing => rename_path(&tmp_path, out_path).map_err(Into::into),
-        Publish::IfAbsent => publish_if_absent(&tmp_path, out_path, size, mtime_unix_nanos).map(
-            |fallback_identity| {
-                if fallback_identity.is_some() {
-                    identity = fallback_identity;
-                }
-            },
-        ),
-    });
-    if let Err(error) = published {
-        let _ = remove_path(&tmp_path);
-        return Err(error);
-    }
-    // Once rename succeeds, callers must advance their index state to
-    // Placeholder. Reporting a later directory-fsync failure as if publish
-    // failed would make them roll back to Hydrated while the visible file is
-    // already a placeholder. Keep the runtime state coherent and surface the
-    // reduced crash-durability guarantee diagnostically.
-    if let Err(error) = sync_parent_directory(out_path) {
-        tracing::warn!(
-            path = %out_path.display(),
-            error = %error,
-            "placeholder was published but its parent directory could not be synced"
-        );
-    }
-    Ok(identity)
-}
-
-/// Sizes and stamps a freshly created placeholder file, then persists it.
-fn write_placeholder_contents(
-    file: &fs::File,
-    size: u64,
-    mtime_unix_nanos: i64,
-) -> Result<(), StorageError> {
-    file.set_len(size)?;
-    stamp_mtime(file, mtime_unix_nanos);
-    // A sparse length and its metadata are not durable merely because
-    // the handle is closed. Persist the complete placeholder before its
-    // name becomes visible, matching `reconstruct_file`'s ordering.
-    file.sync_all()?;
-    Ok(())
-}
-
-/// Gives the prepared placeholder at `tmp_path` the name `out_path` only if
-/// nothing has that name. A hard link is the one portable primitive that is
-/// both atomic and refuses an existing destination; the temp name is
-/// removed afterwards, whatever happened. On a volume without hard links
-/// the placeholder is instead created at `out_path` directly and
-/// exclusively, which is equally unable to replace anything but can leave a
-/// partly written placeholder behind on a crash -- something a later pass
-/// reads as an object it does not recognise and keeps, never loses. Returns
-/// the identity of that directly created file when it took that route.
-fn publish_if_absent(
-    tmp_path: &Path,
-    out_path: &Path,
-    size: u64,
-    mtime_unix_nanos: i64,
-) -> Result<Option<PlaceholderDiskIdentity>, StorageError> {
-    let linked = link_if_absent(tmp_path, out_path);
-    let _ = remove_path(tmp_path);
-    match linked {
-        Ok(()) => Ok(None),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(error.into()),
-        Err(_) => {
-            let file = fs::OpenOptions::new().write(true).create_new(true).open(out_path)?;
-            write_placeholder_contents(&file, size, mtime_unix_nanos)?;
-            Ok(disk_identity_of(&file))
-        }
-    }
-}
-
-/// What a placeholder-creation call site must persist once
-/// [`create_or_defer_placeholder`] returns, and HOW -- mirrors
-/// `write_placeholder`'s own `Some`/`None` contract, but with the provider
-/// kind bundled in (so a caller can never persist a Windows-minted
-/// generation under [`INTERNAL_INODE_PROVIDER_KIND`] or vice versa) and the
-/// persist DISCIPLINE made explicit, because the two platforms need
-/// different ones:
-///
-/// - Unix: the write and the identity are the same atomic fact -- this
-///   identity IS what's on disk right now, so persisting it must always WIN,
-///   unconditionally, even over a stale prior value.
-/// - Windows: real on-disk creation is deferred to a second process
+/// - `RecordIfAbsent`: Windows. Creation is deferred to a second process
 ///   (`cfapi-host.exe`) polling on its own schedule, so a concurrent
 ///   `ListFolderFilesRequest` backfill (`ensure_windows_placeholder_
 ///   generation`) can mint and persist its OWN generation for the same path
 ///   first and hand it to that process before this call's persist runs. An
-///   unconditional overwrite here would then silently orphan the generation
-///   already in use on disk. Must persist only-if-absent, keeping whichever
-///   value won.
+///   unconditional overwrite would then silently orphan the generation
+///   already in use on disk, so only-if-absent keeps whichever value won.
+/// - `RecordOverwrite`: an object this call (or the caller's own
+///   dehydration) positively identifies, persisted unconditionally.
+/// - `Clear`: nothing is on disk for this path and nothing will be created
+///   for it, so any recorded identity is withdrawn. This is the whole
+///   outcome on a platform without a native provider: a `Remote` row has no
+///   local object there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaceholderIdentityToRecord {
     RecordOverwrite { identity: PlaceholderDiskIdentity, provider_kind: &'static str },
@@ -897,156 +744,63 @@ pub enum PlaceholderIdentityToRecord {
 }
 
 impl PlaceholderIdentityToRecord {
-    /// Whether the real placeholder object this outcome describes is
-    /// deferred to a separate, out-of-process step (Windows's
-    /// `cfapi-host.exe`, on its own ~30s poll -- see `create_or_defer_
-    /// placeholder`'s own doc comment) rather than already, durably on
-    /// disk right now. `RecordOverwrite` and `Clear` both mean the real
-    /// write already happened synchronously (Unix's `write_placeholder`
-    /// either minted an identity or could not, but the rename onto
-    /// `out_path` itself already succeeded either way) -- only
-    /// `RecordIfAbsent` means nothing has actually landed on disk yet.
+    /// Whether the real provider object this outcome describes is deferred
+    /// to a separate, out-of-process step (Windows's `cfapi-host.exe`, on
+    /// its own ~30s poll) rather than already on disk right now.
     ///
-    /// A caller must not clear a materialization intent that is
-    /// protecting this exact path, or settle an outcome that completes
-    /// this path's projection obligation, while this is `true`: doing so
-    /// removes every one of the tombstone loop's three vetoes for a path
-    /// that genuinely has nothing under its own name yet, before
-    /// `cfapi-host.exe` has had a chance to create it.
+    /// A caller must not clear a materialization intent that is protecting
+    /// this exact path, or settle an outcome that completes this path's
+    /// projection obligation, while this is `true`: doing so removes a
+    /// protection for a path that genuinely has nothing under its own name
+    /// yet, before `cfapi-host.exe` has had a chance to create it.
     pub fn is_deferred_to_a_separate_process(&self) -> bool {
         matches!(self, Self::RecordIfAbsent { .. })
     }
+
+    /// Whether this outcome leaves a provider object on disk that the caller
+    /// should now give the row's mode and attributes. Never true where no
+    /// native provider exists.
+    pub fn placed_an_object(&self) -> bool {
+        matches!(self, Self::RecordOverwrite { .. })
+    }
 }
 
-/// The one sanctioned entry point every production placeholder-creation
-/// call site (repair, eviction, peer materialize) must use INSTEAD OF
-/// calling [`write_placeholder`] directly.
+/// The one sanctioned entry point for making a path's `Remote` row
+/// projectable by a native provider.
 ///
-/// On every platform except Windows this is exactly `write_placeholder`,
-/// unchanged: writes a real sparse file and returns its on-disk identity
-/// under [`INTERNAL_INODE_PROVIDER_KIND`].
-///
-/// On Windows this writes NOTHING to disk. Calling `write_placeholder`
-/// unconditionally would still write a real sparse file there (identity
-/// capture is the only part that's a no-op on non-Unix) and return `None`,
-/// with two consequences: (1) `cfapi-host.exe`'s `sync_placeholders` skips
-/// any path that already `exists()` on disk, so that sparse file would
-/// permanently pre-empt the native `CfCreatePlaceholders` call; (2) the
-/// caller would clear the generation, so Windows dirty detection could
-/// never do better than fail-closed `Unknown` for that path.
-///
-/// Here, instead, no sparse file is written at all: a fresh generation is
-/// minted and returned tagged [`WINDOWS_CFAPI_GENERATION_PROVIDER_KIND`] for
-/// the caller to persist immediately (the same call-site pattern the
-/// `write_placeholder` path already used, just with a different provider
-/// kind). The caller's normal `set_materialization_state(..., Placeholder)`
-/// still runs exactly as before. The real on-disk reparse-point placeholder
-/// is created afterward by `cfapi-host.exe`'s existing poll
-/// (`sync_placeholders` -> `create_placeholder`), which is unaffected by
-/// this change and already reads the generation this call persists via
-/// `ListFolderFilesRequest`. No parent directory is created here, and
-/// `cfapi-host.exe` creates none either: the caller must already have
-/// created (and recorded) the parents through the structural `mkdir`
-/// helper before recording the placeholder.
-pub fn create_or_defer_placeholder(
-    out_path: &Path,
-    size: u64,
-    mtime_unix_nanos: i64,
-) -> Result<PlaceholderIdentityToRecord, StorageError> {
+/// A `Remote` row has no local object in the user tree. Where a native
+/// provider exists (Windows CfAPI) the object is created later by that
+/// provider's own process, so this writes NOTHING to disk and mints a fresh
+/// generation tagged [`WINDOWS_CFAPI_GENERATION_PROVIDER_KIND`] for the
+/// caller to persist; `cfapi-host.exe`'s poll reads it back through
+/// `ListFolderFilesRequest`. Nowhere else is a stand-in object written: on
+/// a platform without a native provider this is [`PlaceholderIdentityToRecord::Clear`]
+/// and the path stays empty.
+pub fn create_or_defer_placeholder(out_path: &Path) -> PlaceholderIdentityToRecord {
     #[cfg(any(test, feature = "test-support"))]
-    if test_force_deferred_placeholder_is_armed_for(out_path) {
-        let _ = (out_path, size, mtime_unix_nanos);
-        return Ok(PlaceholderIdentityToRecord::RecordIfAbsent {
+    let deferred = test_force_deferred_placeholder_is_armed_for(out_path);
+    #[cfg(not(any(test, feature = "test-support")))]
+    let deferred = false;
+    let _ = out_path;
+    if deferred || cfg!(windows) {
+        return PlaceholderIdentityToRecord::RecordIfAbsent {
             identity: PlaceholderDiskIdentity {
                 dev: 0,
                 ino: mint_windows_placeholder_generation(),
             },
             provider_kind: WINDOWS_CFAPI_GENERATION_PROVIDER_KIND,
-        });
+        };
     }
-    #[cfg(windows)]
-    {
-        let _ = (out_path, size, mtime_unix_nanos);
-        Ok(PlaceholderIdentityToRecord::RecordIfAbsent {
-            identity: PlaceholderDiskIdentity {
-                dev: 0,
-                ino: mint_windows_placeholder_generation(),
-            },
-            provider_kind: WINDOWS_CFAPI_GENERATION_PROVIDER_KIND,
-        })
-    }
-    #[cfg(not(windows))]
-    {
-        Ok(match write_placeholder(out_path, size, mtime_unix_nanos)? {
-            Some(identity) => PlaceholderIdentityToRecord::RecordOverwrite {
-                identity,
-                provider_kind: INTERNAL_INODE_PROVIDER_KIND,
-            },
-            None => PlaceholderIdentityToRecord::Clear,
-        })
-    }
+    PlaceholderIdentityToRecord::Clear
 }
 
-/// [`create_or_defer_placeholder`], except that where it writes the
-/// placeholder itself it never replaces an object already at `out_path`
-/// (see [`write_placeholder_if_absent`]). Where creation is deferred to a
-/// separate process nothing is written here, and that process already
-/// skips a path something occupies.
-pub fn create_or_defer_placeholder_if_absent(
-    out_path: &Path,
-    size: u64,
-    mtime_unix_nanos: i64,
-) -> Result<PlaceholderIdentityToRecord, StorageError> {
-    #[cfg(not(windows))]
-    {
-        #[cfg(any(test, feature = "test-support"))]
-        let deferred = test_force_deferred_placeholder_is_armed_for(out_path);
-        #[cfg(not(any(test, feature = "test-support")))]
-        let deferred = false;
-        if !deferred {
-            return Ok(match write_placeholder_if_absent(out_path, size, mtime_unix_nanos)? {
-                Some(identity) => PlaceholderIdentityToRecord::RecordOverwrite {
-                    identity,
-                    provider_kind: INTERNAL_INODE_PROVIDER_KIND,
-                },
-                None => PlaceholderIdentityToRecord::Clear,
-            });
-        }
-    }
-    create_or_defer_placeholder(out_path, size, mtime_unix_nanos)
-}
-
-/// Test-only failure-injection flag, consumed by `create_or_defer_
-/// placeholder` itself: when armed, forces the Windows-deferred
-/// (`RecordIfAbsent`) outcome regardless of the actual host platform.
-/// Every production caller's Windows-deferred handling is otherwise
-/// exercisable only on a real Windows host -- this lets a test on any
-/// platform drive that exact caller-side branch (does it skip clearing
-/// the protecting intent / settling the projection obligation the way it
-/// must?) without needing one. `test-support`, not just `test`: the
-/// regression tests that need this live in OTHER crates' test builds
-/// (`yadorilink-peer-session`, `yadorilink-filesystem-sync`), which link
-/// against a normal (non-`#[cfg(test)]`) build of this crate -- see this
-/// crate's own `test-support` feature. Compiled out entirely in a
-/// production build.
-///
-/// Path-keyed, deliberately NOT a single process-wide flag: this same
-/// process (a single `cargo test` binary runs every `#[test]`/
-/// `#[tokio::test]` function in a crate concurrently, on separate
-/// threads, by default) can be running an UNRELATED test at the exact
-/// same moment that also reaches `create_or_defer_placeholder` -- for
-/// example, an eviction test's own `#[cfg(not(windows))]` call site,
-/// which must always take the real, synchronous `write_placeholder` path
-/// regardless of what any OTHER concurrently-running test has armed. A
-/// blanket global flag armed by one test's `RecordIfAbsent` scenario
-/// would silently hijack that unrelated call too -- confirmed by a real,
-/// intermittent (measured ~10%) test corruption this exact shape caused
-/// before this fix, not a theoretical concern. Scoping the seam to the
-/// exact path each test already uses (every test using this seam already
-/// picks a path unique to itself) means concurrently-running tests need
-/// no serialization against each other at all -- unlike a lock, this
-/// requires no caller elsewhere in the workspace to remember to opt in in
-/// order to stay safe.
+/// Test-only failure-injection flag, consumed by [`create_or_defer_placeholder`]
+/// itself: when armed for a path, forces the Windows-deferred
+/// (`RecordIfAbsent`) outcome regardless of the actual host platform, so a
+/// test on any platform can drive every caller's deferred branch.
+/// Path-keyed, deliberately NOT a process-wide flag: a single test binary
+/// runs unrelated tests concurrently, and a blanket flag armed by one
+/// scenario would hijack another's call.
 #[cfg(any(test, feature = "test-support"))]
 static TEST_FORCE_DEFERRED_PLACEHOLDER_PATHS: std::sync::Mutex<
     Option<std::collections::HashSet<std::path::PathBuf>>,
@@ -1062,9 +816,7 @@ fn test_force_deferred_placeholder_is_armed_for(path: &Path) -> bool {
 }
 
 /// Test-only: arms (or disarms) the failure-injection flag above for one
-/// exact path. Only ever affects calls to `create_or_defer_placeholder`
-/// for THIS path -- see the static's own doc comment for why that
-/// matters.
+/// exact path.
 #[cfg(any(test, feature = "test-support"))]
 pub fn set_test_force_deferred_placeholder_for_path(path: &Path, armed: bool) {
     let mut guard = TEST_FORCE_DEFERRED_PLACEHOLDER_PATHS.lock().unwrap_or_else(|p| p.into_inner());
@@ -1074,6 +826,117 @@ pub fn set_test_force_deferred_placeholder_for_path(path: &Path, armed: bool) {
     } else {
         paths.remove(path);
     }
+}
+
+/// Renames `from` to `to` without ever replacing an existing `to`: it fails
+/// with `AlreadyExists` instead. The rename is atomic and moves exactly the
+/// object that has the name `from` at that instant, so a caller that detaches
+/// an object to examine it cannot destroy a file already standing at `to`, and
+/// cannot take a replacement of `from` for the object it meant. Uses
+/// `RENAME_EXCL` (macOS), `RENAME_NOREPLACE` (Linux) or `MoveFileExW` without
+/// the replace flag (Windows). Where no atomic no-replace move exists (another
+/// platform, or a volume without the flag) it FAILS CLOSED with
+/// `Unsupported`: there is deliberately no check-then-rename or link-then-
+/// unlink fallback, since either can destroy an object it never looked at.
+pub fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(any(test, feature = "test-support"))]
+    if TEST_NO_ATOMIC_RENAME.with(std::cell::Cell::get) {
+        return Err(std::io::Error::from(std::io::ErrorKind::Unsupported));
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let c_from = std::ffi::CString::new(from.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        let c_to = std::ffi::CString::new(to.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        loop {
+            #[cfg(target_os = "macos")]
+            // SAFETY: both pointers are valid NUL-terminated strings for the call.
+            let rc = unsafe { libc::renamex_np(c_from.as_ptr(), c_to.as_ptr(), libc::RENAME_EXCL) };
+            #[cfg(target_os = "linux")]
+            // SAFETY: both pointers are valid NUL-terminated strings for the call.
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_renameat2,
+                    libc::AT_FDCWD,
+                    c_from.as_ptr(),
+                    libc::AT_FDCWD,
+                    c_to.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                ) as libc::c_int
+            };
+            if rc == 0 {
+                return Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(libc::EINVAL | libc::ENOSYS | libc::ENOTSUP) => {
+                    return Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+                }
+                _ => return Err(error),
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+        let wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain(Some(0)).collect() };
+        let (f, t) = (wide(from), wide(to));
+        // SAFETY: both are NUL-terminated wide strings that outlive the call;
+        // flags 0 means no replace of an existing destination.
+        if unsafe { MoveFileExW(f.as_ptr(), t.as_ptr(), 0) } != 0 {
+            return Ok(());
+        }
+        return Err(std::io::Error::last_os_error());
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    {
+        let _ = (from, to);
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
+}
+
+// Test-only: makes `rename_no_replace` behave as on a volume without an atomic
+// no-replace move, for this thread.
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static TEST_NO_ATOMIC_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Arms (or disarms) the condition described on `TEST_NO_ATOMIC_RENAME`.
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_test_no_atomic_rename(armed: bool) {
+    TEST_NO_ATOMIC_RENAME.with(|c| c.set(armed));
+}
+
+/// Makes the directory entries of `path`'s parent durable.
+pub fn sync_parent_dir(path: &Path) -> Result<(), StorageError> {
+    sync_parent_directory(path)
+}
+
+/// Removes the regular file at `out_path` so that its row can be `Remote`:
+/// eviction on a platform without a native provider leaves NO object in the
+/// user tree. A file that is already gone is not an error. The removal is
+/// made durable by syncing the parent directory; a failure of that sync is
+/// logged, not returned, because the visible state has already changed and
+/// the caller must advance its index state to match it.
+pub fn remove_evicted_object(out_path: &Path) -> Result<(), StorageError> {
+    match remove_path(out_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    if let Err(error) = sync_parent_directory(out_path) {
+        tracing::warn!(
+            path = %out_path.display(),
+            error = %error,
+            "an evicted object was removed but its parent directory could not be synced"
+        );
+    }
+    Ok(())
 }
 
 /// Mints a fresh Windows CfAPI placeholder generation: a process-lifetime

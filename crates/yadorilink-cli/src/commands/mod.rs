@@ -12,6 +12,8 @@ pub mod limits;
 pub mod link;
 pub mod materialization;
 pub mod membership_render;
+pub mod preserved;
+pub mod provider_folder;
 pub mod recovery;
 pub mod report;
 pub mod rewind;

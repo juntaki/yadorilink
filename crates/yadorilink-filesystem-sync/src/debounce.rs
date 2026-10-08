@@ -461,7 +461,7 @@ fn accumulate_event(
 /// write on disk, and when the event finally is dequeued, `process_flush`
 /// re-reads the path, finds the remote bytes already matching the index,
 /// suppresses it as a self-echo, and the local write is never authored at
-/// all. Measured as exactly this, on `dst_network_fault_chaos` seeds
+/// all. Measured as exactly this, on the retired network-fault scenario seeds
 /// 3298840576/3298840578: every lost write was on the device driven through
 /// the watcher/debounce path, and its round printed no flush line.
 ///

@@ -9,9 +9,8 @@ fn test_state() -> Arc<DaemonState> {
     let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
     let state = DaemonState::new("device-a".into(), sync_state, store);
     // A registered device with no signing key fails closed (see
-    // `ensure_initial_change_history`'s doc comment) -- every test using
-    // this shared harness needs one wired, matching `change_auth.rs`'s
-    // and `rebootstrap_handler.rs`'s own `test_state()` helpers.
+    // `open_group_author`) -- every test using
+    // this shared harness needs one wired.
     state.set_device_signing_key(ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]));
     state
 }
@@ -22,29 +21,6 @@ fn sample_record(path: &str) -> yadorilink_replica_domain::file::FileRecord {
         size: 10,
         mtime_unix_nanos: 0,
         blocks: vec![],
-        deleted: false,
-    }
-}
-
-/// Like `sample_record`, but with a size and single block hash that
-/// actually corroborate `content` on disk — `sample_record`'s placeholder
-/// size/empty blocks never match real bytes, so a test relying on
-/// `VerifiedRoot`/root-identity adoption corroborating a real file (not
-/// just referencing its path) needs this instead.
-fn record_matching_disk_content(
-    path: &str,
-    content: &[u8],
-) -> yadorilink_replica_domain::file::FileRecord {
-    use sha2::{Digest, Sha256};
-    yadorilink_replica_domain::file::FileRecord {
-        path: path.to_string(),
-        size: content.len() as u64,
-        mtime_unix_nanos: 0,
-        blocks: vec![yadorilink_replica_domain::file::BlockInfo {
-            hash: Sha256::digest(content).to_vec(),
-            offset: 0,
-            size: content.len() as u32,
-        }],
         deleted: false,
     }
 }
@@ -108,8 +84,8 @@ async fn failed_watcher_setup_must_fail_the_gate_not_leave_it_absent() {
 
 /// A link whose row is already `OnDemand` (e.g. from before the
 /// placeholder-pipeline gate existed, or committed by any other path)
-/// must refuse to start watching -- the same invariant `finish_link_
-/// setup`/`set_storage_mode` enforce at *creation* time, applied here to
+/// must refuse to start watching -- the same invariant linking and
+/// `set_storage_mode` enforce at *creation* time, applied here to
 /// a row that's already on disk, since neither entry point's refusal
 /// helps a row that's already committed OnDemand.
 #[tokio::test]
@@ -134,10 +110,16 @@ async fn an_existing_on_demand_link_refuses_to_start_while_the_pipeline_is_not_c
         Arc::new(RealFolderWatchSource),
     );
 
+    let error = match result {
+        Ok(_) => panic!(
+            "an existing OnDemand link must refuse to start while no placeholder pipeline is \
+             connected, not silently watch/materialize anyway"
+        ),
+        Err(error) => error.to_string(),
+    };
     assert!(
-        result.is_err(),
-        "an existing OnDemand link must refuse to start while no placeholder pipeline is \
-         connected, not silently watch/materialize anyway"
+        error.contains("no connected placeholder provider"),
+        "the refusal must come from the pipeline gate, not an unrelated failure: {error}"
     );
     assert!(
         !state.links.has_entry(&local_path),
@@ -352,7 +334,7 @@ async fn the_survivors_first_scan_after_a_recovery_emits_no_tombstones() {
         .unwrap();
     // Unlike the other tests sharing `test_state()`, this one pre-seeds
     // the index with rows (below) before the watch starts, so
-    // `ensure_initial_change_history` has real DAG history to establish
+    // the watch start has indexed rows to author deltas for
     // and genuinely calls into local-emission authorization -- which
     // `DaemonState::new`'s real provider withholds for a linked group
     // with no verified policy loaded (exactly the fail-closed behavior
@@ -366,37 +348,24 @@ async fn the_survivors_first_scan_after_a_recovery_emits_no_tombstones() {
     state
         .replica_coordinator
         .set_local_policy_head_provider(std::sync::Arc::new(|_group_id| Ok([0u8; 32])));
-    // The survivor's own file, indexed and present: that is what corroborates
-    // the root, so the root-identity check adopts rather than refusing it as
-    // a possible bare mountpoint. Without it this test would never reach the
-    // tombstone decision it is about. Must actually match the bytes just
-    // written above — `sample_record`'s placeholder size/blocks would not
-    // corroborate and `VerifiedRoot::open` below would refuse.
-    let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
-    state
-        .replica_coordinator
-        .file_index_repository()
-        .upsert_file(group, &record_matching_disk_content("in-a.txt", b"aaa"), &permit)
-        .unwrap();
-    yadorilink_root_authority::root_identity::VerifiedRoot::open(
-        root.path(),
-        group,
-        state.replica_coordinator.as_ref(),
-    )
-    .unwrap();
-    // A path that only ever existed under the folder the user just unlinked,
-    // still indexed for the group -- the shape a second root leaves behind.
-    // `ensure_initial_change_history` now genuinely emits DAG history for
-    // pre-existing index rows (fail-closed restored), which needs a real,
-    // hash-consistent `FileVersion` -- `sample_record`'s placeholder
-    // size/empty blocks would fail that, so use `record_matching_disk_content`
-    // instead even though this content is never written to this test's disk
-    // (the whole point: it only ever existed on the departed root).
-    state
-        .replica_coordinator
-        .file_index_repository()
-        .upsert_file(group, &record_matching_disk_content("only-in-b.txt", b"bbb"), &permit)
-        .unwrap();
+    // Both roots' files are captured natively by a first scan: the survivor's
+    // own file, and a path that only ever existed under the folder the user
+    // just unlinked -- the shape a second root leaves behind.
+    std::fs::write(root.path().join("only-in-b.txt"), b"bbb").unwrap();
+    let controller = LinkRuntimeController::new(state.clone());
+    start_watch_and_await_scan(&state, root.path(), group).await;
+    assert!(
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .get_file(group, "only-in-b.txt")
+            .unwrap()
+            .is_some_and(|row| !row.deleted),
+        "sanity: the first scan captured the second root's file"
+    );
+    // The second root departs: its file is gone from this folder, its row stays.
+    controller.stop(&root.path().to_string_lossy()).await;
+    std::fs::remove_file(root.path().join("only-in-b.txt")).unwrap();
 
     // Exactly what the unlink handler's recovery arms on the survivor:
     // both the additive-scan flag AND the durable set of paths that must
@@ -458,7 +427,7 @@ async fn a_clean_scan_closes_the_additive_window() {
     );
 }
 
-/// Sync-root single-instance ownership (design doc §15), driven through
+/// Sync-root single-instance ownership, driven through
 /// the real watch-start/stop path rather than calling
 /// `SyncRootLock::acquire` directly: while the watch is running, another
 /// attempt to acquire the same root's lock must be refused (a second
@@ -691,4 +660,166 @@ async fn the_disk_reconcile_backstop_sweep_does_not_hold_the_worker_that_polls_i
          sweep: a yield-now loop sharing the runtime's only worker was rescheduled only \
          {during} times while the sweep ran (expected at least 100)"
     );
+}
+
+/// Something that still holds the runtime when `stop` removes it (a targeted
+/// flush, a File Provider write, a resume or the backstop sweep, each of
+/// which clones the `Arc` across long awaits) used to turn `stop` into
+/// abort-only teardown: admission was never closed, so the stray operation
+/// kept committing after `stop` returned, even after the link was removed.
+#[tokio::test]
+async fn stop_closes_admission_even_while_something_still_holds_the_runtime() {
+    let state = test_state();
+    let root = tempfile::tempdir().unwrap();
+    let group = "group-1";
+    let local_path = root.path().to_string_lossy().to_string();
+    state.replica_coordinator.link_repository().add_link(&local_path, group).unwrap();
+    start_watch_and_await_scan(&state, root.path(), group).await;
+    let held = state.links.runtime(&local_path).expect("the link is running");
+    let lease = held.root_lease().clone();
+    assert!(lease.begin_operation().is_ok(), "sanity: admission is open before the stop");
+
+    let controller = LinkRuntimeController::new(state.clone());
+    tokio::time::timeout(std::time::Duration::from_secs(60), controller.stop(&local_path))
+        .await
+        .expect("stop must return even though the runtime is still held");
+
+    assert!(
+        lease.begin_operation().is_err(),
+        "an operation begun after stop returned would commit against a link that is gone"
+    );
+    drop(held);
+}
+
+/// An operation already admitted when `stop` runs is waited for, even though
+/// the runtime it came through cannot be unwrapped: the root lock is not
+/// handed to a new owner under a write still in flight.
+#[tokio::test]
+async fn stop_waits_for_an_admitted_operation_while_the_runtime_is_still_held() {
+    let state = test_state();
+    let root = tempfile::tempdir().unwrap();
+    let group = "group-1";
+    let local_path = root.path().to_string_lossy().to_string();
+    state.replica_coordinator.link_repository().add_link(&local_path, group).unwrap();
+    start_watch_and_await_scan(&state, root.path(), group).await;
+    let held = state.links.runtime(&local_path).expect("the link is running");
+    let lease = held.root_lease().clone();
+    let operation = lease.begin_operation().expect("admitted before the stop");
+
+    let controller = LinkRuntimeController::new(state.clone());
+    let stopping = {
+        let local_path = local_path.clone();
+        tokio::spawn(async move { controller.stop(&local_path).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let returned_early = stopping.is_finished();
+    drop(operation);
+    tokio::time::timeout(std::time::Duration::from_secs(60), stopping)
+        .await
+        .expect("stop returns once the admitted operation finishes")
+        .unwrap();
+
+    assert!(!returned_early, "stop returned while an admitted operation was still running");
+    drop(held);
+}
+
+/// A startup fault that outlasts the immediate attempts used to leave the
+/// group's peer-apply gate `Failed` until a relink or restart: nothing
+/// re-ran the scan. The executor keeps retrying with backoff for as long as
+/// the link runs, so the gate re-opens once the fault clears.
+#[tokio::test]
+async fn a_startup_fault_that_outlasts_the_immediate_attempts_is_retried_until_it_clears() {
+    let state = test_state();
+    let root = tempfile::tempdir().unwrap();
+    let group = "group-startup-fault";
+    let local_path = root.path().to_string_lossy().to_string();
+    state.replica_coordinator.link_repository().add_link(&local_path, group).unwrap();
+    // Five failed attempts: more than the three made back to back.
+    crate::link_runtime::tasks::inject_startup_failures(group, 5);
+
+    let controller = LinkRuntimeController::new(state.clone());
+    controller
+        .start_with_source(local_path.clone(), group.to_string(), Arc::new(RealFolderWatchSource))
+        .expect("the watch starts; it is the startup scan that fails");
+    let first = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        state.replica_coordinator.wait_group_ready(group),
+    )
+    .await
+    .expect("startup settles");
+    assert!(first.is_err(), "sanity: the injected faults fail startup, got {first:?}");
+
+    // Nothing relinks and nothing restarts; the fault simply runs out.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut ready = false;
+    while std::time::Instant::now() < deadline {
+        if state.replica_coordinator.wait_group_ready(group).await.is_ok() {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    assert!(ready, "the gate must re-open once the fault clears, without a relink");
+    controller.stop(&local_path).await;
+}
+
+/// The backstop used to walk its links one after another, so one link whose
+/// whole-folder reconcile stalled held every later link's recovery behind it.
+/// Each link's pass now runs on its own: while the first link stalls, the
+/// second still gets its pass, and the sweep stops waiting for the stalled
+/// one after its time budget instead of holding every later sweep behind it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stalled_link_does_not_hold_the_backstop_pass_of_another_link() {
+    let state = test_state();
+    let roots = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+    let paths: Vec<String> =
+        roots.iter().map(|root| root.path().to_string_lossy().to_string()).collect();
+    for (index, root) in roots.iter().enumerate() {
+        let group = format!("backstop-group-{index}");
+        state.replica_coordinator.link_repository().add_link(&paths[index], &group).unwrap();
+        start_watch_and_await_scan(&state, root.path(), &group).await;
+    }
+
+    // Whichever link is reconciled first stalls until released; the other
+    // reports that its pass was reached.
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel::<String>();
+    let reached_tx = std::sync::Mutex::new(Some(reached_tx));
+    let stalled: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    let ours = paths.clone();
+    *BACKSTOP_PROBE.lock().unwrap() = Some(Arc::new(move |local_path: &str| {
+        if !ours.iter().any(|path| path == local_path) {
+            return;
+        }
+        let first = {
+            let mut stalled = stalled.lock().unwrap();
+            if stalled.is_none() {
+                *stalled = Some(local_path.to_string());
+                true
+            } else {
+                false
+            }
+        };
+        if first {
+            let _ = release_rx.lock().unwrap().recv_timeout(std::time::Duration::from_secs(60));
+        } else if let Some(tx) = reached_tx.lock().unwrap().take() {
+            let _ = tx.send(local_path.to_string());
+        }
+    }));
+
+    let controller = LinkRuntimeController::new(state.clone());
+    let sweep = tokio::spawn(async move { controller.run_disk_reconcile_backstop_sweep().await });
+    let reached = tokio::time::timeout(std::time::Duration::from_secs(20), reached_rx).await;
+    // The sweep gives up on the stalled link after its budget.
+    let returned = tokio::time::timeout(std::time::Duration::from_secs(20), sweep).await;
+    release_tx.send(()).unwrap();
+    *BACKSTOP_PROBE.lock().unwrap() = None;
+
+    assert!(
+        reached.is_ok_and(|reached| reached.is_ok()),
+        "the second link's pass never ran while the first link stalled"
+    );
+    assert!(returned.is_ok(), "one stalled link held the whole sweep");
 }

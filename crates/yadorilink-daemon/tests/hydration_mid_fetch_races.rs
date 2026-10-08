@@ -11,7 +11,7 @@
 //!
 //!   remote   a newer version supersedes the row. The attempt is still
 //!            holding the OLD record; committing it would write the old
-//!            bytes and then mark the NEW version `Hydrated`, leaving the
+//!            bytes and then mark the NEW version `Present`, leaving the
 //!            index claiming a version disk does not hold.
 //!
 //!   both     the attempt must fail rather than commit. Failing costs a
@@ -22,7 +22,7 @@
 //! supersession can land after the pre-write identity re-check and before the
 //! commit — that window is narrow but real, and both hydration paths document
 //! it — so the old version's bytes reaching disk is a legal outcome. What is
-//! never legal is the row claiming `Hydrated` for a version this attempt did
+//! never legal is the row claiming `Present` for a version this attempt did
 //! not write; the next attempt rewrites disk from the row that actually won.
 //!
 //! ```text
@@ -46,7 +46,7 @@
 //! object (`CfCreatePlaceholders`/`CfGetPlaceholderInfo`) that this pure-Rust
 //! harness never creates; that's deferred to a separate `yadorilink-cfapi-
 //! host.exe` process this test never runs. `admit_hydration_start`'s Windows
-//! branch (`untouched_placeholder_verdict` / `inspect_windows_placeholder` in
+//! branch (`cfapi_placeholder_untouched` / `inspect_windows_placeholder` in
 //! `disk_observation.rs`) is correctly fail-closed against exactly this: a
 //! recorded placeholder generation with no real placeholder object backing
 //! it on disk reads as "the user may have deleted this," and hydration
@@ -70,7 +70,6 @@ use yadorilink_daemon::hydration;
 use yadorilink_local_storage::{
     BlockStore, ContentHash, GcReport, LocallyHashedBlock, SegmentBlockStore, StorageError,
 };
-use yadorilink_replica_domain::ids::ChangeHash;
 use yadorilink_replica_domain::session_state::{MaterializationPolicy, MaterializationState};
 
 const GROUP: &str = "hydration-race-group";
@@ -208,15 +207,6 @@ impl TestDevice {
             .flatten()
             .map(|record| record.size)
     }
-
-    fn authoring_change_hash(&self, path: &str) -> Option<ChangeHash> {
-        self.state
-            .replica_coordinator
-            .file_index_repository()
-            .get_authoring_change_hash(GROUP, path)
-            .ok()
-            .flatten()
-    }
 }
 
 fn setup_device(name: &str) -> TestDevice {
@@ -229,6 +219,8 @@ fn setup_device(name: &str) -> TestDevice {
     let (sync_state, index_dir) = support::open_file_backed_replica_coordinator();
     let state = DaemonState::new(name.to_string(), Arc::new(sync_state), store.clone());
     support::ensure_device_signing_key(&state);
+    // The on-demand capability of this device's (plain) roots, for the legacy lane these tests exercise.
+    state.set_test_on_demand_allowed(true);
     TestDevice {
         device_id: name.to_string(),
         state,
@@ -239,17 +231,9 @@ fn setup_device(name: &str) -> TestDevice {
     }
 }
 
-/// See `ondemand_adoption.rs`'s own copy of this: an on-demand link refuses
-/// to start without a connected placeholder provider, the override is
-/// thread-local, and `start` runs on the test's own thread.
-fn placeholder_provider_present() -> yadorilink_filesystem_sync::placeholder_backend::OverrideForTest
-{
-    yadorilink_filesystem_sync::placeholder_backend::OverrideForTest::enable()
-}
-
 fn start_watching(device: &TestDevice, policy: MaterializationPolicy) {
     let local_path = device.root.path().to_string_lossy().to_string();
-    device.state.set_test_placeholder_pipeline_connected(true);
+    device.state.set_test_on_demand_allowed(true);
     device.state.replica_coordinator.link_repository().add_link(&local_path, GROUP).unwrap();
     device
         .state
@@ -282,7 +266,7 @@ async fn publish_and_adopt(author: &TestDevice, adopter: &TestDevice, content: &
     std::fs::write(author.path(PATH), content).unwrap();
     wait_until_with_context(
         || {
-            adopter.materialization_state(PATH) == Some(MaterializationState::Placeholder)
+            adopter.materialization_state(PATH) == Some(MaterializationState::Remote)
                 && adopter.indexed_size(PATH) == Some(content.len() as u64)
         },
         Duration::from_secs(60),
@@ -348,11 +332,10 @@ async fn hydrate_with_an_edit_during_the_assemble(
 /// watcher sees the write, and the pre-commit disk fingerprint no longer
 /// matches what the attempt captured — so this is stated on the outcome
 /// rather than on either one. Disabling one leaves it green; disabling both
-/// makes hydration commit over the edit and report `Hydrated`.
+/// makes hydration commit over the edit and report `Present`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(windows, ignore = "needs a real CfAPI placeholder; see this file's module doc")]
 async fn a_local_edit_during_a_fetch_is_never_overwritten() {
-    let _provider = placeholder_provider_present();
     let device_a = setup_device("device-a");
     let device_b = setup_device("device-b");
 
@@ -389,11 +372,10 @@ async fn a_local_edit_during_a_fetch_is_never_overwritten() {
 /// its size, and the rename that follows replaces whatever the file became
 /// meanwhile. The guards have to be asked again after the assemble, right
 /// before the rename, or an edit landing in that window is silently lost
-/// under a row reporting `Hydrated`.
+/// under a row reporting `Present`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(windows, ignore = "needs a real CfAPI placeholder; see this file's module doc")]
 async fn a_local_edit_while_the_file_is_assembled_is_never_overwritten() {
-    let _provider = placeholder_provider_present();
     let device_a = setup_device("device-a");
     let device_b = setup_device("device-b");
 
@@ -419,7 +401,7 @@ async fn a_local_edit_while_the_file_is_assembled_is_never_overwritten() {
     );
     assert_ne!(
         device_b.materialization_state(PATH),
-        Some(MaterializationState::Hydrated),
+        Some(MaterializationState::Present),
         "the row claims Hydrated for content the attempt never published"
     );
 }
@@ -428,7 +410,7 @@ async fn a_local_edit_while_the_file_is_assembled_is_never_overwritten() {
 /// not only from itself.
 ///
 /// Refusing drops the attempt's guard, which puts the row back to
-/// `Placeholder`, and a new attempt takes the file as it is NOW as its
+/// `Remote`, and a new attempt takes the file as it is NOW as its
 /// baseline -- which is the edit. If nothing durable says the path holds an
 /// uncaptured edit, an attempt started before the watcher journals it finds
 /// its own baseline unchanged and renames the remote content over the edit.
@@ -437,7 +419,6 @@ async fn a_local_edit_while_the_file_is_assembled_is_never_overwritten() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(windows, ignore = "needs a real CfAPI placeholder; see this file's module doc")]
 async fn a_retry_right_after_a_refused_assemble_does_not_overwrite_the_edit() {
-    let _provider = placeholder_provider_present();
     let device_a = setup_device("device-a");
     let device_b = setup_device("device-b");
 
@@ -464,7 +445,7 @@ async fn a_retry_right_after_a_refused_assemble_does_not_overwrite_the_edit() {
     );
     assert_ne!(
         device_b.materialization_state(PATH),
-        Some(MaterializationState::Hydrated),
+        Some(MaterializationState::Present),
         "the row claims Hydrated over a local edit"
     );
 }
@@ -474,7 +455,6 @@ async fn a_retry_right_after_a_refused_assemble_does_not_overwrite_the_edit() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(windows, ignore = "needs a real CfAPI placeholder; see this file's module doc")]
 async fn a_retry_right_after_a_refused_fetch_does_not_overwrite_the_edit() {
-    let _provider = placeholder_provider_present();
     let device_a = setup_device("device-a");
     let device_b = setup_device("device-b");
 
@@ -502,16 +482,20 @@ async fn a_retry_right_after_a_refused_fetch_does_not_overwrite_the_edit() {
     );
     assert_ne!(
         device_b.materialization_state(PATH),
-        Some(MaterializationState::Hydrated),
+        Some(MaterializationState::Present),
         "the row claims Hydrated over a local edit"
     );
 }
 
-/// A newer version landing mid-fetch is not reported as hydrated.
+/// A newer version landing mid-fetch is not reported as hydrated: the row the
+/// attempt started from now shows another version, so the bytes it assembled
+/// are stale and nothing is committed as hydrated.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(windows, ignore = "needs a real CfAPI placeholder; see this file's module doc")]
 async fn a_version_superseded_during_a_fetch_is_never_reported_hydrated() {
-    let _provider = placeholder_provider_present();
+    use yadorilink_replica_domain::file::{FileRecord, FileVersion};
+    use yadorilink_replica_domain::native_plan::{NativePlannedNode, NativeRowIdentity};
+
     let device_a = setup_device("device-a");
     let device_b = setup_device("device-b");
 
@@ -522,37 +506,86 @@ async fn a_version_superseded_during_a_fetch_is_never_reported_hydrated() {
     let content = vec![0x77u8; 8_000_000];
     publish_and_adopt(&device_a, &device_b, &content).await;
 
-    // A second real file, synced the same way, purely to obtain an authoring
-    // hash that is genuinely admitted on this device — a `current` row's
-    // authoring hash has to reference an admitted Change, so a fabricated
-    // one would be rejected for a reason that has nothing to do with the
-    // race. Which real Change it is does not matter; only that it differs.
-    std::fs::write(device_a.path("marker.txt"), b"unrelated").unwrap();
-    wait_until_with_context(
-        || device_b.authoring_change_hash("marker.txt").is_some(),
-        Duration::from_secs(60),
-        || "the unrelated file never reached the on-demand peer".into(),
-    )
-    .await;
-    let superseding = device_b.authoring_change_hash("marker.txt").expect("just waited for it");
-    let original = device_b.authoring_change_hash(PATH).expect("the placeholder must be authored");
-    assert_ne!(superseding, original, "the two files must have distinct authoring identities");
-
     let hydrating = device_b.state.clone();
     let hydrate = tokio::spawn(async move { hydration::hydrate(&hydrating, GROUP, PATH).await });
-
     wait_until_with_context(
         || device_b.materialization_state(PATH) == Some(MaterializationState::Hydrating),
         Duration::from_secs(30),
         || "the hydration attempt never started".into(),
     )
     .await;
-    // What a peer's newer version landing on this row would do to it.
+
+    // What a peer's newer version landing on this row does: a native head that
+    // supersedes the one being hydrated, and the row now showing it.
+    // Same kind and metadata as the row, so the row it becomes shows exactly
+    // this version; only the content and mtime differ.
+    let files = device_b.state.replica_coordinator.file_index_repository();
+    let shown = yadorilink_replica_domain::session_state::CurrentVersionRecord::from(
+        files.canonical_current_row(GROUP, PATH).unwrap().unwrap().snapshot,
+    )
+    .to_file_version();
+    let mut meta = shown.meta.clone();
+    meta.mtime_unix_nanos = 7;
+    let newer = FileVersion::new(vec![], 0, meta);
     device_b
         .state
         .replica_coordinator
-        .file_index_repository()
-        .set_authoring_change_hash(GROUP, PATH, &superseding)
+        .database()
+        .write(|conn| {
+            yadorilink_sync_sqlite::dag_store::put_file_version(conn, GROUP, &newer)?;
+            Ok::<_, yadorilink_sync_sqlite::SyncSqliteError>(())
+        })
+        .unwrap();
+    {
+        use yadorilink_daemon::test_support::remote_admission_fixture as peer;
+        let observing = device_b
+            .state
+            .replica_coordinator
+            .database()
+            .read(|conn| {
+                yadorilink_sync_sqlite::native_store::native_heads_at(
+                    conn,
+                    &yadorilink_replica_domain::ids::FolderGroupId(GROUP.to_owned()),
+                    &yadorilink_replica_domain::ids::SyncPath(PATH.to_owned()),
+                )
+            })
+            .unwrap()
+            .into_iter()
+            .map(|head| head.payload.provenance)
+            .collect();
+        peer::admit_remote(
+            &device_b.state.replica_coordinator,
+            GROUP,
+            "device-x",
+            vec![peer::put(PATH, newer.version_hash, observing)],
+            std::slice::from_ref(&newer),
+        );
+    }
+    let head = match files
+        .native_plan_level(GROUP, "")
+        .unwrap()
+        .nodes
+        .into_iter()
+        .find(|(path, _)| path.as_str() == PATH)
+        .map(|(_, node)| node)
+    {
+        Some(NativePlannedNode::Entry { head, .. }) => head,
+        other => panic!("the newer version must be planned at {PATH}: {other:?}"),
+    };
+    files
+        .upsert_file_with_origin_and_authoring(
+            GROUP,
+            &FileRecord {
+                path: PATH.to_owned(),
+                size: 0,
+                mtime_unix_nanos: 7,
+                blocks: vec![],
+                deleted: false,
+            },
+            "device-x",
+            Some(&NativeRowIdentity::of(&head)),
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
         .unwrap();
 
     let result = hydrate.await.unwrap();
@@ -564,12 +597,12 @@ async fn a_version_superseded_during_a_fetch_is_never_reported_hydrated() {
     );
     assert_ne!(
         device_b.materialization_state(PATH),
-        Some(MaterializationState::Hydrated),
+        Some(MaterializationState::Present),
         "the row was marked hydrated for a version this attempt never materialized"
     );
     assert_eq!(
-        device_b.authoring_change_hash(PATH),
-        Some(superseding),
-        "the superseding identity must survive the attempt it interrupted"
+        device_b.indexed_size(PATH),
+        Some(0),
+        "the superseding version must survive the attempt it interrupted"
     );
 }

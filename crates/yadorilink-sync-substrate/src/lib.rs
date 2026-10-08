@@ -16,6 +16,7 @@ mod error;
 mod lan;
 mod lane;
 mod link;
+mod native_replication_transport;
 mod network;
 mod node;
 mod observe;
@@ -32,8 +33,15 @@ pub use admission::AdmitAnyAuthenticated;
 pub use admission::{AdmitNone, AdmitWhen, PeerAdmission};
 pub use directory::AddressDirectory;
 pub use error::SubstrateError;
-pub use lane::{HistoryStreamKind, Lane, LaneLimits};
-pub use link::{Carrier, CarrierChanges, LaneRecv, LaneSend, LaneStream, PathWatcher, PeerLink};
+pub use lane::{Lane, LaneLimits};
+pub use link::{
+    Carrier, CarrierChanges, InboundStream, LaneRecv, LaneSend, LaneStream, PathWatcher, PeerLink,
+    LANE_TAG_DEADLINE,
+};
+pub use native_replication_transport::{
+    NativeReplicationConnection, NativeReplicationConnections, NativeReplicationReader,
+    NativeReplicationWriter, YADORI_NATIVE_REPLICATION_ALPN,
+};
 pub use network::YadoriNetwork;
 pub use node::{is_relay_url, NetworkConfig, SubstrateNode, YADORI_SYNC_ALPN};
 pub use observe::{DialFailure, LinkEvent, LinkObserver};

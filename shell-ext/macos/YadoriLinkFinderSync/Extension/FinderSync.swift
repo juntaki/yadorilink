@@ -95,7 +95,7 @@ class FinderSync: FIFinderSync {
         // Provider extension that owns it (`beginObservingDirectory` is
         // the same API either way), which is how a single Finder-visible
         // custom badge (online-only/open-elsewhere) and context menu
-        // (pin/evict) mechanism covers both Eager and OnDemand folders
+        // (evict) mechanism covers both Eager and OnDemand folders
         // without a second, File-Provider-native decoration API.
         //
         // BUG FOUND AND FIXED (real VM verification): the
@@ -206,7 +206,6 @@ class FinderSync: FIFinderSync {
             ("View sync status", Int32(YadoriLinkContextActionViewStatus.rawValue), #selector(viewStatus(_:))),
             ("Pause sync for this item", Int32(YadoriLinkContextActionPauseItem.rawValue), #selector(pauseItem(_:))),
             ("Resume sync for this item", Int32(YadoriLinkContextActionResumeItem.rawValue), #selector(resumeItem(_:))),
-            ("Pin (keep hydrated)", Int32(YadoriLinkContextActionPinItem.rawValue), #selector(pinItem(_:))),
             ("Evict (free disk space)", Int32(YadoriLinkContextActionEvictItem.rawValue), #selector(evictItem(_:))),
         ]
         for (title, action, selector) in actions {
@@ -254,7 +253,6 @@ class FinderSync: FIFinderSync {
     @objc func viewStatus(_ sender: NSMenuItem) { sendAction(sender.tag) }
     @objc func pauseItem(_ sender: NSMenuItem) { sendAction(sender.tag) }
     @objc func resumeItem(_ sender: NSMenuItem) { sendAction(sender.tag) }
-    @objc func pinItem(_ sender: NSMenuItem) { sendAction(sender.tag) }
     @objc func evictItem(_ sender: NSMenuItem) { sendAction(sender.tag) }
 
     /// Launches the menu-bar status app

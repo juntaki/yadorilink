@@ -17,6 +17,8 @@ r2d2_sqlite = "0.24"
 # The version r2d2 0.8 itself builds its worker pool from; named directly
 # only so `build_pool` can choose that pool's drop behavior.
 scheduled-thread-pool = "0.2.7"
+# `write_immediate_offloaded` runs a commit on the blocking pool.
+tokio = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 tempfile = "3"

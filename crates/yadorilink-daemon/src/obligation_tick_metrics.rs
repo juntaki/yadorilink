@@ -17,13 +17,3 @@ static ZERO_WORK_ATTEMPTED: AtomicU64 = AtomicU64::new(0);
 pub(crate) fn record_zero_work_attempted(n: usize) {
     ZERO_WORK_ATTEMPTED.fetch_add(n as u64, Ordering::Relaxed);
 }
-
-/// Paths handed to the zero-work pre-check since process start or the last
-/// [`reset`].
-pub(crate) fn zero_work_attempted() -> u64 {
-    ZERO_WORK_ATTEMPTED.load(Ordering::Relaxed)
-}
-
-pub(crate) fn reset() {
-    ZERO_WORK_ATTEMPTED.store(0, Ordering::Relaxed);
-}

@@ -38,13 +38,12 @@ impl ReplicaCoordinator {
         }
         // Custody confirmation may have waited on the network. Revalidate
         // local retention requirements under the exclusive deletion guard so
-        // a concurrent pin or re-hydration cannot be followed by reclaiming
-        // the blocks its final state requires.
-        if self.file_index_repository().is_pinned(custody.group_id(), custody.path())?
-            || self
-                .materialization_state_repository()
-                .get_materialization_state(custody.group_id(), custody.path())?
-                != Some(MaterializationState::Placeholder)
+        // a concurrent re-hydration cannot be followed by reclaiming the
+        // blocks its final state requires.
+        if self
+            .materialization_state_repository()
+            .get_materialization_state(custody.group_id(), custody.path())?
+            != Some(MaterializationState::Remote)
         {
             return Ok(GcReport::default());
         }

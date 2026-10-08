@@ -332,8 +332,6 @@ fn build_router(state: AppState) -> Router {
         .route("/events", get(handlers::events::events))
         .route("/pause", post(handlers::writes::pause))
         .route("/resume", post(handlers::writes::resume))
-        .route("/pin", post(handlers::writes::pin))
-        .route("/unpin", post(handlers::writes::unpin))
         .route("/evict", post(handlers::writes::evict))
         .route("/restore", post(handlers::writes::restore))
         .route_layer(axum::middleware::from_fn_with_state(

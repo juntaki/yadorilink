@@ -7,7 +7,7 @@ use ed25519_dalek::SigningKey;
 use yadorilink_filesystem_sync::debounce::DebounceFlush;
 use yadorilink_filesystem_sync::watcher::FsChangeKind;
 use yadorilink_local_storage::SegmentBlockStore;
-use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
+use yadorilink_sync_sqlite::dag_store::LocalAuthorKey;
 
 use crate::local_change::LocalChangeProcessor;
 use crate::test_support::TestReplica;
@@ -25,7 +25,8 @@ fn processor() -> (
     let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let state = Arc::new(TestReplica::open_in_memory().unwrap());
     state.set_local_change_auth_provider(Arc::new(|_group_id| Ok(())));
-    let emitter = Arc::new(ChangeEmitter::new("device-a", SigningKey::from_bytes(&[7u8; 32])));
+    let emitter =
+        Arc::new(LocalAuthorKey::for_tests("device-a", SigningKey::from_bytes(&[7u8; 32])));
     let proc = LocalChangeProcessor::new(
         state.clone(),
         store,
@@ -53,11 +54,9 @@ fn authoring(state: &TestReplica, paths: &[&str]) -> BTreeMap<String, Option<[u8
     paths
         .iter()
         .map(|p| {
-            let hash = state
-                .file_index_repository()
-                .get_authoring_change_hash(GROUP, p)
-                .unwrap()
-                .map(|h| h.0);
+            let hash = crate::test_support::native_path_head_provenances(state, GROUP, p)
+                .into_iter()
+                .next();
             (p.to_string(), hash)
         })
         .collect()

@@ -67,6 +67,33 @@ pub struct NestedLinkConflict {
     pub relation: NestedLinkRelation,
 }
 
+impl NestedLinkConflict {
+    /// Whether this relation is an unsupported topology that no
+    /// acknowledgement can accept: a linked folder inside or containing
+    /// another linked folder. An exact-path match is not decided here -- it
+    /// is only a conflict against a link of a DIFFERENT group, which only the
+    /// daemon, holding the groups, can tell apart from an idempotent
+    /// re-link.
+    pub fn is_structural(&self) -> bool {
+        matches!(self.relation, NestedLinkRelation::Ancestor | NestedLinkRelation::Descendant)
+    }
+
+    /// The refusal text for this conflict, naming the other link.
+    pub fn refusal(&self) -> String {
+        match self.relation {
+            NestedLinkRelation::Ancestor => {
+                format!("{} is already linked and is an ancestor of this folder", self.other_path)
+            }
+            NestedLinkRelation::Descendant => {
+                format!("{} is already linked and is nested inside this folder", self.other_path)
+            }
+            NestedLinkRelation::Same => {
+                format!("{} is already linked to a different folder group", self.other_path)
+            }
+        }
+    }
+}
+
 /// Risky/unsupported first-run environment conditions (used for risky location
 /// detection and generating unsupported environment warnings).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,6 +162,14 @@ pub struct LinkPreflightReport {
 }
 
 impl LinkPreflightReport {
+    /// Refusals no acknowledgement can override: nested links. Unlike
+    /// [`Self::warnings`], these are never accepted with `--yes` or an
+    /// interactive confirmation -- two linked folders over the same files
+    /// would each treat the other's changes as their own.
+    pub fn structural_prohibitions(&self) -> Vec<String> {
+        self.nested_conflicts.iter().filter(|c| c.is_structural()).map(|c| c.refusal()).collect()
+    }
+
     pub fn is_empty_folder(&self) -> bool {
         self.entry_count == 0
     }
@@ -153,7 +188,7 @@ impl LinkPreflightReport {
                 self.free_space_state(),
                 Some(FreeSpaceState::Low) | Some(FreeSpaceState::Critical)
             )
-            || !self.nested_conflicts.is_empty()
+            || self.nested_conflicts.iter().any(|c| !c.is_structural())
             || self.risky_location.is_some()
             || self.ignore_rules_unreadable
             || !self.reserved_namespace_blocked_paths.is_empty()
@@ -197,20 +232,8 @@ impl LinkPreflightReport {
             )),
             _ => {}
         }
-        for conflict in &self.nested_conflicts {
-            match conflict.relation {
-                NestedLinkRelation::Ancestor => out.push(format!(
-                    "{} is already linked and is an ancestor of this folder — both links would race over the same files",
-                    conflict.other_path
-                )),
-                NestedLinkRelation::Descendant => out.push(format!(
-                    "{} is already linked and is nested inside this folder — both links would race over the same files",
-                    conflict.other_path
-                )),
-                NestedLinkRelation::Same => {
-                    out.push(format!("{} is already linked", conflict.other_path))
-                }
-            }
+        for conflict in self.nested_conflicts.iter().filter(|c| !c.is_structural()) {
+            out.push(format!("{} is already linked", conflict.other_path));
         }
         if let Some(loc) = &self.risky_location {
             match loc {
@@ -337,8 +360,8 @@ fn scan_directory(root: &Path) -> ScanResult {
         // nothing about it collides with a name the engine itself would
         // ever construct), while an artefact-shaped path is a genuine
         // naming collision worth calling out by name before the user
-        // links the folder at all — surfacing exactly what design §10
-        // calls a reserved-namespace collision, rather than folding it
+        // links the folder at all — surfacing what is a
+        // reserved-namespace collision, rather than folding it
         // silently into the ordinary ignored-file count.
         //
         // The daemon's own top-level files -- the sync-root lock
@@ -387,37 +410,96 @@ fn scan_directory(root: &Path) -> ScanResult {
     }
 }
 
+/// A path as a comparable component list: symlinks resolved (through the
+/// deepest ancestor that exists, so a folder not created yet still compares
+/// by where it will be), and case-folded where the platform's filesystems
+/// fold, so two spellings of one folder never compare as two.
+fn comparable_components(path: &Path) -> Vec<String> {
+    let mut missing = Vec::new();
+    let mut probe = path.to_path_buf();
+    let resolved = loop {
+        match probe.canonicalize() {
+            Ok(real) => break real,
+            Err(_) => match (probe.file_name().map(|n| n.to_os_string()), probe.parent()) {
+                (Some(name), Some(parent)) => {
+                    missing.push(name);
+                    probe = parent.to_path_buf();
+                }
+                _ => break path.to_path_buf(),
+            },
+        }
+    };
+    let mut full = resolved;
+    full.extend(missing.into_iter().rev());
+    full.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => {
+                let name = name.to_string_lossy().into_owned();
+                Some(if cfg!(any(target_os = "macos", windows)) {
+                    name.to_lowercase()
+                } else {
+                    name
+                })
+            }
+            std::path::Component::Prefix(prefix) => {
+                Some(prefix.as_os_str().to_string_lossy().to_lowercase())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// How `other` (an already-linked path) relates to `candidate`, comparing
+/// resolved, case-folded components, or `None` when they are unrelated.
+fn relation_to(candidate: &[String], other: &Path) -> Option<NestedLinkRelation> {
+    let other = comparable_components(other);
+    if other == candidate {
+        Some(NestedLinkRelation::Same)
+    } else if candidate.starts_with(&other) {
+        Some(NestedLinkRelation::Ancestor)
+    } else if other.starts_with(candidate) {
+        Some(NestedLinkRelation::Descendant)
+    } else {
+        None
+    }
+}
+
 /// Ancestor/descendant/exact-match detection against every already-linked
-/// path — both `local_path` and every entry of `existing_link_paths` are
-/// expected to already be absolute/canonical (the CLI canonicalizes before
-/// calling this; the daemon's own `links` table only ever stores paths the
-/// CLI canonicalized), so a plain `Path::starts_with` comparison is a
-/// correct ancestor test without needing to re-canonicalize here.
+/// path, by resolved and case-folded location rather than by spelling.
 fn detect_nested_conflicts(
     local_path: &Path,
     existing_link_paths: &[String],
 ) -> Vec<NestedLinkConflict> {
-    let mut conflicts = Vec::new();
-    for other in existing_link_paths {
-        let other_path = Path::new(other);
-        if other_path == local_path {
-            conflicts.push(NestedLinkConflict {
-                other_path: other.clone(),
-                relation: NestedLinkRelation::Same,
-            });
-        } else if local_path.starts_with(other_path) {
-            conflicts.push(NestedLinkConflict {
-                other_path: other.clone(),
-                relation: NestedLinkRelation::Ancestor,
-            });
-        } else if other_path.starts_with(local_path) {
-            conflicts.push(NestedLinkConflict {
-                other_path: other.clone(),
-                relation: NestedLinkRelation::Descendant,
-            });
-        }
-    }
-    conflicts
+    let candidate = comparable_components(local_path);
+    existing_link_paths
+        .iter()
+        .filter_map(|other| {
+            relation_to(&candidate, Path::new(other))
+                .map(|relation| NestedLinkConflict { other_path: other.clone(), relation })
+        })
+        .collect()
+}
+
+/// The conflicts that make linking `local_path` to `group_id` an unsupported
+/// topology, given every existing link as `(path, group)`: a link inside or
+/// containing another (whatever its group), and the same folder already
+/// linked to a different group. The same folder already linked to THIS group
+/// is an idempotent re-link, not a conflict. Evaluated by the daemon at the
+/// point a link is committed, where no acknowledgement can reach it.
+pub fn detect_topology_conflicts(
+    local_path: &Path,
+    group_id: &str,
+    existing_links: &[(String, String)],
+) -> Vec<NestedLinkConflict> {
+    let candidate = comparable_components(local_path);
+    existing_links
+        .iter()
+        .filter_map(|(other, other_group)| {
+            let relation = relation_to(&candidate, Path::new(other))?;
+            (relation != NestedLinkRelation::Same || other_group != group_id)
+                .then(|| NestedLinkConflict { other_path: other.clone(), relation })
+        })
+        .collect()
 }
 
 fn detect_risky_location(path: &Path) -> Option<RiskyLocation> {

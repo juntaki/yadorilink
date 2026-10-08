@@ -80,9 +80,13 @@ pub enum LoginEvent {
     WaitingForApproval { expires_in: Duration },
     /// Waiting for the browser to come back to the loopback redirect.
     WaitingForAuthorization,
-    /// Device-code flow only: the verification page and the code to enter on
-    /// it, deliberately never the URI with the code already in it.
-    ShowDeviceCode { verification_uri: String, user_code: String },
+    /// Device-code flow only: the verification page, the URI with the code
+    /// already in it when the server sent one, and the code itself.
+    ShowDeviceCode {
+        verification_uri: String,
+        verification_uri_complete: Option<String>,
+        user_code: String,
+    },
     /// Signed in; the credential store now holds this installation's
     /// credential.
     SignedIn { client_id: String },
@@ -105,7 +109,7 @@ pub async fn login(device: bool, mut sink: impl FnMut(LoginEvent)) -> Result<(),
         return Err(already_enrolled());
     }
 
-    let base_url = crate::coordination::http_client::coordination_http_addr();
+    let base_url = crate::coordination::http_client::coordination_addr();
     let http = crate::coordination::http_client::client()?;
 
     // 1. The port this machine will receive its redirect on, decided by the
@@ -156,6 +160,7 @@ pub async fn login(device: bool, mut sink: impl FnMut(LoginEvent)) -> Result<(),
         let authorization = client.request_device_authorization(LOGIN_SCOPE).await?;
         sink(LoginEvent::ShowDeviceCode {
             verification_uri: authorization.verification_uri.clone(),
+            verification_uri_complete: authorization.verification_uri_complete.clone(),
             user_code: authorization.user_code.clone(),
         });
         loop {

@@ -355,11 +355,12 @@ fn grant(target: &str, lease: &str) -> Option<PeerHandoffTicketGrant> {
 
 fn link(group_id: &str) -> FolderLink {
     FolderLink {
-        local_path: "/home/alice/Photos".to_string(),
+        location: yadorilink_replica_domain::session_state::LinkLocation::Folder(
+            "/home/alice/Photos".to_string(),
+        ),
         group_id: group_id.to_string(),
         paused: false,
         materialization_policy: MaterializationPolicy::Eager,
-        max_local_size_bytes: None,
         orphaned: false,
     }
 }

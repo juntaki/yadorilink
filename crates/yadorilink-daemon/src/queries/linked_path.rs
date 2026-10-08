@@ -23,4 +23,9 @@ impl LinkedPathResolver {
     pub(crate) fn resolve(&self, absolute_path: &str) -> Option<(String, String)> {
         crate::shell_status::resolve_group_and_rel_path(&self.sync_state, absolute_path)
     }
+
+    /// The same for a path inside a File Provider location (a provider root has no directory).
+    pub(crate) fn resolve_provider(&self, absolute_path: &str) -> Option<(String, String)> {
+        crate::shell_status::resolve_provider_group_and_rel_path(&self.sync_state, absolute_path)
+    }
 }

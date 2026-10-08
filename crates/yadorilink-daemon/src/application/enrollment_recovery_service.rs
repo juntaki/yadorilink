@@ -164,7 +164,7 @@ impl EnrollmentRecoveryService {
         for marker in scan.valid {
             let local_link = local_links
                 .iter()
-                .find(|l| l.local_path == marker.local_path && l.group_id == marker.group_id);
+                .find(|l| l.key() == marker.local_path && l.group_id == marker.group_id);
             match local_link {
                 Some(link) => {
                     // Gate remote activation on the durable journal row
@@ -264,13 +264,13 @@ impl EnrollmentRecoveryService {
                             // marker commit together -- see
                             // `EnrollmentLinkPort::rollback`'s own doc
                             // comment.
-                            match self.links.rollback(&link.local_path, &marker.operation_id).await
+                            match self.links.rollback(link.key(), &marker.operation_id).await
                             {
                                 Ok(()) => {
                                     tracing::info!(
                                         operation_id = %marker.operation_id,
                                         group_id = %marker.group_id,
-                                        local_path = %link.local_path,
+                                        local_path = %link.key(),
                                         "coordination-side authorization for this link is gone; \
                                          marked orphaned (on-disk files left untouched)"
                                     );
@@ -278,7 +278,7 @@ impl EnrollmentRecoveryService {
                                 Err(e) => tracing::warn!(
                                     error = %e,
                                     operation_id = %marker.operation_id,
-                                    local_path = %link.local_path,
+                                    local_path = %link.key(),
                                     "failed to mark link orphaned; leaving the pending-enrollment \
                                      marker in place for the next sweep to retry"
                                 ),
@@ -493,6 +493,7 @@ impl EnrollmentRecoveryService {
                                 &operation.operation_id,
                                 group_name,
                                 &operation.device_id,
+                                &operation.storage_mode,
                             )
                             .await
                     }
@@ -563,9 +564,9 @@ impl EnrollmentRecoveryService {
                         return;
                     }
                 };
-                let matching_link = links.into_iter().find(|link| {
-                    link.local_path == operation.local_path && link.group_id == group_id
-                });
+                let matching_link = links
+                    .into_iter()
+                    .find(|link| link.key() == operation.local_path && link.group_id == group_id);
                 // Full-identity match -- path+group alone isn't enough,
                 // since an unrelated pre-existing link could coincidentally
                 // share both.
@@ -654,7 +655,7 @@ impl EnrollmentRecoveryService {
                     Err(_) => return,
                 };
                 let has_matching_link = links.iter().any(|link| {
-                    link.local_path == operation.local_path
+                    link.key() == operation.local_path
                         && Some(link.group_id.as_str()) == operation.group_id.as_deref()
                 });
                 if has_matching_link {

@@ -153,9 +153,24 @@ pub enum Op {
     /// a large count here means the attribution is incomplete, and the
     /// split above is not yet a partition of anything.
     BlockReadOther = 20,
+
+    // ---- receive-side file publication ----
+    //
+    // Each of these sits on the path that turns a received version into a
+    // visible file: they say where a receive's wall time goes between "the
+    // bytes are in the block store" and "the file is published".
+    /// `sync_all` of the finished temp file, before it is renamed into place.
+    FileFsync = 22,
+    /// `fsync` of the destination's parent directory after a rename (also
+    /// after a placeholder publish). Calls against
+    /// [`distinct_parent_dirs`] says how much a coalescing of these could
+    /// save.
+    DirFsync = 23,
+    /// The temp-file-to-final-name rename of a reconstructed file.
+    Rename = 24,
 }
 
-const OP_COUNT: usize = 22;
+const OP_COUNT: usize = 25;
 
 const OP_NAMES: [&str; OP_COUNT] = [
     "submit",
@@ -180,6 +195,9 @@ const OP_NAMES: [&str; OP_COUNT] = [
     "block_read_compaction",
     "block_read_other",
     "block_read_custody_evidence",
+    "file_fsync",
+    "dir_fsync",
+    "rename",
 ];
 
 /// Who asked for a block read. Set by the caller, read by the store.
@@ -359,8 +377,83 @@ pub fn set_enabled(on: bool) {
     ENABLED.store(on, Ordering::Relaxed);
 }
 
+/// Parents of directories fsynced after a publish, by path hash: how many
+/// DISTINCT directories the run's publishes touched. Only touched when
+/// armed, and only by the publish path, so the lock is off the hot path of
+/// an unarmed process.
+static PUBLISH_PARENTS: std::sync::Mutex<ParentSet> =
+    std::sync::Mutex::new(ParentSet { set: None, saturated: false });
+
+/// Most distinct directories remembered. Past it nothing more is inserted
+/// and the count is a lower bound (see [`parent_dirs_saturated`]).
+const PARENT_CAP: usize = 1_000_000;
+
+struct ParentSet {
+    set: Option<std::collections::HashSet<u64>>,
+    saturated: bool,
+}
+
+impl ParentSet {
+    fn note(&mut self, hash: u64, cap: usize) {
+        let set = self.set.get_or_insert_with(Default::default);
+        if set.len() >= cap {
+            if !set.contains(&hash) {
+                self.saturated = true;
+            }
+            return;
+        }
+        set.insert(hash);
+    }
+
+    fn count(&self) -> u64 {
+        self.set.as_ref().map_or(0, |s| s.len() as u64)
+    }
+}
+
+/// Notes that a directory fsync was issued for `dir`. No-op when unarmed.
+pub fn note_dir_fsync(dir: &std::path::Path) {
+    if !enabled() {
+        return;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    dir.hash(&mut hasher);
+    PUBLISH_PARENTS.lock().unwrap_or_else(|p| p.into_inner()).note(hasher.finish(), PARENT_CAP);
+}
+
+/// How many distinct directories [`note_dir_fsync`] has seen; a lower bound
+/// when [`parent_dirs_saturated`].
+pub fn distinct_parent_dirs() -> u64 {
+    PUBLISH_PARENTS.lock().unwrap_or_else(|p| p.into_inner()).count()
+}
+
+/// Whether the directory set hit its cap and stopped growing.
+pub fn parent_dirs_saturated() -> bool {
+    PUBLISH_PARENTS.lock().unwrap_or_else(|p| p.into_inner()).saturated
+}
+
+#[cfg(test)]
+mod parent_set_tests {
+    use super::ParentSet;
+
+    #[test]
+    fn the_set_stops_growing_at_its_cap_and_reports_saturation() {
+        let mut p = ParentSet { set: None, saturated: false };
+        for h in 0..3 {
+            p.note(h, 3);
+        }
+        p.note(1, 3);
+        assert!(!p.saturated, "a repeat at the cap is not an overflow");
+        p.note(99, 3);
+        assert!(p.saturated);
+        assert_eq!(p.count(), 3);
+    }
+}
+
 /// Zeroes every counter. Call between measured runs.
 pub fn reset() {
+    *PUBLISH_PARENTS.lock().unwrap_or_else(|p| p.into_inner()) =
+        ParentSet { set: None, saturated: false };
     for i in 0..OP_COUNT {
         CALLS[i].store(0, Ordering::Relaxed);
         NANOS[i].store(0, Ordering::Relaxed);

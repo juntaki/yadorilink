@@ -80,17 +80,17 @@ chmod 644 "$STAGE_DIR/usr/share/keyrings/yadorilink-archive-keyring.gpg"
 
 cat > "$STAGE_DIR/etc/apt/sources.list.d/yadorilink.sources" <<'EOF'
 Types: deb
-URIs: https://yadorilink.juntaki.com/apt
+URIs: https://control.yadori.link/apt
 Suites: stable
 Components: main
 Signed-By: /usr/share/keyrings/yadorilink-archive-keyring.gpg
 EOF
 chmod 644 "$STAGE_DIR/etc/apt/sources.list.d/yadorilink.sources"
 
-install -m 644 "$REPO_ROOT/LICENSE-MIT" "$STAGE_DIR/usr/share/doc/yadorilink-archive-keyring/LICENSE-MIT"
+install -m 644 "$REPO_ROOT/LICENSE" "$STAGE_DIR/usr/share/doc/yadorilink-archive-keyring/LICENSE"
 
 # Debian Policy 12.5: every package ships /usr/share/doc/<pkg>/copyright,
-# named exactly that -- LICENSE-MIT above satisfies "the license text is
+# named exactly that -- LICENSE above satisfies "the license text is
 # present" but not this specific, separately-checked requirement.
 cat > "$STAGE_DIR/usr/share/doc/yadorilink-archive-keyring/copyright" <<'EOF'
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
@@ -99,11 +99,11 @@ Source: https://github.com/juntaki/yadorilink
 
 Files: *
 Copyright: 2026 Jumpei Takiyasu
-License: MIT
+License: AGPL-3.0-only
 
-License: MIT
- See /usr/share/doc/yadorilink-archive-keyring/LICENSE-MIT (installed from
- this repository's LICENSE-MIT at build time).
+License: AGPL-3.0-only
+ See /usr/share/doc/yadorilink-archive-keyring/LICENSE (installed from
+ this repository's LICENSE at build time).
 EOF
 chmod 644 "$STAGE_DIR/usr/share/doc/yadorilink-archive-keyring/copyright"
 
@@ -136,7 +136,7 @@ Architecture: all
 Maintainer: yadorilink project <juntaki@users.noreply.github.com>
 Description: yadorilink APT repository signing key and sources entry
  Installs the public signing key for the yadorilink APT repository
- (https://yadorilink.juntaki.com/apt) and a deb822 sources entry
+ (https://control.yadori.link/apt) and a deb822 sources entry
  (/etc/apt/sources.list.d/yadorilink.sources) scoped to that key. Installing
  this package registers the repository; it does not install yadorilink
  itself and never runs 'apt-get update' on your behalf -- run that (and

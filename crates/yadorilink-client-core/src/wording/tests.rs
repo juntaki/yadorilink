@@ -147,19 +147,27 @@ fn membership_notices_name_each_completed_handoff() {
 
 #[test]
 fn device_code_instructions_match_the_credential_clients_own_text() {
-    let authorization: yadorilink_fapi_client::DeviceAuthorization =
-        serde_json::from_value(serde_json::json!({
+    for complete in [Some("https://as.test/device?user_code=ABCD-EFGH"), None] {
+        let mut body = serde_json::json!({
             "device_code": "dc",
             "user_code": "ABCD-EFGH",
             "verification_uri": "https://as.test/device",
-            "verification_uri_complete": "https://as.test/device?user_code=ABCD-EFGH",
             "expires_in": 600,
-        }))
-        .unwrap();
-    assert_eq!(
-        device_code_instructions(&authorization.verification_uri, &authorization.user_code),
-        authorization.instructions()
-    );
+        });
+        if let Some(c) = complete {
+            body["verification_uri_complete"] = c.into();
+        }
+        let authorization: yadorilink_fapi_client::DeviceAuthorization =
+            serde_json::from_value(body).unwrap();
+        assert_eq!(
+            device_code_instructions(
+                &authorization.verification_uri,
+                authorization.verification_uri_complete.as_deref(),
+                &authorization.user_code
+            ),
+            authorization.instructions()
+        );
+    }
 }
 
 /// The exact lines a terminal shows for each sign-in step, in the order the
@@ -195,6 +203,18 @@ fn login_event_lines_are_pinned_verbatim() {
     assert_eq!(
         login_event_lines(&LoginEvent::ShowDeviceCode {
             verification_uri: "https://as.test/device".into(),
+            verification_uri_complete: Some("https://as.test/device?user_code=ABCD-EFGH".into()),
+            user_code: "ABCD-EFGH".into(),
+        }),
+        vec!["\nTo finish signing in, open this link on any device (your phone is fine) and check \
+              that the code shown there matches:\n\n  https://as.test/device?user_code=ABCD-EFGH\n\n  \
+              Code: ABCD-EFGH\n"
+            .to_string()]
+    );
+    assert_eq!(
+        login_event_lines(&LoginEvent::ShowDeviceCode {
+            verification_uri: "https://as.test/device".into(),
+            verification_uri_complete: None,
             user_code: "ABCD-EFGH".into(),
         }),
         vec!["\nTo finish signing in, open https://as.test/device on any device and enter this \

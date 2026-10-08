@@ -207,7 +207,6 @@ fn an_absence_proof_publishes_nothing_once_the_root_it_was_admitted_against_is_g
         &coordinator,
         GROUP,
         PATH,
-        &[],
         ExactActualState::Absent,
         generation,
         &operation.permit(),
@@ -225,7 +224,7 @@ fn an_absence_proof_publishes_nothing_once_the_root_it_was_admitted_against_is_g
 
 /// Access hydration's proof heal has the same window.
 ///
-/// The lane re-verified a `Hydrated` row's bytes, identity, mode and
+/// The lane re-verified a `Present` row's bytes, identity, mode and
 /// xattrs and now re-publishes its proof under the live fence. If the root
 /// is swapped after that check began and before the proof commits, the
 /// heal must fail and publish nothing: a proof committed first and a
@@ -240,7 +239,7 @@ fn a_hydrated_proof_heal_publishes_nothing_once_the_root_it_was_admitted_against
         .set_materialization_state(
             GROUP,
             PATH,
-            MaterializationState::Hydrated,
+            MaterializationState::Present,
             &RootCommitPermit::for_tests(),
         )
         .unwrap();
@@ -264,14 +263,8 @@ fn a_hydrated_proof_heal_publishes_nothing_once_the_root_it_was_admitted_against
         "fixture check: the root must really look lost, or this test proves nothing"
     );
 
-    let outcome = coordinator.reprove_hydrated_file(
-        GROUP,
-        PATH,
-        &version,
-        identity,
-        row.authoring_change_hash.as_ref(),
-        &operation.permit(),
-    );
+    let outcome =
+        coordinator.reprove_hydrated_file(GROUP, PATH, &version, identity, &operation.permit());
 
     assert!(outcome.is_err(), "a proof heal under a lost root must fail");
     assert!(
@@ -291,7 +284,7 @@ fn a_hydrated_proof_heal_under_a_live_root_still_publishes() {
         .set_materialization_state(
             GROUP,
             PATH,
-            MaterializationState::Hydrated,
+            MaterializationState::Present,
             &RootCommitPermit::for_tests(),
         )
         .unwrap();
@@ -305,14 +298,7 @@ fn a_hydrated_proof_heal_under_a_live_root_still_publishes() {
     let operation = lease.begin_operation().unwrap();
 
     let published = coordinator
-        .reprove_hydrated_file(
-            GROUP,
-            PATH,
-            &row.version_hash(),
-            identity,
-            row.authoring_change_hash.as_ref(),
-            &operation.permit(),
-        )
+        .reprove_hydrated_file(GROUP, PATH, &row.version_hash(), identity, &operation.permit())
         .unwrap();
 
     assert!(published, "a live root's heal must publish");

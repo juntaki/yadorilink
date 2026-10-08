@@ -72,6 +72,7 @@ test-support = [
     "yadorilink-sync-sqlite/test-support",
     "yadorilink-sqlite-runtime/test-support",
     "yadorilink-root-authority/test-support",
+    "yadorilink-replica-domain/test-support",
 ]
 
 [dependencies]
@@ -79,7 +80,6 @@ async-trait = "0.1"
 bytes.workspace = true
 yadorilink-local-capture = { path = "../yadorilink-local-capture" }
 yadorilink-sync-sqlite = { path = "../yadorilink-sync-sqlite" }
-yadorilink-rbsr = { path = "../yadorilink-rbsr" }
 yadorilink-sync-protocol = { path = "../yadorilink-sync-protocol" }
 yadorilink-sync-runtime = { path = "../yadorilink-sync-runtime" }
 yadorilink-lane-ports = { path = "../yadorilink-lane-ports" }
@@ -150,7 +150,7 @@ ed25519-dalek = { version = "3", features = ["rand_core"] }
 # — already present in Cargo.lock as a transitive dependency
 # elsewhere in the workspace; this is its first direct use.
 semver = "1"
-base64 = "0.22"
+base64 = "0.23"
 rand = "0.10.2"
 # WebSocket client for the coordination plane's `/netmap/subscribe` route,
 # the sole netmap subscription transport. rustls-tls-webpki-roots to match
@@ -204,7 +204,6 @@ yadorilink-sync-substrate = { path = "../yadorilink-sync-substrate", features = 
 # `tests/metadata_propagation.rs` sets and reads a `user.` extended attribute
 # directly, to state the invariant against the real file rather than against
 # whatever the crate's own writer believes it wrote.
-libc = "0.2"
 # This crate's own `tests/*.rs` integration binaries link against
 # `yadorilink-daemon` as an ordinary external library, so `#[cfg(test)]` is
 # never active for it there --
@@ -217,10 +216,9 @@ yadorilink-daemon = { path = ".", features = ["test-support"] }
 # reachable from this crate's own `#[cfg(test)]` unit tests and integration
 # binaries, same reason as the two overrides above. Deliberately does NOT
 # also enable `yadorilink-filesystem-sync`'s separate
-# `evict-custody-test-bypass` feature: this crate's own eviction tests
-# (`preflight_disk_pressure_runs_eviction_sweep_for_on_demand_link_first`,
-# `gc::tests::eviction_without_remote_lease_never_reaches_physical_reclaim`)
-# assert that an instantaneous custody confirmation without a durable
+# `evict-custody-test-bypass` feature: this crate's own eviction test
+# (`gc::tests::eviction_without_remote_lease_never_reaches_physical_reclaim`)
+# asserts that an instantaneous custody confirmation without a durable
 # remote lease must NOT authorize physical block deletion, so they need the
 # real `verify_reclaim_custody`, not the bypass.
 yadorilink-filesystem-sync = { path = "../yadorilink-filesystem-sync", features = ["test-support"] }
@@ -272,6 +270,11 @@ wiremock = "0.6"
 # cannot see an ignore attribute at all and could also be fooled by a
 # comment or string literal that happens to contain the same text.
 syn = { version = "3", features = ["full"] }
+
+# Raising the open-file limit at startup (`fd_limit`), and the test-only
+# `user.` xattr access in `tests/metadata_propagation.rs`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

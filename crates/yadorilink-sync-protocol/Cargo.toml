@@ -7,7 +7,6 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-yadorilink-rbsr = { path = "../yadorilink-rbsr" }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

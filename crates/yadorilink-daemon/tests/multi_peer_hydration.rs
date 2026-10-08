@@ -165,33 +165,23 @@ async fn seed_published_serving_placeholder(
         .state
         .device_signing_key()
         .expect("the checkpoint authority assigns every device a signing key");
-    let emitter = yadorilink_sync_sqlite::dag_store::ChangeEmitter::new(
-        device.device_id.clone(),
+    let emitter = yadorilink_daemon::test_support::local_seam::replica_author_key(
+        &device.state.replica_coordinator,
+        &device.device_id,
         signing_key,
-    );
-    device
-        .state
-        .replica_coordinator
-        .upsert_file_emitting_change(
-            GROUP,
-            &record,
-            &device.device_id,
-            yadorilink_replica_domain::session_state::ChangeContent {
-                ops: vec![yadorilink_replica_domain::change::Op::Put {
-                    path: yadorilink_replica_domain::ids::SyncPath(PATH.to_string()),
-                    version: version.version_hash,
-                    origin: yadorilink_replica_domain::change::PutOrigin::Direct,
-                }],
-                versions: std::slice::from_ref(&version),
-            },
-            None,
-            None,
-            yadorilink_daemon::replica_coordinator::ReplicaChangeEmission {
-                emitter: &emitter,
-                permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-            },
-        )
-        .unwrap();
+    )
+    .unwrap();
+    yadorilink_daemon::test_support::local_seam::commit_local_upsert(
+        &device.state.replica_coordinator,
+        GROUP,
+        &record,
+        &device.device_id,
+        &version,
+        None,
+        &emitter,
+        &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+    )
+    .unwrap();
     finish_seed(device, owned_blocks, data_by_hash);
     // Pending is not servable. In production a checkpoint flush is triggered
     // by a new local mutation's broadcast or by a reconnect; this fixture
@@ -256,7 +246,7 @@ fn finish_seed(
         .set_materialization_state(
             GROUP,
             PATH,
-            MaterializationState::Placeholder,
+            MaterializationState::Remote,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
@@ -279,8 +269,7 @@ fn finish_seed(
         device
             .state
             .replica_coordinator
-            .change_history_repository()
-            .record_group_block_provenance(GROUP, std::slice::from_ref(&block.hash))
+            .record_block_provenance(GROUP, std::slice::from_ref(&block.hash))
             .unwrap();
     }
 }
@@ -314,14 +303,10 @@ async fn transports_and_nodes(
         yadorilink_peer_session::ports::SessionTransports {
             blocks: transports_a.clone(),
             service: transports_a.clone(),
-            prepared_snapshots: Arc::new(yadorilink_lane_ports::PreparedSnapshots::new()),
-            snapshot_fetch: transports_a,
         },
         yadorilink_peer_session::ports::SessionTransports {
             blocks: transports_b.clone(),
             service: transports_b.clone(),
-            prepared_snapshots: Arc::new(yadorilink_lane_ports::PreparedSnapshots::new()),
-            snapshot_fetch: transports_b,
         },
     )
 }
@@ -351,10 +336,8 @@ async fn connect_as_peer(hydrating: &TestDevice, peer: &TestDevice) {
         replica_engine_to_peer_1,
         hydrating_peer_store_1,
         vec![GROUP.to_string()],
-        HashMap::from([(GROUP.to_string(), hydrating.root.path().to_path_buf())]),
         transports_to_peer,
-        None,
-        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::test_permissive(),
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::denied(),
     );
     // Every real (`DaemonState`-backed) session has a block-serve engine
     // installed by the orchestrator; without one, an incoming
@@ -390,10 +373,8 @@ async fn connect_as_peer(hydrating: &TestDevice, peer: &TestDevice) {
         replica_engine_from_hydrating_1,
         peer_peer_store_1,
         vec![GROUP.to_string()],
-        HashMap::from([(GROUP.to_string(), peer.root.path().to_path_buf())]),
         transports_from_hydrating,
-        None,
-        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::test_permissive(),
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::denied(),
     );
     session_from_hydrating.set_block_serve_engine(peer.state.block_serve_engine.clone());
     node_peer.serve_with(&hydrating.device_id, session_from_hydrating.clone());
@@ -462,7 +443,7 @@ async fn blocks_split_across_two_peers_each_holding_a_disjoint_subset() {
             .materialization_state_repository()
             .get_materialization_state(GROUP, PATH)
             .unwrap(),
-        Some(MaterializationState::Hydrated)
+        Some(MaterializationState::Present)
     );
     let reconstructed = std::fs::read(device_d.root.path().join(PATH)).unwrap();
     assert_eq!(reconstructed, content);
@@ -574,8 +555,12 @@ async fn a_block_missing_from_every_peer_fails_hydration_cleanly() {
         device_b
             .state
             .replica_coordinator
-            .change_history_repository()
-            .dag_group_file_version_references_block(GROUP, missing)
+            .database()
+            .read::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+                yadorilink_sync_sqlite::dag_store::published_view::published_group_file_version_references_block(
+                    conn, GROUP, missing,
+                )
+            })
             .unwrap(),
         "the serving peer must be authorized to serve the missing block's version -- otherwise \
          this test proves an authorization refusal, not the physical-absence path it names"
@@ -591,7 +576,7 @@ async fn a_block_missing_from_every_peer_fails_hydration_cleanly() {
             .materialization_state_repository()
             .get_materialization_state(GROUP, PATH)
             .unwrap(),
-        Some(MaterializationState::Placeholder),
+        Some(MaterializationState::Remote),
         "file must remain a placeholder, not end up stuck Hydrating or falsely Hydrated"
     );
     assert!(
@@ -686,7 +671,7 @@ async fn ordinary_hydration_error_restores_placeholder_state() {
             .materialization_state_repository()
             .get_materialization_state(GROUP, PATH)
             .unwrap(),
-        Some(MaterializationState::Placeholder),
+        Some(MaterializationState::Remote),
         "ordinary hydration errors must not leave the file stuck Hydrating"
     );
 }
@@ -724,73 +709,9 @@ async fn corrupt_local_block_restores_placeholder_state() {
             .materialization_state_repository()
             .get_materialization_state(GROUP, PATH)
             .unwrap(),
-        Some(MaterializationState::Placeholder),
+        Some(MaterializationState::Remote),
         "corrupt-block hydration failure must restore Placeholder"
     );
-}
-
-/// `hydration::pin`'s multi-session dispatch path — the pin
-/// flag is set correctly alongside successful multi-peer hydration.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn pin_hydrates_via_multiple_peers_and_sets_the_pin_flag() {
-    let content = big_content();
-    let (blocks, data_by_hash) = chunk_content(&content);
-    let half = blocks.len() / 2;
-
-    let device_b = new_device("device-b");
-    let device_c = new_device("device-c");
-    let device_d = new_device("device-d");
-
-    let _authority = support::shared_checkpoint_authority(
-        &[
-            ("device-b", &device_b.state),
-            ("device-c", &device_c.state),
-            ("device-d", &device_d.state),
-        ],
-        &[GROUP.to_string()],
-    )
-    .await;
-
-    seed_published_serving_placeholder(
-        &device_b,
-        &blocks,
-        content.len() as u64,
-        &blocks[..half],
-        &data_by_hash,
-    )
-    .await;
-    seed_published_serving_placeholder(
-        &device_c,
-        &blocks,
-        content.len() as u64,
-        &blocks[half..],
-        &data_by_hash,
-    )
-    .await;
-    seed_placeholder(&device_d, &blocks, content.len() as u64, &[], &data_by_hash);
-
-    connect_as_peer(&device_d, &device_b).await;
-    connect_as_peer(&device_d, &device_c).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    hydration::pin(&device_d.state, GROUP, PATH).await.unwrap();
-
-    assert_eq!(
-        device_d
-            .state
-            .replica_coordinator
-            .materialization_state_repository()
-            .get_materialization_state(GROUP, PATH)
-            .unwrap(),
-        Some(MaterializationState::Hydrated)
-    );
-    assert!(device_d
-        .state
-        .replica_coordinator
-        .file_index_repository()
-        .is_pinned(GROUP, PATH)
-        .unwrap());
-    assert_eq!(std::fs::read(device_d.root.path().join(PATH)).unwrap(), content);
 }
 
 /// the file-level deadline bounds the *whole* multi-session
@@ -845,10 +766,8 @@ async fn hydration_deadline_bounds_an_unresponsive_peer() {
         replica_engine_d_to_b_1,
         device_d_peer_store_1,
         vec![GROUP.to_string()],
-        HashMap::from([(GROUP.to_string(), device_d.root.path().to_path_buf())]),
         transports_d,
-        None,
-        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::test_permissive(),
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::denied(),
     );
     device_d.state.peers.register_session(
         device_b.device_id.clone(),
@@ -873,7 +792,7 @@ async fn hydration_deadline_bounds_an_unresponsive_peer() {
             .materialization_state_repository()
             .get_materialization_state(GROUP, PATH)
             .unwrap(),
-        Some(MaterializationState::Placeholder)
+        Some(MaterializationState::Remote)
     );
 }
 
@@ -919,10 +838,8 @@ async fn silent_peer_is_detected_within_the_sized_per_block_deadline() {
         replica_engine_d_to_b_2,
         device_d_peer_store_2,
         vec![GROUP.to_string()],
-        HashMap::from([(GROUP.to_string(), device_d.root.path().to_path_buf())]),
         transports_d,
-        None,
-        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::test_permissive(),
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::denied(),
     );
 
     // A modest, arbitrary size (well below `DEFAULT_BLOCK_SIZE`) -- large
@@ -983,10 +900,8 @@ async fn cancelled_hydration_restores_placeholder_state() {
         replica_engine_3,
         hydrating_peer_store_3,
         vec![GROUP.to_string()],
-        HashMap::from([(GROUP.to_string(), hydrating.root.path().to_path_buf())]),
         transports_hydrating,
-        None,
-        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::test_permissive(),
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::denied(),
     );
     hydrating.state.peers.register_session(
         peer.device_id.clone(),
@@ -1023,7 +938,7 @@ async fn cancelled_hydration_restores_placeholder_state() {
             .materialization_state_repository()
             .get_materialization_state(GROUP, PATH)
             .unwrap(),
-        Some(MaterializationState::Placeholder),
+        Some(MaterializationState::Remote),
         "cancelling hydration must not leave the file stuck Hydrating"
     );
 }
@@ -1137,7 +1052,7 @@ async fn placeholder_with_all_local_blocks_hydrates_without_peers() {
             .materialization_state_repository()
             .get_materialization_state(GROUP, PATH)
             .unwrap(),
-        Some(MaterializationState::Hydrated)
+        Some(MaterializationState::Present)
     );
     assert_eq!(std::fs::read(device.root.path().join(PATH)).unwrap(), content);
 }
@@ -1217,7 +1132,7 @@ async fn retained_last_local_copy_remains_user_accessible_offline() {
         .set_materialization_state(
             GROUP,
             PATH,
-            MaterializationState::Hydrated,
+            MaterializationState::Present,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
@@ -1228,9 +1143,9 @@ async fn retained_last_local_copy_remains_user_accessible_offline() {
     // `DaemonState::full_replica_custody_confirmed`'s doc comment). This
     // test is about that custody gate, not the on-demand pipeline's own
     // real-vs-fake state, so connect the fake here (see
-    // `hydration::evict`'s own `on_demand_pipeline_is_connected` gate,
+    // `hydration::evict`'s own per-root on-demand gate,
     // checked before the custody gate).
-    device.state.set_test_placeholder_pipeline_connected(true);
+    device.state.set_test_on_demand_allowed(true);
     hydration::evict(&device.state, GROUP, PATH).unwrap();
     assert_eq!(
         device
@@ -1239,7 +1154,7 @@ async fn retained_last_local_copy_remains_user_accessible_offline() {
             .materialization_state_repository()
             .get_materialization_state(GROUP, PATH)
             .unwrap(),
-        Some(MaterializationState::Placeholder),
+        Some(MaterializationState::Remote),
         "eviction placeholders the on-disk file even when the blocks themselves are retained"
     );
     let hashes: Vec<_> = blocks.iter().map(|b| hex::encode(&b.hash)).collect();
@@ -1292,10 +1207,8 @@ async fn connect_as_peer_sharing_hydrating_rate_limiters(
         replica_engine_to_peer_2,
         hydrating_peer_store_2,
         vec![GROUP.to_string()],
-        HashMap::from([(GROUP.to_string(), hydrating.root.path().to_path_buf())]),
         transports_to_peer,
-        None,
-        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::test_permissive(),
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::denied(),
     );
     session_to_peer.set_rate_limiters(hydrating.state.rate_limiters.clone());
     // See `connect_as_peer` on why the serve engine must be installed on
@@ -1326,10 +1239,8 @@ async fn connect_as_peer_sharing_hydrating_rate_limiters(
         replica_engine_from_hydrating_2,
         peer_peer_store_2,
         vec![GROUP.to_string()],
-        HashMap::from([(GROUP.to_string(), peer.root.path().to_path_buf())]),
         transports_from_hydrating,
-        None,
-        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::test_permissive(),
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::denied(),
     );
     // The serving peer's own upload bucket is irrelevant to this test (this
     // asserts on D's shared *download* bucket only) — left unlimited, the

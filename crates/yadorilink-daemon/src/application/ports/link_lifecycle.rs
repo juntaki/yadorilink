@@ -37,17 +37,29 @@ pub(crate) enum LinkOutcome {
     AlreadyLinked,
 }
 
+/// A provider-backed link has no directory: it names a display name and whether the owner created
+/// an empty group. The link key is a synthetic locator derived from the request token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderLinkTarget {
+    pub(crate) display_name: String,
+    pub(crate) empty_owner: bool,
+    /// The folder is created in on-demand mode (the OS fetches content on first access).
+    pub(crate) on_demand: bool,
+    /// Digest of the creation request (display name, group, policy) bound to the token.
+    pub(crate) creation_digest: String,
+}
+
 pub(crate) struct LinkCommand {
     pub(crate) local_path: String,
     pub(crate) group_id: String,
     pub(crate) on_demand: bool,
-    pub(crate) max_local_size_bytes: Option<i64>,
-    pub(crate) acknowledge_risks: bool,
     /// `None` for a plain `yadorilink link` -- no pending-enrollment
     /// marker is written. `Some` for a `share create`/`share
     /// join` link, coupling the link row and the marker in one
     /// transaction.
     pub(crate) pending_enrollment: Option<PendingEnrollmentLinkCommand>,
+    /// `Some` for a provider-backed link: the local_path is then its locator, never a directory.
+    pub(crate) provider: Option<ProviderLinkTarget>,
 }
 
 pub(crate) trait LinkRepositoryPort: Send + Sync {
@@ -56,9 +68,14 @@ pub(crate) trait LinkRepositoryPort: Send + Sync {
     /// only be linked to one folder on a device).
     fn live_link_paths_for_group(&self, group_id: &str) -> Result<Vec<String>, SyncError>;
 
-    /// Every currently-linked local path on this device -- used for the
-    /// nested-path preflight (ancestor/descendant/exact-match conflicts).
-    fn list_link_paths(&self) -> Result<Vec<String>, SyncError>;
+    /// Every currently-linked `(local path, group)` on this device -- used
+    /// for the unsupported-topology refusal (nested links, one folder linked
+    /// to two groups).
+    /// The `links` keys (paths for folder links, locators for provider links) of the group's live
+    /// links: identity strings, never to be opened.
+    fn live_link_keys_for_group(&self, group_id: &str) -> Result<Vec<String>, SyncError>;
+
+    fn list_link_paths_and_groups(&self) -> Result<Vec<(String, String)>, SyncError>;
 
     /// Commits the link row. Reports what that did to the row (inserted, or
     /// updated a row that already existed for the same path and group) so a
@@ -78,6 +95,7 @@ pub(crate) trait LinkRepositoryPort: Send + Sync {
         local_path: &str,
         group_id: &str,
         marker: &PendingEnrollmentLinkCommand,
+        provider: Option<&ProviderLinkTarget>,
     ) -> Result<LinkRowWrite, SyncError>;
 
     /// Undoes a [`Self::commit_plain_link`] whose setup failed: deletes a row
@@ -133,7 +151,6 @@ pub(crate) trait LinkWatcherPort: Send + Sync {
         local_path: &'a str,
         group_id: &'a str,
         on_demand: bool,
-        max_local_size_bytes: Option<i64>,
     ) -> BoxFuture<'a, Result<(), DaemonError>>;
 
     fn stop<'a>(&'a self, local_path: &'a str) -> BoxFuture<'a, ()>;

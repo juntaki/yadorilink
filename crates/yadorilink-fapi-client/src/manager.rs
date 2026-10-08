@@ -43,6 +43,20 @@
 //! from the store *inside* the lock rather than trusted from memory -- because
 //! the other process may have rotated it since this one last looked.
 //!
+//! # The crash window, and why the client has no recovery code
+//!
+//! Between the server rotating the token and this process's durable write
+//! there is a window no client ordering can close: a power loss or `SIGKILL`
+//! there leaves the disk holding the token the server just retired. The server
+//! closes it instead. For a short window after a rotation it accepts the
+//! retired token again from the same client, provided its successor was never
+//! used, and answers with a fresh successor in place of the unconfirmed one --
+//! so a restarted process simply refreshes with what the disk holds, and the
+//! response is persisted like any other rotation. A failed refresh is a single
+//! request that leaves the stored token untouched; there is no retry loop here,
+//! and the caller's next attempt re-presents the same token. The DPoP key is
+//! not part of that contract, because it is fresh in every process.
+//!
 //! A refresh that does *not* rotate is a failure, not a warning. This module
 //! used to log one, leave the spent token in the store, and hand the caller an
 //! access token: a session that was already over, reported as success, good for

@@ -46,17 +46,31 @@ WORKDIR /build
 # same as every other build in this repo (`installer/linux/build-deb.sh`,
 # CI's `cargo build --workspace`).
 COPY . .
-RUN cargo build --release --locked \
+# Release images talk to the production coordination service by default;
+# YADORILINK_COORDINATION_ADDR still overrides it at runtime. Plain local
+# builds leave this empty and fall back to loopback.
+ARG YADORILINK_DEFAULT_COORDINATION_ADDR=
+RUN if [ -z "$YADORILINK_DEFAULT_COORDINATION_ADDR" ]; then unset YADORILINK_DEFAULT_COORDINATION_ADDR; fi; \
+    cargo build --release --locked \
     --workspace --exclude yadorilink-desktop-app \
     --bin yadorilink-daemon
 
 FROM debian:bookworm-slim AS runtime
+# Git ref (release tag, or commit for nightly builds) the image was built from;
+# it names the corresponding source in /usr/share/doc/yadorilink/SOURCE.txt.
+ARG YADORILINK_SOURCE_REF=main
+LABEL org.opencontainers.image.source="https://github.com/juntaki/yadorilink" \
+      org.opencontainers.image.licenses="AGPL-3.0-only"
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --create-home --home-dir /var/lib/yadorilink --shell /usr/sbin/nologin yadorilink
 
 COPY --from=builder /build/target/release/yadorilink-daemon /usr/local/bin/yadorilink-daemon
+# AGPL-3.0 licence text and the pointer to the corresponding source.
+COPY --from=builder /build/LICENSE /usr/share/doc/yadorilink/LICENSE
+RUN printf 'Corresponding source: https://github.com/juntaki/yadorilink/tree/%s\n' "$YADORILINK_SOURCE_REF" \
+    > /usr/share/doc/yadorilink/SOURCE.txt
 
 # `device_config::config_dir()` (crates/yadorilink-daemon/src/device_config.rs)
 # honors YADORILINK_CONFIG_DIR -- point it at a volume so device identity,

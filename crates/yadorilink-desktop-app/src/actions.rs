@@ -334,18 +334,6 @@ pub async fn materialization_status(
     Ok(files::materialization_status(absolute_path).await?)
 }
 
-/// Force-hydrates a placeholder file and keeps it hydrated -- identical
-/// request `yadorilink pin <path>` sends.
-pub async fn pin_file(absolute_path: String) -> Result<(), IpcError> {
-    Ok(files::pin_file(absolute_path).await?)
-}
-
-/// Allows a pinned file to become a placeholder again -- identical
-/// request `yadorilink unpin <path>` sends.
-pub async fn unpin_file(absolute_path: String) -> Result<(), IpcError> {
-    Ok(files::unpin_file(absolute_path).await?)
-}
-
 /// Fetches a placeholder file's real content -- identical request
 /// `yadorilink hydrate <path>` sends.
 pub async fn hydrate_file(absolute_path: String) -> Result<(), IpcError> {
@@ -357,7 +345,7 @@ pub async fn hydrate_file(absolute_path: String) -> Result<(), IpcError> {
 /// whether the file was actually dehydrated (mirrors
 /// `commands::materialization::evict`'s own `EvictResponse.dehydrated`
 /// check -- a request that silently did nothing, e.g. the file is
-/// pinned/busy/not fully synced, must never read as success).
+/// busy/not fully synced, must never read as success).
 pub async fn evict_file(absolute_path: String) -> Result<bool, IpcError> {
     Ok(files::evict_file(absolute_path).await?)
 }

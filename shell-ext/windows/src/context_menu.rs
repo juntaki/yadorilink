@@ -1,12 +1,10 @@
 //! A classic `IContextMenu` handler (shows
 //! under Explorer's "Show more options" on Windows 11's default menu,
 //! or as a primary entry pre-11/with the classic-menu policy) exposing
-//! View Status / Pause / Resume / Pin / Evict, calling
+//! View Status / Pause / Resume / Evict, calling
 //! `ipc_client::send_context_action` for the same daemon operations
-//! `yadorilink pin`/`yadorilink evict`/etc. (control_socket) already expose to
-//! the CLI. Registered per-file-type as `*\shellex\ContextMenuHandlers`,
-//! matching the on-demand-sync spec's "Context Menu Actions Include Pin
-//! and Evict".
+//! `yadorilink evict`/etc. (control_socket) already expose to the CLI.
+//! Registered per-file-type as `*\shellex\ContextMenuHandlers`.
 
 use std::sync::Mutex;
 
@@ -31,21 +29,19 @@ enum Command {
     ViewStatus = 0,
     Pause = 1,
     Resume = 2,
-    Pin = 3,
-    Evict = 4,
+    Evict = 3,
     /// Per the shell-integration spec's "Shell Actions Can Open Desktop
     /// Status App": kept out of `COMMANDS` below since it's a pure UI
     /// action (spawns a companion process) rather
     /// than a daemon `ContextAction` — see `QueryContextMenu`/
     /// `InvokeCommand`'s special-cased handling of this id.
-    OpenStatusApp = 5,
+    OpenStatusApp = 4,
 }
 
-const COMMANDS: [(Command, &str, ContextAction); 5] = [
+const COMMANDS: [(Command, &str, ContextAction); 4] = [
     (Command::ViewStatus, "View yadorilink sync status", ContextAction::ViewStatus),
     (Command::Pause, "Pause yadorilink sync for this item", ContextAction::PauseItem),
     (Command::Resume, "Resume yadorilink sync for this item", ContextAction::ResumeItem),
-    (Command::Pin, "Pin (keep hydrated)", ContextAction::PinItem),
     (Command::Evict, "Evict (free disk space)", ContextAction::EvictItem),
 ];
 

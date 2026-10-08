@@ -5,7 +5,7 @@
 //! on a decision, and removal. A dedicated window rather than a section of
 //! the folder-detail window: `folder_status_window.rs` does mutate, but
 //! only this device's own local state (trash restore, version restore,
-//! pin/unpin, hydrate/evict), never who else can reach the folder.
+//! hydrate/evict), never who else can reach the folder.
 //! Granting and revoking access is a different blast radius and a
 //! different decision, so it gets its own window; that window's "Share…"
 //! button only launches this process.
@@ -1502,7 +1502,7 @@ pub mod preview {
         // and the sink is kept alive only because `ShareApp` owns one.
         let sink = EventSink::new(tx, Arc::new(|| {}));
         let mut app =
-            ShareApp::new("/Users/jumpei/Documents/Quarterly design review".to_string(), rx, sink);
+            ShareApp::new("/Users/alex/Documents/Quarterly design review".to_string(), rx, sink);
         app.folder = Folder::Linked { group_id: GROUP_ID.to_string() };
         app.own_device_id = Some("dev_self_0001".to_string());
         // Every scene has already "loaded": leaving this false would make

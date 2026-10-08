@@ -15,7 +15,7 @@
 //! entry"), and `scan_existing_files`'s walker skips anything that isn't
 //! a file or a symlink. `types::RecordKind::Directory` exists only as a
 //! wire-compatibility enum value (`domain_record_kind_from_proto`/
-//! `apply_incoming_wire_metadata`) -- it is never assigned by any local
+//! `apply_projected_metadata`) -- it is never assigned by any local
 //! scan or watch path. Consequently there is no directory-level tombstone,
 //! no "recursive delete" message, and no directory-rename decomposition
 //! anywhere in this engine: every scenario below reduces, one way or
@@ -57,7 +57,6 @@ use support::{
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_local_storage::SegmentBlockStore;
-use yadorilink_replica_domain::change::Op;
 
 use namespace_oracle::{check_trees_converge, disk_tree, sha256_hex, DiskNode, DiskTree};
 
@@ -281,7 +280,7 @@ async fn concurrent_directory_rename_to_different_targets() {
 /// "remove_dir"/directory-tombstone handling): there is none.
 /// `RecordKind::Directory` is the only directory-shaped thing either file
 /// deals with, and it's a wire-compatibility value only
-/// (`domain_record_kind_from_proto`/`apply_incoming_wire_metadata`),
+/// (`domain_record_kind_from_proto`/`apply_projected_metadata`),
 /// never assigned locally. So there is no "delete this whole directory"
 /// message on the wire at all -- from the sync engine's point of view, a
 /// directory delete is indistinguishable from "someone deleted these N
@@ -548,24 +547,19 @@ async fn concurrently_creating_same_named_directory_with_a_conflicting_file_insi
 // need it are ignored with the capability each one waits for; the rename
 // scenario and the materialization guard already hold and run normally.
 
-/// What `author` wrote to `path` in the group's history as `device` has
-/// admitted it: one label per op (`put`/`delete`/`move-from`/`move-to`).
+/// What `author` wrote to `path` in the group's native state as `device` holds
+/// it: one label per op (`put`/`delete`), in the author's sequence order.
 fn ops_by_author_at(device: &TestDevice, group_id: &str, author: &str, path: &str) -> Vec<String> {
-    let changes = device
-        .state
-        .replica_coordinator
-        .change_history_repository()
-        .dag_list_group_changes(group_id)
-        .unwrap();
     let mut out = Vec::new();
-    for change in changes.iter().filter(|c| c.device_id.0 == author) {
-        for op in &change.ops {
-            match op {
-                Op::Put { path: p, .. } if p.as_str() == path => out.push("put".into()),
-                Op::Delete { path: p } if p.as_str() == path => out.push("delete".into()),
-                Op::Move { from, .. } if from.as_str() == path => out.push("move-from".into()),
-                Op::Move { to, .. } if to.as_str() == path => out.push("move-to".into()),
-                _ => {}
+    for delta in support::native_deltas(&device.state, group_id)
+        .iter()
+        .filter(|delta| delta.author.device.as_str() == author)
+    {
+        for op in delta.ops.iter().filter(|op| op.path.as_str() == path) {
+            match (&op.put, op.removes.is_empty()) {
+                (Some(_), _) => out.push("put".to_owned()),
+                (None, false) => out.push("delete".to_owned()),
+                (None, true) => {}
             }
         }
     }
@@ -844,13 +838,9 @@ async fn peer_file_materialization_never_authors_a_directory_change() {
     let a_put =
         ops_by_author_at(&device_b, &group_id, &device_a.device_id, "nested/deeper/file.txt");
     assert_eq!(a_put, ["put"], "B never admitted A's change");
-    let changes = device_b
-        .state
-        .replica_coordinator
-        .change_history_repository()
-        .dag_list_group_changes(&group_id)
-        .unwrap();
-    let authored: Vec<_> = changes.iter().filter(|c| c.device_id.0 == device_b.device_id).collect();
+    let changes = support::native_deltas(&device_b.state, &group_id);
+    let authored: Vec<_> =
+        changes.iter().filter(|c| c.author.device.as_str() == device_b.device_id).collect();
     assert!(
         authored.is_empty(),
         "the receiver authored changes of its own after only materializing a peer's file: \

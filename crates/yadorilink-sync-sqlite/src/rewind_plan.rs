@@ -4,35 +4,24 @@
 //! this device held at T.
 //!
 //! Read-only in the strongest sense. Nothing in this module emits a signed
-//! `Change`, writes to the filesystem, creates a projection or
-//! materialization obligation, or touches DAG admission in any way. It runs
+//! `NativeDelta`, writes to the filesystem, creates a projection or
+//! materialization obligation, or touches native admission in any way. It runs
 //! a fixed handful of `SELECT`s and does arithmetic on the rows.
 //!
-//! # Why this does not consult the change DAG
+//! # Why this does not replay native history
 //!
-//! There is a real, working temporal index over the DAG --
-//! `dag_store::frontier_heads_at_or_before`, backed by `change_time_index`
-//! -- that answers "what was this group's head-set at T". It is deliberately
-//! NOT used here, and this module must never grow a call to it, to
-//! `resolve_path_heads`, or to `is_ancestor`.
-//!
-//! A head-set is a GROUP-level answer. Turning one into "what should path X
-//! contain at T" requires resolving that path against a historical frontier
-//! -- a per-path ancestor walk. That call shape is expensive at scale: see
-//! `dag_store::retained_history_integrity::
-//! is_ancestor`'s own doc comment on how a hot per-record `is_ancestor`
-//! call during reconciliation can pin a runtime worker thread at 100k-file
-//! scale. Running
-//! the per-path version of that walk across every path in a whole-folder
-//! rewind would reproduce exactly that collapse, just at plan-computation
-//! time instead of reconciliation time.
+//! A group's head-set at T is a GROUP-level answer. Turning one into "what
+//! should path X contain at T" requires resolving that path against a
+//! historical frontier -- a per-path history walk, which is expensive at
+//! 100k-file scale, and across every path in a whole-folder rewind would
+//! make plan computation proportional to the group's history.
 //!
 //! So the plan is computed from `files.admitted_at_unix_nanos` instead --
 //! a plain, unindexed, per-row local timestamp that every writer of a
 //! `files` row stamps (see `file_index::upsert_file_in_tx`'s own doc
 //! comment for the enumerated set and the invariant it upholds). Every
 //! query below is a single `WHERE group_id = ?1` scan producing one row per
-//! path; none is issued per path, and there is no graph traversal anywhere
+//! path; none is issued per path, and there is no history traversal anywhere
 //! in this file. Their number is fixed -- it does not grow with the group's
 //! path count, its history depth, or the rewind distance.
 //!
@@ -146,11 +135,8 @@ fn current_rows(conn: &Connection, group_id: &str) -> Result<Vec<VersionRecord>,
 /// `version_seq DESC` is a tie-break, not decoration, and it is load-
 /// bearing in two distinct situations. Two rows for one path can share an
 /// `admitted_at_unix_nanos` when the clock's granularity is coarser than
-/// the gap between two writes; and, more consequentially, a rebootstrap
-/// snapshot install writes a path's ENTIRE retained history in one pass, so
-/// every one of those rows carries the same stamp by construction (see
-/// `rebootstrap_store::replace_group_files_from_snapshot`). Without a
-/// second ordering key the winner would be arbitrary in both cases, making
+/// the gap between two writes. Without a
+/// second ordering key the winner would be arbitrary, making
 /// the plan nondeterministic for that path. `version_seq` is strictly
 /// increasing per path, and the `current` row holds its maximum (maintained
 /// by `file_index::upsert_file_in_tx`, whose supersede-then-insert pair
@@ -200,17 +186,14 @@ fn rows_at_or_before(
 ///   causes produce that, and the reported reason must not claim to know
 ///   which: retention expired the earlier versions
 ///   (`expire_superseded_and_trashed_versions`), or this device never held
-///   them in the first place -- it joined the group late, or crossed a
-///   re-bootstrap boundary, and its local history for this path simply
-///   starts above version 1.
+///   them in the first place -- it joined the group late, and its local
+///   history for this path simply starts above version 1.
 ///
 /// Both readings are about THIS device's own admission history, which is
 /// what makes them meaningful, and both stop being about it below the
 /// group's local history floor ([`local_history_floor`]) -- below which the
-/// numbering in `files` began on someone else's terms, either because this
-/// device joined an existing group or because a re-bootstrap install
-/// reinstalled the source device's `version_seq` numbering over a table it
-/// had just emptied. [`classify_without_history`] tests that boundary before
+/// numbering in `files` began on someone else's terms, because this
+/// device joined an existing group. [`classify_without_history`] tests that boundary before
 /// it reads either one.
 ///
 /// `unstamped_rows` counts rows with no admission timestamp at all. Any such
@@ -305,14 +288,12 @@ pub(crate) fn record_local_history_floor(
 /// merely cautious. Re-linking a folder this device already has an index
 /// for -- an unlink followed by a link, or a repeated `share accept` --
 /// does NOT restart `version_seq`: `upsert_file_in_tx` numbers up from the
-/// rows already there (the only whole-group `DELETE FROM files` is a
-/// re-bootstrap install, which records its own floor). Moving the floor
+/// rows already there (there is no whole-group `DELETE FROM files`). Moving the floor
 /// forward in that case would throw away real, answerable history for no
 /// gain, so this writes nothing.
 ///
 /// A clock that cannot be read at all (before the Unix epoch) writes no
-/// floor and leaves any earlier one in place, matching the re-bootstrap
-/// writer: rows admitted by such a device carry no admission stamp either,
+/// floor and leaves any earlier one in place: rows admitted by such a device carry no admission stamp either,
 /// which the reader already reports as unanswerable on its own.
 ///
 /// Must be called inside the caller's own link-commit transaction -- see
@@ -338,21 +319,18 @@ pub(crate) fn record_local_history_floor_for_a_first_link(
 /// The instant this group's *continuous* local `files` history begins on
 /// this device, if anything has ever started that history somewhere other
 /// than at this device's own first observation of each path. `None` -- a
-/// group this device created locally, and never re-bootstrapped -- means
+/// group this device created locally -- means
 /// nothing has, so the history in `files` runs unbroken back to whatever
 /// this device first indexed.
 ///
-/// Exactly one row per group, written by [`record_local_history_floor`] from
-/// either of the two events that begin such a history: this device linking a
-/// group it did not originate and holds no files for yet (both link commits
-/// that can name one, via [`record_local_history_floor_for_a_first_link`]),
-/// or a re-bootstrap snapshot install replacing its history wholesale
-/// (`rebootstrap_store::replace_group_files_from_snapshot`, the only
-/// whole-group `DELETE FROM files` in this crate). See
+/// At most one row per group, written by [`record_local_history_floor`] when
+/// this device links a group it did not originate and holds no files for yet
+/// (both link commits that can name one, via
+/// [`record_local_history_floor_for_a_first_link`]). See
 /// `group_local_history_floor`'s own table comment.
 ///
 /// A single-row primary-key lookup and nothing else -- deliberately not a
-/// derivation, and specifically not anything that consults the change DAG.
+/// derivation, and specifically not anything that replays native history.
 /// [`classify_without_history`] compares the rewind target against this
 /// value and that comparison is the entire use of it.
 fn local_history_floor(conn: &Connection, group_id: &str) -> Result<Option<i64>, SyncSqliteError> {
@@ -407,12 +385,11 @@ fn local_history_floor(conn: &Connection, group_id: &str) -> Result<Option<i64>,
 ///   `RETENTION_MAX_AGE_DAYS` days, union-retain/intersection-expire; see
 ///   `FileIndexRepository::expire_superseded_and_trashed_versions`);
 /// * history this device never held -- it joined the group after the path
-///   already had versions, or a re-bootstrap install replaced its local
-///   history with a snapshot. Both boundaries are recorded, at the instant
-///   they happen, by [`record_local_history_floor`]. A target before one is
+///   already had versions. That boundary is recorded, at the instant it
+///   happens, by [`record_local_history_floor`]. A target before it is
 ///   genuinely unanswerable HERE, which is not the same as unanswerable
 ///   anywhere; a peer that holds the history can still answer it. (A target
-///   AFTER either boundary is answered normally: every row admitted since
+///   AFTER that boundary is answered normally: every row admitted since
 ///   carries this device's own admission stamp, so it is ordinary
 ///   evidence.)
 /// * a row with no recorded admission timestamp -- only possible in a
@@ -428,7 +405,7 @@ fn local_history_floor(conn: &Connection, group_id: &str) -> Result<Option<i64>,
 /// function does not call it, for the reasons in this module's own header.)
 /// The one thing that turns that answer back into `Unavailable` is a group
 /// whose own local history on this device did not yet exist at T -- it
-/// joined the group after T, or a re-bootstrap replaced its history after T
+/// joined the group after T
 /// -- which is exactly what [`local_history_floor`] records. That
 /// distinction is what keeps a freshly-joined device from reporting a
 /// folder full of files as "everything was created since T".
@@ -439,7 +416,7 @@ fn local_history_floor(conn: &Connection, group_id: &str) -> Result<Option<i64>,
 /// path has no row at or before the target, and the fourth of them a
 /// single-row primary-key lookup), independent of path count, plus O(paths)
 /// in-memory work. Nothing here is issued per path, and nothing here walks
-/// the change DAG.
+/// native history.
 pub fn compute_rewind_plan(
     conn: &Connection,
     group_id: &str,
@@ -551,11 +528,8 @@ fn classify_with_history(now: &VersionRecord, then: &VersionRecord) -> RewindPat
 ///   path it sees for the first time from 1, so every file the group already
 ///   held when this device arrived -- however old, however often edited
 ///   elsewhere -- lands here as `version_seq = 1`.
-/// * a re-bootstrap install reinstalled the SOURCE device's numbering over a
-///   table it had just emptied, so a file created years ago and never edited
-///   arrives as `version_seq = 1` too.
 ///
-/// These two, `local_history_floor` below closes. Either way the inference
+/// `local_history_floor` below closes this. The inference
 /// would otherwise report the never-modified majority of an
 /// ordinary folder as having been created after T -- inventing information
 /// rather than declining to give it. Below `local_floor` this device simply
@@ -592,17 +566,14 @@ fn classify_without_history(
         // the earlier versions" is not a possible cause here either and
         // naming it would be a wrong explanation rather than a cautious one.
         if at_unix_nanos < local_floor {
-            // Both boundary events are named rather than one being guessed
-            // at: the stored floor is a single instant with no cause
-            // attached, and claiming the wrong one would be a confident
-            // wrong explanation of an otherwise correct verdict. Same
-            // reasoning as the two-cause wording in the `min_version_seq`
-            // arm below.
+            // The stored floor is a single instant with no cause attached, so
+            // the reason states the fact rather than a cause. Same reasoning
+            // as the two-cause wording in the `min_version_seq` arm below.
             return RewindPathAction::Unavailable {
                 reason: format!(
                     "this device's own history for this group only reaches back to \
-                     {local_floor}, when it joined the group or a re-bootstrap replaced its \
-                     history wholesale, so nothing here records what this path held at the \
+                     {local_floor}, when it joined the group, \
+                     so nothing here records what this path held at the \
                      target time"
                 ),
             };
@@ -625,10 +596,9 @@ fn classify_without_history(
         // version, so nothing here can answer for the target time. Two
         // different causes look identical from this row set -- retention
         // expired the earlier versions, or this device never held them
-        // (it joined the group late, or crossed a rebootstrap boundary
-        // that replaced its local history with a snapshot). Naming only
+        // (it joined the group late). Naming only
         // the first would be a confident wrong explanation for a
-        // rebootstrapped or late-joining path, so the reason states the
+        // late-joining path, so the reason states the
         // fact and both possible causes rather than picking one.
         RewindPathAction::Unavailable {
             reason: format!(

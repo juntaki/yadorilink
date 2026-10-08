@@ -33,7 +33,7 @@ fn head(change: u8, lamport: u64, device: &str, content: Option<[u8; 32]>) -> Pa
     change_hash[0] = change;
     PathHead {
         change_hash,
-        lamport,
+        rank: lamport,
         device_id: device.to_string(),
         naming_device_id: device.to_string(),
         content: content.map(|version_hash| PathHeadContent { version_hash, mtime_unix_nanos: 0 }),
@@ -126,7 +126,7 @@ fn assert_projection_rules(
             let Some(content) = &h.content else { continue };
             if winner
                 .get(path)
-                .is_none_or(|best| (best.lamport, best.change_hash) < (h.lamport, h.change_hash))
+                .is_none_or(|best| (best.rank, best.change_hash) < (h.rank, h.change_hash))
             {
                 winner.insert(path.clone(), h);
             }
@@ -135,9 +135,9 @@ fn assert_projection_rules(
             }
             if kind_of(&content.version_hash) == Some(RecordKind::Directory) {
                 needs_dir.insert(path.clone());
-                let better = best_dir.get(path).is_none_or(|best| {
-                    (best.lamport, best.change_hash) < (h.lamport, h.change_hash)
-                });
+                let better = best_dir
+                    .get(path)
+                    .is_none_or(|best| (best.rank, best.change_hash) < (h.rank, h.change_hash));
                 if better {
                     best_dir.insert(path.clone(), h);
                 }
@@ -257,102 +257,6 @@ fn assert_projection_rules(
     }
 }
 
-/// Applies `steps` to `prev`'s tree under POSIX rules, panicking on any
-/// step the filesystem would refuse, and returns the resulting tree.
-fn simulate(prev: &NamespaceProjection, steps: &[PlanStep]) -> BTreeMap<String, PhysicalNode> {
-    fn parent_is_directory(fs: &BTreeMap<String, PhysicalNode>, path: &str) -> bool {
-        parent_of(path).is_none_or(|parent| fs.get(parent).is_some_and(PhysicalNode::is_directory))
-    }
-    fn has_children(fs: &BTreeMap<String, PhysicalNode>, path: &str) -> bool {
-        let prefix = format!("{path}/");
-        fs.range(prefix.clone()..).next().is_some_and(|(p, _)| p.starts_with(&prefix))
-    }
-    let mut fs = prev.nodes().clone();
-    for (index, step) in steps.iter().enumerate() {
-        match step {
-            PlanStep::RemoveEntry { path } => {
-                assert!(
-                    matches!(fs.remove(path), Some(PhysicalNode::Entry(_))),
-                    "step {index}: unlink of a non-leaf {path:?}\n{steps:#?}"
-                );
-            }
-            PlanStep::RemoveDirectory { path } => {
-                assert!(
-                    !has_children(&fs, path),
-                    "step {index}: rmdir of {path:?} while tracked content is inside\n{steps:#?}"
-                );
-                assert!(
-                    matches!(fs.remove(path), Some(PhysicalNode::Directory(_))),
-                    "step {index}: rmdir of a non-directory {path:?}\n{steps:#?}"
-                );
-            }
-            PlanStep::Move { from, to, entry } => {
-                assert_eq!(parent_of(from), parent_of(to), "step {index}: move across dirs");
-                let Some(PhysicalNode::Entry(moved)) = fs.remove(from) else {
-                    panic!("step {index}: move of a missing leaf {from:?}\n{steps:#?}");
-                };
-                assert_eq!(
-                    (&moved.source, moved.version_hash, moved.kind),
-                    (&entry.source, entry.version_hash, entry.kind),
-                    "step {index}: move changed the content it carries"
-                );
-                assert!(
-                    !fs.contains_key(to),
-                    "step {index}: move onto occupied {to:?}\n{steps:#?}"
-                );
-                assert!(parent_is_directory(&fs, to), "step {index}: move into missing parent");
-                fs.insert(to.clone(), PhysicalNode::Entry(entry.clone()));
-            }
-            PlanStep::CreateDirectory { path, node } => {
-                assert!(!fs.contains_key(path), "step {index}: mkdir over existing {path:?}");
-                assert!(parent_is_directory(&fs, path), "step {index}: mkdir without parent");
-                fs.insert(path.clone(), PhysicalNode::Directory(*node));
-            }
-            PlanStep::UpdateDirectory { path, node } => {
-                assert!(
-                    fs.get(path).is_some_and(PhysicalNode::is_directory),
-                    "step {index}: update of a non-directory {path:?}"
-                );
-                fs.insert(path.clone(), PhysicalNode::Directory(*node));
-            }
-            PlanStep::WriteEntry { path, entry } => {
-                assert!(
-                    !fs.get(path).is_some_and(PhysicalNode::is_directory),
-                    "step {index}: write over directory {path:?}\n{steps:#?}"
-                );
-                assert!(parent_is_directory(&fs, path), "step {index}: write without parent");
-                fs.insert(path.clone(), PhysicalNode::Entry(entry.clone()));
-            }
-        }
-    }
-    fs
-}
-
-fn assert_plan_reaches(prev: &NamespaceProjection, next: &NamespaceProjection, label: &str) {
-    // Placement is bookkeeping read from `next`, not something on disk: a
-    // leaf that keeps its name and content while its placement changes
-    // needs no step, so the comparison is over what the filesystem holds.
-    fn physical(nodes: &BTreeMap<String, PhysicalNode>) -> BTreeMap<String, PhysicalNode> {
-        let mut nodes = nodes.clone();
-        for node in nodes.values_mut() {
-            if let PhysicalNode::Entry(entry) = node {
-                entry.placement = Placement::AtPath;
-            }
-        }
-        nodes
-    }
-    let steps = plan_transition(prev, next);
-    let reached = simulate(prev, &steps);
-    assert_eq!(
-        physical(&reached),
-        physical(next.nodes()),
-        "{label}: plan did not reach the target\n{steps:#?}"
-    );
-    if prev == next {
-        assert!(steps.is_empty(), "{label}: no-op transition emitted steps {steps:#?}");
-    }
-}
-
 // --- Exhaustive enumeration ---------------------------------------------
 
 /// The head alphabet: a removal, two file versions, two directory
@@ -435,25 +339,6 @@ fn projection_never_drops_a_live_head() {
     }
 }
 
-#[test]
-fn every_plan_is_posix_valid_and_reaches_the_next_projection() {
-    for tree in TREES {
-        let mut states = Vec::new();
-        for_each_state(&tree, |heads| states.push(proj(heads)));
-        let n = states.len();
-        // Every state against its neighbour (one path's heads differ) and
-        // the empty tree, and every fourth against a far stride, in both
-        // directions.
-        for (i, prev) in states.iter().enumerate() {
-            let stride = (i % 4 == 0).then_some((i * 7919 + 13) % n);
-            for partner in [Some((i + 1) % n), Some(0), stride].into_iter().flatten() {
-                assert_plan_reaches(prev, &states[partner], &format!("{tree:?} {i}->{partner}"));
-                assert_plan_reaches(&states[partner], prev, &format!("{tree:?} {partner}->{i}"));
-            }
-        }
-    }
-}
-
 // --- Named cases ---------------------------------------------------------
 
 #[test]
@@ -492,59 +377,6 @@ fn symlink_vs_descendant_relocates_symlink() {
         at(&projection, &copy_name("a", &link)),
         Some(entry(RecordKind::Symlink, LINK_1, "a", Placement::Relocated))
     );
-}
-
-#[test]
-fn sibling_names_a_b_and_a_slash_do_not_interleave() {
-    // "a" < "a b" < "a-b" < "a.txt" < "a/x" < "a0" byte-wise: a prefix scan
-    // for "a" would sweep up every one of them.
-    let mut heads = state(vec![
-        ("a", vec![put(1, 1, FILE_1)]),
-        ("a b", vec![put(2, 1, FILE_1)]),
-        ("a-b", vec![put(3, 1, FILE_1)]),
-        ("a.txt", vec![put(4, 1, FILE_1)]),
-        ("a0", vec![put(5, 1, FILE_1)]),
-    ]);
-    let flat = proj(&heads);
-    for path in ["a", "a b", "a-b", "a.txt", "a0"] {
-        assert_eq!(
-            at(&flat, path),
-            Some(entry(RecordKind::File, FILE_1, path, Placement::AtPath)),
-            "{path:?} is untouched when nothing lives under a/"
-        );
-    }
-    assert_eq!(flat.nodes().len(), 5);
-
-    heads.insert("a/x".to_string(), vec![put(6, 1, FILE_2)]);
-    let nested = proj(&heads);
-    assert_eq!(at(&nested, "a"), Some(PhysicalNode::Directory(DirectoryNode::Structural)));
-    for path in ["a b", "a-b", "a.txt", "a0"] {
-        assert_eq!(
-            at(&nested, path),
-            Some(entry(RecordKind::File, FILE_1, path, Placement::AtPath)),
-            "a/x must not turn sibling {path:?} into anything else"
-        );
-    }
-    assert_projection_rules(&heads, &nested, "siblings");
-
-    // Creation is ordered by depth, not by byte order: a/ precedes a/x even
-    // though "a b" sorts between them.
-    let steps = plan_transition(&NamespaceProjection::default(), &nested);
-    let position = |wanted: &str| {
-        steps
-            .iter()
-            .position(|s| match s {
-                PlanStep::CreateDirectory { path, .. } | PlanStep::WriteEntry { path, .. } => {
-                    path == wanted
-                }
-                _ => false,
-            })
-            .unwrap_or_else(|| panic!("{wanted:?} never created: {steps:#?}"))
-    };
-    assert!(position("a") < position("a/x"));
-    assert!(position("a b") < position("a/x"));
-    assert_plan_reaches(&flat, &nested, "flat -> nested");
-    assert_plan_reaches(&nested, &flat, "nested -> flat");
 }
 
 #[test]
@@ -737,155 +569,6 @@ fn loser_already_authored_at_its_copy_name_is_not_copied_again() {
 }
 
 #[test]
-fn nested_file_chain_a_ab_abc_relocates_without_loss() {
-    let (fa, fab, fabc) = (put(1, 1, FILE_1), put(2, 1, FILE_1), put(3, 1, FILE_2));
-    let heads =
-        state(vec![("a", vec![fa.clone()]), ("a/b", vec![fab.clone()]), ("a/b/c", vec![fabc])]);
-    let projection = proj(&heads);
-    assert_eq!(at(&projection, "a"), Some(PhysicalNode::Directory(DirectoryNode::Structural)));
-    assert_eq!(at(&projection, "a/b"), Some(PhysicalNode::Directory(DirectoryNode::Structural)));
-    assert_eq!(
-        at(&projection, &copy_name("a", &fa)),
-        Some(entry(RecordKind::File, FILE_1, "a", Placement::Relocated))
-    );
-    assert_eq!(
-        at(&projection, &copy_name("a/b", &fab)),
-        Some(entry(RecordKind::File, FILE_1, "a/b", Placement::Relocated))
-    );
-    assert_eq!(
-        at(&projection, "a/b/c"),
-        Some(entry(RecordKind::File, FILE_2, "a/b/c", Placement::AtPath))
-    );
-    assert_eq!(projection.nodes().len(), 5);
-    assert_projection_rules(&heads, &projection, "chain");
-    assert_plan_reaches(&NamespaceProjection::default(), &projection, "chain from empty");
-}
-
-#[test]
-fn last_descendant_deleted_moves_relocated_file_back() {
-    let file = put(1, 1, FILE_1);
-    let copy = copy_name("a", &file);
-    let only_a = proj(&state(vec![("a", vec![file.clone()])]));
-    let with_child =
-        proj(&state(vec![("a", vec![file.clone()]), ("a/x", vec![put(2, 1, FILE_2)])]));
-    let child_deleted = proj(&state(vec![("a", vec![file.clone()]), ("a/x", vec![tomb(3, 2)])]));
-    assert_eq!(child_deleted, only_a);
-
-    let placed = |source_path: &str, placement| PlacedEntry {
-        kind: RecordKind::File,
-        version_hash: FILE_1,
-        source: source_path.to_string(),
-        placement,
-    };
-
-    // Forward: move the file aside, then make the directory, then the child.
-    assert_eq!(
-        plan_transition(&only_a, &with_child),
-        vec![
-            PlanStep::Move {
-                from: "a".to_string(),
-                to: copy.clone(),
-                entry: placed("a", Placement::Relocated)
-            },
-            PlanStep::CreateDirectory { path: "a".to_string(), node: DirectoryNode::Structural },
-            PlanStep::WriteEntry {
-                path: "a/x".to_string(),
-                entry: PlacedEntry {
-                    kind: RecordKind::File,
-                    version_hash: FILE_2,
-                    source: "a/x".to_string(),
-                    placement: Placement::AtPath,
-                },
-            },
-        ]
-    );
-    // Reverse: child out, directory out, file back.
-    assert_eq!(
-        plan_transition(&with_child, &child_deleted),
-        vec![
-            PlanStep::RemoveEntry { path: "a/x".to_string() },
-            PlanStep::RemoveDirectory { path: "a".to_string() },
-            PlanStep::Move {
-                from: copy,
-                to: "a".to_string(),
-                entry: placed("a", Placement::AtPath)
-            },
-        ]
-    );
-}
-
-#[test]
-fn projection_plan_orders_deletes_depth_descending() {
-    let full = proj(&state(vec![
-        ("a", vec![put(1, 1, DIR_1)]),
-        ("a/b", vec![put(2, 1, DIR_1)]),
-        ("a/b/c", vec![put(3, 1, FILE_1)]),
-        ("a/b/d", vec![put(4, 1, LINK_1)]),
-        ("a b", vec![put(5, 1, FILE_1)]),
-    ]));
-    let steps = plan_transition(&full, &NamespaceProjection::default());
-    assert_eq!(
-        steps,
-        vec![
-            PlanStep::RemoveEntry { path: "a/b/d".to_string() },
-            PlanStep::RemoveEntry { path: "a/b/c".to_string() },
-            PlanStep::RemoveEntry { path: "a b".to_string() },
-            PlanStep::RemoveDirectory { path: "a/b".to_string() },
-            PlanStep::RemoveDirectory { path: "a".to_string() },
-        ]
-    );
-}
-
-#[test]
-fn directory_removal_runs_only_after_every_tracked_descendant_is_gone() {
-    // A deleted explicit directory whose only child is also deleted: the
-    // rmdir is a plain non-recursive removal after the child's unlink, so
-    // whatever is still inside when it runs is untracked content the
-    // materializer settles as retained.
-    let prev = proj(&state(vec![("a", vec![put(1, 1, DIR_1)]), ("a/x", vec![put(2, 1, FILE_1)])]));
-    let next = proj(&state(vec![("a", vec![tomb(3, 2)]), ("a/x", vec![tomb(4, 2)])]));
-    assert_eq!(
-        plan_transition(&prev, &next),
-        vec![
-            PlanStep::RemoveEntry { path: "a/x".to_string() },
-            PlanStep::RemoveDirectory { path: "a".to_string() },
-        ]
-    );
-}
-
-#[test]
-fn explicit_directory_deleted_while_child_lives_is_retagged_not_removed() {
-    let prev = proj(&state(vec![("a", vec![put(1, 1, DIR_1)]), ("a/x", vec![put(2, 1, FILE_1)])]));
-    let next = proj(&state(vec![("a", vec![tomb(3, 2)]), ("a/x", vec![put(2, 1, FILE_1)])]));
-    assert_eq!(
-        plan_transition(&prev, &next),
-        vec![PlanStep::UpdateDirectory { path: "a".to_string(), node: DirectoryNode::Structural }]
-    );
-}
-
-#[test]
-fn directory_replaced_by_file_removes_the_directory_before_writing() {
-    let prev = proj(&state(vec![("a", vec![put(1, 1, DIR_1)]), ("a/x", vec![put(2, 1, FILE_1)])]));
-    let next = proj(&state(vec![("a", vec![put(5, 5, FILE_2)]), ("a/x", vec![tomb(4, 2)])]));
-    assert_eq!(
-        plan_transition(&prev, &next),
-        vec![
-            PlanStep::RemoveEntry { path: "a/x".to_string() },
-            PlanStep::RemoveDirectory { path: "a".to_string() },
-            PlanStep::WriteEntry {
-                path: "a".to_string(),
-                entry: PlacedEntry {
-                    kind: RecordKind::File,
-                    version_hash: FILE_2,
-                    source: "a".to_string(),
-                    placement: Placement::AtPath,
-                },
-            },
-        ]
-    );
-}
-
-#[test]
 fn unknown_version_kind_is_undecidable() {
     let heads = state(vec![("a", vec![put(1, 1, UNKNOWN)])]);
     assert_eq!(
@@ -895,64 +578,6 @@ fn unknown_version_kind_is_undecidable() {
     // A removal needs no kind.
     let heads = state(vec![("a", vec![tomb(1, 1)])]);
     assert_eq!(project(&heads, kind_of), Ok(NamespaceProjection::default()));
-}
-
-#[test]
-fn mass_relocation_plans_in_near_linear_time() {
-    // Every file of a large flat tree is displaced by a child arriving at
-    // once (two devices imported trees whose names are files on one side
-    // and directories on the other), then moved back when the children go.
-    // Each direction is one Move per file; scheduling them must not cost a
-    // rescan of every pending move per step.
-    const FILES: usize = 20_000;
-    let files: Vec<(String, Vec<PathHead>)> =
-        (0..FILES).map(|i| (format!("f{i:05}"), vec![put(1, 1, FILE_1)])).collect();
-    let flat = proj(&files.iter().cloned().collect());
-    let nested = proj(
-        &files
-            .iter()
-            .cloned()
-            .chain((0..FILES).map(|i| (format!("f{i:05}/x"), vec![put(2, 1, FILE_2)])))
-            .collect(),
-    );
-    let started = std::time::Instant::now();
-    let forward = plan_transition(&flat, &nested);
-    let back = plan_transition(&nested, &flat);
-    let elapsed = started.elapsed();
-    let moves =
-        |steps: &[PlanStep]| steps.iter().filter(|s| matches!(s, PlanStep::Move { .. })).count();
-    assert_eq!((moves(&forward), moves(&back)), (FILES, FILES));
-    // Quadratic scheduling takes minutes here; linearithmic takes well
-    // under a second even unoptimized, so the bound leaves a wide margin.
-    assert!(elapsed < std::time::Duration::from_secs(10), "planning took {elapsed:?}");
-}
-
-#[test]
-fn swapped_leaves_break_the_move_cycle_without_loss() {
-    // Two leaves trading names: neither move's destination is ever free,
-    // so one source is unlinked and its content rewritten at the end.
-    let leaf = |version| PlacedEntry {
-        kind: RecordKind::File,
-        version_hash: version,
-        source: "s".to_string(),
-        placement: Placement::ConflictCopy,
-    };
-    let tree = |p, q| NamespaceProjection {
-        nodes: BTreeMap::from([
-            ("p".to_string(), PhysicalNode::Entry(leaf(p))),
-            ("q".to_string(), PhysicalNode::Entry(leaf(q))),
-        ]),
-    };
-    let (prev, next) = (tree(FILE_1, FILE_2), tree(FILE_2, FILE_1));
-    assert_eq!(
-        plan_transition(&prev, &next),
-        vec![
-            PlanStep::RemoveEntry { path: "p".to_string() },
-            PlanStep::Move { from: "q".to_string(), to: "p".to_string(), entry: leaf(FILE_2) },
-            PlanStep::WriteEntry { path: "q".to_string(), entry: leaf(FILE_1) },
-        ]
-    );
-    assert_plan_reaches(&prev, &next, "swap");
 }
 
 /// A path's own node needs only its own heads and whether anything below
@@ -988,49 +613,4 @@ fn own_node_of_an_unknown_kind_is_undecidable() {
         project_own_node("a", &heads, false, kind_of),
         Err(ProjectionError::Undecidable { .. })
     ));
-}
-
-/// One level of the tree, projected from that level's own heads and a
-/// live-descendant bit per path, is exactly the whole projection's nodes
-/// at that level: a caller never has to read the whole group to learn
-/// where a relocated file lives.
-#[test]
-fn level_projection_equals_the_whole_projection_at_that_level() {
-    const LEVEL_TREES: [[&str; 3]; 3] =
-        [["a", "a/x", "a/x/y"], ["a", "a b", "a/x"], ["a", "b", "b/x"]];
-    for tree in LEVEL_TREES {
-        for_each_state(&tree, |heads| {
-            let whole = proj(heads);
-            let parents: BTreeSet<Option<&str>> = heads
-                .keys()
-                .flat_map(|path| {
-                    std::iter::once(parent_of(path))
-                        .chain(proper_ancestors(path).into_iter().map(parent_of))
-                })
-                .collect();
-            for parent in parents {
-                let at_level = |path: &str| parent_of(path) == parent;
-                let children: BTreeMap<String, Vec<PathHead>> = heads
-                    .iter()
-                    .filter(|(path, _)| at_level(path))
-                    .map(|(path, hs)| (path.clone(), hs.clone()))
-                    .collect();
-                let below: BTreeSet<String> = heads
-                    .iter()
-                    .filter(|(_, hs)| hs.iter().any(|h| h.content.is_some()))
-                    .flat_map(|(path, _)| proper_ancestors(path))
-                    .filter(|ancestor| at_level(ancestor))
-                    .map(str::to_string)
-                    .collect();
-                let level = project_level(&children, &below, kind_of).unwrap();
-                let expected: BTreeMap<String, PhysicalNode> = whole
-                    .nodes()
-                    .iter()
-                    .filter(|(path, _)| at_level(path))
-                    .map(|(path, node)| (path.clone(), node.clone()))
-                    .collect();
-                assert_eq!(level.nodes(), &expected, "level {parent:?} of {heads:?}");
-            }
-        });
-    }
 }

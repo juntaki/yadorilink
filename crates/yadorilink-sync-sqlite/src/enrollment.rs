@@ -18,7 +18,7 @@ use yadorilink_replica_domain::recovery::{
 };
 use yadorilink_replica_domain::session_state::{
     EnrollmentKind, EnrollmentOperation, EnrollmentOperationScan, EnrollmentOperationState,
-    FolderLink, InvalidEnrollmentOperation, InvalidPendingEnrollment, LinkRowWrite,
+    FolderLink, InvalidEnrollmentOperation, InvalidPendingEnrollment, LinkLocation, LinkRowWrite,
     MaterializationPolicy, PendingEnrollment, PendingEnrollmentScan,
 };
 use yadorilink_sqlite_runtime::SyncDatabase;
@@ -78,35 +78,6 @@ impl EnrollmentRepository {
     /// crash window the single transaction exists to close. A future
     /// cross-repository "commit store" (Commit 14 candidate) may formalize
     /// this; it is not a design flaw to fix now.
-    /// Removes a link row and its pending-enrollment marker in ONE SQLite
-    /// transaction — the all-or-nothing rollback for a link whose post-commit
-    /// setup failed. Doing the two deletes as separate writes (as the earlier
-    /// rollback path did) could remove the link but leave the marker if the
-    /// second write failed, stranding a marker that names a local path with no
-    /// link behind it until a later reconciliation pass. One transaction makes
-    /// that half-state impossible: either both rows are gone or neither is.
-    /// Mirrors [`Self::orphan_link_and_remove_pending_enrollment`]. Absent
-    /// row(s) are not an error — a `DELETE` that matches nothing is a no-op,
-    /// matching the idempotence every other enrollment-marker write already
-    /// has.
-    pub fn remove_link_and_pending_marker(
-        &self,
-        local_path: &str,
-        operation_id: &str,
-    ) -> Result<(), SyncSqliteError> {
-        self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            tx.execute("DELETE FROM links WHERE local_path = ?1", [local_path])?;
-            tx.execute("DELETE FROM pending_enrollments WHERE operation_id = ?1", [operation_id])?;
-            Ok(())
-        })
-    }
-
-    /// Writes to `links` as well as its own enrollment tables in one
-    /// transaction to preserve atomicity -- decomposing this into separate
-    /// `LinkRepository`/`EnrollmentRepository` calls would reopen the exact
-    /// crash window the single transaction exists to close. A future
-    /// cross-repository "commit store" (Commit 14 candidate) may formalize
-    /// this; it is not a design flaw to fix now.
     /// Marks a link orphaned and drops the pending-enrollment marker that
     /// diagnosed it as such, in one SQLite transaction -- the `Deleted`
     /// activation outcome's reconciliation step.
@@ -128,33 +99,6 @@ impl EnrollmentRepository {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
             tx.execute("UPDATE links SET orphaned = 1 WHERE local_path = ?1", [local_path])?;
             tx.execute("DELETE FROM pending_enrollments WHERE operation_id = ?1", [operation_id])?;
-            Ok(())
-        })
-    }
-
-    /// Persists a marker for a local link that was just committed but whose
-    /// coordination-plane activation has not been confirmed yet. Replaces
-    /// any existing marker for the same `operation_id` (idempotent).
-    /// `add_link_with_pending_enrollment` is the atomic version used when
-    /// the link itself is being created in the same step; this standalone
-    /// form exists for callers (and tests) that only need the marker.
-    pub fn record_pending_enrollment(
-        &self,
-        marker: &PendingEnrollment,
-    ) -> Result<(), SyncSqliteError> {
-        self.database.write::<_, SyncSqliteError>(|conn| {
-            conn.execute(
-                "INSERT OR REPLACE INTO pending_enrollments \
-                 (operation_id, kind, group_id, device_id, local_path) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![
-                    marker.operation_id,
-                    marker.kind.as_db_str(),
-                    marker.group_id,
-                    marker.device_id,
-                    marker.local_path,
-                ],
-            )?;
             Ok(())
         })
     }
@@ -491,9 +435,15 @@ impl EnrollmentRepository {
         group_id: &str,
         marker: &PendingEnrollment,
         now_unix: i64,
+        provider: Option<&crate::provider::ProviderLinkSpec>,
     ) -> Result<LinkRowWrite, SyncSqliteError> {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
             let write = crate::link::LinkRepository::insert_link_row(tx, local_path, group_id)?;
+            // A provider link declares its root in THIS transaction: the link, the root, the
+            // install marker (derived) and the enrollment marker commit together or not at all.
+            if let Some(spec) = provider {
+                crate::provider::declare_link_root_in_tx(tx, group_id, spec)?;
+            }
             tx.execute(
                 "INSERT OR REPLACE INTO pending_enrollments \
                  (operation_id, kind, group_id, device_id, local_path) \
@@ -554,8 +504,7 @@ impl EnrollmentRepository {
             let changed = tx.execute(
                 "UPDATE enrollment_operations SET state = 'local_setup_pending', group_id = ?1, \
                     last_error = NULL, updated_at_unix = ?2, link_row_write = ?4, \
-                    prior_link_paused = ?5, prior_link_orphaned = ?6, prior_link_policy = ?7, \
-                    prior_link_max_local_size_bytes = ?8 \
+                    prior_link_paused = ?5, prior_link_orphaned = ?6, prior_link_policy = ?7 \
                  WHERE operation_id = ?3 AND state = 'prepared'",
                 rusqlite::params![
                     group_id,
@@ -565,7 +514,6 @@ impl EnrollmentRepository {
                     prior.map(|p| i64::from(p.paused)),
                     prior.map(|p| i64::from(p.orphaned)),
                     prior.map(|p| p.materialization_policy.as_db_str()),
-                    prior.and_then(|p| p.max_local_size_bytes),
                 ],
             )?;
             if changed != 1 {
@@ -629,10 +577,9 @@ impl EnrollmentRepository {
     /// Deliberately does NOT undo the `group_local_history_floor` row a
     /// `Join` commit wrote. A floor is not link state: it says when this
     /// device's own `files` history for the group begins, and `files` rows
-    /// survive an unlink (every `DELETE FROM files` outside a re-bootstrap
-    /// install is keyed by path). Clearing it here could therefore drop a
+    /// survive an unlink (every `DELETE FROM files` is keyed by path). Clearing it here could therefore drop a
     /// boundary that still bounds real, still-present rows -- an earlier
-    /// re-bootstrap's, for a group being re-linked. Leaving it can only make
+    /// join's, for a group being re-linked. Leaving it can only make
     /// a later answer more conservative, and for a link that really was
     /// rolled back the group has no rows for it to bound at all.
     pub fn rollback_local_setup_to_cancel_pending(
@@ -664,7 +611,7 @@ impl EnrollmentRepository {
         let recorded = tx
             .query_row(
                 "SELECT group_id, link_row_write, prior_link_paused, prior_link_orphaned, \
-                        prior_link_policy, prior_link_max_local_size_bytes \
+                        prior_link_policy \
                  FROM enrollment_operations \
                  WHERE operation_id = ?1 AND local_path = ?2 AND state = 'local_setup_pending'",
                 rusqlite::params![operation_id, local_path],
@@ -675,25 +622,21 @@ impl EnrollmentRepository {
                         r.get::<_, Option<i64>>(2)?,
                         r.get::<_, Option<i64>>(3)?,
                         r.get::<_, Option<String>>(4)?,
-                        r.get::<_, Option<i64>>(5)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((Some(group_id), Some(kind), paused, orphaned, policy, max_local_size_bytes)) =
-            recorded
-        else {
+        let Some((Some(group_id), Some(kind), paused, orphaned, policy)) = recorded else {
             return Ok(None);
         };
         let write = match (kind.as_str(), paused, orphaned, policy) {
             ("inserted", ..) => LinkRowWrite::Inserted,
             ("updated", Some(paused), Some(orphaned), Some(policy)) => {
                 LinkRowWrite::Updated(FolderLink {
-                    local_path: local_path.to_string(),
+                    location: LinkLocation::Folder(local_path.to_string()),
                     group_id: group_id.clone(),
                     paused: paused != 0,
                     materialization_policy: MaterializationPolicy::from_db_str(&policy),
-                    max_local_size_bytes,
                     orphaned: orphaned != 0,
                 })
             }

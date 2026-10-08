@@ -12,10 +12,8 @@
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::SyncSqliteError;
-use yadorilink_replica_domain::change::{Change, Op};
 use yadorilink_replica_domain::file::FileVersion;
-use yadorilink_replica_domain::ids::{ChangeHash, VersionHash};
-use yadorilink_root_authority::reserved_namespace::{wire_path_admission_refusal, WirePathRefusal};
+use yadorilink_replica_domain::ids::VersionHash;
 
 /// Whether a content-addressed file version is present.
 pub fn has_file_version(
@@ -30,102 +28,6 @@ pub fn has_file_version(
     Ok(present.is_some())
 }
 
-pub(crate) fn op_version_hash(op: &Op) -> Option<&VersionHash> {
-    match op {
-        Op::Put { version, .. } | Op::Move { version, .. } => Some(version),
-        Op::Delete { .. } => None,
-    }
-}
-
-/// Rejects a change that names a versioned reserved-namespace artefact (see
-/// `yadorilink_root_authority::reserved_namespace`) or this device's own sync-root lock file
-/// (see `yadorilink_root_authority::sync_root_lock`) anywhere it can appear in an op: a
-/// `Put`/`Delete` path, or either side of a `Move`. Applied before any
-/// other admission check, matching the reserved namespace's requirement
-/// that a peer cannot name one of its own artefact paths into another
-/// device's index by shipping a change that claims it — a user cannot
-/// un-ignore this any more than they could locally, and a peer cannot
-/// route around it either.
-///
-/// The sync-root lock check closes a real hole this predicate alone did not:
-/// without it, a change naming `.yadorilink-root.lock` was admitted and
-/// later materialized, replacing the on-disk lock file out from under this
-/// device's live `flock` — on Unix the held lock stays bound to the
-/// now-unlinked inode while a *second* daemon happily locks the fresh file
-/// materialization just created at the same path, so both processes end up
-/// believing they exclusively own this sync root, which is precisely the
-/// state `yadorilink_root_authority::sync_root_lock` exists to make unreachable.
-///
-/// Deliberately keys on [`path_has_artefact_component_in_wire_path`] /
-/// [`yadorilink_root_authority::sync_root_lock::wire_path_names_sync_root_lock`], NOT either
-/// function's host-`Path` form: `op`'s paths were authored by a remote peer,
-/// not walked off this device's own disk, so finding component boundaries
-/// via this process's own `std::path::Path` would make rejection depend on
-/// which OS happens to be running admission — see
-/// [`path_has_artefact_component_in_wire_path`]'s doc comment for the
-/// platform-split this would otherwise cause. Also, NOT the broader
-/// exclusion predicate `path_has_reserved_component`(`_in_wire_path`): the
-/// legacy `.yadorilink-tmp.` marker must never fail admission. It is a
-/// substring match within a component (real user content can precede it),
-/// so rejecting it here could permanently block a legitimate file; and
-/// history predating this module can already contain a legacy-marked path
-/// that was admitted before anything excluded it — rejecting that on
-/// replay would turn an upgraded peer into a permanent sync stall for the
-/// whole group. See `reserved_namespace`'s "Two predicates, not one". The
-/// sync-root lock file has no such look-alike concern (it is an exact,
-/// unambiguous name this device itself owns), so it is rejected outright
-/// rather than merely excluded.
-pub(crate) fn validate_no_reserved_paths(change: &Change) -> Result<(), SyncSqliteError> {
-    for op in &change.ops {
-        let paths: Vec<&str> = match op {
-            Op::Put { path, .. } | Op::Delete { path } => vec![path.as_str()],
-            Op::Move { from, to, .. } => vec![from.as_str(), to.as_str()],
-        };
-        for path in paths {
-            // Both rules come from `wire_path_admission_refusal` rather than
-            // being spelled out here, because this is not the only site that
-            // has to agree with them: `yadorilink_local_capture` filters the
-            // same paths out BEFORE they reach the local-authoring emission,
-            // since a refusal here fails a whole batched change -- every
-            // unrelated path in it included -- and the dirty-journal
-            // backstop then re-drives that same batch forever. Two copies of
-            // this list would let that filter drift narrower than admission
-            // without either side failing; one shared predicate cannot. See
-            // that function's own doc comment for the full argument, and
-            // `path_has_non_portable_wire_component`'s for why the
-            // portability rule is host-independent (a trailing '.'/' ' that
-            // Windows silently strips would otherwise admit two distinct
-            // paths that collide onto one on-disk name).
-            match wire_path_admission_refusal(path) {
-                Some(WirePathRefusal::ReservedNamespace) => {
-                    return Err(SyncSqliteError::ReservedNamespaceCollision(path.to_string()));
-                }
-                Some(WirePathRefusal::NonPortable) => {
-                    return Err(SyncSqliteError::NonPortablePath(path.to_string()));
-                }
-                None => {}
-            }
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_referenced_versions(
-    conn: &Connection,
-    change: &Change,
-) -> Result<(), SyncSqliteError> {
-    for op in &change.ops {
-        let Some(version_hash) = op_version_hash(op) else { continue };
-        if !has_file_version(conn, change.group_id.as_str(), version_hash)? {
-            return Err(SyncSqliteError::NotFound(format!(
-                "change references missing file version {}",
-                version_hash.to_hex()
-            )));
-        }
-    }
-    Ok(())
-}
-
 /// The file version stored under `hash`, decoded from its canonical bytes, or
 /// `None`. The decoded version's hash is recomputed and checked against the
 /// key, so a lookup only ever returns a version whose bytes actually hash to
@@ -137,11 +39,10 @@ pub fn get_file_version(
     hash: &VersionHash,
 ) -> Result<Option<FileVersion>, SyncSqliteError> {
     let encoded: Option<Vec<u8>> = conn
-        .query_row(
+        .prepare_cached(
             "SELECT encoded FROM file_versions WHERE group_id = ?1 AND version_hash = ?2",
-            rusqlite::params![group_id, &hash.0[..]],
-            |r| r.get(0),
-        )
+        )?
+        .query_row(rusqlite::params![group_id, &hash.0[..]], |r| r.get(0))
         .optional()?;
     match encoded {
         Some(bytes) => {
@@ -156,62 +57,6 @@ pub fn get_file_version(
         }
         None => Ok(None),
     }
-}
-
-/// Whether any retained file version in `group_id` references `block_hash`.
-/// Conflict-copy materialization may request a block before the derived copy
-/// path has been projected into the current-file index; the DAG version is the
-/// durable group-scoped proof that serving that content is authorized.
-pub fn group_file_version_references_block(
-    conn: &Connection,
-    group_id: &str,
-    block_hash: &[u8],
-) -> Result<bool, SyncSqliteError> {
-    if versions_reference_block(
-        conn,
-        "SELECT DISTINCT fv.encoded \
-         FROM change_file_versions cfv \
-         JOIN changes c ON c.change_hash = cfv.change_hash AND c.group_id = cfv.group_id \
-         JOIN file_versions fv ON fv.group_id = cfv.group_id \
-                              AND fv.version_hash = cfv.version_hash \
-         WHERE cfv.group_id = ?1",
-        group_id,
-        block_hash,
-    )? {
-        return Ok(true);
-    }
-    // A version whose only referencing change was compacted away falls
-    // through to this second, ordinarily-empty source rather than costing
-    // every ordinary (uncompacted) lookup a UNION/DISTINCT merge against it.
-    versions_reference_block(
-        conn,
-        "SELECT DISTINCT fv.encoded \
-         FROM pruned_published_change_versions w \
-         JOIN file_versions fv ON fv.group_id = w.group_id \
-                              AND fv.version_hash = w.version_hash \
-         WHERE w.group_id = ?1",
-        group_id,
-        block_hash,
-    )
-}
-
-fn versions_reference_block(
-    conn: &Connection,
-    query: &str,
-    group_id: &str,
-    block_hash: &[u8],
-) -> Result<bool, SyncSqliteError> {
-    let mut stmt = conn.prepare(query)?;
-    let mut rows = stmt.query([group_id])?;
-    while let Some(row) = rows.next()? {
-        let encoded: Vec<u8> = row.get(0)?;
-        let version = FileVersion::from_canonical_encoding(&encoded)
-            .map_err(|_| SyncSqliteError::NotFound("stored file version is corrupt".into()))?;
-        if version.blocks.iter().any(|block| block.hash.0.as_slice() == block_hash) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 /// Records that this device obtained verified block bytes through `group_id`.
@@ -231,51 +76,6 @@ pub fn record_group_block_provenance(
     Ok(())
 }
 
-/// Records that `version_hash` was authored by `authoring_change_hash` --
-/// the link `change_file_versions` would otherwise carry, preserved past
-/// that change's own row being pruned by compaction, so
-/// `published_group_file_version_references_block` can still reach its
-/// (untouched-by-pruning) `change_authorization`/`authorization_
-/// checkpoints` evidence. This is a link, not evidence storage -- see the
-/// owning table's own schema doc comment (`dag_store::mod`) for the full
-/// trust-boundary reasoning. Idempotent: recording the same link twice is a
-/// no-op; recording a DIFFERENT `authoring_change_hash` for an already-
-/// linked `(group_id, version_hash)` is `CorruptState` -- a version's
-/// authorship must never silently change out from under an existing row,
-/// mirroring `published_view::attach_authorization_evidence`'s own
-/// idempotency posture.
-pub fn record_pruned_published_change_version(
-    conn: &Connection,
-    group_id: &str,
-    version_hash: &VersionHash,
-    authoring_change_hash: &ChangeHash,
-) -> Result<(), SyncSqliteError> {
-    let existing: Option<Vec<u8>> = conn
-        .query_row(
-            "SELECT authoring_change_hash FROM pruned_published_change_versions \
-             WHERE group_id = ?1 AND version_hash = ?2",
-            rusqlite::params![group_id, &version_hash.0[..]],
-            |r| r.get(0),
-        )
-        .optional()?;
-    match existing {
-        None => {
-            conn.execute(
-                "INSERT INTO pruned_published_change_versions \
-                 (group_id, version_hash, authoring_change_hash) VALUES (?1, ?2, ?3)",
-                rusqlite::params![group_id, &version_hash.0[..], &authoring_change_hash.0[..]],
-            )?;
-            Ok(())
-        }
-        Some(existing_change_hash) if existing_change_hash == authoring_change_hash.0 => Ok(()),
-        Some(_) => Err(SyncSqliteError::CorruptState(format!(
-            "pruned_published_change_versions already links group {group_id} version {} to a \
-             DIFFERENT authoring change -- refusing to silently overwrite it",
-            hex::encode(version_hash.0),
-        ))),
-    }
-}
-
 /// Whether verified bytes for `block_hash` were actually obtained through
 /// `group_id`, independently of any peer-supplied metadata references.
 pub fn group_has_block_provenance(
@@ -288,6 +88,39 @@ pub fn group_has_block_provenance(
         rusqlite::params![group_id, block_hash],
         |row| row.get(0),
     )?)
+}
+
+/// Records the blocks the just-stored `versions` name in `file_version_blocks`, a few rows per
+/// statement. Only called for versions that were newly inserted, in the same transaction.
+fn index_version_blocks(
+    conn: &Connection,
+    group_id: &str,
+    versions: &[&FileVersion],
+) -> Result<(), SyncSqliteError> {
+    // Three parameters per row, under SQLite's default limit.
+    const ROWS_PER_INSERT: usize = 300;
+    let mut rows = versions.iter().flat_map(|version| {
+        version.blocks.iter().map(move |block| (&block.hash.0[..], &version.version_hash.0[..]))
+    });
+    loop {
+        let chunk: Vec<(&[u8], &[u8])> = rows.by_ref().take(ROWS_PER_INSERT).collect();
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        let marks = vec!["(?,?,?)"; chunk.len()].join(",");
+        let mut stmt = conn.prepare_cached(&format!(
+            "INSERT OR IGNORE INTO file_version_blocks (group_id, block_hash, version_hash) \
+             VALUES {marks}"
+        ))?;
+        let params = chunk.iter().flat_map(|(block, version)| {
+            [
+                rusqlite::types::Value::from(group_id.to_owned()),
+                rusqlite::types::Value::from(block.to_vec()),
+                rusqlite::types::Value::from(version.to_vec()),
+            ]
+        });
+        stmt.execute(rusqlite::params_from_iter(params))?;
+    }
 }
 
 /// Persists a file version, keyed by its content hash. Idempotent — re-putting
@@ -315,231 +148,80 @@ pub fn put_file_version(
             hex::encode(version.version_hash.0)
         ))
     })?;
-    let changed = conn.execute(
-        "INSERT OR IGNORE INTO file_versions (version_hash, group_id, encoded) VALUES (?1, ?2, ?3)",
-        rusqlite::params![&version.version_hash.0[..], group_id, version.canonical_encoding()],
-    )?;
+    let changed = conn
+        .prepare_cached(
+            "INSERT OR IGNORE INTO file_versions (version_hash, group_id, encoded) \
+             VALUES (?1, ?2, ?3)",
+        )?
+        .execute(rusqlite::params![
+            &version.version_hash.0[..],
+            group_id,
+            version.canonical_encoding()
+        ])?;
+    if changed > 0 {
+        index_version_blocks(conn, group_id, &[version])?;
+        crate::native_desired_state::arm_projection_for_arrived_version(
+            conn,
+            group_id,
+            &version.version_hash,
+        )?;
+    }
     Ok(changed > 0)
 }
 
-/// Deletes every `file_versions` row for `group_id` that no retained change
-/// references *and* that is not explicitly authorized via
-/// `pruned_published_change_versions` (a version compaction/re-bootstrap
-/// deliberately retains independently of any single admitted change — see
-/// [`record_pruned_published_change_version`]). Recomputes the live
-/// reference set by decoding the group's remaining changes' ops plus the
-/// authorization table, so it is correct regardless of which changes the
-/// prune/install removed. Bounded by the checkpoint frontier, so the full
-/// scan is acceptable.
-pub fn sweep_unreferenced_file_versions(
+/// [`put_file_version`] for the versions of one bulk capture group: every version is verified,
+/// the ones not yet stored are inserted in a few statements, and only those re-arm the paths
+/// whose heads name them -- a version already stored, or repeated within `versions`, arms
+/// nothing, as with [`put_file_version`] one version at a time. Returns how many were new.
+pub fn put_file_versions_batch(
     conn: &Connection,
     group_id: &str,
-) -> Result<(), SyncSqliteError> {
-    // `commit_prune` calls this only after every Change/edge deletion. Close the
-    // checkpoint-opened prune context before doing any fallible scan work, so a
-    // later unrelated history deletion cannot inherit stale prune authority.
-    // In the intended enclosing transaction, any subsequent error rolls this
-    // clear and the preceding prune back together.
-    super::retained_history_integrity::finish_prune_context(conn, group_id)?;
-
-    use std::collections::HashSet;
-    let mut referenced: HashSet<[u8; 32]> = HashSet::new();
-    {
-        let mut stmt = conn.prepare("SELECT encoded FROM changes WHERE group_id = ?1")?;
-        let rows = stmt.query_map([group_id], |r| r.get::<_, Vec<u8>>(0))?;
-        for row in rows {
-            let change = Change::from_wire_bytes(&row?).map_err(|error| {
-                SyncSqliteError::CorruptState(format!(
-                    "cannot compact group {group_id}: retained change is corrupt: {error}"
-                ))
-            })?;
-            for op in &change.ops {
-                match op {
-                    Op::Put { version, .. } | Op::Move { version, .. } => {
-                        referenced.insert(version.0);
-                    }
-                    Op::Delete { .. } => {}
-                }
-            }
-        }
+    versions: &[&FileVersion],
+) -> Result<usize, SyncSqliteError> {
+    // The most rows one insert binds: three parameters each, under SQLite's default limit.
+    const ROWS_PER_INSERT: usize = 300;
+    for version in versions {
+        version.verify_hash().map_err(|error| {
+            SyncSqliteError::InvalidInput(format!(
+                "file version {} is invalid: {error}",
+                hex::encode(version.version_hash.0)
+            ))
+        })?;
     }
-    {
-        let mut stmt = conn.prepare(
-            "SELECT version_hash FROM pruned_published_change_versions WHERE group_id = ?1",
-        )?;
-        let rows = stmt.query_map([group_id], |r| r.get::<_, Vec<u8>>(0))?;
-        for row in rows {
-            let bytes = row?;
-            if let Ok(array) = <[u8; 32]>::try_from(bytes.as_slice()) {
-                referenced.insert(array);
-            }
-        }
-    }
-    let stored: Vec<Vec<u8>> = {
-        let mut stmt =
-            conn.prepare("SELECT version_hash FROM file_versions WHERE group_id = ?1")?;
-        let rows = stmt.query_map([group_id], |r| r.get::<_, Vec<u8>>(0))?;
-        let mut v = Vec::new();
-        for row in rows {
-            v.push(row?);
-        }
-        v
-    };
-    for vh in stored {
-        let retained = <[u8; 32]>::try_from(vh.as_slice())
-            .map(|arr| referenced.contains(&arr))
-            .unwrap_or(false);
-        if !retained {
-            conn.execute(
-                "DELETE FROM file_versions WHERE group_id = ?1 AND version_hash = ?2",
-                rusqlite::params![group_id, &vh[..]],
-            )?;
-        }
-    }
-    Ok(())
-}
-
-/// Records exactly the versions referenced by an admitted change. Mere
-/// presence in `file_versions` is not a block-serving capability.
-pub(crate) fn record_change_file_versions(
-    conn: &Connection,
-    change: &Change,
-) -> Result<(), SyncSqliteError> {
-    let hash = change.compute_hash();
-    for op in &change.ops {
-        let Some(version_hash) = op_version_hash(op) else { continue };
-        conn.prepare_cached(
-            "INSERT OR IGNORE INTO change_file_versions \
-             (group_id, change_hash, version_hash) VALUES (?1, ?2, ?3)",
-        )?
-        .execute(rusqlite::params![
-            change.group_id.as_str(),
-            &hash.0[..],
-            &version_hash.0[..]
-        ])?;
-    }
-    Ok(())
-}
-
-fn file_version_encoding_matches(encoded: &[u8], expected: &VersionHash) -> bool {
-    matches!(
-        FileVersion::from_canonical_encoding(encoded),
-        Ok(version) if version.version_hash == *expected
-    )
-}
-
-fn find_valid_file_version_encoding(
-    conn: &Connection,
-    hash: &VersionHash,
-) -> Result<Option<Vec<u8>>, SyncSqliteError> {
-    let mut stmt = conn
-        .prepare("SELECT encoded FROM file_versions WHERE version_hash = ?1 ORDER BY group_id")?;
-    let rows = stmt.query_map([&hash.0[..]], |row| row.get::<_, Vec<u8>>(0))?;
-    for row in rows {
-        let encoded = row?;
-        if file_version_encoding_matches(&encoded, hash) {
-            return Ok(Some(encoded));
-        }
-    }
-    Ok(None)
-}
-
-/// Repairs the versions one change references into `group_id`'s scope. Returns
-/// `false` only for a buffered orphan whose referenced version has no valid
-/// retained encoding in any group; admitted history returns `CorruptState`
-/// instead. An admitted change also gets its `change_file_versions` binding
-/// recorded; an orphan must not grant block-serving authorization before it is
-/// promoted.
-pub(crate) fn repair_change_file_versions(
-    tx: &Connection,
-    change: &Change,
-    admitted: bool,
-) -> Result<bool, SyncSqliteError> {
-    let change_hash = change.compute_hash();
     let mut seen = std::collections::HashSet::new();
-    let mut repairs: Vec<([u8; 32], Vec<u8>)> = Vec::new();
-
-    for op in &change.ops {
-        let Some(version_hash) = op_version_hash(op) else { continue };
-        if !seen.insert(version_hash.0) {
-            continue;
-        }
-
-        let target_encoded: Option<Vec<u8>> = tx
-            .query_row(
-                "SELECT encoded FROM file_versions WHERE group_id = ?1 AND version_hash = ?2",
-                rusqlite::params![change.group_id.as_str(), &version_hash.0[..]],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if target_encoded
-            .as_deref()
-            .is_some_and(|encoded| file_version_encoding_matches(encoded, version_hash))
-        {
-            continue;
-        }
-
-        let Some(encoded_version) = find_valid_file_version_encoding(tx, version_hash)? else {
-            if admitted {
-                return Err(SyncSqliteError::CorruptState(format!(
-                    "cannot repair file version ownership: change {} in group {} references version {} with no valid retained bytes in any group",
-                    hex::encode(change_hash.0),
-                    change.group_id.as_str(),
-                    hex::encode(version_hash.0),
-                )));
-            }
-            return Ok(false);
-        };
-        repairs.push((version_hash.0, encoded_version));
-    }
-
-    for (version_hash, encoded_version) in repairs {
-        tx.execute(
-            "INSERT INTO file_versions (version_hash, group_id, encoded) VALUES (?1, ?2, ?3) \
-             ON CONFLICT(group_id, version_hash) DO UPDATE SET encoded = excluded.encoded",
-            rusqlite::params![&version_hash[..], change.group_id.as_str(), encoded_version],
-        )?;
-    }
-    if admitted {
-        record_change_file_versions(tx, change)?;
-    }
-    Ok(true)
-}
-
-/// Removes any `change_file_versions` row for an admitted change that its own
-/// decoded `ops` do not justify. This authorization index is otherwise only
-/// ever grown by `record_change_file_versions` from that same field
-/// (`INSERT OR IGNORE`, additive only), so an extra relation is reachable
-/// only through direct tampering or corruption — but since it is what
-/// `group_file_version_references_block` consults to decide whether a
-/// group's retained history justifies serving a physical block, an
-/// unjustified row is a live authorization boundary, not inert metadata.
-pub(crate) fn prune_unjustified_change_file_versions(
-    conn: &Connection,
-    change: &Change,
-    change_hash: &ChangeHash,
-) -> Result<(), SyncSqliteError> {
-    let justified: std::collections::HashSet<Vec<u8>> =
-        change.ops.iter().filter_map(op_version_hash).map(|v| v.0.to_vec()).collect();
-    let recorded: Vec<Vec<u8>> = {
-        let mut stmt = conn.prepare(
-            "SELECT version_hash FROM change_file_versions \
-             WHERE group_id = ?1 AND change_hash = ?2",
-        )?;
-        let rows = stmt
-            .query_map(rusqlite::params![change.group_id.as_str(), &change_hash.0[..]], |row| {
-                row.get(0)
-            })?;
-        rows.collect::<Result<_, _>>()?
-    };
-    for version_hash in recorded {
-        if !justified.contains(&version_hash) {
-            conn.execute(
-                "DELETE FROM change_file_versions \
-                 WHERE group_id = ?1 AND change_hash = ?2 AND version_hash = ?3",
-                rusqlite::params![change.group_id.as_str(), &change_hash.0[..], &version_hash],
-            )?;
+    let distinct: Vec<&FileVersion> =
+        versions.iter().copied().filter(|v| seen.insert(v.version_hash.0)).collect();
+    let mut stored = std::collections::HashSet::new();
+    for chunk in distinct.chunks(crate::store::PATHS_PER_QUERY) {
+        let marks = vec!["?"; chunk.len()].join(",");
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT version_hash FROM file_versions WHERE group_id = ?1 AND version_hash IN ({marks})"
+        ))?;
+        let params = std::iter::once(rusqlite::types::Value::from(group_id.to_owned()))
+            .chain(chunk.iter().map(|v| rusqlite::types::Value::from(v.version_hash.0.to_vec())));
+        let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
+        while let Some(row) = rows.next()? {
+            stored.insert(row.get::<_, Vec<u8>>(0)?);
         }
     }
-    Ok(())
+    let fresh: Vec<&FileVersion> =
+        distinct.into_iter().filter(|v| !stored.contains(&v.version_hash.0[..])).collect();
+    for chunk in fresh.chunks(ROWS_PER_INSERT) {
+        let marks = vec!["(?,?,?)"; chunk.len()].join(",");
+        let mut stmt = conn.prepare_cached(&format!(
+            "INSERT OR IGNORE INTO file_versions (version_hash, group_id, encoded) VALUES {marks}"
+        ))?;
+        let params = chunk.iter().flat_map(|v| {
+            [
+                rusqlite::types::Value::from(v.version_hash.0.to_vec()),
+                rusqlite::types::Value::from(group_id.to_owned()),
+                rusqlite::types::Value::from(v.canonical_encoding()),
+            ]
+        });
+        stmt.execute(rusqlite::params_from_iter(params))?;
+    }
+    index_version_blocks(conn, group_id, &fresh)?;
+    let arrived: Vec<VersionHash> = fresh.iter().map(|v| v.version_hash).collect();
+    crate::native_desired_state::arm_projection_for_arrived_versions(conn, group_id, &arrived)?;
+    Ok(arrived.len())
 }

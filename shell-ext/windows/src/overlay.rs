@@ -177,9 +177,9 @@ impl IShellIconOverlayIdentifier_Impl for ErrorOverlay_Impl {
 /// Represents on-demand-sync's "online-only" placeholder state — mapped
 /// from `SyncState::Pending` here since the base `SyncState` enum
 /// (shared with the daemon's control protocol) has no dedicated
-/// placeholder value; `MaterializationState::Placeholder` on the same
-/// `StatusResponse` is the authoritative signal, so this queries that
-/// instead of `SyncState` (see `ipc_client::query_materialization_state`).
+/// placeholder value; the `local_state` on the same `StatusResponse`
+/// (no current content, no transition) is the authoritative signal, so this
+/// queries that instead of `SyncState` (see `ipc_client::is_placeholder`).
 #[implement(IShellIconOverlayIdentifier)]
 pub struct OnlineOnlyOverlay;
 

@@ -67,7 +67,8 @@ How a hit is found (a textual scan, not a Rust parser):
 Known blind spots, recorded rather than hidden: an `OpenMaterializationIntent`
 guard's `.clear()` and its uncleared drop cannot be told apart from any other
 `.clear()`/drop by text, so the guard instead pins every way to OBTAIN one
-(`open_materialization_intent_guard(`, `MaterializationIntentGuard::open(`);
+(`open_materialization_intent_guard(`, `MaterializationIntentGuard::open(`,
+`MaterializationIntentGuard::opened(`);
 and a primitive passed as a function value without a call (`.map(name)`) is
 not seen. Reviewer judgment remains the backstop.
 
@@ -81,6 +82,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+import functools
 from pathlib import Path
 import re
 import sys
@@ -93,11 +95,11 @@ SOURCE_GLOB = "crates/*/src/**/*.rs"
 # The raw materialization-semantic APIs, by bare callable name.
 FORBIDDEN = (
     "MaterializationIntentGuard::open",
+    "MaterializationIntentGuard::opened",
     "adopt_local_capture_absent_state",
     "adopt_local_capture_actual_state",
     "adopt_observed_actual_generation_in_tx",
     "append_initial_import",
-    "backfill_placeholder_generations",
     "begin_materialization_intent",
     "begin_materialization_intent_in_tx",
     "bump_mutation_fence",
@@ -126,15 +128,12 @@ FORBIDDEN = (
     "dehydrate_windows_placeholder",
     "discard_restore_operation",
     "finalize_projected_mutations_batch",
-    "forget_group_materialized_generations",
     "has_usable_materialized_generation",
     "invalidate_published_generations",
     "mark_deleted_at",
-    "retire_bases_after_local_emission",
     "mark_deleted_emitting_change",
     "mark_restore_disk_committed",
     "open_materialization_intent_guard",
-    "open_projected_upserts_batch",
     "plan_admission",
     "publish_materialized_generation_if_fence_current",
     "read_mutation_fence",
@@ -193,45 +192,24 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     D + "convergence/engine.rs": {
         "dag_publish_materialized_generation_if_fence_current": 1,
     },
-    # Local capture: initial import of a group with no change DAG yet.
-    D + "dag_import.rs": {
-        "append_initial_import": 1,
-    },
-    # Access-triggered hydration's proof reads, pin; live version restore
-    # (its authoring, which journals only a restore it writes itself, and
-    # the bump after target verification).
+    # Access-triggered hydration's proof read; live version restore (its
+    # authoring, which journals only a restore it writes itself, and the
+    # bump after target verification).
     D + "hydration.rs": {
-        "dag_usable_proof_names_current_version": 2,
+        "dag_usable_proof_names_current_version": 1,
         "dag_lookup_materialized_generation": 1,
         "dag_bump_mutation_fence": 1,
         "record_restore_placing": 1,
-    },
-    # Placeholder-identity backfill at link start.
-    D + "link_runtime/factory.rs": {
-        "backfill_placeholder_generations": 1,
     },
     # Windows CfAPI placeholder generation mint-or-read.
     D + "link_runtime/operations/capture_local_change.rs": {
         "record_placeholder_generation_if_absent": 1,
     },
-    # Backfill operation wrapper (root lease + permit).
-    D + "link_runtime/operations/repair_materialization.rs": {
-        "backfill_placeholder_generations": 1,
-    },
-    # Equal-authoring metadata repair (File, and the symlink policy-skip
-    # demotion); convergence rehydration's candidate proof read.
-    D + "local_convergence/hydrate.rs": {
-        "dag_snapshot_mutation_fence": 1,
-        "dag_bump_mutation_fence": 1,
-        "set_materialization_state": 1,
-        "dag_usable_proof_names_current_version": 1,
-    },
-    # Eager/pinned content write (fence bump after the lane's verify, the
-    # commit); the reconstruct-failed placeholder demotion.
+    # Eager/pinned content write (the commit; its fence bump is in the
+    # owner's pre-write transaction); the reconstruct-failed placeholder
+    # demotion.
     D + "local_convergence/materialize/eager.rs": {
         "set_materialization_state": 1,
-        "dag_bump_mutation_fence": 1,
-        "commit_internal_materialized_state_if_fence_current": 1,
     },
     # Shared write_placeholder helper (the bump after the lane's verify).
     D + "local_convergence/materialize/placeholder.rs": {
@@ -245,15 +223,12 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     D + "local_convergence/materialize.rs": {
         "clear_held": 1,
     },
-    # Batched projected upsert/delete, the one already-absent settle
-    # (`already_absent`: a reflected tombstone, and a path an installed base
-    # leaves absent with no head in Gamma), and the
-    # materialize_dag_content_head metadata fast path.
+    # The metadata fast path of a projected content head: the fence snapshot
+    # when bytes and metadata already match disk, the bump when only
+    # metadata is repaired.
     D + "local_convergence/reconcile.rs": {
-        "dag_snapshot_mutation_fence": 2,
-        "open_projected_upserts_batch": 1,
-        "dag_bump_mutation_fence": 3,
-        "finalize_projected_mutations_batch": 1,
+        "dag_snapshot_mutation_fence": 1,
+        "dag_bump_mutation_fence": 1,
     },
     # materialize_symlink_at's commit; metadata-only update.
     D + "local_convergence/types.rs": {
@@ -261,12 +236,22 @@ ALLOWLIST: dict[str, dict[str, int]] = {
         "commit_internal_materialized_state_if_fence_current": 1,
         "dag_snapshot_mutation_fence": 1,
     },
-    # materialize_tombstone's already-deleted snapshot; zero-work
-    # settlement for a path.
+    # Native level projection (`reconcile_native.rs`): the fence snapshot an
+    # observed-absent path's exact-absent evidence is valid under, and the
+    # zero-work settlement of a path whose actual state is already current.
+    # Both only read the fence or settle without a disk write; neither
+    # composes a materialization write.
+    D + "local_convergence/reconcile_native.rs": {
+        "dag_snapshot_mutation_fence": 1,
+        "dag_zero_work_settlement_if_already_current": 1,
+    },
+    # materialize_tombstone's already-deleted snapshot, and the two
+    # read-only "does a usable proof exist" questions (the reconcile settle
+    # check and the zero-work pre-check that asks the same question first);
+    # both only read, neither composes a protocol.
     D + "local_convergence.rs": {
         "dag_snapshot_mutation_fence": 1,
-        "dag_has_usable_materialized_generation": 1,
-        "dag_zero_work_settlement_if_already_current": 1,
+        "dag_has_usable_materialized_generation": 2,
     },
     # The intent guard primitive itself.
     D + "materialization_intent.rs": {
@@ -275,12 +260,9 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     },
     # Coordinator adapters: repository delegation behind ReplicaCoordinator.
     D + "replica_coordinator/local_mutation.rs": {
-        "upsert_file_emitting_change": 2,
         "commit_local_mutations_batch": 1,
         "upsert_files_batch": 2,
-        "upsert_files_batch_emitting_change": 1,
         "mark_deleted_at": 2,
-        "mark_deleted_emitting_change": 1,
         # Capture follows a structural directory a user renamed.
         "dag_rekey_structural_origin": 1,
         # Capture's directory operations (`commit_captured_directory`,
@@ -290,11 +272,19 @@ ALLOWLIST: dict[str, dict[str, int]] = {
         # delete or, without an emitter, index tombstones; a directory
         # rename, as one signed recursive rename. The capture lane calls
         # these and composes none of the primitives itself.
+    },
+    # Owner-side seams of the file index's local commits: a captured
+    # mutation batch, an explicit directory's own commit (one mutation
+    # through the same batch), and a directory's recursive delete and
+    # rename. Each takes the capture's author handle and the root commit
+    # permit; the capture lane reaches them only through
+    # `LocalMutationStore`.
+    D + "replica_coordinator/local_commit.rs": {
+        "commit_local_mutations_batch": 2,
         "commit_recursive_operation": 2,
     },
     D + "replica_coordinator/materialization_execution.rs": {
         "clear_materialization_intent": 1,
-        "mark_deleted_emitting_change": 1,
         "commit_recovered_materialized_state": 1,
         "dag_usable_proof_names_current_version": 1,
         "commit_restore_operation": 1,
@@ -323,9 +313,13 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     # open half, so it adds no call there).
     D + "replica_coordinator/materialization_owner/lanes.rs": {
         "open_materialization_intent_guard": 4,
-        "set_materialization_state": 4,
-        "clear_held": 6,
+        "set_materialization_state": 3,
+        "clear_held": 5,
         "dag_bump_mutation_fence": 2,
+        # The content write's pre-write transaction: intent, row, in-flight
+        # state, hold clear and fence bump in one commit, and the guard of
+        # the intent it opened.
+        "MaterializationIntentGuard::opened": 1,
         "dag_snapshot_mutation_fence": 1,
         "set_held": 2,
         "set_held_with_key": 1,
@@ -338,7 +332,6 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     # and zero-work settlement.
     D + "replica_coordinator/peer_replica_state.rs": {
         "set_materialization_state": 1,
-        "transition_materialization_state_if_same_authoring": 1,
         "clear_held": 1,
         "set_held": 1,
         "bump_mutation_fence": 1,
@@ -346,12 +339,10 @@ ALLOWLIST: dict[str, dict[str, int]] = {
         "publish_materialized_generation_if_fence_current": 1,
         "commit_internal_materialized_state_if_fence_current": 2,
         "dag_lookup_materialized_generation": 2,
-        "dag_usable_proof_names_current_version": 1,
+        "dag_usable_proof_names_current_version": 2,
         "dag_snapshot_mutation_fence": 1,
-        "MaterializationIntentGuard::open": 1,
-        "begin_materialization_intent_in_tx": 1,
-        "set_materialization_state_in_tx": 1,
-        "clear_held_in_tx": 2,
+        "MaterializationIntentGuard::open": 2,
+        "clear_held_in_tx": 1,
     },
     # Owner operations for the hydration lanes: convergence
     # rehydration's guard (entry CAS, hazard hold, hold release under an
@@ -362,12 +353,8 @@ ALLOWLIST: dict[str, dict[str, int]] = {
         "reprove_verified_hydrated_state": 1,
         "mark_restore_disk_committed": 1,
         "commit_restore_operation": 1,
-        "transition_materialization_state_if_same_authoring": 4,
-        "set_held": 1,
-        "open_materialization_intent_guard": 1,
-        "clear_held": 1,
-        "dag_bump_mutation_fence": 2,
-        "commit_internal_materialized_state_if_fence_current": 2,
+        "dag_bump_mutation_fence": 1,
+        "commit_internal_materialized_state_if_fence_current": 1,
     },
     # Owner operations for eviction and recovery: eviction's open
     # (Evicting, fence bump) and settle (Evicting -> Placeholder CAS); the
@@ -395,11 +382,8 @@ ALLOWLIST: dict[str, dict[str, int]] = {
         "set_materialization_state": 1,
         "dag_bump_mutation_fence": 4,
         "transition_materialization_state": 1,
-        "reset_stale_hydrating_to_placeholder": 1,
-        "reset_stale_evicting_to_placeholder": 1,
         "open_materialization_intent_guard": 2,
         "commit_internal_materialized_state_if_fence_current": 1,
-        "transition_materialization_state_if_same_authoring": 2,
         "commit_recovered_materialized_state": 1,
         "set_materialization_state_in_tx": 1,
     },
@@ -430,20 +414,7 @@ ALLOWLIST: dict[str, dict[str, int]] = {
         "clear_placeholder_generation": 1,
     },
     D + "replica_coordinator.rs": {
-        "upsert_file_emitting_change": 1,
-        "mark_deleted_emitting_change": 1,
-        "append_initial_import": 1,
-        "record_restore_operation_emitting_change": 1,
         "record_restore_placing": 1,
-    },
-    # Remote admission fence CAS (read-only on the fence).
-    D + "sync_adapter/admission.rs": {
-        "plan_admission": 1,
-        "commit_admission": 1,
-    },
-    D + "sync_adapter/async_store.rs": {
-        "plan_admission": 1,
-        "commit_admission": 1,
     },
     # Eviction to placeholder: the Windows native dehydrate (the physical
     # write itself on that platform).
@@ -459,33 +430,28 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     F + "materialization_repair.rs": {
         "has_usable_materialized_generation": 2,
         "commit_recovered_materialized_state": 2,
-        "mark_deleted_emitting_change": 2,
         "open_materialization_intent_guard": 1,
         "dag_bump_mutation_fence": 3,
         "clear_materialization_intent": 2,
         "discard_restore_operation": 2,
         "commit_restore_operation": 1,
     },
-    # Local capture (watcher events, flush, scan).
+    # Local capture (watcher events, flush, scan). Each commits what it
+    # observed through the `LocalMutationStore` port's
+    # `commit_local_mutations_batch`, under the path lock, with the
+    # capture's own signing author and a fresh root-commit permit: the
+    # watcher's delete, the watcher's upsert, and one scan chunk.
     L + "local_change/event_ingest.rs": {
-        "mark_deleted_emitting_change": 1,
+        "commit_local_mutations_batch": 2,
         "mark_deleted_at": 1,
-        "upsert_file_emitting_change": 1,
         "upsert_files_batch": 1,
     },
     L + "local_change/flush.rs": {
         "commit_local_mutations_batch": 1,
     },
     L + "local_change/scan.rs": {
-        "upsert_files_batch_emitting_change": 1,
+        "commit_local_mutations_batch": 1,
         "upsert_files_batch": 1,
-    },
-    # Repository layer: initial import adoption, and the record that each
-    # row the import binds was read off this disk by the first scan (the
-    # import is that scan's emission).
-    S + "change_history.rs": {
-        "adopt_local_capture_actual_state": 1,
-        "record_local_capture_in_tx": 1,
     },
     # Atomic commit primitives (internal, recovered, reprove).
     # A zero-work close re-anchors the proof it accepts in the same
@@ -495,22 +461,21 @@ ALLOWLIST: dict[str, dict[str, int]] = {
         "set_materialization_state_in_tx": 2,
         "clear_materialization_intent_in_tx": 2,
         "snapshot_mutation_fence": 3,
-        "complete_obligation_if_exact_proof_current": 1,
+        "complete_obligation_if_exact_proof_current": 2,
+        "commit_internal_materialized_state_if_fence_current": 2,
     },
     # Local-capture writes composing adoption / retirement in-tx, and the
     # record that each capture route's change was read off this disk (which
     # decides that projecting it may never write the disk): one per capture
     # route, in the transaction that emits the change, and nowhere else.
     S + "file_index.rs": {
-        "record_local_capture_in_tx": 4,
-        "adopt_local_capture_actual_state": 4,
-        "stamp_hydrated_after_local_emission_in_tx": 4,
-        "retire_unproven_actual_state_in_tx": 7,
-        "adopt_local_capture_absent_state": 3,
+        "adopt_local_capture_actual_state": 2,
+        "stamp_hydrated_after_local_emission_in_tx": 2,
+        "retire_unproven_actual_state_in_tx": 4,
+        "adopt_local_capture_absent_state": 1,
         "mark_deleted_at": 1,
         "adopt_observed_actual_generation_in_tx": 2,
-        "complete_obligation_if_exact_proof_current": 2,
-        "strip_carried_forward_hydrated_in_tx": 2,
+        "complete_obligation_if_exact_proof_current": 1,
         "invalidate_published_generations": 1,
     },
     # Repository wrapper around the internal atomic commit.
@@ -524,26 +489,6 @@ ALLOWLIST: dict[str, dict[str, int]] = {
         "snapshot_mutation_fence": 1,
         "bump_mutation_fence": 1,
     },
-    # A history-base install -- a peer's snapshot, or the base a merge
-    # adopts or mints -- replaces the group's rows through one shared step
-    # and retires the materialized bases of the history it replaces; a
-    # sealing epoch reset retires the bases of the history it absorbs, in
-    # the same transaction.
-    S + "rebootstrap_store.rs": {
-        "replace_group_files_from_snapshot": 1,
-        "forget_group_materialized_generations": 1,
-    },
-    # The DAG store retires bases in the same transaction as the history change
-    # that stales them: a prune drops the group's bases, and every local
-    # emission retires the bases of the paths it writes.
-    S + "dag_store/mod.rs": {
-        "forget_group_materialized_generations": 1,
-        "retire_bases_after_local_emission": 1,
-    },
-    # Remote admission reads the fence for its CAS.
-    S + "remote_admission.rs": {
-        "read_mutation_fence": 2,
-    },
     # Restore commit (internal commit, or external adoption on recovery).
     S + "restore_operation.rs": {
         "commit_internal_materialized_state_if_fence_current": 1,
@@ -555,8 +500,8 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     # installed entry belongs moves the entry to its copy name, releases
     # the path's hold and records the directory as retained in one
     # transaction: a crash between the two would leave the directory
-    # unrecorded with nothing held to bring the path back (P9-C).
-    S + "snapshot_install_hold.rs": {
+    # unrecorded with nothing held to bring the path back.
+    S + "held_path.rs": {
         "record_retained_directory": 1,
     },
     # A structural `mkdir` bumps the path's fence as it records its intent,
@@ -583,6 +528,16 @@ ALLOWLIST: dict[str, dict[str, int]] = {
         "forget_structural_origin": 1,
         "record_retained_directory": 1,
         "clear_retained_directory": 1,
+        "dag_lookup_materialized_generation": 1,
+    },
+    # The repository half of the owner's content-write open (intent, state
+    # move, held release and fence bump in one transaction); it replaced the
+    # same primitives previously called from the owner's lane operations.
+    S + "content_write_open.rs": {
+        "begin_materialization_intent_in_tx": 1,
+        "bump_mutation_fence": 1,
+        "clear_held_in_tx": 1,
+        "set_materialization_state_in_tx": 1,
     },
 }
 
@@ -590,85 +545,67 @@ ALLOWLIST: dict[str, dict[str, int]] = {
 # after reviewing the added/removed site. Per file, so the next person can
 # check the same list instead of re-deriving it (O = owner, R = repository,
 # L = orchestration lane; see `file_kind`):
-#   L daemon/convergence/engine.rs                               1
-#   L daemon/dag_import.rs                                       1
-#   L daemon/hydration.rs                                        5
-#   L daemon/link_runtime/factory.rs                             1
-#   L daemon/link_runtime/operations/capture_local_change.rs     1
-#   L daemon/link_runtime/operations/repair_materialization.rs   1
-#   L daemon/local_convergence.rs                                3
-#   L daemon/local_convergence/hydrate.rs                        4
-#   L daemon/local_convergence/materialize.rs                    1
-#   L daemon/local_convergence/materialize/eager.rs              3
-#   L daemon/local_convergence/materialize/placeholder.rs        1
-#   L daemon/local_convergence/materialize/symlink.rs            1
-#   L daemon/local_convergence/reconcile.rs                      7
-#   L daemon/local_convergence/types.rs                          3
-#   L daemon/materialization_intent.rs                           2
-#   L daemon/sync_adapter/admission.rs                           2
-#   L daemon/sync_adapter/async_store.rs                         2
-#   L filesystem-sync/materialization_eviction.rs                1
-#   L filesystem-sync/materialization_repair.rs                 15
-#   L local-capture/local_change/event_ingest.rs                 4
-#   L local-capture/local_change/flush.rs                        1
-#   L local-capture/local_change/scan.rs                         2
-#   O daemon/replica_coordinator.rs                              5
-#   O daemon/replica_coordinator/local_mutation.rs              12
-#   O daemon/replica_coordinator/materialization_execution.rs    8
-#   O daemon/replica_coordinator/materialization_owner.rs        3
-#   O daemon/replica_coordinator/materialization_owner/hydration.rs 14
-#   O daemon/replica_coordinator/materialization_owner/lanes.rs 25
-#   O daemon/replica_coordinator/materialization_owner/repair.rs 16
+#   L daemon/convergence/engine.rs                                  1
+#   L daemon/hydration.rs                                           4
+#   L daemon/link_runtime/factory.rs                                1
+#   L daemon/link_runtime/operations/capture_local_change.rs        1
+#   L daemon/link_runtime/operations/repair_materialization.rs      1
+#   L daemon/local_convergence.rs                                   2
+#   L daemon/local_convergence/materialize.rs                       1
+#   L daemon/local_convergence/materialize/eager.rs                 2
+#   L daemon/local_convergence/materialize/placeholder.rs           1
+#   L daemon/local_convergence/materialize/symlink.rs               1
+#   L daemon/local_convergence/reconcile.rs                         2
+#   L daemon/local_convergence/reconcile_native.rs                  2
+#   L daemon/local_convergence/types.rs                             3
+#   L daemon/materialization_intent.rs                              2
+#   L filesystem-sync/materialization_eviction.rs                   1
+#   L filesystem-sync/materialization_repair.rs                    13
+#   L local-capture/local_change/event_ingest.rs                    4
+#   L local-capture/local_change/flush.rs                           1
+#   L local-capture/local_change/scan.rs                            2
+#   O daemon/replica_coordinator.rs                                 1
+#   O daemon/replica_coordinator/local_commit.rs                    4
+#   O daemon/replica_coordinator/local_mutation.rs                  6
+#   O daemon/replica_coordinator/materialization_execution.rs       7
+#   O daemon/replica_coordinator/materialization_owner.rs           3
+#   O daemon/replica_coordinator/materialization_owner/hydration.rs 10
+#   O daemon/replica_coordinator/materialization_owner/lanes.rs    27
+#   O daemon/replica_coordinator/materialization_owner/repair.rs 14
 #   O daemon/replica_coordinator/materialization_owner/structural.rs 11
-#   O daemon/replica_coordinator/peer_replica_state.rs          18
-#   R sync-sqlite/change_history.rs                              2
-#   R sync-sqlite/dag_store/mod.rs                               2
-#   R sync-sqlite/exact_materialized_commit.rs                  12
-#   R sync-sqlite/file_index.rs                                 30
-#   R sync-sqlite/materialization_state.rs                       1
-#   R sync-sqlite/materialized_generation.rs                     2
-#   R sync-sqlite/rebootstrap_store.rs                           2
-#   R sync-sqlite/remote_admission.rs                            2
-#   R sync-sqlite/restore_operation.rs                           4
-#   R sync-sqlite/snapshot_install_hold.rs                       1
-#   R sync-sqlite/store.rs                                      12
-#   R sync-sqlite/structural_origin.rs                           3
+#   O daemon/replica_coordinator/peer_replica_state.rs             17
+#   R sync-sqlite/exact_materialized_commit.rs                     12
+#   R sync-sqlite/file_index.rs                                    16
+#   R sync-sqlite/materialization_state.rs                          1
+#   R sync-sqlite/materialized_generation.rs                        2
+#   R sync-sqlite/restore_operation.rs                              4
+#   R sync-sqlite/held_path.rs                          1
+#   R sync-sqlite/store.rs                                         12
+#   R sync-sqlite/structural_origin.rs                              3
 #   ------------------------------------------------------------
-#   total 247 = lane 62 + owner 112 + repository 73
-EXPECTED_ALLOWED = 247
+#   total 189 = lane 43 + owner 89 + repository 57 (the per-file rows above are
+#   indicative; the pins in ALLOWLIST are authoritative)
+EXPECTED_ALLOWED = 189
 
 # The in-family row mutators outside `FORBIDDEN`. Each also writes
 # materialization-relevant columns (a peer row's version and authoring, the
-# row itself, the pin that decides eager hydration, the provenance that lets
-# a fetched block be trusted), but is shared with writers that are not about
+# row itself, the provenance that lets a fetched block be trusted), but is shared with writers that are not about
 # materialization, so each site is pinned rather than forbidden.
 IN_FAMILY = (
-    "apply_incoming_wire_metadata",
+    "apply_projected_metadata",
     "apply_projected_row_atomic",
     "erase_local_only_file",
+    "record_block_provenance",
     "record_group_block_provenance",
     "set_authoring_change_hash",
-    "set_pinned",
     "upsert_file_with_origin",
     "upsert_file_with_origin_and_author",
 )
 
 IN_FAMILY_ALLOWLIST: dict[str, dict[str, int]] = {
-    # Fetched-block provenance (access hydration); pin and unpin.
+    # Fetched-block provenance (access hydration).
     D + "hydration.rs": {
-        "record_group_block_provenance": 1,
-        "set_pinned": 2,
-    },
-    # Single-path tombstone: the authoring advance of an already-reflected
-    # delete.
-    D + "local_convergence.rs": {
-        "set_authoring_change_hash": 1,
-    },
-    # apply_locked_record's wire metadata application: an incoming live
-    # record, the equal-authoring metadata repair, and a tombstone's
-    # pre-delete metadata when the delete may be held.
-    D + "local_convergence/hydrate.rs": {
-        "apply_incoming_wire_metadata": 3,
+        "record_block_provenance": 1,
     },
     # Convergence block acquisition: provenance flush.
     D + "local_convergence/knobs.rs": {
@@ -678,32 +615,26 @@ IN_FAMILY_ALLOWLIST: dict[str, dict[str, int]] = {
     # delete, and reconcile_group_paths' already-settled re-drive); the
     # materialize_dag_content_head metadata fast path.
     D + "local_convergence/reconcile.rs": {
-        "apply_incoming_wire_metadata": 2,
+        "apply_projected_metadata": 2,
         "apply_projected_row_atomic": 1,
-        "set_authoring_change_hash": 2,
-    },
-    # Content-identical metadata-only update.
-    D + "local_convergence/types.rs": {
-        "upsert_file_with_origin": 1,
-        "upsert_file_with_origin_and_author": 1,
     },
     # Coordinator adapters: repository delegation behind ReplicaCoordinator.
-    D + "replica_coordinator/local_mutation.rs": {
+    D + "replica_coordinator.rs": {
         "record_group_block_provenance": 1,
     },
+    D + "replica_coordinator/local_mutation.rs": {
+        "record_block_provenance": 1,
+    },
     D + "replica_coordinator/peer_replica_state.rs": {
-        "apply_projected_row_atomic": 1,
-        "record_group_block_provenance": 1,
-        "set_authoring_change_hash": 1,
+        "record_block_provenance": 1,
         "upsert_file_with_origin": 1,
-        "upsert_file_with_origin_and_author": 1,
+        "record_group_block_provenance": 1,
     },
     # Owner operations: the row persist of a fresh write, the symlink open,
     # the hazard hold, and the retired copy's erase.
     D + "replica_coordinator/materialization_owner/lanes.rs": {
+        "apply_projected_row_atomic": 1,
         "erase_local_only_file": 1,
-        "upsert_file_with_origin": 3,
-        "upsert_file_with_origin_and_author": 3,
     },
     # Local capture: provenance of freshly chunked blocks.
     L + "local_change/record_builder.rs": {
@@ -713,17 +644,14 @@ IN_FAMILY_ALLOWLIST: dict[str, dict[str, int]] = {
         "record_group_block_provenance": 1,
     },
     # Repository layer.
-    S + "change_history.rs": {
-        "record_group_block_provenance": 1,
-    },
     S + "file_index.rs": {
         "upsert_file_with_origin": 1,
     },
 }
 
 # Pinned total of IN_FAMILY_ALLOWLIST:
-#   total 32 = lane 17 + owner 13 + repository 2
-EXPECTED_IN_FAMILY_ALLOWED = 32
+#   total 14 = lane 7 + owner 6 + repository 1
+EXPECTED_IN_FAMILY_ALLOWED = 15
 
 # The orchestration-lane files that still hold raw calls of either section.
 # Pinned exactly: a lane file that appears in either allowlist but not here
@@ -735,23 +663,18 @@ EXPECTED_IN_FAMILY_ALLOWED = 32
 LANE_FILES = frozenset(
     {
         D + "convergence/engine.rs",
-        D + "dag_import.rs",
         D + "hydration.rs",
-        D + "link_runtime/factory.rs",
         D + "link_runtime/operations/capture_local_change.rs",
-        D + "link_runtime/operations/repair_materialization.rs",
         D + "local_convergence.rs",
-        D + "local_convergence/hydrate.rs",
         D + "local_convergence/knobs.rs",
         D + "local_convergence/materialize.rs",
         D + "local_convergence/materialize/eager.rs",
         D + "local_convergence/materialize/placeholder.rs",
         D + "local_convergence/materialize/symlink.rs",
         D + "local_convergence/reconcile.rs",
+        D + "local_convergence/reconcile_native.rs",
         D + "local_convergence/types.rs",
         D + "materialization_intent.rs",
-        D + "sync_adapter/admission.rs",
-        D + "sync_adapter/async_store.rs",
         F + "materialization_eviction.rs",
         F + "materialization_repair.rs",
         L + "local_change/event_ingest.rs",
@@ -882,6 +805,7 @@ def _code_only(line: str) -> str:
     return line[:marker] if marker != -1 else line
 
 
+@functools.lru_cache(maxsize=None)
 def cfg_test_spans(text: str) -> list[tuple[int, int]]:
     """Line ranges (1-indexed, inclusive) of items under a test-only `cfg`.
 
@@ -948,10 +872,21 @@ def test_module_files(files: list[Path]) -> set[Path]:
     roots: set[Path] = set()
     for path in files:
         text = path.read_text(encoding="utf-8")
+        spans = cfg_test_spans(text)
         for match in MOD_DECL.finditer(text):
             attrs, name = match.group(1), match.group(2)
-            if not any(cfg_requires_test(c.group(1)) for c in CFG_ATTR.finditer(attrs)):
+            line = text.count("\n", 0, match.start(2)) + 1
+            inside_test_span = any(start <= line <= end for start, end in spans)
+            if not inside_test_span and not any(
+                cfg_requires_test(c.group(1)) for c in CFG_ATTR.finditer(attrs)
+            ):
                 continue
+            if inside_test_span:
+                # `mod name;` written inside an inline test module
+                # (`#[cfg(test)] mod tests { mod name; }`): the file sits one
+                # directory level below the declaring file's module directory.
+                nested_base = path.parent if path.name in ("mod.rs", "lib.rs", "main.rs") else path.parent / path.stem
+                roots.update(p.resolve() for p in nested_base.glob(f"*/{name}.rs"))
             explicit = PATH_ATTR.search(attrs)
             base = path.parent
             if path.name not in ("mod.rs", "lib.rs", "main.rs") and not explicit:
@@ -1212,8 +1147,8 @@ def self_test() -> None:
             "fn g(s: &S) {\n"
             "    s.upsert_file_with_origin(1);\n"
             "    s.upsert_file_with_origin_and_author(2);\n"
-            "    s.set_pinned(3);\n"
-            "    s.set_pinned_flag(4);\n"
+            "    s.set_authoring_change_hash(3);\n"
+            "    s.set_authoring_change_hash_flag(4);\n"
             "}\n",
             encoding="utf-8",
         )
@@ -1225,7 +1160,7 @@ def self_test() -> None:
         assert family == [
             (3, "upsert_file_with_origin"),
             (4, "upsert_file_with_origin_and_author"),
-            (5, "set_pinned"),
+            (5, "set_authoring_change_hash"),
         ], family
 
 

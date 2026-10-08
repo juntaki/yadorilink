@@ -33,7 +33,15 @@ impl LinkRepositoryPort for DaemonLinkRepositoryAdapter {
             .map_err(SyncError::from)
     }
 
-    fn list_link_paths(&self) -> Result<Vec<String>, SyncError> {
+    fn live_link_keys_for_group(&self, group_id: &str) -> Result<Vec<String>, SyncError> {
+        self.state
+            .replica_coordinator
+            .link_repository()
+            .live_link_key_vec_for_group(group_id)
+            .map_err(SyncError::from)
+    }
+
+    fn list_link_paths_and_groups(&self) -> Result<Vec<(String, String)>, SyncError> {
         Ok(self
             .state
             .replica_coordinator
@@ -41,7 +49,7 @@ impl LinkRepositoryPort for DaemonLinkRepositoryAdapter {
             .list_links()
             .map_err(SyncError::from)?
             .into_iter()
-            .map(|l| l.local_path)
+            .filter_map(|l| l.folder_path().map(|p| (p.to_string(), l.group_id.clone())))
             .collect())
     }
 
@@ -62,6 +70,7 @@ impl LinkRepositoryPort for DaemonLinkRepositoryAdapter {
         local_path: &str,
         group_id: &str,
         marker: &PendingEnrollmentLinkCommand,
+        provider: Option<&crate::application::ports::ProviderLinkTarget>,
     ) -> Result<LinkRowWrite, SyncError> {
         let kind = match marker.kind {
             EnrollmentKind::Create => {
@@ -83,6 +92,16 @@ impl LinkRepositoryPort for DaemonLinkRepositoryAdapter {
                     local_path: local_path.to_string(),
                 },
                 crate::daemon_state::now_unix(),
+                provider
+                    .map(|target| yadorilink_sync_sqlite::provider::ProviderLinkSpec {
+                        kind:
+                            yadorilink_replica_domain::session_state::ProviderKind::MacFileProvider,
+                        display_name: target.display_name.clone(),
+                        empty_owner: target.empty_owner,
+                        on_demand: target.on_demand,
+                        creation_digest: target.creation_digest.clone(),
+                    })
+                    .as_ref(),
             )
             .map_err(SyncError::from)
     }
@@ -165,12 +184,10 @@ impl LinkWatcherPort for DaemonLinkWatcherAdapter {
         local_path: &'a str,
         group_id: &'a str,
         on_demand: bool,
-        max_local_size_bytes: Option<i64>,
     ) -> BoxFuture<'a, Result<(), DaemonError>> {
         Box::pin(async move {
             if on_demand {
-                if !yadorilink_filesystem_sync::placeholder_backend::on_demand_pipeline_is_connected(
-                ) {
+                if !self.state.root_allows_on_demand(group_id) {
                     return Err(DaemonError::Config(
                         "on-demand (placeholder) materialization is not available in this build \
                          yet -- link this folder in eager (full-copy) mode instead"
@@ -185,23 +202,57 @@ impl LinkWatcherPort for DaemonLinkWatcherAdapter {
                         yadorilink_replica_domain::session_state::MaterializationPolicy::OnDemand,
                     )
                     .map_err(SyncError::from)?;
-                if let Some(max_bytes) = max_local_size_bytes {
-                    self.state
-                        .replica_coordinator
-                        .link_repository()
-                        .set_max_local_size_bytes(local_path, Some(max_bytes))
-                        .map_err(SyncError::from)?;
-                }
             }
             // Retention is a fixed built-in policy (10 versions / 30 days)
             // applied to every link, so there is nothing per-link to
             // configure here.
             self.controller.start(local_path.to_string(), group_id.to_string())?;
+            // A new group here is what makes the next reconcile round productive.
+            self.state.native_replication.wake_reconcile();
             Ok(())
         })
     }
 
     fn stop<'a>(&'a self, local_path: &'a str) -> BoxFuture<'a, ()> {
         Box::pin(self.controller.stop(local_path))
+    }
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use super::*;
+    use crate::application::{LinkCommand, LinkLifecycleService};
+
+    /// Linking a folder wakes the native reconcile loops: the new group is what makes the next
+    /// round productive.
+    #[tokio::test]
+    async fn linking_a_folder_wakes_the_reconcile_loops() {
+        let store = Arc::new(
+            yadorilink_local_storage::SegmentBlockStore::new(tempfile::tempdir().unwrap().keep())
+                .unwrap(),
+        );
+        let sync_state =
+            Arc::new(crate::replica_coordinator::ReplicaCoordinator::open_in_memory().unwrap());
+        let state = DaemonState::new("device-a".into(), sync_state, store);
+        state.set_device_signing_key(ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]));
+        let controller = Arc::new(LinkRuntimeController::new(state.clone()));
+        let service = LinkLifecycleService::new(
+            Arc::new(DaemonLinkRepositoryAdapter::new(state.clone())),
+            Arc::new(DaemonLinkWatcherAdapter::new(state.clone(), controller)),
+        );
+        let wake = state.native_replication.subscribe_wake_for_test();
+        assert!(!wake.has_changed().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        service
+            .link(LinkCommand {
+                local_path: dir.path().to_string_lossy().to_string(),
+                group_id: "group-1".to_string(),
+                on_demand: false,
+                pending_enrollment: None,
+                provider: None,
+            })
+            .await
+            .unwrap();
+        assert!(wake.has_changed().unwrap());
     }
 }

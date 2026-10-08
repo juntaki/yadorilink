@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Keep index reads fail-closed, and off the panic path.
 
-`index.rs` is the daemon's local SQLite state. A single-row read there is
+`file_index.rs` (`yadorilink-sync-sqlite`'s `FileIndexRepository`) is the
+daemon's local file-row state. A single-row read there is
 written as `conn.query_row(...)` and must map ONLY "no such row" to `None`,
 propagating every other outcome (corruption, I/O, a locked/busy database, a
 schema/column-type mismatch) as an error the caller can defer or abort on.
@@ -11,12 +12,12 @@ The correct idiom is `rusqlite::OptionalExtension::optional()?`, which returns
 hazard is `query_row(...).ok()`: `.ok()` collapses EVERY error into `None`, so a
 transient fault reads back as a wrong "absent/default" answer. The worst case is
 `get_file` returning `None` on a transient error, which makes the local-change
-path treat an existing file as brand-new and emit a spurious `Create` plus a
-fresh version vector that diverges from peers. Milder cases downgrade to a
-dangerous default (`is_pinned` -> `false` mis-evicts a pinned file;
-`is_paused_for_group` -> `false` un-pauses a paused group).
+path treat an existing file as brand-new and capture a spurious create over a
+row that already exists, diverging from peers. Milder cases downgrade to a
+dangerous default (`is_paused_for_group` -> `false` un-pauses a paused
+group).
 
-This guard therefore fails when production `index.rs` code:
+This guard therefore fails when production `file_index.rs` code:
   1. ends a `query_row(...)` / `optional(...)` statement with `.ok()` (the
      error-masking read), or
   2. reaches the panic path on the library boundary via `unwrap()`,
@@ -38,7 +39,7 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TARGET = ROOT / "crates/yadorilink-sync-core/src/index.rs"
+TARGET = ROOT / "crates/yadorilink-sync-sqlite/src/file_index.rs"
 
 # A read statement that masks a real error as absent/default. A `query_row`
 # (or `optional`) result must be consumed with `.optional()?`, which forwards
@@ -72,7 +73,13 @@ PANIC_TOKENS = re.compile(
 # substring that must appear on the offending line. Keep this empty unless a
 # reviewer has confirmed the site cannot propagate (e.g. an infallible trait
 # method or a `Drop`); a fail-closed read is always preferable.
-ALLOWLIST: list[str] = []
+ALLOWLIST: list[str] = [
+    # `encode_xattrs_column` returns `String`, not a `Result`: serializing a
+    # `&[(String, Vec<u8>)]` to JSON cannot fail (string keys, byte arrays),
+    # so there is no error a caller could be handed. The decode half,
+    # `decode_xattrs_column`, is the fail-closed one and returns CorruptState.
+    "xattr list is always representable as JSON",
+]
 
 
 def _strip_test_blocks(lines: list[str]) -> list[tuple[int, str]]:
@@ -148,7 +155,7 @@ def scan_text(text: str) -> list[tuple[int, str]]:
             continue
         if PANIC_TOKENS.search(code):
             violations.append(
-                (lineno, "boundary panic in index.rs; return "
+                (lineno, "boundary panic in file_index.rs; return "
                          "SyncError::CorruptState instead of aborting the daemon")
             )
 
@@ -209,26 +216,8 @@ def main(argv: list[str]) -> int:
         return self_test()
 
     if not TARGET.exists():
-        # `yadorilink-sync-core` (and its `index.rs`, this guard's sole
-        # subject) was deleted outright. The hazard this guard protects against (a rusqlite
-        # `query_row`/`.optional()` read masked with `.ok()`/`.unwrap_or*`,
-        # or a boundary panic) has by now mostly relocated to
-        # `yadorilink-sync-sqlite`'s own repository files -- but that crate
-        # was never gated by this guard, carries its own large, pre-existing
-        # (unrelated to this deletion) population of the same patterns, and
-        # picking a new single-file target there would be a guess, not a
-        # verified repoint. Rather than silently broaden scope (which would
-        # newly fail CI on ~135 pre-existing, un-reviewed sites) or leave a
-        # false pass, this exits clean but visibly gapped: retargeting this
-        # guard at its code's real new home is real design work, out of
-        # this pass's scope.
-        print(
-            f"guard target not found: {TARGET} -- yadorilink-sync-core was deleted in Phase "
-            "7D-10; this guard's index-read hazard now needs a fresh home in "
-            "yadorilink-sync-sqlite, not yet retargeted (see this script's own comment)",
-            file=sys.stderr,
-        )
-        return 0
+        print(f"guard target not found: {TARGET}", file=sys.stderr)
+        return 1
 
     text = TARGET.read_text(encoding="utf-8")
     violations = scan_text(text)

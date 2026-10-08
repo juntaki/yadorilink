@@ -205,9 +205,11 @@ public struct FolderSummary: Sendable, Equatable, Hashable {
     public var degraded: Bool
     public var degradedReason: String?
     public var volume: VolumeSummary?
+    /// A provider-backed folder (macOS File Provider): it has no directory, so `localPath` is only its
+    /// identity key and nothing may reveal, open or restore into it as a path.
+    public var provider: Bool
 
-
-    public init(localPath: String, groupId: String, name: String, mode: FolderMode, state: FolderState, paused: Bool, conflictCount: UInt64, hydratedFileCount: UInt64, placeholderFileCount: UInt64, hydratingFileCount: UInt64, heldFileCount: UInt64, skippedSymlinkCount: UInt64, transfer: FolderTransferProgress?, durability: DurabilityStatus, durabilityEvidence: DurabilityEvidence, localStorage: LocalStorageState, fetchAvailability: FetchAvailability, fullReplicaDeviceIds: [String], policyStale: Bool, ambiguous: Bool, ambiguousLocalPaths: [String], degraded: Bool, degradedReason: String?, volume: VolumeSummary?) {
+    public init(localPath: String, groupId: String, name: String, mode: FolderMode, state: FolderState, paused: Bool, conflictCount: UInt64, hydratedFileCount: UInt64, placeholderFileCount: UInt64, hydratingFileCount: UInt64, heldFileCount: UInt64, skippedSymlinkCount: UInt64, transfer: FolderTransferProgress?, durability: DurabilityStatus, durabilityEvidence: DurabilityEvidence, localStorage: LocalStorageState, fetchAvailability: FetchAvailability, fullReplicaDeviceIds: [String], policyStale: Bool, ambiguous: Bool, ambiguousLocalPaths: [String], degraded: Bool, degradedReason: String?, volume: VolumeSummary?, provider: Bool = false) {
         self.localPath = localPath; self.groupId = groupId; self.name = name; self.mode = mode
         self.state = state; self.paused = paused; self.conflictCount = conflictCount
         self.hydratedFileCount = hydratedFileCount; self.placeholderFileCount = placeholderFileCount
@@ -218,6 +220,7 @@ public struct FolderSummary: Sendable, Equatable, Hashable {
         self.fullReplicaDeviceIds = fullReplicaDeviceIds; self.policyStale = policyStale
         self.ambiguous = ambiguous; self.ambiguousLocalPaths = ambiguousLocalPaths
         self.degraded = degraded; self.degradedReason = degradedReason; self.volume = volume
+        self.provider = provider
     }
 }
 
@@ -379,13 +382,10 @@ public struct ConflictSummary: Sendable, Equatable, Hashable {
     public var conflictTimestamp: String?
     public var kind: EntryKind
     public var reason: ConflictReason
-    /// The folder's history compaction is waiting for this conflict to be
-    /// resolved; sync is unaffected.
-    public var holdsCompaction: Bool
-    public init(localPath: String, path: String, size: UInt64, modifiedAt: Date?, currentPath: String, loserDeviceId: String?, conflictTimestamp: String?, kind: EntryKind, reason: ConflictReason, holdsCompaction: Bool = false) {
+    public init(localPath: String, path: String, size: UInt64, modifiedAt: Date?, currentPath: String, loserDeviceId: String?, conflictTimestamp: String?, kind: EntryKind, reason: ConflictReason) {
         self.localPath = localPath; self.path = path; self.size = size; self.modifiedAt = modifiedAt
         self.currentPath = currentPath; self.loserDeviceId = loserDeviceId; self.conflictTimestamp = conflictTimestamp
-        self.kind = kind; self.reason = reason; self.holdsCompaction = holdsCompaction
+        self.kind = kind; self.reason = reason
     }
 }
 
@@ -459,9 +459,8 @@ public enum MaterializationState: Sendable, Equatable, Hashable, CaseIterable { 
 public struct FileAvailability: Sendable, Equatable, Hashable {
     public var tracked: Bool
     public var state: MaterializationState
-    public var pinned: Bool
-    public init(tracked: Bool, state: MaterializationState, pinned: Bool) {
-        self.tracked = tracked; self.state = state; self.pinned = pinned
+    public init(tracked: Bool, state: MaterializationState) {
+        self.tracked = tracked; self.state = state
     }
 }
 
@@ -695,6 +694,19 @@ public struct LinkOutcome: Sendable, Equatable, Hashable {
     public var mode: FolderMode
     public init(groupId: String, localPath: String, mode: FolderMode) {
         self.groupId = groupId; self.localPath = localPath; self.mode = mode
+    }
+}
+
+/// A provider-backed folder just created: it has no local path, the File Provider domain is the folder.
+public struct ProviderFolderOutcome: Sendable, Equatable, Hashable {
+    public var groupId: String
+    public var rootId: String
+    public var displayName: String
+    public var mode: FolderMode
+    public var alreadyExisted: Bool
+    public init(groupId: String, rootId: String, displayName: String, mode: FolderMode, alreadyExisted: Bool) {
+        self.groupId = groupId; self.rootId = rootId; self.displayName = displayName
+        self.mode = mode; self.alreadyExisted = alreadyExisted
     }
 }
 

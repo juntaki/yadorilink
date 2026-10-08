@@ -1,13 +1,13 @@
-//! The two ways a path may come to claim `Hydrated`, kept deliberately
+//! The two ways a path may come to claim `Present`, kept deliberately
 //! apart.
 //!
-//! `MaterializationState::Hydrated` is an exact claim about disk, not a UI
+//! `MaterializationState::Present` is an exact claim about disk, not a UI
 //! label, and the claim is only worth anything alongside the proof that
 //! earns it: a materialized generation carrying the version that was
 //! written, published under the mutation-fence epoch the write itself
 //! produced. The invariant this module exists to make structural is
 //!
-//! > if `Hydrated` is observable, a usable actual-state generation exists
+//! > if `Present` is observable, a usable actual-state generation exists
 //! > in that same durable commit.
 //!
 //! "Usable" is exact. [`crate::materialized_generation::
@@ -29,7 +29,7 @@
 //! disk and must publish nothing.
 //!
 //! **Recovery** did not mutate anything. It found a path that already
-//! claims `Hydrated` whose proof is missing or stale, re-verified the disk
+//! claims `Present` whose proof is missing or stale, re-verified the disk
 //! bytes under a held path lock, and is restoring the evidence for state
 //! that was already true --
 //! [`reprove_verified_hydrated_state`]. It has no epoch of its own to CAS
@@ -50,7 +50,7 @@
 use rusqlite::Transaction;
 
 use yadorilink_replica_domain::file::RecordKind;
-use yadorilink_replica_domain::ids::{ChangeHash, VersionHash};
+use yadorilink_replica_domain::ids::VersionHash;
 use yadorilink_replica_domain::session_state::MaterializationState;
 use yadorilink_root_authority::fs_identity::FileIdentity;
 use yadorilink_root_authority::root_commit::RootCommitPermit;
@@ -128,31 +128,25 @@ impl ExactMaterializedState {
 /// check and the commit are not one step on their own -- a concurrent
 /// update can land in between while the same path lock is held, because
 /// the lock serializes daemon-internal work and the supersession comes
-/// from the DAG side. Passing the guard here folds the check into the
+/// from the native admission side. Passing the guard here folds the check into the
 /// same transaction as the proof, so the attempt either records bytes
 /// that are still current or records nothing.
 ///
-/// Without it, the attempt would stamp `Hydrated` for a version it never
+/// Without it, the attempt would stamp `Present` for a version it never
 /// materialized: the bytes on disk are stale for whatever is current now.
 #[derive(Debug, Clone, Copy)]
 pub struct ExpectedAuthoring<'a> {
     /// The materialization state the row must still be in -- normally
     /// `Hydrating`, the marker this attempt set when it began.
     pub state: MaterializationState,
-    /// The authoring change hash the row must still carry. `None` means
-    /// it must still carry no authoring hash at all, which is a distinct
-    /// condition from "any".
-    pub authoring_change_hash: Option<&'a ChangeHash>,
-    /// The version the current row must still name, checked explicitly
-    /// rather than inferred from `authoring_change_hash`.
+    /// The version the current row must still name.
     ///
-    /// `None` skips it, for a caller whose authoring binding was taken in
-    /// the same breath as the version it is committing. A caller whose
-    /// version came from a SNAPSHOT read in an EARLIER transaction -- the
-    /// repair sweep -- passes it, because between that snapshot and this
-    /// commit the row can be superseded, and an authoring check alone
-    /// would not catch a supersession that kept the authoring hash while
-    /// changing the content the version is derived from.
+    /// `None` skips it, for a caller whose binding was taken in the same
+    /// breath as the version it is committing. A caller whose version came
+    /// from a SNAPSHOT read in an EARLIER transaction -- the repair sweep --
+    /// passes it, because between that snapshot and this commit the row can
+    /// be superseded, and the state check alone would not catch a
+    /// supersession that changed the content the version is derived from.
     ///
     /// The version is not a stored column; it is recomputed here from the
     /// same current row this guard reads, which is why the comparison
@@ -202,8 +196,8 @@ pub enum InternalMaterializedCommit {
 /// ```
 ///
 /// They are one commit because any subset of them is a state the system
-/// has no way to read correctly. A proof without `Hydrated` re-drives work
-/// that is already done; `Hydrated` without a proof is a claim nothing can
+/// has no way to read correctly. A proof without `Present` re-drives work
+/// that is already done; `Present` without a proof is a claim nothing can
 /// verify and the readers fail closed on; and a cleared intent without
 /// either erases the only record that a write was ever attempted, so
 /// nothing retries.
@@ -213,17 +207,12 @@ pub enum InternalMaterializedCommit {
 /// which is the failure this whole module exists to make unreachable.
 ///
 /// `Absent` publishes its generation and clears the intent but stamps no
-/// `Hydrated`: a path that is exactly absent holds no content, and saying
+/// `Present`: a path that is exactly absent holds no content, and saying
 /// it does would be the same false claim in the other direction. Its
 /// materialization state belongs to whatever tombstoned it.
 ///
-/// `causal_basis` is the frontier these physical writes actually realized.
-/// A writer that resolved a specific frontier -- a projected upsert
-/// realizing one particular winner -- must pass it, because re-deriving it
-/// here would attribute the write to whatever resolution happens to be
-/// current when it lands. `None` derives the group's current heads inside
-/// this same transaction, which is the honest basis for a writer whose
-/// work simply reconstructs whatever the path currently resolves to.
+/// The proof records the path's present heads in this transaction
+/// ([`crate::materialization_basis::record`]).
 ///
 /// `expected_authoring`, when supplied, must still hold or nothing is
 /// written -- see [`ExpectedAuthoring`]. It is checked first, so a
@@ -235,7 +224,6 @@ pub fn commit_internal_materialized_state_if_fence_current(
     tx: &Transaction<'_>,
     group_id: &str,
     path: &str,
-    causal_basis: Option<&[ChangeHash]>,
     exact_state: &ExactMaterializedState,
     expected_mutation_generation: i64,
     expected_authoring: Option<ExpectedAuthoring<'_>>,
@@ -244,22 +232,13 @@ pub fn commit_internal_materialized_state_if_fence_current(
     // Checked before anything is written, so a superseded attempt leaves
     // the row exactly as it found it -- including its still-open intent.
     if let Some(guard) = expected_authoring {
-        let still_matches: i64 = match guard.authoring_change_hash {
-            Some(hash) => tx.query_row(
-                "SELECT COUNT(*) FROM files \
-                 WHERE group_id = ?1 AND path = ?2 AND state = 'current' \
-                   AND materialization_state = ?3 AND authoring_change_hash = ?4",
-                rusqlite::params![group_id, path, guard.state.as_db_str(), &hash.0[..]],
-                |r| r.get(0),
-            )?,
-            None => tx.query_row(
-                "SELECT COUNT(*) FROM files \
-                 WHERE group_id = ?1 AND path = ?2 AND state = 'current' \
-                   AND materialization_state = ?3 AND authoring_change_hash IS NULL",
-                rusqlite::params![group_id, path, guard.state.as_db_str()],
-                |r| r.get(0),
-            )?,
-        };
+        let still_matches: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM files \
+             WHERE group_id = ?1 AND path = ?2 AND state = 'current' \
+               AND materialization_state = ?3",
+            rusqlite::params![group_id, path, guard.state.as_db_str()],
+            |r| r.get(0),
+        )?;
         if still_matches == 0 {
             return Ok(InternalMaterializedCommit::AuthoringSuperseded);
         }
@@ -279,22 +258,10 @@ pub fn commit_internal_materialized_state_if_fence_current(
         }
     }
 
-    // Derived here, inside the caller's own transaction, when the caller
-    // has no frontier of its own to name. Reading it outside would cost a
-    // second connection round-trip on a hot path for the same answer.
-    let derived;
-    let causal_basis = match causal_basis {
-        Some(basis) => basis,
-        None => {
-            derived = crate::dag_store::group_heads(tx, group_id)?;
-            &derived
-        }
-    };
     let published = publish_materialized_generation_if_fence_current(
         tx,
         group_id,
         path,
-        causal_basis,
         exact_state.object_kind(),
         exact_state.version(),
         exact_state.identity(),
@@ -319,12 +286,204 @@ pub fn commit_internal_materialized_state_if_fence_current(
             tx,
             group_id,
             path,
-            MaterializationState::Hydrated,
+            MaterializationState::Present,
         )?;
     }
     MaterializationIntentRepository::clear_materialization_intent_in_tx(tx, group_id, path)?;
 
     Ok(InternalMaterializedCommit::Published(Box::new(basis)))
+}
+
+/// [`commit_internal_materialized_state_if_fence_current`] that also closes
+/// the path's projection obligation, in the caller's same transaction, when
+/// a worker holds a claim on it. Returns the commit's outcome and whether the
+/// obligation was closed.
+///
+/// The obligation is closed only by the completion statement every exact
+/// close uses ([`crate::projection_obligations::complete_obligation_if_exact_proof_current`]),
+/// run AFTER the proof landed in this same transaction. So, at the commit:
+///
+/// - The claim is still checked: the row's invalidation generation and
+///   incarnation must equal `claim`'s, read inside this transaction. A claim
+///   a newer admission (or a re-arm) has overtaken closes nothing.
+/// - A refused proof completes nothing. `FenceLost` and
+///   `AuthoringSuperseded` return before the completion is reached, and
+///   the completion's own predicate demands a proof published under the
+///   live fence carrying exactly this state's resolved hash, so it would
+///   refuse anyway.
+/// - A stale claim does not undo the proof. The proof, the `Present`
+///   stamp and the intent clear stand on their own: they say the exact
+///   bytes for the row's version are on disk under the fence this write
+///   bumped, which the fence CAS and the authoring guard just established,
+///   whatever happened to the obligation. Rolling them back would only
+///   reopen the intent over correct bytes and make the next pass rewrite
+///   them. The obligation stays open at its newer generation and the next
+///   claim closes it with no physical work (the zero-work close), exactly
+///   as a crash between a proof and its completion would leave it.
+/// - A stale claim does not let the proof name a frontier its bytes do not
+///   reflect. The fenced commit records the path's heads as they are now,
+///   and an admission that overtook the claim may have added a head these
+///   bytes are not; a proof whose basis included it would read as current
+///   for a change never written. So the basis is replaced by the head the
+///   row was written from (the one the authoring guard just matched), or,
+///   when the row names none at its own name, by a basis no frontier
+///   equals, which only costs the next claim a re-anchor.
+///
+/// Everything here is one commit, so a crash leaves either none of it (the
+/// intent and the obligation still open, the write re-driven) or all of it.
+// One argument more than the fenced commit it extends: the claim.
+#[allow(clippy::too_many_arguments)]
+pub fn commit_internal_materialized_state_closing_obligation(
+    tx: &Transaction<'_>,
+    group_id: &str,
+    path: &str,
+    exact_state: &ExactMaterializedState,
+    expected_mutation_generation: i64,
+    expected_authoring: Option<ExpectedAuthoring<'_>>,
+    claim: crate::projection_obligations::ObligationClaimToken,
+    now_unix_nanos: i64,
+) -> Result<(InternalMaterializedCommit, bool), SyncSqliteError> {
+    let commit = commit_internal_materialized_state_if_fence_current(
+        tx,
+        group_id,
+        path,
+        exact_state,
+        expected_mutation_generation,
+        expected_authoring,
+        now_unix_nanos,
+    )?;
+    if !matches!(commit, InternalMaterializedCommit::Published(_)) {
+        return Ok((commit, false));
+    }
+    let desired = crate::materialized_generation::compute_resolved_path_state_hash(
+        group_id,
+        path,
+        exact_state.object_kind(),
+        exact_state.version(),
+    );
+    let closed = crate::projection_obligations::complete_obligation_if_exact_proof_current(
+        tx,
+        group_id,
+        path,
+        claim.invalidation_generation,
+        claim.obligation_incarnation,
+        &desired,
+    )?;
+    let mut commit = commit;
+    if !closed {
+        let written = match crate::file_index::row_authoring_in_tx(tx, group_id, path)? {
+            Some(identity) if identity.source_path.as_str() == path => {
+                crate::materialization_basis::of_unplaced_heads(&[identity.provenance.0])
+            }
+            _ => crate::materialization_basis::ReflectedHeads(Vec::new()),
+        };
+        crate::materialized_generation::replace_proof_basis(tx, group_id, path, &written)?;
+        if let InternalMaterializedCommit::Published(basis) = &mut commit {
+            basis.basis = written;
+        }
+    }
+    Ok((commit, closed))
+}
+
+/// One file's close, as [`close_content_writes_in_tx`] takes it: exactly the
+/// inputs of [`commit_internal_materialized_state_closing_obligation`] (or,
+/// without a claim, of [`commit_internal_materialized_state_if_fence_current`]).
+pub struct CloseWriteRequest<'a> {
+    pub group_id: &'a str,
+    pub path: &'a str,
+    pub exact_state: &'a ExactMaterializedState,
+    pub expected_mutation_generation: i64,
+    pub expected_authoring: ExpectedAuthoring<'a>,
+    pub claim: Option<crate::projection_obligations::ObligationClaimToken>,
+}
+
+/// The outcome of one file's close in a batch: what the single-file commit
+/// returns, and whether the obligation was closed.
+pub type CloseWriteOutcome = Result<(InternalMaterializedCommit, bool), SyncSqliteError>;
+
+/// Closes several content writes in the caller's one transaction, each as
+/// its own unit.
+///
+/// Every request runs the checks and writes of the single-file close, in the
+/// same order, against its own row: the authoring and expected-version
+/// guard, the fence-current proof publish, the `Present` stamp, the intent
+/// clear (which clears the replaced targets with it), and the claimed
+/// obligation's completion with the claim's generation and incarnation. Then
+/// `verify(index)` runs for that request, which is where the caller checks
+/// that request's own root permit.
+///
+/// A failing `verify` means the root is no longer this link's, which no
+/// item's commit may outlive: it fails the whole call, so the transaction
+/// rolls back and every request keeps its pre-commit state.
+///
+/// Each request runs under its own savepoint. A refusal (`FenceLost`,
+/// `AuthoringSuperseded`) writes nothing, as in the single-file close. A
+/// request that fails after writing something (an error from one of its
+/// statements) is rolled back to its savepoint, so none of its
+/// partial writes survive, and its error is its outcome; the others in the
+/// batch are unaffected and commit with the transaction. Only a failure of
+/// the savepoint statements themselves, which leaves the transaction in an
+/// unknown state, fails the whole call.
+pub fn close_content_writes_in_tx(
+    tx: &Transaction<'_>,
+    requests: &[CloseWriteRequest<'_>],
+    now_unix_nanos: i64,
+    mut disk_exact: impl FnMut(usize) -> bool,
+    mut verify: impl FnMut(usize) -> Result<(), SyncSqliteError>,
+) -> Result<Vec<CloseWriteOutcome>, SyncSqliteError> {
+    let mut outcomes = Vec::with_capacity(requests.len());
+    for (index, request) in requests.iter().enumerate() {
+        if !disk_exact(index) {
+            // Nothing is written for this item, but a lost root still fails
+            // the whole call.
+            verify(index)?;
+            outcomes.push(Ok((InternalMaterializedCommit::AuthoringSuperseded, false)));
+            continue;
+        }
+        tx.execute_batch("SAVEPOINT close_content_write")?;
+        let outcome: CloseWriteOutcome = (|| {
+            Ok(match request.claim {
+                Some(claim) => commit_internal_materialized_state_closing_obligation(
+                    tx,
+                    request.group_id,
+                    request.path,
+                    request.exact_state,
+                    request.expected_mutation_generation,
+                    Some(request.expected_authoring),
+                    claim,
+                    now_unix_nanos,
+                )?,
+                None => (
+                    commit_internal_materialized_state_if_fence_current(
+                        tx,
+                        request.group_id,
+                        request.path,
+                        request.exact_state,
+                        request.expected_mutation_generation,
+                        Some(request.expected_authoring),
+                        now_unix_nanos,
+                    )?,
+                    false,
+                ),
+            })
+        })();
+        // Whatever the statements did, a lost root fails the whole call.
+        verify(index)?;
+        // A transient lock is not this item's verdict: it fails the whole call,
+        // whose transaction is rolled back and retried by the writer.
+        let outcome = match outcome {
+            Err(error) if yadorilink_sqlite_runtime::SqlOperationError::is_locked(&error) => {
+                return Err(error);
+            }
+            other => other,
+        };
+        if outcome.is_err() {
+            tx.execute_batch("ROLLBACK TO close_content_write")?;
+        }
+        tx.execute_batch("RELEASE close_content_write")?;
+        outcomes.push(outcome);
+    }
+    Ok(outcomes)
 }
 
 /// The reader half of this module's invariant: whether the proof standing
@@ -420,7 +579,7 @@ pub enum RecoveredMaterializedCommit {
 /// syscall; recovery mutated nothing and owns no such epoch, and minting
 /// one would claim a write that never happened and invalidate whatever a
 /// concurrent internal mutator is holding. [`reprove_verified_hydrated_state`]
-/// is fence-free and correct for a row that is ALREADY `Hydrated` -- it
+/// is fence-free and correct for a row that is ALREADY `Present` -- it
 /// deliberately does not touch the state, because there is no claim to
 /// make, only footing to restore.
 ///
@@ -431,8 +590,8 @@ pub enum RecoveredMaterializedCommit {
 /// publish, promote, and clear the intent. Doing them as three calls is
 /// three transactions, and the path lock does not span them -- it
 /// serializes daemon-internal work, while a supersession comes from the
-/// DAG side. Between the publish and the promotion the row can move from
-/// V1 to V2, and the promotion then stamps `Hydrated` on a V2 row whose
+/// native admission side. Between the publish and the promotion the row can move from
+/// V1 to V2, and the promotion then stamps `Present` on a V2 row whose
 /// only proof describes V1. That is the precise combination this module
 /// exists to make unreachable, reached through its own repair path.
 ///
@@ -448,7 +607,6 @@ pub fn commit_recovered_materialized_state(
     tx: &Transaction<'_>,
     group_id: &str,
     path: &str,
-    causal_basis: Option<&[ChangeHash]>,
     exact_state: &ExactMaterializedState,
     expected: ExpectedAuthoring<'_>,
     now_unix_nanos: i64,
@@ -460,9 +618,6 @@ pub fn commit_recovered_materialized_state(
         return Ok(RecoveredMaterializedCommit::Superseded);
     };
     if current.materialization_state != Some(expected.state) {
-        return Ok(RecoveredMaterializedCommit::Superseded);
-    }
-    if current.authoring_change_hash.as_ref() != expected.authoring_change_hash {
         return Ok(RecoveredMaterializedCommit::Superseded);
     }
     // Not optional here, unlike the guard's own `Option`: the version is
@@ -480,14 +635,6 @@ pub fn commit_recovered_materialized_state(
     }
     require_state_describes_row(path, exact_state, expected_version, &current)?;
 
-    let derived;
-    let causal_basis = match causal_basis {
-        Some(basis) => basis,
-        None => {
-            derived = crate::dag_store::group_heads(tx, group_id)?;
-            &derived
-        }
-    };
     // The live value, read and published under in this same transaction's
     // write lock. Not a bump: nothing was mutated, so advancing the fence
     // would supersede evidence a concurrent internal mutator is holding
@@ -497,7 +644,6 @@ pub fn commit_recovered_materialized_state(
         tx,
         group_id,
         path,
-        causal_basis,
         exact_state.object_kind(),
         exact_state.version(),
         exact_state.identity(),
@@ -518,25 +664,25 @@ pub fn commit_recovered_materialized_state(
             tx,
             group_id,
             path,
-            MaterializationState::Hydrated,
+            MaterializationState::Present,
         )?;
     }
     MaterializationIntentRepository::clear_materialization_intent_in_tx(tx, group_id, path)?;
     Ok(RecoveredMaterializedCommit::Published(Box::new(published)))
 }
 
-/// Restores the proof for a path that is already `Hydrated` and whose disk
+/// Restores the proof for a path that is already `Present` and whose disk
 /// state has just been re-verified.
 ///
 /// This is the healing lane, and it is deliberately not
 /// [`commit_internal_materialized_state_if_fence_current`]. Nothing was
-/// mutated here: a repair pass found a path claiming `Hydrated` whose
+/// mutated here: a repair pass found a path claiming `Present` whose
 /// proof was missing or stale, compared its on-disk bytes against the
 /// index under a held path lock, and is re-recording evidence for state
 /// that was already true. It has no epoch of its own to CAS against.
 ///
 /// The combination this exists for is a genuine wedge:
-/// `Hydrated` + disk bytes that match exactly + no usable proof. Hydration
+/// `Present` + disk bytes that match exactly + no usable proof. Hydration
 /// refuses it (fail closed, no proof), pinning refuses it, and a repair
 /// pass that merely observed "disk matches" and moved on would leave it
 /// permanently stuck. Publishing under the *live* fence is what makes the
@@ -545,7 +691,7 @@ pub fn commit_recovered_materialized_state(
 /// It deliberately does not bump the fence: doing so would claim a
 /// physical mutation that never happened, and would invalidate any
 /// evidence a concurrent internal mutator is holding. It also does not
-/// touch the materialization state -- the row is already `Hydrated`, and
+/// touch the materialization state -- the row is already `Present`, and
 /// this call is restoring that claim's footing, not making it.
 ///
 /// `permit` is verified here, inside `tx`, once the guard has passed and
@@ -561,7 +707,6 @@ pub fn reprove_verified_hydrated_state(
     tx: &Transaction<'_>,
     group_id: &str,
     path: &str,
-    causal_basis: Option<&[ChangeHash]>,
     exact_state: &ExactMaterializedState,
     expected: Option<ExpectedAuthoring<'_>>,
     now_unix_nanos: i64,
@@ -580,9 +725,6 @@ pub fn reprove_verified_hydrated_state(
         if current.materialization_state != Some(guard.state) {
             return Ok(None);
         }
-        if current.authoring_change_hash.as_ref() != guard.authoring_change_hash {
-            return Ok(None);
-        }
         if let Some(expected_version) = guard.expected_version {
             if current.version_hash() != *expected_version {
                 return Ok(None);
@@ -592,19 +734,6 @@ pub fn reprove_verified_hydrated_state(
     // Root identity is re-verified before the publish, inside the same
     // transaction, so a lost root rolls the whole heal back.
     permit.verify()?;
-    // Derived here, inside the caller's own transaction, when the caller
-    // has no frontier of its own to name -- same reasoning as the internal
-    // commit above. It matters more here: the repair sweep calls this once
-    // per wedged row, so a second connection round-trip would be paid per
-    // row across the whole scan.
-    let derived;
-    let causal_basis = match causal_basis {
-        Some(basis) => basis,
-        None => {
-            derived = crate::dag_store::group_heads(tx, group_id)?;
-            &derived
-        }
-    };
     // Read the live fence and publish under it. Not a bump: the value is
     // whatever is already current, so this republication supersedes no
     // other writer's evidence.
@@ -613,7 +742,6 @@ pub fn reprove_verified_hydrated_state(
         tx,
         group_id,
         path,
-        causal_basis,
         exact_state.object_kind(),
         exact_state.version(),
         exact_state.identity(),
@@ -638,18 +766,12 @@ pub fn reprove_verified_hydrated_state(
 /// physical work -- and the proof it closes against is re-anchored on the
 /// frontier that resolution was made from.
 ///
-/// Closing alone is not enough. The proof's causal basis is also the
-/// parent set a later local edit of those bytes is signed onto
-/// ([`crate::file_index`]'s `local_edit_parents_in_tx`). A proof whose
-/// basis predates changes the close has just accepted as already
-/// reflected on disk leaves those changes concurrent with the user's
-/// next edit, and a concurrent content head beats a delete: a peer's
-/// conflict-copy merge resolution that re-put bytes this device already
-/// had, followed by the user deleting that copy here, resurrected the
-/// copy on every device.
+/// Closing alone is not enough. A proof whose basis predates heads the
+/// close has just accepted as already reflected on disk would read as stale
+/// (and the path as unproven) for the rest of its life.
 ///
 /// One transaction. The close's own CAS establishes that the obligation's
-/// DAG generation, the proof's fence epoch and its resolved state are all
+/// invalidation generation, the proof's fence epoch and its resolved state are all
 /// still what the caller verified; only then is the same object -- kind,
 /// version and identity unchanged -- republished under the live fence,
 /// with no bump (nothing was mutated), on the group's current heads. A
@@ -682,12 +804,9 @@ pub fn complete_zero_work_obligation_rebasing_proof(
     else {
         return Ok(true);
     };
-    let heads = crate::dag_store::group_heads(tx, group_id)?;
-    // Already on this frontier: nothing to re-anchor, and the proof keeps
-    // its generation.
-    if crate::dag_store::lookup_causal_basis_members(tx, &proof.causal_basis_id.0)?.as_ref()
-        == Some(&heads)
-    {
+    // Already on the current basis: nothing to re-anchor, and the proof
+    // keeps its generation.
+    if crate::materialization_basis::is_current(tx, group_id, path, &proof.basis)? {
         return Ok(true);
     }
     let live = snapshot_mutation_fence(tx, group_id, path)?;
@@ -695,7 +814,6 @@ pub fn complete_zero_work_obligation_rebasing_proof(
         tx,
         group_id,
         path,
-        &heads,
         proof.object_kind,
         proof.version.as_ref(),
         proof.filesystem_identity.as_ref(),

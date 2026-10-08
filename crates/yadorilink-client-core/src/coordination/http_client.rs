@@ -64,13 +64,8 @@ use yadorilink_fapi_client::{CoordinationAuth, CredentialManager};
 
 use crate::error::{CoreError, LimitKind};
 
-pub fn coordination_http_addr() -> String {
-    std::env::var("YADORILINK_COORDINATION_HTTP_ADDR")
-        .unwrap_or_else(|_| "http://127.0.0.1:8787".into())
-}
-
-/// Serializes test-only mutation of `YADORILINK_COORDINATION_HTTP_ADDR`, the
-/// process-global env var [`coordination_http_addr`] reads -- shared by
+/// Serializes test-only mutation of `YADORILINK_COORDINATION_ADDR`, the
+/// process-global env var [`coordination_addr`] reads -- shared by
 /// every test in this crate that points the coordination HTTP client at a
 /// local mock server, so two such tests can never race on the same global
 /// env var when `cargo test` runs them concurrently in one process. A
@@ -84,13 +79,35 @@ pub fn coordination_http_addr() -> String {
 pub(crate) static COORDINATION_ADDR_ENV_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
 
-/// The coordination endpoint recorded in this device's `device.json` at
-/// registration time, read from
-/// `YADORILINK_COORDINATION_ADDR`. Kept distinct from
-/// [`coordination_http_addr`] so the persisted device record and the
-/// request base URL can be configured independently.
+/// Loopback endpoint used when neither the environment nor the build supplies
+/// one (development and local builds).
+const LOOPBACK_COORDINATION_ADDR: &str = "http://127.0.0.1:8787";
+
+/// Endpoint baked in at build time. Release builds set
+/// `YADORILINK_DEFAULT_COORDINATION_ADDR` while compiling; other builds leave
+/// it unset and fall back to loopback.
+const COMPILED_COORDINATION_ADDR: Option<&str> =
+    option_env!("YADORILINK_DEFAULT_COORDINATION_ADDR");
+
+/// The coordination endpoint: the `YADORILINK_COORDINATION_ADDR` environment
+/// variable if set, else the build-time default, else loopback. This is the
+/// single resolver for the request base URL and for the endpoint recorded in
+/// `device.json` at registration.
 pub fn coordination_addr() -> String {
-    std::env::var("YADORILINK_COORDINATION_ADDR").unwrap_or_else(|_| "http://127.0.0.1:7443".into())
+    resolve_coordination_addr(
+        std::env::var("YADORILINK_COORDINATION_ADDR").ok().as_deref(),
+        COMPILED_COORDINATION_ADDR,
+    )
+}
+
+fn resolve_coordination_addr(env: Option<&str>, compiled: Option<&str>) -> String {
+    [env, compiled]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|v| !v.is_empty())
+        .unwrap_or(LOOPBACK_COORDINATION_ADDR)
+        .to_string()
 }
 
 /// Where this installation's Authorization Server lives.
@@ -277,7 +294,7 @@ fn error_from_body(status: u16, body: &serde_json::Value) -> CoreError {
 /// Builds the request URL for `path` after checking the configured coordination
 /// address is one this client will talk to at all.
 fn endpoint(path: &str) -> Result<String, CoreError> {
-    let addr = coordination_http_addr();
+    let addr = coordination_addr();
     validate_addr(&addr)?;
     Ok(format!("{addr}{path}"))
 }

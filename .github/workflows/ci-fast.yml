@@ -63,8 +63,8 @@ jobs:
         # prefix: `--skip` matches a substring of the whole test path, and that
         # prefix also silences credential_manager.rs's
         # `..._while_the_first_holds_the_rotation_lock`, which is not in the
-        # lane and would then run nowhere. check-test-inventory.py derives this
-        # list from the two files and fails if it drifts.
+        # lane and would then run nowhere. Keep this list in step with the
+        # two files.
         run: >-
           cargo test --no-fail-fast --workspace --exclude yadorilink-daemon --exclude yadorilink-desktop-app
           --exclude yadorilink-transport --exclude yadorilink-lane-ports
@@ -104,9 +104,9 @@ jobs:
         # * sync-sqlite holds the scale tests, which assert wall-clock
         #   budgets that concurrent load would distort.
         #
-        # A whole-crate `--tests -- --test-threads=1` lane is what
-        # check-test-inventory.py reads to exempt a crate's integration files,
-        # so adding a file to one of these crates needs no registration.
+        # Each of these is a whole-crate `--tests -- --test-threads=1` lane, so
+        # adding an integration test file to one of these crates needs no
+        # registration.
         run: >-
           cargo test --no-fail-fast -p yadorilink-transport --tests -- --test-threads=1 &&
           cargo test --no-fail-fast -p yadorilink-lane-ports --tests -- --test-threads=1 &&
@@ -215,9 +215,8 @@ jobs:
           key: auth-runtime-boundaries
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Coordination credential runtime boundaries
-        # Pinned verbatim by scripts/check-test-inventory.py. Removing either
-        # `--test` argument, or the `--test-threads=1`, fails the inventory gate
-        # rather than silently dropping a security proof out of CI.
+        # Keep both `--test` arguments and the `--test-threads=1`: removing
+        # one would silently drop a security proof out of CI.
         run: >-
           cargo test -p yadorilink-fapi-client
           --test cross_process_rotation

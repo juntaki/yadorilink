@@ -7,7 +7,7 @@
 //! scaffolding) rather than reinventing it — see that file's own doc
 //! comment for the rationale behind each piece this one reuses unchanged,
 //! including the change-history-DAG propagation both scenarios drive: a signed
-//! `ChangeEmitter` per device, and `announce_local_commit` (not an index push)
+//! `LocalAuthorKey` per device, and `announce_local_commit` (not an index push)
 //! to hand a committed edit to the peer, whose `run()` loop pulls the ancestry
 //! it is missing and materializes the same state.
 //!
@@ -103,7 +103,7 @@ use yadorilink_local_storage::SegmentBlockStore;
 use yadorilink_peer_session::peer_session::{
     PeerSyncSession, PendingLocalChangeFlush, PendingLocalFlushOutcome,
 };
-use yadorilink_replica_domain::ids::ChangeHash;
+use yadorilink_replica_domain::ids::DeltaHash;
 
 const GROUP_ID: &str = "dst-dir-chaos-group";
 const CANARY_PATH: &str = "startup-canary.bin";
@@ -422,7 +422,7 @@ async fn connect_sessions(
 
     // Same DAG propagation as `dst_two_device_chaos.rs`'s `connect_sessions`,
     // for the same reason: each device materializes a conflict copy locally
-    // from the shared change set, so the legacy `broadcast_change`-shaped
+    // from the shared change set, so the legacy `on_local_native_commit`-shaped
     // forwarding channel has nothing left to carry and is dropped.
     // Pin both devices' verifying keys (each admits the other's signed changes)
     // -- moved ahead of session construction so the authenticator (now a
@@ -544,7 +544,7 @@ async fn deliver_local_delete(device: &Arc<ChaosDevice>, path: &str) -> Result<(
     dst_support::fs_ops::remove(&device.root.join(path))?;
     device
         .events_tx
-        .send(FsChangeEvent { path: device.root.join(path), kind: FsChangeKind::Removed })
+        .send(FsChangeEvent { path: device.root.join(path), kind: FsChangeKind::ObservedRemoval })
         .await
         .map_err(|_| "watcher channel closed early".to_string())
 }
@@ -650,7 +650,7 @@ async fn deliver_local_rmdir(device: &Arc<ChaosDevice>, dir_path: &str) -> Resul
     }
     device
         .events_tx
-        .send(FsChangeEvent { path: full, kind: FsChangeKind::Removed })
+        .send(FsChangeEvent { path: full, kind: FsChangeKind::ObservedRemoval })
         .await
         .map_err(|_| "watcher channel closed early".to_string())
 }
@@ -801,7 +801,7 @@ fn register_content(content_table: &mut ContentTable, next_id: &mut u64, bytes: 
 /// compares by DAG ancestry; `None` (no current row / no authoring identity
 /// yet) makes the entry un-superseded, which fails loud rather than quietly
 /// excusing a disappearance.
-fn authoring_of(device: &ChaosDevice, path: &str) -> Option<ChangeHash> {
+fn authoring_of(device: &ChaosDevice, path: &str) -> Option<DeltaHash> {
     device
         .state
         .change_history_repository()
@@ -1690,7 +1690,7 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
                 // hand-tuned +100ms sub-step needed, same as race (a) above.
 
                 dst_support::fs_ops::remove(&y.root.join(&old_path))?;
-                apply_and_push(y, &old_path, FsChangeKind::Removed).await?;
+                apply_and_push(y, &old_path, FsChangeKind::ObservedRemoval).await?;
 
                 // Settle *before* recording, not after. Recording is a pure model
                 // action with no effect on the system, so moving the wait ahead of it

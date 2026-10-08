@@ -12,7 +12,7 @@
 //! # Why installation is not a request that arrives later
 //!
 //! The hook is installed between the sync stack starting and the
-//! reconciliation driver starting, and that placement is the whole design.
+//! peer session driver starting, and that placement is the whole design.
 //!
 //! A "begin witnessing now" control message would be simpler and would be
 //! wrong. `SyncStack::link_to` hands back a cached link without dialling when

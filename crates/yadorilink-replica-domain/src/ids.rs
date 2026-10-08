@@ -1,10 +1,11 @@
 //! Content-addressed identities and opaque string newtypes shared across
 //! the replica domain model.
 
-/// SHA-256 of a change's canonical encoding — its content-addressed
-/// identity. Two byte-identical encodings hash equal on every device.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ChangeHash(pub [u8; 32]);
+/// SHA-256 of a signed delta's header — its content-addressed identity, and
+/// the provenance of every head it lands. Two byte-identical headers hash
+/// equal on every device. Zero where nothing is signed yet.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct DeltaHash(pub [u8; 32]);
 
 /// SHA-256 of a `FileVersion`'s canonical encoding.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -137,9 +138,9 @@ string_newtype!(DeviceId);
 string_newtype!(FolderGroupId);
 string_newtype!(SyncPath);
 
-impl std::fmt::Debug for ChangeHash {
+impl std::fmt::Debug for DeltaHash {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ChangeHash({})", hex::encode(self.0))
+        write!(f, "DeltaHash({})", hex::encode(self.0))
     }
 }
 impl std::fmt::Debug for VersionHash {
@@ -147,7 +148,7 @@ impl std::fmt::Debug for VersionHash {
         write!(f, "VersionHash({})", hex::encode(self.0))
     }
 }
-impl ChangeHash {
+impl DeltaHash {
     pub fn to_hex(&self) -> String {
         hex::encode(self.0)
     }

@@ -46,8 +46,6 @@ use yadorilink_daemon::daemon_state::{
     set_default_materialization_repair_sweep_interval_for_tests, DaemonState,
 };
 use yadorilink_local_storage::SegmentBlockStore;
-use yadorilink_replica_domain::ids::ChangeHash;
-use yadorilink_replica_engine::conflict::{resolve_path_heads, PathResolution};
 
 const ABSOLUTE_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(900);
 const STALL_TIMEOUT: Duration = Duration::from_secs(90);
@@ -381,32 +379,9 @@ async fn n_synced_devices(n: usize, test_name: &str) -> (Vec<TestDevice>, String
     for device in &devices {
         start_watching(device, &group_id).await;
     }
-    // Reconciliation counters are process-global; reset before the run so
-    // what is reported at the end describes this run only.
-    yadorilink_daemon::sync_adapter::metrics::reset();
-
     connect_all_pairs(&devices, std::slice::from_ref(&group_id)).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     (devices, group_id)
-}
-
-/// What reconciliation actually cost, against the numbers the old path
-/// produced on this same scenario (Run3/4: 560-676 verification attempts per
-/// unique Change; retroactive planner 74s max, 1200-2180s cumulative under
-/// the writer gate).
-fn report_reconciliation_cost(devices: &[TestDevice]) {
-    let stats = yadorilink_daemon::sync_adapter::metrics::stats();
-    let peak = devices
-        .iter()
-        .filter_map(|d| d.state.reconciliation_driver())
-        .map(|driver| driver.stack().store_metrics().peak_in_flight)
-        .max()
-        .unwrap_or(0);
-    eprintln!(
-        "row14_strict_acceptance: reconciliation {stats:?};          verification amplification = {:?}; staging amplification = {:?};          store peak in flight = {peak}",
-        stats.verification_amplification(),
-        stats.staging_amplification(),
-    );
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -469,154 +444,49 @@ fn snapshot(root: &std::path::Path) -> std::collections::HashMap<String, String>
 /// D. Resolution and job state agree everywhere but the conflict-copy
 ///    still never lands on disk -- a pure projection/materialization bug.
 ///
-/// Identifies the winner/loser `ChangeHash` values by finding a device
+/// Identifies the winner/loser `DeltaHash` values by finding a device
 /// whose own `resolve_path_heads(source_path)` call already produces a
 /// `ConflictCopy` matching `target_conflict_copy_path` by name -- avoids
 /// having to reverse-parse the conflict-copy filename (its embedded hash
-/// is a losing FILE VERSION hash prefix, not a `ChangeHash`, so it cannot
+/// is a losing FILE VERSION hash prefix, not a `DeltaHash`, so it cannot
 /// be used to look up the change directly).
-#[allow(
-    clippy::excessive_nesting,
-    reason = "failure-path diagnostic dump: the nested loops walk device -> peer session -> \
-              path-head resolution -> DAG parent closure in one pass, and each inner level \
-              appends to the same ordered report buffer; hoisting a level into a helper would \
-              split the report's layer-by-layer ordering across functions for output that only \
-              ever runs once, immediately before a panic"
-)]
 fn dump_conflict_diagnostic_snapshot(
     devices: &[TestDevice],
     group_id: &str,
     source_path: &str,
     target_conflict_copy_path: &str,
 ) -> String {
-    let mut winner_hash: Option<ChangeHash> = None;
-    let mut loser_hash: Option<ChangeHash> = None;
-    let mut resolution_by_device: Vec<String> = Vec::new();
-
-    for (i, device) in devices.iter().enumerate() {
-        // The combined-heads read is the executor's, not the session's:
-        // it is a local index query with no wire involved.
-        let convergence = device
-            .state
-            .peers
-            .all_sessions()
-            .into_iter()
-            .next()
-            .and_then(|(peer_device_id, _)| device.state.peers.convergence(&peer_device_id));
-        let Some(convergence) = convergence else {
-            resolution_by_device.push(format!("device-{i}: no peer session available"));
-            continue;
-        };
-        match convergence.combined_heads(group_id, source_path, None) {
-            Ok(heads) => match resolve_path_heads(source_path, &heads) {
-                PathResolution::Present { winner, conflict_copies } => {
-                    resolution_by_device.push(format!(
-                        "device-{i}: Present winner_device={} winner_hash={} conflict_copies={:?}",
-                        heads[winner].device_id,
-                        hex::encode(heads[winner].change_hash),
-                        conflict_copies.iter().map(|c| c.path.clone()).collect::<Vec<_>>()
-                    ));
-                    if winner_hash.is_none() {
-                        winner_hash = Some(ChangeHash(heads[winner].change_hash));
-                    }
-                    for cc in &conflict_copies {
-                        if cc.path == target_conflict_copy_path && loser_hash.is_none() {
-                            loser_hash = Some(ChangeHash(heads[cc.head].change_hash));
-                        }
-                    }
-                }
-                PathResolution::Absent => {
-                    resolution_by_device.push(format!("device-{i}: Absent"));
-                }
-            },
-            Err(e) => {
-                resolution_by_device.push(format!("device-{i}: error reading path heads: {e}"));
-            }
-        }
-    }
-
-    let mut out = String::new();
-    out.push_str(&format!(
+    let mut out = format!(
         "=== conflict diagnostic snapshot: source_path={source_path:?} \
          target_conflict_copy_path={target_conflict_copy_path:?} ===\n"
-    ));
-    out.push_str(&format!(
-        "identified winner_hash={:?} loser_hash={:?}\n",
-        winner_hash.map(|h| hex::encode(h.0)),
-        loser_hash.map(|h| hex::encode(h.0)),
-    ));
-    for line in &resolution_by_device {
-        out.push_str(line);
-        out.push('\n');
-    }
-
+    );
     for (i, device) in devices.iter().enumerate() {
-        let heads = device.state.replica_coordinator.sqlite().dag_group_heads(group_id).ok();
+        let coordinator = &device.state.replica_coordinator;
+        let heads = coordinator.database().read(|conn| {
+            yadorilink_sync_sqlite::native_store::native_heads_at(
+                conn,
+                &yadorilink_replica_domain::ids::FolderGroupId(group_id.to_owned()),
+                &yadorilink_replica_domain::ids::SyncPath(source_path.to_owned()),
+            )
+        });
+        let authors = device.state.replica_coordinator.native_author_frontier(group_id).ok();
         out.push_str(&format!(
-            "device-{i}: dag_group_heads={:?}\n",
-            heads.map(|hs| hs.iter().map(|h| hex::encode(h.0)).collect::<Vec<_>>())
+            "device-{i}: native heads at the source path = {:?}; authors in the frontier = {:?}\n",
+            heads.map(|heads| {
+                heads
+                    .iter()
+                    .map(|head| {
+                        format!(
+                            "{}@{} delta={}",
+                            head.dot.author.device.0,
+                            head.dot.seq.get(),
+                            hex::encode(&head.payload.provenance.0[..4])
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }),
+            authors.map(|frontier| frontier.len()),
         ));
-        for (label, hash) in [("winner", winner_hash), ("loser", loser_hash)] {
-            let Some(hash) = hash else { continue };
-            let has_change = device
-                .state
-                .replica_coordinator
-                .change_history_repository()
-                .dag_has_change(&hash)
-                .unwrap_or(false);
-            let has_orphan_or_change = device
-                .state
-                .replica_coordinator
-                .change_history_repository()
-                .dag_has_change_or_buffered_orphan(&hash)
-                .unwrap_or(false);
-            let status = if has_change {
-                "admitted"
-            } else if has_orphan_or_change {
-                "orphaned (buffered, cannot recurse into its own parents -- no public API reads \
-                 orphan content)"
-            } else {
-                "UNKNOWN (never received at all)"
-            };
-            out.push_str(&format!(
-                "device-{i}: {label} change {} = {status}\n",
-                hex::encode(hash.0)
-            ));
-            if has_change {
-                let mut missing = Vec::new();
-                let mut visited = std::collections::HashSet::new();
-                let mut stack = vec![hash];
-                while let Some(h) = stack.pop() {
-                    if !visited.insert(h) {
-                        continue;
-                    }
-                    match device.state.replica_coordinator.sqlite().dag_get_change(&h) {
-                        Ok(Some(change)) => {
-                            for parent in &change.parents {
-                                if device
-                                    .state
-                                    .replica_coordinator
-                                    .change_history_repository()
-                                    .dag_has_change(parent)
-                                    .unwrap_or(false)
-                                {
-                                    stack.push(*parent);
-                                } else {
-                                    missing.push(*parent);
-                                }
-                            }
-                        }
-                        _ => missing.push(h),
-                    }
-                }
-                if !missing.is_empty() {
-                    out.push_str(&format!(
-                        "device-{i}: {label} parent-closure gaps: {:?}\n",
-                        missing.iter().map(|h| hex::encode(h.0)).collect::<Vec<_>>()
-                    ));
-                }
-            }
-        }
     }
     out
 }
@@ -801,7 +671,6 @@ async fn row14_strict_acceptance() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     eprintln!("row14_strict_acceptance: max no-progress gap observed = {max_gap:?}");
-    report_reconciliation_cost(&devices);
     assert!(
         max_gap <= MAX_ACCEPTABLE_PROGRESS_GAP,
         "row14_strict_acceptance: max no-progress gap {max_gap:?} exceeded the strict \

@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Privacy Policy — YadoriLink</title>
+<meta name="description" content="How the YadoriLink coordination service handles your data.">
+<link rel="canonical" href="https://yadori.link/privacy/">
+<link rel="alternate" hreflang="en" href="https://yadori.link/privacy/">
+<link rel="alternate" hreflang="ja" href="https://yadori.link/ja/privacy/">
+<link rel="alternate" hreflang="x-default" href="https://yadori.link/privacy/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="YadoriLink">
+<meta property="og:title" content="Privacy Policy — YadoriLink">
+<meta property="og:description" content="How the YadoriLink coordination service handles your data.">
+<meta property="og:url" content="https://yadori.link/privacy/">
+<meta property="og:image" content="https://yadori.link/assets/og-image.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:locale" content="en_US">
+<meta property="og:locale:alternate" content="ja_JP">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Privacy Policy — YadoriLink">
+<meta name="twitter:description" content="How the YadoriLink coordination service handles your data.">
+<meta name="twitter:image" content="https://yadori.link/assets/og-image.png">
+<link rel="icon" href="/assets/favicon.ico" sizes="any">
+<link rel="icon" type="image/webp" sizes="64x64" href="/assets/logo-64.webp">
+<link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
+<meta name="theme-color" content="#f5f9ff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#060d1f" media="(prefers-color-scheme: dark)">
+<link rel="stylesheet" href="/assets/site.css">
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+<div class="wrap">
+<header class="site-header">
+  <a class="brand" href="/" aria-label="YadoriLink home">
+    <img src="/assets/logo-64.webp" srcset="/assets/logo-128.webp 2x" width="36" height="36" alt="">
+    <span>YadoriLink</span>
+  </a>
+  <nav aria-label="Site">
+    <a href="/privacy/">Privacy</a>
+    <a href="/terms/">Terms</a>
+    <a href="https://github.com/juntaki/yadorilink">GitHub</a>
+  </nav>
+  <a class="lang" href="/ja/privacy/" lang="ja" hreflang="ja">日本語</a>
+</header>
+
+<main id="content" class="legal">
+<h1>Privacy Policy</h1>
+<p class="meta">Effective 2026-10-04</p>
+
+<p>YadoriLink is a peer-to-peer folder sync tool. This policy explains what the hosted YadoriLink coordination service (<code>control.yadori.link</code>) and this website do with personal information. YadoriLink is pre-1.0 beta software, and this policy describes how it works today.</p>
+
+<h2>1. Who is responsible</h2>
+<p>YadoriLink is operated by an individual, Jumpei Takiyasu (&ldquo;I&rdquo;). Questions, access requests and deletion requests: <a href="mailto:me@juntaki.com">me@juntaki.com</a>. My postal address is disclosed without delay on request sent to that email address.</p>
+
+<h2>2. The short version</h2>
+<ul>
+<li>Your file contents, file names and folder paths are <strong>never uploaded to the coordination service</strong>. Files are transferred between your authorised devices end-to-end encrypted; where a direct connection is not possible they pass through third-party encrypted relays (iroh public relays), which can see network metadata but not contents (section 5).</li>
+<li>The service stores the minimum needed to let your devices find and authorize each other: your Google account identifier and email address, your devices, and the folder groups and access rules between them.</li>
+<li>I do not sell personal information, show ads, or run analytics or trackers. This website sets no cookies and makes no requests to third parties.</li>
+</ul>
+
+<h2>3. What the coordination service stores</h2>
+<h3>Account</h3>
+<p>When you sign in with Google, the service asks Google for the <code>openid</code> and <code>email</code> scopes only. It stores your Google account identifier (the <code>sub</code> value), your email address and the time the account was created. It does not store a password, and it does not access your Google contacts, Drive or other Google data.</p>
+<h3>Devices</h3>
+<p>For each device you register: a device name (by default your computer&rsquo;s host name, which you can change), the device&rsquo;s public signing key, when it was created, whether it is currently online and when it was last seen, and the network addresses it reports so that your other devices can reach it (IP addresses and ports, and relay addresses). Private keys stay on the device.</p>
+<h3>Folder groups and sharing</h3>
+<p>For each folder group: its identifier, the name you gave it, its owner, and when it was created. For access control: which devices belong to which group, their role and storage mode, invitations (stored as hashed codes with role and expiry), and a signed log of access changes. Other members of a group you share can see the group name and the names of the devices in it.</p>
+<h3>Sign-in and device credentials</h3>
+<p>The service issues tokens that are bound to a cryptographic key held by each device. It stores the records needed to issue and revoke them (identifiers are stored as hashes where possible), a short-lived record of the Google sign-in result while a sign-in completes, and a permanent, append-only list of revoked credentials (identifiers, time and reason) so a revoked credential can never be revived, for example after a database restore.</p>
+<h3>Operation records</h3>
+<p>Records of membership operations (such as removing a device) and of forced overrides you perform (device identifier, action, folder group identifiers, time).</p>
+<h3>Abuse protection</h3>
+<p>To limit abuse, the service keeps short-lived request counters keyed by the source IP address (and by account). Counters cover a window of about a minute and are cleaned up afterwards.</p>
+<h3>Logs</h3>
+<p>The service runs on Cloudflare Workers with Cloudflare&rsquo;s logging enabled. Operational logs generated by Cloudflare Workers are collected to the extent needed for troubleshooting, security and operating the Service, and are retained on Cloudflare for at most 7 days.</p>
+<p>These logs can contain Worker invocation logs with request and response metadata (such as source IP address, URL path, status and timing); console output and error messages, which may include internal identifiers; and unhandled exceptions. File contents are never part of them.</p>
+<h3>Beta invitations</h3>
+<p>If you join with a beta invitation code, the service stores a hash of the code, its cohort and which account used it.</p>
+
+<h2>4. What it does not do</h2>
+<ul>
+<li>It never receives file contents, file names, folder paths, or the list of files you sync.</li>
+<li>It has no analytics. Aggregate service metrics are disabled by default; if enabled they are fixed, coarse counters that carry no account, device, IP address or path.</li>
+<li>Optional crash and error reporting is disabled on the service. If it is enabled in future, it is opt-in on your device and accepts only a redacted report: software version and channel, an error category, the subsystem and the top stack frame, with no account attached. Your IP address is used only to rate-limit submissions and is not saved with the report. No automatic deletion period is built in for these reports.</li>
+</ul>
+
+<h2>5. Device-to-device transfer</h2>
+<p>Synced data goes between your authorized devices over end-to-end encrypted connections, directly where possible. When two devices cannot connect directly (for example behind strict firewalls), traffic can pass through public relay servers of the iroh project, which are operated by its developers and not by me. A relay forwards encrypted packets; it can see the IP addresses and device identifiers involved and the timing and volume of traffic, but not file contents. Devices in the same group exchange file names and changes with each other, because that is what syncing is.</p>
+
+<h2>6. Updates and downloads</h2>
+<p>Update manifests and the Linux package repository are served from <code>control.yadori.link</code>, backed by Cloudflare R2; no account is needed. Cloudflare handles those requests as described in section 3 (Logs). Installers are also downloaded from GitHub Releases, which is governed by GitHub&rsquo;s own privacy statement.</p>
+
+<h2>7. Data on your devices</h2>
+<p>Your synced files, the local sync state and your device credentials are stored on your own devices and are not copied to the service.</p>
+
+<h2>8. Why information is used</h2>
+<p>To provide sign-in, register your devices, let them find each other, enforce who may sync which folder group, prevent abuse, keep the service running and secure, and answer your requests. I do not use it for advertising or profiling.</p>
+
+<h2>9. Third parties</h2>
+<ul>
+<li><strong>Google</strong>: sign-in (identity verification).</li>
+<li><strong>Cloudflare</strong>: hosting of this website and the service (Workers, D1 database, Durable Objects, R2 storage) and DNS. Cloudflare operates globally, so data may be processed in countries outside Japan.</li>
+<li><strong>GitHub</strong>: source code and release downloads.</li>
+<li><strong>iroh relay servers</strong>: packet relaying as described in section 5.</li>
+</ul>
+<p>I do not sell your information. I do not provide it to third parties other than the following: the processors listed above; the people you share a folder group with, who can see the group name and device names (section 3); and where required by law.</p>
+
+<h2 id="retention">10. Retention and deletion</h2>
+<p>Account, device and sharing records are kept while your account exists. The only built-in expiry periods apply to temporary sign-in and invitation records and to the request counters above.</p>
+<p>You can request deletion in the CLI (<code>yadorilink account delete request</code>, then <code>confirm</code>) or in the desktop app under &ldquo;Account &amp; Data&hellip;&rdquo;. After you confirm, there is a grace period (7 days by default) in which you can cancel. When it ends, your account, devices, folder groups you own, their access entries, invitations you created and all credentials are deleted, and devices that you shared with lose access. Folders already on your devices are not touched. Only a marker with a random identifier and a timestamp remains, and revocation records (section 3) are kept. During the beta the automatic final step may not yet be switched on; if your grace period has ended and your account still exists, email me and I will complete the deletion. Cloudflare may keep restorable backups for a limited period under its own policy.</p>
+
+<h2>11. Your rights</h2>
+<ul>
+<li><strong>Access / export</strong>: <code>yadorilink account export</code> (or the desktop app) gives you a JSON copy of your account, devices, folder groups, sharing entries and account events.</li>
+<li><strong>Deletion</strong>: as in section 10.</li>
+<li><strong>Correction, disclosure, suspension of use</strong>: email me. I will respond after confirming that the request comes from the account holder.</li>
+</ul>
+
+<h2>12. Security</h2>
+<p>Connections to the service use HTTPS. Access tokens are bound to device keys (DPoP), revoked credentials are recorded in a permanent revocation ledger, invitation codes and credential identifiers are stored as hashes, and device private keys never leave the device. Service secrets are held as Cloudflare Worker secrets, and the operator console is reachable only behind Cloudflare Access. No system is perfectly secure; report vulnerabilities to <a href="mailto:me@juntaki.com">me@juntaki.com</a>.</p>
+
+<h2>13. Children</h2>
+<p>YadoriLink is not directed to children under 16, and I do not knowingly collect their information.</p>
+
+<h2>14. Changes</h2>
+<p>I may update this policy as the software changes. The effective date above shows the latest version; for material changes I will say so on the website or the project page.</p>
+
+<h2>15. Contact</h2>
+<p>Jumpei Takiyasu &mdash; <a href="mailto:me@juntaki.com">me@juntaki.com</a></p>
+
+</main>
+
+<footer class="site-footer">
+  <div class="foot-top"><img src="/assets/logo-64.webp" width="28" height="28" alt=""><span>YadoriLink</span></div>
+  <p>Cloud-like sync, without cloud file storage.</p>
+  <div class="cols">
+    <a href="/privacy/">Privacy</a> <a href="/terms/">Terms</a> <a href="https://github.com/juntaki/yadorilink">GitHub</a> <a href="https://github.com/juntaki/yadorilink/blob/main/SECURITY.md">Security</a> <a href="mailto:me@juntaki.com">Contact</a>
+    <a href="/ja/privacy/" lang="ja" hreflang="ja">日本語</a>
+    <span>AGPL-3.0-only</span>
+  </div>
+</footer>
+</div>
+</body>
+</html>

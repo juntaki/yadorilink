@@ -373,3 +373,63 @@ struct OnboardingTests {
         #expect(model.destinations.map(\.title) == ["New shared folder", "Sync into: Documents", "Sync into: Photos"])
     }
 }
+
+@MainActor
+@Suite("Provider folder creation")
+struct ProviderFolderCreationTests {
+    private func model(_ client: FakeYadoriLinkClient, available: Bool = true) -> OnboardingViewModel {
+        OnboardingViewModel(client: client, mode: .addFolder, loginItem: LoginItemModel(service: FakeLoginItemService(status: .notRegistered)), openURL: { _ in }, providerFoldersAvailable: available)
+    }
+
+    /// The option exists only when the build offers it.
+    @Test func theOptionIsHiddenUnlessAvailable() async throws {
+        let client = FakeYadoriLinkClient(scenario: .healthy)
+        let m = model(client, available: false)
+        await m.prepare()
+        m.chooseProviderFolder()
+        #expect(m.step == .chooseFolder)
+        #expect(!m.useProviderFolder)
+    }
+
+    /// A provider folder is named, needs no folder on disk, and shows up as a provider folder.
+    @Test func creatingAProviderFolderNeedsOnlyANameAndShowsNoPath() async throws {
+        let client = FakeYadoriLinkClient(scenario: .healthy)
+        let m = model(client)
+        await m.prepare()
+        m.chooseProviderFolder()
+        #expect(m.step == .review)
+        #expect(!m.canLink, "a name is required")
+        m.providerDisplayName = "Field notes"
+        #expect(m.canLink)
+        await m.link()
+        #expect(m.isFinished)
+        #expect(m.linkedName == "Field notes")
+        let snapshot = try await client.statusSnapshot()
+        let created = snapshot.folders.first { $0.name == "Field notes" }
+        #expect(created?.provider == true)
+    }
+
+    /// A failed attempt is retried as the SAME request (the client layer keeps its retry identity on disk, so
+    /// the daemon answers a repeat with what it already made); a changed request is a different one.
+    @Test func aRetryRepeatsTheSameRequestAndAChangedRequestDiffers() async throws {
+        let client = FakeYadoriLinkClient(scenario: .healthy)
+        let m = model(client)
+        await m.prepare()
+        m.chooseProviderFolder()
+        m.providerDisplayName = "Photos"
+        client.failNextProviderRequest = DesktopError.invalidInput(message: "try again", field: "x")
+        await m.link()
+        #expect(m.notice != nil && !m.isFinished)
+        await m.link()
+        #expect(m.isFinished)
+        let requests = client.providerRequests
+        #expect(requests.count == 2 && requests[0] == requests[1], "a retry was a different request: \(requests)")
+
+        let other = model(client)
+        await other.prepare()
+        other.chooseProviderFolder()
+        other.providerDisplayName = "Documents"
+        await other.link()
+        #expect(client.providerRequests.last != requests[0])
+    }
+}

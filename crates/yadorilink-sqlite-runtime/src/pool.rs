@@ -22,6 +22,10 @@ pub const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// statements longer than the cache never hits it: each one is evicted
 /// before it comes round again, so every statement would be parsed afresh
 /// on every admission, which is the cost the cache exists to remove.
+///
+/// A bulk local capture commit runs about forty distinct statement texts per
+/// file, well inside the capacity; a statement on that path that skips the
+/// cache is parsed once per file instead.
 pub const STATEMENT_CACHE_CAPACITY: usize = 128;
 
 /// The connection pool backing a [`crate::SyncDatabase`].

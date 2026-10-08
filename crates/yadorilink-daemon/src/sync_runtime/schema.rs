@@ -1,43 +1,19 @@
-//! Thin sequencing shim over `yadorilink_sqlite_runtime::init_schema`.
-//! `yadorilink-daemon` is the composition root for schema bootstrap: it
-//! sequences its own `pre_dag_schema` -> `yadorilink_sqlite_runtime::init_schema`
-//! -> `post_dag_schema` steps directly, because the authoring-identity
-//! triggers `pre_dag_schema` creates reference `changes`/`pruned_changes`,
-//! which only exist once `dag_store::init_dag_schema` has run.
+//! Maps the replica schema init's errors onto the error type
+//! `SyncDatabase::open` takes. The init itself is composed by
+//! `yadorilink_sync_sqlite::init_replica_schema`; a store-side failure is
+//! reported through this crate's `SyncError`, as it always has been.
 
-use rusqlite::Connection;
+use yadorilink_sync_sqlite::ReplicaSchemaError;
 
 use crate::sync_error::SyncError;
 
-/// Sequenced by [`crate::replica_coordinator`]'s own `schema_init`, which
-/// `ReplicaCoordinator::open`/`open_in_memory` use to bootstrap a database's
-/// schema from scratch.
-pub fn pre_dag_schema(conn: &Connection) -> Result<(), yadorilink_sqlite_runtime::DatabaseError> {
-    // `conflict_copy_provenance` must exist BEFORE `init_dag_schema` runs:
-    // that call's own internal retained-history repair pass promotes
-    // orphans, which runs carrier validation against this table.
-    yadorilink_sync_sqlite::dag_store::init_conflict_copy_provenance_schema(conn)
-        .map_err(|e| schema_err(SyncError::from(e)))?;
-    yadorilink_sync_sqlite::dag_store::init_dag_schema(conn)
-        .map_err(|e| schema_err(SyncError::from(e)))?;
-    yadorilink_sync_sqlite::materialized_generation::init_materialized_generation_schema(conn)
-        .map_err(|e| schema_err(SyncError::from(e)))?;
-    Ok(())
-}
-
-/// See [`pre_dag_schema`]'s doc comment above.
-pub fn post_dag_schema(conn: &Connection) -> Result<(), yadorilink_sqlite_runtime::DatabaseError> {
-    yadorilink_sync_sqlite::rebootstrap_store::init_rebootstrap_schema(conn)
-        .map_err(|e| schema_err(SyncError::from(e)))?;
-    // The verified-possession staging tables. They live in this same
-    // database and this same transaction domain deliberately: promotion has
-    // to be one atomic commit spanning staged and canonical state, which a
-    // second database file would make impossible.
-    yadorilink_sync_sqlite::verified_change_store::init_verified_change_schema(conn)
-        .map_err(|e| schema_err(SyncError::from(e)))?;
-    Ok(())
-}
-
-fn schema_err(err: SyncError) -> yadorilink_sqlite_runtime::DatabaseError {
-    yadorilink_sqlite_runtime::DatabaseError::CorruptSchema(err.to_string())
+pub fn map_replica_schema_error(
+    err: ReplicaSchemaError,
+) -> yadorilink_sqlite_runtime::DatabaseError {
+    match err {
+        ReplicaSchemaError::Database(err) => err,
+        ReplicaSchemaError::Store(err) => yadorilink_sqlite_runtime::DatabaseError::CorruptSchema(
+            SyncError::from(err).to_string(),
+        ),
+    }
 }

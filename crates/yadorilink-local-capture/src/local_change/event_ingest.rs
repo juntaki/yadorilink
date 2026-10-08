@@ -6,10 +6,11 @@ use std::path::Path;
 use crate::error::LocalCaptureError;
 use yadorilink_filesystem_sync::watcher::{FsChangeEvent, FsChangeKind};
 use yadorilink_local_storage::read_replicated_xattrs;
-use yadorilink_replica_domain::change::Op;
 use yadorilink_replica_domain::file::{FileRecord, RecordKind};
 use yadorilink_replica_domain::ids::SyncPath;
-use yadorilink_replica_domain::session_state::ChangeContent;
+use yadorilink_replica_domain::local_op::Op;
+use yadorilink_replica_domain::session_state::MaterializationState;
+
 use yadorilink_root_authority::fs_identity::disk_race_fingerprint;
 use yadorilink_root_authority::ignore_patterns::{
     is_ignore_file_relative_path, EffectiveIgnoreSet,
@@ -17,14 +18,15 @@ use yadorilink_root_authority::ignore_patterns::{
 use yadorilink_sync_sqlite::file_index::ImportedActualState;
 
 use super::disk_observation::{
-    closed_disk_observation_if_unraced, exact_leaf_exists_as_directory,
+    closed_disk_observation_if_unraced, error_means_absent, exact_leaf_exists_as_directory,
     exact_leaf_exists_as_file_or_symlink,
 };
 use super::flush::PendingBatchedCommit;
 use super::path_policy::{
     is_excluded_from_sync, path_to_wire_relative_string, skip_reason_for_inadmissible_wire_path,
 };
-use super::record_builder::{file_and_authoring, metadata_columns_for};
+use super::record_builder::{metadata_columns_for, record_of_row};
+use super::semantic_delete::{Removal, SemanticDelete};
 use super::{now_unix_nanos, LocalChangeOutcome, LocalChangeProcessor};
 
 /// `process_event_with_ignore_at`'s outcome once batching exists: either
@@ -32,7 +34,7 @@ use super::{now_unix_nanos, LocalChangeOutcome, LocalChangeProcessor};
 /// exactly as this function always behaved before batching (`Ready` --
 /// what every caller other than the `DebounceFlush::Paths` loop always
 /// gets, since they pass `pending_batch: None`), or the simple,
-/// DAG-emitting create/modify/delete case applied and a mutation was
+/// delta-emitting create/modify/delete case applied and a mutation was
 /// prepared and pushed onto `pending_batch` instead of being committed
 /// here (`Deferred`) -- only the `DebounceFlush::Paths` loop ever sees
 /// this, and it alone is responsible for resolving every `Deferred` path
@@ -57,6 +59,23 @@ impl LocalChangeProcessor {
     ) -> Result<LocalChangeOutcome, LocalCaptureError> {
         let ignore_set = EffectiveIgnoreSet::load_for_link_root(root)?;
         self.process_event_with_ignore(group_id, root, event, &ignore_set).await
+    }
+
+    /// Whether a removal is a delete. A user's or a platform provider's
+    /// [`SemanticDelete`] always is; an OBSERVED absence is only for a
+    /// `Present` object (or a path with no row, which the branch below then
+    /// authors nothing for).
+    fn removal_is_a_delete(
+        &self,
+        group_id: &str,
+        semantic: Option<&SemanticDelete>,
+        rel_path: &str,
+    ) -> Result<bool, LocalCaptureError> {
+        Ok(semantic.is_some()
+            || matches!(
+                self.state.get_materialization_state(group_id, rel_path)?,
+                None | Some(MaterializationState::Present)
+            ))
     }
 
     pub async fn process_event_with_ignore(
@@ -93,7 +112,7 @@ impl LocalChangeProcessor {
     /// "now", identical to this method's behavior before this parameter
     /// existed.
     ///
-    /// `pending_batch`, when `Some`, lets the simple, DAG-emitting
+    /// `pending_batch`, when `Some`, lets the simple, delta-emitting
     /// create/modify/delete case (not a symlink, an emitter configured)
     /// defer its commit into a shared batch instead of committing here --
     /// see [`EventOutcome::Deferred`]/[`PendingBatchedCommit`]'s own docs.
@@ -121,6 +140,36 @@ impl LocalChangeProcessor {
         observed_at_unix_nanos: Option<i64>,
         pending_batch: Option<&mut Vec<PendingBatchedCommit>>,
     ) -> Result<EventOutcome, LocalCaptureError> {
+        self.process_event_inner(
+            group_id,
+            root,
+            event,
+            ignore_set,
+            observed_at_unix_nanos,
+            pending_batch,
+            None,
+        )
+        .await
+    }
+
+    /// The one decision path behind the observed-event entry points
+    /// (`semantic: None`) and [`Self::process_semantic_delete`].
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        clippy::excessive_nesting,
+        reason = "see process_event_with_ignore_at"
+    )]
+    pub(super) async fn process_event_inner(
+        &self,
+        group_id: &str,
+        root: &Path,
+        event: &FsChangeEvent,
+        ignore_set: &EffectiveIgnoreSet,
+        observed_at_unix_nanos: Option<i64>,
+        pending_batch: Option<&mut Vec<PendingBatchedCommit>>,
+        semantic: Option<&SemanticDelete>,
+    ) -> Result<EventOutcome, LocalCaptureError> {
         // OS-level watchers (notify's FSEvents backend on macOS in
         // particular) report fully-resolved paths — e.g. `/private/var/...`
         // rather than the `/var/...` symlink most callers construct their
@@ -135,7 +184,7 @@ impl LocalChangeProcessor {
         // index and emitted tombstones against `root` for the rest of this
         // process's life with no ownership re-check at all — the gap
         // `verified_root_of_established_link`'s own doc describes. Checked
-        // before anything else below touches the index or DAG.
+        // before anything else below touches the index or native state.
         self.verified_root_of_established_link(group_id, &root)?;
         let Ok(rel_path) = event.path.strip_prefix(&root) else {
             return Ok(EventOutcome::Ready(LocalChangeOutcome::None));
@@ -190,7 +239,7 @@ impl LocalChangeProcessor {
                 path = %rel_path,
                 reason,
                 "skipping a local change event for a file whose name can never enter this \
-                 group's change history; it stays on disk untouched but is not synced"
+                 group's native state; it stays on disk untouched but is not synced"
             );
             return Ok(EventOutcome::Ready(LocalChangeOutcome::None));
         }
@@ -212,18 +261,18 @@ impl LocalChangeProcessor {
         let path_lock = self.state.path_lock(group_id, &rel_path);
         let _guard = path_lock.lock().await;
 
-        // A path a snapshot install holds is left unauthored the same way,
+        // A held path is left unauthored the same way,
         // but asked only now, under the lock. The reconciliation that
         // releases a hold works under this lock too, and a save that lands
-        // after it placed the installed placeholder produces no event but
+        // after it placed the row's placeholder produces no event but
         // this one: read before the lock, the hold it is about to release
         // would drop that save for good. Read here, the flush waits for the
-        // release and captures the save as an edit of the installed version.
+        // release and captures the save as an edit of the row's version.
         if self.is_paused(group_id, &rel_path)? {
             tracing::debug!(
                 group_id,
                 path = %rel_path,
-                "holding a local change to a path awaiting snapshot install reconciliation"
+                "holding a local change to a path awaiting reconciliation of a held path"
             );
             return Ok(EventOutcome::Ready(LocalChangeOutcome::None));
         }
@@ -261,7 +310,22 @@ impl LocalChangeProcessor {
         // below, and `is_real_directory` in `watcher.rs`).
         let effective_kind = match event.path.symlink_metadata() {
             // Nothing answers to this name at all: a genuine removal.
-            Err(_) => FsChangeKind::Removed,
+            Err(error) if error_means_absent(&error) => FsChangeKind::ObservedRemoval,
+            // The path could not be looked at (a directory this process may
+            // not search, an I/O error, a stale network handle). That is no
+            // evidence the file is gone, and authoring a delete for it would
+            // propagate one to every peer while the file still exists. The
+            // dirty row stays, so the path is looked at again.
+            Err(error) => {
+                tracing::warn!(
+                    group_id,
+                    path = %rel_path,
+                    error = %error,
+                    "could not observe a changed path; leaving it journaled dirty to be \
+                     looked at again instead of reading it as a deletion"
+                );
+                return Ok(EventOutcome::Ready(LocalChangeOutcome::RetryLater));
+            }
             // A directory, captured as an entry of its own below -- under
             // its exact name only, for the same case-fold reason as a file.
             Ok(meta) if meta.is_dir() => {
@@ -315,7 +379,16 @@ impl LocalChangeProcessor {
         };
 
         match effective_kind {
-            FsChangeKind::Removed => {
+            FsChangeKind::ObservedRemoval => {
+                // A path's absence is delete evidence only for a `Present`
+                // object. A `Remote` row has no local object, a `Hydrating`
+                // one is producing it and an `Evicting` one is removing it:
+                // this removal is then the daemon's own (an eviction's echo)
+                // or says nothing at all, and is not a delete. Only an
+                // explicit delete by the user or a platform provider is.
+                if !self.removal_is_a_delete(group_id, semantic, &rel_path)? {
+                    return Ok(EventOutcome::Ready(LocalChangeOutcome::None));
+                }
                 // `mark_deleted` creates a brand-new tombstone row
                 // even for a path that was never indexed — an editor's
                 // atomic-save (temp file created then renamed away)
@@ -324,10 +397,15 @@ impl LocalChangeProcessor {
                 // never had, accumulating mesh-wide junk over repeated
                 // saves. Only mark-deleted (and broadcast) a path that
                 // already has an index entry.
-                // Content and authoring identity from ONE read, so the
-                // batched path's revalidation compares against a prepare
-                // snapshot some single row actually held.
-                let (existing_for_delete, authoring_change_hash_at_prepare) = file_and_authoring(
+                // Content from ONE read, so the batched path's revalidation
+                // compares against a prepare snapshot some single row
+                // actually held.
+                // Native's witness is read before the row it accompanies, so a
+                // head landing between the two reads makes the commit stale
+                // rather than unseen.
+                let native_witness_at_prepare =
+                    self.state.native_capture_witness(group_id, &rel_path)?;
+                let existing_for_delete = record_of_row(
                     &rel_path,
                     self.state.canonical_current_row(group_id, &rel_path)?,
                 );
@@ -341,6 +419,18 @@ impl LocalChangeProcessor {
                     .state
                     .canonical_current_row(group_id, &rel_path)?
                     .is_some_and(|row| row.snapshot.record_kind == RecordKind::Directory);
+                if let Some(delete) = semantic {
+                    if !existing_is_directory
+                        && existing_for_delete.as_ref().is_some_and(|row| !row.deleted)
+                        && !delete.names_current_version(
+                            &rel_path,
+                            self.state.canonical_current_row(group_id, &rel_path)?.as_ref(),
+                        )
+                    {
+                        // A version this delete did not see was admitted since.
+                        return Ok(EventOutcome::Ready(LocalChangeOutcome::None));
+                    }
+                }
                 if existing_for_delete.as_ref().is_none_or(|row| row.deleted)
                     || existing_is_directory
                 {
@@ -382,6 +472,7 @@ impl LocalChangeProcessor {
                             &rel_path,
                             &pending_deletes,
                             now,
+                            semantic.map_or(Removal::Observed, Removal::Semantic),
                         )
                         .await?,
                     ));
@@ -425,13 +516,12 @@ impl LocalChangeProcessor {
                                 rel_path: rel_path.clone(),
                                 event_path: event.path.clone(),
                                 observed_at_unix_nanos: observed,
-                                index_state_at_prepare: existing_for_delete,
-                                authoring_change_hash_at_prepare,
                                 disk_fingerprint_at_prepare: disk_race_fingerprint(&event.path),
                                 mutation:
                                     yadorilink_replica_domain::session_state::PreparedLocalMutation::Delete {
                                         record,
                                         op,
+                                        native_witness: Some(native_witness_at_prepare),
                                     },
                             });
                             return Ok(EventOutcome::Deferred);
@@ -443,6 +533,7 @@ impl LocalChangeProcessor {
                                 group_id,
                                 &rel_path,
                                 &source,
+                                Some(native_witness_at_prepare),
                                 &self.device_id,
                                 observed,
                                 emitter,
@@ -455,21 +546,43 @@ impl LocalChangeProcessor {
                                 },
                             ));
                         }
-                        self.state.mark_deleted_emitting_change(
+                        // One `Delete` mutation, committed as one change:
+                        // the same tombstone the batched branch above
+                        // builds, over the head the row showed at capture.
+                        // Absent evidence is safe to publish here:
+                        // `effective_kind`'s own `symlink_metadata`
+                        // re-check (this function's entry) confirmed
+                        // `rel_path` -- the SAME path `_guard` above locks
+                        // for this whole call -- is gone from disk,
+                        // immediately before this branch and under that
+                        // same lock the whole way through.
+                        let mut record =
+                            existing_for_delete.clone().unwrap_or_else(|| FileRecord {
+                                path: rel_path.clone(),
+                                size: 0,
+                                mtime_unix_nanos: 0,
+                                blocks: vec![],
+                                deleted: false,
+                            });
+                        record.deleted = true;
+                        record.mtime_unix_nanos = observed;
+                        let mutation =
+                            yadorilink_replica_domain::session_state::PreparedLocalMutation::Delete {
+                                record,
+                                op: Op::Delete { path: SyncPath(rel_path.clone()) },
+                                native_witness: Some(native_witness_at_prepare),
+                            };
+                        self.state.commit_local_mutations_batch(
                             group_id,
-                            &rel_path,
+                            std::slice::from_ref(&mutation),
+                            &[Some(
+                                yadorilink_sync_sqlite::file_index::LocalCaptureActualStateEvidence::Absent,
+                            )],
                             &self.device_id,
-                            observed,
-                            // Safe to publish an Absent proof here:
-                            // `effective_kind`'s own `symlink_metadata`
-                            // re-check (this function's entry) confirmed
-                            // `rel_path` -- the SAME path `_guard` above
-                            // locks for this whole call -- is gone from
-                            // disk, immediately before this branch and
-                            // under that same lock the whole way through.
-                            true,
-                            emitter,
-                            &self.begin_operation()?.permit(),
+                            crate::ports::LocalChangeEmission {
+                                author: emitter,
+                                permit: &self.begin_operation()?.permit(),
+                            },
                         )?;
                     }
                     None => {
@@ -520,6 +633,7 @@ impl LocalChangeProcessor {
                         &rel_path,
                         &pending_deletes,
                         observed_at_unix_nanos.unwrap_or_else(now_unix_nanos),
+                        Removal::Observed,
                     )
                     .await?;
                 }
@@ -527,17 +641,12 @@ impl LocalChangeProcessor {
                     self.state.get_materialization_state(group_id, &rel_path)?;
                 let placeholder_generation =
                     self.state.get_placeholder_generation(group_id, &rel_path)?;
-                // Content and authoring identity from ONE read, so both
-                // reflect the identical moment.
-                let (existing, authoring_change_hash_at_prepare) = file_and_authoring(
+                let native_witness_at_prepare =
+                    self.state.native_capture_witness(group_id, &rel_path)?;
+                let existing = record_of_row(
                     &rel_path,
                     self.state.canonical_current_row(group_id, &rel_path)?,
                 );
-                // Cloned before the call below moves `existing` --
-                // `PendingBatchedCommit` needs its own snapshot of the
-                // index state this preparation was based on, to revalidate
-                // against later at batch-commit time.
-                let existing_at_prepare = existing.clone();
                 // Captured before this event's own content read below, so
                 // the eventual commit-time proof-publication check
                 // (`fingerprint_before_content_read == disk_race_
@@ -660,8 +769,6 @@ impl LocalChangeProcessor {
                                         event_path: event.path.clone(),
                                         observed_at_unix_nanos: observed_at_unix_nanos
                                             .unwrap_or_else(now_unix_nanos),
-                                        index_state_at_prepare: existing_at_prepare,
-                                        authoring_change_hash_at_prepare,
                                         disk_fingerprint_at_prepare: disk_race_fingerprint(&event.path),
                                         mutation:
                                             yadorilink_replica_domain::session_state::PreparedLocalMutation::Upsert {
@@ -669,6 +776,7 @@ impl LocalChangeProcessor {
                                                 op,
                                                 version,
                                                 meta: Some(meta),
+                                                native_witness: Some(native_witness_at_prepare),
                                             },
                                     });
                                     return Ok(EventOutcome::Deferred);
@@ -677,7 +785,7 @@ impl LocalChangeProcessor {
                             // Zero-field `phase T_*` marker: a timestamp anchor for offline
                             // timing analysis of captured logs.
                             tracing::trace!(
-                                "phase T_author_start: authoritative FileRecord/DAG commit begins"
+                                "phase T_author_start: authoritative FileRecord/native commit begins"
                             );
                             // This commit happens right here, with nothing
                             // between the bracket closing and the write, so
@@ -690,30 +798,56 @@ impl LocalChangeProcessor {
                                 fingerprint_before_content_read,
                             )
                             .map(|observation| observation.identity);
-                            self.state.upsert_file_emitting_change(
+                            // One `Upsert` mutation, committed as one
+                            // change over the head the row showed at
+                            // capture, with the freshly observed identity as
+                            // its `Present` evidence.
+                            let mutation =
+                                yadorilink_replica_domain::session_state::PreparedLocalMutation::Upsert {
+                                    record: record.clone(),
+                                    op,
+                                    version,
+                                    meta: Some(meta),
+                                    native_witness: Some(native_witness_at_prepare),
+                                };
+                            let evidence = filesystem_identity.map(|filesystem_identity| {
+                                yadorilink_sync_sqlite::file_index::LocalCaptureActualStateEvidence::Present {
+                                    filesystem_identity,
+                                }
+                            });
+                            let committed = self.state.commit_local_mutations_batch(
                                 group_id,
-                                record,
+                                std::slice::from_ref(&mutation),
+                                &[evidence],
                                 &self.device_id,
-                                ChangeContent {
-                                    ops: vec![op],
-                                    versions: std::slice::from_ref(&version),
-                                },
-                                Some(&meta),
-                                filesystem_identity.as_ref(),
                                 crate::ports::LocalChangeEmission {
-                                    emitter,
+                                    author: emitter,
                                     permit: &self.begin_operation()?.permit(),
                                 },
-                            )?;
-                            tracing::trace!("phase T_author_done: authoritative FileRecord/DAG commit completes");
+                            );
+                            if let Err(error) = &committed {
+                                // See `flush_pending_batch`: an edit its
+                                // own full bucket refuses is preserved as a
+                                // conflict copy, never retried at the path.
+                                if super::flush::unauthorable_upsert(error)
+                                    == Some(rel_path.as_str())
+                                {
+                                    self.hold_unauthorable_edit(group_id, &rel_path)?;
+                                    drop(_guard);
+                                    self.state.wake_install_reconciliation();
+                                    return Ok(EventOutcome::Ready(LocalChangeOutcome::None));
+                                }
+                            }
+                            committed?;
+                            tracing::trace!("phase T_author_done: authoritative FileRecord/native commit completes");
                         }
                         None => {
                             tracing::trace!(
-                                "phase T_author_start: authoritative FileRecord/DAG commit begins"
+                                "phase T_author_start: authoritative FileRecord/native commit begins"
                             );
-                            // No signing key yet, so no DAG emission -- but
+                            // No signing key yet, so no delta emission -- but
                             // the row, the proof for what is on disk and the
-                            // `Hydrated` that proof earns still land in one
+                            // `Present` that proof earns still land in one
                             // transaction. `record`'s bytes were read from
                             // this device's own disk to build it, so the
                             // identity observed here describes what a reader
@@ -755,7 +889,7 @@ impl LocalChangeProcessor {
                                 std::slice::from_ref(&observed),
                                 &self.begin_operation()?.permit(),
                             )?;
-                            tracing::trace!("phase T_author_done: authoritative FileRecord/DAG commit completes");
+                            tracing::trace!("phase T_author_done: authoritative FileRecord/native commit completes");
                         }
                     }
                 }

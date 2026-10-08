@@ -99,7 +99,7 @@ impl RuntimeDiagnosticsPort for DaemonRuntimeDiagnostics {
                 } else {
                     "synced"
                 };
-                DiagnosticsLinkView { local_path: link.local_path.clone(), state_label }
+                DiagnosticsLinkView { state_label }
             })
             .collect();
 

@@ -4,7 +4,7 @@
 //! sync engine does for its own captures, just against a wholly separate
 //! store root (see `store.rs`'s own doc comment for why: dedup and crash-
 //! durable commits for free, with zero visibility to the sync engine's
-//! DAG-driven GC liveness sweep).
+//! native-state-driven GC liveness sweep).
 //!
 //! Chunking a file freezes its offered content at offer time: once
 //! `build_outbound_manifest` returns, every chunk is durably content-
@@ -107,6 +107,51 @@ pub fn build_outbound_manifest(
     ))
 }
 
+/// Length of a chunk hash (SHA-256).
+const CHUNK_HASH_LEN: usize = 32;
+
+/// Checks an offered manifest is internally consistent before it is stored,
+/// so nothing downstream sizes an allocation from a claim the sender made up:
+/// every file's `chunk_size` is within `1..=MAX_BLOCK_SIZE_BYTES`, its hash
+/// count is exactly `ceil(size / chunk_size)` with every hash a SHA-256
+/// digest, and `total_size` is the sum of the file sizes. The reason names
+/// the first inconsistency.
+pub fn validate_offered_manifest(manifest: &SendManifest) -> std::result::Result<(), String> {
+    let max_chunk = yadorilink_replica_domain::limits::MAX_BLOCK_SIZE_BYTES;
+    let mut total: u64 = 0;
+    for entry in &manifest.files {
+        let name = &entry.relative_path;
+        if entry.chunk_size == 0 || entry.chunk_size > max_chunk {
+            return Err(format!(
+                "{name}: chunk size {} is outside 1..={max_chunk}",
+                entry.chunk_size
+            ));
+        }
+        let expected_chunks = entry.size.div_ceil(u64::from(entry.chunk_size));
+        if entry.chunk_hashes.len() as u64 != expected_chunks {
+            return Err(format!(
+                "{name}: {} chunk hashes for {} bytes in chunks of {}, expected {expected_chunks}",
+                entry.chunk_hashes.len(),
+                entry.size,
+                entry.chunk_size
+            ));
+        }
+        if entry.chunk_hashes.iter().any(|hash| hash.len() != CHUNK_HASH_LEN) {
+            return Err(format!("{name}: a chunk hash is not {CHUNK_HASH_LEN} bytes"));
+        }
+        total = total
+            .checked_add(entry.size)
+            .ok_or_else(|| "the file sizes overflow the total".to_string())?;
+    }
+    if total != manifest.total_size {
+        return Err(format!(
+            "total size {} does not match the files' {total} bytes",
+            manifest.total_size
+        ));
+    }
+    Ok(())
+}
+
 /// The byte size of chunk `chunk_index` within `entry` -- every chunk is
 /// `entry.chunk_size` bytes except the last, which is whatever remains.
 /// Matches `chunk_file`'s own fixed-size splitting exactly (a short final
@@ -123,8 +168,10 @@ pub fn chunk_byte_size(entry: &SendFileEntry, chunk_index: usize) -> Result<u32>
     if chunk_index + 1 < num_chunks {
         return Ok(entry.chunk_size);
     }
-    let full_chunks = (num_chunks - 1) as u64 * entry.chunk_size as u64;
-    Ok(entry.size.saturating_sub(full_chunks) as u32)
+    let full_chunks = (num_chunks as u64 - 1).saturating_mul(u64::from(entry.chunk_size));
+    u32::try_from(entry.size.saturating_sub(full_chunks)).map_err(|_| {
+        SendError::Protocol(format!("final chunk of {} bytes does not fit a chunk", entry.size))
+    })
 }
 
 #[cfg(test)]

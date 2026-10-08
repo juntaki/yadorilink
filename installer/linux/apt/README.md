@@ -9,7 +9,7 @@ update manifest (`src/routes/apt.ts`, bucket `yadorilink-apt`).
 ## Install
 
 ```sh
-curl -fsSL https://yadorilink.juntaki.com/apt/install.sh | sudo sh
+curl -fsSL https://control.yadori.link/apt/install.sh | sudo sh
 sudo apt update
 sudo apt install yadorilink
 ```
@@ -17,7 +17,7 @@ sudo apt install yadorilink
 Or, if you'd rather install a `.deb` than pipe a script to a shell:
 
 ```sh
-curl -fsSLO https://yadorilink.juntaki.com/apt/yadorilink-archive-keyring_1_all.deb
+curl -fsSLO https://control.yadori.link/apt/yadorilink-archive-keyring_1_all.deb
 sudo dpkg -i yadorilink-archive-keyring_1_all.deb
 sudo apt update
 sudo apt install yadorilink
@@ -33,9 +33,9 @@ newer) for the `deb822` `.sources` format. On an older system, use the
 one-line legacy format instead:
 
 ```sh
-curl -fsSL https://yadorilink.juntaki.com/apt/yadorilink-archive-keyring.asc \
+curl -fsSL https://control.yadori.link/apt/yadorilink-archive-keyring.asc \
   | sudo gpg --dearmor -o /usr/share/keyrings/yadorilink-archive-keyring.gpg
-echo "deb [signed-by=/usr/share/keyrings/yadorilink-archive-keyring.gpg] https://yadorilink.juntaki.com/apt stable main" \
+echo "deb [signed-by=/usr/share/keyrings/yadorilink-archive-keyring.gpg] https://control.yadori.link/apt stable main" \
   | sudo tee /etc/apt/sources.list.d/yadorilink.list
 sudo apt update
 sudo apt install yadorilink

@@ -37,9 +37,6 @@ use std::time::Duration;
 use yadorilink_peer_session::peer_session::PeerSyncSessionDeps;
 use yadorilink_transport::{diff_netmap, NetmapDiff, NetmapSnapshot};
 
-use crate::checkpoint_source::{
-    flush_pending_checkpoint, FlushOutcome, ProductionCheckpointSource,
-};
 use crate::connection_trace::{AddressClass, AttemptOutcome, CandidateSource};
 use crate::daemon_state::DaemonState;
 use crate::device_config;
@@ -305,7 +302,7 @@ fn apply_authoritative_peer_metadata(
     // this pass leaves behind, and it is what gets persisted.
     state.seed_netmap_peer_identity(device_id, signing_key);
 
-    let effective_groups = crate::change_auth::NetmapChangeAuthenticator::effective_servable_groups(
+    let effective_groups = crate::change_auth::effective_servable_groups(
         state.clone(),
         authorized_groups,
         validation_cache,
@@ -320,7 +317,11 @@ fn apply_authoritative_peer_metadata(
         &effective_full_replica_groups,
     );
     if let Some(session) = state.peers.session(device_id) {
-        session.set_authorized_groups(effective_groups.iter().cloned());
+        // Only a change can make a refused round succeed; a snapshot that repeats what the
+        // session already has must not wake every connection.
+        if session.set_authorized_groups(effective_groups.iter().cloned()) {
+            state.native_replication.wake_reconcile();
+        }
     }
     // The reconciliation event for a new authorization is raised by
     // `replace_peer_netmap_metadata` itself, not here: that is where the
@@ -782,7 +783,7 @@ fn policy_service_key_pin_decision(
 pub async fn run(config: OrchestratorConfig, state: Arc<DaemonState>) -> Result<(), DaemonError> {
     // Idempotent: `app.rs`'s real bootstrap already records this "once, up
     // front" for control-socket callers (see `DaemonState::coordination_
-    // client_config`'s own doc comment), but `broadcast_change`'s checkpoint-
+    // client_config`'s own doc comment), but `on_local_native_commit`'s checkpoint-
     // flush hook needs it
     // available from ANY orchestrator start, including a lightweight test
     // harness that constructs `OrchestratorConfig` directly and never calls
@@ -876,7 +877,7 @@ where
     let mut attempt: u32 = 0;
     loop {
         start(state).await;
-        if state.reconciliation_driver().is_some() {
+        if state.peer_session_driver().is_some() {
             return;
         }
         let delay = reconnect_delay(attempt);
@@ -916,27 +917,21 @@ async fn start_reconciliation_with(
     state: &Arc<DaemonState>,
     network: yadorilink_sync_substrate::NetworkConfig,
 ) {
-    if state.reconciliation_driver().is_some() {
+    if state.peer_session_driver().is_some() {
         return;
     }
 
-    // The netmap-backed authenticator: a checkpoint's signer is resolved from
-    // the policy this device's own coordination plane distributes, never from
-    // anything the carrier claims.
-    let authenticator = crate::change_auth::NetmapChangeAuthenticator::new(state.clone());
-
-    let stack =
-        match crate::sync_adapter::SyncStack::spawn(state.clone(), authenticator, network).await {
-            Ok(stack) => Arc::new(stack),
-            Err(error) => {
-                tracing::error!(
-                    %error,
-                    "could not start the reconciliation stack; this daemon cannot converge until \
-                     it does -- retrying on the next coordination reconnect"
-                );
-                return;
-            }
-        };
+    let stack = match crate::sync_adapter::SyncStack::spawn(state.clone(), network).await {
+        Ok(stack) => Arc::new(stack),
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "could not start the reconciliation stack; this daemon cannot converge until \
+                 it does -- retrying on the next coordination reconnect"
+            );
+            return;
+        }
+    };
 
     tracing::info!(
         endpoint = %hex::encode(stack.peer_id().as_bytes()),
@@ -952,8 +947,8 @@ async fn start_reconciliation_with(
         sink.install(&stack);
     }
 
-    let driver = crate::sync_adapter::ReconciliationDriver::start(state.clone(), stack);
-    state.install_reconciliation_driver(driver);
+    let driver = crate::sync_adapter::PeerSessionDriver::start(state.clone(), stack);
+    state.install_peer_session_driver(driver);
 }
 
 /// Mirrors `supervise::BackoffConfig::RECONNECT`'s schedule (exponential
@@ -1260,6 +1255,28 @@ fn apply_netmap_group_edge_revocations(diff: &NetmapDiff, state: &Arc<DaemonStat
     }
 }
 
+/// Every `PeerSyncSessionDeps` field this device's own daemon state can
+/// supply, identical for every `PeerSyncSession` this device constructs.
+pub(crate) fn peer_sync_session_deps(state: &Arc<DaemonState>) -> PeerSyncSessionDeps {
+    PeerSyncSessionDeps {
+        // Every session shares this daemon's one global upload/download
+        // token-bucket pair (never an independent per-session copy).
+        rate_limiters: state.rate_limiters.clone(),
+        block_serve_engine: Some(state.block_serve_engine.clone()),
+        // Lets this session answer an incoming peer `HandoffLeaseRequest`
+        // by running this device's own target-side lease flow — see
+        // `HandoffLeaseResponder for DaemonState`'s doc comment
+        // (`daemon_state.rs`).
+        handoff_lease_responder: state.clone(),
+        // Lets this session answer an incoming peer `HandoffTicketRequest`
+        // (from a different device removing/revoking this one) by running
+        // this device's own removed-device-ticket flow — see
+        // `HandoffTicketResponder for DaemonState`'s doc comment
+        // (`daemon_state.rs`).
+        handoff_ticket_responder: state.clone(),
+    }
+}
+
 /// Resolves each group to its one live sync root. A group that cannot be
 /// resolved unambiguously is OMITTED from the map — the peer-apply path then
 /// has no write target for it and defers, rather than writing into a folder
@@ -1272,65 +1289,6 @@ fn apply_netmap_group_edge_revocations(diff: &NetmapDiff, state: &Arc<DaemonStat
 /// is "the" root for one group, at the same moment. An orphaned link's
 /// coordination-side authorization is gone and must never be handed back as a
 /// valid write target; the primitive filters those out.
-/// Every `PeerSyncSessionDeps` field this device's own daemon state can
-/// supply, identical for every `PeerSyncSession` this device constructs --
-/// factored out of what used to be two independently-maintained inline
-/// literals (the outbound-connect and inbound-accept paths below) that had
-/// already drifted (one carried every field's doc comment, the other only
-/// some).
-pub(crate) fn peer_sync_session_deps(state: &Arc<DaemonState>) -> PeerSyncSessionDeps {
-    PeerSyncSessionDeps {
-        // Every session shares this daemon's one global upload/download
-        // token-bucket pair (never an independent per-session copy).
-        rate_limiters: state.rate_limiters.clone(),
-        block_serve_engine: Some(state.block_serve_engine.clone()),
-        // The disk-headroom preflight is not wired here any more: it belongs
-        // to `LocalConvergenceExecutor`, which owns the materialize path that
-        // runs it, and `DaemonState::local_convergence_with_roots` decides it
-        // for every executor it builds -- a session's or not.
-        // Lets this session's `reconcile_one_file` force a racing local
-        // change out of this device's per-link debounce accumulators
-        // before comparing/applying a peer update — see
-        // `PendingLocalChangeFlush for DaemonState`'s doc comment
-        // (the daemon's own `LinkRuntimeController`).
-        pending_local_change_flush: state.clone(),
-        root_commit_authority_provider: state.clone(),
-        // Admit incoming change-history changes only when this device
-        // has pinned the author's signing key and the author is an
-        // authorized writer for the change's group — both mirrored from
-        // the netmap onto `DaemonState`. Without an authenticator a
-        // session announces heads and serves stored changes but never
-        // admits an incoming one.
-        change_authenticator: crate::change_auth::NetmapChangeAuthenticator::new(state.clone()),
-        // Lets this session author a captured change for content its
-        // own materialize path displaces during custody transfer (see
-        // `PeerSyncSession::set_change_emitter`'s doc comment). A device
-        // that has not yet been provisioned a signing key is left with
-        // no emitter -- the same fail-closed default the field itself
-        // documents -- so a future caller must retain rather than
-        // author in that case; it never falls back to an unsigned or
-        // wrong-identity write.
-        change_emitter: state.device_signing_key().map(|signing_key| {
-            Arc::new(yadorilink_sync_sqlite::dag_store::ChangeEmitter::new(
-                state.device_id.clone(),
-                signing_key,
-            ))
-        }),
-        // Lets this session answer an incoming peer `HandoffLeaseRequest`
-        // by running this device's own target-side lease flow — see
-        // `HandoffLeaseResponder for DaemonState`'s doc comment
-        // (`daemon_state.rs`).
-        handoff_lease_responder: state.clone(),
-        block_write_activity_provider: state.clone(),
-        // Lets this session answer an incoming peer `HandoffTicketRequest`
-        // (from a different device removing/revoking this one) by running
-        // this device's own removed-device-ticket flow — see
-        // `HandoffTicketResponder for DaemonState`'s doc comment
-        // (`daemon_state.rs`).
-        handoff_ticket_responder: state.clone(),
-    }
-}
-
 pub(crate) fn sync_roots_for_groups(
     state: &DaemonState,
     group_ids: &[String],
@@ -1342,6 +1300,8 @@ pub(crate) fn sync_roots_for_groups(
                 roots.insert(group_id.clone(), PathBuf::from(local_path));
             }
             Ok(None) => {}
+            // A provider group has no directory: it is replicated natively, never through a root.
+            Err(yadorilink_sync_sqlite::SyncSqliteError::NotFilesystemRoot(_)) => {}
             Err(e) => {
                 tracing::error!(
                     group_id = %group_id,

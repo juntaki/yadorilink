@@ -37,42 +37,41 @@
 //! A recursive delete or directory rename that observed such a copy
 //! writes it through the same way ([`write_recursive_operation_through`]):
 //! `rm -rf p` deletes `p/a`, and `mv p q` deletes `p/a` and puts `q/a`,
-//! never an op at the copy name. A directory made where the copy was (a
+//! never an op at the copy name. When `p/a` held a winner and a loser, both
+//! move: `q/a` receives two puts, and the copy's name at `q` is derived anew
+//! from the heads there. A directory made where the copy was (a
 //! type change) deletes the source first, then is a new entry of its own.
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::Connection;
 
-use yadorilink_replica_domain::conflict::{conflict_copy_source_path, is_conflict_copy_path};
 use yadorilink_replica_domain::file::RecordKind;
-use yadorilink_replica_engine::conflict::PathHead;
 
-use crate::dag_store::{get_file_version, path_gamma_heads};
 use crate::error::SyncSqliteError;
 
-/// The source entry a local operation on `path` is an operation on, when
-/// `path` is a copy name at which the projection places one of the
-/// source's live File or Symlink versions: `path`'s live row is that
-/// version's content under the change that wrote it at the source (the
-/// winner relocated or held there, a loser the current history wrote, or
-/// a loser an installed base carries that nothing has named since), and
-/// no change authored anything at `path` itself. `None` for every other
-/// path, which authors at its own name.
+/// The source entry a local operation on the physical path `path` is an
+/// operation on, or `None` when `path` is an entry of its own.
 ///
-/// The source's heads are its live path frontier, or, for a path no live
-/// change has touched since a HistoryBase install, the installed base's
-/// heads (the install relocates such a row the same way).
+/// `path` is a copy of a source only when native's physical placement
+/// authority says its index row shows one
+/// ([`crate::native_projection_binding::resolve_native_physical_path`]):
+/// the placement, or failing that the native head the row was produced from,
+/// names the logical path and the exact head the row displays, and holds
+/// until the row is replaced, whether or not that head is still live. The
+/// path's name is never inspected. A path whose own entry holds the content
+/// the row shows is that entry whatever it is placed as, and the index row
+/// must be a live File or Symlink.
 pub fn write_through_source(
     conn: &Connection,
     group_id: &str,
     path: &str,
 ) -> Result<Option<String>, SyncSqliteError> {
-    if !is_conflict_copy_path(path) {
+    use yadorilink_replica_domain::ids::{FolderGroupId, SyncPath};
+
+    let Some(target) =
+        crate::native_projection_binding::resolve_native_physical_path(conn, group_id, path)?
+    else {
         return Ok(None);
-    }
-    let source = conflict_copy_source_path(path);
-    if source == path {
-        return Ok(None);
-    }
+    };
     let Some(row) = crate::store::read_canonical_current_row(conn, group_id, path)? else {
         return Ok(None);
     };
@@ -81,68 +80,19 @@ pub fn write_through_source(
     {
         return Ok(None);
     }
-    let Some(authoring) = row.authoring_change_hash else { return Ok(None) };
-    // Authored at its own name: an entry of its own, whatever it is named.
-    if !path_gamma_heads(conn, group_id, path)?.is_empty() {
+    // An entry of the path's own that holds the very content the row shows is
+    // what the row is. Another entry of the path (one a copy's name happens
+    // to coincide with) is not: the row shows the copy's content, so it is
+    // the copy.
+    let group = FolderGroupId(group_id.to_owned());
+    let shown = row.version_hash();
+    if crate::native_store::native_heads_at(conn, &group, &SyncPath(path.to_owned()))?
+        .iter()
+        .any(|head| head.payload.version == shown)
+    {
         return Ok(None);
     }
-    let version = row.version_hash().0;
-    let source_heads = path_gamma_heads(conn, group_id, &source)?;
-    // The copy holds one of the source's live versions, under the change
-    // that wrote it there: the placed winner, a version the current
-    // history wrote concurrently with the one at the source, or one an
-    // installed base carries that nothing has named since. Nothing
-    // authored the copy; it is where that version is visible, and the
-    // user deleting or editing it is acting on that version of the
-    // source. The write names exactly that head and leaves every other
-    // version of the source live beside it.
-    let live = source_heads.iter().any(|head| {
-        head.change_hash == authoring.0
-            && head.content.as_ref().is_some_and(|content| content.version_hash == version)
-    });
-    if live {
-        return Ok(Some(source));
-    }
-    let known = (version, row.snapshot.record_kind);
-    let Some(leaves) = leaf_heads(conn, group_id, &source_heads, known)? else {
-        return Ok(None);
-    };
-    // The copy still shows an earlier version of one of the source's
-    // leaves: a later write of the source that descends from the one the
-    // copy holds is admitted, and the reconcile has not yet moved the copy
-    // -- whether that write now holds the source or itself sits at a copy
-    // name. The user is still acting on that entry; the write is signed
-    // without the heads the copy has not seen, so it stays concurrent with
-    // them.
-    if !wrote_version_at(conn, group_id, &authoring.0, &source, &version)? {
-        return Ok(None);
-    }
-    for leaf in leaves {
-        let leaf = yadorilink_replica_domain::ids::ChangeHash(leaf.change_hash);
-        if crate::dag_store::path_frontier::is_ancestor_bounded(conn, &authoring, &leaf)? {
-            return Ok(Some(source));
-        }
-    }
-    Ok(None)
-}
-
-/// Whether `change` wrote `version` at `path` (its content effect there).
-fn wrote_version_at(
-    conn: &Connection,
-    group_id: &str,
-    change: &[u8; 32],
-    path: &str,
-    version: &[u8; 32],
-) -> Result<bool, SyncSqliteError> {
-    let written: Option<Option<Vec<u8>>> = conn
-        .query_row(
-            "SELECT version_hash FROM change_path_effects \
-              WHERE group_id = ?1 AND path = ?2 AND change_hash = ?3",
-            params![group_id, path, &change[..]],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(written.flatten().is_some_and(|written| written.as_slice() == version.as_slice()))
+    Ok(Some(target.source_path.as_str().to_owned()))
 }
 
 /// One mutation of a recursive operation after write-through, in the
@@ -159,28 +109,28 @@ pub(crate) struct WrittenMutation {
     pub absorbed: bool,
 }
 
-/// The recursive operation's `mutations` with every op on a copy name
-/// written through to its source (see [`write_through_source`]): the
-/// delete of a copy a recursive delete or rename observed is authored at
-/// the entry the copy is, and a rename's put of that copy under the new
-/// name at the entry's own new path. The rows stay where they are.
-///
-/// A copy whose source already has a delete in the operation (the version
-/// at the source, or an explicit Directory there, deleted or moved with
-/// it) is folded into that delete ([`WrittenMutation::absorbed`]): one
-/// change carries one op per path, and that one delete supersedes every
-/// version of the source the user was shown, at the source and at its
-/// copies, and nothing else. A rename's put of such a copy stays at the
-/// copy's new name, an entry of its own: the source's new path already
-/// has the put of the version that was at the source.
+/// [`write_recursive_operation_through`] over native heads:
+/// each copy's source is decided by [`write_through_source`].
 pub(crate) fn write_recursive_operation_through(
     conn: &Connection,
     group_id: &str,
     kind: &yadorilink_replica_domain::recursive_operation::RecursiveOperationKind,
     mutations: &[yadorilink_replica_domain::session_state::PreparedLocalMutation],
 ) -> Result<Vec<WrittenMutation>, SyncSqliteError> {
-    use yadorilink_replica_domain::change::Op;
+    write_recursive_operation_through_with(kind, mutations, |path| {
+        write_through_source(conn, group_id, path)
+    })
+}
+
+/// The write-through of a recursive operation's `mutations`, deciding each
+/// copy's source with `source_of` (see [`write_recursive_operation_through`]).
+fn write_recursive_operation_through_with(
+    kind: &yadorilink_replica_domain::recursive_operation::RecursiveOperationKind,
+    mutations: &[yadorilink_replica_domain::session_state::PreparedLocalMutation],
+    mut source_of: impl FnMut(&str) -> Result<Option<String>, SyncSqliteError>,
+) -> Result<Vec<WrittenMutation>, SyncSqliteError> {
     use yadorilink_replica_domain::ids::SyncPath;
+    use yadorilink_replica_domain::local_op::Op;
     use yadorilink_replica_domain::recursive_operation::RecursiveOperationKind;
     use yadorilink_replica_domain::session_state::PreparedLocalMutation;
 
@@ -188,19 +138,35 @@ pub(crate) fn write_recursive_operation_through(
         Op::Put { path, .. } | Op::Delete { path } => Some(path.as_str().to_string()),
         Op::Move { .. } => None,
     };
-    let mut taken: std::collections::HashSet<String> =
-        mutations.iter().filter_map(|m| op_path(m.op())).collect();
     let mut out = mutations.to_vec();
+    // The source each delete of a copy is written through to. Decided before
+    // any op is rewritten: a copy's own name is no longer an op path once its
+    // delete names its source, and another copy's source may be that very
+    // name (an ordinary entry whose name a copy of the same directory
+    // coincides with on this device).
+    let mut sources: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+    for (index, mutation) in out.iter().enumerate() {
+        let PreparedLocalMutation::Delete { record, op, .. } = mutation else { continue };
+        if op_path(op).as_deref() != Some(record.path.as_str()) {
+            continue;
+        }
+        if let Some(source) = source_of(&record.path)? {
+            sources.insert(index, source);
+        }
+    }
+    let mut taken: std::collections::HashSet<String> = mutations
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !sources.contains_key(index))
+        .filter_map(|(_, m)| op_path(m.op()))
+        .collect();
     // Old copy path -> the source its delete was written through to.
     let mut written: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     // Copy index -> the source path its delete is folded into.
     let mut folded: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
     for (index, mutation) in out.iter_mut().enumerate() {
-        let PreparedLocalMutation::Delete { record, op } = mutation else { continue };
-        if op_path(op).as_deref() != Some(record.path.as_str()) {
-            continue;
-        }
-        let Some(source) = write_through_source(conn, group_id, &record.path)? else { continue };
+        let PreparedLocalMutation::Delete { record, op, .. } = mutation else { continue };
+        let Some(source) = sources.remove(&index) else { continue };
         *op = Op::Delete { path: SyncPath(source.clone()) };
         if !taken.insert(source.clone()) {
             folded.insert(index, source.clone());
@@ -213,18 +179,17 @@ pub(crate) fn write_recursive_operation_through(
             let PreparedLocalMutation::Upsert { record, op, .. } = mutation else { continue };
             let Op::Put { path, .. } = op else { continue };
             let Some(rest) = path.as_str().strip_prefix(to) else { continue };
-            if path.as_str() != record.path || !written.contains_key(&format!("{from}{rest}")) {
+            if path.as_str() != record.path {
                 continue;
             }
-            let copy_source =
-                yadorilink_replica_domain::conflict::conflict_copy_source_path(&record.path);
-            let Some(source) = write_through_op_path(&record.path, &copy_source) else {
-                continue;
-            };
-            if !taken.insert(source.to_string()) {
-                continue;
-            }
-            *path = SyncPath(source.to_string());
+            // The copy moved with its directory: its source moves the same
+            // way, so the new source is the old one under `to`.
+            let Some(old_source) = written.get(&format!("{from}{rest}")) else { continue };
+            let Some(source_rest) = old_source.strip_prefix(from) else { continue };
+            // The destination may already hold the winner's put: the copy's
+            // put is a second put at that source, a head concurrent with the
+            // winner's, which the authoring signs as a follow-up delta.
+            *path = SyncPath(format!("{to}{source_rest}"));
         }
     }
     // The mutation each source's op belongs to: the first delete of it
@@ -271,41 +236,152 @@ pub(crate) fn write_recursive_operation_through(
 
 /// Whether a single-op local write of the row at `record_path` whose op
 /// is at `op_path` is a write-through: the op is at another path, and
-/// `record_path` is a copy name of it. Returns the op path when it is.
-pub(crate) fn write_through_op_path<'a>(record_path: &str, op_path: &'a str) -> Option<&'a str> {
-    (op_path != record_path
-        && is_conflict_copy_path(record_path)
-        && conflict_copy_source_path(record_path) == op_path)
-        .then_some(op_path)
-}
-
-/// The File and Symlink content heads: the versions the projection places
-/// as the path's leaf (at the path, or relocated) or at a copy name of it.
-/// `None` when a content head's kind is not known here (undecidable: never
-/// a reason to write through). `known` is the kind of the version the
-/// copy's row holds, which an installed base's head may name without this
-/// replica holding the version itself.
-fn leaf_heads(
+/// `record_path` is bound as a copy of it.
+pub(crate) fn write_through_op_path(
     conn: &Connection,
     group_id: &str,
-    heads: &[PathHead],
-    known: ([u8; 32], RecordKind),
-) -> Result<Option<Vec<PathHead>>, SyncSqliteError> {
-    let mut leaves = Vec::new();
-    for head in heads {
-        let Some(content) = head.content.as_ref() else { continue };
-        let kind = if content.version_hash == known.0 {
-            known.1
-        } else {
-            let version = yadorilink_replica_domain::ids::VersionHash(content.version_hash);
-            match get_file_version(conn, group_id, &version)? {
-                Some(file_version) => file_version.meta.record_kind,
-                None => return Ok(None),
-            }
-        };
-        if matches!(kind, RecordKind::File | RecordKind::Symlink) {
-            leaves.push(head.clone());
+    record_path: &str,
+    op_path: &str,
+) -> Result<bool, SyncSqliteError> {
+    if op_path == record_path {
+        return Ok(false);
+    }
+    Ok(crate::native_projection_binding::resolve_native_physical_path(conn, group_id, record_path)?
+        .is_some_and(|target| target.source_path.as_str() == op_path))
+}
+
+#[cfg(test)]
+mod tests {
+    use yadorilink_replica_domain::file::{FileMeta, FileRecord, FileVersion, RecordKind};
+    use yadorilink_replica_domain::ids::{SyncPath, VersionHash};
+    use yadorilink_replica_domain::local_op::Op;
+    use yadorilink_replica_domain::recursive_operation::RecursiveOperationKind;
+    use yadorilink_replica_domain::session_state::PreparedLocalMutation;
+
+    use super::*;
+
+    fn version(mtime: i64) -> FileVersion {
+        FileVersion::new(
+            Vec::new(),
+            0,
+            FileMeta {
+                mtime_unix_nanos: mtime,
+                unix_mode: Some(0o644),
+                symlink_target: None,
+                record_kind: RecordKind::File,
+                xattrs: Vec::new(),
+            },
+        )
+    }
+
+    fn record(path: &str, deleted: bool) -> FileRecord {
+        FileRecord { path: path.into(), size: 0, mtime_unix_nanos: 1, blocks: Vec::new(), deleted }
+    }
+
+    fn delete(path: &str) -> PreparedLocalMutation {
+        PreparedLocalMutation::Delete {
+            record: record(path, true),
+            op: Op::Delete { path: SyncPath(path.into()) },
+            native_witness: None,
         }
     }
-    Ok(Some(leaves))
+
+    fn upsert(path: &str, version: &FileVersion) -> PreparedLocalMutation {
+        PreparedLocalMutation::Upsert {
+            record: record(path, false),
+            op: Op::Put { path: SyncPath(path.into()), version: version.version_hash },
+            version: version.clone(),
+            meta: None,
+            native_witness: None,
+        }
+    }
+
+    /// A copy whose name is also an ordinary entry's logical path: the copy's
+    /// delete is written through to its source, which frees that name for the
+    /// ordinary entry's own copy-shaped delete to name it as its source. The
+    /// operation must not read the freed name as a second op at it.
+    #[test]
+    fn a_copys_name_that_is_another_entrys_source_is_not_a_second_op_at_it() {
+        let (winner, loser, ordinary) = (version(1), version(2), version(3));
+        let mutations = vec![
+            delete("p/f"),
+            delete("p/f (copy)"),
+            delete("p/f (copy) (moved)"),
+            upsert("q/f", &winner),
+            upsert("q/f (copy)", &loser),
+            upsert("q/f (copy) (moved)", &ordinary),
+        ];
+        let kind = RecursiveOperationKind::RenameTree {
+            from: SyncPath("p".into()),
+            to: SyncPath("q".into()),
+        };
+
+        let written = write_recursive_operation_through_with(&kind, &mutations, |path| {
+            Ok(match path {
+                "p/f (copy)" => Some("p/f".to_owned()),
+                "p/f (copy) (moved)" => Some("p/f (copy)".to_owned()),
+                _ => None,
+            })
+        })
+        .unwrap();
+
+        let ops: Vec<(String, String)> = written
+            .iter()
+            .map(|w| {
+                let op = match w.mutation.op() {
+                    Op::Put { path, .. } => format!("put {}", path.as_str()),
+                    Op::Delete { path } => format!("delete {}", path.as_str()),
+                    other => format!("{other:?}"),
+                };
+                (op, w.mutation.record().path.clone())
+            })
+            .collect();
+        assert!(
+            ops.iter().any(|(op, row)| op == "delete p/f (copy)" && row == "p/f (copy) (moved)"),
+            "the displaced entry is deleted at its own source: {ops:?}"
+        );
+        assert!(
+            ops.iter().any(|(op, row)| op == "put q/f (copy)" && row == "q/f (copy) (moved)"),
+            "and moves to its own source under q: {ops:?}"
+        );
+    }
+
+    /// `mv p q` over `p/f` held as a winner plus a conflict loser shown at a
+    /// copy name: the loser moves with its directory, so its put is written
+    /// through to the source `q/f` beside the winner's, never left at a name
+    /// of its own that would make it an independent entry.
+    #[test]
+    fn a_directory_rename_writes_the_conflict_loser_through_beside_the_winner() {
+        let (winner, loser) = (version(1), version(2));
+        let mutations = vec![
+            delete("p/f"),
+            delete("p/f (copy)"),
+            upsert("q/f", &winner),
+            upsert("q/f (copy)", &loser),
+        ];
+        let kind = RecursiveOperationKind::RenameTree {
+            from: SyncPath("p".into()),
+            to: SyncPath("q".into()),
+        };
+
+        let written = write_recursive_operation_through_with(&kind, &mutations, |path| {
+            Ok((path == "p/f (copy)").then(|| "p/f".to_owned()))
+        })
+        .unwrap();
+
+        let puts: Vec<(&str, &str, VersionHash)> = written
+            .iter()
+            .filter_map(|w| match w.mutation.op() {
+                Op::Put { path, version } => {
+                    Some((path.as_str(), w.mutation.record().path.as_str(), *version))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            puts,
+            vec![("q/f", "q/f", winner.version_hash), ("q/f", "q/f (copy)", loser.version_hash)],
+            "both heads of the contested path move to the destination"
+        );
+    }
 }

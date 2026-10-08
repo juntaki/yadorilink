@@ -29,7 +29,7 @@ async fn convergence_starts_without_an_environment_variable_selecting_it() {
         .await;
 
     assert!(
-        state.reconciliation_driver().is_some(),
+        state.peer_session_driver().is_some(),
         "a daemon with no convergence driver installed cannot sync at all"
     );
 }
@@ -50,9 +50,9 @@ async fn starting_convergence_again_keeps_the_stack_already_running() {
 
     let config = || yadorilink_sync_substrate::NetworkConfig::direct_only();
     start_reconciliation_with(&state, config()).await;
-    let first = state.reconciliation_driver().expect("a driver after the first start");
+    let first = state.peer_session_driver().expect("a driver after the first start");
     start_reconciliation_with(&state, config()).await;
-    let second = state.reconciliation_driver().expect("a driver after the second start");
+    let second = state.peer_session_driver().expect("a driver after the second start");
 
     assert!(
         Arc::ptr_eq(&first, &second),
@@ -141,7 +141,7 @@ async fn convergence_startup_retries_until_it_succeeds_and_then_stops() {
         3,
         "the loop must stop on the attempt that succeeds, not keep going"
     );
-    assert!(state.reconciliation_driver().is_some());
+    assert!(state.peer_session_driver().is_some());
 }
 
 #[test]
@@ -349,9 +349,7 @@ async fn fake_session(state: &Arc<DaemonState>) -> Arc<PeerSyncSession> {
         replica_engine,
         peer_store,
         vec![],
-        HashMap::new(),
         transports,
-        Some(state.forward_tx.clone()),
         PeerSyncSessionDeps::standalone(),
     )
 }
@@ -394,6 +392,38 @@ async fn authoritative_netmap_replaces_metadata_for_an_existing_session() {
     assert!(!state.authority.peer_group_is_full_replica("device-b", "group-2"));
     assert_eq!(state.authority.peer_signing_key("device-b"), None);
     assert!(state.authority.membership_generation() > generation_before);
+}
+
+/// A snapshot that repeats the groups a session already has must not wake the reconcile
+/// loops (it arrives for every peer on every netmap push); a changed set must.
+#[tokio::test]
+async fn netmap_push_wakes_reconcile_only_when_the_groups_change() {
+    let state = test_state();
+    let session = fake_session(&state).await;
+    state.peers.register_session("device-b".into(), session.clone(), state.local_convergence());
+    let mut wake = state.native_replication.subscribe_wake_for_test();
+    let apply = |groups: &[&str]| {
+        let groups: HashSet<String> = groups.iter().map(|g| g.to_string()).collect();
+        apply_authoritative_peer_metadata(
+            &state,
+            "device-b",
+            Some([7; 32]),
+            &groups,
+            &groups,
+            &std::sync::Mutex::new(HashMap::new()),
+        );
+    };
+
+    apply(&["group-1"]);
+    assert!(wake.has_changed().unwrap(), "a new group must wake");
+    wake.borrow_and_update();
+
+    apply(&["group-1"]);
+    apply(&["group-1"]);
+    assert!(!wake.has_changed().unwrap(), "an unchanged push must not wake");
+
+    apply(&["group-1", "group-2"]);
+    assert!(wake.has_changed().unwrap(), "a changed set must wake");
 }
 
 /// A netmap push carrying every field the plane always sends, so a
@@ -601,9 +631,7 @@ async fn fake_session_for(
         replica_engine,
         peer_store,
         shared_group_ids,
-        HashMap::new(),
         transports,
-        Some(state.forward_tx.clone()),
         PeerSyncSessionDeps::standalone(),
     )
 }

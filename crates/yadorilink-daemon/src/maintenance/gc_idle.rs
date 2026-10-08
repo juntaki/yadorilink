@@ -1,17 +1,13 @@
-//! `GcIdleJob` -- the idle-triggered GC scheduler's single tick, sharing
-//! its poll tick with the periodic capacity-eviction sweep (see
-//! `gc::run_periodic_capacity_eviction_sweep`'s own doc for why that one
-//! doesn't need the same idle/write-safe-point gating GC itself does).
+//! `GcIdleJob` -- the idle-triggered GC scheduler's single tick.
 //! Interval-only -- no startup-immediate run.
 //!
-//! Holds a full `Arc<DaemonState>`: both `gc::maybe_run_idle_sweep` and
-//! `gc::run_periodic_capacity_eviction_sweep` take the full state today
-//! (idle-duration tracking, the sync/block-store index, `gc` scheduling
-//! state), and neither is behind a narrower port.
+//! Holds a full `Arc<DaemonState>`: `gc::maybe_run_idle_sweep` takes the
+//! full state today (idle-duration tracking, the sync/block-store index,
+//! `gc` scheduling state), and is not behind a narrower port.
 
 use std::sync::Arc;
 
-use crate::daemon_state::{run_blocking_sweep_offloaded, DaemonState};
+use crate::daemon_state::DaemonState;
 
 pub(crate) struct GcIdleJob {
     state: Arc<DaemonState>,
@@ -47,6 +43,5 @@ impl GcIdleJob {
                 tracing::warn!(error = %e, "idle-triggered GC sweep failed");
             }
         }
-        run_blocking_sweep_offloaded(|| crate::gc::run_periodic_capacity_eviction_sweep(state));
     }
 }

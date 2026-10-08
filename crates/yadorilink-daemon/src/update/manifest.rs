@@ -99,17 +99,6 @@ fn is_placeholder_public_key(public_key_hex: &str) -> bool {
     public_key_hex.trim().eq_ignore_ascii_case(PLACEHOLDER_TRUST_ROOT_PUBLIC_KEY_HEX)
 }
 
-/// Whether any pinned trust-root key IS the development/beta placeholder,
-/// detected by key material (`is_placeholder_public_key`) so a renamed
-/// `key_id` can never hide it. A release pipeline SHALL treat `true` as a
-/// hard failure: serving real update manifests to real users while the
-/// placeholder key is pinned cannot guarantee the update path's
-/// authenticity. See `enforce_release_trust_root_gate` for the gate built on
-/// this that a release pipeline actually runs.
-pub fn trust_root_has_placeholder() -> bool {
-    TRUSTED_KEYS.iter().any(|k| is_placeholder_public_key(k.public_key_hex))
-}
-
 /// Whether `trusted_keys` configures at least one REAL trusted key: not
 /// empty, and not made up entirely of blank/whitespace or placeholder key
 /// material. An empty or placeholder-only trusted-key set is exactly as

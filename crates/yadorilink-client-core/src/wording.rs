@@ -174,18 +174,28 @@ pub fn membership_outcome_warnings(
     warnings
 }
 
-/// The device-code sign-in instructions: the bare verification URI and the
-/// code, separately. Never the URI with the code already in it, which would
-/// put a live credential in a browser address bar and its history.
+/// The device-code sign-in instructions. With the completed verification URI,
+/// one link that already carries the code plus the code to compare; without
+/// it, the bare verification URI and the code to type.
 ///
 /// The same text `yadorilink_fapi_client::DeviceAuthorization::instructions`
-/// produces for the same two values.
+/// produces for the same values.
 #[must_use]
-pub fn device_code_instructions(verification_uri: &str, user_code: &str) -> String {
-    format!(
-        "To finish signing in, open {verification_uri} on any device and enter this code:\n\n    \
-         {user_code}\n"
-    )
+pub fn device_code_instructions(
+    verification_uri: &str,
+    verification_uri_complete: Option<&str>,
+    user_code: &str,
+) -> String {
+    match verification_uri_complete {
+        Some(complete) => format!(
+            "To finish signing in, open this link on any device (your phone is fine) and check \
+             that the code shown there matches:\n\n  {complete}\n\n  Code: {user_code}\n"
+        ),
+        None => format!(
+            "To finish signing in, open {verification_uri} on any device and enter this \
+             code:\n\n    {user_code}\n"
+        ),
+    }
 }
 
 /// What a front end writing to a terminal (or a log) prints for each
@@ -207,8 +217,15 @@ pub fn login_event_lines(event: &crate::ops::auth::LoginEvent) -> Vec<String> {
         LoginEvent::OpenBrowser { url, purpose: BrowserPurpose::SignIn } => {
             vec!["\nNow sign in to finish:\n".to_owned(), format!("    {url}\n")]
         }
-        LoginEvent::ShowDeviceCode { verification_uri, user_code } => {
-            vec![format!("\n{}", device_code_instructions(verification_uri, user_code))]
+        LoginEvent::ShowDeviceCode { verification_uri, verification_uri_complete, user_code } => {
+            vec![format!(
+                "\n{}",
+                device_code_instructions(
+                    verification_uri,
+                    verification_uri_complete.as_deref(),
+                    user_code
+                )
+            )]
         }
         LoginEvent::SignedIn { client_id } => {
             vec![format!("Logged in. This computer is enrolled as {client_id}.")]

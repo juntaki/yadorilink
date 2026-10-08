@@ -65,8 +65,7 @@ async fn can_round_trip(node: &SubstrateNode, peer: PeerId) -> bool {
 
     let attempt = async {
         let link = node.connect(peer).await.ok()?;
-        let mut lane =
-            link.open_lane(yadorilink_sync_substrate::Lane::Reconciliation).await.ok()?;
+        let mut lane = link.open_lane(yadorilink_sync_substrate::Lane::Service).await.ok()?;
         lane.write_all(b"ping").await.ok()?;
         let mut echoed = [0u8; 4];
         lane.read_exact(&mut echoed).await.ok()?;

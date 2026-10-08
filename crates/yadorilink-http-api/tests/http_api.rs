@@ -102,20 +102,11 @@ async fn start() -> TestServer {
 }
 
 /// Adds a link and indexes one hydrated file under it, the same fixture
-/// shape `materialization.rs`'s own tests use.
-/// Mirrors `materialization.rs`'s own `pin_command_succeeds_for_an_already_hydrated_file`
-/// fixture (empty `blocks` list, real content written straight to disk).
-/// `pin`'s real implementation (`hydration::pin`) only short-circuits to
-/// `Ok(())` without contacting any peer when the file reads
-/// `MaterializationState::Hydrated` AND a usable actual-state proof names
-/// the version the row derives; anything else falls through to a real
-/// `hydrate()` call, which unconditionally needs a live root-commit
-/// authority (`hydrate_inner`'s `state.root_lease_for`) that a plain
-/// `add_link` (never a real `start_link_watch`) never installs. This
-/// crate's tests don't install `state.install_test_root_commit_authority`
-/// either, since `pin`/`unpin`/`materialization`/`versions` should only
-/// ever need a path that resolves and has *some* materialized content,
-/// never a live peer/session. A `Hydrated` stamp on its own is a
+/// shape `materialization.rs`'s own tests use (empty `blocks` list, real
+/// content written straight to disk). This crate's tests never install a
+/// live root-commit authority, since `materialization`/`versions` only ever
+/// need a path that resolves and has *some* materialized content, never a
+/// live peer/session. A `Hydrated` stamp on its own is a
 /// combination production can no longer produce, so the fixture seeds the
 /// pair the one way a writer produces it: `seed_prior_cycle_proof`, the
 /// single commit that publishes the proof and stamps the claim together.
@@ -400,7 +391,7 @@ async fn links_and_pause_resume_round_trip() {
 }
 
 #[tokio::test]
-async fn materialization_and_versions_and_pin_round_trip() {
+async fn materialization_and_versions_round_trip() {
     let _guard = TEST_MUTEX.lock().await;
     let ts = start().await;
     let folder = ts._dir.path().join("shared");
@@ -418,41 +409,6 @@ async fn materialization_and_versions_and_pin_round_trip() {
         .await
         .unwrap();
     assert_eq!(m["known"], true);
-    assert_eq!(m["pinned"], false);
-
-    let resp = ts
-        .client
-        .post(ts.url("/api/pin"))
-        .bearer_auth(&ts.token)
-        .json(&serde_json::json!({ "path": file_path }))
-        .send()
-        .await
-        .unwrap();
-    let status = resp.status();
-    let body = resp.text().await.unwrap();
-    assert_eq!(status, 200, "pin failed, body: {body}");
-
-    let m: serde_json::Value = ts
-        .client
-        .get(ts.url(&format!("/api/materialization?path={}", urlencoding_lite(&file_path))))
-        .bearer_auth(&ts.token)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(m["pinned"], true);
-
-    let resp = ts
-        .client
-        .post(ts.url("/api/unpin"))
-        .bearer_auth(&ts.token)
-        .json(&serde_json::json!({ "path": file_path.clone() }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
 
     let versions: serde_json::Value = ts
         .client
@@ -490,7 +446,7 @@ async fn mutating_an_unlinked_path_is_a_client_error_not_a_server_error() {
 
     let resp = ts
         .client
-        .post(ts.url("/api/pin"))
+        .post(ts.url("/api/evict"))
         .bearer_auth(&ts.token)
         .json(&serde_json::json!({ "path": "/nowhere/linked.txt" }))
         .send()
@@ -574,7 +530,6 @@ async fn conflicts_endpoint_returns_real_per_file_detail() {
     // Why the copy is kept, the same reason the CLI and apps show.
     assert_eq!(rows[0]["reason"], "CONFLICT_REASON_CONCURRENT_EDIT");
     // No compaction is waiting on it.
-    assert_eq!(rows[0]["holds_compaction"], false);
 }
 
 /// Seeds a live explicit-directory row at `path`: a canonical `size=0`,
@@ -600,8 +555,8 @@ fn seed_directory_row(state: &DaemonState, path: &str) {
 
 /// `/api/versions` and `/api/conflicts` name each row's entry kind, so a
 /// client can show an explicit directory as a folder instead of a zero-byte
-/// file. Reads only -- no pin step, which needs a live root-commit
-/// authority this fixture does not run.
+/// file. Reads only: nothing here needs a live root-commit authority, which
+/// this fixture does not run.
 #[tokio::test]
 async fn versions_and_conflicts_report_each_entry_kind() {
     let _guard = TEST_MUTEX.lock().await;

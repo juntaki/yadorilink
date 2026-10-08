@@ -16,8 +16,8 @@ use yadorilink_sync_substrate::{Lane, PeerAddress};
 
 use crate::daemon_state::{DaemonState, SendGrantPeer};
 use crate::sync_adapter::sync_stack::SyncStack;
-use crate::sync_adapter::ReconciliationDriver;
-use crate::test_support::sync_stack_fixture::{device, pin, FixtureAuthenticator};
+use crate::sync_adapter::PeerSessionDriver;
+use crate::test_support::sync_stack_fixture::{device, pin};
 
 const ALICE: &str = "device-alice";
 const BOB: &str = "device-bob";
@@ -47,15 +47,11 @@ impl Device {
 async fn start(name: &str, key: u8) -> Device {
     let (state, store_dir) = device(name, key);
     let stack = Arc::new(
-        SyncStack::spawn(
-            state.clone(),
-            Arc::new(FixtureAuthenticator),
-            yadorilink_sync_substrate::NetworkConfig::direct_only(),
-        )
-        .await
-        .expect("stack starts"),
+        SyncStack::spawn(state.clone(), yadorilink_sync_substrate::NetworkConfig::direct_only())
+            .await
+            .expect("stack starts"),
     );
-    state.install_reconciliation_driver(ReconciliationDriver::start(state.clone(), stack.clone()));
+    state.install_peer_session_driver(PeerSessionDriver::start(state.clone(), stack.clone()));
     let send_dir = tempfile::tempdir().unwrap();
     {
         let state = state.clone();
@@ -167,13 +163,13 @@ async fn a_track_send_peer_reaches_nothing_on_the_sync_side() {
         .await
         .expect("admitted on the send ALPN");
     let (mut writer, _reader) = connection.open_stream().await.expect("a stream opens");
-    writer.write_all(&[Lane::Reconciliation.tag(), 0, 0, 0, 0]).await.expect("written");
+    writer.write_all(&[Lane::Service.tag(), 0, 0, 0, 0]).await.expect("written");
     writer.finish().expect("finished");
 
     // The sync ALPN refuses her: the grant is never asked there.
     let sync_attempt = async {
         let link = carol.stack.endpoint().node().connect(alice.stack.peer_id()).await.ok()?;
-        let mut lane = link.open_lane(Lane::Reconciliation).await.ok()?;
+        let mut lane = link.open_lane(Lane::Service).await.ok()?;
         lane.write_all(b"ping").await.ok()?;
         let mut buf = [0u8; 4];
         tokio::io::AsyncReadExt::read_exact(&mut lane, &mut buf).await.ok()?;

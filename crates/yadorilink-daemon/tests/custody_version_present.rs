@@ -91,8 +91,7 @@ fn put_and_record(daemon: &Daemon, data: &[u8]) -> Vec<u8> {
     daemon
         .state
         .replica_coordinator
-        .change_history_repository()
-        .record_group_block_provenance(GROUP, std::slice::from_ref(&hash_bytes))
+        .record_block_provenance(GROUP, std::slice::from_ref(&hash_bytes))
         .unwrap();
     hash_bytes
 }

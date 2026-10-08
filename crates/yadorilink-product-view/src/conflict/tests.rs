@@ -102,3 +102,22 @@ fn carries_the_reason_the_daemon_states() {
     file.reason = Wire::ConcurrentEdit as i32;
     assert_eq!(conflict_detail(&file).reason, ConflictReason::ConcurrentEdit);
 }
+
+/// A native copy name carries a label and a hash prefix but no timestamp; the
+/// label must not be read as a timestamp (nor the hash as a device).
+#[test]
+fn parses_a_name_without_a_timestamp() {
+    let detail = conflict_detail(&conflicted(
+        "docs/report (conflicted copy, sync, 0102030405060708090a0b0c0d0e0f10).txt",
+    ));
+    assert_eq!(
+        detail,
+        ConflictDetail {
+            current_path: "docs/report.txt".into(),
+            loser_device_id: Some("sync".into()),
+            timestamp: None,
+            content_hash_hex: Some("0102030405060708090a0b0c0d0e0f10".into()),
+            reason: ConflictReason::ConcurrentEdit,
+        }
+    );
+}

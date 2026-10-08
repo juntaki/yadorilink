@@ -8,9 +8,8 @@
  *
  * Included via the FileProvider extension target's bridging header
  * (YadoriLinkFileProvider/Extension/YadoriLinkFileProvider-Bridging-Header.h)
- * and the host app's bridging header (HostApp needs
- * yadorilink_fp_list_on_demand_folders / yadorilink_fp_real_home_dir for
- * domain registration).
+ * and the host app's bridging header (the host connection, the folder
+ * list and the home directory).
  */
 
 #ifndef YADORILINK_FILEPROVIDER_CORE_H
@@ -39,10 +38,14 @@ void yadorilink_fp_free_string(char *ptr);
 char *yadorilink_fp_real_home_dir(void);
 
 /*
- * Returns a JSON array of {"local_path": string, "group_id": string}
- * for every OnDemand-linked folder group the daemon currently knows
- * about -- the authoritative desired-registration-state snapshot domain
- * reconciliation (DomainRegistration.swift) reconciles against. Returns
+ * Returns a JSON array of {"root_id": string (hex), "group_id": string,
+ * "display_name": string, "hydration_policy": "on_demand"|"eager"|"unspecified",
+ * "registration_ready": bool} for every provider-backed root the daemon
+ * currently knows about (root_id is the File Provider domain identifier; there is no
+ * local path). registration_ready == false: the host must NOT register a new
+ * domain and must NOT delete an existing one (the OS caches an empty root
+ * listing registered before the namespace is queryable). The authoritative desired-registration-state snapshot domain
+ * reconciliation (ProviderDriver) reconciles against. Returns
  * NULL, deliberately distinct from a valid "[]" string, on any failure
  * (unreachable daemon, timeout, malformed response): the caller MUST
  * treat NULL as "cannot currently confirm the desired state, do not
@@ -50,66 +53,20 @@ char *yadorilink_fp_real_home_dir(void);
  * registered." Caller must free a non-NULL result with
  * yadorilink_fp_free_string.
  */
-char *yadorilink_fp_list_on_demand_folders(void);
+char *yadorilink_fp_list_provider_folders(const char *app_group_container);
 
-/*
- * Returns a JSON array of {"relative_path": string, "size": uint64,
- * "mtime_unix_nanos": int64, "materialization_state": string} for every
- * non-deleted file in the folder group rooted at `local_path` (must
- * match a local_path from yadorilink_fp_list_on_demand_folders).
- * `materialization_state` is one of "hydrated" | "placeholder" |
- * "hydrating" | "unspecified". "[]" only for a confirmed empty folder;
- * NULL on a NULL path or when the listing could not be confirmed (daemon
- * unreachable, timeout, snapshot_available=false). The caller MUST end
- * the enumeration with an error on NULL, never report an empty folder.
- * Caller must free a non-NULL result with yadorilink_fp_free_string.
- *
- * `local_path` must be a null-terminated UTF-8 C string, or NULL.
- */
-char *yadorilink_fp_list_folder_files(const char *local_path);
+/* One request of the provider-root protocol (JSON in, JSON out). NULL on any transport failure
+   (map to .serverUnreachable, never to an empty result). Free a non-NULL result with
+   yadorilink_fp_free_string. */
+char *yadorilink_fp_provider_call(const char *request_json);
 
-/*
- * Returns a JSON object {"sync_state": string, "materialization_state":
- * string} for `path`. Falls back to an all-"unspecified" object on a
- * NULL path or any failure. Caller must free with
- * yadorilink_fp_free_string.
- *
- * `path` must be a null-terminated UTF-8 C string, or NULL.
- */
-char *yadorilink_fp_query_status(const char *path);
-
-/*
- * Requests hydration of `path` from the daemon, blocking the calling
- * thread up to ~35s (a bounded-timeout decision — long enough to cover
- * the daemon-side 30s hydration deadline plus IPC overhead). Returns
- * true only on a confirmed successful hydration;
- * false for a NULL path, timeout, unreachable daemon, or a
- * daemon-reported failure. Callers with a synchronous OS callback to
- * satisfy (fetchContents(for:...)) must complete that callback with a
- * clear error on false, never hang.
- *
- * `path` must be a null-terminated UTF-8 C string, or NULL.
- */
-bool yadorilink_fp_hydrate(const char *path);
-
-/*
- * Notifies the daemon that a local write already landed on disk at
- * local_path/relative_path (backs createItem/modifyItem via kind == 0,
- * deleteItem via kind == 1). Carries no content or metadata -- the daemon
- * re-observes the live file itself and routes it through the same
- * local-change/DAG admission path a filesystem watcher's own event would
- * take. Blocks the calling thread up to ~10s. Returns true only on a
- * confirmed successful admission; false for a NULL/empty argument, an
- * unrecognized kind, timeout, unreachable daemon, or a daemon-reported
- * admission failure. Callers with a synchronous OS callback to satisfy
- * (createItem/modifyItem/deleteItem) must complete that callback with a
- * clear error on false, never report success for a write the daemon
- * never actually admitted.
- *
- * `local_path` and `relative_path` must each be a null-terminated UTF-8
- * C string, or NULL.
- */
-bool yadorilink_fp_notify_local_write(const char *local_path, const char *relative_path, int32_t kind);
+/* The host app's persistent connection (see host_client.rs). Events arrive as JSON text through
+   `callback` on the connection's own thread; the text is valid only during the call. */
+typedef struct YadoriLinkHost YadoriLinkHost;
+typedef void (*YadoriLinkHostCallback)(const char *event_json, void *context);
+YadoriLinkHost *yadorilink_fp_host_open(YadoriLinkHostCallback callback, void *context);
+bool yadorilink_fp_host_send(YadoriLinkHost *host, const char *command_json);
+void yadorilink_fp_host_close(YadoriLinkHost *host);
 
 #ifdef __cplusplus
 }

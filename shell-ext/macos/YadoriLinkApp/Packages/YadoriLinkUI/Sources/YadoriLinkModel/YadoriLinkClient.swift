@@ -40,8 +40,6 @@ public protocol YadoriLinkClient: AnyObject, Sendable {
     func listVersions(absolutePath: String) async throws -> [FileVersion]
     func restoreVersion(absolutePath: String, versionSeq: Int64?) async throws
     func fileAvailability(absolutePath: String) async throws -> FileAvailability
-    func pinFile(absolutePath: String) async throws
-    func unpinFile(absolutePath: String) async throws
     func hydrateFile(absolutePath: String) async throws
     func evictFile(absolutePath: String) async throws -> EvictOutcome
 
@@ -97,6 +95,11 @@ public protocol YadoriLinkClient: AnyObject, Sendable {
     func createGroupAndLink(groupName: String, localPath: String, mode: FolderMode, acknowledgeRisks: Bool) async throws -> LinkOutcome
     func joinGroupAndLink(groupId: String, groupName: String, localPath: String, mode: FolderMode, acknowledgeRisks: Bool) async throws -> LinkOutcome
     func linkFolder(localPath: String, groupId: String, mode: FolderMode, acknowledgeRisks: Bool) async throws -> LinkOutcome
+    /// A new group and a provider-backed folder (no directory). The client layer keeps the request's retry
+    /// identity on disk, so repeating the same request, even after a restart, answers with the folder it
+    /// already made.
+    func createProviderFolder(groupName: String, displayName: String, mode: FolderMode) async throws -> ProviderFolderOutcome
+    func joinProviderFolder(groupId: String, groupName: String, displayName: String, mode: FolderMode) async throws -> ProviderFolderOutcome
 }
 
 /// An explicit sign-in lifecycle. The app opens the browser itself when it

@@ -80,7 +80,7 @@ fn materialized_proofs(conn: &rusqlite::Connection) -> i64 {
 }
 
 fn dag_backed(conn: &rusqlite::Connection) -> bool {
-    count(conn, "SELECT COUNT(*) FROM changes") > 0
+    count(conn, "SELECT COUNT(*) FROM native_heads") > 0
 }
 
 fn current_rows(conn: &rusqlite::Connection) -> i64 {
@@ -141,7 +141,7 @@ fn can_confirm_repeated_observation(dir: &std::path::Path) -> bool {
 }
 
 /// Paths whose actual-state proof names a different version than the one
-/// the DAG currently resolves them to.
+/// the native state currently resolves them to.
 ///
 /// The number that matters, and the one a "did it settle" check cannot
 /// see. A proof and a live head are supposed to be two records of a
@@ -152,13 +152,10 @@ fn can_confirm_repeated_observation(dir: &std::path::Path) -> bool {
 /// alone is not evidence that this is right.
 fn proofs_disagreeing_with_the_live_head(conn: &rusqlite::Connection) -> i64 {
     conn.query_row(
-        "SELECT COUNT(*) FROM path_live_heads l \
-         JOIN change_path_effects e \
-           ON e.group_id = l.group_id AND e.path = l.path AND e.change_hash = l.change_hash \
+        "SELECT COUNT(*) FROM native_heads h \
          LEFT JOIN path_materialized_generations g \
-           ON g.group_id = l.group_id AND g.path = l.path \
-         WHERE e.effect_kind = 0 \
-           AND (g.version_hash IS NULL OR g.version_hash != e.version_hash)",
+           ON g.group_id = h.group_id AND g.path = h.path \
+         WHERE g.version_hash IS NULL OR g.version_hash != h.version",
         [],
         |row| row.get(0),
     )
@@ -291,7 +288,7 @@ async fn restart(device: Device, local_path: &str, group_id: &str) -> Device {
     // generation's root-lock sidecar still being released.
     let mut attempts = 0;
     loop {
-        let _override = yadorilink_filesystem_sync::placeholder_backend::OverrideForTest::enable();
+        device.state.set_test_on_demand_allowed(true);
         match LinkRuntimeController::new(device.state.clone())
             .start(local_path.to_string(), group_id.to_string())
         {

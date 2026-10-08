@@ -2,8 +2,8 @@
 //!
 //! A session talks to exactly one peer, so each of these is bound to one and
 //! takes no peer argument — there is no way to pass the wrong one because
-//! there is none to pass. What they share is a connection: blocks, service
-//! RPCs and snapshots all ride lanes of the same iroh connection to that peer,
+//! there is none to pass. What they share is a connection: blocks and service
+//! RPCs both ride lanes of the same iroh connection to that peer,
 //! which is what makes their flow-control separation mean anything.
 //!
 //! The connection is resolved per call rather than held. A link that has gone
@@ -13,14 +13,13 @@
 use std::sync::Arc;
 
 use yadorilink_peer_session::ports::{
-    BlockStreamTransport, PeerBlockStream, PeerServiceStream, ServiceStreamTransport, SnapshotFetch,
+    BlockStreamTransport, PeerBlockStream, PeerServiceStream, ServiceStreamTransport,
 };
 use yadorilink_sync_substrate::Lane;
 use yadorilink_transport::TransportError;
 
 use crate::block_lane::LaneBlockStream;
 use crate::service_lane::LaneServiceStream;
-use crate::snapshot_service::LaneSnapshotFetch;
 
 /// Where a connection to this session's peer comes from.
 ///
@@ -81,17 +80,5 @@ impl BlockStreamTransport for PeerTransports {
 impl ServiceStreamTransport for PeerTransports {
     async fn open(&self, group_id: &str) -> Result<Box<dyn PeerServiceStream>, TransportError> {
         Ok(Box::new(LaneServiceStream::new(self.open_lane_for(Lane::Service, group_id).await?)))
-    }
-}
-
-#[async_trait::async_trait]
-impl SnapshotFetch for PeerTransports {
-    async fn fetch(
-        &self,
-        group_id: &str,
-        snapshot_hash: [u8; 32],
-    ) -> Result<Vec<u8>, TransportError> {
-        let link = self.source.link().await?;
-        LaneSnapshotFetch::new(link).fetch(group_id, snapshot_hash).await
     }
 }

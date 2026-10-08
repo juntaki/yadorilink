@@ -12,13 +12,11 @@ struct YadoriLinkApp: App {
 
     init() {
         let app = AppModel(client: ClientFactory.makeClient())
-        // Keep File Provider domains in step with the daemon: once at launch
-        // and whenever the On-Demand folder set changes. The reconciliation
-        // asks the daemon itself and leaves domains alone when it can't.
-        // Runs never overlap: a change during a run queues one more run.
-        let reconciler = CoalescingRunner { done in DomainRegistration.reconcileInBackground(done: done) }
-        app.onDemandGroupsChanged = { _ in reconciler.request() }
-        reconciler.request()
+        // The provider duties (domains, the materialized report, evict and signal answers, the Eager
+        // loop) run on one persistent daemon connection; a change of the provider-folder set asks it
+        // to reconcile at once.
+        ProviderHostService.shared.start()
+        app.onDemandGroupsChanged = { _ in ProviderHostService.shared.requestReconcile() }
         app.start()
         let loginItem = LoginItemModel(service: MainAppLoginItem())
         // Open at login is on by default, independent of whether setup is
@@ -66,7 +64,7 @@ struct YadoriLinkApp: App {
 
     @MainActor
     private func makeOnboarding(_ flow: OnboardingViewModel.Flow) -> OnboardingViewModel {
-        let model = OnboardingViewModel(client: context.app.client, mode: flow, loginItem: context.loginItem, openURL: context.openURL)
+        let model = OnboardingViewModel(client: context.app.client, mode: flow, loginItem: context.loginItem, openURL: context.openURL, providerFoldersAvailable: ProviderFolders.available)
         let app = context.app
         model.onLinked = { _ in
             app.refresh()
@@ -129,13 +127,5 @@ struct MenuBarLabel: View {
         case .warning: "exclamationmark.circle"
         case .danger: "xmark.circle"
         }
-    }
-}
-
-extension DomainRegistration {
-    /// The daemon query blocks for up to its own timeout, so it never runs
-    /// on the main thread. `done` runs once the whole run has finished.
-    static func reconcileInBackground(done: @escaping @Sendable () -> Void) {
-        DispatchQueue.global(qos: .utility).async { registerOnDemandDomains(completion: done) }
     }
 }

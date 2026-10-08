@@ -122,7 +122,7 @@
 //!     end-to-end burst coverage, not a DST scenario.
 //!
 //! Propagation is the production DAG path: each device's
-//! `LocalChangeProcessor` carries a signed `ChangeEmitter`, so an accepted
+//! `LocalChangeProcessor` carries a signed `LocalAuthorKey`, so an accepted
 //! local mutation appends a signed change in the same transaction as its index
 //! write, and the committing device announces its new heads. The peer's `run()`
 //! loop diffs those heads, requests only the ancestry it lacks, and

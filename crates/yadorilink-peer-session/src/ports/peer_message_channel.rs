@@ -1,6 +1,5 @@
 //! The transport surface `PeerSyncSession` (`peer_session.rs`) needs to
-//! reach one peer: block streams, service RPC streams, and where a
-//! re-bootstrap snapshot is published and collected -- all bundled in
+//! reach one peer: block streams and service RPC streams, bundled in
 //! [`SessionTransports`]. There is no message channel: everything a session
 //! exchanges with its peer rides one of these streams.
 
@@ -59,35 +58,6 @@ pub trait PeerServiceStream: Send {
     async fn send_response(&mut self, payload: &[u8]) -> Result<(), TransportError>;
 }
 
-/// Collects a re-bootstrap snapshot from this session's peer, given the hash
-/// its signed manifest named.
-///
-/// That hash is the whole correlation between the two lanes — the manifest
-/// arrived on the service lane, the bytes come back on the history lane, and
-/// there is no second request id to allocate or match.
-#[async_trait::async_trait]
-pub trait SnapshotFetch: Send + Sync {
-    async fn fetch(
-        &self,
-        group_id: &str,
-        snapshot_hash: [u8; 32],
-    ) -> Result<Vec<u8>, TransportError>;
-}
-
-/// Holds a re-bootstrap snapshot that a manifest has just been signed
-/// against, so the peer handed that manifest can collect it.
-///
-/// Keyed by `(group_id, snapshot_hash)` because the hash is in a signed
-/// manifest the peer already has, and so is not a secret. Nothing here is
-/// durable: see the daemon's `PreparedSnapshots` for why issuing a manifest
-/// is a chance to collect, not an obligation to serve.
-pub trait PreparedSnapshotStore: Send + Sync {
-    fn prepare(&self, group_id: &str, snapshot_hash: [u8; 32], bytes: std::sync::Arc<Vec<u8>>);
-
-    fn take_for(&self, group_id: &str, snapshot_hash: &[u8; 32])
-        -> Option<std::sync::Arc<Vec<u8>>>;
-}
-
 /// Where this session's service RPC streams come from.
 ///
 /// Peer-bound like [`BlockStreamTransport`], for the same reason: the caller
@@ -115,8 +85,7 @@ pub trait BlockStreamTransport: Send + Sync {
 }
 
 /// Everything a `PeerSyncSession` needs to reach its peer: where its block
-/// and service RPC streams come from, and where a re-bootstrap snapshot is
-/// published/collected. A REQUIRED constructor parameter (see
+/// and service RPC streams come from. A REQUIRED constructor parameter (see
 /// `PeerSyncSession::over_substrate`'s own doc comment) -- there is no
 /// path meaning "no transport wired yet" or "fall back to something else",
 /// because a session that could exist without a real way to reach its peer
@@ -135,8 +104,6 @@ pub trait BlockStreamTransport: Send + Sync {
 pub struct SessionTransports {
     pub blocks: Arc<dyn BlockStreamTransport>,
     pub service: Arc<dyn ServiceStreamTransport>,
-    pub prepared_snapshots: Arc<dyn PreparedSnapshotStore>,
-    pub snapshot_fetch: Arc<dyn SnapshotFetch>,
 }
 
 #[async_trait::async_trait]

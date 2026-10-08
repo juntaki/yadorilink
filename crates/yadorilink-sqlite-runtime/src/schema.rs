@@ -3,7 +3,7 @@
 //! `SyncState::open`/`open_in_memory` call [`init_schema`] once per freshly
 //! opened connection.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::DatabaseError;
 
@@ -18,7 +18,7 @@ use crate::error::DatabaseError;
 /// Bump this whenever the created shape changes at all, since the previous
 /// shape becomes unopenable by this binary and unopenable is the intended
 /// outcome.
-pub const SCHEMA_VERSION: i32 = 63;
+pub const SCHEMA_VERSION: i32 = 113;
 
 /// Reads `PRAGMA user_version` and refuses anything that is not exactly
 /// this binary's [`SCHEMA_VERSION`], in either direction: a newer stamp is
@@ -80,36 +80,40 @@ pub fn check_replica_schema_generation(conn: &Connection) -> Result<(), Database
     Ok(())
 }
 
-/// This crate's own core schema DDL/version-check machinery. Takes only a
-/// raw SQLite [`Connection`] and knows nothing about any caller's domain
-/// concepts (DAG, filesystem transactions, materialization jobs, ...) --
-/// callers with their own schema pieces that must interleave with this
-/// one (an ordering dependency, not a naming one -- the triggers below
-/// reference `changes`/`pruned_changes`/`group_history_bases`/
-/// `history_base_path_heads`/`history_base_carried_authors`, tables this
-/// function does not create) sequence their own calls around this one in the single
-/// `schema_init` closure they hand to [`crate::SyncDatabase::open`]/
-/// `open_in_memory`; this function does not accept or invoke any hook.
+/// This crate's own core schema: its tables, indexes and triggers, in one
+/// ordered DDL sequence. Takes only a raw SQLite [`Connection`] and knows
+/// nothing about any caller's domain concepts; the `files` authoring
+/// triggers reference `native_authoring_witness`, which the caller
+/// (`yadorilink-sync-sqlite`'s replica schema) creates. It does not
+/// check or stamp `user_version`: the replica open does that, in the same
+/// transaction.
+pub fn init_schema(conn: &Connection) -> Result<(), DatabaseError> {
+    create_tables_and_links_triggers(conn)?;
+    files_authoring_triggers(conn)?;
+    create_root_set_generation(conn)?;
+    refuse_unverified_authoring_rows(conn, unverified_authoring_identity)
+}
+
 #[allow(
     clippy::too_many_lines,
-    reason = "one ordered schema-init sequence: the downgrade guard, the `files` primary-key \
-              rebuild, the idempotent CREATE TABLE/ALTER TABLE DDL and the trigger definitions \
-              must run in exactly this order against the same connection, and each step's \
-              comment explains the migration dependency on the step before it; splitting it \
-              into helpers would let a caller invoke them out of order and silently \
-              reinterpret an old database"
+    reason = "one ordered DDL sequence: the `files` primary-key rebuild, the idempotent \
+              CREATE TABLE/ALTER TABLE DDL and the `links` triggers must run in exactly this \
+              order against the same connection, and each step's comment explains the \
+              dependency on the step before it; it stays private so that only `init_schema` \
+              sequences it"
 )]
-pub fn init_schema(conn: &Connection) -> Result<(), DatabaseError> {
-    // Refuse to touch a database
-    // an older binary migrated *this* binary doesn't understand,
-    // before any migration below runs a single statement against it —
-    // an unsupported downgrade must error cleanly, not silently drop
-    // into the migration loop and potentially reinterpret/clobber
-    // columns this binary has never heard of. A brand-new database
-    // reads `user_version = 0` (SQLite's own default), which is always
-    // `<= SCHEMA_VERSION`, so this never blocks first-run.
-    check_schema_version_supported(conn)?;
-
+fn create_tables_and_links_triggers(conn: &Connection) -> Result<(), DatabaseError> {
+    // Which model authorizes a group's rows. Absent means no authority is
+    // recorded; a group is `native` only through the transaction that adopts
+    // it under native authority with no indexed rows, and it does not change
+    // within an epoch. The authoring gate below reads it, so the trigger and the
+    // unauthored-row query share one predicate.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS group_authority (
+            group_id  TEXT PRIMARY KEY,
+            authority TEXT NOT NULL CHECK (authority IN ('dcf', 'native'))
+        );",
+    )?;
     // Widening `files`' primary key
     // from `(group_id, path)` to `(group_id, path, version_seq)` is not
     // expressible as an `ALTER TABLE... ADD COLUMN` — SQLite has no
@@ -134,13 +138,12 @@ pub fn init_schema(conn: &Connection) -> Result<(), DatabaseError> {
             version_seq       INTEGER NOT NULL DEFAULT 1,
             state             TEXT NOT NULL DEFAULT 'current',
             origin_device_id  TEXT,
-            -- Causal identity of the DAG change that authored this
-            -- projection. Only the pre-import scan may leave it NULL; once
-            -- a group has history the triggers below require one.
-            authoring_change_hash BLOB,
-            materialization_state TEXT NOT NULL DEFAULT 'placeholder',
-            pinned            INTEGER NOT NULL DEFAULT 0,
-            last_accessed_unix INTEGER,
+            -- The NativeState head this row was materialized from
+            -- (`NativeRowIdentity`, one canonical blob, provenance first).
+            -- NULL when the row was not produced under native authority:
+            -- never inferred from a version or a path.
+            native_authoring_identity BLOB,
+            materialization_state TEXT NOT NULL DEFAULT 'remote',
             record_kind       TEXT NOT NULL DEFAULT 'file',
             symlink_target    BLOB,
             -- -1 means "no Unix permission info".
@@ -165,33 +168,51 @@ pub fn init_schema(conn: &Connection) -> Result<(), DatabaseError> {
             -- NULL for every other row.
             trashed_by_operation_author TEXT,
             trashed_by_operation_id     BLOB,
+            -- The path's name-collision keys, written with the row by every
+            -- writer that sets `path` (the shared folds, so the hazard check
+            -- is an index lookup rather than a scan of the group). Empty only
+            -- on a row inserted by hand outside those writers.
+            case_fold_key      TEXT NOT NULL DEFAULT '',
+            canonical_fold_key TEXT NOT NULL DEFAULT '',
             PRIMARY KEY (group_id, path, version_seq)
         );
+        CREATE INDEX IF NOT EXISTS files_case_fold_key
+            ON files (group_id, case_fold_key) WHERE state = 'current' AND deleted = 0;
+        CREATE INDEX IF NOT EXISTS files_canonical_fold_key
+            ON files (group_id, canonical_fold_key) WHERE state = 'current' AND deleted = 0;
+        -- The live rows whose path carries the conflict-copy marker anywhere,
+        -- so the retirement pass reads only these instead of decoding the
+        -- whole group. A superset of the filename-only rule: the reader
+        -- applies that rule itself. The query must repeat this predicate
+        -- verbatim for the planner to use the index.
+        CREATE INDEX IF NOT EXISTS files_conflict_copy_candidates
+            ON files (group_id, path)
+            WHERE state = 'current' AND deleted = 0
+              AND instr(path, ' (conflicted copy, ') > 0;
 
         CREATE TABLE IF NOT EXISTS links (
             local_path TEXT PRIMARY KEY,
             group_id   TEXT NOT NULL,
             paused     INTEGER NOT NULL DEFAULT 0,
             materialization_policy TEXT NOT NULL DEFAULT 'eager',
-            max_local_size_bytes INTEGER,
             windows_symlink_opt_in INTEGER NOT NULL DEFAULT 0,
             orphaned   INTEGER NOT NULL DEFAULT 0,
             root_token TEXT,
+            -- The provider declaration of this link: `none` (the direct-filesystem path),
+            -- or a provider kind plus the `provider_roots.root_id` it names. A link that
+            -- declares a provider whose `provider_roots` row is missing or names another
+            -- root is CORRUPT state (never read as a plain directory).
+            provider_kind TEXT NOT NULL DEFAULT 'none',
+            provider_root_id TEXT,
+            -- A provider link's creation request, bound to its token (the locator): a digest of the
+            -- display name, group and policy, so a retry of the SAME token with a different request
+            -- is refused instead of answered with the old link.
+            creation_digest TEXT,
             -- Set by departed-root recovery: while 1, a full scan is
             -- additive (indexes what it finds, emits no deletions) so the
             -- departed root's paths survive and can hydrate from a peer.
             -- Cleared after one clean full scan.
             suppress_tombstones_until_scan INTEGER NOT NULL DEFAULT 0
-        );
-
-        -- A folder kept on this device as a whole: every entry at or below
-        -- `prefix`, those there now and those that arrive later, counts as
-        -- pinned. Local policy, never replicated; the link root is the
-        -- empty prefix. A file's own `files.pinned` flag is separate.
-        CREATE TABLE IF NOT EXISTS pinned_directories (
-            group_id TEXT NOT NULL,
-            prefix   TEXT NOT NULL,
-            PRIMARY KEY (group_id, prefix)
         );
 
         CREATE TABLE IF NOT EXISTS duplicate_recovery_paths (
@@ -236,8 +257,8 @@ pub fn init_schema(conn: &Connection) -> Result<(), DatabaseError> {
             authority_key_fingerprint BLOB NOT NULL
         );
         -- Durable journal of local paths detected as changed but not yet
-        -- fully processed into the index + change DAG. A path is recorded
-        -- here *before* the read/blockify/put/index+DAG step runs and only
+        -- fully processed into the index + native state. A path is recorded
+        -- here *before* the read/blockify/put/index+delta step runs and only
         -- deleted once that step commits, so a crash, restart, or a
         -- multi-second block-store fault (disk-full / EIO) mid-processing
         -- can never silently drop an already-detected local edit: the row
@@ -275,7 +296,9 @@ pub fn init_schema(conn: &Connection) -> Result<(), DatabaseError> {
             mtime_unix_nanos  INTEGER NOT NULL,
             blocks_json       TEXT NOT NULL,
             origin_device_id  TEXT NOT NULL,
-            authoring_change_hash BLOB,
+            -- The native head the restore authored (`NativeRowIdentity`
+            -- bytes), so the committed row shows it.
+            authoring_native_identity BLOB,
             created_at_unix_nanos INTEGER NOT NULL,
             record_kind       TEXT NOT NULL DEFAULT 'file',
             symlink_target    BLOB,
@@ -409,6 +432,18 @@ pub fn init_schema(conn: &Connection) -> Result<(), DatabaseError> {
             created_at_unix_nanos INTEGER NOT NULL,
             PRIMARY KEY (group_id, path)
         );
+        -- The content targets of earlier writes of a path that a newer
+        -- write's intent replaced before they were proven. Such a write may
+        -- have renamed its bytes onto disk and then lost its proof commit
+        -- (the path moved on meanwhile), so while the newer intent is open
+        -- these are content this daemon itself may have put there, never a
+        -- local edit. Cleared with the path's intent.
+        CREATE TABLE IF NOT EXISTS materialization_replaced_targets (
+            group_id            TEXT NOT NULL,
+            path                TEXT NOT NULL,
+            target_version_hash BLOB NOT NULL,
+            PRIMARY KEY (group_id, path, target_version_hash)
+        );
         -- A durable backstop for the one enrollment-rollback path that
         -- had none: if `link()` fails during create/join AND the
         -- immediate cancel-with-retries also fails, NOTHING is written
@@ -454,8 +489,7 @@ pub fn init_schema(conn: &Connection) -> Result<(), DatabaseError> {
             link_row_write                 TEXT,
             prior_link_paused              INTEGER,
             prior_link_orphaned            INTEGER,
-            prior_link_policy              TEXT,
-            prior_link_max_local_size_bytes INTEGER
+            prior_link_policy              TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_enrollment_operations_state
             ON enrollment_operations(state);
@@ -498,8 +532,8 @@ pub fn init_schema(conn: &Connection) -> Result<(), DatabaseError> {
 
         -- The instant this device's own *continuous* local file history for
         -- a group begins, when that history started somewhere other than at
-        -- this device's own first sight of each path. Two events write it,
-        -- each at the moment it happens:
+        -- this device's own first sight of each path. One event writes it, at
+        -- the moment it happens:
         --
         --   * LINKING a group this device did not originate and holds no
         --     files for yet -- both link commits that can name such a group
@@ -510,30 +544,23 @@ pub fn init_schema(conn: &Connection) -> Result<(), DatabaseError> {
         --     numbers a path it is seeing for the first time from
         --     `version_seq = 1` however much history that path already has
         --     elsewhere.
-        --   * a re-bootstrap snapshot install
-        --     (`replace_group_files_from_snapshot`), which deletes every
-        --     `files` row for the group and reinstalls the snapshot's rows
-        --     carrying the SOURCE device's `version_seq` numbering.
         --
-        -- After either, a row's `version_seq` says nothing about when THIS
+        -- After it, a row's `version_seq` says nothing about when THIS
         -- device first saw the path.
         --
-        -- Read only by the rewind planning layer, which needs it to tell the
-        -- two cases apart: below this instant its own `version_seq` evidence
+        -- Read only by the rewind planning layer, which needs it to decide
+        -- whether the evidence is usable: below this instant its own `version_seq` evidence
         -- describes someone else's history and cannot be reasoned from, so
         -- the honest answer for a target that early is "no answer here"
         -- rather than an inference. At or above it, the group's local
         -- history is this device's own unbroken record and the inference is
-        -- sound. No row means this device originated the group locally and
-        -- has never re-bootstrapped it, so its history really does run back
-        -- to each path's own first version.
+        -- sound. No row means this device originated the group locally, so
+        -- its history really does run back to each path's own first version.
         --
         -- One row per group, overwritten (never accumulated) by each such
         -- event, because only the most recent one bounds the history that
-        -- actually survives. Deliberately stores the instant alone and not
-        -- which event set it: the reader states both possible causes rather
-        -- than committing to one, and a stored cause would be one more thing
-        -- to keep true. A new additive table, so a bare `CREATE TABLE IF NOT
+        -- actually survives. Deliberately stores the instant alone, with no
+        -- cause attached. A new additive table, so a bare `CREATE TABLE IF NOT
         -- EXISTS` is the whole migration, like `group_policy_watermark`
         -- above.
         CREATE TABLE IF NOT EXISTS group_local_history_floor (
@@ -634,7 +661,7 @@ pub fn init_schema(conn: &Connection) -> Result<(), DatabaseError> {
     // only in Rust: the index is group-scoped and path-relative while every
     // scan is root-scoped and authoritative, so two live roots on one group
     // make each root's scan read the other's files as deleted and tombstone
-    // them — signed changes that ride the change-DAG to every device. This
+    // them — signed deltas that replicate to every device. This
     // layer survives a writer that never reads the Rust chokepoint, a raw
     // `sqlite3` session, and a second process.
     //
@@ -687,33 +714,40 @@ pub fn init_schema(conn: &Connection) -> Result<(), DatabaseError> {
                  'links: un-orphaning would give this group a second live link'); \
          END;",
     )?;
+    Ok(())
+}
 
-    // The triggers immediately below reference `changes`/`pruned_changes`
-    // and the installed history base's `group_history_bases`/
-    // `history_base_path_heads`/`history_base_carried_authors` -- tables
-    // this function does not create.
-    // The caller's `schema_init` closure (see `crate::SyncDatabase::open`'s
-    // own doc comment) is responsible for creating them, and anything else
-    // this database's schema needs, before calling this function at all.
+/// The `files` authoring-identity triggers. They read
+/// `native_authoring_witness`, created by the caller (`yadorilink-sync-sqlite`);
+/// SQLite resolves a trigger body's names when the trigger fires, not when it
+/// is created.
+pub fn files_authoring_triggers(conn: &Connection) -> Result<(), DatabaseError> {
     let violation = unverified_authoring_identity("NEW");
     conn.execute_batch(&format!(
         r#"
-        CREATE TRIGGER IF NOT EXISTS files_require_authoring_identity_on_insert
+        -- Recreated on every open, so a database created before the predicate
+        -- last changed enforces the current one.
+        DROP TRIGGER IF EXISTS files_require_authoring_identity_on_insert;
+        DROP TRIGGER IF EXISTS files_require_authoring_identity_on_update;
+        CREATE TRIGGER files_require_authoring_identity_on_insert
         AFTER INSERT ON files
         WHEN {violation}
         BEGIN
             SELECT RAISE(ABORT, 'current DAG-backed file row requires verified authoring identity');
         END;
 
-        CREATE TRIGGER IF NOT EXISTS files_require_authoring_identity_on_update
-        AFTER UPDATE OF state, version_seq, authoring_change_hash ON files
+        CREATE TRIGGER files_require_authoring_identity_on_update
+        AFTER UPDATE OF state, version_seq, native_authoring_identity ON files
         WHEN {violation}
         BEGIN
             SELECT RAISE(ABORT, 'current DAG-backed file row requires verified authoring identity');
         END;
         "#
     ))?;
+    Ok(())
+}
 
+fn create_root_set_generation(conn: &Connection) -> Result<(), DatabaseError> {
     // A change-detector for each group's durability-root set, so a caller
     // can tell "this group's root set has not moved since I last read it"
     // in one indexed row read instead of re-enumerating and re-hashing
@@ -780,9 +814,459 @@ pub fn init_schema(conn: &Connection) -> Result<(), DatabaseError> {
         END;
         "#,
     )?;
+    create_provider_tables(conn)?;
+    create_provider_removals(conn)?;
+    Ok(())
+}
 
+/// The durable removal intents of provider roots (written by an unlink, read by the host app).
+fn create_provider_removals(conn: &Connection) -> Result<(), DatabaseError> {
+    conn.execute_batch(
+        r#"
+        -- The DURABLE intent to remove a provider root's OS domain: written in the transaction of the
+        -- unlink (or of a rebootstrap the daemon starts), read by the host as the only authority to
+        -- remove a domain. `requested` until the host reports the removal; then `done`, with the
+        -- location the OS preserved the user's downloaded data at. The provider state of an unlinked
+        -- root is kept until the removal is acknowledged.
+        CREATE TABLE IF NOT EXISTS provider_removals (
+            root_id            TEXT PRIMARY KEY,
+            group_id           TEXT NOT NULL,
+            display_name       TEXT NOT NULL,
+            state              TEXT NOT NULL CHECK (state IN ('requested', 'done')),
+            requested_at       INTEGER NOT NULL,
+            preserved_location TEXT
+        );
+        "#,
+    )?;
+    Ok(())
+}
+
+/// The provider layer's per-root state and item index. DOMAIN-BOUND state: it
+/// records what the OS was told and is NOT rebuildable inside the same domain
+/// (if it is lost or rolled back the root is rebootstrapped with a new `root_id`).
+/// Must come after `files`, which its liveness triggers attach to.
+fn create_provider_tables(conn: &Connection) -> Result<(), DatabaseError> {
+    conn.execute_batch(
+        r#"
+        -- One row per provider-backed root (a group with no row is kind `none`).
+        CREATE TABLE IF NOT EXISTS provider_roots (
+            root_id            TEXT PRIMARY KEY,
+            group_id           TEXT NOT NULL UNIQUE,
+            kind               TEXT NOT NULL,
+            display_name       TEXT NOT NULL,
+            domain_registered  INTEGER NOT NULL DEFAULT 0,
+            -- Unix nanos of the first extension handshake since the domain was
+            -- registered; persisted so a daemon restart does not unlearn it.
+            first_handshake_at INTEGER,
+            error_description  TEXT,
+            -- Set when the root's children are queryable: gates registration.
+            namespace_ready    INTEGER NOT NULL DEFAULT 0,
+            -- The daemon's durable, monotonic revision of the namespace it has told the OS
+            -- (bumped before each publication; the host persists the highest it acknowledged,
+            -- so a restored or rolled-back database is detected by a lower revision).
+            namespace_revision INTEGER NOT NULL DEFAULT 0,
+            -- Latest handoff sequence: replayable state the host reads on connect (`evidence_seq`).
+            latest_evidence_seq INTEGER NOT NULL DEFAULT 0,
+            -- Counts provider-visible namespace changes (a rename, a create, a delete, a parent
+            -- change), bumped in the transaction of the change itself; `announced_change_seq` is
+            -- how many of them a root-level signal has been acknowledged for.
+            change_seq INTEGER NOT NULL DEFAULT 0,
+            announced_change_seq INTEGER NOT NULL DEFAULT 0,
+            -- The lowest event sequence still retained in `provider_change_events`: an anchor
+            -- below it can no longer be answered incrementally.
+            change_floor INTEGER NOT NULL DEFAULT 0,
+            -- The group's namespace was installed (a checkpoint install, or the creation of an
+            -- empty owner folder): before it, an empty verification is not "queryable".
+            install_done INTEGER NOT NULL DEFAULT 0,
+            -- User edits kept as a file beside the item instead of changing the canonical
+            -- version (the provenance of their bytes could not be proven): how many, and when
+            -- the first was kept (unix ms). Surfaced in the status.
+            kept_edits INTEGER NOT NULL DEFAULT 0,
+            kept_edit_first_ms INTEGER
+        );
+
+        -- The derived item index of a provider root: opaque stable `item_id`s,
+        -- the path they currently name, and the parent index (`parent_path`,
+        -- `name`). `published_version_hash` is the version the OS was last told.
+        CREATE TABLE IF NOT EXISTS provider_items (
+            root_id                TEXT NOT NULL,
+            item_id                BLOB NOT NULL,
+            group_id               TEXT NOT NULL,
+            path                   TEXT NOT NULL,
+            parent_path            TEXT NOT NULL,
+            name                   TEXT NOT NULL,
+            live                   INTEGER NOT NULL DEFAULT 1,
+            published_version_hash BLOB,
+            -- The version being announced (its change event is durable, the signal may not
+            -- have been acknowledged yet) and that event's sequence. NULL when nothing is in
+            -- flight. The shown view is this version when set, else the published one.
+            announce_version_hash  BLOB,
+            announce_seq           INTEGER,
+            -- Strictly increasing and never reused: advanced in the transaction of every change
+            -- of what the item SHOWS (an announcement, a rename or move, a direct edit). The
+            -- OS-visible version identifiers carry it.
+            generation             INTEGER NOT NULL DEFAULT 1,
+            -- How many of the generation's advances were a change of this folder's CHILD SET (a
+            -- child added, removed or moved in or out). `generation - child_bumps` is the
+            -- folder's PLACE generation (renames, moves, announcements): the source-folder
+            -- check of a rename uses it, so a sibling being added does not stale a rename.
+            child_bumps            INTEGER NOT NULL DEFAULT 0,
+            -- When the item first became pending in the current episode (unix ms); stays through
+            -- successive announcements and is cleared when the announced version is released.
+            pending_since          INTEGER,
+            -- Set when a version was released by the timer (not by a confirmed handoff of it)
+            -- and no confirmed handoff has shown the OS fetching it yet (unix ms): reported as
+            -- "published, not yet confirmed by the OS".
+            unconfirmed_since      INTEGER,
+            -- Working-set membership: the OS was shown the item and no removal was reported.
+            -- SEPARATE from the history of what was published and handed (`published_version_hash`,
+            -- the handoff ledger), which a removal never erases.
+            exposed                INTEGER NOT NULL DEFAULT 0,
+            -- What YadoriLink MAY HAVE handed the OS for this item: a monotone summary within an
+            -- epoch (never served -> one content -> mixed, absorbing), never a history. Only a
+            -- trusted local edit starts the next epoch (Single of its content, with the
+            -- generation advanced in the same transaction). Written BEFORE any bytes are sent.
+            -- See `provider_provenance`.
+            served_content_sig     TEXT,
+            served_mixed           INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (root_id, item_id)
+        ) WITHOUT ROWID;
+
+        CREATE UNIQUE INDEX IF NOT EXISTS provider_items_live_path
+            ON provider_items (root_id, path) WHERE live = 1;
+        CREATE INDEX IF NOT EXISTS provider_items_parent
+            ON provider_items (root_id, parent_path, name) WHERE live = 1;
+        CREATE INDEX IF NOT EXISTS provider_items_group_path
+            ON provider_items (group_id, path) WHERE live = 1;
+
+        -- Liveness is reconciled AFTER the complete semantic mutation, in the same
+        -- transaction, never from per-row triggers that would see intermediate states
+        -- (a version replacement first sets the current row superseded and only then
+        -- inserts the new one). The triggers below only RECORD which paths changed
+        -- (`provider_dirty_paths`); `reconcile_provider_liveness` runs before the commit
+        -- of every write and evaluates the FINAL set: an item is live iff its path has a
+        -- live current row or a live current row below it, and a change at a path
+        -- re-evaluates that path and each of its ancestors. A directory rename keeps its
+        -- `item_id`s through `provider::rename_tree`, which runs first.
+        -- Cost: groups without a provider root pay one UNIQUE-index existence check per
+        -- `files` write (the WHEN clause) and one empty-table check per transaction.
+        -- The ledger of verified handoffs: for each item, the version the daemon handed to the OS
+        -- (bytes verified against the block store), the signature of that version's CONTENT, and
+        -- the evidence sequence it took. It is what the daemon itself did and cannot be recomputed
+        -- from anything else, so it is stored; it is DOMAIN-BOUND like the item index. A version
+        -- change that alters the content deletes the row in the same transaction (see
+        -- `reconcile_provider_liveness`): the OS drops its blocks on an update.
+        CREATE TABLE IF NOT EXISTS provider_handoffs (
+            root_id      TEXT NOT NULL,
+            item_id      BLOB NOT NULL,
+            version_hash BLOB NOT NULL,
+            content_sig  TEXT NOT NULL,
+            evidence_seq INTEGER NOT NULL,
+            PRIMARY KEY (root_id, item_id)
+        ) WITHOUT ROWID;
+
+        -- The Eager download driver's only persistent state: per item, how many times fetching
+        -- the version `version_hash` failed (no peer had the content) and when it may be
+        -- offered again. Bound to the version: a different current version ignores the row.
+        -- Domain-bound like the item index (cleared with the root).
+        CREATE TABLE IF NOT EXISTS provider_download_failures (
+            root_id         TEXT NOT NULL,
+            item_id         BLOB NOT NULL,
+            version_hash    BLOB NOT NULL,
+            failures        INTEGER NOT NULL,
+            next_attempt_ms INTEGER NOT NULL,
+            PRIMARY KEY (root_id, item_id)
+        ) WITHOUT ROWID;
+
+        -- The provider write path's idempotency: the stored result of every applied operation
+        -- (one per logical OS action, `(session_id, operation_seq)`), written in the SAME
+        -- transaction as the change, so a replay returns the result and never re-authors. The
+        -- fingerprint hashes the operation's stable wire fields. Bounded (24 h / 4096 per root).
+        CREATE TABLE IF NOT EXISTS provider_apply_log (
+            root_id       TEXT NOT NULL,
+            session_id    BLOB NOT NULL,
+            operation_seq INTEGER NOT NULL,
+            fingerprint   BLOB NOT NULL,
+            result        BLOB NOT NULL,
+            created_ms    INTEGER NOT NULL,
+            PRIMARY KEY (root_id, session_id, operation_seq)
+        ) WITHOUT ROWID;
+        -- The uploads (ingest copies) of operations that carry bytes and are not decided yet,
+        -- journaled by operation identity BEFORE the first transaction and removed in the same
+        -- transaction as the operation's log entry. A copy named here is never aged out as an
+        -- abandoned upload, and a retry of the same operation finds and reuses it.
+        CREATE TABLE IF NOT EXISTS provider_pending_ingest (
+            root_id       TEXT NOT NULL,
+            session_id    BLOB NOT NULL,
+            operation_seq INTEGER NOT NULL,
+            ingest_name   TEXT NOT NULL,
+            created_ms    INTEGER NOT NULL,
+            PRIMARY KEY (root_id, session_id, operation_seq)
+        ) WITHOUT ROWID;
+        -- The compact "processed" identity that outlives the stored result: every operation_seq
+        -- up to `floor` was processed (or abandoned), `above` lists the processed ones above it
+        -- as big-endian u64s. A late replay whose result expired is STALE, never a new change.
+        CREATE TABLE IF NOT EXISTS provider_apply_sessions (
+            root_id    TEXT NOT NULL,
+            session_id BLOB NOT NULL,
+            floor_seq  INTEGER NOT NULL,
+            above      BLOB NOT NULL,
+            seen_ms    INTEGER NOT NULL,
+            PRIMARY KEY (root_id, session_id)
+        ) WITHOUT ROWID;
+
+        CREATE TABLE IF NOT EXISTS provider_dirty_paths (
+            group_id TEXT NOT NULL,
+            path     TEXT NOT NULL,
+            PRIMARY KEY (group_id, path)
+        ) WITHOUT ROWID;
+        CREATE TRIGGER IF NOT EXISTS provider_items_dirty_insert
+        AFTER INSERT ON files
+        WHEN EXISTS (SELECT 1 FROM provider_roots WHERE group_id = NEW.group_id)
+        BEGIN
+            INSERT OR IGNORE INTO provider_dirty_paths (group_id, path)
+            VALUES (NEW.group_id, NEW.path);
+        END;
+        CREATE TRIGGER IF NOT EXISTS provider_items_dirty_update
+        AFTER UPDATE OF path, state, deleted ON files
+        WHEN EXISTS (SELECT 1 FROM provider_roots WHERE group_id = NEW.group_id)
+        BEGIN
+            INSERT OR IGNORE INTO provider_dirty_paths (group_id, path)
+            VALUES (NEW.group_id, NEW.path);
+            INSERT OR IGNORE INTO provider_dirty_paths (group_id, path)
+            SELECT OLD.group_id, OLD.path WHERE OLD.path <> NEW.path;
+        END;
+        CREATE TRIGGER IF NOT EXISTS provider_items_dirty_delete
+        AFTER DELETE ON files
+        WHEN EXISTS (SELECT 1 FROM provider_roots WHERE group_id = OLD.group_id)
+        BEGIN
+            INSERT OR IGNORE INTO provider_dirty_paths (group_id, path)
+            VALUES (OLD.group_id, OLD.path);
+        END;
+        "#,
+    )?;
+    create_provider_namespace_tables(conn)?;
+    Ok(())
+}
+
+/// The namespace layer of a provider root: the change log, the folders the OS opened, the
+/// structural directories and the parent index. Must come after `provider_roots` and `files`.
+fn create_provider_namespace_tables(conn: &Connection) -> Result<(), DatabaseError> {
+    conn.execute_batch(
+        r#"
+        -- The append-only change log of a root: ONE row per event with a unique, strictly
+        -- increasing `seq` (taken from `provider_roots.namespace_revision`, which advances once
+        -- per event). Written in the transaction that causes the event, and only for what the OS
+        -- can know (a published item, or an item under an enumerated parent). `kind` is
+        -- 'upsert', 'move' or 'delete'; `old_parent_item_id` is set for a move. The empty blob
+        -- is the root container. Pruned only from the front, raising `change_floor`.
+        CREATE TABLE IF NOT EXISTS provider_change_events (
+            root_id            TEXT NOT NULL,
+            seq                INTEGER NOT NULL,
+            kind               TEXT NOT NULL,
+            item_id            BLOB NOT NULL,
+            parent_item_id     BLOB NOT NULL,
+            old_parent_item_id BLOB,
+            at_s               INTEGER NOT NULL,
+            PRIMARY KEY (root_id, seq)
+        ) WITHOUT ROWID;
+        CREATE INDEX IF NOT EXISTS provider_change_events_parent
+            ON provider_change_events (root_id, parent_item_id, seq);
+        CREATE INDEX IF NOT EXISTS provider_change_events_old_parent
+            ON provider_change_events (root_id, old_parent_item_id, seq)
+            WHERE old_parent_item_id IS NOT NULL;
+
+        -- The revision of a root advances if and only if change events exist for every number it
+        -- advances over: no code path can move the anchor without a durable event.
+        CREATE TRIGGER IF NOT EXISTS provider_revision_needs_events
+        BEFORE UPDATE OF namespace_revision ON provider_roots
+        WHEN NEW.namespace_revision > OLD.namespace_revision
+         AND (SELECT COUNT(*) FROM provider_change_events e
+              WHERE e.root_id = NEW.root_id
+                AND e.seq > OLD.namespace_revision AND e.seq <= NEW.namespace_revision)
+             <> NEW.namespace_revision - OLD.namespace_revision
+        BEGIN
+            SELECT RAISE(ABORT, 'the namespace revision advances only with logged change events');
+        END;
+
+        -- The displaced placements the provider projector wrote (a conflict copy, a relocation):
+        -- which physical path stands for which source path, so a plan that no longer holds one
+        -- can retire its row. Derived, group-scoped.
+        CREATE TABLE IF NOT EXISTS provider_placements (
+            group_id      TEXT NOT NULL,
+            physical_path TEXT NOT NULL,
+            source_path   TEXT NOT NULL,
+            -- The authoring identity of the head that holds the physical path: a row is retired
+            -- only while it still shows THIS identity (another head may own the path by now).
+            owner_identity BLOB NOT NULL,
+            PRIMARY KEY (group_id, physical_path)
+        ) WITHOUT ROWID;
+        CREATE INDEX IF NOT EXISTS provider_placements_source
+            ON provider_placements (group_id, source_path);
+
+        -- The folders whose contents the OS has requested (the empty blob is the root
+        -- container). A hint: losing it only costs extra signals.
+        CREATE TABLE IF NOT EXISTS provider_enumerated_parents (
+            root_id        TEXT NOT NULL,
+            parent_item_id BLOB NOT NULL,
+            PRIMARY KEY (root_id, parent_item_id)
+        ) WITHOUT ROWID;
+
+        -- Every directory path that is an ancestor of a live row of a provider group,
+        -- structural ones (no row of their own) included, at any depth. Maintained by
+        -- `reconcile_provider_liveness` in the transaction of every semantic mutation.
+        CREATE TABLE IF NOT EXISTS provider_dirs (
+            group_id    TEXT NOT NULL,
+            path        TEXT NOT NULL,
+            parent_path TEXT NOT NULL,
+            PRIMARY KEY (group_id, path)
+        ) WITHOUT ROWID;
+        CREATE INDEX IF NOT EXISTS provider_dirs_parent
+            ON provider_dirs (group_id, parent_path, path);
+
+        -- The children of a folder in one index: the keyset of an enumeration page. The
+        -- scaffold rows (`version_seq = 0`) are never part of a namespace.
+        CREATE INDEX IF NOT EXISTS files_parent_path
+            ON files (group_id, (rtrim(rtrim(path, replace(path, '/', '')), '/')), path)
+            WHERE state = 'current' AND deleted = 0 AND version_seq > 0;
+        "#,
+    )?;
+    Ok(())
+}
+
+/// Reconciles `provider_items.live` against the FINAL state of the paths recorded in
+/// `provider_dirty_paths`, then clears them. Call it before a write transaction
+/// commits (`SyncDatabase` does), so liveness never reflects an intermediate state of
+/// one semantic mutation. A no-op when nothing was recorded.
+pub fn reconcile_provider_liveness(conn: &Connection) -> rusqlite::Result<()> {
+    let dirty: bool =
+        conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_dirty_paths)", [], |r| r.get(0))?;
+    if !dirty {
+        return Ok(());
+    }
+    // The ancestors of every changed path (and the paths themselves), for the steps below.
+    conn.execute_batch(
+        r#"
+        CREATE TEMP TABLE IF NOT EXISTS provider_anc (g TEXT NOT NULL, p TEXT NOT NULL, PRIMARY KEY (g, p)) WITHOUT ROWID;
+        CREATE TEMP TABLE IF NOT EXISTS provider_retiring (root_id TEXT NOT NULL, item_id BLOB NOT NULL, parent_path TEXT NOT NULL, published BLOB);
+        CREATE TEMP TABLE IF NOT EXISTS provider_new_paths (root_id TEXT NOT NULL, group_id TEXT NOT NULL, path TEXT NOT NULL);
+        DELETE FROM provider_anc;
+        DELETE FROM provider_retiring;
+        DELETE FROM provider_new_paths;
+        INSERT OR IGNORE INTO provider_anc (g, p)
+        WITH RECURSIVE ancestors(g, p) AS (
+            SELECT group_id, path FROM provider_dirty_paths
+            UNION
+            SELECT g, rtrim(rtrim(p, replace(p, '/', '')), '/')
+            FROM ancestors WHERE instr(p, '/') > 0
+        )
+        SELECT g, p FROM ancestors;
+        -- The items about to retire, with what decides whether the OS must be told.
+        INSERT INTO provider_retiring (root_id, item_id, parent_path, published)
+        SELECT pi.root_id, pi.item_id, pi.parent_path, pi.published_version_hash
+        FROM provider_anc a CROSS JOIN provider_items pi
+             ON pi.group_id = a.g AND pi.path = a.p AND pi.live = 1
+        WHERE NOT EXISTS (SELECT 1 FROM files f
+                          WHERE f.group_id = pi.group_id AND f.state = 'current'
+                            AND f.deleted = 0 AND f.path = pi.path)
+          AND NOT EXISTS (SELECT 1 FROM files f
+                          WHERE f.group_id = pi.group_id AND f.state = 'current'
+                            AND f.deleted = 0
+                            AND f.path > pi.path || '/' AND f.path < pi.path || '0');
+        "#,
+    )?;
+    let retired = conn.execute(
+        r#"
+        -- Driven from the changed paths (a handful), never from every live item: each candidate is
+        -- two primary-key probes of `files` (the path itself, then the range below it).
+        UPDATE provider_items SET live = 0, published_version_hash = NULL
+        WHERE live = 1
+          AND (root_id, item_id) IN (
+              SELECT pi.root_id, pi.item_id
+              FROM provider_anc a CROSS JOIN provider_items pi
+                   ON pi.group_id = a.g AND pi.path = a.p AND pi.live = 1
+              WHERE NOT EXISTS (SELECT 1 FROM files f
+                                WHERE f.group_id = pi.group_id AND f.state = 'current'
+                                  AND f.deleted = 0 AND f.path = pi.path)
+                AND NOT EXISTS (SELECT 1 FROM files f
+                                WHERE f.group_id = pi.group_id AND f.state = 'current'
+                                  AND f.deleted = 0
+                                  AND f.path > pi.path || '/' AND f.path < pi.path || '0'))
+        "#,
+        [],
+    )?;
+    if retired > 0 {
+        // The download failures of an item that is no longer live have nothing left to hold back.
+        conn.execute(
+            "DELETE FROM provider_download_failures WHERE EXISTS ( \
+                 SELECT 1 FROM provider_items i \
+                 WHERE i.root_id = provider_download_failures.root_id \
+                   AND i.item_id = provider_download_failures.item_id AND i.live = 0)",
+            [],
+        )?;
+    }
+    // A provider-visible namespace change (a delete, or a create/rename target the OS has no item
+    // for yet) is counted in this same transaction, so a change that makes no item pending is
+    // still announced by a root-level signal. A content change of a known item is not one: its
+    // own signal announces it.
+    let created: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM provider_dirty_paths d \
+         JOIN files f ON f.group_id = d.group_id AND f.path = d.path \
+         AND f.state = 'current' AND f.deleted = 0 \
+         JOIN provider_roots r ON r.group_id = d.group_id \
+         WHERE NOT EXISTS (SELECT 1 FROM provider_items i WHERE i.root_id = r.root_id \
+                           AND i.path = d.path AND i.live = 1))",
+        [],
+        |r| r.get(0),
+    )?;
+    if retired > 0 || created {
+        conn.execute(
+            "UPDATE provider_roots SET change_seq = change_seq + 1 \
+             WHERE group_id IN (SELECT group_id FROM provider_dirty_paths)",
+            [],
+        )?;
+    }
+    reconcile_provider_namespace(conn)?;
+    conn.execute_batch(
+        r#"
+        -- Demotion: a changed path whose live current row no longer has the content that was
+        -- handed over (or has none) loses its handoff, in this same transaction, so the daemon
+        -- never claims the OS holds bytes that an update has since replaced.
+        DELETE FROM provider_handoffs
+        WHERE EXISTS (SELECT 1 FROM provider_items i
+                      JOIN provider_dirty_paths d ON d.group_id = i.group_id AND d.path = i.path
+                      WHERE i.root_id = provider_handoffs.root_id
+                        AND i.item_id = provider_handoffs.item_id)
+          AND NOT EXISTS (SELECT 1 FROM provider_items i
+                          JOIN files f ON f.group_id = i.group_id AND f.path = i.path
+                          WHERE i.root_id = provider_handoffs.root_id
+                            AND i.item_id = provider_handoffs.item_id
+                            AND f.state = 'current' AND f.deleted = 0
+                            AND (f.size || '|' || f.blocks_json || '|' || f.record_kind || '|'
+                                 || COALESCE(CAST(f.symlink_target AS TEXT), ''))
+                                = provider_handoffs.content_sig);
+        DELETE FROM provider_dirty_paths;
+        "#,
+    )
+}
+
+/// Whether this database carries the provider tables (the replica index does; the
+/// other databases opened through this crate do not).
+pub fn has_provider_liveness(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' \
+         AND name = 'provider_dirty_paths')",
+        [],
+        |r| r.get(0),
+    )
+}
+
+fn refuse_unverified_authoring_rows(
+    conn: &Connection,
+    unverified: fn(&str) -> String,
+) -> Result<(), DatabaseError> {
     let invalid_authoring_rows: i64 = conn.query_row(
-        &format!("SELECT COUNT(*) FROM files f WHERE {}", unverified_authoring_identity("f")),
+        &format!("SELECT COUNT(*) FROM files f WHERE {}", unverified("f")),
         [],
         |row| row.get(0),
     )?;
@@ -791,57 +1275,56 @@ pub fn init_schema(conn: &Connection) -> Result<(), DatabaseError> {
             "{invalid_authoring_rows} current DAG-backed file row(s) lack verified authoring identity"
         )));
     }
-    // Stamp the now-current
-    // schema version *after* every migration above has run —
-    // unconditionally, not just when it changed, so this is exactly as
-    // idempotent as the migrations themselves (setting `user_version`
-    // to the value it's already at is a harmless no-op restart-safety
-    // net if a crash happened between the last migration statement
-    // above and this pragma on a previous attempt).
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
 
-/// The condition under which the `files` row `row` is a current,
-/// DAG-backed row without a verified authoring identity.
+/// Whether `row`'s group is authorized by native authoring (`group_authority`).
+fn native_group(row: &str) -> String {
+    format!(
+        "EXISTS(SELECT 1 FROM group_authority ga \
+                 WHERE ga.group_id = {row}.group_id AND ga.authority = 'native')"
+    )
+}
+
+/// The condition under which the `files` row `row` names no verified
+/// authoring identity.
 ///
-/// A group is DAG-backed once it has any history: a retained change, a
-/// pruned change's stub, or an installed history base -- a sealed group
-/// retains no change at all, and its base is its whole history. A row's
-/// authoring change is verified when this device retains it, keeps its
-/// stub, or the group's installed base carries it: as a content head, or
-/// as the author of a row the base carries. A row outlives the head that
-/// wrote it -- a removal's row, a conflict copy after its path is
-/// rewritten -- so the heads alone would refuse rows the base carries.
+/// A native head that was held when the row was written
+/// (`native_authoring_witness`) vouches for it. A tombstone names no content,
+/// so it needs none.
+///
+/// This is the definition of "has retained evidence" -- the `files` triggers
+/// and the open-time check both read it, so they cannot disagree about which
+/// rows are authored.
+///
+/// Evidence only: that a native identity's head was held. That the row *shows
+/// the version* its native head carried is not expressible here (a version
+/// hash is derived from several columns); the writers check it in the
+/// transaction that completes the row (`require_row_shows_native_head`).
+pub fn authoring_evidence_missing(row: &str) -> String {
+    format!(
+        "({row}.deleted = 0
+          AND ({row}.native_authoring_identity IS NULL
+               OR length({row}.native_authoring_identity) < 58
+               OR NOT EXISTS(
+                   SELECT 1 FROM native_authoring_witness
+                    WHERE group_id = {row}.group_id
+                      AND identity = {row}.native_authoring_identity
+               )))"
+    )
+}
+
+/// The trigger condition: a current row, in a native-authority group that has
+/// native history, without a verified authoring identity. Before that a row may be unauthored
+/// (the initial scan writes rows before it authors them).
 fn unverified_authoring_identity(row: &str) -> String {
     format!(
         "{row}.state = 'current' AND {row}.version_seq > 0
-          AND (EXISTS(SELECT 1 FROM changes WHERE group_id = {row}.group_id)
-               OR EXISTS(SELECT 1 FROM pruned_changes WHERE group_id = {row}.group_id)
-               OR EXISTS(SELECT 1 FROM group_history_bases WHERE group_id = {row}.group_id))
-          AND ({row}.authoring_change_hash IS NULL
-               OR length({row}.authoring_change_hash) != 32
-               OR NOT EXISTS(
-                   SELECT 1 FROM changes
-                    WHERE group_id = {row}.group_id
-                      AND change_hash = {row}.authoring_change_hash
-                   UNION ALL
-                   SELECT 1 FROM pruned_changes
-                    WHERE group_id = {row}.group_id
-                      AND change_hash = {row}.authoring_change_hash
-                   UNION ALL
-                   SELECT 1 FROM history_base_path_heads h
-                     JOIN group_history_bases b
-                       ON b.group_id = h.group_id AND b.history_base = h.base_hash
-                    WHERE h.group_id = {row}.group_id
-                      AND h.change_hash = {row}.authoring_change_hash
-                   UNION ALL
-                   SELECT 1 FROM history_base_carried_authors a
-                     JOIN group_history_bases b
-                       ON b.group_id = a.group_id AND b.history_base = a.base_hash
-                    WHERE a.group_id = {row}.group_id
-                      AND a.change_hash = {row}.authoring_change_hash
-               ))"
+          AND {}
+          AND EXISTS(SELECT 1 FROM native_authoring_witness WHERE group_id = {row}.group_id)
+          AND {}",
+        native_group(row),
+        authoring_evidence_missing(row)
     )
 }
 
@@ -856,3 +1339,275 @@ pub fn table_exists(conn: &Connection, table: &str) -> Result<bool, DatabaseErro
 
 #[cfg(test)]
 mod tests;
+
+/// A folder's child set changed: its generation (and `child_bumps`) advance and, when the OS can
+/// know the folder (it is published, or its own parent is enumerated), an upsert event tells it the
+/// folder's new token. `next` is the last event sequence used; the caller stores the revision.
+fn bump_item(
+    conn: &Connection,
+    root_id: &str,
+    folder_path: &str,
+    next: &mut i64,
+    child_set: bool,
+) -> rusqlite::Result<()> {
+    if folder_path.is_empty() {
+        return Ok(());
+    }
+    let row: Option<(Vec<u8>, bool, String)> = conn
+        .query_row(
+            "UPDATE provider_items SET generation = generation + 1, child_bumps = child_bumps + ?3 \
+             WHERE root_id = ?1 AND path = ?2 AND live = 1 \
+             RETURNING item_id, published_version_hash IS NOT NULL, parent_path",
+            rusqlite::params![root_id, folder_path, i64::from(child_set)],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let Some((item_id, published, parent_path)) = row else { return Ok(()) };
+    if published {
+        *next += 1;
+        conn.execute(
+            "INSERT INTO provider_change_events \
+             (root_id, seq, kind, item_id, parent_item_id, old_parent_item_id, at_s) \
+             VALUES (?1, ?2, 'upsert', ?3, \
+                     COALESCE((SELECT p.item_id FROM provider_items p WHERE p.root_id = ?1 \
+                               AND p.path = ?4 AND p.live = 1 AND ?4 <> ''), x''), \
+                     NULL, CAST(strftime('%s', 'now') AS INTEGER))",
+            rusqlite::params![root_id, *next, item_id, parent_path],
+        )?;
+    }
+    Ok(())
+}
+
+fn bump_folder(
+    conn: &Connection,
+    root_id: &str,
+    folder_path: &str,
+    next: &mut i64,
+) -> rusqlite::Result<()> {
+    bump_item(conn, root_id, folder_path, next, true)
+}
+
+/// The item at `path` of the provider group was REPLACED (the same path now shows another head, or
+/// was deleted and recreated in one transaction): its generation advances and the OS is told, so
+/// every token taken before the replacement is stale even when the new version hashes the same.
+/// The item id is kept (the path is the identity the user named); the token is what changes.
+pub fn note_item_replaced(conn: &Connection, group_id: &str, path: &str) -> rusqlite::Result<()> {
+    let known: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM provider_items WHERE group_id = ?1 AND path = ?2 AND live = 1)",
+        rusqlite::params![group_id, path],
+        |r| r.get(0),
+    )?;
+    if !known {
+        return Ok(());
+    }
+    let roots: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT root_id FROM provider_roots WHERE group_id = ?1")?;
+        let rows = stmt.query_map([group_id], |r| r.get(0))?.collect::<Result<_, _>>()?;
+        rows
+    };
+    for root in roots {
+        bump_and_store(conn, &root, path, false)?;
+    }
+    Ok(())
+}
+
+/// [`bump_folder`] outside the reconcile (a local create or move changed the folder's child set):
+/// advances the root's revision with the event it logged.
+pub fn note_child_set_change(
+    conn: &Connection,
+    root_id: &str,
+    folder_path: &str,
+) -> rusqlite::Result<()> {
+    bump_and_store(conn, root_id, folder_path, true)
+}
+
+/// Advances the item at `path` (see [`bump_item`]) and stores the revision its event moved to: the
+/// one statement of this module that writes the revision outside the reconcile.
+fn bump_and_store(
+    conn: &Connection,
+    root_id: &str,
+    path: &str,
+    child_set: bool,
+) -> rusqlite::Result<()> {
+    let base: i64 = conn.query_row(
+        "SELECT namespace_revision FROM provider_roots WHERE root_id = ?1",
+        [root_id],
+        |r| r.get(0),
+    )?;
+    let mut next = base;
+    bump_item(conn, root_id, path, &mut next, child_set)?;
+    if next != base {
+        conn.execute(
+            "UPDATE provider_roots SET namespace_revision = ?2 WHERE root_id = ?1",
+            rusqlite::params![root_id, next],
+        )?;
+    }
+    Ok(())
+}
+
+/// The namespace half of the reconcile, in the same transaction: keeps `provider_dirs` equal to
+/// the set of ancestors of live rows (structural directories included), and appends the change
+/// events of what the OS can know. Runs after the liveness update, over the `provider_anc`,
+/// `provider_retiring` and `provider_new_paths` scratch tables filled by the caller.
+///
+/// An event is written only for an item that is published or whose parent is an enumerated
+/// parent, so importing a namespace nobody has opened writes none.
+fn reconcile_provider_namespace(conn: &Connection) -> rusqlite::Result<()> {
+    const DESCENDANT: &str = "EXISTS (SELECT 1 FROM files f WHERE f.group_id = a.g \
+         AND f.state = 'current' AND f.deleted = 0 AND f.version_seq > 0 \
+         AND f.path > a.p || '/' AND f.path < a.p || '0')";
+    // Directories that gained their first live descendant: new entries (and, below, new items
+    // when their parent is enumerated).
+    conn.execute_batch(&format!(
+        r#"
+        CREATE TEMP TABLE IF NOT EXISTS provider_new_dirs (g TEXT NOT NULL, p TEXT NOT NULL);
+        DELETE FROM provider_new_dirs;
+        INSERT INTO provider_new_dirs (g, p)
+        SELECT a.g, a.p FROM provider_anc a
+        WHERE a.p <> ''
+          AND EXISTS (SELECT 1 FROM provider_roots r WHERE r.group_id = a.g)
+          AND NOT EXISTS (SELECT 1 FROM provider_dirs d WHERE d.group_id = a.g AND d.path = a.p)
+          AND {DESCENDANT};
+        INSERT INTO provider_dirs (group_id, path, parent_path)
+        SELECT g, p, rtrim(rtrim(p, replace(p, '/', '')), '/') FROM provider_new_dirs;
+        -- The direct-child set transitions of this transaction, whatever the child is to the OS:
+        -- a path that is live now but has no item (new, or never minted under an unopened
+        -- folder), a path that is no longer live, and the structural directories that appeared
+        -- or vanished. The folder each belongs to has its child set changed.
+        CREATE TEMP TABLE IF NOT EXISTS provider_child_changes (g TEXT NOT NULL, parent TEXT NOT NULL);
+        DELETE FROM provider_child_changes;
+        INSERT INTO provider_child_changes (g, parent)
+        SELECT d.group_id, rtrim(rtrim(d.path, replace(d.path, '/', '')), '/')
+        FROM provider_dirty_paths d
+        WHERE EXISTS (SELECT 1 FROM provider_roots r WHERE r.group_id = d.group_id)
+          AND ((EXISTS (SELECT 1 FROM files f WHERE f.group_id = d.group_id AND f.path = d.path
+                        AND f.state = 'current' AND f.deleted = 0 AND f.version_seq > 0)
+                AND NOT EXISTS (SELECT 1 FROM provider_items i WHERE i.group_id = d.group_id
+                                AND i.path = d.path AND i.live = 1))
+               OR NOT EXISTS (SELECT 1 FROM files f WHERE f.group_id = d.group_id
+                              AND f.state = 'current' AND f.deleted = 0 AND f.version_seq > 0
+                              AND (f.path = d.path
+                                   OR (f.path > d.path || '/' AND f.path < d.path || '0'))));
+        INSERT INTO provider_child_changes (g, parent)
+        SELECT g, rtrim(rtrim(p, replace(p, '/', '')), '/') FROM provider_new_dirs;
+        INSERT INTO provider_child_changes (g, parent)
+        SELECT d.group_id, d.parent_path FROM provider_dirs d
+        WHERE EXISTS (SELECT 1 FROM provider_anc a WHERE a.g = d.group_id AND a.p = d.path
+                      AND NOT {DESCENDANT});
+        DELETE FROM provider_dirs
+        WHERE EXISTS (SELECT 1 FROM provider_anc a WHERE a.g = provider_dirs.group_id
+                      AND a.p = provider_dirs.path
+                      AND NOT {DESCENDANT});
+        "#
+    ))?;
+
+    let roots: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT r.root_id FROM provider_roots r \
+             WHERE r.group_id IN (SELECT group_id FROM provider_dirty_paths)",
+        )?;
+        let rows = stmt.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+        rows
+    };
+    // Is the parent (by item id expression) an enumerated parent of the root?
+    for root in roots {
+        let base: i64 = conn.query_row(
+            "SELECT namespace_revision FROM provider_roots WHERE root_id = ?1",
+            [&root],
+            |r| r.get(0),
+        )?;
+        let mut next = base;
+        // Created items: a live row (or a new structural directory) under an enumerated parent
+        // that has no item yet is minted now, and told as an upsert.
+        conn.execute(
+            r#"
+            INSERT INTO provider_new_paths (root_id, group_id, path)
+            SELECT r.root_id, r.group_id, d.path FROM provider_dirty_paths d
+            JOIN provider_roots r ON r.group_id = d.group_id AND r.root_id = ?1
+            WHERE EXISTS (SELECT 1 FROM files f WHERE f.group_id = d.group_id AND f.path = d.path
+                          AND f.state = 'current' AND f.deleted = 0 AND f.version_seq > 0)
+            UNION
+            SELECT r.root_id, r.group_id, n.p FROM provider_new_dirs n
+            JOIN provider_roots r ON r.group_id = n.g AND r.root_id = ?1
+            "#,
+            [&root],
+        )?;
+        const PARENT_ENUMERATED: &str = "(CASE WHEN {pp} = '' THEN EXISTS (SELECT 1 FROM provider_enumerated_parents e WHERE e.root_id = {root} AND e.parent_item_id = x'') ELSE EXISTS (SELECT 1 FROM provider_items pi JOIN provider_enumerated_parents e ON e.root_id = pi.root_id AND e.parent_item_id = pi.item_id WHERE pi.root_id = {root} AND pi.path = {pp} AND pi.live = 1) END)";
+        let enumerated = |pp: &str, root_col: &str| {
+            PARENT_ENUMERATED.replace("{pp}", pp).replace("{root}", root_col)
+        };
+        let pp_new = "rtrim(rtrim(n.path, replace(n.path, '/', '')), '/')";
+        let minted: Vec<(Vec<u8>, String)> = {
+            let mut stmt = conn.prepare(&format!(
+                r#"
+                INSERT INTO provider_items (root_id, item_id, group_id, path, parent_path, name, live)
+                SELECT n.root_id, randomblob(16), n.group_id, n.path, {pp_new},
+                       substr(n.path, length({pp_new}) + CASE WHEN {pp_new} = '' THEN 1 ELSE 2 END), 1
+                FROM provider_new_paths n
+                WHERE n.root_id = ?1
+                  AND NOT EXISTS (SELECT 1 FROM provider_items i WHERE i.root_id = n.root_id
+                                  AND i.path = n.path AND i.live = 1)
+                  AND {enumerated}
+                RETURNING item_id, parent_path
+                "#,
+                enumerated = enumerated(pp_new, "n.root_id")
+            ))?;
+            let rows = stmt
+                .query_map([&root], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<_, _>>()?;
+            rows
+        };
+        for (item_id, parent_path) in minted {
+            next += 1;
+            conn.execute(
+                r#"
+                INSERT INTO provider_change_events (root_id, seq, kind, item_id, parent_item_id, old_parent_item_id, at_s)
+                VALUES (?1, ?2, 'upsert', ?3,
+                        COALESCE((SELECT p.item_id FROM provider_items p WHERE p.root_id = ?1
+                                  AND p.path = ?4 AND p.live = 1 AND ?4 <> ''), x''),
+                        NULL, CAST(strftime('%s', 'now') AS INTEGER))
+                "#,
+                rusqlite::params![root, next, item_id, parent_path],
+            )?;
+        }
+        // Retired items the OS knew: published, or under an enumerated parent.
+        let pp_ret = "t.parent_path";
+        let events = conn.execute(
+            &format!(
+                r#"
+                INSERT INTO provider_change_events (root_id, seq, kind, item_id, parent_item_id, old_parent_item_id, at_s)
+                SELECT t.root_id, ?2 + row_number() OVER (ORDER BY t.item_id), 'delete', t.item_id,
+                       COALESCE((SELECT p.item_id FROM provider_items p WHERE p.root_id = t.root_id
+                                 AND p.path = t.parent_path AND p.live = 1 AND t.parent_path <> ''), x''),
+                       NULL, CAST(strftime('%s', 'now') AS INTEGER)
+                FROM provider_retiring t
+                WHERE t.root_id = ?1 AND (t.published IS NOT NULL OR {enumerated})
+                "#,
+                enumerated = enumerated(pp_ret, "t.root_id")
+            ),
+            rusqlite::params![root, next],
+        )?;
+        next += events as i64;
+        // A folder whose child set changed advances its generation (and tells the OS): a delete
+        // based on an older view of the folder is a stale view.
+        let parents: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT c.parent FROM provider_child_changes c \
+                 JOIN provider_roots r ON r.group_id = c.g WHERE r.root_id = ?1",
+            )?;
+            let rows =
+                stmt.query_map([&root], |r| r.get::<_, String>(0))?.collect::<Result<_, _>>()?;
+            rows
+        };
+        for parent in &parents {
+            bump_folder(conn, &root, parent, &mut next)?;
+        }
+        if next != base {
+            conn.execute(
+                "UPDATE provider_roots SET namespace_revision = ?2 WHERE root_id = ?1",
+                rusqlite::params![root, next],
+            )?;
+        }
+    }
+    Ok(())
+}

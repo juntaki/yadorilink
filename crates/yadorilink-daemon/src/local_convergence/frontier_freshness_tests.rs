@@ -1,9 +1,10 @@
 #![cfg(test)]
 
 use super::*;
+use yadorilink_replica_domain::ids::DeltaHash;
 
-fn hash(byte: u8) -> ChangeHash {
-    ChangeHash([byte; 32])
+fn hash(byte: u8) -> DeltaHash {
+    DeltaHash([byte; 32])
 }
 
 /// Case 1: an unchanged frontier is the only shape

@@ -113,10 +113,42 @@ pub struct DaemonConfig {
     pub config_dir: PathBuf,
     pub block_store_root: PathBuf,
     pub sync_db_path: PathBuf,
+    /// The fixed directory provider items are handed to the OS in (`handoff/`), uploaded in
+    /// (`ingest/`) and assembled in (`staging/`): the macOS app-group container's `provider`
+    /// directory. `None` unless configured (`YADORILINK_PROVIDER_TEMP_ROOT`); otherwise the daemon adopts
+    /// the container the host app reports through the shell socket (it knows no path of its own).
+    pub provider_temp_root: Option<PathBuf>,
     #[cfg(unix)]
     pub control_socket_path: PathBuf,
     #[cfg(unix)]
     pub shell_ipc_socket_path: PathBuf,
+}
+
+/// Uploads of undecided operations are retained (never aged out): report them, and sweep the
+/// unclaimed finished copies now that the journal is known.
+#[cfg(any(windows, unix))]
+fn report_retained_uploads(
+    state: &Arc<crate::daemon_state::DaemonState>,
+    handoff: &Arc<crate::provider_handoff::HandoffRoot>,
+) {
+    let repo = state.replica_coordinator.provider_repository();
+    let Ok(names) = repo.pending_ingest_names() else { return };
+    handoff.sweep_ingest(Some(&names));
+    if names.is_empty() {
+        return;
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64);
+    let (count, oldest_ms) = repo.undecided_uploads(now_ms).unwrap_or((0, 0));
+    let (orphans, orphan_oldest_ms) = repo.orphaned_uploads(now_ms).unwrap_or((0, 0));
+    tracing::warn!(
+        count,
+        oldest_ms,
+        orphans,
+        orphan_oldest_ms,
+        "uploads of undecided operations are retained"
+    );
 }
 
 impl DaemonConfig {
@@ -140,10 +172,13 @@ impl DaemonConfig {
         let shell_ipc_socket_path = std::env::var("YADORILINK_SHELL_IPC_SOCKET")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| dir.join("shell.sock"));
+        let provider_temp_root =
+            std::env::var("YADORILINK_PROVIDER_TEMP_ROOT").ok().map(std::path::PathBuf::from);
         Self {
             config_dir: dir,
             block_store_root,
             sync_db_path,
+            provider_temp_root,
             #[cfg(unix)]
             control_socket_path,
             #[cfg(unix)]
@@ -254,6 +289,17 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     if std::env::var("YADORILINK_DIAGNOSTIC_IO_COUNTERS").as_deref() == Ok("1") {
         yadorilink_local_storage::io_diag::set_enabled(true);
     }
+    // `YADORILINK_DIAGNOSTIC_RECEIVE_BUDGET=1` arms the receive serial
+    // budget (`receive_diag`): path lock wait/hold per site and the SQLite
+    // body/commit split. It also arms the `io_diag` counters above, because
+    // the file and directory fsync and rename counters live there and the
+    // dump below is gated on them. Unset (every production process) all of
+    // it stays off at the cost of one relaxed load per instrumented site.
+    if std::env::var("YADORILINK_DIAGNOSTIC_RECEIVE_BUDGET").as_deref() == Ok("1") {
+        crate::receive_diag::set_enabled(true);
+        yadorilink_local_storage::io_diag::set_enabled(true);
+        yadorilink_sqlite_runtime::writer_gate_stats::set_split_enabled(true);
+    }
     // Reads those same totals on demand rather than only at shutdown; see
     // the function's own doc comment. No-op unless the line above armed
     // them, so a production daemon installs nothing.
@@ -350,6 +396,7 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     let _data_resource_locks =
         crate::resource_lock::DataResourceLocks::acquire(&block_store_root, &sync_db_path)?;
 
+    let provider_temp_root = config.provider_temp_root;
     #[cfg(unix)]
     let control_socket_path = config.control_socket_path;
     #[cfg(unix)]
@@ -361,6 +408,18 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     // throwaway `ReportingStorage` over the same config directory rather
     // than waiting for `DaemonState::new`, since a failure here is exactly
     // the kind of thing a maintainer would want a local candidate for.
+    // Opening a missing replica database creates an empty one, and an empty
+    // database references no blocks: the first idle sweep would then delete
+    // every block that survived. Decide, before either is opened, whether a
+    // missing database is a new install or a lost one.
+    let surviving_blocks = SegmentBlockStore::holds_segment_data(&block_store_root)?
+        .then_some("the block store still holds data");
+    yadorilink_sqlite_runtime::refuse_lost_database(&sync_db_path, surviving_blocks).inspect_err(
+        |e| {
+            record_startup_error_best_effort("daemon_startup", "sync-state", e.to_string());
+        },
+    )?;
+
     let block_store = Arc::new(SegmentBlockStore::new(&block_store_root).inspect_err(|e| {
         record_startup_error_best_effort("daemon_startup", "block-store", e.to_string());
     })?);
@@ -368,6 +427,7 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
         Arc::new(ReplicaCoordinator::open(&sync_db_path).inspect_err(|e| {
             record_startup_error_best_effort("daemon_startup", "sync-state", e.to_string());
         })?);
+    yadorilink_sqlite_runtime::record_database_created(&sync_db_path)?;
 
     // Both resets run (each its own transaction) before either result is
     // looked at, and fail independently.
@@ -441,10 +501,9 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     // after `build` (before any of that later setup) preserves the exact
     // ordering `DaemonState::new` always had -- this is not a behavior
     // change, just the same two steps made explicit and separately owned.
-    let build =
+    let state =
         DaemonState::build(device_id.clone(), replica_coordinator.clone(), block_store.clone());
-    let recovery_job = crate::maintenance_coordinator::start(&build.state, build.forward_rx);
-    let state = build.state;
+    let recovery_job = crate::maintenance_coordinator::start(&state);
     // Only the real `yadorilink-daemon`
     // binary itself opts into disk-headroom enforcement — see
     // `DaemonState::enable_disk_headroom_enforcement`'s doc comment for why
@@ -515,8 +574,10 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
         // identical hardcoded `true`); the additive-scan flag a two-live-
         // roots recovery arms on the survivor is similarly read and ANDed
         // in by `start_inner` itself, not by this caller.
+        // A provider link has no directory to watch.
+        let Some(folder) = link.folder_path() else { continue };
         if let Err(e) = link_runtime_controller.start_gating_tombstones(
-            link.local_path.clone(),
+            folder.to_string(),
             link.group_id.clone(),
             true,
         ) {
@@ -526,7 +587,7 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
             // fallible step, so the failure leaves the gate Failed and peer apply
             // for this group defers rather than overwriting un-indexed local
             // content. Error, not warn: this folder syncs nothing until fixed.
-            tracing::error!(error = %e, local_path = %link.local_path, "failed to resume watching linked folder; this folder will not sync until startup succeeds for it");
+            tracing::error!(error = %e, local_path = %folder, "failed to resume watching linked folder; this folder will not sync until startup succeeds for it");
         }
     }
 
@@ -588,8 +649,43 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     // The shell extension's hydrate/pin/evict share the control socket's
     // `ApplicationServices` instance rather than reaching `DaemonState`.
     #[cfg(any(windows, unix))]
-    let shell_context =
-        std::sync::Arc::new(crate::shell_context::ShellContext::new(&control_context, &state));
+    let shell_context = std::sync::Arc::new(
+        crate::shell_context::ShellContext::new(&control_context, &state).with_handoff_slot(
+            crate::provider_handoff::HandoffSlot::lazy(
+                // Resolved again on every access that finds no root: the app group container only
+                // exists once the host app has run, which may be after the daemon started.
+                // An explicitly configured path (`YADORILINK_PROVIDER_TEMP_ROOT`); otherwise the container the
+                // host app reports through the shell socket is adopted (the daemon knows no path of its own).
+                Arc::new(move || provider_temp_root.clone()),
+                {
+                    let state = state.clone();
+                    Arc::new(move |handoff| report_retained_uploads(&state, handoff))
+                },
+            ),
+        ),
+    );
+    // Open it now when it can be (this also reports retained uploads at start-up).
+    #[cfg(any(windows, unix))]
+    let _ = shell_context.handoff.get();
+
+    #[cfg(any(windows, unix))]
+    {
+        let context = shell_context.clone();
+        crate::supervise::spawn_logged("provider-prefetch", async move {
+            crate::provider_prefetch::run(context).await;
+            Ok(())
+        });
+    }
+
+    // The provider projector: the only consumer of a provider group's projection obligations.
+    {
+        let state = state.clone();
+        let publication = shell_context.publication.clone();
+        crate::supervise::spawn_logged(
+            "provider-projector",
+            crate::provider_projector::run(state, publication),
+        );
+    }
 
     #[cfg(unix)]
     {
@@ -784,7 +880,7 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
             // device's iroh endpoint, then builds and serves this device's
             // Track Send service on its own ALPN (`yadorilink/send/v1`) --
             // a wholly separate protocol on the same endpoint, never the
-            // sync DAG/materialization machinery the rest of this daemon
+            // native-state/materialization machinery the rest of this daemon
             // serves. Not
             // an `essential.spawn` task: a device that cannot yet (or ever)
             // establish coordination-plane connectivity should not bring
@@ -1024,6 +1120,7 @@ fn spawn_io_diag_mark_listener() {
             // read is detectable rather than silently short.
             tracing::info!(seq, "io_diag mark begin");
             emit_io_diag_counters("mark");
+            crate::receive_diag::emit_report("mark");
             tracing::info!(seq, "io_diag mark end");
         }
     });
@@ -1092,6 +1189,10 @@ async fn graceful_shutdown(
         // `link_runtimes` was the only place this `Arc` was ever cloned
         // from, so removing it there (via `drain` above) leaves exactly
         // one strong reference: this one.
+        //
+        // Admission is closed first, so an operation some other holder starts
+        // from here on is refused whether or not the unwrap below succeeds.
+        runtime.root_lease().begin_stopping();
         match Arc::try_unwrap(runtime) {
             Ok(runtime) => runtime.shutdown().await,
             Err(shared) => {
@@ -1099,9 +1200,9 @@ async fn graceful_shutdown(
                     local_path,
                     refs = Arc::strong_count(&shared),
                     "graceful_shutdown: Arc<LinkRuntime> unexpectedly still shared after \
-                     removal from link_runtimes; falling back to abort-only teardown"
+                     removal from link_runtimes; draining it in place"
                 );
-                shared.abort_tasks();
+                shared.drain_shared().await;
             }
         }
     }))
@@ -1134,9 +1235,16 @@ async fn graceful_shutdown(
         // same total is produced by every call getting slower and by a few
         // getting much slower, which have different causes and different
         // fixes.
-        for op in
-            [Op::SegmentFsync, Op::GroupCommit, Op::IndexCommit, Op::CommitBatch, Op::SegmentAppend]
-        {
+        for op in [
+            Op::SegmentFsync,
+            Op::GroupCommit,
+            Op::IndexCommit,
+            Op::CommitBatch,
+            Op::SegmentAppend,
+            Op::FileFsync,
+            Op::DirFsync,
+            Op::Rename,
+        ] {
             let stat = yadorilink_local_storage::io_diag::stat(op);
             if stat.calls == 0 {
                 continue;
@@ -1182,6 +1290,10 @@ async fn graceful_shutdown(
                 );
             }
         }
+        // New lines under their own prefix; the `io_diag` and `sqlite_diag`
+        // lines above are unchanged. Writes nothing for an instrument that
+        // was not armed.
+        crate::receive_diag::emit_report("shutdown");
     }
 
     // Close the substrate endpoint while the tasks that serve it are still
@@ -1193,7 +1305,7 @@ async fn graceful_shutdown(
     // again, not even after it comes back. `SubstrateNode::shutdown`'s own
     // doc comment says this lifecycle is owned explicitly for exactly that
     // reason; nothing was calling it.
-    if let Some(driver) = state.reconciliation_driver() {
+    if let Some(driver) = state.peer_session_driver() {
         driver.stack().shutdown().await;
     }
 
@@ -1412,6 +1524,49 @@ mod startup_config_validation_tests {
         assert!(
             attempt.stale_temp_file.exists(),
             "a missing device key must abort before startup repair"
+        );
+    }
+
+    /// A block store that survives while the replica database is gone must
+    /// stop startup. Opening a missing database creates an empty one, and an
+    /// empty database references no blocks, so the next idle sweep would
+    /// delete every stored block.
+    #[tokio::test]
+    async fn a_missing_replica_database_beside_a_populated_block_store_aborts_startup() {
+        let _env_guard = CONFIG_ENV_MUTEX.lock().await;
+        let config_dir = tempfile::tempdir().unwrap();
+        let block_store_root = config_dir.path().join("blocks");
+        let sync_db_path = config_dir.path().join("sync-state.sqlite3");
+        std::env::set_var("YADORILINK_CONFIG_DIR", config_dir.path());
+        std::env::set_var("YADORILINK_BLOCK_STORE", &block_store_root);
+        std::env::set_var("YADORILINK_SYNC_DB", &sync_db_path);
+        std::fs::write(config_dir.path().join("device.json"), current_device_json()).unwrap();
+        yadorilink_transport::DeviceSigningKeyPair::generate_and_persist(
+            config_dir.path().join("signing_key"),
+        )
+        .unwrap();
+        {
+            let store = SegmentBlockStore::new(&block_store_root).unwrap();
+            yadorilink_local_storage::BlockStore::put(&store, b"a block that outlived its index")
+                .unwrap();
+        }
+
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(20), run(DaemonConfig::from_env()))
+                .await;
+
+        std::env::remove_var("YADORILINK_CONFIG_DIR");
+        std::env::remove_var("YADORILINK_BLOCK_STORE");
+        std::env::remove_var("YADORILINK_SYNC_DB");
+
+        let error = outcome
+            .expect("startup must fail closed rather than carry on")
+            .expect_err("startup must refuse a missing replica database beside stored blocks")
+            .to_string();
+        assert!(error.contains("is missing"), "{error}");
+        assert!(
+            !sync_db_path.exists(),
+            "no empty replacement database may be created beside surviving blocks"
         );
     }
 

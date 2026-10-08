@@ -83,13 +83,6 @@ pub(crate) fn rename_path(source: &Path, destination: &Path) -> std::io::Result<
     fs::rename(source, destination)
 }
 
-/// Single crate-wide boundary for publishing `source` at `destination`
-/// only if nothing is there: a hard link never replaces an existing entry,
-/// and fails with `AlreadyExists` instead.
-pub(crate) fn link_if_absent(source: &Path, destination: &Path) -> std::io::Result<()> {
-    fs::hard_link(source, destination)
-}
-
 /// Makes `path`'s own directory entries durable. A file that has been
 /// written and fsynced is still unreachable after a crash until the
 /// directory entry naming it has itself reached disk, so every path that

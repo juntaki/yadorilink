@@ -14,6 +14,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # What the corresponding-source pointer shipped in every artifact names: the
+  # tag for a tagged build, otherwise the exact commit.
+  YADORILINK_SOURCE_REF: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || github.sha }}
 
 jobs:
   build-and-test:
@@ -25,6 +28,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
@@ -36,6 +41,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          # Tag builds publish what they build: never write the shared cache.
+          save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
           key: ${{ matrix.os }}-public-ci
 
       - name: Check formatting
@@ -123,6 +130,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
@@ -134,6 +143,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          # Tag builds publish what they build: never write the shared cache.
+          save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
           workspaces: shell-ext/windows
 
       - name: Check formatting
@@ -156,6 +167,8 @@ jobs:
         crate: [core, fileprovider-core]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
@@ -167,6 +180,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          # Tag builds publish what they build: never write the shared cache.
+          save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
           workspaces: shell-ext/macos/${{ matrix.crate }}
 
       - name: Check formatting
@@ -185,15 +200,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master @ 2026-06-30
-      - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2.87.19
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
       - name: Audit
         run: cargo audit
 
   linux-artifacts:
     runs-on: ubuntu-latest
+    env:
+      # Release binaries talk to the production coordination service by default.
+      # Users can still override it with YADORILINK_COORDINATION_ADDR.
+      YADORILINK_DEFAULT_COORDINATION_ADDR: https://control.yadori.link
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
@@ -203,6 +226,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          # Tag builds publish what they build: never write the shared cache.
+          save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
           key: ubuntu-release
 
       - name: Build release binaries
@@ -217,6 +242,7 @@ jobs:
           cp target/release/yadorilink \
              target/release/yadorilink-daemon \
              release/linux/bin/
+          bash scripts/ci/write-source-notice.sh "$YADORILINK_SOURCE_REF" release/linux/bin
           tar -C release/linux/bin -czf "release/linux/yadorilink-${version}-linux-${arch}-binaries.tar.gz" .
           python3 scripts/ci/generate-release-checksums.py \
             --sidecars \
@@ -258,7 +284,7 @@ jobs:
 
   # Multi-arch (amd64+arm64) yadorilink-daemon image, published to GHCR --
   # see installer/docker/Dockerfile's header for what it contains and why.
-  # Gated like windows-signed-artifacts/macos-signed-artifacts: this pushes
+  # Gated like windows-release-artifacts/macos-signed-artifacts: this pushes
   # to a registry (not just an unpublished build-health artifact), so fork
   # PRs must never reach it. Unlike those two jobs this needs no protected
   # Environment secret -- GITHUB_TOKEN's per-job `packages: write`
@@ -273,12 +299,14 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
         with:
           platforms: arm64
 
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
@@ -307,11 +335,14 @@ jobs:
             printf 'tags=%s:nightly\n' "$image" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: installer/docker/Dockerfile
           platforms: linux/amd64,linux/arm64
+          build-args: |
+            YADORILINK_DEFAULT_COORDINATION_ADDR=https://control.yadori.link
+            YADORILINK_SOURCE_REF=${{ env.YADORILINK_SOURCE_REF }}
           push: true
           tags: ${{ steps.tags.outputs.tags }}
 
@@ -319,6 +350,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
@@ -328,6 +361,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          # Tag builds publish what they build: never write the shared cache.
+          save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
           key: windows-release
 
       - name: Install Inno Setup
@@ -351,6 +386,7 @@ jobs:
                     target/release/yadorilink-status-app.exe -Destination release/windows/bin
           Copy-Item shell-ext/windows/target/release/yadorilink_shell_ext.dll,
                     shell-ext/windows/target/release/yadorilink-cfapi-host.exe -Destination release/windows/bin
+          bash scripts/ci/write-source-notice.sh $env:YADORILINK_SOURCE_REF release/windows/bin
           $zipPath = "release/windows/yadorilink-$version-windows-x86_64-binaries.zip"
           Compress-Archive -Path release/windows/bin/* -DestinationPath $zipPath -Force
           py -3 scripts/ci/generate-release-checksums.py --sidecars $zipPath
@@ -381,13 +417,25 @@ jobs:
           path: release/windows
           if-no-files-found: error
 
-  windows-signed-artifacts:
+  # Signs the installer when the Windows code-signing secrets exist in the
+  # release-signing Environment. While no certificate exists the installer is
+  # built unsigned and published ONLY under the explicit name
+  # yadorilink-setup-unsigned.exe; it is never advertised in an update
+  # manifest. macOS signing below has no such fallback and fails when its
+  # secrets are missing.
+  windows-release-artifacts:
     if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     needs: windows-build-health
     runs-on: windows-latest
+    env:
+      # Release binaries talk to the production coordination service by default.
+      # Users can still override it with YADORILINK_COORDINATION_ADDR.
+      YADORILINK_DEFAULT_COORDINATION_ADDR: https://control.yadori.link
     environment: release-signing
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Download unsigned Windows build artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -405,16 +453,31 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master @ 2026-06-30
 
-      - name: Require and import code-signing certificate
+      - name: Detect Windows code-signing configuration
+        id: signing
         shell: pwsh
         env:
           WIN_CERT_BASE64: ${{ secrets.WINDOWS_CODE_SIGN_PFX_BASE64 }}
           WIN_CERT_PASSWORD: ${{ secrets.WINDOWS_CODE_SIGN_PFX_PASSWORD }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:WIN_CERT_BASE64) -or
-              [string]::IsNullOrWhiteSpace($env:WIN_CERT_PASSWORD)) {
-            throw 'Windows signing secrets are required in the release-signing environment'
+          $haveCert = -not [string]::IsNullOrWhiteSpace($env:WIN_CERT_BASE64)
+          $havePwd = -not [string]::IsNullOrWhiteSpace($env:WIN_CERT_PASSWORD)
+          if ($haveCert -and $havePwd) {
+            'signed=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          } elseif ($haveCert -or $havePwd) {
+            throw 'Windows signing configuration is incomplete: set both WINDOWS_CODE_SIGN_PFX_BASE64 and WINDOWS_CODE_SIGN_PFX_PASSWORD, or neither.'
+          } else {
+            'signed=false' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            Write-Host '::warning::No Windows code-signing certificate configured; building an UNSIGNED installer published as yadorilink-setup-unsigned.exe.'
           }
+
+      - name: Import code-signing certificate
+        if: steps.signing.outputs.signed == 'true'
+        shell: pwsh
+        env:
+          WIN_CERT_BASE64: ${{ secrets.WINDOWS_CODE_SIGN_PFX_BASE64 }}
+          WIN_CERT_PASSWORD: ${{ secrets.WINDOWS_CODE_SIGN_PFX_PASSWORD }}
+        run: |
           $pfxPath = Join-Path $env:RUNNER_TEMP 'yadorilink-codesign.pfx'
           [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WIN_CERT_BASE64))
           $securePwd = ConvertTo-SecureString $env:WIN_CERT_PASSWORD -AsPlainText -Force
@@ -429,7 +492,19 @@ jobs:
           if (-not $archive) { throw 'Windows binary archive missing from build-health artifacts' }
           Expand-Archive -LiteralPath $archive.FullName -DestinationPath release-input -Force
 
+      - name: Build unsigned Windows installer
+        if: steps.signing.outputs.signed != 'true'
+        shell: pwsh
+        env:
+          YADORILINK_RELEASE_MANIFEST_KEY_ID: ${{ vars.RELEASE_MANIFEST_KEY_ID }}
+          YADORILINK_RELEASE_MANIFEST_PUBLIC_KEY_HEX: ${{ vars.RELEASE_MANIFEST_PUBLIC_KEY_HEX }}
+        run: |
+          powershell -ExecutionPolicy Bypass -File installer\windows\build-installer.ps1 `
+            -ShellExtDir release-input -Release -Unsigned
+          if ($LASTEXITCODE -ne 0) { throw "unsigned installer build failed" }
+
       - name: Build signed Windows installer
+        if: steps.signing.outputs.signed == 'true'
         shell: pwsh
         env:
           YADORILINK_RELEASE_MANIFEST_KEY_ID: ${{ vars.RELEASE_MANIFEST_KEY_ID }}
@@ -443,7 +518,7 @@ jobs:
             -ShellExtDir release-input -Release `
             -SignToolName yadorilink -SignToolCommand $signCmd
 
-      - name: Package signed Windows binary archive
+      - name: Package Windows binary archive
         shell: pwsh
         env:
           YADORILINK_RELEASE_MANIFEST_PUBLIC_KEY_HEX: ${{ vars.RELEASE_MANIFEST_PUBLIC_KEY_HEX }}
@@ -468,6 +543,7 @@ jobs:
           # job's copy here is not a trust-root regression.
           Copy-Item release-input\yadorilink_shell_ext.dll,
                     release-input\yadorilink-cfapi-host.exe -Destination signed-bin
+          bash scripts/ci/write-source-notice.sh $env:YADORILINK_SOURCE_REF signed-bin
           # Cheap positive confirmation this binary was genuinely built
           # with the enforced, real trust root: this build's actual
           # configured public key hex must be present in the binary. NOT
@@ -485,7 +561,31 @@ jobs:
           Compress-Archive -Path signed-bin\* -DestinationPath $zipPath -Force
           py -3 scripts/ci/generate-release-checksums.py --sidecars $zipPath
 
+      - name: Verify and collect unsigned Windows artifacts
+        if: steps.signing.outputs.signed != 'true'
+        shell: pwsh
+        run: |
+          $exe = 'installer\windows\Output\yadorilink-setup.exe'
+          # Report-only (no -Release): checksum verified, signature status
+          # printed as unsigned.
+          powershell -ExecutionPolicy Bypass -File installer\windows\verify-installer.ps1 -Path $exe
+          if ($LASTEXITCODE -ne 0) { throw "verify-installer.ps1 failed for $exe" }
+          $sig = Get-AuthenticodeSignature -LiteralPath $exe
+          if ($sig.Status -ne 'NotSigned') { throw "expected an unsigned installer, Authenticode status is $($sig.Status)" }
+
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"$').Matches[0].Groups[1].Value
+          New-Item -ItemType Directory -Force -Path release/windows | Out-Null
+          Copy-Item "yadorilink-$version-windows-x86_64-binaries.zip", "yadorilink-$version-windows-x86_64-binaries.zip.sha256" release/windows
+          # Published under an explicit unsigned name so it can never be
+          # mistaken for (or consumed as) the signed installer.
+          $unsignedExe = 'release/windows/yadorilink-setup-unsigned.exe'
+          Copy-Item $exe $unsignedExe
+          py -3 scripts/ci/generate-release-checksums.py --sidecars $unsignedExe
+          $archive = Get-ChildItem release/windows -Filter 'yadorilink-*-windows-x86_64-binaries.zip' | Select-Object -First 1
+          py -3 scripts/ci/generate-release-checksums.py --out release/windows/SHA256SUMS $archive.FullName $unsignedExe
+
       - name: Verify and collect signed Windows artifacts
+        if: steps.signing.outputs.signed == 'true'
         shell: pwsh
         run: |
           $exe = 'installer\windows\Output\yadorilink-setup.exe'
@@ -523,6 +623,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
@@ -532,6 +634,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          # Tag builds publish what they build: never write the shared cache.
+          save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
           key: macos-release
 
       - name: Build release binaries
@@ -547,12 +651,13 @@ jobs:
              target/release/yadorilink-daemon \
              target/release/yadorilink-status-app \
              release/macos/bin/
+          bash scripts/ci/write-source-notice.sh "$YADORILINK_SOURCE_REF" release/macos
           cat > release/macos/README.txt <<'EOF'
           This tar.gz contains the bare, unsigned macOS binaries for build-health checks.
           This build-health artifact is always unsigned and receives no signing secrets.
           Official releases consume the separate, protected macos-signed-artifacts job.
           EOF
-          tar -C release/macos -czf "release/macos/yadorilink-${version}-macos-${arch}-binaries.tar.gz" bin README.txt
+          tar -C release/macos -czf "release/macos/yadorilink-${version}-macos-${arch}-binaries.tar.gz" bin README.txt LICENSE SOURCE.txt
           python3 scripts/ci/generate-release-checksums.py \
             --sidecars \
             "release/macos/yadorilink-${version}-macos-${arch}-binaries.tar.gz"
@@ -573,9 +678,15 @@ jobs:
     if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     needs: macos-build-health
     runs-on: macos-latest
+    env:
+      # Release binaries talk to the production coordination service by default.
+      # Users can still override it with YADORILINK_COORDINATION_ADDR.
+      YADORILINK_DEFAULT_COORDINATION_ADDR: https://control.yadori.link
     environment: release-signing
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
@@ -585,6 +696,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          # Tag builds publish what they build: never write the shared cache.
+          save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
           key: macos-release-signed
 
       - name: Require complete macOS signing configuration
@@ -694,7 +807,8 @@ jobs:
             echo "yadorilink-daemon does not contain the configured update-manifest trust root -- it was not built with enforce-release-trust-root and the real key" >&2
             exit 1
           fi
-          tar -C release/macos -czf "release/macos/yadorilink-${version}-macos-${arch}-binaries.tar.gz" bin
+          bash scripts/ci/write-source-notice.sh "$YADORILINK_SOURCE_REF" release/macos
+          tar -C release/macos -czf "release/macos/yadorilink-${version}-macos-${arch}-binaries.tar.gz" bin LICENSE SOURCE.txt
           rm -rf release/macos/bin
           python3 scripts/ci/generate-release-checksums.py \
             --sidecars \
@@ -745,7 +859,7 @@ jobs:
       - shell-ext-macos-rust
       - cargo-audit
       - linux-artifacts
-      - windows-signed-artifacts
+      - windows-release-artifacts
       - macos-build-health
       - macos-signed-artifacts
     runs-on: ubuntu-latest
@@ -756,7 +870,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1  # zizmor: ignore[artipacked] -- pushes the rolling nightly tag with git
 
       - name: Download build artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -787,9 +901,15 @@ jobs:
             dist/yadorilink-linux-x86_64.tar.gz
             dist/yadorilink-linux-amd64.deb
             dist/yadorilink-windows-x86_64.zip
-            dist/yadorilink-setup.exe
             dist/yadorilink-macos.tar.gz
           )
+          # Exactly one of these exists: the signed installer when Windows
+          # code-signing secrets were configured, otherwise the explicitly
+          # named unsigned one. Only the signed name is ever put in an
+          # update manifest.
+          for exe in dist/yadorilink-setup.exe dist/yadorilink-setup-unsigned.exe; do
+            if [ -f "$exe" ]; then sidecar_targets+=("$exe"); fi
+          done
           # The signed, notarized .pkg is only present when the macos job ran
           # with signing secrets (trusted events). Publish it under a stable
           # name with its checksum when it exists; skip it otherwise.
@@ -917,7 +1037,7 @@ jobs:
       - shell-ext-macos-rust
       - cargo-audit
       - linux-artifacts
-      - windows-signed-artifacts
+      - windows-release-artifacts
       - macos-build-health
       - macos-signed-artifacts
     runs-on: ubuntu-latest
@@ -928,6 +1048,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Resolve tag and enforce immutability
         id: tag
@@ -1021,9 +1143,15 @@ jobs:
             dist/yadorilink-linux-x86_64.tar.gz
             dist/yadorilink-linux-amd64.deb
             dist/yadorilink-windows-x86_64.zip
-            dist/yadorilink-setup.exe
             dist/yadorilink-macos.tar.gz
           )
+          # Exactly one of these exists: the signed installer when Windows
+          # code-signing secrets were configured, otherwise the explicitly
+          # named unsigned one. Only the signed name is ever put in an
+          # update manifest.
+          for exe in dist/yadorilink-setup.exe dist/yadorilink-setup-unsigned.exe; do
+            if [ -f "$exe" ]; then sidecar_targets+=("$exe"); fi
+          done
           macos_pkg="$(find dist -maxdepth 1 -name 'yadorilink-*.pkg' ! -name 'yadorilink-macos.pkg' -print -quit)"
           if [ -n "$macos_pkg" ]; then
             cp "$macos_pkg" dist/yadorilink-macos.pkg
@@ -1100,6 +1228,12 @@ jobs:
           trap cleanup_failed_draft EXIT
 
           printf '%s\n' "$NOTES" > release-notes.md
+          if [ -f dist/yadorilink-setup-unsigned.exe ]; then
+            {
+              echo
+              echo "**Windows installer is unsigned.** \`yadorilink-setup-unsigned.exe\` has no Authenticode signature, so Windows SmartScreen will warn before running it. Verify it against the published SHA-256 (\`yadorilink-setup-unsigned.exe.sha256\`) before you run it."
+            } >> release-notes.md
+          fi
           # Keep the release invisible until every required asset is present.
           # No --target force-move; the tag already exists (this job runs on it).
           gh release create "$TAG" \
@@ -1259,5 +1393,5 @@ jobs:
               echo "by hand (see \`installer/windows/winget/README.md\`'s Status section for why this workflow doesn't run it itself). Submission to microsoft/winget-pkgs stays a manual, human-gated step (same README's Submission section)."
             } >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "::warning::No signed yadorilink-setup.exe checksum found; skipping WinGet manifest input summary."
+            echo "::warning::No signed yadorilink-setup.exe checksum found (Windows installer is unsigned or missing); skipping WinGet manifest input summary."
           fi

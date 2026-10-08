@@ -119,6 +119,7 @@ async fn scenario_body(seed: u64) -> Result<IndexSnapshot, String> {
     let probe: app::StateProbe = Arc::new(Mutex::new(None));
 
     let config = DaemonConfig {
+        provider_temp_root: None,
         config_dir: config_dir.path().to_path_buf(),
         block_store_root: block_store_dir.path().to_path_buf(),
         sync_db_path: config_dir.path().join("sync-state.sqlite3"),

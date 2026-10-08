@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>プライバシーポリシー — YadoriLink</title>
+<meta name="description" content="YadoriLink の調整サービスがどのようなデータを扱うかを説明します。">
+<link rel="canonical" href="https://yadori.link/ja/privacy/">
+<link rel="alternate" hreflang="en" href="https://yadori.link/privacy/">
+<link rel="alternate" hreflang="ja" href="https://yadori.link/ja/privacy/">
+<link rel="alternate" hreflang="x-default" href="https://yadori.link/privacy/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="YadoriLink">
+<meta property="og:title" content="プライバシーポリシー — YadoriLink">
+<meta property="og:description" content="YadoriLink の調整サービスがどのようなデータを扱うかを説明します。">
+<meta property="og:url" content="https://yadori.link/ja/privacy/">
+<meta property="og:image" content="https://yadori.link/assets/og-image.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:locale" content="ja_JP">
+<meta property="og:locale:alternate" content="en_US">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="プライバシーポリシー — YadoriLink">
+<meta name="twitter:description" content="YadoriLink の調整サービスがどのようなデータを扱うかを説明します。">
+<meta name="twitter:image" content="https://yadori.link/assets/og-image.png">
+<link rel="icon" href="/assets/favicon.ico" sizes="any">
+<link rel="icon" type="image/webp" sizes="64x64" href="/assets/logo-64.webp">
+<link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
+<meta name="theme-color" content="#f5f9ff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#060d1f" media="(prefers-color-scheme: dark)">
+<link rel="stylesheet" href="/assets/site.css">
+</head>
+<body>
+<a class="skip" href="#content">本文へスキップ</a>
+<div class="wrap">
+<header class="site-header">
+  <a class="brand" href="/ja/" aria-label="YadoriLink ホーム">
+    <img src="/assets/logo-64.webp" srcset="/assets/logo-128.webp 2x" width="36" height="36" alt="">
+    <span>YadoriLink</span>
+  </a>
+  <nav aria-label="サイト">
+    <a href="/ja/privacy/">プライバシー</a>
+    <a href="/ja/terms/">利用規約</a>
+    <a href="https://github.com/juntaki/yadorilink">GitHub</a>
+  </nav>
+  <a class="lang" href="/privacy/" lang="en" hreflang="en">English</a>
+</header>
+
+<main id="content" class="legal">
+<h1>プライバシーポリシー</h1>
+<p class="meta">施行日: 2026年10月4日</p>
+
+<p>YadoriLink はピアツーピアのフォルダー同期ツールです。このポリシーでは、YadoriLink が提供する調整サービス（<code>control.yadori.link</code>）とこのウェブサイトが、個人情報をどのように取り扱うかを説明します。YadoriLink は 1.0 未満のベータ版ソフトウェアであり、このポリシーは現在の動作に基づいています。</p>
+
+<h2>1. 事業者</h2>
+<p>YadoriLink は個人のJumpei Takiyasu（以下「運営者」）が運営しています。お問い合わせ、開示・訂正・利用停止・削除のご請求は <a href="mailto:me@juntaki.com">me@juntaki.com</a> までご連絡ください。運営者の住所は、このメールアドレスへのご請求に応じて、遅滞なくお知らせします。</p>
+
+<h2>2. 要点</h2>
+<ul>
+<li>ファイルの内容、ファイル名、フォルダーのパスは、<strong>調整サービスにはアップロードされません</strong>。ファイルは、認可されたデバイス間でエンドツーエンドで暗号化されて転送され、直接接続できない場合は、第三者が運用する暗号化リレー（iroh の公開リレー）を経由します。リレーはネットワークのメタデータは把握できますが、内容は見られません（第 5 項）。</li>
+<li>サービスが保存するのは、デバイス同士が互いを見つけて認可するために必要な最小限の情報です。具体的には、Google アカウント識別子とメールアドレス、デバイス、そしてフォルダーグループとその権限です。</li>
+<li>個人情報の販売、広告表示、アクセス解析やトラッカーの利用は行いません。このウェブサイトは Cookie を設定せず、第三者へのリクエストも行いません。</li>
+</ul>
+
+<h2>3. 調整サービスが保存する情報</h2>
+<h3>アカウント</h3>
+<p>Google でサインインする際、サービスが Google に要求するのは <code>openid</code> と <code>email</code> のスコープだけです。保存するのは、Google アカウント識別子（<code>sub</code> 値）、メールアドレス、アカウント作成日時です。パスワードは保存せず、Google の連絡先やドライブなどのデータにはアクセスしません。</p>
+<h3>デバイス</h3>
+<p>登録した各デバイスについて、デバイス名（初期値はコンピューターのホスト名で、変更できます）、デバイスの署名用公開鍵、作成日時、現在オンラインかどうかと最終確認時刻、他のデバイスが接続できるようにデバイスが報告するネットワークアドレス（IP アドレスとポート、リレーのアドレス）を保存します。秘密鍵はデバイスの外に出ません。</p>
+<h3>フォルダーグループと共有</h3>
+<p>各フォルダーグループについて、識別子、付けた名前、所有者、作成日時を保存します。アクセス制御のために、どのデバイスがどのグループに属するか、その役割とストレージモード、招待（ハッシュ化した招待コード、役割、有効期限）、アクセス変更の署名付きログも保存します。共有したグループの他のメンバーには、グループ名とグループ内のデバイス名が表示されます。</p>
+<h3>サインインとデバイスの認証情報</h3>
+<p>サービスは、各デバイスが保持する暗号鍵に結び付けたトークンを発行します。発行と失効に必要な記録（識別子は可能な限りハッシュで保存）、サインイン完了までの間だけ保持する Google のサインイン結果の短期記録、そして失効した認証情報の追記専用の一覧（識別子、時刻、理由）を保存します。この一覧は、データベースの復元などがあっても失効済みの認証情報が復活しないようにするために、削除されません。</p>
+<h3>操作記録</h3>
+<p>デバイスの削除などのメンバーシップ操作の記録と、強制オーバーライドを実行した場合の記録（デバイス識別子、操作内容、フォルダーグループ識別子、時刻）です。</p>
+<h3>不正利用の防止</h3>
+<p>不正利用を抑えるため、送信元 IP アドレス（およびアカウント）をキーにした短期のリクエストカウンターを保持します。カウンターは 1 分程度の期間を対象とし、その後に消去されます。</p>
+<h3>ログ</h3>
+<p>サービスは Cloudflare Workers 上で動作しており、Cloudflare のログ機能を有効にしています。Cloudflare Workers が生成する運用ログは、障害対応、セキュリティの確保その他サービスの運用に必要な範囲で収集され、Cloudflare 上で最大 7 日間保持されます。</p>
+<p>これらのログには、Worker の呼び出しログ（送信元 IP アドレス、URL パス、ステータス、処理時間などのリクエストおよびレスポンスのメタデータ）、コンソール出力やエラーメッセージ（内部識別子を含むことがあります）、未処理の例外が含まれることがあります。ファイルの内容がこれらに含まれることはありません。</p>
+<h3>ベータ招待</h3>
+<p>ベータ招待コードで参加した場合、コードのハッシュ、コホート、使用したアカウントを保存します。</p>
+
+<h2>4. サービスが行わないこと</h2>
+<ul>
+<li>ファイルの内容、ファイル名、フォルダーのパス、同期しているファイルの一覧は受け取りません。</li>
+<li>アクセス解析は行いません。サービスの集計メトリクスは既定で無効です。有効にした場合も、アカウント・デバイス・IP アドレス・パスを含まない、固定の粗いカウンターのみです。</li>
+<li>任意のクラッシュ・エラー報告の受付は、サービス側で無効になっています。将来有効にする場合も、デバイス側でオプトインした場合のみ、マスク済みの報告（ソフトウェアのバージョンとチャンネル、エラーの種別、サブシステム、スタックの最上位フレーム）だけを、アカウントに紐付けずに受け付けます。IP アドレスは送信頻度の制限にのみ使い、報告とともには保存しません。これらの報告には、自動削除の期間は設けられていません。</li>
+</ul>
+
+<h2>5. デバイス間の転送</h2>
+<p>同期されるデータは、認可されたデバイス間で、エンドツーエンドで暗号化された接続を通じて、可能な場合は直接やり取りされます。2 台のデバイスが直接接続できない場合（厳しいファイアウォールの内側にある場合など）は、iroh プロジェクトの公開リレーサーバーを経由することがあります。このリレーは運営者ではなく iroh の開発元が運用しています。リレーが転送するのは暗号化されたパケットで、関係する IP アドレスやデバイス識別子、通信のタイミングと量は把握できますが、ファイルの内容は見られません。同じグループのデバイス同士は、同期の性質上、ファイル名や変更内容を互いにやり取りします。</p>
+
+<h2>6. アップデートとダウンロード</h2>
+<p>アップデートのマニフェストと Linux 用パッケージリポジトリは、Cloudflare R2 を基盤とする <code>control.yadori.link</code> から配信されます。アカウントは不要です。これらのリクエストは、第 3 項「ログ」に記載のとおり Cloudflare が処理します。インストーラーは GitHub Releases からもダウンロードでき、その場合は GitHub のプライバシーに関する規定が適用されます。</p>
+
+<h2>7. お使いのデバイス上のデータ</h2>
+<p>同期するファイル、ローカルの同期状態、デバイスの認証情報は、お使いのデバイス上に保存され、サービスにはコピーされません。</p>
+
+<h2>8. 利用目的</h2>
+<p>取得した情報は、次の目的のために利用します。サインインの提供、デバイスの登録、デバイス同士の接続、どのフォルダーグループを誰が同期できるかの制御、不正利用の防止、サービスの運用と安全の確保、お問い合わせへの対応です。広告やプロファイリングには利用しません。</p>
+
+<h2>9. 第三者への提供と委託先</h2>
+<ul>
+<li><strong>Google</strong>：サインイン（本人確認）。</li>
+<li><strong>Cloudflare</strong>：このウェブサイトとサービスのホスティング（Workers、D1 データベース、Durable Objects、R2 ストレージ）と DNS。Cloudflare は世界各地で事業を行っているため、情報が日本国外で処理される場合があります。</li>
+<li><strong>GitHub</strong>：ソースコードとリリースのダウンロード。</li>
+<li><strong>iroh リレーサーバー</strong>：第 5 項に記載したパケットの中継。</li>
+</ul>
+<p>個人情報を販売することはありません。次の場合を除き、第三者に提供しません。上記の委託先への提供、フォルダーグループを共有している相手への表示（グループ名とデバイス名。第 3 項）、および法令に基づく場合です。</p>
+
+<h2 id="retention">10. 保存期間と削除</h2>
+<p>アカウント、デバイス、共有の記録は、アカウントが存在する間は保存されます。あらかじめ有効期限が設定されているのは、一時的なサインインや招待の記録と、上記のリクエストカウンターだけです。</p>
+<p>削除は、CLI（<code>yadorilink account delete request</code> のあとに <code>confirm</code>）またはデスクトップアプリの「Account &amp; Data…」から請求できます。確認後に猶予期間（既定では 7 日間）が始まり、その間はキャンセルできます。猶予期間が終わると、アカウント、デバイス、ご自身が所有するフォルダーグループとそのアクセス設定、作成した招待、すべての認証情報が削除され、共有先のデバイスはアクセスできなくなります。すでにデバイス上にあるフォルダーには影響しません。ランダムな識別子と時刻だけのマーカーと、第 3 項の失効記録は残ります。ベータ期間中は、この最終処理の自動実行がまだ有効になっていない場合があります。猶予期間が過ぎてもアカウントが残っている場合は、メールでご連絡いただければ、運営者が削除を完了します。なお、Cloudflare が自社の方針に従い、復元用のバックアップを一定期間保持することがあります。</p>
+
+<h2>11. 開示等のご請求</h2>
+<ul>
+<li><strong>開示・エクスポート</strong>：<code>yadorilink account export</code>（またはデスクトップアプリ）で、アカウント、デバイス、フォルダーグループ、共有エントリー、アカウントイベントを JSON で取得できます。</li>
+<li><strong>削除</strong>：第 10 項のとおりです。</li>
+<li><strong>訂正、利用停止、第三者提供記録の開示など</strong>：メールでご連絡ください。アカウントの本人であることを確認したうえで対応します。</li>
+</ul>
+
+<h2>12. 安全管理</h2>
+<p>サービスとの通信には HTTPS を使用します。アクセストークンはデバイスの鍵に結び付けられ（DPoP）、失効した認証情報は削除されない失効台帳に記録され、招待コードや認証情報の識別子はハッシュで保存し、デバイスの秘密鍵はデバイスの外に出ません。サービスのシークレットは Cloudflare Worker のシークレットとして保持し、運用者向けコンソールは Cloudflare Access の背後でのみ利用できます。ただし、完全に安全なシステムはありません。脆弱性を見つけた場合は <a href="mailto:me@juntaki.com">me@juntaki.com</a> までご報告ください。</p>
+
+<h2>13. 未成年のお子様</h2>
+<p>YadoriLink は 16 歳未満のお子様を対象としておらず、お子様の情報を意図的に収集することはありません。</p>
+
+<h2>14. 改定</h2>
+<p>ソフトウェアの変更に合わせて、このポリシーを改定することがあります。最新版は上記の施行日で確認できます。重要な変更は、ウェブサイトまたはプロジェクトのページでお知らせします。</p>
+
+<h2>15. お問い合わせ窓口</h2>
+<p>Jumpei Takiyasu &mdash; <a href="mailto:me@juntaki.com">me@juntaki.com</a></p>
+
+</main>
+
+<footer class="site-footer">
+  <div class="foot-top"><img src="/assets/logo-64.webp" width="28" height="28" alt=""><span>YadoriLink</span></div>
+  <p>クラウドのような手軽さで、ファイルはクラウドに置かない。</p>
+  <div class="cols">
+    <a href="/ja/privacy/">プライバシー</a> <a href="/ja/terms/">利用規約</a> <a href="https://github.com/juntaki/yadorilink">GitHub</a> <a href="https://github.com/juntaki/yadorilink/blob/main/SECURITY.md">セキュリティ</a> <a href="mailto:me@juntaki.com">お問い合わせ</a>
+    <a href="/privacy/" lang="en" hreflang="en">English</a>
+    <span>AGPL-3.0-only</span>
+  </div>
+</footer>
+</div>
+</body>
+</html>

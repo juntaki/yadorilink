@@ -14,27 +14,18 @@ fn tags_round_trip_and_are_distinct() {
 }
 
 #[test]
-fn reconciliation_is_never_subject_to_a_concurrency_budget() {
+fn every_lane_has_a_concurrency_budget() {
     let limits = super::LaneLimits::default();
-    assert_eq!(limits.for_lane(Lane::Reconciliation), None);
-    assert_eq!(limits.for_lane(Lane::History), Some(limits.history));
-    assert_eq!(limits.for_lane(Lane::Block), Some(limits.block));
-    assert_eq!(limits.for_lane(Lane::Service), Some(limits.service));
-}
-
-#[test]
-fn history_stream_kinds_round_trip_and_reject_the_unknown() {
-    use super::HistoryStreamKind;
-    for kind in [HistoryStreamKind::ProofBundle, HistoryStreamKind::RebootstrapSnapshot] {
-        assert_eq!(HistoryStreamKind::from_tag(kind.tag()), Some(kind));
-    }
-    assert_eq!(HistoryStreamKind::from_tag(0), None);
-    assert_eq!(HistoryStreamKind::from_tag(3), None);
+    assert_eq!(limits.for_lane(Lane::Block), limits.block);
+    assert_eq!(limits.for_lane(Lane::Service), limits.service);
 }
 
 #[test]
 fn unknown_tag_is_rejected_not_guessed() {
     assert_eq!(Lane::from_tag(0), None);
+    // Tags of lanes that no longer exist stay refused rather than reused.
+    assert_eq!(Lane::from_tag(1), None);
+    assert_eq!(Lane::from_tag(2), None);
     assert_eq!(Lane::from_tag(5), None);
     assert_eq!(Lane::from_tag(u8::MAX), None);
 }

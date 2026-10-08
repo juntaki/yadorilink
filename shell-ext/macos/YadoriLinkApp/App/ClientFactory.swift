@@ -54,3 +54,9 @@ extension ClientFactory {
     }
 }
 #endif
+
+/// Whether the Add Folder flow offers a File Provider folder. It mirrors the daemon's
+/// `PROVIDER_ROOTS_ENABLED` (which refuses the request while it is off); the two are switched together.
+enum ProviderFolders {
+    static let available = true
+}

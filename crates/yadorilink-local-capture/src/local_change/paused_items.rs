@@ -30,18 +30,23 @@ impl LocalChangeProcessor {
     /// The paused items of `group_id`, read fresh: a pause or resume takes
     /// effect on the very next event.
     ///
-    /// Together with the paths a snapshot install holds, which local
-    /// capture must leave unauthored in exactly the same way -- edits and
-    /// offline deletions alike -- for a different reason: whatever is on
-    /// disk under them has a replaced row as its base (see
-    /// `yadorilink_sync_sqlite::snapshot_install_hold`). Unlike a pause,
+    /// Together with the held paths, which local capture must leave
+    /// unauthored in exactly the same way -- edits and offline deletions
+    /// alike -- for a different reason: whatever is on disk under them
+    /// belongs to no row this device placed (see
+    /// `yadorilink_sync_sqlite::held_path`). Unlike a pause,
     /// nothing is captured when such a hold is released: the
     /// reconciliation that releases it has already removed what was stale
     /// and moved anything else aside under a name of its own, which local
     /// capture sees as a new file.
     pub(super) fn paused_items(&self, group_id: &str) -> Result<Vec<String>, LocalCaptureError> {
         let mut held = self.state.paused_items(group_id)?;
-        held.extend(self.state.snapshot_install_held_paths(group_id)?);
+        held.extend(self.state.held_path_names(group_id)?);
+        // A group a rebootstrap freezes is paused as a whole: nothing is authored for it,
+        // and the edits stay on disk for the scan that follows the freeze.
+        if self.state.group_frozen(group_id)? {
+            held.push(String::new());
+        }
         Ok(held)
     }
 
@@ -54,7 +59,7 @@ impl LocalChangeProcessor {
     }
 
     /// Whether `rel_path` is under an item the user paused, leaving out
-    /// the paths a snapshot install holds. A hold is released by a
+    /// the held paths. A hold is released by a
     /// reconciliation that owns the path's lock while it works, so only a
     /// check made under that lock sees whether it still stands.
     pub(super) fn is_under_user_pause(

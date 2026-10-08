@@ -361,6 +361,27 @@ impl SyncRootLock {
     pub fn verify_still_owns(&self) -> Result<(), RootAuthorityError> {
         verify_sidecar_identity(&self.root, self.sidecar_identity)
     }
+
+    /// The same check as [`Self::verify_still_owns`], detached from this
+    /// lock so it can run where the lock itself cannot be borrowed.
+    pub fn identity_check(&self) -> RootIdentityCheck {
+        RootIdentityCheck { root: self.root.clone(), expected: self.sidecar_identity }
+    }
+}
+
+/// [`SyncRootLock::verify_still_owns`] with its inputs copied out: the root
+/// and the sidecar identity the lock was granted against. Verifying it
+/// re-observes the sidecar exactly as the lock would.
+#[derive(Debug, Clone)]
+pub struct RootIdentityCheck {
+    root: PathBuf,
+    expected: FileIdentity,
+}
+
+impl RootIdentityCheck {
+    pub fn verify(&self) -> Result<(), RootAuthorityError> {
+        verify_sidecar_identity(&self.root, self.expected)
+    }
 }
 
 impl Drop for SyncRootLock {

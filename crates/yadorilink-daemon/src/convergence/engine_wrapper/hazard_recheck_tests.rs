@@ -3,10 +3,7 @@
 use super::{run_hazard_recheck_pass, DaemonState};
 use ed25519_dalek::SigningKey;
 use std::sync::Arc;
-use yadorilink_replica_domain::change::{Change, Op, PutOrigin};
 use yadorilink_replica_domain::file::{FileMeta, FileVersion, RecordKind};
-use yadorilink_replica_domain::ids::{DeviceId, FolderGroupId, SyncPath};
-use yadorilink_replica_domain::test_authoring::create_signed_for_tests;
 use yadorilink_root_authority::root_identity::VerifiedRoot;
 
 const GROUP: &str = "hazard-recheck-group";
@@ -45,8 +42,7 @@ async fn build_state_with_adopted_group() -> (Arc<DaemonState>, tempfile::TempDi
     let generation = replica_coordinator.startup_readiness().begin_group_startup(GROUP);
     replica_coordinator.startup_readiness().mark_group_ready(GROUP, generation);
 
-    let build = DaemonState::build("device-local".to_string(), replica_coordinator, block_store);
-    let state = build.state;
+    let state = DaemonState::build("device-local".to_string(), replica_coordinator, block_store);
     state.test_root_commit_authorities.lock().unwrap().insert(
         GROUP.to_string(),
         Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()),
@@ -58,33 +54,26 @@ async fn build_state_with_adopted_group() -> (Arc<DaemonState>, tempfile::TempDi
 fn admit_change(
     state: &DaemonState,
     device: &str,
-    key: &SigningKey,
+    _key: &SigningKey,
     path: &str,
     version: &FileVersion,
-) -> Change {
-    let change = create_signed_for_tests(
-        vec![],
-        0,
-        DeviceId(device.to_string()),
-        FolderGroupId(GROUP.to_string()),
-        vec![Op::Put {
-            path: SyncPath(path.to_string()),
-            version: version.version_hash,
-            origin: PutOrigin::Direct,
-        }],
-        key,
-    );
-    state
-        .replica_coordinator
-        .change_history_repository()
-        .dag_admit_change_with_versions(&change, std::slice::from_ref(version))
-        .unwrap();
-    change
+) -> yadorilink_replica_domain::signed_delta::NativeDelta {
+    crate::test_support::remote_admission_fixture::admit_remote(
+        &state.replica_coordinator,
+        GROUP,
+        device,
+        vec![crate::test_support::remote_admission_fixture::put(
+            path,
+            version.version_hash,
+            vec![],
+        )],
+        std::slice::from_ref(version),
+    )
 }
 
 /// The core regression: a path manually marked held (standing in for
 /// any real hazard reason) with an already-admitted, trivially-
-/// materializable DAG version gets written to disk and un-held by
+/// materializable native version gets written to disk and un-held by
 /// `run_hazard_recheck_pass` alone -- no new incoming record for this
 /// exact path is ever admitted or announced. RED-confirmed by
 /// commenting out the `reconcile_paths_directly` call inside `run_
@@ -96,19 +85,17 @@ async fn a_held_path_is_re_examined_and_cleared_by_the_sweep_alone() {
     let (state, root_dir) = build_state_with_adopted_group().await;
     let key = SigningKey::from_bytes(&[81u8; 32]);
     let version = empty_version(1_700_000_000);
-    let change = admit_change(&state, "device-a", &key, "held.txt", &version);
+    admit_change(&state, "device-a", &key, "held.txt", &version);
 
     // `set_held` is an UPDATE on an existing `files` row (see its own
     // doc comment) -- production always reaches it through `hold_
     // record`, which upserts the index row first. Mirrors that here
     // directly rather than going through real hazard detection (see
-    // this test module's own doc comment for why); a DAG-backed row
-    // needs its authoring change attached (`upsert_file_with_origin_
-    // and_author`), or the schema's own constraint rejects it.
+    // this test module's own doc comment for why).
     state
         .replica_coordinator
         .file_index_repository()
-        .upsert_file_with_origin_and_author(
+        .upsert_file_with_origin(
             GROUP,
             &yadorilink_replica_domain::file::FileRecord {
                 path: "held.txt".to_string(),
@@ -118,7 +105,6 @@ async fn a_held_path_is_re_examined_and_cleared_by_the_sweep_alone() {
                 deleted: false,
             },
             "device-a",
-            &change.change_hash(),
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
@@ -207,15 +193,14 @@ fn seed_owner_unreadable_file_needing_an_xattr(
         },
     );
     let key = SigningKey::from_bytes(&[82u8; 32]);
-    let change = admit_change(state, "device-a", &key, path, &version);
+    admit_change(state, "device-a", &key, path, &version);
     state
         .replica_coordinator
         .file_index_repository()
-        .upsert_file_with_origin_and_author(
+        .upsert_file_with_origin(
             GROUP,
             &crate::local_convergence::types::file_record_from_version(path, &version),
             "device-a",
-            &change.change_hash(),
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();

@@ -17,10 +17,9 @@ struct NoopHost;
 impl LinkRuntimeHostPort for NoopHost {
     fn note_capture_settled(&self, _group_id: &str) {}
 
-    fn broadcast_change<'a>(
+    fn on_local_native_commit<'a>(
         &'a self,
         _group_id: &'a str,
-        _records: Vec<FileRecord>,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async {})
     }
@@ -45,10 +44,9 @@ impl LinkRuntimeHostPort for RecordingHost {
         self.settled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
-    fn broadcast_change<'a>(
+    fn on_local_native_commit<'a>(
         &'a self,
         _group_id: &'a str,
-        _records: Vec<FileRecord>,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         self.broadcasts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Box::pin(async {})
@@ -361,7 +359,7 @@ async fn flush_case_fold_sibling_returns_retry_required_when_the_channel_stays_f
     assert_eq!(outcome, PendingLocalFlushOutcome::RetryRequired);
 }
 
-/// Seeds a `Placeholder`-state row for `path` in `deps`'s index
+/// Seeds a `Remote`-state row for `path` in `deps`'s index
 /// (`ensure_windows_placeholder_generation` requires the row to
 /// already exist -- `record_placeholder_generation`'s own `UPDATE`
 /// affects zero rows and returns `NotFound` otherwise), independent of
@@ -379,7 +377,7 @@ fn seed_placeholder_row(deps: &LinkRuntimeDependencies, group_id: &str, path: &s
         .set_materialization_state(
             group_id,
             path,
-            yadorilink_replica_domain::session_state::MaterializationState::Placeholder,
+            yadorilink_replica_domain::session_state::MaterializationState::Remote,
             &permit,
         )
         .unwrap();

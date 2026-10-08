@@ -20,8 +20,8 @@ fn current_version_of(coordinator: &ReplicaCoordinator, path: &str) -> VersionHa
         .version_hash
 }
 
-/// Leaves the row exactly as `open_projected_upserts_batch` does
-/// before the physical write: the transient state the finalizer's
+/// Leaves the row as an ordinary batch does before the physical
+/// write: the transient state the finalizer's
 /// guard expects to still find.
 fn open_the_batch_row(coordinator: &ReplicaCoordinator, path: &str, permit: &RootCommitPermit) {
     coordinator
@@ -87,8 +87,6 @@ fn an_observed_eager_batch_write_publishes_a_versioned_proof_under_its_own_epoch
         version_hash,
         mutation_generation: n,
         observed_identity: Some(identity),
-        causal_basis: coordinator.dag_group_heads("group-1").unwrap(),
-        expected_authoring: None,
         expected_state: yadorilink_peer_session::ports::MATERIALIZATION_IN_FLIGHT_STATE,
     }];
 
@@ -163,8 +161,6 @@ fn an_unobserved_eager_batch_write_still_publishes_a_versioned_proof_under_its_o
         version_hash,
         mutation_generation: n,
         observed_identity: None,
-        causal_basis: coordinator.dag_group_heads("group-1").unwrap(),
-        expected_authoring: None,
         expected_state: yadorilink_peer_session::ports::MATERIALIZATION_IN_FLIGHT_STATE,
     }];
 
@@ -241,7 +237,6 @@ fn an_eager_batch_write_that_loses_its_publish_cas_keeps_its_materialization_int
     let n = coordinator
         .dag_bump_mutation_fence("group-1", "doc.txt", "ordinary_batch_upsert_write")
         .unwrap();
-    let basis = coordinator.dag_group_heads("group-1").unwrap();
 
     // Someone else mutates this path between the batch's write and its
     // commit, so the epoch the batch is holding is no longer current.
@@ -261,8 +256,6 @@ fn an_eager_batch_write_that_loses_its_publish_cas_keeps_its_materialization_int
         version_hash,
         mutation_generation: n,
         observed_identity: Some(identity),
-        causal_basis: basis,
-        expected_authoring: None,
         expected_state: yadorilink_peer_session::ports::MATERIALIZATION_IN_FLIGHT_STATE,
     }];
 
@@ -298,10 +291,10 @@ fn an_eager_batch_write_that_loses_its_publish_cas_keeps_its_materialization_int
 
 /// A batch spans many paths and takes real time. The finalizer used to
 /// commit whatever the write produced against whatever the row had
-/// become, guarded only by the mutation fence -- which a DAG-side
+/// become, guarded only by the mutation fence -- which a native-side
 /// supersession does not touch. So a path superseded while its batch
 /// was still writing had the older version's bytes on disk stamped
-/// `Hydrated` and proven current.
+/// `Present` and proven current.
 ///
 /// The guard is the row itself, recomputed inside the commit's own
 /// transaction: the version the finalizer is publishing for must still
@@ -333,7 +326,7 @@ fn an_eager_batch_write_superseded_during_the_batch_publishes_nothing() {
 
     // A newer version lands for the same path while this batch is
     // still publishing its other paths' temp files. The fence is
-    // untouched -- this is a DAG-side supersession, not a physical
+    // untouched -- this is a native-side supersession, not a physical
     // mutation -- so the fence CAS alone would still succeed.
     let superseding = FileRecord {
         path: "doc.txt".into(),
@@ -355,8 +348,6 @@ fn an_eager_batch_write_superseded_during_the_batch_publishes_nothing() {
         version_hash,
         mutation_generation: n,
         observed_identity: None,
-        causal_basis: coordinator.dag_group_heads("group-1").unwrap(),
-        expected_authoring: None,
         expected_state: yadorilink_peer_session::ports::MATERIALIZATION_IN_FLIGHT_STATE,
     }];
 
@@ -389,7 +380,7 @@ fn an_eager_batch_write_superseded_during_the_batch_publishes_nothing() {
     );
     assert_ne!(
         left_as,
-        Some(yadorilink_replica_domain::session_state::MaterializationState::Hydrated),
+        Some(yadorilink_replica_domain::session_state::MaterializationState::Present),
         "and what the batch left there in the first place is not the exact claim: these \
          bytes were never proven, and now never will be"
     );
@@ -440,8 +431,6 @@ fn an_eager_batch_write_publishes_the_hash_the_desired_resolution_will_be_compar
         version_hash,
         mutation_generation: n,
         observed_identity: None,
-        causal_basis: coordinator.dag_group_heads("group-1").unwrap(),
-        expected_authoring: None,
         expected_state: yadorilink_peer_session::ports::MATERIALIZATION_IN_FLIGHT_STATE,
     }];
 

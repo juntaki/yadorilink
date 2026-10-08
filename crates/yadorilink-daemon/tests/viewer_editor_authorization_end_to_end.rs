@@ -351,7 +351,7 @@ async fn pre_existing_content_initial_import_scenario(role: WriterRole, expect_s
              unchanged content"
         );
         assert_eq!(
-            daemon_b.state.replica_coordinator.sqlite().dag_group_heads(&group_id).unwrap().len(),
+            support::native_group_head_set(&daemon_b.state, &group_id).len(),
             1,
             "an Editor-granted device's initial import must commit exactly one head locally"
         );
@@ -370,7 +370,7 @@ async fn pre_existing_content_initial_import_scenario(role: WriterRole, expect_s
         // Pending head; only checkpoint issuance (and thus sync to A)
         // is withheld.
         assert_eq!(
-            daemon_b.state.replica_coordinator.sqlite().dag_group_heads(&group_id).unwrap().len(),
+            support::native_group_head_set(&daemon_b.state, &group_id).len(),
             1,
             "local emission is unconditional -- a Viewer-granted device's pre-existing content \
              must still be committed to its own local signed change history as a Pending head"
@@ -698,8 +698,8 @@ async fn a_downgraded_authors_pre_downgrade_history_still_reaches_a_newly_joined
     // endpoints the coordination plane lists.
     daemon_author
         .state
-        .reconciliation_driver()
-        .expect("the author's orchestrator has started its reconciliation driver")
+        .peer_session_driver()
+        .expect("the author's orchestrator has started its peer session driver")
         .stack()
         .shutdown()
         .await;

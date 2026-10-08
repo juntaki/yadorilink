@@ -131,7 +131,7 @@ async fn eviction_without_remote_lease_never_reaches_physical_reclaim() {
         .set_materialization_state(
             "group-a",
             "evicted.txt",
-            yadorilink_replica_domain::session_state::MaterializationState::Hydrated,
+            yadorilink_replica_domain::session_state::MaterializationState::Present,
             &permit,
         )
         .unwrap();
@@ -373,6 +373,25 @@ async fn idle_sweep_fires_once_idle_past_the_threshold() {
     assert!(state.gc.last_run_unix() > 0, "a real sweep must record its completion time");
 }
 
+/// Native replication is the daemon's peer-reconciliation activity: once a
+/// peer connection reports that it admitted deltas (or joined a recovery
+/// bundle), the idle scheduler must wait out a fresh idle period instead of
+/// sweeping in the middle of a sync.
+#[tokio::test]
+async fn idle_sweep_waits_out_native_replication_activity() {
+    let (state, _dir) = test_state();
+    state.set_last_activity_unix_for_test(now_unix() - 3600);
+    let env = crate::native_replication_runtime::env_for_peer(&state, "device-peer");
+
+    (env.activity)();
+    let outcome = maybe_run_idle_sweep(&state, Duration::from_secs(60)).await;
+
+    assert!(
+        outcome.is_none(),
+        "peer replication activity must restart the idle period, got {outcome:?}"
+    );
+}
+
 /// a daemon idle past the threshold, but with sync activity
 /// actively in progress right now, still must not sweep — idle-ness
 /// alone is not sufficient; the two conditions are independent —
@@ -451,4 +470,68 @@ async fn real_sweep_deletes_and_records_last_run_bookkeeping() {
     assert_eq!(state.gc.last_blocks_deleted(), 1);
     assert_eq!(state.gc.last_bytes_reclaimed(), report.bytes_reclaimed);
     assert_eq!(state.gc.reclaimable_estimate_bytes(), 0);
+}
+
+/// A replica whose index references nothing while the block store is full
+/// looks exactly like a replica whose database was lost. The automatic idle
+/// sweep must not read that as "everything is garbage"; only an explicit
+/// on-demand `gc` may reclaim in that state.
+#[tokio::test]
+async fn idle_sweep_refuses_an_empty_live_set_over_a_populated_store() {
+    let (state, _dir) = test_state();
+    let hash = state.block_store.put(b"a block the index no longer references").unwrap();
+    let future_cutoff = SystemTime::now() + Duration::from_secs(1);
+
+    let outcome = run_idle_sweep_with_grace_cutoff(state.clone(), future_cutoff).await;
+
+    assert!(
+        matches!(outcome, Err(GcTriggerError::Failed(_))),
+        "an idle sweep over an empty live set must refuse, got {outcome:?}"
+    );
+    assert!(state.block_store.exists(&hash).unwrap(), "the block must survive");
+    assert_eq!(state.gc.last_run_unix(), 0, "a refused sweep is not a completed sweep");
+
+    let report = run_sweep_with_grace_cutoff(state.clone(), false, future_cutoff).await.unwrap();
+    assert_eq!(report.blocks_deleted, 1, "an explicit on-demand sweep still reclaims");
+}
+
+/// The blocks a recovery item holds are roots of the real sweep: the item may be the last
+/// copy of a version the group dropped, and nothing but its discard may release the blocks. A
+/// block no row and no item names is still reclaimed, so the sweep is not simply keeping
+/// everything.
+#[tokio::test]
+async fn the_real_sweep_keeps_the_blocks_a_recovery_item_holds() {
+    let (state, _dir) = test_state();
+    let held = state.block_store.put(b"the only copy of a dropped version").unwrap();
+    let loose = state.block_store.put(b"referenced by nothing at all").unwrap();
+    state
+        .replica_coordinator
+        .database()
+        .write::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+            conn.execute(
+                "INSERT INTO native_recovery_item \
+                 (group_id, item_id, kind, path, author_device, author_incarnation, seq, \
+                  provenance, version_hash, content, size, content_sha256, retained_blocks, \
+                  source_recovery_id, created_at) \
+                 VALUES ('group-a', ?1, 'remote_only', 'gone.txt', 'device-b', ?2, 1, ?3, ?4, \
+                         'unavailable', 0, ?5, ?6, 'recovery', 0)",
+                rusqlite::params![
+                    "a".repeat(64),
+                    vec![0u8; 16],
+                    vec![1u8; 32],
+                    vec![2u8; 32],
+                    vec![3u8; 32],
+                    serde_json::to_string(&[&held]).unwrap(),
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let future_cutoff = SystemTime::now() + Duration::from_secs(1);
+
+    let report = run_idle_sweep_with_grace_cutoff(state.clone(), future_cutoff).await.unwrap();
+
+    assert!(state.block_store.exists(&held).unwrap(), "the item's block must survive the sweep");
+    assert!(!state.block_store.exists(&loose).unwrap(), "an unreferenced block is reclaimed");
+    assert_eq!(report.blocks_deleted, 1);
 }

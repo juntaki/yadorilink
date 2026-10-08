@@ -534,7 +534,12 @@ async fn a_device_grant_polls_past_pending_and_slow_down_to_a_token() {
     assert!(client.metadata().supports_device_grant());
     let authorization =
         client.request_device_authorization("openid offline_access").await.expect("device auth");
-    assert!(authorization.instructions().contains("BCDF-GHJK-LMNP"));
+    let printed = authorization.instructions();
+    assert!(printed.contains("BCDF-GHJK-LMNP"));
+    assert!(
+        printed.contains(&format!("{}/device?user_code=BCDF-GHJK-LMNP", server.uri())),
+        "the completed verification URI the server sent must be the printed link: {printed}"
+    );
 
     let tokens = client.complete_device_authorization(&authorization).await.expect("granted");
     assert_eq!(tokens.access_token(), "at-device");
@@ -656,4 +661,102 @@ async fn a_server_this_client_cannot_use_is_refused_at_discovery() {
     .expect_err("this client cannot authenticate against that server");
     assert!(matches!(err, Error::UnsupportedServer(_)), "got {err}");
     assert!(err.to_string().contains("private_key_jwt"), "got {err}");
+}
+
+// --- a crash between the server's rotation and the durable write ------------
+
+/// The server rotates the token and the process dies before its write lands, so
+/// the disk still holds the token the server just retired. Nothing the dying
+/// process does can prevent that; what the restarted one does must be
+/// ordinary: present what the disk holds. The server accepts a re-presented
+/// token for a short window while its successor has gone unused, so the
+/// restarted client needs no recovery code of its own -- and, because every
+/// process uses a fresh DPoP key, the contract cannot depend on the key that
+/// obtained the token.
+#[tokio::test]
+async fn a_restart_after_a_lost_rotation_response_recovers_by_presenting_what_the_disk_holds() {
+    let server = MockServer::start().await;
+    serve_discovery(&server, false).await;
+    let presentations = std::sync::atomic::AtomicUsize::new(0);
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_string_contains("refresh_token=rt-1"))
+        .respond_with(move |_: &Request| {
+            // First presentation rotates to rt-2; a re-presentation inside the
+            // server's recovery window replaces the unconfirmed rt-2.
+            let n = presentations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let successor = if n == 0 { "rt-2" } else { "rt-2-recovered" };
+            ResponseTemplate::new(200).set_body_json(token_body("at", successor, 300))
+        })
+        .mount(&server)
+        .await;
+
+    let enrolled = enrol(&server.uri(), "rt-1").await;
+
+    // The first process: the server answers, and the process dies before the
+    // write. A `Detach` that never runs the closure is that death -- the
+    // closure is dropped, the manager's own contract violation panics the
+    // task, and the disk is untouched.
+    let doomed: yadorilink_fapi_client::Detach = Arc::new(drop);
+    let first = Arc::new(manager(&server, &enrolled).await.with_detach(doomed));
+    let died = tokio::spawn(async move { first.access_token().await }).await;
+    assert!(died.is_err(), "the first process did not die before persisting");
+    assert_eq!(
+        enrolled.store.load().expect("load").expect("enrolled").refresh_token(),
+        "rt-1",
+        "the write never happened, so the disk holds the retired token"
+    );
+
+    // The restart: a fresh manager, hence a fresh DPoP key, doing the ordinary
+    // thing.
+    let restarted = manager(&server, &enrolled).await;
+    assert_eq!(restarted.access_token().await.expect("recovery refresh"), "at");
+    assert_eq!(
+        enrolled.store.load().expect("load").expect("enrolled").refresh_token(),
+        "rt-2-recovered",
+        "a recovery response is persisted exactly like a normal rotation"
+    );
+
+    let requests = server.received_requests().await.expect("recorded");
+    let proofs: Vec<String> =
+        requests.iter().filter(|r| r.url.path() == "/token").map(proof_jkt).collect();
+    assert_eq!(proofs.len(), 2);
+    assert_ne!(proofs[0], proofs[1], "each process proves its own DPoP key");
+}
+
+/// There is no retry loop to storm with: a failed refresh is one request, the
+/// store is untouched, and the caller's next attempt presents the same token --
+/// which the server's recovery window makes safe to re-present.
+#[tokio::test]
+async fn a_failed_refresh_is_one_request_and_leaves_the_stored_token_to_be_presented_again() {
+    let server = MockServer::start().await;
+    serve_discovery(&server, false).await;
+    let attempts = std::sync::atomic::AtomicUsize::new(0);
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_string_contains("refresh_token=rt-1"))
+        .respond_with(move |_: &Request| {
+            if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(503)
+            } else {
+                ResponseTemplate::new(200).set_body_json(token_body("at-1", "rt-2", 300))
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let enrolled = enrol(&server.uri(), "rt-1").await;
+    let manager = manager(&server, &enrolled).await;
+
+    assert!(manager.access_token().await.is_err());
+    let after_failure = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        after_failure.iter().filter(|r| r.url.path() == "/token").count(),
+        1,
+        "one failed refresh must be one request"
+    );
+    assert_eq!(enrolled.store.load().expect("load").expect("enrolled").refresh_token(), "rt-1");
+
+    assert_eq!(manager.access_token().await.expect("second attempt"), "at-1");
+    assert_eq!(enrolled.store.load().expect("load").expect("enrolled").refresh_token(), "rt-2");
 }

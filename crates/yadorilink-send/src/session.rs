@@ -759,8 +759,14 @@ impl SendService {
         // netmap/sync authorization must never be sufficient on its own to
         // receive a Send.
         let (grant_id, grant_nonce) = grant.unwrap_or_default();
-        if let Err(reason) = self.directory.consume_grant(&grant_id, &grant_nonce, &peer_key).await
-        {
+        let verdict = match self.directory.consume_grant(&grant_id, &grant_nonce, &peer_key).await {
+            // An authorized sender's manifest is still the sender's claim: it
+            // sizes the allocations of the pull, so it must be consistent
+            // before it is recorded.
+            Ok(()) => crate::manifest::validate_offered_manifest(&manifest),
+            Err(reason) => Err(reason),
+        };
+        if let Err(reason) = verdict {
             write_message(send, &SendManifestAck { accepted: false, reason: reason.clone() })
                 .await?;
             send.finish().ok();

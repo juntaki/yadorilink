@@ -1,7 +1,6 @@
 //! The Convergence Engine's scheduler loop: claims every currently-runnable
-//! `projection_obligations` row (bumped by DAG admission — `dag_store::
-//! admit_change`/`admit_prepared_emission` — not enqueued by `PeerSyncSession
-//! ::handle_change_batch`, which no longer schedules anything at all) and
+//! `projection_obligations` row (bumped by native admission, not enqueued by the
+//! peer session, which does not schedule anything) and
 //! drives them to completion on its own schedule, using the SAME
 //! `reconcile_local_materialization_audit` / `reconcile_group_paths` /
 //! `materialize` machinery this codebase already had and already tests --
@@ -35,8 +34,6 @@ use std::time::Duration;
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
 
-use yadorilink_replica_domain::ids::ChangeHash;
-
 use crate::daemon_state::{run_blocking_sweep_offloaded, DaemonState};
 
 use super::backoff::next_backoff;
@@ -68,23 +65,40 @@ const FALLBACK_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// How many groups' audits run concurrently. Without this, `run_once`
 /// processing groups one at a time meant one group with many slow, blocked
 /// (sole-source-unreachable) attempts could hold up every other group's
-/// otherwise-instant materialization for the whole tick — CONV-1 keeps
-/// message *intake* unblocked, but the engine itself would still have its
+/// otherwise-instant materialization for the whole tick — message
+/// *intake* is kept unblocked separately, but the engine itself would still have its
 /// own head-of-line blocking across groups without this. Kept small (not
 /// unbounded) since each group audit can itself spend real wall-clock time
 /// in a block fetch; a handful of groups stalled on unreachable sources
 /// should not turn into an unbounded fan-out of blocked network attempts.
 const MAX_CONCURRENT_GROUP_AUDITS: usize = 4;
 
-/// Bounded per-attempt path budget: handing an entire claimed batch of
-/// paths to a single `reconcile_paths_directly` call processes every
-/// path's blocks fully serially, and a large backlog of
-/// not-yet-referenced/genuinely-missing blocks can accumulate into a 40+
-/// second single call with no intermediate progress. Capping how many paths one attempt is asked to resolve, and
-/// rotating which bounded subset gets the attempt each tick, bounds a
-/// single call's worst case while still giving every path its turn across
-/// a few ticks. Used by `process_group_via_obligations`.
-const MAX_PATHS_PER_RECONCILE_ATTEMPT: usize = 8;
+/// Bounded per-attempt path budget: how many paths one candidate attempt is
+/// asked to resolve. Capping it, and rotating which bounded subset gets the
+/// attempt each tick, bounds a single call's worst case while still giving
+/// every path its turn across a few ticks. Used by
+/// `process_group_via_obligations`.
+///
+/// The window was 8 while an attempt fetched its paths' blocks serially, and
+/// a large backlog accumulated into 40+ second calls with no intermediate
+/// progress. Fetching now overlaps across paths and the settle is
+/// concurrent, so a wider window no longer lengthens an attempt in
+/// proportion. Measured on a 15,000-file receive: 8 -> 126 files/s,
+/// 16 -> 177, 32 -> 229, 64 -> 255-280, at the price of a longer window wall
+/// time (mean about 200 ms, tail past 500 ms at 64). 32 is the default: most
+/// of the gain, with a bounded tail. It matches the receive write
+/// concurrency and the prefetch budget, so the window is not the binding
+/// limit by default.
+const MAX_PATHS_PER_RECONCILE_ATTEMPT: usize = 32;
+
+/// Largest window any override can select. A claim takes at most
+/// `MAX_JOBS_PER_TICK_PER_GROUP` jobs per group; a window covering the whole
+/// claim leaves no deferred work, so the engine sleeps until its fallback
+/// poll after every window (measured: 128-path window = 92 files/s against
+/// 255 at 64). Half the claim cap keeps deferred work on hand.
+const MAX_RECONCILE_PATHS_OVERRIDE: usize = (MAX_JOBS_PER_TICK_PER_GROUP / 2) as usize;
+
+const _: () = assert!(MAX_PATHS_PER_RECONCILE_ATTEMPT <= MAX_RECONCILE_PATHS_OVERRIDE);
 
 /// `MAX_PATHS_PER_RECONCILE_ATTEMPT`, with a diagnostic override.
 ///
@@ -109,6 +123,8 @@ const MAX_PATHS_PER_RECONCILE_ATTEMPT: usize = 8;
 /// rebuild. Invalid or absent falls back to the compiled default, so an
 /// unset environment behaves exactly as before this existed.
 ///
+/// An override is clamped to `MAX_RECONCILE_PATHS_OVERRIDE`.
+///
 /// The unit tests in this module deliberately keep using the `const`: they
 /// pin the shipped default's behaviour, and should not start tracking
 /// whatever a sweep happens to have exported.
@@ -129,7 +145,7 @@ const RECONCILE_PATHS_VAR: &str = "YADORILINK_DIAGNOSTIC_RECONCILE_PATHS";
 fn parse_reconcile_paths(raw: Option<&str>) -> usize {
     raw.and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
-        .unwrap_or(MAX_PATHS_PER_RECONCILE_ATTEMPT)
+        .map_or(MAX_PATHS_PER_RECONCILE_ATTEMPT, |n| n.min(MAX_RECONCILE_PATHS_OVERRIDE))
 }
 
 fn now_unix_nanos() -> i64 {
@@ -309,7 +325,7 @@ fn majority_author(authors: impl IntoIterator<Item = String>) -> Option<String> 
 /// content this attempt is actually trying to materialize, correct even
 /// across a divergent-branch/conflict-copy resolution where "the change
 /// that first bumped the obligation's generation" could name a losing
-/// branch's author instead. `session` only needs to be ABLE to resolve DAG
+/// branch's author instead. `session` only needs to be ABLE to resolve native
 /// state (`diagnostic_path_heads`'s own doc comment: "identical result
 /// regardless of which peer session it's called through — this reads
 /// purely local state"), so the caller may pass whichever session it
@@ -326,15 +342,13 @@ fn origin_candidate_index_for_obligations<S>(
     budget: &BTreeSet<String>,
     candidates: &[(String, S)],
 ) -> Option<usize> {
-    let authors = budget.iter().filter_map(|path| {
-        let heads = local.combined_heads(group_id, path, None).ok()?;
-        match yadorilink_replica_engine::conflict::resolve_path_heads(path, &heads) {
-            yadorilink_replica_engine::conflict::PathResolution::Present { winner, .. } => {
-                heads.get(winner).map(|head| head.device_id.clone())
-            }
-            yadorilink_replica_engine::conflict::PathResolution::Absent => None,
-        }
-    });
+    let authors =
+        budget.iter().filter_map(|path| match local.native_planned_node(group_id, path).ok()? {
+            Some(yadorilink_replica_domain::native_plan::NativePlannedNode::Entry {
+                head, ..
+            }) => Some(head.dot().author.device.0.clone()),
+            _ => None,
+        });
     let author = majority_author(authors)?;
     candidates.iter().position(|(device_id, _)| *device_id == author)
 }
@@ -493,7 +507,7 @@ async fn run_once(engine: &ConvergenceEngine) -> RunOnceOutcome {
     while next_idx < group_ids.len() && in_flight.len() < MAX_CONCURRENT_GROUP_AUDITS {
         let group_id = group_ids[next_idx].clone();
         let obligations = obligations_by_group.remove(&group_id).unwrap_or_default();
-        in_flight.push(process_group_via_obligations(engine, group_id, obligations, None, None));
+        in_flight.push(process_group_via_obligations(engine, group_id, obligations, None));
         next_idx += 1;
     }
     while let Some(outcome) = in_flight.next().await {
@@ -503,13 +517,7 @@ async fn run_once(engine: &ConvergenceEngine) -> RunOnceOutcome {
         if next_idx < group_ids.len() {
             let group_id = group_ids[next_idx].clone();
             let obligations = obligations_by_group.remove(&group_id).unwrap_or_default();
-            in_flight.push(process_group_via_obligations(
-                engine,
-                group_id,
-                obligations,
-                None,
-                None,
-            ));
+            in_flight.push(process_group_via_obligations(engine, group_id, obligations, None));
             next_idx += 1;
         }
     }
@@ -591,128 +599,10 @@ struct ProcessGroupOutcome {
     deferred_runnable: bool,
 }
 
-/// A test-only rendezvous letting a deterministic-interleaving test pause
-/// a worker at the exact instant it has decided to close a path's exact
-/// obligation -- after its settlement evidence is computed and (in
-/// `complete_one_obligation`) its proof already published, and immediately
-/// before it calls the owner's exact completion
-/// (`ReplicaCoordinator::complete_obligation_exact`; in
-/// `complete_zero_work_obligation` nothing is published first) -- so the
-/// test can interleave an independent mutator's own fence bump in between,
-/// then release the worker to observe whether that completion correctly
-/// fails. The non-exact completion arm never pauses. Never constructed
-/// in production: every call site that consults one takes
-/// `Option<&Arc<BeforeCompletionHook>>` and is a no-op when `None`, which
-/// is what every non-hooked caller (every live production path, plus the
-/// existing `drive_obligations_once_for_test`) passes. Not itself
-/// `cfg`-gated (unlike most of this module's obligation-driven-worker
-/// code): `process_group_via_obligations` -- the always-live scheduler --
-/// takes one as a parameter, so the type must be nameable in a plain
-/// production build even though nothing in production ever builds one.
-///
-/// A bare `Notify` is not enough here: signaling "I'm parked" and "you may
-/// proceed" are two independent directions, and a single `Notify` cannot
-/// represent both without a race between the worker's own wait and the
-/// test's own notify potentially landing before the worker starts
-/// listening. Two `Notify`s give each direction its own, order-independent
-/// signal.
-pub struct BeforeCompletionHook {
-    parked: tokio::sync::Notify,
-    proceed: tokio::sync::Notify,
-}
-
-/// Test-only rendezvous, kept as permanent regression-test infrastructure
-/// for `unrelated_path_head_movement_must_not_discard_an_already_settled_
-/// attempt` (the heads-stability-fence removal this hook was built to
-/// pin -- that fence is gone from production code, but this hook is what
-/// lets the regression test park a candidate attempt at the exact window
-/// the old fence used to gate, so the test keeps proving the fence stays
-/// gone). Same rendezvous shape as [`BeforeCompletionHook`], but for the OTHER,
-/// earlier pause point `process_group_via_obligations` has -- immediately
-/// after one candidate's `reconcile_paths_directly` attempt has resolved
-/// (desired state/evidence computed for every claimed path in that
-/// attempt), and immediately before the group's `dag_group_heads` is
-/// re-read to decide `before == after`. `BeforeCompletionHook` cannot reach
-/// this window: it only pauses once `before == after` has ALREADY been
-/// checked and passed, so it can never let a test interleave a change
-/// admission that the heads-stability fence itself should observe. Never
-/// constructed in production, same as `BeforeCompletionHook`.
-pub struct BeforeHeadsAfterHook {
-    parked: tokio::sync::Notify,
-    proceed: tokio::sync::Notify,
-}
-
-impl BeforeHeadsAfterHook {
-    async fn pause(&self) {
-        self.parked.notify_one();
-        self.proceed.notified().await;
-    }
-}
-
-// Construction and the test-side drive (`wait_parked`/`resume`) are only
-// ever reached from this module's own `#[cfg(test)] mod tests` -- unlike
-// `BeforeCompletionHook`, this hook has no `test-support`-feature re-export
-// for an external test crate to construct one, so (unlike `pause` above,
-// which every non-hooked production caller reaches unconditionally) these
-// are genuinely dead outside a `cfg(test)` build.
-#[cfg(test)]
-impl BeforeHeadsAfterHook {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self { parked: tokio::sync::Notify::new(), proceed: tokio::sync::Notify::new() })
-    }
-
-    pub async fn wait_parked(&self) {
-        self.parked.notified().await;
-    }
-
-    pub fn resume(&self) {
-        self.proceed.notify_one();
-    }
-}
-
-impl BeforeCompletionHook {
-    /// Called from inside the worker, immediately before it issues its
-    /// completion CAS: announces that it has parked, then waits for the
-    /// test to call [`Self::resume`].
-    ///
-    /// Ungated, unlike the rest of this type's methods, because the worker
-    /// reaches it through a plain `Option<&Arc<BeforeCompletionHook>>`
-    /// parameter that is `None` in production -- the call site is ordinary
-    /// production code, so removing this method outside test builds would
-    /// stop the crate compiling.
-    async fn pause(&self) {
-        self.parked.notify_one();
-        self.proceed.notified().await;
-    }
-}
-
-// The driving half. Only a test ever constructs a hook or steps it, so
-// outside a build that can construct one these are dead -- gated to match
-// `engine_wrapper`'s re-export of the type exactly, rather than the plain
-// `cfg(test)` that fits `BeforeHeadsAfterHook` above: this hook IS
-// re-exported under the `test-support` feature for tests living outside
-// this crate, and gating on `test` alone would break them.
-#[cfg(any(test, feature = "test-support"))]
-impl BeforeCompletionHook {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self { parked: tokio::sync::Notify::new(), proceed: tokio::sync::Notify::new() })
-    }
-
-    /// Called from the test: blocks until the worker has actually reached
-    /// its `pause()` call (not merely until the worker task was spawned),
-    /// so the test's own subsequent fence bump is guaranteed to land while
-    /// the worker is genuinely parked, never before it gets there.
-    pub async fn wait_parked(&self) {
-        self.parked.notified().await;
-    }
-
-    /// Called from the test, after its own interleaved mutation has
-    /// committed: releases the parked worker to proceed to its completion
-    /// CAS.
-    pub fn resume(&self) {
-        self.proceed.notify_one();
-    }
-}
+/// The test-only rendezvous at a claimed path's completion. It now lives
+/// with the claims it rides on, because the eager content write closes its
+/// obligation inside its own commit; see its own doc comment.
+pub use crate::local_convergence::obligation_claims::BeforeCompletionHook;
 
 /// Closes one path's claimed obligation against the evidence
 /// `reconcile_paths_directly` just settled it with, publishing first for an
@@ -722,6 +612,10 @@ impl BeforeCompletionHook {
 /// leaves the obligation outstanding for a later claim to re-resolve from
 /// scratch — never treated as this path's final word: a rejected
 /// publication must not close its obligation.
+///
+/// Not reached for a path whose lane already decided its obligation in the
+/// commit that published its proof (a received file's content write): the
+/// caller skips those.
 // Each parameter is independently meaningful obligation-completion context;
 // grouping into a params struct is out of scope for a lint cleanup.
 #[allow(clippy::too_many_arguments)]
@@ -732,7 +626,6 @@ async fn complete_one_obligation(
     claimed_generation: i64,
     claimed_incarnation: i64,
     evidence: &crate::local_convergence::types::SettlementEvidence,
-    causal_basis: &[ChangeHash],
     hooks: Option<&Arc<BeforeCompletionHook>>,
 ) {
     use crate::local_convergence::types::SettlementEvidence;
@@ -741,7 +634,6 @@ async fn complete_one_obligation(
     if let Some((exact_state, expected_mutation_generation)) = evidence.as_exact_actual_state() {
         let group_id_owned = group_id.to_string();
         let path_owned = path.to_string();
-        let causal_basis_owned = causal_basis.to_vec();
         let exact_state_for_publish = exact_state.clone();
         // The proof is published after whatever physical work it is
         // about, so the root is re-verified inside the publishing
@@ -764,7 +656,6 @@ async fn complete_one_obligation(
             state.replica_coordinator.dag_publish_materialized_generation_if_fence_current(
                 &group_id_owned,
                 &path_owned,
-                &causal_basis_owned,
                 exact_state_for_publish,
                 expected_mutation_generation,
                 &operation.permit(),
@@ -831,7 +722,7 @@ async fn complete_one_obligation(
         }
     } else {
         let kind = match evidence {
-            SettlementEvidence::PolicyPlaceholder => NonExactProofKind::Placeholder,
+            SettlementEvidence::PolicyRemote => NonExactProofKind::ContentNotOwed,
             SettlementEvidence::HazardHeld { .. } => NonExactProofKind::HazardHeld,
             SettlementEvidence::IgnoreExcluded => NonExactProofKind::IgnoreExcluded,
             SettlementEvidence::Retained { .. } => NonExactProofKind::RetainedDirectory,
@@ -985,7 +876,6 @@ async fn process_group_via_obligations(
     group_id: String,
     claimed: Vec<yadorilink_sync_sqlite::projection_obligations::ClaimedObligation>,
     hooks: Option<&Arc<BeforeCompletionHook>>,
-    heads_hook: Option<&Arc<BeforeHeadsAfterHook>>,
 ) -> ProcessGroupOutcome {
     let state = &engine.state;
     if claimed.is_empty() {
@@ -1013,6 +903,13 @@ async fn process_group_via_obligations(
         claimed.iter().map(|c| (c.path.clone(), c.obligation_incarnation)).collect();
     let claimed_attempt: BTreeMap<String, i64> =
         claimed.iter().map(|c| (c.path.clone(), c.attempt_count)).collect();
+    // The same claims, carried into the attempt: a lane that closes a path's
+    // obligation in the same transaction as its proof needs the token, and
+    // the loop below must then skip that path.
+    let lane_claims = crate::local_convergence::obligation_claims::ObligationClaims::new(
+        claimed.iter().map(|c| (c.path.clone(), c.token())).collect(),
+        hooks.cloned(),
+    );
     // Per-tick cost attribution: feeds the slow-obligation-tick alarm
     // below. Throughput here is (paths resolved per tick) / (tick
     // duration), and only the first factor is visible from the outside -- it
@@ -1030,8 +927,8 @@ async fn process_group_via_obligations(
     // much gets CLAIMED per tick, not how much one attempt is asked to
     // resolve in a single call. Chosen BEFORE the zero-work pre-check below
     // (not after, as an earlier version of this function did): a zero-work
-    // resolution is itself a real per-path DAG-ancestry walk
-    // (`combined_heads`), not a free operation, so pre-checking every one
+    // resolution is itself a real per-path head resolution,
+    // not a free operation, so pre-checking every one
     // of up to 128 claimed paths when at most `MAX_PATHS_PER_RECONCILE_
     // ATTEMPT` of them can ever reach a real reconcile attempt this tick
     // was an up-to-16x resolution amplification with no corresponding
@@ -1191,32 +1088,24 @@ async fn process_group_via_obligations(
         }
         tried += 1;
         let (_, session) = &candidates[candidate_index];
-        let heads_before = run_blocking_sweep_offloaded(|| {
-            state.replica_coordinator.sqlite().dag_group_heads(&group_id)
-        });
         let local = state.peers.local_convergence(&candidates[candidate_index].0);
         let attempt_result =
             match local {
                 Some(local) => local
-                    .reconcile_paths_directly(
+                    .reconcile_claimed_paths(
                         &(session.clone()
                             as std::sync::Arc<
                                 dyn yadorilink_peer_session::convergence_driver::ConvergenceDriver,
                             >),
                         &group_id,
                         remaining.clone(),
+                        &lane_claims,
                     )
                     .await,
                 None => Ok(None),
             };
-        if let Some(h) = heads_hook {
-            h.pause().await;
-        }
-        let heads_after = run_blocking_sweep_offloaded(|| {
-            state.replica_coordinator.sqlite().dag_group_heads(&group_id)
-        });
 
-        match (attempt_result, heads_before, heads_after) {
+        match attempt_result {
             // No group-wide `before == after` comparison gates publishing/
             // completing this attempt's settlements --
             // `unrelated_path_head_movement_must_not_discard_an_already_
@@ -1234,34 +1123,41 @@ async fn process_group_via_obligations(
             // `reconcile_paths_directly` call rare, so already-resolved
             // settlements would be repeatedly discarded for reasons
             // unconnected to the paths they targeted.
-            (Ok(Some(attempt)), Ok(before), Ok(_)) => {
+            Ok(Some(attempt)) => {
                 any_trustworthy_audit = true;
                 remaining.retain(|p| !attempt.path_fully_resolved(p));
                 for (path, evidence) in attempt.settled_with_evidence() {
+                    // Already decided under its claim, in the same commit
+                    // as its proof: closed, or left open because the claim
+                    // had been overtaken. Completing it again could only
+                    // repeat that answer.
+                    if lane_claims.decided_in_lane(path) {
+                        continue;
+                    }
+                    // Settled is not done: a conflict copy derived from this
+                    // path that still needs another attempt has no
+                    // obligation of its own, so closing this one would leave
+                    // the copy with nothing to retry it.
+                    if !attempt.path_fully_resolved(path) {
+                        continue;
+                    }
                     let Some(&claimed_g) = claimed_generation.get(path) else { continue };
                     let Some(&claimed_i) = claimed_incarnation.get(path) else { continue };
                     complete_one_obligation(
-                        state, &group_id, path, claimed_g, claimed_i, evidence, &before, hooks,
+                        state, &group_id, path, claimed_g, claimed_i, evidence, hooks,
                     )
                     .await;
                 }
             }
-            (Ok(None), _, _) => {
+            Ok(None) => {
                 // Skipped: guard contention or the group's link gate is no
                 // longer live. Leave `remaining` untouched.
             }
-            (Err(e), _, _) => {
+            Err(e) => {
                 tracing::warn!(
                     group_id = %group_id,
                     error = %e,
                     "obligation-driven reconciliation failed for this group"
-                );
-            }
-            (_, Err(e), _) | (_, _, Err(e)) => {
-                tracing::warn!(
-                    group_id = %group_id,
-                    error = %e,
-                    "obligation-driven driver failed to read this group's DAG heads"
                 );
             }
         }
@@ -1284,7 +1180,7 @@ async fn process_group_via_obligations(
     // Retry/backoff bookkeeping for every path still outstanding
     // (`remaining` never shrinks below what `path_fully_resolved` removed
     // above -- see that arm's own comment). A `HazardHeld`/`IgnoreExcluded`/
-    // `PolicyPlaceholder` settlement is never in `remaining` at all: it was
+    // `PolicyRemote` settlement is never in `remaining` at all: it was
     // `is_settled`, so `path_fully_resolved` already dropped it, and its own
     // dedicated liveness mechanism (the hazard-recheck sweep, the ignore-set
     // refresh) — not this generic backoff — owns re-arming it later. Only a
@@ -1367,7 +1263,6 @@ async fn drive_obligations_once_for_test_inner(
     per_group_limit: u32,
     total_limit: u32,
     hooks: Option<&Arc<BeforeCompletionHook>>,
-    heads_hook: Option<&Arc<BeforeHeadsAfterHook>>,
 ) -> bool {
     let state = &engine.state;
     let now = now_unix_nanos();
@@ -1393,8 +1288,7 @@ async fn drive_obligations_once_for_test_inner(
     }
     let mut any_healthy = false;
     for (group_id, group_claimed) in by_group {
-        let outcome =
-            process_group_via_obligations(engine, group_id, group_claimed, hooks, heads_hook).await;
+        let outcome = process_group_via_obligations(engine, group_id, group_claimed, hooks).await;
         any_healthy = any_healthy || outcome.audit_healthy;
     }
     any_healthy
@@ -1417,7 +1311,7 @@ pub async fn drive_obligations_once_for_test(
     per_group_limit: u32,
     total_limit: u32,
 ) -> bool {
-    drive_obligations_once_for_test_inner(engine, per_group_limit, total_limit, None, None).await
+    drive_obligations_once_for_test_inner(engine, per_group_limit, total_limit, None).await
 }
 
 /// Identical to [`drive_obligations_once_for_test`], except every
@@ -1434,56 +1328,9 @@ pub async fn drive_obligations_once_for_test_with_hooks(
     total_limit: u32,
     hooks: &Arc<BeforeCompletionHook>,
 ) -> bool {
-    drive_obligations_once_for_test_inner(engine, per_group_limit, total_limit, Some(hooks), None)
-        .await
-}
-
-/// Identical to [`drive_obligations_once_for_test`], except every
-/// candidate attempt this tick makes pauses at [`BeforeHeadsAfterHook`]
-/// immediately after `reconcile_paths_directly` resolves and immediately
-/// before the group's post-attempt `dag_group_heads` re-read, letting a
-/// deterministic-interleaving test admit an independent change in between
-/// and observe whether the heads-stability fence discards this attempt's
-/// settlements as a result.
-///
-/// `#[cfg(test)]` only (unlike its siblings above, which are also `feature =
-/// "test-support"`-gated): nothing outside this module's own `mod tests`
-/// calls it -- no `engine_wrapper` re-export makes it reachable from an
-/// external test-support consumer, so gating it in only for `cfg(test)`
-/// keeps it out of (and therefore not dead code in) a plain `test-support`
-/// build.
-#[cfg(test)]
-pub async fn drive_obligations_once_for_test_with_heads_hook(
-    engine: &ConvergenceEngine,
-    per_group_limit: u32,
-    total_limit: u32,
-    heads_hook: &Arc<BeforeHeadsAfterHook>,
-) -> bool {
-    drive_obligations_once_for_test_inner(
-        engine,
-        per_group_limit,
-        total_limit,
-        None,
-        Some(heads_hook),
-    )
-    .await
+    drive_obligations_once_for_test_inner(engine, per_group_limit, total_limit, Some(hooks)).await
 }
 
 #[cfg(test)]
 #[path = "engine/tests.rs"]
 mod tests;
-
-/// The obligation-driven scheduler's own CONV-7 publication arm
-/// (`attempt.settled_with_evidence()` above), driven with a REAL,
-/// deterministic race against a real `DaemonState`. No existing harness in
-/// this crate can drive `process_group_via_obligations` deterministically --
-/// `DaemonState::new` always starts a `MaintenanceCoordinator` that runs its
-/// own concurrent ticks, and `DaemonState::build` (the maintenance-free
-/// constructor) is `pub(crate)`, unreachable from an external `tests/*.rs`
-/// crate. Living in-crate, as a sibling to `mod tests` above, is what makes
-/// this possible: `process_group_via_obligations` itself is a private
-/// sibling item, and `DaemonState::build` starts nothing else that could
-/// race our own manual call.
-#[cfg(test)]
-#[path = "engine/process_group_publication_tests.rs"]
-mod process_group_publication_tests;

@@ -14,11 +14,13 @@ use super::*;
 /// never populated, just present.
 fn schema_init(conn: &rusqlite::Connection) -> Result<(), DatabaseError> {
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS changes (group_id TEXT NOT NULL, change_hash BLOB NOT NULL);
-         CREATE TABLE IF NOT EXISTS pruned_changes (group_id TEXT NOT NULL, change_hash BLOB NOT NULL);
+        "CREATE TABLE IF NOT EXISTS admitted_changes (group_id TEXT NOT NULL, change_hash BLOB NOT NULL);
          CREATE TABLE IF NOT EXISTS group_history_bases (group_id TEXT NOT NULL, history_base BLOB NOT NULL);
          CREATE TABLE IF NOT EXISTS history_base_path_heads (group_id TEXT NOT NULL, base_hash BLOB NOT NULL, change_hash BLOB NOT NULL);
-         CREATE TABLE IF NOT EXISTS history_base_carried_authors (group_id TEXT NOT NULL, base_hash BLOB NOT NULL, change_hash BLOB NOT NULL);",
+         CREATE TABLE IF NOT EXISTS history_base_carried_authors (group_id TEXT NOT NULL, base_hash BLOB NOT NULL, change_hash BLOB NOT NULL);
+         CREATE TABLE IF NOT EXISTS native_authoring_witness (group_id TEXT NOT NULL, identity BLOB NOT NULL);
+         CREATE TABLE IF NOT EXISTS published_evidence (change_hash BLOB NOT NULL, checkpoint_hash BLOB NOT NULL);
+         CREATE TABLE IF NOT EXISTS authorization_checkpoints (checkpoint_hash BLOB NOT NULL, group_id TEXT NOT NULL);",
     )?;
     yadorilink_sqlite_runtime::init_schema(conn)
 }
@@ -53,7 +55,7 @@ fn batch_journal_commits_all_paths_together() {
 }
 
 /// A batch-journaled row that is never cleared (standing in for a crash
-/// between the journal commit and the per-path index+DAG commit) stays
+/// between the journal commit and the per-path index+delta commit) stays
 /// fully re-drivable -- exactly what `redrive_dirty_journal` reads from
 /// on the next startup.
 #[test]

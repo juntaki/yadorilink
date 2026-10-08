@@ -7,7 +7,7 @@ const GROUP: &str = "g";
 fn open_full_test_db() -> Arc<SyncDatabase> {
     Arc::new(
         SyncDatabase::open_in_memory(|conn| {
-            crate::dag_store::init_dag_schema(conn).map_err(|e| {
+            crate::replica_tables::init_for_tests(conn).map_err(|e| {
                 yadorilink_sqlite_runtime::DatabaseError::CorruptSchema(e.to_string())
             })?;
             crate::materialized_generation::init_materialized_generation_schema(conn).map_err(
@@ -73,14 +73,12 @@ fn a_hydrating_row_with_no_intent_is_reset_and_one_with_an_intent_is_left_for_re
         .begin_materialization_intent(GROUP, "interrupted-batch.txt", &[7u8; 32], &permit)
         .unwrap();
 
-    let reset = MaterializationStateRepository::new(db.clone())
-        .reset_stale_hydrating_to_placeholder()
-        .unwrap();
+    let reset = MaterializationStateRepository::new(db.clone()).reset_stale_hydrating().unwrap();
 
     assert_eq!(reset, 1, "only the row with nothing in flight may be reset");
     assert_eq!(
         state_of(&db, "abandoned-fetch.txt"),
-        MaterializationState::Placeholder,
+        MaterializationState::Remote,
         "an abandoned fetch wrote nothing; Placeholder is what is true about it"
     );
     assert_eq!(
@@ -114,15 +112,13 @@ fn a_hydrating_row_repair_would_skip_is_reset_even_though_it_holds_an_intent() {
         intents.begin_materialization_intent(GROUP, path, &[7u8; 32], &permit).unwrap();
     }
 
-    let reset = MaterializationStateRepository::new(db.clone())
-        .reset_stale_hydrating_to_placeholder()
-        .unwrap();
+    let reset = MaterializationStateRepository::new(db.clone()).reset_stale_hydrating().unwrap();
 
     assert_eq!(reset, 2, "every row repair declines must be freed here");
     for path in ["empty.txt", "tombstoned.txt"] {
         assert_eq!(
             state_of(&db, path),
-            MaterializationState::Placeholder,
+            MaterializationState::Remote,
             "{path}: repair skips this shape, so leaving it transient wedges it forever"
         );
     }
@@ -136,7 +132,7 @@ fn a_hydrating_row_repair_would_skip_is_reset_even_though_it_holds_an_intent() {
 /// Symlink and directory rows carry no blocks and repair walks them
 /// anyway, each on its own arm -- so the empty-block rule must not sweep
 /// them up. A directory demoted here would be listed to a placeholder
-/// host as a file-shaped `Placeholder`.
+/// host as a file-shaped `Remote`.
 #[test]
 fn a_hydrating_symlink_or_directory_with_an_intent_is_left_for_repair() {
     let db = open_full_test_db();
@@ -148,9 +144,7 @@ fn a_hydrating_symlink_or_directory_with_an_intent_is_left_for_repair() {
         intents.begin_materialization_intent(GROUP, path, &[7u8; 32], &permit).unwrap();
     }
 
-    let reset = MaterializationStateRepository::new(db.clone())
-        .reset_stale_hydrating_to_placeholder()
-        .unwrap();
+    let reset = MaterializationStateRepository::new(db.clone()).reset_stale_hydrating().unwrap();
 
     assert_eq!(reset, 0);
     assert_eq!(state_of(&db, "link"), MaterializationState::Hydrating);
@@ -163,9 +157,9 @@ fn seed_file_proof(db: &SyncDatabase, path: &str, published_under: i64, fence: i
     db.write::<_, SyncSqliteError>(|conn| {
         conn.execute(
             "INSERT INTO path_materialized_generations (group_id, path, generation_id, \
-             causal_basis_id, resolved_path_state_hash, object_kind, version_hash, \
+             reflected_heads, resolved_path_state_hash, object_kind, version_hash, \
              encoding_version, updated_at_unix_nanos, published_under_mutation_generation) \
-             VALUES (?1, ?2, 'gen', 'basis', X'00', 'regular_file', X'01', 1, 0, ?3)",
+             VALUES (?1, ?2, 'gen', X'', X'00', 'regular_file', X'01', 1, 0, ?3)",
             rusqlite::params![GROUP, path, published_under],
         )?;
         conn.execute(
@@ -179,17 +173,17 @@ fn seed_file_proof(db: &SyncDatabase, path: &str, published_under: i64, fence: i
 }
 
 /// A `Hydrating` row with no intent over a proof that still stands
-/// against its fence was entered from `Hydrated` and crashed before its
+/// against its fence was entered from `Present` and crashed before its
 /// own fence bump -- nothing has touched disk since the proof, so it goes
-/// back to `Hydrated`, where hydrate will not reconstruct over an
+/// back to `Present`, where hydrate will not reconstruct over an
 /// unjournalled edit and startup repair re-proves or quarantines it.
 ///
 /// The guard is the fence: a proof the fence has moved past (an eviction,
 /// or an attempt that crashed after its own bump) says nothing about
-/// disk, and that row still resets to `Placeholder`. An intent keeps a
+/// disk, and that row still resets to `Remote`. An intent keeps a
 /// row with the carve-out whatever its proof says.
 #[test]
-fn a_hydrating_row_over_a_standing_proof_goes_back_to_hydrated() {
+fn a_hydrating_row_over_a_standing_proof_goes_back_to_present() {
     let db = open_full_test_db();
     let permit = RootCommitPermit::for_tests();
     seed_hydrating_row(&db, "crashed-from-hydrated.txt");
@@ -202,20 +196,18 @@ fn a_hydrating_row_over_a_standing_proof_goes_back_to_hydrated() {
         .begin_materialization_intent(GROUP, "with-intent.txt", &[7u8; 32], &permit)
         .unwrap();
 
-    let reset = MaterializationStateRepository::new(db.clone())
-        .reset_stale_hydrating_to_placeholder()
-        .unwrap();
+    let reset = MaterializationStateRepository::new(db.clone()).reset_stale_hydrating().unwrap();
 
     assert_eq!(reset, 2, "both rows without an intent leave Hydrating");
     assert_eq!(
         state_of(&db, "crashed-from-hydrated.txt"),
-        MaterializationState::Hydrated,
+        MaterializationState::Present,
         "a standing proof means no write happened since it; the row's local-edit protection \
          must survive the restart"
     );
     assert_eq!(
         state_of(&db, "fence-moved.txt"),
-        MaterializationState::Placeholder,
+        MaterializationState::Remote,
         "a proof the fence has moved past vouches for nothing on disk"
     );
     assert_eq!(

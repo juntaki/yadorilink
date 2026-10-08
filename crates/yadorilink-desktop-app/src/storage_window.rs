@@ -8,7 +8,7 @@
 //! `StatusResponse.{block_store_total_bytes,block_store_block_count,
 //! last_gc_unix,gc_reclaimable_estimate_bytes}`) or `GcResponse` -- no
 //! re-derivation, matching `folder_detail.rs`'s own established discipline.
-//! Per-file pin/unpin/hydrate/evict stays exactly where it already lives
+//! Per-file hydrate/evict stays exactly where it already lives
 //! (`folder_status_window.rs`'s "Version history & selective sync"
 //! panel) -- this window
 //! links out to it rather than duplicating a second per-file picker.
@@ -285,7 +285,7 @@ impl StorageApp {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(&folder.name).strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        manage_files_button(ui, &link.local_path);
+                        manage_files_button(ui, link);
                     });
                 });
                 ui.label(
@@ -307,7 +307,12 @@ impl StorageApp {
 }
 
 /// Opens the folder's own status window, where its files are managed.
-fn manage_files_button(ui: &mut egui::Ui, local_path: &str) {
+fn manage_files_button(ui: &mut egui::Ui, link: &yadorilink_ipc_proto::daemonctl::LinkStatus) {
+    // A provider folder has no directory to manage files in.
+    if !link.provider_display_name.is_empty() {
+        return;
+    }
+    let local_path = link.local_path.as_str();
     if ui.button("Manage files…").clicked() {
         crate::actions::spawn_window_with_path("folder-status", local_path);
     }

@@ -1,22 +1,15 @@
 //! Owns spawning every one of this daemon's periodic background
 //! maintenance tasks: the update-check scheduler, the pending-report retry
 //! sweep, materialization repair, the Convergence Engine's own scheduler
-//! loop, forward-rebroadcast, degraded-link recheck, retention expiry,
+//! loop, degraded-link recheck, retention expiry,
 //! membership recovery, the disk-reconcile backstop, and the idle-triggered
 //! GC scheduler.
 //!
 //! This module holds the SPAWNING CODE, kept out of `DaemonState::new`'s
 //! own body -- `DaemonState::new` calls `start` as a single line. The
-//! CALL SITE itself stays inside `new` (not in `app.rs`/`DaemonContext`
-//! after construction returns):
-//! `forward_rx` (the local `mpsc::Receiver` half of the change-forwarding
-//! channel `new` constructs) is consumed directly by one of these tasks
-//! and isn't stored anywhere on `DaemonState`, so moving the call site out
-//! of `new` would require either widening `DaemonState::new`'s own return
-//! type or storing `forward_rx` behind an `Option`/`Mutex` purely to hand
-//! it back out again -- a real signature change touching every one of
-//! `DaemonState::new`'s call sites (production and every test in this
-//! crate) for no behavioral gain.
+//! production composition root (`app::run`) builds the state with
+//! `DaemonState::build` and calls `start` itself, so it controls exactly
+//! when maintenance begins relative to the rest of its wiring.
 //!
 //! Most of these tasks are named job types under `crate::maintenance`,
 //! each with a `run_once` method holding the sweep/check logic. This module's own remaining job is
@@ -26,18 +19,12 @@
 //! below (`spawn_logged` vs `spawn_restarting`, which jobs run once
 //! immediately at startup, which don't) lives here; the sweep bodies live
 //! in their own files.
-//! `#4` (`convergence-engine-scheduler`) and `#5` (`forward-rebroadcast`)
-//! are untouched -- see each one's own comment below for why.
-//!
 //! No queue unification, no `ConvergenceWork` enum, no priority
 //! scheduling, no dedup, no event-driven enqueue -- every task below keeps
 //! its own independent spawn, own interval, own supervision strategy
 //! (`spawn_logged` vs `spawn_restarting`), completely unchanged.
 
 use std::sync::Arc;
-
-use tokio::sync::mpsc;
-use yadorilink_replica_domain::file::FileRecord;
 
 use crate::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use crate::daemon_state::{
@@ -60,10 +47,7 @@ use crate::supervise;
 /// Returns the daemon's single [`RecoveryJob`], so the caller can schedule
 /// the enrollment sweep (which must wait for the coordination-plane config)
 /// through the same owner instead of building a second one.
-pub(crate) fn start(
-    state: &Arc<DaemonState>,
-    mut forward_rx: mpsc::UnboundedReceiver<(String, FileRecord)>,
-) -> Arc<RecoveryJob> {
+pub(crate) fn start(state: &Arc<DaemonState>) -> Arc<RecoveryJob> {
     let controller = Arc::new(LinkRuntimeController::new(state.clone()));
     // Built once here rather than per sweep: the recovery workflows live in
     // the application services, which read the daemon's state lazily
@@ -198,38 +182,6 @@ pub(crate) fn start(
             move || crate::convergence::engine::run(convergence_engine.clone()),
         );
     }
-    // Every one of `DaemonState`'s own background tasks
-    // used to be a bare `tokio::spawn` with its `JoinHandle` dropped —
-    // a panic partway through a single forwarded record
-    // would silently stop mesh propagation
-    // for the rest of the process's life with no log line at all.
-    // `supervise::spawn_logged` doesn't restart these (unlike the
-    // reconnect loops in `peer_orchestrator`/`yadorilink-transport`,
-    // these consume an owned `mpsc::Receiver` that can't be recreated
-    // per attempt the way `spawn_restarting`'s `make_task` expects),
-    // but it does guarantee a loud `error`-level log naming the task
-    // if it ever exits or panics, instead of a zombie behavior gap.
-    // Not given a named job type (the inventory's own #5 row, "a
-    // lighter-touch pass"): this task is channel-owned, draining an
-    // `mpsc::Receiver` until it closes, with no periodic interval and no
-    // `run_once`-shaped "one unit of work" to extract -- it already is
-    // exactly one small, explicit loop, and wrapping it in a struct
-    // holding a single owned, non-cloneable `Receiver` field plus one
-    // method that does the same drain-forever loop body would be
-    // indirection without a second caller or narrower dependency to show
-    // for it.
-    let task_state = state.clone();
-    supervise::spawn_logged("daemon-state-forward-rebroadcast", async move {
-        while let Some((group_id, record)) = forward_rx.recv().await {
-            // A record forwarded here is
-            // exactly a peer session having just adopted/resolved an
-            // incoming file — this is this crate's "peer-reconciliation
-            // activity" signal for the GC idle scheduler.
-            task_state.record_activity();
-            task_state.broadcast_change(&group_id, vec![record]).await;
-        }
-        Ok(())
-    });
     // A dedicated, short-interval poll for every currently-Degraded
     // link whose backoff window has elapsed. The whole point of
     // `BackoffConfig::DEGRADED_LINK_RECHECK`'s 5s *initial* interval is
@@ -308,7 +260,7 @@ pub(crate) fn start(
         });
     }
     // Piggy-backs on the same cadence as
-    // `PeerSyncSession`'s own periodic DAG-frontier maintenance
+    // `PeerSyncSession`'s own periodic native-frontier maintenance
     // (`DEFAULT_MAINTENANCE_RECONCILE_INTERVAL`) rather than a new,
     // independent timer. Not run once immediately at startup the way the
     // retention sweep above is: `start_link_watch`'s own initial
@@ -328,13 +280,8 @@ pub(crate) fn start(
             }
         });
     }
-    // The idle-triggered GC scheduler,
-    // modeled on this same `spawn_logged` periodic-task shape as every
-    // other sweep in this file. Shares its poll tick with the
-    // previously-uncalled `run_eviction_sweep` — see
-    // `gc::run_periodic_capacity_eviction_sweep`'s doc comment for why
-    // that one doesn't need the same idle/write-safe-point gating GC
-    // itself does.
+    // The idle-triggered GC scheduler, modeled on this same `spawn_logged`
+    // periodic-task shape as every other sweep in this file.
     {
         let gc_idle_job = GcIdleJob::new(state.clone());
         supervise::spawn_logged("daemon-state-gc-idle-scheduler", async move {

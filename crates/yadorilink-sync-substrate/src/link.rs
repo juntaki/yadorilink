@@ -15,7 +15,7 @@ use crate::peer::PeerId;
 
 /// Holds a lane's concurrency slot for as long as any half of its stream is
 /// alive. Shared so that splitting a stream does not silently release it.
-type LaneSlot = Arc<Option<LanePermit>>;
+type LaneSlot = Arc<LanePermit>;
 
 /// One stream belonging to a lane class.
 ///
@@ -51,7 +51,7 @@ impl LaneStream {
         lane: Lane,
         send: iroh::endpoint::SendStream,
         recv: iroh::endpoint::RecvStream,
-        slot: Option<LanePermit>,
+        slot: LanePermit,
     ) -> Self {
         let slot: LaneSlot = Arc::new(slot);
         Self {
@@ -209,6 +209,17 @@ impl CarrierChanges {
     }
 }
 
+/// How long a stream the peer opened may take to send its one-byte lane tag.
+pub const LANE_TAG_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A stream the remote side opened whose lane tag has not been read yet; see
+/// [`PeerLink::accept_stream`].
+#[derive(Debug)]
+pub struct InboundStream {
+    send: iroh::endpoint::SendStream,
+    recv: iroh::endpoint::RecvStream,
+}
+
 /// An established connection to one peer.
 ///
 /// A link is cheap to clone; clones share the underlying QUIC connection and
@@ -272,11 +283,7 @@ impl PeerLink {
     ) -> Self {
         let budgets = Lane::ALL
             .into_iter()
-            .filter_map(|lane| {
-                limits
-                    .for_lane(lane)
-                    .map(|budget| (lane, Arc::new(FairLaneGate::new(lane, budget))))
-            })
+            .map(|lane| (lane, Arc::new(FairLaneGate::new(lane, limits.for_lane(lane)))))
             .collect();
 
         Self { peer, connection, budgets: Arc::new(budgets) }
@@ -296,7 +303,7 @@ impl PeerLink {
 
     /// Open a stream in `lane` as the initiating side.
     ///
-    /// A lane is a class, not a single stream: several bundle or block
+    /// A lane is a class, not a single stream: several block or service
     /// transfers run concurrently, up to that lane's budget. Opening blocks
     /// only on the lane's own budget — an already-open stream that is stalled,
     /// saturated or waiting on storage never delays a different lane, which is
@@ -310,7 +317,7 @@ impl PeerLink {
     /// The lane's budget is shared out BETWEEN classes rather than in arrival
     /// order -- see [`FairLaneGate`] for the measurement that made this
     /// necessary. Callers that have a meaningful class (a folder group, for
-    /// block and history transfers) should name it; the rest share one.
+    /// block transfers) should name it; the rest share one.
     pub async fn open_lane_for(
         &self,
         lane: Lane,
@@ -334,17 +341,44 @@ impl PeerLink {
     }
 
     /// Accept the next stream the remote side opens, on whichever lane.
+    ///
+    /// Reads the lane tag and takes a budget slot before returning, so a
+    /// serial caller is held up by a stream that never sends its tag (bounded
+    /// by [`LANE_TAG_DEADLINE`]) or by a full lane budget. A server that must
+    /// keep accepting while one stream waits uses [`Self::accept_stream`] and
+    /// finishes each stream with [`Self::identify_stream`] in its own task.
     pub async fn accept_lane(&self) -> Result<LaneStream, SubstrateError> {
-        let (send, mut recv) = self
+        let stream = self.accept_stream().await?;
+        self.identify_stream(stream).await
+    }
+
+    /// Accept the next stream the remote side opens without reading anything
+    /// from it. An error here means the connection itself ended.
+    pub async fn accept_stream(&self) -> Result<InboundStream, SubstrateError> {
+        let (send, recv) = self
             .connection
             .accept_bi()
             .await
             .map_err(|err| SubstrateError::Accept { reason: err.to_string() })?;
+        Ok(InboundStream { send, recv })
+    }
 
+    /// Reads `stream`'s lane tag, within [`LANE_TAG_DEADLINE`], and takes its
+    /// lane's budget slot. An error here is about this one stream only; the
+    /// connection is unaffected.
+    pub async fn identify_stream(
+        &self,
+        stream: InboundStream,
+    ) -> Result<LaneStream, SubstrateError> {
+        let InboundStream { send, mut recv } = stream;
         let mut tag = [0u8; 1];
-        tokio::io::AsyncReadExt::read_exact(&mut recv, &mut tag)
-            .await
-            .map_err(|err| SubstrateError::Accept { reason: err.to_string() })?;
+        tokio::time::timeout(
+            LANE_TAG_DEADLINE,
+            tokio::io::AsyncReadExt::read_exact(&mut recv, &mut tag),
+        )
+        .await
+        .map_err(|_| SubstrateError::Accept { reason: "no lane tag within the deadline".into() })?
+        .map_err(|err| SubstrateError::Accept { reason: err.to_string() })?;
 
         let lane = Lane::from_tag(tag[0]).ok_or(SubstrateError::UnknownLaneTag(tag[0]))?;
         // One class on the accepting side: the lane tag is all that has
@@ -354,6 +388,18 @@ impl PeerLink {
         let slot = self.reserve(lane, "").await?;
 
         Ok(LaneStream::assemble(lane, send, recv, slot))
+    }
+
+    /// Opens a bidirectional stream and returns it raw, with no lane tag
+    /// written, so a test can send a malformed or missing tag.
+    #[cfg(feature = "test-support")]
+    pub async fn open_raw_stream_for_test(
+        &self,
+    ) -> Result<(iroh::endpoint::SendStream, iroh::endpoint::RecvStream), SubstrateError> {
+        self.connection
+            .open_bi()
+            .await
+            .map_err(|err| SubstrateError::Accept { reason: err.to_string() })
     }
 
     /// Which network path this connection is currently sending on.
@@ -401,12 +447,9 @@ impl PeerLink {
         self.connection.close_reason().is_none()
     }
 
-    async fn reserve(&self, lane: Lane, class: &str) -> Result<Option<LanePermit>, SubstrateError> {
-        let Some(gate) = self.budgets.get(&lane) else {
-            // Reconciliation: deliberately unbudgeted.
-            return Ok(None);
-        };
-        Ok(Some(gate.acquire(class).await?))
+    async fn reserve(&self, lane: Lane, class: &str) -> Result<LanePermit, SubstrateError> {
+        let gate = self.budgets.get(&lane).expect("every lane has a budget");
+        gate.acquire(class).await
     }
 }
 

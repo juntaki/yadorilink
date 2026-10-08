@@ -10,7 +10,7 @@
 //! sync-engine module this crate does NOT depend on — see this crate's
 //! own top doc comment) always produces
 //! `<name> (conflicted copy, <ISO-8601-ish timestamp>, <device_id>[,
-//! <content hash hex>]).<ext>`, and the CLI's own
+//! <content hash hex>]).<ext>` (a native copy omits the timestamp), and the CLI's own
 //! `commands::version_history` test
 //! fixtures encode the identical shape. Parsing that documented, spec-level
 //! convention here (rather than adding a sync-engine dependency just to
@@ -136,12 +136,27 @@ fn parse_conflict_path(path: &str, reason: ConflictReason) -> ConflictDetail {
     // for the exact shape this mirrors).
     let after_marker = &stem[marker_idx + MARKER.len()..];
     let detail = after_marker.strip_suffix(')').unwrap_or(after_marker);
-    let mut parts = detail.split(", ").map(str::trim).filter(|s| !s.is_empty());
-    let timestamp = parts.next().map(str::to_string);
+    let parts = detail.split(", ").map(str::trim).filter(|s| !s.is_empty());
+    // The timestamp is absent from native copy names, so the first field is
+    // only taken for one when it has a timestamp's shape.
+    let mut parts = parts.peekable();
+    let timestamp = parts.next_if(|part| looks_like_timestamp(part)).map(str::to_string);
     let loser_device_id = parts.next().map(str::to_string);
     let content_hash_hex = parts.next().map(str::to_string);
 
     ConflictDetail { current_path, loser_device_id, timestamp, content_hash_hex, reason }
+}
+
+/// `YYYY-MM-DD-HHMMSS`, as `conflict_copy_path` writes it.
+fn looks_like_timestamp(part: &str) -> bool {
+    part.len() == 17
+        && part.bytes().enumerate().all(|(i, b)| {
+            if matches!(i, 4 | 7 | 10) {
+                b == b'-'
+            } else {
+                b.is_ascii_digit()
+            }
+        })
 }
 
 fn join(dir: Option<&str>, stem: &str, ext: Option<&str>) -> String {

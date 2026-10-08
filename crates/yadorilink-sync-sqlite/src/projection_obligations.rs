@@ -1,9 +1,8 @@
 //! The desired-side fence and the Convergence Engine's own live claim
 //! source. `projection_obligations` records, per `(group_id, path)`, a
 //! durable `invalidation_generation` bumped by exactly one statement
-//! whenever a genuine DAG state transition (not-admitted -> admitted, for a
-//! primary change, a promoted orphan, a local emission, or a startup
-//! self-heal promotion) touches that path, plus the obligation-native retry/
+//! whenever a genuine native state transition (a delta admitted from a
+//! peer, or a local delta authored) touches that path, plus the obligation-native retry/
 //! backoff state (`attempt_count`/`next_attempt_at`) and the parked
 //! `'ignore_blocked'` state a path settles into when its own materialization
 //! is excluded by ignore policy rather than genuinely completed.
@@ -11,13 +10,12 @@
 //! longer scheduled-off-of table now — the engine claims and drives
 //! entirely from this one.
 //!
-//! Network redelivery of an already-admitted change never reaches
+//! Network redelivery of an already-admitted delta never reaches
 //! [`bump_projection_obligations_for_touched_paths`] at all: it is called
-//! only from the four durable-transition seams inside `dag_store` (see that
-//! module's own `admit_change`/`admit_prepared_emission`/`init_dag_schema`),
-//! never from message/batch receipt. This is what makes "a Change receipt is
-//! not a projection event" a property of the call graph, not a runtime
-//! check.
+//! only from the durable-transition seams in `native_desired_state`
+//! (`arm_projection_for_delta` and its siblings), never from message/batch
+//! receipt. This is what makes "a delta receipt is not a projection event" a
+//! property of the call graph, not a runtime check.
 
 use rusqlite::{Connection, OptionalExtension};
 
@@ -56,29 +54,25 @@ pub fn init_projection_obligations_schema(conn: &Connection) -> Result<(), SyncS
     )?;
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_projection_obligations_runnable
-             ON projection_obligations (state, next_attempt_at);",
+             ON projection_obligations (state, group_id, updated_at, path, next_attempt_at);
+         CREATE INDEX IF NOT EXISTS idx_projection_obligations_due
+             ON projection_obligations (state, group_id, next_attempt_at, updated_at, path);",
     )?;
     // The claim below reads it, so it exists wherever obligations do.
     crate::paused_items::init_paused_items_schema(conn)?;
-    crate::snapshot_install_hold::init_snapshot_install_hold_schema(conn)?;
+    crate::held_path::init_held_path_schema(conn)?;
+    crate::native_rebootstrap::init_tables(conn)?;
     Ok(())
 }
 
 /// Bumps (or creates, at generation 1) the projection obligation for every
 /// path in `touched_paths`, via one `INSERT ... ON CONFLICT DO UPDATE` per
-/// path. Called ALONGSIDE
-/// `dag_store`'s existing `bump_execution_fence_for_change`/`_for_promoted`
-/// at their existing four call sites, reusing those call sites' own
-/// `op_touched_paths` extraction rather than re-deriving touched paths here.
+/// path. Called from the `native_desired_state` seams with the paths the
+/// delta or state change touched.
 ///
 /// Runs inside whatever transaction the caller is already in -- this
-/// function opens none of its own. For the three DAG-side seams
-/// (`admit_change`'s primary/promoted-orphan arms, `admit_prepared_
-/// emission`) that transaction is the caller's `write_immediate`; for
-/// startup self-heal it is `init_dag_schema`'s own explicit
-/// `unchecked_transaction`. A no-op for an empty
-/// `touched_paths` (matches `bump_execution_fence_for_change`'s own
-/// early-return shape for the same case).
+/// function opens none of its own. A no-op for an empty
+/// `touched_paths`.
 ///
 /// **Obligation row-incarnation ABA**: `invalidation_
 /// generation` alone identifies a claim only for as long as the row it was
@@ -109,58 +103,106 @@ pub fn bump_projection_obligations_for_touched_paths(
     touched_paths: &[&str],
     now_unix_nanos: i64,
 ) -> Result<(), SyncSqliteError> {
-    for path in touched_paths {
-        // Always allocates a fresh incarnation id, even on the (far more
-        // common) `ON CONFLICT` bump-in-place path where it goes unused --
-        // wasting an `i64` SEQUENCE VALUE is free; the alternative (a
-        // conditional allocation) would need to know in advance whether the
-        // upsert below is about to insert or update, which is exactly the
-        // information a single upsert statement doesn't expose. The ROW
-        // this INSERT creates, however, is immediately deleted again right
-        // below (an earlier draft of this fix left it in place:
-        // that made `projection_obligation_incarnations`
-        // grow by one permanent row per touched-path event -- unbounded
-        // storage growth proportional to total admitted mutations, not to
-        // live obligations). This is safe: SQLite's `AUTOINCREMENT` tracks
-        // the high-water mark for this table in `sqlite_sequence`
-        // independently of which rows currently exist, so deleting the row
-        // can never cause a later `INSERT` to reuse `fresh_incarnation`.
-        conn.prepare_cached("INSERT INTO projection_obligation_incarnations DEFAULT VALUES")?
-            .execute([])?;
-        let fresh_incarnation = conn.last_insert_rowid();
-        conn.prepare_cached("DELETE FROM projection_obligation_incarnations WHERE id = ?1")?
-            .execute(rusqlite::params![fresh_incarnation])?;
-        // `origin` is always written as `'remote'` here, on BOTH the fresh
-        // `INSERT` and the `ON CONFLICT` bump-in-place arm -- this is the
-        // universal, conservative default every one of this function's
-        // three call sites gets for free. `admit_prepared_emission` (the
-        // sole local-authoring seam) additionally calls
-        // [`mark_projection_obligations_local_origin`] immediately
-        // afterward, in the SAME transaction, to overwrite it to `'local'`
-        // for the paths it just touched. Writing `'remote'` unconditionally
-        // in the `ON CONFLICT` arm too (not just on first insert) is
-        // deliberate: a later REMOTE-authored admission bumping a path an
-        // earlier LOCAL emission had marked must reset origin back to
-        // `'remote'`, since the row now again describes desired content
-        // this device has not necessarily placed -- see `ObligationOrigin`'s
-        // own doc comment for why leaving a stale `'local'` tag in place
-        // across a subsequent remote bump would be unsound.
-        conn.prepare_cached(
-            "INSERT INTO projection_obligations
-                (group_id, path, invalidation_generation, state, attempt_count,
-                 next_attempt_at, created_at, updated_at, obligation_incarnation, origin)
-             VALUES (?1, ?2, 1, 'pending', 0, ?3, ?3, ?3, ?4, 'remote')
-             ON CONFLICT (group_id, path) DO UPDATE SET
-                invalidation_generation = invalidation_generation + 1,
-                state = 'pending',
-                attempt_count = 0,
-                next_attempt_at = ?3,
-                updated_at = ?3,
-                origin = 'remote'",
-        )?
-        .execute(rusqlite::params![group_id, path, now_unix_nanos, fresh_incarnation])?;
+    bump_projection_obligations_with_origin(
+        conn,
+        group_id,
+        touched_paths,
+        now_unix_nanos,
+        ObligationOrigin::Remote,
+    )
+    .map(|_| ())
+}
+
+/// An obligation as a bump left it: `pending`, at the generation and incarnation it now holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ArmedObligation {
+    pub invalidation_generation: i64,
+    pub obligation_incarnation: i64,
+}
+
+/// [`bump_projection_obligations_for_touched_paths`] writing `origin` on both the fresh
+/// `INSERT` and the `ON CONFLICT` arm. Every bump is `Remote` (the conservative default: the row
+/// describes desired content this device has not necessarily placed) except the one for a delta
+/// this device authored itself, whose bytes were on its own disk before the delta existed;
+/// writing that origin in the bump itself leaves the row exactly as bumping and then overwriting
+/// its origin in a second statement would. A later remote bump resets a `Local` row to `Remote`.
+pub(crate) fn bump_projection_obligations_with_origin(
+    conn: &Connection,
+    group_id: &str,
+    touched_paths: &[&str],
+    now_unix_nanos: i64,
+    origin: ObligationOrigin,
+) -> Result<std::collections::BTreeMap<String, ArmedObligation>, SyncSqliteError> {
+    if touched_paths.is_empty() {
+        return Ok(std::collections::BTreeMap::new());
     }
-    Ok(())
+    // Always allocates a fresh incarnation for every path, even on the (far more common)
+    // `ON CONFLICT` bump-in-place path where it goes unused: wasting `i64` SEQUENCE VALUES is
+    // free, while a conditional allocation would need to know in advance whether the upsert
+    // is about to insert or update, which a single upsert statement does not expose. The ROWS
+    // the allocation creates are deleted again right away, or the allocator table would grow
+    // by one permanent row per touched-path event, in proportion to total admitted mutations
+    // rather than live obligations. That is safe: SQLite's `AUTOINCREMENT` tracks the
+    // high-water mark in `sqlite_sequence` independently of which rows currently exist, so
+    // deleting the rows can never let a later `INSERT` reuse an incarnation.
+    //
+    // One statement allocates the whole block: the rows of a single `INSERT ... SELECT` take
+    // consecutive ids, so path `i` gets `first + i`, each unique and above everything
+    // allocated before. The delete must find exactly the block it allocated, or the ids were
+    // not the consecutive block the upsert below assumes.
+    let count = touched_paths.len() as i64;
+    conn.prepare_cached(
+        "INSERT INTO projection_obligation_incarnations (id) \
+         SELECT NULL FROM (WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n \
+         WHERE i < ?1) SELECT i FROM n)",
+    )?
+    .execute(rusqlite::params![count])?;
+    let last = conn.last_insert_rowid();
+    let first = last - count + 1;
+    let released = conn
+        .prepare_cached(
+            "DELETE FROM projection_obligation_incarnations WHERE id BETWEEN ?1 AND ?2",
+        )?
+        .execute(rusqlite::params![first, last])?;
+    if released as i64 != count {
+        return Err(SyncSqliteError::CorruptState(format!(
+            "allocated {count} obligation incarnations but found {released} in {first}..={last}"
+        )));
+    }
+    let paths = serde_json::to_string(touched_paths)
+        .map_err(|error| SyncSqliteError::InvalidInput(error.to_string()))?;
+    // `origin` is written on BOTH the fresh `INSERT` and the `ON CONFLICT` bump-in-place arm: a
+    // later REMOTE-authored admission bumping a path an earlier LOCAL emission had marked must
+    // reset origin back to `'remote'`, since the row now again describes desired content this
+    // device has not necessarily placed -- see `ObligationOrigin`'s own doc comment for why a
+    // stale `'local'` tag across a subsequent remote bump would be unsound.
+    let mut stmt = conn.prepare_cached(
+        "INSERT INTO projection_obligations
+            (group_id, path, invalidation_generation, state, attempt_count,
+             next_attempt_at, created_at, updated_at, obligation_incarnation, origin)
+         SELECT ?1, value, 1, 'pending', 0, ?3, ?3, ?3, ?4 + key, ?5 FROM json_each(?2) WHERE true
+         ON CONFLICT (group_id, path) DO UPDATE SET
+            invalidation_generation = invalidation_generation + 1,
+            state = 'pending',
+            attempt_count = 0,
+            next_attempt_at = ?3,
+            updated_at = ?3,
+            origin = ?5
+         RETURNING path, invalidation_generation, obligation_incarnation",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![group_id, paths, now_unix_nanos, first, origin.as_db_str()],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                ArmedObligation {
+                    invalidation_generation: row.get(1)?,
+                    obligation_incarnation: row.get(2)?,
+                },
+            ))
+        },
+    )?;
+    Ok(rows.collect::<Result<_, _>>()?)
 }
 
 /// Diagnostic/test-only read of one path's current obligation, or `None` if
@@ -211,27 +253,27 @@ pub struct ProjectionObligation {
     pub origin: ObligationOrigin,
 }
 
-/// Which kind of DAG admission most recently bumped a `projection_
+/// Which kind of native admission most recently bumped a `projection_
 /// obligations` row -- the distinction the offline-delete-vs-not-yet-placed
 /// tombstone veto was missing.
 ///
 /// `bump_projection_obligations_for_touched_paths` bumps identically for
-/// EVERY admission -- a primary change, a promoted orphan, a startup
-/// self-heal promotion, or a local emission -- because all four are
+/// EVERY admission -- a delta received from a peer or a local
+/// emission -- because both are
 /// equally genuine "desired state changed" events from the Convergence
 /// Engine's scheduling point of view. But they are NOT equally ambiguous
 /// for the *offline-delete-vs-not-yet-placed* question the tombstone veto
 /// (`has_unsettled_projection_obligation`, in both
 /// `yadorilink-local-capture`'s restart scan and
 /// `yadorilink-filesystem-sync`'s interrupted-materialization repair pass)
-/// exists to answer: a primary change/promoted orphan/self-heal promotion
-/// all describe content that arrived (or was buffered) from a PEER -- this
+/// exists to answer: a remotely admitted delta
+/// describes content that arrived from a PEER -- this
 /// device may not yet have written those bytes anywhere, so the path's
 /// absence from disk is genuinely ambiguous between "never materialized
 /// yet" and "deleted after materializing." A LOCAL emission is different by
-/// construction: `admit_prepared_emission`'s caller already observed the
+/// construction: the caller already observed the
 /// bytes on this device's own disk (that observation IS the local capture
-/// that produced the change) before the change was ever admitted -- there
+/// that produced the delta) before the delta was ever admitted -- there
 /// is no fetch/materialize step for content this device authored itself,
 /// so an obligation whose most recent bump was a local emission can never
 /// represent "not yet placed." Its path's absence from disk at scan/repair
@@ -240,21 +282,20 @@ pub struct ProjectionObligation {
 /// `Remote` is the fail-closed default (see the schema migration's own doc
 /// comment and `bump_projection_obligations_for_touched_paths`'s own doc
 /// comment on why the `ON CONFLICT` arm always resets to `Remote`): only
-/// `admit_prepared_emission`'s own immediate follow-up call to
-/// [`mark_projection_obligations_local_origin`] ever produces `Local`, and
-/// any later bump from ANY of the other three seams overwrites it back to
+/// the bump for a delta this device authored itself
+/// ([`bump_projection_obligations_with_origin`]) ever produces `Local`, and
+/// any later remote bump overwrites it back to
 /// `Remote` -- so a path that ever again needs content from elsewhere loses
 /// its `Local` tag the instant that need is recorded, never leaving a stale
 /// `Local` tag protecting the wrong generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObligationOrigin {
-    /// This device authored the change itself; the desired bytes were
+    /// This device authored the delta itself; the desired bytes were
     /// already on this device's own disk (observed directly by local
     /// capture) before the obligation was ever created. Never a "not yet
     /// placed" veto reason.
     Local,
-    /// The change came from (or through) a peer -- a primary admission, a
-    /// promoted orphan, or a startup self-heal promotion. This device may
+    /// The delta came from (or through) a peer. This device may
     /// not have the desired bytes on disk yet. The veto-preserving default.
     Remote,
 }
@@ -264,38 +305,19 @@ impl ObligationOrigin {
     /// writes -- including a value from some future, not-yet-understood
     /// migration path -- reads as `Remote`, matching the column's own
     /// fail-closed `DEFAULT 'remote'`.
+    fn as_db_str(self) -> &'static str {
+        match self {
+            ObligationOrigin::Local => "local",
+            ObligationOrigin::Remote => "remote",
+        }
+    }
+
     fn from_db_str(s: &str) -> Self {
         match s {
             "local" => ObligationOrigin::Local,
             _ => ObligationOrigin::Remote,
         }
     }
-}
-
-/// Overwrites the `origin` of the just-bumped obligation row for each of
-/// `touched_paths` to [`ObligationOrigin::Local`]. Must be called in the
-/// SAME transaction as, and strictly after,
-/// [`bump_projection_obligations_for_touched_paths`] for the same
-/// `touched_paths` -- it updates whatever row currently exists for
-/// `(group_id, path)`, which that preceding call is what guarantees is the
-/// row this bump just touched, not a stale one from an earlier admission.
-///
-/// The sole production call site is `admit_prepared_emission` (the local-
-/// authoring emission seam) -- see [`ObligationOrigin`]'s own doc comment
-/// for why only that seam ever produces `Local`.
-pub fn mark_projection_obligations_local_origin(
-    conn: &Connection,
-    group_id: &str,
-    touched_paths: &[&str],
-) -> Result<(), SyncSqliteError> {
-    for path in touched_paths {
-        conn.execute(
-            "UPDATE projection_obligations SET origin = 'local'
-              WHERE group_id = ?1 AND path = ?2",
-            rusqlite::params![group_id, path],
-        )?;
-    }
-    Ok(())
 }
 
 /// One obligation a claim call handed to a worker: enough to drive an
@@ -330,6 +352,25 @@ pub struct ClaimedObligation {
     pub attempt_count: i64,
 }
 
+impl ClaimedObligation {
+    /// The part of this claim a completion re-checks.
+    pub fn token(&self) -> ObligationClaimToken {
+        ObligationClaimToken {
+            invalidation_generation: self.invalidation_generation,
+            obligation_incarnation: self.obligation_incarnation,
+        }
+    }
+}
+
+/// What a completion must find unchanged on an obligation row to close it:
+/// the generation and the row incarnation its claim read. Carried by a
+/// worker from the claim to whichever transaction closes the obligation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObligationClaimToken {
+    pub invalidation_generation: i64,
+    pub obligation_incarnation: i64,
+}
+
 /// Every currently-runnable obligation (`state = 'pending'` AND its
 /// `next_attempt_at` backoff deadline has passed), fairly windowed per group
 /// exactly like `materialization_jobs::claim_runnable_jobs`. This is a plain
@@ -351,12 +392,227 @@ pub struct ClaimedObligation {
 /// that window first -- a paused folder with enough held changes would
 /// starve every other path of its group.
 ///
-/// A path a snapshot install holds (see `crate::snapshot_install_hold`) is
-/// excluded the same way, for a stronger reason: projecting the installed
+/// A held path (see `crate::held_path`) is
+/// excluded the same way, for a stronger reason: projecting the row's
 /// version would overwrite whatever is on disk there, and until the
-/// install's reconciliation has looked at it that may be an edit nobody has
+/// reconciliation has looked at it that may be an edit nobody has
 /// captured.
+///
+/// A group a rebootstrap freezes (see `crate::native_rebootstrap::group_frozen`) is
+/// excluded as a whole: its rows wait, unclaimed, until the freeze ends.
 pub fn claim_runnable_obligations(
+    conn: &Connection,
+    now_unix_nanos: i64,
+    per_group_limit: u32,
+    total_limit: u32,
+) -> Result<Vec<ClaimedObligation>, SyncSqliteError> {
+    // The first `per_group_limit` runnable rows of each group, in claim
+    // order, then the first `total_limit` of those in claim order. That is
+    // the set a per-group rank filter followed by a global limit keeps, at a
+    // cost of the groups times the window rather than the table. Paused and
+    // held paths are excluded in each statement's own WHERE clause (so they
+    // never take a window slot) and a frozen group is skipped whole. The
+    // caller runs this inside one read snapshot, so every statement sees
+    // the same database.
+    if total_limit == 0 || per_group_limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut candidates: Vec<(i64, ClaimedObligation)> = Vec::new();
+    for group_id in pending_group_ids(conn)? {
+        if crate::native_rebootstrap::group_frozen(conn, &group_id)? {
+            continue;
+        }
+        // A provider group's obligations belong to the provider projector alone: the engine
+        // lanes cannot project a group that has no directory.
+        if is_provider_group(conn, &group_id)? {
+            continue;
+        }
+        candidates.extend(group_window(conn, &group_id, now_unix_nanos, per_group_limit)?);
+    }
+    sort_in_claim_order(&mut candidates);
+    candidates.truncate(total_limit as usize);
+    Ok(candidates.into_iter().map(|(_, claimed)| claimed).collect())
+}
+
+/// Whether `group_id` has a provider root (a database without the provider tables has none).
+fn is_provider_group(conn: &Connection, group_id: &str) -> Result<bool, SyncSqliteError> {
+    let has_table: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'provider_roots')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_table {
+        return Ok(false);
+    }
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM provider_roots WHERE group_id = ?1)",
+        [group_id],
+        |r| r.get(0),
+    )?)
+}
+
+/// How many due rows the due-first probe reads before concluding the due
+/// set is too large to order in memory.
+const DUE_PROBE_ROWS: u32 = 128;
+
+fn sort_in_claim_order(rows: &mut [(i64, ClaimedObligation)]) {
+    rows.sort_by(|(at_a, a), (at_b, b)| {
+        at_a.cmp(at_b).then_with(|| a.path.cmp(&b.path)).then_with(|| a.group_id.cmp(&b.group_id))
+    });
+}
+
+/// Every group holding a pending row, seeking from one group to the next.
+fn pending_group_ids(conn: &Connection) -> Result<Vec<String>, SyncSqliteError> {
+    let mut first = conn.prepare_cached(
+        "SELECT group_id FROM projection_obligations INDEXED BY idx_projection_obligations_runnable \
+         WHERE state = 'pending' ORDER BY group_id ASC LIMIT 1",
+    )?;
+    let mut next = conn.prepare_cached(
+        "SELECT group_id FROM projection_obligations INDEXED BY idx_projection_obligations_runnable \
+         WHERE state = 'pending' AND group_id > ?1 ORDER BY group_id ASC LIMIT 1",
+    )?;
+    let mut groups = Vec::new();
+    let mut current = first.query_row([], |r| r.get::<_, String>(0)).optional()?;
+    while let Some(group_id) = current {
+        current = next.query_row([&group_id], |r| r.get::<_, String>(0)).optional()?;
+        groups.push(group_id);
+    }
+    Ok(groups)
+}
+
+fn runnable_filters_sql() -> String {
+    format!(
+        "AND NOT {paused} AND NOT {held}",
+        paused = crate::paused_items::covered_by_paused_item_sql(
+            "projection_obligations.group_id",
+            "projection_obligations.path",
+        ),
+        held = crate::held_path::held_sql(
+            "projection_obligations.group_id",
+            "projection_obligations.path",
+        ),
+    )
+}
+
+/// How many index rows the ordered walk may pass over, runnable or not,
+/// before the due-index pass takes over.
+const WALK_ROWS: u32 = 1024;
+
+/// A row ordered by claim order within one group, for the bounded heap.
+struct ByClaimOrder(i64, ClaimedObligation);
+
+impl PartialEq for ByClaimOrder {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+impl Eq for ByClaimOrder {}
+impl PartialOrd for ByClaimOrder {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for ByClaimOrder {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0).then_with(|| self.1.path.cmp(&other.1.path))
+    }
+}
+
+/// One group's first `limit` runnable rows in claim order, each with its
+/// `updated_at`. Three access paths, none of which walks a large population
+/// that cannot qualify:
+///
+/// 1. a due-first probe (an index leading with `next_attempt_at`, so a group
+///    whose deadlines all lie in the future costs a seek) that orders the
+///    due set in memory when it is small;
+/// 2. otherwise a walk of the claim-ordered index that stops at `limit`
+///    qualifying rows -- dense, and so cheap, when most rows are due -- but
+///    gives up after [`WALK_ROWS`] rows passed;
+/// 3. otherwise one pass over exactly the due rows, keeping the best `limit`
+///    in a bounded heap, so a few due rows behind a very large number of older
+///    not-yet-due ones cost the due rows, not the population.
+fn group_window(
+    conn: &Connection,
+    group_id: &str,
+    now_unix_nanos: i64,
+    limit: u32,
+) -> Result<Vec<(i64, ClaimedObligation)>, SyncSqliteError> {
+    let decode = |r: &rusqlite::Row<'_>| -> rusqlite::Result<(i64, ClaimedObligation)> {
+        Ok((
+            r.get::<_, i64>(5)?,
+            ClaimedObligation {
+                group_id: r.get(0)?,
+                path: r.get(1)?,
+                invalidation_generation: r.get(2)?,
+                obligation_incarnation: r.get(3)?,
+                attempt_count: r.get(4)?,
+            },
+        ))
+    };
+    let columns = "group_id, path, invalidation_generation, obligation_incarnation, \
+                   attempt_count, updated_at";
+    let filters = runnable_filters_sql();
+    let mut probe = conn.prepare_cached(&format!(
+        "SELECT {columns} FROM projection_obligations INDEXED BY idx_projection_obligations_due \
+         WHERE state = 'pending' AND group_id = ?1 AND next_attempt_at <= ?2 {filters} \
+         LIMIT ?3"
+    ))?;
+    let mut due = probe
+        .query_map(rusqlite::params![group_id, now_unix_nanos, DUE_PROBE_ROWS + 1], decode)?
+        .collect::<Result<Vec<_>, _>>()?;
+    if due.len() <= DUE_PROBE_ROWS as usize {
+        sort_in_claim_order(&mut due);
+        due.truncate(limit as usize);
+        return Ok(due);
+    }
+
+    let mut walk = conn.prepare_cached(&format!(
+        "SELECT {columns}, next_attempt_at, (1 {filters}) \
+         FROM projection_obligations INDEXED BY idx_projection_obligations_runnable \
+         WHERE state = 'pending' AND group_id = ?1 \
+         ORDER BY updated_at ASC, path ASC"
+    ))?;
+    let mut walked = Vec::new();
+    let mut passed = 0u32;
+    let mut rows = walk.query([group_id])?;
+    while let Some(r) = rows.next()? {
+        passed += 1;
+        if r.get::<_, i64>(6)? <= now_unix_nanos && r.get::<_, bool>(7)? {
+            walked.push(decode(r)?);
+            if walked.len() >= limit as usize {
+                return Ok(walked);
+            }
+        }
+        if passed >= WALK_ROWS {
+            break;
+        }
+    }
+    if passed < WALK_ROWS {
+        // The walk reached the end of the group: what it found is the lot.
+        return Ok(walked);
+    }
+    drop(rows);
+
+    let mut due_pass = conn.prepare_cached(&format!(
+        "SELECT {columns} FROM projection_obligations INDEXED BY idx_projection_obligations_due \
+         WHERE state = 'pending' AND group_id = ?1 AND next_attempt_at <= ?2 {filters}"
+    ))?;
+    let mut best: std::collections::BinaryHeap<ByClaimOrder> = std::collections::BinaryHeap::new();
+    let mut rows = due_pass.query(rusqlite::params![group_id, now_unix_nanos])?;
+    while let Some(r) = rows.next()? {
+        let (updated_at, claimed) = decode(r)?;
+        best.push(ByClaimOrder(updated_at, claimed));
+        if best.len() > limit as usize {
+            best.pop();
+        }
+    }
+    Ok(best.into_sorted_vec().into_iter().map(|ByClaimOrder(at, c)| (at, c)).collect())
+}
+
+/// The original whole-table form of [`claim_runnable_obligations`], kept as
+/// the oracle the streaming form is checked against.
+#[cfg(test)]
+pub(crate) fn claim_runnable_obligations_oracle(
     conn: &Connection,
     now_unix_nanos: i64,
     per_group_limit: u32,
@@ -373,6 +629,7 @@ pub fn claim_runnable_obligations(
             WHERE state = 'pending' AND next_attempt_at <= ?1 \
               AND NOT {paused} \
               AND NOT {held} \
+              AND NOT {frozen} \
          ) \
          SELECT group_id, path, invalidation_generation, obligation_incarnation, attempt_count \
          FROM runnable \
@@ -383,10 +640,11 @@ pub fn claim_runnable_obligations(
             "projection_obligations.group_id",
             "projection_obligations.path",
         ),
-        held = crate::snapshot_install_hold::held_sql(
+        held = crate::held_path::held_sql(
             "projection_obligations.group_id",
             "projection_obligations.path",
         ),
+        frozen = crate::native_rebootstrap::frozen_group_sql("projection_obligations.group_id"),
     ))?;
     let rows =
         stmt.query_map(rusqlite::params![now_unix_nanos, per_group_limit, total_limit], |r| {
@@ -398,7 +656,8 @@ pub fn claim_runnable_obligations(
                 attempt_count: r.get(4)?,
             })
         })?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    let claimed = rows.collect::<Result<Vec<_>, _>>()?;
+    Ok(claimed)
 }
 
 /// Records a failed attempt at exactly `claimed_invalidation_generation`:
@@ -483,40 +742,11 @@ pub fn defer_obligation_without_penalty(
     Ok(affected == 1)
 }
 
-/// The earliest `next_attempt_at` among every currently-`'pending'`
-/// obligation NOT YET runnable (`next_attempt_at > now`) -- available for a
-/// scheduler loop that wants a precise timer wake instead of its own coarse
-/// poll interval whenever a backed-off retry is the only thing left
-/// outstanding. Not required for correctness today: the Convergence
-/// Engine's existing 1-second fallback poll (`FALLBACK_POLL_INTERVAL`)
-/// already bounds worst-case retry latency to about a second regardless of
-/// backoff, which is sufficient liveness for the initial obligation-driven
-/// cutover -- a dynamic earliest-deadline timer built on this query is a
-/// possible future optimization, not a requirement. `None` when
-/// there is nothing pending at all, or everything pending is already
-/// runnable (in which case the caller should be draining, not computing a
-/// wake deadline).
-pub fn earliest_pending_next_attempt_at(
-    conn: &Connection,
-    now_unix_nanos: i64,
-) -> Result<Option<i64>, SyncSqliteError> {
-    // `SELECT MIN(...)` always returns exactly one row (NULL, not zero rows,
-    // when nothing matches), so this reads the aggregate directly rather
-    // than treating a NULL result as `QueryReturnedNoRows`.
-    conn.query_row(
-        "SELECT MIN(next_attempt_at) FROM projection_obligations
-          WHERE state = 'pending' AND next_attempt_at > ?1",
-        rusqlite::params![now_unix_nanos],
-        |r| r.get::<_, Option<i64>>(0),
-    )
-    .map_err(SyncSqliteError::from)
-}
-
 /// The single atomic compound completion for an EXACT outcome (a real
 /// `path_materialized_generations` proof). Establishes, at one instant --
 /// the instant this `DELETE` commits, not at any earlier read -- all of:
 ///
-/// (a) DAG-side currency: `invalidation_generation` still equals the
+/// (a) desired-side currency: `invalidation_generation` still equals the
 ///     claimed generation `G`;
 /// (b) filesystem-side currency of the proof: its
 ///     `published_under_mutation_generation` still equals the path's
@@ -571,20 +801,81 @@ pub fn complete_obligation_if_exact_proof_current(
     Ok(affected == 1)
 }
 
+/// One close for [`complete_obligations_if_exact_proofs_current`]: the claim on a path's
+/// obligation and the desired state the path must be proven to hold.
+pub(crate) struct ExactClose<'a> {
+    pub path: &'a str,
+    pub claimed_invalidation_generation: i64,
+    pub claimed_obligation_incarnation: i64,
+    pub desired_resolved_path_state_hash: [u8; 32],
+}
+
+/// [`complete_obligation_if_exact_proof_current`] for many paths in one statement per chunk: each
+/// close deletes its path's obligation under exactly the conditions the single close names (the
+/// claimed generation and incarnation still hold, and the path's published proof was minted under
+/// the live fence and carries the desired hash). Returns the paths whose obligation was closed.
+pub(crate) fn complete_obligations_if_exact_proofs_current(
+    conn: &Connection,
+    group_id: &str,
+    closes: &[ExactClose<'_>],
+) -> Result<std::collections::HashSet<String>, SyncSqliteError> {
+    let mut closed = std::collections::HashSet::with_capacity(closes.len());
+    for chunk in closes.chunks(100) {
+        let values: Vec<String> = (0..chunk.len())
+            .map(|i| {
+                let b = 2 + 4 * i;
+                format!("(?{}, ?{}, ?{}, ?{})", b, b + 1, b + 2, b + 3)
+            })
+            .collect();
+        let mut stmt = conn.prepare_cached(&format!(
+            "WITH c(path, generation, incarnation, hash) AS (VALUES {}) \
+             DELETE FROM projection_obligations \
+              WHERE group_id = ?1 AND path IN ( \
+                SELECT c.path FROM c \
+                  CROSS JOIN projection_obligations o \
+                    ON o.group_id = ?1 AND o.path = c.path \
+                   AND o.invalidation_generation = c.generation \
+                   AND o.obligation_incarnation = c.incarnation \
+                  CROSS JOIN path_materialized_generations g \
+                    ON g.group_id = ?1 AND g.path = c.path \
+                   AND g.resolved_path_state_hash = c.hash \
+                  CROSS JOIN path_actual_mutation_fences f \
+                    ON f.group_id = ?1 AND f.path = c.path \
+                   AND g.published_under_mutation_generation = f.mutation_generation) \
+             RETURNING path",
+            values.join(", ")
+        ))?;
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(1 + 4 * chunk.len());
+        params.push(group_id.to_owned().into());
+        for close in chunk {
+            params.push(close.path.to_owned().into());
+            params.push(close.claimed_invalidation_generation.into());
+            params.push(close.claimed_obligation_incarnation.into());
+            params.push(close.desired_resolved_path_state_hash.to_vec().into());
+        }
+        let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
+        while let Some(row) = rows.next()? {
+            closed.insert(row.get::<_, String>(0)?);
+        }
+    }
+    Ok(closed)
+}
+
 /// Which durable, live proof to re-check in the SAME transaction as the
 /// close, for an outcome that never publishes to
 /// `path_materialized_generations` at all and so has nothing for the
 /// exact-outcome check's (b)/(c) to compare against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NonExactProofKind {
-    /// Closes against the EXISTING `MaterializationState::Placeholder`
-    /// state on the path's current `files` row. A placeholder that gets
-    /// hydrated between the worker's decision and this close leaves the
-    /// path MORE satisfied than the obligation required (benign to miss
-    /// closing this tick; the next admission or the periodic repair
+    /// Closes against the path's EXISTING `files` row being `Remote` or
+    /// `Present`: the policy owes this device no content for it (an on-demand
+    /// device records the version and fetches nothing until it is opened).
+    /// A row that is hydrated between the worker's decision and this close
+    /// leaves the path MORE satisfied than the obligation required (benign
+    /// to miss closing this tick; the next admission or the periodic repair
     /// candidate scan re-examines it regardless) -- this direction of
     /// staleness is harmless, unlike the hazard-hold direction below.
-    Placeholder,
+    ContentNotOwed,
     /// Closes against the EXISTING `held_reason` on the path's current
     /// `files` row (any non-NULL reason, not a specific one -- logic that
     /// decided this exact reason no longer applies would itself already
@@ -599,13 +890,13 @@ pub enum NonExactProofKind {
     /// hazard engine's own responsibility, not this completion
     /// primitive's.
     HazardHeld,
-    /// Unlike `Placeholder`/`HazardHeld`, an ignore-policy decision has NO
+    /// Unlike `Remote`/`HazardHeld`, an ignore-policy decision has NO
     /// durable, queryable proof row at all -- `is_locally_ignored` is a
     /// live, in-memory, per-session check against the current ignore sets,
     /// never persisted to `files` or anywhere else. There is therefore
     /// nothing for a same-transaction SQL re-read to compare against for
     /// this outcome: this variant's completion checks ONLY (a) -- the
-    /// DAG-side generation CAS.
+    /// desired-side generation CAS.
     ///
     /// This variant does NOT delete the obligation row the way the other
     /// two do: it transitions `state` to `'ignore_blocked'` instead,
@@ -638,7 +929,7 @@ pub enum NonExactProofKind {
 /// decision and this commit is observed here, not assumed away. Same
 /// `write_immediate`-only requirement as the exact-outcome primitive.
 ///
-/// "Close" means "remove the row" for `Placeholder`/`HazardHeld`, but NOT
+/// "Close" means "remove the row" for `Remote`/`HazardHeld`, but NOT
 /// for `IgnoreExcluded` -- see that variant's own doc comment for why it
 /// transitions to `'ignore_blocked'` instead of deleting.
 pub fn complete_obligation_if_non_exact_proof_current(
@@ -650,7 +941,7 @@ pub fn complete_obligation_if_non_exact_proof_current(
     proof: NonExactProofKind,
 ) -> Result<bool, SyncSqliteError> {
     let affected = match proof {
-        NonExactProofKind::Placeholder => conn.execute(
+        NonExactProofKind::ContentNotOwed => conn.execute(
             "DELETE FROM projection_obligations
               WHERE group_id = ?1 AND path = ?2
                 AND invalidation_generation = ?3
@@ -658,7 +949,7 @@ pub fn complete_obligation_if_non_exact_proof_current(
                 AND EXISTS (
                      SELECT 1 FROM files
                       WHERE group_id = ?1 AND path = ?2 AND state = 'current'
-                        AND materialization_state = 'placeholder'
+                        AND materialization_state IN ('remote', 'present')
                 )",
             rusqlite::params![
                 group_id,
@@ -744,7 +1035,7 @@ pub fn list_ignore_blocked_paths(
 /// Re-arms one `'ignore_blocked'` obligation back to `'pending'` (and
 /// immediately claimable, `next_attempt_at` reset to `now`) once a
 /// re-check sweep confirms the path is no longer locally ignored.
-/// Deliberately does NOT bump `invalidation_generation`: the DAG-side
+/// Deliberately does NOT bump `invalidation_generation`: the
 /// desired state never actually changed while this path sat blocked, only
 /// the LOCAL policy that was blocking it did, so the existing generation
 /// still correctly describes what a fresh resolve must satisfy. Guarded on

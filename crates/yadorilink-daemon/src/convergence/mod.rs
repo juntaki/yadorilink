@@ -1,8 +1,8 @@
 //! The Convergence Engine: a durable, persistent-state process that plans,
-//! fetches, and materializes DAG-resolved file content independently of
+//! fetches, and materializes native-resolved file content independently of
 //! message handling.
 //!
-//! `peer_session.rs`'s `handle_message` does authentication, DAG admission,
+//! `peer_session.rs`'s `handle_message` does authentication, native admission,
 //! and writes a `materialization_jobs` row (see
 //! `yadorilink_sync_sqlite::materialization_jobs`), then returns — releasing
 //! its bounded `message_slots` permit without ever awaiting network or disk
@@ -16,6 +16,17 @@ pub mod engine;
 #[path = "engine.rs"]
 mod engine_impl;
 pub mod retirement_service;
+
+#[cfg(test)]
+mod receive_budget_tests;
+#[cfg(test)]
+mod receive_completion_tests;
+#[cfg(test)]
+mod receive_cost_tests;
+#[cfg(test)]
+mod receive_kernel_bench;
+#[cfg(test)]
+mod retirement_candidates_tests;
 
 // `engine.rs` drives both via `DaemonState`. `availability`/`scheduler` as
 // their own modules are stage-3/stage-2 concerns (block-availability

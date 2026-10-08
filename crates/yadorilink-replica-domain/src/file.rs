@@ -4,8 +4,11 @@
 use sha2::{Digest, Sha256};
 
 use crate::codec::{put_i64, put_len_bytes, put_u32, ChangeError, Reader};
-use crate::ids::{BlockHash, ChangeHash, VersionHash};
-use crate::limits::{MAX_BLOCKS, MAX_BLOCK_SIZE_BYTES, MAX_XATTRS};
+use crate::ids::{BlockHash, VersionHash};
+use crate::limits::{
+    MAX_BLOCKS, MAX_BLOCK_SIZE_BYTES, MAX_ENCODED_VERSION_BYTES, MAX_XATTRS,
+    VERSION_BLOCK_ENCODED_BYTES,
+};
 
 /// Domain tag for a `FileVersion`'s canonical encoding. Version 2 carries a
 /// per-block size alongside each block hash, so v1 and v2 encodings of the
@@ -84,7 +87,7 @@ impl RecordKind {
 /// Current projected content state for one path.
 ///
 /// Causality is intentionally absent: it is represented by the authoring change
-/// hash and DAG ancestry, never by per-file counters.
+/// hash, never by per-file counters.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileRecord {
     pub path: String,
@@ -94,27 +97,10 @@ pub struct FileRecord {
     pub deleted: bool,
 }
 
-/// Complete native representation of one projected path.
-///
-/// `proto::FileInfo` is only a serialization envelope. This type keeps content,
-/// filesystem metadata, origin, and verified DAG identity together after
-/// decoding, so later code cannot accidentally drop fields by converting the
-/// wire message to a bare legacy [`FileRecord`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FileProjection {
-    pub record: FileRecord,
-    pub record_kind: RecordKind,
-    pub symlink_target: Option<String>,
-    pub symlink_out_of_root: bool,
-    pub unix_mode: Option<u32>,
-    pub origin_device_id: String,
-    pub authoring_change_hash: ChangeHash,
-}
-
 /// Per-file metadata carried by a `FileVersion` — everything that is part of
 /// a file's identity beyond its block content. `mtime` participates in
 /// version identity (a metadata-only touch is a distinct version) but never
-/// in causality: causality is exclusively DAG ancestry, and the deterministic
+/// in causality: causality is exclusively the recorded delta ancestry, and the deterministic
 /// tie-break among concurrent changes uses `lamport`, never wall-clock.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct FileMeta {
@@ -363,6 +349,7 @@ impl FileVersion {
                 self.blocks.len()
             )));
         }
+        self.validate_encoded_len()?;
         match self.meta.record_kind {
             RecordKind::File => {
                 if self.blocks.is_empty() != (self.size == 0) {
@@ -452,6 +439,32 @@ impl FileVersion {
         Ok(())
     }
 
+    /// Size in bytes of [`Self::canonical_encoding`].
+    pub fn encoded_len(&self) -> usize {
+        self.canonical_encoding().len()
+    }
+
+    /// Refuses a version whose canonical encoding exceeds
+    /// [`MAX_ENCODED_VERSION_BYTES`]: one that large cannot ride in a
+    /// replication item, so admitting it would leave a head whose version
+    /// never arrives.
+    pub fn validate_encoded_len(&self) -> Result<(), ChangeError> {
+        // Cheap lower bound first: the block list alone decides the common case.
+        let blocks_floor = self.blocks.len().saturating_mul(VERSION_BLOCK_ENCODED_BYTES);
+        let encoded_bytes = if blocks_floor > MAX_ENCODED_VERSION_BYTES {
+            blocks_floor
+        } else {
+            self.encoded_len()
+        };
+        if encoded_bytes > MAX_ENCODED_VERSION_BYTES {
+            return Err(ChangeError::VersionTooLarge {
+                encoded_bytes,
+                max_bytes: MAX_ENCODED_VERSION_BYTES,
+            });
+        }
+        Ok(())
+    }
+
     /// The canonical byte layout hashed to form `version_hash`. Does not
     /// include `version_hash` itself.
     pub fn canonical_encoding(&self) -> Vec<u8> {
@@ -482,7 +495,7 @@ impl FileVersion {
     /// enumeration and the peer version-present responder go through this
     /// rather than each re-deriving the byte layout, so the exact-version
     /// identifier used for durability is always the same
-    /// `FileVersion::compute_hash()` the change-DAG itself hashes versions
+    /// `FileVersion::compute_hash()` every replica hashes versions
     /// with — never a separate, ad hoc hash over a subset of these fields.
     ///
     /// For a directory row, the stored `size` and `mtime_unix_nanos` are
@@ -569,3 +582,6 @@ mod record_kind_symlink_target_consistency_tests;
 
 #[cfg(test)]
 mod directory_version_canonical_tests;
+
+#[cfg(test)]
+mod encoded_len_tests;

@@ -1,7 +1,7 @@
 //! `MaterializationIntentRepository` owns the crash-recovery intent
 //! journal, `materialization_intents`, whose rows record "a
 //! materialization write for this path is in progress" so a startup repair
-//! can disambiguate a `Hydrated`-but-missing file from an interrupted
+//! can disambiguate a `Present`-but-missing file from an interrupted
 //! write. `begin_materialization_intent`/`clear_materialization_intent`/
 //! `has_materialization_intent` are plain CRUD directly on
 //! `materialization_intents`.
@@ -23,6 +23,47 @@ fn now_unix_nanos() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as i64)
         .unwrap_or(0)
+}
+
+/// Before an intent for `path` is (re)written to `target`, keeps the target
+/// of the intent it replaces when that differs: an unproven earlier write
+/// whose bytes may already be on disk (see `materialization_replaced_targets`).
+fn keep_replaced_target(
+    conn: &rusqlite::Connection,
+    group_id: &str,
+    path: &str,
+    target: &[u8],
+) -> Result<(), SyncSqliteError> {
+    conn.execute(
+        "INSERT OR IGNORE INTO materialization_replaced_targets \
+         (group_id, path, target_version_hash) \
+         SELECT group_id, path, target_version_hash FROM materialization_intents \
+          WHERE group_id = ?1 AND path = ?2 AND target_version_hash != ?3",
+        rusqlite::params![group_id, path, target],
+    )?;
+    Ok(())
+}
+
+/// Clears `path`'s intent and, with it, the targets it had replaced --
+/// the targets first. Where the two statements commit separately, a crash
+/// between them then leaves the intent with no recorded targets (a capture
+/// may author one of those contents again, as before they were recorded),
+/// never recorded targets with no intent, which a later unrelated write of
+/// the path would inherit and refuse a genuine edit restoring that content.
+fn delete_intent(
+    conn: &rusqlite::Connection,
+    group_id: &str,
+    path: &str,
+) -> Result<(), SyncSqliteError> {
+    conn.execute(
+        "DELETE FROM materialization_replaced_targets WHERE group_id = ?1 AND path = ?2",
+        rusqlite::params![group_id, path],
+    )?;
+    conn.execute(
+        "DELETE FROM materialization_intents WHERE group_id = ?1 AND path = ?2",
+        rusqlite::params![group_id, path],
+    )?;
+    Ok(())
 }
 
 pub struct MaterializationIntentRepository {
@@ -50,6 +91,7 @@ impl MaterializationIntentRepository {
         let now = now_unix_nanos();
         self.database.write::<_, SyncSqliteError>(|conn| {
             permit.verify()?;
+            keep_replaced_target(conn, group_id, path, target_version_hash)?;
             conn.execute(
                 "INSERT INTO materialization_intents \
                  (group_id, path, target_version_hash, created_at_unix_nanos) \
@@ -74,11 +116,7 @@ impl MaterializationIntentRepository {
     ) -> Result<(), SyncSqliteError> {
         self.database.write::<_, SyncSqliteError>(|conn| {
             permit.verify()?;
-            conn.execute(
-                "DELETE FROM materialization_intents WHERE group_id = ?1 AND path = ?2",
-                rusqlite::params![group_id, path],
-            )?;
-            Ok(())
+            delete_intent(conn, group_id, path)
         })
     }
 
@@ -93,6 +131,7 @@ impl MaterializationIntentRepository {
         target_version_hash: &[u8],
         now: i64,
     ) -> Result<(), SyncSqliteError> {
+        keep_replaced_target(tx, group_id, path, target_version_hash)?;
         tx.execute(
             "INSERT INTO materialization_intents \
              (group_id, path, target_version_hash, created_at_unix_nanos) \
@@ -113,16 +152,12 @@ impl MaterializationIntentRepository {
         group_id: &str,
         path: &str,
     ) -> Result<(), SyncSqliteError> {
-        tx.execute(
-            "DELETE FROM materialization_intents WHERE group_id = ?1 AND path = ?2",
-            rusqlite::params![group_id, path],
-        )?;
-        Ok(())
+        delete_intent(tx, group_id, path)
     }
 
     /// Whether an in-progress materialization intent exists for
     /// `(group_id, path)` — the crash-vs-offline-delete disambiguator repair
-    /// consults for a `Hydrated`-but-missing file.
+    /// consults for a `Present`-but-missing file.
     pub fn has_materialization_intent(
         &self,
         group_id: &str,

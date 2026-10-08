@@ -628,11 +628,6 @@ pub const RETAINED_LIVE_DESCENDANTS: &str = "retained: live descendants";
 /// so the delete never aimed at it. Kept for good, however empty.
 pub const RETAINED_REPLACED_LOCALLY: &str = "retained: replaced by local directory";
 
-/// Why an entry is kept at its copy name: on this volume, which folds case
-/// or Unicode normalization, a directory the tree needs holds a name that
-/// folds to the entry's own.
-pub const RETAINED_FOLDED_NAME: &str = "retained: a directory holds this name on this volume";
-
 /// Records that the directory at `path` stays on disk although its entry
 /// is deleted, and why, in the caller's transaction. Replaces an earlier
 /// record for the path.

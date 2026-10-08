@@ -1125,13 +1125,6 @@ public struct ConflictSummary: Equatable, Hashable {
     public var conflictTimestamp: String?
     public var kind: EntryKind
     public var reason: ConflictReason
-    /**
-     * The folder's history compaction is waiting for this conflict to be
-     * resolved. The copy and the file it conflicts with hold two versions
-     * written by one device, which compaction cannot carry; sync goes on,
-     * and deleting or editing the copy resolves it.
-     */
-    public var holdsCompaction: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -1144,13 +1137,7 @@ public struct ConflictSummary: Equatable, Hashable {
          */path: String, size: UInt64, modifiedAt: Date?, 
         /**
          * The file the copy conflicts with, relative to the root.
-         */currentPath: String, loserDeviceId: String?, conflictTimestamp: String?, kind: EntryKind, reason: ConflictReason, 
-        /**
-         * The folder's history compaction is waiting for this conflict to be
-         * resolved. The copy and the file it conflicts with hold two versions
-         * written by one device, which compaction cannot carry; sync goes on,
-         * and deleting or editing the copy resolves it.
-         */holdsCompaction: Bool) {
+         */currentPath: String, loserDeviceId: String?, conflictTimestamp: String?, kind: EntryKind, reason: ConflictReason) {
         self.localPath = localPath
         self.path = path
         self.size = size
@@ -1160,7 +1147,6 @@ public struct ConflictSummary: Equatable, Hashable {
         self.conflictTimestamp = conflictTimestamp
         self.kind = kind
         self.reason = reason
-        self.holdsCompaction = holdsCompaction
     }
 
     
@@ -1187,8 +1173,7 @@ public struct FfiConverterTypeConflictSummary: FfiConverterRustBuffer {
                 loserDeviceId: FfiConverterOptionString.read(from: &buf), 
                 conflictTimestamp: FfiConverterOptionString.read(from: &buf), 
                 kind: FfiConverterTypeEntryKind.read(from: &buf), 
-                reason: FfiConverterTypeConflictReason.read(from: &buf), 
-                holdsCompaction: FfiConverterBool.read(from: &buf)
+                reason: FfiConverterTypeConflictReason.read(from: &buf)
         )
     }
 
@@ -1202,7 +1187,6 @@ public struct FfiConverterTypeConflictSummary: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.conflictTimestamp, into: &buf)
         FfiConverterTypeEntryKind.write(value.kind, into: &buf)
         FfiConverterTypeConflictReason.write(value.reason, into: &buf)
-        FfiConverterBool.write(value.holdsCompaction, into: &buf)
     }
 }
 
@@ -1513,14 +1497,12 @@ public func FfiConverterTypeEvictOutcome_lower(_ value: EvictOutcome) -> RustBuf
 public struct FileAvailability: Equatable, Hashable {
     public var tracked: Bool
     public var state: MaterializationState
-    public var pinned: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(tracked: Bool, state: MaterializationState, pinned: Bool) {
+    public init(tracked: Bool, state: MaterializationState) {
         self.tracked = tracked
         self.state = state
-        self.pinned = pinned
     }
 
     
@@ -1540,15 +1522,13 @@ public struct FfiConverterTypeFileAvailability: FfiConverterRustBuffer {
         return
             try FileAvailability(
                 tracked: FfiConverterBool.read(from: &buf), 
-                state: FfiConverterTypeMaterializationState.read(from: &buf), 
-                pinned: FfiConverterBool.read(from: &buf)
+                state: FfiConverterTypeMaterializationState.read(from: &buf)
         )
     }
 
     public static func write(_ value: FileAvailability, into buf: inout [UInt8]) {
         FfiConverterBool.write(value.tracked, into: &buf)
         FfiConverterTypeMaterializationState.write(value.state, into: &buf)
-        FfiConverterBool.write(value.pinned, into: &buf)
     }
 }
 
@@ -1876,6 +1856,11 @@ public struct FolderSummary: Equatable, Hashable {
      */
     public var degradedReason: String?
     public var volume: VolumeSummary?
+    /**
+     * A provider-backed folder: it has no directory, so `local_path` is only its identity key and
+     * nothing may reveal, open or restore into it as a path.
+     */
+    public var provider: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -1885,7 +1870,11 @@ public struct FolderSummary: Equatable, Hashable {
          */localPath: String, groupId: String, name: String, mode: FolderMode, state: FolderState, paused: Bool, conflictCount: UInt64, hydratedFileCount: UInt64, placeholderFileCount: UInt64, hydratingFileCount: UInt64, heldFileCount: UInt64, skippedSymlinkCount: UInt64, transfer: FolderTransferProgress?, durability: DurabilityStatus, durabilityEvidence: DurabilityEvidence, localStorage: LocalStorageState, fetchAvailability: FetchAvailability, fullReplicaDeviceIds: [String], policyStale: Bool, ambiguous: Bool, ambiguousLocalPaths: [String], degraded: Bool, 
         /**
          * Diagnostic text for a tooltip.
-         */degradedReason: String?, volume: VolumeSummary?) {
+         */degradedReason: String?, volume: VolumeSummary?, 
+        /**
+         * A provider-backed folder: it has no directory, so `local_path` is only its identity key and
+         * nothing may reveal, open or restore into it as a path.
+         */provider: Bool) {
         self.localPath = localPath
         self.groupId = groupId
         self.name = name
@@ -1910,6 +1899,7 @@ public struct FolderSummary: Equatable, Hashable {
         self.degraded = degraded
         self.degradedReason = degradedReason
         self.volume = volume
+        self.provider = provider
     }
 
     
@@ -1951,7 +1941,8 @@ public struct FfiConverterTypeFolderSummary: FfiConverterRustBuffer {
                 ambiguousLocalPaths: FfiConverterSequenceString.read(from: &buf), 
                 degraded: FfiConverterBool.read(from: &buf), 
                 degradedReason: FfiConverterOptionString.read(from: &buf), 
-                volume: FfiConverterOptionTypeVolumeSummary.read(from: &buf)
+                volume: FfiConverterOptionTypeVolumeSummary.read(from: &buf), 
+                provider: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -1980,6 +1971,7 @@ public struct FfiConverterTypeFolderSummary: FfiConverterRustBuffer {
         FfiConverterBool.write(value.degraded, into: &buf)
         FfiConverterOptionString.write(value.degradedReason, into: &buf)
         FfiConverterOptionTypeVolumeSummary.write(value.volume, into: &buf)
+        FfiConverterBool.write(value.provider, into: &buf)
     }
 }
 
@@ -3167,6 +3159,81 @@ public func FfiConverterTypePreflightResult_lift(_ buf: RustBuffer) throws -> Pr
 #endif
 public func FfiConverterTypePreflightResult_lower(_ value: PreflightResult) -> RustBuffer {
     return FfiConverterTypePreflightResult.lower(value)
+}
+
+
+/**
+ * A provider-backed folder just created: it has no local path, the File Provider domain is the folder.
+ */
+public struct ProviderFolderOutcome: Equatable, Hashable {
+    public var groupId: String
+    public var rootId: String
+    public var displayName: String
+    public var mode: FolderMode
+    /**
+     * The request was a retry of one that had already completed.
+     */
+    public var alreadyExisted: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(groupId: String, rootId: String, displayName: String, mode: FolderMode, 
+        /**
+         * The request was a retry of one that had already completed.
+         */alreadyExisted: Bool) {
+        self.groupId = groupId
+        self.rootId = rootId
+        self.displayName = displayName
+        self.mode = mode
+        self.alreadyExisted = alreadyExisted
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ProviderFolderOutcome: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeProviderFolderOutcome: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ProviderFolderOutcome {
+        return
+            try ProviderFolderOutcome(
+                groupId: FfiConverterString.read(from: &buf), 
+                rootId: FfiConverterString.read(from: &buf), 
+                displayName: FfiConverterString.read(from: &buf), 
+                mode: FfiConverterTypeFolderMode.read(from: &buf), 
+                alreadyExisted: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ProviderFolderOutcome, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.groupId, into: &buf)
+        FfiConverterString.write(value.rootId, into: &buf)
+        FfiConverterString.write(value.displayName, into: &buf)
+        FfiConverterTypeFolderMode.write(value.mode, into: &buf)
+        FfiConverterBool.write(value.alreadyExisted, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeProviderFolderOutcome_lift(_ buf: RustBuffer) throws -> ProviderFolderOutcome {
+    return try FfiConverterTypeProviderFolderOutcome.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeProviderFolderOutcome_lower(_ value: ProviderFolderOutcome) -> RustBuffer {
+    return FfiConverterTypeProviderFolderOutcome.lower(value)
 }
 
 

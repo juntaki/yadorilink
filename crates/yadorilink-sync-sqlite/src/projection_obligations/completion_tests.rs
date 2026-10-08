@@ -7,15 +7,14 @@ use crate::materialized_generation::{
     MaterializedObjectKind,
 };
 
-/// Full schema this module's tests need: DAG + projection_obligations
-/// (via `init_dag_schema`), the fence/proof tables, and `files` (for
-/// the non-exact-outcome tests) -- `yadorilink_sqlite_runtime::
-/// init_schema` must run AFTER `init_dag_schema` (it assumes `changes`/
-/// `pruned_changes` already exist, per its own doc comment), matching
-/// the real production schema initialization order.
+/// Full schema this module's tests need: the replica tables
+/// (including projection_obligations), the fence/proof tables, and `files`
+/// (for the non-exact-outcome tests) -- `yadorilink_sqlite_runtime::
+/// init_schema` runs after them, matching the real production schema
+/// initialization order.
 fn conn() -> Connection {
     let c = Connection::open_in_memory().unwrap();
-    crate::dag_store::init_dag_schema(&c).unwrap();
+    crate::replica_tables::init_for_tests(&c).unwrap();
     init_materialized_generation_schema(&c).unwrap();
     yadorilink_sqlite_runtime::init_schema(&c).unwrap();
     c
@@ -60,7 +59,6 @@ fn exact_completion_closes_when_all_three_conditions_hold() {
         &conn,
         "g",
         "a.txt",
-        &[],
         MaterializedObjectKind::RegularFile,
         None,
         None,
@@ -88,7 +86,7 @@ fn exact_completion_closes_when_all_three_conditions_hold() {
     );
 }
 
-/// (a) fails: an independent DAG admission bumped `invalidation_
+/// (a) fails: an independent native admission bumped `invalidation_
 /// generation` past the claimed value between claim and completion.
 #[test]
 fn exact_completion_fails_when_dag_side_generation_moved() {
@@ -103,7 +101,6 @@ fn exact_completion_fails_when_dag_side_generation_moved() {
         &conn,
         "g",
         "a.txt",
-        &[],
         MaterializedObjectKind::RegularFile,
         None,
         None,
@@ -133,7 +130,7 @@ fn exact_completion_fails_when_dag_side_generation_moved() {
 }
 
 /// (b) fails: an independent mutator bumped the FILESYSTEM-side fence
-/// (never touching the DAG at all) between publication and
+/// (never touching native state at all) between publication and
 /// completion. The proof row still exists and its content is
 /// untouched, but it is no longer usable.
 #[test]
@@ -149,7 +146,6 @@ fn exact_completion_fails_when_filesystem_side_fence_moved_even_though_dag_side_
         &conn,
         "g",
         "a.txt",
-        &[],
         MaterializedObjectKind::RegularFile,
         None,
         None,
@@ -159,7 +155,7 @@ fn exact_completion_fails_when_filesystem_side_fence_moved_even_though_dag_side_
     .unwrap()
     .unwrap();
 
-    // A DAG-invisible mutator (e.g. on-demand hydration/eviction, or a
+    // A mutator invisible to native admission (e.g. on-demand hydration/eviction, or a
     // retirement pass for an unrelated reason) bumps the fence without
     // ever touching projection_obligations.
     bump_mutation_fence(&conn, "g", "a.txt", "some-other-mutator", 3000).unwrap();
@@ -174,14 +170,14 @@ fn exact_completion_fails_when_filesystem_side_fence_moved_even_though_dag_side_
             &published.resolved_path_state_hash,
         )
         .unwrap(),
-        "a DAG-side-only completion must not close once the filesystem-side proof it points \
-         at has been invalidated by a mutator the DAG never saw"
+        "a desired-side-only completion must not close once the filesystem-side proof it points \
+         at has been invalidated by a mutator native admission never saw"
     );
     assert_eq!(
         lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap().invalidation_generation,
         claimed_g,
         "the obligation is left outstanding at the SAME generation, to be re-resolved -- it \
-         was never invalidated on the DAG side, only the fs-side proof was"
+         was never invalidated on the desired side, only the fs-side proof was"
     );
 }
 
@@ -202,7 +198,6 @@ fn exact_completion_fails_when_the_usable_proofs_content_does_not_match_the_desi
         &conn,
         "g",
         "a.txt",
-        &[],
         MaterializedObjectKind::RegularFile,
         None,
         None,
@@ -248,7 +243,7 @@ fn exact_completion_fails_when_no_proof_was_ever_published() {
 
 /// Non-exact: a Placeholder settlement closes while the path's
 /// `files` row still genuinely reads `materialization_state =
-/// 'placeholder'`.
+/// 'remote'`.
 #[test]
 fn non_exact_placeholder_completion_closes_while_still_a_placeholder() {
     let conn = conn();
@@ -256,7 +251,7 @@ fn non_exact_placeholder_completion_closes_while_still_a_placeholder() {
     let claimed_obligation = lookup_projection_obligation(&conn, "g", "p.txt").unwrap().unwrap();
     let claimed_g = claimed_obligation.invalidation_generation;
     let claimed_i = claimed_obligation.obligation_incarnation;
-    seed_file_row(&conn, "g", "p.txt", "placeholder", None);
+    seed_file_row(&conn, "g", "p.txt", "remote", None);
 
     assert!(complete_obligation_if_non_exact_proof_current(
         &conn,
@@ -264,24 +259,25 @@ fn non_exact_placeholder_completion_closes_while_still_a_placeholder() {
         "p.txt",
         claimed_g,
         claimed_i,
-        NonExactProofKind::Placeholder,
+        NonExactProofKind::ContentNotOwed,
     )
     .unwrap());
     assert!(lookup_projection_obligation(&conn, "g", "p.txt").unwrap().is_none());
 }
 
-/// Non-exact: a Placeholder settlement must NOT close once the path
-/// has since been hydrated -- the live, same-transaction re-read is
+/// Non-exact: a content-not-owed settlement must NOT close once the path
+/// has since entered `Hydrating` -- the live, same-transaction re-read is
 /// required even though this specific direction of staleness is
-/// independently benign.
+/// independently benign. A `Present` object (an older version's bytes kept
+/// under the newer row) still owes nothing and does close.
 #[test]
-fn non_exact_placeholder_completion_fails_once_hydrated_in_the_meantime() {
+fn non_exact_content_not_owed_completion_fails_once_hydrating_in_the_meantime() {
     let conn = conn();
     bump_projection_obligations_for_touched_paths(&conn, "g", &["p.txt"], 1000).unwrap();
     let claimed_obligation = lookup_projection_obligation(&conn, "g", "p.txt").unwrap().unwrap();
     let claimed_g = claimed_obligation.invalidation_generation;
     let claimed_i = claimed_obligation.obligation_incarnation;
-    seed_file_row(&conn, "g", "p.txt", "hydrated", None);
+    seed_file_row(&conn, "g", "p.txt", "hydrating", None);
 
     assert!(!complete_obligation_if_non_exact_proof_current(
         &conn,
@@ -289,7 +285,7 @@ fn non_exact_placeholder_completion_fails_once_hydrated_in_the_meantime() {
         "p.txt",
         claimed_g,
         claimed_i,
-        NonExactProofKind::Placeholder,
+        NonExactProofKind::ContentNotOwed,
     )
     .unwrap());
     assert!(lookup_projection_obligation(&conn, "g", "p.txt").unwrap().is_some());
@@ -304,7 +300,7 @@ fn non_exact_hazard_held_completion_closes_while_still_held() {
     let claimed_obligation = lookup_projection_obligation(&conn, "g", "h.txt").unwrap().unwrap();
     let claimed_g = claimed_obligation.invalidation_generation;
     let claimed_i = claimed_obligation.obligation_incarnation;
-    seed_file_row(&conn, "g", "h.txt", "hydrated", Some("case_collision"));
+    seed_file_row(&conn, "g", "h.txt", "present", Some("case_collision"));
 
     assert!(complete_obligation_if_non_exact_proof_current(
         &conn,
@@ -328,7 +324,7 @@ fn non_exact_hazard_held_completion_fails_once_the_hold_is_lifted() {
     let claimed_obligation = lookup_projection_obligation(&conn, "g", "h.txt").unwrap().unwrap();
     let claimed_g = claimed_obligation.invalidation_generation;
     let claimed_i = claimed_obligation.obligation_incarnation;
-    seed_file_row(&conn, "g", "h.txt", "hydrated", None);
+    seed_file_row(&conn, "g", "h.txt", "present", None);
 
     assert!(!complete_obligation_if_non_exact_proof_current(
         &conn,
@@ -425,7 +421,7 @@ fn a_fresh_admission_rearms_an_ignore_blocked_path_too() {
     )
     .unwrap();
 
-    // A genuinely new DAG admission must re-arm the path regardless of
+    // A genuinely new native admission must re-arm the path regardless of
     // whatever local scheduler state it was parked in.
     bump_projection_obligations_for_touched_paths(&conn, "g", &["i.txt"], 2000).unwrap();
 
@@ -472,7 +468,6 @@ fn completing_one_paths_obligation_never_touches_an_unrelated_path() {
         &conn,
         "g",
         "a.txt",
-        &[],
         MaterializedObjectKind::RegularFile,
         None,
         None,
@@ -529,7 +524,6 @@ fn a_concurrent_admissions_rearmed_obligation_is_independently_claimable_through
         &conn,
         "g",
         "a.txt",
-        &[],
         MaterializedObjectKind::RegularFile,
         None,
         None,
@@ -588,7 +582,6 @@ fn exact_completion_closes_for_a_content_identical_verifications_snapshot_epoch(
         &conn,
         "g",
         "a.txt",
-        &[],
         MaterializedObjectKind::RegularFile,
         None,
         None,

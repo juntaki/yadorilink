@@ -86,24 +86,80 @@ pub fn load() -> std::io::Result<DeviceConfig> {
     Ok(config)
 }
 
-#[cfg(unix)]
+/// The points in [`write_config_file`] after which a crash or I/O error can
+/// strike, in order. Tests inject a failure at each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteStep {
+    TempWritten,
+    TempSynced,
+    Renamed,
+}
+
+/// Replaces `path` atomically. `device.json` is this device's registered
+/// identity: the daemon refuses to start on an empty or partial file, so a
+/// crash must leave either the previous document or the complete new one.
+///
+/// A sibling temporary file (owner-only from creation) is written and
+/// fsynced, renamed over the target, and the parent directory is fsynced so
+/// the rename itself is durable.
 fn write_config_file(path: &Path, contents: &str) -> std::io::Result<()> {
+    write_config_file_with(path, contents, &mut |_| Ok(()))
+}
+
+fn write_config_file_with(
+    path: &Path,
+    contents: &str,
+    after: &mut dyn FnMut(WriteStep) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     use std::io::Write;
+
+    let name = path.file_name().map_or_else(|| "device.json".into(), |n| n.to_string_lossy());
+    let temporary = path.with_file_name(format!(".{name}.tmp-{}", std::process::id()));
+    // A leftover from an earlier crash would make `create_new` fail forever;
+    // the name carries this process's id, so it cannot be another writer's.
+    let _ = std::fs::remove_file(&temporary);
+
+    let result = (|| -> std::io::Result<()> {
+        let mut file = create_owner_only(&temporary)?;
+        file.write_all(contents.as_bytes())?;
+        after(WriteStep::TempWritten)?;
+        file.sync_all()?;
+        drop(file);
+        after(WriteStep::TempSynced)?;
+        std::fs::rename(&temporary, path)?;
+        after(WriteStep::Renamed)?;
+        sync_parent_directory(path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(unix)]
+fn create_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(path)?;
+    let file = std::fs::OpenOptions::new().create_new(true).write(true).mode(0o600).open(path)?;
+    // `mode` is masked by the umask at creation; set it explicitly too.
     file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    file.write_all(contents.as_bytes())
+    Ok(file)
 }
 
 #[cfg(not(unix))]
-fn write_config_file(path: &Path, contents: &str) -> std::io::Result<()> {
-    std::fs::write(path, contents)
+fn create_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new().create_new(true).write(true).open(path)
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    std::fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// `YADORILINK_CONFIG_DIR` is process-global and Rust runs tests concurrently.

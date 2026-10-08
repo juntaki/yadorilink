@@ -74,7 +74,7 @@ fn link(state: &Arc<DaemonState>, root: &std::path::Path, group_id: &str) {
 /// Diagnostic-only: one device's index state for `path` -- distinguishes
 /// "never arrived in the index at all" (delivery/DAG-admission never
 /// reached it) from "indexed but not materialized" (e.g. stuck
-/// `Hydrating`/`Placeholder`, or held) from "DAG head advanced, index says
+/// `Hydrating`/`Remote`, or held) from "DAG head advanced, index says
 /// live, but the bytes never landed on disk" (a materialization bug).
 /// Mirrors `monkey_chaos.rs`'s `describe_index_state`.
 fn describe_index_state(state: &DaemonState, group_id: &str, path: &str) -> String {
@@ -88,7 +88,7 @@ fn describe_index_state(state: &DaemonState, group_id: &str, path: &str) -> Stri
     let heads = state
         .replica_coordinator
         .sqlite()
-        .dag_group_heads(group_id)
+        .native_group_heads(group_id)
         .map(|hs| hs.iter().map(|h| h.to_hex()).collect::<Vec<_>>());
     format!(
         "record={record:?} materialization={materialization:?} held={held:?} \

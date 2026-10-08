@@ -60,7 +60,7 @@ fn local_write_request(
 /// notification (here, a plain file already written to disk plus this
 /// request -- see `LinkFlushHandle::capture_local_write`'s own doc for
 /// why the request itself carries no content) results in exactly one
-/// DAG change and one indexed row, through the SAME admission path a
+/// native delta and one indexed row, through the SAME admission path a
 /// filesystem watcher's own event takes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_write_request_for_a_new_file_admits_exactly_one_dag_change() {
@@ -88,13 +88,13 @@ async fn local_write_request_for_a_new_file_admits_exactly_one_dag_change() {
     assert_eq!(
         state.replica_coordinator.sqlite().dag_list_versions("group-1", "new.txt").unwrap().len(),
         1,
-        "exactly one DAG change for the create"
+        "exactly one native delta for the create"
     );
 }
 
 /// A duplicate `createItem` replay for the exact same unchanged content
 /// (a real callback retry, or the OS re-delivering the same
-/// notification) must not mint a second DAG change -- `process_event`'s
+/// notification) must not mint a second native delta -- `process_event`'s
 /// own self-echo/no-op suppression, exercised here through the new
 /// signal source.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -126,7 +126,7 @@ async fn duplicate_local_write_request_for_unchanged_content_does_not_duplicate_
     assert_eq!(
         state.replica_coordinator.sqlite().dag_list_versions("group-1", "new.txt").unwrap().len(),
         1,
-        "a duplicate replay of unchanged content must not mint a second DAG change"
+        "a duplicate replay of unchanged content must not mint a second native delta"
     );
 }
 

@@ -25,7 +25,6 @@ test-support = []
 # build. A caller whose tests assert the opposite -- that an instantaneous
 # confirmation without a durable remote lease must NOT authorize deletion
 # (`yadorilink-daemon`'s
-# `preflight_disk_pressure_runs_eviction_sweep_for_on_demand_link_first`/
 # `eviction_without_remote_lease_never_reaches_physical_reclaim`) -- must
 # NOT enable it, or its tests silently stop exercising the real,
 # fails-closed `verify_reclaim_custody` path.
@@ -38,7 +37,7 @@ yadorilink-root-authority = { path = "../yadorilink-root-authority" }
 # dependency, same as `yadorilink-root-authority`'s own (this crate does not
 # depend back on `yadorilink-filesystem-sync`, so no cycle risk).
 yadorilink-local-storage = { path = "../yadorilink-local-storage" }
-# The restore/eviction value types (`RestoreOperation`/`EvictableFile`,
+# The restore value types (`RestoreOperation`/`RestoreCommitOutcome`,
 # owned by `session_state`) and `materialization_execution.rs`'s
 # `MaterializationExecutionPort` surface (7D-9C) -- already a transitive
 # dependency via `yadorilink-local-storage`/`yadorilink-root-authority`, made

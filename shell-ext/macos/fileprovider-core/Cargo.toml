@@ -2,7 +2,7 @@
 name = "yadorilink-fileprovider-core"
 version = "0.1.0"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "AGPL-3.0-only"
 
 # the small Rust FFI core behind the macOS
 # NSFileProviderReplicatedExtension (shell-ext/macos/YadoriLinkFileProvider),
@@ -41,7 +41,7 @@ yadorilink-ipc-proto = { path = "../../../crates/yadorilink-ipc-proto" }
 # `#[cfg(test)]` module, but declared here rather than split into a
 # `[dev-dependencies]` override to avoid re-declaring `tokio` twice --
 # negligible extra compile surface for a small leaf crate.
-tokio = { version = "1", features = ["net", "rt", "time", "io-util", "macros"] }
+tokio = { version = "1", features = ["net", "rt", "time", "io-util", "macros", "sync"] }
 libc = "0.2"
 # Item/enumerator lists cross the FFI boundary as JSON (see lib.rs's doc
 # comment) rather than hand-rolled C arrays-of-structs — the payloads are

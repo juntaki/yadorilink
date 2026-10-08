@@ -37,13 +37,9 @@ async fn the_daemon_holds_no_reference_to_a_local_executor() {
 
 use super::*;
 use ed25519_dalek::SigningKey;
-use std::collections::HashMap;
 use yadorilink_local_storage::SegmentBlockStore;
 use yadorilink_peer_session::peer_session::PeerSyncSession;
-use yadorilink_replica_domain::change::{Op, PutOrigin};
 use yadorilink_replica_domain::file::{FileMeta, FileVersion, RecordKind};
-use yadorilink_replica_domain::ids::{DeviceId, FolderGroupId, SyncPath};
-use yadorilink_replica_domain::test_authoring::create_signed_for_tests;
 use yadorilink_root_authority::root_identity::VerifiedRoot;
 
 const GROUP_A: &str = "group-a";
@@ -103,32 +99,25 @@ async fn build_state_with_two_linked_groups() -> (
 
     replica_coordinator.link_repository().add_link(&root_b.to_string_lossy(), GROUP_B).unwrap();
 
-    let build = DaemonState::build("device-local".to_string(), replica_coordinator, block_store);
-    let state = build.state;
+    let state = DaemonState::build("device-local".to_string(), replica_coordinator, block_store);
     state.test_root_commit_authorities.lock().unwrap().insert(
         GROUP_A.to_string(),
         Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()),
     );
 
-    let key = SigningKey::from_bytes(&[77u8; 32]);
+    let _key = SigningKey::from_bytes(&[77u8; 32]);
     let version = empty_version(1_700_002_000);
-    let bystander_change = create_signed_for_tests(
-        vec![],
-        0,
-        DeviceId("device-untrusted-for-hazard-test".to_string()),
-        FolderGroupId(GROUP_B.to_string()),
-        vec![Op::Put {
-            path: SyncPath("bystander.txt".to_string()),
-            version: version.version_hash,
-            origin: PutOrigin::Direct,
-        }],
-        &key,
+    let _bystander_change = crate::test_support::remote_admission_fixture::admit_remote(
+        &state.replica_coordinator,
+        GROUP_B,
+        "device-untrusted-for-hazard-test",
+        vec![crate::test_support::remote_admission_fixture::put(
+            "bystander.txt",
+            version.version_hash,
+            vec![],
+        )],
+        std::slice::from_ref(&version),
     );
-    state
-        .replica_coordinator
-        .change_history_repository()
-        .dag_admit_change_with_versions(&bystander_change, std::slice::from_ref(&version))
-        .unwrap();
 
     let deps_a = crate::peer_orchestrator::peer_sync_session_deps(&state);
     let (transports_a, _peer_transports_a) =
@@ -148,9 +137,7 @@ async fn build_state_with_two_linked_groups() -> (
         replica_engine_a,
         peer_store_a,
         vec![GROUP_A.to_string()],
-        HashMap::from([(GROUP_A.to_string(), root_a.clone())]),
         transports_a,
-        Some(state.forward_tx.clone()),
         deps_a,
     );
     let session_a_handle = session_a.clone();
@@ -174,9 +161,7 @@ async fn build_state_with_two_linked_groups() -> (
         replica_engine_b,
         peer_store_b,
         vec![GROUP_B.to_string()],
-        HashMap::from([(GROUP_B.to_string(), root_b.clone())]),
         transports_b,
-        Some(state.forward_tx.clone()),
         deps_b,
     );
     let session_b_handle = session_b.clone();

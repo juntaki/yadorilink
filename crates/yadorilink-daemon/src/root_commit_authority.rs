@@ -46,7 +46,10 @@ impl yadorilink_peer_session::peer_session::RootCommitAuthorityProvider for Daem
             return Some(lease.clone());
         }
         let local_path = match self.replica_coordinator.link_repository().list_links() {
-            Ok(links) => links.into_iter().find(|l| l.group_id == group_id).map(|l| l.local_path),
+            Ok(links) => links
+                .into_iter()
+                .find(|l| l.group_id == group_id)
+                .and_then(|l| l.folder_path().map(str::to_string)),
             Err(e) => {
                 tracing::warn!(error = %e, group_id, "failed to look up this group's local link");
                 None
@@ -75,20 +78,17 @@ impl DaemonState {
     }
 
     /// Overrides the answer `adapters::build_application_services` wires
-    /// into `ReplicaRoleService`'s `PlaceholderPipelineCapabilityPort` for
+    /// into `ReplicaRoleService`'s `OnDemandCapabilityPort` for
     /// this daemon instance, in place of the real, unconditionally-`false`
-    /// `on_demand_pipeline_is_connected()` probe -- see `test_placeholder_
-    /// pipeline_connected`'s own doc comment for why a daemon integration
-    /// test needs this instead of the free function's thread-local
-    /// `OverrideForTest`. Call before `control_context::ControlContext::
+    /// per-root decision of `provider_gate` (a plain root never allows it) -- see
+    /// `test_on_demand_allowed`'s own doc comment for why a daemon integration
+    /// test needs a per-daemon override. Call before `control_context::ControlContext::
     /// from_state`/`control_socket::unix_transport::serve` build this
     /// instance's `ApplicationServices` -- the override is read once, at
     /// that composition-root call, not polled per-request.
-    pub fn set_test_placeholder_pipeline_connected(&self, connected: bool) {
-        *self
-            .test_placeholder_pipeline_connected
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(connected);
+    pub fn set_test_on_demand_allowed(&self, connected: bool) {
+        *self.test_on_demand_allowed.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(connected);
     }
 }
 

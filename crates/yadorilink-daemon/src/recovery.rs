@@ -292,10 +292,9 @@ pub enum LocalObservation<T> {
     Ambiguous { detail: String },
 }
 
-/// The subset of a `links` row a recovery diagnosis actually needs --
-/// deliberately narrower than `yadorilink_replica_domain::session_state::FolderLink`,
-/// which also carries fields (`max_local_size_bytes`, ...) no diagnosis
-/// decision reads.
+/// What a recovery diagnosis reads of a `links` row, kept as its own type
+/// rather than `yadorilink_replica_domain::session_state::FolderLink` so this
+/// module's public shape does not follow that type's changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalLinkEvidence {
     pub group_id: String,

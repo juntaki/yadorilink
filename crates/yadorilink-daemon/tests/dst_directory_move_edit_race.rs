@@ -53,7 +53,7 @@
 //! orderings without changing any dispatch behavior.
 //!
 //! Propagation runs over the change-history DAG (`dst_dag_migrate_b2`):
-//! each device's `LocalChangeProcessor` carries a signed `ChangeEmitter`,
+//! each device's `LocalChangeProcessor` carries a signed `LocalAuthorKey`,
 //! so every accepted local mutation appends a signed change in the same
 //! transaction as its index write, and a commit is published by announcing
 //! this device's new heads -- the peer then pulls exactly the ancestry it
@@ -580,7 +580,7 @@ async fn run_scenario(seed: u64, ordering: Ordering) -> Result<(), String> {
     // timer will not dispatch it; the test does, per ordering).
     device_a
         .events_tx
-        .send(FsChangeEvent { path: root_a.join(DIR1), kind: FsChangeKind::Removed })
+        .send(FsChangeEvent { path: root_a.join(DIR1), kind: FsChangeKind::ObservedRemoval })
         .await
         .map_err(|_| "A's watcher channel closed early".to_string())?;
     // Let run_debouncer register the event as pending before proceeding.

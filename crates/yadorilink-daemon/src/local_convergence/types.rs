@@ -9,14 +9,17 @@ use futures_util::stream::FuturesUnordered;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-use yadorilink_local_storage::{reconstruct_file, verify_write_target_within_root};
+use yadorilink_local_storage::{
+    persist_reconstructed_file, reconstruct_file_to_temp, verify_write_target_within_root,
+};
 use yadorilink_peer_session::hazard;
 use yadorilink_peer_session::PeerSessionError;
 use yadorilink_replica_domain::file::FileVersion;
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord, RecordKind};
-use yadorilink_replica_domain::ids::{ChangeHash, VersionHash};
-use yadorilink_replica_engine::conflict::PathHead;
+use yadorilink_replica_domain::ids::VersionHash;
+use yadorilink_replica_domain::native_plan::{NativeLocatedHead, NativeRowIdentity};
 use yadorilink_root_authority::root_commit::RootCommitPermit;
+use yadorilink_sync_sqlite::file_index::NameFoldKey;
 
 /// Offloads a blocking call, and the handle it returns.
 ///
@@ -51,8 +54,6 @@ impl Tuning {
     pub(crate) const BULK_MATERIALIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
         Self::BULK_FETCH_RESPONSE_TIMEOUT.as_secs() * Self::BULK_ATTEMPT_WORST_CASE_SLOW_BLOCKS,
     );
-    pub(crate) const FETCH_RESPONSE_TIMEOUT: std::time::Duration =
-        std::time::Duration::from_secs(5);
     pub(crate) const MAX_COMMITS_IN_FLIGHT: usize = 2;
     pub(crate) const RECEIVE_COMMIT_BATCH_BLOCKS: usize = 256;
     pub(crate) const RECEIVE_COMMIT_BATCH_BYTES: u64 = 16 * 1024 * 1024;
@@ -67,14 +68,11 @@ impl Tuning {
 /// Once exhausted, further records that would otherwise be eagerly
 /// fetched fall back to writing a placeholder instead (the same behavior
 /// as an `OnDemand` group) — content is not lost or refused forever, it's
-/// simply not eagerly pulled beyond the budget; an explicit pin still
-/// always fetches (a deliberate, user-initiated request bypasses this
-/// admission budget, same as it already bypasses the materialization
-/// policy check below). Resets when this session ends (a new connection
-/// starts a fresh budget) — bounding how much any *one* session can push
-/// onto local disk eagerly, not a permanent per-group ceiling (that's
-/// `max_local_size_bytes`, reactive eviction, and (out of scope here)
-/// the separate free-space headroom mechanism).
+/// simply not eagerly pulled beyond the budget. Resets when this session
+/// ends (a new connection starts a fresh budget) — bounding how much any
+/// *one* session can push onto local disk eagerly, not a permanent
+/// per-group ceiling (that is the separate free-space headroom
+/// mechanism).
 pub(crate) const MAX_EAGER_BLOCKS_PER_GROUP_PER_SESSION: u64 = 200_000;
 
 /// the actual admission bookkeeping behind
@@ -103,14 +101,6 @@ pub(crate) fn admit_eager_blocks_impl(
         _ => false,
     }
 }
-
-/// Cap on how many materialization-audit records are re-driven concurrently.
-/// Bounded (not "spawn one task per record
-/// unconditionally") for the same reason `MAX_IN_FLIGHT_MESSAGES_PER_PEER`
-/// bounds concurrently-spawned message handlers: a large audit shouldn't spawn
-/// thousands of tasks — many of them concurrently awaiting a block-fetch
-/// round trip from this same peer connection — all at once.
-pub(crate) const MAX_CONCURRENT_RECONCILES: usize = 16;
 
 /// How long a cached entry in `ignore_sets` is trusted before
 /// `effective_ignore_set` reloads it from the group's live sync root — see
@@ -179,7 +169,7 @@ pub(crate) enum TombstoneRemoval {
 /// device authored the version or which device eventually receives it,
 /// precisely so a mtime-only edit is a distinct version, a `Some(0o755)`
 /// mode survives a hop through a Windows peer with no Unix mode model of
-/// its own, and the DAG's notion of "which version is this" never
+/// its own, and native state's notion of "which version is this" never
 /// changes depending on which platform happens to be looking at it.
 /// Separately, each RECEIVING target has its own capability to
 /// physically reproduce any one of those fields, and that capability is
@@ -235,7 +225,7 @@ pub(crate) enum TombstoneRemoval {
 /// earns an exact-required upgrade.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SettlementEvidence {
-    /// Disk holds the exact DAG-desired object at the exact desired
+    /// Disk holds the exact desired object at the exact desired
     /// version, verified -- a real write, or the content-identical fast
     /// path's own verification. `mutation_generation` is the fence value
     /// this evidence is valid under: the bump's own return for a real
@@ -265,8 +255,8 @@ pub enum SettlementEvidence {
     },
     /// A policy-authorized deferral: an on-demand placeholder was
     /// intentionally written. Closes the obligation via the EXISTING
-    /// `MaterializationState::Placeholder`, never an exact record.
-    PolicyPlaceholder,
+    /// `MaterializationState::Remote`, never an exact record.
+    PolicyRemote,
     /// A hazard moved the record to `hold`; nothing was written. Closes
     /// via the EXISTING held-reason mechanism, never an exact record.
     HazardHeld { reason: String },
@@ -283,7 +273,7 @@ pub enum SettlementEvidence {
 impl SettlementEvidence {
     /// The checked, publishable half of this evidence, if any -- `None`
     /// for every scheduler-level settlement
-    /// (`PolicyPlaceholder`/`HazardHeld`/`IgnoreExcluded`), which has no
+    /// (`PolicyRemote`/`HazardHeld`/`IgnoreExcluded`), which has no
     /// `ExactActualState` to convert to at all. Also returns the
     /// `mutation_generation` a publication CASes on, since a caller always
     /// needs both together.
@@ -311,7 +301,7 @@ impl SettlementEvidence {
                 },
                 *mutation_generation,
             )),
-            SettlementEvidence::PolicyPlaceholder
+            SettlementEvidence::PolicyRemote
             | SettlementEvidence::HazardHeld { .. }
             | SettlementEvidence::IgnoreExcluded
             | SettlementEvidence::Retained { .. } => None,
@@ -357,14 +347,14 @@ pub enum MaterializeResult {
     /// This path's outcome is final for this attempt. See
     /// [`SettlementEvidence`] for what it settled AS -- `Settled` alone no
     /// longer says: a
-    /// `PolicyPlaceholder`/`HazardHeld`/ `IgnoreExcluded` evidence is
+    /// `PolicyRemote`/`HazardHeld`/ `IgnoreExcluded` evidence is
     /// exactly the case this doc comment used to warn callers NOT to
     /// conflate with "content fully materialized and disk-verified", now
     /// made structurally impossible to conflate by carrying the
     /// distinction as data instead of as a comment.
     Settled(SettlementEvidence),
-    /// This path is NOT done: an eager/pinned fetch could not obtain every
-    /// block (a retriable `Placeholder` was written instead), a local
+    /// This path is NOT done: an eager fetch could not obtain every
+    /// block (a retriable `Remote` was written instead), a local
     /// reconstruct failed even after its own retries, the resolved
     /// version's blocks were not locally available to plan against at
     /// all, or a hazardous tombstone held/dropped without ever recording
@@ -387,18 +377,6 @@ pub enum MaterializeResult {
 pub struct BlockRequirement {
     /// The path whose content is wanted.
     pub(crate) path: String,
-    /// The path whose resolution DEMANDS this content.
-    ///
-    /// Equal to `path` for an ordinary record. For a conflict copy it is the
-    /// SOURCE path the copy was derived from, because a copy is never
-    /// something a user asked for by name -- it exists only because
-    /// resolving the source produced it, and it inherits the source's demand
-    /// rather than carrying one of its own.
-    ///
-    /// Carried explicitly rather than re-derived from `path`: a conflict
-    /// copy's name encodes its origin, and parsing it back out would make a
-    /// correctness decision depend on a display format.
-    pub(crate) demand_path: String,
     /// The record naming the blocks to obtain. Carried so whoever satisfies
     /// this request needs nothing from the pass that raised it.
     pub(crate) record: FileRecord,
@@ -412,6 +390,16 @@ pub struct BlockRequirement {
     /// `disk_race_fingerprint` for this record's target path, sampled before
     /// the request was handed out.
     pub(crate) observed_disk: Option<(u64, Option<std::time::SystemTime>, i64, i64)>,
+}
+
+/// A [`BlockRequirement`] together with the source path whose live head
+/// demanded it. The requirement is keyed by its physical path (a conflict
+/// copy's own name), but whether the plan still stands is a question about
+/// the source path's heads.
+#[derive(Clone, Debug)]
+pub(crate) struct PlannedRequirement {
+    pub(crate) source_path: yadorilink_replica_domain::ids::SyncPath,
+    pub(crate) requirement: BlockRequirement,
 }
 
 /// What the local half of materialization concluded on its own.
@@ -465,7 +453,7 @@ pub enum RetirementAttempt {
     /// targeted frontier, so the pass as a whole did not settle it.
     RetryRequired,
     /// The pass ran and every copy it examined resolved cleanly, but this
-    /// device's own admitted DAG frontier for the group was different
+    /// device's own admitted native frontier for the group was different
     /// after the pass than before it started -- see
     /// `retire_conflict_copies_only`'s own doc comment for exactly what is
     /// compared and why. Every decision this pass made (justified/
@@ -505,7 +493,7 @@ pub enum RetirementAttempt {
 /// publication step CASes against.
 ///
 /// `retry`: this path is NOT done and must be tried again — a real error,
-/// an eager/pinned fetch that could not obtain every block, or this call
+/// an eager fetch that could not obtain every block, or this call
 /// read a state (no live heads at all for a path it was asked to resolve)
 /// it cannot currently make a positive claim about.
 ///
@@ -538,11 +526,6 @@ impl ProjectionAttempt {
     /// iterates this to decide, per path, what (if anything) to publish.
     pub fn settled_with_evidence(&self) -> impl Iterator<Item = (&str, &SettlementEvidence)> {
         self.settled.iter().map(|(path, evidence)| (path.as_str(), evidence))
-    }
-
-    /// Whether `path` is in `retry`.
-    pub fn needs_retry(&self, path: &str) -> bool {
-        self.retry.contains(path)
     }
 
     /// Whether any path in `retry` is a conflict copy derived from `path`
@@ -668,38 +651,23 @@ impl ReceiveCommitPool {
     }
 }
 
-/// Materializes a non-deleted symlink
-/// record at `group_id`/`record.path` under `root`. Factored out as a
-/// free function (explicit `state`/`root`/`group_id`/`record` rather than
-/// a `PeerSyncSession` receiver) purely for direct unit-testability — the
-/// same reason `index_message_exceeds_cardinality_cap`/
-/// `admit_eager_blocks_impl` above are free functions: a symlink record
-/// carries no blocks at all, so materializing one needs no
-/// peer/channel access whatsoever, unlike ordinary file
+/// Materializes a non-deleted symlink record at `group_id`/`record.path`
+/// under `root`. A symlink record carries no blocks at all, so materializing
+/// one needs no peer access whatsoever, unlike ordinary file
 /// materialization/hydration.
 ///
-/// **Wire schema**: `proto::FileInfo` (`yadorilink-ipc-proto`) carries
-/// no `record_kind`/`symlink_target` field,
-/// so a peer's incoming index message cannot yet actually tell this
-/// device "this path is a symlink". Routing is therefore decided by the
-/// *payload's* `record_kind` (`payload.version().meta.record_kind`),
-/// which for a wire-sourced payload is this device's own already-recorded
-/// classification, folded into the payload once at its construction
-/// (`MaterializationPayload::from_wire`) rather than re-read from the row
-/// at each decision point. That distinction is the whole point: the row
-/// can move between the dispatch, the write and the proof; the payload
-/// cannot. Wiring a peer's advertised kind through to that construction
-/// is the natural extension seam; until then, this function is real,
-/// tested, and ready, but a symlink genuinely cannot cross the wire from
-/// a peer that classified it during section 2's scan/watch path on a
-/// *different* device.
+/// Routing is decided by the *payload's* `record_kind`
+/// (`payload.version().meta.record_kind`), folded into the payload once at
+/// its construction rather than re-read from the row at each decision point.
+/// That distinction is the whole point: the row can move between the
+/// dispatch, the write and the proof; the payload cannot.
 pub(crate) struct SymlinkMaterialization<'a> {
     pub(crate) state: &'a crate::replica_coordinator::ReplicaCoordinator,
     pub(crate) root: &'a Path,
     pub(crate) group_id: &'a str,
     pub(crate) windows_opt_in: bool,
     pub(crate) origin_device_id: &'a str,
-    pub(crate) authoring_change_hash: Option<&'a ChangeHash>,
+    pub(crate) authoring: Option<&'a yadorilink_replica_domain::native_plan::NativeRowIdentity>,
     pub(crate) permit: &'a RootCommitPermit<'a>,
 }
 
@@ -742,7 +710,7 @@ pub(crate) enum SymlinkMaterializeOutcome {
     /// target) changes; there is no other re-arm path for it.
     PolicySkipped,
     /// The symlink was written, but the commit recording it was refused,
-    /// so nothing was committed: no proof, no `Hydrated`, and the
+    /// so nothing was committed: no proof, no `Present`, and the
     /// materialization intent is still open.
     ///
     /// Two different refusals land here, and this outcome does not say
@@ -775,7 +743,7 @@ pub(crate) fn materialize_symlink_at(
         group_id,
         windows_opt_in,
         origin_device_id,
-        authoring_change_hash,
+        authoring,
         permit,
     } = context;
     let out_path = root.join(&record.path);
@@ -842,7 +810,7 @@ pub(crate) fn materialize_symlink_at(
         group_id,
         record,
         origin_device_id,
-        authoring_change_hash,
+        authoring,
         write_target,
         permit,
     )? {
@@ -891,7 +859,7 @@ pub(crate) fn materialize_symlink_at(
     // The symlink now genuinely exists on disk under this exact name.
     // Everything this write proved is recorded in ONE durable step: the
     // versioned generation under the epoch this write itself produced,
-    // the `Hydrated` stamp, and the intent clear.
+    // the `Present` stamp, and the intent clear.
     //
     // This deliberately does not go through the external-adoption path
     // (`adopt_local_capture_actual_state`), which mints a fresh epoch of
@@ -923,19 +891,18 @@ pub(crate) fn materialize_symlink_at(
         mutation_generation,
         // Guarded on the row this write was built from. The fence CAS
         // alone catches a competing physical mutator and says nothing
-        // about a DAG-side supersession, which moves the version without
+        // about a native-side supersession, which moves the version without
         // moving the fence -- so an unguarded commit could stamp
-        // `Hydrated` and publish for a version this path had already
+        // `Present` and publish for a version this path had already
         // left, with the link on disk still pointing at the old one.
         Some(yadorilink_peer_session::ports::ExpectedAuthoring {
             state: yadorilink_peer_session::ports::MATERIALIZATION_IN_FLIGHT_STATE,
-            authoring_change_hash,
             expected_version: Some(&version),
         }),
         permit,
     )? {
         // Refused: either the fence moved or the row names another
-        // version. Nothing was written -- no proof, no `Hydrated`, and
+        // version. Nothing was written -- no proof, no `Present`, and
         // the intent is still open -- so report this as a retry rather
         // than an exact write, which would settle an obligation against
         // evidence the store just refused.
@@ -1038,7 +1005,7 @@ pub(crate) fn try_apply_metadata_only_update(
     group_id: &str,
     record: &FileRecord,
     origin_device_id: &str,
-    authoring_change_hash: Option<&ChangeHash>,
+    authoring: Option<&yadorilink_replica_domain::native_plan::NativeRowIdentity>,
     // The version this update is applying, from the caller's payload. The
     // metadata written below comes from it too, so what lands on disk and
     // what the proof will name are the same decision.
@@ -1122,16 +1089,13 @@ pub(crate) fn try_apply_metadata_only_update(
     if !terminal_object_is_a_regular_file(&out_path) {
         return Ok(None);
     }
-    match authoring_change_hash {
-        Some(hash) => state.upsert_file_with_origin_and_author(
-            group_id,
-            record,
-            origin_device_id,
-            hash,
-            permit,
-        )?,
-        None => state.upsert_file_with_origin(group_id, record, origin_device_id, permit)?,
-    }
+    state.upsert_file_with_origin_and_authoring(
+        group_id,
+        record,
+        origin_device_id,
+        authoring,
+        permit,
+    )?;
     // From the version this update applies, not from the row it just
     // upserted. These two lines used to be `state.get_unix_mode` /
     // `state.get_xattrs`, with `let _ = desired_version;` at the bottom
@@ -1189,22 +1153,6 @@ pub(crate) fn try_apply_metadata_only_update(
     };
     require_xattr_evidence(&record.path, &out_path, &xattrs, &xattr_evidence)?;
     Ok(Some(MetadataOnlyUpdate { mutation_generation, xattrs: xattr_evidence }))
-}
-
-/// Whether the regular file already at `out_path` denies its owner read
-/// access -- the one condition under which its replicated metadata can be
-/// neither read back nor set (a `user.*` attribute needs the file opened
-/// for reading). Asked before any mutation, never after: the answer
-/// decides whether a repair may start at all. A missing file is not
-/// "unreadable"; the caller's ordinary handling decides what that means.
-pub(crate) fn existing_file_is_owner_unreadable(out_path: &Path) -> Result<bool, PeerSessionError> {
-    match std::fs::File::open(out_path) {
-        Ok(_) => Ok(false),
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        // A storage error, not a bare `Io`: it belongs to this path alone.
-        Err(error) => Err(yadorilink_local_storage::StorageError::Io(error).into()),
-    }
 }
 
 /// A metadata-only update that took effect: the fence it ran under, and the
@@ -1272,75 +1220,47 @@ pub(crate) fn require_physical_kind_matches(
     Err(PeerSessionError::PhysicalKindMismatch(path.to_string()))
 }
 
-/// `reconstruct_file` does synchronous `std::fs` I/O for EVERY block
-/// in `blocks` (a `store.get` read plus a `write_all`), then a final
-/// `sync_all` (fsync) on the assembled temp file and again on its parent
-/// directory. Every OTHER call in this file that does comparable
-/// synchronous block-store I/O already routes through `spawn_blocking`
-/// (`handle_block_request`'s `store.get`, `ensure_blocks_present`'s `store
-/// ::put` -- see their own identical doc comments), but `reconstruct_file`
-/// itself did not, until now: it ran directly on whatever tokio worker
-/// thread happened to be executing the calling async task.
-///
-/// For a small file this is a few milliseconds, unnoticeable. For a large
-/// single-file transfer this call can run long enough (confirmed: a real
-/// clean-loopback `yadorilink-bench L1 --two-process` run at 4+ GiB) to
-/// starve OTHER work sharing this process's fixed-size tokio worker pool --
-/// including this SAME peer's own transport tasks. Observed directly on the
-/// transport that preceded this one: timer-driven work silently not polled
-/// for seconds at a stretch, then firing bunched together once the starved
-/// tasks got a scheduling turn again -- symptoms of tasks that stopped being
-/// *polled*, not of any packet actually lost on the wire (`nstat -az
-/// UdpRcvbufErrors` stayed flat through the runs where this fix's absence
-/// was confirmed, ruling out the kernel socket buffer as the cause).
-/// Starvation long enough to exhaust the transport's own recovery forces a
-/// reconnect, whose retry/materialize work can re-trigger this exact same
-/// blocking call again -- a self-sustaining cycle that, left unfixed, never
-/// let a large transfer's connection stay up long enough to converge.
-pub(crate) async fn reconstruct_file_off_runtime(
-    store: Arc<dyn yadorilink_peer_session::ports::BlockContentStore>,
-    out_path: &std::path::Path,
-    blocks: &[yadorilink_replica_domain::file::BlockInfo],
-    mtime_unix_nanos: i64,
-) -> Result<(), PeerSessionError> {
-    let out_path = out_path.to_path_buf();
-    let blocks = blocks.to_vec();
-    match spawn_blocking(move || {
-        reconstruct_file(store.as_ref(), &out_path, &blocks, mtime_unix_nanos)
-    })
-    .await
-    {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(e.into()),
-        Err(join_err) => Err(PeerSessionError::from(std::io::Error::other(format!(
-            "reconstruct_file blocking task panicked: {join_err}"
-        )))),
-    }
-}
-
-/// The "assemble" half of [`reconstruct_file_off_runtime`], run off
-/// the async runtime for the identical reason -- see that function's doc
-/// comment. Used by `prepare_ordinary_projected_upsert` to do the slow,
-/// network-fetch-bound block assembly with no path lock held at all.
+/// The blocks are read and written into a temp file beside `out_path`, off
+/// the async runtime, and nothing is published. The caller decides, as late as it can,
+/// whether to rename it into place with [`persist_reconstructed_file_off_runtime`].
 pub(crate) async fn reconstruct_file_to_temp_off_runtime(
     store: Arc<dyn yadorilink_peer_session::ports::BlockContentStore>,
     out_path: &std::path::Path,
     blocks: &[yadorilink_replica_domain::file::BlockInfo],
     mtime_unix_nanos: i64,
+    headroom: Option<Arc<super::reconcile::HeadroomReservation>>,
 ) -> Result<std::path::PathBuf, PeerSessionError> {
     let out_path = out_path.to_path_buf();
     let blocks = blocks.to_vec();
+    // The blocking task cannot be cancelled, so it keeps assembling when this
+    // future is dropped (a link stopping, a shutdown). `owner` decides who
+    // removes the finished temp file: this future once it has the path, the
+    // task itself or the drop guard otherwise.
+    let owner = Arc::new(std::sync::Mutex::new(TempOwner::Assembling));
+    let guard = TempGuard(owner.clone());
+    let permit = super::receive_write_gate::admit(super::receive_write_gate::global()).await;
     match spawn_blocking(move || {
-        yadorilink_local_storage::reconstruct_file_to_temp(
-            store.as_ref(),
-            &out_path,
-            &blocks,
-            mtime_unix_nanos,
-        )
+        let _permit = permit;
+        // The reserved space is released only when this task, temp file
+        // included, is done, whatever happens to the future awaiting it.
+        let _headroom = headroom;
+        let result = reconstruct_file_to_temp(store.as_ref(), &out_path, &blocks, mtime_unix_nanos);
+        if let Ok(tmp_path) = &result {
+            let mut owner = owner.lock().unwrap_or_else(|p| p.into_inner());
+            if matches!(*owner, TempOwner::Abandoned) {
+                let _ = std::fs::remove_file(tmp_path);
+            } else {
+                *owner = TempOwner::Finished(tmp_path.clone());
+            }
+        }
+        result
     })
     .await
     {
-        Ok(Ok(tmp_path)) => Ok(tmp_path),
+        Ok(Ok(tmp_path)) => {
+            guard.hand_over();
+            Ok(tmp_path)
+        }
         Ok(Err(e)) => Err(e.into()),
         Err(join_err) => Err(PeerSessionError::from(std::io::Error::other(format!(
             "reconstruct_file_to_temp blocking task panicked: {join_err}"
@@ -1348,22 +1268,47 @@ pub(crate) async fn reconstruct_file_to_temp_off_runtime(
     }
 }
 
-/// The "publish" half -- run off the async runtime for the same
-/// reason `reconstruct_file_off_runtime` is: this still does a real
-/// syscall (rename + directory fsync), and `try_commit_ordinary_batch`
-/// calls it while holding this batch's path locks, so it must not block
-/// the runtime's worker thread any more than any other write branch does.
+/// Who owns the temp file an off-runtime assembly produces.
+enum TempOwner {
+    Assembling,
+    /// Finished and not yet handed to the awaiting caller.
+    Finished(std::path::PathBuf),
+    /// The caller went away while the task was still assembling.
+    Abandoned,
+    HandedOver,
+}
+
+/// Removes an assembled temp file nobody is waiting for any more.
+struct TempGuard(Arc<std::sync::Mutex<TempOwner>>);
+
+impl TempGuard {
+    fn hand_over(&self) {
+        *self.0.lock().unwrap_or_else(|p| p.into_inner()) = TempOwner::HandedOver;
+    }
+}
+
+impl Drop for TempGuard {
+    fn drop(&mut self) {
+        let mut owner = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        match std::mem::replace(&mut *owner, TempOwner::HandedOver) {
+            TempOwner::Assembling => *owner = TempOwner::Abandoned,
+            TempOwner::Finished(tmp_path) => {
+                let _ = std::fs::remove_file(tmp_path);
+            }
+            other => *owner = other,
+        }
+    }
+}
+
+/// The publish half: renames an assembled temp file over `out_path` and
+/// syncs the parent directory, off the async runtime. Removes the temp file
+/// on failure, so `tmp_path` is spent either way.
 pub(crate) async fn persist_reconstructed_file_off_runtime(
-    tmp_path: &std::path::Path,
+    tmp_path: std::path::PathBuf,
     out_path: &std::path::Path,
 ) -> Result<(), PeerSessionError> {
-    let tmp_path = tmp_path.to_path_buf();
     let out_path = out_path.to_path_buf();
-    match spawn_blocking(move || {
-        yadorilink_local_storage::persist_reconstructed_file(&tmp_path, &out_path)
-    })
-    .await
-    {
+    match spawn_blocking(move || persist_reconstructed_file(&tmp_path, &out_path)).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(e.into()),
         Err(join_err) => Err(PeerSessionError::from(std::io::Error::other(format!(
@@ -1384,7 +1329,7 @@ pub(crate) async fn persist_reconstructed_file_off_runtime(
 /// actually committed yet or not. This is deliberately NOT the flush
 /// mechanism itself -- the actual SQL writes happen separately, once per
 /// bounded (`ORDINARY_BATCH_MAX_PATHS`-sized) commit chunk, inside `try_
-/// commit_ordinary_batch`, using each `PreparedProjectedUpsert`'s own
+/// commit_ordinary_batch`, using each candidate's own
 /// attached `newly_fetched_block_hashes` -- this type exists ONLY so a
 /// LATER file in the same reconciliation window that references a block
 /// an EARLIER file already fetched this same window can recognize it as
@@ -1418,77 +1363,6 @@ impl ReconcileProvenanceBatch {
     }
 }
 
-/// One item accumulated by `reconcile_group_paths`'s per-path loop
-/// for a bounded, batched commit via `PeerSyncSession::
-/// try_commit_ordinary_batch`, instead of the unbatched per-path
-/// `materialize_dag_content_head`/`materialize` call every other path
-/// still takes.
-pub(crate) enum OrdinaryBatchItem<'a> {
-    /// The `Box<dyn Send + 'a>` is the same block-write-activity guard
-    /// `prepare_ordinary_projected_upsert` acquired before fetching this
-    /// upsert's blocks -- kept alive here so it is still held when `try_
-    /// commit_ordinary_batch` later commits this upsert's row, matching
-    /// the unbatched `materialize_dag_content_head`'s single guard held
-    /// across its whole call. Never inspected, only kept alive; dropped
-    /// once this item is consumed (committed or dropped to retry).
-    // `PreparedProjectedUpsert` boxed to keep this variant's size close to
-    // `Delete`'s (clippy large_enum_variant).
-    Upsert(Box<dyn Send + 'a>, Box<yadorilink_peer_session::ports::PreparedProjectedUpsert>),
-    /// `(path, tombstone_author, derived_head)` -- mirrors the synthetic
-    /// tombstone `FileRecord` reconcile_group_paths' own Absent branch
-    /// builds for the unbatched case, minus the record itself (rebuilt
-    /// fresh once this item is revalidated, since it never carries a
-    /// payload beyond the path itself). `tombstone_author` is only a HINT
-    /// from the unlocked classification pass -- `try_commit_ordinary_
-    /// batch` re-derives the real one fresh under its lock (see its own
-    /// Delete-handling doc comment for why the hint alone is not safe to
-    /// commit on). `derived_head` must travel with this item for the same
-    /// reason `PreparedProjectedUpsert` carries one: a pure conflict-copy
-    /// path's fresh re-resolution under the batch's lock needs it to see
-    /// any live head at all.
-    Delete(String, ChangeHash, Option<PathHead>),
-}
-
-impl OrdinaryBatchItem<'_> {
-    pub(crate) fn path(&self) -> &str {
-        match self {
-            OrdinaryBatchItem::Upsert(_, u) => &u.rel_path,
-            OrdinaryBatchItem::Delete(path, ..) => path,
-        }
-    }
-}
-
-/// Bounded retry
-/// parameters for a `reconcile_one_file` call failing transiently — see
-/// its call site's doc comment (the `in_flight.spawn` dispatch loop) for
-/// the specific race this is sized for. Same shape as the
-/// `NOT_FOUND_RETRY_*` constants used for block-fetch retries
-/// (bounded attempts, fixed delay with jitter to avoid synchronized retry
-/// bursts) — free functions/constants rather than `PeerSyncSession`
-/// associated items since the retry loop lives inside a `'static`
-/// `tokio::spawn`'d closure, not a `&self` method.
-pub(crate) const RECONCILE_RETRY_ATTEMPTS: u32 = 5;
-
-const RECONCILE_RETRY_BASE_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
-
-const RECONCILE_RETRY_JITTER_FRACTION: f64 = 0.25;
-
-/// `reconcile_group_paths`'s own diagnostic threshold for "the conflict-copy
-/// fixpoint derived a lot more paths than its seed window" — every caller
-/// bounds its seed-path window to a small count (the Convergence Engine's
-/// `MAX_PATHS_PER_RECONCILE_ATTEMPT`, currently 8), so a derived-path count
-/// well past that is worth a log line even though it's not truncated (see
-/// that check's own doc comment for why). Not tied to any specific caller's
-/// window size — just a fixed, generous magnitude past which "the fixpoint
-/// grew a lot" is worth surfacing.
-pub(crate) const UNUSUALLY_LARGE_CONFLICT_COPY_FIXPOINT_THRESHOLD: usize = 32;
-
-pub(crate) fn reconcile_retry_delay() -> std::time::Duration {
-    let jitter =
-        rand::random_range(-RECONCILE_RETRY_JITTER_FRACTION..=RECONCILE_RETRY_JITTER_FRACTION);
-    RECONCILE_RETRY_BASE_DELAY.mul_f64(1.0 + jitter)
-}
-
 /// What the volume this path is about to land on folds together.
 ///
 /// The two axes are probed and applied separately because they do not
@@ -1520,6 +1394,7 @@ impl VolumeFolding {
 /// case-fold and normalization cases silently skipped on every
 /// case-sensitive Linux runner, the platform they most need to keep
 /// working for a peer that syncs *to* macOS.
+#[cfg(test)]
 pub(crate) fn hazard_reason_for_siblings(
     path: &str,
     volume: VolumeFolding,
@@ -1613,11 +1488,67 @@ pub(crate) fn hazard_reason_for_policy(
         case_insensitive: hazard::is_case_insensitive_filesystem(root),
         normalization_insensitive: hazard::is_normalization_insensitive_filesystem(root),
     };
+    hazard_reason_for_volume(state, group_id, record, volume)
+}
+
+/// The sibling check of [`hazard_reason_for_policy`] for a volume whose
+/// folding is already known, so a test can force a folding the host volume
+/// does not have.
+pub(crate) fn hazard_reason_for_volume(
+    state: &crate::replica_coordinator::ReplicaCoordinator,
+    group_id: &str,
+    record: &FileRecord,
+    volume: VolumeFolding,
+) -> Result<Option<String>, PeerSessionError> {
     if !volume.folds_anything() {
-        // The common case on Linux, and the reason the read below is
-        // guarded rather than hoisted: nothing this group holds can fold
-        // onto this name, so listing the group would be a query whose
-        // answer cannot change the outcome.
+        // The common case on Linux: nothing this group holds can fold onto
+        // this name, so there is nothing to look up.
+        return Ok(None);
+    }
+    let path = record.path.as_str();
+    let held =
+        |kind: &str, colliding: &str| Some(format!("{kind}: collides with existing '{colliding}'"));
+    // The same three checks, in the same order, as the scan this replaces
+    // (`hazard_reason_for_siblings`), each answered by an index lookup on the
+    // key stored with every row instead of by folding every sibling.
+    if volume.case_insensitive {
+        let folded = yadorilink_root_authority::canonical_fold::case_fold(path);
+        let matches = state.name_fold_matches(group_id, NameFoldKey::Case, &folded, path)?;
+        if let Some(colliding) = matches.first() {
+            return Ok(held(hazard::HELD_REASON_CASE_COLLISION, colliding));
+        }
+    }
+    // Both remaining checks match on the combined key: two names equal under
+    // NFC alone are equal under it, and the combined check is it exactly.
+    let canonical = yadorilink_root_authority::canonical_fold::canonical_fold(path);
+    let candidates = state.name_fold_matches(group_id, NameFoldKey::Canonical, &canonical, path)?;
+    if volume.normalization_insensitive {
+        let nfc = yadorilink_root_authority::canonical_fold::nfc(path);
+        if let Some(colliding) = candidates
+            .iter()
+            .find(|sibling| yadorilink_root_authority::canonical_fold::nfc(sibling) == nfc)
+        {
+            return Ok(held(hazard::HELD_REASON_NORMALIZATION_COLLISION, colliding));
+        }
+    }
+    if volume.case_insensitive && volume.normalization_insensitive {
+        if let Some(colliding) = candidates.first() {
+            return Ok(held(hazard::HELD_REASON_CASE_AND_NORMALIZATION_COLLISION, colliding));
+        }
+    }
+    Ok(None)
+}
+
+/// The scan [`hazard_reason_for_volume`] replaced, kept verbatim as the
+/// oracle its equivalence tests compare against.
+#[cfg(test)]
+pub(crate) fn hazard_reason_for_volume_scan(
+    state: &crate::replica_coordinator::ReplicaCoordinator,
+    group_id: &str,
+    record: &FileRecord,
+    volume: VolumeFolding,
+) -> Result<Option<String>, PeerSessionError> {
+    if !volume.folds_anything() {
         return Ok(None);
     }
     Ok(hazard_reason_for_siblings(&record.path, volume, &state.list_files(group_id)?))
@@ -1637,23 +1568,26 @@ pub(crate) fn hazard_reason_for_policy(
 /// `no_hazard_ever_writes_under_any_alternate_name` (in
 /// `tests/peer_session.rs`) for a regression test asserting exactly that
 /// through the real, wire-driven `materialize` path.
+#[allow(clippy::too_many_arguments)] // one argument per input of the held row
 pub(crate) fn hold_record(
     state: &crate::replica_coordinator::ReplicaCoordinator,
     group_id: &str,
     record: &FileRecord,
     reason: &str,
     origin_device_id: &str,
-    authoring_change_hash: Option<&ChangeHash>,
+    authoring: Option<&yadorilink_replica_domain::native_plan::NativeRowIdentity>,
+    meta: &yadorilink_replica_domain::session_state::LocalFileMetaColumns,
     permit: &RootCommitPermit,
 ) -> Result<(), PeerSessionError> {
-    // Upsert, demote to `Placeholder`, mark held: see
+    // Upsert, demote to `Remote`, mark held: see
     // `ReplicaCoordinator::hold_row_for_hazard`.
     state.hold_row_for_hazard(
         group_id,
         record,
         reason,
         origin_device_id,
-        authoring_change_hash,
+        authoring,
+        meta,
         permit,
     )?;
     tracing::info!(
@@ -1666,204 +1600,92 @@ pub(crate) fn hold_record(
     Ok(())
 }
 
-/// The symlink/exec-bit/authoring metadata paired with an incoming peer's
-/// `FileRecord` (the wire's `proto::FileInfo` fields 7-10 in
-/// `ProtobufPeerWireCodec`'s decode, or the equivalent local-audit fields
-/// from `file_info_for_record`) that `FileRecord` itself cannot carry (see
-/// `yadorilink_local_storage::chunker::unix_mode_from_metadata`'s doc
-/// comment for the owner-exec-bit half of this gap). Threaded alongside the
-/// resulting `FileRecord` through
-/// `reconcile_one_file`/`resolve_and_apply_conflict` so
-/// `apply_incoming_wire_metadata` can persist it into `SyncState` at the
-/// record's *final* path — which can differ from the wire path when a
-/// concurrent-edit conflict renames it — immediately before `materialize`
-/// is called, since `materialize`'s own symlink dispatch
-/// (`SyncState::get_record_kind`) reads the local index, never the wire
-/// message directly.
+/// The head a materialization projects: who wrote it, which content it lands
+/// and what names it. The executor's decisions past the election read only
+/// this, so every head goes through the same steps.
 #[derive(Clone, Debug)]
-pub struct IncomingWireMeta {
-    pub record_kind: RecordKind,
-    pub symlink_target: Option<Vec<u8>>,
-    pub symlink_out_of_root: bool,
-    pub unix_mode: Option<u32>,
-    pub xattrs: Vec<(String, Vec<u8>)>,
-    /// The device that
-    /// actually produced this incoming record's content, per the sending
-    /// peer's own `SyncState::get_origin_device_id` lookup (see
-    /// `file_info_for_record`). `None` when absent/empty on the wire — an
-    /// peer that did not record one, or a row that peer never
-    /// recorded an origin for — callers fall back to `self.peer_device_id`
-    /// in that case, matching the pre-this-fix assumption.
-    pub origin_device_id: Option<String>,
-    /// Required causal identity of the retained DAG change that authored
-    /// this projection. A missing or malformed value is rejected; there is
-    /// no version-vector compatibility fallback.
-    pub authoring_change_hash: Option<ChangeHash>,
+pub struct Head {
+    pub device_id: String,
+    pub version_hash: VersionHash,
+    pub identity: NativeRowIdentity,
 }
 
-/// What the materialization audit found for one repair-candidate path.
-///
-/// The three non-payload arms are not errors and not the same thing, and
-/// the audit logs them differently, so they are named rather than folded
-/// into an `Option`.
-#[derive(Debug)]
-pub enum AuditCandidate {
-    /// The path has no `state = 'current'` row at all — it was listed as
-    /// a repair candidate and then stopped being one, which a concurrent
-    /// writer can do at any time.
-    NoRow,
-    /// A tombstone. There is nothing to rematerialize towards.
-    Deleted,
-    /// A genuine current row that has no authoring identity yet.
-    ///
-    /// Deliberately recognised broadly (any missing identity), not
-    /// narrowed to a route like `version_seq == 0`: at least two real
-    /// production writers produce this shape, with different `version_seq`
-    /// values. The bootstrap scaffold `apply_incoming_wire_metadata`
-    /// creates before a change's real content lands starts at
-    /// `version_seq == 0`. A device rebootstrapping from a checkpoint
-    /// snapshot (`replace_group_files_from_snapshot`) is the other: it
-    /// deliberately never trusts a snapshot's claim that a `Current`,
-    /// non-deleted file's content is present locally (stamping
-    /// `Placeholder`, correctly conservative) but also never carries an
-    /// authoring identity across the snapshot boundary, at whatever
-    /// `version_seq` the snapshot recorded — almost never `0`.
-    ///
-    /// Either way the row is genuinely `Placeholder` with nothing to
-    /// eagerly rehydrate FROM until it is paired with real content.
-    /// `list_materialization_repair_candidates` selecting it is correct
-    /// (it does need materializing eventually); it is the ordinary
-    /// DAG-driven obligation pipeline, not this audit, that resolves it.
-    NotYetPaired,
-    /// The payload: one incarnation of the row, split into the pair every
-    /// materialization lane already takes.
-    Payload(FileRecord, IncomingWireMeta),
-}
-
-/// The payload the local materialization audit will materialize a path
-/// towards, derived from ONE incarnation of this device's current row.
-///
-/// This is a *producer*, and the distinction is the whole point. What it
-/// returns decides what bytes, symlink target, kind, mode and xattrs land
-/// on disk, and — through `MaterializationPayload::from_wire` — which
-/// version the resulting proof names. So it may not stitch its answer
-/// together out of several reads: a payload holding one incarnation's
-/// blocks beside another's mode and authoring hash derives a version hash
-/// over a column combination that was never in the index at all, and no
-/// downstream guard catches it, because every guard compares against the
-/// row rather than against what was written.
-///
-/// It takes the snapshot rather than a state handle so that it cannot
-/// read at all, which is what makes the above structural instead of
-/// merely tested. [`yadorilink_peer_session::ports::CurrentRowSnapshot`]
-/// is one statement's result, so tearing would now require a caller to
-/// hand-build an incoherent snapshot.
-///
-/// The row is not a guard here and is not used as one. Whether the write
-/// is still admissible when it lands is decided later, under the path
-/// lock, by `apply_locked_record` and by the exact-version-guarded
-/// commit — against the row as it is *then*, which is exactly where a
-/// supersession that raced the read is supposed to be caught.
-pub(crate) fn materialization_audit_candidate(
-    row: Option<yadorilink_peer_session::ports::CurrentRowSnapshot>,
-) -> AuditCandidate {
-    let Some(row) = row else {
-        return AuditCandidate::NoRow;
-    };
-    if row.record.deleted {
-        return AuditCandidate::Deleted;
+impl Head {
+    /// The native head an entry of the plan stands for.
+    pub fn of_native(head: &NativeLocatedHead) -> Self {
+        Self {
+            device_id: head.dot().author.device.0.clone(),
+            version_hash: head.version(),
+            identity: NativeRowIdentity::of(head),
+        }
     }
-    let Some(authoring_change_hash) = row.authoring_change_hash else {
-        return AuditCandidate::NotYetPaired;
-    };
-    AuditCandidate::Payload(
-        row.record,
-        IncomingWireMeta {
-            record_kind: row.record_kind,
-            symlink_target: row.symlink_target,
-            symlink_out_of_root: row.symlink_out_of_root,
-            unix_mode: row.unix_mode,
-            xattrs: row.xattrs,
-            // This device's own record of who actually produced this
-            // path's current content — see `IncomingWireMeta`'s doc
-            // comment for how the receiving side uses this.
-            origin_device_id: row.origin_device_id,
-            authoring_change_hash: Some(authoring_change_hash),
-        },
-    )
+
+    /// A short form of the head's identity for traces.
+    pub fn short_identity(&self) -> String {
+        format!("{}#{}", self.identity.dot.author.device.0, self.identity.dot.seq.get())
+    }
+
+    /// What a row written for this head records as its author.
+    pub fn authoring(&self) -> &NativeRowIdentity {
+        &self.identity
+    }
 }
 
-/// Closes a wire-serialization handoff gap (see `IncomingWireMeta`'s own doc
-/// comment above for the precise gap this fills):
-/// persists an incoming peer's advertised `record_kind`/`symlink_target`/
-/// `symlink_out_of_root`/`unix_mode` into `SyncState` at `record.path`,
-/// which must be `record`'s *final* target path (post-conflict-rename, if
-/// any) — the same path `materialize` is about to be called for.
+/// Persists a projected head's `record_kind`/`symlink_target`/
+/// `symlink_out_of_root`/`unix_mode`/`xattrs` columns into `SyncState` at
+/// `record.path`, which must be `record`'s *final* target path
+/// (post-conflict-rename, if any) -- the same path `materialize` is about to
+/// be called for. `FileRecord` itself cannot carry these (see
+/// `yadorilink_local_storage::chunker::unix_mode_from_metadata`'s doc
+/// comment for the owner-exec-bit half of this gap), and `materialize`'s own
+/// symlink dispatch (`SyncState::get_record_kind`) reads the local index,
+/// never the projected version directly.
 ///
 /// **Correctness-critical: never upserts `record`'s real content fields
-/// over an existing row.** Every one of the four setters below is an
+/// over an existing row.** The column setters are an
 /// `UPDATE... WHERE group_id = ?, path = ?` that errors with
-/// `PeerSessionError::NotFound` if no row exists yet for this path (see
-/// `index.rs`'s `set_record_kind`/etc. doc comments), so *some* row must
-/// exist first. The first, broken version of this function called
-/// `state.upsert_file(group_id, record)` unconditionally to guarantee
-/// that — which introduced a real regression, caught by this change's own
-/// two-peer wire test (`tests/peer_session.rs`): `materialize`'s
-/// `try_apply_metadata_only_update` fast-paths whenever the
+/// `PeerSessionError::NotFound` if no row exists yet for this path, so
+/// *some* row must exist first. The first, broken version of this function
+/// called `state.upsert_file(group_id, record)` unconditionally to
+/// guarantee that -- which introduced a real regression:
+/// `materialize`'s `try_apply_metadata_only_update` fast-paths whenever the
 /// path's *already-indexed* blocks equal the incoming record's blocks,
 /// skipping the real fetch/write and just chmod'ing the (assumed
 /// already-on-disk) file. Pre-upserting `record` here made that
-/// comparison compare `record` against itself — trivially equal, every
-/// time, for *every* brand-new file — so the fast path fired for a file
+/// comparison compare `record` against itself -- trivially equal, every
+/// time, for *every* brand-new file -- so the fast path fired for a file
 /// whose content was never actually written to disk, and the chmod call
 /// failed with `ENOENT`. The fix: only create a row when none exists yet
 /// (a path this device has genuinely never seen before), and when
 /// creating one, use an **empty block list** regardless of `record`'s
-/// real blocks — structurally guaranteed to differ from any real,
-/// non-empty content the same message is about to deliver, so
+/// real blocks -- structurally guaranteed to differ from any real,
+/// non-empty content the same projection is about to deliver, so
 /// `try_apply_metadata_only_update`'s comparison (or its own
 /// `record.blocks.is_empty` guard, for a genuinely empty file) correctly
 /// falls through to a real fetch/write. When a row *does* already exist
 /// (an update to a previously-seen path), it is left completely untouched
-/// here — its old content fields are exactly what `try_apply_metadata_
-/// only_update` needs to compare the incoming record against.
+/// here -- its old content fields are exactly what `try_apply_metadata_
+/// only_update` needs to compare the projected record against.
+///
+/// The bootstrap row is the same kind of scaffold row `SyncState`'s own
+/// `files_supersede_prior_current` trigger recognizes and *deletes*
+/// (rather than supersedes) on the next real upsert, so it never becomes a
+/// spurious empty first version in the path's history. One transaction
+/// (`apply_incoming_metadata_atomic`) does the bootstrap-if-needed plus all
+/// the column writes, so this call, which runs on every path resolution,
+/// takes the writer gate once.
 ///
 /// Factored out as a free function (matching `materialize_symlink_at`/
 /// `try_apply_metadata_only_update`/`hazard_reason_for_policy` before it)
-/// for direct unit-testability without a live `QuicPeerChannel`.
-pub fn apply_incoming_wire_metadata(
+/// for direct unit-testability.
+pub fn apply_projected_metadata(
     state: &crate::replica_coordinator::ReplicaCoordinator,
     group_id: &str,
     record: &FileRecord,
-    meta: &IncomingWireMeta,
+    columns: &yadorilink_replica_domain::session_state::LocalFileMetaColumns,
     permit: &RootCommitPermit,
 ) -> Result<(), PeerSessionError> {
-    // This was `state.upsert_file(group_id, &FileRecord
-    // { blocks: Vec::new,..record.clone })` guarded by the same
-    // `is_none` check — that call now goes through the version-retaining
-    // `upsert_file_in_tx` path, which would otherwise record
-    // this empty bootstrap row as a genuine (if short-lived) superseded
-    // version once `materialize` immediately upserts the real content
-    // moments later, leaving every peer-adopted file's history with a
-    // spurious empty first version. `ensure_bootstrap_row_for_metadata`
-    // creates the same kind of scaffold row `SyncState`'s own
-    // `files_supersede_prior_current` trigger recognizes and *deletes*
-    // (rather than supersedes) on the next real upsert — see that
-    // function's and the trigger's doc comments for the full mechanism.
-    // One transaction, not 6 separate `state.set_*`/`ensure_bootstrap_
-    // row_for_metadata` calls each taking its own `writer_gate`: this
-    // unconditional-on-every-path-resolution call would otherwise dominate
-    // writer_gate load under a large change burst.
-    // `apply_incoming_metadata_atomic` does the same bootstrap-if-needed
-    // plus all 5 field writes in ONE transaction.
-    let columns = yadorilink_replica_domain::session_state::LocalFileMetaColumns {
-        record_kind: meta.record_kind,
-        symlink_target: meta.symlink_target.clone(),
-        symlink_out_of_root: meta.symlink_out_of_root,
-        unix_mode: meta.unix_mode,
-        xattrs: meta.xattrs.clone(),
-    };
-    state.apply_incoming_metadata_atomic(group_id, &record.path, &columns, permit)?;
+    state.apply_incoming_metadata_atomic(group_id, &record.path, columns, permit)?;
     Ok(())
 }
 
@@ -1885,11 +1707,10 @@ pub(crate) fn next_audit_attempt_id() -> u64 {
 /// factored out to a pure function so its exact semantics (a plain slice
 /// comparison; any number of intermediate admissions during the pass
 /// collapses to the same before/after mismatch as a single one) can be
-/// tested without any async execution, DAG store, or session plumbing.
-/// `dag_group_heads`'s own `ORDER BY change_hash` makes two reads of an
-/// unchanged frontier compare equal regardless of admission order, so this
-/// never needs to sort its inputs itself.
-pub(crate) fn frontier_changed_during_pass(before: &[ChangeHash], after: &[ChangeHash]) -> bool {
+/// tested without any async execution, store, or session plumbing. The
+/// frontier is the group's native author frontier (each author's position and
+/// tip), which is a map and so compares equal regardless of admission order.
+pub(crate) fn frontier_changed_during_pass<T: PartialEq + ?Sized>(before: &T, after: &T) -> bool {
     before != after
 }
 
@@ -1964,78 +1785,12 @@ impl Drop for RetirementAuditGuard {
     }
 }
 
-/// Outcome of `hydrate_file`/`hydrate_file_with_timeout`. A plain `Ok(())`
-/// used to mean "bytes fetched AND written to disk under this name" in
-/// every case except one: a filename hazard discovered after every block
-/// was already fetched into the local block store reverts the row to
-/// `Placeholder` and returns success anyway (the blocks really were
-/// fetched; only the physical write was withheld) -- see the hazard
-/// short-circuit inside `hydrate_file_with_timeout`. That collapsed two
-/// meaningfully different outcomes into one signal: `pin_and_hydrate_file`
-/// (whose own doc says "pinning forces hydration") could report success
-/// while the pinned file still had no content on disk at all. This type
-/// exists so a caller can tell the two apart.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HydrationOutcome {
-    /// Content is fully written to disk under this path's name.
-    Hydrated,
-    /// Every block was fetched into the local block store (so this device
-    /// can still serve them onward to another peer), but a filename
-    /// hazard withheld the physical write. The row is back at
-    /// `Placeholder`, held, exactly as if hydration had never been
-    /// attempted -- a caller relying on "hydration means the file is now
-    /// on disk" must not treat this the same as `Hydrated`.
-    Held { reason: String },
-}
-
-/// Outcome of `apply_locked_record`: the incoming record was either fully
-/// handled without a conflict (adopted / peer-ahead / already-current /
-/// never-seen), or it is genuinely concurrent with the local record and the
-/// caller must decide how to resolve it. No surviving caller turns
-/// `Concurrent` into a resolution: the DAG engine resolves concurrency by
-/// (lamport, change-hash) before a record ever reaches here, and the
-/// materialization-audit path treats it as unreachable.
-#[derive(Debug)]
-pub enum LockedRecordOutcome {
-    Settled,
-    /// `materialize` reported `MaterializeResult::RetryRequired` for this
-    /// record: an eager/pinned fetch could not obtain every block, a
-    /// hazard-collision tombstone dropped or held without actually
-    /// deleting anything, or some other "not done" outcome
-    /// `MaterializeResult`'s own doc comment describes.
-    RetryRequired,
-    /// Carries only the local record, for the caller's diagnostic log: no
-    /// surviving caller resolves a concurrency here, so the incoming record
-    /// and its wire metadata would be dead payload.
-    Concurrent {
-        local: FileRecord,
-    },
-}
-
-/// Rejects a peer-supplied `FileRecord.path` unless every component is an
-/// ordinary path segment — no `..`, no absolute-path root/prefix (a
-/// Windows drive letter, a leading `/`). Being authorized to sync a folder
-/// group only grants access to *that folder*; without this check, a path
-/// like `"../../../.ssh/authorized_keys"` or `"/etc/passwd"` would let any
-/// device sharing the group write (via `materialize`) or delete (via a
-/// tombstone) an arbitrary file anywhere on the receiving device's
-/// filesystem, well outside the synced directory — `PathBuf::join` with an
-/// absolute path silently discards the base entirely, and `..` components
-/// aren't otherwise neutralized anywhere in the reconciliation path.
-pub(crate) fn is_safe_relative_path(path: &str) -> bool {
-    use std::path::Component;
-    if path.is_empty() {
-        return false;
-    }
-    std::path::Path::new(path).components().all(|c| matches!(c, Component::Normal(_)))
-}
-
 /// Builds a materializable `FileRecord` for `path` from a resolved
 /// `FileVersion`. Each block carries its real `size` (canonical encoding v2
 /// records a per-block size) and a prefix-sum `offset`, so the built record is
 /// suitable for the derived materialized index. The version
-/// vector is empty because causality in the change-history model is DAG
-/// ancestry, not a version vector; the index row is only a DAG projection.
+/// vector is empty because causality is carried by native provenance, not a
+/// version vector; the index row is only a projection of native state.
 pub(crate) fn file_record_from_version(path: &str, version: &FileVersion) -> FileRecord {
     let mut offset = 0u64;
     let blocks = version
@@ -2056,26 +1811,11 @@ pub(crate) fn file_record_from_version(path: &str, version: &FileVersion) -> Fil
     }
 }
 
-/// Content identity of two index rows used to corroborate equal authoring
-/// identity: the deletion flag, size, mtime, and the ordered
-/// block hash/size sequence — the same components `FileVersion`'s canonical
-/// version hash commits to at this layer. Paths are deliberately not
-/// compared (every caller already scopes to a single path); block offsets
-/// are a prefix sum of the sizes, so comparing them would be redundant.
-pub(crate) fn same_record_content(a: &FileRecord, b: &FileRecord) -> bool {
-    a.deleted == b.deleted
-        && a.size == b.size
-        && a.mtime_unix_nanos == b.mtime_unix_nanos
-        && a.blocks.len() == b.blocks.len()
-        && a.blocks.iter().zip(&b.blocks).all(|(x, y)| x.hash == y.hash && x.size == y.size)
-}
-
 /// A record and the version that produced it, kept together so they
 /// cannot come from different moments.
 ///
-/// Every physical materialization has a source payload: an incoming wire
-/// record, a resolved DAG version, the current row a hydration was asked
-/// to place. That payload determines both the bytes to write and the
+/// Every physical materialization has a source payload: a resolved native
+/// version, the current row a hydration was asked to place. That payload determines both the bytes to write and the
 /// version those bytes are. Reading the version back out of the index row
 /// instead -- at any point, however early -- asks about the row rather
 /// than about the payload, and a supersession that keeps the same
@@ -2095,29 +1835,10 @@ pub struct MaterializationPayload {
 
 impl MaterializationPayload {
     /// From a resolved `FileVersion` and the path it is being placed at --
-    /// the DAG projection's own shape, where the record is derived from
+    /// native state projection's own shape, where the record is derived from
     /// the version and the two cannot disagree by construction.
     pub fn from_version(path: &str, version: FileVersion) -> Self {
         Self { record: file_record_from_version(path, &version), version }
-    }
-
-    /// From a record and the metadata that arrived with it on the wire.
-    ///
-    /// Safe because both halves are the source payload: the version is
-    /// derived once, here, from exactly the values that will be written.
-    /// What is never safe is re-reading that metadata from the row
-    /// afterwards and calling the result the version that was applied.
-    pub fn from_wire(record: FileRecord, meta: &IncomingWireMeta) -> Self {
-        let version = FileVersion::from_index_row(
-            record.blocks.clone(),
-            record.size,
-            record.mtime_unix_nanos,
-            meta.record_kind,
-            meta.unix_mode,
-            meta.symlink_target.clone(),
-            meta.xattrs.clone(),
-        );
-        Self { record, version }
     }
 
     /// From an already-committed current row this device is being asked to

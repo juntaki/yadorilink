@@ -174,6 +174,45 @@ pub async fn stop_daemon() -> Result<(), CoreError> {
     Ok(())
 }
 
+/// Restarts a daemon that is already running, so it starts again with the
+/// device registration and credential that now exist on disk; a daemon
+/// reads both only at startup. Does nothing when no daemon answers: the next
+/// one to start reads them anyway.
+///
+/// # Errors
+/// [`CoreError::Other`] when the old daemon is still answering after
+/// [`RESTART_BUDGET`], or the new one could not be started.
+pub(crate) async fn restart_if_running() -> Result<(), CoreError> {
+    restart_if_running_with(&DaemonLaunch::SpawnBinary { path: None }).await
+}
+
+/// [`restart_if_running`] with a chosen launch strategy. Under a supervisor
+/// that restarts the daemon by itself the launch finds it already running.
+pub(crate) async fn restart_if_running_with(launch: &DaemonLaunch) -> Result<(), CoreError> {
+    if !daemon_answers().await {
+        return Ok(());
+    }
+    stop_daemon().await?;
+    let gone = tokio::time::timeout(RESTART_BUDGET, async {
+        while daemon_answers().await {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    if gone.is_err() {
+        return Err(CoreError::Other(
+            "the running daemon did not stop; restart it with `yadorilink daemon stop` and \
+             `yadorilink daemon start`"
+                .into(),
+        ));
+    }
+    start_daemon_with(launch).await?;
+    Ok(())
+}
+
+/// How long a daemon asked to stop has to stop answering.
+const RESTART_BUDGET: Duration = Duration::from_secs(10);
+
 /// `yadorilink-daemon[.exe]` next to the current executable when it exists
 /// there, else the bare name for a PATH lookup.
 fn daemon_binary_path() -> PathBuf {
@@ -188,6 +227,11 @@ fn daemon_binary_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tests that point the control client at their own socket share the
+    /// process-global `YADORILINK_CONTROL_SOCKET`, so they run one at a time.
+    #[cfg(unix)]
+    static SOCKET_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     // A LaunchAgent is started through `/bin/launchctl` (see `launch_steps`),
     // which is never absolute by Windows's own definition of the term
@@ -281,5 +325,99 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+    /// A running daemon read the device registration at startup, so
+    /// registering has to restart it: ask it to stop, wait until it is gone,
+    /// launch a new one, and return only once that one answers.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restart_stops_the_running_daemon_and_launches_a_new_one() {
+        use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
+        use yadorilink_ipc_proto::daemonctl::{
+            DaemonControlRequest, DaemonControlResponse, ShutdownResponse, StatusResponse,
+            CONTROL_PROTOCOL_VERSION,
+        };
+        use yadorilink_ipc_proto::framing::{read_message, write_message};
+
+        async fn serve_until_shutdown(listener: &tokio::net::UnixListener) {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let Ok(Some(request)) = read_message::<DaemonControlRequest>(&mut stream).await
+                else {
+                    continue;
+                };
+                let (payload, done) = match request.payload {
+                    Some(ReqPayload::Shutdown(_)) => {
+                        (RespPayload::Shutdown(ShutdownResponse {}), true)
+                    }
+                    _ => (RespPayload::Status(StatusResponse::default()), false),
+                };
+                let response = DaemonControlResponse {
+                    daemon_protocol_version: CONTROL_PROTOCOL_VERSION,
+                    payload: Some(payload),
+                };
+                write_message(&mut stream, &response).await.unwrap();
+                if done {
+                    return;
+                }
+            }
+        }
+
+        let _guard = SOCKET_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let launched = dir.path().join("launched");
+        let script = dir.path().join("launch.sh");
+        std::fs::write(&script, format!("#!/bin/sh\ntouch '{}'\n", launched.display())).unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        std::env::set_var("YADORILINK_CONTROL_SOCKET", &socket);
+
+        let fake_daemon = tokio::spawn({
+            let socket = socket.clone();
+            let launched = launched.clone();
+            async move {
+                serve_until_shutdown(&listener).await;
+                drop(listener);
+                std::fs::remove_file(&socket).unwrap();
+                // The new daemon appears only once it has been launched.
+                while !launched.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+                serve_until_shutdown(&listener).await;
+            }
+        });
+
+        let launch = DaemonLaunch::SpawnBinary { path: Some(script.display().to_string()) };
+        let result = restart_if_running_with(&launch).await;
+        std::env::remove_var("YADORILINK_CONTROL_SOCKET");
+        fake_daemon.abort();
+
+        result.unwrap();
+        assert!(launched.exists(), "the stopped daemon was never launched again");
+    }
+
+    /// With no daemon running there is nothing to restart and nothing to
+    /// launch: the next daemon to start reads the registration anyway.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restart_without_a_running_daemon_launches_nothing() {
+        let _guard = SOCKET_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let launched = dir.path().join("launched");
+        let script = dir.path().join("launch.sh");
+        std::fs::write(&script, format!("#!/bin/sh\ntouch '{}'\n", launched.display())).unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        std::env::set_var("YADORILINK_CONTROL_SOCKET", dir.path().join("absent.sock"));
+        let result = restart_if_running_with(&DaemonLaunch::SpawnBinary {
+            path: Some(script.display().to_string()),
+        })
+        .await;
+        std::env::remove_var("YADORILINK_CONTROL_SOCKET");
+        result.unwrap();
+        assert!(!launched.exists());
     }
 }

@@ -18,8 +18,8 @@ mod unix_socket_tests {
     use yadorilink_ipc_proto::framing::{read_message, write_message};
     use yadorilink_ipc_proto::shellipc::shell_ipc_message::Payload;
     use yadorilink_ipc_proto::shellipc::{
-        ContextAction, ContextActionRequest, HydrateRequest,
-        MaterializationState as ShellMaterializationState, ShellIpcMessage, StatusQuery,
+        ContextAction, ContextActionRequest, HydrateRequest, LocalState as ShellLocalState,
+        LocalTransition as ShellLocalTransition, ShellIpcMessage, StatusQuery,
         SyncState as ShellSyncState,
     };
     use yadorilink_local_storage::SegmentBlockStore;
@@ -49,10 +49,10 @@ mod unix_socket_tests {
         (socket_path, state, dir)
     }
 
-    /// Stamps `path` as `Hydrated`, which `upsert_file` alone does NOT do.
+    /// Stamps `path` as `Present`, which `upsert_file` alone does NOT do.
     ///
     /// `files.materialization_state` defaults to `'placeholder'` in the
-    /// schema, and the only writer that stamps `Hydrated` as part of
+    /// schema, and the only writer that stamps `Present` as part of
     /// indexing is the local-emission path
     /// (`stamp_hydrated_after_local_emission_in_tx`). A test that seeds a
     /// row with a bare `upsert_file` therefore gets a PLACEHOLDER, no
@@ -71,7 +71,7 @@ mod unix_socket_tests {
             .set_materialization_state(
                 "group-1",
                 path,
-                yadorilink_replica_domain::session_state::MaterializationState::Hydrated,
+                yadorilink_replica_domain::session_state::MaterializationState::Present,
                 &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
@@ -138,8 +138,11 @@ mod unix_socket_tests {
         state.telemetry.push_status(yadorilink_ipc_proto::shellipc::StatusPush {
             path: absolute_path.clone(),
             state: ShellSyncState::Synced as i32,
-            materialization_state: yadorilink_ipc_proto::shellipc::MaterializationState::Hydrated
-                as i32,
+            local_state: Some(ShellLocalState {
+                local_object_present: true,
+                current_content_present: true,
+                transition: ShellLocalTransition::None as i32,
+            }),
         });
 
         let msg = tokio::time::timeout(
@@ -189,71 +192,7 @@ mod unix_socket_tests {
         );
     }
 
-    /// on-demand-sync spec "Context Menu Actions Include Pin and Evict":
-    /// pinning an already-hydrated file via the shell extension's context
-    /// menu needs no peer at all — same as `yadorilink pin` (control_socket).
-    #[tokio::test]
-    async fn pin_item_context_action_pins_an_already_hydrated_file() {
-        let (socket_path, state, dir) = start_daemon().await;
-        std::fs::write(dir.path().join("photos/vacation.jpg"), b"hello").unwrap();
-        state
-            .replica_coordinator
-            .file_index_repository()
-            .upsert_file(
-                "group-1",
-                &FileRecord {
-                    path: "vacation.jpg".into(),
-                    size: 5,
-                    mtime_unix_nanos: 0,
-                    blocks: vec![],
-                    deleted: false,
-                },
-                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-            )
-            .unwrap();
-        // `PinItem`'s "already hydrated" short-circuit -- the path this test
-        // is named for -- asks for everything `Hydrated` claims: the stamp
-        // AND a usable actual-state proof naming the version the row
-        // derives. A stamp alone is a state no production writer leaves
-        // behind, so with only the stamp the request falls through to a real
-        // hydration, which needs a peer this fixture does not have, and
-        // answers `ok = false`. Seed the pair the way a writer produces it:
-        // one commit that publishes the proof and stamps the claim.
-        yadorilink_daemon::test_support::seed_prior_cycle_proof(
-            &state.replica_coordinator,
-            "group-1",
-            "vacation.jpg",
-            &dir.path().join("photos/vacation.jpg"),
-            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-        );
-
-        let mut stream = UnixStream::connect(&socket_path).await.unwrap();
-        let path = dir.path().join("photos/vacation.jpg").to_string_lossy().to_string();
-        write_message(
-            &mut stream,
-            &ShellIpcMessage {
-                payload: Some(Payload::ContextActionRequest(ContextActionRequest {
-                    path: path.clone(),
-                    action: ContextAction::PinItem as i32,
-                })),
-            },
-        )
-        .await
-        .unwrap();
-
-        let resp = read_message::<ShellIpcMessage>(&mut stream).await.unwrap().unwrap();
-        let Some(Payload::ContextActionResponse(r)) = resp.payload else {
-            panic!("expected a ContextActionResponse")
-        };
-        assert!(r.ok);
-        assert!(state
-            .replica_coordinator
-            .file_index_repository()
-            .is_pinned("group-1", "vacation.jpg")
-            .unwrap());
-    }
-
-    /// Evicting an unpinned, hydrated file via the shell extension's
+    /// Evicting a hydrated file via the shell extension's
     /// context menu turns it back into a placeholder.
     #[tokio::test]
     async fn evict_item_context_action_turns_a_hydrated_file_into_a_placeholder() {
@@ -261,12 +200,12 @@ mod unix_socket_tests {
         // This test is about the eviction gate's own success path, not the
         // on-demand pipeline's real-vs-fake state, so unconditionally
         // connect the fake here. See `DaemonState::
-        // set_test_placeholder_pipeline_connected`'s own doc comment for why
+        // set_test_on_demand_allowed`'s own doc comment for why
         // a daemon integration test needs this instead of the production
         // probe (unconditionally `false`) or the free function's
-        // thread-local `OverrideForTest` (unreliable across this
+        // thread-local a thread-local override (unreliable across this
         // multi-threaded runtime).
-        state.set_test_placeholder_pipeline_connected(true);
+        state.set_test_on_demand_allowed(true);
         // `start_daemon` above only registers the link row in the
         // repository, never a real `LinkRuntimeController::start`/watcher,
         // so `hydration::evict`'s own `root_lease_for` lookup (which
@@ -353,9 +292,12 @@ mod unix_socket_tests {
                 .materialization_state_repository()
                 .get_materialization_state("group-1", "notes.txt")
                 .unwrap(),
-            Some(yadorilink_replica_domain::session_state::MaterializationState::Placeholder)
+            Some(yadorilink_replica_domain::session_state::MaterializationState::Remote)
         );
-        assert_ne!(std::fs::read(dir.path().join("photos/notes.txt")).unwrap(), content);
+        assert!(
+            std::fs::symlink_metadata(dir.path().join("photos/notes.txt")).is_err(),
+            "an evicted file must no longer stand in the user tree"
+        );
     }
 
     /// shell-integration spec: an unrelated path outside any linked folder
@@ -403,7 +345,7 @@ mod unix_socket_tests {
             .set_materialization_state(
                 "group-1",
                 "big.zip",
-                yadorilink_replica_domain::session_state::MaterializationState::Placeholder,
+                yadorilink_replica_domain::session_state::MaterializationState::Remote,
                 &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
@@ -452,9 +394,19 @@ mod unix_socket_tests {
             )
             .unwrap();
         // The assertion below expects `Hydrated`; the schema default is
-        // `placeholder`, so without this the test asserts the default and
-        // never exercises the status handler's state reporting at all.
-        set_hydrated(&state, "vacation.jpg");
+        // `remote`, so without this the test asserts the default and never
+        // exercises the status handler's state reporting at all. `Hydrated`
+        // is reported only for content a usable proof names as the current
+        // version's, so the object stands on disk under such a proof.
+        let on_disk = dir.path().join("photos/vacation.jpg");
+        std::fs::write(&on_disk, b"x").unwrap();
+        yadorilink_daemon::test_support::seed_prior_cycle_proof(
+            &state.replica_coordinator,
+            "group-1",
+            "vacation.jpg",
+            &on_disk,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        );
 
         let mut stream = UnixStream::connect(&socket_path).await.unwrap();
         let path = dir.path().join("photos/vacation.jpg").to_string_lossy().to_string();
@@ -468,7 +420,8 @@ mod unix_socket_tests {
         let Some(Payload::StatusResponse(r)) = resp.payload else {
             panic!("expected a StatusResponse")
         };
-        assert_eq!(r.materialization_state, ShellMaterializationState::Hydrated as i32);
+        let local = r.local_state.expect("an indexed path has a local state");
+        assert!(local.local_object_present && local.current_content_present);
     }
 } // mod unix_socket_tests
 
@@ -587,8 +540,11 @@ mod windows_pipe_tests {
         state.telemetry.push_status(yadorilink_ipc_proto::shellipc::StatusPush {
             path: absolute_path.clone(),
             state: ShellSyncState::Synced as i32,
-            materialization_state: yadorilink_ipc_proto::shellipc::MaterializationState::Hydrated
-                as i32,
+            local_state: Some(ShellLocalState {
+                local_object_present: true,
+                current_content_present: true,
+                transition: ShellLocalTransition::None as i32,
+            }),
         });
 
         let msg = tokio::time::timeout(
@@ -637,7 +593,7 @@ mod windows_pipe_tests {
             .set_materialization_state(
                 "group-1",
                 "big.zip",
-                yadorilink_replica_domain::session_state::MaterializationState::Placeholder,
+                yadorilink_replica_domain::session_state::MaterializationState::Remote,
                 &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();

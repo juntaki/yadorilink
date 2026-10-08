@@ -14,8 +14,7 @@
 //!
 //! - **Call counts.** The zero-write assertions are about work *not*
 //!   done. A path that is already settled must perform no metadata
-//!   apply, no projected-row write and no authoring-hash write -- and a
-//!   final-state check cannot tell "wrote nothing" apart from "wrote the
+//!   apply and no projected-row write -- and a final-state check cannot tell "wrote nothing" apart from "wrote the
 //!   same value again", which is precisely the regression these guard.
 //! - **Batch shapes.** Recording one entry per call, holding that call's
 //!   block hashes, is what makes "these hashes were written in ONE call"
@@ -46,7 +45,6 @@ pub(crate) struct ArmedSupersession {
 pub(crate) struct TestObservers {
     pub apply_incoming_metadata_atomic_calls: AtomicUsize,
     pub apply_projected_row_atomic_calls: AtomicUsize,
-    pub set_authoring_change_hash_calls: AtomicUsize,
     /// One per metadata-unprovable hold decided, including one that
     /// re-confirms an existing hold: how many times a blocked path was
     /// actually re-examined, which the hold's final state cannot show.
@@ -75,16 +73,41 @@ pub(crate) struct TestObservers {
     /// asserts is that what gets written is decided by the payload, with
     /// the row only ever a guard.
     pub armed_upsert_supersession: Mutex<Option<ArmedSupersession>>,
-    /// Fails the ordinary batch's post-rename metadata step for one path,
-    /// with the error the test names: `(group_id, path, error)`. One-shot.
-    /// Nothing a test can do to a file the batch has just renamed into
-    /// place makes the owner's own `chmod` fail, and the class of the
-    /// error (path-local or batch-wide) is what the assertion is about.
-    pub ordinary_batch_metadata_fault: Mutex<Option<BatchMetadataFault>>,
+    /// The number of items of every batched close transaction that ran.
+    pub close_batch_sizes: Mutex<Vec<usize>>,
+    /// Fails a batched close transaction after every item has been
+    /// written and before it commits, as a crash in the middle of it would:
+    /// none of the batch may survive.
+    pub close_batch_fails_before_commit: AtomicBool,
+    /// Runs when a batched close is about to open its transaction, before
+    /// anything is written: a test parks the committing task here with every
+    /// file of the batch renamed into place and none of them committed.
+    pub close_batch_gate: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
+    /// The number of items of every batched metadata transaction that ran.
+    pub metadata_batch_sizes: Mutex<Vec<usize>>,
+    /// Fails a batched metadata transaction after its last item has been
+    /// written and before it commits, as a crash in the middle of it would:
+    /// none of the batch may survive.
+    pub metadata_batch_fails_before_commit: AtomicBool,
+    /// Runs when a batched metadata apply is about to open its transaction.
+    pub metadata_batch_gate: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
+    /// Runs inside a content write's open transaction before its first
+    /// statement (on whichever thread runs the commit): a test parks the
+    /// commit here.
+    pub open_commit_gate: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
+    /// The number of items of every batched open transaction that ran.
+    pub open_batch_sizes: Mutex<Vec<usize>>,
+    /// Fails a batched open transaction after every item has been written and
+    /// before it commits, as a crash in the middle of it would: none of the
+    /// batch may survive.
+    pub open_batch_fails_before_commit: AtomicBool,
+    /// Runs when a batched open is about to open its transaction, before
+    /// anything is written.
+    pub open_batch_gate: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
+    /// Overrides `YADORILINK_RECEIVE_ASYNC_COMMIT` for this coordinator:
+    /// 0 = the environment, 1 = on, 2 = off.
+    pub async_commit_override: std::sync::atomic::AtomicU8,
 }
-
-/// `(group_id, path, error)` -- see `TestObservers::ordinary_batch_metadata_fault`.
-pub type BatchMetadataFault = (String, String, fn() -> yadorilink_peer_session::PeerSessionError);
 
 impl TestObservers {
     pub fn note_apply_incoming_metadata_atomic(&self) {
@@ -93,10 +116,6 @@ impl TestObservers {
 
     pub fn note_apply_projected_row_atomic(&self) {
         self.apply_projected_row_atomic_calls.fetch_add(1, Ordering::SeqCst);
-    }
-
-    pub fn note_set_authoring_change_hash(&self) {
-        self.set_authoring_change_hash_calls.fetch_add(1, Ordering::SeqCst);
     }
 
     pub fn note_metadata_unprovable_hold(&self) {
@@ -156,28 +175,7 @@ impl TestObservers {
         }
     }
 
-    /// The armed fault for `path`, taken so it fires once.
-    pub fn take_ordinary_batch_metadata_fault(
-        &self,
-        group_id: &str,
-        path: &str,
-    ) -> Option<yadorilink_peer_session::PeerSessionError> {
-        let mut slot = self.lock(&self.ordinary_batch_metadata_fault);
-        match slot.as_ref() {
-            Some((g, p, _)) if g == group_id && p == path => slot.take().map(|(_, _, e)| e()),
-            _ => None,
-        }
-    }
-
     fn lock<'a, T>(&self, m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
         m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    pub fn provenance_batches(&self) -> Vec<Vec<Vec<u8>>> {
-        self.lock(&self.record_group_block_provenance_batches).clone()
-    }
-
-    pub fn clear_block_fetch_refusal_call_log(&self) -> Vec<(String, String, String, String)> {
-        self.lock(&self.clear_block_fetch_refusal_calls).clone()
     }
 }

@@ -198,7 +198,22 @@ impl SegmentBlockStore {
         ensure_segments_directory(&root)?;
         write_format_marker(&root)?;
 
-        let index = Arc::new(BlockIndex::open(&root.join(INDEX_FILE))?);
+        // The index is the only record of which segment records are
+        // committed. Opening a missing one creates an empty index, and
+        // recovery would then treat every surviving segment as an orphan
+        // and delete it -- the only copy of its bytes. An index is always
+        // created before the first segment, so segments with data and no
+        // index means the index was lost: refuse and leave them untouched.
+        let index_path = root.join(INDEX_FILE);
+        if !index_path.try_exists()? && Self::holds_segment_data(&root)? {
+            return Err(StorageError::CorruptStore(format!(
+                "{} is missing but {} holds segment data; refusing to treat the segments as \
+                 uncommitted. Restore the index, or remove the segments directory to start over",
+                index_path.display(),
+                root.display()
+            )));
+        }
+        let index = Arc::new(BlockIndex::open(&index_path)?);
         let recovered = recovery::recover(&root, &index)?;
         if !recovered.report.is_clean() {
             tracing::warn!(
@@ -229,6 +244,16 @@ impl SegmentBlockStore {
             durability_barrier_hook: Mutex::new(None),
             recovery_report: recovered.report,
         })
+    }
+
+    /// Whether `root` holds any segment file with a record in it, without
+    /// opening (or creating anything in) the store. Lets a caller that owns
+    /// the metadata the stored blocks are accounted against tell "a new
+    /// install" from "this data outlived its metadata".
+    pub fn holds_segment_data(root: &Path) -> Result<bool, StorageError> {
+        Ok(recovery::enumerate_segment_files(root)?
+            .values()
+            .any(|&len| len > format::SEGMENT_HEADER_LEN))
     }
 
     /// Default per-OS application data directory for the block store.

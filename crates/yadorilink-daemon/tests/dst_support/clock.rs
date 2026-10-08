@@ -2,7 +2,7 @@
 //!
 //! Before this module every `dst_*.rs` scenario carried its own copy of a
 //! seed-derived synthetic "now" plus a `stamp_deterministic_mtime` helper
-//! (canonically `dst_network_fault_chaos.rs`'s `virtual_now_nanos` loop and
+//! (canonically the retired network-fault scenario's `virtual_now_nanos` loop and
 //! `stamp_deterministic_mtime`), keeping the simulated clock and the
 //! kernel-stamped tempdir mtimes on one timeline *by convention*. A write
 //! path that forgot to stamp produced a tie-break outcome production could
@@ -66,7 +66,7 @@ pub struct HarnessClock {
 impl HarnessClock {
     /// Seeds the synthetic "now" from `seed` itself (not a constant, not
     /// the round number) -- extracted verbatim from
-    /// `dst_network_fault_chaos.rs`'s `virtual_now_nanos` initialization so
+    /// the retired network-fault scenario's `virtual_now_nanos` initialization so
     /// migrating scenarios keep byte-identical timelines.
     pub fn from_seed(seed: u64) -> Self {
         Self {

@@ -58,10 +58,9 @@ pub struct DeviceAuthorization {
     /// no Durable Object to build.
     pub user_code: String,
     pub verification_uri: String,
-    /// The URI with the code already in it. Convenient and a hazard: it puts a
-    /// live credential in a browser address bar, in history, and in the
-    /// platform's own request log. Offered because the server sends it, and
-    /// deliberately not the one [`DeviceAuthorization::instructions`] prints.
+    /// The URI with the code already in it (RFC 8628 section 3.3.1). When the
+    /// server sends it, it is what [`DeviceAuthorization::instructions`]
+    /// prints, so nobody has to type the code.
     #[serde(default)]
     pub verification_uri_complete: Option<String>,
     pub expires_in: u64,
@@ -71,20 +70,22 @@ pub struct DeviceAuthorization {
 }
 
 impl DeviceAuthorization {
-    /// What to show the user: the bare verification URI and the code,
-    /// separately.
-    ///
-    /// Not `verification_uri_complete`. The combined URI is a live credential
-    /// in a URL, and a Worker deployment with observability enabled records
-    /// the request URL of every invocation. Printing the two halves
-    /// costs the user one paste and keeps the code out of every log between
-    /// here and the Worker.
+    /// What to show the user. With `verification_uri_complete`: one link that
+    /// already carries the code, plus the code to compare against the page
+    /// it opens. Without it: the bare verification URI and the code to type.
     #[must_use]
     pub fn instructions(&self) -> String {
-        format!(
-            "To finish signing in, open {} on any device and enter this code:\n\n    {}\n",
-            self.verification_uri, self.user_code
-        )
+        match &self.verification_uri_complete {
+            Some(complete) => format!(
+                "To finish signing in, open this link on any device (your phone is fine) and \
+                 check that the code shown there matches:\n\n  {complete}\n\n  Code: {}\n",
+                self.user_code
+            ),
+            None => format!(
+                "To finish signing in, open {} on any device and enter this code:\n\n    {}\n",
+                self.verification_uri, self.user_code
+            ),
+        }
     }
 
     #[must_use]

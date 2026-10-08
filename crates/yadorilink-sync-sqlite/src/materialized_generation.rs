@@ -1,25 +1,22 @@
 //! `path_materialized_generations`: the durable record of what the engine
 //! believes the disk currently reflects for a path, kept separate from
-//! what the change DAG resolves that path to (`DiskGenerationBasis`). This
+//! what native state resolves that path to (`DiskGenerationBasis`). This
 //! module is deliberately narrow: it records and reads one row per
 //! `(group_id, path)`. Nothing here decides *when* a generation should
 //! change -- that is a caller's job, restated here because it is easy to
 //! get backwards: a new admission (desired state) must never touch this
 //! table; a row here changes only after a filesystem placement has been
 //! observed committed and durably recorded. # Immutability A generation's
-//! causal basis is fixed for its lifetime: if the frontier a path reflects
-//! moves, that is a *new* generation, never an edit to the old one's
-//! basis. This module has exactly one write entry point,
-//! [`record_materialized_generation`], and it always replaces every column
-//! together under a freshly minted [`GenerationId`] -- there is no "update
-//! just the basis" function to reach for by mistake. Basis membership
-//! itself is even more strongly protected: interned causal bases
-//! (`crate::dag_store::causal_basis`) are never mutated once written, only
-//! ever referenced by a new row. # Absence is a generation too A path with
-//! nothing on disk is not "no row" -- it is a row whose `object_kind` is
+//! basis (the path's reflected heads, [`crate::materialization_basis`]) is
+//! fixed for its lifetime: if the heads a path reflects move, that is a
+//! *new* generation, never an edit to the old one's basis. Every write
+//! replaces every column together under a freshly minted [`GenerationId`]
+//! -- there is no "update just the basis" function to reach for by
+//! mistake. # Absence is a generation too A path with nothing on disk is
+//! not "no row" -- it is a row whose `object_kind` is
 //! [`MaterializedObjectKind::Absent`], `version` is `None`, and
-//! `filesystem_identity` is `None`. The basis is still the frontier whose
-//! resolution produced that absence (a tombstone or a move-away).
+//! `filesystem_identity` is `None`. The basis is still the heads whose
+//! resolution produced that absence.
 //! [`record_materialized_generation`] does not special-case this: an
 //! absent generation is written through the exact same call as a present
 //! one, with `object_kind: Absent`, so there is no separate path to forget
@@ -29,23 +26,34 @@
 use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
-use crate::dag_store::intern_causal_basis;
 use crate::error::SyncSqliteError;
 use crate::file_identity_codec::{
     decode_file_identity, encode_file_identity, GenerationId,
     MATERIALIZED_GENERATION_ENCODING_VERSION,
 };
-use yadorilink_replica_domain::ids::{ChangeHash, VersionHash};
+use yadorilink_replica_domain::ids::VersionHash;
 use yadorilink_root_authority::fs_identity::FileIdentity;
 
-pub fn init_materialized_generation_schema(conn: &Connection) -> Result<(), SyncSqliteError> {
-    conn.execute_batch(
-        r#"
+/// Creates `path_materialized_generations` and the mutation fences. A proof
+/// stores the path's reflected heads ([`crate::materialization_basis`]).
+pub(crate) fn init_materialized_generation_schema(
+    conn: &Connection,
+) -> Result<(), SyncSqliteError> {
+    conn.execute_batch(PATH_MATERIALIZED_GENERATIONS)?;
+    init_mutation_fences(conn)
+}
+
+const PATH_MATERIALIZED_GENERATIONS: &str = concat!(
+    r#"
         CREATE TABLE IF NOT EXISTS path_materialized_generations (
             group_id                   TEXT NOT NULL,
             path                       TEXT NOT NULL,
             generation_id              TEXT NOT NULL,
-            causal_basis_id            TEXT NOT NULL,
+            -- The sorted, concatenated hashes of the path's present heads
+            -- when the proof was published.
+            "#,
+    "reflected_heads",
+    r#" BLOB NOT NULL,
             resolved_path_state_hash   BLOB NOT NULL,
             object_kind                TEXT NOT NULL,
             version_hash               BLOB,
@@ -54,15 +62,17 @@ pub fn init_materialized_generation_schema(conn: &Connection) -> Result<(), Sync
             hardlink_group_id          TEXT,
             encoding_version           INTEGER NOT NULL,
             updated_at_unix_nanos      INTEGER NOT NULL,
-            -- The filesystem-side fence value this row's publisher observed
-            -- when it wrote. `lookup_materialized_generation` trusts a row
-            -- only while this still equals the path's CURRENT fence.
             published_under_mutation_generation INTEGER,
             PRIMARY KEY (group_id, path)
         );
+"#
+);
 
+fn init_mutation_fences(conn: &Connection) -> Result<(), SyncSqliteError> {
+    conn.execute_batch(
+        r#"
         -- The filesystem-side fence, independent
-        -- of and complementary to the DAG-side `invalidation_generation`
+        -- of and complementary to the desired-side `invalidation_generation`
         -- (`projection_obligations`). Bumped by every physical mutator
         -- before its first mutating syscall, inside the same path-lock
         -- critical section as the mutation; snapshotted (never bumped) by
@@ -107,6 +117,9 @@ pub fn bump_mutation_fence(
     mutation_kind: &str,
     now_unix_nanos: i64,
 ) -> Result<i64, SyncSqliteError> {
+    // Every lane takes this step inside the path's lock before its first write,
+    // so it is where a frozen group stops them all.
+    crate::native_rebootstrap::refuse_materialization_if_frozen(conn, group_id)?;
     conn.query_row(
         "INSERT INTO path_actual_mutation_fences
             (group_id, path, mutation_generation, last_mutation_kind, last_mutation_at)
@@ -192,34 +205,6 @@ pub fn invalidate_published_generations(
     advance_existing_fence(conn, group_id, path, mutation_kind, now_unix_nanos)
 }
 
-/// Retires the materialized basis of every path a local emission just
-/// wrote, in the emission's own transaction (`conn` is that transaction).
-///
-/// The emission has moved each path past whatever basis it held, and
-/// nothing at the emission knows what is on disk for it now. A basis left
-/// standing would still read as current, and a later local edit of the path
-/// would be parented on it -- beside the new change instead of on it, so one
-/// author would hold two heads of one path. So each path's fence advances
-/// and nothing is published, exactly as [`invalidate_published_generations`]
-/// does for one path; a caller that did observe the result publishes a fresh
-/// proof afterwards, in the same transaction, whose basis contains the
-/// change.
-///
-/// The per-path sibling of [`forget_group_materialized_generations`]: the
-/// emission knows exactly which paths moved, so it retires those and keeps
-/// every other path's proof.
-pub fn retire_bases_after_local_emission(
-    conn: &Connection,
-    group_id: &str,
-    paths: &[&str],
-    now_unix_nanos: i64,
-) -> Result<(), SyncSqliteError> {
-    for path in paths {
-        advance_existing_fence(conn, group_id, path, "local-emission", now_unix_nanos)?;
-    }
-    Ok(())
-}
-
 /// The fence advance behind [`invalidate_published_generations`] and
 /// [`retire_bases_after_local_emission`]; see the former for why there is
 /// no `INSERT` fallback.
@@ -230,60 +215,18 @@ fn advance_existing_fence(
     mutation_kind: &str,
     now_unix_nanos: i64,
 ) -> Result<Option<i64>, SyncSqliteError> {
-    conn.query_row(
+    conn.prepare_cached(
         "UPDATE path_actual_mutation_fences
             SET mutation_generation = mutation_generation + 1,
                 last_mutation_kind = ?3,
                 last_mutation_at = ?4
           WHERE group_id = ?1 AND path = ?2
          RETURNING mutation_generation",
-        rusqlite::params![group_id, path, mutation_kind, now_unix_nanos],
-        |r| r.get(0),
-    )
+    )?
+    .query_row(rusqlite::params![group_id, path, mutation_kind, now_unix_nanos], |r| r.get(0))
     .optional()
     .map_err(SyncSqliteError::from)
 }
-
-/// Drops every published generation of `group_id` and advances every one
-/// of its fences, for a writer that has just removed or replaced history
-/// those generations' causal bases may name -- a prune, or a base install.
-///
-/// A generation's basis is what a local edit of its path is parented on,
-/// so a basis naming a change the group no longer holds must not read as
-/// current. The rows are deleted outright rather than merely fenced off:
-/// what they name is gone, so they are not even a useful record of what
-/// this device last believed. The fences are advanced as well because a
-/// physical writer may be in flight with an epoch captured before this
-/// transaction and a basis resolved before it; its compare-and-set must
-/// fail rather than publish that basis afterwards. Fence rows themselves
-/// are kept -- a fence only ever moves forward.
-///
-/// Group-wide rather than per basis: after a prune almost every recorded
-/// basis predates the checkpoint, and an in-flight writer's basis is not
-/// visible here to be checked at all.
-pub fn forget_group_materialized_generations(
-    conn: &Connection,
-    group_id: &str,
-    mutation_kind: &str,
-    now_unix_nanos: i64,
-) -> Result<(), SyncSqliteError> {
-    conn.execute(
-        "UPDATE path_actual_mutation_fences
-            SET mutation_generation = mutation_generation + 1,
-                last_mutation_kind = ?2,
-                last_mutation_at = ?3
-          WHERE group_id = ?1",
-        rusqlite::params![group_id, mutation_kind, now_unix_nanos],
-    )?;
-    conn.execute("DELETE FROM path_materialized_generations WHERE group_id = ?1", [group_id])?;
-    Ok(())
-}
-
-/// The id [`crate::dag_store::intern_causal_basis`] returns, wrapped so a
-/// `GenerationId` and a `CausalBasisId` -- both opaque strings -- cannot be
-/// swapped positionally without a type error.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct CausalBasisId(pub String);
 
 /// What a materialized generation's path currently names. [`Absent`] is a
 /// real, first-class member here -- see the module doc's "Absence is a
@@ -335,7 +278,9 @@ impl MaterializedObjectKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DiskGenerationBasis {
     pub generation_id: GenerationId,
-    pub causal_basis_id: CausalBasisId,
+    /// What the proof's write realized, as [`crate::materialization_basis`]
+    /// records it.
+    pub basis: crate::materialization_basis::ReflectedHeads,
     pub resolved_path_state_hash: [u8; 32],
     pub object_kind: MaterializedObjectKind,
     pub version: Option<VersionHash>,
@@ -366,7 +311,7 @@ fn object_kind_tag(kind: MaterializedObjectKind) -> u8 {
 /// The canonical encoding `resolved_path_state_hash` is derived from. This
 /// is the reference definition: nothing in this crate computes a
 /// desired-state `resolved_path_state_hash` yet (the resolver that turns a
-/// DAG frontier into a desired target is not built), so whichever later
+/// native frontier into a desired target is not built), so whichever later
 /// phase builds it must produce byte-identical input for the two hashes to
 /// ever be comparable, and this function is where that shape lives.
 fn canonical_resolved_path_state_encoding(
@@ -411,13 +356,28 @@ fn new_generation_id(group_id: &str) -> GenerationId {
     GenerationId(format!("{group_id}:{}", hex::encode(random)))
 }
 
+/// Replaces the basis recorded on the proof standing for `(group_id, path)`,
+/// leaving everything else about it as it is. For a writer that knows the
+/// basis it realized better than the heads read at publication.
+pub(crate) fn replace_proof_basis(
+    conn: &Connection,
+    group_id: &str,
+    path: &str,
+    basis: &crate::materialization_basis::ReflectedHeads,
+) -> Result<(), SyncSqliteError> {
+    conn.execute(
+        "UPDATE path_materialized_generations SET reflected_heads = ?3 \
+         WHERE group_id = ?1 AND path = ?2",
+        rusqlite::params![group_id, path, basis],
+    )?;
+    Ok(())
+}
+
 /// Records a new materialized generation for `(group_id, path)`. Always
 /// replaces the row wholesale under a freshly minted [`GenerationId`] --
 /// see the module doc's immutability section for why there is no separate
-/// "update the basis" entry point. `causal_basis` is the complete frontier
-/// this generation reflects; it is interned via
-/// [`crate::dag_store::intern_causal_basis`], so a path sharing a frontier
-/// with a million others shares one basis row, not a million copies.
+/// "update the basis" entry point. The basis is the path's present heads
+/// ([`crate::materialization_basis::record`]).
 ///
 /// `object_kind: Absent` and `version: None`/`filesystem_identity: None`
 /// together record an absent path's generation -- there is no separate
@@ -446,7 +406,6 @@ pub fn record_materialized_generation(
     conn: &Connection,
     group_id: &str,
     path: &str,
-    causal_basis: &[ChangeHash],
     object_kind: MaterializedObjectKind,
     version: Option<&VersionHash>,
     filesystem_identity: Option<&FileIdentity>,
@@ -457,7 +416,6 @@ pub fn record_materialized_generation(
         conn,
         group_id,
         path,
-        causal_basis,
         object_kind,
         version,
         filesystem_identity,
@@ -484,7 +442,6 @@ pub fn publish_materialized_generation_if_fence_current(
     conn: &Connection,
     group_id: &str,
     path: &str,
-    causal_basis: &[ChangeHash],
     object_kind: MaterializedObjectKind,
     version: Option<&VersionHash>,
     filesystem_identity: Option<&FileIdentity>,
@@ -506,7 +463,6 @@ pub fn publish_materialized_generation_if_fence_current(
         conn,
         group_id,
         path,
-        causal_basis,
         object_kind,
         version,
         filesystem_identity,
@@ -516,7 +472,7 @@ pub fn publish_materialized_generation_if_fence_current(
 }
 
 /// Adopts an externally-authored filesystem state -- one local capture just
-/// durably observed and is committing to the DAG/index in this SAME
+/// durably observed and is committing to the native state/index in this SAME
 /// transaction -- as `(group_id, path)`'s current actual-state generation.
 ///
 /// **E's meaning, generalized**: E (the mutation-fence epoch) is the
@@ -542,16 +498,16 @@ pub fn publish_materialized_generation_if_fence_current(
 /// visible to a reader instead of looking like an ordinary internal
 /// mutator that merely forgot to CAS.
 ///
-/// Call this from inside the SAME transaction as the local Change
+/// Call this from inside the SAME transaction as the local delta
 /// admission/index commit, with the path lock already held, only after
 /// every other pre-commit revalidation (disk fingerprint, index state,
 /// authoring identity) has already passed -- see the call site's own
 /// documentation for the full precondition list. Never call this outside
-/// a transaction that also durably commits the admitted local Change: a
+/// a transaction that also durably commits the admitted local delta: a
 /// crash between the two must never leave one without the other (a
 /// desired-state bump with no actual-state proof is merely the ordinary,
 /// already-handled "not yet zero-work-closeable" case; the reverse -- a
-/// proof with no corresponding admitted Change -- is a correctness bug
+/// proof with no corresponding admitted delta -- is a correctness bug
 /// this atomicity exists to rule out).
 ///
 /// **External-writer consistency boundary**: this adopts the state local
@@ -570,7 +526,6 @@ pub fn adopt_observed_actual_generation_in_tx(
     conn: &Connection,
     group_id: &str,
     path: &str,
-    causal_basis: &[ChangeHash],
     object_kind: MaterializedObjectKind,
     version: Option<&VersionHash>,
     filesystem_identity: Option<&FileIdentity>,
@@ -582,7 +537,6 @@ pub fn adopt_observed_actual_generation_in_tx(
         conn,
         group_id,
         path,
-        causal_basis,
         object_kind,
         version,
         filesystem_identity,
@@ -591,12 +545,150 @@ pub fn adopt_observed_actual_generation_in_tx(
     )
 }
 
+/// A present object local capture observed, with the basis its proof records, for
+/// [`adopt_observed_present_generations_batch`].
+pub(crate) struct ObservedPresent<'a> {
+    pub path: &'a str,
+    pub object_kind: MaterializedObjectKind,
+    pub version: &'a VersionHash,
+    pub filesystem_identity: &'a FileIdentity,
+    /// The path's reflected heads, which the caller holds from the install that wrote them.
+    pub basis: crate::materialization_basis::ReflectedHeads,
+}
+
+/// Rows one batched statement binds, under SQLite's variable limit.
+const PATHS_PER_BATCH: usize = 100;
+
+/// [`adopt_observed_actual_generation_in_tx`] for many present objects at once, with each basis
+/// given: every path's fence is bumped first, in one statement per chunk, and each proof is then
+/// written under the epoch its own bump returned, so a row is never published under an epoch
+/// that was not minted for it. The paths must be distinct.
+pub(crate) fn adopt_observed_present_generations_batch(
+    conn: &Connection,
+    group_id: &str,
+    items: &[ObservedPresent<'_>],
+    now_unix_nanos: i64,
+) -> Result<(), SyncSqliteError> {
+    let mut seen = std::collections::HashSet::with_capacity(items.len());
+    if let Some(duplicate) = items.iter().find(|item| !seen.insert(item.path)) {
+        return Err(SyncSqliteError::InvalidInput(format!(
+            "two observed generations for {group_id}/{} in one batch",
+            duplicate.path
+        )));
+    }
+    let mut epochs: std::collections::HashMap<&str, i64> =
+        std::collections::HashMap::with_capacity(items.len());
+    for chunk in items.chunks(PATHS_PER_BATCH) {
+        let rows: Vec<String> =
+            (0..chunk.len()).map(|i| format!("(?1, ?{}, 1, ?2, ?3)", 4 + i)).collect();
+        let mut stmt = conn.prepare_cached(&format!(
+            "INSERT INTO path_actual_mutation_fences \
+                (group_id, path, mutation_generation, last_mutation_kind, last_mutation_at) \
+             VALUES {} \
+             ON CONFLICT (group_id, path) DO UPDATE SET \
+                mutation_generation = mutation_generation + 1, \
+                last_mutation_kind = excluded.last_mutation_kind, \
+                last_mutation_at = excluded.last_mutation_at \
+             RETURNING path, mutation_generation",
+            rows.join(", ")
+        ))?;
+        let params = [
+            rusqlite::types::Value::from(group_id.to_owned()),
+            "external-actual-state-adopted".to_owned().into(),
+            now_unix_nanos.into(),
+        ]
+        .into_iter()
+        .chain(chunk.iter().map(|item| item.path.to_owned().into()));
+        let mut returned = stmt.query(rusqlite::params_from_iter(params))?;
+        let mut count = 0;
+        while let Some(row) = returned.next()? {
+            let path: String = row.get(0)?;
+            let epoch: i64 = row.get(1)?;
+            let item = chunk.iter().find(|item| item.path == path).ok_or_else(|| {
+                SyncSqliteError::CorruptState(format!(
+                    "a fence bump returned the unknown path {path}"
+                ))
+            })?;
+            epochs.insert(item.path, epoch);
+            count += 1;
+        }
+        if count != chunk.len() {
+            return Err(SyncSqliteError::CorruptState(format!(
+                "{} fence bumps returned {count} rows",
+                chunk.len()
+            )));
+        }
+    }
+    for chunk in items.chunks(PATHS_PER_BATCH) {
+        let rows: Vec<String> = (0..chunk.len())
+            .map(|i| {
+                let b = 4 + 9 * i;
+                format!(
+                    "(?1, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, NULL, ?2, ?3, ?{})",
+                    b,
+                    b + 1,
+                    b + 2,
+                    b + 3,
+                    b + 4,
+                    b + 5,
+                    b + 6,
+                    b + 7,
+                    b + 8
+                )
+            })
+            .collect();
+        let mut stmt = conn.prepare_cached(&format!(
+            "INSERT INTO path_materialized_generations \
+                (group_id, path, generation_id, reflected_heads, resolved_path_state_hash, \
+                 object_kind, version_hash, filesystem_identity, metadata_fingerprint, \
+                 hardlink_group_id, encoding_version, updated_at_unix_nanos, \
+                 published_under_mutation_generation) \
+             VALUES {} \
+             ON CONFLICT (group_id, path) DO UPDATE SET \
+                generation_id = excluded.generation_id, \
+                reflected_heads = excluded.reflected_heads, \
+                resolved_path_state_hash = excluded.resolved_path_state_hash, \
+                object_kind = excluded.object_kind, \
+                version_hash = excluded.version_hash, \
+                filesystem_identity = excluded.filesystem_identity, \
+                metadata_fingerprint = excluded.metadata_fingerprint, \
+                hardlink_group_id = NULL, \
+                encoding_version = excluded.encoding_version, \
+                updated_at_unix_nanos = excluded.updated_at_unix_nanos, \
+                published_under_mutation_generation = excluded.published_under_mutation_generation",
+            rows.join(", ")
+        ))?;
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(3 + 9 * chunk.len());
+        params.push(group_id.to_owned().into());
+        params.push(MATERIALIZED_GENERATION_ENCODING_VERSION.into());
+        params.push(now_unix_nanos.into());
+        for item in chunk {
+            let hash = compute_resolved_path_state_hash(
+                group_id,
+                item.path,
+                item.object_kind,
+                Some(item.version),
+            );
+            params.push(item.path.to_owned().into());
+            params.push(new_generation_id(group_id).0.into());
+            params.push(item.basis.0.clone().into());
+            params.push(hash.to_vec().into());
+            params.push(item.object_kind.as_db_str().to_owned().into());
+            params.push(item.version.0.to_vec().into());
+            params.push(encode_file_identity(item.filesystem_identity).into());
+            params.push(item.filesystem_identity.metadata_fingerprint.to_vec().into());
+            params.push(epochs[item.path].into());
+        }
+        stmt.execute(rusqlite::params_from_iter(params))?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_generation_row(
     conn: &Connection,
     group_id: &str,
     path: &str,
-    causal_basis: &[ChangeHash],
     object_kind: MaterializedObjectKind,
     version: Option<&VersionHash>,
     filesystem_identity: Option<&FileIdentity>,
@@ -615,7 +707,7 @@ fn write_generation_row(
             object_kind.as_db_str()
         )));
     }
-    let causal_basis_id = CausalBasisId(intern_causal_basis(conn, group_id, causal_basis)?);
+    let basis = crate::materialization_basis::record(conn, group_id, path)?;
     let resolved_path_state_hash =
         compute_resolved_path_state_hash(group_id, path, object_kind, version);
     let generation_id = new_generation_id(group_id);
@@ -623,16 +715,16 @@ fn write_generation_row(
     let metadata_fingerprint_blob = filesystem_identity.map(|id| id.metadata_fingerprint.to_vec());
     let version_blob = version.map(|v| v.0.to_vec());
 
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO path_materialized_generations
-            (group_id, path, generation_id, causal_basis_id, resolved_path_state_hash,
+            (group_id, path, generation_id, reflected_heads, resolved_path_state_hash,
              object_kind, version_hash, filesystem_identity, metadata_fingerprint,
              hardlink_group_id, encoding_version, updated_at_unix_nanos,
              published_under_mutation_generation)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11, ?12)
          ON CONFLICT (group_id, path) DO UPDATE SET
             generation_id = excluded.generation_id,
-            causal_basis_id = excluded.causal_basis_id,
+            reflected_heads = excluded.reflected_heads,
             resolved_path_state_hash = excluded.resolved_path_state_hash,
             object_kind = excluded.object_kind,
             version_hash = excluded.version_hash,
@@ -642,25 +734,25 @@ fn write_generation_row(
             encoding_version = excluded.encoding_version,
             updated_at_unix_nanos = excluded.updated_at_unix_nanos,
             published_under_mutation_generation = excluded.published_under_mutation_generation",
-        rusqlite::params![
-            group_id,
-            path,
-            generation_id.0,
-            causal_basis_id.0,
-            &resolved_path_state_hash[..],
-            object_kind.as_db_str(),
-            version_blob,
-            filesystem_identity_blob,
-            metadata_fingerprint_blob,
-            MATERIALIZED_GENERATION_ENCODING_VERSION,
-            now_unix_nanos,
-            published_under_mutation_generation,
-        ],
-    )?;
+    )?
+    .execute(rusqlite::params![
+        group_id,
+        path,
+        generation_id.0,
+        &basis,
+        &resolved_path_state_hash[..],
+        object_kind.as_db_str(),
+        version_blob,
+        filesystem_identity_blob,
+        metadata_fingerprint_blob,
+        MATERIALIZED_GENERATION_ENCODING_VERSION,
+        now_unix_nanos,
+        published_under_mutation_generation,
+    ])?;
 
     Ok(DiskGenerationBasis {
         generation_id,
-        causal_basis_id,
+        basis,
         resolved_path_state_hash,
         object_kind,
         version: version.copied(),
@@ -668,13 +760,22 @@ fn write_generation_row(
     })
 }
 
-#[allow(clippy::type_complexity)]
+/// One `path_materialized_generations` row as the lookups select it.
+type GenerationRow = (
+    String,
+    crate::materialization_basis::ReflectedHeads,
+    Vec<u8>,
+    String,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+);
+
 fn decode_generation_row(
-    row: (String, String, Vec<u8>, String, Option<Vec<u8>>, Option<Vec<u8>>),
+    row: GenerationRow,
     group_id: &str,
     path: &str,
 ) -> Result<DiskGenerationBasis, SyncSqliteError> {
-    let (generation_id, causal_basis_id, hash_blob, kind_str, version_blob, identity_blob) = row;
+    let (generation_id, basis, hash_blob, kind_str, version_blob, identity_blob) = row;
     let resolved_path_state_hash: [u8; 32] = hash_blob.try_into().map_err(|_| {
         SyncSqliteError::CorruptState(format!(
             "invalid resolved_path_state_hash length for {group_id}/{path}"
@@ -695,7 +796,7 @@ fn decode_generation_row(
         identity_blob.map(|bytes| decode_file_identity(&bytes)).transpose()?;
     Ok(DiskGenerationBasis {
         generation_id: GenerationId(generation_id),
-        causal_basis_id: CausalBasisId(causal_basis_id),
+        basis,
         resolved_path_state_hash,
         object_kind,
         version,
@@ -731,10 +832,9 @@ pub fn lookup_materialized_generation(
     group_id: &str,
     path: &str,
 ) -> Result<Option<DiskGenerationBasis>, SyncSqliteError> {
-    #[allow(clippy::type_complexity)]
-    let row: Option<(String, String, Vec<u8>, String, Option<Vec<u8>>, Option<Vec<u8>>)> = conn
+    let row: Option<GenerationRow> = conn
         .query_row(
-            "SELECT g.generation_id, g.causal_basis_id, g.resolved_path_state_hash, \
+            "SELECT g.generation_id, g.reflected_heads, g.resolved_path_state_hash, \
                     g.object_kind, g.version_hash, g.filesystem_identity \
                FROM path_materialized_generations g \
                JOIN path_actual_mutation_fences f \
@@ -766,10 +866,9 @@ pub fn lookup_materialized_generation_diagnostic(
     group_id: &str,
     path: &str,
 ) -> Result<Option<DiskGenerationBasis>, SyncSqliteError> {
-    #[allow(clippy::type_complexity)]
-    let row: Option<(String, String, Vec<u8>, String, Option<Vec<u8>>, Option<Vec<u8>>)> = conn
+    let row: Option<GenerationRow> = conn
         .query_row(
-            "SELECT generation_id, causal_basis_id, resolved_path_state_hash, object_kind, \
+            "SELECT generation_id, reflected_heads, resolved_path_state_hash, object_kind, \
                     version_hash, filesystem_identity \
              FROM path_materialized_generations WHERE group_id = ?1 AND path = ?2",
             rusqlite::params![group_id, path],
@@ -777,6 +876,76 @@ pub fn lookup_materialized_generation_diagnostic(
         )
         .optional()?;
     row.map(|r| decode_generation_row(r, group_id, path)).transpose()
+}
+
+/// The content targets (`intent_target_hash` of the blocks) of what may be
+/// on disk at `path` from this daemon's own writes while a write of other
+/// content is still open over it: the regular-file version the path's most
+/// recent proof names, whether or not a mutation has invalidated that proof
+/// since, and every earlier write whose intent the open one replaced before
+/// it was proven (`materialization_replaced_targets` -- such a write may
+/// have renamed its bytes into place and then lost its proof commit).
+///
+/// A stale proof never vouches for disk, and this does not use it to: its
+/// one caller asks only whether bytes local capture is about to author are
+/// one of these while an intent for other content is open. Then they are a
+/// pre-image of that write, not an edit, and authoring them would put older
+/// content over the version being written. The answer only ever withholds
+/// authoring; it never skips a physical write or closes anything.
+///
+/// A user who deliberately restores exactly one of these contents while the
+/// newer write is still pending is not told apart: that write's retry puts
+/// the newer version over it, and the restored content stays in history.
+pub fn pre_image_content_targets(
+    conn: &Connection,
+    group_id: &str,
+    path: &str,
+) -> Result<Vec<Vec<u8>>, SyncSqliteError> {
+    let mut targets: Vec<Vec<u8>> = conn
+        .prepare_cached(
+            "SELECT target_version_hash FROM materialization_replaced_targets \
+             WHERE group_id = ?1 AND path = ?2",
+        )?
+        .query_map(rusqlite::params![group_id, path], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    targets.extend(last_proven_content_target(conn, group_id, path)?);
+    Ok(targets)
+}
+
+/// The content target of the regular-file version `path`'s most recent
+/// proof names, stale or not; `None` when there is no proof or it names no
+/// stored regular-file version. See [`pre_image_content_targets`].
+fn last_proven_content_target(
+    conn: &Connection,
+    group_id: &str,
+    path: &str,
+) -> Result<Option<Vec<u8>>, SyncSqliteError> {
+    let Some(version) =
+        lookup_materialized_generation_diagnostic(conn, group_id, path)?.and_then(|b| b.version)
+    else {
+        return Ok(None);
+    };
+    let Some(file_version) = crate::dag_store::get_file_version(conn, group_id, &version)? else {
+        return Ok(None);
+    };
+    if file_version.meta.record_kind != yadorilink_replica_domain::file::RecordKind::File {
+        return Ok(None);
+    }
+    let mut offset = 0u64;
+    let blocks: Vec<yadorilink_replica_domain::file::BlockInfo> = file_version
+        .blocks
+        .iter()
+        .map(|block| {
+            let info = yadorilink_replica_domain::file::BlockInfo {
+                hash: block.hash.0.clone(),
+                offset,
+                size: block.size,
+            };
+            offset += u64::from(block.size);
+            info
+        })
+        .collect();
+    Ok(Some(yadorilink_local_storage::intent_target_hash(&blocks)))
 }
 
 /// The outcome of [`revalidate_identity_against_disk`]. `Confirmed` is the
@@ -812,7 +981,7 @@ pub enum IdentityRevalidation {
 ///
 /// This is defense in depth for staleness the fence did not cause -- e.g.
 /// a `chmod`/rename this device's own watcher has not reconciled into a
-/// fresh DAG admission yet, or an external writer that never took this
+/// fresh native admission yet, or an external writer that never took this
 /// daemon's path lock at all -- **not** what closes the ABA gap (the fence
 /// CAS already does that structurally). `IdentityComparison::
 /// Ambiguous` is reachable in ordinary conditions (a coarse volume clock),

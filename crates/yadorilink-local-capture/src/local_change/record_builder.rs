@@ -9,18 +9,19 @@ use crate::scan_block_staging::ScanBlockStaging;
 use yadorilink_local_storage::{
     chunk_open_file, read_replicated_xattrs, unix_mode_from_metadata, CDC_SIZE_THRESHOLD,
 };
-use yadorilink_replica_domain::change::{Op, PutOrigin};
 use yadorilink_replica_domain::file::{FileMeta, FileVersion, VersionBlock};
 use yadorilink_replica_domain::file::{FileRecord, RecordKind};
 use yadorilink_replica_domain::ids::{BlockHash, SyncPath};
+use yadorilink_replica_domain::limits::MAX_SYNCABLE_BLOCKS;
+use yadorilink_replica_domain::local_op::Op;
 use yadorilink_replica_domain::session_state::LocalFileMetaColumns;
 use yadorilink_replica_domain::session_state::MaterializationState;
 use yadorilink_root_authority::fs_identity::{disk_race_fingerprint_of, metadata_mtime_matches};
 use yadorilink_sync_sqlite::SyncSqliteError;
 
 use super::disk_observation::{
-    disk_bytes_match_indexed_blocks_off_worker, run_capture_pass_off_worker,
-    untouched_placeholder_verdict,
+    cfapi_placeholder_untouched, disk_bytes_match_indexed_blocks_off_worker,
+    run_capture_pass_off_worker,
 };
 use super::{LocalChangeOutcome, LocalChangeProcessor};
 
@@ -39,26 +40,20 @@ pub(super) fn indexed_mode_and_xattrs(
     row.map(|row| (row.snapshot.unix_mode, row.snapshot.xattrs)).unwrap_or_default()
 }
 
-/// Splits one current-row read into the `FileRecord` a `get_file` read
-/// would return for it plus the row's authoring identity, so the two can
-/// never describe different incarnations of the row.
-pub(super) fn file_and_authoring(
+/// The `FileRecord` a `get_file` read would return for one current-row
+/// read, so a caller that also needs the row's other columns reads them
+/// from the same incarnation.
+pub(super) fn record_of_row(
     path: &str,
     row: Option<yadorilink_sync_sqlite::CanonicalCurrentRow>,
-) -> (Option<FileRecord>, Option<yadorilink_replica_domain::ids::ChangeHash>) {
-    match row {
-        None => (None, None),
-        Some(row) => (
-            Some(FileRecord {
-                path: path.to_string(),
-                size: row.snapshot.size,
-                mtime_unix_nanos: row.snapshot.mtime_unix_nanos,
-                blocks: row.snapshot.blocks,
-                deleted: row.snapshot.deleted,
-            }),
-            row.authoring_change_hash,
-        ),
-    }
+) -> Option<FileRecord> {
+    row.map(|row| FileRecord {
+        path: path.to_string(),
+        size: row.snapshot.size,
+        mtime_unix_nanos: row.snapshot.mtime_unix_nanos,
+        blocks: row.snapshot.blocks,
+        deleted: row.snapshot.deleted,
+    })
 }
 
 /// Extra classification produced when `build_record_for_created_or_modified`
@@ -360,6 +355,51 @@ fn fire_content_read_race_hook(path: &Path) {
     }
 }
 
+/// Whether a file of `block_count` blocks is too large to sync, logging the
+/// refusal. A file whose block list could not travel in one replication item
+/// can never be synced: peers would admit its head and never receive its
+/// version. It is refused before anything is indexed or authored and the path
+/// is left unsettled, so it is picked up again once it shrinks.
+fn refuse_unsyncable(group_id: &str, rel_path: &str, block_count: usize) -> bool {
+    let limit = syncable_block_limit();
+    if block_count <= limit {
+        return false;
+    }
+    tracing::error!(
+        group_id,
+        path = %rel_path,
+        blocks = block_count,
+        max_blocks = limit,
+        "file too large to sync (block list exceeds the limit); nothing captured, the path \
+         stays unsynced"
+    );
+    true
+}
+
+/// The most blocks a captured file may have and still be synced.
+fn syncable_block_limit() -> usize {
+    #[cfg(test)]
+    {
+        let overridden = SYNCABLE_BLOCK_LIMIT_OVERRIDE.load(std::sync::atomic::Ordering::SeqCst);
+        if overridden != usize::MAX {
+            return overridden;
+        }
+    }
+    MAX_SYNCABLE_BLOCKS
+}
+
+/// Lowers the syncable block limit for a test, so a file of a few blocks
+/// stands in for one of a hundred thousand. `usize::MAX` restores the real
+/// limit. Process-global: a test that sets it must restore it.
+#[cfg(test)]
+static SYNCABLE_BLOCK_LIMIT_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+#[cfg(test)]
+pub(super) fn override_syncable_block_limit(limit: usize) {
+    SYNCABLE_BLOCK_LIMIT_OVERRIDE.store(limit, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// path-string analysis only — never dereferences `raw_target`
 /// (no `canonicalize`, no `metadata`, no filesystem read of the target at
 /// all) to decide whether it escapes `root`. `link_path` is the symlink's
@@ -440,8 +480,50 @@ impl LocalChangeProcessor {
         let version = FileVersion::new(blocks, record.size, meta);
         let version_hash = version.version_hash;
         let path = SyncPath(record.path.clone());
-        let op = Op::Put { path, version: version_hash, origin: PutOrigin::Direct };
+        let op = Op::Put { path, version: version_hash };
         (op, version)
+    }
+
+    /// Whether the object at `path` is a native provider's placeholder that
+    /// the provider itself reports untouched. Only a `Remote` row can have
+    /// one; where no provider exists this is always `false`.
+    fn is_untouched_provider_placeholder(
+        &self,
+        materialization_state: Option<MaterializationState>,
+        path: &Path,
+        lstat: &std::fs::Metadata,
+        existing: Option<&FileRecord>,
+        placeholder_generation: Option<&yadorilink_sync_sqlite::RecordedPlaceholderGeneration>,
+    ) -> bool {
+        materialization_state == Some(MaterializationState::Remote)
+            && cfapi_placeholder_untouched(
+                self.state.as_ref(),
+                path,
+                lstat,
+                existing,
+                placeholder_generation,
+            )
+    }
+
+    /// Whether the regular file at `path` is, untouched, what a usable proof
+    /// says this device wrote at `rel_path` -- whichever version the row now
+    /// names. `Present` says only that an object exists, so an older
+    /// version's bytes can stand under a newer row; they are the daemon's
+    /// own write, not an edit, and authoring them would put the older
+    /// version over the newer one. Asked only after the cheap
+    /// size/mtime/content fast path has found the file differs from the row.
+    fn is_untouched_proven_write(
+        &self,
+        existing: Option<&FileRecord>,
+        group_id: &str,
+        rel_path: &str,
+        root: &Path,
+        path: &Path,
+    ) -> Result<bool, LocalCaptureError> {
+        if existing.is_none_or(|existing| existing.deleted) {
+            return Ok(false);
+        }
+        Ok(self.state.disk_is_untouched_proven_write(group_id, rel_path, root, path)?)
     }
 
     /// Builds the `FileRecord` for a `CreatedOrModified` event without
@@ -466,6 +548,13 @@ impl LocalChangeProcessor {
     /// obscure that rather than clarify it, so this stays a plain argument
     /// list at 8 rather than introducing a parameter object.
     #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one file's complete capture decision, written as a single top-to-bottom \
+                  ladder: each early return is a different reason the file is not an edit, and \
+                  splitting the ladder would separate them from the ordering that makes the \
+                  expensive chunking the last resort"
+    )]
     #[allow(
         clippy::excessive_nesting,
         reason = "the nested arms are the fast-path ladder for an \
@@ -556,71 +645,20 @@ impl LocalChangeProcessor {
             return Ok((LocalChangeOutcome::None, None, None)); // directory event, or exotic entry
         }
 
-        // A placeholder's own creation/refresh (`peer_session::materialize`
-        // writing a sparse file for an `OnDemand` folder — see
-        // `chunker::write_placeholder`) fires this same
-        // `CreatedOrModified` event on this device's own watcher. Its
-        // content is a sparse stand-in, not the file's real bytes, so
-        // chunking it would both waste effort and index wrong block
-        // hashes — skip immediately, mirroring the self-echo suppression
-        // below but before the expensive (and here, actively incorrect)
-        // chunking step.
-        //
-        // BUT only when the on-disk object is PROVEN to still be this
-        // crate's own untouched placeholder -- via `placeholder_generation`,
-        // the `(dev, ino)` identity `write_placeholder` captured
-        // and persisted when it created this exact file, compared here
-        // against the identity `lstat` (already fetched above) reports for
-        // whatever object is at `path` right now. This platform has no
-        // real OS-level transparent-hydration provider wired up yet (no
-        // Cloud Filter API reparse point on Windows, no File Provider item
-        // on macOS -- see `chunker::write_placeholder`'s own doc comment),
-        // so a `Placeholder` row's on-disk file is, today, an ORDINARY
-        // sparse file sitting at an ordinary path: nothing stops a user
-        // (or an editor that doesn't know or care it's "just a
-        // placeholder") from opening and overwriting it directly.
-        // Unconditionally treating every `CreatedOrModified` on a
-        // `Placeholder` path as this crate's own echo -- as this check
-        // used to, with no comparison at all -- silently and PERMANENTLY
-        // discarded such an edit: never chunked, never indexed, and the
-        // next `hydrate` would then overwrite it again with the stale
-        // synced content, with no error, no warning, and no way for the
-        // user to discover their edit was ever lost.
-        //
-        // Deliberately NOT a size/mtime/sparse-file comparison -- that
-        // has a gap it can never close: an edit that happens to preserve both byte length and mtime
-        // (an
-        // in-place same-length overwrite, or any writer that restores
-        // mtime via `utimes`/`touch -r` after editing) is invisible to
-        // it. `(dev, ino)` closes this: a same-size/mtime edit performed
-        // via an atomic-rename save (the common case for ordinary editors)
-        // still mints a fresh inode, so it is caught here even though it
-        // would have slipped past the old heuristic. An in-place
-        // truncate-and-rewrite that reuses the same inode is the one edit
-        // shape this still cannot distinguish from an untouched
-        // placeholder -- accepted as the same class of residual gap the
-        // old heuristic already had, not a new one, and one only a real
-        // OS-transparent provider closes for good.
-        //
-        // `provider_kind` is checked too: only `INTERNAL_INODE_PROVIDER_KIND`
-        // is a `(dev, ino)` comparison this process can perform itself. A
-        // future real OS provider's own token needs its own comparison
-        // logic, not this one, so an unrecognized kind falls through to
-        // the ordinary local-edit path below rather than being silently
-        // (and wrongly) compared as if it were an inode pair.
-        if let Some(MaterializationState::Placeholder) = materialization_state {
-            if untouched_placeholder_verdict(
-                self.state.as_ref(),
-                path,
-                &lstat,
-                existing.as_ref(),
-                placeholder_generation.as_ref(),
-            ) {
-                return Ok((LocalChangeOutcome::None, None, None));
-            }
-            // Not proven untouched -- do NOT silently discard the event:
-            // fall through to the same ordinary local-edit path (chunk,
-            // compare, index) any other `CreatedOrModified` event takes.
+        // A native provider's placeholder (Windows CfAPI) is not the file's
+        // content: chunking it would index wrong block hashes, and reading it
+        // could hydrate it. Only a placeholder this device created and the
+        // provider itself reports untouched is skipped. Where no provider
+        // exists nothing is ever taken as untouched: whatever stands at the
+        // path is user bytes, and falls through to the ordinary edit path.
+        if self.is_untouched_provider_placeholder(
+            materialization_state,
+            path,
+            &lstat,
+            existing.as_ref(),
+            placeholder_generation.as_ref(),
+        ) {
+            return Ok((LocalChangeOutcome::None, None, None));
         }
 
         // a size+mtime fast-path, checked before
@@ -709,6 +747,20 @@ impl LocalChangeProcessor {
                             // behavior exactly.
                             return Ok((LocalChangeOutcome::None, None, None));
                         }
+                        // A mode or xattr set that differs from the row is a
+                        // local edit only if someone made it. The daemon's own
+                        // untouched write of an older version still carries
+                        // that version's metadata, and authoring it would put
+                        // the older mode over the newer version.
+                        if self.is_untouched_proven_write(
+                            Some(existing),
+                            group_id,
+                            &rel_path,
+                            root,
+                            path,
+                        )? {
+                            return Ok((LocalChangeOutcome::None, None, None));
+                        }
                         let record = existing.clone();
                         return Ok((
                             LocalChangeOutcome::FileChanged(record),
@@ -718,6 +770,12 @@ impl LocalChangeProcessor {
                     }
                 }
             }
+        }
+
+        // An older version's bytes under a newer row are the daemon's own
+        // untouched write, not an edit (see `is_untouched_proven_write`).
+        if self.is_untouched_proven_write(existing.as_ref(), group_id, &rel_path, root, path)? {
+            return Ok((LocalChangeOutcome::None, None, None));
         }
 
         // Offloaded, not a bare synchronous call — for a large
@@ -875,6 +933,9 @@ impl LocalChangeProcessor {
             );
             return Ok((LocalChangeOutcome::RetryLater, None, None));
         }
+        if refuse_unsyncable(group_id, &rel_path, blocks.len()) {
+            return Ok((LocalChangeOutcome::RetryLater, None, None));
+        }
         // Chunking has read these bytes from this group's local filesystem,
         // hashed them, and durably put them in the shared physical store.
         // Record that fact separately from peer-controlled metadata so block
@@ -984,6 +1045,8 @@ impl LocalChangeProcessor {
                         return Ok((LocalChangeOutcome::None, None, None));
                     }
                 }
+            } else if self.is_pre_image_of_open_write(group_id, &rel_path, &blocks)? {
+                return Ok((LocalChangeOutcome::None, None, None));
             }
         }
 

@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use yadorilink_peer_session::ports::OpenMaterializationIntent;
 use yadorilink_peer_session::PeerSessionError;
@@ -7,9 +8,9 @@ use yadorilink_replica_domain::session_state::MaterializationState;
 
 use super::super::types::*;
 use super::MaterializationPlan;
-use yadorilink_root_authority::fs_identity::disk_race_fingerprint;
+use yadorilink_root_authority::fs_identity::{disk_race_fingerprint, DiskRaceFingerprint};
 
-// The eager/pinned lane is a pipeline. Each stage consumes the value the
+// The eager lane is a pipeline. Each stage consumes the value the
 // previous one produced, so a stage can only run once everything before it
 // has: a write needs a revalidated target, a verification needs a written
 // object whose payload metadata is applied, and the commit needs the
@@ -41,6 +42,73 @@ struct LocatedContent {
 /// has indexed. Every write below consumes one.
 struct RevalidatedTarget {
     all_present: bool,
+    /// The target as it stood when it passed those revalidations; the
+    /// write is only published over exactly this.
+    baseline: TargetBaseline,
+}
+
+/// What the target looked like at the moment it was last found free of
+/// uncaptured local state.
+#[derive(Clone)]
+pub(in crate::local_convergence) struct TargetBaseline {
+    fingerprint: Option<DiskRaceFingerprint>,
+    /// Whether the path was already journaled dirty then. A path that
+    /// becomes dirty afterwards was written to by someone else.
+    was_dirty: bool,
+}
+
+tokio::task_local! {
+    /// The target as it stood BEFORE the file's metadata step (which may wait
+    /// in a batch while the path lock is held), for the path it names. The
+    /// write's baseline is this, not a fresh one: a mode or xattr edit made
+    /// while the step waited has already raised the path's dirty mark, and a
+    /// baseline taken afterwards would absorb it and let the peer's write
+    /// replace the edit.
+    static PRE_STEP_BASELINE: (String, TargetBaseline);
+}
+
+impl TargetBaseline {
+    /// Whether `now` differs from this baseline in a way only someone else's
+    /// write explains: the file's observation changed, or the path became
+    /// dirty after a baseline that found it clean.
+    pub(in crate::local_convergence) fn moved_by_someone_else(&self, now: &TargetBaseline) -> bool {
+        now.fingerprint != self.fingerprint || (!self.was_dirty && now.was_dirty)
+    }
+
+    pub(in crate::local_convergence) fn exists(&self) -> bool {
+        self.fingerprint.is_some()
+    }
+}
+
+impl super::super::LocalConvergenceExecutor {
+    /// The target's state now, to be passed to [`Self::with_pre_step_baseline`].
+    pub(in crate::local_convergence) fn observe_target_baseline(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<TargetBaseline, PeerSessionError> {
+        Ok(TargetBaseline {
+            fingerprint: disk_race_fingerprint(&self.local_file_path(group_id, path)?),
+            was_dirty: self.state.is_path_dirty(group_id, path)?,
+        })
+    }
+
+    /// Runs `future` (the write of `path`) with `baseline` as its baseline.
+    pub(in crate::local_convergence) async fn with_pre_step_baseline<F: std::future::Future>(
+        path: &str,
+        baseline: TargetBaseline,
+        future: F,
+    ) -> F::Output {
+        PRE_STEP_BASELINE.scope((path.to_owned(), baseline), future).await
+    }
+}
+
+/// Whether an assembled temp file was published.
+enum AssembleOutcome {
+    Written,
+    /// The target changed while the temp file was assembled; nothing was
+    /// published.
+    LocalEdit,
 }
 
 /// The row is committed under an open materialization intent, the target is
@@ -51,6 +119,9 @@ struct PendingContentWrite<'a> {
     out_path: PathBuf,
     written_version: FileVersion,
     mutation_generation: i64,
+    baseline: TargetBaseline,
+    /// Free space this write claimed, held until its bytes are in place.
+    headroom: Arc<super::super::reconcile::HeadroomReservation>,
 }
 
 /// The outcome of the content write: the payload's bytes are durably
@@ -59,6 +130,9 @@ struct PendingContentWrite<'a> {
 enum Reconstruction {
     Written(WrittenObject),
     DemotedToPlaceholder,
+    /// A local write landed while the bytes were being assembled and was
+    /// left in place.
+    LocalEditDuringAssembly,
 }
 
 /// The payload's bytes on disk at `out_path`, written under
@@ -86,7 +160,7 @@ struct VerifiedObject {
 }
 
 impl super::super::LocalConvergenceExecutor {
-    /// The eager/pinned lane of [`Self::materialize_local`]: this record's
+    /// The eager lane of [`Self::materialize_local`]: this record's
     /// content is wanted on disk now.
     pub(super) async fn materialize_eager_lane(
         &self,
@@ -115,34 +189,34 @@ impl super::super::LocalConvergenceExecutor {
         // `ensure_blocks_present` returns `false` (not an error) when a
         // peer could not supply one or more of this record's blocks
         // (reported not-found/unusable, or returned bytes failing
-        // integrity verification). Committing a `Hydrated` row and
+        // integrity verification). Committing a `Present` row and
         // running `reconstruct_file` here would then fail at
         // `store.get(<missing block>)` mid-loop, orphaning its temp file
-        // and leaving a live-but-fileless `Hydrated` row — which
+        // and leaving a live-but-fileless `Present` row — which
         // `repair_interrupted_materializations` (blocks still absent)
         // demotes to an empty placeholder, silently destroying a
         // still-pending write (for a losing conflict copy, its only
-        // preservation). Instead record a retriable `Placeholder` — the
-        // exact `all_present == false` handling `hydrate_file_with_timeout`
+        // preservation). Instead record a retriable `Remote` — the
+        // exact `all_present == false` handling `hydration::hydrate_inner`
         // already uses — so the fetch is retried on a later reconcile
         // (`live_record_needs_rehydrate`) and recovery never
         // clobbers it. Reuses the not-admitted branch's placeholder path.
         if !target.all_present {
             return self.write_incomplete_content_placeholder(plan, target);
         }
-        let pending = self.begin_content_write(plan, target)?;
+        let pending = self.begin_content_write(plan, target).await?;
         let written = match self.reconstruct_content(plan, pending).await? {
             Reconstruction::Written(written) => written,
-            Reconstruction::DemotedToPlaceholder => {
+            Reconstruction::DemotedToPlaceholder | Reconstruction::LocalEditDuringAssembly => {
                 return Ok(MaterializeResult::RetryRequired.into());
             }
         };
-        // The proof, the `Hydrated` stamp and the intent clear are
-        // committed HERE, in one transaction, under exactly the epoch
-        // this write bumped -- and the evidence is still returned, so
-        // the engine can close the obligation as it always has. Its
-        // own publication re-publishes the same row under the same
-        // epoch, which replaces it with an identical value.
+        // The proof, the `Present` stamp, the intent clear and -- when
+        // the obligation engine handed this attempt a claim on the path --
+        // the obligation's completion are committed HERE, in one
+        // transaction, under exactly the epoch this write bumped. The
+        // engine publishes nothing more for this path and does not
+        // complete it again (see `ReplicaCoordinator::close_content_write`).
         //
         // Publishing here is not what was reverted before. That was
         // the EXTERNAL-capture lane (`adopt_local_capture_actual_state`),
@@ -165,7 +239,41 @@ impl super::super::LocalConvergenceExecutor {
             // intent open, since nothing has been proven.
             return Ok(MaterializeResult::RetryRequired.into());
         };
-        self.commit_verified_object(plan, verified)
+        // The seam between the disk and the commit. Everything above it
+        // is on disk and durable -- the temp file synced, renamed into
+        // place, its parent directory synced (`assemble_and_persist`),
+        // then the payload's metadata applied and the object verified --
+        // and nothing about it is committed: no proof, no `Present`, the
+        // intent and the obligation open. A crash here is exactly that
+        // state, which repair and the next claim finish without rewriting
+        // the bytes; a mutator landing here moves the fence or the claim
+        // and the commit below refuses accordingly. A test parks here.
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let probe =
+                self.overlap_probe.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+            if let Some(probe) = probe {
+                probe
+                    .pass(crate::local_convergence::ProbeSeam::BeforeCommit, &plan.record.path)
+                    .await;
+            }
+        }
+        if let Some(claim) = plan.claim {
+            claim.before_completion().await;
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let straggles = self
+                .completion_straggler
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_deref()
+                == Some(plan.record.path.as_str());
+            if straggles {
+                tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+            }
+        }
+        self.commit_verified_object(plan, verified).await
     }
 
     /// Stage 1: fingerprint the target before any block is requested.
@@ -240,9 +348,6 @@ impl super::super::LocalConvergenceExecutor {
             // them belong on this side of the boundary.
             return Ok(ContentLocation::NeedBlocks(BlockRequirement {
                 path: record.path.clone(),
-                // This path IS what is being materialized, so it demands
-                // its own content; only the prefetch path derives copies.
-                demand_path: record.path.clone(),
                 version_hash: payload.version().version_hash,
                 record: record.clone(),
                 observed_disk: pre_fetch_disk_state,
@@ -325,16 +430,16 @@ impl super::super::LocalConvergenceExecutor {
         // disk right now), NOT `record` (the incoming content this call
         // is about to install).
         //
-        // Reproduced and traced on `dst_network_fault_chaos` seed
+        // Reproduced and traced on the retired network-fault scenario seed
         // 3298840609: a solo write landed while the previous round's race
         // winner was still materialising over it, was overwritten before
         // it could author, and left the harness reading back the previous
-        // round's authoring hash -- two ops sharing one hash, which
+        // round's authored version -- two ops sharing one version, which
         // `oracle::supersedes` refuses to treat as superseding, surfacing
         // as `[NoLoss]`.
         //
         // Cost: one content hash of the destination (two for an unproven
-        // `Placeholder` row), and only for a path that already exists as a
+        // `Remote` row), and only for a path that already exists as a
         // regular file. Skipped for an untouched placeholder and for
         // `Hydrating`/`Evicting` rows, whose whole point is to disagree
         // with their file, and for tombstones. Deliberately paid: the
@@ -375,7 +480,7 @@ impl super::super::LocalConvergenceExecutor {
         // dispatch and will still author the deletion once it runs.
         //
         // Which rows this covers -- including a row with no blocks, and a
-        // `Placeholder` row this device never wrote a placeholder for -- is
+        // `Remote` row this device never wrote a placeholder for -- is
         // `disk_holds_uncaptured_local_bytes`'s own doc. Both were once
         // skipped, and both are how a file still being written (a `git
         // clone`'s pack) got this device's own older version of it written
@@ -402,93 +507,69 @@ impl super::super::LocalConvergenceExecutor {
             });
             return Ok(None);
         }
-        Ok(Some(RevalidatedTarget { all_present }))
+        let pre_step = PRE_STEP_BASELINE
+            .try_with(|(path, baseline)| (*path == record.path).then(|| baseline.clone()))
+            .ok()
+            .flatten();
+        let baseline = match pre_step {
+            Some(baseline) => baseline,
+            None => TargetBaseline {
+                fingerprint: disk_race_fingerprint(&out_path_for_race_check),
+                was_dirty: self.state.is_path_dirty(group_id, &record.path)?,
+            },
+        };
+        Ok(Some(RevalidatedTarget { all_present, baseline }))
     }
 
-    /// Stage 3b, when not every block is present: record a retriable
-    /// placeholder instead of unfetched content.
+    /// Stage 3b, when not every block is present: record the version
+    /// without its content and retry.
     fn write_incomplete_content_placeholder(
         &self,
         plan: &MaterializationPlan<'_>,
         _target: RevalidatedTarget,
     ) -> Result<LocalMaterializeOutcome, PeerSessionError> {
         let MaterializationPlan { group_id, record, permit: root_commit_permit, .. } = *plan;
-        // Same journaled-write seam the sibling "demoted after a
-        // failed reconstruct" arm below uses, and for the identical
-        // reason: `persist_row_under_
-        // fresh_operation`'s underlying `upsert_file_with_origin` INSERTs a
-        // fresh row that DEFAULTS to `Hydrated` before the explicit
-        // `set_materialization_state(..., Placeholder, ...)` below
-        // runs, and even once demoted, `create_or_defer_
-        // placeholder` (the actual on-disk write) has not run yet
-        // either. A crash/restart in EITHER window leaves an
-        // indexed, not-deleted row with no local file and no
-        // protecting intent -- exactly what the startup "full
-        // reconciliation" scan (`local_change.rs`'s `reconcile_
-        // disk_with_ignore`) reads as an offline deletion, silently
-        // tombstoning a file this device never actually lost.
-        // Exercised by a restart-mid-relay-sync integration test.
-        // Opening the guard before the row commit
-        // and clearing it right before the placeholder disk write
-        // (mirroring the sibling arm exactly) closes both windows.
-        let intent_guard = self.state.open_placeholder_write(
+        // Same journaled-write seam the sibling "demoted after a failed
+        // reconstruct" arm below uses: the row is committed and the path
+        // settled in separate steps, and a crash/restart in between must not
+        // leave an indexed, not-deleted row with no protection at all.
+        let out_path = self.local_file_path(group_id, &record.path)?;
+        let object_present = std::fs::symlink_metadata(&out_path).is_ok();
+        let intent_guard = self.state.open_remote_write(
             group_id,
             record,
             plan.origin_device_id,
-            plan.authoring_change_hash,
+            plan.authoring,
             &|| self.root_lease_for(group_id),
+            object_present,
             root_commit_permit,
         )?;
-        let out_path = self.local_file_path(group_id, &record.path)?;
-        // A placeholder is a real on-disk write -- bump before it,
-        // same as any other physical mutator, so any stale
-        // exact-object proof for this path is invalidated even
-        // though this attempt itself never publishes one (it
-        // returns `RetryRequired`, carrying no evidence).
-        let placeholder_deferred =
-            self.write_placeholder(plan, &out_path, "eager_placeholder_write")?;
-        // Clear the intent right after the placeholder write is
-        // confirmed, BEFORE `apply_unix_mode`/`apply_xattrs` below
-        // -- correcting an earlier version of this fix that
-        // cleared BEFORE `create_or_defer_placeholder` instead
-        // (see the OnDemand branch below for the fuller
-        // reasoning). Those are real, fallible syscalls (a
-        // repeatable chmod EPERM or xattr EOPNOTSUPP is not
-        // hypothetical), and clearing only after them would leak
-        // this guard permanently were a failure to hit there: the
-        // placeholder is already durably on disk (this device's
-        // own write, not a peer's content), so nothing would ever
-        // re-drive materialization for this exact path again to
-        // clean the intent up. Also skipped entirely when Windows
-        // deferred the write to `cfapi-host.exe`: nothing is
-        // actually on disk yet in that case, so the intent must
-        // stay open -- this call already returns `RetryRequired`
-        // below regardless, so a later retry naturally
-        // re-examines this path.
-        if !placeholder_deferred {
+        // Bump before settling the path, same as any other mutator, so any
+        // stale exact-object proof for this path is invalidated even though
+        // this attempt itself never publishes one (it returns
+        // `RetryRequired`, carrying no evidence).
+        let provider_deferred =
+            self.place_provider_object(plan, &out_path, object_present, "eager_remote_record")?;
+        // Clear the intent unless Windows deferred the object to
+        // `cfapi-host.exe`: nothing is on disk yet in that case, so the
+        // intent must stay open -- this call returns `RetryRequired` below
+        // regardless, so a later retry naturally re-examines this path.
+        if !provider_deferred {
             intent_guard.clear()?;
-            // Also skipped when deferred: nothing was actually
-            // written under `out_path` yet on Windows, so there is
-            // no real file to apply the exec bit/xattrs to -- both
-            // are real syscalls against a path that does not exist
-            // in that case.
-            // Payload metadata, like every other lane -- see the
-            // eager `Hydrated` branch's own comment below.
-            plan.apply_payload_metadata(&out_path)?;
         }
-        // Eager/pinned wanted real content but not every block was
-        // available -- this is a retriable Placeholder, not a
-        // settled outcome (the confirmed bug this type exists to
-        // close: see `MaterializeResult`'s own doc comment).
+        // Eager wanted real content but not every block was available --
+        // this is a retriable `Remote` row, not a settled outcome (the
+        // confirmed bug this type exists to close: see `MaterializeResult`'s
+        // own doc comment).
         Ok(MaterializeResult::RetryRequired.into())
     }
 
-    /// Stage 4: commit the row under an open intent and bump the fence for
-    /// the content write that follows.
-    fn begin_content_write<'p>(
+    /// Stage 4: commit the row under an open intent, with the fence bump for
+    /// the content write that follows, in one transaction.
+    async fn begin_content_write<'p>(
         &'p self,
         plan: &'p MaterializationPlan<'p>,
-        _target: RevalidatedTarget,
+        target: RevalidatedTarget,
     ) -> Result<PendingContentWrite<'p>, PeerSessionError> {
         let MaterializationPlan { group_id, payload, record, permit: root_commit_permit, .. } =
             *plan;
@@ -504,15 +585,15 @@ impl super::super::LocalConvergenceExecutor {
         );
         // Open the single sanctioned materialization-intent seam BEFORE
         // committing the brand-new row below. This branch deliberately
-        // stamps the row `Hydrated` optimistically, before the temp-
+        // stamps the row `Present` optimistically, before the temp-
         // write-then-rename even begins (see the explicit stamp right
         // after `persist_row_under_fresh_operation` below -- `upsert_file_
         // with_origin` itself no longer defaults a fresh row to
-        // `Hydrated`; the schema's own default is `Placeholder` as of
+        // `Present`; the schema's own default is `Remote` as of
         // v25, see `SCHEMA_VERSION`'s doc comment), and that commit is
         // durable (`PRAGMA synchronous = FULL`) — so a crash *after* it
         // but before the temp-write-then-rename lands would otherwise leave
-        // a `Hydrated` row with no file on disk, its blocks present, and no
+        // a `Present` row with no file on disk, its blocks present, and no
         // intent. Startup/periodic repair reads exactly that state as an
         // offline deletion and tombstones the path, destroying a
         // just-received file group-wide. `MaterializationIntentGuard::open`
@@ -521,25 +602,49 @@ impl super::super::LocalConvergenceExecutor {
         // repair instead sees the intent and reconstructs from the
         // locally-present blocks. The guard is cleared the instant the
         // rename is durable (below) or when this write is demoted to a
-        // `Placeholder`; an early `?` return on a failed write drops it
+        // `Remote`; an early `?` return on a failed write drops it
         // without clearing, leaving the intent for repair.
         //
         // The owner operation below opens that intent, commits the row
         // under it, stamps the row with the in-flight state -- explicitly
-        // NOT `Hydrated`: the intent is what makes the row-before-file
+        // NOT `Present`: the intent is what makes the row-before-file
         // ordering safe across a crash, not what makes the exact claim
         // true, and the bytes are still nowhere at this point (the batched
         // receive this branch was modelled on moved to the in-flight state
-        // for the same reason, and left this one behind) -- and clears any
-        // hazard hold, each in its own transaction.
-        let intent_guard = self.state.open_content_write(
-            group_id,
-            record,
-            plan.origin_device_id,
-            plan.authoring_change_hash,
-            &|| self.root_lease_for(group_id),
-            root_commit_permit,
-        )?;
+        // for the same reason, and left this one behind) -- clears any
+        // hazard hold, and bumps the fence for the content write below
+        // (the retry loop that follows is all one logical write attempt, so
+        // one bump covers it -- a bump is safe-but-pessimistic, never a
+        // lock: see the tombstone-delete branch for the identical
+        // reasoning), all in ONE transaction that commits before anything
+        // below touches the disk. The bumped value is kept so the eventual
+        // `Settled` evidence CASes on the value this specific write
+        // invalidated the path's prior proof under, not a value re-read
+        // later that some other mutator could have already advanced past.
+        //
+        // In a window run the transaction is queued with the run's other files
+        // and committed with them (`Participant::submit_open`): this future
+        // keeps its path lock, the lane's operation and the row's own
+        // operation until the outcome has come back, and writes no byte
+        // before it has.
+        let participant = super::super::completion_window::current_for_open();
+        let (content_write_mutation_generation, intent_guard) = self
+            .state
+            .open_content_write_via(
+                group_id,
+                record,
+                plan.origin_device_id,
+                plan.authoring,
+                &|| self.root_lease_for(group_id),
+                root_commit_permit,
+                |open| async {
+                    match &participant {
+                        Some(participant) => participant.submit_open(&self.state, open).await,
+                        None => self.state.commit_open_single(open).await,
+                    }
+                },
+            )
+            .await?;
         let out_path = self.local_file_path(group_id, &record.path)?;
         // defense-in-depth: `is_safe_relative_path` (in
         // `reconcile_files`) already blocks `..`/absolute components,
@@ -553,15 +658,14 @@ impl super::super::LocalConvergenceExecutor {
         // Preflight before the
         // temp-then-rename write below begins — see
         // `preflight_disk_headroom`'s doc comment.
-        self.preflight_disk_headroom(group_id, &out_path, record.size)?;
+        let headroom = Arc::new(self.preflight_disk_headroom(group_id, &out_path, record.size)?);
         // Off the async runtime -- see `reconstruct_file_off_
         // runtime`'s own doc comment for the failure mode this closes
         // (large-file reconstruction blocking this process's tokio
         // worker pool long enough to starve this same peer's own
         // channel actor). This retry loop is the eager-fetch path's
-        // OWN reconstruct call (distinct from `hydrate_file_with_
-        // timeout_locked`'s single attempt above), so it gets the
-        // identical treatment here too.
+        // OWN reconstruct call (the same shared assembly the interactive
+        // hydration uses), so it gets the identical treatment here too.
         //
         // Receiver-side phase marker: about to begin
         // reconstructing the real file from CAS blocks -- the
@@ -574,29 +678,19 @@ impl super::super::LocalConvergenceExecutor {
         tracing::debug!(
             "phase T_recv_materialize_start: begins reconstructing the real file from CAS blocks"
         );
-        // Bump before the real content write below (the retry loop
-        // that follows is all one logical
-        // write attempt, so one bump covers it -- a bump is
-        // safe-but-pessimistic, never a lock: see the tombstone-delete
-        // branch above for the identical reasoning). Captured now so
-        // the eventual `Settled` evidence CASes on the value this
-        // specific write invalidated the path's prior proof under, not
-        // a value re-read later that some other mutator could have
-        // already advanced past.
         // The payload's own version -- what these bytes ARE. Reading
         // it from the row, even before the write, asked about the row
-        // instead: a supersession that keeps the authoring identity
-        // moves the row's version while the payload does not move at
-        // all, and every check downstream then agreed with itself
+        // instead: a supersession moves the row's version while the
+        // payload does not move at all, and every check downstream then agreed with itself
         // while the bytes disagreed.
         let written_version = payload.version().clone();
-        let content_write_mutation_generation =
-            self.state.dag_bump_mutation_fence(group_id, &record.path, "eager_content_write")?;
         Ok(PendingContentWrite {
             intent_guard,
             out_path,
             written_version,
             mutation_generation: content_write_mutation_generation,
+            baseline: target.baseline,
+            headroom,
         })
     }
 
@@ -614,6 +708,8 @@ impl super::super::LocalConvergenceExecutor {
             out_path,
             written_version,
             mutation_generation: content_write_mutation_generation,
+            baseline,
+            headroom,
         } = pending;
         // Guard the one-shot reconstruct. `reconstruct_file` reads every
         // block back through `store.get` mid-loop, so a *transient* block-
@@ -631,18 +727,12 @@ impl super::super::LocalConvergenceExecutor {
         // response to a transient read error is to retry the assembly in
         // place: a retry re-reads those same content-addressed blocks on a
         // later, non-faulting read. Retry a bounded number of times, then
-        // fall back to the same retriable `Placeholder` the `all_present ==
+        // fall back to the same retriable `Remote` the `all_present ==
         // false` branch uses (so a genuinely-stuck read still never leaves a
         // fileless Hydrated row).
         const MAX_RECONSTRUCT_RETRIES: u32 = 20;
         const RECONSTRUCT_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
-        let mut recon = reconstruct_file_off_runtime(
-            self.store.clone(),
-            &out_path,
-            &record.blocks,
-            record.mtime_unix_nanos,
-        )
-        .await;
+        let mut recon = self.assemble_and_persist(&out_path, plan, &baseline, &headroom).await;
         let mut attempts = 0u32;
         while recon.is_err() && attempts < MAX_RECONSTRUCT_RETRIES {
             attempts += 1;
@@ -657,16 +747,17 @@ impl super::super::LocalConvergenceExecutor {
             // unmount-and-replace window `verify_write_target`'s own
             // re-check exists to close could still open between two
             // retries. A verify failure here surfaces as a real error
-            // (not a demotion to `Placeholder`) since a replaced root
+            // (not a demotion to `Remote`) since a replaced root
             // is not a transient, retriable condition.
             self.verify_write_target(group_id, &out_path)?;
-            recon = reconstruct_file_off_runtime(
-                self.store.clone(),
-                &out_path,
-                &record.blocks,
-                record.mtime_unix_nanos,
-            )
-            .await;
+            recon = self.assemble_and_persist(&out_path, plan, &baseline, &headroom).await;
+        }
+        if matches!(recon, Ok(AssembleOutcome::LocalEdit)) {
+            // The intent stays open and nothing is proven, as when the
+            // written object fails verification: the path is re-driven
+            // once capture has taken the edit.
+            drop(intent_guard);
+            return Ok(Reconstruction::LocalEditDuringAssembly);
         }
         if let Err(e) = recon {
             tracing::warn!(
@@ -674,63 +765,54 @@ impl super::super::LocalConvergenceExecutor {
                 path = %record.path,
                 error = %e,
                 attempts,
-                "reconstruct after eager fetch still failing; demoting to retriable placeholder"
+                "reconstruct after eager fetch still failing; recording the version without \
+                 its content for a retry"
             );
+            // The failed write publishes by rename, so the path still holds
+            // whatever it held before: an older version's bytes stay under
+            // the newer row (`Present`), an empty path stays empty
+            // (`Remote`).
+            let object_present = std::fs::symlink_metadata(&out_path).is_ok();
             self.state.set_materialization_state(
                 group_id,
                 &record.path,
-                MaterializationState::Placeholder,
+                if object_present {
+                    MaterializationState::Present
+                } else {
+                    MaterializationState::Remote
+                },
                 root_commit_permit,
             )?;
-            // This is a DIFFERENT physical write than the failed
-            // reconstruct above (a placeholder instead of
-            // real content) -- its own bump, same reasoning as the
-            // `!all_present` branch's identical placeholder write.
-            let placeholder_deferred = self.write_placeholder(
+            // A different mutation than the failed reconstruct above (the
+            // row now names no content) -- its own bump, same reasoning as
+            // the `!all_present` branch.
+            let provider_deferred = self.place_provider_object(
                 plan,
                 &out_path,
-                "eager_reconstruct_failed_placeholder_write",
+                object_present,
+                "eager_reconstruct_failed_record",
             )?;
-            // Clear the intent right after the placeholder write is
-            // confirmed, BEFORE `apply_unix_mode`/`apply_xattrs` below
-            // -- those are real, fallible syscalls (a repeatable chmod
-            // EPERM or xattr EOPNOTSUPP is not hypothetical), and
-            // clearing only after them would leak this guard
-            // permanently on a REACHABLE steady state were a failure
-            // to hit there: the placeholder is already durably on
-            // disk (this device's own write, not a peer's content),
-            // so nothing would ever re-drive materialization for this
-            // exact path again to clean the intent up. Also skipped
-            // entirely when Windows deferred the write to
-            // `cfapi-host.exe`: nothing is actually on disk yet in
-            // that case, so the intent must stay open (see the
-            // OnDemand branch below for the fuller reasoning, identical
-            // here).
-            if !placeholder_deferred {
+            // Clear the intent unless Windows deferred the object to
+            // `cfapi-host.exe`: nothing is on disk yet in that case, so the
+            // intent must stay open.
+            if !provider_deferred {
                 intent_guard.clear()?;
-                // Also skipped when deferred: nothing was actually
-                // written under `out_path` yet on Windows, so there is
-                // no real file to apply the exec bit/xattrs to.
-                // Payload metadata, like every other lane -- see the
-                // eager `Hydrated` branch's own comment below.
-                plan.apply_payload_metadata(&out_path)?;
             }
-            // Reconstruct never actually succeeded despite the blocks
-            // being fetched -- demoted to a retriable Placeholder, not
-            // a settled outcome (same reasoning as the `!all_present`
-            // branch above).
+            // Reconstruct never actually succeeded despite the blocks being
+            // fetched -- a retriable `Remote` row, not a settled outcome
+            // (same reasoning as the `!all_present` branch above).
             return Ok(Reconstruction::DemotedToPlaceholder);
         }
         // Captured immediately
         // after this device's own successful reconstruct -- see
         // `MaterializationStateRepository::record_materialized_
         // fingerprint`'s own doc comment for what the daemon's
-        // already-`Hydrated` fast path (`hydration.rs::hydrate_inner`)
+        // already-`Present` fast path (`hydration.rs::hydrate_inner`)
         // The temp-write-then-rename completed durably — clear the intent
         // NOW, before the post-write metadata touch below. Clearing only
         // after `apply_unix_mode` would leak the intent whenever reading or
         // applying the exec bit errored (a real `chmod` on POSIX) even though
-        // the file is durably on disk and `Hydrated`; a later genuine offline
+        // the file is durably on disk and `Present`; a later genuine offline
         // delete of that path would then read `missing + intent present` and
         // wrongly resurrect it from the blocks. This is exactly
         // `reconstruct_file_journaled`'s "clear right after the rename"
@@ -746,6 +828,70 @@ impl super::super::LocalConvergenceExecutor {
             written_version,
             mutation_generation: content_write_mutation_generation,
         }))
+    }
+
+    /// Assembles the payload's bytes into a temp file beside `out_path` and
+    /// publishes it by rename.
+    ///
+    /// The local-edit guard in `revalidate_target` ran before the assembly,
+    /// which reads every block and fsyncs the result -- time proportional to
+    /// the file. A user save landing in that time would be renamed over, and
+    /// the watcher would then find disk equal to the index and drop the edit
+    /// as an echo of this write. So the target is looked at again right
+    /// before the rename, and the write is abandoned if it moved.
+    async fn assemble_and_persist(
+        &self,
+        out_path: &std::path::Path,
+        plan: &MaterializationPlan<'_>,
+        baseline: &TargetBaseline,
+        headroom: &Arc<super::super::reconcile::HeadroomReservation>,
+    ) -> Result<AssembleOutcome, PeerSessionError> {
+        let MaterializationPlan { group_id, record, permit: root_commit_permit, .. } = *plan;
+        let tmp_path = reconstruct_file_to_temp_off_runtime(
+            self.store.clone(),
+            out_path,
+            &record.blocks,
+            record.mtime_unix_nanos,
+            Some(headroom.clone()),
+        )
+        .await?;
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let hook = self
+                .between_assemble_and_persist_hook
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            if let Some(hook) = hook {
+                hook(out_path);
+            }
+            let probe =
+                self.overlap_probe.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+            if let Some(probe) = probe {
+                probe.pass(crate::local_convergence::ProbeSeam::BeforeRename, &record.path).await;
+            }
+        }
+        let fingerprint = disk_race_fingerprint(out_path);
+        let moved = fingerprint != baseline.fingerprint
+            || (!baseline.was_dirty && self.state.is_path_dirty(group_id, &record.path)?);
+        if moved {
+            let _ = std::fs::remove_file(&tmp_path);
+            self.state.journal_uncaptured_local_edit(
+                group_id,
+                &record.path,
+                fingerprint.is_some(),
+                root_commit_permit,
+            )?;
+            tracing::info!(
+                group_id,
+                path = %record.path,
+                "the target changed on disk while its content was being assembled; leaving \
+                 the local write in place and publishing nothing"
+            );
+            return Ok(AssembleOutcome::LocalEdit);
+        }
+        persist_reconstructed_file_off_runtime(tmp_path, out_path).await?;
+        Ok(AssembleOutcome::Written)
     }
 
     /// Stage 6: apply this payload's mode and xattrs to the written object.
@@ -797,20 +943,15 @@ impl super::super::LocalConvergenceExecutor {
             .map(|evidence| VerifiedObject { written, evidence }))
     }
 
-    /// Stage 8: commit the proof, the `Hydrated` stamp and the intent clear
-    /// under the fence this write bumped, and settle with the evidence.
-    fn commit_verified_object(
+    /// Stage 8: commit the proof, the `Present` stamp, the intent clear and
+    /// the claimed obligation's completion under the fence this write
+    /// bumped, and settle with the evidence.
+    async fn commit_verified_object(
         &self,
         plan: &MaterializationPlan<'_>,
         verified: VerifiedObject,
     ) -> Result<LocalMaterializeOutcome, PeerSessionError> {
-        let MaterializationPlan {
-            group_id,
-            record,
-            authoring_change_hash,
-            permit: root_commit_permit,
-            ..
-        } = *plan;
+        let MaterializationPlan { group_id, record, permit: root_commit_permit, .. } = *plan;
         let VerifiedObject {
             written:
                 WrittenObject {
@@ -820,27 +961,114 @@ impl super::super::LocalConvergenceExecutor {
                 },
             evidence,
         } = verified;
-        if !self.state.commit_internal_materialized_state_if_fence_current(
-            group_id,
-            &record.path,
-            yadorilink_peer_session::ports::ExactActualState::Object {
+        // The identity the exact verification vouched for, not a fresh
+        // observation: an overwrite after that verification must not become
+        // the baseline the commit-time check compares against.
+        let verified_identity = match &evidence {
+            SettlementEvidence::ExactObject { identity, .. } => **identity,
+            _ => None,
+        };
+        let exact_state =
+            yadorilink_sync_sqlite::exact_materialized_commit::ExactMaterializedState::Object {
                 kind: RecordKind::File,
                 version: written_version.version_hash,
-                identity: Box::new(
-                    yadorilink_root_authority::fs_identity::FileIdentity::observe_path(&out_path)
-                        .ok(),
-                ),
-            },
-            content_write_mutation_generation,
-            Some(yadorilink_peer_session::ports::ExpectedAuthoring {
-                state: yadorilink_peer_session::ports::MATERIALIZATION_IN_FLIGHT_STATE,
-                authoring_change_hash,
-                expected_version: Some(&written_version.version_hash),
-            }),
-            root_commit_permit,
-        )? {
-            return Ok(MaterializeResult::RetryRequired.into());
+                identity: Box::new(verified_identity),
+            };
+        let claim = plan.claim.map(|claim| claim.token());
+        let closed = match super::super::completion_window::current() {
+            // Queued with the run's other files and committed with them. This
+            // future keeps its path lock, its root operation and its permit
+            // until the outcome comes back: until then the row is `Hydrating`
+            // over the new bytes, and only the lock keeps a capture from
+            // authoring them (or a newer edit of them) as a local version.
+            Some(window) => {
+                window
+                    .submit(
+                        &self.state,
+                        crate::replica_coordinator::ContentWriteCloseItem {
+                            group_id: group_id.to_owned(),
+                            path: record.path.clone(),
+                            exact_state,
+                            expected_mutation_generation: content_write_mutation_generation,
+                            expected_version: written_version.version_hash,
+                            claim,
+                            root_check: root_commit_permit.owned_check(),
+                            disk_check: Box::new({
+                                let (path, out_path, blocks) =
+                                    (record.path.clone(), out_path.clone(), record.blocks.clone());
+                                move || {
+                                    disk_still_the_verified_object(
+                                        &path,
+                                        &out_path,
+                                        &blocks,
+                                        verified_identity,
+                                    )
+                                }
+                            }),
+                        },
+                    )
+                    .await?
+            }
+            None => self.state.close_content_write(
+                group_id,
+                &record.path,
+                &exact_state,
+                content_write_mutation_generation,
+                yadorilink_sync_sqlite::exact_materialized_commit::ExpectedAuthoring {
+                    state: yadorilink_peer_session::ports::MATERIALIZATION_IN_FLIGHT_STATE,
+                    expected_version: Some(&written_version.version_hash),
+                },
+                claim,
+                root_commit_permit,
+            )?,
+        };
+        match closed {
+            crate::replica_coordinator::ContentWriteClose::Refused => {
+                Ok(MaterializeResult::RetryRequired.into())
+            }
+            crate::replica_coordinator::ContentWriteClose::Published { obligation } => {
+                if let (Some(claim), Some(_)) = (plan.claim, obligation) {
+                    claim.record_decided(&record.path);
+                }
+                Ok(MaterializeResult::Settled(evidence).into())
+            }
         }
-        Ok(MaterializeResult::Settled(evidence).into())
     }
+}
+
+/// Whether `out_path` is still the object the exact verification vouched for
+/// (`verified`, the identity recorded with that evidence): a regular file
+/// whose identity, with the size and the modification and change times it
+/// carries, is that one. A direct write by the user changes it without moving
+/// any fence, and the proof the batch is about to publish would no longer be
+/// true. A missing verified identity or an unavailable observation refuses.
+/// Where the identity cannot show an in-place rewrite (Windows without a
+/// change time) the bytes are compared with the blocks being proven.
+fn disk_still_the_verified_object(
+    path: &str,
+    out_path: &std::path::Path,
+    blocks: &[yadorilink_replica_domain::file::BlockInfo],
+    verified: Option<yadorilink_root_authority::fs_identity::FileIdentity>,
+) -> bool {
+    use yadorilink_root_authority::fs_identity::FileIdentity;
+    let identity_unchanged = verified.is_some()
+        && super::super::types::require_physical_kind_matches(path, out_path, RecordKind::File)
+            .is_ok()
+        && FileIdentity::observe_path(out_path).ok() == verified;
+    let unchanged = super::super::completion_window::verified_bytes_still_on_disk(
+        identity_unchanged,
+        FileIdentity::in_place_rewrite_visible(out_path),
+        || {
+            yadorilink_local_storage::disk_bytes_match_indexed_blocks(out_path, blocks)
+                .unwrap_or(false)
+        },
+    );
+    if !unchanged {
+        tracing::warn!(
+            path,
+            "the file changed on disk after it was verified and before its batch committed; \
+             nothing was recorded for the bytes written and the intent stays open"
+        );
+    }
+    unchanged
 }

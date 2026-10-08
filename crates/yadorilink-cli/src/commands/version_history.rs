@@ -2,7 +2,7 @@
 //! the CLI surface for `yadorilink-daemon/src/control_socket.rs`'s
 //! `ListVersions`/`RestoreVersion`/`ListTrash`/`RestoreTrash` handlers.
 //! Mirrors `commands/materialization.rs`'s by-absolute-path resolution
-//! pattern (pin/unpin/evict), since these commands resolve the same way over
+//! pattern (evict), since these commands resolve the same way over
 //! the same control socket.
 
 use yadorilink_client_core::ops::files;
@@ -149,9 +149,6 @@ fn conflicted_file_line(f: &ConflictedFileInfo) -> String {
     } else {
         line
     };
-    if f.holds_compaction {
-        return format!("{line}  compaction=waiting_for_resolution");
-    }
     line
 }
 

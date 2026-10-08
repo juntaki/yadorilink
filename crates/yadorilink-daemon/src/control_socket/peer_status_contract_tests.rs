@@ -98,7 +98,7 @@ fn device_whose_content_only_the_peer_holds() -> Arc<DaemonState> {
     state
         .replica_coordinator
         .materialization_state_repository()
-        .set_materialization_state(GROUP, "a.bin", MaterializationState::Placeholder, &permit)
+        .set_materialization_state(GROUP, "a.bin", MaterializationState::Remote, &permit)
         .unwrap();
 
     state.set_peer_group_writer(PEER, GROUP, true);

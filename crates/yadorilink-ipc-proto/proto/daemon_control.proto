@@ -152,6 +152,16 @@ message LinkStatus {
   // Additive; `DURABILITY_EVIDENCE_UNSPECIFIED` (0) on a daemon that
   // predates this field.
   DurabilityEvidence durability_evidence = 33;
+  // True while `durability_status` is `UNKNOWN` only because this daemon has
+  // not yet run its first custody check for the group (most visible in the
+  // first minute or two after linking a folder). A transient "checking", not
+  // a failure to confirm: it clears as soon as a check round has run, and
+  // `UNKNOWN` then stands on its own.
+  bool durability_check_pending = 34;
+  // A provider-backed folder (macOS File Provider) has no directory: `local_path` is then only its
+  // identity key, never something to open, reveal or restore into. Its name and root are here.
+  string provider_root_id = 35;
+  string provider_display_name = 36;
 }
 
 // See `LinkStatus.local_storage_state`'s own doc comment.
@@ -400,9 +410,10 @@ message LinkRequest {
   string group_id = 2;
   // `yadorilink link --on-demand`.
   bool on_demand = 3;
-  // Automatic-eviction disk-usage cap; unset/zero means no cap
-  // (manual eviction only). Only meaningful when `on_demand` is set.
-  optional int64 max_local_size_bytes = 4;
+  // Field 4 was `optional int64 max_local_size_bytes`, the automatic-eviction
+  // disk-usage cap, removed with automatic eviction (eviction is manual).
+  reserved 4;
+  reserved "max_local_size_bytes";
   // Field 5 was `bool content_defined_chunking` (`yadorilink link
   // --content-defined-chunking`), removed with the user-selectable
   // chunking policy; chunking is now internal/automatic.
@@ -519,7 +530,7 @@ message FileVersionInfo {
 }
 
 // `yadorilink versions <path>`. `absolute_path` (not
-// `local_path` + relative path) matches `HydrateRequest`/`PinRequest`/etc.
+// `local_path` + relative path) matches `HydrateRequest`/`EvictRequest`/etc.
 // above — the daemon resolves which link and relative path it falls under
 // via `shell_status::resolve_group_and_rel_path`, the same helper those
 // existing per-file commands already use.
@@ -619,11 +630,7 @@ message ConflictedFileInfo {
   EntryKind kind = 5;
   // Why the copy is kept under its own name now.
   ConflictReason reason = 6;
-  // The folder's history compaction is waiting for this conflict to be
-  // resolved: the copy and the path it came from hold two versions written
-  // by one device, which compaction cannot carry. Sync is unaffected;
-  // deleting or editing the copy resolves it.
-  bool holds_compaction = 7;
+  reserved 7;
 }
 
 // Why a conflict copy is kept beside the path it came from.
@@ -774,7 +781,127 @@ message StatusResponse {
   // token, or IP beyond what's already exposed elsewhere in this message).
   // Always empty when `overall_state == "healthy"`.
   repeated string attention_reasons = 23;
+  // What rebootstraps set aside on this device (see `PreservedItem`), summed over every
+  // group including removed ones, and the groups a rebootstrap is replacing right now.
+  PreservedSummary preserved = 24;
+  repeated string rebootstrapping_groups = 25;
+  // Uploads retained for operations never decided (bytes the user may still be waiting on), live
+  // roots and orphaned ones together, and the age in milliseconds of the oldest.
+  uint64 undecided_uploads = 26;
+  uint64 undecided_uploads_oldest_ms = 27;
+  // Every provider-backed root: why it is not ready, its Eager download progress, the files
+  // that keep failing, and the edits kept beside a file.
+  repeated ProviderRootStatus provider_roots = 28;
+  // Provider folders being removed (the OS domain is removed by the app) or removed, with where the
+  // OS kept the user's downloaded data.
+  repeated ProviderRemovalStatus provider_removals = 29;
+  // Domains registered with the OS for a root this database does not know (a lost or rolled-back
+  // database). They are KEPT, never removed automatically.
+  repeated string orphan_domains = 30;
 }
+
+message ProviderRemovalStatus {
+  string root_id = 1;  // the first 8 hex digits
+  string display_name = 2;
+  bool removed = 3;    // false: the app has not yet confirmed the removal
+  string preserved_location = 4;
+}
+
+message ProviderRootStatus {
+  string root_id = 1;          // the first 8 hex digits, enough to tell roots apart
+  string display_name = 2;
+  // "ready", or why not: "waiting for the app to register the folder", "enable File Provider",
+  // "File Provider error: <text>", "preparing the folder".
+  string readiness = 3;
+  bool eager = 4;
+  // Eager only: "running" | "paused (low disk)" | "waiting for peers" | "waiting for File Provider"
+  // | "done".
+  string eager_state = 5;
+  uint64 eager_remote = 6;     // wanted files with no current content on the OS
+  uint64 eager_hydrating = 7;  // handed out and not settled
+  uint64 eager_current = 8;    // files whose current content is on the OS
+  repeated StuckFile stuck = 9;
+  uint64 kept_edits = 10;      // edits kept beside a file instead of replacing it
+  uint64 kept_edits_oldest_ms = 11;  // age of the first one
+  // A new version is waiting to be published to the OS ("file in use": the eviction of the old copy
+  // is busy, or the release is waiting): how many items and the age of the oldest.
+  uint64 pending_publications = 12;
+  uint64 pending_oldest_ms = 13;
+  // Released after the timer but not yet confirmed by the OS fetching it.
+  uint64 unconfirmed_publications = 14;
+  uint64 unconfirmed_oldest_ms = 15;
+}
+
+message ListProviderPendingRequest {
+  uint32 limit = 1;  // at most this many items per root (0 = none)
+}
+message PendingPublication {
+  string root_id = 1;
+  string path = 2;
+  uint64 age_ms = 3;
+}
+message ListProviderPendingResponse {
+  repeated PendingPublication items = 1;
+}
+
+message StuckFile {
+  string path = 1;
+  uint32 failures = 2;
+}
+
+message PreservedSummary {
+  uint32 total = 1;
+  uint32 content_unavailable = 2;
+  uint32 record_unavailable = 3;
+  uint64 bytes = 4;
+  uint32 unreplayed_own_units = 5;
+  // The size above which the total is worth a warning, and whether it is exceeded.
+  uint64 warn_bytes = 6;
+  bool warn = 7;
+}
+
+// One thing a rebootstrap kept for the user: a version another device wrote that the
+// replacing state does not contain (`remote_only`, or `beyond_closure_cutoff` when it is above
+// the cutoff at which that state closes its author), or this device's own changes that were
+// not replayed (`own_unit`). Nothing is ever deleted except by an explicit discard.
+message PreservedItem {
+  string kind = 1;
+  string group_id = 2;
+  bool group_removed = 3;
+  // For an own unit: "<recovery id>:<unit>".
+  string item_id = 4;
+  string path = 5;
+  repeated string paths = 6;
+  // "complete" | "unavailable" | "record_unavailable"; empty for an own unit.
+  string content = 7;
+  uint64 size = 8;
+  uint32 blocks_held = 9;
+  uint32 blocks_total = 10;
+  string recovery_id = 11;
+  bool originals_quarantined = 12;
+}
+
+message ListPreservedRequest {}
+message ListPreservedResponse {
+  repeated PreservedItem items = 1;
+}
+// Restores a version item as one ordinary new write at its original path. The item stays.
+message RestorePreservedRequest {
+  string group_id = 1;
+  string item_id = 2;
+}
+message RestorePreservedResponse {}
+message DiscardPreservedRequest {
+  string group_id = 1;
+  string item_id = 2;
+}
+message DiscardPreservedResponse {}
+// Re-submits an own unit a rebootstrap held back to the replay, as the group's writer now.
+message RetryPreservedRequest {
+  string group_id = 1;
+  string item_id = 2;
+}
+message RetryPreservedResponse {}
 
 // `yadorilink gc [--dry-run]` triggers
 // an immediate mark-and-sweep pass over this device's block store.
@@ -1002,7 +1129,7 @@ message HandoffResult {
 message ShutdownRequest {}
 message ShutdownResponse {}
 
-// Manual hydrate/pin/unpin/evict, issued by
+// Manual hydrate/evict, issued by
 // the CLI over this same control socket (distinct from the shell
 // extension's synchronous OS-callback-driven hydration path in
 // shellipc.proto, which shares the same daemon-side implementation). Takes
@@ -1015,21 +1142,11 @@ message HydrateRequest {
 }
 message HydrateResponse {}
 
-message PinRequest {
-  string absolute_path = 1;
-}
-message PinResponse {}
-
-message UnpinRequest {
-  string absolute_path = 1;
-}
-message UnpinResponse {}
-
 message EvictRequest {
   string absolute_path = 1;
 }
 // Previously empty -- an `Evict` request that daemon-side
-// silently did nothing (the file was pinned, busy, not yet fully synced,
+// silently did nothing (the file was busy, not yet fully synced,
 // or its on-disk identity changed right before the commit) still returned
 // this bare-success message, so `yadorilink evict` printed "Evicted"
 // regardless of what actually happened. `dehydrated` is the one fact that
@@ -1038,18 +1155,18 @@ message EvictResponse {
   // Whether the file was actually reduced to a placeholder. `false` means
   // nothing was freed -- the file is exactly as it was before the
   // request, for one of several possible reasons this response does not
-  // further distinguish (pinned, busy, not yet `Hydrated`, or changed on
+  // further distinguish (busy, not yet present, or changed on
   // disk right before the commit).
   bool dehydrated = 1;
   uint64 blocks_reclaimed = 2;
   uint64 bytes_reclaimed = 3;
 }
 
-// One file's current materialization state and pin flag -- the
+// One file's current materialization state -- the
 // per-FILE analogue of `LinkStatus`'s aggregate hydrated_count/
 // placeholder_count/hydrating_count counts, which answer "how many files
 // across this whole link" but not "what state is THIS file in right
-// now," the question a `pin`/`unpin`/`evict` caller (CLI, desktop app,
+// now," the question a `hydrate`/`evict` caller (CLI, desktop app,
 // or a future GUI) needs answered before deciding what to do next.
 message MaterializationStatusRequest {
   string absolute_path = 1;
@@ -1057,21 +1174,46 @@ message MaterializationStatusRequest {
 message MaterializationStatusResponse {
   // `false` if the daemon has no materialization-state row for this path
   // at all (the path has never been indexed, or is not under any linked
-  // folder) -- `state`/`pinned` are meaningless when this is `false`,
+  // folder) -- `state` is meaningless when this is `false`,
   // matching this file's existing convention for other "nothing to
   // report" cases (e.g. `PeerReachability_UNSPECIFIED`).
   bool known = 1;
-  MaterializationState state = 2;
-  bool pinned = 3;
+  // Field 2 was the `MaterializationState` enum (HYDRATED/PLACEHOLDER/...).
+  reserved 2;
+  reserved "state";
+  // Field 3 was `bool pinned`, removed with pinning.
+  reserved 3;
+  reserved "pinned";
+  // Unset when `known` is false.
+  LocalState local_state = 4;
 }
 
-// Mirrors `yadorilink_replica_domain::session_state::MaterializationState`.
-enum MaterializationState {
-  MATERIALIZATION_STATE_UNSPECIFIED = 0;
-  MATERIALIZATION_STATE_HYDRATED = 1;
-  MATERIALIZATION_STATE_PLACEHOLDER = 2;
-  MATERIALIZATION_STATE_HYDRATING = 3;
-  MATERIALIZATION_STATE_EVICTING = 4;
+// What stands on this device for one path, as two independent facts plus the
+// transition the daemon is in the middle of.
+//
+// `local_object_present`: a physical local object stands (or is being detached)
+// at the path -- the row is `Present`, or `Evicting` (its object is being
+// removed and may still stand). A `Hydrating` row is producing its object and
+// reports false; a `Remote` row has none.
+//
+// `current_content_present`: a usable proof names the CURRENT version and its
+// bytes are usable here. It implies `local_object_present`, and it is false
+// for an older object under a newer row, for anything that is being hydrated
+// or evicted, and whenever the daemon could not read the evidence (it fails
+// closed: an unreadable proof is never "current"). A directory's object is its
+// own content, so a present directory is current.
+//
+// A message that is absent means the daemon knows nothing about the path.
+message LocalState {
+  bool local_object_present = 1;
+  bool current_content_present = 2;
+  LocalTransition transition = 3;
+}
+
+enum LocalTransition {
+  LOCAL_TRANSITION_NONE = 0;
+  LOCAL_TRANSITION_HYDRATING = 1;
+  LOCAL_TRANSITION_EVICTING = 2;
 }
 
 // A lightweight liveness/health surface,
@@ -1526,6 +1668,10 @@ message CreateAndLinkCommandRequest {
   string local_path = 2;
   bool on_demand = 3;
   bool acknowledge_risks = 4;
+  // A provider-backed folder (macOS File Provider): the name it shows under the File Provider
+  // location, and the client's retry identity. `local_path` is ignored when this is set.
+  string provider_display_name = 5;
+  string request_token = 6;
 }
 
 message JoinAndLinkCommandRequest {
@@ -1534,6 +1680,8 @@ message JoinAndLinkCommandRequest {
   string local_path = 3;
   bool on_demand = 4;
   bool acknowledge_risks = 5;
+  string provider_display_name = 6;
+  string request_token = 7;
 }
 
 message EnrollmentCommandOutcome {
@@ -1557,6 +1705,8 @@ message EnrollmentCommandOutcome {
   // changed nothing locally (a repeated `share join`). Lets a caller say so
   // instead of reporting a fresh join.
   bool already_linked = 5;
+  // The root of a provider-backed folder just created (empty for a plain folder).
+  string provider_root_id = 6;
 }
 
 message CreateAndLinkCommandResponse {
@@ -1872,8 +2022,6 @@ message DaemonControlRequest {
     StatusRequest status = 6;
     ShutdownRequest shutdown = 7;
     HydrateRequest hydrate = 8;
-    PinRequest pin = 9;
-    UnpinRequest unpin = 10;
     EvictRequest evict = 11;
     HealthRequest health = 12;
     ReportingStatusRequest reporting_status = 13;
@@ -1934,7 +2082,7 @@ message DaemonControlRequest {
     // recovery diagnosis (`show`) -- see the message definitions above.
     ListRecoveryOperationsRequest list_recovery_operations = 62;
     ShowRecoveryOperationRequest show_recovery_operation = 63;
-    // Per-file materialization state/pin query.
+    // Per-file materialization state query.
     MaterializationStatusRequest materialization_status = 64;
     // C5: `yadorilink conflicts list`.
     ListConflictsRequest list_conflicts = 65;
@@ -1961,6 +2109,14 @@ message DaemonControlRequest {
     DeleteGroupCommandRequest delete_group_command = 73;
 
     RestoreTrashOperationRequest restore_trash_operation = 74;
+
+    // What a rebootstrap set aside for the user: list, restore, discard.
+    ListPreservedRequest list_preserved = 75;
+    RestorePreservedRequest restore_preserved = 76;
+    DiscardPreservedRequest discard_preserved = 77;
+    RetryPreservedRequest retry_preserved = 78;
+    // Provider publications waiting on the OS.
+    ListProviderPendingRequest list_provider_pending = 79;
   }
   // Field numbers 24-26 were the directional-mode requests (set_mode,
   // override, revert); 40-43 were the directional folder-operation requests
@@ -1971,8 +2127,9 @@ message DaemonControlRequest {
   // broadcast discovery that produced the candidate list; LAN discovery is
   // the iroh endpoint's own mDNS, whose candidate set this daemon does not
   // enumerate.
-  reserved 24, 25, 26, 40, 41, 42, 43, 72;
-  reserved "set_mode", "override", "revert", "folder_divergence_summary",
+  // 9 and 10 were `pin` and `unpin`, removed with pinning.
+  reserved 9, 10, 24, 25, 26, 40, 41, 42, 43, 72;
+  reserved "pin", "unpin", "set_mode", "override", "revert", "folder_divergence_summary",
     "folder_resolution_preview", "folder_resolution_confirm",
     "list_folder_operation_audit", "list_lan_discovered_candidates";
   // The CLI's own control-
@@ -1999,8 +2156,6 @@ message DaemonControlResponse {
     StatusResponse status = 6;
     ShutdownResponse shutdown = 7;
     HydrateResponse hydrate = 8;
-    PinResponse pin = 9;
-    UnpinResponse unpin = 10;
     EvictResponse evict = 11;
     string error = 12;
     HealthResponse health = 13;
@@ -2059,7 +2214,7 @@ message DaemonControlResponse {
     // recovery diagnosis (`show`) -- see the message definitions above.
     ListRecoveryOperationsResponse list_recovery_operations = 62;
     ShowRecoveryOperationResponse show_recovery_operation = 63;
-    // Per-file materialization state/pin query.
+    // Per-file materialization state query.
     MaterializationStatusResponse materialization_status = 64;
     // C5: `yadorilink conflicts list`.
     ListConflictsResponse list_conflicts = 65;
@@ -2079,6 +2234,11 @@ message DaemonControlResponse {
     DeleteGroupCommandResponse delete_group_command = 73;
 
     RestoreTrashOperationResponse restore_trash_operation = 74;
+    ListPreservedResponse list_preserved = 75;
+    RestorePreservedResponse restore_preserved = 76;
+    DiscardPreservedResponse discard_preserved = 77;
+    RetryPreservedResponse retry_preserved = 78;
+    ListProviderPendingResponse list_provider_pending = 79;
   }
   // Field numbers 25-27 were the directional-mode responses (set_mode,
   // override, revert); 40-43 were the directional folder-operation responses
@@ -2087,8 +2247,9 @@ message DaemonControlResponse {
   // bidirectional.
   // 72 was `list_lan_discovered_candidates`, removed with the legacy LAN
   // broadcast discovery that produced the candidate list.
-  reserved 25, 26, 27, 40, 41, 42, 43, 72;
-  reserved "set_mode", "override", "revert", "folder_divergence_summary",
+  // 9 and 10 were `pin` and `unpin`, removed with pinning.
+  reserved 9, 10, 25, 26, 27, 40, 41, 42, 43, 72;
+  reserved "pin", "unpin", "set_mode", "override", "revert", "folder_divergence_summary",
     "folder_resolution_preview", "folder_resolution_confirm",
     "list_folder_operation_audit", "list_lan_discovered_candidates";
   // Mirrors

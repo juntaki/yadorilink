@@ -157,3 +157,68 @@ async fn a_one_shot_task_that_fails_is_still_a_warning() {
     let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
     assert!(logs.contains("WARN") && logs.contains("boom"), "a failure must be a warning: {logs}");
 }
+
+#[tokio::test]
+async fn aborting_the_supervisor_stops_the_task_it_supervises() {
+    let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counting = ticks.clone();
+    let supervisor = spawn_restarting("abort-test", BackoffConfig::CONVERGENCE_ENGINE, move || {
+        let counting = counting.clone();
+        async move {
+            loop {
+                counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(ticks.load(std::sync::atomic::Ordering::SeqCst) > 0, "the task runs");
+
+    supervisor.abort();
+    let _ = supervisor.await;
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let after_abort = ticks.load(std::sync::atomic::Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        ticks.load(std::sync::atomic::Ordering::SeqCst),
+        after_abort,
+        "the supervised task keeps running after its supervisor was aborted"
+    );
+}
+
+#[tokio::test]
+async fn every_task_spawned_under_a_collector_can_be_stopped() {
+    let ticks = Arc::new(AtomicU32::new(0));
+    let (_, handles) = collect_spawned_tasks(|| {
+        let counting = ticks.clone();
+        spawn_restarting("collected", BackoffConfig::CONVERGENCE_ENGINE, move || {
+            let counting = counting.clone();
+            async move {
+                loop {
+                    counting.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        });
+        let counting = ticks.clone();
+        spawn_logged("collected-logged", async move {
+            loop {
+                counting.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+    });
+    assert_eq!(handles.len(), 2);
+    // A task spawned outside the collector is not collected.
+    let (_, none) = collect_spawned_tasks(|| {});
+    assert!(none.is_empty());
+
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    for handle in &handles {
+        handle.abort();
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let after_abort = ticks.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert_eq!(ticks.load(Ordering::SeqCst), after_abort, "a collected task kept running");
+}

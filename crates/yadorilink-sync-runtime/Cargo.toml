@@ -7,7 +7,6 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-yadorilink-rbsr = { path = "../yadorilink-rbsr" }
 yadorilink-sync-protocol = { path = "../yadorilink-sync-protocol" }
 yadorilink-sync-substrate = { path = "../yadorilink-sync-substrate" }
 tokio = { workspace = true }

@@ -37,7 +37,7 @@
 //! this matters. The rest of the name is `path`, which is the *same* path
 //! by construction (both losers contend for it), the losing device, and an
 //! mtime stamp that `path_head_from_change` deliberately pins to a
-//! constant for DAG-resolved conflicts. So for a pair of concurrent writes
+//! constant for conflicts resolved from replicated state. So for a pair of concurrent writes
 //! from one device the hash field is the only thing that differs at all,
 //! and truncating it to 32 bits made a silent overwrite a birthday problem
 //! rather than an impossibility.
@@ -56,6 +56,11 @@
 //!   two distinct encodings back together. A case-sensitive encoding such
 //!   as base64 would re-open exactly the collision this closes, on exactly
 //!   the platforms most users are on.
+//!
+//! Native copy names are the one exception: they carry a fixed-width
+//! 128-bit prefix of the version hash instead of the whole hash and no
+//! timestamp; see [`native_copy_path`] and [`NATIVE_COPY_HASH_BYTES`] for why
+//! that width preserves the invariant in practice.
 //!
 //! ## Length bound, and which field yields when the name does not fit
 //!
@@ -140,10 +145,6 @@
 //! why the tie-break itself deliberately stays on device id rather than
 //! "prefer local".
 
-use sha2::{Digest, Sha256};
-
-use crate::file::BlockInfo;
-
 /// A claimed `mtime_unix_nanos` more than this far in the
 /// future of wall-clock "now" is no longer trusted at face value for
 /// conflict-resolution purposes — see this module's trust-boundary doc
@@ -166,20 +167,6 @@ pub const MAX_COMPONENT_BYTES: usize = 255;
 /// the end of a conflict copy's base stem is what
 /// [`conflict_copy_stem_was_truncated`] reports.
 pub const STEM_TRUNCATION_MARKER: &str = "~";
-
-/// Combines a file's per-block content hashes into a single deterministic
-/// digest usable as a conflict-copy filename disambiguator. Each block
-/// hash is already a `Sha256` digest of that block's own bytes, so hashing
-/// their concatenation in block order is cheap, fully deterministic on
-/// both sides of a conflict, and requires no re-read of the file's raw
-/// bytes.
-pub fn combined_block_hash(blocks: &[BlockInfo]) -> Vec<u8> {
-    let mut hasher = Sha256::new();
-    for block in blocks {
-        hasher.update(&block.hash);
-    }
-    hasher.finalize().to_vec()
-}
 
 /// Clamps `mtime_unix_nanos` so it is never trusted as more than
 /// `MAX_FUTURE_MTIME_SKEW_NANOS` beyond `now_unix_nanos`. A no-op for any
@@ -298,6 +285,49 @@ pub fn conflict_copy_path(
     // Only the stem may yield to the component limit, and it yields here
     // rather than at materialization time, where the whole copy would
     // fail to be written at all.
+    let ext_bytes = ext.map_or(0, |ext| 1 + ext.len());
+    let stem = truncate_stem_to_fit(stem, suffix.len() + ext_bytes);
+    match ext {
+        Some(ext) => format!("{dir}{stem}{suffix}.{ext}"),
+        None => format!("{dir}{stem}{suffix}"),
+    }
+}
+
+/// How many leading bytes of a version hash a native copy name shows
+/// (32 hex characters).
+///
+/// This is the one place the whole-hash rule above is relaxed. Native copy
+/// names carry no timestamp and no losing device (the label is fixed, the
+/// time would be invented), so they are short enough to read, and the hash is
+/// the only field left to tell two versions of a path apart. 16 bytes is
+/// 128 bits: two distinct versions sharing a prefix would need a collision of
+/// a 128-bit truncation of a cryptographic hash (about 2^64 versions to find
+/// one by chance, and no cheaper for an adversary). If one ever did occur,
+/// the numbering the resolver already applies to a name held by a different
+/// copy keeps the two apart; the same-source reuse of a recorded name relies
+/// only on this width.
+pub const NATIVE_COPY_HASH_BYTES: usize = 16;
+
+/// Builds `<name> (conflicted copy, <label>, <hash prefix>).<ext>`: the name
+/// of a native copy, a deterministic function of the source path, the label
+/// and the version hash alone, so every replica derives the same one. The
+/// `(conflicted copy, ` marker is the same as [`conflict_copy_path`]'s, so
+/// every reader of that convention (stripping, recognising, listing) treats
+/// both alike; the hash is the first [`NATIVE_COPY_HASH_BYTES`] bytes of
+/// `version_hash`, in lowercase hex, and an existing marker in `path` is
+/// stripped first so a copy of a copy carries one suffix.
+pub fn native_copy_path(path: &str, label: &str, version_hash: &[u8; 32]) -> String {
+    let (dir, filename) = match path.rsplit_once('/') {
+        Some((dir, name)) => (format!("{dir}/"), name),
+        None => (String::new(), path),
+    };
+    let (raw_stem, ext) = match filename.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => (stem, Some(ext)),
+        _ => (filename, None),
+    };
+    let stem = strip_conflict_suffix(raw_stem);
+    let shown = hex::encode(&version_hash[..NATIVE_COPY_HASH_BYTES]);
+    let suffix = format!(" (conflicted copy, {label}, {shown})");
     let ext_bytes = ext.map_or(0, |ext| 1 + ext.len());
     let stem = truncate_stem_to_fit(stem, suffix.len() + ext_bytes);
     match ext {

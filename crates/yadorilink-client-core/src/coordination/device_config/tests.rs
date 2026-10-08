@@ -94,3 +94,40 @@ fn write_config_file_tightens_existing_permissions() {
     assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
     assert_eq!(std::fs::read_to_string(path).unwrap(), "{\"device_id\":\"device-1\"}");
 }
+
+/// Replacing an existing `device.json` must leave either the previous
+/// document or the complete new one whichever step the write is cut at; the
+/// daemon refuses to start on an empty or partial file.
+#[test]
+fn an_interrupted_replacement_never_damages_the_existing_config() {
+    const OLD: &str = "{\"device_id\":\"the-old-identity\"}";
+    const NEW: &str = "{\"device_id\":\"the-new-identity\"}";
+
+    for cut in [WriteStep::TempWritten, WriteStep::TempSynced, WriteStep::Renamed] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device.json");
+        std::fs::write(&path, OLD).unwrap();
+
+        let result = write_config_file_with(&path, NEW, &mut |step| {
+            if step == cut {
+                Err(std::io::Error::other("injected failure"))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.is_err(), "the injected failure at {cut:?} must surface");
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        if cut == WriteStep::Renamed {
+            assert_eq!(on_disk, NEW, "a failure after the rename leaves the complete new file");
+        } else {
+            assert_eq!(on_disk, OLD, "a failure at {cut:?} must leave the previous file intact");
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "device.json")
+            .collect();
+        assert!(leftovers.is_empty(), "no temporary file may remain after {cut:?}: {leftovers:?}");
+    }
+}

@@ -23,7 +23,7 @@ use yadorilink_ipc_proto::framing::{read_message, write_message};
 use yadorilink_ipc_proto::shellipc::shell_ipc_message::Payload;
 use yadorilink_ipc_proto::shellipc::{
     ContextAction, ContextActionRequest, FolderFileEntry, HydrateRequest, ListFolderFilesRequest,
-    ListOnDemandFoldersRequest, MaterializationState, OnDemandFolder, ShellIpcMessage, StatusQuery,
+    ListProviderFoldersRequest, LocalTransition, ShellIpcMessage, StatusQuery,
     SyncState,
 };
 
@@ -185,9 +185,10 @@ async fn query_status_inner(path: &str) -> SyncState {
     }
 }
 
-/// on-demand-sync's "online-only" overlay: `MaterializationState`, not
-/// `SyncState`, is the authoritative signal for whether a file is an
-/// unhydrated placeholder — independent of sync convergence.
+/// on-demand-sync's "online-only" overlay: the local state, not `SyncState`,
+/// is the authoritative signal for whether a file's current content is absent
+/// (no current content and no transition under way) — independent of sync
+/// convergence. Unknown is not online-only.
 pub fn is_placeholder(path: &str) -> bool {
     runtime().block_on(async {
         tokio::time::timeout(DEFAULT_TIMEOUT, is_placeholder_inner(path)).await.unwrap_or(false)
@@ -204,8 +205,9 @@ async fn is_placeholder_inner(path: &str) -> bool {
     }
     match read_message::<ShellIpcMessage>(&mut stream).await {
         Ok(Some(ShellIpcMessage { payload: Some(Payload::StatusResponse(r)) })) => {
-            MaterializationState::try_from(r.materialization_state)
-                == Ok(MaterializationState::Placeholder)
+            r.local_state.is_some_and(|s| {
+                !s.current_content_present && s.transition() == LocalTransition::None
+            })
         }
         _ => false,
     }
@@ -297,23 +299,35 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let msg = ShellIpcMessage {
-        payload: Some(Payload::ListOnDemandFoldersRequest(ListOnDemandFoldersRequest {})),
+        payload: Some(Payload::ListProviderFoldersRequest(ListProviderFoldersRequest { app_group_container: String::new() })),
     };
     write_message(stream, &msg).await.ok()?;
     match read_message::<ShellIpcMessage>(stream).await {
-        Ok(Some(ShellIpcMessage { payload: Some(Payload::ListOnDemandFoldersResponse(r)) }))
+        Ok(Some(ShellIpcMessage { payload: Some(Payload::ListProviderFoldersResponse(r)) }))
             if r.snapshot_available =>
         {
-            Some(r.folders)
+            // The daemon lists provider roots by `root_id`, with no directory. There is no
+            // Windows provider kind until the CfAPI checkpoint, so no root is registered
+            // as a sync root from this snapshot: a confirmed empty desired set.
+            Some(Vec::new())
         }
         _ => None,
     }
 }
 
+/// A linked folder to register as a CfAPI sync root. Windows-local: the shell protocol
+/// no longer carries a directory for provider roots, and no Windows provider kind exists
+/// yet (UNVERIFIED, mechanical).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OnDemandFolder {
+    pub local_path: String,
+    pub group_id: String,
+}
+
 /// Lists every non-deleted file the daemon has indexed under the OnDemand
 /// folder rooted at `local_path` (same reasoning as
 /// `list_on_demand_folders`), with enough metadata (`size`,
-/// `mtime_unix_nanos`, `materialization_state`) to create or update a
+/// `mtime_unix_nanos`, `local_state`) to create or update a
 /// cfapi placeholder per file. `local_path` must match a `local_path`
 /// this client already got back from `list_on_demand_folders`.
 ///
@@ -448,10 +462,11 @@ mod list_on_demand_folders_tests {
     }
 
     fn response(folders: Vec<OnDemandFolder>, snapshot_available: bool) -> ShellIpcMessage {
+        let _ = folders;
         ShellIpcMessage {
-            payload: Some(Payload::ListOnDemandFoldersResponse(
-                yadorilink_ipc_proto::shellipc::ListOnDemandFoldersResponse {
-                    folders,
+            payload: Some(Payload::ListProviderFoldersResponse(
+                yadorilink_ipc_proto::shellipc::ListProviderFoldersResponse {
+                    folders: Vec::new(),
                     snapshot_available,
                 },
             )),
@@ -469,9 +484,9 @@ mod list_on_demand_folders_tests {
     }
 
     #[tokio::test]
-    async fn confirmed_nonempty_snapshot_is_some() {
+    async fn a_confirmed_snapshot_registers_no_sync_root_without_a_windows_provider() {
         let result = respond_with(Some(response(vec![folder("C:\\A", "group-a")], true))).await;
-        assert_eq!(result, Some(vec![folder("C:\\A", "group-a")]));
+        assert_eq!(result, Some(vec![]));
     }
 
     #[tokio::test]

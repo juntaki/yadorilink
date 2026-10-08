@@ -11,7 +11,8 @@
 //!
 //! Every method keeps the transaction boundaries it replaced: each raw step
 //! is still its own transaction, in the same order, with the same checks
-//! and early returns. No method takes a path lock (the caller holds it) or
+//! and early returns. The exception is `open_content_write`, which commits
+//! its steps, still in that order, as one transaction (see its doc). No method takes a path lock (the caller holds it) or
 //! performs a physical write (the lane keeps it, between an open and a
 //! settle). `scripts/check-materialization-semantic-boundary.py` pins every
 //! raw call that remains, here and in the lanes.
@@ -24,14 +25,14 @@ use crate::sync_error::SyncError;
 
 mod hydration;
 mod lanes;
+pub(crate) use lanes::{ContentWriteClose, ContentWriteCloseItem, OwnedContentWriteOpen};
+#[cfg(test)]
+mod pre_write_tests;
 mod repair;
 mod structural;
 
 #[cfg(test)]
-pub(crate) use structural::STALE_STRUCTURAL_INTENT_AGE;
-
-#[cfg(test)]
-pub(crate) use hydration::AccessHydration;
+pub(crate) use hydration::HydrationAttempt;
 #[cfg(test)]
 pub(crate) use repair::set_test_fail_repair_reconstruct_proof_commit;
 

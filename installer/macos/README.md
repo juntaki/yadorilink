@@ -17,10 +17,54 @@ left (`YadoriLinkFinderSyncHost.app`, `yadorilink-status-app`), and
 `build-pkg.sh` refuses to run while `YadoriLink.app` still runs on its
 fake client (see `shell-ext/macos/YadoriLinkApp/App/ClientFactory.swift`).
 
-`yadorilink-coordination` is a server-side binary and is
-**not** part of this installer — deploy it to your own server instead.
+The coordination service is a separate server-side deployment and is
+**not** part of this installer.
 
 This file covers building, signing, verifying, and uninstalling the `.pkg`.
+
+## Installing a release (most people)
+
+Download `yadorilink-macos.pkg` (and its `.sha256`) from
+[GitHub Releases](https://github.com/juntaki/yadorilink/releases). Release
+packages are signed with a Developer ID, notarized and stapled, so
+double-clicking works. Verify the checksum with
+`shasum -a 256 -c yadorilink-macos.pkg.sha256`, then install.
+
+First run, in Terminal:
+
+```bash
+yadorilink login
+yadorilink device register --name "my-mac"
+yadorilink share create my-share --path ~/some/folder
+yadorilink status
+```
+
+Also turn on the Finder extension in System Settings → General → Login Items
+& Extensions → Extensions → Added Extensions → Finder.
+
+If something needs attention, `yadorilink status` and `yadorilink doctor`
+show what the daemon sees, and `yadorilink preserved list` / `restore` /
+`retry` / `discard` manage items set aside when a folder group was reset.
+
+Release builds connect to the YadoriLink coordination service by default;
+set `YADORILINK_COORDINATION_ADDR` to use another one. Builds from source
+default to `http://127.0.0.1:8787` unless the build was made with
+`YADORILINK_DEFAULT_COORDINATION_ADDR` set.
+
+**Updating.** Update every device to the same release: install the newer
+`yadorilink-macos.pkg` over the old one.
+
+**Pre-1.0 reset.** Releases before 1.0 do not promise compatibility
+migrations. If a version incompatibility prevents startup, remove
+YadoriLink's local application state and credentials and set up again; your
+synced folders and their files are not deleted. Quit YadoriLink.app, run
+`yadorilink daemon stop`, and remove
+`~/Library/Application Support/yadorilink`,
+`~/Library/Group Containers/group.com.juntaki.yadorilink.shared`, and the
+Keychain items with service name `yadorilink` (or run
+`yadorilink forget-local-credentials`).
+
+The rest of this file is for building the package from source.
 
 ## Building
 
@@ -130,7 +174,7 @@ component `.pkg` via `pkgbuild --scripts`) run as root during install and:
    from inside the App Sandbox.
 3. Register the two extensions with PlugInKit (`pluginkit -a`, `pluginkit
    -e use`) and launch the host app once, hidden, so
-   `DomainRegistration.swift` can register any already-known OnDemand
+   `ProviderHostService` can register any already-known provider
    File Provider domains. This does **not** flip the user-visible enable
    toggle — Apple provides no supported API for that; the user still
    needs to enable "yadorilink FinderSync" / the File Provider domain in

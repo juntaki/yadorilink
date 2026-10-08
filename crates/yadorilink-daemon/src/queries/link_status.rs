@@ -23,7 +23,7 @@ use crate::durability_service::{DurabilityEvidence, GroupDurabilityStatus};
 /// Trust boundary: `FullCopy`
 /// reflects the `files.materialization_state` DB column's bookkeeping, not
 /// a live disk verification (existence/size/block-content check) -- a row
-/// left `Hydrated` after its on-disk file is externally deleted or
+/// left `Present` after its on-disk file is externally deleted or
 /// corrupted would still report `FullCopy` until the separate
 /// materialization-repair backstop reconciles it. Actually verifying disk
 /// state on every `status` call would make every invocation stat every
@@ -103,7 +103,10 @@ pub(crate) struct LinkTransferView {
 /// One linked folder's full status, as `ListLinks`/`Status` report it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LinkStatusView {
+    /// The link's identity key; for a provider folder (`provider` is `Some`) NOT a path.
     pub(crate) local_path: String,
+    /// `(root_id, display_name)` of a provider-backed folder.
+    pub(crate) provider: Option<(String, String)>,
     pub(crate) group_id: String,
     pub(crate) paused: bool,
     pub(crate) conflict_count: u64,
@@ -127,6 +130,9 @@ pub(crate) struct LinkStatusView {
     /// ninety seconds. This field is where that is said out loud rather than
     /// left for a reader to discover.
     pub(crate) durability_evidence: DurabilityEvidence,
+    /// `durability_status` is `Unknown` only because the first custody check
+    /// for this group has not run yet.
+    pub(crate) durability_check_pending: bool,
     pub(crate) policy_stale: bool,
     /// See `LocalStorageState`'s own doc comment.
     pub(crate) local_storage_state: LocalStorageState,

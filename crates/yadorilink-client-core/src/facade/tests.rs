@@ -19,7 +19,11 @@ fn sign_in_steps_pass_through_and_the_client_layers_signed_in_is_left_to_the_ses
         Some(LoginEvent::WaitingForApproval { expires_in: Duration::from_secs(9) })
     );
     assert_eq!(
-        login_event(Step::ShowDeviceCode { verification_uri: "u".into(), user_code: "c".into() }),
+        login_event(Step::ShowDeviceCode {
+            verification_uri: "u".into(),
+            verification_uri_complete: Some("u?c".into()),
+            user_code: "c".into(),
+        }),
         Some(LoginEvent::ShowDeviceCode { verification_uri: "u".into(), user_code: "c".into() })
     );
     assert_eq!(

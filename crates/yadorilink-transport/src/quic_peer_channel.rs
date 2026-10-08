@@ -80,8 +80,8 @@ use crate::quic_peer_endpoint::ConnectRole;
 ///
 /// No block content passes through here any more, so this no longer has to
 /// clear a block-sized message; what it has to clear is the largest
-/// *metadata* message the sync protocol produces, which is a bounded change
-/// batch or a re-bootstrap snapshot. It is kept at 2 MiB rather than
+/// *metadata* message the sync protocol produces, which is a bounded delta
+/// batch or a bootstrap snapshot. It is kept at 2 MiB rather than
 /// tightened along with the block protocol because that is a separate
 /// question with its own evidence -- the batch and snapshot bounds live in
 /// the crates that produce them -- and lowering it here on the strength of

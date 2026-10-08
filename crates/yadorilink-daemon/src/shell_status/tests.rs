@@ -172,7 +172,7 @@ async fn orphaned_link_resolves_to_no_status() {
     assert!(
         resolve_group_and_rel_path(&state.replica_coordinator, "/home/alice/Photos/vacation.jpg")
             .is_none(),
-        "an orphaned link must not resolve for the shell-IPC hydrate/pin/unpin/evict path \
+        "an orphaned link must not resolve for the shell-IPC hydrate/evict path \
          either"
     );
 }
@@ -377,4 +377,76 @@ async fn a_stale_retained_record_does_not_mask_a_live_entry() {
     let status = resolve_status_detail(&state.replica_coordinator, "/home/alice/Photos/build");
     assert_eq!(status.state, ShellSyncState::Synced);
     assert_eq!(status.detail, None, "the path is a live entry, not a retained directory");
+}
+
+/// The facts a shell is told: an object that stands under a proof naming the
+/// current version is current; when the proof cannot be READ the object still
+/// stands but is never reported current (fail closed).
+#[tokio::test]
+async fn an_unreadable_proof_is_never_current_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let state = state_with_link(&root.to_string_lossy(), "group-1");
+    upsert(&state, "report.pdf");
+    let on_disk = root.join("report.pdf");
+    std::fs::write(&on_disk, b"bytes").unwrap();
+    let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+    crate::test_support::seed_prior_cycle_proof(
+        &state.replica_coordinator,
+        "group-1",
+        "report.pdf",
+        &on_disk,
+        &permit,
+    );
+    let path = on_disk.to_string_lossy().to_string();
+    let present = Some(yadorilink_replica_domain::session_state::MaterializationState::Present);
+
+    let exact = resolve_content_is_current(&state.replica_coordinator, &path);
+    let proven = local_presence(present, exact).unwrap();
+    assert!(proven.object_present && proven.current_content_present);
+
+    state
+        .replica_coordinator
+        .database()
+        .pool_for_test()
+        .get()
+        .unwrap()
+        .execute_batch("DROP TABLE path_materialized_generations")
+        .unwrap();
+    let exact = resolve_content_is_current(&state.replica_coordinator, &path);
+    let unreadable = local_presence(present, exact).unwrap();
+    assert!(unreadable.object_present, "the object still stands");
+    assert!(!unreadable.current_content_present, "an unreadable proof was read as current");
+
+    let remote = local_presence(
+        Some(yadorilink_replica_domain::session_state::MaterializationState::Remote),
+        true,
+    )
+    .unwrap();
+    assert!(!remote.object_present && !remote.current_content_present);
+}
+
+#[tokio::test]
+async fn a_file_provider_location_resolves_by_display_name_not_by_path() {
+    use yadorilink_replica_domain::session_state::ProviderKind;
+    let state = state_with_link("provider://token", "group-1");
+    state
+        .replica_coordinator
+        .provider_repository()
+        .declare_root("group-1", ProviderKind::MacFileProvider, "Photos")
+        .unwrap();
+    let resolve =
+        |path: &str| resolve_provider_group_and_rel_path(&state.replica_coordinator, path);
+    assert_eq!(
+        resolve("/Users/a/Library/CloudStorage/YadoriLink-Photos/trips/a.jpg"),
+        Some(("group-1".to_string(), "trips/a.jpg".to_string()))
+    );
+    assert_eq!(
+        resolve("/Users/a/Library/CloudStorage/YadoriLink-Photos"),
+        Some(("group-1".to_string(), String::new()))
+    );
+    // Another folder's location, or a location that only ends in the same letters, is not it.
+    assert_eq!(resolve("/Users/a/Library/CloudStorage/YadoriLink-Docs/a.jpg"), None);
+    assert_eq!(resolve("/Users/a/Library/CloudStorage/YadoriLinkPhotos/a.jpg"), None);
+    assert_eq!(resolve("/Users/a/Documents/Photos/a.jpg"), None);
 }

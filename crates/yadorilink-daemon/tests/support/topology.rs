@@ -168,7 +168,8 @@ pub fn new_node(device_id: &str) -> TopologyNode {
 /// kernel closes the socket when the process exits, and it leaves every peer
 /// holding a connection to an address that has silently stopped answering.
 pub async fn shutdown_substrate(node: &TopologyNode) {
-    if let Some(driver) = node.state.reconciliation_driver() {
+    node.state.stop_background_tasks_for_tests();
+    if let Some(driver) = node.state.peer_session_driver() {
         driver.stack().shutdown().await;
     }
 }
@@ -218,13 +219,13 @@ pub async fn restart_node(node: TopologyNode) -> TopologyNode {
     // the link ROW in its reopened database, but no active
     // `LinkRuntimeController` watching the folder until something calls
     // `start` again -- so this device's OWN local writes after a
-    // "restart" never even reached the DAG. `OverrideForTest` is applied
+    // "restart" never even reached the DAG. `set_test_on_demand_allowed` is applied
     // unconditionally (harmless for an Eager link, required for
     // OnDemand) rather than duplicating `link_on_demand`'s own policy
     // branch here.
     let links = state.replica_coordinator.link_repository().list_links().unwrap();
     for link in links.iter().filter(|l| !l.orphaned) {
-        let _override = yadorilink_filesystem_sync::placeholder_backend::OverrideForTest::enable();
+        state.set_test_on_demand_allowed(true);
         // Bounded retry, same shape and reason as the DB-reopen retry
         // above: `stop()`'s own bounded retry (`link_runtime_
         // controller.rs`'s fence-gap fix) can still exhaust its attempts
@@ -237,7 +238,7 @@ pub async fn restart_node(node: TopologyNode) -> TopologyNode {
         let mut start_attempts = 0;
         loop {
             match LinkRuntimeController::new(state.clone())
-                .start(link.local_path.clone(), link.group_id.clone())
+                .start(link.key().to_string(), link.group_id.clone())
             {
                 Ok(()) => break,
                 Err(error) if start_attempts < 20 => {
@@ -272,16 +273,16 @@ pub fn link_eager(node: &TopologyNode, group_id: &str) {
 }
 
 /// `LinkRuntimeController::start` fail-closes an `OnDemand` link unless
-/// `on_demand_pipeline_is_connected()` reports a real platform-native
+/// the root's on-demand capability reports a real platform-native
 /// placeholder provider is wired up -- true only on real macOS/Windows
-/// hardware in production. `OverrideForTest` is the test-only escape
+/// hardware in production. `set_test_on_demand_allowed` is the test-only escape
 /// hatch this crate already wires a `test-support`-feature dev-dependency
 /// for; it forces the gate open for THIS THREAD only, matching this
 /// function's own synchronous, one-time-at-link-start call site (not
 /// re-checked on every hydration operation), so it does not need to
 /// cover the multi-threaded tokio runtime's worker threads.
 pub fn link_on_demand(node: &TopologyNode, group_id: &str) {
-    let _override = yadorilink_filesystem_sync::placeholder_backend::OverrideForTest::enable();
+    node.state.set_test_on_demand_allowed(true);
     let local_path = node.root.path().to_string_lossy().to_string();
     node.state.replica_coordinator.link_repository().add_link(&local_path, group_id).unwrap();
     node.state
@@ -382,7 +383,7 @@ impl super::SubstrateDevices for TopologySubstrateDevices<'_> {
     }
 
     fn serving_address(&self, index: usize) -> Option<super::SubstrateAddress> {
-        let driver = self.0[index].state.reconciliation_driver()?;
+        let driver = self.0[index].state.peer_session_driver()?;
         let address = driver.stack().local_address();
         let direct: Vec<std::net::SocketAddr> = address.direct_addrs().copied().collect();
         let relays: Vec<String> = address.relay_urls().map(ToString::to_string).collect();
@@ -392,7 +393,7 @@ impl super::SubstrateDevices for TopologySubstrateDevices<'_> {
     fn record(&self, target: usize, (peer, direct, relays): &super::SubstrateAddress) {
         self.0[target]
             .state
-            .reconciliation_driver()
+            .peer_session_driver()
             .expect("every node was proven to be serving in the phase above")
             .stack()
             .address_directory()

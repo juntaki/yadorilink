@@ -7,13 +7,9 @@ use yadorilink_root_authority::fs_identity::{
 
 fn open() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
-    crate::dag_store::init_dag_schema(&conn).unwrap();
+    crate::replica_tables::init_for_tests(&conn).unwrap();
     init_materialized_generation_schema(&conn).unwrap();
     conn
-}
-
-fn h(byte: u8) -> ChangeHash {
-    ChangeHash([byte; 32])
 }
 
 fn sample_identity() -> FileIdentity {
@@ -39,7 +35,7 @@ fn sample_basis(
 ) -> DiskGenerationBasis {
     DiskGenerationBasis {
         generation_id: GenerationId("g:1".to_string()),
-        causal_basis_id: CausalBasisId("g:cb1".to_string()),
+        basis: crate::materialization_basis::ReflectedHeads::of(&[], &[]),
         resolved_path_state_hash: [0; 32],
         object_kind,
         version: None,
@@ -151,7 +147,6 @@ fn a_new_generation_can_be_looked_up_back_exactly() {
         &conn,
         "g",
         "a.txt",
-        &[h(1), h(2)],
         MaterializedObjectKind::RegularFile,
         Some(&version),
         Some(&identity),
@@ -171,7 +166,6 @@ fn an_absent_path_is_recorded_as_its_own_object_kind_not_a_missing_row() {
         &conn,
         "g",
         "gone.txt",
-        &[h(9)],
         MaterializedObjectKind::Absent,
         None,
         None,
@@ -203,7 +197,6 @@ fn recording_a_new_generation_replaces_the_row_under_a_fresh_id_not_in_place() {
         &conn,
         "g",
         "a.txt",
-        &[h(1)],
         MaterializedObjectKind::RegularFile,
         Some(&VersionHash([1; 32])),
         None,
@@ -214,7 +207,6 @@ fn recording_a_new_generation_replaces_the_row_under_a_fresh_id_not_in_place() {
         &conn,
         "g",
         "a.txt",
-        &[h(2)],
         MaterializedObjectKind::RegularFile,
         Some(&VersionHash([2; 32])),
         None,
@@ -222,20 +214,22 @@ fn recording_a_new_generation_replaces_the_row_under_a_fresh_id_not_in_place() {
     )
     .unwrap();
     assert_ne!(first.generation_id, second.generation_id);
-    assert_ne!(first.causal_basis_id, second.causal_basis_id);
+    // Both generations rest on the same reflected-heads basis (no heads
+    // recorded here); what differs is the version each one proves.
+    assert_eq!(first.basis, second.basis);
+    assert_ne!(first.version, second.version);
     let read = lookup_materialized_generation(&conn, "g", "a.txt").unwrap().unwrap();
     assert_eq!(read, second, "must read back exactly the latest generation, not a merge");
 }
 
 #[test]
-fn a_million_paths_sharing_one_frontier_intern_one_basis_row() {
+fn many_paths_each_get_their_own_generation_row() {
     let conn = open();
     for i in 0..1000 {
         record_materialized_generation(
             &conn,
             "g",
             &format!("path-{i}.txt"),
-            &[h(1), h(2)],
             MaterializedObjectKind::RegularFile,
             Some(&VersionHash([1; 32])),
             None,
@@ -243,13 +237,10 @@ fn a_million_paths_sharing_one_frontier_intern_one_basis_row() {
         )
         .unwrap();
     }
-    let count: i64 =
-        conn.query_row("SELECT COUNT(*) FROM causal_basis_sets", [], |r| r.get(0)).unwrap();
-    assert_eq!(count, 1, "1000 paths sharing one frontier must intern to one basis row");
     let rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM path_materialized_generations", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(rows, 1000, "each path still gets its own generation row");
+    assert_eq!(rows, 1000, "each path gets its own generation row");
 }
 
 #[test]
@@ -341,7 +332,6 @@ fn record_materialized_generation_is_immediately_usable_via_lookup() {
         &conn,
         "g",
         "a.txt",
-        &[h(1)],
         MaterializedObjectKind::RegularFile,
         Some(&version),
         None,
@@ -361,7 +351,6 @@ fn a_row_becomes_unusable_the_moment_something_else_bumps_the_fence() {
         &conn,
         "g",
         "a.txt",
-        &[h(1)],
         MaterializedObjectKind::RegularFile,
         Some(&VersionHash([5; 32])),
         None,
@@ -390,7 +379,6 @@ fn publish_if_fence_current_succeeds_when_the_claimed_epoch_is_still_live() {
         &conn,
         "g",
         "a.txt",
-        &[h(1)],
         MaterializedObjectKind::RegularFile,
         Some(&VersionHash([5; 32])),
         None,
@@ -404,7 +392,7 @@ fn publish_if_fence_current_succeeds_when_the_claimed_epoch_is_still_live() {
 
 /// The headline regression this whole mechanism exists for: an attempt
 /// whose claimed epoch has been superseded by an independent mutator
-/// must have its publication rejected, regardless of the DAG frontier
+/// must have its publication rejected, regardless of the native frontier
 /// (which this test never even touches) -- Context finding 8's race.
 #[test]
 fn publish_if_fence_current_is_rejected_once_an_independent_mutator_has_bumped_it() {
@@ -419,7 +407,6 @@ fn publish_if_fence_current_is_rejected_once_an_independent_mutator_has_bumped_i
         &conn,
         "g",
         "c.txt",
-        &[h(1)],
         MaterializedObjectKind::RegularFile,
         Some(&VersionHash([5; 32])),
         None,
@@ -445,7 +432,6 @@ fn publish_if_fence_current_is_rejected_when_no_fence_row_exists_at_all() {
         &conn,
         "g",
         "never-fenced.txt",
-        &[h(1)],
         MaterializedObjectKind::RegularFile,
         Some(&VersionHash([5; 32])),
         None,
@@ -476,7 +462,6 @@ fn an_invalidated_absent_generation_is_unusable_exactly_like_no_proof_while_a_fr
         &conn,
         "g",
         "gone.txt",
-        &[h(9)],
         MaterializedObjectKind::Absent,
         None,
         None,
@@ -514,7 +499,6 @@ fn an_invalidated_absent_generation_is_unusable_exactly_like_no_proof_while_a_fr
         &conn,
         "g",
         "gone.txt",
-        &[h(9)],
         MaterializedObjectKind::Absent,
         None,
         None,
@@ -527,46 +511,6 @@ fn an_invalidated_absent_generation_is_unusable_exactly_like_no_proof_while_a_fr
         lookup_materialized_generation(&conn, "g", "gone.txt").unwrap().map(|b| b.object_kind),
         Some(MaterializedObjectKind::Absent),
         "a genuinely fresh Absent record must be usable again"
-    );
-}
-
-/// A generation row that predates the mutation-fence machinery
-/// entirely (no corresponding `path_actual_mutation_fences`
-/// row at all -- the pre-migration/backfill case) must be unusable,
-/// never vacuously trusted.
-#[test]
-fn a_generation_row_with_no_fence_row_at_all_is_unusable_the_pre_migration_backfill_case() {
-    let conn = open();
-    let causal_basis_id = CausalBasisId(intern_causal_basis(&conn, "g", &[h(1)]).unwrap());
-    let hash = compute_resolved_path_state_hash(
-        "g",
-        "pre-migration.txt",
-        MaterializedObjectKind::RegularFile,
-        None,
-    );
-    conn.execute(
-        "INSERT INTO path_materialized_generations
-            (group_id, path, generation_id, causal_basis_id, resolved_path_state_hash,
-             object_kind, version_hash, filesystem_identity, metadata_fingerprint,
-             hardlink_group_id, encoding_version, updated_at_unix_nanos,
-             published_under_mutation_generation)
-         VALUES ('g', 'pre-migration.txt', 'g:old', ?1, ?2, 'regular_file', NULL, NULL, NULL,
-                 NULL, 1, 500, NULL)",
-        rusqlite::params![causal_basis_id.0, &hash[..]],
-    )
-    .unwrap();
-    // Deliberately never call bump_mutation_fence/snapshot_mutation_fence
-    // for this path -- no row in path_actual_mutation_fences exists at all.
-
-    assert!(
-        lookup_materialized_generation(&conn, "g", "pre-migration.txt").unwrap().is_none(),
-        "a row with no fence row at all must be unusable"
-    );
-    assert!(
-        lookup_materialized_generation_diagnostic(&conn, "g", "pre-migration.txt")
-            .unwrap()
-            .is_some(),
-        "the diagnostic accessor must still see the raw pre-migration row"
     );
 }
 
@@ -583,7 +527,6 @@ fn bumping_the_fence_leaves_the_proof_rows_own_content_untouched() {
         &conn,
         "g",
         "a.txt",
-        &[h(3), h(4)],
         MaterializedObjectKind::RegularFile,
         Some(&version),
         Some(&identity),
@@ -624,7 +567,6 @@ fn stale_first_publication_is_rejected_when_no_proof_row_existed_yet() {
         &conn,
         "g",
         "c.txt",
-        &[h(5)],
         MaterializedObjectKind::RegularFile,
         None,
         None,
@@ -749,7 +691,6 @@ fn a_structural_directory_generation_is_usable_without_a_version() {
         &conn,
         "g",
         "a",
-        &[h(1)],
         MaterializedObjectKind::StructuralDirectory,
         None,
         Some(&identity),
@@ -770,7 +711,6 @@ fn a_versionless_kind_carrying_a_version_is_refused() {
             &conn,
             "g",
             "a",
-            &[h(1)],
             kind,
             Some(&VersionHash([1; 32])),
             None,

@@ -11,7 +11,7 @@ const PATH: &str = "notes.txt";
 fn open_full_test_db() -> Arc<SyncDatabase> {
     Arc::new(
         SyncDatabase::open_in_memory(|conn| {
-            crate::dag_store::init_dag_schema(conn).map_err(|e| {
+            crate::replica_tables::init_for_tests(conn).map_err(|e| {
                 yadorilink_sqlite_runtime::DatabaseError::CorruptSchema(e.to_string())
             })?;
             crate::materialized_generation::init_materialized_generation_schema(conn).map_err(
@@ -85,13 +85,13 @@ fn a_restore_that_loses_its_fence_writes_nothing_at_all() {
     let restores = RestoreOperationRepository::new(db.clone());
 
     // The live version the restore is about to supersede, left
-    // `Hydrated` the way a previously-materialized path is.
+    // `Present` the way a previously-materialized path is.
     file_index.upsert_file_with_origin(GROUP, &record(5), "device-a", &permit).unwrap();
     crate::materialization_state::MaterializationStateRepository::new(db.clone())
-        .set_materialization_state(GROUP, PATH, MaterializationState::Hydrated, &permit)
+        .set_materialization_state(GROUP, PATH, MaterializationState::Present, &permit)
         .unwrap();
     let (before_seq, before_state) = current_row(&db).expect("the live row");
-    assert_eq!(before_state, MaterializationState::Hydrated.as_db_str());
+    assert_eq!(before_state, MaterializationState::Present.as_db_str());
 
     restores
         .record_restore_operation(&RestoreOperation {
@@ -103,7 +103,6 @@ fn a_restore_that_loses_its_fence_writes_nothing_at_all() {
             state: RestoreOperationState::DiskCommitted,
             record: record(9),
             origin_device_id: "device-a".to_string(),
-            authoring_change_hash: None,
             meta: meta(),
         })
         .unwrap();
@@ -178,7 +177,7 @@ fn a_restore_settle_under_a_lost_root_writes_nothing_at_all() {
     let restores = RestoreOperationRepository::new(db.clone());
     file_index.upsert_file_with_origin(GROUP, &record(5), "device-a", &permit).unwrap();
     crate::materialization_state::MaterializationStateRepository::new(db.clone())
-        .set_materialization_state(GROUP, PATH, MaterializationState::Hydrated, &permit)
+        .set_materialization_state(GROUP, PATH, MaterializationState::Present, &permit)
         .unwrap();
     let before = current_row(&db).expect("the live row");
     restores
@@ -191,7 +190,6 @@ fn a_restore_settle_under_a_lost_root_writes_nothing_at_all() {
             state: RestoreOperationState::Prepared,
             record: record(9),
             origin_device_id: "device-a".to_string(),
-            authoring_change_hash: None,
             meta: meta(),
         })
         .unwrap();

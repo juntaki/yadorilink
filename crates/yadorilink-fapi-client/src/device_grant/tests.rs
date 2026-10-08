@@ -30,24 +30,38 @@ fn a_zero_interval_is_clamped_rather_than_spun_on() {
     assert_eq!(authorization.poll_interval(), Duration::from_secs(1));
 }
 
-/// The combined URI carries the user code, and the platform logs request
-/// URLs. What is printed to the user must not be the one that ends up in
-/// an access log.
-#[test]
-fn the_printed_instructions_never_carry_the_completed_verification_uri() {
-    let authorization = DeviceAuthorization {
+const COMPLETE: &str = "https://as.test/device?user_code=AAAA-BBBB-CCCC";
+
+fn authorization(complete: Option<&str>) -> DeviceAuthorization {
+    DeviceAuthorization {
         device_code: "dc".into(),
         user_code: "AAAA-BBBB-CCCC".into(),
         verification_uri: "https://as.test/device".into(),
-        verification_uri_complete: Some("https://as.test/device?user_code=AAAA-BBBB-CCCC".into()),
+        verification_uri_complete: complete.map(str::to_owned),
         expires_in: 600,
         interval: Some(5),
-    };
-    let printed = authorization.instructions();
-    assert!(printed.contains("https://as.test/device"));
-    assert!(printed.contains("AAAA-BBBB-CCCC"));
-    assert!(
-        !printed.contains("user_code="),
-        "the code must not be printed inside a URL a user will paste into an address bar"
+    }
+}
+
+/// With the completed URI the user opens ONE link and only compares the code;
+/// nothing is typed.
+#[test]
+fn the_printed_instructions_use_the_completed_uri_and_show_the_code_to_compare() {
+    let printed = authorization(Some(COMPLETE)).instructions();
+    assert_eq!(
+        printed,
+        "To finish signing in, open this link on any device (your phone is fine) and check that \
+         the code shown there matches:\n\n  https://as.test/device?user_code=AAAA-BBBB-CCCC\n\n  \
+         Code: AAAA-BBBB-CCCC\n"
     );
+    assert!(!printed.contains("enter this code"));
+}
+
+/// A server that sends no completed URI gets the two-part message.
+#[test]
+fn the_printed_instructions_fall_back_to_typing_the_code_without_a_completed_uri() {
+    let printed = authorization(None).instructions();
+    assert!(printed.contains("open https://as.test/device on any device and enter this code"));
+    assert!(printed.contains("AAAA-BBBB-CCCC"));
+    assert!(!printed.contains("user_code="));
 }
