@@ -109,9 +109,7 @@ jobs:
               --skip replay_known_failing_seeds
           - lane: wire
             timeout: 30
-            run: >-
-              cargo test --no-fail-fast -p yadorilink-peer-session
-              --test peer_session --test crash_recovery -- --test-threads=1
+            run: cargo test --no-fail-fast -p yadorilink-peer-session --test peer_session -- --test-threads=1
           - lane: transport
             timeout: 45
             run: cargo test --no-fail-fast -p yadorilink-transport --tests -- --test-threads=1

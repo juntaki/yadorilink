@@ -778,8 +778,10 @@ fn load_session(
         Some((floor, above)) => Session {
             floor: floor as u64,
             above: above
-                .chunks_exact(8)
-                .map(|c| u64::from_be_bytes(c.try_into().expect("8-byte chunk")))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| u64::from_be_bytes(*c))
                 .filter(|&seq| seq > floor as u64)
                 .collect(),
         },

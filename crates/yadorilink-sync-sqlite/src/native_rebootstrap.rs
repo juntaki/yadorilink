@@ -1987,18 +1987,18 @@ fn preserve(
         PlanError::Blocked(reason) => block(reason),
         PlanError::Store(error) => BeginError::Store(error),
     })?;
-    check_space(&plan, stored, ctx).map_err(&block)?;
+    check_space(&plan, stored, ctx).map_err(block)?;
     let area = RecoveryArea::create(ctx.recovery_root, group, recovery_id, ctx.sync_roots)
         .map_err(|e| block(area_failure(e)))?;
     set_state(conn, group, "preserving", ctx.now_unix)?;
-    write_target(conn, group, &area, stored, ctx.now_unix).map_err(&block)?;
+    write_target(conn, group, &area, stored, ctx.now_unix).map_err(block)?;
     hook(Failpoint::AfterTargetDurable).map_err(|_| BeginError::Crashed)?;
     let versions = copy_items(conn, group, &area, &plan, ctx, hook)?;
     let remote_only = save_remote_only(conn, group, verified, &plan, ctx, recovery_id, hook)?;
     hook(Failpoint::BeforeManifest).map_err(|_| BeginError::Crashed)?;
     // The barrier is crossed only over a set that is wholly durable: re-read, not remembered.
     crate::native_recovery_items::verify_items(conn, &ctx.items_root, group, &remote_only)
-        .map_err(&block)?;
+        .map_err(block)?;
     let manifest =
         build_manifest(group, recovery_id, &plan, versions, remote_only, stored, ctx.now_unix);
     let manifest_sha256 = area.write_manifest(&manifest).map_err(|e| block(area_failure(e)))?;
@@ -2240,7 +2240,7 @@ fn copy_items(
     let mut copies = Vec::new();
     let mut done = 0usize;
     for version in plan.versions.values() {
-        let entry = copy_version(conn, group, area, version, ctx).map_err(&block)?;
+        let entry = copy_version(conn, group, area, version, ctx).map_err(block)?;
         if entry.has_bytes {
             done += 1;
             mark_copied(conn, group, done, ctx.now_unix)?;

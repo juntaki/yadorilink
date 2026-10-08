@@ -138,7 +138,7 @@ impl FaultPlan {
             return false;
         }
         self.remaining
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |left| {
                 left.checked_sub(1).filter(|_| left > 0)
             })
             .is_ok()
