@@ -934,7 +934,20 @@ async fn a_crash_in_the_middle_of_the_batch_transaction_commits_none_of_it() {
         .test_observers
         .close_batch_fails_before_commit
         .store(false, std::sync::atomic::Ordering::SeqCst);
-    repair(&f);
+    // The restart's repair sweep. It `try_lock`s each path and leaves a path whose lock is held to
+    // its next pass (it runs on a live cadence, not only at startup), and the fixture's own
+    // watcher can hold one for a moment; a skipped path stays `Hydrating` with its intent open.
+    // The window's obligation does not wait for that pass (the engine closes it regardless), so
+    // the sweep is re-run until it has reached every path, as the cadence would.
+    let swept = std::time::Instant::now();
+    loop {
+        repair(&f);
+        if window.names.iter().all(|n| hydrated(&f, n) && !intent_open(&f, n)) {
+            break;
+        }
+        assert!(swept.elapsed() < Duration::from_secs(30), "the repair sweep never reached every path");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     drive_until(&f, &engine, "the window closes", |f| {
         window.names.iter().all(|n| obligation(f, n).is_none())
     })
