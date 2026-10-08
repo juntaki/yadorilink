@@ -114,6 +114,24 @@ fn sync_db_lock_rejects_hard_link_via_live_inode_flock() {
     assert!(err.to_string().contains("already in use"), "unexpected error: {err}");
 }
 
+/// A database absent at lock time gets its inode lock once it is created, so
+/// the first session is also protected against a hard-link alias.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn a_database_created_after_locking_gets_the_live_inode_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("sync-state.sqlite3");
+    let mut owner = ResourceLock::lock_sync_db(&db).unwrap();
+    std::fs::write(&db, b"").unwrap();
+    owner.lock_created_live_inode(&db).unwrap();
+
+    let hard = dir.path().join("aliased.sqlite3");
+    std::fs::hard_link(&db, &hard).unwrap();
+    let err = ResourceLock::lock_sync_db(&hard)
+        .expect_err("a hard link to the newly created DB inode must be rejected");
+    assert!(err.to_string().contains("already in use"), "unexpected error: {err}");
+}
+
 /// The live-inode flock must roll back with the sidecar: after the owner
 /// exits, a previously-rejected hard-link path must acquire cleanly
 /// (nothing was left locked).
@@ -173,6 +191,18 @@ fn stale_unlocked_lock_file_is_reacquired() {
     // no stale-PID logic, mirroring the config-dir lock.
     let _new_owner = ResourceLock::lock_block_store(&root)
         .expect("a stale (unlocked) lock file must be reacquired by a new owner");
+}
+
+// --- locking must not create the database -------------------------------
+
+/// An absent database is how startup tells a new install from a lost one.
+/// Locking it must not create an empty file that would pass that check.
+#[test]
+fn locking_a_missing_sync_db_does_not_create_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("sync-state.sqlite3");
+    let _lock = ResourceLock::lock_sync_db(&db).unwrap();
+    assert!(!db.exists(), "taking the lock must not create the database file");
 }
 
 // --- deterministic order + rollback -------------------------------------

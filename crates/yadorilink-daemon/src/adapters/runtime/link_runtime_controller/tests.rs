@@ -727,7 +727,13 @@ async fn stop_waits_for_an_admitted_operation_while_the_runtime_is_still_held() 
 /// group's peer-apply gate `Failed` until a relink or restart: nothing
 /// re-ran the scan. The executor keeps retrying with backoff for as long as
 /// the link runs, so the gate re-opens once the fault clears.
-#[tokio::test]
+// Multi-threaded on purpose: the executor's live flush loop bridges blocking
+// work with `tokio::task::block_in_place`, which panics on a current-thread
+// runtime. This test keeps a real watcher alive for seconds, so a filesystem
+// event for the folder (macOS FSEvents replays events from just before the
+// watch started, e.g. the temp dir's own creation) reaches that loop; on the
+// default test flavor it killed the executor and the gate never re-opened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_startup_fault_that_outlasts_the_immediate_attempts_is_retried_until_it_clears() {
     let state = test_state();
     let root = tempfile::tempdir().unwrap();

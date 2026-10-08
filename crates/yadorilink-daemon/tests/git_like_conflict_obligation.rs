@@ -434,16 +434,32 @@ async fn late_clone_after_merge_edit_preserves_the_pre_merge_loser() {
         state.len() == 2 && state.contains_key("tracked.txt")
     })
     .await;
-    let (conflict_name, conflict_content) = single_conflict(&conflicted);
+    let (_, conflict_content) = single_conflict(&conflicted);
     assert!(
         conflict_content == "feature branch A" || conflict_content == "feature branch B",
         "conflict copy did not preserve either branch: {conflicted:?}"
     );
 
+    // The merge edit supersedes only the head it was written over (the
+    // winner on disk); the pre-merge loser stays a live, concurrent head. Which
+    // of two concurrent heads keeps the real name is decided by the content
+    // version hash alone (`resolve_winner`), and that hash covers the file's
+    // mtime, so it differs from run to run: the merge commit may hold
+    // `tracked.txt` with the loser as the copy, or the other way round. Both are
+    // correct. What must hold on every replica, in either arrangement, is that
+    // exactly these two contents survive, one at the real name and one as
+    // exactly one conflict copy.
     write_file(a.root.path(), "tracked.txt", "merge commit C");
     let expected = settle_pair(a, b, "post-merge descendant", |state| {
-        state.get("tracked.txt").map(String::as_str) == Some("merge commit C")
-            && state.get(&conflict_name) == Some(&conflict_content)
+        let copies = state.iter().filter(|(name, _)| is_conflict_copy(name)).collect::<Vec<_>>();
+        let mut survivors = vec![
+            state.get("tracked.txt").map(String::as_str),
+            copies.first().map(|(_, content)| content.as_str()),
+        ];
+        survivors.sort();
+        let mut wanted = vec![Some(conflict_content.as_str()), Some("merge commit C")];
+        wanted.sort();
+        state.len() == 2 && copies.len() == 1 && survivors == wanted
     })
     .await;
 

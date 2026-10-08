@@ -442,7 +442,8 @@ mod windows_pipe_tests {
     use yadorilink_ipc_proto::framing::{read_message, write_message};
     use yadorilink_ipc_proto::shellipc::shell_ipc_message::Payload;
     use yadorilink_ipc_proto::shellipc::{
-        HydrateRequest, ShellIpcMessage, SyncState as ShellSyncState,
+        HydrateRequest, LocalState as ShellLocalState, LocalTransition as ShellLocalTransition,
+        ShellIpcMessage, SyncState as ShellSyncState,
     };
     use yadorilink_local_storage::SegmentBlockStore;
     use yadorilink_replica_domain::file::FileRecord;

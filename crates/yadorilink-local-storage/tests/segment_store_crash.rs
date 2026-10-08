@@ -31,6 +31,25 @@ use yadorilink_local_storage::{
 /// Small on purpose: a 4 KiB segment target makes roll-over reachable with
 /// a handful of 600-byte blocks, so the roll-over boundary is exercised by
 /// the same harness as every other one.
+/// Removes `path` if it exists. On Windows a just-closed SQLite file can
+/// stay briefly locked by the OS (scanner/indexer), so a failure is retried
+/// for a bounded time rather than silently leaving the file behind (which
+/// would make the test open an intact store instead of a missing-index one).
+fn remove_file_if_present(path: &std::path::Path) {
+    let mut last = None;
+    for _ in 0..100 {
+        match std::fs::remove_file(path) {
+            Ok(()) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                last = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+    panic!("could not remove {}: {:?}", path.display(), last);
+}
+
 fn limits() -> GroupCommitLimits {
     GroupCommitLimits { segment_target_bytes: 4096, ..GroupCommitLimits::default() }
 }
@@ -575,7 +594,7 @@ fn a_missing_index_beside_surviving_segments_fails_closed_and_keeps_them() {
     assert!(!segments_before.is_empty());
 
     for entry in ["index.sqlite3", "index.sqlite3-wal", "index.sqlite3-shm"] {
-        let _ = std::fs::remove_file(dir.path().join(entry));
+        remove_file_if_present(&dir.path().join(entry));
     }
 
     match SegmentBlockStore::with_limits(dir.path(), limits()) {
