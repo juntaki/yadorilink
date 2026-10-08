@@ -312,10 +312,13 @@ pub const fn platform_supports_directory_durability() -> bool {
 /// [`platform_supports_directory_durability`], with a test seam to stand in for
 /// a platform that lacks it.
 pub(crate) fn directory_durability_available() -> bool {
+    // Under test the rebootstrap logic is exercised on every platform, so
+    // Windows runs it too; whether a platform really can flush a directory
+    // entry is asserted separately by `only_a_unix_platform_claims_directory_durability`
+    // and the refusal by `a_platform_without_directory_durability_starts_nothing`.
     #[cfg(test)]
-    if test_hooks::NO_DIRECTORY_DURABILITY.with(std::cell::Cell::get) {
-        return false;
-    }
+    return !test_hooks::NO_DIRECTORY_DURABILITY.with(std::cell::Cell::get);
+    #[cfg(not(test))]
     platform_supports_directory_durability()
 }
 
