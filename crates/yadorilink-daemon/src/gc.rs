@@ -7,7 +7,7 @@
 //! the wire types.
 //!
 //! Liveness is computed fresh from the index
-//! (`SyncState::live_block_hashes_including_all_dag_retention_roots`) on
+//! (`SyncState::live_block_hashes_including_native_heads`) on
 //! every sweep rather than transactionally refcounted, so this module needs
 //! no persisted state of its own beyond simple bookkeeping counters (below)
 //! — a crash mid-sweep just leaves some already-deleted blocks deleted and
@@ -93,7 +93,7 @@ fn now_unix() -> i64 {
 /// -style runtime hygiene, mirroring `SegmentBlockStore::present_blocks`:
 /// the actual sweep is synchronous, batch-throttled blocking I/O
 /// (`SegmentBlockStore::sweep`'s own pacing sleep between batches,
-/// `SyncState::live_block_hashes_including_all_dag_retention_roots`'s SQLite
+/// `SyncState::live_block_hashes_including_native_heads`'s SQLite
 /// scan) — run through
 /// `block_in_place` off the async caller's own poll when a multi-threaded
 /// tokio runtime is current, so a large sweep never stalls the runtime's
@@ -114,6 +114,31 @@ async fn run_sweep_with_grace_cutoff(
     dry_run: bool,
     grace_cutoff: SystemTime,
 ) -> Result<GcReport, GcTriggerError> {
+    run_sweep_with_policy(state, dry_run, grace_cutoff, EmptyLiveSet::Allow).await
+}
+
+/// The idle scheduler's sweep, with the same injectable cutoff.
+async fn run_idle_sweep_with_grace_cutoff(
+    state: Arc<DaemonState>,
+    grace_cutoff: SystemTime,
+) -> Result<GcReport, GcTriggerError> {
+    run_sweep_with_policy(state, false, grace_cutoff, EmptyLiveSet::Refuse).await
+}
+
+/// Whether a sweep may proceed when nothing at all is live yet the store
+/// holds reclaimable blocks.
+#[derive(Clone, Copy)]
+enum EmptyLiveSet {
+    Allow,
+    Refuse,
+}
+
+async fn run_sweep_with_policy(
+    state: Arc<DaemonState>,
+    dry_run: bool,
+    grace_cutoff: SystemTime,
+    empty_live_set: EmptyLiveSet,
+) -> Result<GcReport, GcTriggerError> {
     // Offloads onto a `block_in_place` worker when a multi-thread runtime is
     // current, otherwise runs inline (never a multi-thread worker to offload
     // onto: a current-thread runtime, called outside a runtime, or the
@@ -122,7 +147,7 @@ async fn run_sweep_with_grace_cutoff(
     // call site in this crate that wraps a plain synchronous function this
     // way -- see `daemon_state::run_blocking_sweep_offloaded`'s doc comment.
     crate::daemon_state::run_blocking_sweep_offloaded(|| {
-        run_sweep_sync(&state, dry_run, grace_cutoff)
+        run_sweep_sync(&state, dry_run, grace_cutoff, empty_live_set)
     })
 }
 
@@ -130,6 +155,7 @@ fn run_sweep_sync(
     state: &DaemonState,
     dry_run: bool,
     grace_cutoff: SystemTime,
+    empty_live_set: EmptyLiveSet,
 ) -> Result<GcReport, GcTriggerError> {
     let _guard = state.gc.try_start().map_err(|()| GcTriggerError::AlreadyRunning)?;
 
@@ -164,7 +190,7 @@ fn run_sweep_sync(
     let live = state
         .replica_coordinator
         .materialization_state_repository()
-        .live_block_hashes_including_all_dag_retention_roots()
+        .live_block_hashes_including_native_heads()
         .map_err(|e| GcTriggerError::Failed(e.to_string()))?;
     // `DaemonState::block_store` is already an erased `Arc<dyn BlockStore +
     // Send + Sync>`, which does not itself unsize-coerce to `&dyn
@@ -172,6 +198,26 @@ fn run_sweep_sync(
     // relationship, not one established only via a blanket impl) — wrap it
     // through the adapter, same as every other daemon-side call site below.
     let block_reclamation = BlockStorePortsAdapter::new(state.block_store.clone());
+    if matches!(empty_live_set, EmptyLiveSet::Refuse) && live.is_empty() {
+        // Nothing is referenced, so everything old enough is garbage -- which
+        // is also exactly what a replica index that was lost or rebuilt empty
+        // over a surviving block store looks like. Only an explicit on-demand
+        // sweep may act on that reading.
+        let probe = yadorilink_filesystem_sync::block_deletion::sweep_globally_unreferenced_blocks(
+            &_block_deletion,
+            &block_reclamation,
+            &live,
+            grace_cutoff,
+            true,
+        )
+        .map_err(|e| GcTriggerError::Failed(e.to_string()))?;
+        if probe.blocks_deleted > 0 {
+            return Err(GcTriggerError::Failed(format!(
+                "refusing an automatic sweep: the replica index references no blocks but the                  block store holds {} reclaimable block(s); if the index was lost, restore it,                  otherwise run `yadorilink gc` explicitly",
+                probe.blocks_deleted
+            )));
+        }
+    }
     let report = yadorilink_filesystem_sync::block_deletion::sweep_globally_unreferenced_blocks(
         &_block_deletion,
         &block_reclamation,
@@ -208,122 +254,7 @@ pub async fn maybe_run_idle_sweep(
     if state.idle_duration() < idle_threshold {
         return None;
     }
-    Some(run_sweep(state.clone(), false).await)
-}
-
-/// resolves `materialization::run_eviction_sweep`'s previously
-/// entirely-absent periodic caller — `run_eviction_sweep` existed but
-/// had no periodic caller in the daemon at all. Runs on the same
-/// idle-scheduler cadence as the GC sweep above: every `OnDemand` link
-/// with a configured `max_local_size_bytes` cap gets that cap enforced
-/// here too, not only reactively on measured disk-space pressure
-/// (`run_disk_pressure_eviction_sweep`, already wired from
-/// `hydration.rs`'s materialize path) or never at all between hydrations.
-/// Deliberately not gated on `idle_duration`/`is_write_safe_point` the way
-/// the GC sweep above is — eviction only ever demotes an already-hydrated
-/// file back to a placeholder (index write + one file rename), the same
-/// bounded, synchronous-SQLite-and-filesystem-only shape as
-/// `run_retention_expiry_sweep`, not the store-wide directory walk GC's
-/// sweep performs, so it does not compete for IO the way this change's
-/// own scheduling logic exists to protect against.
-///
-/// Logs (rather than propagates) a per-link failure so one link's error
-/// never stops the sweep from covering the rest, mirroring
-/// `run_retention_expiry_sweep`'s own per-link error handling.
-pub fn run_periodic_capacity_eviction_sweep(state: &DaemonState) {
-    let links = match state.replica_coordinator.link_repository().list_links() {
-        Ok(links) => links,
-        Err(e) => {
-            tracing::warn!(error = %e, "periodic capacity-eviction sweep: failed to list links");
-            return;
-        }
-    };
-    for link in links {
-        // An orphaned link is no longer a live sync target -- eviction still
-        // writes to disk (renaming a hydrated file back to a placeholder),
-        // which would violate "orphaned never touches on-disk files" the
-        // same way any other sync activity would.
-        if link.orphaned {
-            continue;
-        }
-        if link.materialization_policy
-            != yadorilink_replica_domain::session_state::MaterializationPolicy::OnDemand
-            || link.max_local_size_bytes.is_none()
-        {
-            continue;
-        }
-        if !yadorilink_filesystem_sync::placeholder_backend::on_demand_pipeline_is_connected() {
-            tracing::warn!(
-                group_id = %link.group_id,
-                local_path = %link.local_path,
-                "periodic capacity-eviction sweep: on-demand placeholder pipeline is not \
-                 connected; refusing to evict"
-            );
-            continue;
-        }
-        let root = std::path::Path::new(&link.local_path);
-        let root_lease = match state.root_lease_for(&link.group_id) {
-            Ok(lease) => lease,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    group_id = %link.group_id,
-                    local_path = %link.local_path,
-                    "periodic capacity-eviction sweep: no live root lease for this link"
-                );
-                continue;
-            }
-        };
-        let root_op = match root_lease.begin_operation() {
-            Ok(op) => op,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    group_id = %link.group_id,
-                    local_path = %link.local_path,
-                    "periodic capacity-eviction sweep: root lease refused a new operation"
-                );
-                continue;
-            }
-        };
-        let root_commit_permit = root_op.permit();
-        // See `run_sweep_sync`'s matching comment: `state.block_store` is an
-        // already-erased `Arc<dyn BlockStore + Send + Sync>`, so it needs the
-        // adapter to reach `&dyn BlockReclamationStore`.
-        let block_reclamation = BlockStorePortsAdapter::new(state.block_store.clone());
-        // This loop only reaches OnDemand links, so this device is not a full
-        // replica of the group; custody is consulted per file so the sweep only
-        // reclaims blocks a full replica is confirmed to hold.
-        match yadorilink_filesystem_sync::materialization_eviction::run_eviction_sweep(
-            yadorilink_filesystem_sync::materialization_eviction::MaterializationContext {
-                state: state.replica_coordinator.as_ref(),
-                liveness_gate: state.block_liveness_gate(),
-                store: &block_reclamation,
-                root,
-                permit: &root_commit_permit,
-            },
-            &link.group_id,
-            false,
-            link.max_local_size_bytes,
-            state,
-        ) {
-            Ok(evicted) if !evicted.is_empty() => {
-                tracing::debug!(
-                    group_id = %link.group_id,
-                    local_path = %link.local_path,
-                    evicted_count = evicted.len(),
-                    "periodic capacity-eviction sweep evicted files back to placeholders"
-                );
-            }
-            Ok(_) => {}
-            Err(e) => tracing::warn!(
-                error = %e,
-                group_id = %link.group_id,
-                local_path = %link.local_path,
-                "periodic capacity-eviction sweep failed for this link"
-            ),
-        }
-    }
+    Some(run_idle_sweep_with_grace_cutoff(state.clone(), SystemTime::now() - GC_GRACE_WINDOW).await)
 }
 
 #[cfg(test)]

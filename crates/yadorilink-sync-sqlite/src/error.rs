@@ -26,6 +26,11 @@ pub enum SyncSqliteError {
     #[error("invalid input: {0}")]
     InvalidInput(String),
 
+    /// A closure was refused: it does not verify, was signed by another device,
+    /// or does not belong to the state it is offered with. Nothing was stored.
+    #[error("closure refused: {0}")]
+    ClosureRefused(String),
+
     /// An I/O failure surfaced while satisfying a
     /// [`yadorilink_root_authority::root_commit::RootCommitPermit::verify`]
     /// re-check inside a write transaction (see
@@ -36,7 +41,7 @@ pub enum SyncSqliteError {
     Io(#[from] std::io::Error),
 
     /// A path names a component reserved for transaction artefacts
-    /// somewhere it must not: a peer change naming one before DAG
+    /// somewhere it must not: a peer delta naming one before
     /// admission, a collision detected at artefact creation, or one found
     /// unexpectedly at startup. Fail-closed and carries the exact path --
     /// the offending path is never admitted, materialized or deleted.
@@ -54,38 +59,41 @@ pub enum SyncSqliteError {
     )]
     NonPortablePath(String),
 
-    /// A HistoryBase snapshot that does not carry an author this replica
-    /// holds a position for at least as far as this replica holds it: the
-    /// author is missing from the base, stands behind its position here, or
-    /// stands at that position attested by a different change.
-    ///
-    /// Installing it would leave replicas disagreeing about that author for
-    /// good. This one would keep the author where it is -- anchored on the
-    /// history being replaced, or on a change of that history -- while a
-    /// replica installing the base fresh starts it from whatever the base
-    /// says, and the two then admit that author's next changes differently.
+    /// A local authoring of a path held by a held-path hold (see
+    /// `crate::held_path`): the object on disk there belongs to no
+    /// row this device placed, so it is not an edit of the row the index
+    /// holds; the reconciliation pass decides what it is.
     #[error(
-        "re-bootstrap snapshot for group {group_id} does not carry author {device_id} at least \
-         as far as this replica holds it; refusing to install a base its authors cannot all \
-         continue from"
+        "{group_id}/{path} is held pending reconciliation of its disk state; a local change to \
+         it cannot be authored until it is"
     )]
-    HistoryBaseInstallDoesNotCarryAuthor { group_id: String, device_id: String },
+    PathAwaitingHeldPathReconciliation { group_id: String, path: String },
 
-    /// A local authoring of a path a HistoryBase snapshot install replaced
-    /// and has not yet reconciled on disk. Whatever local capture read
-    /// there has the replaced row, not the installed one, as its base, so
-    /// it is not an edit of the installed version; the reconciliation pass
-    /// decides what it is. See `crate::snapshot_install_hold`.
+    /// A delta, write, delete, rename or replace refused because a rebootstrap has frozen the
+    /// group (see `crate::native_rebootstrap::group_frozen`). Nothing was written. Not a fault of the
+    /// delta: a local edit is captured again, and a remote delta is delivered again, once the
+    /// rebootstrap has finished or been discarded.
+    #[error("group {group_id} is frozen by a rebootstrap")]
+    GroupFrozen { group_id: String },
+
+    /// A local write whose row no longer shows what the writer was shown
+    /// when the write was captured: another head replaced it in between.
+    /// Nothing was written. Authoring it anyway would supersede a version
+    /// the writer never saw, so the write is captured again against the
+    /// row as it stands now.
     #[error(
-        "{group_id}/{path} was replaced by a snapshot install whose disk state is not reconciled \
-         yet; a local change to it cannot be authored until it is"
+        "{group_id}/{path} changed between the capture of a local write and its commit; the \
+         write was not authored and must be captured again"
     )]
-    PathAwaitingSnapshotInstallReconciliation { group_id: String, path: String },
+    LocalWriteCaptureStale { group_id: String, path: String },
 
-    /// A seal refused because one of its preconditions does not hold. See
-    /// [`crate::rebootstrap_store::SealRefusal`] for each.
-    #[error("refusing to seal the history of group {group_id}: {refusal}")]
-    SealRefused { group_id: String, refusal: crate::rebootstrap_store::SealRefusal },
+    /// A local authoring refused by an authoring rule
+    /// ([`yadorilink_replica_domain::author::AuthoringRefusal`]). Nothing was
+    /// signed or written. Kept structured so the caller can react to the
+    /// refusals that need it: `StaleAuthor` and `OwnAuthorAhead` rotate the
+    /// incarnation and author again.
+    #[error("local authoring refused: {refusal:?}")]
+    AuthoringRefused { refusal: yadorilink_replica_domain::author::AuthoringRefusal },
 
     #[error("hex decode error: {0}")]
     Hex(#[from] hex::FromHexError),
@@ -112,6 +120,11 @@ pub enum SyncSqliteError {
     )]
     AmbiguousLink { group_id: String, local_paths: Vec<String> },
 
+    /// A filesystem root was asked of a provider-backed group: it has no directory and never yields a
+    /// path.
+    #[error("group {0} is a provider-backed root: it has no filesystem path")]
+    NotFilesystemRoot(String),
+
     /// A change-emitting write's `local_emission_auth` pre-check: the
     /// group's policy has not loaded this run, so the write withheld its
     /// emission rather than stamp a placeholder-auth change.
@@ -119,8 +132,8 @@ pub enum SyncSqliteError {
     PolicyUnavailable,
 }
 
-impl From<yadorilink_replica_domain::change::PolicyUnavailable> for SyncSqliteError {
-    fn from(_: yadorilink_replica_domain::change::PolicyUnavailable) -> Self {
+impl From<yadorilink_replica_domain::local_op::PolicyUnavailable> for SyncSqliteError {
+    fn from(_: yadorilink_replica_domain::local_op::PolicyUnavailable) -> Self {
         SyncSqliteError::PolicyUnavailable
     }
 }

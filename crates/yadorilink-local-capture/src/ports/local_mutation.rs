@@ -1,6 +1,6 @@
 //! The capability surface `LocalChangeProcessor` (`local_change.rs`) needs
 //! from a replica-state type: committing a detected local edit (upsert or
-//! delete) as a DAG-emitting index write, plus the dirty-path journal that
+//! delete) as a delta-emitting index write, plus the dirty-path journal that
 //! survives a crash between detection and that commit. Every method below
 //! is called by `local_change.rs` today via `self.state.<method>`,
 //! surveyed directly from that file. Three additions beyond that original
@@ -17,19 +17,18 @@ use std::path::Path;
 use std::sync::Arc;
 
 use yadorilink_replica_domain::file::FileRecord;
-use yadorilink_replica_domain::ids::ChangeHash;
 use yadorilink_replica_domain::session_state::MaterializationState;
 use yadorilink_replica_domain::session_state::{
-    ChangeContent, DirtyPath, LocalFileMetaColumns, PreparedLocalMutation,
+    DirtyPath, LocalFileMetaColumns, PreparedLocalMutation,
 };
 use yadorilink_root_authority::root_commit::RootCommitPermit;
-use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
+use yadorilink_sync_sqlite::dag_store::LocalAuthorKey;
 use yadorilink_sync_sqlite::structural_origin::StructuralDirectoryOrigin;
 use yadorilink_sync_sqlite::SyncSqliteError;
 
 #[derive(Clone, Copy)]
 pub struct LocalChangeEmission<'a> {
-    pub emitter: &'a ChangeEmitter,
+    pub author: &'a LocalAuthorKey,
     pub permit: &'a RootCommitPermit<'a>,
 }
 
@@ -38,15 +37,33 @@ pub struct LocalChangeEmission<'a> {
 /// with the mode being authored, its identity.
 pub struct CapturedDirectory {
     pub record: FileRecord,
-    pub op: yadorilink_replica_domain::change::Op,
+    pub op: yadorilink_replica_domain::local_op::Op,
     pub version: yadorilink_replica_domain::file::FileVersion,
     pub meta: LocalFileMetaColumns,
     pub identity: Option<yadorilink_root_authority::fs_identity::FileIdentity>,
 }
 
+/// The answer of [`LocalMutationStore::inspect_windows_placeholder`]: whether
+/// the OS still reports the Cloud Files placeholder at a path as the exact,
+/// untouched object the daemon recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaceholderStatus {
+    /// The on-disk object is still exactly the recorded placeholder: safe to
+    /// hydrate over or evict back to a placeholder without losing anything.
+    Untouched,
+    /// The OS's own signal (not this process's stat heuristics) says the
+    /// object has been written to, replaced, or otherwise materialized since
+    /// it was recorded: a real local change, never silently overwritten.
+    Dirty,
+    /// Could not determine which of the above is true (the object is gone,
+    /// the identity does not decode, the OS call failed). Fails closed: every
+    /// caller treats this exactly like `Dirty`, never like `Untouched`.
+    Unknown,
+}
+
 /// Capability surface `LocalChangeProcessor` needs to turn a detected local
-/// filesystem event into a committed index row plus DAG change, and to
-/// journal the attempt durably across the read/blockify/put/index+DAG step
+/// filesystem event into a committed index row plus native delta, and to
+/// journal the attempt durably across the read/blockify/put/index+delta step
 /// so a crash or block-store fault cannot silently drop the edit.
 pub trait LocalMutationStore: Send + Sync {
     /// Acquires the per-`(group_id, path)` lock serializing this local
@@ -78,6 +95,41 @@ pub trait LocalMutationStore: Send + Sync {
         group_id: &str,
         path: &str,
     ) -> Result<Option<yadorilink_sync_sqlite::CanonicalCurrentRow>, SyncSqliteError>;
+
+    /// Native's own capture witness for `path` -- read alongside
+    /// [`canonical_current_row`](Self::canonical_current_row), never
+    /// derived from it. A prepared mutation carries it, and the commit
+    /// refuses the mutation when native no longer shows it.
+    fn native_capture_witness(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<yadorilink_replica_domain::native_state::NativeCaptureWitness, SyncSqliteError>;
+
+    /// [`native_capture_witness`](Self::native_capture_witness) for every
+    /// path native knows in the group, from one read (for a whole-index
+    /// snapshot). A path missing from the result has no head and no
+    /// binding: use `yadorilink_sync_sqlite::native_projection_binding::
+    /// absent_native_witness`.
+    fn native_capture_witnesses(
+        &self,
+        group_id: &str,
+    ) -> Result<
+        std::collections::HashMap<
+            String,
+            yadorilink_replica_domain::native_state::NativeCaptureWitness,
+        >,
+        SyncSqliteError,
+    >;
+
+    /// Whether native still shows `witness` at its physical path: native's
+    /// staleness verdict, the one that decides whether a prepared local
+    /// mutation may still be committed.
+    fn native_capture_is_fresh(
+        &self,
+        group_id: &str,
+        witness: &yadorilink_replica_domain::native_state::NativeCaptureWitness,
+    ) -> Result<bool, SyncSqliteError>;
 
     /// Bulk materialization-state lookup for a whole group — used by
     /// `scan_existing_files` so deciding whether an on-disk entry is a
@@ -130,6 +182,19 @@ pub trait LocalMutationStore: Send + Sync {
         path: &str,
     ) -> Result<Option<Vec<u8>>, SyncSqliteError>;
 
+    /// The content targets of what this daemon's own writes may have left
+    /// on disk at `path` while a write of other content is open over it: the
+    /// version it was last proven to hold, even if that proof has been
+    /// invalidated since, and every earlier write the open intent replaced
+    /// before it was proven. Capture never authors bytes equal to one of
+    /// these while such a write is open (see `yadorilink_sync_sqlite::
+    /// materialized_generation::pre_image_content_targets`).
+    fn pre_image_content_targets(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Vec<Vec<u8>>, SyncSqliteError>;
+
     /// Whether `(group_id, path)` still has an unsettled, REMOTE-origin
     /// `projection_obligations` row -- distinct from
     /// `has_materialization_intent` above, which only covers the narrower
@@ -140,7 +205,7 @@ pub trait LocalMutationStore: Send + Sync {
     /// "we know about this file and are still placing it locally" as an
     /// in-flight intent is: the startup reconciliation scan's own
     /// `has_materialization_intent` check alone is not enough to protect
-    /// this state; a newly-arrived DAG record whose obligation is still
+    /// this state; a newly-arrived native delta whose obligation is still
     /// unsettled when a restart's scan runs was silently tombstoned before
     /// this check existed. While a REMOTE-origin obligation exists for a
     /// path, an absent local file must not yet be interpreted as an
@@ -164,18 +229,41 @@ pub trait LocalMutationStore: Send + Sync {
     /// on disk, and resuming the item captures it.
     fn paused_items(&self, group_id: &str) -> Result<Vec<String>, SyncSqliteError>;
 
-    /// The paths of `group_id` a HistoryBase snapshot install replaced and
-    /// has not yet reconciled on disk (see
-    /// `yadorilink_sync_sqlite::snapshot_install_hold`). Whatever is on
-    /// disk under one of them has the replaced row as its base, so no local
-    /// change to it -- edit or deletion -- is authored until the
+    /// The held paths of `group_id` whose disk has not yet been reconciled
+    /// (see `yadorilink_sync_sqlite::held_path`). Whatever is on
+    /// disk under one of them belongs to no row this device placed, so no
+    /// local change to it -- edit or deletion -- is authored until the
     /// reconciliation pass has released it.
-    fn snapshot_install_held_paths(&self, group_id: &str) -> Result<Vec<String>, SyncSqliteError>;
+    fn held_path_names(&self, group_id: &str) -> Result<Vec<String>, SyncSqliteError>;
+
+    /// Whether a rebootstrap freezes `group_id` (see
+    /// `yadorilink_sync_sqlite::native_rebootstrap::group_frozen`). Nothing is authored
+    /// for a frozen group: its disk edits stay as they are, and the scan that follows the
+    /// freeze captures them.
+    fn group_frozen(&self, group_id: &str) -> Result<bool, SyncSqliteError>;
+
+    /// Holds `path` for a local edit that cannot be authored there because
+    /// this replica's own bucket at the path is full of versions it was not
+    /// shown (see `yadorilink_sync_sqlite::held_path::
+    /// HeldPathRepository::hold_unauthorable_local_edit`). The
+    /// reconciliation that preserves the edit as a conflict copy and places
+    /// the path's current value runs once woken
+    /// ([`Self::wake_install_reconciliation`]).
+    fn hold_unauthorable_local_edit(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<(), SyncSqliteError>;
+
+    /// Wakes the reconciliation of held paths now. The pass skips a path
+    /// whose lock is held, so a caller that held a path wakes it after
+    /// releasing that path's lock.
+    fn wake_install_reconciliation(&self);
 
     /// Whether `(group_id, path)`'s current row is hazard-held right now
     /// (`held_reason` set -- a case-fold/reserved-name/other on-disk-name
     /// collision `hold_record` recorded, per that function's own doc
-    /// comment). A held row is `Placeholder`, has nothing written under
+    /// comment). A held row is `Remote`, has nothing written under
     /// this exact name, and opens no materialization intent -- by design,
     /// per `hold_record`'s own fix -- so neither `has_materialization_
     /// intent` nor (once `HazardHeld` settlement deletes the path's
@@ -242,10 +330,25 @@ pub trait LocalMutationStore: Send + Sync {
         sync_root: &Path,
     ) -> yadorilink_root_authority::fs_identity::TimestampGranularity;
 
+    /// Whether the regular file at `out_path` is, untouched, what a usable
+    /// proof says this device wrote at `path` -- whichever version the row
+    /// now names. A `Present` row says only that an object exists, so an
+    /// older version's bytes can stand under a newer row; those bytes are
+    /// the daemon's own write, not an edit, and must not be authored over the
+    /// newer version. Fail-closed: any doubt is `false`, which leaves the
+    /// file to the ordinary comparison against the row.
+    fn disk_is_untouched_proven_write(
+        &self,
+        group_id: &str,
+        path: &str,
+        sync_root: &Path,
+        out_path: &Path,
+    ) -> Result<bool, SyncSqliteError>;
+
     /// Bulk placeholder-identity lookup for a whole group -- used by
     /// `scan_existing_files` for the same reason as
     /// `list_materialization_states`: one query for the whole scan instead
-    /// of one per file. Only paths whose row is currently `Placeholder`
+    /// of one per file. Only paths whose row is currently `Remote`
     /// AND carries a recorded identity appear here -- see
     /// `MaterializationStateRepository::list_placeholder_generations`'s own
     /// doc comment for why the state gate matters.
@@ -272,7 +375,7 @@ pub trait LocalMutationStore: Send + Sync {
     /// call): any failure to confirm both -- the path isn't a real
     /// placeholder, the identity doesn't decode, the API call itself
     /// fails -- must come back as
-    /// [`yadorilink_filesystem_sync::placeholder_backend::PlaceholderStatus::Unknown`],
+    /// [`PlaceholderStatus::Unknown`],
     /// which every caller treats exactly like `Dirty` (fail-closed).
     ///
     /// `path` is the absolute on-disk path, not a `group_id`/relative-path
@@ -285,38 +388,7 @@ pub trait LocalMutationStore: Send + Sync {
         &self,
         path: &Path,
         expected_generation: u64,
-    ) -> yadorilink_filesystem_sync::placeholder_backend::PlaceholderStatus;
-
-    /// Commits a local create/update and appends the signed DAG change
-    /// describing it, in one transaction — the primary write for a captured
-    /// local edit.
-    ///
-    /// `filesystem_identity`: `Some` only when the caller has a strong
-    /// `FileIdentity` freshly observed from the real path, immediately
-    /// before this call, with disk fingerprint/index state/authoring
-    /// identity all independently reconfirmed unchanged since the content
-    /// was read — see `yadorilink_sync_sqlite::file_index::
-    /// FileIndexRepository::upsert_file_emitting_change`'s own doc comment
-    /// for the full precondition list and what passing `Some` here
-    /// actually commits (an exact actual-state proof, in the SAME
-    /// transaction, so the Convergence Engine's zero-work pre-check can
-    /// recognize this device's own locally-authored content as already
-    /// correct). `None` is always correct/safe — it simply forgoes that
-    /// optimization for this call.
-    // Port trait method with many call sites workspace-wide; grouping
-    // these into a params struct would be a call-site-touching refactor
-    // well beyond a toolchain-drift lint cleanup.
-    #[allow(clippy::too_many_arguments)]
-    fn upsert_file_emitting_change(
-        &self,
-        group_id: &str,
-        record: &FileRecord,
-        origin_device_id: &str,
-        content: ChangeContent<'_>,
-        meta: Option<&LocalFileMetaColumns>,
-        filesystem_identity: Option<&yadorilink_root_authority::fs_identity::FileIdentity>,
-        emission: LocalChangeEmission<'_>,
-    ) -> Result<ChangeHash, SyncSqliteError>;
+    ) -> PlaceholderStatus;
 
     /// Commits a bounded batch of already-prepared, already-revalidated
     /// local mutations in one transaction — the batched counterpart to
@@ -337,7 +409,7 @@ pub trait LocalMutationStore: Send + Sync {
         evidence: &[Option<yadorilink_sync_sqlite::file_index::LocalCaptureActualStateEvidence>],
         origin_device_id: &str,
         emission: LocalChangeEmission<'_>,
-    ) -> Result<Vec<ChangeHash>, SyncSqliteError>;
+    ) -> Result<(), SyncSqliteError>;
 
     /// Commits the capture of one explicit directory: its entry `directory`
     /// describes, with the observed identity as its actual-state proof when
@@ -351,13 +423,14 @@ pub trait LocalMutationStore: Send + Sync {
         group_id: &str,
         directory: &CapturedDirectory,
         origin_device_id: &str,
-        emitter: Option<&ChangeEmitter>,
+        emitter: Option<&LocalAuthorKey>,
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), SyncSqliteError>;
 
     /// Commits the removal of the directory `root`: a point delete of each
     /// of `tombstones` (the explicit entries this device observed there,
-    /// deepest first, each re-verified absent and locked by the caller).
+    /// deepest first, each re-verified absent and locked by the caller,
+    /// each carrying the change its row showed at capture).
     /// With an emitter they are one signed recursive delete rooted at
     /// `root`, cut into parts, each path adopting its Absent evidence (see
     /// `yadorilink_sync_sqlite::file_index::FileIndexRepository::
@@ -371,10 +444,10 @@ pub trait LocalMutationStore: Send + Sync {
         &self,
         group_id: &str,
         root: &str,
-        tombstones: &[FileRecord],
+        tombstones: &[PreparedLocalMutation],
         origin_device_id: &str,
         observed_at_unix_nanos: i64,
-        emitter: Option<&ChangeEmitter>,
+        emitter: Option<&LocalAuthorKey>,
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), SyncSqliteError>;
 
@@ -434,9 +507,9 @@ pub trait LocalMutationStore: Send + Sync {
     /// `observed` (same alignment) is what the scan saw on disk for each
     /// path: the exact version it derived for those bytes, the object's
     /// kind, and the identity it observed. A path with one gets its
-    /// actual-state generation and its `Hydrated` stamp in the same
+    /// actual-state generation and its `Present` stamp in the same
     /// transaction; a path without one gets neither -- and has whatever
-    /// proof its previous version left behind retired, since `Hydrated` is
+    /// proof its previous version left behind retired, since `Present` is
     /// carried forward by the row upsert and is exactly the claim that
     /// proof supports.
     fn upsert_files_batch(
@@ -449,25 +522,6 @@ pub trait LocalMutationStore: Send + Sync {
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), SyncSqliteError>;
 
-    /// Batch upsert under a single DAG change, for a large initial scan that
-    /// must emit history rather than write silently.
-    // Port of `FileIndexRepository::upsert_files_batch_emitting_change`,
-    // which carries the same allow.
-    #[allow(clippy::too_many_arguments)]
-    fn upsert_files_batch_emitting_change(
-        &self,
-        group_id: &str,
-        records: &[FileRecord],
-        origin_device_id: &str,
-        content: ChangeContent<'_>,
-        metas: &[Option<LocalFileMetaColumns>],
-        actual_state: &std::collections::HashMap<
-            String,
-            yadorilink_sync_sqlite::file_index::LocalCaptureActualStateEvidence,
-        >,
-        emission: LocalChangeEmission<'_>,
-    ) -> Result<Option<ChangeHash>, SyncSqliteError>;
-
     /// Tombstones a path with "now" as the observed time — the plain local
     /// delete path when no debounce-recorded observation time applies.
     fn mark_deleted_at(
@@ -479,37 +533,13 @@ pub trait LocalMutationStore: Send + Sync {
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), SyncSqliteError>;
 
-    /// Tombstones a path and appends the signed `Delete` change describing
-    /// it, in one transaction — the debounced local-deletion dispatch path,
-    /// which stamps the debounce accumulator's own observed time rather
-    /// than "now at dispatch time" (see `mark_deleted_at`'s doc comment for
-    /// why that distinction matters for conflict ordering).
-    ///
-    /// `publish_absent_proof`: `true` only when the caller has revalidated
-    /// the path as still absent immediately before this call — commits an
-    /// exact `Absent` actual-state proof in the SAME transaction, same
-    /// reasoning as `upsert_file_emitting_change`'s `filesystem_identity`
-    /// parameter. `false` is always correct/safe.
-    // Port trait method with many call sites workspace-wide; grouping
-    // these into a params struct would be a call-site-touching refactor
-    // well beyond a toolchain-drift lint cleanup.
-    #[allow(clippy::too_many_arguments)]
-    fn mark_deleted_emitting_change(
-        &self,
-        group_id: &str,
-        path: &str,
-        device_id: &str,
-        observed_at_unix_nanos: i64,
-        publish_absent_proof: bool,
-        emitter: &ChangeEmitter,
-        permit: &RootCommitPermit<'_>,
-    ) -> Result<ChangeHash, SyncSqliteError>;
-
     /// Commits a local deletion of the copy name `copy_path` as
     /// `Delete(source)`, the entry [`Self::write_through_source`] named for
     /// it: the copy's row is tombstoned, only the head it held is
     /// superseded, and an `Absent` proof for `copy_path` is committed with
     /// it (the caller revalidated the path gone under its lock).
+    /// `native_witness` is what native showed at the copy when the deletion
+    /// was captured.
     // One argument per fact the deletion needs, as for
     // `mark_deleted_emitting_change`.
     #[allow(clippy::too_many_arguments)]
@@ -518,11 +548,12 @@ pub trait LocalMutationStore: Send + Sync {
         group_id: &str,
         copy_path: &str,
         source: &str,
+        native_witness: Option<yadorilink_replica_domain::native_state::NativeCaptureWitness>,
         device_id: &str,
         observed_at_unix_nanos: i64,
-        emitter: &ChangeEmitter,
+        emitter: &LocalAuthorKey,
         permit: &RootCommitPermit<'_>,
-    ) -> Result<ChangeHash, SyncSqliteError>;
+    ) -> Result<(), SyncSqliteError>;
 
     fn remove_file(
         &self,
@@ -540,7 +571,7 @@ pub trait LocalMutationStore: Send + Sync {
     ) -> Result<(), SyncSqliteError>;
 
     /// Journals `path` as a detected-but-not-yet-processed local edit,
-    /// before the read/blockify/put/index+DAG step runs, so a crash or fault
+    /// before the read/blockify/put/index+delta step runs, so a crash or fault
     /// mid-processing cannot drop the edit.
     fn record_dirty_path(
         &self,

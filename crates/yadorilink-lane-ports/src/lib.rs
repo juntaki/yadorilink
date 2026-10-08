@@ -27,13 +27,10 @@
 pub mod block_lane;
 pub mod directory;
 pub mod peer_transports;
-pub mod prepared_snapshots;
 pub mod service_lane;
 /// Network faults for the simulated substrate, injected at the carrier.
 #[cfg(feature = "test-support")]
 pub mod sim_fault;
-pub mod snapshot_service;
-pub mod snapshot_stream;
 /// A real substrate endpoint for tests that build their own sessions.
 #[cfg(feature = "test-support")]
 pub mod testing;
@@ -41,14 +38,9 @@ pub mod testing;
 pub use block_lane::LaneBlockStream;
 pub use directory::{PeerDirectory, StaticPeerDirectory};
 pub use peer_transports::{PeerLinkSource, PeerTransports};
-pub use prepared_snapshots::PreparedSnapshots;
 pub use service_lane::{LaneServiceStream, MAX_SERVICE_MESSAGE_BYTES};
-pub use snapshot_service::{serve_snapshot_stream, LaneSnapshotFetch};
-pub use snapshot_stream::{receive_snapshot_into, send_snapshot};
 
 #[cfg(test)]
 mod block_lane_tests;
 #[cfg(test)]
 mod service_lane_tests;
-#[cfg(test)]
-mod snapshot_stream_tests;

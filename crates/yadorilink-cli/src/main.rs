@@ -13,40 +13,27 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Log in to the coordination plane. Google OIDC login opens a browser
-    /// approval flow: no email or password, and a first login automatically
-    /// creates the account.
+    /// Log in with your Google account in a browser; the first login creates your account.
     Login {
-        /// Use the RFC 8628 device-authorization grant for the sign-in leg
-        /// instead of a local loopback redirect. For a host with no browser
-        /// of its own, or one whose loopback port a human's browser cannot
-        /// reach (an SSH session onto a different machine): this prints a
-        /// verification URL and a short code to enter on ANY device, and
-        /// polls the server instead of waiting on a local socket.
+        /// Print a URL and short code to enter on any device, for hosts with no usable browser.
         #[arg(long)]
         device: bool,
     },
-    /// Sign out: irreversibly revoke this computer's access on the server,
-    /// then remove its stored credentials. Use `forget-local-credentials` if
-    /// you only want the local half.
+    /// Sign out and revoke this computer's access. This cannot be undone.
     Logout,
-    /// Remove this computer's stored credentials WITHOUT revoking its access.
-    /// This computer stays authorized on the server; sign out instead unless
-    /// you specifically want the local half alone.
+    /// Remove this computer's stored credentials without revoking its access on the server.
     ForgetLocalCredentials,
     /// Manage registered devices.
     Device {
         #[command(subcommand)]
         action: DeviceAction,
     },
-    /// Manage folder-group sharing/ACLs.
+    /// Manage who can access your folder groups.
     Share {
         #[command(subcommand)]
         action: ShareAction,
     },
-    /// Inspect the local recovery-journal inventory (create/join enrollment,
-    /// account-membership, and role-loss operations still in flight or
-    /// requiring operator attention). Strictly read-only.
+    /// Inspect operations that were interrupted and may need attention (read-only).
     Recovery {
         #[command(subcommand)]
         action: RecoveryAction,
@@ -55,97 +42,62 @@ enum Command {
     Link {
         local_path: String,
         group_name: String,
-        /// on-demand-sync: create placeholders instead of fetching full
-        /// content immediately; content is fetched on first access.
+        /// Fetch file contents on first access instead of downloading everything now.
         #[arg(long)]
         on_demand: bool,
-        /// Automatic-eviction disk-usage cap in bytes for an `--on-demand`
-        /// folder; only meaningful together with `--on-demand`.
-        #[arg(long)]
-        max_local_size: Option<i64>,
-        /// Run the link preflight and print its findings without
-        /// registering the link (no daemon writes at all).
+        /// Check the folder and print any problems without linking it.
         #[arg(long)]
         dry_run: bool,
-        /// Acknowledge a risky preflight result (non-empty folder, low disk
-        /// space, a nested-link conflict, or a risky location)
-        /// non-interactively, matching `backup import`'s existing `--yes`
-        /// precedent.
+        /// Proceed past warnings about a non-empty folder, low disk space, or a risky location.
         #[arg(long)]
         yes: bool,
     },
-    /// Unlink a local directory.
+    /// Folders with no directory: the operating system shows them under File Provider (macOS).
+    ProviderFolder {
+        #[command(subcommand)]
+        action: ProviderFolderAction,
+    },
+    /// Unlink a local directory. Its files stay on disk.
     Unlink {
         local_path: String,
-        /// Bypass the durability handoff gate (refuses to unlink this
-        /// device's last confirmed-ready full replica for the folder's
-        /// group) for a genuinely dead sole replica that would otherwise
-        /// have no way to ever unlink. Data-loss risk: this may permanently
-        /// lose the only complete copy of the folder's data; every forced
-        /// override is logged by the daemon as an audit trail.
+        /// Unlink even if this device holds the only complete copy of the folder. This can permanently lose data.
         #[arg(long)]
         force: bool,
     },
     /// List currently linked folders.
     Links,
-    /// List every retained version of a file (current, superseded, and
-    /// trashed alike), newest first.
+    /// List every retained version of a file, newest first.
     Versions { local_path: String },
-    /// Restore a file to a chosen (or, by default, the most recently
-    /// superseded) version, as a new current version.
+    /// Restore a file to an earlier version (default: the most recent previous one).
     Restore {
         local_path: String,
-        /// The specific version to restore to; omitted defaults to the
-        /// most recently superseded version (spec "Restore without a
-        /// version defaults to the most recent superseded version").
+        /// The version to restore; defaults to the most recent previous version.
         #[arg(long)]
         version: Option<i64>,
     },
-    /// List and recover deleted files still within their link's retention
-    /// window. A genuine `list`/`restore` verb pair under one noun (unlike
-    /// `Link`, which takes
-    /// positional args at its own top level) — nested under `trash` the
-    /// same way `Daemon`/`DaemonAction` and `Report`/`ReportAction` already
-    /// nest below.
+    /// List and recover deleted files that are still within the retention window.
     Trash {
         #[command(subcommand)]
         action: TrashAction,
     },
-    /// List currently-live conflicted-copy files across every linked
-    /// folder -- the same files `status`'s per-link `conflict_count`
-    /// already tallies, shown here individually.
+    /// List conflicted copies across all linked folders.
     Conflicts {
         #[command(subcommand)]
         action: ConflictsAction,
     },
-    /// Send a file or directory to another device on this account --
-    /// one-shot, not linked/synced. Resolves `target_device` against this
-    /// account's already-known device list.
+    /// Send a file or directory to another device on your account.
     Send { source_path: String, target_device: String },
-    /// List transfers other devices have sent to this device, whether or
-    /// not `receive` has been run for them yet.
+    /// List transfers other devices have sent to this device.
     Inbox,
-    /// Accept an inbound transfer, materializing it into `--to` (or this
-    /// daemon's default inbox directory). Resumable: re-running this for a
-    /// transfer already partially received continues where it left off.
+    /// Accept an incoming transfer into `--to`, or the default inbox directory if omitted.
     Receive {
         transfer_id: String,
         #[arg(long)]
         to: Option<String>,
     },
-    /// Force-hydrate a placeholder file and keep it hydrated (on-demand-sync).
-    /// A folder keeps everything below it hydrated, including what is added
-    /// to it later.
-    Pin { local_path: String },
-    /// Allow a pinned file or folder to become a placeholder again
-    /// (on-demand-sync).
-    Unpin { local_path: String },
-    /// Manually convert a hydrated file back into a placeholder to
-    /// reclaim local disk space (on-demand-sync). A folder releases its own
-    /// pin and evicts every file below it that is not pinned on its own.
+    /// Free local disk space by removing a downloaded file's contents. The file stays listed.
     Evict { local_path: String },
-    /// Show one file's current materialization state (hydrated/
-    /// placeholder/hydrating/evicting) and pin flag (on-demand-sync).
+    /// Show whether a file is stored locally or fetched on demand.
     MaterializationStatus { local_path: String },
     /// Control the sync daemon.
     Daemon {
@@ -154,31 +106,34 @@ enum Command {
     },
     /// Show sync status.
     Status {
-        /// Re-poll and re-render status on an interval instead of exiting
-        /// after one snapshot — useful for watching a big sync's
-        /// per-transfer progress live.
+        /// Keep refreshing the status instead of printing it once.
         #[arg(long)]
         watch: bool,
+        /// Also list up to N publications per provider folder that are waiting on the OS (a file in
+        /// use, or a release still pending).
+        #[arg(long, value_name = "N")]
+        pending_items: Option<u32>,
     },
-    /// Manually trigger block-store garbage collection.
+    /// Delete unused data blocks to free disk space.
     Gc {
-        /// Compute and report what would be deleted without actually
-        /// deleting anything.
+        /// Report what would be deleted without deleting anything.
         #[arg(long)]
         dry_run: bool,
     },
 
-    /// Preview what restoring a folder to an earlier point in time would
-    /// change. Read-only: this shows the plan and changes nothing.
+    /// List and manage items set aside when a folder group was reset.
+    Preserved {
+        #[command(subcommand)]
+        action: PreservedAction,
+    },
+    /// Preview what rewinding a folder to an earlier point in time would change.
     Rewind {
-        /// The folder group to preview a rewind for.
+        /// The folder group to preview.
         group: String,
-        /// The point in time to rewind to: unix nanoseconds
-        /// (e.g. 1750000000000000000), or an offset back from now
-        /// (e.g. 90s, 30m, 2h, 7d).
+        /// The point in time: unix nanoseconds (e.g. 1750000000000000000) or an offset back from now (e.g. 90s, 30m, 2h, 7d).
         #[arg(long)]
         at: String,
-        /// List every path and its action, not just the per-action counts.
+        /// List every path and its action, not just the counts.
         #[arg(long)]
         verbose: bool,
     },
@@ -187,78 +142,62 @@ enum Command {
         #[command(subcommand)]
         action: LimitsAction,
     },
-    /// Inspect per-link ignore patterns.
+    /// Inspect ignore patterns for a linked folder.
     Ignore {
         #[command(subcommand)]
         action: IgnoreAction,
     },
-    /// OSS usage/error reporting: preview or export a usage summary,
-    /// preview/export/submit a local error report, and manage reporting
-    /// consent.
+    /// Preview or export usage and error reports, and manage reporting consent.
     Report {
         #[command(subcommand)]
         action: ReportAction,
     },
-    /// Point beta testers at the
-    /// project's existing GitHub issue templates (there is no separate in-app
-    /// feedback system) and remind them how automatic crash reporting stays
-    /// local and consent-gated.
+    /// Show where to send feedback and how crash reporting works.
     Feedback,
-    /// Preview or export a privacy-safe diagnostics support bundle.
+    /// Preview or export a privacy-safe diagnostics bundle.
     Diagnose {
         #[command(subcommand)]
         action: DiagnoseAction,
     },
-    /// Self-service account management -- request/confirm/cancel/status for
-    /// account deletion, and a machine-readable export of your
-    /// coordination-plane records.
+    /// Delete your account or export your account data.
     Account {
         #[command(subcommand)]
         action: AccountAction,
     },
-    /// Inspect and manage local backup/disaster-recovery material.
+    /// Inspect and manage local backups of your configuration.
     Backup {
         #[command(subcommand)]
         action: BackupAction,
     },
-    /// Check update status, trigger a manual check/install, and configure
-    /// automatic checks/install.
+    /// Check for updates and configure automatic updates.
     Update {
         #[command(subcommand)]
         action: UpdateAction,
     },
-    /// Connectivity-doctor summary
-    /// (daemon/listener/discovery/coordination-plane/authorization/
-    /// clock/policy categories).
+    /// Check connectivity: daemon, network, sign-in, permissions and clock.
     Doctor,
-    /// Recent connection-attempt history plus the LAN-discovered addresses
-    /// currently held as dial candidates, optionally filtered to one peer
-    /// device id.
+    /// Show recent connection attempts and addresses found on the local network.
     Connections {
         #[arg(long)]
         peer: Option<String>,
     },
 }
 
-/// Check update status, trigger a manual check/install, and configure
-/// automatic checks/install.
+/// Check for updates and configure automatic updates.
 #[derive(Subcommand)]
 enum UpdateAction {
-    /// Print current version, channel, install source, last check,
-    /// available version, rollout/holdback state, and last update error.
+    /// Show the current version, update channel and update status.
     Status,
-    /// Ask the daemon to check the signed update manifest immediately and
-    /// print whether an update is available.
+    /// Check for an update now.
     Check,
-    /// Ask the daemon to install a verified update at the next safe
-    /// point, or report the platform-specific handoff required.
+    /// Install an available update at the next safe moment.
     Install,
-    /// Configure automatic update checks and/or automatic install mode.
+    /// Turn automatic update checks and installs on or off.
     Config {
-        /// `on` or `off`.
+        /// Automatic checks: `on` or `off`.
         #[arg(long)]
         checks: Option<String>,
-        /// `automatic` or `manual`.
+        /// Automatic install: `automatic` or `manual`.
         #[arg(long)]
         install: Option<String>,
     },
@@ -266,16 +205,22 @@ enum UpdateAction {
 
 #[derive(Subcommand)]
 enum BackupAction {
-    /// Show which non-sensitive recovery artifacts (config, link metadata)
-    /// exist locally and what is still missing.
+    /// Show which configuration backups exist locally and what is missing.
     Status,
-    /// Export non-sensitive config and link metadata (no secrets, no device
-    /// identity keys).
-    Export { output_path: std::path::PathBuf },
-    /// Import non-sensitive config and link metadata written by `export`.
+    /// Export configuration and linked-folder list. Secrets and device keys are not included.
+    Export {
+        output_path: std::path::PathBuf,
+        /// Overwrite the output file if it already exists.
+        #[arg(long)]
+        yes: bool,
+        /// Export even if the linked-folder list cannot be read; the backup will contain no folders.
+        #[arg(long)]
+        without_folders: bool,
+    },
+    /// Import a configuration backup created by `export`.
     Import {
         input_path: std::path::PathBuf,
-        /// Confirm overwriting existing local config.
+        /// Confirm overwriting your existing local configuration.
         #[arg(long)]
         yes: bool,
     },
@@ -283,58 +228,45 @@ enum BackupAction {
 
 #[derive(Subcommand)]
 enum AccountAction {
-    /// Self-service account deletion --
-    /// request, confirm, cancel, or check status. Deletion removes your
-    /// server-side coordination records and revokes device access; it never
-    /// deletes the folders synced on your machines.
+    /// Delete your account: request, confirm, cancel, or check status.
     Delete {
         #[command(subcommand)]
         action: AccountDeleteAction,
     },
-    /// Export a machine-readable copy of
-    /// your coordination-plane records (account, devices, groups, shares).
-    /// Never includes file contents, file/folder names, or paths.
-    /// Writes to `output_path` if given, otherwise prints to stdout.
+    /// Export your account data (account, devices, groups, shares) as JSON.
     Export { output_path: Option<std::path::PathBuf> },
 }
 
 /// Self-service account-deletion actions.
 #[derive(Subcommand)]
 enum AccountDeleteAction {
-    /// Request account deletion. Returns a one-time confirmation token;
-    /// nothing is deleted until you confirm.
+    /// Request account deletion and get a confirmation token. Nothing is deleted yet.
     Request,
-    /// Confirm a requested deletion with its confirmation token, starting
-    /// the bounded, cancellable grace period.
+    /// Confirm the deletion with your token and start the grace period.
     Confirm { confirmation_token: String },
-    /// Cancel an in-progress deletion (any time before the grace period
-    /// ends) and fully restore the account.
+    /// Cancel a pending deletion during the grace period and keep your account.
     Cancel,
-    /// Show whether the account is active, deletion-requested, or in the
-    /// grace window (with the time remaining).
+    /// Show whether your account is active or being deleted, and the time left.
     Status,
 }
 
 #[derive(Subcommand)]
 enum ReportAction {
-    /// Preview or export a usage summary. Usage summaries are never sent
-    /// over the network — this command only prints the report or writes
-    /// it to a file.
+    /// Preview or export a usage summary. Nothing is sent over the network.
     Usage {
-        /// Print the exact report envelope that would be exported.
+        /// Print the report that would be exported.
         #[arg(long)]
         preview: bool,
-        /// Write the report envelope as JSON to this path.
+        /// Write the report as JSON to this path.
         #[arg(long)]
         export: Option<std::path::PathBuf>,
     },
-    /// Preview, export, or submit a local error report candidate.
+    /// Preview, export, or submit an error report.
     Error {
-        /// Use the most recently captured error candidate (the default
-        /// when neither --last nor --id is given).
+        /// Use the most recent error (the default).
         #[arg(long)]
         last: bool,
-        /// Use a specific error candidate by id.
+        /// Use the error with this id.
         #[arg(long)]
         id: Option<String>,
         #[arg(long)]
@@ -346,14 +278,12 @@ enum ReportAction {
         #[arg(long)]
         yes: bool,
     },
-    /// Reporting consent controls.
+    /// Manage reporting consent.
     Consent {
         #[command(subcommand)]
         action: ReportConsentAction,
     },
-    /// Inspect and manage the local submit-retry queue (reports that
-    /// failed to submit and are waiting to be retried automatically).
-    /// Requires the daemon -- the queue is daemon-owned runtime state.
+    /// Manage reports waiting to be retried automatically.
     Queue {
         #[command(subcommand)]
         action: ReportQueueAction,
@@ -362,61 +292,73 @@ enum ReportAction {
 
 #[derive(Subcommand)]
 enum ReportQueueAction {
-    /// List queued reports awaiting automatic retry.
+    /// List queued reports.
     List,
-    /// Print one queued report's full JSON envelope.
+    /// Print one queued report.
     Show { report_id: String },
     /// Remove one queued report without submitting it.
     Delete { report_id: String },
-    /// Remove every queued report without submitting any of them.
+    /// Remove all queued reports without submitting them.
     Flush,
 }
 
 #[derive(Subcommand)]
 enum DiagnoseAction {
-    /// Print a redacted diagnostics summary without writing a bundle.
+    /// Print a redacted diagnostics summary.
     Preview,
-    /// Write a redacted diagnostics bundle to the requested path.
+    /// Write a redacted diagnostics bundle to a file.
     Export { output_path: std::path::PathBuf },
 }
 
 #[derive(Subcommand)]
 enum IgnoreAction {
-    /// Print the effective ignore patterns for a linked folder.
+    /// Print the ignore patterns in effect for a linked folder.
     List { link_path: std::path::PathBuf },
-    /// Test whether a path is ignored by the inferred link root's rules.
+    /// Check whether a path is ignored.
     Test { path: std::path::PathBuf },
-    /// Explain why a path is (or isn't) ignored — the winning rule's text,
-    /// source file, `#include` chain, line number, and case-sensitivity
-    /// mode, using the exact same evaluator `test` uses.
+    /// Explain which rule ignores a path, and where that rule comes from.
     Explain { path: std::path::PathBuf },
 }
 
 #[derive(Subcommand)]
+enum PreservedAction {
+    /// List preserved items with their state and size.
+    List,
+    /// Write a preserved version back to its original path as a new version.
+    Restore { item_id: String },
+    /// Re-submit your own changes that were held back, once this device can write again.
+    Retry { item_id: String },
+    /// Permanently delete a preserved item.
+    Discard {
+        item_id: String,
+        /// Confirm the deletion.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum LimitsAction {
-    /// Set the global upload/download rate limits (bytes/sec, `0` =
-    /// unlimited), persisted and applied to the running daemon without a
-    /// restart.
+    /// Set the upload and download rate limits in bytes per second (0 = unlimited).
     Set {
         #[arg(long)]
         up: u64,
         #[arg(long)]
         down: u64,
     },
-    /// Show the currently configured upload/download rate limits.
+    /// Show the current rate limits.
     Show,
 }
 
 #[derive(Subcommand)]
 enum ReportConsentAction {
-    /// Show current consent state, queue size, and local candidate count.
+    /// Show consent state, queue size, and number of local reports.
     Status,
-    /// Opt in to automatic crash/error reporting.
+    /// Opt in to automatic crash and error reporting.
     Enable,
-    /// Disable all network submission (usage and automatic error).
+    /// Turn off all report submission.
     Disable,
-    /// Enable/disable the local "you could report this" hint shown after
-    /// reportable command failures (`true`/`false`).
+    /// Show or hide the hint offered after a failure that can be reported (`true` or `false`).
     Prompts {
         // Any explicit `#[arg(...)]` (even value_name-only) opts a `bool`
         // field out of clap's auto-flag inference (which would otherwise
@@ -429,22 +371,17 @@ enum ReportConsentAction {
 
 #[derive(Subcommand)]
 enum RecoveryAction {
-    /// List every local recovery-journal row (enrollment, membership, and
-    /// role-loss alike), plus any row that failed to decode.
+    /// List interrupted operations.
     List {
-        /// Print machine-readable JSON instead of a table.
+        /// Print JSON instead of a table.
         #[arg(long)]
         json: bool,
     },
-    /// Diagnose one recovery operation against the coordination plane's own
-    /// evidence: local journal state, exactly one remote lookup, and a
-    /// recommendation. The three recovery journals share no cross-table id
-    /// uniqueness, so `domain` is required to disambiguate which journal to
-    /// look in.
+    /// Diagnose one interrupted operation and recommend what to do.
     Show {
         domain: RecoveryDomainArg,
         operation_id: String,
-        /// Print machine-readable JSON instead of plain text.
+        /// Print JSON instead of text.
         #[arg(long)]
         json: bool,
     },
@@ -470,27 +407,49 @@ impl RecoveryDomainArg {
 
 #[derive(Subcommand)]
 enum DeviceAction {
+    /// Register this computer as a device on your account.
     Register {
+        /// Name for this device (default: "this device").
         #[arg(long, default_value = "this device")]
         name: String,
     },
+    /// List the devices registered on your account.
     List,
-    /// De-register a device, revoking its access to every folder group at
-    /// once. Takes effect promptly, not just eventually: any
-    /// currently-connected peer of this device is pushed an updated
-    /// netmap immediately and tears its QUIC connection/sync session
-    /// down; a peer that's offline at removal time gets the
-    /// already-updated (device-absent) netmap the next time it
-    /// reconnects.
+    /// Remove a device and revoke its access to every folder group.
     Remove {
         device_id: String,
-        /// Bypass the durability readiness pre-check (refuses when this
-        /// device would leave a folder group without another
-        /// confirmed-ready full replica) for a device that must be removed
-        /// regardless. Data-loss risk: this may permanently lose the only
-        /// complete copy of a folder group's data; every forced override is
-        /// logged as an audit trail. The coordination plane's own
-        /// access-count guard still applies regardless of this flag.
+        /// Remove even if this device holds the only complete copy of a folder group. This can permanently lose data.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProviderFolderAction {
+    /// Create a new group and a provider folder for it.
+    Create {
+        /// The name the folder shows under the File Provider location.
+        display_name: String,
+        /// The group's name (default: the display name).
+        #[arg(long)]
+        group_name: Option<String>,
+        /// Fetch file contents on first access instead of downloading everything now.
+        #[arg(long)]
+        on_demand: bool,
+    },
+    /// Join an existing group as a provider folder.
+    Join {
+        group_id: String,
+        display_name: String,
+        #[arg(long)]
+        group_name: Option<String>,
+        #[arg(long)]
+        on_demand: bool,
+    },
+    /// Remove a provider folder; the downloaded files are kept.
+    Remove {
+        display_name: String,
+        /// Remove even if this device holds the only complete copy. This can permanently lose data.
         #[arg(long)]
         force: bool,
     },
@@ -498,226 +457,117 @@ enum DeviceAction {
 
 #[derive(Subcommand)]
 enum ShareAction {
-    /// Create a new folder group and link it locally in one step. The
-    /// creating device becomes the group's first full replica ('eager'), so
-    /// a local copy must exist before the group is advertised. Uses the
-    /// coordination plane's crash-safe Pending -> Active enrollment protocol
-    /// (prepare the group, commit the local link, then activate); a failure
-    /// at any step compensates by canceling the still-Pending group so a
-    /// create never leaves a phantom full replica with no local copy.
+    /// Create a folder group and link a local folder to it.
     Create {
         group_name: String,
         /// Local directory to link the new folder group into.
         #[arg(long)]
         path: String,
-        /// Acknowledge a risky link preflight (non-empty folder, low disk
-        /// space, a nested-link conflict, or a risky location) non-interactively.
+        /// Proceed past warnings about a non-empty folder, low disk space, or a risky location.
         #[arg(long)]
         yes: bool,
     },
-    /// Grant another of your own already-registered devices access to a
-    /// folder group. Same-account only -- for a different account's device,
-    /// use `share invite`/`share accept` instead.
+    /// Give one of your own devices access to a folder group.
     Grant {
         group_name: String,
         device_id: String,
-        /// The granted device's role: `viewer` or `editor`. Defaults to
-        /// `editor` if omitted -- deliberately DIFFERENT from `share
-        /// invite`'s own default (`viewer`): this preserves `grant`'s
-        /// pre-existing, always-full-writer behavior for every caller that
-        /// never adopts this flag. `owner` is not available via this
-        /// command yet.
+        /// The device's role: `viewer` or `editor` (default `editor`).
         #[arg(long)]
         role: Option<String>,
     },
-    /// Move a device that ALREADY has access to a folder group to a
-    /// different role, in place — no revoke-and-re-invite round trip, and
-    /// the device is never dropped from the group while the change is
-    /// applied. A downgrade takes effect promptly for a currently-connected
-    /// peer rather than only on its next poll.
-    ///
-    /// Use `grant`/`invite` to give a device access it does not have yet;
-    /// this command only changes an existing member's role.
+    /// Change the role of a device that already has access to a folder group.
     ChangeRole {
         group_name: String,
         /// A device id from `share members`.
         device_id: String,
-        /// The role to move the device to: `viewer` or `editor`. Required
-        /// and never defaulted — unlike `grant`'s own `--role`, since
-        /// silently picking a role for an EXISTING collaborator is not a
-        /// safe default to have. `owner` is not available via this command:
-        /// there is no management-authority model yet to back it.
+        /// The new role: `viewer` or `editor`.
         #[arg(long)]
         role: String,
     },
-    /// Revoke a device's access to one folder group, or (given a single
-    /// argument) revoke one edge listed by `share list` by its edge id —
-    /// the `yadorilink share revoke <edge>` form. Takes effect promptly for a
-    /// currently-connected peer (bounded, sub-second propagation target)
-    /// rather than only on its next poll: if the two devices still share
-    /// another folder group, their QUIC connection stays up and only this
-    /// group's sync activity stops; otherwise the connection is torn down
-    /// entirely, same as `device remove`.
+    /// Revoke a device's access to a folder group, or revoke a share listed by `share list`.
     Revoke {
-        /// A folder-group name (when `device_id` is also given, the
-        /// original owner-only form) or an edge id from
-        /// `share list` (when `device_id` is omitted).
+        /// A folder group name, or a share id from `share list` when no device id is given.
         group_name_or_edge: String,
         device_id: Option<String>,
-        /// Bypass the durability readiness pre-check (refuses when the
-        /// revoked device would leave the group without another
-        /// confirmed-ready full replica) for a device that must be revoked
-        /// regardless. Data-loss risk: this may permanently lose the only
-        /// complete copy of the group's data; every forced override is
-        /// logged as an audit trail. The coordination plane's own
-        /// access-count guard still applies regardless of this flag.
+        /// Revoke even if the device holds the only complete copy of the group. This can permanently lose data.
         #[arg(long)]
         force: bool,
     },
-    /// Terminal delete of a whole folder group this account owns: the group
-    /// and every ACL edge on it, gone, with an updated netmap pushed to
-    /// every former member. Unlike `revoke`, this is NOT subject to the
-    /// last-full-replica guard -- the group ceases to exist, so there is no
-    /// group left to protect. Use this to get back to a clean state from an
-    /// abandoned group whose sole remaining full-replica device `revoke`
-    /// refuses to remove.
+    /// Delete a folder group you own, for every member.
     Delete {
         group_name: String,
-        /// Required (and refused without it) only when the group has any
-        /// cross-account member.
+        /// Required when the group has members from other accounts.
         #[arg(long)]
         acknowledge_cross_account_members: bool,
     },
-    /// List every ACL edge visible to this account — folder groups it
-    /// owns, and its own devices' shares.
+    /// List the shares you own and the shares of your own devices.
     List,
-    /// "People with access": list every device authorized for a folder
-    /// group and its role. Read-only -- this never grants, revokes, or
-    /// changes a role; use `grant`/`invite` to give access, `change-role`
-    /// to move an existing member, and `revoke` to take it away. Visible to
-    /// the group's owning account and to any account with a member device
-    /// in the group, matching `share list`'s own policy-log visibility.
-    /// Identity shown is group-scoped and minimal: device name and a
-    /// shortened device id only, never another account's email address.
+    /// List the devices with access to a folder group and their roles.
     Members { group_name: String },
-    /// Same-account onboarding: list the folder groups this account owns and
-    /// can join on this device, by name. A newly-registered device lists
-    /// these, then joins the ones it wants with `share join`.
+    /// List the folder groups you can join on this device.
     Joinable,
-    /// Same-account onboarding: join one of the joinable folder groups on this
-    /// device. Authorizes this device for the group (the explicit act of
-    /// selecting it) and links it locally at `--path` with the chosen
-    /// `--storage-mode`.
+    /// Join one of your folder groups on this device and link it to a local folder.
     Join {
         group_name: String,
         /// Local directory to link the folder group into.
         #[arg(long)]
         path: String,
-        /// `eager` (store everything) or `on-demand` (store only needed
-        /// files, fetched on first access). Defaults to `eager`.
+        /// `eager` (store everything) or `on-demand` (fetch files on first access). Defaults to `eager`.
         #[arg(long, default_value = "eager")]
         storage_mode: String,
-        /// Acknowledge a risky link preflight (non-empty folder, low disk
-        /// space, a nested-link conflict, or a risky location)
-        /// non-interactively, matching `link --yes`.
+        /// Proceed past warnings about a non-empty folder, low disk space, or a risky location.
         #[arg(long)]
         yes: bool,
     },
-    /// Change this device's storage mode for a folder group it already
-    /// links. Switching FROM eager (full replica) TO on-demand is refused
-    /// unless another full replica can be confirmed to durably hold every
-    /// file in the group first — without central storage, a full replica is
-    /// the group's only durable copy, so giving that status up without a
-    /// confirmed handoff would risk permanent data loss. Switching TO eager
-    /// has no such hazard and always succeeds.
+    /// Change how this device stores a folder group: `eager` or `on-demand`.
     SetStorageMode {
         group_name: String,
-        /// `eager` (store everything) or `on-demand` (store only needed
-        /// files, fetched on first access).
+        /// `eager` (store everything) or `on-demand` (fetch files on first access).
         #[arg(long)]
         mode: String,
     },
-    /// Cross-account onboarding: mint a one-use, expiring invite for a
-    /// folder group this account owns, printing its code, a
-    /// `yadorilink://` URL, and a terminal QR code. Share the code/URL/QR
-    /// with exactly one recipient -- accepting it is `share accept`.
+    /// Create a one-use invite for a folder group you own, for someone on another account.
     Invite {
         group_name: String,
-        /// The accepting device's role: `viewer` or `editor`. Defaults to
-        /// `viewer` if omitted -- least privilege for a stranger-facing
-        /// invite, deliberately DIFFERENT from `share grant`'s own default
-        /// (`editor`). Affects whether the daemon-side verifier accepts the
-        /// device's own changes (`viewer` is read-only; `editor` may
-        /// write). `owner` is not available via this command yet: there is
-        /// no management-authority model yet to back it (re-inviting,
-        /// revoking other members, transferring ownership).
+        /// The invited device's role: `viewer` or `editor` (default `viewer`).
         #[arg(long)]
         role: Option<String>,
-        /// Override the invite's expiry, in seconds. Defaults to the
-        /// coordination plane's own default (7 days) if omitted.
+        /// How long the invite stays valid, in seconds (default 7 days).
         #[arg(long)]
         ttl_secs: Option<u64>,
-        /// Make accepting this invite a REQUEST rather than a completed
-        /// join: the recipient redeems the code as usual, but gains no
-        /// access at all until you approve them with `share approve`.
-        /// Review waiting requests with `share pending`; turn one down
-        /// with `share deny`. Off by default, and an independent choice
-        /// from `--role` -- either role can be approval-gated or not.
+        /// Require your approval before the recipient gains access; see `share pending`.
         #[arg(long)]
         require_approval: bool,
     },
-    /// Cross-account onboarding: redeem a one-use invite minted by another
-    /// account's `share invite` (accepts either the bare code or the full
-    /// `yadorilink://invite/<code>` URL/QR payload) and link it locally at
-    /// `--path` with the chosen `--storage-mode`.
+    /// Accept an invite code or link and link the folder group to a local folder.
     Accept {
         code_or_url: String,
-        /// Local directory to link the group into.
+        /// Local directory to link the folder group into.
         #[arg(long)]
         path: String,
-        /// `eager` (store everything) or `on-demand` (store only needed
-        /// files, fetched on first access). Defaults to `eager`.
+        /// `eager` (store everything) or `on-demand` (fetch files on first access). Defaults to `eager`.
         #[arg(long, default_value = "eager")]
         storage_mode: String,
-        /// Acknowledge a risky link preflight (non-empty folder, low disk
-        /// space, a nested-link conflict, or a risky location)
-        /// non-interactively, matching `join --yes`.
+        /// Proceed past warnings about a non-empty folder, low disk space, or a risky location.
         #[arg(long)]
         yes: bool,
     },
-    /// Cross-account onboarding: list every invite this account has minted
-    /// (via a group it owns) that nobody has redeemed yet, with its
-    /// remaining TTL -- `pending`, `expired`, or `cancelled`. An invite
-    /// someone HAS already accepted does not appear here; see it as an
-    /// ordinary grant via `share list` instead.
+    /// List invites you created that have not been accepted yet.
     Invites,
-    /// Cross-account onboarding: withdraw a not-yet-redeemed invite (an id
-    /// from `share invites`) before it is ever used or expires. For an
-    /// invite that has already been accepted, use `share revoke` instead.
+    /// Cancel an invite that has not been accepted.
     CancelInvite {
         /// An invite id from `share invites`.
         invite_id: String,
     },
-    /// List the devices waiting for your approval to join a folder group
-    /// you own -- someone redeemed an invite you minted with
-    /// `--require-approval` and cannot see anything until you decide. Admit
-    /// one with `share approve`, turn it down with `share deny`.
+    /// List devices waiting for your approval to join a folder group.
     Pending,
-    /// Admit a device that is waiting for your approval (from `share
-    /// pending`) into a folder group you own. It is granted exactly the
-    /// role the invite it redeemed named -- this command takes no role of
-    /// its own. Repeating it on an already-admitted device is a no-op, not
-    /// an error.
+    /// Approve a device waiting to join a folder group you own.
     Approve {
         group_name: String,
         /// A device id from `share pending`.
         device_id: String,
     },
-    /// Turn down a device waiting for your approval (from `share
-    /// pending`), so it never gains access and its invite cannot be
-    /// redeemed again. This is the same operation as `share revoke` -- a
-    /// device already admitted (including one admitted by a concurrent
-    /// `share approve`) loses the access it has.
+    /// Turn down a device waiting to join a folder group you own.
     Deny {
         group_name: String,
         /// A device id from `share pending`.
@@ -727,45 +577,40 @@ enum ShareAction {
 
 #[derive(Subcommand)]
 enum DaemonAction {
+    /// Start the sync daemon.
     Start,
+    /// Stop the sync daemon.
     Stop,
+    /// Pause syncing.
     Pause,
+    /// Resume syncing after a pause.
     Resume,
-    /// View/toggle the daemon's opt-in `/metrics` endpoint. Persists to
-    /// the same config directory
-    /// the daemon itself reads at startup (`metrics_config.json`) — a
-    /// change here takes effect on the daemon's *next* start, not the
-    /// currently-running process (binding a new listener isn't something
-    /// a running process can do to itself mid-flight).
+    /// Show or change the daemon's metrics endpoint; changes apply on the next start.
     Metrics {
-        /// Enable the endpoint on the daemon's next start.
+        /// Enable the endpoint on the next start.
         #[arg(long, conflicts_with = "disable")]
         enable: bool,
-        /// Disable the endpoint on the daemon's next start.
+        /// Disable the endpoint on the next start.
         #[arg(long, conflicts_with = "enable")]
         disable: bool,
-        /// Bind address to use when enabling (default: 127.0.0.1:9184,
-        /// loopback-only). Ignored with `--disable`.
+        /// Address to listen on when enabling (default: 127.0.0.1:9184).
         #[arg(long)]
         addr: Option<String>,
-        /// Print the currently-persisted configuration without changing it.
+        /// Show the saved configuration without changing it.
         #[arg(long)]
         show: bool,
     },
 }
 
-/// List and recover deleted files still within their link's retention
-/// window.
+/// List and recover deleted files that are still within the retention window.
 #[derive(Subcommand)]
 enum TrashAction {
-    /// List deleted files still within their link's retention window.
+    /// List deleted files that can still be recovered.
     List,
-    /// Recover a deleted file's last version before deletion as a new
-    /// current version.
+    /// Recover a deleted file as a new current version.
     Restore {
         local_path: String,
-        /// Restore, together, everything removed by the same folder delete
-        /// or folder rename that removed this entry.
+        /// Also restore everything removed by the same folder delete or rename.
         #[arg(long)]
         folder: bool,
     },
@@ -773,8 +618,7 @@ enum TrashAction {
 
 #[derive(Subcommand)]
 enum ConflictsAction {
-    /// List currently-live conflicted-copy files across every linked
-    /// folder.
+    /// List conflicted copies across all linked folders.
     List,
 }
 
@@ -799,6 +643,20 @@ async fn main() {
             commands::report::handle_reportable_error(&e).await;
         }
         std::process::exit(e.exit_code());
+    }
+}
+
+async fn run_provider_folder(action: ProviderFolderAction) -> Result<(), CliError> {
+    match action {
+        ProviderFolderAction::Create { display_name, group_name, on_demand } => {
+            commands::provider_folder::create(display_name, group_name, on_demand).await
+        }
+        ProviderFolderAction::Join { group_id, display_name, group_name, on_demand } => {
+            commands::provider_folder::join(group_id, display_name, group_name, on_demand).await
+        }
+        ProviderFolderAction::Remove { display_name, force } => {
+            commands::provider_folder::remove(display_name, force).await
+        }
     }
 }
 
@@ -866,9 +724,9 @@ async fn run(command: Command) -> Result<(), CliError> {
                 commands::share::cancel_invite(invite_id).await
             }
         },
-        Command::Link { local_path, group_name, on_demand, max_local_size, dry_run, yes } => {
-            commands::link::link(local_path, group_name, on_demand, max_local_size, dry_run, yes)
-                .await
+        Command::ProviderFolder { action } => run_provider_folder(action).await,
+        Command::Link { local_path, group_name, on_demand, dry_run, yes } => {
+            commands::link::link(local_path, group_name, on_demand, dry_run, yes).await
         }
         Command::Unlink { local_path, force } => commands::link::unlink(local_path, force).await,
         Command::Links => commands::link::list().await,
@@ -893,8 +751,6 @@ async fn run(command: Command) -> Result<(), CliError> {
         }
         Command::Inbox => commands::send::inbox().await,
         Command::Receive { transfer_id, to } => commands::send::receive(transfer_id, to).await,
-        Command::Pin { local_path } => commands::materialization::pin(local_path).await,
-        Command::Unpin { local_path } => commands::materialization::unpin(local_path).await,
         Command::Evict { local_path } => commands::materialization::evict(local_path).await,
         Command::MaterializationStatus { local_path } => {
             commands::materialization::status(local_path).await
@@ -908,9 +764,23 @@ async fn run(command: Command) -> Result<(), CliError> {
                 commands::daemon::metrics(enable, disable, addr, show)
             }
         },
-        Command::Status { watch } => commands::status::status(watch).await,
+        Command::Status { watch, pending_items } => {
+            commands::status::status(watch).await?;
+            match pending_items {
+                Some(limit) => commands::status::pending_items(limit).await,
+                None => Ok(()),
+            }
+        }
         Command::Feedback => commands::feedback::run(),
         Command::Gc { dry_run } => commands::gc::run(dry_run).await,
+        Command::Preserved { action } => match action {
+            PreservedAction::List => commands::preserved::list().await,
+            PreservedAction::Restore { item_id } => commands::preserved::restore(&item_id).await,
+            PreservedAction::Retry { item_id } => commands::preserved::retry(&item_id).await,
+            PreservedAction::Discard { item_id, yes } => {
+                commands::preserved::discard(&item_id, yes).await
+            }
+        },
         Command::Rewind { group, at, verbose } => commands::rewind::run(group, at, verbose).await,
         Command::Limits { action } => match action {
             LimitsAction::Set { up, down } => commands::limits::set(up, down).await,
@@ -967,7 +837,9 @@ async fn run(command: Command) -> Result<(), CliError> {
                 commands::backup::status();
                 Ok(())
             }
-            BackupAction::Export { output_path } => commands::backup::export(output_path).await,
+            BackupAction::Export { output_path, yes, without_folders } => {
+                commands::backup::export(output_path, yes, without_folders).await
+            }
             BackupAction::Import { input_path, yes } => {
                 commands::backup::import(input_path, yes).await
             }
@@ -982,5 +854,84 @@ async fn run(command: Command) -> Result<(), CliError> {
         },
         Command::Doctor => commands::connection_ops::doctor().await,
         Command::Connections { peer } => commands::connection_ops::traces(peer).await,
+    }
+}
+
+#[cfg(test)]
+mod help_text_tests {
+    use super::Cli;
+    use clap::CommandFactory;
+
+    /// Words that belong in design notes, not in what a user reads in `--help`.
+    const FORBIDDEN: &[&str] = &[
+        "spec \"",
+        "(spec",
+        "openspec",
+        "on-demand-sync",
+        "verb pair",
+        "`Link`",
+        "precedent",
+        "pre-existing",
+        "policy-log",
+        "evaluator",
+        "netmap",
+        "QUIC",
+        "RFC ",
+        "OIDC",
+        "coordination plane",
+        "coordination-plane",
+        "management-authority",
+        "round trip",
+    ];
+    const MAX_ABOUT_CHARS: usize = 110;
+
+    fn check(cmd: &clap::Command, path: &str, offenders: &mut Vec<String>) {
+        let mut texts: Vec<(String, String)> = Vec::new();
+        for (kind, text) in [("about", cmd.get_about()), ("long_about", cmd.get_long_about())] {
+            if let Some(t) = text {
+                texts.push((kind.to_string(), t.to_string()));
+            }
+        }
+        for arg in cmd.get_arguments() {
+            for (kind, text) in [("help", arg.get_help()), ("long_help", arg.get_long_help())] {
+                if let Some(t) = text {
+                    texts.push((format!("--{} {kind}", arg.get_id()), t.to_string()));
+                }
+            }
+        }
+        for (kind, text) in &texts {
+            for marker in FORBIDDEN {
+                if text.contains(marker) {
+                    offenders.push(format!("{path} [{kind}] contains {marker:?}"));
+                }
+            }
+        }
+        if !path.is_empty() {
+            match cmd.get_about() {
+                None => offenders.push(format!("{path} has no description")),
+                Some(a) if a.to_string().trim().is_empty() => {
+                    offenders.push(format!("{path} has an empty description"))
+                }
+                Some(a) if a.to_string().chars().count() > MAX_ABOUT_CHARS => {
+                    offenders.push(format!("{path} description is longer than a short sentence"))
+                }
+                _ => {}
+            }
+        }
+        for sub in cmd.get_subcommands().filter(|s| s.get_name() != "help") {
+            check(sub, format!("{path} {}", sub.get_name()).trim(), offenders);
+        }
+    }
+
+    #[test]
+    fn help_text_reads_like_product_text() {
+        let mut offenders = Vec::new();
+        check(&Cli::command(), "", &mut offenders);
+        assert!(
+            offenders.is_empty(),
+            "{} help-text offenders:\n{}",
+            offenders.len(),
+            offenders.join("\n")
+        );
     }
 }

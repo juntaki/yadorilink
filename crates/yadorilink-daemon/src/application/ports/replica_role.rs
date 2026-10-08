@@ -21,7 +21,7 @@ use crate::handoff_proof::StrongHandoffProof;
 pub(crate) trait ReplicaRoleRepository: Send + Sync {
     fn list_links(&self) -> Result<Vec<FolderLink>, SyncError>;
 
-    fn live_link_local_path_for_group(&self, group_id: &str) -> Result<Option<String>, SyncError>;
+    fn live_link_key_for_group(&self, group_id: &str) -> Result<Option<String>, SyncError>;
 
     /// Atomically re-enumerates the group's durability-root digest and, only
     /// if it still equals `expected_digest`, flips `local_path`'s
@@ -184,12 +184,8 @@ pub(crate) trait LinkRuntimePort: Send + Sync {
     fn stop_link_watch<'a>(&'a self, local_path: &'a str) -> BoxFuture<'a, ()>;
 }
 
-/// A port rather than calling that free function directly so a test can
-/// inject a fixed answer deterministically -- the free function's own
-/// `OverrideForTest` is a thread-local, which a multi-threaded Tokio
-/// integration test (this port's actual callers) cannot reliably rely on:
-/// the async task that calls `set_storage_mode` is not guaranteed to run
-/// on the same OS thread the test itself set the override from.
-pub(crate) trait PlaceholderPipelineCapabilityPort: Send + Sync {
-    fn is_connected(&self) -> bool;
+/// A port so a test can inject a fixed answer deterministically per daemon: the async task that calls
+/// `set_storage_mode` is not guaranteed to run on the OS thread a test set a thread-local from.
+pub(crate) trait OnDemandCapabilityPort: Send + Sync {
+    fn allows_on_demand(&self, group_id: &str) -> bool;
 }

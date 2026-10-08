@@ -194,7 +194,7 @@ impl UpdateManager {
     /// placeholder domain.
     pub fn new(config_dir: impl AsRef<Path>, current_version: semver::Version) -> Self {
         let manifest_url = std::env::var("YADORILINK_UPDATE_MANIFEST_URL").unwrap_or_else(|_| {
-            "https://yadorilink.juntaki.com/updates/beta/manifest.json".to_string()
+            "https://control.yadori.link/updates/beta/manifest.json".to_string()
         });
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(20))
@@ -294,6 +294,11 @@ impl UpdateManager {
             .send()
             .await
             .map_err(|e| UpdateError::Fetch(e.to_string()))?;
+        // A channel nothing has been released on yet has no manifest: there is
+        // nothing to update to, which is not a failed check.
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(Applicability::UpToDate);
+        }
         let response =
             response.error_for_status().map_err(|e| UpdateError::Fetch(e.to_string()))?;
         let body = response.text().await.map_err(|e| UpdateError::Fetch(e.to_string()))?;

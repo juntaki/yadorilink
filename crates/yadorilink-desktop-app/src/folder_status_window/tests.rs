@@ -4,15 +4,6 @@ use super::*;
 use yadorilink_ipc_proto::daemonctl::EntryKind;
 
 #[test]
-fn materialization_state_label_covers_every_state() {
-    assert_eq!(materialization_state_label(MaterializationState::Hydrated), "hydrated");
-    assert_eq!(materialization_state_label(MaterializationState::Placeholder), "placeholder");
-    assert_eq!(materialization_state_label(MaterializationState::Hydrating), "hydrating");
-    assert_eq!(materialization_state_label(MaterializationState::Evicting), "evicting");
-    assert_eq!(materialization_state_label(MaterializationState::Unspecified), "unknown");
-}
-
-#[test]
 fn version_line_renders_every_field() {
     let v = FileVersionInfo {
         version_seq: 3,

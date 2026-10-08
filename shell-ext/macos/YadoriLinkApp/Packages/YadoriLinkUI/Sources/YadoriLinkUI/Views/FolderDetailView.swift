@@ -55,7 +55,10 @@ public struct FolderDetailView: View {
                     Button("Share…") {
                         context.shareTarget = ShareTarget(groupId: model.folder.groupId, folderName: model.folder.name)
                     }
-                    Button("Show in Finder") { context.revealInFinder(model.folder.localPath) }
+                    // A provider folder has no directory to reveal; Finder shows it under Locations.
+                    if !model.folder.provider {
+                        Button("Show in Finder") { context.revealInFinder(model.folder.localPath) }
+                    }
                 }
             }
 

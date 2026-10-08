@@ -58,6 +58,29 @@ fn conflict_is_attention() {
     assert_eq!(reasons, vec!["conflict:group-1".to_string()]);
 }
 
+/// `Unknown` durability while the first custody check is still pending is
+/// "checking" on a freshly linked folder, not something to act on; the same
+/// `Unknown` after a check has run still needs attention.
+#[test]
+fn durability_unknown_needs_attention_only_once_a_check_has_run() {
+    let unknown = LinkStatus {
+        durability_status: yadorilink_ipc_proto::daemonctl::GroupDurabilityStatus::Unknown as i32,
+        ..protected_link("group-1")
+    };
+    let pending = StatusResponse {
+        links: vec![LinkStatus { durability_check_pending: true, ..unknown.clone() }],
+        ..Default::default()
+    };
+    let (state, reasons) = overall_status(&pending);
+    assert_eq!(state, OverallState::Healthy);
+    assert!(reasons.is_empty(), "{reasons:?}");
+
+    let checked = StatusResponse { links: vec![unknown], ..Default::default() };
+    let (state, reasons) = overall_status(&checked);
+    assert_eq!(state, OverallState::Attention);
+    assert_eq!(reasons, vec!["durability_unknown:group-1".to_string()]);
+}
+
 /// A link the daemon has positively confirmed has no durable copy
 /// anywhere (`AtRisk`) is `Degraded`, not `Healthy` -- this is the
 /// exact overstatement this guards against: the rollup used to
@@ -212,4 +235,21 @@ fn update_failure_is_attention() {
     let (state, reasons) = overall_status(&response);
     assert_eq!(state, OverallState::Attention);
     assert_eq!(reasons, vec!["update_failed:update_manifest_fetch_failed".to_string()]);
+}
+
+/// A group linked at two folders syncs nothing at all; the rollup must not
+/// read healthy next to the `NOT SYNCING` detail line.
+#[test]
+fn an_ambiguous_link_makes_the_rollup_degraded() {
+    let response = StatusResponse {
+        links: vec![LinkStatus {
+            ambiguous: true,
+            ambiguous_local_paths: vec!["/a".into(), "/b".into()],
+            ..protected_link("group-1")
+        }],
+        ..Default::default()
+    };
+    let (state, reasons) = overall_status(&response);
+    assert_eq!(state, OverallState::Degraded);
+    assert_eq!(reasons, vec!["ambiguous:group-1".to_string()]);
 }

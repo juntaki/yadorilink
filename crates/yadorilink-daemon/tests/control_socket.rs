@@ -17,9 +17,8 @@ mod unix_socket_tests {
     use yadorilink_ipc_proto::daemonctl::{
         DaemonControlRequest, DaemonControlResponse, EvictRequest, HydrateRequest, LinkRequest,
         ListConflictsRequest, ListLinksRequest, ListTrashRequest, ListVersionsRequest,
-        MaterializationState, MaterializationStatusRequest, PauseRequest, PendingEnrollmentKind,
-        PinRequest, RestoreTrashRequest, RestoreVersionRequest, ResumeRequest, StatusRequest,
-        UnlinkRequest, UnpinRequest,
+        MaterializationStatusRequest, PauseRequest, PendingEnrollmentKind, RestoreTrashRequest,
+        RestoreVersionRequest, ResumeRequest, StatusRequest, UnlinkRequest,
     };
     use yadorilink_ipc_proto::framing::{read_message, write_message};
     use yadorilink_local_storage::SegmentBlockStore;
@@ -96,7 +95,6 @@ mod unix_socket_tests {
                 local_path: folder.to_string_lossy().to_string(),
                 group_id: "group-1".into(),
                 on_demand: false,
-                max_local_size_bytes: None,
                 acknowledge_risks: true,
                 pending_enrollment_operation_id: String::new(),
                 pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
@@ -115,12 +113,12 @@ mod unix_socket_tests {
         assert!(!list.links[0].paused);
     }
 
-    /// The daemon rejects linking a folder that overlaps an already-linked
-    /// folder unless `acknowledge_risks` is set -- defense-in-depth
-    /// independent of whatever the CLI already showed/gated, since the
-    /// daemon alone knows every existing link's path.
+    /// The daemon refuses linking a folder that overlaps an already-linked
+    /// folder at every confirmation level: nesting is an unsupported topology,
+    /// not a risk `acknowledge_risks` can accept. The refusal is the daemon's
+    /// alone, since it alone knows every existing link's path.
     #[tokio::test]
-    async fn link_rejects_unacknowledged_nested_conflict() {
+    async fn link_refuses_a_nested_link_even_with_acknowledge_risks() {
         let (socket_path, dir) = start_daemon().await;
         let parent = dir.path().join("parent");
         let child = parent.join("child");
@@ -132,7 +130,6 @@ mod unix_socket_tests {
                 local_path: parent.to_string_lossy().to_string(),
                 group_id: "group-1".into(),
                 on_demand: false,
-                max_local_size_bytes: None,
                 acknowledge_risks: true,
                 pending_enrollment_operation_id: String::new(),
                 pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
@@ -142,28 +139,32 @@ mod unix_socket_tests {
         .await;
         assert!(matches!(resp.payload, Some(RespPayload::Link(_))));
 
-        // Linking `child` (nested inside the already-linked `parent`)
-        // without acknowledging the risk is rejected.
-        let resp = send(
-            &socket_path,
-            ReqPayload::Link(LinkRequest {
-                local_path: child.to_string_lossy().to_string(),
-                group_id: "group-2".into(),
-                on_demand: false,
-                max_local_size_bytes: None,
-                acknowledge_risks: false,
-                pending_enrollment_operation_id: String::new(),
-                pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
-                pending_enrollment_device_id: String::new(),
-            }),
-        )
-        .await;
-        let Some(RespPayload::Error(msg)) = resp.payload else {
-            panic!("expected the nested-link conflict to be rejected, got {:?}", resp.payload)
-        };
-        assert!(msg.contains("nested-link conflict"), "expected a clear message, got {msg:?}");
+        // Linking `child` (nested inside the already-linked `parent`) is
+        // refused with and without the acknowledgement.
+        for acknowledge_risks in [false, true] {
+            let resp = send(
+                &socket_path,
+                ReqPayload::Link(LinkRequest {
+                    local_path: child.to_string_lossy().to_string(),
+                    group_id: "group-2".into(),
+                    on_demand: false,
+                    acknowledge_risks,
+                    pending_enrollment_operation_id: String::new(),
+                    pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
+                    pending_enrollment_device_id: String::new(),
+                }),
+            )
+            .await;
+            let Some(RespPayload::Error(msg)) = resp.payload else {
+                panic!("expected the nested link to be refused, got {:?}", resp.payload)
+            };
+            assert!(
+                msg.contains("unsupported link topology"),
+                "expected a clear message (acknowledge_risks={acknowledge_risks}), got {msg:?}"
+            );
+        }
 
-        // The rejected link never got registered.
+        // The refused link never got registered.
         let resp = send(&socket_path, ReqPayload::ListLinks(ListLinksRequest {})).await;
         let Some(RespPayload::ListLinks(list)) = resp.payload else {
             panic!("wrong response variant")
@@ -171,37 +172,22 @@ mod unix_socket_tests {
         assert_eq!(list.links.len(), 1);
     }
 
-    /// The same nested-conflict attempt succeeds once `acknowledge_risks`
-    /// is set -- the daemon-side check is a gate, not an absolute ban.
+    /// With the on-demand pipeline not connected (the production answer), a
+    /// request to link a folder on-demand is refused and leaves no link row
+    /// behind: an unsupported root fails closed instead of falling back to
+    /// some other placeholder mechanism.
     #[tokio::test]
-    async fn link_allows_acknowledged_nested_conflict() {
+    async fn link_on_demand_is_refused_while_the_pipeline_is_not_connected() {
         let (socket_path, dir) = start_daemon().await;
-        let parent = dir.path().join("parent");
-        let child = parent.join("child");
-        std::fs::create_dir_all(&child).unwrap();
-
-        send(
-            &socket_path,
-            ReqPayload::Link(LinkRequest {
-                local_path: parent.to_string_lossy().to_string(),
-                group_id: "group-1".into(),
-                on_demand: false,
-                max_local_size_bytes: None,
-                acknowledge_risks: true,
-                pending_enrollment_operation_id: String::new(),
-                pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
-                pending_enrollment_device_id: String::new(),
-            }),
-        )
-        .await;
+        let folder = dir.path().join("remote-docs");
+        std::fs::create_dir_all(&folder).unwrap();
 
         let resp = send(
             &socket_path,
             ReqPayload::Link(LinkRequest {
-                local_path: child.to_string_lossy().to_string(),
-                group_id: "group-2".into(),
-                on_demand: false,
-                max_local_size_bytes: None,
+                local_path: folder.to_string_lossy().to_string(),
+                group_id: "group-1".into(),
+                on_demand: true,
                 acknowledge_risks: true,
                 pending_enrollment_operation_id: String::new(),
                 pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
@@ -209,13 +195,16 @@ mod unix_socket_tests {
             }),
         )
         .await;
-        assert!(matches!(resp.payload, Some(RespPayload::Link(_))));
+        let Some(RespPayload::Error(msg)) = resp.payload else {
+            panic!("expected the on-demand link to be refused, got {:?}", resp.payload)
+        };
+        assert!(msg.contains("not available in this build"), "got {msg:?}");
 
         let resp = send(&socket_path, ReqPayload::ListLinks(ListLinksRequest {})).await;
         let Some(RespPayload::ListLinks(list)) = resp.payload else {
             panic!("wrong response variant")
         };
-        assert_eq!(list.links.len(), 2);
+        assert!(list.links.is_empty(), "a refused link must not be registered: {list:?}");
     }
 
     /// sync-engine spec: "Pause halts sync activity" / "Resume processes
@@ -231,7 +220,6 @@ mod unix_socket_tests {
                 local_path: folder.to_string_lossy().to_string(),
                 group_id: "group-2".into(),
                 on_demand: false,
-                max_local_size_bytes: None,
                 acknowledge_risks: true,
                 pending_enrollment_operation_id: String::new(),
                 pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
@@ -275,7 +263,6 @@ mod unix_socket_tests {
                 local_path: local_path.clone(),
                 group_id: "group-3".into(),
                 on_demand: false,
-                max_local_size_bytes: None,
                 acknowledge_risks: true,
                 pending_enrollment_operation_id: String::new(),
                 pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
@@ -300,6 +287,79 @@ mod unix_socket_tests {
             panic!("wrong response variant")
         };
         assert!(list.links.is_empty());
+    }
+
+    /// An unlink whose path matches no recorded link must fail loudly and
+    /// leave the real link live, never report success.
+    #[tokio::test]
+    async fn unlink_of_a_path_matching_no_link_is_an_error_and_keeps_the_link() {
+        let (socket_path, dir) = start_daemon().await;
+        let folder = dir.path().join("Docs");
+        std::fs::create_dir_all(&folder).unwrap();
+        let local_path = folder.to_string_lossy().to_string();
+        send(
+            &socket_path,
+            ReqPayload::Link(LinkRequest {
+                local_path: local_path.clone(),
+                group_id: "group-unlink-miss".into(),
+                on_demand: false,
+                acknowledge_risks: true,
+                pending_enrollment_operation_id: String::new(),
+                pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
+                pending_enrollment_device_id: String::new(),
+            }),
+        )
+        .await;
+
+        let respelled = format!("{local_path}/");
+        let resp = send(
+            &socket_path,
+            ReqPayload::Unlink(UnlinkRequest { local_path: respelled, force: false }),
+        )
+        .await;
+        let Some(RespPayload::Error(message)) = resp.payload else {
+            panic!("expected an error for an unmatched path, got {:?}", resp.payload)
+        };
+        assert!(message.contains("no folder is linked"), "{message}");
+
+        let resp = send(&socket_path, ReqPayload::ListLinks(ListLinksRequest {})).await;
+        let Some(RespPayload::ListLinks(list)) = resp.payload else {
+            panic!("wrong response variant")
+        };
+        assert_eq!(list.links.len(), 1);
+    }
+
+    /// The daemon's working directory is unrelated to the user's, so a
+    /// relative transfer path is refused rather than resolved against it.
+    #[tokio::test]
+    async fn transfer_requests_with_relative_paths_are_rejected() {
+        let (socket_path, _dir) = start_daemon().await;
+
+        let resp = send(
+            &socket_path,
+            ReqPayload::SendFile(yadorilink_ipc_proto::daemonctl::SendFileRequest {
+                source_path: "notes.txt".into(),
+                target_device: "laptop".into(),
+            }),
+        )
+        .await;
+        let Some(RespPayload::Error(message)) = resp.payload else {
+            panic!("expected an error, got {:?}", resp.payload)
+        };
+        assert!(message.contains("absolute"), "{message}");
+
+        let resp = send(
+            &socket_path,
+            ReqPayload::ReceiveTransfer(yadorilink_ipc_proto::daemonctl::ReceiveTransferRequest {
+                transfer_id: "t".into(),
+                destination_dir: "inbox".into(),
+            }),
+        )
+        .await;
+        let Some(RespPayload::Error(message)) = resp.payload else {
+            panic!("expected an error, got {:?}", resp.payload)
+        };
+        assert!(message.contains("absolute"), "{message}");
     }
 
     /// THE C14 SEAM, end to end over the real socket.
@@ -354,6 +414,27 @@ mod unix_socket_tests {
             );
         }
         assert_eq!(list.links.len(), 2, "both rows must stay visible for recovery");
+    }
+
+    /// A link whose coordination-side authorization is gone no longer syncs;
+    /// status must not show it as healthy and up to date.
+    #[tokio::test]
+    async fn status_reports_an_orphaned_link_as_degraded() {
+        let (socket_path, dir, state) = start_daemon_with_state().await;
+        let folder = dir.path().join("photos");
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.to_string_lossy().to_string();
+        let links = state.replica_coordinator.link_repository();
+        links.add_link(&path, "group-orphan").unwrap();
+        links.mark_link_orphaned(&path).unwrap();
+
+        let resp = send(&socket_path, ReqPayload::ListLinks(ListLinksRequest {})).await;
+        let Some(RespPayload::ListLinks(list)) = resp.payload else {
+            panic!("wrong response variant")
+        };
+        assert_eq!(list.links.len(), 1);
+        assert!(list.links[0].degraded, "an orphaned link is not syncing");
+        assert!(!list.links[0].degraded_reason.is_empty());
     }
 
     /// A healthy one-folder group must NOT be flagged. Without this, hardcoding
@@ -497,7 +578,6 @@ mod unix_socket_tests {
                 local_path: local_path.clone(),
                 group_id: "group-4".into(),
                 on_demand: false,
-                max_local_size_bytes: None,
                 acknowledge_risks: true,
                 pending_enrollment_operation_id: String::new(),
                 pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
@@ -549,10 +629,12 @@ mod unix_socket_tests {
         let signing_key = state
             .device_signing_key()
             .expect("start_daemon_with_state installs one before anything links");
-        let emitter = yadorilink_sync_sqlite::dag_store::ChangeEmitter::new(
-            state.device_id.clone(),
+        let emitter = yadorilink_daemon::test_support::local_seam::replica_author_key(
+            &state.replica_coordinator,
+            &state.device_id,
             signing_key,
-        );
+        )
+        .unwrap();
         let version = FileVersion::new(
             vec![VersionBlock {
                 hash: yadorilink_replica_domain::ids::BlockHash(hash.clone()),
@@ -574,28 +656,17 @@ mod unix_socket_tests {
             blocks: vec![BlockInfo { hash, offset: 0, size: content.len() as u32 }],
             deleted: false,
         };
-        state
-            .replica_coordinator
-            .upsert_file_emitting_change(
-                group_id,
-                &record,
-                &state.device_id,
-                yadorilink_replica_domain::session_state::ChangeContent {
-                    ops: vec![yadorilink_replica_domain::change::Op::Put {
-                        path: yadorilink_replica_domain::ids::SyncPath(record.path.clone()),
-                        version: version.version_hash,
-                        origin: yadorilink_replica_domain::change::PutOrigin::Direct,
-                    }],
-                    versions: std::slice::from_ref(&version),
-                },
-                None,
-                None,
-                yadorilink_daemon::replica_coordinator::ReplicaChangeEmission {
-                    emitter: &emitter,
-                    permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-                },
-            )
-            .unwrap();
+        yadorilink_daemon::test_support::local_seam::commit_local_upsert(
+            &state.replica_coordinator,
+            group_id,
+            &record,
+            &state.device_id,
+            &version,
+            None,
+            &emitter,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
     }
 
     /// `yadorilink conflicts list` -- a live file whose path already
@@ -616,7 +687,6 @@ mod unix_socket_tests {
                 local_path: local_path.clone(),
                 group_id: "group-conflicts".into(),
                 on_demand: false,
-                max_local_size_bytes: None,
                 acknowledge_risks: true,
                 pending_enrollment_operation_id: String::new(),
                 pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
@@ -679,7 +749,6 @@ mod unix_socket_tests {
                 local_path: local_path.clone(),
                 group_id: "group-retired-conflict".into(),
                 on_demand: false,
-                max_local_size_bytes: None,
                 acknowledge_risks: true,
                 pending_enrollment_operation_id: String::new(),
                 pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
@@ -708,28 +777,29 @@ mod unix_socket_tests {
         // divergence justifies keeping the copy around.
         // Emitted, not a bare tombstone upsert. Once the group has DAG
         // history, a `deleted: true` row written straight through the index
-        // has a NULL authoring hash with `version_seq > 0`, which the
+        // has no native authoring identity with `version_seq > 0`, which the
         // `files_require_authoring_identity_on_insert` trigger aborts
         // outright -- the delete has to come from a change like any other.
         let signing_key = state
             .device_signing_key()
             .expect("start_daemon_with_state installs one before anything links");
-        let emitter = yadorilink_sync_sqlite::dag_store::ChangeEmitter::new(
-            state.device_id.clone(),
+        let emitter = yadorilink_daemon::test_support::local_seam::replica_author_key(
+            &state.replica_coordinator,
+            &state.device_id,
             signing_key,
-        );
-        state
-            .replica_coordinator
-            .mark_deleted_emitting_change(
-                "group-retired-conflict",
-                conflict_path,
-                &state.device_id,
-                0,
-                false,
-                &emitter,
-                &permit,
-            )
-            .unwrap();
+        )
+        .unwrap();
+        yadorilink_daemon::test_support::local_seam::commit_local_delete(
+            &state.replica_coordinator,
+            "group-retired-conflict",
+            conflict_path,
+            &state.device_id,
+            0,
+            false,
+            &emitter,
+            &permit,
+        )
+        .unwrap();
 
         // Deleted: both surfaces agree it's gone -- neither still counts it.
         let resp = send(&socket_path, ReqPayload::ListConflicts(ListConflictsRequest {})).await;
@@ -767,7 +837,6 @@ mod unix_socket_tests {
                 local_path: local_path.clone(),
                 group_id: "group-held".into(),
                 on_demand: false,
-                max_local_size_bytes: None,
                 acknowledge_risks: true,
                 pending_enrollment_operation_id: String::new(),
                 pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
@@ -833,7 +902,6 @@ mod unix_socket_tests {
                 local_path: local_path.clone(),
                 group_id: "group-not-held".into(),
                 on_demand: false,
-                max_local_size_bytes: None,
                 acknowledge_risks: true,
                 pending_enrollment_operation_id: String::new(),
                 pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
@@ -878,7 +946,6 @@ mod unix_socket_tests {
                 local_path: local_path.clone(),
                 group_id: "group-symlink".into(),
                 on_demand: false,
-                max_local_size_bytes: None,
                 acknowledge_risks: true,
                 pending_enrollment_operation_id: String::new(),
                 pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
@@ -946,7 +1013,6 @@ mod unix_socket_tests {
                 local_path: local_path.clone(),
                 group_id: "group-symlink-optin".into(),
                 on_demand: false,
-                max_local_size_bytes: None,
                 acknowledge_risks: true,
                 pending_enrollment_operation_id: String::new(),
                 pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
@@ -1014,7 +1080,6 @@ mod unix_socket_tests {
                 local_path: local_path.clone(),
                 group_id: "group-symlink-posix".into(),
                 on_demand: false,
-                max_local_size_bytes: None,
                 acknowledge_risks: true,
                 pending_enrollment_operation_id: String::new(),
                 pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
@@ -1077,7 +1142,6 @@ mod unix_socket_tests {
                 local_path: local_path.clone(),
                 group_id: "group-5".into(),
                 on_demand: false,
-                max_local_size_bytes: None,
                 acknowledge_risks: true,
                 pending_enrollment_operation_id: String::new(),
                 pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
@@ -1109,12 +1173,12 @@ mod unix_socket_tests {
         // This test is about the eviction gate's own success path, not the
         // on-demand pipeline's real-vs-fake state, so unconditionally
         // connect the fake here. See `DaemonState::
-        // set_test_placeholder_pipeline_connected`'s own doc comment for why
+        // set_test_on_demand_allowed`'s own doc comment for why
         // a daemon integration test needs this instead of the production
         // probe (unconditionally `false`) or the free function's
-        // thread-local `OverrideForTest` (unreliable across this
+        // thread-local a thread-local override (unreliable across this
         // multi-threaded runtime).
-        state.set_test_placeholder_pipeline_connected(true);
+        state.set_test_on_demand_allowed(true);
         let folder = dir.path().join("shared");
         std::fs::create_dir_all(&folder).unwrap();
         let local_path = folder.to_string_lossy().to_string();
@@ -1124,7 +1188,6 @@ mod unix_socket_tests {
                 local_path: local_path.clone(),
                 group_id: "group-7".into(),
                 on_demand: false,
-                max_local_size_bytes: None,
                 acknowledge_risks: true,
                 pending_enrollment_operation_id: String::new(),
                 pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
@@ -1143,11 +1206,9 @@ mod unix_socket_tests {
         // immediate `Evict`, racing for the same per-path lock
         // `evict_file`'s non-blocking `try_lock` refuses to wait for.
         // Confirmed as the actual cause of a real CI failure: the eviction
-        // was rejected with "it is pinned", but that error variant is also
-        // used for a busy path lock (`{path} is busy`), which is what the
-        // rejection message actually said -- the watcher, not a real pin,
-        // held the lock. Stopping the watch makes the bypass genuine
-        // instead of merely likely on a fast host.
+        // was rejected as `{path} is busy` -- the watcher held the lock.
+        // Stopping the watch makes the bypass genuine instead of merely
+        // likely on a fast host.
         LinkRuntimeController::new(state.clone()).stop(&local_path).await;
         // Stopping the watch above also tears down this link's runtime
         // registration, which is what `hydration::evict`'s own
@@ -1189,7 +1250,7 @@ mod unix_socket_tests {
             )
             .unwrap();
         // `upsert_file` alone leaves `materialization_state` at the
-        // schema's own default, `Placeholder` -- not `Hydrated` -- since it
+        // schema's own default, `Remote` -- not `Present` -- since it
         // is the generic index-write primitive every kind of row (including
         // a not-yet-fetched on-demand placeholder) goes through. This test
         // is specifically about evicting an already-*hydrated* file (see
@@ -1209,7 +1270,7 @@ mod unix_socket_tests {
             .set_materialization_state(
                 "group-7",
                 "report.pdf",
-                yadorilink_replica_domain::session_state::MaterializationState::Hydrated,
+                yadorilink_replica_domain::session_state::MaterializationState::Present,
                 &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
@@ -1233,11 +1294,86 @@ mod unix_socket_tests {
                 .materialization_state_repository()
                 .get_materialization_state("group-7", "report.pdf")
                 .unwrap(),
-            Some(yadorilink_replica_domain::session_state::MaterializationState::Placeholder)
+            Some(yadorilink_replica_domain::session_state::MaterializationState::Remote)
         );
-        let metadata = std::fs::metadata(folder.join("report.pdf")).unwrap();
-        assert_eq!(metadata.len(), 1000);
-        assert_ne!(std::fs::read(folder.join("report.pdf")).unwrap(), content);
+        assert!(
+            std::fs::symlink_metadata(folder.join("report.pdf")).is_err(),
+            "an evicted file must no longer stand in the user tree"
+        );
+    }
+
+    /// Evicting a folder over the control socket frees every hydrated file
+    /// below it, and only those.
+    #[tokio::test]
+    async fn evict_via_control_socket_frees_every_hydrated_file_below_a_folder() {
+        use yadorilink_replica_domain::session_state::MaterializationState;
+        let (socket_path, dir, state) = start_daemon_with_state().await;
+        state.set_test_on_demand_allowed(true);
+        let folder = dir.path().join("shared");
+        std::fs::create_dir_all(folder.join("album")).unwrap();
+        let local_path = folder.to_string_lossy().to_string();
+        send(
+            &socket_path,
+            ReqPayload::Link(LinkRequest {
+                local_path: local_path.clone(),
+                group_id: "group-8".into(),
+                on_demand: false,
+                acknowledge_risks: true,
+                pending_enrollment_operation_id: String::new(),
+                pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
+                pending_enrollment_device_id: String::new(),
+            }),
+        )
+        .await;
+        // Same direct-index setup as the single-file test above, for the
+        // same reasons: no watcher racing the per-path lock, and a live root
+        // authority for the eviction to resolve.
+        LinkRuntimeController::new(state.clone()).stop(&local_path).await;
+        state.install_test_root_commit_authority("group-8");
+        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+        let index = state.replica_coordinator.file_index_repository();
+        let materialization = state.replica_coordinator.materialization_state_repository();
+        for (path, byte) in [("album/a.jpg", 1u8), ("album/b.jpg", 2u8), ("outside.txt", 3u8)] {
+            let content = vec![byte; 500];
+            std::fs::write(folder.join(path), &content).unwrap();
+            let hash = {
+                use sha2::{Digest, Sha256};
+                Sha256::digest(&content).to_vec()
+            };
+            let record = yadorilink_replica_domain::file::FileRecord {
+                path: path.into(),
+                size: 500,
+                mtime_unix_nanos: 0,
+                blocks: vec![yadorilink_replica_domain::file::BlockInfo {
+                    hash,
+                    offset: 0,
+                    size: 500,
+                }],
+                deleted: false,
+            };
+            index.upsert_file("group-8", &record, &permit).unwrap();
+            materialization
+                .set_materialization_state("group-8", path, MaterializationState::Present, &permit)
+                .unwrap();
+        }
+
+        let resp = send(
+            &socket_path,
+            ReqPayload::Evict(EvictRequest {
+                absolute_path: folder.join("album").to_string_lossy().to_string(),
+            }),
+        )
+        .await;
+        let Some(RespPayload::Evict(evicted)) = resp.payload else {
+            panic!("a folder of hydrated files should evict, got {:?}", resp.payload)
+        };
+        assert!(evicted.dehydrated);
+
+        let state_of = |path: &str| materialization.get_materialization_state("group-8", path);
+        assert_eq!(state_of("album/a.jpg").unwrap(), Some(MaterializationState::Remote));
+        assert_eq!(state_of("album/b.jpg").unwrap(), Some(MaterializationState::Remote));
+        assert_eq!(state_of("outside.txt").unwrap(), Some(MaterializationState::Present));
+        assert_eq!(std::fs::read(folder.join("outside.txt")).unwrap(), vec![3u8; 500]);
     }
 
     /// A path the daemon has never indexed reports `known: false`
@@ -1253,7 +1389,6 @@ mod unix_socket_tests {
                 local_path: folder.to_string_lossy().to_string(),
                 group_id: "group-status-1".into(),
                 on_demand: false,
-                max_local_size_bytes: None,
                 acknowledge_risks: true,
                 pending_enrollment_operation_id: String::new(),
                 pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
@@ -1277,10 +1412,10 @@ mod unix_socket_tests {
         }
     }
 
-    /// An indexed file's real materialization state and pin flag
-    /// round-trip through the control socket exactly, end to end.
+    /// An indexed file's real materialization state round-trips through the
+    /// control socket exactly, end to end.
     #[tokio::test]
-    async fn materialization_status_via_control_socket_reports_the_real_state_and_pin_flag() {
+    async fn materialization_status_via_control_socket_reports_the_real_state() {
         let (socket_path, dir, state) = start_daemon_with_state().await;
         let folder = dir.path().join("shared");
         std::fs::create_dir_all(&folder).unwrap();
@@ -1291,7 +1426,6 @@ mod unix_socket_tests {
                 local_path: local_path.clone(),
                 group_id: "group-status-2".into(),
                 on_demand: false,
-                max_local_size_bytes: None,
                 acknowledge_risks: true,
                 pending_enrollment_operation_id: String::new(),
                 pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
@@ -1317,21 +1451,42 @@ mod unix_socket_tests {
                 &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
+        // `current_content_present` is reported only for content a usable
+        // proof names as the current version's; `Present` alone says an
+        // object exists.
         state
             .replica_coordinator
             .materialization_state_repository()
             .set_materialization_state(
                 "group-status-2",
                 "report.pdf",
-                yadorilink_replica_domain::session_state::MaterializationState::Hydrated,
+                yadorilink_replica_domain::session_state::MaterializationState::Present,
                 &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
-        state
-            .replica_coordinator
-            .file_index_repository()
-            .set_pinned("group-status-2", "report.pdf", true)
-            .unwrap();
+        let path = folder.join("report.pdf").to_string_lossy().to_string();
+        let before = send(
+            &socket_path,
+            ReqPayload::MaterializationStatus(MaterializationStatusRequest {
+                absolute_path: path.clone(),
+            }),
+        )
+        .await;
+        match before.payload {
+            Some(RespPayload::MaterializationStatus(status)) => {
+                let local = status.local_state.expect("an indexed path has a local state");
+                assert!(local.local_object_present, "the object stands");
+                assert!(!local.current_content_present, "no proof names the current version");
+            }
+            other => panic!("expected a MaterializationStatus response, got {other:?}"),
+        }
+        yadorilink_daemon::test_support::seed_prior_cycle_proof(
+            &state.replica_coordinator,
+            "group-status-2",
+            "report.pdf",
+            &folder.join("report.pdf"),
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        );
 
         let resp = send(
             &socket_path,
@@ -1343,17 +1498,18 @@ mod unix_socket_tests {
         match resp.payload {
             Some(RespPayload::MaterializationStatus(status)) => {
                 assert!(status.known);
-                assert_eq!(status.state(), MaterializationState::Hydrated);
-                assert!(status.pinned);
+                let local = status.local_state.expect("an indexed path has a local state");
+                assert!(local.local_object_present);
+                assert!(local.current_content_present);
             }
             other => panic!("expected a MaterializationStatus response, got {other:?}"),
         }
     }
 
-    /// hydrate/pin with no peer connected must
-    /// return a clear error over the control socket, not hang the connection.
+    /// hydrate with no peer connected must return a clear error over the
+    /// control socket, not hang the connection.
     #[tokio::test]
-    async fn hydrate_and_pin_without_a_connected_peer_return_a_clear_error() {
+    async fn hydrate_without_a_connected_peer_returns_a_clear_error() {
         let (socket_path, dir) = start_daemon().await;
         let folder = dir.path().join("shared");
         std::fs::create_dir_all(&folder).unwrap();
@@ -1364,7 +1520,6 @@ mod unix_socket_tests {
                 local_path,
                 group_id: "group-6".into(),
                 on_demand: false,
-                max_local_size_bytes: None,
                 acknowledge_risks: true,
                 pending_enrollment_operation_id: String::new(),
                 pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
@@ -1375,22 +1530,9 @@ mod unix_socket_tests {
 
         let nope_path = folder.join("nope.bin").to_string_lossy().to_string();
 
-        let resp = send(
-            &socket_path,
-            ReqPayload::Hydrate(HydrateRequest { absolute_path: nope_path.clone() }),
-        )
-        .await;
-        assert!(matches!(resp.payload, Some(RespPayload::Error(_))));
-
         let resp =
-            send(&socket_path, ReqPayload::Pin(PinRequest { absolute_path: nope_path.clone() }))
+            send(&socket_path, ReqPayload::Hydrate(HydrateRequest { absolute_path: nope_path }))
                 .await;
-        assert!(matches!(resp.payload, Some(RespPayload::Error(_))));
-
-        // Unpin needs no peer at all, but still requires the path to actually
-        // be indexed — same "not found" error as any other unknown path.
-        let resp =
-            send(&socket_path, ReqPayload::Unpin(UnpinRequest { absolute_path: nope_path })).await;
         assert!(matches!(resp.payload, Some(RespPayload::Error(_))));
     }
     /// `ListVersions`/`RestoreVersion` round-trip against a running
@@ -1410,7 +1552,6 @@ mod unix_socket_tests {
                 local_path,
                 group_id: "group-versions".into(),
                 on_demand: false,
-                max_local_size_bytes: None,
                 acknowledge_risks: true,
                 pending_enrollment_operation_id: String::new(),
                 pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
@@ -1431,8 +1572,7 @@ mod unix_socket_tests {
         // never having been obtained through the group, and refuses it.
         state
             .replica_coordinator
-            .change_history_repository()
-            .record_group_block_provenance("group-versions", std::slice::from_ref(&v1_block.hash))
+            .record_block_provenance("group-versions", std::slice::from_ref(&v1_block.hash))
             .unwrap();
         state
             .replica_coordinator
@@ -1459,8 +1599,7 @@ mod unix_socket_tests {
         };
         state
             .replica_coordinator
-            .change_history_repository()
-            .record_group_block_provenance("group-versions", std::slice::from_ref(&v2_block.hash))
+            .record_block_provenance("group-versions", std::slice::from_ref(&v2_block.hash))
             .unwrap();
         state
             .replica_coordinator
@@ -1531,7 +1670,6 @@ mod unix_socket_tests {
                 local_path,
                 group_id: "group-default-restore".into(),
                 on_demand: false,
-                max_local_size_bytes: None,
                 acknowledge_risks: true,
                 pending_enrollment_operation_id: String::new(),
                 pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
@@ -1550,11 +1688,7 @@ mod unix_socket_tests {
         // round_trips_through_control_socket` above.
         state
             .replica_coordinator
-            .change_history_repository()
-            .record_group_block_provenance(
-                "group-default-restore",
-                std::slice::from_ref(&v1_block.hash),
-            )
+            .record_block_provenance("group-default-restore", std::slice::from_ref(&v1_block.hash))
             .unwrap();
         state
             .replica_coordinator
@@ -1576,8 +1710,7 @@ mod unix_socket_tests {
         let v2_hash = hex::decode(state.block_store.put(b"second content").unwrap()).unwrap();
         state
             .replica_coordinator
-            .change_history_repository()
-            .record_group_block_provenance("group-default-restore", std::slice::from_ref(&v2_hash))
+            .record_block_provenance("group-default-restore", std::slice::from_ref(&v2_hash))
             .unwrap();
         state
             .replica_coordinator
@@ -1621,7 +1754,6 @@ mod unix_socket_tests {
                 local_path: folder2.to_string_lossy().to_string(),
                 group_id: "group-no-superseded".into(),
                 on_demand: false,
-                max_local_size_bytes: None,
                 acknowledge_risks: true,
                 pending_enrollment_operation_id: String::new(),
                 pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
@@ -1674,7 +1806,6 @@ mod unix_socket_tests {
                 local_path,
                 group_id: "group-missing-blocks".into(),
                 on_demand: false,
-                max_local_size_bytes: None,
                 acknowledge_risks: true,
                 pending_enrollment_operation_id: String::new(),
                 pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
@@ -1743,7 +1874,6 @@ mod unix_socket_tests {
                 local_path: local_path.clone(),
                 group_id: "group-trash".into(),
                 on_demand: false,
-                max_local_size_bytes: None,
                 acknowledge_risks: true,
                 pending_enrollment_operation_id: String::new(),
                 pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
@@ -1762,8 +1892,7 @@ mod unix_socket_tests {
         // round_trips_through_control_socket` above.
         state
             .replica_coordinator
-            .change_history_repository()
-            .record_group_block_provenance("group-trash", std::slice::from_ref(&block.hash))
+            .record_block_provenance("group-trash", std::slice::from_ref(&block.hash))
             .unwrap();
         state
             .replica_coordinator
@@ -1910,7 +2039,6 @@ mod windows_pipe_tests {
                 local_path: folder.to_string_lossy().to_string(),
                 group_id: "group-1".into(),
                 on_demand: false,
-                max_local_size_bytes: None,
                 acknowledge_risks: true,
                 pending_enrollment_operation_id: String::new(),
                 pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
@@ -1942,7 +2070,6 @@ mod windows_pipe_tests {
                 local_path: folder.to_string_lossy().to_string(),
                 group_id: "group-2".into(),
                 on_demand: false,
-                max_local_size_bytes: None,
                 acknowledge_risks: true,
                 pending_enrollment_operation_id: String::new(),
                 pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
@@ -1987,7 +2114,6 @@ mod windows_pipe_tests {
                     local_path: folder_a.to_string_lossy().to_string(),
                     group_id: "group-a".into(),
                     on_demand: false,
-                    max_local_size_bytes: None,
                     acknowledge_risks: true,
                     pending_enrollment_operation_id: String::new(),
                     pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
@@ -2000,7 +2126,6 @@ mod windows_pipe_tests {
                     local_path: folder_b.to_string_lossy().to_string(),
                     group_id: "group-b".into(),
                     on_demand: false,
-                    max_local_size_bytes: None,
                     acknowledge_risks: true,
                     pending_enrollment_operation_id: String::new(),
                     pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,

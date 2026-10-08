@@ -103,7 +103,20 @@ impl MaterializationRepairJob {
             }
         };
         for group_id in groups {
-            state.backfill_missing_change_history(&group_id).await;
+            // A planned entry with no row is owed a projection whether or not
+            // any peer is connected: a missed wake-up leaves no obligation to
+            // say so, and the engine only acts on obligations. Armed here so
+            // the ordinary engine pass projects it.
+            match state.replica_coordinator.arm_native_plan_gaps(&group_id) {
+                Ok(0) => {}
+                Ok(armed) => {
+                    tracing::info!(group_id, armed, "armed planned entries that had no row");
+                    state.replica_coordinator.notify_materialization_wake();
+                }
+                Err(error) => {
+                    tracing::warn!(group_id, %error, "could not arm planned entries with no row");
+                }
+            }
             let candidates = state.peers.sessions_for_group(&group_id);
             if candidates.is_empty() {
                 tracing::debug!(

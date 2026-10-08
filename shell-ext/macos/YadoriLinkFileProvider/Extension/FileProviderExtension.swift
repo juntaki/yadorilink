@@ -1,62 +1,57 @@
 //
-//  FileProviderExtension.swift — on-demand-sync.
+//  FileProviderExtension.swift
 //
-//  `NSFileProviderReplicatedExtension` (the modern replicated-extension
-//  API — confirmed available since macOS 11.0 via this SDK's
-//  `FILEPROVIDER_API_AVAILABILITY_V3_IOS` macro on the protocol itself,
-//  `#define FILEPROVIDER_API_AVAILABILITY_V3_IOS API_AVAILABLE(macos(11.0),...)`
-//  in NSFileProviderDefines.h — so this target keeps the same 11.0
-//  deployment target as YadoriLinkFinderSync rather than needing a bump;
-//  see project.yml's comment for the full verification note). All
-//  required-protocol methods below satisfy `NSFileProviderReplicatedExtension`
-//  and its `NSFileProviderEnumerating` refinement, per
-//  `NSFileProviderReplicatedExtension.h` read directly from the local
-//  SDK (no public docs access needed — the header is the source of
-//  truth for exact Swift signatures).
+//  `NSFileProviderReplicatedExtension` for a provider root. The daemon is the only authority on
+//  what an item is; this extension is a transport for user intent and for bytes.
 //
-//  All Rust FFI calls (`yadorilink_fp_*`) run on a background queue, never
-//  the calling thread the system hands the completion handler on,
-//  matching `core`'s "must never block Finder noticeably" contract —
-//  here the constraint is "must never block the system's File Provider
-//  XPC dispatch queue," same shape, different caller.
+//  THE TOKEN RULE: every item and every materialized file carries the daemon's
+//  40-byte version token. The OS stores it with the bytes it holds and hands it back as
+//  `baseVersion`; the extension echoes it VERBATIM as the base of a modify or delete, and never
+//  builds one, splits one, or combines a hash and a generation taken at different moments. A
+//  `baseVersion` that is not exactly 40 bytes is sent as NO base (unknown): the daemon keeps an
+//  edit beside the file and leaves a deleted file in place.
+//
+//  Nothing the OS reports about its own state (materialization, signals, evictions) is used to
+//  decide a write. All FFI calls run on a background queue.
 
+import CryptoKit
 import FileProvider
+import os
+import FileProviderCore
 import UniformTypeIdentifiers
 
-// @objc(FileProviderExtension) is required: without it, Swift's runtime
-// class name is mangled with the module name
-// (YadoriLinkFileProvider.FileProviderExtension), which doesn't match
-// Info.plist's NSExtensionPrincipalClass — confirmed via a real crash on
-// a signed build: "Extension Info.plist does not define a principal
-// class, or class was not found (expected class name:
-// FileProviderExtension)". Same class of bug FinderSync.swift already
-// documents fixing for the same reason.
 @objc(FileProviderExtension)
 final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
     private let domain: NSFileProviderDomain
-    private let localPath: String
+    private static let log = Logger(subsystem: "com.juntaki.yadorilink.extension", category: "modify")
+    private let client: ProviderClient
+    private let providerRoot: URL?
 
-    init(domain: NSFileProviderDomain) {
+    required init(domain: NSFileProviderDomain) {
         self.domain = domain
-        // Domains are registered by the host app with
-        // `identifier.rawValue == group_id` (see
-        // HostApp/DomainRegistration.swift) — recover the matching
-        // `local_path` by re-querying the daemon rather than caching it
-        // anywhere durable. The extension process can be relaunched by
-        // the OS at any time (per this protocol's own doc comment on
-        // `invalidate`) and must reconstruct all state from the daemon
-        // alone; the daemon's local index is the single source of truth
-        // throughout this project, and this extension is no
-        // exception.
-        let folders = FileProviderCatalog.listOnDemandFolders()
-        self.localPath = folders.first(where: { $0.group_id == domain.identifier.rawValue })?.local_path ?? ""
+        // The domain identifier is the root id as lowercase hex.
+        let root = NSFileProviderItemIdentifier(domain.identifier.rawValue).itemID ?? Data()
+        // The daemon's fixed temp root (`handoff/` for bytes out, `ingest/` for bytes in) lives in
+        // the app group container. Without the container the extension fails closed: every call is
+        // unreachable and nothing is staged.
+        let group = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: "group.com.juntaki.yadorilink.shared")
+        switch ProviderStorage.decide(groupContainer: group, domainID: domain.identifier.rawValue) {
+        case .available(let providerRoot, let operationLog):
+            self.providerRoot = providerRoot
+            client = ProviderClient(root: root, transport: FFITransport(), log: OperationLog(url: operationLog))
+        case .unavailable:
+            Self.log.error("the app group container is unavailable; the provider refuses all work")
+            providerRoot = nil
+            client = ProviderClient(
+                root: root, transport: UnavailableTransport(),
+                log: OperationLog(url: FileManager.default.temporaryDirectory.appendingPathComponent("provider-unavailable-\(UUID().uuidString).json")))
+        }
         super.init()
-        NSLog("yadorilink: FileProviderExtension initialized for domain \(domain.identifier.rawValue), localPath=\(self.localPath)")
     }
 
     func invalidate() {}
 
-    // MARK: -: item(for:) — placeholder metadata
+    // MARK: item(for:)
 
     func item(
         for identifier: NSFileProviderItemIdentifier,
@@ -64,29 +59,26 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         completionHandler: @escaping (NSFileProviderItem?, Error?) -> Void
     ) -> Progress {
         let progress = Progress(totalUnitCount: 1)
-        let localPath = self.localPath
-        DispatchQueue.global(qos: .userInitiated).async {
+        DispatchQueue.global(qos: .userInitiated).async { [client, domain] in
             defer { progress.completedUnitCount = 1 }
             if identifier == .rootContainer {
-                completionHandler(FileProviderItem.rootItem(), nil)
+                completionHandler(RootItem(displayName: domain.displayName, readOnly: client.rootReadOnly), nil)
                 return
             }
-            // An unconfirmed listing is not "no such item".
-            guard let entries = FileProviderCatalog.listFiles(localPath: localPath) else {
-                completionHandler(nil, NSFileProviderError(.serverUnreachable))
-                return
-            }
-            let nodes = FileProviderCatalog.buildTree(from: entries)
-            guard let node = FileProviderCatalog.node(at: identifier.rawValue, in: nodes) else {
+            guard let id = identifier.itemID else {
                 completionHandler(nil, NSFileProviderError(.noSuchItem))
                 return
             }
-            completionHandler(FileProviderItem(node: node), nil)
+            switch client.item(id) {
+            case .success(let item):
+                completionHandler(ProviderItem(item), nil)
+            case .failure(let failure): completionHandler(nil, osError(failure))
+            }
         }
         return progress
     }
 
-    // MARK: -: fetchContents — on-open hydration
+    // MARK: fetchContents
 
     func fetchContents(
         for itemIdentifier: NSFileProviderItemIdentifier,
@@ -95,97 +87,86 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         completionHandler: @escaping (URL?, NSFileProviderItem?, Error?) -> Void
     ) -> Progress {
         let progress = Progress(totalUnitCount: 1)
-        let localPath = self.localPath
-        DispatchQueue.global(qos: .userInitiated).async {
+        guard let providerRoot else {
+            completionHandler(nil, nil, NSFileProviderError(.serverUnreachable))
+            progress.completedUnitCount = 1
+            return progress
+        }
+        let handoff = providerRoot.appendingPathComponent("handoff", isDirectory: true)
+        DispatchQueue.global(qos: .userInitiated).async { [client] in
             defer { progress.completedUnitCount = 1 }
-            guard itemIdentifier != .rootContainer else {
+            guard let id = itemIdentifier.itemID, !id.isEmpty else {
                 completionHandler(nil, nil, NSFileProviderError(.noSuchItem))
                 return
             }
-            let relativePath = itemIdentifier.rawValue
-            let absolutePath = (localPath as NSString).appendingPathComponent(relativePath)
-
-            // Calls the daemon's HydrateRequest via the Rust core, bounded
-            // to ~35s (see fileprovider-core's HYDRATION_TIMEOUT doc
-            // comment) — synchronous from the opening application's point
-            // of view, exactly the bounded timeout a synchronous OS
-            // callback requires. `false` covers both "timed out" and
-            // "daemon reported hydration failure (no reachable peer had
-            // this block)" — either way the OS callback completes with a
-            // clear error rather than hanging.
-            let ok = absolutePath.withCString { yadorilink_fp_hydrate($0) }
-            guard ok else {
-                completionHandler(nil, nil, NSFileProviderError(.serverUnreachable))
-                return
+            client.activity(item: id, fetch: true)
+            // A version the OS names is passed on: the daemon refuses bytes that are not that
+            // version (old bytes are never returned), and the OS retries against the current one.
+            let wanted = ItemToken.requestedContentHash(of: requestedVersion?.contentVersion)
+            switch client.materialize(item: id, requestID: Data(UUID().uuidString.utf8), requestedHash: wanted) {
+            case .failure(let failure):
+                completionHandler(nil, nil, osError(failure))
+            case .success(let bytes):
+                // The item returned for these bytes names the token they are PAIRED with.
+                guard case .success(let shown) = client.item(id) else {
+                    completionHandler(nil, nil, NSFileProviderError(.serverUnreachable))
+                    return
+                }
+                completionHandler(
+                    handoff.appendingPathComponent(bytes.handoffName),
+                    ProviderItem(shown, pairedContentVersion: bytes.token), nil)
             }
-
-            guard let entries = FileProviderCatalog.listFiles(localPath: localPath) else {
-                completionHandler(nil, nil, NSFileProviderError(.serverUnreachable))
-                return
-            }
-            let nodes = FileProviderCatalog.buildTree(from: entries)
-            guard let node = FileProviderCatalog.node(at: relativePath, in: nodes) else {
-                completionHandler(nil, nil, NSFileProviderError(.noSuchItem))
-                return
-            }
-            completionHandler(URL(fileURLWithPath: absolutePath), FileProviderItem(node: node), nil)
         }
         return progress
     }
 
-    // MARK: -: enumerator(for:) — placeholder tree presentation
+    // MARK: enumerator(for:)
 
     func enumerator(
         for containerItemIdentifier: NSFileProviderItemIdentifier,
         request: NSFileProviderRequest
     ) throws -> NSFileProviderEnumerator {
-        FileProviderEnumerator(containerItemIdentifier: containerItemIdentifier, localPath: localPath)
+        if containerItemIdentifier == .workingSet { return WorkingSetEnumerator(client: client) }
+        guard containerItemIdentifier != .trashContainer, let parent = containerItemIdentifier.itemID else {
+            throw NSFileProviderError(.noSuchItem)
+        }
+        return FolderEnumerator(client: client, parent: parent)
     }
 
-    // MARK: - Write path
-    //
-    // No File-Provider-specific sync engine: each of the three methods
-    // below (1) makes disk match what the OS callback asked for, using
-    // ordinary `FileManager` operations exactly like any other app would,
-    // then (2) notifies the daemon that *something* changed at this path
-    // via `yadorilink_fp_notify_local_write` -- carrying no content or
-    // metadata, only the relative path and a create/modify-vs-delete
-    // signal. The daemon re-observes the live file itself and routes it
-    // through the EXACT SAME `local_change::process_event` admission path
-    // a filesystem watcher's own event would take (see
-    // `LinkFlushHandle::capture_local_write`'s own doc comment on the Rust
-    // side). This callback never trusts `itemTemplate`/`changedFields`
-    // for anything beyond computing the target path and staged content
-    // location -- the daemon is the sole authority on what actually
-    // landed.
-    //
-    // Documented behaviour of this write path:
-    //
-    // - No rollback story: disk is mutated BEFORE the daemon is notified,
-    //   so a notify failure (daemon unreachable/timeout) after a
-    //   successful disk write leaves real bytes on disk with no
-    //   corresponding admission. A later retry of the SAME operation
-    //   (same content) self-heals once connectivity returns -- File
-    //   Provider's own retry behavior after a `.serverUnreachable`
-    //   completion is what's relied on here, not anything this extension
-    //   does itself. `deleteItem` specifically also tolerates its own
-    //   retry (see its own comment on `NSFileNoSuchFileError`).
-    // - An empty directory (`createItem` with `contentType == .folder`)
-    //   is reported to Finder as fully created, but nothing durable is
-    //   recorded on the daemon side for it: `LocalChangeProcessor` has no
-    //   directory-only admission signal, so an empty folder exists only
-    //   on THIS device's disk until either a file is created inside it
-    //   (which admits successfully, independent of any parent-directory
-    //   row) or this link's own reconcile/scan pass happens to observe
-    //   the bare directory. A folder created and left empty is not
-    //   guaranteed to survive indefinitely or reach peers.
+    // MARK: writes
 
-    /// Resolves an item's on-disk relative path from its parent identifier
-    /// (which is either `.rootContainer` or another item's own relative
-    /// path, per `FileProviderItem.parentItemIdentifier`'s convention) and
-    /// filename.
-    private func relativePath(parent: NSFileProviderItemIdentifier, filename: String) -> String {
-        parent == .rootContainer ? filename : "\(parent.rawValue)/\(filename)"
+    /// Copies the OS's file into the daemon's ingest directory (`.name.partial`, then an atomic
+    /// rename) and describes it; the daemon verifies the bytes itself.
+    private func stage(_ url: URL) throws -> (name: String, size: UInt64, sha256: Data) {
+        guard let providerRoot else { throw NSFileProviderError(.serverUnreachable) }
+        let ingest = providerRoot.appendingPathComponent("ingest", isDirectory: true)
+        let name = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+        let partial = ingest.appendingPathComponent(".\(name).partial")
+        try FileManager.default.copyItem(at: url, to: partial)
+        let handle = try FileHandle(forReadingFrom: partial)
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        var size: UInt64 = 0
+        while let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty {
+            hasher.update(data: chunk)
+            size += UInt64(chunk.count)
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o400], ofItemAtPath: partial.path)
+        // Durable BEFORE the upload is named to the daemon (which journals it on that name): the
+        // bytes, then the rename in the directory. A crash after this point cannot leave a name
+        // whose bytes are missing or short.
+        try Self.sync(partial)
+        try FileManager.default.moveItem(at: partial, to: ingest.appendingPathComponent(name))
+        try Self.sync(ingest)
+        return (name, size, Data(hasher.finalize()))
+    }
+
+    /// fsync of a file or a directory.
+    private static func sync(_ url: URL) throws {
+        let descriptor = open(url.path, O_RDONLY)
+        guard descriptor >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        defer { close(descriptor) }
+        guard fsync(descriptor) == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
     }
 
     func createItem(
@@ -197,70 +178,44 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         completionHandler: @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, Error?) -> Void
     ) -> Progress {
         let progress = Progress(totalUnitCount: 1)
-        let localPath = self.localPath
-        let relPath = relativePath(parent: itemTemplate.parentItemIdentifier, filename: itemTemplate.filename)
-        let absolutePath = (localPath as NSString).appendingPathComponent(relPath)
-        let isDirectory = itemTemplate.contentType == .folder
-        DispatchQueue.global(qos: .userInitiated).async {
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
             defer { progress.completedUnitCount = 1 }
-            do {
-                let fm = FileManager.default
-                if isDirectory {
-                    try fm.createDirectory(atPath: absolutePath, withIntermediateDirectories: true)
-                } else if let url {
-                    // `replaceItemAt` when the destination already exists
-                    // (a `createItem` replay after a prior notify timeout,
-                    // say) is an ATOMIC same-directory rename, not a
-                    // remove followed by a move, because that sequence
-                    // leaves a real window where the filesystem watcher can observe the destination
-                    // genuinely absent and emit its own tombstone for it,
-                    // racing this call's own notify. `moveItem` (used only
-                    // when nothing exists at the destination yet, so there
-                    // is no such window) is still correct for a genuinely
-                    // brand-new path.
-                    if fm.fileExists(atPath: absolutePath) {
-                        _ = try fm.replaceItemAt(URL(fileURLWithPath: absolutePath), withItemAt: url)
-                    } else {
-                        try fm.moveItem(at: url, to: URL(fileURLWithPath: absolutePath))
-                    }
-                } else {
-                    fm.createFile(atPath: absolutePath, contents: nil)
-                }
-            } catch {
-                completionHandler(nil, [], false, error)
-                return
-            }
-            // Directory creation (mkdir) is a real, admissible local
-            // change too, but this device's daemon-side admission path
-            // (`local_change::process_event`) is file-content-oriented --
-            // it has no directory-creation signal to emit today. Only
-            // notify for a plain file; a bare mkdir with no file inside it
-            // yet is picked up by this link's own reconcile/scan passes
-            // the same way an out-of-band `mkdir` on an Eager folder
-            // already is.
-            guard !isDirectory else {
-                completionHandler(FileProviderItem(node: CatalogNode(relativePath: relPath, isDirectory: true, entry: nil)), [], false, nil)
-                return
-            }
-            let ok = localPath.withCString { lp in
-                relPath.withCString { rp in
-                    yadorilink_fp_notify_local_write(lp, rp, 0)
-                }
-            }
-            guard ok else {
-                completionHandler(nil, [], false, NSFileProviderError(.serverUnreachable))
-                return
-            }
-            guard let entries = FileProviderCatalog.listFiles(localPath: localPath) else {
-                completionHandler(nil, [], false, NSFileProviderError(.serverUnreachable))
-                return
-            }
-            let nodes = FileProviderCatalog.buildTree(from: entries)
-            guard let node = FileProviderCatalog.node(at: relPath, in: nodes) else {
+            guard let parent = itemTemplate.parentItemIdentifier.itemID else {
                 completionHandler(nil, [], false, NSFileProviderError(.noSuchItem))
                 return
             }
-            completionHandler(FileProviderItem(node: node), [], false, nil)
+            Self.log.notice("create type=\(itemTemplate.contentType?.identifier ?? "none", privacy: .public) hasContents=\(url != nil) options=\(options.rawValue)")
+            var change = Change(kind: .create)
+            change.parent = parent
+            change.name = itemTemplate.filename
+            if itemTemplate.contentType == .folder {
+                change.entryKind = .directory
+            } else if itemTemplate.contentType == .symbolicLink, let target = itemTemplate.symlinkTargetPath ?? nil {
+                change.entryKind = .symlink
+                change.symlinkTarget = Data(target.utf8)
+            } else if let url {
+                do {
+                    let staged = try stage(url)
+                    change.ingestName = staged.name
+                    change.size = staged.size
+                    change.sha256 = staged.sha256
+                } catch {
+                    completionHandler(nil, [], false, error)
+                    return
+                }
+            } else {
+                Self.log.error("create: no contents were provided for a non-folder")
+                completionHandler(nil, [], false, NSFileProviderError(.cannotSynchronize))
+                return
+            }
+            // The destination folder is an identity (its item id): no view is named for it.
+            switch client.apply(change) {
+            case .success(let applied):
+                completionHandler(applied.item.map { ProviderItem($0) }, [], false, nil)
+            case .failure(let failure):
+                Self.log.error("create failed: \(failure.logClass, privacy: .public)")
+                completionHandler(nil, [], false, osError(failure))
+            }
         }
         return progress
     }
@@ -275,56 +230,59 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         completionHandler: @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, Error?) -> Void
     ) -> Progress {
         let progress = Progress(totalUnitCount: 1)
-        let localPath = self.localPath
-        let relPath = item.itemIdentifier.rawValue
-        let absolutePath = (localPath as NSString).appendingPathComponent(relPath)
-        DispatchQueue.global(qos: .userInitiated).async {
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
             defer { progress.completedUnitCount = 1 }
-            if let newContents {
+            guard let id = item.itemIdentifier.itemID, !id.isEmpty else {
+                completionHandler(nil, [], false, NSFileProviderError(.noSuchItem))
+                return
+            }
+            var change = Change(kind: .modify)
+            change.item = id
+            // The token the OS holds for the version the user saw, verbatim (nil if malformed).
+            change.base = ItemToken(raw: version.contentVersion)
+            var handled: NSFileProviderItemFields = []
+            if changedFields.contains(.contents), let newContents {
                 do {
-                    let fm = FileManager.default
-                    // Same atomic-replace reasoning as `createItem`'s own
-                    // content-replace path above -- see that comment.
-                    if fm.fileExists(atPath: absolutePath) {
-                        _ = try fm.replaceItemAt(URL(fileURLWithPath: absolutePath), withItemAt: newContents)
-                    } else {
-                        try fm.moveItem(at: newContents, to: URL(fileURLWithPath: absolutePath))
-                    }
+                    let staged = try stage(newContents)
+                    change.ingestName = staged.name
+                    change.size = staged.size
+                    change.sha256 = staged.sha256
+                    handled.insert(.contents)
                 } catch {
                     completionHandler(nil, [], false, error)
                     return
                 }
             }
-            // A metadata-only modification (no `newContents`, e.g. only
-            // `changedFields` touched something this extension does not
-            // model, such as a Finder tag) still notifies the daemon --
-            // `process_event` re-observes disk and correctly finds nothing
-            // changed (a no-op), rather than this callback trying to guess
-            // which metadata-only changes are worth propagating.
-            let ok = localPath.withCString { lp in
-                relPath.withCString { rp in
-                    yadorilink_fp_notify_local_write(lp, rp, 0)
-                }
+            // A rename or move acts on the folder the user SAW the item in: its generation travels
+            // with the item (inside the metadata version the OS stored with it), never read again
+            // now. Without it (unknown) the daemon refuses the operation as a stale view.
+            let sourceGeneration = ViewVersion.parentGeneration(fromMetadataVersion: version.metadataVersion)
+            if changedFields.contains(.filename) {
+                change.name = item.filename
+                change.parentGeneration = sourceGeneration
+                handled.insert(.filename)
             }
-            guard ok else {
-                completionHandler(nil, [], false, NSFileProviderError(.serverUnreachable))
-                return
+            if changedFields.contains(.parentItemIdentifier), let parent = item.parentItemIdentifier.itemID {
+                change.parent = parent
+                change.parentGeneration = sourceGeneration
+                handled.insert(.parentItemIdentifier)
             }
-            guard let entries = FileProviderCatalog.listFiles(localPath: localPath) else {
-                completionHandler(nil, [], false, NSFileProviderError(.serverUnreachable))
-                return
+            if changedFields.contains(.contentModificationDate), let date = item.contentModificationDate ?? nil {
+                change.mtimeUnixNanos = Int64(date.timeIntervalSince1970 * 1e9)
+                handled.insert(.contentModificationDate)
             }
-            let nodes = FileProviderCatalog.buildTree(from: entries)
-            guard let node = FileProviderCatalog.node(at: relPath, in: nodes) else {
-                completionHandler(nil, [], false, NSFileProviderError(.noSuchItem))
-                return
+            let sent = ItemToken(raw: version.contentVersion)?.generation
+            switch client.apply(change) {
+            case .success(let applied):
+                Self.log.notice("modify item=\(id.hexString, privacy: .public) fields=\(changedFields.rawValue) sent_generation=\(sent.map(String.init) ?? "none", privacy: .public) returned_generation=\(applied.item?.contentVersion.map { String($0.generation) } ?? "none", privacy: .public)")
+                // A concurrent edit that lost keeps the user's bytes in a file beside the item;
+                // the item itself is the canonical version, whose bytes must be fetched again.
+                let refetch = applied.needsRefetch
+                completionHandler(applied.item.map { ProviderItem($0) }, changedFields.subtracting(handled), refetch, nil)
+            case .failure(let failure):
+                Self.log.notice("modify item=\(id.hexString, privacy: .public) fields=\(changedFields.rawValue) sent_generation=\(sent.map(String.init) ?? "none", privacy: .public) failed=\(failure.logClass, privacy: .public)")
+                completionHandler(nil, [], false, osError(failure))
             }
-            // Only `.contents` is actually applied above -- any other
-            // requested field (rename, reparent, tags, ...) is neither
-            // implemented nor silently discarded: report it back as still
-            // pending, per this callback's own documented contract, rather
-            // than overclaiming every requested change was applied.
-            completionHandler(FileProviderItem(node: node), changedFields.subtracting(.contents), false, nil)
         }
         return progress
     }
@@ -337,33 +295,22 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         completionHandler: @escaping (Error?) -> Void
     ) -> Progress {
         let progress = Progress(totalUnitCount: 1)
-        let localPath = self.localPath
-        let relPath = identifier.rawValue
-        let absolutePath = (localPath as NSString).appendingPathComponent(relPath)
-        DispatchQueue.global(qos: .userInitiated).async {
+        DispatchQueue.global(qos: .userInitiated).async { [client] in
             defer { progress.completedUnitCount = 1 }
-            do {
-                try FileManager.default.removeItem(atPath: absolutePath)
-            } catch let error as NSError where error.domain == NSCocoaErrorDomain
-                && error.code == NSFileNoSuchFileError {
-                // Already absent from disk -- almost certainly a RETRY of
-                // a delete whose earlier attempt removed the file but
-                // never got a chance to notify the daemon (e.g. the
-                // daemon was briefly unreachable). Bailing out here on "not found" would silently
-                // strand that earlier delete un-admitted forever, since
-                // nothing else ever re-notifies for a path the OS
-                // considers already gone. Fall through to notify exactly
-                // as if the removal had just succeeded.
-            } catch {
-                completionHandler(error)
+            guard let id = identifier.itemID, !id.isEmpty else {
+                completionHandler(NSFileProviderError(.noSuchItem))
                 return
             }
-            let ok = localPath.withCString { lp in
-                relPath.withCString { rp in
-                    yadorilink_fp_notify_local_write(lp, rp, 1)
-                }
+            var change = Change(kind: .delete)
+            change.item = id
+            change.base = ItemToken(raw: version.contentVersion)
+            change.recursive = options.contains(.recursive)
+            switch client.apply(change) {
+            // An ambiguous delete leaves the file: the OS has already removed its copy, and the
+            // survivor comes back through enumeration as a new item.
+            case .success: completionHandler(nil)
+            case .failure(let failure): completionHandler(osError(failure))
             }
-            completionHandler(ok ? nil : NSFileProviderError(.serverUnreachable))
         }
         return progress
     }

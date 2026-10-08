@@ -6,8 +6,8 @@
 //! parent directory, so their commit — or, for a probe, the operation it
 //! measures — can share the same filesystem and volume as the object
 //! itself. That only works if every path-consuming entry point in this
-//! crate — the watcher, local change processing, the initial scan, DAG
-//! import, peer admission and stale-file cleanup — agrees on exactly which
+//! crate — the watcher, local change processing, the initial scan,
+//! peer admission and stale-file cleanup — agrees on exactly which
 //! names are reserved, and agrees on it *before* user ignore rules run: a
 //! user can configure `.yadorilinkignore` to un-ignore anything, but must
 //! never be able to make an artefact name eligible for ordinary indexing.
@@ -40,14 +40,14 @@
 //! - **"Should this stay out of ordinary sync?"** — [`is_reserved_component`]
 //!   / [`path_has_reserved_component`]. True for both a versioned artefact
 //!   and the legacy marker. Used by the watcher, the initial scan, local
-//!   change processing and DAG import: every place that decides what to
+//!   change processing: every place that decides what to
 //!   index or track. `fs_capabilities`'s probe artefacts rely on exactly
 //!   this predicate to stay invisible to those entry points for the brief
 //!   window between their creation and their own removal — see
 //!   [`ArtefactKind::Probe`].
 //! - **"May a peer or a local writer *name* this path at all?"** —
 //!   [`is_artefact_component`] / [`path_has_artefact_component`]. True only
-//!   for a versioned artefact, never for the legacy marker. Used by DAG
+//!   for a versioned artefact, never for the legacy marker. Used by native
 //!   admission and peer materialization: every place that fails a whole
 //!   operation closed.
 //!
@@ -520,7 +520,7 @@ fn is_artefact_wire_component(component: &str) -> bool {
 ///
 /// Use this (never the host-`Path` form) at every site that rejects a
 /// whole operation because of a path a peer supplied, rather than one this
-/// process discovered on its own disk: DAG admission
+/// process discovered on its own disk: native admission
 /// (`dag_store::admit_change`) and peer materialization
 /// (`PeerSyncSession::materialize`) are the two such sites today. Splits
 /// on both `/` and `\` (see [`wire_path_components`]) and strips an
@@ -766,7 +766,7 @@ fn wire_component_is_non_portable(component: &str) -> bool {
 /// for the same host-independence reason as
 /// [`path_has_artefact_component_in_wire_path`]: whether a path is
 /// portable cannot depend on which platform happens to be running the
-/// check, so every peer in a group — DAG admission
+/// check, so every peer in a group — native admission
 /// (`dag_store::admit_change`) and, as defense-in-depth, peer
 /// materialization (`PeerSyncSession::materialize`) — must reach the
 /// identical verdict for the identical wire path.
@@ -777,9 +777,9 @@ fn wire_component_is_non_portable(component: &str) -> bool {
 /// independent index rows, and silently collide onto the same on-disk
 /// object the moment either one materializes on a Windows device —
 /// whichever writes second overwrites the other's bytes with no conflict
-/// ever detected (they are different paths, so no DAG conflict machinery
+/// ever detected (they are different paths, so no conflict machinery
 /// ever compares them), while the index keeps believing both are
-/// correctly, independently `Hydrated`. Refusing the path at admission is
+/// correctly, independently `Present`. Refusing the path at admission is
 /// what prevents that divergence from ever being created in the first
 /// place.
 pub fn path_has_non_portable_wire_component(path: &str) -> bool {
@@ -802,7 +802,7 @@ pub enum WirePathRefusal {
     NonPortable,
 }
 
-/// Whether `path` is one DAG admission will refuse **permanently**, and
+/// Whether `path` is one native admission will refuse **permanently**, and
 /// why -- the single predicate every site that must agree with admission
 /// reads, so none of them can drift narrower than it.
 ///

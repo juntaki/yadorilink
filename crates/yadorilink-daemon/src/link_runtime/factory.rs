@@ -91,36 +91,14 @@ impl LinkRuntimeFactory {
             .ensure_unambiguous_group(&group_id)
             .map_err(crate::sync_error::SyncError::from)?;
 
-        // Fail-closed for a link whose policy is already `OnDemand` from a
-        // previous run: `finish_link_setup`/`set_storage_mode` already refuse to
-        // CREATE a new `OnDemand` link while the placeholder pipeline is not
-        // connected (see `placeholder_backend::on_demand_pipeline_is_connected`'s
-        // own doc), but a row already committed OnDemand before that gate
-        // existed (or by any other path) must not silently start watching and
-        // materializing anyway -- this is the second half of that same
-        // invariant: no `OnDemand` link runs, either newly created or already
-        // on disk, without a real provider.
-        match deps.replica_coordinator.link_repository().materialization_policy_for_group(&group_id) {
-            Ok(Some(yadorilink_replica_domain::session_state::MaterializationPolicy::OnDemand))
-                if !yadorilink_filesystem_sync::placeholder_backend::on_demand_pipeline_is_connected(
-                ) =>
-            {
-                return Err(DaemonError::Config(format!(
-                    "link {local_path} (group {group_id}) is configured OnDemand, but this build has \
-                     no connected placeholder provider; refusing to start it fail-closed -- migrate \
-                     it to eager (full-copy) mode to resume syncing"
-                )));
-            }
-            Ok(_) => {}
-            Err(e) => {
-                return Err(DaemonError::Config(format!(
-                    "cannot verify materialization policy for group {group_id}: {e}"
-                )));
-            }
-        }
+        // A provider-backed root never enters the filesystem runtime (no watch, no scan, no
+        // capture, no tombstones), ready or not, and a root with inconsistent provider state
+        // is refused ("rebootstrap required"): only a plain root starts here.
+        crate::provider_gate::require_filesystem_root(&deps.replica_coordinator, &group_id)
+            .map_err(|e| DaemonError::Config(format!("link {local_path}: {e}")))?;
 
-        // Sync-root single-instance ownership (design doc §15:
-        // "hold/verify ownership for each linked root"). A conflict here
+        // Sync-root single-instance ownership (hold and verify
+        // ownership for each linked root). A conflict here
         // drops the guard and publishes `Failed` for this group, which is
         // the correct outcome -- a root already owned by another process
         // must not be watched at all, let alone scanned. Held in a local
@@ -228,40 +206,6 @@ impl LinkRuntimeFactory {
                 }
             }
         };
-        // Closes the crash window between `write_placeholder`'s
-        // durable disk write and its separate `record_placeholder_
-        // generation` commit -- see that function's own doc comment. Runs
-        // here, still before this link's watcher starts (same ordering
-        // guarantee `repair_interrupted_materializations` above relies
-        // on), and is soft-fail for the same reason: a failure here must
-        // not abort this link's startup, only leave the affected paths on
-        // the existing fail-closed fallback (full chunk-and-compare on
-        // their next local event) until the next successful boot's pass.
-        match crate::link_runtime::operations::repair_materialization::backfill_placeholder_generations(
-            &deps.replica_coordinator,
-            &root_lease,
-            Path::new(&local_path),
-            &group_id,
-        ) {
-            Ok(backfilled) => {
-                if backfilled > 0 {
-                    tracing::info!(
-                        local_path = %local_path,
-                        backfilled,
-                        "backfilled placeholder identity for paths left unrecorded by an \
-                         interrupted eviction"
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    local_path = %local_path,
-                    "failed to backfill placeholder identities on startup; affected paths stay \
-                     on the fail-closed full chunk-and-compare fallback"
-                );
-            }
-        }
         // The additive-scan window, read HERE rather than at the caller, and ANDed
         // with whatever the caller already decided.
         //

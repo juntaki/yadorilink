@@ -50,9 +50,8 @@ use std::path::Path;
 
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_replica_domain::file::RecordKind;
-use yadorilink_replica_domain::ids::ChangeHash;
+use yadorilink_replica_domain::native_plan::NativeRowIdentity;
 use yadorilink_replica_domain::session_state::MaterializationState;
-use yadorilink_sync_sqlite::dag_store::ChangeOrdering;
 
 use super::case_ir::ContentTable;
 use super::content_hash;
@@ -178,7 +177,7 @@ struct HistoryEntry {
     device_idx: usize,
     /// `None` for a delete.
     content_id: Option<u64>,
-    authoring_change_hash: Option<ChangeHash>,
+    authoring: Option<NativeRowIdentity>,
 }
 
 /// Multi-device history + the checks run against it at the end of a run
@@ -251,12 +250,12 @@ impl GlobalOracle {
         path: &str,
         device_idx: usize,
         content_id: u64,
-        authoring_change_hash: Option<ChangeHash>,
+        authoring: Option<NativeRowIdentity>,
     ) {
         // The evidence itself is what the supersession test runs on, and a
         // wrong or repeated hash here manufactures a `[NoLoss]` out of a
         // perfectly converged run -- `supersedes` returns false when either
-        // hash is `None` AND when the two are equal, so a stale read that
+        // identity is `None` AND when the two are equal, so a stale read that
         // repeats the previous op's hash makes both ops mutually
         // unsupersedable and reports them as a *pair* of losses. Tracing the
         // recorded evidence is therefore the only way to tell a real loss
@@ -265,15 +264,16 @@ impl GlobalOracle {
         dst_trace_path(path, || {
             format!(
                 "oracle.record_write: device_idx={device_idx} content_id={content_id} evidence={}",
-                authoring_change_hash
-                    .map(|h| hex::encode(&h.0[..4]))
+                authoring
+                    .as_ref()
+                    .map(|identity| hex::encode(&identity.provenance.0[..4]))
                     .unwrap_or_else(|| "NONE".to_string())
             )
         });
         self.history.entry(path.to_string()).or_default().push(HistoryEntry {
             device_idx,
             content_id: Some(content_id),
-            authoring_change_hash,
+            authoring,
         });
     }
 
@@ -283,56 +283,107 @@ impl GlobalOracle {
         &mut self,
         path: &str,
         device_idx: usize,
-        authoring_change_hash: Option<ChangeHash>,
+        authoring: Option<NativeRowIdentity>,
     ) {
         self.history.entry(path.to_string()).or_default().push(HistoryEntry {
             device_idx,
             content_id: None,
-            authoring_change_hash,
+            authoring,
         });
     }
 
-    /// True when `later` is a strict DAG descendant of `earlier` — the
-    /// replacement for the retired "later's version vector dominates
-    /// earlier's" test.
+    /// True when `later`'s head strictly supersedes `earlier`'s head: the
+    /// later head's delta lists the earlier head's dot in the `removes` of an
+    /// op at this path, directly or through a chain of removed heads' own
+    /// deltas.
     ///
-    /// Ancestry is asked of every device because a single replica may not yet
-    /// retain both changes; one device answering `Before` is proof, since
-    /// ancestry is fixed by the signed change bytes and cannot differ between
-    /// replicas that both hold the pair.
+    /// The delta is asked of every device because a single replica may not yet
+    /// retain the whole chain; one device answering yes is proof, since a
+    /// delta's removal list is fixed by its signed bytes and cannot differ
+    /// between replicas that both hold it.
     fn supersedes(
         devices: &[(&Path, &ReplicaCoordinator)],
         group_id: &str,
+        path: &str,
         later: &HistoryEntry,
         earlier: &HistoryEntry,
     ) -> bool {
-        let (Some(later_hash), Some(earlier_hash)) =
-            (later.authoring_change_hash, earlier.authoring_change_hash)
-        else {
+        let (Some(later_id), Some(earlier_id)) = (&later.authoring, &earlier.authoring) else {
             return false;
         };
-        if later_hash == earlier_hash {
+        if later_id == earlier_id || later_id.dot == earlier_id.dot {
             return false;
         }
         devices.iter().any(|(_, state)| {
-            matches!(
-                state.change_history_repository().dag_compare_authoring(
-                    group_id,
-                    &earlier_hash,
-                    &later_hash
-                ),
-                Ok(Some(ChangeOrdering::Before))
-            )
+            Self::removes_transitively(state, group_id, path, later_id, earlier_id)
         })
+    }
+
+    /// Breadth-first walk from `later`'s dot through the heads each visited
+    /// delta removes at the path (or at either head's source path), looking
+    /// for `earlier`'s dot. Bounded: a replica missing a delta body simply
+    /// ends that branch.
+    fn removes_transitively(
+        state: &ReplicaCoordinator,
+        group_id: &str,
+        path: &str,
+        later: &NativeRowIdentity,
+        earlier: &NativeRowIdentity,
+    ) -> bool {
+        use yadorilink_replica_domain::ids::FolderGroupId;
+        use yadorilink_replica_domain::signed_delta::NativeDelta;
+        use yadorilink_sync_sqlite::SyncSqliteError;
+
+        const MAX_VISITED: usize = 256;
+        let group = FolderGroupId(group_id.to_string());
+        let mut visited = HashSet::new();
+        let mut queue = std::collections::VecDeque::from([later.dot.clone()]);
+        while let Some(dot) = queue.pop_front() {
+            if !visited.insert(dot.clone()) || visited.len() > MAX_VISITED {
+                continue;
+            }
+            let body = state
+                .database()
+                .read::<_, SyncSqliteError>(|conn| {
+                    yadorilink_sync_sqlite::native_store::fetch_delta_body(
+                        conn,
+                        &group,
+                        &dot.author,
+                        dot.seq,
+                    )
+                })
+                .ok()
+                .flatten();
+            let Some(delta) = body.and_then(|bytes| NativeDelta::from_wire_bytes(&bytes).ok())
+            else {
+                continue;
+            };
+            for op in &delta.ops {
+                let op_path = op.path.as_str();
+                if op_path != path
+                    && op_path != later.source_path.as_str()
+                    && op_path != earlier.source_path.as_str()
+                {
+                    continue;
+                }
+                for removal in &op.removes {
+                    if removal.dot == earlier.dot {
+                        return true;
+                    }
+                    queue.push_back(removal.dot.clone());
+                }
+            }
+        }
+        false
     }
 
     /// **No-loss (causal-supersession-aware).** A recorded entry needs to
     /// survive (as the live file, or as a `(conflicted copy...)` sibling)
     /// unless some *other* recorded entry for the same path has a version
-    /// vector that strictly dominates it (`ChangeOrdering::After` from the
-    /// other entry's perspective) — i.e. was genuinely superseded by a
+    /// head that strictly supersedes it (the other entry's delta removes this
+    /// entry's head, directly or transitively) — i.e. was genuinely superseded by a
     /// causally-later write or delete. Two genuinely concurrent entries
-    /// (`ChangeOrdering::Concurrent`) both need to survive *unless* one is a
+    /// (neither supersedes the other) both need to survive *unless* one is a
     /// delete that lost the conflict to the other's content ('s
     /// documented delete-vs-write outcome: the losing tombstone is
     /// dropped outright, never conflict-copied) — a losing delete is
@@ -353,7 +404,7 @@ impl GlobalOracle {
                     if i == j {
                         return false;
                     }
-                    Self::supersedes(devices, group_id, other, entry)
+                    Self::supersedes(devices, group_id, path, other, entry)
                 });
                 if superseded {
                     continue; // legitimately overwritten; no survival required
@@ -431,7 +482,7 @@ impl GlobalOracle {
                 .filter(|(i, entry)| {
                     entry.content_id.is_some()
                         && !entries.iter().enumerate().any(|(j, other)| {
-                            *i != j && Self::supersedes(devices, group_id, other, entry)
+                            *i != j && Self::supersedes(devices, group_id, path, other, entry)
                         })
                 })
                 .map(|(_, e)| e)
@@ -478,7 +529,7 @@ impl GlobalOracle {
     /// sibling this oracle can find on any device must hash to a value
     /// present in `content_table` — a value nobody's recorded write
     /// produced is either a torn/partial write or genuinely mixed content.
-    /// Exempts a row currently in `MaterializationState::Placeholder`: a
+    /// Exempts a row currently in `MaterializationState::Remote`: a
     /// placeholder is deliberately sparse/zero-filled content pre-sized to
     /// the record's length (see `repair_interrupted_materializations`'s
     /// eviction-placeholder handling in `materialization.rs`), so its bytes
@@ -513,7 +564,7 @@ impl GlobalOracle {
                     state
                         .materialization_state_repository()
                         .get_materialization_state(group_id, &file_name.to_string_lossy()),
-                    Ok(Some(MaterializationState::Placeholder))
+                    Ok(Some(MaterializationState::Remote))
                 ) {
                     continue;
                 }
@@ -580,11 +631,7 @@ impl GlobalOracle {
         let mut violations = Vec::new();
         let mut identities_by_path: HashMap<
             String,
-            Vec<(
-                usize,
-                yadorilink_replica_domain::ids::ChangeHash,
-                yadorilink_replica_domain::ids::VersionHash,
-            )>,
+            Vec<(usize, NativeRowIdentity, yadorilink_replica_domain::ids::VersionHash)>,
         > = HashMap::new();
         for (device_idx, (root, state)) in devices.iter().enumerate() {
             let Ok(files) = state.file_index_repository().list_files(group_id) else { continue };
@@ -605,8 +652,8 @@ impl GlobalOracle {
                         )
                         .version_hash;
                     // The authoring-identity invariant is defined over LIVE
-                    // content rows: one authoring change must project one
-                    // content identity everywhere. A tombstone's authored
+                    // content rows: one native head (dot + provenance) must
+                    // project one content identity everywhere. A tombstone's authored
                     // "content" is the deletion itself; its row's residual
                     // content columns are whatever that device happened to
                     // hold when the delete landed (a never-hydrated scaffold
@@ -614,21 +661,19 @@ impl GlobalOracle {
                     // device-local, so comparing them across devices is a
                     // false positive, not a divergence. A REAL
                     // deleted-vs-live divergence is still caught: the live
-                    // side's row carries a different (content) authoring
-                    // change than the tombstone author, and the disk-level
+                    // side's row shows a different (content) head than the
+                    // tombstone's, and the disk-level
                     // convergence oracle flags the file's presence anyway.
                     // (Scoped to this check only — the tombstone-orphan
                     // disk check below must still see deleted records.)
-                    if let (false, Ok(Some(authoring_hash))) = (
+                    if let (false, Ok(Some(authoring_id))) = (
                         record.deleted,
-                        state
-                            .file_index_repository()
-                            .get_authoring_change_hash(group_id, &record.path),
+                        state.file_index_repository().row_authoring(group_id, &record.path),
                     ) {
                         let identities = identities_by_path.entry(record.path.clone()).or_default();
                         if let Some((other_device, _, other_hash)) =
                             identities.iter().find(|(_, author, hash)| {
-                                author == &authoring_hash && hash != &version_hash
+                                author == &authoring_id && hash != &version_hash
                             })
                         {
                             violations.push(Violation {
@@ -637,13 +682,13 @@ impl GlobalOracle {
                                 content_ids: Vec::new(),
                                 devices: vec![*other_device, device_idx],
                                 detail: format!(
-                                    "one authoring change identifies different content: device \
+                                    "one native head identifies different content: device \
                                      {other_device}={}, device {device_idx}={} \
                                      (author={} row: size={} mtime={} blocks={} kind={:?} \
                                      exec={:?} deleted={})",
                                     hex::encode(other_hash.0),
                                     hex::encode(version_hash.0),
-                                    hex::encode(&authoring_hash.0[..8]),
+                                    hex::encode(&authoring_id.provenance.0[..8]),
                                     current.size,
                                     current.mtime_unix_nanos,
                                     current.blocks.len(),
@@ -653,7 +698,7 @@ impl GlobalOracle {
                                 ),
                             });
                         }
-                        identities.push((device_idx, authoring_hash, version_hash));
+                        identities.push((device_idx, authoring_id, version_hash));
                     }
                 }
                 let on_disk = root.join(&record.path);
@@ -711,7 +756,7 @@ impl GlobalOracle {
                 };
                 let disk_len = std::fs::metadata(&on_disk).map(|m| m.len()).unwrap_or(0);
                 match mat {
-                    MaterializationState::Hydrated => {
+                    MaterializationState::Present => {
                         // A row claiming full materialization backed by an
                         // empty file for a non-empty record is a placeholder
                         // or torn write mislabeled `hydrated`. A genuinely
@@ -730,7 +775,7 @@ impl GlobalOracle {
                             });
                         }
                     }
-                    MaterializationState::Placeholder => {
+                    MaterializationState::Remote => {
                         // A full-size placeholder is normal: eviction (and
                         // the interrupted-materialize repair path) writes a
                         // sparse, zero-filled stub pre-sized to the record's
@@ -763,7 +808,7 @@ impl GlobalOracle {
                         // `Hydrating` is transient. Although the oracle runs
                         // at a quiescent convergence checkpoint (where a
                         // still-hydrating row is the stale-hydrating hazard
-                        // `reset_stale_hydrating_to_placeholder`
+                        // `reset_stale_hydrating`
                         // repairs), this oracle fires shortly after
                         // `check_convergence` first passes, which can still
                         // overlap a final in-flight hydration on a device.
@@ -831,7 +876,7 @@ impl GlobalOracle {
     /// identical in every respect to
     /// `check_convergence` except it walks subdirectories too, via
     /// `recursive_hash_snapshot` instead of `flat_hash_snapshot` — a new
-    /// sibling method, not a rewrite, so `dst_two_device_chaos.rs`'s flat
+    /// sibling method, not a rewrite, so the retired two-device scenario's flat
     /// candidate-path scenario (and every other existing caller) keeps its
     /// exact current behavior unchanged. Any scenario that writes nested
     /// paths (`dir1/a.bin`) must call this variant instead: the flat one
@@ -887,7 +932,7 @@ impl GlobalOracle {
                     if i == j {
                         return false;
                     }
-                    Self::supersedes(devices, group_id, other, entry)
+                    Self::supersedes(devices, group_id, path, other, entry)
                 });
                 if superseded {
                     continue;
@@ -954,7 +999,7 @@ impl GlobalOracle {
                 .filter(|(i, entry)| {
                     entry.content_id.is_some()
                         && !entries.iter().enumerate().any(|(j, other)| {
-                            *i != j && Self::supersedes(devices, group_id, other, entry)
+                            *i != j && Self::supersedes(devices, group_id, path, other, entry)
                         })
                 })
                 .map(|(_, e)| e)
@@ -1063,7 +1108,7 @@ fn flat_hash_snapshot(root: &Path) -> HashMap<String, String> {
 
 /// True if `expected` bytes are present on `root`, either as the live
 /// file at `path` or as a `(conflicted copy...)` sibling — generalizes
-/// `dst_two_device_chaos.rs`'s own `write_survives` to be called against
+/// the retired two-device scenario's own `write_survives` to be called against
 /// an arbitrary device root from shared oracle code.
 fn write_survives_anywhere(root: &Path, path: &str, expected: &[u8]) -> bool {
     let live = root.join(path);
@@ -1227,9 +1272,9 @@ mod tests {
     /// Puts `path` in `state` explicitly, for a test whose subject is what
     /// the oracle makes of a given materialization state.
     ///
-    /// These tests used to lean on `upsert_file` leaving a row `Hydrated`,
+    /// These tests used to lean on `upsert_file` leaving a row `Present`,
     /// and said so in their comments. It does not: moving a path to a new
-    /// version strips a carried-forward `Hydrated` back to `Placeholder`
+    /// version strips a carried-forward `Present` back to `Remote`
     /// (`file_index.rs`'s `strip_carried_forward_hydrated_in_tx`), because a
     /// new version is not materialized until something materializes it.
     /// That is the product's invariant and not a thing to work around, so
@@ -1247,18 +1292,28 @@ mod tests {
             .unwrap();
     }
 
-    /// Authors a real signed change for `path` and returns its hash.
+    const DEVICE: &str = "oracle-test-device";
+
+    /// The replica's author handle for [`DEVICE`].
+    fn author_key(state: &ReplicaCoordinator) -> yadorilink_sync_sqlite::dag_store::LocalAuthorKey {
+        yadorilink_daemon::test_support::local_seam::replica_author_key(
+            state,
+            DEVICE,
+            ed25519_dalek::SigningKey::from_bytes(&[77u8; 32]),
+        )
+        .unwrap()
+    }
+
+    /// Saves `path` as one local write through the production capture seam
+    /// and returns the identity of the head the row then shows.
     ///
-    /// Successive calls build on the current head, so the second call's change
-    /// is a genuine DAG descendant of the first — supersession in these tests
-    /// is decided by the same ancestry walk production uses, never by a
-    /// fabricated ordering.
-    fn author_change(state: &ReplicaCoordinator, path: &str, mtime: i64) -> ChangeHash {
-        use yadorilink_replica_domain::change::{Op, PutOrigin};
+    /// The write's basis is the head the current row shows, exactly as
+    /// capture reads it, so a second call's head supersedes the first --
+    /// supersession in these tests is decided by the same removal relation
+    /// production uses, never by a fabricated ordering.
+    fn author_put(state: &ReplicaCoordinator, path: &str, mtime: i64) -> NativeRowIdentity {
         use yadorilink_replica_domain::file::RecordKind;
         use yadorilink_replica_domain::file::{FileMeta, FileVersion};
-        use yadorilink_replica_domain::ids::SyncPath;
-        use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
 
         let version = FileVersion::new(
             vec![],
@@ -1271,25 +1326,80 @@ mod tests {
                 xattrs: Vec::new(),
             },
         );
-        let emitter = ChangeEmitter::new(
-            "oracle-test-device",
-            ed25519_dalek::SigningKey::from_bytes(&[77u8; 32]),
-        );
+        let record = FileRecord {
+            path: path.to_string(),
+            size: 0,
+            mtime_unix_nanos: mtime,
+            blocks: vec![],
+            deleted: false,
+        };
+        yadorilink_daemon::test_support::local_seam::commit_local_upsert(
+            state,
+            group_id(),
+            &record,
+            DEVICE,
+            &version,
+            None,
+            &author_key(state),
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
+        authored_identity(state, path)
+    }
+
+    /// The identity of the head `path`'s current row shows, read back after a
+    /// local commit (never fabricated).
+    fn authored_identity(state: &ReplicaCoordinator, path: &str) -> NativeRowIdentity {
         state
-            .append_history_backfill(
-                group_id(),
-                vec![Op::Put {
-                    path: SyncPath(path.to_string()),
-                    version: version.version_hash,
-                    origin: PutOrigin::Direct,
-                }],
-                std::slice::from_ref(&version),
-                &emitter,
-            )
+            .file_index_repository()
+            .row_authoring(group_id(), path)
+            .unwrap()
+            .expect("a local commit leaves the row showing its own head")
+    }
+
+    /// Deletes `path` as one local write over the head its row shows.
+    fn author_delete(
+        state: &ReplicaCoordinator,
+        path: &str,
+        observed_at: i64,
+    ) -> NativeRowIdentity {
+        yadorilink_daemon::test_support::local_seam::commit_local_delete(
+            state,
+            group_id(),
+            path,
+            DEVICE,
+            observed_at,
+            true,
+            &author_key(state),
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
+        authored_tombstone_identity(state)
+    }
+
+    /// A delete lands no head, so the row has nothing to show: the identity
+    /// of the delete is the author's newest delta (its dot, with that
+    /// delta's hash as provenance), read back from the frontier.
+    fn authored_tombstone_identity(state: &ReplicaCoordinator) -> NativeRowIdentity {
+        use yadorilink_replica_domain::native_state::Dot;
+        use yadorilink_sync_sqlite::SyncSqliteError;
+        let group = yadorilink_replica_domain::ids::FolderGroupId(group_id().to_string());
+        let (author, entry) = state
+            .database()
+            .read::<_, SyncSqliteError>(|conn| {
+                let author = yadorilink_sync_sqlite::author_incarnation::current_author(conn)?;
+                let entry = yadorilink_sync_sqlite::native_store::frontier_entry_get(
+                    conn, &group, &author,
+                )?;
+                Ok((author, entry))
+            })
             .unwrap();
-        let heads = state.sqlite().dag_group_heads(group_id()).unwrap();
-        assert_eq!(heads.len(), 1, "linear fixture must keep one head");
-        heads[0]
+        let entry = entry.expect("a local delete advances the author's frontier");
+        NativeRowIdentity {
+            source_path: yadorilink_replica_domain::ids::SyncPath(String::new()),
+            dot: Dot { author, seq: entry.seq },
+            provenance: entry.tip,
+        }
     }
 
     #[test]
@@ -1319,8 +1429,8 @@ mod tests {
         table.insert(1, b"first".to_vec());
         table.insert(2, b"second".to_vec());
 
-        let first = author_change(&state_a, "a.txt", 1);
-        let second = author_change(&state_a, "a.txt", 2);
+        let first = author_put(&state_a, "a.txt", 1);
+        let second = author_put(&state_a, "a.txt", 2);
 
         let mut oracle = GlobalOracle::new();
         oracle.record_write("a.txt", 0, 1, Some(first));
@@ -1491,8 +1601,8 @@ mod tests {
         let mut table = ContentTable::default();
         table.insert(1, b"superseded-by-delete".to_vec());
 
-        let written = author_change(&state_a, "a.txt", 1);
-        let deleted = author_change(&state_a, "a.txt", 2);
+        let written = author_put(&state_a, "a.txt", 1);
+        let deleted = author_delete(&state_a, "a.txt", 2);
 
         let mut oracle = GlobalOracle::new();
         oracle.record_write("a.txt", 0, 1, Some(written));
@@ -1614,37 +1724,44 @@ mod tests {
         for (state, root, byte) in
             [(&state_a, root_a.path(), b'a'), (&state_b, root_b.path(), b'b')]
         {
-            state
-                .file_index_repository()
-                .upsert_file(
-                    group_id(),
-                    &FileRecord {
-                        path: "split.txt".to_string(),
-                        size: 1,
-                        mtime_unix_nanos: 0,
-                        blocks: vec![yadorilink_replica_domain::file::BlockInfo {
-                            hash: vec![byte; 32],
-                            offset: 0,
-                            size: 1,
-                        }],
-                        deleted: false,
+            let identity = NativeRowIdentity {
+                source_path: yadorilink_replica_domain::ids::SyncPath("split.txt".to_string()),
+                dot: yadorilink_replica_domain::native_state::Dot {
+                    author: yadorilink_replica_domain::author::AuthorId {
+                        device: yadorilink_replica_domain::ids::DeviceId("planted".to_string()),
+                        incarnation: yadorilink_replica_domain::author::IncarnationId([1; 16]),
                     },
-                    &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-                )
-                .unwrap();
+                    seq: yadorilink_replica_domain::ids::AuthorSeq(1),
+                },
+                provenance: yadorilink_replica_domain::ids::DeltaHash([7; 32]),
+            };
             state
-                .file_index_repository()
-                .set_authoring_change_hash(
-                    group_id(),
-                    "split.txt",
-                    &yadorilink_replica_domain::ids::ChangeHash([7; 32]),
-                )
+                .database()
+                .write_immediate::<_, yadorilink_sync_sqlite::SyncSqliteError>(|tx| {
+                    yadorilink_sync_sqlite::file_index::upsert_file_with_authoring_in_tx(
+                        tx,
+                        group_id(),
+                        &FileRecord {
+                            path: "split.txt".to_string(),
+                            size: 1,
+                            mtime_unix_nanos: 0,
+                            blocks: vec![yadorilink_replica_domain::file::BlockInfo {
+                                hash: vec![byte; 32],
+                                offset: 0,
+                                size: 1,
+                            }],
+                            deleted: false,
+                        },
+                        DEVICE,
+                        Some(&identity),
+                    )
+                })
                 .unwrap();
             std::fs::write(root.join("split.txt"), [byte]).unwrap();
             // The subject here is the authoring-identity mismatch, so both
-            // devices are genuinely materialized; leaving them `Placeholder`
+            // devices are genuinely materialized; leaving them `Remote`
             // would add a second, unrelated violation to the count below.
-            mark(state, "split.txt", MaterializationState::Hydrated);
+            mark(state, "split.txt", MaterializationState::Present);
         }
 
         let oracle = GlobalOracle::new();
@@ -1737,7 +1854,7 @@ mod tests {
                 &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
-        mark(&state_a, "a.txt", MaterializationState::Hydrated);
+        mark(&state_a, "a.txt", MaterializationState::Present);
         // ...but disk holds an empty file: content was never materialized.
         std::fs::write(root_a.path().join("a.txt"), b"").unwrap();
 
@@ -1759,7 +1876,7 @@ mod tests {
             )
             .unwrap();
         std::fs::write(root_a.path().join("a.txt"), b"hello").unwrap();
-        mark(&state_a, "a.txt", MaterializationState::Hydrated);
+        mark(&state_a, "a.txt", MaterializationState::Present);
 
         let oracle = GlobalOracle::new();
         let violations = oracle.check_structural(group_id(), &[(root_a.path(), &state_a)]);
@@ -1785,7 +1902,7 @@ mod tests {
             .set_materialization_state(
                 group_id(),
                 "a.txt",
-                MaterializationState::Placeholder,
+                MaterializationState::Remote,
                 &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
@@ -1815,7 +1932,7 @@ mod tests {
             .set_materialization_state(
                 group_id(),
                 "a.txt",
-                MaterializationState::Placeholder,
+                MaterializationState::Remote,
                 &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();

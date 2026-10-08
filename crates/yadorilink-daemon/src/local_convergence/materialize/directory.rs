@@ -25,7 +25,7 @@ impl super::super::LocalConvergenceExecutor {
             payload,
             record,
             origin_device_id,
-            authoring_change_hash,
+            authoring,
             permit: root_commit_permit,
             ..
         } = *plan;
@@ -53,7 +53,7 @@ impl super::super::LocalConvergenceExecutor {
             group_id,
             record,
             origin_device_id,
-            authoring_change_hash,
+            authoring,
             root_commit_permit,
         )?;
         create_explicit_directory(&out_path, &canonical_root, &self.structural_ledger(group_id))?;
@@ -66,7 +66,6 @@ impl super::super::LocalConvergenceExecutor {
             &record.path,
             &out_path,
             written.version_hash,
-            authoring_change_hash,
             mutation_generation,
             root_commit_permit,
         )? {

@@ -3,19 +3,16 @@
 //! The daemon-process side of `dehydrate_server`'s pipe --
 //! `materialization_eviction.rs`'s ONLY way to get a confirmed answer
 //! that a Windows placeholder's local content was actually dehydrated
-//! before it commits the row to `Placeholder` and reclaims blocks. See
+//! before it commits the row to `Remote` and reclaims blocks. See
 //! `shell-ext/windows/src/dehydrate_server.rs`'s own module doc for why
 //! this is a real cross-process RPC (daemon dials cfapi-host), unlike
 //! `placeholder_inspect_windows.rs`'s direct-call bet for the read-only
 //! dirty-detection query.
 //!
-//! Mirrors `shell_ipc::client::query_status`'s Windows client exactly
-//! (bounded retry on `ERROR_PIPE_BUSY`, no server-identity verification --
-//! that check exists in `shell-ext/windows/src/ipc_client.rs` because
-//! THAT client runs inside every Explorer.exe process, a much more
-//! exposed context than this daemon-to-daemon-owned-process call; this
-//! module follows the daemon's own existing convention for dialing
-//! another local process's pipe, not the Explorer-DLL one).
+//! Mirrors `shell_ipc::client::query_status`'s Windows client (bounded retry
+//! on `ERROR_PIPE_BUSY`), and additionally verifies that the pipe is served by
+//! a process running as the current user before sending anything, as
+//! `shell-ext/windows/src/ipc_client.rs` does.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -75,7 +72,7 @@ pub fn dehydrate_via_cfapi_host_blocking(
 /// its dehydrate pipe is saturated, `evict_file`'s caller must eventually
 /// get an error back rather than hang the eviction sweep indefinitely --
 /// see [`DehydrateError`]'s own doc comment for what the caller does with
-/// that error (NOT an unconditional rollback to `Hydrated`).
+/// that error (NOT an unconditional rollback to `Present`).
 const DEHYDRATE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Not every variant here means "dehydration did NOT happen":
@@ -92,7 +89,7 @@ const DEHYDRATE_TIMEOUT: Duration = Duration::from_secs(15);
 /// variants for exactly this reason: `Io`/`Timeout` become
 /// `EvictionOutcomeAmbiguous` (the caller must NOT assume the file is
 /// still materialized), `Rejected` becomes `EvictionRejected` (the caller
-/// safely rolls the row back to `Hydrated`). A `CfDehydratePlaceholder`
+/// safely rolls the row back to `Present`). A `CfDehydratePlaceholder`
 /// call that itself partially completes before erroring at the Win32
 /// layer is a separate, deeper residual risk this module cannot close
 /// (see `dehydrate_placeholder`'s own doc comment in `cfapi.rs`) --
@@ -206,7 +203,12 @@ async fn connect() -> std::io::Result<NamedPipeClient> {
     let mut attempt = 0;
     loop {
         match ClientOptions::new().open(&name) {
-            Ok(client) => return Ok(client),
+            Ok(client) => {
+                // A pipe another user created first could answer "dehydrated"
+                // and make the caller reclaim blocks still needed locally.
+                yadorilink_ipc_proto::pipe_peer::verify_pipe_server_is_current_user(&client)?;
+                return Ok(client);
+            }
             Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) && attempt < MAX_ATTEMPTS => {
                 attempt += 1;
                 tokio::time::sleep(RETRY_DELAY).await;

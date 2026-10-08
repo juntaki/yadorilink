@@ -14,7 +14,7 @@
 //! sequence itself. The passes this test exercises both run
 //! *unconditionally* at every boot — before `DaemonState` is published, so
 //! by the time the restart's state probe fires the recovery has already
-//! completed: - `SyncState::reset_stale_hydrating_to_placeholder` (resets
+//! completed: - `SyncState::reset_stale_hydrating` (resets
 //! rows a crash left stuck mid-hydration), and -
 //! `materialization::cleanup_stale_temp_files` over the block-store root
 //! (removes orphaned `.yadorilink-tmp` files a crash left behind). What is
@@ -134,6 +134,7 @@ async fn boot_daemon(
 ) -> Result<BootedDaemon, String> {
     let probe: app::StateProbe = Arc::new(Mutex::new(None));
     let config = DaemonConfig {
+        provider_temp_root: None,
         config_dir: config_dir.to_path_buf(),
         block_store_root: block_store_root.to_path_buf(),
         sync_db_path: sync_db_path.to_path_buf(),
@@ -238,7 +239,7 @@ async fn scenario_body(seed: u64) -> Result<(), String> {
 
     // ---- Stage an interrupted-materialization footprint. -----------------
     // (a) A stuck `Hydrating` row — as if the crash hit mid-hydration. The
-    //     startup `reset_stale_hydrating_to_placeholder` must clear it.
+    //     startup `reset_stale_hydrating` must clear it.
     daemon1
         .state
         .replica_coordinator
@@ -322,7 +323,7 @@ async fn scenario_body(seed: u64) -> Result<(), String> {
         .state
         .replica_coordinator
         .materialization_state_repository()
-        .reset_stale_hydrating_to_placeholder()
+        .reset_stale_hydrating()
         .map_err(|e| format!("reset_stale_hydrating (post-check): {e}"))?;
     if still_stale != 0 {
         return Err(format!(

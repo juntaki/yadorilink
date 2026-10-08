@@ -1,29 +1,26 @@
-//! Runs the existing materialization engine together with the independent
-//! retroactive conflict-copy repair loop.
+//! Runs the existing materialization engine together with its independent
+//! maintenance loops (ephemeral conflict-copy retirement, hazard and ignore
+//! rechecks).
 //!
-//! Keeping the repair as a wrapper leaves `engine.rs` free to evolve
+//! Keeping the loops in a wrapper leaves `engine.rs` free to evolve
 //! independently. If either essential loop exits, this wrapper exits and
 //! `DaemonState`'s existing `spawn_restarting` supervision restarts both.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::local_convergence::types::RetirementAttempt;
-use yadorilink_replica_domain::ids::ChangeHash;
-use yadorilink_replica_domain::session_state::RetroactiveRepairOutcome;
 use yadorilink_root_authority::ignore_patterns::{
     is_ignore_file_relative_path, EffectiveIgnoreSet,
 };
-use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
 
 use crate::daemon_state::DaemonState;
 
 pub use super::engine_impl::ConvergenceEngine;
 
-const REPAIR_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// The retirement loop's own backstop cadence, now that
-/// `RetirementWake`-driven events (DAG frontier advanced, materialization
+/// `RetirementWake`-driven events (native frontier advanced, materialization
 /// job completed) are its primary trigger -- see
 /// `run_ephemeral_conflict_copy_retire_loop`'s own doc comment. Kept far
 /// looser than a correctness-critical poll needs to be: this pass exists
@@ -53,16 +50,6 @@ const HAZARD_RECHECK_BACKSTOP_INTERVAL: Duration = Duration::from_secs(30);
 /// `HAZARD_RECHECK_BACKSTOP_INTERVAL` so an ignore-policy edit and a lifted
 /// hazard hold carry the same worst-case re-arm latency.
 const IGNORE_RECHECK_BACKSTOP_INTERVAL: Duration = Duration::from_secs(30);
-/// Each rank gets an exclusive window before the next deterministic fallback
-/// becomes eligible. This only suppresses duplicate work: after enough
-/// unchanged-frontier windows every authorized writer may act.
-const REPAIR_FAILOVER_RANK_INTERVAL: Duration = Duration::from_secs(5);
-
-fn eligible_rank_for_elapsed(elapsed: Duration) -> usize {
-    (elapsed.as_millis() / REPAIR_FAILOVER_RANK_INTERVAL.as_millis())
-        .try_into()
-        .unwrap_or(usize::MAX)
-}
 
 /// See `engine_impl::run_once_for_test`'s own doc comment -- this is the
 /// only way to drive the Convergence Engine's scheduler deterministically
@@ -113,51 +100,51 @@ pub async fn drive_obligations_once_for_test_with_hooks(
 pub async fn run(engine: Arc<ConvergenceEngine>) {
     let state = engine.state().clone();
     // Each loop is spawned as its own task rather than raced directly via
-    // `tokio::select!` on the bare futures: `run_retroactive_repair_loop`
-    // calls several synchronous, blocking `SyncState` methods; racing that
-    // future directly alongside the main engine's on the SAME task would
+    // `tokio::select!` on the bare futures: a loop that calls synchronous,
+    // blocking `SyncState` methods, raced directly alongside the main
+    // engine's future on the SAME task, would
     // let a slow synchronous call in this poll starve the engine's own tick
     // for as long as it runs (`select!` only gets to poll whichever branch
     // it currently has control in) -- exactly the kind of added per-tick
     // latency the row-14 stress scenario's stall detector is tuned to
     // catch. Spawning each onto its own task lets tokio schedule them on
-    // genuinely separate worker threads (the blocking `SyncState` calls
-    // inside the repair loop are themselves further isolated via
-    // `spawn_blocking` at each call site below, since a plain
-    // `tokio::spawn` alone only guarantees a *possibly*-different async
-    // worker thread, not the dedicated blocking pool -- see
-    // `run_retroactive_repair_loop`'s own doc comment).
+    // genuinely separate worker threads.
     //
-    // Explicit abort-and-await of the four survivors below, not a bare
-    // `tokio::select!` on the five `JoinHandle`s alone, gives the "either
+    // Explicit abort-and-await of the three survivors below, not a bare
+    // `tokio::select!` on the four `JoinHandle`s alone, gives the "either
     // dies, all restart" semantics this wrapper's own doc comment
     // describes: a `JoinHandle` a `select!` branch drops only DETACHES its
     // task rather than cancelling it (it keeps running), so
     // `spawn_restarting`'s subsequent restart would otherwise leave the old
     // survivors running undetached alongside a brand new set of tasks --
-    // duplicate materialization engines or repair loops, compounding on
+    // duplicate materialization engines or maintenance loops, compounding on
     // every restart. This manual select-then-abort-and-await reproduces
     // `tokio::task::JoinSet`'s "aborts every remaining task and awaits their
     // completion" contract explicitly -- this function never returns while
-    // any of the five tasks is still alive.
+    // any of the four tasks is still alive.
     let retire_state = state.clone();
     let hazard_recheck_state = state.clone();
-    let ignore_recheck_state = state.clone();
+    let ignore_recheck_state = state;
     let mut engine_handle = tokio::spawn(super::engine_impl::run(engine));
-    let mut repair_handle = tokio::spawn(run_retroactive_repair_loop(state));
     let mut retire_handle = tokio::spawn(run_ephemeral_conflict_copy_retire_loop(retire_state));
     let mut hazard_recheck_handle = tokio::spawn(run_hazard_recheck_loop(hazard_recheck_state));
     let mut ignore_recheck_handle = tokio::spawn(run_ignore_recheck_loop(ignore_recheck_state));
+    // Cancelling this future (an aborted supervisor) must stop all four
+    // rather than detach them.
+    let _stop_with_wrapper = [
+        crate::supervise::AbortOnDrop(engine_handle.abort_handle()),
+        crate::supervise::AbortOnDrop(retire_handle.abort_handle()),
+        crate::supervise::AbortOnDrop(hazard_recheck_handle.abort_handle()),
+        crate::supervise::AbortOnDrop(ignore_recheck_handle.abort_handle()),
+    ];
     tokio::select! {
         _ = &mut engine_handle => {}
-        _ = &mut repair_handle => {}
         _ = &mut retire_handle => {}
         _ = &mut hazard_recheck_handle => {}
         _ = &mut ignore_recheck_handle => {}
     }
     for handle in [
         &mut engine_handle,
-        &mut repair_handle,
         &mut retire_handle,
         &mut hazard_recheck_handle,
         &mut ignore_recheck_handle,
@@ -174,12 +161,12 @@ pub async fn run(engine: Arc<ConvergenceEngine>) {
 /// never derives it: byte-identical DAGs, permanently different file sets
 /// (see `PeerSyncSession::retire_unjustified_ephemeral_conflict_copies`'s
 /// own doc comment). Without retirement, one device (of several, all on an
-/// identical multi-head DAG frontier) can keep holding a conflict copy
+/// identical multi-head native frontier) can keep holding a conflict copy
 /// every device's own `resolve_path_heads` agrees is no longer required.
 ///
 /// Primarily event-driven, not polled: `RetirementWake::mark_dirty` fires
 /// after exactly the two events that can change a copy's justification --
-/// this device's own DAG frontier advancing (locally authored or admitted
+/// this device's own native frontier advancing (locally authored or admitted
 /// from a peer) and a materialization job reaching `Completed` -- so this
 /// loop reacts within one wake rather than waiting up to a whole poll
 /// interval. `RETIREMENT_BACKSTOP_INTERVAL` remains as a correctness
@@ -299,7 +286,7 @@ fn settles_generation(attempt: &RetirementAttempt) -> bool {
 }
 
 /// Re-evaluates every currently-`HazardHeld` path in a group whenever this
-/// device's DAG frontier advances or a materialization job completes --
+/// device's native frontier advances or a materialization job completes --
 /// see `MaterializationStateRepository::list_held_paths`'s own doc comment
 /// for why nothing else ever re-visits a held path once the sibling that
 /// caused its hold changes. Structurally identical to
@@ -331,10 +318,10 @@ async fn run_hazard_recheck_loop(state: Arc<DaemonState>) {
 
 /// For each group in `pending` (group id -> the generation `RetirementWake::
 /// pending` reported for it), lists its currently-held paths and, if any,
-/// re-resolves them directly against this device's current DAG heads via
+/// re-resolves them directly against this device's current native heads via
 /// `reconcile_paths_directly` -- the SAME entry point the Convergence
 /// Engine's own per-job completion oracle uses. A held path's hazard status
-/// follows only local DAG and disk state, so this decision is not
+/// follows only local native state and disk state, so this decision is not
 /// peer-dependent at all. It still prefers an already-live candidate session
 /// when one exists, because a peer is what makes content the recheck may need
 /// obtainable; with none, the local executor runs the same pass and a path
@@ -600,210 +587,6 @@ async fn run_ignore_recheck_pass(state: &Arc<DaemonState>, group_id: &str) {
     }
     if any_rearmed {
         state.replica_coordinator.materialization_wake().notify_materialization_wake();
-    }
-}
-
-/// Every direct `SyncState` call in this loop's body is wrapped in
-/// `spawn_blocking` (`list_links`, `dag_group_heads`, and `get_file`
-/// further below), not called inline -- these are synchronous, blocking
-/// SQLite calls, and a plain `tokio::spawn` around this whole function
-/// (`run`, above) only guarantees these run on SOME async worker thread,
-/// not tokio's dedicated blocking-pool thread. Calling them inline here
-/// would still risk blocking whichever async worker happens to be running
-/// this task, competing with the main engine's own tick for that worker
-/// exactly as directly co-scheduling the two loops on one task did before
-/// `run` started spawning them separately.
-async fn run_retroactive_repair_loop(state: Arc<DaemonState>) {
-    let mut observed_heads: HashMap<String, Vec<ChangeHash>> = HashMap::new();
-    let mut failover_frontiers: HashMap<String, (Vec<ChangeHash>, tokio::time::Instant)> =
-        HashMap::new();
-
-    loop {
-        let replica_coordinator_for_links = state.replica_coordinator.clone();
-        let groups = match tokio::task::spawn_blocking(move || {
-            replica_coordinator_for_links.link_repository().list_links()
-        })
-        .await
-        {
-            Ok(Ok(links)) => links
-                .into_iter()
-                .filter(|link| !link.paused && !link.orphaned)
-                .map(|link| link.group_id)
-                .collect::<BTreeSet<_>>(),
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "retroactive conflict-copy repair could not list links");
-                tokio::time::sleep(REPAIR_POLL_INTERVAL).await;
-                continue;
-            }
-            Err(error) => {
-                tracing::error!(%error, "retroactive conflict-copy repair's list_links task panicked");
-                tokio::time::sleep(REPAIR_POLL_INTERVAL).await;
-                continue;
-            }
-        };
-        observed_heads.retain(|group_id, _| groups.contains(group_id));
-        failover_frontiers.retain(|group_id, _| groups.contains(group_id));
-
-        for group_id in groups {
-            let replica_coordinator_for_heads = state.replica_coordinator.clone();
-            let heads_group_id = group_id.clone();
-            let mut heads = match tokio::task::spawn_blocking(move || {
-                replica_coordinator_for_heads.sqlite().dag_group_heads(&heads_group_id)
-            })
-            .await
-            {
-                Ok(Ok(heads)) => heads,
-                Ok(Err(error)) => {
-                    tracing::warn!(%error, %group_id, "retroactive conflict-copy repair could not read DAG heads");
-                    continue;
-                }
-                Err(error) => {
-                    tracing::error!(%error, %group_id, "retroactive conflict-copy repair's dag_group_heads task panicked");
-                    continue;
-                }
-            };
-            heads.sort();
-            if observed_heads.get(&group_id) == Some(&heads) {
-                continue;
-            }
-            let first_seen = match failover_frontiers.get(&group_id) {
-                Some((tracked, first_seen)) if tracked == &heads => *first_seen,
-                _ => {
-                    let now = tokio::time::Instant::now();
-                    failover_frontiers.insert(group_id.clone(), (heads.clone(), now));
-                    now
-                }
-            };
-            let eligible_rank = eligible_rank_for_elapsed(first_seen.elapsed());
-
-            let Some(signing_key) = state.device_signing_key() else {
-                // A registered daemon wires this during startup. Do not cache the
-                // heads: once the key arrives, the unchanged frontier still needs
-                // its first repair pass.
-                continue;
-            };
-
-            let replica_coordinator = state.replica_coordinator.clone();
-            let device_id = state.device_id.clone();
-            let repair_group = group_id.clone();
-            let repair = tokio::task::spawn_blocking(move || {
-                let emitter = ChangeEmitter::new(device_id, signing_key);
-                replica_coordinator.repair_retroactive_conflict_copy_obligations(
-                    &repair_group,
-                    &emitter,
-                    eligible_rank,
-                )
-            })
-            .await;
-
-            let outcome = match repair {
-                Ok(Ok(outcome)) => outcome,
-                Ok(Err(error)) => {
-                    // Includes policy-unavailable and transient SQLite failures.
-                    // Do not cache this frontier; retry it on the next poll.
-                    tracing::warn!(%error, %group_id, "retroactive conflict-copy repair deferred");
-                    continue;
-                }
-                Err(error) => {
-                    tracing::error!(%error, %group_id, "retroactive conflict-copy repair task panicked");
-                    continue;
-                }
-            };
-
-            match outcome {
-                RetroactiveRepairOutcome::NothingToDo { committed_frontier } => {
-                    // Cache only the exact frontier examined inside the atomic
-                    // repair transaction. Re-reading here is incorrect: a peer
-                    // could admit a new head after that transaction and before
-                    // this task runs, and caching that unexamined head would
-                    // suppress its repair.
-                    observed_heads.insert(group_id.clone(), committed_frontier);
-                    failover_frontiers.remove(&group_id);
-                }
-                RetroactiveRepairOutcome::PermanentlyBlocked { path, committed_frontier } => {
-                    // This frontier's obligation at `path` alone exceeds the
-                    // bounded change size and cannot yet be split across
-                    // multiple carriers, so re-examining this exact frontier
-                    // every poll can only ever reproduce the same result --
-                    // cache it exactly like a real no-op, rather than
-                    // re-running full-history planning and re-acquiring the
-                    // SQLite writer lock once a second forever. A NEW head
-                    // (e.g. one that resolves some of `path`'s concurrent
-                    // losers through ordinary use) still re-examines this
-                    // group on the next poll, since `observed_heads` is keyed
-                    // on the frontier, not the group alone.
-                    tracing::warn!(
-                        %group_id,
-                        %path,
-                        "retroactive conflict-copy repair permanently blocked at this frontier: \
-                         obligation exceeds the bounded change size and cannot yet be split \
-                         across multiple carriers"
-                    );
-                    observed_heads.insert(group_id.clone(), committed_frontier);
-                    failover_frontiers.remove(&group_id);
-                }
-                RetroactiveRepairOutcome::PlanStale { reason } => {
-                    // Something the plan was built against moved while this
-                    // pass ran, and nothing was written. The next poll plans
-                    // against the state that actually exists now. Deliberately
-                    // not cached — caching the frontier here would suppress
-                    // exactly the re-plan this asks for, and for
-                    // `ObligationsChanged` that frontier has not even moved.
-                    tracing::debug!(
-                        %group_id,
-                        ?reason,
-                        "retroactive conflict-copy repair re-driving: the plan went stale"
-                    );
-                }
-                RetroactiveRepairOutcome::AwaitingFailover { local_rank, committed_frontier } => {
-                    tracing::debug!(
-                        %group_id,
-                        ?local_rank,
-                        eligible_rank,
-                        frontier = ?committed_frontier,
-                        "retroactive conflict-copy repair waiting for deterministic failover rank"
-                    );
-                }
-                RetroactiveRepairOutcome::Repaired { repaired_paths, committed_frontier: _ } => {
-                    // A successful bounded carrier is deliberately not cached. It
-                    // may have left additional eligible source paths behind, so
-                    // the next poll examines its new head and drains another
-                    // batch. The first eventual no-op caches the final frontier.
-                    tracing::info!(
-                        %group_id,
-                        repaired_paths = ?repaired_paths,
-                        "authored retroactive conflict-copy merge resolution"
-                    );
-                    state.record_activity();
-                    // Announces unconditionally (`repaired_paths` is already
-                    // known non-empty), never gated on whether this device
-                    // happens to have the repaired source materialized yet.
-                    // Using `DaemonState::broadcast_change`'s own
-                    // `records`-derived path here would be wrong: the carrier
-                    // this just authored is already a durable DAG fact
-                    // regardless of this device's local materialization
-                    // state, and a peer must learn of it immediately rather
-                    // than only after the next periodic audit -- see
-                    // `note_local_commit_for_group`'s own doc comment.
-                    //
-                    // Flush BEFORE announcing, for the identical reason
-                    // `broadcast_change` itself does -- this repair carrier
-                    // calls `note_local_commit_for_group` directly rather
-                    // than going through `broadcast_change`, so without this
-                    // it would get no checkpoint-flush trigger at all: the
-                    // repair Change would be announced but never Published,
-                    // a peer's fetch would find no evidence to serve, and
-                    // the carrier would silently never arrive (exercised by
-                    // every mesh chaos test whose conflict resolution routes
-                    // through this carrier path).
-                    state.flush_pending_checkpoint_for_group(&group_id).await;
-                    state.note_local_commit_for_group(&group_id).await;
-                    failover_frontiers.remove(&group_id);
-                }
-            }
-        }
-
-        tokio::time::sleep(REPAIR_POLL_INTERVAL).await;
     }
 }
 

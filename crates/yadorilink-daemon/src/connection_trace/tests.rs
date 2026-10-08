@@ -1,7 +1,6 @@
 #![cfg(test)]
 
 use super::*;
-use yadorilink_replica_domain::test_authoring::create_signed_for_tests;
 
 #[test]
 fn records_are_bounded_and_return_newest_first() {
@@ -195,24 +194,12 @@ fn checkpoint_pending_is_ok_when_nothing_is_locally_pending() {
 
 #[test]
 fn checkpoint_pending_warns_for_an_unpublished_locally_authored_change_and_clears_once_published() {
-    use ed25519_dalek::SigningKey;
-    use yadorilink_replica_domain::ids::{DeviceId, FolderGroupId};
-    use yadorilink_sync_sqlite::dag_store::{
-        admit_change, published_view::attach_authorization_evidence,
-    };
+    use yadorilink_sync_sqlite::native_publication::attach_authorization_evidence;
 
     let sync_state = crate::replica_coordinator::ReplicaCoordinator::open_in_memory().unwrap();
     sync_state.link_repository().add_link("/tmp/does-not-matter", "g").unwrap();
 
-    let change = create_signed_for_tests(
-        vec![],
-        0,
-        DeviceId("device-A".into()),
-        FolderGroupId("g".into()),
-        vec![],
-        &SigningKey::from_bytes(&[3u8; 32]),
-    );
-    sync_state.database().write(|conn| admit_change(conn, &change)).unwrap();
+    let change = author_local(&sync_state, "device-A", 3);
 
     let telem = telemetry();
     let before = run_connectivity_doctor(&telem, &sync_state, "device-A");
@@ -235,7 +222,7 @@ fn checkpoint_pending_warns_for_an_unpublished_locally_authored_change_and_clear
                 b"cp",
                 b"sig",
                 &[0xAAu8; 32],
-                &[(change.compute_hash(), b"proof".to_vec())],
+                &[(change, b"proof".to_vec())],
             )
         })
         .unwrap();
@@ -246,22 +233,10 @@ fn checkpoint_pending_warns_for_an_unpublished_locally_authored_change_and_clear
 
 #[test]
 fn checkpoint_pending_ignores_another_devices_pending_change() {
-    use ed25519_dalek::SigningKey;
-    use yadorilink_replica_domain::ids::{DeviceId, FolderGroupId};
-    use yadorilink_sync_sqlite::dag_store::admit_change;
-
     let sync_state = crate::replica_coordinator::ReplicaCoordinator::open_in_memory().unwrap();
     sync_state.link_repository().add_link("/tmp/does-not-matter", "g").unwrap();
 
-    let others_change = create_signed_for_tests(
-        vec![],
-        0,
-        DeviceId("device-B".into()),
-        FolderGroupId("g".into()),
-        vec![],
-        &SigningKey::from_bytes(&[4u8; 32]),
-    );
-    sync_state.database().write(|conn| admit_change(conn, &others_change)).unwrap();
+    author_local(&sync_state, "device-B", 4);
 
     let telem = telemetry();
     let out = run_connectivity_doctor(&telem, &sync_state, "device-A");
@@ -270,4 +245,36 @@ fn checkpoint_pending_ignores_another_devices_pending_change() {
         "ok",
         "device-B's pending change must not count against device-A's own doctor reading"
     );
+}
+
+/// Authors one local native delta of `device` in group `g`, unpublished, and
+/// returns its hash.
+fn author_local(
+    sync_state: &crate::replica_coordinator::ReplicaCoordinator,
+    device: &str,
+    key: u8,
+) -> yadorilink_replica_domain::native_state::DeltaHash {
+    let key = ed25519_dalek::SigningKey::from_bytes(&[key; 32]);
+    let author = yadorilink_replica_domain::author::fixtures::author(device, 1);
+    let local = yadorilink_sync_sqlite::local_author::LocalAuthor {
+        author: author.clone(),
+        signing_key: &key,
+        capture: None,
+    };
+    let path = yadorilink_replica_domain::ids::SyncPath("a.txt".into());
+    let op = yadorilink_replica_domain::local_op::Op::Put {
+        path: path.clone(),
+        version: yadorilink_replica_domain::ids::VersionHash([1; 32]),
+    };
+    let group = yadorilink_replica_domain::ids::FolderGroupId("g".into());
+    sync_state
+        .database()
+        .write(|conn| {
+            yadorilink_sync_sqlite::native_authoring::author_op(conn, &group, &local, &op, &path)?;
+            let entry =
+                yadorilink_sync_sqlite::native_store::frontier_entry_get(conn, &group, &author)?
+                    .expect("the authored delta advanced its author's frontier");
+            Ok::<_, yadorilink_sync_sqlite::SyncSqliteError>(entry.tip)
+        })
+        .unwrap()
 }

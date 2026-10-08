@@ -1,41 +1,28 @@
-//! Pure replica-engine policy: DAG-driven change admission, causal
-//! authorization, custody/durability evidence checks, and deterministic
-//! conflict-repair election, with zero I/O, SQL, wire, or async runtime
-//! dependency.
+//! Pure replica-engine policy: custody/durability evidence checks, conflict
+//! and namespace resolution, native bootstrap snapshot shapes,
+//! with zero I/O, SQL, wire, or async runtime dependency.
 //!
-//! Depends only on `yadorilink-replica-domain`. Storage/filesystem-coupled
-//! code lives in `yadorilink-peer-session`, which implements this crate's 4
-//! ports ([`ports::ReplicaHistoryPort`], [`ports::ChangeAdmissionPort`],
-//! [`ports::FrontierStorePort`], [`ports::DurabilityEvidencePort`]) as thin
-//! adapters over its own storage.
+//! Depends only on `yadorilink-replica-domain`. The daemon implements this
+//! crate's port ([`ports::DurabilityEvidencePort`]) as a thin adapter over
+//! its own storage.
 
-pub mod change_ops;
-pub mod compaction;
+pub mod authorized_writer;
 pub mod conflict;
-pub mod conflict_authoring;
 pub mod custody;
 mod engine;
 pub mod error;
 pub mod handoff_lease;
 pub mod namespace;
+pub mod native_snapshot;
 pub mod outcomes;
 pub mod ports;
-pub mod rebootstrap;
-pub mod rebootstrap_snapshot;
-pub mod repair_election;
 
 use std::sync::Arc;
 
-pub use engine::{AntiEntropyPage, DurableVersionQuery, PeerReplicaEngine};
-pub use ports::{
-    ChangeAdmissionPort, DurabilityEvidencePort, FrontierStorePort, ReplicaHistoryPort,
-};
+pub use engine::{DurableVersionQuery, PeerReplicaEngine};
+pub use ports::DurabilityEvidencePort;
 
-/// `PeerReplicaEngine`'s 4 port dependencies, held as one bundle so its own
-/// constructor takes a single argument rather than 4 positional `Arc`s.
+/// `PeerReplicaEngine`'s port dependency.
 pub struct ReplicaEngineDependencies {
-    pub history: Arc<dyn ReplicaHistoryPort>,
-    pub admission: Arc<dyn ChangeAdmissionPort>,
-    pub frontier: Arc<dyn FrontierStorePort>,
     pub durability: Arc<dyn DurabilityEvidencePort>,
 }

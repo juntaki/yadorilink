@@ -48,6 +48,38 @@ fn protected_full_replica_facts() -> DurabilityFacts {
     )
 }
 
+/// `Unknown` before any check round has run is "not checked yet"; every other
+/// reason for `Unknown` (a latch, stale policy, unreadable materialization) or
+/// a check that already ran is not.
+#[test]
+fn first_check_pending_only_before_the_first_round_with_trustworthy_facts() {
+    let mut fresh = protected_full_replica_facts();
+    fresh.peer_confirmed_custody = false;
+    fresh.ever_confirmation_swept = false;
+    assert!(first_check_pending(&fresh));
+
+    let mut swept = fresh.clone();
+    swept.ever_confirmation_swept = true;
+    assert!(!first_check_pending(&swept), "a round has run: Unknown now stands on its own");
+
+    let mut confirmed = fresh.clone();
+    confirmed.peer_confirmed_custody = true;
+    assert!(!first_check_pending(&confirmed), "confirmed custody is not pending");
+
+    for distrust in [
+        |f: &mut DurabilityFacts| f.latched_unknown = true,
+        |f: &mut DurabilityFacts| f.latch_load_failed = true,
+        |f: &mut DurabilityFacts| f.scope_unknown = true,
+        |f: &mut DurabilityFacts| f.recovery_blocked = true,
+        |f: &mut DurabilityFacts| f.group_policy_stale = true,
+        |f: &mut DurabilityFacts| f.materialization = Err(()),
+    ] {
+        let mut f = fresh.clone();
+        distrust(&mut f);
+        assert!(!first_check_pending(&f), "{f:?} is Unknown for a real reason, not pending");
+    }
+}
+
 /// Table-driven pin of `classify`'s exact precedence, matched against
 /// `DaemonState::group_durability_status`'s real, current
 /// implementation at the time this was written -- see this module's

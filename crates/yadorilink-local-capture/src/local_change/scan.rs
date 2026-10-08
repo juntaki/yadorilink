@@ -8,12 +8,12 @@ use crate::error::LocalCaptureError;
 use crate::scan_block_staging::ScanBlockStaging;
 use yadorilink_filesystem_sync::watcher::FsChangeKind;
 use yadorilink_local_storage::{read_replicated_xattrs, unix_mode_from_metadata};
-use yadorilink_replica_domain::change::{encoded_op_len, Op};
 use yadorilink_replica_domain::file::FileVersion;
 use yadorilink_replica_domain::file::{FileRecord, RecordKind};
 use yadorilink_replica_domain::ids::SyncPath;
+use yadorilink_replica_domain::local_op::{encoded_op_len, Op};
 use yadorilink_replica_domain::session_state::MaterializationState;
-use yadorilink_replica_domain::session_state::{ChangeContent, LocalFileMetaColumns};
+use yadorilink_replica_domain::session_state::{LocalFileMetaColumns, PreparedLocalMutation};
 use yadorilink_root_authority::fs_identity::{disk_race_fingerprint_of, metadata_mtime_matches};
 use yadorilink_root_authority::ignore_patterns::EffectiveIgnoreSet;
 use yadorilink_root_authority::root_identity::VerifiedRoot;
@@ -74,7 +74,7 @@ pub(super) type ChunkCommittedSink<'cb, 'obj> = Option<&'cb mut (dyn FnMut(&[Fil
 /// That is not hypothetical. The metadata-only branch pushed a record and
 /// a mode, and no actual-state evidence — so the commit that emitted its
 /// new `FileVersion` wrote no proof, and the path kept the proof its
-/// previous commit had written, naming a version the DAG had already
+/// previous commit had written, naming a version native state had already
 /// superseded. Nothing could close that path's projection obligation
 /// afterwards, and on a device with no peer nothing ever would.
 ///
@@ -123,6 +123,71 @@ pub(super) enum PreparedMutation {
     Delete { record: FileRecord, op: Op },
 }
 
+/// Whether disk still holds the bytes a scan read, given whether the path's
+/// identity is unchanged since the read and whether that identity would
+/// show an in-place rewrite that kept the length and restored the
+/// modification time. When it would not (see
+/// `FileIdentity::in_place_rewrite_visible`), an unchanged identity proves
+/// nothing about the bytes, so they are compared themselves.
+fn scanned_bytes_still_on_disk(
+    identity_unchanged: bool,
+    rewrite_visible: bool,
+    bytes_match: impl FnOnce() -> bool,
+) -> bool {
+    identity_unchanged && (rewrite_visible || bytes_match())
+}
+
+#[cfg(test)]
+mod scanned_bytes_still_on_disk_tests {
+    use super::scanned_bytes_still_on_disk;
+
+    #[test]
+    fn an_identity_that_cannot_see_a_rewrite_defers_to_the_bytes() {
+        assert!(!scanned_bytes_still_on_disk(true, false, || false));
+        assert!(scanned_bytes_still_on_disk(true, false, || true));
+    }
+
+    #[test]
+    fn an_identity_that_sees_rewrites_is_enough_and_the_bytes_are_not_read() {
+        assert!(scanned_bytes_still_on_disk(true, true, || panic!("bytes read")));
+        assert!(!scanned_bytes_still_on_disk(false, true, || panic!("bytes read")));
+        assert!(!scanned_bytes_still_on_disk(false, false, || panic!("bytes read")));
+    }
+}
+
+/// The path locks one commit holds through its write.
+///
+/// The lock registry folds names, so two names in one commit can share a
+/// lock -- an offline case-only rename deletes `Report.txt` and writes
+/// `report.txt` -- and tokio's mutex is not re-entrant: a second
+/// `try_lock` of a lock this commit already holds would fail against the
+/// commit itself and withhold half of the rename. A lock already held here
+/// is simply held. Every other acquisition is a `try_lock`, so holding
+/// several never waits on another holder.
+#[derive(Default)]
+pub(super) struct CommitPathLocks(Vec<tokio::sync::OwnedMutexGuard<()>>);
+
+impl CommitPathLocks {
+    /// Holds `lock` until this value drops; `false` when another holder
+    /// has it.
+    pub(super) fn try_hold(&mut self, lock: std::sync::Arc<tokio::sync::Mutex<()>>) -> bool {
+        if self
+            .0
+            .iter()
+            .any(|held| std::sync::Arc::ptr_eq(tokio::sync::OwnedMutexGuard::mutex(held), &lock))
+        {
+            return true;
+        }
+        match lock.try_lock_owned() {
+            Ok(guard) => {
+                self.0.push(guard);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
 impl PreparedMutation {
     /// The mutation for a path that is gone.
     fn tombstone(record: FileRecord) -> Self {
@@ -162,8 +227,8 @@ fn split_offline_directory_removals(
     root: &Path,
     snapshot: &ReconcileSnapshot,
     prepared: Vec<PreparedMutation>,
-) -> (std::collections::BTreeMap<String, Vec<FileRecord>>, Vec<PreparedMutation>) {
-    let mut removed: std::collections::BTreeMap<String, Vec<FileRecord>> =
+) -> (std::collections::BTreeMap<String, Vec<OfflineRemovalCandidate>>, Vec<PreparedMutation>) {
+    let mut removed: std::collections::BTreeMap<String, Vec<OfflineRemovalCandidate>> =
         std::collections::BTreeMap::new();
     let mut rest = Vec::with_capacity(prepared.len());
     for mutation in prepared {
@@ -180,7 +245,10 @@ fn split_offline_directory_removals(
             let directory = topmost_gone
                 .or_else(|| snapshot.is_directory(&record.path).then_some(record.path.as_str()));
             if let Some(directory) = directory {
-                removed.entry(directory.to_string()).or_default().push(record.clone());
+                removed.entry(directory.to_string()).or_default().push(OfflineRemovalCandidate {
+                    record: record.clone(),
+                    native_witness: snapshot.native_witness(&record.path),
+                });
                 continue;
             }
         }
@@ -286,15 +354,38 @@ struct ReconcileSnapshot {
     /// Each row's kind: whether a directory-only ignore pattern covers a
     /// row cannot be asked of a path that is gone from disk.
     kind_by_path: std::collections::HashMap<String, RecordKind>,
+    /// What native showed at each path it knows, read BEFORE the rows above
+    /// so a head landing in between makes a commit stale rather than
+    /// unseen. A path missing here was absent to native.
+    native_witness_by_path: std::collections::HashMap<
+        String,
+        yadorilink_replica_domain::native_state::NativeCaptureWitness,
+    >,
     materialization_by_path: std::collections::HashMap<String, MaterializationState>,
     placeholder_generation_by_path:
         std::collections::HashMap<String, yadorilink_sync_sqlite::RecordedPlaceholderGeneration>,
 }
 
 impl ReconcileSnapshot {
+    fn native_witness(
+        &self,
+        path: &str,
+    ) -> yadorilink_replica_domain::native_state::NativeCaptureWitness {
+        self.native_witness_by_path.get(path).cloned().unwrap_or_else(|| {
+            yadorilink_sync_sqlite::native_projection_binding::absent_native_witness(path)
+        })
+    }
+
     fn is_directory(&self, path: &str) -> bool {
         self.kind_by_path.get(path) == Some(&RecordKind::Directory)
     }
+}
+
+/// One path a folder removal found gone: the tombstone record and what
+/// native showed at it in the pass's snapshot.
+struct OfflineRemovalCandidate {
+    record: FileRecord,
+    native_witness: yadorilink_replica_domain::native_state::NativeCaptureWitness,
 }
 
 /// What a pass's walk established: the mutations it prepared, in walk
@@ -312,13 +403,13 @@ struct ReconcileWalk {
 }
 
 /// Max ops in a single reconciliation-emitted change. Matches the initial
-/// import's [`yadorilink_replica_domain::change::IMPORT_BATCH_OP_LIMIT`] so a
+/// import's [`yadorilink_replica_domain::local_op::IMPORT_BATCH_OP_LIMIT`] so a
 /// bulk offline diff converts into a chain of same-sized changes whichever
 /// path (import or reconcile) first observes it, and stays far under the
 /// change decoder's hard [`yadorilink_replica_domain::limits::MAX_OPS`]
 /// (65536) per-change ceiling.
 pub(super) const RECONCILE_CHUNK_OP_LIMIT: usize =
-    yadorilink_replica_domain::change::IMPORT_BATCH_OP_LIMIT;
+    yadorilink_replica_domain::local_op::IMPORT_BATCH_OP_LIMIT;
 
 /// Max canonical op-bytes in a single reconciliation-emitted change. A change
 /// cannot be wire-split, so one change must fit in one delivered
@@ -331,10 +422,10 @@ pub(super) const RECONCILE_CHUNK_OP_LIMIT: usize =
 /// alone — is instead split by this byte cap. At least one op is always taken
 /// per chunk, so a single over-cap op (never possible: one op is at most a
 /// 4 KiB-ish path plus 37 bytes) could not wedge the loop. Shares
-/// [`yadorilink_replica_domain::change::MAX_CHANGE_OP_BYTES`] with the initial import so the two
+/// [`yadorilink_replica_domain::local_op::MAX_CHANGE_OP_BYTES`] with the initial import so the two
 /// byte bounds can never drift.
 pub(super) const RECONCILE_CHUNK_BYTE_LIMIT: usize =
-    yadorilink_replica_domain::change::MAX_CHANGE_OP_BYTES;
+    yadorilink_replica_domain::local_op::MAX_CHANGE_OP_BYTES;
 
 /// How much of a disk-vs-index reconciliation scan is allowed to mutate
 /// the index.
@@ -483,7 +574,7 @@ impl LocalChangeProcessor {
     /// locally, an open materialization intent -> reconstruct) from an offline
     /// user delete (missing target, no intent -> tombstone). When that repair
     /// pass ERRORED for this group on this boot, its disambiguation input is
-    /// unavailable, so a `Hydrated`-but-missing file cannot be safely told apart
+    /// unavailable, so a `Present`-but-missing file cannot be safely told apart
     /// from a genuine deletion. Passing `emit_tombstones = false` then defers
     /// ALL of this scan's delete emission to a later boot on which repair
     /// succeeds — fail-closed: never emit a delete when a crash cannot be told
@@ -674,6 +765,82 @@ impl LocalChangeProcessor {
         self.reconcile_added_files_with_ignore(group_id, root, &ignore_set)
     }
 
+    /// The final check before a scan authors content it read at `path`:
+    /// `true` when it is safe to author now, with the path's lock held in
+    /// `locks` through the commit; `false` when it is not, with the path
+    /// already left to be captured again (or, for an unfinished write's
+    /// pre-image, to that write's retry).
+    ///
+    /// A write of a path holds its lock from the transaction that moves the
+    /// row to the version it writes until those bytes are proven, so while
+    /// it is held the row can be ahead of disk: bytes the scan read then are
+    /// the version being replaced, and authoring them would put that older
+    /// content over the newer version. Native's witness cannot tell -- it
+    /// saw the row already at the newer version. So the upsert commits only
+    /// under the lock and only while disk is still exactly what the scan
+    /// read: the rule a debounced flush commits under. A path whose lock is
+    /// busy is journaled once the holder releases it; one that changed since
+    /// the read is journaled now, under its lock. Bytes that are the
+    /// pre-image of a write still open over the path (one that failed after
+    /// moving the row) are not authored either, and not journaled: that
+    /// write's retry owns the path.
+    fn recheck_scanned_upsert(
+        &self,
+        group_id: &str,
+        root: &Path,
+        record: &FileRecord,
+        version: &FileVersion,
+        observation: Option<DiskObservation>,
+        locks: &mut CommitPathLocks,
+    ) -> Result<bool, LocalCaptureError> {
+        let path = record.path.as_str();
+        #[cfg(test)]
+        scan_test_hooks::fire_pre_upsert_commit_recheck(group_id, path);
+        if !locks.try_hold(self.state.path_lock(group_id, path)) {
+            tracing::info!(
+                group_id,
+                path,
+                "a path the scan read is being written; capturing it again once the write \
+                 releases it"
+            );
+            self.journal_uncaptured_once_unlocked(group_id, path);
+            return Ok(false);
+        }
+        let disk_path = root.join(path);
+        let still_as_read = observation.is_some_and(|observation| {
+            scanned_bytes_still_on_disk(
+                observation.identity_if_still_current(&disk_path).is_some(),
+                version.meta.record_kind != RecordKind::File
+                    || yadorilink_root_authority::fs_identity::FileIdentity::in_place_rewrite_visible(
+                        &disk_path,
+                    ),
+                || {
+                    yadorilink_local_storage::disk_bytes_match_indexed_blocks(
+                        &disk_path,
+                        &record.blocks,
+                    )
+                    .unwrap_or(false)
+                },
+            )
+        });
+        if !still_as_read {
+            tracing::info!(
+                group_id,
+                path,
+                "a path changed on disk after the scan read it; capturing it again instead of \
+                 authoring what the scan read"
+            );
+            self.journal_uncaptured_local_edit(group_id, path, now_unix_nanos())?;
+            return Ok(false);
+        }
+        // Not journaled: the open write's own retry owns the path, and a
+        // capture of these bytes would find nothing to author either.
+        if self.authors_pre_image_of_open_write(group_id, record, version)? {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     /// The single choke point every disk reconcile passes through, and the
     /// reason it takes a [`VerifiedRoot`] rather than a `&Path`.
     ///
@@ -710,18 +877,20 @@ impl LocalChangeProcessor {
     /// candidate, immediately before it is trusted -- shared by both the
     /// candidacy filter in `reconcile_disk_with_ignore`'s main loop and
     /// the final pre-commit re-verification right before each chunk
-    /// actually writes. `Ok(Some(guard))` means safe to tombstone THIS
-    /// instant, with the guard that must stay held until the write this
-    /// check is protecting actually lands (a caller that drops it
-    /// immediately closes nothing -- see both call sites' own comments).
-    /// `Ok(None)` means not safe right now (contended, protected, or the
+    /// actually writes. `Ok(true)` means safe to tombstone THIS
+    /// instant, with the path's lock held in `locks`, which must stay held
+    /// until the write this check is protecting actually lands (a caller
+    /// that drops it immediately closes nothing -- see the call sites' own
+    /// comments).
+    /// `Ok(false)` means not safe right now (contended, protected, or the
     /// path exists again) -- skip this candidate for this pass.
     pub(super) fn recheck_tombstone_candidate(
         &self,
         group_id: &str,
         root: &Path,
         path: &str,
-    ) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>, LocalCaptureError> {
+        locks: &mut CommitPathLocks,
+    ) -> Result<bool, LocalCaptureError> {
         // `try_lock`, never a blocking `lock`: mirrors
         // `materialization_repair.rs`'s own established pattern for the
         // identical shape of problem (a synchronous sweep racing an async
@@ -730,9 +899,9 @@ impl LocalChangeProcessor {
         // actively working on this exact path right now, that alone
         // proves the "genuinely missing, nothing in progress"
         // precondition for a tombstone does not hold.
-        let Ok(guard) = self.state.path_lock(group_id, path).try_lock_owned() else {
-            return Ok(None);
-        };
+        if !locks.try_hold(self.state.path_lock(group_id, path)) {
+            return Ok(false);
+        }
         // Exact-name, not `std::fs::symlink_metadata(...).is_ok()`: on a
         // case- or Unicode-normalization-insensitive filesystem (macOS,
         // Windows), a direct path lookup resolves to whatever sibling
@@ -747,8 +916,18 @@ impl LocalChangeProcessor {
         // more than it was during the walk itself, which would have
         // skipped it the same way.
         if exact_leaf_exists_as_file_or_symlink(root, path) {
-            return Ok(None);
+            return Ok(false);
         }
+        // Absence is delete evidence only for a `Present` object (see
+        // `prepare_offline_tombstones`). Read under the lock held above, so a
+        // row that became `Remote`, `Hydrating` or `Evicting` since the
+        // candidate was accepted is no longer one.
+        if self.state.get_materialization_state(group_id, path)?
+            != Some(MaterializationState::Present)
+        {
+            return Ok(false);
+        }
+
         // An explicit Directory row is present while a directory stands at
         // its exact name. The walk skips directories, so without this every
         // settled Directory would read as an offline deletion here and be
@@ -759,17 +938,17 @@ impl LocalChangeProcessor {
                 !row.snapshot.deleted && row.snapshot.record_kind == RecordKind::Directory
             })
         {
-            return Ok(None);
+            return Ok(false);
         }
         if self.state.has_materialization_intent(group_id, path)?
             || self.state.has_unsettled_projection_obligation(group_id, path)?
             || (self.state.is_held(group_id, path)?
                 && self.state.get_materialization_state(group_id, path)?
-                    != Some(MaterializationState::Hydrated))
+                    != Some(MaterializationState::Present))
         {
-            return Ok(None);
+            return Ok(false);
         }
-        Ok(Some(guard))
+        Ok(true)
     }
 
     /// Runs ONE reconciliation pass for this group at a time, performing at
@@ -944,7 +1123,7 @@ impl LocalChangeProcessor {
         // `emit_tombstones` is `false` when the interrupted-materialization
         // repair pass that must run before this scan ERRORED for this group on
         // this boot: without repair's crash-vs-offline-delete disambiguation, a
-        // `Hydrated`-but-missing file cannot be safely told apart from a
+        // `Present`-but-missing file cannot be safely told apart from a
         // genuine deletion, so ALL delete emission is deferred to a later boot
         // on which repair succeeds. Fail-closed: never emit a delete when a
         // crash cannot be told from a delete. See
@@ -957,12 +1136,16 @@ impl LocalChangeProcessor {
         // stay unauthored on disk until it is resumed (see `paused_items`).
         let paused = self.paused_items(group_id)?;
         if !paused.is_empty() {
-            walk.prepared.retain(|mutation| {
-                !yadorilink_sync_sqlite::paused_items::path_is_covered(
+            let mut kept = Vec::with_capacity(walk.prepared.len());
+            for mutation in walk.prepared.drain(..) {
+                if !yadorilink_sync_sqlite::paused_items::path_is_covered(
                     &paused,
                     &mutation.record().path,
-                )
-            });
+                ) {
+                    kept.push(mutation);
+                }
+            }
+            walk.prepared = kept;
         }
 
         // A copy name the namespace placed another entry's leaf under is
@@ -980,9 +1163,8 @@ impl LocalChangeProcessor {
         // Route the reconciliation's detected changes through the same
         // change-emission path a live `process_event` uses, so an offline
         // edit or delete picked up only by this startup scan advances the
-        // group's change-history DAG — not merely the local index — closing
-        // the gap where a change-history-negotiating peer would otherwise
-        // never learn of it -- and so a first scan's rows enter history in
+        // group's native state — not merely the local index — closing
+        // the gap where a peer would otherwise never learn of it -- and so a first scan's rows enter history in
         // the same transaction that writes them (see `can_author_history`).
         // An empty record set emits nothing, so re-running the scan never
         // appends a duplicate head. A scan is always this device's own local
@@ -1004,6 +1186,7 @@ impl LocalChangeProcessor {
                 records.extend(self.commit_prepared_with_history(
                     group_id,
                     root,
+                    &snapshot,
                     &prepared,
                     on_chunk_committed,
                     &mut trace,
@@ -1031,7 +1214,7 @@ impl LocalChangeProcessor {
                 continue;
             }
             let kind = if record.deleted {
-                FsChangeKind::Removed
+                FsChangeKind::ObservedRemoval
             } else {
                 FsChangeKind::CreatedOrModified
             };
@@ -1055,6 +1238,7 @@ impl LocalChangeProcessor {
     ) -> Result<ReconcileSnapshot, LocalCaptureError> {
         let mut existing_by_path = std::collections::HashMap::new();
         let mut kind_by_path = std::collections::HashMap::new();
+        let native_witness_by_path = self.state.native_capture_witnesses(group_id)?;
         for (record, kind) in self.state.list_files_with_kind(group_id)? {
             kind_by_path.insert(record.path.clone(), kind);
             existing_by_path.insert(record.path.clone(), record);
@@ -1064,6 +1248,7 @@ impl LocalChangeProcessor {
         Ok(ReconcileSnapshot {
             existing_by_path,
             kind_by_path,
+            native_witness_by_path,
             materialization_by_path,
             placeholder_generation_by_path,
         })
@@ -1086,6 +1271,11 @@ impl LocalChangeProcessor {
             .cloned()
             .collect();
         for path in &ignored_existing_paths {
+            // The rows of a group a rebootstrap freezes stay; a later full scan drops
+            // them once the freeze is over.
+            if self.state.group_frozen(group_id)? {
+                continue;
+            }
             self.state.remove_file(group_id, path, &self.begin_operation()?.permit())?;
         }
         Ok(())
@@ -1238,7 +1428,7 @@ impl LocalChangeProcessor {
             if is_excluded_from_sync(Path::new(&rel_path), false, ignore_set) {
                 continue;
             }
-            // A name DAG admission will refuse permanently is skipped here,
+            // A name native admission will refuse permanently is skipped here,
             // for the same reason and in the same shape as the lossy-wire-
             // path skip just above: it can never become a change, so
             // carrying it further can only fail -- and because a scan chunk
@@ -1374,13 +1564,21 @@ impl LocalChangeProcessor {
                         let on_disk_xattrs = std::fs::File::open(path)
                             .map(|f| read_replicated_xattrs(&f))
                             .unwrap_or_default();
-                        if on_disk_unix_mode != indexed_unix_mode
-                            || on_disk_xattrs != indexed_xattrs
+                        // A differing mode or xattr set is a local edit only if
+                        // someone made it: the daemon's own untouched write of
+                        // an older version still carries that version's
+                        // metadata, and authoring it would put it over the
+                        // newer version.
+                        if (on_disk_unix_mode != indexed_unix_mode
+                            || on_disk_xattrs != indexed_xattrs)
+                            && !self
+                                .state
+                                .disk_is_untouched_proven_write(group_id, &rel_path, root, path)?
                         {
                             // A mode or xattr change is still a change:
                             // the version hash covers both, so this emits
                             // a genuinely new `FileVersion` for the path
-                            // and the DAG's answer for it moves. That
+                            // and native state's answer for it moves. That
                             // makes this branch's proof obligation
                             // identical to the content branch's -- the
                             // commit has to publish evidence describing
@@ -1487,9 +1685,9 @@ impl LocalChangeProcessor {
         // THE ORDERING POINT. The walk is over, so no further block can be
         // staged; this drains what is left in the pool and does not return
         // until `put_prepared_batch` has. Every commit this function makes
-        // -- the DAG-authoring chunk loop and the index-only branch alike
+        // -- the delta-authoring chunk loop and the index-only branch alike
         // -- happens strictly below this line, so no `FileRecord` and no
-        // `Change` can become authoritative while any block it references
+        // native delta can become authoritative while any block it references
         // is still only staged. That is the same crash invariant the
         // per-file commit gave for free, re-established at the one place
         // that can see both ends of it.
@@ -1568,23 +1766,24 @@ impl LocalChangeProcessor {
     /// asked again under the path's lock immediately before its chunk
     /// commits: the walk read the ledger and the index without it, and in
     /// between the materializer may have begun placing an entry there or
-    /// recorded the directory as structural. `Some(guard)` keeps the lock
-    /// until the commit lands.
+    /// recorded the directory as structural. `true` keeps the lock, in
+    /// `locks`, until the commit lands.
     fn recheck_directory_upsert(
         &self,
         group_id: &str,
         root: &Path,
         path: &str,
         unix_mode: Option<u32>,
-    ) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>, LocalCaptureError> {
-        let Ok(guard) = self.state.path_lock(group_id, path).try_lock_owned() else {
-            return Ok(None);
-        };
-        let Ok(lstat) = std::fs::symlink_metadata(root.join(path)) else { return Ok(None) };
-        Ok(match self.directory_verdict(group_id, root, path, &lstat)? {
-            DirectoryVerdict::Author { unix_mode: now } if now == unix_mode => Some(guard),
-            _ => None,
-        })
+        locks: &mut CommitPathLocks,
+    ) -> Result<bool, LocalCaptureError> {
+        if !locks.try_hold(self.state.path_lock(group_id, path)) {
+            return Ok(false);
+        }
+        let Ok(lstat) = std::fs::symlink_metadata(root.join(path)) else { return Ok(false) };
+        Ok(matches!(
+            self.directory_verdict(group_id, root, path, &lstat)?,
+            DirectoryVerdict::Author { unix_mode: now } if now == unix_mode
+        ))
     }
 
     /// Appends a tombstone to `walk.prepared` for every snapshot path the
@@ -1600,6 +1799,8 @@ impl LocalChangeProcessor {
         walk: &mut ReconcileWalk,
     ) -> Result<(), LocalCaptureError> {
         let ReconcileWalk { prepared, seen_paths, failed_prefixes, .. } = walk;
+        // Read once, and only if some path is missing at all.
+        let mut materialization_states = None;
         for (path, existing) in &snapshot.existing_by_path {
             if existing.deleted || seen_paths.contains(path) {
                 continue;
@@ -1658,6 +1859,22 @@ impl LocalChangeProcessor {
             // it. Compiled out entirely in non-test builds.
             #[cfg(test)]
             scan_test_hooks::fire_pre_tombstone_recheck(group_id, path);
+            // A path's absence is delete evidence only for a `Present`
+            // object. A `Remote` row has no local object, a `Hydrating` one
+            // is producing it and an `Evicting` one is removing it: nothing
+            // missing from the user tree says anything about any of them,
+            // however unprotected the path otherwise looks. The authoritative
+            // twin of this check runs under the path lock in
+            // `recheck_tombstone_candidate`.
+            let states = match &materialization_states {
+                Some(states) => states,
+                None => {
+                    materialization_states.insert(self.state.list_materialization_states(group_id)?)
+                }
+            };
+            if states.get(path) != Some(&MaterializationState::Present) {
+                continue;
+            }
             // Never tombstone a path with an open materialization intent: a
             // crash interrupted its write (the file is missing precisely
             // because the rename never completed), and the durable intent
@@ -1675,11 +1892,11 @@ impl LocalChangeProcessor {
             // An open intent alone is not enough. A path can have a
             // durably-committed, non-deleted index row whose REMOTE-
             // origin projection obligation is still unsettled (right
-            // after the DAG record was admitted from a peer, before
+            // after a native delta was admitted from a peer, before
             // `materialize()` itself has ever run) -- no intent has
             // ever been opened for it, but it is exactly as "not yet
             // known to be deleted" as an in-flight intent is. Without
-            // this check, a restart landing between DAG-record
+            // this check, a restart landing between native delta
             // admission and the obligation's first successful
             // materialize reads this as an offline deletion and
             // tombstones a file the device never even finished
@@ -1702,7 +1919,7 @@ impl LocalChangeProcessor {
                 continue;
             }
             // A hazard-held path is not deleted: `hold_record` demotes
-            // it to `Placeholder`, writes nothing under this exact
+            // it to `Remote`, writes nothing under this exact
             // name, and opens no materialization intent, ALL by
             // design (see that fix's own doc comment) -- so neither
             // check above protects it. `HazardHeld` settlement also
@@ -1720,18 +1937,18 @@ impl LocalChangeProcessor {
             // `is_held` alone: `held_reason` and `materialization_
             // state` are independently-cleared columns
             // (`clear_held`/`set_materialization_state`/`transition_
-            // materialization_state_if_same_authoring` are all
+            // materialization_state_if_same_version` are all
             // separate calls, not one atomic operation), so a stale
             // `held_reason` left behind on a row that a LATER,
             // successful materialize genuinely wrote real content for
-            // and stamped `Hydrated` must not suppress its real
+            // and stamped `Present` must not suppress its real
             // deletion forever -- that row's own actual, current
             // state already proves it is not the "nothing on disk
             // under this name" shape this whole check exists to
             // protect.
             if self.state.is_held(group_id, path)?
                 && self.state.get_materialization_state(group_id, path)?
-                    != Some(MaterializationState::Hydrated)
+                    != Some(MaterializationState::Present)
             {
                 continue;
             }
@@ -1754,7 +1971,7 @@ impl LocalChangeProcessor {
             //
             // A cheap PRE-filter, not the authoritative check: this
             // guard is dropped at the end of this loop iteration, long
-            // before the actual DAG write for this candidate happens
+            // before the actual native write for this candidate happens
             // (the chunked commit loop further down, potentially many
             // paths and real elapsed time later, itself unlocked). A
             // mutator that completes a held-to-materialize transition
@@ -1767,7 +1984,12 @@ impl LocalChangeProcessor {
             // 3-veto check with no lock) so an already-doomed
             // candidate is discarded early rather than carried all the
             // way to the commit loop only to be filtered there.
-            if self.recheck_tombstone_candidate(group_id, root, path)?.is_none() {
+            if !self.recheck_tombstone_candidate(
+                group_id,
+                root,
+                path,
+                &mut CommitPathLocks::default(),
+            )? {
                 continue;
             }
             tracing::info!(
@@ -1793,21 +2015,41 @@ impl LocalChangeProcessor {
         &self,
         group_id: &str,
         root: &Path,
-        removed_directories: std::collections::BTreeMap<String, Vec<FileRecord>>,
+        removed_directories: std::collections::BTreeMap<String, Vec<OfflineRemovalCandidate>>,
         mut on_chunk_committed: ChunkCommittedSink<'_, '_>,
     ) -> Result<Vec<FileRecord>, LocalCaptureError> {
         let emitter = self.change_emitter.as_ref().expect("emitter present");
         let mut committed = Vec::new();
         for (directory, candidates) in removed_directories {
-            let mut guards = Vec::with_capacity(candidates.len());
+            let mut locks = CommitPathLocks::default();
             let mut kept: Vec<FileRecord> = Vec::with_capacity(candidates.len());
-            for record in candidates {
+            let mut witnesses = Vec::with_capacity(candidates.len());
+            for OfflineRemovalCandidate { record, native_witness } in candidates {
                 #[cfg(test)]
                 scan_test_hooks::fire_pre_chunk_commit_recheck(group_id, &record.path);
-                match self.recheck_tombstone_candidate(group_id, root, &record.path)? {
-                    Some(guard) => {
-                        guards.push(guard);
+                let recheck = match self.recheck_tombstone_candidate(
+                    group_id,
+                    root,
+                    &record.path,
+                    &mut locks,
+                )? {
+                    true => {
+                        // The delete acts on the row the pass read, so it
+                        // goes ahead only while native still shows what it
+                        // showed when the pass read it: a head another
+                        // author landed since -- even one with identical
+                        // size, mtime and blocks -- is a version this
+                        // removal never saw, and must not enter its basis.
+                        self.state
+                            .native_capture_is_fresh(group_id, &native_witness)?
+                            .then_some(native_witness)
+                    }
+                    false => None,
+                };
+                match recheck {
+                    Some(witness) => {
                         kept.push(record);
+                        witnesses.push(witness);
                     }
                     None => {
                         tracing::info!(
@@ -1823,17 +2065,27 @@ impl LocalChangeProcessor {
                 continue;
             }
             // Deepest first, as `rm -rf` removes them.
+            let mut tombstones: Vec<PreparedLocalMutation> = kept
+                .iter()
+                .zip(witnesses)
+                .map(|(record, native_witness)| PreparedLocalMutation::Delete {
+                    record: record.clone(),
+                    op: Op::Delete { path: SyncPath(record.path.clone()) },
+                    native_witness: Some(native_witness),
+                })
+                .collect();
+            tombstones.sort_by(|a, b| b.record().path.cmp(&a.record().path));
             kept.sort_by(|a, b| b.path.cmp(&a.path));
             let result = self.state.commit_directory_removal(
                 group_id,
                 &directory,
-                &kept,
+                &tombstones,
                 &self.device_id,
                 now_unix_nanos(),
                 Some(&**emitter),
                 &self.begin_operation()?.permit(),
             );
-            drop(guards);
+            drop(locks);
             match result {
                 Ok(_) => {
                     if let Some(ref mut cb) = on_chunk_committed {
@@ -1847,7 +2099,7 @@ impl LocalChangeProcessor {
                         if let Err(e) = self.state.record_dirty_path(
                             group_id,
                             &record.path,
-                            dirty_kind_str(FsChangeKind::Removed),
+                            dirty_kind_str(FsChangeKind::ObservedRemoval),
                             observed,
                             &self.begin_operation()?.permit(),
                         ) {
@@ -1878,6 +2130,7 @@ impl LocalChangeProcessor {
         &self,
         group_id: &str,
         root: &Path,
+        snapshot: &ReconcileSnapshot,
         prepared: &[PreparedMutation],
         mut on_chunk_committed: ChunkCommittedSink<'cb, 'obj>,
         trace: &mut ReconcilePassTrace,
@@ -1929,16 +2182,21 @@ impl LocalChangeProcessor {
             // after the candidacy-time check but before this exact
             // moment -- the window the candidacy-time check alone
             // cannot close, since nothing serializes between the two
-            // -- is caught here instead. Non-tombstone entries (new/
-            // changed content) need no re-verification of their
-            // eligibility; only `record.deleted` candidates ever reach
-            // a delete. What they DO need re-verified is the proof
-            // their observation would publish, and that is decided in
-            // the pass below, after every candidate in this chunk has
-            // been settled -- so it sits as close to the commit as
-            // anything in this loop can.
+            // -- is caught here instead. Content upserts take their lock
+            // here too, and re-check that disk is still what the scan
+            // read (see the arm below). The proof their observation
+            // would publish is decided in the pass below, after every
+            // candidate in this chunk has been settled -- so it sits as
+            // close to the commit as anything in this loop can.
+            //
+            // Every lock this loop takes is a `try_lock`: it never waits
+            // while holding the locks already taken for this chunk, so it
+            // cannot close a lock-order cycle with any other holder, and a
+            // busy lock only defers its path (to
+            // `journal_uncaptured_once_unlocked`, whose waiter holds no
+            // other lock).
             let mut kept_indices: Vec<usize> = Vec::with_capacity(end - start);
-            let mut kept_guards: Vec<tokio::sync::OwnedMutexGuard<()>> = Vec::new();
+            let mut kept_locks = CommitPathLocks::default();
             let mut chunk_actual_state: std::collections::HashMap<
                 String,
                 yadorilink_sync_sqlite::file_index::LocalCaptureActualStateEvidence,
@@ -1953,12 +2211,12 @@ impl LocalChangeProcessor {
                             root,
                             &record.path,
                             meta.unix_mode,
+                            &mut kept_locks,
                         )? {
-                            Some(guard) => {
+                            true => {
                                 kept_indices.push(i);
-                                kept_guards.push(guard);
                             }
-                            None => {
+                            false => {
                                 tracing::info!(
                                     group_id,
                                     path = %record.path,
@@ -1968,8 +2226,17 @@ impl LocalChangeProcessor {
                             }
                         }
                     }
-                    PreparedMutation::Upsert { .. } => {
-                        kept_indices.push(i);
+                    PreparedMutation::Upsert { record, version, observation, .. } => {
+                        if self.recheck_scanned_upsert(
+                            group_id,
+                            root,
+                            record,
+                            version,
+                            *observation,
+                            &mut kept_locks,
+                        )? {
+                            kept_indices.push(i);
+                        }
                     }
                     PreparedMutation::Delete { record, .. } => {
                         // Test-only seam: fires once per tombstone
@@ -1982,10 +2249,14 @@ impl LocalChangeProcessor {
                         // Compiled out entirely in non-test builds.
                         #[cfg(test)]
                         scan_test_hooks::fire_pre_chunk_commit_recheck(group_id, &record.path);
-                        match self.recheck_tombstone_candidate(group_id, root, &record.path)? {
-                            Some(guard) => {
+                        match self.recheck_tombstone_candidate(
+                            group_id,
+                            root,
+                            &record.path,
+                            &mut kept_locks,
+                        )? {
+                            true => {
                                 kept_indices.push(i);
-                                kept_guards.push(guard);
                                 // That re-check IS this mutation's
                                 // absence observation: it confirmed,
                                 // under this path's own lock, held
@@ -2009,7 +2280,7 @@ impl LocalChangeProcessor {
                                         LocalCaptureActualStateEvidence::Absent,
                                 );
                             }
-                            None => {
+                            false => {
                                 tracing::info!(
                                     group_id,
                                     path = %record.path,
@@ -2030,26 +2301,37 @@ impl LocalChangeProcessor {
             // from cannot disagree about which path they belong to.
             let chunk_records: Vec<FileRecord> =
                 kept_indices.iter().map(|&i| prepared[i].record().clone()).collect();
-            let chunk_ops: Vec<Op> =
-                kept_indices.iter().map(|&i| prepared[i].op().clone()).collect();
-            // A withheld tombstone candidate carries no version
-            // (`Op::Delete` references none), so filtering by
-            // `kept_indices` here removes nothing a full `start..end`
-            // range would have kept.
-            let chunk_versions: Vec<FileVersion> = kept_indices
+            // One local mutation per kept record, each authored as its own
+            // change over the head its row showed when the scan read it
+            // (the snapshot): a row that shows another head by the commit
+            // is refused (`LocalWriteCaptureStale`) and captured again.
+            let chunk_mutations: Vec<PreparedLocalMutation> = kept_indices
                 .iter()
-                .filter_map(|&i| match &prepared[i] {
-                    PreparedMutation::Upsert { version, .. } => Some(version.clone()),
-                    PreparedMutation::Delete { .. } => None,
+                .map(|&i| {
+                    let path = &prepared[i].record().path;
+                    match &prepared[i] {
+                        PreparedMutation::Upsert { record, op, version, meta, .. } => {
+                            PreparedLocalMutation::Upsert {
+                                record: record.clone(),
+                                op: op.clone(),
+                                version: version.clone(),
+                                meta: Some(meta.clone()),
+                                native_witness: Some(snapshot.native_witness(path)),
+                            }
+                        }
+                        PreparedMutation::Delete { record, op } => PreparedLocalMutation::Delete {
+                            record: record.clone(),
+                            op: op.clone(),
+                            native_witness: Some(snapshot.native_witness(path)),
+                        },
+                    }
                 })
                 .collect();
-            let chunk_metas: Vec<Option<LocalFileMetaColumns>> =
-                kept_indices.iter().map(|&i| prepared[i].meta()).collect();
             if chunk_records.is_empty() {
                 // Every candidate in this chunk was withheld by the
                 // re-check above (or the chunk was entirely
                 // tombstones, all now stale) -- nothing left to
-                // commit. `kept_guards` drops here, releasing every
+                // commit. `kept_locks` drops here, releasing every
                 // lock this iteration took.
                 start = end;
                 continue;
@@ -2102,15 +2384,17 @@ impl LocalChangeProcessor {
             // ownership(root)?` call here; that check is now folded
             // into the permit's own `verify`, alongside the daemon's
             // lifecycle-fence check the standalone call never covered.
-            let commit_result = self.state.upsert_files_batch_emitting_change(
+            let chunk_evidence: Vec<_> = chunk_mutations
+                .iter()
+                .map(|mutation| chunk_actual_state.get(&mutation.record().path).cloned())
+                .collect();
+            let commit_result = self.state.commit_local_mutations_batch(
                 group_id,
-                &chunk_records,
+                &chunk_mutations,
+                &chunk_evidence,
                 &self.device_id,
-                ChangeContent { ops: chunk_ops, versions: &chunk_versions },
-                &chunk_metas,
-                &chunk_actual_state,
                 crate::ports::LocalChangeEmission {
-                    emitter,
+                    author: emitter,
                     permit: &self.begin_operation()?.permit(),
                 },
             );
@@ -2120,7 +2404,7 @@ impl LocalChangeProcessor {
             // actually closes the window: nothing else can complete a
             // materialization for any of these exact paths while this
             // commit is in flight.
-            drop(kept_guards);
+            drop(kept_locks);
             match commit_result {
                 Ok(_) => {
                     committed.extend_from_slice(&chunk_records);
@@ -2133,13 +2417,19 @@ impl LocalChangeProcessor {
                 // placeholder-auth change every valid-policy peer would
                 // reject (see `upsert_file_emitting_change`). Any earlier
                 // chunks already committed are real emitted changes and
-                // stand; do NOT fall back to a DAG-silent index write for
+                // stand; do NOT fall back to a delta-silent index write for
                 // the rest. Journal this chunk and the remaining tail dirty
                 // (below) so the dirty-journal re-drive re-emits them — with
                 // a real authorization stamp — once policy heals, leaving
                 // the index unadvanced for them so a later full rescan can
                 // still re-derive the same diff.
-                Err(SyncSqliteError::PolicyUnavailable) => {
+                //
+                // A row that no longer shows what the scan read (a remote
+                // change or another capture landed on it since) is the same
+                // case for the rest of the chain: nothing of this chunk was
+                // written, and the dirty journal captures it again.
+                Err(SyncSqliteError::PolicyUnavailable)
+                | Err(SyncSqliteError::LocalWriteCaptureStale { .. }) => {
                     withheld_from = Some(start);
                     break;
                 }
@@ -2153,7 +2443,7 @@ impl LocalChangeProcessor {
             for mutation in &prepared[from..] {
                 let record = mutation.record();
                 let kind = if record.deleted {
-                    FsChangeKind::Removed
+                    FsChangeKind::ObservedRemoval
                 } else {
                     FsChangeKind::CreatedOrModified
                 };
@@ -2174,7 +2464,7 @@ impl LocalChangeProcessor {
                 }
             }
             trace.record_counts(prepared.len(), committed.len());
-            // Broadcast only the chunks that durably entered the DAG; the
+            // Broadcast only the chunks that durably entered native state; the
             // withheld tail re-emits via the dirty journal.
             return Ok(committed);
         }
@@ -2192,8 +2482,8 @@ impl LocalChangeProcessor {
         trace: &mut ReconcilePassTrace,
     ) -> Result<Vec<FileRecord>, LocalCaptureError> {
         // No emitter at all: an unregistered device, which has no
-        // signing key to author a change with. An index-only write is
-        // not a silent DAG divergence here, because there is no DAG to
+        // signing key to author a delta with. An index-only write is
+        // not a silent divergence here, because there is no native state to
         // diverge from and never will be until this device registers.
         //
         // The metadata columns still go in the SAME transaction as the
@@ -2209,7 +2499,7 @@ impl LocalChangeProcessor {
         // touched. On a 100-file folder that was 96 spurious versions,
         // one per path the setter loop had not reached.
         //
-        // Same permit re-check as the DAG-history branch above,
+        // Same permit re-check as the delta-authoring branch above,
         // immediately before this scan's commit (see that branch's
         // own comment).
         let records: Vec<FileRecord> =
@@ -2218,7 +2508,7 @@ impl LocalChangeProcessor {
             prepared.iter().map(PreparedMutation::meta).collect();
         // Observed now, from the bytes this scan just read, and written
         // in the same transaction as the row: the proof and the
-        // `Hydrated` it earns cannot come apart across a crash.
+        // `Present` it earns cannot come apart across a crash.
         //
         // The version travels with the identity rather than being
         // re-derived at the commit boundary. This scan already computed

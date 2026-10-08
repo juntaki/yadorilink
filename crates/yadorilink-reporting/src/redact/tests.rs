@@ -139,3 +139,72 @@ fn known_sensitive_example_fixture_produces_no_leaked_substrings() {
     }
     assert!(summary.categories.len() >= 6, "expected most categories to fire on this fixture");
 }
+
+/// Asserts none of `needles` survive redaction of `text`.
+fn assert_all_gone(text: &str, needles: &[&str]) {
+    let (out, _) = redact(text);
+    for needle in needles {
+        assert!(!out.contains(needle), "{needle:?} survived in {out:?}");
+    }
+}
+
+#[test]
+fn windows_home_path_loses_folder_and_file_names_not_just_the_user() {
+    assert_all_gone(
+        r"C:\Users\alice\Clients\Acme Merger\x.docx",
+        &["alice", "Clients", "Acme", "Merger", "x.docx", "Users"],
+    );
+    // JSON-escaped backslashes, as a path looks inside a serialized log line.
+    assert_all_gone(
+        r#"{"path":"C:\\Users\\alice\\Clients\\Acme Merger\\x.docx"}"#,
+        &["alice", "Clients", "Acme", "Merger", "x.docx"],
+    );
+}
+
+#[test]
+fn unix_home_path_with_spaces_loses_folder_and_file_names() {
+    assert_all_gone(
+        "scanning /Users/alice/Tax Returns/2025.pdf failed",
+        &["alice", "Tax", "Returns", "2025.pdf"],
+    );
+    assert_all_gone(
+        "opened /home/bob/Family Photos/Trip 2025",
+        &["bob", "Family", "Photos", "Trip"],
+    );
+}
+
+#[test]
+fn a_final_path_segment_with_spaces_is_redacted_whole() {
+    assert_all_gone("watching /Users/alice/Acme Merger Notes", &["Acme", "Merger", "Notes"]);
+}
+
+#[test]
+fn absolute_paths_outside_home_with_spaces_are_redacted_whole() {
+    assert_all_gone(
+        "synced /Volumes/Work Drive/Tax Returns/2025.pdf ok",
+        &["Volumes", "Work", "Tax", "Returns", "2025.pdf"],
+    );
+    assert_all_gone(r"D:\Clients\Acme Merger\x.docx", &["Clients", "Acme", "Merger", "x.docx"]);
+    assert_all_gone(r"\\fileserver\share\Acme Merger\x.docx", &["fileserver", "Acme", "x.docx"]);
+}
+
+#[test]
+fn a_comma_inside_a_name_does_not_end_the_path() {
+    assert_all_gone("error at /Users/alice/Smith, John/notes.pdf", &["Smith", "John", "notes.pdf"]);
+}
+
+#[test]
+fn text_after_a_clear_delimiter_survives() {
+    let (out, _) = redact("failed to read /Users/alice/Tax Returns/a.pdf: permission denied");
+    assert!(out.ends_with(": permission denied"), "{out:?}");
+    let (out, _) = redact(r#"path "/Users/alice/My Docs/a.txt" is missing"#);
+    assert!(out.ends_with(r#"" is missing"#), "{out:?}");
+    assert!(!out.contains("My Docs"));
+    let (out, _) = redact("a /Users/alice/x\nnext line /etc/passwd stays? no");
+    assert!(out.contains("\nnext line "), "{out:?}");
+}
+
+#[test]
+fn an_apostrophe_inside_a_name_does_not_end_the_path() {
+    assert_all_gone("opened /Users/alice/Alice's notes/todo.txt", &["Alice", "notes", "todo.txt"]);
+}

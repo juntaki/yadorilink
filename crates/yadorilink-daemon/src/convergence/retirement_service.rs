@@ -4,7 +4,7 @@
 //! device's currently-connected peer sessions for a group) purely because
 //! `retire_conflict_copies_only` happened to live on `PeerSyncSession`.
 //! It no longer does: retirement's decision is driven entirely by local
-//! DAG/file-index/disk state, and it now runs on the executor that owns
+//! native-state/file-index/disk state, and it now runs on the executor that owns
 //! exactly that — see `DaemonState::local_convergence`.
 
 use std::sync::Arc;
@@ -27,7 +27,7 @@ impl ConvergenceRetirementService {
     ///
     /// Runs on this device's own local convergence executor, because the
     /// decision is a function of local durable state alone: which copies the
-    /// current frontier still justifies, on this device's DAG, file index and
+    /// current frontier still justifies, on this device's native state, file index and
     /// disk.
     ///
     /// This used to pick a session — a live peer's when one existed, a

@@ -191,7 +191,7 @@ fn a_fresh_admission_resets_attempt_count_and_backoff_even_after_repeated_failur
     mark_obligation_attempt_failed(&conn, "g", "a.txt", claimed_g, claimed_i, 100_000, 1000)
         .unwrap();
 
-    // A new DAG admission supersedes the old generation's backoff --
+    // A new native admission supersedes the old generation's backoff --
     // the new desired state must be runnable immediately, not delayed
     // by the old generation's failure history.
     bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 2000).unwrap();
@@ -241,7 +241,7 @@ fn a_stale_failure_report_at_a_superseded_generation_is_a_no_op() {
 /// one") -- but that reasoning implicitly assumed the row underneath
 /// both claims stays the SAME row for the obligation's whole lifetime.
 /// It does not: `complete_obligation_if_exact_proof_current` and the
-/// `Placeholder`/`HazardHeld` arms of `complete_obligation_if_non_exact_
+/// `Remote`/`HazardHeld` arms of `complete_obligation_if_non_exact_
 /// proof_current` all `DELETE` the row on success, and `bump_projection_
 /// obligations_for_touched_paths` INSERTs a brand-new row at
 /// `invalidation_generation = 1` (via `ON CONFLICT DO UPDATE`'s INSERT
@@ -288,7 +288,7 @@ fn stale_claimant_cannot_corrupt_a_reincarnated_obligation_row() {
     .unwrap();
     assert!(lookup_projection_obligation(&conn, "g", "a.txt").unwrap().is_none());
 
-    // A genuinely NEW, unrelated DAG admission later touches the same
+    // A genuinely NEW, unrelated native admission later touches the same
     // path -- a fresh incarnation, starting at G = 1 again (identical to
     // OLD's stale claim) since there is no surviving row to conflict
     // against, but with a NEW `obligation_incarnation` value.
@@ -357,35 +357,6 @@ fn defer_without_penalty_delays_reclaim_but_never_increments_attempt_count() {
     );
 }
 
-#[test]
-fn earliest_pending_next_attempt_at_ignores_already_runnable_rows() {
-    let conn = conn();
-    bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt", "b.txt"], 1000).unwrap();
-    let claimed = claim_runnable_obligations(&conn, 1000, 10, 10).unwrap();
-    let a = claimed.iter().find(|c| c.path == "a.txt").unwrap();
-    mark_obligation_attempt_failed(
-        &conn,
-        "g",
-        "a.txt",
-        a.invalidation_generation,
-        a.obligation_incarnation,
-        9000,
-        1000,
-    )
-    .unwrap();
-
-    // b.txt is still immediately runnable, so the earliest FUTURE
-    // deadline must not be confused with it.
-    assert_eq!(earliest_pending_next_attempt_at(&conn, 1000).unwrap(), Some(9000));
-}
-
-#[test]
-fn earliest_pending_next_attempt_at_is_none_when_nothing_is_backed_off() {
-    let conn = conn();
-    bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 1000).unwrap();
-    assert_eq!(earliest_pending_next_attempt_at(&conn, 1000).unwrap(), None);
-}
-
 /// Nothing in this module ever moves a row's `state` out of `'pending'`
 /// or otherwise marks it in-flight -- `claim_runnable_obligations` is a
 /// plain `SELECT`, and a fresh admission's bump unconditionally resets
@@ -439,4 +410,489 @@ fn an_obligation_survives_a_connection_restart_with_no_worker_tick_and_stays_cla
     assert_eq!(claimed.len(), 1);
     assert_eq!(claimed[0].path, "a.txt");
     assert_eq!(claimed[0].invalidation_generation, 2);
+}
+
+/// A block of paths bumped together gets one fresh incarnation per path: unique, ascending in
+/// the order the paths were given, above everything allocated before, and never left behind in
+/// the allocator table.
+#[test]
+fn a_bumped_block_gets_unique_ascending_incarnations_above_earlier_ones() {
+    let conn = conn();
+    bump_projection_obligations_for_touched_paths(&conn, "g", &["early-1", "early-2"], 1000)
+        .unwrap();
+    let earlier = ["early-1", "early-2"]
+        .map(|p| lookup_projection_obligation(&conn, "g", p).unwrap().unwrap());
+    let mut paths: Vec<String> = (0..700).map(|i| format!("p-{:04}", 699 - i)).collect();
+    paths.push("early-1".to_owned());
+    let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+    bump_projection_obligations_for_touched_paths(&conn, "g", &refs, 2000).unwrap();
+    let mut previous = earlier.iter().map(|o| o.obligation_incarnation).max().unwrap();
+    for path in refs.iter().take(700) {
+        let row = lookup_projection_obligation(&conn, "g", path).unwrap().unwrap();
+        assert!(row.obligation_incarnation > previous, "{path} is not above the one before it");
+        previous = row.obligation_incarnation;
+        assert_eq!(row.invalidation_generation, 1);
+    }
+    // A path that already had a row keeps its incarnation and counts the bump.
+    let again = lookup_projection_obligation(&conn, "g", "early-1").unwrap().unwrap();
+    assert_eq!(again.obligation_incarnation, earlier[0].obligation_incarnation);
+    assert_eq!(again.invalidation_generation, 2);
+    let leftover: i64 = conn
+        .query_row("SELECT COUNT(*) FROM projection_obligation_incarnations", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(leftover, 0);
+    // The next allocation still lands above the whole block.
+    bump_projection_obligations_for_touched_paths(&conn, "g", &["late"], 3000).unwrap();
+    let late = lookup_projection_obligation(&conn, "g", "late").unwrap().unwrap();
+    assert!(late.obligation_incarnation > previous);
+}
+
+/// Bumping with the local origin leaves the same rows as a remote bump followed by overwriting
+/// the origin, on fresh rows and on rows a remote bump had written; a remote bump after it
+/// resets the origin.
+#[test]
+fn a_local_origin_bump_matches_a_bump_then_overwriting_the_origin() {
+    let rows = |c: &Connection| -> Vec<(String, i64, String, String, i64)> {
+        c.prepare(
+            "SELECT path, invalidation_generation, state, origin, updated_at \
+             FROM projection_obligations ORDER BY path",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+    };
+    let (folded, two_step) = (conn(), conn());
+    for c in [&folded, &two_step] {
+        bump_projection_obligations_for_touched_paths(c, "g", &["a", "b"], 1000).unwrap();
+    }
+    let touched = ["b", "c", "d", "c"];
+    bump_projection_obligations_with_origin(&folded, "g", &touched, 2000, ObligationOrigin::Local)
+        .unwrap();
+    bump_projection_obligations_for_touched_paths(&two_step, "g", &touched, 2000).unwrap();
+    two_step
+        .execute(
+            "UPDATE projection_obligations SET origin = 'local' WHERE path IN ('b','c','d')",
+            [],
+        )
+        .unwrap();
+    assert_eq!(rows(&folded), rows(&two_step));
+    let by_path = rows(&folded);
+    assert_eq!(by_path[0].3, "remote", "a path the bump did not touch keeps its origin");
+    assert_eq!((by_path[2].1, by_path[2].3.as_str()), (2, "local"), "a repeated path bumps twice");
+    bump_projection_obligations_for_touched_paths(&folded, "g", &["b"], 3000).unwrap();
+    assert_eq!(rows(&folded)[1].3, "remote");
+}
+
+/// A deterministic generator, so a failing corpus can be replayed.
+struct Lcg(u64);
+impl Lcg {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 >> 33
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+/// The claim walks the index in claim order and stops early; it must hand
+/// back exactly what the whole-table form hands back: same rows, same order,
+/// under every limit, with pending/non-pending rows, backed-off rows (some
+/// due, some not), paused/held paths, a frozen group and several groups.
+#[test]
+fn streamed_claim_matches_the_whole_table_claim() {
+    for seed in 0..16u64 {
+        let conn = conn();
+        // Alternate small and large corpora so both access paths run.
+        let rows = if seed % 2 == 0 { 400 } else { 6000 };
+        let mut rng = Lcg(seed + 1);
+        let groups = ["g0", "g1", "g2", "g3", ""];
+        for i in 0..rows {
+            let group = groups[rng.below(5) as usize];
+            let path = format!("d{}/f{i}", rng.below(5));
+            // Few distinct timestamps, so ties are broken by path.
+            let updated_at = rng.below(12) as i64 * 100;
+            let state = if rng.below(5) == 0 { "done" } else { "pending" };
+            let next_attempt_at =
+                if rng.below(4) == 0 { 5_000 + rng.below(2) as i64 * 5_000 } else { 0 };
+            conn.execute(
+                "INSERT INTO projection_obligations (group_id, path, invalidation_generation, \
+                 state, created_at, updated_at, attempt_count, next_attempt_at, \
+                 obligation_incarnation) VALUES (?1, ?2, 1, ?3, 0, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    group,
+                    path,
+                    state,
+                    updated_at,
+                    rng.below(4) as i64,
+                    next_attempt_at,
+                    i
+                ],
+            )
+            .unwrap();
+        }
+        for d in 0..2 {
+            conn.execute(
+                "INSERT INTO paused_items (group_id, path, paused_at_unix_nanos) VALUES (?1, ?2, 0)",
+                rusqlite::params![groups[rng.below(5) as usize], format!("d{}", rng.below(5) + d)],
+            )
+            .unwrap();
+        }
+        for i in 0..20 {
+            conn.execute(
+                "INSERT OR IGNORE INTO held_paths (group_id, path, held_at_unix_nanos) VALUES (?1, ?2, 0)",
+                rusqlite::params![groups[rng.below(5) as usize], format!("d{}/f{}", rng.below(5), i * 20)],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO native_rebootstrap_journal (group_id, recovery_id, state, \
+             target_checkpoint_hash, started_at, updated_at) VALUES ('g3', 'r', 'capturing', x'00', 0, 0)",
+            [],
+        )
+        .unwrap();
+        let mut nonempty = 0;
+        for now in [0i64, 4_999, 5_000, 10_000] {
+            for (per_group, total) in
+                [(1u32, 1u32), (2, 3), (3, 100), (10, 7), (1000, 1000), (4, 20), (0, 5), (5, 0)]
+            {
+                let streamed = claim_runnable_obligations(&conn, now, per_group, total).unwrap();
+                let oracle =
+                    claim_runnable_obligations_oracle(&conn, now, per_group, total).unwrap();
+                let key = |c: &ClaimedObligation| {
+                    (
+                        c.group_id.clone(),
+                        c.path.clone(),
+                        c.invalidation_generation,
+                        c.obligation_incarnation,
+                        c.attempt_count,
+                    )
+                };
+                assert_eq!(
+                    streamed.iter().map(key).collect::<Vec<_>>(),
+                    oracle.iter().map(key).collect::<Vec<_>>(),
+                    "seed {seed} now {now} limits {per_group}/{total}"
+                );
+                nonempty += usize::from(!streamed.is_empty());
+            }
+        }
+        assert!(nonempty > 10, "the corpus must exercise real claims");
+    }
+}
+
+fn plan_of(conn: &Connection, sql: &str) -> Vec<String> {
+    conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(3))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// Both access paths read their window through an index: no scan and no sort.
+#[test]
+fn claim_access_paths_use_an_index_without_scan_or_sort() {
+    let conn = conn();
+    let due = plan_of(
+        &conn,
+        "SELECT group_id FROM projection_obligations INDEXED BY idx_projection_obligations_due \
+         WHERE state = 'pending' AND group_id = 'g' AND next_attempt_at <= 1 LIMIT 129",
+    );
+    let walk = plan_of(
+        &conn,
+        "SELECT group_id FROM projection_obligations INDEXED BY idx_projection_obligations_runnable \
+         WHERE state = 'pending' AND group_id = 'g' AND next_attempt_at <= 1 \
+         ORDER BY updated_at ASC, path ASC LIMIT 8",
+    );
+    for plan in [&due, &walk] {
+        assert!(
+            plan.iter().all(|p| !p.contains("TEMP B-TREE") && !p.starts_with("SCAN")),
+            "no scan or sort: {plan:?}"
+        );
+    }
+    assert!(
+        due[0].contains("next_attempt_at<?"),
+        "the due probe must seek on the deadline: {due:?}"
+    );
+}
+
+/// Claim cost by population and window (informal measurement, run with
+/// `-- --ignored --nocapture`): the streamed claim should follow the window.
+#[test]
+#[ignore = "measurement; run explicitly"]
+fn claim_cost_by_population_and_window() {
+    for rows in [1_000i64, 10_000, 100_000, 1_000_000] {
+        let conn = conn();
+        conn.execute(
+            "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < ?1 - 1) \
+             INSERT INTO projection_obligations (group_id, path, invalidation_generation, state, \
+             created_at, updated_at, obligation_incarnation) \
+             SELECT 'g', 'p/' || i, 1, 'pending', 0, i, i FROM n",
+            [rows],
+        )
+        .unwrap();
+        for window in [1u32, 8, 32, 256] {
+            let t = std::time::Instant::now();
+            let got = claim_runnable_obligations(&conn, 10, window, window).unwrap();
+            let streamed = t.elapsed();
+            assert_eq!(got.len(), window as usize);
+            let t = std::time::Instant::now();
+            claim_runnable_obligations_oracle(&conn, 10, window, window).unwrap();
+            println!(
+                "claim rows={rows:>8} window={window:>4}: streamed {:.3} ms, whole-table {:.1} ms",
+                streamed.as_secs_f64() * 1000.0,
+                t.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "prints the plan"]
+fn print_claim_plan() {
+    let conn = conn();
+    let sql = format!(
+        "EXPLAIN QUERY PLAN SELECT group_id, path FROM projection_obligations \
+         INDEXED BY idx_projection_obligations_runnable \
+         WHERE state = 'pending' AND group_id = 'g' AND next_attempt_at <= 1 AND NOT {} AND NOT {} AND NOT {} \
+         ORDER BY updated_at ASC, path ASC LIMIT 8",
+        crate::paused_items::covered_by_paused_item_sql("projection_obligations.group_id", "projection_obligations.path"),
+        crate::held_path::held_sql("projection_obligations.group_id", "projection_obligations.path"),
+        crate::native_rebootstrap::frozen_group_sql("projection_obligations.group_id"),
+    );
+    for row in conn.prepare(&sql).unwrap().query_map([], |r| r.get::<_, String>(3)).unwrap() {
+        println!("PLAN {}", row.unwrap());
+    }
+}
+
+fn insert_pending(
+    conn: &Connection,
+    group: &str,
+    path: &str,
+    updated_at: i64,
+    next_attempt_at: i64,
+) {
+    conn.execute(
+        "INSERT INTO projection_obligations (group_id, path, invalidation_generation, state, \
+         created_at, updated_at, next_attempt_at, obligation_incarnation) \
+         VALUES (?1, ?2, 1, 'pending', 0, ?3, ?4, 0)",
+        rusqlite::params![group, path, updated_at, next_attempt_at],
+    )
+    .unwrap();
+}
+
+fn names(claimed: &[ClaimedObligation]) -> Vec<(String, String)> {
+    claimed.iter().map(|c| (c.group_id.clone(), c.path.clone())).collect()
+}
+
+/// Paused and held rows at the top of a group's order never take a window
+/// slot: the runnable rows behind them are still claimed, as the whole-table
+/// query did (both access paths, the due probe and the ordered walk).
+#[test]
+fn held_and_paused_rows_do_not_eat_the_window() {
+    for rows in [20usize, 1500] {
+        let conn = conn();
+        for i in 0..rows {
+            insert_pending(&conn, "g", &format!("d/{i:05}"), i as i64, 0);
+        }
+        for i in 0..6 {
+            conn.execute(
+                "INSERT INTO held_paths (group_id, path, held_at_unix_nanos) VALUES ('g', ?1, 0)",
+                [format!("d/{i:05}")],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO paused_items (group_id, path, paused_at_unix_nanos) VALUES ('g', 'd/00006', 0)",
+            [],
+        )
+        .unwrap();
+        let claimed = claim_runnable_obligations(&conn, 10, 3, 3).unwrap();
+        assert_eq!(
+            claimed.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(),
+            ["d/00007", "d/00008", "d/00009"][..],
+            "rows {rows}"
+        );
+        assert_eq!(
+            names(&claimed),
+            names(&claim_runnable_obligations_oracle(&conn, 10, 3, 3).unwrap())
+        );
+    }
+}
+
+/// More than 128 due rows behind many older not-yet-due ones (the due-index
+/// pass with a bounded heap): same rows, same order as the whole-table
+/// query, for limits below, at and above the due count, with ties on
+/// `updated_at` broken by path and some due rows paused or held.
+#[test]
+fn many_due_rows_behind_older_backed_off_rows_match_the_whole_table_claim() {
+    for due in [129usize, 500] {
+        let conn = conn();
+        for i in 0..3000 {
+            insert_pending(&conn, "g", &format!("old/{i:05}"), (i % 7) as i64, 1_000_000);
+        }
+        for i in 0..due {
+            // Few distinct timestamps: ties are broken by path.
+            insert_pending(&conn, "g", &format!("new/{:05}", due - i), 10_000 + (i % 5) as i64, 0);
+        }
+        insert_pending(&conn, "h", "other", 10_002, 0);
+        conn.execute(
+            "INSERT INTO held_paths (group_id, path, held_at_unix_nanos) VALUES ('g', 'new/00003', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO paused_items (group_id, path, paused_at_unix_nanos) VALUES ('g', 'new/00004', 0)",
+            [],
+        )
+        .unwrap();
+        for per_group in [1u32, 8, 128, 129, due as u32 - 1, due as u32, 1000] {
+            for total in [3u32, 200, 1000] {
+                let got = claim_runnable_obligations(&conn, 10, per_group, total).unwrap();
+                let want = claim_runnable_obligations_oracle(&conn, 10, per_group, total).unwrap();
+                assert_eq!(names(&got), names(&want), "due {due} limits {per_group}/{total}");
+            }
+        }
+    }
+}
+
+/// A group whose every deadline is in the future yields nothing, and a group
+/// with a few due rows among many backed-off ones yields exactly those.
+#[test]
+fn backed_off_rows_are_never_claimed_early() {
+    let conn = conn();
+    for i in 0..3000 {
+        insert_pending(&conn, "g", &format!("p/{i:05}"), i, 1_000_000 + i);
+    }
+    assert!(claim_runnable_obligations(&conn, 999_999, 8, 8).unwrap().is_empty());
+    insert_pending(&conn, "g", "z/late", 99_999, 0);
+    insert_pending(&conn, "g", "a/early", 99_998, 5);
+    let got = claim_runnable_obligations(&conn, 10, 8, 8).unwrap();
+    assert_eq!(names(&got), vec![("g".into(), "a/early".into()), ("g".into(), "z/late".into())]);
+    assert_eq!(names(&got), names(&claim_runnable_obligations_oracle(&conn, 10, 8, 8).unwrap()));
+}
+
+/// Repeated ticks over several groups whose rows tie on `(updated_at, path)`,
+/// with more runnable rows than `total_limit`, so every tick returns a full
+/// window. Property: while claimed rows leave the runnable set (completed, or
+/// backed off after a failed attempt), every row is claimed within
+/// ceil(rows / total_limit) ticks, so no group is starved; and where the old
+/// query's order is defined (no tie spans groups) each tick equals the old
+/// query's tick, while where it is not, each tick still holds the same
+/// (updated_at, path) multiset as the old query's.
+#[test]
+fn repeated_ticks_serve_every_group_and_match_the_whole_table_claim() {
+    for (tie_across_groups, complete) in
+        [(false, true), (true, true), (false, false), (true, false)]
+    {
+        let conn = conn();
+        let groups = ["a", "b", "c", "d"];
+        let per_group_rows = 9;
+        for g in groups {
+            for i in 0..per_group_rows {
+                // Tied runs: same updated_at and path in every group.
+                let path = if tie_across_groups { format!("p{i}") } else { format!("p{i}-{g}") };
+                insert_pending(&conn, g, &path, (i / 3) as i64, 0);
+            }
+        }
+        let total_limit = 5u32;
+        let total_rows = groups.len() * per_group_rows;
+        let mut seen = std::collections::HashSet::new();
+        let mut now = 100i64;
+        let bound = total_rows.div_ceil(total_limit as usize);
+        for tick in 0..bound {
+            let streamed = claim_runnable_obligations(&conn, now, 3, total_limit).unwrap();
+            let oracle = claim_runnable_obligations_oracle(&conn, now, 3, total_limit).unwrap();
+            assert_eq!(streamed.len(), oracle.len(), "tick {tick}: the window stays full");
+            if !tie_across_groups {
+                assert_eq!(names(&streamed), names(&oracle), "tick {tick}");
+            } else {
+                let mut a: Vec<_> = streamed.iter().map(|c| c.path.clone()).collect();
+                let mut b: Vec<_> = oracle.iter().map(|c| c.path.clone()).collect();
+                a.sort();
+                b.sort();
+                assert_eq!(a, b, "tick {tick}: same ranks served, only the tied group may differ");
+                // Where the old order is undefined, ties break by group id.
+                let key = |c: &ClaimedObligation| -> (i64, String, String) {
+                    let at: i64 = conn
+                        .query_row(
+                            "SELECT updated_at FROM projection_obligations WHERE group_id = ?1 AND path = ?2",
+                            rusqlite::params![c.group_id, c.path],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                    (at, c.path.clone(), c.group_id.clone())
+                };
+                let keys: Vec<_> = streamed.iter().map(key).collect();
+                assert!(keys.windows(2).all(|w| w[0] <= w[1]), "tick {tick}: claim order {keys:?}");
+            }
+            for c in &streamed {
+                assert!(seen.insert((c.group_id.clone(), c.path.clone())), "claimed twice");
+                if complete {
+                    conn.execute(
+                        "DELETE FROM projection_obligations WHERE group_id = ?1 AND path = ?2",
+                        rusqlite::params![c.group_id, c.path],
+                    )
+                    .unwrap();
+                } else {
+                    // Not completed: the attempt failed and backed off past
+                    // every later tick, which is what a lease or backoff does.
+                    assert!(mark_obligation_attempt_failed(
+                        &conn,
+                        &c.group_id,
+                        &c.path,
+                        c.invalidation_generation,
+                        c.obligation_incarnation,
+                        1_000_000,
+                        now,
+                    )
+                    .unwrap());
+                }
+            }
+            now += 1;
+        }
+        assert_eq!(seen.len(), total_rows, "every runnable row claimed within {bound} ticks");
+        assert!(claim_runnable_obligations(&conn, now, 3, total_limit).unwrap().is_empty());
+    }
+}
+
+/// A group id of `''` is permitted by the schema and claimable.
+#[test]
+fn an_empty_group_id_is_claimed() {
+    let conn = conn();
+    insert_pending(&conn, "", "a", 1, 0);
+    insert_pending(&conn, "g", "b", 2, 0);
+    let got = claim_runnable_obligations(&conn, 10, 5, 5).unwrap();
+    assert_eq!(names(&got), vec![("".into(), "a".into()), ("g".into(), "b".into())]);
+}
+
+/// Claim cost with every deadline in the future, and with a few due rows
+/// among them (informal measurement, run with `-- --ignored --nocapture`).
+#[test]
+#[ignore = "measurement; run explicitly"]
+fn claim_cost_when_backed_off() {
+    for rows in [100_000i64, 1_000_000] {
+        for due in [0i64, 100, 129, 100_000] {
+            let conn = conn();
+            conn.execute(
+                "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < ?1 - 1) \
+                 INSERT INTO projection_obligations (group_id, path, invalidation_generation, \
+                 state, created_at, updated_at, next_attempt_at, obligation_incarnation) \
+                 SELECT 'g', 'p/' || i, 1, 'pending', 0, i, CASE WHEN i >= ?1 - ?2 THEN 0 ELSE 1000000 END, i FROM n",
+                [rows, due],
+            )
+            .unwrap();
+            for window in [1u32, 8, 128] {
+                let t = std::time::Instant::now();
+                let got = claim_runnable_obligations(&conn, 10, window, window).unwrap();
+                println!(
+                    "backoff rows={rows:>8} due={due:>3} window={window:>3}: {:.3} ms ({} claimed)",
+                    t.elapsed().as_secs_f64() * 1000.0,
+                    got.len()
+                );
+            }
+        }
+    }
 }

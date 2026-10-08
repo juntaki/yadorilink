@@ -35,9 +35,7 @@ use support::{open_file_backed_replica_coordinator, real_entry_names, TestAccoun
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_local_storage::SegmentBlockStore;
-use yadorilink_replica_domain::change::{Op, PutOrigin};
-use yadorilink_replica_domain::ids::ChangeHash;
-use yadorilink_sync_sqlite::dag_store::DagHashDisposition;
+use yadorilink_replica_domain::ids::DeltaHash;
 
 const DEVICE_COUNT: usize = 4;
 const CANDIDATE_FILE_COUNT: usize = 8;
@@ -55,9 +53,11 @@ const PHASE1_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(180);
 /// Phase 2 (stability confirmation): once phase 1 first observes agreement,
 /// it must hold continuously for this long before the run is accepted --
 /// any change resets this clock, but never phase 1's own (already-spent)
-/// budget. Total worst-case wait is therefore PHASE1 + PHASE2 = 210s, not
-/// PHASE1 alone.
-const PHASE2_STABILITY_TIMEOUT: Duration = Duration::from_secs(30);
+/// budget. Total worst-case wait is therefore PHASE1 + PHASE2 = 188s, not
+/// PHASE1 alone. Convergence is observed within seconds; the window only has
+/// to outlast a poll of every device, so a longer one mostly bought the
+/// replay a fixed half-minute per seed.
+const PHASE2_STABILITY_TIMEOUT: Duration = Duration::from_secs(8);
 const CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// How often the convergence-wait loop emits one DAG-progress line per
 /// device (in poll iterations; 50 polls ~= 5s). The line shows *DAG-level*
@@ -237,6 +237,18 @@ impl Drop for MeshTeardownGuard {
             if let Some(runtime) = state.links.remove_if_ready(local_path) {
                 runtime.abort_tasks();
             }
+            // The convergence engine holds its state for as long as it runs:
+            // left running it keeps claiming obligations against a folder the
+            // seed has already deleted, and every later seed pays for it.
+            state.stop_background_tasks_for_tests();
+            // Close the reconciliation endpoint too: left open, every finished
+            // seed keeps its sockets and dial state alive, and a later seed's
+            // pairing dial can fail to find a route.
+            if let Some(driver) = state.peer_session_driver() {
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(driver.stack().shutdown());
+                });
+            }
         }
     }
 }
@@ -338,7 +350,7 @@ fn snapshot(root: &std::path::Path) -> HashMap<String, String> {
 /// what's actually materialized on disk -- distinguishes "this device's
 /// index has no record of this file at all" (propagation never reached
 /// it) from "the index has a record but it's not materialized" (e.g.
-/// stuck `Hydrating`/`Placeholder`, or held due to a hazard).
+/// stuck `Hydrating`/`Remote`, or held due to a hazard).
 fn describe_index_state(state: &DaemonState, group_id: &str, path: &str) -> String {
     let record = state.replica_coordinator.file_index_repository().get_file(group_id, path);
     let materialization = state
@@ -379,7 +391,7 @@ fn diff_diagnostics(
     }
     let mut out = String::new();
     for (d, device) in devices.iter().enumerate() {
-        let heads = match device.state.replica_coordinator.sqlite().dag_group_heads(group_id) {
+        let heads = match device.state.replica_coordinator.sqlite().native_group_heads(group_id) {
             Ok(hs) => hs.iter().map(|h| h.to_hex()).collect::<Vec<_>>(),
             Err(e) => vec![format!("<error reading heads: {e}>")],
         };
@@ -392,60 +404,13 @@ fn diff_diagnostics(
                 describe_index_state(&device.state, group_id, name)
             ));
         }
-        // Which admitted changes touch this path at all, from device-0's
-        // DAG (arbitrary but sufficient in the shape this exists to
-        // diagnose — identical heads everywhere). Distinguishes "no change
-        // ever carried this path durably" (an ephemeral-derivation copy
-        // kept only by devices that passed through a transient frontier —
-        // a retroactivity gap) from "a change carries it but one device's
-        // projection skipped it" (a projection bug).
-        match devices[0]
-            .state
-            .replica_coordinator
-            .change_history_repository()
-            .dag_list_group_changes(group_id)
-        {
-            Err(e) => out.push_str(&format!("  history[{name:?}]: <error: {e}>\n")),
-            Ok(changes) => {
-                let mut touched = false;
-                for change in &changes {
-                    let touching: Vec<String> = change
-                        .ops
-                        .iter()
-                        .filter(|op| match op {
-                            Op::Put { path, .. } | Op::Delete { path } => path.as_str() == name,
-                            Op::Move { from, to, .. } => {
-                                from.as_str() == name || to.as_str() == name
-                            }
-                        })
-                        .map(|op| summarize_ops(std::slice::from_ref(op)))
-                        .collect();
-                    if !touching.is_empty() {
-                        touched = true;
-                        out.push_str(&format!(
-                            "  history[{name:?}]: change {} author={} lamport={}: {}\n",
-                            short_hash(&change.compute_hash()),
-                            author_label(devices, &change.device_id.0),
-                            change.lamport,
-                            touching.join("; "),
-                        ));
-                    }
-                }
-                if !touched {
-                    out.push_str(&format!(
-                        "  history[{name:?}]: NO admitted change on device-0 touches this path \
-                         (ephemeral-derivation-only content)\n"
-                    ));
-                }
-            }
-        }
     }
     out
 }
 
 /// First 8 hex chars — enough to correlate hashes across a log by eye
 /// without each line being unreadably wide.
-fn short_hash(hash: &ChangeHash) -> String {
+fn short_hash(hash: &DeltaHash) -> String {
     hash.to_hex()[..8].to_string()
 }
 
@@ -456,27 +421,6 @@ fn author_label(devices: &[TestDevice], author: &str) -> String {
         Some(i) => format!("device-{i}"),
         None => format!("unknown({author})"),
     }
-}
-
-fn summarize_ops(ops: &[Op]) -> String {
-    ops.iter()
-        .map(|op| match op {
-            Op::Put { path, origin: PutOrigin::Direct, .. } => format!("put {}", path.as_str()),
-            Op::Put { path, origin: PutOrigin::ConflictCopy { source_path, .. }, .. } => {
-                format!("conflict-copy {} (from {})", path.as_str(), source_path.as_str())
-            }
-            Op::Put { path, origin: PutOrigin::Reasserted { naming_device_id, .. }, .. } => {
-                // Names the content's author, not this change's signer --
-                // the two differ here by construction, and which device a
-                // re-assertion carries content for is exactly what these
-                // chaos-run lines need to show.
-                format!("reassert {} (wrote by {})", path.as_str(), naming_device_id.as_str())
-            }
-            Op::Delete { path } => format!("delete {}", path.as_str()),
-            Op::Move { from, to, .. } => format!("move {} -> {}", from.as_str(), to.as_str()),
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 /// One compact DAG-progress line per device: current heads, admitted /
@@ -493,7 +437,7 @@ fn dag_progress_report(devices: &[TestDevice], group_id: &str, elapsed: Duration
     let t = elapsed.as_secs();
     for (d, device) in devices.iter().enumerate() {
         let sync = &device.state.replica_coordinator;
-        let heads = match sync.sqlite().dag_group_heads(group_id) {
+        let heads = match sync.sqlite().native_group_heads(group_id) {
             Ok(hs) => {
                 let mut short: Vec<String> = hs.iter().map(short_hash).collect();
                 short.sort();
@@ -501,114 +445,187 @@ fn dag_progress_report(devices: &[TestDevice], group_id: &str, elapsed: Duration
             }
             Err(e) => format!("<error: {e}>"),
         };
-        let line = match sync.change_history_repository().dag_group_diagnostics(group_id) {
-            Ok(diag) => {
-                let self_authored =
-                    diag.admitted_by_author.get(&device.device_id).copied().unwrap_or(0);
-                let dirty = match sync.dirty_path_repository().list_dirty_paths(group_id) {
-                    Ok(v) => v.len().to_string(),
-                    Err(e) => format!("<error: {e}>"),
-                };
-                let mat = match sync
-                    .materialization_state_repository()
-                    .materialization_counts(group_id)
-                {
-                    Ok(m) => format!("{}/{}/{}", m.hydrated, m.placeholder, m.hydrating),
-                    Err(e) => format!("<error: {e}>"),
-                };
-                let missing: Vec<String> =
-                    diag.orphan_missing_frontier.iter().map(short_hash).collect();
-                format!(
-                    "[dag t={t:>3}s] device-{d} heads={heads} admitted={} \
-                     orphans={} missing={missing:?} self_authored={self_authored} dirty={dirty} \
-                     mat(h/p/hy)={mat}",
-                    diag.admitted_total, diag.orphan_total,
-                )
-            }
-            Err(e) => {
-                format!("[dag t={t:>3}s] device-{d} heads={heads} <diagnostics error: {e}>")
-            }
+        let dirty = match sync.dirty_path_repository().list_dirty_paths(group_id) {
+            Ok(v) => v.len().to_string(),
+            Err(e) => format!("<error: {e}>"),
         };
+        let mat = match sync.materialization_state_repository().materialization_counts(group_id) {
+            Ok(m) => format!("{}/{}/{}", m.hydrated, m.placeholder, m.hydrating),
+            Err(e) => format!("<error: {e}>"),
+        };
+        let line =
+            format!("[dag t={t:>3}s] device-{d} heads={heads} dirty={dirty} mat(h/p/hy)={mat}");
         out.push_str(&line);
         out.push('\n');
     }
     out
 }
 
-/// Per-head detail whenever the devices' head sets disagree: for every head
-/// any device currently holds, each device's disposition for that hash
-/// (admitted / admitted-but-unprojected / orphaned-waiting-on-hashes /
-/// MISSING), plus the change's own author, lamport, parents and ops from
-/// whichever device can decode it. This is the report that distinguishes
-/// the competing explanations for a divergent frontier: a head every other
-/// device reports MISSING and whose author is the holding device itself
-/// points at local emission (watcher echo / late dirty-journal redrive); a
-/// head sitting orphaned with a non-empty waiting_on set points at
-/// request/delivery; a head admitted everywhere but still a *head* only
-/// somewhere points at frontier/announce bookkeeping.
+/// Whether the devices agree on the native state (frontier and heads) and, when
+/// they do, where each device's projection differs from its own native plan:
+/// names the plan places that the disk or index lacks, and names on disk or in
+/// the index that the plan does not place. Separates "the heads differ" (an
+/// admission or delivery problem) from "the heads agree and the tree does not"
+/// (a materialization or obligation problem).
+fn native_projection_report(devices: &[TestDevice], group_id: &str) -> String {
+    use std::collections::BTreeSet;
+    let mut report = String::new();
+    let mut summaries = Vec::new();
+    for device in devices {
+        #[allow(clippy::type_complexity)]
+        let (frontier, heads): (Vec<(String, i64)>, Vec<(String, String, i64)>) = device
+            .state
+            .replica_coordinator
+            .database()
+            .write(|conn| {
+                let mut a = conn.prepare(
+                    "SELECT author, seq FROM native_author_frontier WHERE group_id = ?1 ORDER BY author",
+                )?;
+                let f = a
+                    .query_map([group_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut b = conn.prepare(
+                    "SELECT path, author, seq FROM native_heads WHERE group_id = ?1 ORDER BY path, author, seq",
+                )?;
+                let h = b
+                    .query_map([group_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok::<_, yadorilink_sync_sqlite::SyncSqliteError>((f, h))
+            })
+            .unwrap_or_default();
+        report.push_str(&format!(
+            "\nNATIVE {} frontier={frontier:?} live_heads={}",
+            device.device_id,
+            heads.len()
+        ));
+        summaries.push((frontier, heads));
+    }
+    for device in devices {
+        let (placements, kept): (Vec<String>, Vec<String>) = device
+            .state
+            .replica_coordinator
+            .database()
+            .write(|conn| {
+                let mut a = conn.prepare(
+                    "SELECT substr(physical_path, 1, 10) || '..' || substr(physical_path, -14) || ' src=' || source_path || ' ' || author || '#' || seq || ' ' || origin \
+                     FROM native_physical_placement WHERE group_id = ?1 ORDER BY physical_path",
+                )?;
+                let p = a.query_map([group_id], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+                let mut b = conn.prepare(
+                    "SELECT path || ' ' || author || '#' || seq FROM native_head_keep WHERE group_id = ?1 ORDER BY 1",
+                )?;
+                let k = b.query_map([group_id], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+                Ok::<_, yadorilink_sync_sqlite::SyncSqliteError>((p, k))
+            })
+            .unwrap_or_default();
+        report.push_str(&format!(
+            "\nPLACEMENTS {} ({}): {placements:?}\nKEPT {}: {kept:?}",
+            device.device_id,
+            placements.len(),
+            device.device_id
+        ));
+    }
+    for device in devices {
+        let obligations: Vec<String> = device
+            .state
+            .replica_coordinator
+            .database()
+            .write(|conn| {
+                let mut a = conn.prepare(
+                    "SELECT substr(path, 1, 10) || '..' || substr(path, -14) || ' ' || state || ' a=' || attempt_count || ' ' || origin FROM projection_obligations WHERE group_id = ?1",
+                )?;
+                let rows = a.query_map([group_id], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+                Ok::<_, yadorilink_sync_sqlite::SyncSqliteError>(rows)
+            })
+            .unwrap_or_default();
+        report.push_str(&format!("\nOBLIGATIONS {}: {obligations:?}", device.device_id));
+    }
+    let native_agrees = summaries[1..].iter().all(|s| s == &summaries[0]);
+    report.push_str(&format!("\nNATIVE STATE AGREES ACROSS DEVICES: {native_agrees}"));
+    for device in devices {
+        let planned: BTreeSet<String> = device
+            .state
+            .replica_coordinator
+            .file_index_repository()
+            .native_plan_level(group_id, "")
+            .map(|plan| plan.nodes.keys().map(|k| k.as_str().to_owned()).collect())
+            .unwrap_or_default();
+        let indexed: BTreeSet<String> = device
+            .state
+            .replica_coordinator
+            .file_index_repository()
+            .list_files(group_id)
+            .map(|rows| rows.into_iter().filter(|r| !r.deleted).map(|r| r.path).collect())
+            .unwrap_or_default();
+        let on_disk: BTreeSet<String> = real_entry_names(device.root.path()).into_iter().collect();
+        let held: BTreeSet<String> = planned
+            .iter()
+            .filter(|p| {
+                device
+                    .state
+                    .replica_coordinator
+                    .materialization_state_repository()
+                    .get_held_state(group_id, p)
+                    .ok()
+                    .flatten()
+                    .is_some()
+            })
+            .cloned()
+            .collect();
+        let short = |names: Vec<&String>| -> Vec<String> {
+            names
+                .into_iter()
+                .map(|n| n.replace("1970-01-01-000000, ", "").chars().take(48).collect())
+                .collect()
+        };
+        report.push_str(&format!(
+            "\nPROJECTION {}: planned_not_on_disk={:?} on_disk_not_planned={:?} planned_not_indexed={:?} held={:?}",
+            device.device_id,
+            short(planned.difference(&on_disk).collect()),
+            short(on_disk.difference(&planned).collect()),
+            short(planned.difference(&indexed).collect()),
+            short(held.iter().collect()),
+        ));
+    }
+    report
+}
+
+/// Per-author detail whenever the devices' native author frontiers disagree:
+/// for every author any device knows, the sequence number each device has
+/// reached. A device that is behind on an author never received (or never
+/// admitted) that author's later deltas; one that is ahead is the holder.
 fn divergent_head_report(devices: &[TestDevice], group_id: &str) -> String {
-    let per_device_heads: Vec<Vec<ChangeHash>> = devices
+    let frontiers: Vec<_> = devices
         .iter()
         .map(|device| {
-            device.state.replica_coordinator.sqlite().dag_group_heads(group_id).unwrap_or_default()
+            device.state.replica_coordinator.native_author_frontier(group_id).unwrap_or_default()
         })
         .collect();
-    let all_agree = per_device_heads[1..].iter().all(|hs| {
-        let (a, b): (std::collections::BTreeSet<String>, std::collections::BTreeSet<String>) = (
-            hs.iter().map(|h| h.to_hex()).collect(),
-            per_device_heads[0].iter().map(|h| h.to_hex()).collect(),
-        );
-        a == b
-    });
-    if all_agree {
-        return "  all devices report identical dag_group_heads\n".to_string();
+    if frontiers[1..].iter().all(|frontier| *frontier == frontiers[0]) {
+        return "  all devices report identical native author frontiers\n".to_string();
     }
-    // Keyed by full hex for stable ordering; value is the hash itself.
-    let union: std::collections::BTreeMap<String, ChangeHash> =
-        per_device_heads.iter().flatten().map(|h| (h.to_hex(), *h)).collect();
-    let mut out = String::from("  divergent head detail (one line per head in the union):\n");
-    for (hex, hash) in &union {
-        let mut states = Vec::with_capacity(devices.len());
-        let mut decoded = None;
-        for (d, device) in devices.iter().enumerate() {
-            let sync = &device.state.replica_coordinator;
-            let is_head = per_device_heads[d].contains(hash);
-            let head_marker = if is_head { "*" } else { "" };
-            match sync.change_history_repository().dag_describe_hash(hash) {
-                Ok(DagHashDisposition::Admitted { change }) => {
-                    states.push(format!("device-{d}{head_marker}=admitted"));
-                    decoded.get_or_insert(change);
-                }
-                Ok(DagHashDisposition::Orphaned { received_seq, change }) => {
-                    let waiting: Vec<String> = sync
-                        .sqlite()
-                        .dag_missing_ancestor_frontier([*hash])
-                        .map(|f| f.iter().map(short_hash).collect())
-                        .unwrap_or_else(|e| vec![format!("<error: {e}>")]);
-                    states.push(format!(
-                        "device-{d}{head_marker}=orphaned(seq={received_seq},waiting_on={waiting:?})"
-                    ));
-                    decoded.get_or_insert(change);
-                }
-                Ok(DagHashDisposition::Missing) => {
-                    states.push(format!("device-{d}{head_marker}=MISSING"));
-                }
-                Err(e) => states.push(format!("device-{d}{head_marker}=<error: {e}>")),
-            }
-        }
-        out.push_str(&format!("  head {}: {}\n", &hex[..8], states.join(" ")));
-        match decoded {
-            Some(change) => {
-                let parents: Vec<String> = change.parents.iter().map(short_hash).collect();
-                out.push_str(&format!(
-                    "    author={} lamport={} parents={parents:?} ops=[{}]\n",
-                    author_label(devices, &change.device_id.0),
-                    change.lamport,
-                    summarize_ops(&change.ops),
-                ));
-            }
-            None => out.push_str("    (no device could produce this change's content)\n"),
-        }
+    let authors: std::collections::BTreeSet<_> =
+        frontiers.iter().flat_map(|frontier| frontier.keys().cloned()).collect();
+    let mut out = String::from("  divergent frontier detail (one line per author):\n");
+    for author in authors {
+        let positions: Vec<String> = frontiers
+            .iter()
+            .enumerate()
+            .map(|(d, frontier)| {
+                format!(
+                    "device-{d}={}",
+                    frontier
+                        .get(&author)
+                        .map_or("none".to_string(), |entry| entry.seq.get().to_string())
+                )
+            })
+            .collect();
+        out.push_str(&format!(
+            "  author {} (incarnation {}): {}\n",
+            author_label(devices, author.device.as_str()),
+            hex::encode(&author.incarnation.0[..4]),
+            positions.join(" ")
+        ));
     }
     out
 }
@@ -823,7 +840,11 @@ async fn run_chaos(seed: u64) {
         // materialization determinism bug apart.
         let diag = diff_diagnostics(devices_ref, &group_id, current);
         let progress = dag_progress_report(devices_ref, &group_id, started.elapsed());
-        let head_report = divergent_head_report(devices_ref, &group_id);
+        let head_report = format!(
+            "{}{}",
+            divergent_head_report(devices_ref, &group_id),
+            native_projection_report(devices_ref, &group_id)
+        );
         format!(
             "replica_mismatch_polls={replica_mismatch_polls} snapshot_changed_polls={snapshot_changed_polls} \
              read_error_polls={read_error_polls} current_stable_polls={current_stable_polls} \

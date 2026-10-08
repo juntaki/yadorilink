@@ -1,4 +1,5 @@
 pub mod framing;
+pub mod pipe_peer;
 
 pub mod sync {
     include!(concat!(env!("OUT_DIR"), "/yadorilink.sync.v1.rs"));
@@ -22,6 +23,22 @@ pub mod send {
 pub mod daemonctl {
     include!(concat!(env!("OUT_DIR"), "/yadorilink.daemonctl.v1.rs"));
 
+    /// The one human-readable word for a path's local state, derived from its
+    /// two independent facts: `remote` (nothing here), `local-stale` (an
+    /// object stands but is not the current version), `local-current`,
+    /// `hydrating`, `evicting`; `unknown` when the daemon reported nothing.
+    #[must_use]
+    pub fn local_state_word(state: Option<&LocalState>) -> &'static str {
+        let Some(state) = state else { return "unknown" };
+        match state.transition() {
+            LocalTransition::Hydrating => "hydrating",
+            LocalTransition::Evicting => "evicting",
+            LocalTransition::None if state.current_content_present => "local-current",
+            LocalTransition::None if state.local_object_present => "local-stale",
+            LocalTransition::None => "remote",
+        }
+    }
+
     /// Exact daemon-control protocol generation for the current pre-release
     /// source tree. The CLI, desktop app, and daemon are shipped as one unit;
     /// development builds are not required to interoperate across protocol
@@ -42,7 +59,18 @@ pub mod daemonctl {
     /// variant this daemon no longer has a field for, and must be refused
     /// at the version check rather than have its request silently decode
     /// as "no payload set".
-    pub const CONTROL_PROTOCOL_VERSION: u32 = 11;
+    ///
+    /// `12`: adds the preserved-data requests (`list_preserved`, `restore_preserved`,
+    /// `discard_preserved`) and the `preserved` summary of `StatusResponse`.
+    ///
+    /// `13`: adds `retry_preserved`.
+    ///
+    /// `14`: adds `LinkStatus.durability_check_pending`.
+    ///
+    /// `15`: removes the `pin`/`unpin` requests,
+    /// `LinkRequest.max_local_size_bytes` and
+    /// `MaterializationStatusResponse.pinned`.
+    pub const CONTROL_PROTOCOL_VERSION: u32 = 15;
 }
 
 #[cfg(test)]

@@ -7,7 +7,7 @@
 
     <!--
       Deliberately no notarization/Developer-ID signing of this outer
-      Distribution package — per the user's own instruction, this pass of
+      Distribution package, this pass of
       the installer is unsigned/unnotarized. Gatekeeper will show an
       "unidentified developer" warning when this .pkg is opened; that is
       expected for unsigned local builds. The .app bundle payload embedded

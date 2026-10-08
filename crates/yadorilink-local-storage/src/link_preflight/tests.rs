@@ -166,7 +166,9 @@ fn linking_a_subfolder_of_an_existing_link_is_an_ancestor_conflict() {
     let report = run_preflight(&sub, &existing, Some(0));
     assert_eq!(report.nested_conflicts.len(), 1);
     assert_eq!(report.nested_conflicts[0].relation, NestedLinkRelation::Ancestor);
-    assert!(report.is_risky());
+    // A structural prohibition, not a risk an acknowledgement can accept.
+    assert!(!report.is_risky());
+    assert_eq!(report.structural_prohibitions().len(), 1);
 }
 
 /// Nested-link descendant: linking a folder that already contains an
@@ -180,7 +182,10 @@ fn linking_a_parent_of_an_existing_link_is_a_descendant_conflict() {
     let report = run_preflight(dir.path(), &existing, Some(0));
     assert_eq!(report.nested_conflicts.len(), 1);
     assert_eq!(report.nested_conflicts[0].relation, NestedLinkRelation::Descendant);
-    assert!(report.is_risky());
+    // The folder is non-empty (it holds the linked one), so it is risky for
+    // that reason alone; the nesting is a prohibition, never a warning.
+    assert!(!report.warnings().iter().any(|w| w.contains("already linked")));
+    assert_eq!(report.structural_prohibitions().len(), 1);
 }
 
 /// Re-linking the exact same path that's already linked.
@@ -241,4 +246,47 @@ fn nonexistent_path_is_risky() {
     assert!(!report.path_exists);
     assert!(report.is_risky());
     assert_eq!(report.warnings(), vec!["path does not exist".to_string()]);
+}
+
+/// A symlink spelling of an already-linked folder is the same folder.
+#[cfg(unix)]
+#[test]
+fn a_symlink_spelling_of_a_linked_folder_is_a_conflict() {
+    let dir = tempdir();
+    let real = dir.path().join("real");
+    std::fs::create_dir_all(real.join("inner")).unwrap();
+    let alias = dir.path().join("alias");
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    let existing = vec![(real.to_string_lossy().to_string(), "g1".to_string())];
+
+    let same = detect_topology_conflicts(&alias, "g2", &existing);
+    assert_eq!(same.len(), 1);
+    assert_eq!(same[0].relation, NestedLinkRelation::Same);
+    let inside = detect_topology_conflicts(&alias.join("inner"), "g2", &existing);
+    assert_eq!(inside.len(), 1);
+    assert_eq!(inside[0].relation, NestedLinkRelation::Ancestor);
+}
+
+/// The same folder linked again to the SAME group is an idempotent re-link,
+/// not a conflict; to a different group it is.
+#[test]
+fn the_same_folder_conflicts_only_with_a_different_group() {
+    let dir = tempdir();
+    let path = dir.path().to_string_lossy().to_string();
+    let existing = vec![(path, "g1".to_string())];
+    assert!(detect_topology_conflicts(dir.path(), "g1", &existing).is_empty());
+    assert_eq!(detect_topology_conflicts(dir.path(), "g2", &existing).len(), 1);
+}
+
+/// Where the platform's filesystems fold case, a differently-cased spelling
+/// is the same folder, even for a folder that does not exist yet.
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn a_case_folded_spelling_is_the_same_folder() {
+    let dir = tempdir();
+    let existing = vec![(dir.path().join("Photos").to_string_lossy().to_string(), "g1".into())];
+    let conflicts =
+        detect_topology_conflicts(&dir.path().join("PHOTOS").join("raw"), "g2", &existing);
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].relation, NestedLinkRelation::Ancestor);
 }

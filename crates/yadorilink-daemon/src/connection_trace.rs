@@ -301,11 +301,13 @@ pub fn run_connectivity_doctor(
         .iter()
         .map(|group_id| {
             db.read(|conn| {
-                yadorilink_sync_sqlite::dag_store::published_view::pending_local_changes_for_group(
-                    conn, group_id, device_id,
+                yadorilink_sync_sqlite::native_publication::pending_native_deltas_for_device(
+                    conn,
+                    &yadorilink_replica_domain::ids::FolderGroupId((*group_id).to_owned()),
+                    device_id,
                 )
             })
-            .map(|hashes| hashes.len())
+            .map(|deltas| deltas.len())
             .unwrap_or_else(|e| {
                 tracing::warn!(
                     group_id, error = %e,

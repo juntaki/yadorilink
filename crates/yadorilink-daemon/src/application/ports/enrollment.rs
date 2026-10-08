@@ -41,6 +41,9 @@ pub(crate) trait EnrollmentRepository: Send + Sync {
 
     fn list_links(&self) -> Result<Vec<FolderLink>, SyncError>;
 
+    /// The creation digest recorded with a provider link (the token-bound request).
+    fn creation_digest(&self, locator: &str) -> Result<Option<String>, SyncError>;
+
     fn scan_pending(&self) -> Result<PendingEnrollmentScan, SyncError>;
 
     /// Removes the `pending_enrollments` marker once activation is
@@ -112,6 +115,7 @@ pub(crate) trait EnrollmentCoordination: Send + Sync {
         operation_id: &'a str,
         group_name: &'a str,
         device_id: &'a str,
+        storage_mode: &'a str,
     ) -> BoxFuture<'a, EnrollmentPrepareResult>;
 
     fn prepare_join<'a>(
@@ -199,7 +203,8 @@ pub(crate) struct EnrollmentLinkRequest {
     pub(crate) group_id: String,
     pub(crate) absolute_path: std::path::PathBuf,
     pub(crate) on_demand: bool,
-    pub(crate) acknowledge_risks: bool,
+    /// `Some` for a provider-backed link (`absolute_path` is then its locator).
+    pub(crate) provider: Option<super::ProviderLinkTarget>,
 }
 
 pub(crate) trait EnrollmentLinkPort: Send + Sync {
@@ -248,6 +253,5 @@ pub(crate) trait EnrollmentLinkPort: Send + Sync {
         group_id: &'a str,
         absolute_path: &'a std::path::Path,
         on_demand: bool,
-        acknowledge_risks: bool,
     ) -> BoxFuture<'a, Result<(), crate::application::EnrollmentLinkError>>;
 }

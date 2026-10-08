@@ -122,7 +122,6 @@ async fn pause_all_and_resume_all_affect_every_linked_folder() {
         local_path: folder.to_string_lossy().to_string(),
         group_id: "group-1".into(),
         on_demand: false,
-        max_local_size_bytes: None,
         acknowledge_risks: true,
         pending_enrollment_operation_id: String::new(),
         pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
@@ -157,7 +156,6 @@ async fn list_conflicts_for_and_list_trash_for_return_empty_for_a_fresh_link() {
         local_path: local_path.clone(),
         group_id: "group-conflicts".into(),
         on_demand: false,
-        max_local_size_bytes: None,
         acknowledge_risks: true,
         pending_enrollment_operation_id: String::new(),
         pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
@@ -188,7 +186,6 @@ async fn materialization_status_reports_unknown_for_an_unindexed_path() {
         local_path: folder.to_string_lossy().to_string(),
         group_id: "group-materialization".into(),
         on_demand: false,
-        max_local_size_bytes: None,
         acknowledge_risks: true,
         pending_enrollment_operation_id: String::new(),
         pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
@@ -204,7 +201,7 @@ async fn materialization_status_reports_unknown_for_an_unindexed_path() {
     assert!(!status.known);
 }
 
-/// The mutating file-tools actions (`pin_file`/`hydrate_file`/
+/// The mutating file-tools actions (`hydrate_file`/`evict_file`/
 /// `restore_version`/`restore_trash`) each surface a clear daemon error
 /// for a path that was never indexed -- same "not found" contract the
 /// daemon's own `control_socket.rs` tests already pin for the raw IPC
@@ -220,7 +217,6 @@ async fn mutating_file_actions_return_a_clear_error_for_an_unknown_path() {
         local_path: folder.to_string_lossy().to_string(),
         group_id: "group-actions".into(),
         on_demand: false,
-        max_local_size_bytes: None,
         acknowledge_risks: true,
         pending_enrollment_operation_id: String::new(),
         pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
@@ -230,7 +226,7 @@ async fn mutating_file_actions_return_a_clear_error_for_an_unknown_path() {
     .expect("linking a fresh folder should succeed");
 
     let nope = folder.join("nope.bin").to_string_lossy().to_string();
-    assert!(actions::pin_file(nope.clone()).await.is_err());
+    assert!(actions::evict_file(nope.clone()).await.is_err());
     assert!(actions::hydrate_file(nope.clone()).await.is_err());
     assert!(actions::restore_version(nope.clone(), None).await.is_err());
     assert!(actions::restore_trash(nope).await.is_err());

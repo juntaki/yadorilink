@@ -489,7 +489,7 @@ static PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// removes 32 such artefacts (see [`GRANULARITY_SAMPLE_COUNT`]); on the
 /// commit path, that is 32 enqueued creates and 32 enqueued deletes per
 /// commit, racing this function's own unlink — worst case, a create wins
-/// that race and a probe artefact gets signed into the DAG and replicated
+/// that race and a probe artefact gets signed into native state and replicated
 /// to every peer. Building the name through
 /// [`crate::reserved_namespace::artefact_component_name`] instead makes
 /// that unreachable: every one of those entry points excludes a reserved

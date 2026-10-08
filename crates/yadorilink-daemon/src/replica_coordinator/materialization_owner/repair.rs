@@ -22,7 +22,7 @@ use yadorilink_filesystem_sync::materialization_execution::{
 };
 use yadorilink_local_storage::PlaceholderIdentityToRecord;
 use yadorilink_replica_domain::file::RecordKind;
-use yadorilink_replica_domain::ids::{ChangeHash, VersionHash};
+use yadorilink_replica_domain::ids::VersionHash;
 use yadorilink_replica_domain::session_state::MaterializationState;
 use yadorilink_root_authority::fs_identity::FileIdentity;
 use yadorilink_root_authority::root_commit::RootCommitPermit;
@@ -33,6 +33,21 @@ use yadorilink_sync_sqlite::exact_materialized_commit::{
 
 use super::super::ReplicaCoordinator;
 use crate::sync_error::SyncError;
+
+/// Whether `object` is a native provider's placeholder rather than
+/// materialized content. Only Windows has one (CfAPI: offline / recall-on-
+/// access attributes); elsewhere every object is content. Windows: UNVERIFIED.
+fn is_native_placeholder(_object: &std::path::Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        const RECALL: u32 = 0x0000_1000 | 0x0004_0000 | 0x0040_0000;
+        return std::fs::symlink_metadata(_object)
+            .is_ok_and(|metadata| metadata.file_attributes() & RECALL != 0);
+    }
+    #[cfg(not(windows))]
+    false
+}
 
 impl ReplicaCoordinator {
     /// Open half of an eviction to a placeholder, after the lane's
@@ -48,6 +63,13 @@ impl ReplicaCoordinator {
         path: &str,
         permit: &RootCommitPermit<'_>,
     ) -> Result<Result<i64, MaterializationExecutionError>, MaterializationExecutionError> {
+        // Before the row is touched: marking a frozen group's row `Evicting` is a write
+        // of it, and the fence would refuse the lane only afterwards.
+        if self.held_path_repository().group_frozen(group_id).map_err(SyncError::from)? {
+            return Err(MaterializationExecutionError::EvictionRejected(format!(
+                "{group_id}/{path} is frozen by a rebootstrap"
+            )));
+        }
         self.materialization_state_repository()
             .set_materialization_state(group_id, path, MaterializationState::Evicting, permit)
             .map_err(SyncError::from)?;
@@ -60,7 +82,7 @@ impl ReplicaCoordinator {
     }
 
     /// Settle half of an eviction, after the placeholder write: CAS the
-    /// row `Evicting` -> `Placeholder` (tx). `false` when the CAS was lost,
+    /// row `Evicting` -> `Remote` (tx). `false` when the CAS was lost,
     /// with nothing else written; otherwise record the placeholder's
     /// identity (tx) and answer `true`. An eviction that fails before this,
     /// or in it, closes the row with [`Self::abandon_eviction`].
@@ -77,7 +99,7 @@ impl ReplicaCoordinator {
                 group_id,
                 path,
                 MaterializationState::Evicting,
-                MaterializationState::Placeholder,
+                MaterializationState::Remote,
                 permit,
             )
             .map_err(SyncError::from)?
@@ -93,15 +115,15 @@ impl ReplicaCoordinator {
     /// else moves a row out of it: it is neither an eviction nor a repair
     /// candidate). One transaction: while the row is still `Evicting`,
     ///
-    /// - a row that no longer names `version` goes to `Placeholder`: its
-    ///   content was never on disk, and `Placeholder` is what re-fetches it;
-    /// - `Intact` goes back to `Hydrated` through the recovery commit,
+    /// - a row that no longer names `version` goes to `Remote`: its
+    ///   content was never on disk, and `Remote` is what re-fetches it;
+    /// - `Intact` goes back to `Present` through the recovery commit,
     ///   which publishes a proof of `version` under the live fence (the
     ///   attempt's bump invalidated the old one) and clears any intent;
-    /// - `NotWritten` goes back to `Hydrated` with no proof, the entry
+    /// - `NotWritten` goes back to `Present` with no proof, the entry
     ///   state, so an edit that landed during the attempt is captured as
     ///   one and the repair sweep re-proves bytes that still match;
-    /// - `PlaceholderMayExist` goes to `Placeholder`, as the startup reset
+    /// - `PlaceholderMayExist` goes to `Remote`, as the startup reset
     ///   resolves a stale `Evicting` row.
     ///
     /// The permit is verified inside the transaction. `false`, with
@@ -136,7 +158,7 @@ impl ReplicaCoordinator {
                     return Ok(false);
                 }
                 let next = if current.version_hash() != *version {
-                    Some(MaterializationState::Placeholder)
+                    Some(MaterializationState::Remote)
                 } else {
                     match abandoned {
                         AbandonedEviction::Intact { identity } => {
@@ -144,7 +166,6 @@ impl ReplicaCoordinator {
                                 tx,
                                 group_id,
                                 path,
-                                None,
                                 &ExactMaterializedState::Object {
                                     kind: RecordKind::File,
                                     version: *version,
@@ -152,7 +173,6 @@ impl ReplicaCoordinator {
                                 },
                                 ExpectedAuthoring {
                                     state: MaterializationState::Evicting,
-                                    authoring_change_hash: current.authoring_change_hash.as_ref(),
                                     expected_version: Some(version),
                                 },
                                 now,
@@ -163,13 +183,13 @@ impl ReplicaCoordinator {
                                 // are the commit's own guard read in this
                                 // same transaction; the entry state then.
                                 RecoveredMaterializedCommit::Superseded => {
-                                    Some(MaterializationState::Hydrated)
+                                    Some(MaterializationState::Present)
                                 }
                             }
                         }
-                        AbandonedEviction::NotWritten => Some(MaterializationState::Hydrated),
+                        AbandonedEviction::NotWritten => Some(MaterializationState::Present),
                         AbandonedEviction::PlaceholderMayExist => {
-                            Some(MaterializationState::Placeholder)
+                            Some(MaterializationState::Remote)
                         }
                     }
                 };
@@ -185,10 +205,17 @@ impl ReplicaCoordinator {
     }
 
     /// Startup recovery of the two transient states a crash can strand a
-    /// row in: every `Hydrating` row goes back to `Placeholder` (tx), then
+    /// row in: every `Hydrating` row goes back to `Remote` (tx), then
     /// every `Evicting` row does (tx). Both always run; each result is
     /// returned for the caller to log, so one failing does not stop the
     /// other. Must run before any link starts.
+    ///
+    /// `Remote` means no local object, and the resets cannot see the disk. A
+    /// row they demote whose object still stands (an access hydration that
+    /// crashed past its fence bump over the older version's bytes, or an
+    /// eviction that crashed before its unlink) is therefore set `Present`
+    /// afterwards: `Remote` there would hide the object from the repair sweep
+    /// and from the evidence that protects it. Nothing on disk stays `Remote`.
     pub(crate) fn reset_stale_transient_states(
         &self,
     ) -> (
@@ -196,9 +223,89 @@ impl ReplicaCoordinator {
         Result<usize, yadorilink_sync_sqlite::SyncSqliteError>,
     ) {
         let repository = self.materialization_state_repository();
-        let stale_hydrating = repository.reset_stale_hydrating_to_placeholder();
-        let stale_evicting = repository.reset_stale_evicting_to_placeholder();
-        (stale_hydrating, stale_evicting)
+        let stranded = match repository.list_transient_rows() {
+            Ok(rows) => rows,
+            Err(error) => {
+                return (
+                    Err(yadorilink_sync_sqlite::SyncSqliteError::CorruptState(error.to_string())),
+                    Err(error),
+                )
+            }
+        };
+        // Recovery is decided FIRST, per row, and only a CONFIRMED outcome
+        // lets a row be reset: a quarantined object that was put back (or
+        // confirmed absent), or a row whose root is known. A row whose live
+        // root cannot be determined, or whose quarantine could not be
+        // inspected or restored, is left exactly as it is (an `Evicting`
+        // marker stays `Evicting`) and the next start decides again.
+        let mut keep: Vec<(String, String)> = Vec::new();
+        let mut promote: Vec<(String, String)> = Vec::new();
+        let mut lookup_errors_reported = std::collections::HashSet::<String>::new();
+        for (group_id, path) in &stranded {
+            // A provider root (or one with inconsistent provider state) owns no directory this
+            // process may look at: no quarantine recovery, no object inspection. Its marker
+            // stays as it is.
+            if self.provider_repository().require_plain(group_id).is_err() {
+                keep.push((group_id.clone(), path.clone()));
+                continue;
+            }
+            let root = match self.link_repository().live_link_local_path_for_group(group_id) {
+                Ok(Some(root)) => std::path::PathBuf::from(root),
+                // No live root: unknown, the marker is retained.
+                Ok(None) => {
+                    keep.push((group_id.clone(), path.clone()));
+                    continue;
+                }
+                Err(error) => {
+                    // Reported once per group per start; the marker is retained.
+                    if !lookup_errors_reported.contains(group_id) {
+                        tracing::error!(
+                            group_id = %group_id,
+                            error = %error,
+                            "cannot look up the live root of a group at startup; its stranded \
+                             rows keep their transient markers"
+                        );
+                        lookup_errors_reported.insert(group_id.clone());
+                    }
+                    keep.push((group_id.clone(), path.clone()));
+                    continue;
+                }
+            };
+            if let Err(error) =
+                yadorilink_filesystem_sync::materialization_eviction::recover_eviction_quarantine(
+                    self, &root, group_id, path,
+                )
+            {
+                tracing::warn!(
+                    group_id = %group_id,
+                    path = %path,
+                    error = %error,
+                    "could not recover an eviction's quarantined object at startup; the row \
+                     stays transient and the next start retries"
+                );
+                keep.push((group_id.clone(), path.clone()));
+                continue;
+            }
+            let object = root.join(path);
+            match std::fs::symlink_metadata(&object) {
+                // On Windows an object that is still a native placeholder (a
+                // dehydrate that landed before its state commit) is not content.
+                Ok(_) if !is_native_placeholder(&object) => {
+                    promote.push((group_id.clone(), path.clone()));
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                // Cannot tell whether the object stands: do not guess.
+                Err(_) => keep.push((group_id.clone(), path.clone())),
+            }
+        }
+        match repository.reset_stale_transients(&keep, &promote) {
+            Ok((hydrating, evicting)) => (Ok(hydrating), Ok(evicting)),
+            Err(error) => (
+                Err(yadorilink_sync_sqlite::SyncSqliteError::CorruptState(error.to_string())),
+                Err(error),
+            ),
+        }
     }
 
     /// Open half of the repair sweep's quarantine of divergent on-disk
@@ -232,11 +339,11 @@ impl ReplicaCoordinator {
         Ok(quarantine_intent_guard)
     }
 
-    /// Open half of the snapshot-install reconciliation's disk write: bump
+    /// Open half of the held-path reconciliation's disk write: bump
     /// the fence (tx) before the lane removes, moves aside or places
     /// anything under a path the install holds, so a proof or an in-flight
     /// writer that read the path before cannot outlive the change.
-    pub(crate) fn begin_snapshot_install_disk_write(
+    pub(crate) fn begin_held_path_disk_write(
         &self,
         group_id: &str,
         path: &str,
@@ -245,7 +352,7 @@ impl ReplicaCoordinator {
             self,
             group_id,
             path,
-            "snapshot_install_reconcile",
+            "held_path_reconcile",
         )?;
         Ok(())
     }
@@ -253,23 +360,21 @@ impl ReplicaCoordinator {
     /// First step of the repair sweep's placeholder demotion (the
     /// reconstruct-failed arm and the missing-blocks arm), before the
     /// lane's target verification, fence bump and placeholder write: move
-    /// the row to `Placeholder` only while it is still the row the lane
-    /// read -- in `row_state`, with `authoring` and, when the lane had one,
-    /// `version` (tx). `false` when it moved, with nothing written.
+    /// the row to `Remote` only while it is still the row the lane
+    /// read -- in `row_state` and, when the lane had one, `version` (tx).
+    /// `false` when it moved, with nothing written.
     ///
-    /// The path lock does not make a plain set safe here: the rebootstrap
-    /// install replaces a group's rows without it, so a live pass can find
+    /// The path lock does not make a plain set safe here: native admission
+    /// does not take it, so a live pass can find
     /// its row superseded between its snapshot and this step. A blind set
     /// then let the lane go on to write a placeholder sized and stamped for
     /// the version it read over the newer row, record that object's
-    /// identity for it, and clear the intent, exactly the authoring- and
-    /// version-bound case `settle_repair_reconstruct`'s demotion guards.
+    /// identity for it, and clear the intent, exactly the version-bound case `settle_repair_reconstruct`'s demotion guards.
     pub(crate) fn open_repair_placeholder_demotion(
         &self,
         group_id: &str,
         path: &str,
         row_state: MaterializationState,
-        authoring: Option<&ChangeHash>,
         version: Option<&VersionHash>,
         permit: &RootCommitPermit<'_>,
     ) -> Result<bool, MaterializationExecutionError> {
@@ -278,13 +383,12 @@ impl ReplicaCoordinator {
         permit.verify().map_err(SyncError::from)?;
         Ok(self
             .materialization_state_repository()
-            .transition_materialization_state_if_same_authoring(
+            .transition_materialization_state_if_same_version(
                 group_id,
                 path,
                 Some(row_state),
-                authoring,
                 version,
-                MaterializationState::Placeholder,
+                MaterializationState::Remote,
             )
             .map_err(SyncError::from)?)
     }
@@ -295,7 +399,7 @@ impl ReplicaCoordinator {
     ///
     /// Publishes the proof for `version` with the identity now observed at
     /// `out_path`, guarded on the row still being in `row_state` with
-    /// `authoring` and `version` (tx). No version, an unobservable
+    /// `version` (tx). No version, an unobservable
     /// identity, a failed or refused commit: nothing is published, the
     /// lane's intent stays open, and the row is demoted to `Hydrating`, a
     /// repair candidate while that intent is open, only while it is still
@@ -309,32 +413,31 @@ impl ReplicaCoordinator {
         path: &str,
         out_path: &Path,
         row_state: MaterializationState,
-        authoring: Option<&ChangeHash>,
         version: Option<VersionHash>,
         mutation_generation: i64,
         permit: &RootCommitPermit<'_>,
     ) -> bool {
         // This pass reconstructs real content and leaves the row
-        // `Hydrated`, exactly like the live materialize/hydrate paths -- so
+        // `Present`, exactly like the live materialize/hydrate paths -- so
         // it owes the same proof they publish. Without it every repaired
-        // row would sit `Hydrated` with nothing vouching for it, which is
+        // row would sit `Present` with nothing vouching for it, which is
         // the state the invariant excludes.
         //
         // If the proof cannot be published, the row must not keep the
-        // claim: demote it instead of only logging. A `Hydrated` row with
+        // claim: demote it instead of only logging. A `Present` row with
         // no usable generation is what the hydration reader refuses to
         // reconstruct over, so leaving one here would convert a transient
         // stat or write failure into a permanently stuck path -- and this
         // is the repair pass, the thing that is supposed to get a path
         // unstuck.
         //
-        // The demotion target is the in-flight state, not `Placeholder`.
+        // The demotion target is the in-flight state, not `Remote`.
         // The lane's intent stays open (it is the only durable record that
         // this write was never proven), and `Hydrating` with an open
         // intent is exactly what the next repair pass, live or startup,
         // picks up: its disk-matches arm proves the bytes and clears the
         // intent in one commit, and the startup `Hydrating` reset leaves
-        // the pair to it. A `Placeholder` is never a repair candidate, so
+        // the pair to it. A `Remote` is never a repair candidate, so
         // demoting to it stranded the open intent with nothing left to
         // decide it, and every scan kept deferring an offline delete of
         // the path for as long as it lasted.
@@ -379,11 +482,7 @@ impl ReplicaCoordinator {
                     // found in -- a batch interrupted before its finalizer
                     // is still mid-flight, and this commit is what
                     // promotes it.
-                    Some(ExpectedAuthoring {
-                        state: row_state,
-                        authoring_change_hash: authoring,
-                        expected_version: Some(&version),
-                    }),
+                    Some(ExpectedAuthoring { state: row_state, expected_version: Some(&version) }),
                     permit,
                 ) {
                     Ok(published) => published,
@@ -412,17 +511,17 @@ impl ReplicaCoordinator {
         if !proof_published {
             // Authoring-bound, not a plain state CAS: the commit above can
             // have been refused BECAUSE the row was superseded, and the row
-            // that replaced it may legitimately be `Hydrated` already.
+            // that replaced it may legitimately be `Present` already.
             // Demoting on state alone would take that healthy, newer row
             // back to `Hydrating` on the strength of an attempt that was
             // about the version it replaced.
             if let Err(e) = self
                 .materialization_state_repository()
-                .transition_materialization_state_if_same_authoring(
+                .transition_materialization_state_if_same_version(
                     group_id,
                     path,
                     // The state this row was actually found in. Naming
-                    // `Hydrated` unconditionally made this a no-op for a row
+                    // `Present` unconditionally made this a no-op for a row
                     // repaired out of the batch's transient state, leaving
                     // it transient and unproven. The lane's intent is not
                     // cleared by this demotion: it stays open, the durable
@@ -430,11 +529,8 @@ impl ReplicaCoordinator {
                     // next repair pass proves the path (see above) or a
                     // later materialization's own commit clears it.
                     Some(row_state),
-                    authoring,
                     // The version this attempt was about, from the same
-                    // snapshot as the authoring hash -- a supersession that
-                    // keeps the authoring identity still moves the row off
-                    // it.
+                    // snapshot as the row state.
                     version.as_ref(),
                     MaterializationState::Hydrating,
                 )
@@ -493,7 +589,7 @@ impl ReplicaCoordinator {
     /// now observable at `out_path` (none when it cannot be observed), under
     /// the fence value
     /// the open returned (tx). Guarded on the row still being in
-    /// `row_state` with `authoring` and `version` when the lane found it in
+    /// `row_state` with `version` when the lane found it in
     /// a state; unguarded when it found none. `false`, logged, when the
     /// fence was lost or the row superseded: the intent stays open for the
     /// next pass. Errors propagate.
@@ -506,7 +602,6 @@ impl ReplicaCoordinator {
         out_path: &Path,
         version: VersionHash,
         row_state: Option<MaterializationState>,
-        authoring: Option<&ChangeHash>,
         mutation_generation: i64,
         permit: &RootCommitPermit<'_>,
     ) -> Result<bool, MaterializationExecutionError> {
@@ -518,7 +613,6 @@ impl ReplicaCoordinator {
             mutation_generation,
             row_state.map(|state_now| ExpectedAuthoring {
                 state: state_now,
-                authoring_change_hash: authoring,
                 expected_version: Some(&version),
             }),
             permit,
@@ -567,7 +661,6 @@ impl ReplicaCoordinator {
             .commit_internal_materialized_state_if_fence_current(
                 group_id,
                 path,
-                None,
                 exact,
                 mutation_generation,
                 expected,

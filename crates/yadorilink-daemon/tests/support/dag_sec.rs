@@ -194,7 +194,7 @@ fn head_for(dag: &Dag, c: usize, path: &str) -> Option<PathHead> {
     }
     Some(PathHead {
         change_hash: ch.hash,
-        lamport: ch.lamport,
+        rank: ch.lamport,
         device_id: format!("device-{}", ch.device),
         // The generator never emits a retroactive re-assertion, so the
         // signing device is always the device that wrote the content --
@@ -251,7 +251,7 @@ fn build_candidates(
             Some(v) => {
                 inputs.push(PathHead {
                     change_hash: dag.changes[c].hash,
-                    lamport: dag.changes[c].lamport,
+                    rank: dag.changes[c].lamport,
                     device_id: format!("device-{}", dag.changes[c].device),
                     naming_device_id: format!("device-{}", dag.changes[c].device),
                     content: Some(PathHeadContent {

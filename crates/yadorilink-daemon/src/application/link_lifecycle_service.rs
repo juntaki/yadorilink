@@ -78,12 +78,49 @@ impl LinkLifecycleService {
         result
     }
 
+    /// A provider-backed link: no directory, so no topology, recovery-area or watcher step. The link
+    /// row, the declared root and the enrollment marker commit in one transaction; the only fallible
+    /// step after it is advancing the journal row, which has nothing to undo but the commit itself.
+    fn link_provider(&self, command: LinkCommand) -> Result<LinkOutcome, DaemonError> {
+        let Some(marker) = &command.pending_enrollment else {
+            return Err(DaemonError::Config(
+                "a provider folder is only created through a journaled enrollment".to_string(),
+            ));
+        };
+        let live = self.repository.live_link_keys_for_group(&command.group_id)?;
+        if live.iter().any(|key| key != &command.local_path) {
+            return Err(DaemonError::Config(format!(
+                "folder group {} already has a link on this device",
+                command.group_id
+            )));
+        }
+        if live.iter().any(|key| key == &command.local_path) {
+            return Ok(LinkOutcome::AlreadyLinked);
+        }
+        self.repository.commit_link_with_pending_enrollment(
+            &command.local_path,
+            &command.group_id,
+            marker,
+            command.provider.as_ref(),
+        )?;
+        if !self.repository.mark_enrollment_activation_pending(&marker.operation_id)? {
+            return Err(DaemonError::Config(
+                "local setup completed but the enrollment operation could not advance to \
+                 ActivationPending; remote activation was not attempted"
+                    .to_string(),
+            ));
+        }
+        Ok(LinkOutcome::Linked)
+    }
+
     /// [`Self::link`]'s body, run while this path's lock is held.
     async fn link_serialized(&self, command: LinkCommand) -> Result<LinkOutcome, DaemonError> {
-        // Deliberately NOT gated by `!command.acknowledge_risks` the way the
-        // nested-path preflight below is: a second live root on one group is
-        // never acceptable at any confirmation level, because each root's
-        // scan tombstones the other's files on every device.
+        if command.provider.is_some() {
+            return self.link_provider(command);
+        }
+        // A second live root on one group is never acceptable at any
+        // confirmation level, because each root's scan tombstones the
+        // other's files on every device.
         //
         // `any(|p| p != &command.local_path)` rather than `!is_empty()`:
         // re-linking the SAME folder to the same group is idempotent and
@@ -132,39 +169,47 @@ impl LinkLifecycleService {
             )));
         }
 
-        let existing_paths = self.repository.list_link_paths()?;
-        let preflight = yadorilink_local_storage::link_preflight::run_preflight(
+        // Nested links, and one folder linked to two groups, are an unsupported
+        // topology: refused at every confirmation level, because two linked
+        // roots over the same files would each treat the other's changes as
+        // their own. No confirmation flag is consulted: those only cover risks
+        // a user may knowingly accept (a non-empty folder, a cloud-provider
+        // folder). Paths are compared resolved and case-folded, so a symlink
+        // or a differently-cased spelling is the same folder.
+        let existing_links = self.repository.list_link_paths_and_groups()?;
+        let conflicts = yadorilink_local_storage::link_preflight::detect_topology_conflicts(
             std::path::Path::new(&command.local_path),
-            &existing_paths,
-            None,
+            &command.group_id,
+            &existing_links,
         );
-        if !preflight.nested_conflicts.is_empty() && !command.acknowledge_risks {
-            let conflict_summary = preflight
-                .nested_conflicts
-                .iter()
-                .map(|c| match c.relation {
-                    yadorilink_local_storage::link_preflight::NestedLinkRelation::Ancestor => {
-                        format!(
-                            "{} is already linked and is an ancestor of this folder",
-                            c.other_path
-                        )
-                    }
-                    yadorilink_local_storage::link_preflight::NestedLinkRelation::Descendant => {
-                        format!(
-                            "{} is already linked and is nested inside this folder",
-                            c.other_path
-                        )
-                    }
-                    yadorilink_local_storage::link_preflight::NestedLinkRelation::Same => {
-                        format!("{} is already linked", c.other_path)
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("; ");
+        if !conflicts.is_empty() {
+            let conflict_summary =
+                conflicts.iter().map(|c| c.refusal()).collect::<Vec<_>>().join("; ");
             return Err(DaemonError::Config(format!(
-                "link preflight rejected (nested-link conflict): {conflict_summary} -- re-run \
-                 with acknowledge_risks/--yes to proceed"
+                "link refused (unsupported link topology): {conflict_summary}. Linked folders \
+                 cannot be nested or linked twice, and no confirmation overrides this; unlink \
+                 the other folder first"
             )));
+        }
+
+        // The recovery area of a rebootstrap and the store of the versions it set aside hold
+        // the user's own files outside every synced folder; a folder around either, or
+        // inside it, would have the sync read them back as new files.
+        for kept in
+            [crate::device_config::recovery_root(), crate::device_config::recovery_items_root()]
+        {
+            if crate::device_config::link_overlaps_recovery_area(
+                std::path::Path::new(&command.local_path),
+                &kept,
+            ) {
+                return Err(DaemonError::Config(format!(
+                    "link refused: {} would contain or lie within the daemon's recovery area \
+                     ({}), which keeps what a rebootstrap saves of your changes and is never \
+                     synced",
+                    command.local_path,
+                    kept.display()
+                )));
+            }
         }
 
         // From here on the link (and, if `pending_enrollment` was set, its
@@ -178,18 +223,12 @@ impl LinkLifecycleService {
                 &command.local_path,
                 &command.group_id,
                 marker,
+                None,
             )?,
         };
 
-        if let Err(e) = self
-            .watcher
-            .start(
-                &command.local_path,
-                &command.group_id,
-                command.on_demand,
-                command.max_local_size_bytes,
-            )
-            .await
+        if let Err(e) =
+            self.watcher.start(&command.local_path, &command.group_id, command.on_demand).await
         {
             // The rollback undoes exactly what the commit above did to the
             // link row -- deletes a row it inserted, restores a row it

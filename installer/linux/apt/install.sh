@@ -4,7 +4,7 @@
 #
 # Registers the yadorilink APT repository and its signing key. Run as:
 #
-#   curl -fsSL https://yadorilink.juntaki.com/apt/install.sh | sudo sh
+#   curl -fsSL https://control.yadori.link/apt/install.sh | sudo sh
 #
 # This script does exactly two things and nothing else: writes the
 # archive's public signing key to /usr/share/keyrings, and writes a
@@ -31,8 +31,8 @@ set -eu
 KEYRING_DIR="/usr/share/keyrings"
 KEYRING_PATH="$KEYRING_DIR/yadorilink-archive-keyring.gpg"
 SOURCES_PATH="/etc/apt/sources.list.d/yadorilink.sources"
-KEY_URL="https://yadorilink.juntaki.com/apt/yadorilink-archive-keyring.asc"
-REPO_URL="https://yadorilink.juntaki.com/apt"
+KEY_URL="https://control.yadori.link/apt/yadorilink-archive-keyring.asc"
+REPO_URL="https://control.yadori.link/apt"
 
 log() { echo "[yadorilink apt install] $*"; }
 

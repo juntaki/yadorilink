@@ -8,20 +8,28 @@ use rusqlite::OptionalExtension;
 use crate::error::SyncSqliteError;
 use crate::file_index::enumerate_group_durability_roots_on_conn;
 use yadorilink_replica_domain::session_state::{
-    FolderLink, LinkGate, LinkRowWrite, MaterializationPolicy,
+    FolderLink, LinkGate, LinkLocation, LinkRowWrite, MaterializationPolicy,
 };
 use yadorilink_sqlite_runtime::SyncDatabase;
 
 /// One `links` row, selected as `local_path, group_id, paused,
-/// materialization_policy, max_local_size_bytes, orphaned`.
+/// materialization_policy, orphaned`.
 fn row_to_folder_link(r: &rusqlite::Row<'_>) -> rusqlite::Result<FolderLink> {
+    let path: String = r.get(0)?;
+    let kind: String = r.get(5)?;
+    let root_id: Option<String> = r.get(6)?;
+    let location = match (kind.as_str(), root_id) {
+        ("none", _) => LinkLocation::Folder(path),
+        (_, Some(root_id)) => LinkLocation::Provider { locator: path, root_id },
+        // A declared provider with no root id is corrupt state; it must not read as a folder.
+        (_, None) => LinkLocation::Provider { locator: path, root_id: String::new() },
+    };
     Ok(FolderLink {
-        local_path: r.get(0)?,
+        location,
         group_id: r.get(1)?,
         paused: r.get::<_, i64>(2)? != 0,
         materialization_policy: MaterializationPolicy::from_db_str(&r.get::<_, String>(3)?),
-        max_local_size_bytes: r.get(4)?,
-        orphaned: r.get::<_, i64>(5)? != 0,
+        orphaned: r.get::<_, i64>(4)? != 0,
     })
 }
 
@@ -107,7 +115,7 @@ impl LinkRepository {
         let existing = tx
             .query_row(
                 "SELECT local_path, group_id, paused, materialization_policy, \
-                 max_local_size_bytes, orphaned FROM links WHERE local_path = ?1",
+                 orphaned, provider_kind, provider_root_id FROM links WHERE local_path = ?1",
                 [local_path],
                 row_to_folder_link,
             )
@@ -159,6 +167,13 @@ impl LinkRepository {
     ) -> Result<&'static str, SyncSqliteError> {
         match write {
             LinkRowWrite::Inserted => {
+                // A provider link's root was created in the same transaction as the row and has
+                // no state yet: it goes with the row it was declared on.
+                tx.execute(
+                    "DELETE FROM provider_roots WHERE root_id IN (SELECT provider_root_id FROM \
+                     links WHERE local_path = ?1 AND group_id = ?2)",
+                    rusqlite::params![local_path, group_id],
+                )?;
                 tx.execute(
                     "DELETE FROM links WHERE local_path = ?1 AND group_id = ?2",
                     rusqlite::params![local_path, group_id],
@@ -167,8 +182,7 @@ impl LinkRepository {
             }
             LinkRowWrite::Updated(prior) => {
                 tx.execute(
-                    "UPDATE links SET paused = ?3, orphaned = ?4, materialization_policy = ?5, \
-                        max_local_size_bytes = ?6 \
+                    "UPDATE links SET paused = ?3, orphaned = ?4, materialization_policy = ?5 \
                      WHERE local_path = ?1 AND group_id = ?2",
                     rusqlite::params![
                         local_path,
@@ -176,7 +190,6 @@ impl LinkRepository {
                         i64::from(prior.paused),
                         i64::from(prior.orphaned),
                         prior.materialization_policy.as_db_str(),
-                        prior.max_local_size_bytes,
                     ],
                 )?;
                 Ok("restored the link row that already existed")
@@ -254,18 +267,54 @@ impl LinkRepository {
         })
     }
 
-    pub fn remove_link(&self, local_path: &str) -> Result<(), SyncSqliteError> {
-        self.database.write::<_, SyncSqliteError>(|conn| {
-            conn.execute("DELETE FROM links WHERE local_path = ?1", [local_path])?;
-            Ok(())
-        })
+    /// Deletes the link recorded at exactly `local_path`; `false` when none was.
+    pub fn remove_link(&self, local_path: &str) -> Result<bool, SyncSqliteError> {
+        self.database
+            .write_immediate::<_, SyncSqliteError>(|tx| Self::remove_link_on_tx(tx, local_path))
+    }
+
+    /// [`Self::remove_link`] inside the caller's transaction: every way a link row is deleted
+    /// goes through here, so the removal intent of a provider root can never be skipped.
+    fn remove_link_on_tx(
+        tx: &rusqlite::Transaction<'_>,
+        local_path: &str,
+    ) -> Result<bool, SyncSqliteError> {
+        let group: Option<String> = tx
+            .query_row("SELECT group_id FROM links WHERE local_path = ?1", [local_path], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        let deleted = tx.execute("DELETE FROM links WHERE local_path = ?1", [local_path])?;
+        // The last link of a provider root removes it: its domain is removed by the host on
+        // the strength of a DURABLE intent written here, in this transaction, and its provider
+        // state stays until the host acknowledges (so nothing is deleted while the OS may
+        // still hold what it describes).
+        if let Some(group) = group {
+            let remaining: i64 =
+                tx.query_row("SELECT COUNT(*) FROM links WHERE group_id = ?1", [&group], |r| {
+                    r.get(0)
+                })?;
+            if remaining == 0 {
+                let root: Option<(String, String)> = tx
+                    .query_row(
+                        "SELECT root_id, display_name FROM provider_roots WHERE group_id = ?1",
+                        [&group],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                if let Some((root_id, display_name)) = root {
+                    crate::provider::request_removal_in_tx(tx, &root_id, &group, &display_name)?;
+                }
+            }
+        }
+        Ok(deleted > 0)
     }
 
     pub fn list_links(&self) -> Result<Vec<FolderLink>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT local_path, group_id, paused, materialization_policy, \
-                 max_local_size_bytes, orphaned FROM links",
+                 orphaned, provider_kind, provider_root_id FROM links",
             )?;
             let rows = stmt.query_map([], row_to_folder_link)?;
             Ok(rows.collect::<Result<_, _>>()?)
@@ -547,26 +596,6 @@ impl LinkRepository {
         Ok(())
     }
 
-    /// Sets (or clears, with `None`) an `OnDemand` folder's automatic
-    /// eviction disk-usage cap — unset means no automatic
-    /// eviction, matching the existing manual-only default.
-    pub fn set_max_local_size_bytes(
-        &self,
-        local_path: &str,
-        max_bytes: Option<i64>,
-    ) -> Result<(), SyncSqliteError> {
-        let affected = self.database.write::<_, SyncSqliteError>(|conn| {
-            Ok(conn.execute(
-                "UPDATE links SET max_local_size_bytes = ?1 WHERE local_path = ?2",
-                rusqlite::params![max_bytes, local_path],
-            )?)
-        })?;
-        if affected == 0 {
-            return Err(SyncSqliteError::NotFound(format!("link {local_path}")));
-        }
-        Ok(())
-    }
-
     pub fn set_paused(&self, local_path: &str, paused: bool) -> Result<(), SyncSqliteError> {
         let affected = self.database.write::<_, SyncSqliteError>(|conn| {
             Ok(conn.execute(
@@ -729,8 +758,64 @@ impl LinkRepository {
         &self,
         group_id: &str,
     ) -> Result<Vec<String>, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            Self::refuse_provider_group(conn, group_id)?;
+            Self::live_link_paths_on_conn(conn, group_id)
+        })
+    }
+
+    /// A provider-backed group has no filesystem path: every by-group path lookup fails with
+    /// `NotFilesystemRoot` rather than hand out its synthetic locator.
+    pub(crate) fn refuse_provider_group(
+        conn: &rusqlite::Connection,
+        group_id: &str,
+    ) -> Result<(), SyncSqliteError> {
+        let provider: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM links WHERE group_id = ?1 AND orphaned = 0 \
+             AND provider_kind <> 'none')",
+            [group_id],
+            |r| r.get(0),
+        )?;
+        if provider {
+            return Err(SyncSqliteError::NotFilesystemRoot(group_id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// The creation digest recorded with a provider link (`None` for a folder link or no link).
+    pub fn creation_digest(&self, local_path: &str) -> Result<Option<String>, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT creation_digest FROM links WHERE local_path = ?1",
+                    [local_path],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten())
+        })
+    }
+
+    /// The keys of every live link of the group (see [`Self::live_link_key_for_group`]).
+    pub fn live_link_key_vec_for_group(
+        &self,
+        group_id: &str,
+    ) -> Result<Vec<String>, SyncSqliteError> {
         self.database
             .read::<_, SyncSqliteError>(|conn| Self::live_link_paths_on_conn(conn, group_id))
+    }
+
+    /// The `links` key of the one live link for `group_id` (a path for a folder link, the synthetic
+    /// locator for a provider link): an identity for keyed writes such as the storage mode, never
+    /// something to open.
+    pub fn live_link_key_for_group(
+        &self,
+        group_id: &str,
+    ) -> Result<Option<String>, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            Self::ensure_unambiguous_group_on_conn(conn, group_id, None)?;
+            Ok(Self::live_link_paths_on_conn(conn, group_id)?.into_iter().next())
+        })
     }
 
     /// The one live `local_path` for `group_id`, or `None` if the group has no
@@ -743,6 +828,7 @@ impl LinkRepository {
     ) -> Result<Option<String>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             Self::ensure_unambiguous_group_on_conn(conn, group_id, None)?;
+            Self::refuse_provider_group(conn, group_id)?;
             Ok(Self::live_link_paths_on_conn(conn, group_id)?.into_iter().next())
         })
     }
@@ -783,6 +869,7 @@ impl LinkRepository {
     pub fn link_gate_for_group(&self, group_id: &str) -> Result<LinkGate, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             Self::ensure_unambiguous_group_on_conn(conn, group_id, None)?;
+            Self::refuse_provider_group(conn, group_id)?;
             let row: Option<(String, i64, String)> = conn
                 .query_row(
                     "SELECT local_path, paused, materialization_policy FROM links \
@@ -893,7 +980,7 @@ impl LinkRepository {
             if current.digest != expected_digest {
                 return Ok(false);
             }
-            tx.execute("DELETE FROM links WHERE local_path = ?1", [local_path])?;
+            Self::remove_link_on_tx(tx, local_path)?;
             Ok(true)
         })
     }

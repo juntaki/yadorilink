@@ -11,6 +11,32 @@ use yadorilink_root_authority::fs_identity::{
     disk_race_fingerprint, DiskRaceFingerprint, FileIdentity,
 };
 
+/// Whether `error`, from looking a path up, says nothing answers to that
+/// name. Only a missing name or a missing parent directory does. Any other
+/// error (a directory this process may not search, an I/O error, a stale
+/// network handle) says the path could not be observed, which is no evidence
+/// that it is gone: reading it as a deletion would author a delete, and
+/// propagate it, for a file that still exists.
+pub(super) fn error_means_absent(error: &std::io::Error) -> bool {
+    matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory)
+}
+
+/// Whether `path` is observably absent right now, as opposed to merely
+/// unreadable.
+pub(super) fn is_confirmed_absent(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_err_and(|error| error_means_absent(&error))
+}
+
+/// Whether the disk at `path` still matches what a mutation was prepared
+/// against. Two failed observations are not "unchanged": a path that was
+/// absent at prepare must still be confirmed absent, not just unreadable.
+pub(super) fn disk_matches_prepare(path: &Path, at_prepare: &Option<DiskRaceFingerprint>) -> bool {
+    match (disk_race_fingerprint(path), at_prepare) {
+        (None, None) => is_confirmed_absent(path),
+        (current, prepared) => current == *prepared,
+    }
+}
+
 /// One path's closed disk observation: what the scan saw at the moment its
 /// observation bracket closed, carried forward as the single thing a later
 /// commit may derive an actual-state proof from.
@@ -108,70 +134,7 @@ pub(super) fn closed_disk_observation_if_unraced(
     Some(DiskObservation { identity })
 }
 
-/// Whether the on-disk object `lstat` describes is still proven to be this
-/// crate's own untouched placeholder, for the `MaterializationState::
-/// Placeholder` fast path in `build_record_for_created_or_modified`. On
-/// Unix, this requires BOTH: a `(dev, ino)` identity match against
-/// `placeholder_generation`, AND the object still being sparse (no
-/// allocated data blocks) -- see that call site's own doc comment for why
-/// this is used instead of a size/mtime/sparse-file heuristic there.
-///
-/// Identity alone is not sufficient: a
-/// genuine in-place edit (a `truncate`+`write` that reuses the same file
-/// descriptor/inode rather than an atomic rename, or an `mmap` write) keeps
-/// the SAME inode while genuinely changing the file's bytes. The OLD
-/// heuristic caught this case (real content allocates disk blocks, so the
-/// sparse-file check alone already said "not untouched") even though it
-/// missed the atomic-rename-preserving-size/mtime case this file's own
-/// identity check exists to close. Requiring both keeps the union of what
-/// each signal alone catches: identity closes the atomic-rename gap,
-/// sparseness closes the in-place-edit gap.
-///
-/// Also the check an on-demand hydration asks before it starts: an attempt
-/// may only replace the file if it is still this placeholder, so that local
-/// capture and hydration agree on what counts as an uncaptured edit.
-#[cfg(unix)]
-pub fn untouched_placeholder_verdict(
-    _store: &dyn crate::ports::LocalMutationStore,
-    _path: &Path,
-    lstat: &std::fs::Metadata,
-    existing: Option<&FileRecord>,
-    placeholder_generation: Option<&yadorilink_sync_sqlite::RecordedPlaceholderGeneration>,
-) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    if let Some(recorded) = placeholder_generation {
-        return recorded.provider_kind == yadorilink_local_storage::INTERNAL_INODE_PROVIDER_KIND
-            && yadorilink_local_storage::PlaceholderDiskIdentity::from_metadata(lstat)
-                == Some(recorded.identity)
-            && lstat.blocks() == 0;
-    }
-    // Defense in depth for the startup repair pass (`materialization_repair::
-    // backfill_placeholder_generations`): persisting an identity is not
-    // atomic with `write_placeholder`'s own disk write (a crash between
-    // the two, or the repair pass itself failing for this one path,
-    // leaves no identity recorded even though the placeholder is
-    // genuinely untouched). Falling through unconditionally whenever no
-    // identity is recorded would chunk and index the placeholder's own
-    // sparse/all-zero bytes as if real content on every such path --
-    // exactly the corruption this whole mechanism exists to prevent, and
-    // it would keep happening for as long as backfill keeps failing for
-    // that path.
-    //
-    // A completely unallocated object at EXACTLY the indexed size, with
-    // no identity to compare against, is still overwhelming evidence
-    // this is still the crate's own untouched placeholder: no ordinary
-    // editor or real edit leaves a file fully sparse. This closes the
-    // gap independent of the backfill pass's own success -- it is not a
-    // substitute for identity tracking (a same-size in-place edit that
-    // preserves sparseness, or a deliberately-crafted same-size sparse
-    // replacement, are both still missed -- the same class of residual
-    // gap the size/mtime-only heuristic always had), only a narrower,
-    // still-safe fallback for the one case identity tracking cannot
-    // currently guarantee it has closed.
-    existing.is_some_and(|record| lstat.len() == record.size) && lstat.blocks() == 0
-}
-
-/// On Windows, this is the ONLY signal permitted to produce
+/// Whether the CfAPI placeholder at `path` is still untouched. On Windows, this is the ONLY signal permitted to produce
 /// `true` -- a live query against the real CfAPI placeholder at `path`
 /// (`LocalMutationStore::inspect_windows_placeholder`, which in
 /// production calls `CfGetPlaceholderInfo`/`CfGetPlaceholderStateFromFileInfo`
@@ -191,13 +154,13 @@ pub fn untouched_placeholder_verdict(
 ///   call site hasn't reached yet) -- there is nothing to compare against,
 ///   so this cannot possibly be proven untouched.
 /// - `inspect_windows_placeholder` returns anything other than
-///   [`yadorilink_filesystem_sync::placeholder_backend::PlaceholderStatus::Untouched`]
+///   [`crate::ports::PlaceholderStatus::Untouched`]
 ///   -- `Dirty` is an honest "this was locally written since creation",
 ///   and `Unknown` (the path isn't a real placeholder, the identity
 ///   doesn't decode, the API call itself failed) is deliberately treated
 ///   exactly like `Dirty`, never like a confirmed match.
 #[cfg(windows)]
-pub fn untouched_placeholder_verdict(
+pub fn cfapi_placeholder_untouched(
     store: &dyn crate::ports::LocalMutationStore,
     path: &Path,
     _lstat: &std::fs::Metadata,
@@ -217,8 +180,22 @@ pub fn untouched_placeholder_verdict(
     let expected_generation = recorded.identity.ino;
     matches!(
         store.inspect_windows_placeholder(path, expected_generation),
-        yadorilink_filesystem_sync::placeholder_backend::PlaceholderStatus::Untouched
+        crate::ports::PlaceholderStatus::Untouched
     )
+}
+
+/// Where no native provider exists, no object is ever a provider
+/// placeholder: whatever is at a path is user bytes, so nothing is taken as
+/// untouched on this platform's say-so.
+#[cfg(not(windows))]
+pub fn cfapi_placeholder_untouched(
+    _store: &dyn crate::ports::LocalMutationStore,
+    _path: &Path,
+    _lstat: &std::fs::Metadata,
+    _existing: Option<&FileRecord>,
+    _placeholder_generation: Option<&yadorilink_sync_sqlite::RecordedPlaceholderGeneration>,
+) -> bool {
+    false
 }
 
 /// Whether `path` (root-relative) exists on disk RIGHT NOW as a regular

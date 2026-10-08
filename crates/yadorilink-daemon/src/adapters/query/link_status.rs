@@ -100,8 +100,15 @@ impl LinkStatusReadPort for DaemonLinkStatusReader {
             // Independent of `paused` (a link can be paused and/or degraded
             // at once -- see `DegradedLinkInfo`'s doc comment).
             let degraded = state
-                .degraded_link_info(&link.local_path)
-                .map(|info| DegradedLinkView { reason: info.reason });
+                .degraded_link_info(link.key())
+                .map(|info| DegradedLinkView { reason: info.reason })
+                // An orphaned link no longer takes part in sync at all; without a
+                // reason here it would read as an idle, up-to-date folder.
+                .or_else(|| {
+                    link.orphaned.then(|| DegradedLinkView {
+                        reason: "no longer authorized to sync; unlink this folder".to_string(),
+                    })
+                });
             // This link's active-transfer rollup, if any is currently in
             // flight.
             let transfer =
@@ -114,6 +121,7 @@ impl LinkStatusReadPort for DaemonLinkStatusReader {
                 });
             let durability_status = state.group_durability_status(&link.group_id);
             let durability_evidence = state.group_durability_evidence(&link.group_id);
+            let durability_check_pending = state.group_durability_check_pending(&link.group_id);
             let fully_hydrated_locally =
                 materialization.placeholder == 0 && materialization.hydrating == 0;
             let local_storage_state = match link.materialization_policy {
@@ -153,6 +161,11 @@ impl LinkStatusReadPort for DaemonLinkStatusReader {
                 .replica_coordinator
                 .link_repository()
                 .live_link_paths_for_group(&link.group_id)
+                .or_else(|e| match e {
+                    // A provider folder has no path to be linked twice at.
+                    yadorilink_sync_sqlite::SyncSqliteError::NotFilesystemRoot(_) => Ok(Vec::new()),
+                    other => Err(other),
+                })
                 .unwrap_or_else(|e| {
                     tracing::warn!(
                         group_id = %link.group_id,
@@ -161,8 +174,25 @@ impl LinkStatusReadPort for DaemonLinkStatusReader {
                     );
                     Vec::new()
                 });
+            let provider = match &link.location {
+                yadorilink_replica_domain::session_state::LinkLocation::Provider {
+                    root_id,
+                    ..
+                } => {
+                    let name = state
+                        .replica_coordinator
+                        .provider_repository()
+                        .root_display_name(root_id)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    Some((root_id.clone(), name))
+                }
+                yadorilink_replica_domain::session_state::LinkLocation::Folder(_) => None,
+            };
             out.push(LinkStatusView {
-                local_path: link.local_path.clone(),
+                provider,
+                local_path: link.key().to_string(),
                 group_id: link.group_id.clone(),
                 paused: link.paused,
                 conflict_count,
@@ -176,6 +206,7 @@ impl LinkStatusReadPort for DaemonLinkStatusReader {
                 transfer,
                 durability_status,
                 durability_evidence,
+                durability_check_pending,
                 // Surfaces the same staleness gate admission and local emission
                 // fail closed on, so a group whose policy this daemon distrusts
                 // (own verification failure or coordinator-flagged invalid) is

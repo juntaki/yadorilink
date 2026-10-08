@@ -37,6 +37,12 @@ fn now_unix_nanos() -> i64 {
         .unwrap_or(0)
 }
 
+/// How many names of one directory level are planned for themselves before the whole level is
+/// planned instead. A name costs a few indexed reads; a level costs its size, so for a directory
+/// of ten thousand entries the two meet at a couple of thousand names, and a smaller directory
+/// meets earlier.
+const SCOPED_PLAN_NAME_LIMIT: usize = 32;
+
 impl ReplicaCoordinator {
     /// Phase 1 of a structural `mkdir`: the intent and the fence bump for
     /// `path`, committed before the syscall.
@@ -204,6 +210,36 @@ impl ReplicaCoordinator {
         Ok(())
     }
 
+    /// Records that the reconciler left the entry of `path` at the copy name
+    /// `copy` for a reason only this device's disk knows, so native's
+    /// physical placement authority resolves the row there to that entry
+    /// until the row is replaced. Nothing is recorded when native shows no
+    /// head at `path` with the row's version.
+    pub(crate) fn record_reconciliation_hold(
+        &self,
+        group_id: &str,
+        copy: &str,
+        path: &str,
+    ) -> Result<(), SyncSqliteError> {
+        self.file_index_repository()
+            .record_native_reconciliation_hold(group_id, copy, path)
+            .map(|_| ())
+    }
+
+    /// Raises an obligation for every planned entry with no live row.
+    pub(crate) fn arm_native_plan_gaps(&self, group_id: &str) -> Result<usize, SyncSqliteError> {
+        self.file_index_repository().arm_native_plan_gaps(group_id)
+    }
+
+    /// The copy and relocated names native still records for `path`.
+    pub(crate) fn native_placed_names_of(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Vec<String>, SyncSqliteError> {
+        self.file_index_repository().native_placed_names_of(group_id, path)
+    }
+
     /// Records that the directory at `path` stays on disk although its
     /// entry is settled as deleted, with `reason` for status. `removable`
     /// is the identity of the directory a delete aimed at, which goes once
@@ -311,18 +347,6 @@ impl ReplicaCoordinator {
         self.sqlite().clear_retained_directory(group_id, path)
     }
 
-    /// Every entry this device keeps at its copy name because, on this
-    /// volume, a directory holds a name that folds to its own.
-    pub(crate) fn entries_held_beside_folded_directories(
-        &self,
-        group_id: &str,
-    ) -> Result<Vec<String>, SyncSqliteError> {
-        self.sqlite().retained_paths_with_reason(
-            group_id,
-            yadorilink_sync_sqlite::structural_origin::RETAINED_FOLDED_NAME,
-        )
-    }
-
     /// The reason a directory at `path` is retained, if it is.
     pub(crate) fn retained_directory_reason(
         &self,
@@ -359,22 +383,71 @@ impl ReplicaCoordinator {
     }
 
     /// What the namespace requires at `path` on its own account (one
-    /// transaction).
+    /// transaction), from native state.
     pub(crate) fn desired_path_state(
         &self,
         group_id: &str,
         path: &str,
     ) -> Result<yadorilink_sync_sqlite::desired_state::DesiredPathState, SyncSqliteError> {
-        self.sqlite().dag_desired_path_state(group_id, path)
+        self.sqlite().native_desired_path_state(group_id, path)
     }
 
-    /// One directory level of the desired namespace, relocated and
-    /// conflict-copy entries included (one transaction).
-    pub(crate) fn desired_level_projection(
+    /// Records `group_id` as native-authorized when it has no indexed rows
+    /// yet (see [`yadorilink_sync_sqlite::group_authority`]); whether it is
+    /// native afterwards.
+    pub(crate) fn adopt_native_authority_if_fresh(
+        &self,
+        group_id: &str,
+    ) -> Result<bool, SyncSqliteError> {
+        self.database().write::<_, SyncSqliteError>(|conn| {
+            yadorilink_sync_sqlite::group_authority::adopt_native_if_fresh(conn, group_id)
+        })
+    }
+
+    /// One directory level of native's materialization plan: the exact live
+    /// head behind every node, copies and relocated entries included.
+    pub(crate) fn native_plan_level(
         &self,
         group_id: &str,
         parent: &str,
-    ) -> Result<yadorilink_replica_engine::namespace::NamespaceProjection, SyncSqliteError> {
-        self.sqlite().dag_desired_level_projection(group_id, parent)
+    ) -> Result<yadorilink_replica_domain::native_plan::NativeLevelPlan, SyncSqliteError> {
+        self.file_index_repository().native_plan_level(group_id, parent)
+    }
+
+    /// The node of [`Self::native_plan_level`] at `path`, read without the rest of its level.
+    pub(crate) fn native_plan_node(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<yadorilink_replica_domain::native_plan::NativePlannedNode>, SyncSqliteError>
+    {
+        self.file_index_repository().native_plan_node(group_id, path)
+    }
+
+    /// The nodes of [`Self::native_plan_level`] that `names` are or stand for. A handful of
+    /// names is read for themselves; past [`SCOPED_PLAN_NAME_LIMIT`] the whole level is
+    /// planned once, which then costs less than naming each (the plan holds the requested nodes
+    /// and others, which callers ignore).
+    pub(crate) fn native_plan_for_names(
+        &self,
+        group_id: &str,
+        parent: &str,
+        names: &std::collections::BTreeSet<String>,
+    ) -> Result<yadorilink_replica_domain::native_plan::NativeLevelPlan, SyncSqliteError> {
+        if names.len() > SCOPED_PLAN_NAME_LIMIT {
+            self.native_plan_level(group_id, parent)
+        } else {
+            self.native_plan_nodes(group_id, parent, names)
+        }
+    }
+
+    /// The nodes of [`Self::native_plan_level`] that `names` are or stand for.
+    pub(crate) fn native_plan_nodes(
+        &self,
+        group_id: &str,
+        parent: &str,
+        names: &std::collections::BTreeSet<String>,
+    ) -> Result<yadorilink_replica_domain::native_plan::NativeLevelPlan, SyncSqliteError> {
+        self.file_index_repository().native_plan_nodes(group_id, parent, names)
     }
 }

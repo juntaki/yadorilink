@@ -63,7 +63,7 @@ pub fn folder_display_name(local_path: &str) -> String {
 /// split within a single `Attention` state, which `FolderState` doesn't
 /// need to distinguish) stays local to this function.
 pub fn folder_menu_label(link: &LinkStatus) -> String {
-    let name = folder_display_name(&link.local_path);
+    let name = yadorilink_product_view::folder::link_name(link);
     let suffix = match FolderState::from_link(link) {
         FolderState::Blocked => "  (not syncing: this folder group is linked twice)".to_string(),
         FolderState::Paused => "  (paused)".to_string(),

@@ -13,9 +13,62 @@ This is a **CLI/daemon-only** package:
 `yadorilink-desktop-app` (the tray/menu-bar status GUI, macOS/Windows only)
 and a Linux file-manager shell integration are explicitly out of scope.
 There is no GTK/appindicator dependency anywhere in this
-package as a result. `yadorilink-coordination` is a
-server-side binary and, as on the other platforms' installers, is
-**not** part of this package — deploy it to your own server instead.
+package as a result. The coordination service is a separate server-side
+deployment and, as on the other platforms' installers, is **not** part of this
+package.
+
+## Installing a release (most people)
+
+Download `yadorilink-linux-amd64.deb` (and its `.sha256`) from
+[GitHub Releases](https://github.com/juntaki/yadorilink/releases), then:
+
+```bash
+sha256sum -c yadorilink-linux-amd64.deb.sha256
+sudo apt install ./yadorilink-linux-amd64.deb
+systemctl --user enable --now yadorilink-daemon
+```
+
+First run:
+
+```bash
+yadorilink login
+yadorilink device register --name "my-box"
+yadorilink share create my-share --path ~/some/folder
+yadorilink status
+```
+
+If something needs attention, `yadorilink status` and `yadorilink doctor`
+show what the daemon sees, and `yadorilink preserved list` / `restore` /
+`retry` / `discard` manage items set aside when a folder group was reset.
+The [top-level README](../../README.md) covers the same flow and sharing
+with other people.
+
+Release builds connect to the YadoriLink coordination service by default;
+set `YADORILINK_COORDINATION_ADDR` to use another one (for the daemon, add
+it to the unit's environment, for example with `systemctl --user edit
+yadorilink-daemon`). Builds from source default to `http://127.0.0.1:8787`
+unless the build was made with `YADORILINK_DEFAULT_COORDINATION_ADDR` set.
+
+**Updating.** Update every device to the same release: install the newer
+`.deb` the same way.
+
+**Uninstalling.** `./uninstall.sh` from a repository checkout, or
+`systemctl --user disable --now yadorilink-daemon` followed by
+`sudo apt remove yadorilink`. Your synced folders and
+`~/.local/share/yadorilink` stay in place.
+
+**Pre-1.0 reset.** Releases before 1.0 do not promise compatibility
+migrations. If a version incompatibility prevents startup, remove
+YadoriLink's local application state and credentials and set up again; your
+synced folders and their files are not deleted. Run
+`systemctl --user stop yadorilink-daemon`, then remove
+`~/.local/share/yadorilink` (or `$XDG_DATA_HOME/yadorilink` if set), which
+holds the sync state database, block store, and the sign-in credentials
+file `credentials.json`, then start the daemon and run `yadorilink login`
+again. If you chose the system keyring as the credential store, also
+remove the `yadorilink` entries there.
+
+The rest of this file is for building the package from source.
 
 ## Packaging approach: hand-authored `control`/`postinst` + `dpkg-deb`, not `cargo-deb`
 
@@ -312,7 +365,7 @@ above apply here too, and were not re-checked separately for arm64).
 - `debian/postinst`, `debian/postrm` — package scripts (reminders only,
   no automatic systemd enable/disable — see "What the package does" above)
 - `debian/copyright` — DEP-5 copyright file, references the bundled
-  `LICENSE-MIT`
+  `LICENSE`
 - `systemd/yadorilink-daemon.service` — the daemon's systemd `--user`
   service unit, installed to `/usr/lib/systemd/user/`
 - `uninstall.sh` — companion uninstaller (run as your normal user, not

@@ -7,7 +7,7 @@
 #  - crates/yadorilink-daemon -> /usr/bin/yadorilink-daemon
 #  - systemd/yadorilink-daemon.service
 #  -> /usr/lib/systemd/user/yadorilink-daemon.service
-#  - LICENSE-MIT -> /usr/share/doc/yadorilink/
+#  - LICENSE -> /usr/share/doc/yadorilink/
 #
 # yadorilink-desktop-app (the GTK tray app) and yadorilink-sign-manifest
 # (a maintainer-only offline signing tool, see yadorilink-daemon's
@@ -145,7 +145,7 @@ strip "$STAGE_DIR/usr/bin/yadorilink" "$STAGE_DIR/usr/bin/yadorilink-daemon"
 
 install -m 644 "$SCRIPT_DIR/systemd/yadorilink-daemon.service" \
     "$STAGE_DIR/usr/lib/systemd/user/yadorilink-daemon.service"
-install -m 644 "$REPO_ROOT/LICENSE-MIT" "$STAGE_DIR/usr/share/doc/yadorilink/LICENSE-MIT"
+install -m 644 "$REPO_ROOT/LICENSE" "$STAGE_DIR/usr/share/doc/yadorilink/LICENSE"
 install -m 644 "$SCRIPT_DIR/debian/copyright" "$STAGE_DIR/usr/share/doc/yadorilink/copyright"
 install -m 644 "$SCRIPT_DIR/debian/yadorilink.lintian-overrides" \
     "$STAGE_DIR/usr/share/lintian/overrides/yadorilink"

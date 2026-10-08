@@ -236,6 +236,7 @@ fn unavailable_category_to_str(category: RemoteEvidenceErrorCategory) -> &'stati
         RemoteEvidenceErrorCategory::Unauthorized => "unauthorized",
         RemoteEvidenceErrorCategory::MalformedResponse => "malformed_response",
         RemoteEvidenceErrorCategory::Unsupported => "unsupported",
+        RemoteEvidenceErrorCategory::Pending => "pending",
     }
 }
 

@@ -151,7 +151,7 @@ fn create_key(parent: HKEY, subkey: &str) -> Result<HKEY> {
 /// handler (`*\shellex\ContextMenuHandlers`, i.e. applies to every file
 /// regardless of extension) rather than a folder-specific one, since a
 /// linked folder can contain any file type and every entry needs the
-/// same View Status/Pause/Resume/Pin/Evict actions.
+/// same View Status/Pause/Resume/Evict actions.
 const CONTEXT_MENU_NAME: &str = "YadoriLink";
 
 pub fn register_all() -> Result<()> {

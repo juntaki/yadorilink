@@ -60,7 +60,7 @@ impl LinkPauseResumePort for DaemonPauseResumeAdapter {
                 .list_links()?
                 .into_iter()
                 .find(|link| link.group_id == group_id && !link.orphaned)
-                .map(|link| link.local_path);
+                .and_then(|link| link.folder_path().map(str::to_string));
             if let Some(runtime) = local_path.and_then(|path| self.state.links.runtime(&path)) {
                 runtime.capture_resumed_item(group_id, rel_path).await.map_err(|e| {
                     SyncError::Io(std::io::Error::other(format!(

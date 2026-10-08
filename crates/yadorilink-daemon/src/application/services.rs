@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use super::ports::{
     DaemonLifecyclePort, DurabilityCommandPort, GcPort, GovernanceCommandPort, GroupAdministration,
-    HandoffCommandPort, LinkPauseResumePort, MaterializationPort, ReportingCommandPort,
-    UpdateCommandPort,
+    HandoffCommandPort, LinkPauseResumePort, MaterializationPort, PreservedPort,
+    ReportingCommandPort, UpdateCommandPort,
 };
 use super::{
     EnrollmentRecoveryService, EnrollmentService, LinkLifecycleService, ReplicaMembershipService,
@@ -30,6 +30,7 @@ pub(crate) struct ApplicationServices {
     pub(crate) replica_role: Arc<ReplicaRoleService>,
     pub(crate) pause_resume: Arc<dyn LinkPauseResumePort>,
     pub(crate) gc: Arc<dyn GcPort>,
+    pub(crate) preserved: Arc<dyn PreservedPort>,
     pub(crate) lifecycle: Arc<dyn DaemonLifecyclePort>,
     pub(crate) durability: Arc<dyn DurabilityCommandPort>,
     pub(crate) handoff: Arc<dyn HandoffCommandPort>,

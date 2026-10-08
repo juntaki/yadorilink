@@ -11,7 +11,7 @@ use yadorilink_ipc_proto::daemonctl::{
     StatusRequest,
 };
 
-use super::{link_status_json, materialization_state_word, peer_status_json};
+use super::{link_status_json, local_state_json, peer_status_json};
 use crate::error::ApiError;
 use crate::AppState;
 
@@ -107,7 +107,6 @@ pub async fn conflicts(State(state): State<AppState>) -> Result<Json<Value>, Api
                 "mtime_unix_nanos": f.mtime_unix_nanos,
                 "kind": f.kind().as_str_name(),
                 "reason": f.reason().as_str_name(),
-                "holds_compaction": f.holds_compaction,
             })
         })
         .collect();
@@ -192,7 +191,6 @@ pub async fn materialization(
     };
     Ok(Json(json!({
         "known": m.known,
-        "state": materialization_state_word(m.state()),
-        "pinned": m.pinned,
+        "local_state": local_state_json(m.local_state.as_ref()),
     })))
 }

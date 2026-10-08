@@ -1,7 +1,7 @@
 //! When a peer session exists: authorized, and reachable over the iroh
 //! substrate -- and never because a legacy QUIC channel came up.
 //!
-//! Two devices, each a `SyncStack` and a `ReconciliationDriver` over real
+//! Two devices, each a `SyncStack` and a `PeerSessionDriver` over real
 //! iroh endpoints, exactly the pieces a daemon assembles. No legacy endpoint
 //! is bound and no session is registered by hand.
 
@@ -11,9 +11,9 @@ use std::time::Duration;
 use yadorilink_sync_substrate::NetworkConfig;
 
 use crate::daemon_state::DaemonState;
-use crate::sync_adapter::driver::ReconciliationDriver;
+use crate::sync_adapter::driver::PeerSessionDriver;
 use crate::sync_adapter::sync_stack::SyncStack;
-use crate::test_support::sync_stack_fixture::{device, pin, FixtureAuthenticator, GROUP};
+use crate::test_support::sync_stack_fixture::{device, pin, GROUP};
 
 const ALICE: &str = "device-alice";
 const BOB: &str = "device-bob";
@@ -49,24 +49,20 @@ async fn pair(introduce: bool) -> Pair {
     pin(&alice, BOB, 22);
     pin(&bob, ALICE, 11);
     let alice_stack = Arc::new(
-        SyncStack::spawn(
-            alice.clone(),
-            Arc::new(FixtureAuthenticator),
-            NetworkConfig::direct_only(),
-        )
-        .await
-        .expect("alice's stack starts"),
+        SyncStack::spawn(alice.clone(), NetworkConfig::direct_only())
+            .await
+            .expect("alice's stack starts"),
     );
     let bob_stack = Arc::new(
-        SyncStack::spawn(bob.clone(), Arc::new(FixtureAuthenticator), NetworkConfig::direct_only())
+        SyncStack::spawn(bob.clone(), NetworkConfig::direct_only())
             .await
             .expect("bob's stack starts"),
     );
     if introduce {
         SyncStack::teach_each_other_for_tests(&alice_stack, &bob_stack);
     }
-    alice.install_reconciliation_driver(ReconciliationDriver::start(alice.clone(), alice_stack));
-    bob.install_reconciliation_driver(ReconciliationDriver::start(bob.clone(), bob_stack));
+    alice.install_peer_session_driver(PeerSessionDriver::start(alice.clone(), alice_stack));
+    bob.install_peer_session_driver(PeerSessionDriver::start(bob.clone(), bob_stack));
     Pair { alice, bob, _dirs: (alice_dir, bob_dir) }
 }
 
@@ -101,8 +97,8 @@ async fn a_peer_the_substrate_cannot_reach_gets_no_session_until_it_can() {
         "authorization alone is not a session: with nowhere to dial, there is none"
     );
 
-    let alice_stack = pair.alice.reconciliation_driver().unwrap().stack().clone();
-    let bob_stack = pair.bob.reconciliation_driver().unwrap().stack().clone();
+    let alice_stack = pair.alice.peer_session_driver().unwrap().stack().clone();
+    let bob_stack = pair.bob.peer_session_driver().unwrap().stack().clone();
     SyncStack::teach_each_other_for_tests(&alice_stack, &bob_stack);
     assert!(
         within(Duration::from_secs(60), || pair.alice.peers.has_session(BOB)).await,
@@ -140,7 +136,7 @@ async fn a_session_ends_with_its_connection_and_with_its_driver() {
 
     // Bob stops answering: his endpoint closes. Alice's connection to him
     // ends, and her session with it.
-    let bob_driver = pair.bob.take_reconciliation_driver().expect("bob's driver");
+    let bob_driver = pair.bob.take_peer_session_driver().expect("bob's driver");
     bob_driver.stack().shutdown().await;
     drop(bob_driver);
 
@@ -167,7 +163,7 @@ async fn a_keeper_that_finds_another_session_standing_takes_over_once_it_goes() 
             .await,
         "precondition"
     );
-    let alice_stack = pair.alice.reconciliation_driver().unwrap().stack().clone();
+    let alice_stack = pair.alice.peer_session_driver().unwrap().stack().clone();
 
     // Stand a session the keeper did not register in its place -- what a
     // replaced keeper's session looks like to its successor.

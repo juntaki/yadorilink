@@ -45,21 +45,7 @@ run_exact_ignored yadorilink-peer-session lib - \
 # rather than an absolute number, so they are meaningful on a soak runner
 # without being pinned to one machine's speed.
 run_exact_ignored yadorilink-sync-sqlite lib - \
-  retroactive_conflict::tests::plan_retroactive_merge_latency_vs_chain_depth
-run_exact_ignored yadorilink-sync-sqlite lib - \
-  rebootstrap_store::scale_cost_tests::seal_install_merge_and_admission_costs_stay_in_proportion_to_a_hundred_thousand_paths
-run_exact_ignored yadorilink-sync-sqlite test change_time_index_scale_benchmark \
-  frontier_heads_at_or_before_scale_sweep
-run_exact_ignored yadorilink-sync-sqlite test change_time_index_scale_benchmark \
-  frontier_heads_at_or_before_is_indifferent_to_unrelated_group_size
-run_exact_ignored yadorilink-sync-sqlite test change_time_index_scale_benchmark \
-  admission_write_cost_with_and_without_the_time_index
-run_exact_ignored yadorilink-sync-sqlite test dag_is_ancestor_scale_benchmark \
-  is_ancestor_latency_vs_linear_chain_depth
-run_exact_ignored yadorilink-sync-sqlite test dag_is_ancestor_unrelated_group_isolation \
-  is_ancestor_old_shape_for_a_fixed_target_group_as_an_unrelated_group_grows_red_baseline
-run_exact_ignored yadorilink-sync-sqlite test dag_is_ancestor_unrelated_group_isolation \
-  is_ancestor_for_a_fixed_target_group_as_an_unrelated_group_grows
+  native_summary_scaling_tests::summary_cost_at_100k_heads
 run_exact_ignored yadorilink-sync-sqlite test rewind_plan_scale_benchmark \
   compute_rewind_plan_scales_linearly_with_the_groups_own_path_count
 run_exact_ignored yadorilink-sync-sqlite test rewind_plan_scale_benchmark \
@@ -79,8 +65,6 @@ run_exact_ignored yadorilink-sync-sqlite test root_set_generation_write_cost \
 # meant to mean.
 run_exact_ignored yadorilink-daemon test retirement_backstop_group_deauthorization \
   manually_registered_session_survives_the_retirement_backstop
-run_exact_ignored yadorilink-daemon test authoring_identity_live_proof \
-  ensure_initial_import_keeps_the_invariant_zero_from_first_dag_backed_commit_onward
 
 # --- Environment probe ----------------------------------------------------
 #

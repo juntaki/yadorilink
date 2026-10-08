@@ -2,7 +2,7 @@
 //! drive convergence over the real `run()` loop (HeadsAnnounce ->
 //! ChangeRequest -> ChangeBatch) instead of the direct index exchange. A
 //! scenario gives each device's `LocalChangeProcessor` a signed
-//! [`ChangeEmitter`] (so every accepted local mutation appends a signed
+//! [`LocalAuthorKey`] (so every accepted local mutation appends a signed
 //! change to the history DAG in the same transaction as its index write),
 //! pins every device's verifying key on every session via a
 //! [`PinnedAuthenticator`], and then propagates a committed edit by
@@ -23,7 +23,7 @@ use ed25519_dalek::SigningKey;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_peer_session::block_serve::BlockServeEngine;
 use yadorilink_peer_session::peer_session::{ChangeAuthenticator, PeerSyncSession};
-use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
+use yadorilink_sync_sqlite::dag_store::LocalAuthorKey;
 
 /// Heads-announce re-drive cadence. The `run()` loop's periodic frontier
 /// audit re-sends an idempotent `HeadsAnnounce` every
@@ -53,8 +53,8 @@ pub fn signing_key_for(device_id: &str) -> SigningKey {
 
 /// The signed change emitter for `device_id`, wired into that device's
 /// `LocalChangeProcessor` via `with_change_emitter`.
-pub fn emitter_for(device_id: &str) -> Arc<ChangeEmitter> {
-    Arc::new(ChangeEmitter::new(device_id, signing_key_for(device_id)))
+pub fn emitter_for(device_id: &str) -> Arc<LocalAuthorKey> {
+    Arc::new(LocalAuthorKey::for_tests(device_id, signing_key_for(device_id)))
 }
 
 /// A change authenticator that pins every participating device's verifying

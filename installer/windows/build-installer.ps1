@@ -1,6 +1,7 @@
-# Builds the Windows installer and enforces the SEC-LOCAL-3 release policy:
-# release builds must be Authenticode-signed through an Inno Setup SignTool
-# profile. Every build, signed or unsigned, gets a SHA-256 sidecar -- every
+# Builds the Windows installer and enforces the release policy: release
+# builds are Authenticode-signed through an Inno Setup SignTool profile, or,
+# only while no code-signing certificate exists, built with -Release
+# -Unsigned and published under an explicitly unsigned name. Every build, signed or unsigned, gets a SHA-256 sidecar -- every
 # downloadable release artifact must have a published checksum regardless
 # of signing status (a signed
 # installer can still be checksummed to detect corruption/tampering in
@@ -11,7 +12,13 @@ param(
     [string]$ShellExtDir = "",
     [string]$SignToolName = "",
     [string]$SignToolCommand = "",
-    [switch]$Release
+    [switch]$Release,
+    # Release build WITHOUT Authenticode signing. Only valid together with
+    # -Release and without -SignToolName; used while no code-signing
+    # certificate exists. Every other release requirement (trust-root
+    # enforcement, checksum sidecar) still applies. The caller must publish
+    # the result under an explicitly unsigned name.
+    [switch]$Unsigned
 )
 
 $ErrorActionPreference = "Stop"
@@ -25,10 +32,16 @@ if (-not (Test-Path -LiteralPath $IsccPath)) {
     throw "ISCC.exe not found at $IsccPath"
 }
 
-if ($Release -and [string]::IsNullOrWhiteSpace($SignToolName)) {
+if ($Unsigned -and -not $Release) {
+    throw "-Unsigned is only meaningful together with -Release."
+}
+if ($Unsigned -and (-not [string]::IsNullOrWhiteSpace($SignToolName) -or -not [string]::IsNullOrWhiteSpace($SignToolCommand))) {
+    throw "-Unsigned cannot be combined with -SignToolName/-SignToolCommand."
+}
+if ($Release -and -not $Unsigned -and [string]::IsNullOrWhiteSpace($SignToolName)) {
     throw "Release builds must pass -SignToolName so yadorilink-setup.exe is Authenticode-signed."
 }
-if ($Release -and [string]::IsNullOrWhiteSpace($SignToolCommand)) {
+if ($Release -and -not $Unsigned -and [string]::IsNullOrWhiteSpace($SignToolCommand)) {
     throw "Release builds must pass -SignToolCommand so Inno Setup can invoke the signing tool."
 }
 if ($Release -and (
@@ -81,6 +94,17 @@ if (-not [string]::IsNullOrWhiteSpace($BinDir)) {
 if (-not [string]::IsNullOrWhiteSpace($ShellExtDir)) {
     $args += "/DShellExtDir=$ShellExtDir"
 }
+# AGPL-3.0 corresponding-source pointer shipped next to the LICENSE text: the
+# release workflow's tag/commit, else this checkout's commit.
+$sourceRef = $env:YADORILINK_SOURCE_REF
+if ([string]::IsNullOrWhiteSpace($sourceRef)) {
+    $sourceRef = (& git -C $repoRoot rev-parse HEAD).Trim()
+}
+$noticeDir = Join-Path $repoRoot "target\installer-notice"
+New-Item -ItemType Directory -Force -Path $noticeDir | Out-Null
+Set-Content -Path (Join-Path $noticeDir "SOURCE.txt") -Encoding ascii `
+    -Value "Corresponding source: https://github.com/juntaki/yadorilink/tree/$sourceRef"
+$args += "/DNoticeDir=$noticeDir"
 $args += $issPath
 
 & $IsccPath @args

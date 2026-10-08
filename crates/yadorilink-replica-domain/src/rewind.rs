@@ -2,7 +2,7 @@
 //! *would* have to change, per path, to bring a group's desired state back
 //! to what this device held at some wall-clock time T.
 //!
-//! Pure data. Nothing here emits a signed [`crate::change::Change`], touches
+//! Pure data. Nothing here emits a signed [`crate::local_op::Change`], touches
 //! a filesystem, creates a materialization obligation, or otherwise
 //! commits to anything -- a [`RewindPlan`] is a preview a caller renders
 //! and a human decides about. The types deliberately carry enough to

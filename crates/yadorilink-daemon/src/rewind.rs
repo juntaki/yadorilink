@@ -3,7 +3,7 @@
 //! This whole layer IS the dry run. It computes a [`RewindPlan`] and hands
 //! it back; it emits no signed change, writes nothing to any filesystem,
 //! creates no projection or materialization obligation, and changes nothing
-//! about DAG admission. Structurally: it calls one read-only query and maps
+//! about native admission. Structurally: it calls one read-only query and maps
 //! its error. There is deliberately no `dry_run` flag to distinguish,
 //! because there is no other mode.
 //!

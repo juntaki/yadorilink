@@ -39,7 +39,7 @@ const DEFAULT_LANE1_OPS: usize = 4;
 /// in the bundle is reproduced *by* the replay, not read from the file.
 #[derive(Debug, Deserialize)]
 struct ReplayTarget {
-    /// The scenario test-binary name, e.g. `dst_two_device_chaos`. Optional on
+    /// The scenario test-binary name, e.g. `dst_sec_convergence`. Optional on
     /// older corpus entries; then `--scenario` is required.
     scenario: Option<String>,
     seed: u64,
@@ -329,7 +329,7 @@ fn cmd_lane0(_args: &[String]) -> Result<(), String> {
     } else {
         eprintln!(
             "dst-lane0: skipping dst_runbook_freshness_lint -- its own subject \
-             (tests/dst_support/AGENT.md) is private-only and not present in this tree"
+             (tests/dst_support/AGENT.md) is not present in this tree"
         );
     }
     lints.arg("--test").arg("dst_fidelity_lint").arg("--test").arg("watcher_decompose_conformance");
@@ -422,7 +422,7 @@ fn cmd_prune(args: &[String]) -> Result<(), String> {
 ///
 /// `--seed <n>` runs a fresh, generator-driven case for that seed -- what
 /// `DST_BASE_SEED`/`DST_VARIATIONS=1` already means everywhere else in this
-/// tree, and what "§22's fresh sweep" gate is about. `--case <path>` instead
+/// tree, and what a fresh sweep means. `--case <path>` instead
 /// resolves a *recorded* corpus entry's own `seed` field (matched against
 /// `--seed` too, when both are given, to disambiguate one entry out of a
 /// shared multi-line corpus file) and repeats exactly that. These are NOT

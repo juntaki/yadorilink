@@ -5,7 +5,7 @@
 //! to this crate. The fixture could not follow them by being copied -- two
 //! copies of a 200-line mini-replica drift, and a fix lands on one side only --
 //! and it could not stay behind either, because `Device` is a
-//! `ReplicaCoordinator`, a link row, a `VerifiedRoot`, a startup gate, a DAG
+//! `ReplicaCoordinator`, a link row, a `VerifiedRoot`, a startup gate, native state
 //! and a self-signing checkpoint author: this crate's subject, not
 //! peer-session's.
 //!
@@ -16,9 +16,7 @@
 //! peer-session half can both go.
 #![allow(dead_code)] // each side of the split uses a different subset
 
-// Reusable plain-build change-DAG test support (pinned-key authenticator +
-// signed-change producer). Only `pinned_authenticator` is used here; the
-// module is `#![allow(dead_code)]` so the unused `DagProducer` is fine.
+// Reusable plain-build native-delta test support (signed-delta producer).
 pub mod dag_wire_support;
 
 use ed25519_dalek::SigningKey;
@@ -30,27 +28,27 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 
 use crate::replica_coordinator::ReplicaCoordinator;
-use dag_wire_support::{attach_self_signed_checkpoint, pinned_authenticator, DagProducer};
+use dag_wire_support::DagProducer;
 use proto::block_response_header::Outcome as BlockOutcome;
 use yadorilink_ipc_proto::sync as proto;
 use yadorilink_local_capture::{LocalChangeOutcome, LocalChangeProcessor};
 use yadorilink_local_storage::SegmentBlockStore;
 use yadorilink_peer_session::peer_session::{
-    BlockWriteActivityProvider, ChangeAuthenticator, PeerSyncSession, PeerSyncSessionDeps,
-    RootCommitAuthorityProvider,
+    BlockWriteActivityProvider, PeerSyncSession, PeerSyncSessionDeps, PendingLocalChangeFlush,
+    PendingLocalFlushOutcome, RootCommitAuthorityProvider,
 };
 use yadorilink_peer_session::ports::BlockStreamTransport;
 use yadorilink_peer_session::rate_limiter::RateLimiters;
 use yadorilink_replica_domain::session_state::MaterializationState;
 use yadorilink_root_authority::root_commit::RootCommitPermit;
-use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
+use yadorilink_sync_sqlite::dag_store::LocalAuthorKey;
 use yadorilink_transport::{QuicBlockStream, QuicPeerChannel, MAX_BLOCK_STREAM_HEADER_BYTES};
 
 /// The payload a test's bare `FileRecord` stands for: an ordinary
 /// regular file with no separately-carried metadata.
 ///
 /// Production never builds one this way -- it carries the version from
-/// whatever produced the bytes (a resolved DAG version, the wire metadata
+/// whatever produced the bytes (a resolved native version, the wire metadata
 /// that arrived with the record). These fixtures have only the record, so
 /// this derives the version that record itself names.
 ///
@@ -151,9 +149,9 @@ pub struct Device {
     pub root: tempfile::TempDir,
     pub store: Arc<SegmentBlockStore>,
     pub state: Arc<ReplicaCoordinator>,
-    // This device's Ed25519 change-signing key. Local edits go through the
-    // change DAG (`processor()` wires this as the `ChangeEmitter`), and the
-    // peer pins the matching verifying key so it admits the signed changes.
+    // This device's Ed25519 change-signing key. Local edits go through
+    // native authoring (`processor()` wires this as the `LocalAuthorKey`), and the
+    // peer pins the matching verifying key so it admits the signed deltas.
     pub signing_key: SigningKey,
     // Next `checkpoint_seq` [`Device::publish_pending`] self-signs with --
     // see that method's own doc comment.
@@ -174,11 +172,6 @@ pub struct Device {
     /// A device joins an existing book with [`Device::peer`], which is what
     /// makes a pairing explicit rather than ambient.
     pub book: yadorilink_lane_ports::testing::TestAddressBook,
-    /// Where this device holds a re-bootstrap snapshot between signing a
-    /// manifest against it and a peer collecting it -- the real production
-    /// type (`yadorilink-lane-ports`'s own), not a test double, mirroring
-    /// `SyncStack`'s identical one-per-daemon field.
-    pub prepared_snapshots: Arc<yadorilink_lane_ports::PreparedSnapshots>,
 }
 
 pub struct BlockingActivityProvider {
@@ -292,17 +285,17 @@ impl Device {
             state,
             node,
             book,
-            prepared_snapshots: Arc::new(yadorilink_lane_ports::PreparedSnapshots::new()),
             signing_key: SigningKey::from_bytes(&seed),
             next_checkpoint_seq: std::sync::atomic::AtomicU64::new(1),
         }
     }
 
-    /// A `ChangeEmitter` signing as this device. Recreated on demand — its
-    /// lamport/parent state lives in the group's DAG in `ReplicaCoordinator`, not in the
-    /// emitter, so a fresh instance auto-parents from the current heads.
-    pub fn emitter(&self) -> Arc<ChangeEmitter> {
-        Arc::new(ChangeEmitter::new(self.device_id.clone(), self.signing_key.clone()))
+    /// A `LocalAuthorKey` signing as this device. Recreated on demand — its
+    /// authoring state lives in the group's native state in
+    /// `ReplicaCoordinator`, not in the emitter, so a fresh instance authors
+    /// from the current heads.
+    pub fn emitter(&self) -> Arc<LocalAuthorKey> {
+        Arc::new(LocalAuthorKey::for_tests(self.device_id.clone(), self.signing_key.clone()))
     }
 
     pub fn processor(&self) -> LocalChangeProcessor {
@@ -316,7 +309,7 @@ impl Device {
     }
 
     /// A signed-change producer over this device's state/store, for scenarios
-    /// that need to inject a specific record as a genuine DAG commit rather than
+    /// that need to inject a specific record as a genuine native commit rather than
     /// via a real on-disk edit (`commit_create` stores the block and emits a
     /// signed Create, the same primitive the local-change producer drives).
     pub fn producer(&self) -> DagProducer {
@@ -337,7 +330,7 @@ impl Device {
         HashMap::from([(GROUP.to_string(), self.root_path())])
     }
 
-    /// Publishes every change this device's own DAG head reaches from
+    /// Publishes every change this device's own native head reaches from
     /// `heads` -- the whole "everything committed since the last publish"
     /// span for [`GROUP`] -- by self-signing one covering checkpoint and
     /// attaching it to this device's own store, mirroring the daemon's real
@@ -352,47 +345,14 @@ impl Device {
     /// buffer like `DagProducer::publish_pending` does, since `processor()`
     /// builds a FRESH `LocalChangeProcessor` per call (no persistent
     /// producer instance to track authored hashes on) -- so this instead
-    /// re-derives "what's Pending" from the DAG directly: everything
+    /// re-derives "what's Pending" from native state directly: everything
     /// reachable from the current heads that has no evidence yet.
     pub fn publish_pending(&self) {
-        let heads = self.state.sqlite().dag_group_heads(GROUP).unwrap();
-        let mut hashes = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        let mut queue = heads;
-        while let Some(hash) = queue.pop() {
-            if !seen.insert(hash) {
-                continue;
-            }
-            if self.state.sqlite().dag_get_encoded(&hash).unwrap().is_none() {
-                continue;
-            }
-            let published = self
-                .state
-                .database()
-                .read::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
-                    yadorilink_sync_sqlite::dag_store::published_view::change_evidence(conn, &hash)
-                })
-                .unwrap()
-                .is_some();
-            if published {
-                continue;
-            }
-            let change = self.state.sqlite().dag_get_change(&hash).unwrap().unwrap();
-            if change.device_id.as_str() == self.device_id {
-                hashes.push(hash);
-            }
-            queue.extend(self.state.sqlite().dag_parents_of(&hash).unwrap());
-        }
-        if hashes.is_empty() {
-            return;
-        }
-        let changes: Vec<_> = hashes
-            .iter()
-            .map(|h| self.state.sqlite().dag_get_change(h).unwrap().unwrap())
-            .collect();
-        let checkpoint_seq =
-            self.next_checkpoint_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        attach_self_signed_checkpoint(&self.state, &self.signing_key, checkpoint_seq, &changes);
+        dag_wire_support::publish_pending_native_deltas(
+            &self.state,
+            &self.signing_key,
+            &self.device_id,
+        );
     }
 }
 
@@ -404,7 +364,7 @@ impl Device {
 /// every non-orphaned link at boot before any fallible watcher setup, and the
 /// `AddLink` control path arms one via `start_link_watch` in the same call that
 /// commits the row. Peer apply for a live link with no gate therefore defers —
-/// on the change-DAG path and the legacy convergence path alike — so a link set
+/// on every path — so a link set
 /// up with a bare `add_link` would silently defer every incoming record for the
 /// whole test budget instead of exercising what the test means to check.
 pub fn link_with_completed_startup(state: &ReplicaCoordinator, local_path: &str) {
@@ -702,153 +662,6 @@ pub fn spawn_session(device: &Device, peer_device_id: &str) -> Arc<TestPeerRunti
     spawn_session_with_groups(device, peer_device_id, vec![GROUP.to_string()])
 }
 
-/// Like `spawn_session`, but with `change_authenticator` explicitly wired at
-/// construction instead of defaulting to `DerivedKeyAuthenticator` -- for a
-/// test whose subject needs a different authenticator (a fixed pinned key
-/// set via `dag_authenticator`/`pinned_authenticator`, a permissive or
-/// multi-device stand-in, etc.) than the automatic per-device-id derivation
-/// `spawn_session` installs.
-pub fn spawn_session_with_authenticator(
-    device: &Device,
-    peer_device_id: &str,
-    change_authenticator: Arc<dyn ChangeAuthenticator>,
-) -> Arc<TestPeerRuntime> {
-    spawn_session_configured_ex(
-        device,
-        peer_device_id,
-        vec![GROUP.to_string()],
-        true,
-        change_authenticator,
-        Some(AlwaysValidRootCommitAuthorityProvider::shared()),
-    )
-}
-
-/// Admits any device whose signing key matches the deterministic per-id key
-/// `Device::new` assigns (Sha256(device_id)) — the trust material the daemon
-/// would inject from the coordination plane's netmap. Wired automatically by
-/// `spawn_session` so a pair admits each other's signed changes over the change
-/// DAG without per-test key plumbing.
-pub struct DerivedKeyAuthenticator;
-
-/// Every fixed device id `Device::new` is ever constructed with across this
-/// file -- `resolve_authority_key` receives only a fingerprint (one-way
-/// hashed from the checkpoint's signing key, itself one-way derived from a
-/// device id), so recovering "which device" from a bare fingerprint means
-/// re-deriving each known candidate's key and matching fingerprints, not
-/// inverting a hash. Extend this list if a test introduces a new FIXED
-/// device id -- a scenario that generates a bounded, formulaic FAMILY of
-/// device ids (e.g. `recv_loop_survives_a_catchup_batch_larger_than_the_
-/// permit_budget`'s 80 `stress-dev-NNN` producers) instead enumerates its
-/// own family in [`DerivedKeyAuthenticator::resolve_authority_key`] below,
-/// rather than growing this list unboundedly.
-pub const KNOWN_DEVICE_IDS: &[&str] = &["device-a", "device-b", "device-c", "stress-control"];
-
-impl ChangeAuthenticator for DerivedKeyAuthenticator {
-    fn resolve_authority_key(
-        &self,
-        _group_id: &str,
-        signer_key_id: &[u8; 32],
-        _policy_head: &[u8; 32],
-    ) -> Option<ed25519_dalek::VerifyingKey> {
-        let matches_fingerprint = |device_id: &str, signer_key_id: &[u8; 32]| {
-            let seed: [u8; 32] = sha256_bytes(device_id.as_bytes()).try_into().ok()?;
-            let key = SigningKey::from_bytes(&seed).verifying_key();
-            (&yadorilink_replica_domain::authorization_checkpoint::fingerprint_signing_key(&key)
-                == signer_key_id)
-                .then_some(key)
-        };
-        KNOWN_DEVICE_IDS
-            .iter()
-            .find_map(|device_id| matches_fingerprint(device_id, signer_key_id))
-            .or_else(|| {
-                // `recv_loop_survives_a_catchup_batch_larger_than_the_permit_
-                // budget`'s bounded `stress-dev-NNN` producer family -- see
-                // `KNOWN_DEVICE_IDS`'s own doc comment for why this is a
-                // pattern match, not a `KNOWN_DEVICE_IDS` growth.
-                (0..200u32)
-                    .find_map(|i| matches_fingerprint(&format!("stress-dev-{i:03}"), signer_key_id))
-            })
-    }
-}
-
-/// Builds real, self-consistent `(checkpoints, published_changes)` for a
-/// hand-assembled batch: `handle_change_batch`
-/// fully verifies every change against its carried checkpoint/proof now, so
-/// a test injecting a batch by hand (rather than through the real
-/// `PeerSyncSession::announce_local_commit`/`send_change_batch` path) must
-/// carry real evidence too, not bare change bytes. Each entry pairs a
-/// change with the signing key that authored it; changes sharing one
-/// `(group_id, device_id)` are covered by one checkpoint, signed by that
-/// same key -- these tests have no real coordination-plane authority, so
-/// the author signing its own checkpoint is the minimal faithful stand-in
-/// (`DerivedKeyAuthenticator`/`pinned_authenticator` both accept any
-/// pinned/derivable key as a valid authority, not only a real one).
-pub fn checkpointed_batch(
-    keyed_changes: &[(&SigningKey, &yadorilink_replica_domain::change::Change)],
-) -> (
-    Vec<yadorilink_sync_wire::AuthorizationCheckpointEnvelopeFrame>,
-    Vec<yadorilink_sync_wire::PublishedChangeFrame>,
-) {
-    use yadorilink_replica_domain::authorization_checkpoint::{
-        build_merkle_proof, canonical_signing_bytes, checkpoint_hash, fingerprint_signing_key,
-        merkle_root, sign_checkpoint, AuthorizationCheckpoint,
-    };
-
-    let mut by_author: std::collections::BTreeMap<
-        (String, String),
-        (&SigningKey, Vec<&yadorilink_replica_domain::change::Change>),
-    > = std::collections::BTreeMap::new();
-    for (key, change) in keyed_changes {
-        by_author
-            .entry((change.group_id.to_string(), change.device_id.to_string()))
-            .or_insert_with(|| (key, Vec::new()))
-            .1
-            .push(change);
-    }
-
-    let mut checkpoints = Vec::new();
-    let mut published_changes = Vec::new();
-    for ((group_id, device_id), (signing_key, changes)) in by_author {
-        let author_fingerprint = fingerprint_signing_key(&signing_key.verifying_key());
-        let hashes: Vec<[u8; 32]> = changes.iter().map(|c| c.compute_hash().0).collect();
-        let checkpoint = AuthorizationCheckpoint {
-            group_id,
-            device_id,
-            signing_key_fingerprint: author_fingerprint,
-            merkle_root: merkle_root(&hashes),
-            leaf_count: hashes.len() as u64,
-            checkpoint_seq: 1,
-            signer_key_id: author_fingerprint,
-            policy_epoch: 0,
-            policy_seq: 0,
-            policy_head: [0u8; 32],
-            issued_at_unix: 0,
-        };
-        let encoded = canonical_signing_bytes(&checkpoint);
-        let signature = sign_checkpoint(&checkpoint, signing_key);
-        let hash = checkpoint_hash(&encoded, &signature);
-        checkpoints.push(yadorilink_sync_wire::AuthorizationCheckpointEnvelopeFrame {
-            checkpoint_hash: hash.to_vec(),
-            checkpoint: encoded,
-            signature: signature.to_vec(),
-            author_signing_public_key: signing_key.verifying_key().to_bytes().to_vec(),
-        });
-        for (index, change) in changes.iter().enumerate() {
-            let proof = build_merkle_proof(&hashes, index);
-            published_changes.push(yadorilink_sync_wire::PublishedChangeFrame {
-                change: change.to_wire_bytes(),
-                checkpoint_hash: hash.to_vec(),
-                proof: Some(yadorilink_sync_wire::AuthorizationMerkleProofFrame {
-                    leaf_index: proof.leaf_index as u64,
-                    leaf_count: proof.leaf_count as u64,
-                    siblings: proof.siblings.iter().map(|s| s.to_vec()).collect(),
-                }),
-            });
-        }
-    }
-    (checkpoints, published_changes)
-}
-
 /// `yadorilink_peer_session::peer_session::PeerSyncSessionDeps::standalone()` wires the deny-by-default provider
 /// (mirroring the daemon-facing `PeerSyncSessionDeps::denied()`),
 /// which makes every real-mutation call (`materialize`, `hydrate_file_with_
@@ -883,17 +696,81 @@ impl RootCommitAuthorityProvider for AlwaysValidRootCommitAuthorityProvider {
     }
 }
 
+/// The three ports the convergence executor takes beside its session.
+pub struct ExecutorPorts {
+    pub root_commit_authority_provider: Arc<dyn RootCommitAuthorityProvider>,
+    pub pending_local_change_flush: Arc<dyn PendingLocalChangeFlush>,
+    pub block_write_activity_provider: Arc<dyn BlockWriteActivityProvider>,
+}
+
+impl ExecutorPorts {
+    /// No live root-commit authority (every real mutation fails closed), no
+    /// pending local change to flush, no write-activity guard.
+    pub fn denied() -> Self {
+        Self {
+            root_commit_authority_provider: Arc::new(DeniedRootCommitAuthority),
+            pending_local_change_flush: Arc::new(SettledPendingLocalChangeFlush),
+            block_write_activity_provider: Arc::new(NoWriteActivity),
+        }
+    }
+
+    /// [`Self::denied`], with a root-commit authority that always grants a
+    /// lease so a real mutation path can run.
+    pub fn permissive() -> Self {
+        Self {
+            root_commit_authority_provider: AlwaysValidRootCommitAuthorityProvider::shared(),
+            ..Self::denied()
+        }
+    }
+}
+
+struct DeniedRootCommitAuthority;
+
+impl RootCommitAuthorityProvider for DeniedRootCommitAuthority {
+    fn root_lease_for(
+        &self,
+        _group_id: &str,
+    ) -> Option<Arc<yadorilink_root_authority::root_commit::RootLease>> {
+        None
+    }
+}
+
+struct SettledPendingLocalChangeFlush;
+
+impl PendingLocalChangeFlush for SettledPendingLocalChangeFlush {
+    fn flush_pending_local_change<'a>(
+        &'a self,
+        _group_id: &'a str,
+        _rel_path: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = PendingLocalFlushOutcome> + Send + 'a>>
+    {
+        Box::pin(async { PendingLocalFlushOutcome::Settled })
+    }
+
+    fn flush_case_fold_sibling<'a>(
+        &'a self,
+        _group_id: &'a str,
+        _rel_path: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = PendingLocalFlushOutcome> + Send + 'a>>
+    {
+        Box::pin(async { PendingLocalFlushOutcome::Settled })
+    }
+}
+
+struct NoWriteActivity;
+
+impl BlockWriteActivityProvider for NoWriteActivity {
+    fn begin_block_write_activity(&self) -> Box<dyn Send + '_> {
+        Box::new(())
+    }
+}
+
 pub fn spawn_session_with_groups(
     device: &Device,
     peer_device_id: &str,
     shared_group_ids: Vec<String>,
 ) -> Arc<TestPeerRuntime> {
-    spawn_session_configured(
-        device,
-        peer_device_id,
-        shared_group_ids,
-        Arc::new(DerivedKeyAuthenticator),
-    )
+    spawn_session_configured(device, peer_device_id, shared_group_ids)
 }
 
 /// Fallback poll interval for `spawn_test_convergence_driver` when the wake
@@ -902,13 +779,13 @@ pub fn spawn_session_with_groups(
 pub const TEST_CONVERGENCE_FALLBACK: Duration = Duration::from_millis(100);
 
 /// The production daemon's `ConvergenceEngine` is the only thing that
-/// turns an admitted DAG change into on-disk content:
-/// `handle_change_batch` now only admits the change and enqueues a
-/// `materialization_jobs` row. This harness's sessions have no daemon and
-/// thus no engine, so any test that asserts on disk content (not just DAG
+/// turns an admitted native delta into on-disk content:
+/// peer-session delivery only admits the delta and arms a
+/// projection obligation. This harness's sessions have no daemon and
+/// thus no engine, so any test that asserts on disk content (not just native
 /// admission) needs this driver running, or it will hang until its own
 /// timeout regardless of how correct the sync logic is. Deliberately polls
-/// `reconcile_paths_directly` for whatever the DAG currently shows as
+/// `reconcile_paths_directly` for whatever native state currently shows as
 /// admitted-but-unapplied, rather than re-deriving the engine's own
 /// claim/obligation logic — this harness only needs *some* driver of
 /// materialization, not a second implementation of the real scheduler.
@@ -940,15 +817,15 @@ pub fn spawn_test_convergence_driver(
             };
 
             for group_id in &group_ids {
-                if let Ok(changes) =
-                    state.change_history_repository().dag_list_group_changes(group_id)
+                if let Ok(touched) =
+                    state.database().read::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+                        conn.prepare("SELECT DISTINCT path FROM native_heads WHERE group_id = ?1")?
+                            .query_map([group_id], |row| row.get::<_, String>(0))?
+                            .collect::<Result<std::collections::BTreeSet<_>, _>>()
+                            .map_err(Into::into)
+                    })
                 {
-                    let mut paths = std::collections::BTreeSet::new();
-                    for change in &changes {
-                        for op in &change.ops {
-                            yadorilink_replica_engine::change_ops::collect_op_paths(op, &mut paths);
-                        }
-                    }
+                    let mut paths = touched;
                     // Excludes any path a real, in-flight fetch is
                     // currently hydrating: a handful of tests manually
                     // orchestrate a precise race window against ONE
@@ -1010,7 +887,7 @@ pub fn spawn_test_convergence_driver(
 /// `reconcile_local_materialization_audit` alone no longer performs
 /// ordinary reprojection, so a caller expecting a fresh admission to
 /// materialize after ONE call must
-/// also drive `reconcile_paths_directly` for whatever the DAG shows as
+/// also drive `reconcile_paths_directly` for whatever native state shows as
 /// admitted-but-unapplied first. Propagates the audit call's own error
 /// (matching every existing call site's `.unwrap()`); the reconcile step
 /// is best-effort, exactly like `spawn_test_convergence_driver`'s.
@@ -1052,14 +929,12 @@ pub fn spawn_session_configured(
     device: &Device,
     peer_device_id: &str,
     shared_group_ids: Vec<String>,
-    change_authenticator: Arc<dyn ChangeAuthenticator>,
 ) -> Arc<TestPeerRuntime> {
     spawn_session_configured_ex(
         device,
         peer_device_id,
         shared_group_ids,
         true,
-        change_authenticator,
         Some(AlwaysValidRootCommitAuthorityProvider::shared()),
     )
 }
@@ -1078,14 +953,7 @@ pub fn spawn_session_without_convergence_driver(
     device: &Device,
     peer_device_id: &str,
 ) -> Arc<TestPeerRuntime> {
-    spawn_session_configured_ex(
-        device,
-        peer_device_id,
-        vec![GROUP.to_string()],
-        false,
-        Arc::new(DerivedKeyAuthenticator),
-        None,
-    )
+    spawn_session_configured_ex(device, peer_device_id, vec![GROUP.to_string()], false, None)
 }
 
 /// Like `spawn_session_without_convergence_driver`, but wires a permissive
@@ -1103,7 +971,6 @@ pub fn spawn_session_without_convergence_driver_with_root_authority(
         peer_device_id,
         vec![GROUP.to_string()],
         false,
-        Arc::new(DerivedKeyAuthenticator),
         Some(AlwaysValidRootCommitAuthorityProvider::shared()),
     )
 }
@@ -1117,12 +984,8 @@ pub fn spawn_session_with_block_serve_engine(
     let transports = yadorilink_peer_session::ports::SessionTransports {
         blocks: peer_transports.clone(),
         service: peer_transports.clone(),
-        prepared_snapshots: device.prepared_snapshots.clone(),
-        snapshot_fetch: peer_transports,
     };
     let deps = PeerSyncSessionDeps {
-        change_authenticator: Arc::new(DerivedKeyAuthenticator),
-        root_commit_authority_provider: AlwaysValidRootCommitAuthorityProvider::shared(),
         block_serve_engine: Some(block_serve_engine),
         ..yadorilink_peer_session::peer_session::PeerSyncSessionDeps::standalone()
     };
@@ -1138,13 +1001,11 @@ pub fn spawn_session_with_block_serve_engine(
         replica_engine,
         device.store.clone(),
         vec![GROUP.to_owned()],
-        device.sync_roots(),
         transports,
-        None,
-        deps.clone(),
+        deps,
     );
     device.node.serve_with(peer_device_id, session.clone());
-    let runtime = runtime_for(device, session.clone(), &deps);
+    let runtime = runtime_for(device, session.clone(), &ExecutorPorts::permissive());
     spawn_test_convergence_driver(&runtime, device.state.clone(), vec![GROUP.to_owned()]);
     runtime
 }
@@ -1169,12 +1030,8 @@ pub fn spawn_session_with_rate_limiters(
     let transports = yadorilink_peer_session::ports::SessionTransports {
         blocks: peer_transports.clone(),
         service: peer_transports.clone(),
-        prepared_snapshots: device.prepared_snapshots.clone(),
-        snapshot_fetch: peer_transports,
     };
     let deps = PeerSyncSessionDeps {
-        change_authenticator: Arc::new(DerivedKeyAuthenticator),
-        root_commit_authority_provider: AlwaysValidRootCommitAuthorityProvider::shared(),
         rate_limiters,
         ..yadorilink_peer_session::peer_session::PeerSyncSessionDeps::standalone()
     };
@@ -1190,10 +1047,8 @@ pub fn spawn_session_with_rate_limiters(
         replica_engine,
         device.store.clone(),
         vec![GROUP.to_owned()],
-        device.sync_roots(),
         transports,
-        None,
-        deps.clone(),
+        deps,
     );
     device.node.serve_with(peer_device_id, session.clone());
     session.set_block_serve_engine(yadorilink_peer_session::block_serve::BlockServeEngine::new(
@@ -1202,7 +1057,7 @@ pub fn spawn_session_with_rate_limiters(
         u64::MAX,
         1_000,
     ));
-    let runtime = runtime_for(device, session.clone(), &deps);
+    let runtime = runtime_for(device, session.clone(), &ExecutorPorts::permissive());
     spawn_test_convergence_driver(&runtime, device.state.clone(), vec![GROUP.to_owned()]);
     runtime
 }
@@ -1219,24 +1074,16 @@ pub fn spawn_session_configured_ex(
     peer_device_id: &str,
     shared_group_ids: Vec<String>,
     install_convergence_driver: bool,
-    change_authenticator: Arc<dyn ChangeAuthenticator>,
     root_commit_authority_provider: Option<Arc<dyn RootCommitAuthorityProvider>>,
 ) -> Arc<TestPeerRuntime> {
     let convergence_groups = shared_group_ids.clone();
     let convergence_state = device.state.clone();
 
-    let mut deps = PeerSyncSessionDeps {
-        change_authenticator,
-        ..yadorilink_peer_session::peer_session::PeerSyncSessionDeps::standalone()
-    };
+    let deps = PeerSyncSessionDeps::standalone();
+    let mut ports = ExecutorPorts::denied();
     if let Some(provider) = root_commit_authority_provider {
-        deps.root_commit_authority_provider = provider;
+        ports.root_commit_authority_provider = provider;
     }
-    // The executor the session used to construct for itself, built from the
-    // same three dependencies the session is about to be handed. Cloned
-    // before `deps` moves into the constructor, so both halves of the
-    // runtime are demonstrably built from one set of dependencies rather
-    // than from two independently-assembled ones.
 
     // The transports, from this device's own substrate endpoint — the same
     // adapters production uses, over a real iroh connection this fixture
@@ -1248,17 +1095,8 @@ pub fn spawn_session_configured_ex(
     let transports = yadorilink_peer_session::ports::SessionTransports {
         blocks: peer_transports.clone(),
         service: peer_transports.clone(),
-        prepared_snapshots: device.prepared_snapshots.clone(),
-        snapshot_fetch: peer_transports,
     };
 
-    // Every spawned pair admits each other's signed changes (deterministic keys,
-    // or whatever `change_authenticator` the caller supplied), so a pre-existing
-    // file propagates over the DAG via the startup heads-announce exactly as it
-    // would with a coordination-plane netmap.
-    // Cloned before `deps` moves into the constructor, so the executor and
-    // the session are demonstrably built from one set of dependencies.
-    let deps_for_executor = deps.clone();
     let replica_engine = crate::replica_coordinator::engine_ports::build_peer_replica_engine(
         &device.state,
         device.store.clone(),
@@ -1271,9 +1109,7 @@ pub fn spawn_session_configured_ex(
         replica_engine,
         device.store.clone(),
         shared_group_ids,
-        device.sync_roots(),
         transports,
-        None,
         deps,
     );
     // Block serving is no longer optional: every real (`DaemonState`-backed)
@@ -1296,7 +1132,7 @@ pub fn spawn_session_configured_ex(
     // both devices before either session.
     device.node.serve_with(peer_device_id, session.clone());
 
-    let runtime = runtime_for(device, session.clone(), &deps_for_executor);
+    let runtime = runtime_for(device, session.clone(), &ports);
     if install_convergence_driver {
         spawn_test_convergence_driver(&runtime, convergence_state, convergence_groups);
     }
@@ -1304,13 +1140,12 @@ pub fn spawn_session_configured_ex(
 }
 
 /// Puts `record` into `device`'s index as an unhydrated placeholder — the
-/// state a device is in once it has adopted a peer's Change but before it has
+/// state a device is in once it has adopted a peer's delta but before it has
 /// any of the content.
 ///
 /// The tests below are about the block lane: what crosses it, how fast, and
-/// whether the bytes survive the round trip. How the *Change* reached this
-/// device is a separate mechanism with its own coverage, and it used to be
-/// the only reason these tests needed a Change-carrying wire at all.
+/// whether the bytes survive the round trip. How the *delta* reached this
+/// device is a separate mechanism with its own coverage.
 pub fn adopt_as_placeholder(device: &Device, record: &yadorilink_replica_domain::file::FileRecord) {
     device
         .state
@@ -1323,7 +1158,7 @@ pub fn adopt_as_placeholder(device: &Device, record: &yadorilink_replica_domain:
         .set_materialization_state(
             GROUP,
             &record.path,
-            MaterializationState::Placeholder,
+            MaterializationState::Remote,
             &RootCommitPermit::for_tests(),
         )
         .unwrap();
@@ -1370,16 +1205,6 @@ pub fn wait_until<F: Fn() -> bool>(
     }
 }
 
-/// A `ChangeAuthenticator` that pins every listed device's verifying key and
-/// treats each as a writer — the trust material the daemon injects from the
-/// coordination plane's netmap. Wire it onto both sessions of a pair so each
-/// admits the other's signed changes.
-pub fn dag_authenticator(devices: &[&Device]) -> Arc<dyn ChangeAuthenticator> {
-    let pairs: Vec<(&str, &SigningKey)> =
-        devices.iter().map(|d| (d.device_id.as_str(), &d.signing_key)).collect();
-    pinned_authenticator(&pairs)
-}
-
 /// How long a convergence wait tolerates *no* forward progress before it
 /// declares a stall.
 ///
@@ -1400,7 +1225,7 @@ pub const NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Sets `device` up the way a peer that has adopted a file but not its
 /// content is set up: an index row for `path` referencing one block whose
-/// hash is `content`'s, a `Placeholder` materialization state, and a
+/// hash is `content`'s, a `Remote` materialization state, and a
 /// placeholder on disk -- with nothing at all in the block store. A
 /// `hydrate_file_with_timeout` call against it turns into exactly one block
 /// request for the returned hash.
@@ -1435,16 +1260,10 @@ pub fn seed_placeholder_awaiting_hydration(device: &Device, path: &str, content:
         .set_materialization_state(
             GROUP,
             path,
-            MaterializationState::Placeholder,
+            MaterializationState::Remote,
             &RootCommitPermit::for_tests(),
         )
         .unwrap();
-    yadorilink_local_storage::write_placeholder(
-        &device.root_path().join(path),
-        content.len() as u64,
-        0,
-    )
-    .unwrap();
     hash
 }
 
@@ -1465,8 +1284,7 @@ pub fn seed_placeholder_awaiting_hydration(device: &Device, path: &str, content:
 pub fn seed_referenced_block(device: &Device, path: &str, data: &[u8]) -> Vec<u8> {
     // `commit_create` + `publish_pending` (not a raw `store.put` +
     // `upsert_file`): block-serving authorization now requires a real
-    // PUBLISHED Change backing the served path (proof-carrying-change
-    // items 6, 9-12) -- `commit_create` also calls `record_group_block_
+    // PUBLISHED delta backing the served path -- `commit_create` also calls `record_group_block_
     // provenance` itself, matching what this helper used to do explicitly.
     let record = device.producer().commit_create(GROUP, path, data, 0);
     device.publish_pending();
@@ -1484,13 +1302,12 @@ pub fn seed_referenced_block_without_provenance(
     path: &str,
     data: &[u8],
 ) -> Vec<u8> {
-    // Same PUBLISHED-Change authoring as `seed_referenced_block`, but then
+    // Same PUBLISHED-delta authoring as `seed_referenced_block`, but then
     // strips the provenance row `commit_create` records as a side effect --
     // this helper's whole point is isolating "referenced by a real
-    // published Change, but never obtained through this group" from "not
-    // referenced at all," so the Change itself must still be genuinely
-    // published (proof-carrying-change items 6, 9-12), only its provenance
-    // withheld.
+    // published delta, but never obtained through this group" from "not
+    // referenced at all," so the delta itself must still be genuinely
+    // published, only its provenance withheld.
     let record = device.producer().commit_create(GROUP, path, data, 0);
     device.publish_pending();
     let hash = record.blocks[0].hash.clone();
@@ -1580,6 +1397,127 @@ pub struct TestPeerRuntime {
     /// per-path lock the hydration wrappers must take lives on it and the
     /// session's own handle is private.
     pub state: Arc<ReplicaCoordinator>,
+    /// The store as the daemon's own state holds it; present when the runtime was built from a
+    /// device, which is what lets [`TestPeerRuntime::hydrate_file`] run the PRODUCTION hydration.
+    block_store: Option<Arc<dyn yadorilink_local_storage::BlockStore + Send + Sync>>,
+    daemon: std::sync::OnceLock<Arc<crate::daemon_state::DaemonState>>,
+}
+
+/// What a hydration of one path concluded, as these tests observe it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HydrationOutcome {
+    /// Content is fully written to disk under this path's name.
+    Hydrated,
+    /// Every block was fetched, but a filename hazard withheld the physical write.
+    Held { reason: String },
+}
+
+impl TestPeerRuntime {
+    /// A daemon state over the SAME coordinator and store, with this runtime's session registered as
+    /// the peer: the production hydration (`hydration::hydrate`) runs against it, so the tests that
+    /// used the executor's own second hydration body now exercise the one production implementation.
+    fn daemon_state(&self) -> &Arc<crate::daemon_state::DaemonState> {
+        self.daemon.get_or_init(|| {
+            let store = self
+                .block_store
+                .clone()
+                .expect("hydrate_file needs a runtime built from a device (it carries the store)");
+            let state = crate::daemon_state::DaemonState::new(
+                self.convergence.local_device_id.clone(),
+                self.state.clone(),
+                store,
+            );
+            state.peers.register_session(
+                self.driver().peer_device_id().to_string(),
+                self.session.clone(),
+                self.convergence.clone(),
+            );
+            state
+        })
+    }
+
+    /// Obtains and writes one path's content through the convergence executor's PRODUCTION lane
+    /// (`materialize`, the Eager path the receive engine drives): the bulk fetch family, whose
+    /// block-fetch behaviour (what is re-asked, what is not) differs on purpose from the
+    /// interactive one `hydrate_file` runs. `RetryRequired` (content not obtained) is an error.
+    pub async fn materialize_via_convergence(
+        &self,
+        group_id: &str,
+        path: &str,
+        timeout: std::time::Duration,
+    ) -> Result<(), yadorilink_peer_session::PeerSessionError> {
+        use crate::local_convergence::types::{MaterializationPayload, MaterializeResult};
+        use yadorilink_peer_session::PeerSessionError;
+        let current = self
+            .state
+            .current_row_snapshot(group_id, path)?
+            .ok_or_else(|| PeerSessionError::NotFound(format!("file {group_id}/{path}")))?;
+        let payload = MaterializationPayload::from_current_row(path, current.to_file_version());
+        let driver = self.driver();
+        let outcome = tokio::time::timeout(
+            timeout,
+            self.convergence.materialize(
+                &driver,
+                group_id,
+                &payload,
+                yadorilink_replica_domain::session_state::MaterializationPolicy::Eager,
+                driver.peer_device_id(),
+                None,
+            ),
+        )
+        .await;
+        match outcome {
+            Ok(Ok(MaterializeResult::Settled(_))) => Ok(()),
+            Ok(Ok(MaterializeResult::RetryRequired)) | Err(_) => {
+                Err(PeerSessionError::HydrationFailed(path.to_string()))
+            }
+            Ok(Err(error)) => Err(error),
+        }
+    }
+
+    /// Hydrates one path through the production in-place hydration, with its default ceiling.
+    pub async fn hydrate_file(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<HydrationOutcome, yadorilink_peer_session::PeerSessionError> {
+        self.hydrate_file_with_timeout(
+            group_id,
+            path,
+            yadorilink_peer_session::peer_session::DEFAULT_HYDRATION_TIMEOUT,
+        )
+        .await
+    }
+
+    /// [`Self::hydrate_file`] with an absolute ceiling.
+    pub async fn hydrate_file_with_timeout(
+        &self,
+        group_id: &str,
+        path: &str,
+        timeout: std::time::Duration,
+    ) -> Result<HydrationOutcome, yadorilink_peer_session::PeerSessionError> {
+        use yadorilink_peer_session::PeerSessionError;
+        let state = self.daemon_state().clone();
+        // No link runtime runs in these fixtures: the same always-valid authority the executor's
+        // own ports use stands in for the link's root lease.
+        state.install_test_root_commit_authority(group_id);
+        match crate::hydration::hydrate_with_timeout(&state, group_id, path, timeout).await {
+            Ok(()) => {
+                // A path held for a filename hazard is not hydrated, whatever the fetch did.
+                match self.state.get_held_state(group_id, path) {
+                    Ok(Some(reason)) => Ok(HydrationOutcome::Held { reason: reason.reason }),
+                    _ => Ok(HydrationOutcome::Hydrated),
+                }
+            }
+            Err(crate::sync_error::SyncError::NotFound(what)) => {
+                Err(PeerSessionError::NotFound(what))
+            }
+            Err(other) => {
+                let _ = other;
+                Err(PeerSessionError::HydrationFailed(path.to_string()))
+            }
+        }
+    }
 }
 
 impl TestPeerRuntime {
@@ -1592,32 +1530,27 @@ impl TestPeerRuntime {
     }
 }
 
-/// The executor half of a [`TestPeerRuntime`], built from the very
-/// dependencies the session was handed -- passed by reference so a caller
-/// cannot accidentally assemble a second, differently-configured set.
+/// The executor half of a [`TestPeerRuntime`], built from `ports`.
 fn runtime_for(
     device: &Device,
     session: Arc<PeerSyncSession>,
-    deps: &PeerSyncSessionDeps,
+    ports: &ExecutorPorts,
 ) -> Arc<TestPeerRuntime> {
-    runtime_from_parts(
+    runtime_build(
         session,
         &device.device_id,
         device.state.clone(),
         device.store.clone(),
         device.sync_roots(),
-        deps,
+        ports,
+        Some(device.store.clone()),
     )
 }
 
-/// A [`TestPeerRuntime`] for a session built by hand from
-/// `PeerSyncSessionDeps::test_permissive()`, rather than through one of the
-/// `spawn_session*` helpers above.
-///
-/// The executor takes three of its seven dependencies from that same
-/// `test_permissive()` set, so a caller that built its session any other way
-/// would get an executor configured differently from the session beside it.
-/// Use [`runtime_from_parts`] with the real `deps` in that case.
+/// A [`TestPeerRuntime`] for a session built by hand, rather than through one
+/// of the `spawn_session*` helpers above, whose executor takes
+/// [`ExecutorPorts::permissive`]. Use [`runtime_from_parts`] to supply other
+/// ports.
 pub fn permissive_runtime(
     session: Arc<PeerSyncSession>,
     local_device_id: &str,
@@ -1625,37 +1558,81 @@ pub fn permissive_runtime(
     store: Arc<dyn yadorilink_peer_session::ports::BlockContentStore>,
     sync_roots: HashMap<String, std::path::PathBuf>,
 ) -> Arc<TestPeerRuntime> {
+    runtime_build(
+        session,
+        local_device_id,
+        state,
+        store,
+        sync_roots,
+        &ExecutorPorts::permissive(),
+        None,
+    )
+}
+
+/// [`permissive_runtime`] for a concrete store, which also lets [`TestPeerRuntime::hydrate_file`]
+/// run the production hydration over the same store.
+pub fn permissive_runtime_with_store<S>(
+    session: Arc<PeerSyncSession>,
+    local_device_id: &str,
+    state: Arc<ReplicaCoordinator>,
+    store: Arc<S>,
+    sync_roots: HashMap<String, std::path::PathBuf>,
+) -> Arc<TestPeerRuntime>
+where
+    S: yadorilink_peer_session::ports::BlockContentStore
+        + yadorilink_local_storage::BlockStore
+        + 'static,
+{
     runtime_from_parts(
         session,
         local_device_id,
         state,
         store,
         sync_roots,
-        &yadorilink_peer_session::peer_session::PeerSyncSessionDeps::test_permissive(),
+        &ExecutorPorts::permissive(),
     )
 }
 
-/// [`permissive_runtime`], for a session whose `deps` the caller has in hand.
-pub fn runtime_from_parts(
+/// [`permissive_runtime`], for a caller that has its own `ports`.
+pub fn runtime_from_parts<S>(
+    session: Arc<PeerSyncSession>,
+    local_device_id: &str,
+    state: Arc<ReplicaCoordinator>,
+    store: Arc<S>,
+    sync_roots: HashMap<String, std::path::PathBuf>,
+    ports: &ExecutorPorts,
+) -> Arc<TestPeerRuntime>
+where
+    S: yadorilink_peer_session::ports::BlockContentStore
+        + yadorilink_local_storage::BlockStore
+        + 'static,
+{
+    runtime_build(session, local_device_id, state, store.clone(), sync_roots, ports, Some(store))
+}
+
+fn runtime_build(
     session: Arc<PeerSyncSession>,
     local_device_id: &str,
     state: Arc<ReplicaCoordinator>,
     store: Arc<dyn yadorilink_peer_session::ports::BlockContentStore>,
     sync_roots: HashMap<String, std::path::PathBuf>,
-    deps: &PeerSyncSessionDeps,
+    ports: &ExecutorPorts,
+    block_store: Option<Arc<dyn yadorilink_local_storage::BlockStore + Send + Sync>>,
 ) -> Arc<TestPeerRuntime> {
     Arc::new(TestPeerRuntime {
         convergence: crate::local_convergence::LocalConvergenceExecutor::new(
             state.clone(),
             local_device_id.to_string(),
-            deps.root_commit_authority_provider.clone(),
-            deps.pending_local_change_flush.clone(),
+            ports.root_commit_authority_provider.clone(),
+            ports.pending_local_change_flush.clone(),
             sync_roots,
             store,
-            deps.block_write_activity_provider.clone(),
+            ports.block_write_activity_provider.clone(),
             crate::local_convergence::HeadroomPolicy::disabled(),
         ),
         session,
         state,
+        block_store,
+        daemon: std::sync::OnceLock::new(),
     })
 }

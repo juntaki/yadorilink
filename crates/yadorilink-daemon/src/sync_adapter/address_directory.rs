@@ -69,7 +69,7 @@ impl CoordinationAddressDirectory {
     /// Records where `peer` answers, as the coordination plane reported it.
     ///
     /// Called when a netmap push carries substrate addresses for a device.
-    /// Raising the reconciliation driver's own "peer reachable" event here
+    /// Raising the peer session driver's own "peer reachable" event here
     /// would be the wrong layer: iroh decides when an address is usable, and
     /// the driver already learns reachability from the netmap itself.
     pub fn record(&self, peer: PeerId, direct: Vec<SocketAddr>, relays: Vec<String>) {

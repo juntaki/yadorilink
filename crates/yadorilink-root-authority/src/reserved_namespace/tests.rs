@@ -148,7 +148,7 @@ fn path_level_finds_the_specific_component() {
 /// path even though the exclusion predicate
 /// (`is_reserved_component`/`path_has_reserved_component`) is `true`
 /// for the same path — see the module doc's "Two predicates, not one"
-/// section. This is what lets DAG admission and peer materialization
+/// section. This is what lets native admission and peer materialization
 /// (which must key on the rejection predicate) leave a legacy-marked
 /// path alone, while the watcher/scan/import (which key on exclusion)
 /// still keep it out of ordinary sync. Mutation-checked: this fails if

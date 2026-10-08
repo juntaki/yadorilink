@@ -42,13 +42,37 @@ fn refusal_for(
 }
 
 impl PeerSyncSession {
+    /// Test-only: this session's own service RPC deadline.
+    pub fn set_service_rpc_deadline_for_tests(&self, deadline: std::time::Duration) {
+        self.service_rpc_deadline_ms
+            .store(deadline.as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Make one service RPC and read its single answer.
     ///
-    /// No request id, no pending map, no cancellation guard to stop that map
-    /// leaking, and no timeout whose job was to bound an answer that might
-    /// never be correlated: the stream is the correlation, and dropping this
-    /// future closes it.
+    /// No request id, no pending map, and no cancellation guard to stop that
+    /// map leaking: the stream is the correlation, and dropping this future
+    /// closes it. The whole exchange is bounded by the session's service RPC
+    /// deadline, so a peer that takes the stream and never answers gives the
+    /// caller `None` -- the same as any other failure -- rather than a hang.
     async fn service_rpc(
+        &self,
+        transport: &Arc<dyn crate::ports::ServiceStreamTransport>,
+        request: &crate::service_rpc::ServiceRequest,
+    ) -> Option<crate::service_rpc::ServiceResponse> {
+        let deadline = std::time::Duration::from_millis(
+            self.service_rpc_deadline_ms.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        match tokio::time::timeout(deadline, self.service_rpc_unbounded(transport, request)).await {
+            Ok(response) => response,
+            Err(_) => {
+                tracing::debug!(peer = %self.peer_device_id, "service RPC timed out");
+                None
+            }
+        }
+    }
+
+    async fn service_rpc_unbounded(
         &self,
         transport: &Arc<dyn crate::ports::ServiceStreamTransport>,
         request: &crate::service_rpc::ServiceRequest,
@@ -268,8 +292,8 @@ impl PeerSyncSession {
     }
 
     /// Asks this peer whether it durably holds the exact file version
-    /// identified by `version_hash` — the change-DAG's own `change::
-    /// VersionHash`, SHA-256 of the version's canonical `FileVersion`
+    /// identified by `version_hash` — the `VersionHash`,
+    /// SHA-256 of the version's canonical `FileVersion`
     /// encoding (ordered block list with per-block size, total size, and
     /// metadata) — and returns its answer. `blocks` restates the same
     /// version's ordered block list (hash + size) so the responder can run

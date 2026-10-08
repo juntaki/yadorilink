@@ -7,14 +7,14 @@ use crate::error::LocalCaptureError;
 use yadorilink_filesystem_sync::debounce::DebounceFlush;
 use yadorilink_filesystem_sync::watcher::{FsChangeEvent, FsChangeKind};
 use yadorilink_replica_domain::file::FileRecord;
-use yadorilink_root_authority::fs_identity::{disk_race_fingerprint, FileIdentity};
+use yadorilink_root_authority::fs_identity::FileIdentity;
 use yadorilink_root_authority::ignore_patterns::EffectiveIgnoreSet;
 use yadorilink_sync_sqlite::SyncSqliteError;
 
 use super::dirty_journal::dirty_kind_str;
+use super::disk_observation::disk_matches_prepare;
 use super::event_ingest::EventOutcome;
 use super::path_policy::relative_key;
-use super::record_builder::file_and_authoring;
 use super::{FlushOutcome, LocalChangeOutcome, LocalChangeProcessor};
 
 /// One path's authoritative mutation, prepared during a batched flush's
@@ -34,14 +34,6 @@ pub(super) struct PendingBatchedCommit {
     pub(super) rel_path: String,
     pub(super) event_path: PathBuf,
     pub(super) observed_at_unix_nanos: i64,
-    pub(super) index_state_at_prepare: Option<FileRecord>,
-    // A `FileRecord` comparison alone cannot catch a peer commit whose new
-    // version's size/mtime/blocks happen to coincide with the old one (a
-    // metadata-only change, or content that happens to hash the same) --
-    // see `LocalMutationStore::canonical_current_row`'s own doc for why
-    // this is compared too, and why it comes from the same read as
-    // `index_state_at_prepare`.
-    pub(super) authoring_change_hash_at_prepare: Option<yadorilink_replica_domain::ids::ChangeHash>,
     pub(super) disk_fingerprint_at_prepare: Option<(u64, Option<std::time::SystemTime>, i64, i64)>,
     pub(super) mutation: yadorilink_replica_domain::session_state::PreparedLocalMutation,
 }
@@ -185,7 +177,7 @@ impl LocalChangeProcessor {
                 // multi-second disk-full/EIO and the retry loop eventually
                 // gives up, the in-memory knowledge that these paths changed
                 // would otherwise be lost — a permanent split-brain. Rows
-                // survive until the read/blockify/put/index+DAG step commits
+                // survive until the read/blockify/put/index+delta step commits
                 // (cleared on the `Ok` arms below); a startup rescan and the
                 // on-failure retry both re-drive whatever is still journaled.
                 // If the batch call itself fails, fall back to the previous
@@ -293,7 +285,7 @@ impl LocalChangeProcessor {
                     // — must not
                     // silently drop this already-detected local edit: the
                     // debounce accumulator has already drained this path, and
-                    // no live-repair sweep revisits a `Hydrated` row whose
+                    // no live-repair sweep revisits a `Present` row whose
                     // on-disk bytes then silently drifted, so a dropped local
                     // write here is a permanent split-brain (two devices at
                     // the identical version vector with different on-disk
@@ -321,10 +313,10 @@ impl LocalChangeProcessor {
                                 Some(&mut pending_batch),
                             )
                             .await;
-                        // The read/blockify/put/index+DAG step for this path
+                        // The read/blockify/put/index+delta step for this path
                         // committed (or was a no-op), so its durable dirty-journal
                         // row is no longer needed — clear it. A crash in the
-                        // narrow window between the index+DAG commit and this
+                        // narrow window between the index+delta commit and this
                         // delete just leaves the row for the next rescan, which
                         // re-reads the path, finds disk == index, and clears it
                         // as a `None` outcome: idempotent, never a lost edit.
@@ -379,7 +371,7 @@ impl LocalChangeProcessor {
                                 // withheld this edit's change rather than stamp
                                 // it with a placeholder authorization context —
                                 // a placeholder-auth change would become a local
-                                // DAG head every valid-policy peer rejects,
+                                // native head every valid-policy peer rejects,
                                 // stranding this and every descendant change on
                                 // an un-replicable branch. This is expected and
                                 // transient, not a failure: leave the durable
@@ -387,7 +379,7 @@ impl LocalChangeProcessor {
                                 // so the startup/backstop re-drive re-emits the
                                 // path — with a real authorization stamp — once a
                                 // valid policy snapshot restores the group.
-                                // Nothing was written to the index or the DAG
+                                // Nothing was written to the index or native state
                                 // (the emit path returns before opening its write
                                 // transaction), and the user's on-disk bytes are
                                 // untouched; only the change emission is deferred.
@@ -553,12 +545,13 @@ impl LocalChangeProcessor {
     ///    materialization (or another local capture) write to that exact
     ///    path in the gap — reintroducing the stale-materialization race
     ///    class this project has repeatedly had to close elsewhere.
-    ///    Acquired in lexicographic path order (not the batch's original
-    ///    order) so two concurrent holders of overlapping path sets can
-    ///    never form a lock-order cycle; nothing else in this daemon ever
-    ///    holds more than one path lock at a time (`PeerSyncSession`'s own
-    ///    per-path reconcile locks, releases, then moves to the next path),
-    ///    so ordering here is sufficient on its own.
+    ///    Acquired in lexicographic order of each path's lock key -- its
+    ///    case/normalization fold, which is what the lock registry keys on
+    ///    (not the batch's original order, and not the raw string) -- so
+    ///    two concurrent holders of overlapping path sets never form a
+    ///    lock-order cycle, and names that fold together are one lock taken
+    ///    once. Directory capture takes several locks the same way; every
+    ///    other holder in this daemon takes one path lock at a time.
     /// 2. **Revalidation immediately before commit, still under lock.**
     ///    Preparing a mutation (chunk/hash/decide) happens with no lock
     ///    held at all, so by the time this function acquires a path's
@@ -604,25 +597,18 @@ impl LocalChangeProcessor {
             unreachable!("a batched mutation was prepared without a change_emitter configured");
         };
 
-        // Acquire every member's path lock in lexicographic order --
-        // deadlock safety against any other concurrent holder of a
-        // different subset of these same locks (see this function's own
-        // doc comment, point 1).
-        let mut sorted_paths: Vec<&str> = batch.iter().map(|p| p.rel_path.as_str()).collect();
-        sorted_paths.sort_unstable();
-        let mut guards: std::collections::HashMap<String, tokio::sync::OwnedMutexGuard<()>> =
-            std::collections::HashMap::with_capacity(batch.len());
-        for rel_path in sorted_paths {
-            if guards.contains_key(rel_path) {
-                // The same path cannot appear twice in one debounce flush
-                // (`DebounceFlush::Paths` is keyed by path -- see its own
-                // doc comment), so this only guards against a future
-                // caller violating that invariant rather than double-
-                // locking a path against itself here.
-                continue;
-            }
+        // Acquire every member's path lock in lexicographic order of the
+        // fold the lock registry keys on -- deadlock safety against any
+        // other concurrent holder of a different subset of these same
+        // locks (see this function's own doc comment, point 1). Ordering and
+        // de-duplicating the raw strings is not enough: `Report.txt` and
+        // `report.txt` are one lock, so a raw-string pass would take it
+        // twice and wait on itself, and two holders could disagree on the
+        // order of folded-equal names.
+        let mut guards: Vec<tokio::sync::OwnedMutexGuard<()>> = Vec::with_capacity(batch.len());
+        for rel_path in path_lock_order(batch.iter().map(|p| p.rel_path.as_str())) {
             let lock = self.state.path_lock(group_id, rel_path);
-            guards.insert(rel_path.to_string(), lock.lock_owned().await);
+            guards.push(lock.lock_owned().await);
         }
 
         // Revalidate each, in the batch's original order — see this
@@ -639,21 +625,28 @@ impl LocalChangeProcessor {
         // excluded item.
         let mut evidence_if_kept = Vec::with_capacity(batch.len());
         for pending_commit in &batch {
-            let current_disk = disk_race_fingerprint(&pending_commit.event_path);
-            let (current_index, current_authoring_change_hash) = file_and_authoring(
-                &pending_commit.rel_path,
-                self.state.canonical_current_row(group_id, &pending_commit.rel_path)?,
-            );
-            // `current_index == index_state_at_prepare` alone cannot catch
-            // a peer commit whose new version's size/mtime/blocks happen
-            // to coincide with the old one (a metadata-only change, or
-            // content that happens to hash the same) -- comparing the
-            // row's authoring identity too closes that gap, on this exact
-            // batching boundary: every commit,
-            // local or peer, stamps a fresh, distinct authoring hash.
-            let still_current = current_disk == pending_commit.disk_fingerprint_at_prepare
-                && current_index == pending_commit.index_state_at_prepare
-                && current_authoring_change_hash == pending_commit.authoring_change_hash_at_prepare;
+            // Whether the row still shows what the mutation was prepared
+            // against is native's verdict (its witness, read before the
+            // row), so a peer commit that happens to coincide with the old
+            // version's size/mtime/blocks is still caught.
+            let native_fresh = match pending_commit.mutation.native_witness() {
+                Some(witness) => self.state.native_capture_is_fresh(group_id, witness)?,
+                None => true,
+            };
+            let still_current = disk_matches_prepare(
+                &pending_commit.event_path,
+                &pending_commit.disk_fingerprint_at_prepare,
+            ) && native_fresh
+                && !match &pending_commit.mutation {
+                    yadorilink_replica_domain::session_state::PreparedLocalMutation::Upsert {
+                        record,
+                        version,
+                        ..
+                    } => self.authors_pre_image_of_open_write(group_id, record, version)?,
+                    yadorilink_replica_domain::session_state::PreparedLocalMutation::Delete {
+                        ..
+                    } => false,
+                };
             if !still_current {
                 tracing::info!(
                     path = %pending_commit.rel_path,
@@ -703,11 +696,29 @@ impl LocalChangeProcessor {
                 &valid_evidence,
                 &self.device_id,
                 crate::ports::LocalChangeEmission {
-                    emitter: &emitter,
+                    author: &emitter,
                     permit: &self.begin_operation()?.permit(),
                 },
             );
             if let Err(e) = commit_result {
+                // An edit refused because this replica's own bucket at its
+                // path is full of versions it was not shown can never be
+                // authored there by retrying: hand it to the reconciliation
+                // that preserves it as a conflict copy, so it neither stays
+                // dirty (holding the capture barrier against every peer
+                // change at the path) nor is lost.
+                let unauthorable = unauthorable_upsert(&e).and_then(|path| {
+                    valid_mutations.iter().zip(&resolved).find_map(|(mutation, (_, rel, _))| {
+                        (is_upsert_at(mutation, path) && rel == path).then(|| rel.clone())
+                    })
+                });
+                if let Some(rel_path) = unauthorable {
+                    self.hold_unauthorable_edit(group_id, &rel_path)?;
+                    // The reconciliation skips a locked path: wake it only
+                    // once this batch's locks are released.
+                    drop(guards);
+                    self.state.wake_install_reconciliation();
+                }
                 tracing::warn!(
                     error = %e,
                     group_id,
@@ -721,5 +732,73 @@ impl LocalChangeProcessor {
         Ok(resolved)
         // `guards` drops here, releasing every path lock this batch held —
         // only after the shared commit above has returned.
+    }
+}
+
+/// The paths in the order their locks are taken, each lock once.
+///
+/// The lock registry keys a path by its case/normalization fold, so the
+/// order and the identity of a lock are both those of the fold: names that
+/// fold together are one lock and appear once (the first of them), and two
+/// holders ordering by the same key can never wait on each other in a
+/// cycle. Ordering or de-duplicating the raw strings does neither.
+pub(super) fn path_lock_order<S: AsRef<str>>(paths: impl IntoIterator<Item = S>) -> Vec<S> {
+    let mut by_lock_key = std::collections::BTreeMap::new();
+    for path in paths {
+        by_lock_key
+            .entry(yadorilink_root_authority::canonical_fold::canonical_fold(path.as_ref()))
+            .or_insert(path);
+    }
+    by_lock_key.into_values().collect()
+}
+
+/// The path of a local `Put` refused because the author's own bucket there
+/// would hold more than `MAX_SELF_HEADS` heads: both of its own heads at the
+/// path are versions this write was not shown, so no retry authors it.
+pub(super) fn unauthorable_upsert(error: &SyncSqliteError) -> Option<&str> {
+    match error {
+        SyncSqliteError::AuthoringRefused {
+            refusal:
+                yadorilink_replica_domain::author::AuthoringRefusal::OwnBucketOverCap { path, .. },
+        } => Some(path.as_str()),
+        _ => None,
+    }
+}
+
+/// Whether `mutation` saves content at exactly `path`.
+fn is_upsert_at(
+    mutation: &yadorilink_replica_domain::session_state::PreparedLocalMutation,
+    path: &str,
+) -> bool {
+    matches!(
+        mutation,
+        yadorilink_replica_domain::session_state::PreparedLocalMutation::Upsert {
+            op: yadorilink_replica_domain::local_op::Op::Put { path: put, .. },
+            ..
+        } if put.as_str() == path
+    )
+}
+
+impl LocalChangeProcessor {
+    /// Hands the edit on disk at `rel_path`, which this replica cannot
+    /// author there ([`unauthorable_upsert`]), to the install
+    /// reconciliation: the path is held with no prior placement, so the
+    /// reconciliation preserves the edit as a conflict copy (captured as a
+    /// new file) and places the path's current value, and capture authors
+    /// nothing at the path meanwhile. The caller holds the path's lock and
+    /// wakes the reconciliation once it has released it.
+    pub(super) fn hold_unauthorable_edit(
+        &self,
+        group_id: &str,
+        rel_path: &str,
+    ) -> Result<(), LocalCaptureError> {
+        tracing::warn!(
+            group_id,
+            path = rel_path,
+            "a local edit cannot be authored: this device's own heads at the path are two \
+             versions it was not shown; preserving the edit as a conflict copy"
+        );
+        self.state.hold_unauthorable_local_edit(group_id, rel_path)?;
+        Ok(())
     }
 }

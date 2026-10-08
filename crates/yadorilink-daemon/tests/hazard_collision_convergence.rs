@@ -10,7 +10,7 @@
 //! body, including the now-impossible propagation, never ran) and hanging
 //! for real on macOS (the guard doesn't fire there, so the body ran and
 //! waited forever). The real replacement for DAG propagation is this
-//! daemon's `ReconciliationDriver` (RBSR/substrate-based), which lives
+//! daemon's `PeerSessionDriver` (RBSR/substrate-based), which lives
 //! entirely outside `yadorilink-peer-session` -- so all five are migrated
 //! here, driven through the real full daemon stack (`connect_two_daemons`,
 //! real transport, real peer sessions) `collision_matrix.rs` already uses
@@ -44,18 +44,15 @@ use std::time::Duration;
 use support::{real_entry_names, wait_until, wait_until_with_context, TestAccount};
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
-use yadorilink_daemon::local_convergence::types::HydrationOutcome;
-use yadorilink_daemon::replica_coordinator::ReplicaChangeEmission;
+
 use yadorilink_daemon::sync_error::SyncError;
 use yadorilink_local_storage::SegmentBlockStore;
-use yadorilink_replica_domain::change::{Op, PutOrigin};
 use yadorilink_replica_domain::file::{
     BlockInfo, FileMeta, FileRecord, FileVersion, RecordKind, VersionBlock,
 };
-use yadorilink_replica_domain::ids::{BlockHash, ChangeHash, FolderGroupId, SyncPath};
-use yadorilink_replica_domain::session_state::{ChangeContent, MaterializationPolicy};
+use yadorilink_replica_domain::ids::{BlockHash, FolderGroupId};
+use yadorilink_replica_domain::session_state::MaterializationPolicy;
 use yadorilink_root_authority::root_commit::RootCommitPermit;
-use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
 
 struct TestDevice {
     device_id: String,
@@ -181,6 +178,11 @@ fn index_summary(device: &TestDevice, group_id: &str, path: &str) -> String {
 /// authoring device's own disk for it), matching what the original,
 /// now-deleted `peer_session.rs` tests already did for the identical
 /// reason (`DagProducer::commit_create`).
+/// A modification time the projection can write back to disk: a zero mtime is
+/// "unset", and the row would then show the time it was written, a different
+/// version from the head the fixture authored.
+const FIXTURE_MTIME: i64 = 1_700_000_000_000_000_000;
+
 fn commit_pure_dag_create(device: &TestDevice, group_id: &str, path: &str, content: &[u8]) {
     let hash_hex = device.state.block_store.put(content).unwrap();
     let hash = hex::decode(&hash_hex).unwrap();
@@ -190,7 +192,7 @@ fn commit_pure_dag_create(device: &TestDevice, group_id: &str, path: &str, conte
         version_blocks,
         content.len() as u64,
         FileMeta {
-            mtime_unix_nanos: 0,
+            mtime_unix_nanos: FIXTURE_MTIME,
             unix_mode: None,
             symlink_target: None,
             record_kind: RecordKind::File,
@@ -200,38 +202,33 @@ fn commit_pure_dag_create(device: &TestDevice, group_id: &str, path: &str, conte
     let record = FileRecord {
         path: path.to_string(),
         size: content.len() as u64,
-        mtime_unix_nanos: 0,
+        mtime_unix_nanos: FIXTURE_MTIME,
         blocks: vec![BlockInfo { hash: hash.clone(), offset: 0, size: content.len() as u32 }],
         deleted: false,
     };
     let signing_key =
         device.state.device_signing_key().expect("setup_device calls ensure_device_signing_key");
-    let emitter = ChangeEmitter::new(device.device_id.clone(), signing_key);
+    let emitter = yadorilink_daemon::test_support::local_seam::replica_author_key(
+        &device.state.replica_coordinator,
+        &device.device_id,
+        signing_key,
+    )
+    .unwrap();
+    yadorilink_daemon::test_support::local_seam::commit_local_upsert(
+        &device.state.replica_coordinator,
+        group_id,
+        &record,
+        &device.device_id,
+        &version,
+        None,
+        &emitter,
+        &RootCommitPermit::for_tests(),
+    )
+    .unwrap();
     device
         .state
         .replica_coordinator
-        .upsert_file_emitting_change(
-            group_id,
-            &record,
-            &device.device_id,
-            ChangeContent {
-                ops: vec![Op::Put {
-                    path: SyncPath(path.to_string()),
-                    version: version.version_hash,
-                    origin: PutOrigin::Direct,
-                }],
-                versions: std::slice::from_ref(&version),
-            },
-            None,
-            None,
-            ReplicaChangeEmission { emitter: &emitter, permit: &RootCommitPermit::for_tests() },
-        )
-        .unwrap();
-    device
-        .state
-        .replica_coordinator
-        .change_history_repository()
-        .record_group_block_provenance(group_id, std::slice::from_ref(&hash))
+        .record_block_provenance(group_id, std::slice::from_ref(&hash))
         .unwrap();
 }
 
@@ -243,7 +240,7 @@ fn commit_pure_dag_create(device: &TestDevice, group_id: &str, path: &str, conte
 /// real could never also hold the colliding name on the same disk to
 /// delete it from). A third device that knows about a path only through
 /// the DAG (e.g. a peer that never hydrated it) legitimately deletes it
-/// this same way in production. Returns the tombstone's own `ChangeHash`
+/// this same way in production. Returns the tombstone's own `DeltaHash`
 /// so a caller can confirm it was actually admitted on the receiving
 /// device (`ChangeHistoryRepository::dag_has_change`) rather than
 /// trusting timing alone -- the "hold in place" branch this tombstone is
@@ -264,7 +261,7 @@ fn commit_pure_dag_create(device: &TestDevice, group_id: &str, path: &str, conte
 /// comment describes the same ordering requirement), so a test that skips
 /// the removal is not testing a tombstone at all; it is racing the authoring
 /// device's watcher for the meaning of its own change.
-fn commit_pure_dag_tombstone(device: &TestDevice, group_id: &str, path: &str) -> ChangeHash {
+fn commit_pure_dag_tombstone(device: &TestDevice, group_id: &str, path: &str) {
     let on_disk = device.root.path().join(path);
     match std::fs::remove_file(&on_disk) {
         Ok(()) => {}
@@ -273,26 +270,47 @@ fn commit_pure_dag_tombstone(device: &TestDevice, group_id: &str, path: &str) ->
     }
     let signing_key =
         device.state.device_signing_key().expect("setup_device calls ensure_device_signing_key");
-    let emitter = ChangeEmitter::new(device.device_id.clone(), signing_key);
+    let emitter = yadorilink_daemon::test_support::local_seam::replica_author_key(
+        &device.state.replica_coordinator,
+        &device.device_id,
+        signing_key,
+    )
+    .unwrap();
+    yadorilink_daemon::test_support::local_seam::commit_local_delete(
+        &device.state.replica_coordinator,
+        group_id,
+        path,
+        &device.device_id,
+        0,
+        false,
+        &emitter,
+        &RootCommitPermit::for_tests(),
+    )
+    .unwrap();
+}
+
+/// Whether `device` has admitted the removal of `path`: no live native head
+/// is left there.
+fn native_head_gone(device: &TestDevice, group_id: &str, path: &str) -> bool {
     device
         .state
         .replica_coordinator
-        .mark_deleted_emitting_change(
-            group_id,
-            path,
-            &device.device_id,
-            0,
-            false,
-            &emitter,
-            &RootCommitPermit::for_tests(),
-        )
+        .database()
+        .write(|conn| {
+            yadorilink_sync_sqlite::native_store::native_heads_at(
+                conn,
+                &FolderGroupId(group_id.to_owned()),
+                &yadorilink_replica_domain::ids::SyncPath(path.to_owned()),
+            )
+        })
         .unwrap()
+        .is_empty()
 }
 
 /// Publishes `device`'s pending content for `group_id` and wakes its
-/// `ReconciliationDriver` -- the two effects `DaemonState::note_local_
+/// `PeerSessionDriver` -- the two effects `DaemonState::note_local_
 /// commit_for_group` raises for every ordinary local mutation
-/// (`broadcast_change`'s own chokepoint), reproduced explicitly here
+/// (`on_local_native_commit`'s own chokepoint), reproduced explicitly here
 /// because `commit_pure_dag_create`/`commit_pure_dag_tombstone` author
 /// directly against `ReplicaCoordinator`, bypassing that chokepoint (and
 /// its private, crate-internal notification) on purpose -- see their own
@@ -302,19 +320,7 @@ fn commit_pure_dag_tombstone(device: &TestDevice, group_id: &str, path: &str) ->
 /// periodic sweep happened to notice it.
 async fn publish_and_wake(device: &TestDevice, group_id: &str) {
     device.state.flush_pending_checkpoint_for_group_for_test(group_id).await;
-    if let Some(driver) = device.state.reconciliation_driver() {
-        driver.note_local_change(&FolderGroupId(group_id.to_string()));
-    }
-}
-
-/// Declares a placeholder provider present for the calling thread -- an
-/// on-demand link refuses to start otherwise (see `ondemand_adoption.rs`'s
-/// identical helper). Thread-local and `LinkRuntimeController::start` runs
-/// synchronously on the test's own thread, so the guard must outlive every
-/// `start_watching`/on-demand setup call in the test, hence returning it.
-fn placeholder_provider_present() -> yadorilink_filesystem_sync::placeholder_backend::OverrideForTest
-{
-    yadorilink_filesystem_sync::placeholder_backend::OverrideForTest::enable()
+    device.state.flush_pending_native_checkpoint_for_group_for_test(group_id).await;
 }
 
 /// Like `two_synced_devices`, but device B links its folder with
@@ -337,7 +343,7 @@ async fn synced_devices_with_b_on_demand(test_name: &str) -> (TestDevice, TestDe
     start_watching(&device_a, &group_id).await;
 
     let root_b = device_b.root.path().to_string_lossy().to_string();
-    device_b.state.set_test_placeholder_pipeline_connected(true);
+    device_b.state.set_test_on_demand_allowed(true);
     device_b.state.replica_coordinator.link_repository().add_link(&root_b, &group_id).unwrap();
     device_b
         .state
@@ -592,7 +598,7 @@ async fn combined_case_and_normalization_collision_holds_the_second_arriving_fil
 
 /// Migrated from the deleted `peer_session.rs::hydrate_file_reports_held_
 /// not_hydrated_when_a_hazard_collision_exists`. Unlike the other four
-/// tests in this file, this one is NOT purely about `ReconciliationDriver`
+/// tests in this file, this one is NOT purely about `PeerSessionDriver`
 /// propagation: `PeerSyncSession::hydrate_file` is on-access, per-session
 /// hydration -- transport/RPC-level behavior belonging to the peer session,
 /// not the DAG-propagation authority (see this file's header comment for
@@ -616,9 +622,9 @@ async fn combined_case_and_normalization_collision_holds_the_second_arriving_fil
 /// disconnected `PeerSyncSession::standalone()`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hydrate_file_reports_held_not_hydrated_when_a_hazard_collision_exists() {
-    let _provider = placeholder_provider_present();
     let (device_a, device_b, group_id) =
         synced_devices_with_b_on_demand("collision-hydrate-held-hazard").await;
+    device_b.state.set_test_on_demand_allowed(true);
 
     // A genuine sibling already on device_b -- present before the
     // incoming placeholder even arrives, via a real local write device_b's
@@ -700,23 +706,19 @@ async fn hydrate_file_reports_held_not_hydrated_when_a_hazard_collision_exists()
     )
     .await;
 
-    let session_b = device_b
+    // The production in-place hydration: a path held for a hazard collision is never written under the
+    // colliding name, whatever the fetch did, and stays held with its reason.
+    let outcome =
+        yadorilink_daemon::hydration::hydrate(&device_b.state, &group_id, "photo.jpg").await;
+    let held = device_b
         .state
-        .peers
-        .session(&device_a.device_id)
-        .expect("connect_two_daemons paired these two devices");
-    let convergence_b = device_b
-        .state
-        .peers
-        .convergence(&device_a.device_id)
-        .expect("connect_two_daemons paired these two devices");
-    let driver: std::sync::Arc<dyn yadorilink_peer_session::convergence_driver::ConvergenceDriver> =
-        session_b.clone();
-    let outcome = convergence_b.hydrate_file(&driver, &group_id, "photo.jpg").await.unwrap();
-
-    let HydrationOutcome::Held { reason } = outcome else {
-        panic!("a hazard-collision hydration must report Held, not Hydrated: {outcome:?}");
-    };
+        .replica_coordinator
+        .get_held_state(&group_id, "photo.jpg")
+        .unwrap()
+        .unwrap_or_else(|| {
+            panic!("a hazard-collision hydration must leave the path held: {outcome:?}")
+        });
+    let reason = held.reason;
     assert!(reason.starts_with("case_collision"), "unexpected reason: {reason}");
     assert!(
         !device_b.root.path().join("photo.jpg").exists()
@@ -816,19 +818,12 @@ async fn tombstone_of_a_case_fold_colliding_path_holds_rather_than_deletes_the_s
     // redundant hold-in-place leaves completely untouched -- see
     // `commit_pure_dag_tombstone`'s own doc comment) is what actually
     // proves the tombstone was admitted, rather than trusting timing.
-    let tombstone_hash = commit_pure_dag_tombstone(&device_a, &group_id, "photo.jpg");
+    commit_pure_dag_tombstone(&device_a, &group_id, "photo.jpg");
     publish_and_wake(&device_a, &group_id).await;
     wait_until_with_context(
-        || {
-            device_b
-                .state
-                .replica_coordinator
-                .change_history_repository()
-                .dag_has_change(&tombstone_hash)
-                .unwrap()
-        },
+        || native_head_gone(&device_b, &group_id, "photo.jpg"),
         Duration::from_secs(20),
-        || "device-b never admitted the tombstone Change".to_string(),
+        || "device-b never admitted the removal".to_string(),
     )
     .await;
 
@@ -969,16 +964,11 @@ async fn tombstone_of_the_live_file_itself_does_not_corrupt_its_own_index_row_wh
     )
     .await;
 
-    let tombstone_hash = commit_pure_dag_tombstone(&device_a, &group_id, "Photo.jpg");
+    commit_pure_dag_tombstone(&device_a, &group_id, "Photo.jpg");
     publish_and_wake(&device_a, &group_id).await;
     wait_until_with_context(
         || {
-            device_b
-                .state
-                .replica_coordinator
-                .change_history_repository()
-                .dag_has_change(&tombstone_hash)
-                .unwrap()
+            native_head_gone(&device_b, &group_id, "Photo.jpg")
                 && device_b
                     .state
                     .replica_coordinator
@@ -994,12 +984,8 @@ async fn tombstone_of_the_live_file_itself_does_not_corrupt_its_own_index_row_wh
             // held" are different bugs in different subsystems, and the
             // index row alone looks identical either way.
             format!(
-                "device-b never processed the tombstone: dag_has_change={:?} held={:?} {}",
-                device_b
-                    .state
-                    .replica_coordinator
-                    .change_history_repository()
-                    .dag_has_change(&tombstone_hash),
+                "device-b never processed the tombstone: head_gone={:?} held={:?} {}",
+                native_head_gone(&device_b, &group_id, "Photo.jpg"),
                 device_b
                     .state
                     .replica_coordinator

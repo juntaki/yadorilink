@@ -44,7 +44,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use yadorilink_ipc_proto::shellipc::OnDemandFolder;
+use yadorilink_shell_ext::ipc_client::OnDemandFolder;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 

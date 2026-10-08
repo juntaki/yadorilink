@@ -34,11 +34,11 @@ use yadorilink_root_authority::root_identity::RootVerificationStatePort;
 
 use crate::link_runtime::dependencies::LinkRuntimeDependencies;
 use crate::link_runtime::operations::capture_local_change::announce_local_change;
-use crate::link_runtime::startup::{ensure_initial_change_history, GroupStartupReadyGuard};
+use crate::link_runtime::startup::GroupStartupReadyGuard;
 
 /// How often the live dirty-path-journal redrive pass runs for this link.
 /// `record_dirty_path`/`redrive_dirty_journal` (`local_change.rs`) exist
-/// precisely because a local edit's own index+DAG write can fail
+/// precisely because a local edit's own index+delta write can fail
 /// transiently (most commonly `SQLITE_BUSY`/`SQLITE_LOCKED` under real
 /// concurrent load), leaving the edit journaled but never emitted as a
 /// change -- before this, the ONLY consumer of that journal was the
@@ -150,9 +150,7 @@ fn resolve_duplicate_recovery_gate<E: std::fmt::Display>(
 }
 
 /// The synchronous pass that runs immediately after a link's initial scan:
-/// re-checks disk/index convergence for the duplicate-root recovery gate, then
-/// bootstraps this group's change history from the rows the scan just wrote.
-/// Returns the startup failure string, if any, for the caller's retry loop.
+/// re-checks disk/index convergence for the duplicate-root recovery gate.
 ///
 /// Extracted from `spawn_executor_task` so it can be handed to `spawn_blocking`
 /// whole. Both halves are open-ended in exactly the way the scan that precedes
@@ -160,18 +158,14 @@ fn resolve_duplicate_recovery_gate<E: std::fmt::Display>(
 /// `indexed_path_is_corroborated` re-reads and re-hashes every live indexed
 /// file against its recorded blocks (a full content pass over the linked
 /// folder) -- but only when `resolve_duplicate_recovery_gate` determines
-/// duplicate-root recovery is actually pending -- and
-/// `ensure_initial_change_history` converts the whole index into signed
-/// history. Run inline on the executor task, all of that holds the polling
-/// worker for its duration on every link start.
-fn post_scan_convergence_and_history(
+/// duplicate-root recovery is actually pending. Run inline on the executor
+/// task, that holds the polling worker for its duration on every link start.
+fn post_scan_convergence(
     deps: &Arc<LinkRuntimeDependencies>,
     local_path: &str,
     group_id: &str,
     root: &std::path::Path,
-    records_is_empty: bool,
-) -> Option<String> {
-    let mut history_failure = None;
+) {
     // A successful *additive* scan proves only that present
     // disk entries were indexed. It deliberately leaves live
     // rows originating at the departed duplicate root intact,
@@ -186,7 +180,12 @@ fn post_scan_convergence_and_history(
             if let Ok(rows) = deps.replica_coordinator.file_index_repository().list_files(group_id)
             {
                 for row in rows.into_iter().filter(|row| !row.deleted) {
+                    // A row that expects no object (`Remote`) has converged by
+                    // definition: its absence is the correct disk state.
                     if matches!(
+                        deps.replica_coordinator.indexed_path_expects_no_object(group_id, &row),
+                        Ok(true)
+                    ) || matches!(
                         deps.replica_coordinator.indexed_path_is_corroborated(root, group_id, &row),
                         Ok(true)
                     ) {
@@ -215,31 +214,178 @@ fn post_scan_convergence_and_history(
             );
         }
     }
-    // `scan_existing_files_with_ignore` uses the batched index
-    // writer and therefore does not append DAG changes itself.
-    // Re-run the idempotent import after the rows exist so a peer
-    // that negotiates change-history sync has heads to request.
-    if !records_is_empty {
-        // Re-establish DAG heads now that the batched scan's rows
-        // exist, so a peer negotiating change-history sync has heads
-        // to request. `ensure_initial_change_history` fails closed
-        // (a registered device with no signing key is a
-        // configuration error, not a legitimate no-emitter path --
-        // see its own doc comment), so any error here is surfaced
-        // rather than silently discarded, keeping a missing
-        // post-scan history bootstrap observable instead of failing
-        // invisibly.
-        if let Err(error) = ensure_initial_change_history(deps, group_id) {
-            tracing::error!(
-                local_path = %local_path,
-                group_id = %group_id,
-                error = %error,
-                "post-scan change-history bootstrap failed; group startup remains closed"
-            );
-            history_failure = Some(format!("post-scan change-history bootstrap failed: {error}"));
-        }
+}
+
+/// One startup attempt for a link's group: the initial scan of the folder
+/// and the re-drive of the durable dirty-path journal. `None` when both
+/// completed, otherwise why one did not. Idempotent, so a failed attempt is
+/// simply run again.
+async fn startup_scan_and_redrive(
+    deps: Arc<LinkRuntimeDependencies>,
+    local_path: String,
+    group_id: String,
+    processor: Arc<LocalChangeProcessor>,
+    root: PathBuf,
+    ignore_set: Arc<EffectiveIgnoreSet>,
+    emit_tombstones: bool,
+) -> Option<String> {
+    #[cfg(test)]
+    if take_injected_startup_failure(&group_id) {
+        return Some("injected startup failure".to_string());
     }
-    history_failure
+    // `scan_existing_files` walks the whole
+    // linked folder and, for every not-already-current file, reads
+    // and chunks it — synchronous `std::fs` I/O plus CPU-bound
+    // hashing, run directly here would otherwise monopolize this
+    // tokio worker thread for the whole initial scan (a large folder
+    // or a few multi-GB files stall every other task — peer message
+    // handling, heartbeats, control-socket responses — scheduled on
+    // the same worker for the duration). `spawn_blocking` moves it
+    // onto Tokio's dedicated blocking-thread pool instead; `processor`
+    // is already `Arc`-wrapped, so cloning it into the 'static
+    // closure is cheap.
+    let scan_result = {
+        let processor = processor.clone();
+        let group_id = group_id.clone();
+        let root = root.clone();
+        let ignore_set = ignore_set.clone();
+        // The initial scan chunks and
+        // indexes every not-already-current file — a genuine
+        // sync-critical write, held for the guard's whole duration
+        // (including the `spawn_blocking` await) so an update install
+        // never starts mid-scan.
+        let _write_activity = deps.begin_write_activity();
+        {
+            tokio::task::spawn_blocking(move || {
+                processor.scan_existing_files_with_ignore_gated(
+                    &group_id,
+                    &root,
+                    ignore_set.as_ref(),
+                    emit_tombstones,
+                )
+            })
+            .await
+        }
+    };
+    let scan_failure: Option<String> = match scan_result {
+        Ok(Ok(records)) => {
+            // Offloaded for the same reason the scan above is -- see
+            // `post_scan_convergence`'s own doc for what
+            // runs in there. A panicking blocking task is folded into
+            // the same startup-failure string the scan task's own
+            // `JoinError` produces, so this link's bounded startup
+            // retry can re-run it rather than wedging the group's gate.
+            let history_failure = {
+                let deps = deps.clone();
+                let task_local_path = local_path.clone();
+                let group_id = group_id.clone();
+                let root = root.clone();
+                match tokio::task::spawn_blocking(move || {
+                    post_scan_convergence(&deps, &task_local_path, &group_id, &root)
+                })
+                .await
+                {
+                    Ok(()) => None,
+                    Err(join_err) => {
+                        tracing::warn!(
+                            error = %join_err,
+                            local_path = %local_path,
+                            "post-scan convergence task panicked"
+                        );
+                        Some(format!("post-scan convergence task panicked: {join_err}"))
+                    }
+                }
+            };
+            // One batched broadcast for the whole initial scan
+            // (batch processing) instead of one peer message per
+            // pre-existing file.
+            if history_failure.is_none() {
+                // Same reason as the flush arms: a scan that resolves
+                // dirty rows settles the barrier regardless of whether
+                // it produced records to announce.
+                deps.note_capture_settled(&group_id);
+                announce_local_change(&deps, &local_path, &group_id, records).await;
+            }
+            history_failure
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, local_path = %local_path, "failed to scan pre-existing files");
+            Some(format!("initial scan failed: {e}"))
+        }
+        Err(join_err) => {
+            tracing::warn!(error = %join_err, local_path = %local_path, "initial scan task panicked");
+            Some(format!("initial scan task panicked: {join_err}"))
+        }
+    };
+
+    // Startup rescan of the durable dirty-path journal. Any local edit that
+    // was detected before a previous crash/restart — or left unprocessed by
+    // a multi-second disk-full/EIO that outlived the in-flight retry — is
+    // re-driven here, before the live watcher loop resumes, so a detected
+    // edit is never silently lost across a restart. Runs after the initial
+    // scan (whose own writes journal-and-clear the paths they touch), so an
+    // edit already reconciled by the scan resolves to a no-op `None` and is
+    // simply cleared. A redrive failure keeps the barrier closed (below),
+    // so peer apply cannot race ahead of an un-redriven offline edit.
+    let redrive_failure: Option<String> = {
+        let _write_activity = deps.begin_write_activity();
+        match processor.redrive_dirty_journal(&group_id, &root).await {
+            Ok(outcome) => {
+                deps.note_capture_settled(&group_id);
+                if !outcome.records.is_empty() {
+                    announce_local_change(&deps, &local_path, &group_id, outcome.records).await;
+                }
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    local_path = %local_path,
+                    "failed to re-drive the dirty-path journal at startup"
+                );
+                Some(format!("dirty-journal redrive failed: {e}"))
+            }
+        }
+    };
+    scan_failure.or(redrive_failure)
+}
+
+/// Test-only: how many more startup attempts of each group fail outright.
+#[cfg(test)]
+static INJECTED_STARTUP_FAILURES: std::sync::Mutex<Vec<(String, u32)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Makes the next `attempts` startup attempts of `group_id` fail.
+#[cfg(test)]
+pub(crate) fn inject_startup_failures(group_id: &str, attempts: u32) {
+    INJECTED_STARTUP_FAILURES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push((group_id.to_string(), attempts));
+}
+
+#[cfg(test)]
+fn take_injected_startup_failure(group_id: &str) -> bool {
+    let mut injected = INJECTED_STARTUP_FAILURES.lock().unwrap_or_else(|p| p.into_inner());
+    match injected.iter_mut().find(|(group, remaining)| group == group_id && *remaining > 0) {
+        Some((_, remaining)) => {
+            *remaining -= 1;
+            true
+        }
+        None => false,
+    }
+}
+
+/// How long to wait before the startup attempt that follows `failures`
+/// failed ones in a row, once the immediate attempts are spent: doubling from
+/// a few seconds, capped at a minute.
+fn startup_retry_delay(failures: u32) -> std::time::Duration {
+    #[cfg(test)]
+    const BASE: std::time::Duration = std::time::Duration::from_millis(50);
+    #[cfg(not(test))]
+    const BASE: std::time::Duration = std::time::Duration::from_secs(3);
+    BASE.saturating_mul(1u32 << failures.saturating_sub(1).min(10))
+        .min(std::time::Duration::from_secs(60))
 }
 
 /// The executor task: this link's startup scan+redrive retry loop (which
@@ -294,152 +440,24 @@ pub(crate) fn spawn_executor_task(
         // apply for the group forever behind a `Failed` gate that nothing
         // re-opens. On failure the executor supersedes its generation with a
         // fresh `begin_group_startup` and re-runs the idempotent
-        // scan+redrive; only after exhausting the attempts does it settle on
-        // `Failed`, which a later relink/watcher restart can still recover.
+        // scan+redrive; only after exhausting the immediate attempts does it
+        // settle on `Failed`, from which the live loop below keeps retrying
+        // with backoff (and a relink/watcher restart also recovers).
         const STARTUP_MAX_ATTEMPTS: u32 = 3;
         let mut attempt: u32 = 1;
         let startup_outcome: Result<(), String> = loop {
-            // `scan_existing_files` walks the whole
-            // linked folder and, for every not-already-current file, reads
-            // and chunks it — synchronous `std::fs` I/O plus CPU-bound
-            // hashing, run directly here would otherwise monopolize this
-            // tokio worker thread for the whole initial scan (a large folder
-            // or a few multi-GB files stall every other task — peer message
-            // handling, heartbeats, control-socket responses — scheduled on
-            // the same worker for the duration). `spawn_blocking` moves it
-            // onto Tokio's dedicated blocking-thread pool instead; `processor`
-            // is already `Arc`-wrapped, so cloning it into the 'static
-            // closure is cheap.
-            let scan_result = {
-                let processor = executor_processor.clone();
-                let group_id = executor_group_id.clone();
-                let root = executor_root.clone();
-                let ignore_set = executor_ignore_set.clone();
-                let emit_tombstones = executor_emit_tombstones;
-                // The initial scan chunks and
-                // indexes every not-already-current file — a genuine
-                // sync-critical write, held for the guard's whole duration
-                // (including the `spawn_blocking` await) so an update install
-                // never starts mid-scan.
-                let _write_activity = executor_deps.begin_write_activity();
-                {
-                    tokio::task::spawn_blocking(move || {
-                        processor.scan_existing_files_with_ignore_gated(
-                            &group_id,
-                            &root,
-                            ignore_set.as_ref(),
-                            emit_tombstones,
-                        )
-                    })
-                    .await
-                }
-            };
-            let scan_failure: Option<String> = match scan_result {
-                Ok(Ok(records)) => {
-                    // Offloaded for the same reason the scan above is -- see
-                    // `post_scan_convergence_and_history`'s own doc for what
-                    // runs in there. A panicking blocking task is folded into
-                    // the same startup-failure string the scan task's own
-                    // `JoinError` produces, so this link's bounded startup
-                    // retry can re-run it rather than wedging the group's gate.
-                    let history_failure = {
-                        let deps = executor_deps.clone();
-                        let local_path = executor_local_path.clone();
-                        let group_id = executor_group_id.clone();
-                        let root = executor_root.clone();
-                        let records_is_empty = records.is_empty();
-                        match tokio::task::spawn_blocking(move || {
-                            post_scan_convergence_and_history(
-                                &deps,
-                                &local_path,
-                                &group_id,
-                                &root,
-                                records_is_empty,
-                            )
-                        })
-                        .await
-                        {
-                            Ok(history_failure) => history_failure,
-                            Err(join_err) => {
-                                tracing::warn!(
-                                    error = %join_err,
-                                    local_path = %executor_local_path,
-                                    "post-scan convergence/history task panicked"
-                                );
-                                Some(format!(
-                                    "post-scan convergence/history task panicked: {join_err}"
-                                ))
-                            }
-                        }
-                    };
-                    // One batched broadcast for the whole initial scan
-                    // (batch processing) instead of one peer message per
-                    // pre-existing file.
-                    if history_failure.is_none() {
-                        // Same reason as the flush arms: a scan that resolves
-                        // dirty rows settles the barrier regardless of whether
-                        // it produced records to announce.
-                        executor_deps.note_capture_settled(&executor_group_id);
-                        announce_local_change(
-                            &executor_deps,
-                            &executor_local_path,
-                            &executor_group_id,
-                            records,
-                        )
-                        .await;
-                    }
-                    history_failure
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!(error = %e, local_path = %executor_local_path, "failed to scan pre-existing files");
-                    Some(format!("initial scan failed: {e}"))
-                }
-                Err(join_err) => {
-                    tracing::warn!(error = %join_err, local_path = %executor_local_path, "initial scan task panicked");
-                    Some(format!("initial scan task panicked: {join_err}"))
-                }
-            };
+            let startup_failure = startup_scan_and_redrive(
+                executor_deps.clone(),
+                executor_local_path.clone(),
+                executor_group_id.clone(),
+                executor_processor.clone(),
+                executor_root.clone(),
+                executor_ignore_set.clone(),
+                executor_emit_tombstones,
+            )
+            .await;
 
-            // Startup rescan of the durable dirty-path journal. Any local edit that
-            // was detected before a previous crash/restart — or left unprocessed by
-            // a multi-second disk-full/EIO that outlived the in-flight retry — is
-            // re-driven here, before the live watcher loop resumes, so a detected
-            // edit is never silently lost across a restart. Runs after the initial
-            // scan (whose own writes journal-and-clear the paths they touch), so an
-            // edit already reconciled by the scan resolves to a no-op `None` and is
-            // simply cleared. A redrive failure keeps the barrier closed (below),
-            // so peer apply cannot race ahead of an un-redriven offline edit.
-            let redrive_failure: Option<String> = {
-                let _write_activity = executor_deps.begin_write_activity();
-                match executor_processor
-                    .redrive_dirty_journal(&executor_group_id, &executor_root)
-                    .await
-                {
-                    Ok(outcome) => {
-                        executor_deps.note_capture_settled(&executor_group_id);
-                        if !outcome.records.is_empty() {
-                            announce_local_change(
-                                &executor_deps,
-                                &executor_local_path,
-                                &executor_group_id,
-                                outcome.records,
-                            )
-                            .await;
-                        }
-                        None
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            local_path = %executor_local_path,
-                            "failed to re-drive the dirty-path journal at startup"
-                        );
-                        Some(format!("dirty-journal redrive failed: {e}"))
-                    }
-                }
-            };
-
-            match scan_failure.or(redrive_failure) {
+            match startup_failure {
                 None => break Ok(()),
                 Some(reason) if attempt >= STARTUP_MAX_ATTEMPTS => break Err(reason),
                 Some(reason) => {
@@ -486,6 +504,13 @@ pub(crate) fn spawn_executor_task(
         // loop below *after* the barrier resolves: the flush loop and peer apply
         // then observe a fully-committed startup snapshot. The guard lives to end
         // of scope but is now defused, so its eventual `Drop` is a no-op.
+        //
+        // `Failed` is not final: the live loop below keeps trying the startup
+        // attempt again, with a growing delay, for as long as this link runs
+        // (`late_startup_retry`). A fault that outlasts the immediate attempts
+        // (a disk that stays full for a while, a flaky network volume) is
+        // otherwise a gate nothing re-opens until the user relinks.
+        let mut late_startup_retry: Option<(tokio::time::Instant, u32)> = None;
         match startup_outcome {
             Ok(()) => startup_ready_guard.mark_ready(),
             Err(reason) => {
@@ -494,9 +519,11 @@ pub(crate) fn spawn_executor_task(
                     group_id = %executor_group_id,
                     attempts = STARTUP_MAX_ATTEMPTS,
                     reason = %reason,
-                    "group startup failed after retries; deferring peer apply (fail-closed) for this group until it is relinked or the watcher restarts"
+                    "group startup failed after retries; deferring peer apply (fail-closed) for this group and retrying with backoff"
                 );
                 startup_ready_guard.mark_failed(reason);
+                late_startup_retry =
+                    Some((tokio::time::Instant::now() + startup_retry_delay(1), 1));
             }
         }
         // At `debug!` (it fires on every debounced flush -- too noisy for
@@ -504,7 +531,54 @@ pub(crate) fn spawn_executor_task(
         // still alive and draining flushes, or stuck?
         let mut flushes_received: u64 = 0;
         let mut flushes_completed: u64 = 0;
-        while let Some(flush) = flush_rx.recv().await {
+        loop {
+            let flush = match late_startup_retry {
+                None => flush_rx.recv().await,
+                Some((due, failures)) => {
+                    tokio::select! {
+                        flush = flush_rx.recv() => flush,
+                        () = tokio::time::sleep_until(due) => {
+                            let generation = executor_deps
+                                .replica_coordinator
+                                .startup_readiness()
+                                .begin_group_startup(&executor_group_id);
+                            startup_ready_guard.begin_generation(generation);
+                            match startup_scan_and_redrive(
+                                executor_deps.clone(),
+                                executor_local_path.clone(),
+                                executor_group_id.clone(),
+                                executor_processor.clone(),
+                                executor_root.clone(),
+                                executor_ignore_set.clone(),
+                                executor_emit_tombstones,
+                            )
+                            .await
+                            {
+                                None => {
+                                    tracing::info!(
+                                        local_path = %executor_local_path,
+                                        group_id = %executor_group_id,
+                                        "group startup completed on a later attempt; peer apply \
+                                         is admitted again"
+                                    );
+                                    startup_ready_guard.mark_ready();
+                                    late_startup_retry = None;
+                                }
+                                Some(reason) => {
+                                    startup_ready_guard.mark_failed(reason);
+                                    late_startup_retry = Some((
+                                        tokio::time::Instant::now()
+                                            + startup_retry_delay(failures + 1),
+                                        failures + 1,
+                                    ));
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                }
+            };
+            let Some(flush) = flush else { break };
             flushes_received += 1;
             let flush_kind = if matches!(flush, DebounceFlush::RescanRequired) {
                 "RescanRequired"
@@ -603,12 +677,12 @@ pub(crate) fn spawn_executor_task(
                     });
             if burst_fallback {
                 // A `RescanRequired` full-reconciliation scan already commits
-                // its detected changes to the DAG in durable, bounded chunks
+                // its detected changes to native state in durable, bounded chunks
                 // as it walks (`reconcile_disk_with_ignore`'s own chunk
                 // loop). Announcing only once the WHOLE scan returned would
                 // withhold peer visibility for the scan's entire length (a
                 // 15,000-file scan measured ~75s of zero peer-visible
-                // progress) even though the source device's own index/DAG
+                // progress) even though the source device's own index/native state
                 // keeps advancing the whole time -- head-of-line blocking,
                 // not a correctness issue. Streaming each durably-committed
                 // chunk to `announce_local_change` as it lands avoids this

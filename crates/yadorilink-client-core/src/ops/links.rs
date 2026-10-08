@@ -12,6 +12,7 @@ use yadorilink_local_storage::link_preflight::{self, LinkPreflightReport};
 
 use crate::daemon::control;
 use crate::error::CoreError;
+use crate::ops::paths;
 use crate::ops::shares::resolve_group_name;
 
 /// Runs the shared link preflight for `local_path`: canonicalize the path,
@@ -68,36 +69,32 @@ pub async fn link_resolved_as(
     on_demand: bool,
     acknowledge_risks: bool,
 ) -> Result<(), CoreError> {
-    send_link(absolute_path, group_id, on_demand, None, acknowledge_risks).await
+    send_link(absolute_path, group_id, on_demand, acknowledge_risks).await
 }
 
-/// Links an already-preflighted folder to a group named by the user, with an
-/// optional on-demand local size cap (meaningful only when `on_demand`; no cap
-/// means no automatic eviction). Plain links never run the crash-safe
-/// create/join protocol, so there is no pending enrollment to track.
+/// Links an already-preflighted folder to a group named by the user. Plain
+/// links never run the crash-safe create/join protocol, so there is no
+/// pending enrollment to track.
 pub async fn link_to_named_group(
     absolute_path: PathBuf,
     group_name: &str,
     on_demand: bool,
-    max_local_size_bytes: Option<i64>,
     acknowledge_risks: bool,
 ) -> Result<(), CoreError> {
     let group_id = resolve_group_name(group_name).await?;
-    send_link(absolute_path, group_id, on_demand, max_local_size_bytes, acknowledge_risks).await
+    send_link(absolute_path, group_id, on_demand, acknowledge_risks).await
 }
 
 async fn send_link(
     absolute_path: PathBuf,
     group_id: String,
     on_demand: bool,
-    max_local_size_bytes: Option<i64>,
     acknowledge_risks: bool,
 ) -> Result<(), CoreError> {
     control::send(ReqPayload::Link(LinkRequest {
         local_path: absolute_path.to_string_lossy().to_string(),
         group_id,
         on_demand,
-        max_local_size_bytes,
         acknowledge_risks,
         // A plain link tracks no enrollment.
         pending_enrollment_operation_id: String::new(),
@@ -118,6 +115,18 @@ async fn send_link(
 /// The daemon's durability refusal is [`CoreError::DurabilityBlocked`], with
 /// the daemon's own text.
 pub async fn send_unlink(
+    local_path: &str,
+    force: bool,
+) -> Result<Option<HandoffResult>, CoreError> {
+    // The daemon matches the recorded link path exactly, and `link` records the
+    // canonical spelling, so resolve the typed one the same way first.
+    let local_path = paths::resolve_link_path(local_path).to_string_lossy().into_owned();
+    send_unlink_key(&local_path, force).await
+}
+
+/// Unlinks by the link's identity KEY, verbatim: a provider-backed folder has no path to resolve
+/// (its key is a synthetic locator that must reach the daemon unchanged).
+pub async fn send_unlink_key(
     local_path: &str,
     force: bool,
 ) -> Result<Option<HandoffResult>, CoreError> {

@@ -19,9 +19,11 @@ use super::*;
 use ed25519_dalek::SigningKey;
 use std::collections::BTreeSet;
 use yadorilink_local_capture::LocalChangeOutcome;
+use yadorilink_replica_domain::ids::DeltaHash;
 use yadorilink_replica_domain::ids::VersionHash;
+use yadorilink_replica_engine::conflict::PathHead;
 use yadorilink_root_authority::root_commit::RootCommitPermit;
-use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
+use yadorilink_sync_sqlite::dag_store::LocalAuthorKey;
 use yadorilink_sync_sqlite::projection_obligations::ProjectionObligation;
 
 fn now_unix_nanos() -> i64 {
@@ -31,12 +33,8 @@ fn now_unix_nanos() -> i64 {
         .unwrap_or(0)
 }
 
-fn own_emitter() -> ChangeEmitter {
-    ChangeEmitter::new(LOCAL_DEVICE, SigningKey::from_bytes(&[7u8; 32]))
-}
-
-fn remote_emitter() -> ChangeEmitter {
-    ChangeEmitter::new("device-remote", SigningKey::from_bytes(&[9u8; 32]))
+fn own_emitter() -> LocalAuthorKey {
+    LocalAuthorKey::for_tests(LOCAL_DEVICE, SigningKey::from_bytes(&[7u8; 32]))
 }
 
 /// Leaves `path`'s projection owed, the way a capture whose disk
@@ -226,7 +224,6 @@ async fn restore_of_an_older_own_version_still_materializes() {
         state: yadorilink_replica_domain::session_state::RestoreOperationState::Prepared,
         record: file_record_from_version("notes.txt", &older_version),
         origin_device_id: LOCAL_DEVICE.to_string(),
-        authoring_change_hash: None,
         meta: yadorilink_replica_domain::session_state::LocalFileMetaColumns {
             record_kind: older_version.meta.record_kind,
             symlink_target: older_version.meta.symlink_target.clone(),
@@ -235,8 +232,7 @@ async fn restore_of_an_older_own_version_still_materializes() {
             xattrs: older_version.meta.xattrs.clone(),
         },
     };
-    let restore = h
-        .state
+    h.state
         .record_restore_operation_emitting_change(
             &operation,
             &older_version,
@@ -244,7 +240,11 @@ async fn restore_of_an_older_own_version_still_materializes() {
             &RootCommitPermit::for_tests(),
         )
         .unwrap();
-    assert_eq!(h.own_head("notes.txt").change_hash, restore.0, "sanity: the restore wins");
+    assert_eq!(
+        h.own_head("notes.txt").content.unwrap().version_hash,
+        older_version.version_hash.0,
+        "sanity: the restore wins"
+    );
 
     for _ in 0..3 {
         if reconcile_pass(&h, "notes.txt").await.is_settled("notes.txt") {
@@ -256,83 +256,6 @@ async fn restore_of_an_older_own_version_still_materializes() {
         std::fs::read(&file).unwrap(),
         b"the version to restore",
         "a restore's purpose is to change the disk; it must still be written"
-    );
-}
-
-/// A retroactive repair carrier is authored by this device to reassert a
-/// fork's winner at its path. When the winner is a peer's content, the
-/// carrier is an own change whose content this disk has never held -- it
-/// must be written, whatever this device captured there before.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn own_repair_carrier_still_materializes() {
-    let h = Harness::new(true);
-    let file = h.path("notes.txt");
-    std::fs::write(&file, b"this device's side of the fork").unwrap();
-    assert!(matches!(h.capture("notes.txt").await, LocalChangeOutcome::FileChanged(_)));
-    let own = h.own_head("notes.txt");
-
-    // The peer's side: its content (stored here via a scratch capture, so
-    // its blocks are local) put at the same path concurrently with this
-    // device's capture, far enough along its own branch to win.
-    std::fs::write(h.path("peer-content.bin"), b"the peer's side, which wins").unwrap();
-    assert!(matches!(h.capture("peer-content.bin").await, LocalChangeOutcome::FileChanged(_)));
-    let peer_version = VersionHash(h.own_head("peer-content.bin").content.unwrap().version_hash);
-    let remote = remote_emitter();
-    h.state
-        .database()
-        .write(|conn| {
-            let filler = yadorilink_sync_sqlite::dag_store::emit_local_change_onto(
-                conn,
-                GROUP,
-                Vec::new(),
-                vec![yadorilink_replica_domain::change::Op::Put {
-                    path: yadorilink_replica_domain::ids::SyncPath("peer-filler.bin".into()),
-                    version: peer_version,
-                    origin: yadorilink_replica_domain::change::PutOrigin::Direct,
-                }],
-                &remote,
-            )?;
-            yadorilink_sync_sqlite::dag_store::emit_local_change_onto(
-                conn,
-                GROUP,
-                vec![filler.compute_hash()],
-                vec![yadorilink_replica_domain::change::Op::Put {
-                    path: yadorilink_replica_domain::ids::SyncPath("notes.txt".into()),
-                    version: peer_version,
-                    origin: yadorilink_replica_domain::change::PutOrigin::Direct,
-                }],
-                &remote,
-            )
-        })
-        .unwrap();
-    let heads = h.convergence.combined_heads(GROUP, "notes.txt", None).unwrap();
-    assert!(
-        heads.iter().any(|head| head.change_hash == own.change_hash) && heads.len() == 2,
-        "sanity: the path is forked between this device's capture and the peer's put"
-    );
-
-    let outcome =
-        h.state.repair_retroactive_conflict_copy_obligations(GROUP, &own_emitter(), 0).unwrap();
-    assert!(
-        matches!(
-            outcome,
-            yadorilink_replica_domain::session_state::RetroactiveRepairOutcome::Repaired { .. }
-        ),
-        "sanity: this device authors the repair carrier, got {outcome:?}"
-    );
-    let carrier = h.own_head("notes.txt");
-    assert_ne!(carrier.change_hash, own.change_hash, "sanity: the carrier is the path's head");
-
-    for _ in 0..3 {
-        if reconcile_pass(&h, "notes.txt").await.is_settled("notes.txt") {
-            break;
-        }
-    }
-
-    assert_eq!(
-        std::fs::read(&file).unwrap(),
-        b"the peer's side, which wins",
-        "a repair carrier's purpose is to change the disk; it must still be written"
     );
 }
 
@@ -348,28 +271,17 @@ async fn peer_change_over_a_local_edit_keeps_both_sides() {
     std::fs::write(h.path("peer-content.bin"), b"the peer's newer version").unwrap();
     assert!(matches!(h.capture("peer-content.bin").await, LocalChangeOutcome::FileChanged(_)));
     let peer_version = VersionHash(h.own_head("peer-content.bin").content.unwrap().version_hash);
-    let own = h.own_head("notes.txt");
-    let scratch = h.own_head("peer-content.bin");
-    let remote = remote_emitter();
-    h.state
-        .database()
-        .write(|conn| {
-            yadorilink_sync_sqlite::dag_store::emit_local_change_onto(
-                conn,
-                GROUP,
-                vec![
-                    yadorilink_replica_domain::ids::ChangeHash(own.change_hash),
-                    yadorilink_replica_domain::ids::ChangeHash(scratch.change_hash),
-                ],
-                vec![yadorilink_replica_domain::change::Op::Put {
-                    path: yadorilink_replica_domain::ids::SyncPath("notes.txt".into()),
-                    version: peer_version,
-                    origin: yadorilink_replica_domain::change::PutOrigin::Direct,
-                }],
-                &remote,
-            )
-        })
-        .unwrap();
+    let _own = h.own_head("notes.txt");
+    crate::test_support::remote_admission_fixture::admit_remote_ops(
+        &h.state,
+        GROUP,
+        "device-remote",
+        &[yadorilink_replica_domain::local_op::Op::Put {
+            path: yadorilink_replica_domain::ids::SyncPath("notes.txt".into()),
+            version: peer_version,
+        }],
+        crate::test_support::remote_admission_fixture::Basis::CurrentHeads,
+    );
     std::fs::write(&file, b"edited here, never captured").unwrap();
 
     // The pass that captures the edit may already be writing the peer's
@@ -453,12 +365,23 @@ async fn a_file_that_keeps_changing_leaves_no_open_own_obligation_once_it_settle
     );
 }
 
-/// The path's single current head, whatever it is -- a content head or a
-/// tombstone.
-fn only_head(h: &Harness, rel: &str) -> PathHead {
-    let heads = h.convergence.combined_heads(GROUP, rel, None).unwrap();
-    assert_eq!(heads.len(), 1, "sanity: exactly one head for {rel}");
-    heads[0].clone()
+/// The delta that removed `shown` (the head `rel` held before) from `rel`, which
+/// has no head left: a delete leaves none behind. Fails unless a held delta
+/// removes exactly that head, landing nothing at `rel`.
+fn remover_of(h: &Harness, rel: &str, shown: &PathHead) -> (DeltaHash, String) {
+    assert!(h.native_heads(rel).is_empty(), "sanity: no head is left at {rel}");
+    let (hash, delta) = h
+        .all_deltas()
+        .into_iter()
+        .find(|(_, delta)| {
+            delta.ops.iter().any(|op| {
+                op.path.as_str() == rel
+                    && op.put.is_none()
+                    && op.removes.iter().any(|removal| removal.provenance.0 == shown.change_hash)
+            })
+        })
+        .unwrap_or_else(|| panic!("{rel} has no head but no admitted removal either"));
+    (DeltaHash(hash), delta.author.device.0.clone())
 }
 
 /// A deletion is a newer local state too. This device captured a file,
@@ -487,10 +410,9 @@ async fn own_capture_does_not_bring_back_a_file_deleted_since() {
         matches!(result, MaterializeResult::RetryRequired),
         "the superseded change is not what disk holds, got {result:?}"
     );
-    let newer = only_head(&h, "notes.txt");
-    assert_ne!(newer.change_hash, captured.change_hash, "the deletion must be captured");
-    assert_eq!(newer.device_id, LOCAL_DEVICE);
-    assert!(newer.content.is_none(), "the newer change is the deletion");
+    let (remover, device) = remover_of(&h, "notes.txt", &captured);
+    assert_ne!(remover.0, captured.change_hash, "the deletion must be captured");
+    assert_eq!(device, LOCAL_DEVICE, "the deletion is this device's own change");
     assert_superseded_and_settles(&h, "notes.txt", &open).await;
     assert!(std::fs::symlink_metadata(&file).is_err());
 }
@@ -516,6 +438,7 @@ async fn own_capture_does_not_bring_back_a_file_renamed_away_since() {
     let file = h.path("notes.txt");
     std::fs::write(&file, b"captured, then renamed by the user").unwrap();
     assert!(matches!(h.capture("notes.txt").await, LocalChangeOutcome::FileChanged(_)));
+    let captured = h.own_head("notes.txt");
     let open = reopen_obligation(&h, "notes.txt");
 
     std::fs::rename(&file, h.path("renamed.txt")).unwrap();
@@ -529,7 +452,7 @@ async fn own_capture_does_not_bring_back_a_file_renamed_away_since() {
         std::fs::read(h.path("renamed.txt")).unwrap(),
         b"captured, then renamed by the user"
     );
-    assert!(only_head(&h, "notes.txt").content.is_none(), "the old name is deleted");
+    assert_eq!(remover_of(&h, "notes.txt", &captured).1, LOCAL_DEVICE, "the old name is deleted");
     assert_superseded_and_settles(&h, "notes.txt", &open).await;
     assert!(std::fs::symlink_metadata(&file).is_err());
 }

@@ -17,7 +17,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub(crate) struct DiagnosticsLinkView {
-    pub(crate) local_path: String,
     pub(crate) state_label: &'static str,
 }
 

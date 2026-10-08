@@ -219,7 +219,7 @@ fn durability_queue_byte_budget() -> usize {
 /// hit disk yet. Only `finish()` returning `Ok(())` means EVERY submitted
 /// batch, not just the last one, has been committed durably; only then may
 /// a caller proceed to whatever "authoritative" means for it (a source's
-/// `FileRecord`/DAG publish, a receiver's group provenance commit). If any
+/// `FileRecord`/native state publish, a receiver's group provenance commit). If any
 /// batch's commit fails, `finish()` returns that error and the whole
 /// chunking operation fails -- a caller must never treat a file as fully
 /// captured while any batch failed, even if failure was detected only

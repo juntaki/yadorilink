@@ -5,10 +5,10 @@ IDs are the stable source of truth; file line numbers are intentionally omitted.
 
 ## DL-1: Materialized Files Have Their Blocks
 
-- Target state: every current `Hydrated` or `Pinned` regular file at a stable repair boundary.
+- Target state: every current `Hydrated` regular file at a stable repair boundary.
 - Destructive operations: cache eviction, GC, interrupted reconstruction, and block corruption.
 - Enforcement symbol: `repair_interrupted_materializations` and `ReplicaCoordinator::reclaim_cached_blocks`.
-- Test IDs: `repair_demotes_to_placeholder_when_blocks_are_also_missing_locally`, `eviction_must_not_delete_block_used_by_pinned_file_in_another_group`.
+- Test IDs: `repair_demotes_to_placeholder_when_blocks_are_also_missing_locally`, `eviction_must_not_delete_block_used_by_hydrated_file_in_another_group`.
 - Runtime diagnosis: link materialization state, repair warning logs, and recent `block_integrity` errors.
 
 ## DL-2: Non-Forced Role Loss Keeps A Holder

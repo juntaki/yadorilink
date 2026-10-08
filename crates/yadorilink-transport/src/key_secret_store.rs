@@ -298,6 +298,8 @@ fn harden_key_file(path: &Path) -> Result<(), TransportError> {
 //   * not(test), not(turmoil)        -> the real OS keyring.
 //   * not(test), turmoil             -> no-op (simulation stays deterministic
 //                                       and never reaches for a real keychain).
+// On top of these, `YADORILINK_DISABLE_OS_KEYRING=1` short-circuits both entry
+// points before any backend is reached (see `DISABLE_OS_KEYRING_VAR`).
 
 /// Outcome of mirroring the on-disk secret into the OS keyring.
 ///
@@ -330,7 +332,7 @@ fn keyring_username(path: &Path) -> String {
 }
 
 #[cfg(all(not(test), not(turmoil)))]
-fn keyring_load(path: &Path) -> Option<Zeroizing<[u8; 32]>> {
+fn keyring_load_backend(path: &Path) -> Option<Zeroizing<[u8; 32]>> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, &keyring_username(path)).ok()?;
     let hex = Zeroizing::new(entry.get_password().ok()?);
     decode_secret(&hex).ok()
@@ -340,7 +342,7 @@ fn keyring_load(path: &Path) -> Option<Zeroizing<[u8; 32]>> {
 /// (unavailable / locked / headless) reports `Unavailable` — the hardened file
 /// remains the source of truth. Nothing is ever deleted based on the result.
 #[cfg(all(not(test), not(turmoil)))]
-fn keyring_mirror(path: &Path, secret: &[u8; 32]) -> KeyringMirror {
+fn keyring_mirror_backend(path: &Path, secret: &[u8; 32]) -> KeyringMirror {
     let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &keyring_username(path)) else {
         return KeyringMirror::Unavailable;
     };
@@ -363,39 +365,80 @@ fn keyring_mirror(path: &Path, secret: &[u8; 32]) -> KeyringMirror {
     }
     // Independent round-trip read-back: only claim success when the keyring
     // actually returns the secret we just wrote.
-    match keyring_load(path) {
+    match keyring_load_backend(path) {
         Some(v) if v.as_slice() == secret.as_slice() => KeyringMirror::Present,
         _ => KeyringMirror::Unavailable,
     }
 }
 
 #[cfg(all(not(test), turmoil))]
-fn keyring_load(_path: &Path) -> Option<Zeroizing<[u8; 32]>> {
+fn keyring_load_backend(_path: &Path) -> Option<Zeroizing<[u8; 32]>> {
     None
 }
 
 #[cfg(all(not(test), turmoil))]
-fn keyring_mirror(_path: &Path, _secret: &[u8; 32]) -> KeyringMirror {
+fn keyring_mirror_backend(_path: &Path, _secret: &[u8; 32]) -> KeyringMirror {
     KeyringMirror::Unavailable
 }
 
 #[cfg(test)]
-fn keyring_load(path: &Path) -> Option<Zeroizing<[u8; 32]>> {
+fn keyring_load_backend(path: &Path) -> Option<Zeroizing<[u8; 32]>> {
     test_keyring::get(&keyring_username(path)).map(Zeroizing::new)
 }
 
 #[cfg(test)]
-fn keyring_mirror(path: &Path, secret: &[u8; 32]) -> KeyringMirror {
+fn keyring_mirror_backend(path: &Path, secret: &[u8; 32]) -> KeyringMirror {
     if let Some(existing) = test_keyring::get(&keyring_username(path)) {
         return if existing == *secret { KeyringMirror::Present } else { KeyringMirror::Conflict };
     }
     if !test_keyring::set(&keyring_username(path), secret) {
         return KeyringMirror::Unavailable;
     }
-    match keyring_load(path) {
+    match keyring_load_backend(path) {
         Some(v) if v.as_slice() == secret.as_slice() => KeyringMirror::Present,
         _ => KeyringMirror::Unavailable,
     }
+}
+
+/// Environment switch that turns the OS keyring mirror off entirely: with
+/// `YADORILINK_DISABLE_OS_KEYRING=1` no keyring read, write or probe is ever
+/// issued and the hardened key file is the only copy (the same "OS keyring
+/// unavailable, using file at rest" path as a headless host). Production
+/// default is unchanged: unset means the keyring is used. Test and sweep
+/// harnesses set it (`.config/nextest.toml`)
+/// so a run never touches the developer's real keychain; the credential store
+/// has its own, existing `YADORILINK_CREDENTIAL_STORE=file`, which the same
+/// harnesses set alongside.
+#[cfg(not(test))]
+const DISABLE_OS_KEYRING_VAR: &str = "YADORILINK_DISABLE_OS_KEYRING";
+
+/// Whether `value` of [`DISABLE_OS_KEYRING_VAR`] switches the keyring off.
+fn disables_keyring(value: Option<&str>) -> bool {
+    matches!(value, Some("1"))
+}
+
+/// Unit tests ignore the environment (the harness sets it for the whole run,
+/// and the in-memory keyring tests must still exercise the mirror); they drive
+/// the switch through `test_keyring::set_disabled` instead.
+fn os_keyring_disabled() -> bool {
+    #[cfg(test)]
+    return test_keyring::disabled();
+    #[cfg(not(test))]
+    return disables_keyring(std::env::var(DISABLE_OS_KEYRING_VAR).ok().as_deref());
+}
+
+fn keyring_load(path: &Path) -> Option<Zeroizing<[u8; 32]>> {
+    if os_keyring_disabled() {
+        return None;
+    }
+    keyring_load_backend(path)
+}
+
+fn keyring_mirror(path: &Path, secret: &[u8; 32]) -> KeyringMirror {
+    if os_keyring_disabled() {
+        return KeyringMirror::Unavailable;
+    }
+    keyring_mirror_backend(path, secret)
 }
 
 // --- Orchestration -------------------------------------------------------

@@ -25,7 +25,7 @@ pub enum ApiError {
     /// `control_client`'s module doc comment). Surfaced as a client error
     /// (400) rather than a server error (502): every request this adapter
     /// forwards that can produce this is a caller-suppled-path lookup
-    /// (`versions`, `materialization`, `pause`, `pin`, ...), so an
+    /// (`versions`, `materialization`, `pause`, `evict`, ...), so an
     /// unresolvable path is the overwhelmingly common cause.
     DaemonRejected(String),
     /// Anything else: a framing/protocol-version mismatch between this

@@ -274,7 +274,7 @@ fn head_for(device: &str, lamport: u64, entry: Option<ModelEntry>) -> PathHead {
     let change_hash: [u8; 32] = Sha256::digest(format!("change:{device}:{lamport}")).into();
     PathHead {
         change_hash,
-        lamport,
+        rank: lamport,
         device_id: device.to_string(),
         naming_device_id: device.to_string(),
         content: entry

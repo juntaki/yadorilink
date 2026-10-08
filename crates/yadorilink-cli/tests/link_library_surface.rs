@@ -85,7 +85,7 @@ async fn empty_folder_previews_clean_and_links() {
         .list_links()
         .unwrap()
         .into_iter()
-        .map(|l| l.local_path)
+        .map(|l| l.key().to_string())
         .collect();
     assert!(
         linked.iter().any(|p| p == &folder.canonicalize().unwrap().to_string_lossy()),
@@ -116,51 +116,56 @@ async fn non_empty_folder_surfaces_a_warning() {
     );
 }
 
-/// / daemon defense-in-depth: linking a folder that nests an existing link
-/// is a genuine correctness hazard the daemon is the sole authority on. The
-/// window's aggregate acknowledgement (`acknowledge_risks`) is what lets it
-/// through — without it the daemon refuses, with it the link registers.
+/// Linking a folder that nests an existing link is an unsupported topology:
+/// the daemon refuses it with and without the aggregate acknowledgement, naming
+/// the conflicting link, and registers nothing.
 #[tokio::test]
-async fn nested_link_is_refused_without_ack_and_allowed_with_ack() {
+async fn nested_link_is_refused_with_and_without_ack() {
     let _guard = TEST_MUTEX.lock().await;
     let (dir, state) = start_daemon().await;
     let parent = dir.path().join("parent");
     let child = parent.join("child");
     std::fs::create_dir_all(&child).unwrap();
 
-    // Register the child link first — it has no nested conflict, so the
-    // daemon accepts it with ack=false regardless of free-space state.
+    // Register the child link first — it has no nested conflict.
     let (child_abs, child_report) =
         yadorilink_client_core::ops::links::run_link_preflight(&child.to_string_lossy())
             .await
             .unwrap();
     assert!(child_report.nested_conflicts.is_empty());
-    yadorilink_client_core::ops::links::link_resolved(child_abs, "group-child".into(), false)
-        .await
-        .unwrap();
+    yadorilink_client_core::ops::links::link_resolved(
+        child_abs.clone(),
+        "group-child".into(),
+        false,
+    )
+    .await
+    .unwrap();
 
-    // Now the parent nests an existing link — preflight detects it, and the
-    // daemon rejects a link that does not acknowledge it.
+    // Now the parent nests an existing link: preflight detects it as a
+    // prohibition (not an acknowledgeable risk) and the daemon refuses it
+    // whatever the acknowledgement says.
     let (parent_abs, parent_report) =
         yadorilink_client_core::ops::links::run_link_preflight(&parent.to_string_lossy())
             .await
             .unwrap();
     assert!(
-        !parent_report.nested_conflicts.is_empty(),
+        !parent_report.structural_prohibitions().is_empty(),
         "preflight should detect the nested child link"
     );
 
-    let refused = yadorilink_client_core::ops::links::link_resolved(
-        parent_abs.clone(),
-        "group-parent".into(),
-        false,
-    )
-    .await;
-    assert!(refused.is_err(), "daemon must refuse a nested link without acknowledge_risks");
-
-    yadorilink_client_core::ops::links::link_resolved(parent_abs, "group-parent".into(), true)
+    for acknowledge in [false, true] {
+        let refused = yadorilink_client_core::ops::links::link_resolved(
+            parent_abs.clone(),
+            "group-parent".into(),
+            acknowledge,
+        )
         .await
-        .unwrap();
+        .expect_err("a nested link must be refused whatever acknowledge_risks says");
+        assert!(
+            refused.to_string().contains(&child_abs.to_string_lossy().to_string()),
+            "the refusal must name the conflicting link, got {refused}"
+        );
+    }
 
     let linked: Vec<String> = state
         .replica_coordinator
@@ -168,10 +173,7 @@ async fn nested_link_is_refused_without_ack_and_allowed_with_ack() {
         .list_links()
         .unwrap()
         .into_iter()
-        .map(|l| l.local_path)
+        .map(|l| l.key().to_string())
         .collect();
-    assert!(
-        linked.iter().any(|p| p == &parent.canonicalize().unwrap().to_string_lossy()),
-        "the acknowledged nested link should now be registered, got {linked:?}"
-    );
+    assert_eq!(linked, vec![child_abs.to_string_lossy().to_string()], "nothing else was linked");
 }

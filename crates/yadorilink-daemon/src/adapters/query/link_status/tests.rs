@@ -15,8 +15,8 @@ pub(super) fn test_state() -> Arc<DaemonState> {
 }
 
 /// Indexes one current file record. `upsert_file` mimics a LOCAL write
-/// (this device authoring new content), so it defaults to `Hydrated`
-/// -- explicitly overridden to `Placeholder` when `hydrated` is
+/// (this device authoring new content), so it defaults to `Present`
+/// -- explicitly overridden to `Remote` when `hydrated` is
 /// `false`, to simulate a record synced in from a peer whose content
 /// hasn't been fetched yet.
 pub(super) fn upsert_file(state: &DaemonState, path: &str, hydrated: bool) {
@@ -37,7 +37,7 @@ pub(super) fn upsert_file(state: &DaemonState, path: &str, hydrated: bool) {
         )
         .unwrap();
     let target =
-        if hydrated { MaterializationState::Hydrated } else { MaterializationState::Placeholder };
+        if hydrated { MaterializationState::Present } else { MaterializationState::Remote };
     state
         .replica_coordinator
         .materialization_state_repository()

@@ -108,7 +108,7 @@ fn write_len_prefixed(buf: &mut Vec<u8>, bytes: &[u8]) {
 
 /// The exact preimage `WriteLease`'s signature covers. Field order and
 /// framing are part of the wire contract the moment a coordination-worker
-/// implementation exists to mirror this (see the design doc's §3.3) —
+/// implementation exists to mirror this —
 /// changing this function's output for an already-issued lease shape
 /// would be exactly the kind of incompatible change
 /// `change_policy.rs::ACTION_GRANT_WITH_ROLE`'s doc comment warns against

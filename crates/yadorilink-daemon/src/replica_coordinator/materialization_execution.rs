@@ -14,13 +14,9 @@ use yadorilink_filesystem_sync::materialization_execution::{
     OpenMaterializationIntent, RepairRowSnapshot as ExecRepairRowSnapshot,
 };
 use yadorilink_local_storage::{BlockReclamationStore, GcReport};
-use yadorilink_replica_domain::admission::ChangeEmitter;
 use yadorilink_replica_domain::file::{FileRecord, RecordKind};
-use yadorilink_replica_domain::ids::ChangeHash;
 use yadorilink_replica_domain::session_state::MaterializationState;
-use yadorilink_replica_domain::session_state::{
-    EvictableFile, RestoreCommitOutcome, RestoreOperation,
-};
+use yadorilink_replica_domain::session_state::{RestoreCommitOutcome, RestoreOperation};
 use yadorilink_replica_engine::custody::VerifiedCustody;
 use yadorilink_root_authority::root_commit::RootCommitPermit;
 use yadorilink_root_authority::root_identity::VerifiedRoot;
@@ -36,7 +32,6 @@ fn expected_authoring_from(
 ) -> yadorilink_sync_sqlite::exact_materialized_commit::ExpectedAuthoring<'_> {
     yadorilink_sync_sqlite::exact_materialized_commit::ExpectedAuthoring {
         state: guard.state,
-        authoring_change_hash: guard.authoring_change_hash,
         expected_version: guard.expected_version,
     }
 }
@@ -79,35 +74,6 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         Ok(self
             .link_repository()
             .windows_symlink_opt_in_for_group(group_id)
-            .map_err(SyncError::from)?)
-    }
-
-    fn list_evictable_files(
-        &self,
-        group_id: &str,
-    ) -> Result<Vec<EvictableFile>, MaterializationExecutionError> {
-        Ok(self
-            .materialization_state_repository()
-            .list_evictable_files(group_id)
-            .map_err(SyncError::from)?)
-    }
-
-    fn hydrated_usage_bytes(&self, group_id: &str) -> Result<u64, MaterializationExecutionError> {
-        Ok(self
-            .materialization_state_repository()
-            .hydrated_usage_bytes(group_id)
-            .map_err(SyncError::from)?)
-    }
-
-    fn touch_last_accessed(
-        &self,
-        group_id: &str,
-        path: &str,
-        unix_ts: i64,
-    ) -> Result<(), MaterializationExecutionError> {
-        Ok(self
-            .file_index_repository()
-            .touch_last_accessed(group_id, path, unix_ts)
             .map_err(SyncError::from)?)
     }
 
@@ -176,28 +142,6 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
             .map_err(SyncError::from)?)
     }
 
-    fn mark_deleted_emitting_change(
-        &self,
-        group_id: &str,
-        path: &str,
-        device_id: &str,
-        observed_at_unix_nanos: i64,
-        publish_absent_proof: bool,
-        emitter: &ChangeEmitter,
-        permit: &RootCommitPermit<'_>,
-    ) -> Result<ChangeHash, MaterializationExecutionError> {
-        Ok(ReplicaCoordinator::mark_deleted_emitting_change(
-            self,
-            group_id,
-            path,
-            device_id,
-            observed_at_unix_nanos,
-            publish_absent_proof,
-            emitter,
-            permit,
-        )?)
-    }
-
     fn record_dirty_path(
         &self,
         group_id: &str,
@@ -235,7 +179,7 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
             .write_immediate::<_, yadorilink_sync_sqlite::SyncSqliteError>(|tx| {
                 let outcome =
                     yadorilink_sync_sqlite::exact_materialized_commit::commit_recovered_materialized_state(
-                        tx, group_id, path, None, &exact, guard, now,
+                        tx, group_id, path, &exact, guard, now,
                     )?;
                 permit.verify()?;
                 Ok(outcome)
@@ -256,6 +200,16 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
             .sqlite()
             .dag_usable_proof_names_current_version(group_id, path)
             .map_err(SyncError::from)?)
+    }
+
+    fn disk_is_untouched_proven_write(
+        &self,
+        group_id: &str,
+        path: &str,
+        out_path: &Path,
+    ) -> Result<bool, MaterializationExecutionError> {
+        Ok(ReplicaCoordinator::dag_disk_is_untouched_proven_write(self, group_id, path, out_path)
+            .unwrap_or(false))
     }
 
     fn get_recorded_placeholder_identity(
@@ -281,9 +235,7 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         expected_generation: u64,
     ) -> Result<(), MaterializationExecutionError> {
         // Test-only bypass: a `--lib` unit test (`gc::tests::eviction_without_
-        // remote_lease_never_reaches_physical_reclaim`, `hydration::tests::
-        // preflight_disk_pressure_runs_eviction_sweep_for_on_demand_link_
-        // first`) that seeds a real `Hydrated` row via direct index writes
+        // remote_lease_never_reaches_physical_reclaim`) that seeds a real `Present` row via direct index writes
         // (no actual `cfapi-host.exe` ever ran to create a real CfAPI
         // placeholder object underneath it) has no live pipe to dial here --
         // unlike `get_recorded_placeholder_identity`'s "no recorded identity"
@@ -344,25 +296,28 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         })
     }
 
-    fn list_snapshot_install_holds(
+    fn list_held_paths(
         &self,
         group_id: &str,
     ) -> Result<
-        Vec<yadorilink_replica_domain::session_state::SnapshotInstallHold>,
+        Vec<yadorilink_replica_domain::session_state::HeldPath>,
         MaterializationExecutionError,
     > {
-        Ok(self.snapshot_install_hold_repository().list(group_id).map_err(SyncError::from)?)
+        Ok(self
+            .held_path_repository()
+            .list_for_reconciliation(group_id)
+            .map_err(SyncError::from)?)
     }
 
-    fn begin_snapshot_install_disk_write(
+    fn begin_held_path_disk_write(
         &self,
         group_id: &str,
         path: &str,
     ) -> Result<(), MaterializationExecutionError> {
-        ReplicaCoordinator::begin_snapshot_install_disk_write(self, group_id, path)
+        ReplicaCoordinator::begin_held_path_disk_write(self, group_id, path)
     }
 
-    fn release_snapshot_install_hold(
+    fn release_held_path(
         &self,
         group_id: &str,
         path: &str,
@@ -373,7 +328,7 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
             .map(|d| d.as_nanos() as i64)
             .unwrap_or(0);
         Ok(self
-            .snapshot_install_hold_repository()
+            .held_path_repository()
             .release(group_id, path, generation, now)
             .map_err(SyncError::from)?)
     }
@@ -390,18 +345,8 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
             .map(|d| d.as_nanos() as i64)
             .unwrap_or(0);
         Ok(self
-            .snapshot_install_hold_repository()
+            .held_path_repository()
             .relocate_held_entry_beside_directory(group_id, path, generation, removable, now)
-            .map_err(SyncError::from)?)
-    }
-
-    fn list_placeholder_paths_missing_generation(
-        &self,
-        group_id: &str,
-    ) -> Result<Vec<String>, MaterializationExecutionError> {
-        Ok(self
-            .materialization_state_repository()
-            .list_placeholder_paths_missing_generation(group_id)
             .map_err(SyncError::from)?)
     }
 
@@ -443,7 +388,7 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         path: &str,
     ) -> Result<bool, MaterializationExecutionError> {
         Ok(self
-            .snapshot_install_hold_repository()
+            .held_path_repository()
             .has_live_descendant_row(group_id, path)
             .map_err(SyncError::from)?)
     }
@@ -579,10 +524,6 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         path: &str,
     ) -> Result<ExecEvictionEligibilitySnapshot, MaterializationExecutionError> {
         Ok(ExecEvictionEligibilitySnapshot {
-            pinned: self
-                .file_index_repository()
-                .is_pinned(group_id, path)
-                .map_err(SyncError::from)?,
             current_version: self
                 .sqlite()
                 .dag_get_current_version_record(group_id, path)
@@ -603,10 +544,6 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
             current_version: self
                 .sqlite()
                 .dag_get_current_version_record(group_id, path)
-                .map_err(SyncError::from)?,
-            pinned: self
-                .file_index_repository()
-                .is_pinned(group_id, path)
                 .map_err(SyncError::from)?,
             materialization_state: self
                 .materialization_state_repository()
@@ -633,11 +570,9 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         // another. Repair then compared a guard built from the first
         // against bytes chosen by the second.
         //
-        // The path lock does not close this. The mainline DAG appliers do
-        // take it, but a base install (`rebootstrap_store::install_base_rows`,
-        // under a seal or a merge) replaces every row in a group with a
-        // lock-free `DELETE FROM files` plus reinsert, and can land while a
-        // live repair pass is between reads.
+        // The path lock does not close this: native admission does not take
+        // it, so a supersession can land while a live repair pass is
+        // between reads.
         //
         // Nothing had to be added to the canonical read to fix this: it
         // already returned the kind, the block list and the symlink
@@ -665,7 +600,6 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
                 deleted: snapshot.deleted,
             }),
             current_version: Some(current_version),
-            current_authoring: canonical.authoring_change_hash,
             unix_mode: snapshot.unix_mode,
             xattrs: snapshot.xattrs,
         })
@@ -690,8 +624,7 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as i64)
             .unwrap_or(0);
-        Ok(self
-            .database
+        self.database
             .write_immediate::<_, yadorilink_sync_sqlite::SyncSqliteError>(|tx| {
                 yadorilink_sync_sqlite::materialized_generation::bump_mutation_fence(
                     tx,
@@ -701,7 +634,14 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
                     now,
                 )
             })
-            .map_err(SyncError::from)?)
+            .map_err(|error| match error {
+                // A frozen group is refused for this path alone: a sweep goes
+                // on with the others instead of failing the group.
+                yadorilink_sync_sqlite::SyncSqliteError::GroupFrozen { .. } => {
+                    MaterializationExecutionError::Io(std::io::Error::other(error.to_string()))
+                }
+                other => SyncError::from(other).into(),
+            })
     }
 
     fn open_eviction(
@@ -787,7 +727,6 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         out_path: &Path,
         version: yadorilink_replica_domain::ids::VersionHash,
         row_state: Option<MaterializationState>,
-        authoring: Option<&ChangeHash>,
         mutation_generation: i64,
         permit: &RootCommitPermit<'_>,
     ) -> Result<bool, MaterializationExecutionError> {
@@ -799,7 +738,6 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
             out_path,
             version,
             row_state,
-            authoring,
             mutation_generation,
             permit,
         )
@@ -830,12 +768,11 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         group_id: &str,
         path: &str,
         row_state: MaterializationState,
-        authoring: Option<&ChangeHash>,
         version: Option<&yadorilink_replica_domain::ids::VersionHash>,
         permit: &RootCommitPermit<'_>,
     ) -> Result<bool, MaterializationExecutionError> {
         ReplicaCoordinator::open_repair_placeholder_demotion(
-            self, group_id, path, row_state, authoring, version, permit,
+            self, group_id, path, row_state, version, permit,
         )
     }
 
@@ -845,7 +782,6 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         path: &str,
         out_path: &Path,
         row_state: MaterializationState,
-        authoring: Option<&ChangeHash>,
         version: Option<yadorilink_replica_domain::ids::VersionHash>,
         mutation_generation: i64,
         permit: &RootCommitPermit<'_>,
@@ -856,7 +792,6 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
             path,
             out_path,
             row_state,
-            authoring,
             version,
             mutation_generation,
             permit,
@@ -902,7 +837,7 @@ fn test_windows_dehydrate_confirmed_without_cfapi_host_is_armed_for(path: &Path)
 
 /// Test-only: arms (or disarms) the bypass above for one exact path --
 /// see [`TEST_WINDOWS_DEHYDRATE_CONFIRMED_PATHS`]'s own doc comment. Call
-/// after seeding a `Hydrated` row this test intends to `evict_file` on a
+/// after seeding a `Present` row this test intends to `evict_file` on a
 /// build targeting Windows, once a placeholder identity has also been
 /// recorded for it (`record_placeholder_generation`) -- the real
 /// precondition `dehydrate_windows_placeholder`'s own doc comment

@@ -422,6 +422,29 @@ impl FileIdentity {
     /// (uses `lstat`/`symlink_metadata`, never `stat`). This is the right
     /// choice whenever the caller cares about the object actually present
     /// at that path, including when that object is itself a symlink.
+    /// Whether two equal observations of `path`, the later one taken now,
+    /// prove nothing rewrote its bytes in between -- including an in-place
+    /// rewrite that keeps the length and restores the modification time.
+    ///
+    /// On Unix the fingerprint always carries `ctime`, which every write
+    /// moves and no API sets back. On Windows it carries `ChangeTime` only
+    /// when that query succeeded; when it fails now, an earlier observation
+    /// that also lacked it can be equal to this one over different bytes.
+    /// (An earlier observation that had it differs from one that does not,
+    /// so asking about now is enough.) `false` means the caller must compare
+    /// the bytes themselves.
+    pub fn in_place_rewrite_visible(path: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            let _ = path;
+            true
+        }
+        #[cfg(windows)]
+        {
+            win_identity::query_path(path).is_ok_and(|fields| fields.change_time.is_some())
+        }
+    }
+
     // `platform_fields` is `()` on Unix (nothing to bind) and a real
     // struct on Windows -- `clippy::let_unit_value` only fires under the
     // former, so it is allowed here rather than duplicating this function
@@ -1074,7 +1097,7 @@ fn linux_inode_generation(fd: std::os::unix::io::RawFd) -> Option<u128> {
 /// definition of what a symlink target's captured bytes ARE:
 /// `local_change`/`single_pass_capture` reuse it verbatim to build
 /// `change::FileMeta::symlink_target`, so a symlink's identity-hash input
-/// here and its captured DAG target are always the same bytes rather than
+/// here and its captured symlink target are always the same bytes rather than
 /// two independently-lossy conversions of the same on-disk value. On
 /// Windows this serializes the target's UTF-16 code units little-endian via
 /// `encode_wide`, which — unlike a UTF-8/UTF-16 conversion — never rejects
@@ -2002,7 +2025,7 @@ pub type DiskRaceFingerprint = (u64, Option<SystemTime>, i64, i64);
 /// "what does it contain".
 ///
 /// This is the one definition every bracket shares: the peer session's
-/// eager materialize, the daemon's hydration and DAG import, local capture's
+/// eager materialize, the daemon's hydration, local capture's
 /// commit-time re-check, and eviction all compare samples taken here, so a
 /// change to what the fingerprint covers changes every one of them together.
 ///
@@ -2058,8 +2081,7 @@ pub fn disk_race_fingerprint_of(meta: &Metadata) -> DiskRaceFingerprint {
 /// recorded (`FileRecord::mtime_unix_nanos`, stored as nanoseconds since the
 /// Unix epoch). Deriving this in one place keeps the "unchanged file" verdict
 /// identical no matter which path reaches it: local capture's per-file fast
-/// path, its bulk startup/offline reconcile scan, and the daemon's DAG
-/// import MUST agree, or a same-size edit one path treats as a no-op another
+/// path and its bulk startup/offline reconcile scan MUST agree, or a same-size edit one path treats as a no-op another
 /// would silently keep at the stale version.
 pub fn metadata_mtime_matches(metadata: &Metadata, indexed_mtime_unix_nanos: i64) -> bool {
     metadata

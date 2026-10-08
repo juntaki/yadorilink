@@ -6,9 +6,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use rusqlite::{Connection, OptionalExtension};
-use yadorilink_replica_domain::change::Change;
 use yadorilink_replica_domain::file::{BlockInfo, FileVersion, RecordKind};
-use yadorilink_replica_domain::ids::{ChangeHash, FolderGroupId, VersionHash};
+use yadorilink_replica_domain::ids::{DeltaHash, FolderGroupId, VersionHash};
 use yadorilink_sqlite_runtime::SyncDatabase;
 
 use crate::error::SyncSqliteError;
@@ -20,16 +19,15 @@ use crate::types::{CurrentVersionSnapshot, RetainedVersion, RetainedVersionState
 /// They travel together on purpose. A path's version is not a stored
 /// column -- it is derived from the row's own content columns (see
 /// `FileVersion::compute_hash`) -- so reading "the version" and "the
-/// authoring hash" separately can observe two different rows if an update
-/// lands between them, and a guard built that way would compare a version
-/// from one incarnation against an authoring hash from another. The same
+/// materialization state" separately can observe two different rows if an
+/// update lands between them, and a guard built that way would compare a
+/// version from one incarnation against a state from another. The same
 /// applies to a producer: what it writes and what its proof names have to
 /// come from one incarnation, or the proof describes a state that was
 /// never assembled anywhere.
 #[derive(Debug, Clone)]
 pub struct CanonicalCurrentRow {
     pub snapshot: CurrentVersionSnapshot,
-    pub authoring_change_hash: Option<ChangeHash>,
     pub materialization_state:
         Option<yadorilink_replica_domain::session_state::MaterializationState>,
     /// The device that produced this row's content. Not part of version
@@ -54,6 +52,53 @@ impl CanonicalCurrentRow {
     }
 }
 
+/// The current-row column list, in the order [`decode_current_row`] reads it.
+const CURRENT_ROW_COLUMNS: &str = "size, mtime_unix_nanos, blocks_json, deleted, record_kind, \
+     symlink_target, unix_mode, xattrs_json, materialization_state, origin_device_id, \
+     symlink_out_of_root";
+
+/// Decodes the [`CURRENT_ROW_COLUMNS`] starting at column `base` of `r`: the one place the
+/// current row's columns are decoded, for the single-path and the set-based reads alike.
+fn decode_current_row(
+    r: &rusqlite::Row<'_>,
+    base: usize,
+    path: &str,
+) -> Result<CanonicalCurrentRow, SyncSqliteError> {
+    let size: u64 = r.get(base)?;
+    let mtime: i64 = r.get(base + 1)?;
+    let blocks_json: String = r.get(base + 2)?;
+    let deleted: i64 = r.get(base + 3)?;
+    let record_kind: String = r.get(base + 4)?;
+    let symlink_target: Option<Vec<u8>> = r.get(base + 5)?;
+    let unix_mode: i64 = r.get(base + 6)?;
+    let xattrs_json: String = r.get(base + 7)?;
+    let mstate: Option<String> = r.get(base + 8)?;
+    let origin_device_id: Option<String> = r.get(base + 9)?;
+    let symlink_out_of_root: i64 = r.get(base + 10)?;
+    let blocks: Vec<BlockInfo> = serde_json::from_str(&blocks_json).map_err(|error| {
+        SyncSqliteError::CorruptState(format!(
+            "stored block list for current version of {path} is corrupt: {error}"
+        ))
+    })?;
+    Ok(CanonicalCurrentRow {
+        snapshot: CurrentVersionSnapshot {
+            blocks,
+            size,
+            mtime_unix_nanos: mtime,
+            deleted: deleted != 0,
+            record_kind: RecordKind::from_db_str(&record_kind),
+            symlink_target,
+            unix_mode: crate::file_index::decode_unix_mode_column(unix_mode),
+            xattrs: crate::file_index::decode_xattrs_column(&xattrs_json)?,
+        },
+        materialization_state: mstate
+            .as_deref()
+            .map(yadorilink_replica_domain::session_state::MaterializationState::from_db_str),
+        origin_device_id,
+        symlink_out_of_root: symlink_out_of_root != 0,
+    })
+}
+
 /// The canonical current-row read, over `&Connection` so a caller holding
 /// an open `&Transaction` can use it too (a `&Transaction` derefs to
 /// `&Connection`). Every reader of the current row goes through this, so
@@ -65,96 +110,43 @@ pub fn read_canonical_current_row(
     group_id: &str,
     path: &str,
 ) -> Result<Option<CanonicalCurrentRow>, SyncSqliteError> {
-    #[allow(clippy::type_complexity)]
-    let row: Option<(
-        u64,
-        i64,
-        String,
-        i64,
-        String,
-        Option<Vec<u8>>,
-        i64,
-        String,
-        Option<Vec<u8>>,
-        Option<String>,
-        Option<String>,
-        i64,
-    )> = conn
-        .query_row(
-            "SELECT size, mtime_unix_nanos, blocks_json, deleted, record_kind, \
-                    symlink_target, unix_mode, xattrs_json, authoring_change_hash, \
-                    materialization_state, origin_device_id, symlink_out_of_root \
-             FROM files WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
-            rusqlite::params![group_id, path],
-            |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                    r.get(6)?,
-                    r.get(7)?,
-                    r.get(8)?,
-                    r.get(9)?,
-                    r.get(10)?,
-                    r.get(11)?,
-                ))
-            },
-        )
-        .optional()?;
-    let Some((
-        size,
-        mtime,
-        blocks_json,
-        deleted,
-        record_kind,
-        symlink_target,
-        unix_mode,
-        xattrs_json,
-        authoring,
-        mstate,
-        origin_device_id,
-        symlink_out_of_root,
-    )) = row
-    else {
-        return Ok(None);
-    };
-    let blocks: Vec<BlockInfo> = serde_json::from_str(&blocks_json).map_err(|error| {
-        SyncSqliteError::CorruptState(format!(
-            "stored block list for current version of {path} is corrupt: {error}"
-        ))
-    })?;
-    let authoring_change_hash = match authoring {
-        None => None,
-        Some(bytes) => {
-            let exact: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-                SyncSqliteError::CorruptState(format!(
-                    "stored authoring change hash for current version of {path} is not 32 bytes"
-                ))
-            })?;
-            Some(ChangeHash(exact))
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {CURRENT_ROW_COLUMNS} FROM files \
+         WHERE group_id = ?1 AND path = ?2 AND state = 'current'"
+    ))?;
+    let mut rows = stmt.query(rusqlite::params![group_id, path])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(decode_current_row(row, 0, path)?)),
+        None => Ok(None),
+    }
+}
+
+/// Paths bound per statement by the set-based reads, well under SQLite's variable limit.
+pub(crate) const PATHS_PER_QUERY: usize = 500;
+
+/// [`read_canonical_current_row`] for many paths in few statements: the current row of every
+/// path of `paths` that has one, keyed by path. A path with no current row is absent.
+pub fn read_canonical_current_rows(
+    conn: &Connection,
+    group_id: &str,
+    paths: &[&str],
+) -> Result<std::collections::HashMap<String, CanonicalCurrentRow>, SyncSqliteError> {
+    let mut out = std::collections::HashMap::with_capacity(paths.len());
+    for chunk in paths.chunks(PATHS_PER_QUERY) {
+        let marks = vec!["?"; chunk.len()].join(",");
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT path, {CURRENT_ROW_COLUMNS} FROM files \
+             WHERE group_id = ?1 AND state = 'current' AND path IN ({marks})"
+        ))?;
+        let params = std::iter::once(group_id).chain(chunk.iter().copied());
+        let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
+        while let Some(row) = rows.next()? {
+            let path: String = row.get(0)?;
+            let decoded = decode_current_row(row, 1, &path)?;
+            out.insert(path, decoded);
         }
-    };
-    Ok(Some(CanonicalCurrentRow {
-        snapshot: CurrentVersionSnapshot {
-            blocks,
-            size,
-            mtime_unix_nanos: mtime,
-            deleted: deleted != 0,
-            record_kind: RecordKind::from_db_str(&record_kind),
-            symlink_target,
-            unix_mode: crate::file_index::decode_unix_mode_column(unix_mode),
-            xattrs: crate::file_index::decode_xattrs_column(&xattrs_json)?,
-        },
-        authoring_change_hash,
-        materialization_state: mstate
-            .as_deref()
-            .map(yadorilink_replica_domain::session_state::MaterializationState::from_db_str),
-        origin_device_id,
-        symlink_out_of_root: symlink_out_of_root != 0,
-    }))
+    }
+    Ok(out)
 }
 
 pub struct SqliteSyncStore {
@@ -166,69 +158,26 @@ impl SqliteSyncStore {
         Self { database }
     }
 
-    /// The group's current non-superseded heads, ascending by hash --
-    /// `group_heads` is a materialized index kept in step with `changes`,
-    /// not a live query over it.
-    pub fn group_heads(&self, group: &FolderGroupId) -> Result<Vec<ChangeHash>, SyncSqliteError> {
-        self.database
-            .read::<_, SyncSqliteError>(|conn| crate::dag_store::group_heads(conn, group.as_str()))
-    }
-
-    /// [`Self::group_heads`], restricted to the published subgraph -- see
-    /// `dag_store::published_view::published_group_heads`'s own doc
-    /// comment. This is the version any surface that hands heads to a peer
-    /// (heads-announce, have-boundary, outbound `ChangeBatch` construction)
-    /// must use instead of [`Self::group_heads`].
-    pub fn published_group_heads(
-        &self,
-        group: &FolderGroupId,
-    ) -> Result<Vec<ChangeHash>, SyncSqliteError> {
+    /// The signed deltas the group's live native heads stand on, ascending by
+    /// hash: one entry per distinct provenance, whatever number of paths it
+    /// put.
+    pub fn native_group_heads(&self, group_id: &str) -> Result<Vec<DeltaHash>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            crate::dag_store::published_view::published_group_heads(conn, group.as_str())
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT provenance FROM native_heads WHERE group_id = ?1 \
+                 ORDER BY provenance",
+            )?;
+            let rows = stmt.query_map([group_id], |row| row.get::<_, Vec<u8>>(0))?;
+            let mut heads = Vec::new();
+            for row in rows {
+                let bytes = row?;
+                let hash: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+                    SyncSqliteError::CorruptState("a native head provenance is not 32 bytes".into())
+                })?;
+                heads.push(DeltaHash(hash));
+            }
+            Ok(heads)
         })
-    }
-
-    /// [`Self::get_change`], restricted to the published subgraph -- see
-    /// `dag_store::published_view::published_change`.
-    pub fn published_change(&self, hash: &ChangeHash) -> Result<Option<Change>, SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| {
-            crate::dag_store::published_view::published_change(conn, hash)
-        })
-    }
-
-    /// A stored change decoded from its persisted bytes.
-    pub fn get_change(&self, hash: &ChangeHash) -> Result<Option<Change>, SyncSqliteError> {
-        match self.get_encoded(hash)? {
-            None => Ok(None),
-            Some(bytes) => Change::from_wire_bytes(&bytes)
-                .map(Some)
-                .map_err(|e| SyncSqliteError::CorruptState(format!("corrupt stored change: {e}"))),
-        }
-    }
-
-    /// A stored change's raw encoded bytes (canonical + signature), for
-    /// serving it onward to another peer without re-signing. Delegates to
-    /// `dag_store::retained_history_integrity::get_encoded` -- the single
-    /// SQL implementation of this read (see `group_heads`'s doc comment
-    /// above for why this is a delegation rather than a second copy of the
-    /// query).
-    pub fn get_encoded(&self, hash: &ChangeHash) -> Result<Option<Vec<u8>>, SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| crate::dag_store::get_encoded(conn, hash))
-    }
-
-    /// The stored parent edges of a change. Delegates to
-    /// `dag_store::retained_history_integrity::parents_of` (see
-    /// `group_heads`'s doc comment).
-    pub fn parents_of(&self, hash: &ChangeHash) -> Result<Vec<ChangeHash>, SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| crate::dag_store::parents_of(conn, hash))
-    }
-
-    /// Whether a change is already present in the admitted store (not the
-    /// orphan buffer). Delegates to
-    /// `dag_store::retained_history_integrity::has_change` (see
-    /// `group_heads`'s doc comment).
-    pub fn has_change(&self, hash: &ChangeHash) -> Result<bool, SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| crate::dag_store::has_change(conn, hash))
     }
 
     /// Whether a content-addressed file version is present.
@@ -339,29 +288,6 @@ impl SqliteSyncStore {
         })
     }
 
-    /// The true missing frontier reachable from `roots` -- this store's
-    /// read-connection wrapper around
-    /// [`crate::dag_store::missing_ancestor_frontier`], which is where the
-    /// walk itself and the reasoning for its shape live.
-    ///
-    /// It delegates rather than repeating the walk. A second copy here had
-    /// already drifted from the one in `dag_store`: it followed only
-    /// `change_parents` edges, so a change held against its author's
-    /// previous change -- a name no parent edge reaches -- contributed
-    /// nothing to the frontier and the change it waited on was never asked
-    /// for. This is the path the engine actually re-requests through, so
-    /// that drift meant the author link was followed only where tests
-    /// looked.
-    pub fn missing_ancestor_frontier(
-        &self,
-        roots: &[ChangeHash],
-    ) -> Result<Vec<ChangeHash>, SyncSqliteError> {
-        let roots: Vec<ChangeHash> = roots.to_vec();
-        self.database.read::<_, SyncSqliteError>(|conn| {
-            crate::dag_store::missing_ancestor_frontier(conn, roots.iter().copied())
-        })
-    }
-
     /// spec "Version Listing": every retained version of `path` (current,
     /// superseded, and trashed alike), newest first.
     pub fn list_versions(
@@ -443,133 +369,6 @@ impl SqliteSyncStore {
         })
     }
 
-    // --- `&str`-group-id / domain-type convenience wrappers --- The
-    // methods above are keyed by `&FolderGroupId` and return this crate's
-    // own row types (`RetainedVersion`/`CurrentVersionSnapshot`), matching
-    // `dag_store`'s and this crate's own internal callers (e.g.
-    // `replica_history.rs`). Centralizing the translation here, not at
-    // every caller, is the point: every caller gets the exact same
-    // `&str`-keyed, domain-typed call shape the deleted `SyncState`
-    // methods used to provide. Named with a
-    // `dag_`/`dag_get_current_version_record`/ `dag_list_versions` prefix
-    // specifically to avoid colliding with the `&FolderGroupId`-keyed
-    // methods above, not because these are DAG-only reads
-    // (`dag_get_current_version_record`/`dag_list_versions` are file-index
-    // reads, kept in this group only for naming symmetry with their
-    // `SyncState`-era names).
-    pub fn dag_group_heads(&self, group_id: &str) -> Result<Vec<ChangeHash>, SyncSqliteError> {
-        self.group_heads(&FolderGroupId(group_id.to_string()))
-    }
-
-    /// This path's `projection_obligations` row, if one exists -- the
-    /// Convergence Engine's own live claim source (see that module's own
-    /// doc comment). `None` distinguishes "never obliged" from "obliged
-    /// but not yet run", which a caller diagnosing a stalled projection
-    /// needs to tell apart.
-    pub fn dag_projection_obligation(
-        &self,
-        group_id: &str,
-        path: &str,
-    ) -> Result<Option<crate::projection_obligations::ProjectionObligation>, SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| {
-            crate::projection_obligations::lookup_projection_obligation(conn, group_id, path)
-        })
-    }
-
-    /// The `(source_path, losing_change, carrier_change)` this conflict-copy
-    /// `target_path` was durably minted from, if any -- see
-    /// [`crate::dag_store::conflict_copy_provenance_by_target_path`]'s own
-    /// doc comment for why this is the reverse lookup, diagnostic-only.
-    pub fn dag_conflict_copy_provenance_by_target_path(
-        &self,
-        group_id: &str,
-        target_path: &str,
-    ) -> Result<Option<(String, ChangeHash, ChangeHash)>, SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| {
-            crate::dag_store::conflict_copy_provenance_by_target_path(conn, group_id, target_path)
-        })
-    }
-
-    /// [`Self::dag_group_heads`], restricted to the published subgraph --
-    /// see [`Self::published_group_heads`].
-    pub fn dag_published_group_heads(
-        &self,
-        group_id: &str,
-    ) -> Result<Vec<ChangeHash>, SyncSqliteError> {
-        self.published_group_heads(&FolderGroupId(group_id.to_string()))
-    }
-
-    pub fn dag_missing_ancestor_frontier(
-        &self,
-        roots: impl IntoIterator<Item = ChangeHash>,
-    ) -> Result<Vec<ChangeHash>, SyncSqliteError> {
-        let roots: Vec<ChangeHash> = roots.into_iter().collect();
-        self.missing_ancestor_frontier(&roots)
-    }
-
-    /// Every hash this device has STAGED for `group_id`, read from
-    /// `verified_change_objects` directly.
-    ///
-    /// Deliberately not derived from the canonical `changes` table: that
-    /// enumerates only what has already been promoted, so filtering it for
-    /// "staged but not canonical" is vacuously empty however much is
-    /// actually staged.
-    pub fn dag_staged_hashes(&self, group_id: &str) -> Result<Vec<ChangeHash>, SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| {
-            let mut stmt = conn
-                .prepare("SELECT change_hash FROM verified_change_objects WHERE group_id = ?1")?;
-            let rows = stmt.query_map([group_id], |row| row.get::<_, Vec<u8>>(0))?;
-            let mut out = Vec::new();
-            for row in rows {
-                let bytes = row?;
-                if bytes.len() == 32 {
-                    let mut hash = [0u8; 32];
-                    hash.copy_from_slice(&bytes);
-                    out.push(ChangeHash(hash));
-                }
-            }
-            out.sort();
-            Ok(out)
-        })
-    }
-
-    /// The exact set reconciliation compares for `group_id` -- staged
-    /// unioned with authorized canonical. A canonical Change with no
-    /// authorization evidence is NOT in here, so this is not the same
-    /// question as "is it canonical".
-    pub fn dag_servable_hashes(&self, group_id: &str) -> Result<Vec<ChangeHash>, SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| {
-            crate::verified_change_store::servable_change_hashes(
-                conn,
-                &yadorilink_replica_domain::ids::FolderGroupId(group_id.to_string()),
-            )
-        })
-    }
-
-    pub fn dag_get_change(&self, hash: &ChangeHash) -> Result<Option<Change>, SyncSqliteError> {
-        self.get_change(hash)
-    }
-
-    /// [`Self::dag_get_change`], restricted to the published subgraph.
-    pub fn dag_published_change(
-        &self,
-        hash: &ChangeHash,
-    ) -> Result<Option<Change>, SyncSqliteError> {
-        self.published_change(hash)
-    }
-
-    pub fn dag_get_encoded(&self, hash: &ChangeHash) -> Result<Option<Vec<u8>>, SyncSqliteError> {
-        self.get_encoded(hash)
-    }
-
-    pub fn dag_has_file_version(
-        &self,
-        group_id: &str,
-        hash: &VersionHash,
-    ) -> Result<bool, SyncSqliteError> {
-        self.has_file_version(&FolderGroupId(group_id.to_string()), hash)
-    }
-
     pub fn dag_get_file_version(
         &self,
         group_id: &str,
@@ -592,10 +391,6 @@ impl SqliteSyncStore {
         block_hashes: &[Vec<u8>],
     ) -> Result<HashSet<Vec<u8>>, SyncSqliteError> {
         self.group_has_block_provenance_batch(&FolderGroupId(group_id.to_string()), block_hashes)
-    }
-
-    pub fn dag_parents_of(&self, hash: &ChangeHash) -> Result<Vec<ChangeHash>, SyncSqliteError> {
-        self.parents_of(hash)
     }
 
     pub fn dag_get_current_version_record(
@@ -810,15 +605,19 @@ impl SqliteSyncStore {
         })
     }
 
-    /// Whether anything strictly below `path` holds a live content head in
-    /// `Gamma` -- [`crate::dag_store::gamma_has_live_descendant`].
+    /// Whether anything strictly below `path` holds a live head --
+    /// [`crate::native_store::native_has_descendant_head`].
     pub fn dag_has_live_descendant(
         &self,
         group_id: &str,
         path: &str,
     ) -> Result<bool, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            crate::dag_store::gamma_has_live_descendant(conn, group_id, path)
+            crate::native_store::native_has_descendant_head(
+                conn,
+                &FolderGroupId(group_id.to_owned()),
+                &yadorilink_replica_domain::ids::SyncPath(path.to_owned()),
+            )
         })
     }
 
@@ -841,19 +640,6 @@ impl SqliteSyncStore {
                 removable,
                 now_unix_nanos,
             )
-        })
-    }
-
-    /// What this device holds of one recursive operation --
-    /// [`crate::dag_store::recursive_operation`]. `None` when none of its
-    /// parts is recorded here.
-    pub fn dag_recursive_operation(
-        &self,
-        group_id: &str,
-        operation: &yadorilink_replica_domain::recursive_operation::RecursiveOperationRef,
-    ) -> Result<Option<crate::dag_store::RecordedRecursiveOperation>, SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| {
-            crate::dag_store::recursive_operation(conn, group_id, operation)
         })
     }
 
@@ -922,6 +708,35 @@ impl SqliteSyncStore {
         })
     }
 
+    /// Whether the regular file at `out_path` is, untouched, what a usable
+    /// proof says this device wrote at `(group_id, path)` -- whichever
+    /// version the row now names. `MaterializationState::Present` says only
+    /// that an object exists; this is the evidence that tells an older
+    /// version's bytes still sitting under a newer row (the daemon's own
+    /// write, unmodified since) from bytes someone else put there.
+    /// Fail-closed: no usable proof, a proof of anything but a regular file,
+    /// a changed identity or metadata token, or any error observing the path
+    /// is `false`.
+    pub fn dag_disk_is_untouched_proven_write(
+        &self,
+        group_id: &str,
+        path: &str,
+        out_path: &std::path::Path,
+        birth_time_granularity: yadorilink_root_authority::fs_identity::TimestampGranularity,
+    ) -> Result<bool, SyncSqliteError> {
+        use crate::materialized_generation::{
+            revalidate_identity_against_disk, IdentityRevalidation, MaterializedObjectKind,
+        };
+        let Some(basis) = self.dag_lookup_materialized_generation(group_id, path)? else {
+            return Ok(false);
+        };
+        if basis.object_kind != MaterializedObjectKind::RegularFile {
+            return Ok(false);
+        }
+        Ok(revalidate_identity_against_disk(&basis, out_path, birth_time_granularity)
+            == IdentityRevalidation::Confirmed)
+    }
+
     /// The filesystem identity of the directory most recently published as
     /// materialized for the explicit Directory entry at `(group_id, path)`,
     /// read without the fence check: a later fence bump says the proof no
@@ -959,75 +774,43 @@ impl SqliteSyncStore {
         })
     }
 
-    /// Test-facing delegate for the desired-side hash builder, for
-    /// callers outside this crate that need to cross-check it against
-    /// what the real publication path actually wrote (via
-    /// [`Self::dag_lookup_materialized_generation`]).
-    pub fn dag_desired_resolved_path_state_hash(
+    /// [`Self::dag_desired_projected_path_state_hash`] from native state:
+    /// what native requires at `path`, as the state a materialization proof
+    /// records. `NotFound` when a live head's version is not held here (the
+    /// path is undecidable, never absent). A write transaction: the plan
+    /// assigns placements for what is new on the way.
+    pub fn native_desired_projected_path_state_hash(
         &self,
         group_id: &str,
         path: &str,
-        resolution: &yadorilink_replica_engine::conflict::PathResolution,
-        winner_version_hash: Option<&VersionHash>,
     ) -> Result<[u8; 32], SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| {
-            crate::desired_state::desired_resolved_path_state_hash(
-                conn,
-                group_id,
-                path,
-                resolution,
-                winner_version_hash,
+        self.database.write_immediate::<_, SyncSqliteError>(|tx| {
+            crate::native_desired_state::native_desired_projected_path_state_hash(
+                tx, group_id, path,
             )
         })
     }
 
-    /// What `path` is required to be on its own account, namespace
-    /// included -- [`crate::desired_state::desired_path_state`], read in one
-    /// transaction so its heads and descendants come from one frontier.
-    pub fn dag_desired_path_state(
+    /// [`Self::dag_desired_path_state`] from native state (see
+    /// [`Self::native_desired_projected_path_state_hash`]).
+    pub fn native_desired_path_state(
         &self,
         group_id: &str,
         path: &str,
     ) -> Result<crate::desired_state::DesiredPathState, SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| {
-            crate::desired_state::desired_path_state(conn, group_id, path)
+        self.database.write_immediate::<_, SyncSqliteError>(|tx| {
+            crate::native_desired_state::native_desired_path_state(tx, group_id, path)
         })
     }
 
-    /// One directory level of the desired namespace --
-    /// [`crate::desired_state::desired_level_projection`], in one
-    /// transaction.
-    pub fn dag_desired_level_projection(
+    /// [`Self::dag_desired_level_projection`] from native state.
+    pub fn native_desired_level_projection(
         &self,
         group_id: &str,
         parent: &str,
     ) -> Result<yadorilink_replica_engine::namespace::NamespaceProjection, SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| {
-            crate::desired_state::desired_level_projection(conn, group_id, parent)
-        })
-    }
-
-    /// [`Self::dag_desired_path_state`]'s `resolved_path_state_hash`, in
-    /// one transaction.
-    pub fn dag_desired_projected_path_state_hash(
-        &self,
-        group_id: &str,
-        path: &str,
-    ) -> Result<[u8; 32], SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| {
-            crate::desired_state::desired_projected_path_state_hash(conn, group_id, path)
-        })
-    }
-
-    /// Test-facing read-back of a causal basis's member change hashes by
-    /// its interned id, for asserting exactly which
-    /// frontier a publication's `causal_basis_id` was interned from.
-    pub fn dag_lookup_causal_basis_members(
-        &self,
-        causal_basis_id: &str,
-    ) -> Result<Option<Vec<ChangeHash>>, SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| {
-            crate::dag_store::lookup_causal_basis_members(conn, causal_basis_id)
+        self.database.write_immediate::<_, SyncSqliteError>(|tx| {
+            crate::native_desired_state::native_desired_level_projection(tx, group_id, parent)
         })
     }
 
@@ -1068,7 +851,7 @@ impl SqliteSyncStore {
     /// -- production admission reaches that free function directly (this
     /// wrapper is for callers outside this crate, e.g. an integration test
     /// that needs a path to have an outstanding, "not yet settled"
-    /// obligation without driving a full signed `Change` admission).
+    /// obligation without driving a full signed delta admission).
     pub fn dag_bump_projection_obligations_for_touched_paths(
         &self,
         group_id: &str,
@@ -1096,7 +879,7 @@ impl SqliteSyncStore {
         per_group_limit: u32,
         total_limit: u32,
     ) -> Result<Vec<crate::projection_obligations::ClaimedObligation>, SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| {
+        self.database.read_snapshot::<_, SyncSqliteError>(|conn| {
             crate::projection_obligations::claim_runnable_obligations(
                 conn,
                 now_unix_nanos,
@@ -1149,16 +932,6 @@ impl SqliteSyncStore {
                 next_attempt_at,
                 now_unix_nanos,
             )
-        })
-    }
-
-    /// Delegate for [`crate::projection_obligations::earliest_pending_next_attempt_at`].
-    pub fn dag_earliest_pending_next_attempt_at(
-        &self,
-        now_unix_nanos: i64,
-    ) -> Result<Option<i64>, SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| {
-            crate::projection_obligations::earliest_pending_next_attempt_at(conn, now_unix_nanos)
         })
     }
 
@@ -1261,53 +1034,6 @@ impl SqliteSyncStore {
                 path,
                 now_unix_nanos,
             )
-        })
-    }
-
-    /// Replaces `device`'s acknowledged frontier for `group` wholesale --
-    /// delete then per-head insert, in one transaction, so a reader never
-    /// observes a partially-rewritten frontier. Delegates to
-    /// `dag_store::frontier_index::set_device_frontier` -- the single SQL
-    /// implementation of this write (see `group_heads`'s doc comment above
-    /// for why this is a delegation rather than a second copy of the
-    /// query).
-    pub fn set_device_frontier(
-        &self,
-        group: &FolderGroupId,
-        device: &yadorilink_replica_domain::ids::DeviceId,
-        frontier: &[ChangeHash],
-    ) -> Result<(), SyncSqliteError> {
-        self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            crate::dag_store::set_device_frontier(tx, group.as_str(), device.as_str(), frontier)
-        })
-    }
-
-    /// `device`'s most recently acknowledged frontier for `group`, ascending
-    /// by hash. Empty if the device has never reported one. Delegates to
-    /// `dag_store::frontier_index::get_device_frontier` (see
-    /// `group_heads`'s doc comment).
-    pub fn get_device_frontier(
-        &self,
-        group: &FolderGroupId,
-        device: &yadorilink_replica_domain::ids::DeviceId,
-    ) -> Result<Vec<ChangeHash>, SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| {
-            crate::dag_store::get_device_frontier(conn, group.as_str(), device.as_str())
-        })
-    }
-
-    /// Clears `device`'s acknowledged frontier for `group` entirely -- used
-    /// when a device is removed from a group and its frontier should no
-    /// longer hold anything back. Delegates to
-    /// `dag_store::frontier_index::remove_device_frontier` (see
-    /// `group_heads`'s doc comment).
-    pub fn remove_device_frontier(
-        &self,
-        group: &FolderGroupId,
-        device: &yadorilink_replica_domain::ids::DeviceId,
-    ) -> Result<(), SyncSqliteError> {
-        self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            crate::dag_store::remove_device_frontier(tx, group.as_str(), device.as_str())
         })
     }
 }

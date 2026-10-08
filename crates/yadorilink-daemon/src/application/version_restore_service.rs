@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use crate::sync_error::SyncError;
 
+use super::ports::version_restore::TrashOperationRestore;
 use super::ports::VersionRestorePort;
 
 pub(crate) struct VersionRestoreService {
@@ -49,7 +50,7 @@ impl VersionRestoreService {
         &self,
         group_id: &str,
         path: &str,
-    ) -> Result<crate::hydration::TrashOperationRestore, SyncError> {
+    ) -> Result<TrashOperationRestore, SyncError> {
         self.port.restore_trashed_operation(group_id, path).await
     }
 }

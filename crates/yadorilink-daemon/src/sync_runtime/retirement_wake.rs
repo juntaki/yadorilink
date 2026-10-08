@@ -1,6 +1,6 @@
 //! Wakes the ephemeral conflict-copy retirement loop (`engine_wrapper.rs`'s
 //! `run_ephemeral_conflict_copy_retire_loop`) promptly whenever a group's
-//! admitted DAG frontier advances or a materialization job reaches
+//! admitted native frontier advances or a materialization job reaches
 //! `Completed` -- the two events after which a previously-justified
 //! conflict copy can become unjustified (see
 //! `retire_unjustified_ephemeral_conflict_copies`'s own doc comment for what
@@ -60,7 +60,7 @@ impl RetirementWake {
 
     /// Marks `group_id` dirty for retirement re-evaluation (bumping its
     /// requested generation) and wakes the retirement loop. Safe under any
-    /// number of concurrent producers (DAG admission, job completion):
+    /// number of concurrent producers (native admission, job completion):
     /// repeated marks for the same group arriving before it is next
     /// completed all coalesce into the same target generation the next
     /// pass claims via `pending`.

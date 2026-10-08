@@ -1,26 +1,17 @@
-//! Direct implementations of `yadorilink-replica-engine`'s four narrow
-//! ports for `ReplicaCoordinator`, used to build a `PeerReplicaEngine` at
+//! The implementation of `yadorilink-replica-engine`'s durability evidence
+//! port over `ReplicaCoordinator`, used to build a `PeerReplicaEngine` at
 //! the daemon's own composition root (`peer_orchestrator.rs`).
-//! `ReplicaCoordinator` is a concrete daemon type, so it implements these
-//! foreign traits directly, with no wrapper and no dynamic dispatch
-//! through an intermediate `Arc<dyn ...>`.
-//!
-//! Each method here goes to `ReplicaCoordinator`'s own repositories.
 
 use std::sync::Arc;
 
 use yadorilink_local_storage::BlockContentStore;
 use yadorilink_peer_session::PeerSessionError;
-use yadorilink_replica_domain::admission::{AdmitOutcome, PathRefusal};
-use yadorilink_replica_domain::change::Change;
 use yadorilink_replica_domain::file::FileVersion;
-use yadorilink_replica_domain::ids::{BlockHash, ChangeHash, DeviceId, FolderGroupId, VersionHash};
+use yadorilink_replica_domain::ids::{BlockHash, FolderGroupId};
 use yadorilink_replica_domain::session_state::MaterializationPolicy;
-use yadorilink_replica_engine::error::{AdmissionStoreError, ReplicaEngineError};
+use yadorilink_replica_engine::error::ReplicaEngineError;
 use yadorilink_replica_engine::ports::{
-    AdmissionStoreOutcome, AdmissionStoreResult, ChangeAdmissionPort, ChangeEvidence,
-    DurabilityEvidencePort, DurabilityRoot, FrontierStorePort, ReplicaHistoryPort,
-    ReplicaRetentionPolicy,
+    DurabilityEvidencePort, DurabilityRoot, ReplicaRetentionPolicy,
 };
 use yadorilink_replica_engine::{PeerReplicaEngine, ReplicaEngineDependencies};
 
@@ -28,164 +19,6 @@ use super::ReplicaCoordinator;
 
 fn storage_err(error: PeerSessionError) -> ReplicaEngineError {
     ReplicaEngineError::Storage(error.to_string())
-}
-
-impl ReplicaHistoryPort for ReplicaCoordinator {
-    fn parents_of(&self, hash: &ChangeHash) -> Result<Vec<ChangeHash>, ReplicaEngineError> {
-        self.sqlite()
-            .dag_parents_of(hash)
-            .map_err(crate::sync_error::SyncError::from)
-            .map_err(PeerSessionError::from)
-            .map_err(storage_err)
-    }
-
-    fn change(&self, hash: &ChangeHash) -> Result<Option<Change>, ReplicaEngineError> {
-        self.sqlite()
-            .dag_published_change(hash)
-            .map_err(crate::sync_error::SyncError::from)
-            .map_err(PeerSessionError::from)
-            .map_err(storage_err)
-    }
-
-    fn group_heads(&self, group: &FolderGroupId) -> Result<Vec<ChangeHash>, ReplicaEngineError> {
-        self.sqlite()
-            .dag_published_group_heads(group.as_str())
-            .map_err(crate::sync_error::SyncError::from)
-            .map_err(PeerSessionError::from)
-            .map_err(storage_err)
-    }
-
-    fn missing_ancestor_frontier(
-        &self,
-        roots: &[ChangeHash],
-    ) -> Result<Vec<ChangeHash>, ReplicaEngineError> {
-        self.sqlite()
-            .dag_missing_ancestor_frontier(roots.to_vec())
-            .map_err(crate::sync_error::SyncError::from)
-            .map_err(PeerSessionError::from)
-            .map_err(storage_err)
-    }
-
-    fn has_file_version(
-        &self,
-        group: &FolderGroupId,
-        hash: &VersionHash,
-    ) -> Result<bool, ReplicaEngineError> {
-        self.sqlite()
-            .dag_has_file_version(group.as_str(), hash)
-            .map_err(crate::sync_error::SyncError::from)
-            .map_err(PeerSessionError::from)
-            .map_err(storage_err)
-    }
-
-    fn file_version(
-        &self,
-        group: &FolderGroupId,
-        hash: &VersionHash,
-    ) -> Result<Option<FileVersion>, ReplicaEngineError> {
-        self.sqlite()
-            .dag_get_file_version(group.as_str(), hash)
-            .map_err(crate::sync_error::SyncError::from)
-            .map_err(PeerSessionError::from)
-            .map_err(storage_err)
-    }
-}
-
-impl ChangeAdmissionPort for ReplicaCoordinator {
-    fn admit_unprojected_change(
-        &self,
-        change: &Change,
-        versions: &[FileVersion],
-        evidence: &ChangeEvidence,
-    ) -> Result<AdmissionStoreResult, AdmissionStoreError> {
-        self.admit_unprojected_change_batch(&[(change, versions, evidence)]).remove(0)
-    }
-
-    fn admit_unprojected_change_batch(
-        &self,
-        items: &[(&Change, &[FileVersion], &ChangeEvidence)],
-    ) -> Vec<Result<AdmissionStoreResult, AdmissionStoreError>> {
-        let pending: Vec<yadorilink_sync_sqlite::PendingAdmission<'_>> = items
-            .iter()
-            .map(|(change, versions, evidence)| yadorilink_sync_sqlite::PendingAdmission {
-                change,
-                versions,
-                evidence: Some(evidence),
-            })
-            .collect();
-        self.change_history_repository()
-            .dag_admit_change_batch_with_versions(&pending)
-            .into_iter()
-            .map(|r| r.map_err(crate::sync_error::SyncError::from).map_err(PeerSessionError::from))
-            .map(|result| {
-                match result {
-                Ok(result) => Ok(AdmissionStoreResult {
-                    outcome: match result.outcome {
-                        AdmitOutcome::Applied => AdmissionStoreOutcome::Applied,
-                        AdmitOutcome::Orphaned => AdmissionStoreOutcome::Orphaned,
-                        AdmitOutcome::RefusedAuthorChain(refusal) => {
-                            AdmissionStoreOutcome::RefusedAuthorChain {
-                                reason: refusal.to_string(),
-                            }
-                        }
-                        AdmitOutcome::RefusedForeignHistoryBase { local, incoming } => {
-                            AdmissionStoreOutcome::RefusedForeignHistoryBase {
-                                reason: yadorilink_replica_domain::admission::AdmissionRefusal::
-                                    ForeignHistoryBase { local, incoming }
-                                    .to_string(),
-                            }
-                        }
-                        // Comes back from the store as an outcome so that
-                        // the transaction carrying its durable record
-                        // commits. The engine reports it as the permanent
-                        // rejection it is.
-                        AdmitOutcome::RefusedBehindRejectedParent { parent } => {
-                            AdmissionStoreOutcome::RefusedBehindRejectedParent {
-                                reason: yadorilink_replica_domain::admission::AdmissionRefusal::
-                                    BehindRejectedParent { parent }
-                                    .to_string(),
-                            }
-                        }
-                        AdmitOutcome::RefusedInvalidObservedBaseHead { local, head } => {
-                            AdmissionStoreOutcome::RefusedInvalidObservedBaseHead {
-                                reason: yadorilink_replica_domain::admission::AdmissionRefusal::
-                                    InvalidObservedBaseHead { local, head }
-                                    .to_string(),
-                            }
-                        }
-                        AdmitOutcome::RefusedPath(PathRefusal::ReservedNamespaceCollision {
-                            path,
-                        }) => return Err(AdmissionStoreError::ReservedNamespaceCollision { path }),
-                        AdmitOutcome::RefusedPath(PathRefusal::NonPortablePath { path }) => {
-                            return Err(AdmissionStoreError::NonPortablePath { path })
-                        }
-                    },
-                    newly_admitted: result.newly_admitted,
-                }),
-                Err(PeerSessionError::ReservedNamespaceCollision(path)) => {
-                    Err(AdmissionStoreError::ReservedNamespaceCollision { path })
-                }
-                Err(PeerSessionError::NonPortablePath(path)) => {
-                    Err(AdmissionStoreError::NonPortablePath { path })
-                }
-                Err(error) => Err(AdmissionStoreError::Other(error.to_string())),
-            }
-            })
-            .collect()
-    }
-}
-
-impl FrontierStorePort for ReplicaCoordinator {
-    fn record_acknowledged_frontier(
-        &self,
-        group: &FolderGroupId,
-        device: &DeviceId,
-        frontier: &[ChangeHash],
-    ) -> Result<(), ReplicaEngineError> {
-        yadorilink_replica_engine::compaction::record_acknowledged_frontier(
-            self, group, device, frontier,
-        )
-    }
 }
 
 /// `DurabilityEvidencePort` needs both replica state and
@@ -312,9 +145,6 @@ pub fn build_peer_replica_engine(
     store: Arc<dyn BlockContentStore>,
 ) -> PeerReplicaEngine {
     PeerReplicaEngine::new(ReplicaEngineDependencies {
-        history: coordinator.clone(),
-        admission: coordinator.clone(),
-        frontier: coordinator.clone(),
         durability: Arc::new(DurabilityEvidenceAdapter { coordinator: coordinator.clone(), store }),
     })
 }

@@ -3,8 +3,8 @@
 //! database, never opened by anything in this file but this crate), built
 //! on `yadorilink-sqlite-runtime::SyncDatabase` -- the generic pooled-
 //! connection/WAL/writer-gate/retry runtime the sync engine also builds
-//! on, supplying only its OWN schema-bootstrap closure below. No DAG
-//! table (`change_parents`, `dag_group_heads`, ...) is created, read, or
+//! on, supplying only its OWN schema-bootstrap closure below. No native-state
+//! table (`native_heads`, `native_author_context`, ...) is created, read, or
 //! referenced anywhere in this file.
 //!
 //! Chunk-level resume progress is deliberately NOT a table here: it is the

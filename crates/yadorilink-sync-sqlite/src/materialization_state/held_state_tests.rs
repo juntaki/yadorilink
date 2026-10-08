@@ -2,13 +2,12 @@
 
 use super::*;
 
-/// Full schema: DAG tables first (`yadorilink_sqlite_runtime::
-/// init_schema` assumes `changes`/`pruned_changes` already exist, per
-/// its own doc comment), then the real `files` table.
+/// Full schema: the replica tables first, then
+/// `yadorilink_sqlite_runtime::init_schema` (the real `files` table).
 fn open_full_test_db() -> Arc<SyncDatabase> {
     Arc::new(
         SyncDatabase::open_in_memory(|conn| {
-            crate::dag_store::init_dag_schema(conn).map_err(|e| {
+            crate::replica_tables::init_for_tests(conn).map_err(|e| {
                 yadorilink_sqlite_runtime::DatabaseError::CorruptSchema(e.to_string())
             })?;
             yadorilink_sqlite_runtime::init_schema(conn)

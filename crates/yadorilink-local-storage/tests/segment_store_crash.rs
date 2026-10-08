@@ -558,3 +558,44 @@ fn a_crash_between_the_mapping_swap_and_the_old_files_deletion_is_finished_by_re
     }
     assert_index_names_only_readable_blocks(&store);
 }
+
+/// Losing only the index must not look like "every segment is an orphan":
+/// the segment files still hold the only copy of the bytes, so opening has
+/// to refuse and leave them alone rather than delete them.
+#[test]
+fn a_missing_index_beside_surviving_segments_fails_closed_and_keeps_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let kept = block("kept", 300);
+    {
+        let store = SegmentBlockStore::with_limits(dir.path(), limits()).unwrap();
+        store.put_durable_batch(std::slice::from_ref(&kept)).unwrap();
+    }
+    assert!(SegmentBlockStore::holds_segment_data(dir.path()).unwrap());
+    let segments_before = testing::segment_ids_on_disk(dir.path()).unwrap();
+    assert!(!segments_before.is_empty());
+
+    for entry in ["index.sqlite3", "index.sqlite3-wal", "index.sqlite3-shm"] {
+        let _ = std::fs::remove_file(dir.path().join(entry));
+    }
+
+    match SegmentBlockStore::with_limits(dir.path(), limits()) {
+        Err(StorageError::CorruptStore(_)) => {}
+        Err(other) => panic!("expected a fail-closed CorruptStore error, got {other}"),
+        Ok(_) => panic!("a store with segments but no index must not open as a fresh one"),
+    }
+    assert_eq!(
+        testing::segment_ids_on_disk(dir.path()).unwrap(),
+        segments_before,
+        "the surviving segment files must be untouched"
+    );
+}
+
+/// A store with no data in it is not "holding" anything, whatever files
+/// opening it created.
+#[test]
+fn an_empty_store_holds_no_segment_data() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(!SegmentBlockStore::holds_segment_data(dir.path()).unwrap());
+    drop(SegmentBlockStore::with_limits(dir.path(), limits()).unwrap());
+    assert!(!SegmentBlockStore::holds_segment_data(dir.path()).unwrap());
+}

@@ -204,7 +204,7 @@ pub(crate) fn recover(root: &Path, index: &BlockIndex) -> Result<RecoveredStore,
 /// Every `segments/NNNNNNNNNNNNNNNN.seg` and its length. Entries that do
 /// not match the naming scheme are ignored rather than deleted -- the
 /// store never removes a file it does not recognise as its own.
-fn enumerate_segment_files(root: &Path) -> Result<BTreeMap<u64, u64>, StorageError> {
+pub(crate) fn enumerate_segment_files(root: &Path) -> Result<BTreeMap<u64, u64>, StorageError> {
     let mut out = BTreeMap::new();
     let dir = root.join(SEGMENTS_DIR);
     let entries = match std::fs::read_dir(&dir) {

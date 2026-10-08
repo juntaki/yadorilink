@@ -258,7 +258,7 @@ impl ScheduledInjectors {
             NetFault::Heal { .. } => {
                 // Only the partition. This reset the whole plan, which meant
                 // a `Heal` also switched off steady packet loss, added
-                // latency and reordering -- and `dst_network_fault_chaos`
+                // latency and reordering -- and the retired network-fault scenario
                 // engages all three at offset zero before it partitions, so
                 // its heal quietly returned the network to perfect health.
                 // The scenario went on believing it was testing recovery
@@ -566,7 +566,7 @@ mod tests {
     /// A `Heal` closes the partition and leaves everything else alone.
     ///
     /// It used to reset the whole plan, so a heal also switched off steady
-    /// packet loss, latency and reordering. `dst_network_fault_chaos`
+    /// packet loss, latency and reordering. The retired network-fault scenario
     /// engages all three at offset zero and then partitions and heals, so
     /// its healed phase ran on a perfect network while the scenario went on
     /// believing it was testing recovery under a lossy one.

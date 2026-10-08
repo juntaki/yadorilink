@@ -6,7 +6,7 @@
 //! and, by itself, says nothing to the one it already has. Two things hold
 //! the line for the connection that is already up. What each lane serves is
 //! authorized again per stream, from the live netmap, so a revoked device is
-//! told nothing on reconciliation, block or service streams. And revocation
+//! told nothing on block or service streams. And revocation
 //! closes the connection itself -- the one the device dialled, the one this
 //! device dialled and cached, and every one it accepted -- so no stream opens
 //! on it and the link cache never hands it out again. Without the second, a
@@ -14,8 +14,7 @@
 //! that happened to be connected at the moment of revocation.
 //!
 //! Each test below starts from the same state -- two authorized devices, an
-//! open iroh connection in each direction, one reconciliation already run
-//! over the stack -- revokes the peer through `teardown_peer`, the
+//! open iroh connection in each direction -- revokes the peer through `teardown_peer`, the
 //! production whole-device path a netmap without that device takes, and then
 //! asks one question about what is still possible. Every question has a
 //! precondition proving it was possible before the revocation, so a test
@@ -28,18 +27,13 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use yadorilink_replica_domain::ids::FolderGroupId;
-use yadorilink_sync_protocol::ports::{GroupId, PeerKey, PortError, ReplicaPort};
-use yadorilink_sync_protocol::{OpaqueBundle, Reconciled, Role, SessionConfig};
+use yadorilink_sync_protocol::ports::GroupId;
 use yadorilink_sync_substrate::{AddressDirectory as _, Lane, NetworkConfig, PeerId, PeerLink};
 
 use super::{peer_sync_session_deps, teardown_peer};
 use crate::daemon_state::DaemonState;
-use crate::sync_adapter::sync_stack::{SyncAttempt, SyncStack};
-use crate::test_support::sync_stack_fixture::{
-    change_touching, device, honest_bundle, init_staging_schema, pin, stage, FixtureAuthenticator,
-    GROUP,
-};
+use crate::sync_adapter::sync_stack::SyncStack;
+use crate::test_support::sync_stack_fixture::{device, pin, GROUP};
 
 /// How long any single network step may take before it counts as "no answer".
 const STEP: Duration = Duration::from_secs(10);
@@ -69,7 +63,6 @@ struct Established {
     alice_link: Arc<PeerLink>,
     /// Every connection Alice's endpoint accepted, as Alice holds it.
     accepted_by_alice: Arc<Mutex<Vec<PeerLink>>>,
-    next_seq: i64,
     _dirs: (
         crate::test_support::sync_stack_fixture::ReleasingDir,
         crate::test_support::sync_stack_fixture::ReleasingDir,
@@ -79,32 +72,20 @@ struct Established {
 
 impl Established {
     async fn new() -> Self {
-        let group = FolderGroupId(GROUP.into());
         let (alice, alice_dir) = device(ALICE, 11);
         let (bob, bob_dir) = device(BOB, 22);
-        for state in [&alice, &bob] {
-            init_staging_schema(state);
-        }
         pin(&alice, BOB, 22);
         pin(&bob, ALICE, 11);
 
         let alice_stack = Arc::new(
-            SyncStack::spawn(
-                alice.clone(),
-                Arc::new(FixtureAuthenticator),
-                NetworkConfig::direct_only(),
-            )
-            .await
-            .expect("alice's stack starts"),
+            SyncStack::spawn(alice.clone(), NetworkConfig::direct_only())
+                .await
+                .expect("alice's stack starts"),
         );
         let bob_stack = Arc::new(
-            SyncStack::spawn(
-                bob.clone(),
-                Arc::new(FixtureAuthenticator),
-                NetworkConfig::direct_only(),
-            )
-            .await
-            .expect("bob's stack starts"),
+            SyncStack::spawn(bob.clone(), NetworkConfig::direct_only())
+                .await
+                .expect("bob's stack starts"),
         );
 
         let accepted_by_alice = Arc::new(Mutex::new(Vec::new()));
@@ -118,17 +99,6 @@ impl Established {
         alice_stack.serve_peer_lanes();
         bob_stack.serve_peer_lanes();
         register_session_for_peer(&alice, &alice_stack, BOB);
-
-        // One reconciliation over the stack, so the pair is past first
-        // contact rather than merely able to reach each other.
-        let first = change_touching(&["before-revocation.txt"]);
-        stage(&alice, honest_bundle(first), 1);
-        let summary = tokio::time::timeout(STEP, bob_stack.sync_with(ALICE, &group))
-            .await
-            .expect("the first reconciliation must not hang")
-            .expect("the first reconciliation must succeed")
-            .expect_ran("the first reconciliation ran");
-        assert_eq!(summary.staged, 1, "setup: the first reconciliation must carry the Change");
 
         let bob_link = tokio::time::timeout(STEP, bob_stack.link_to(ALICE))
             .await
@@ -146,7 +116,6 @@ impl Established {
             bob_link,
             alice_link,
             accepted_by_alice,
-            next_seq: 2,
             _dirs: (alice_dir, bob_dir),
             _bob: bob,
         };
@@ -182,12 +151,6 @@ impl Established {
             "setup: revocation must withdraw the key, or nothing below means anything"
         );
     }
-
-    /// A Change Alice comes to hold after the revocation.
-    fn alice_learns_something_new(&mut self, path: &str) {
-        stage(&self.alice, honest_bundle(change_touching(&[path])), self.next_seq);
-        self.next_seq += 1;
-    }
 }
 
 /// The session Alice keeps for a peer, as the orchestrator builds one, so the
@@ -208,101 +171,10 @@ fn register_session_for_peer(state: &Arc<DaemonState>, stack: &Arc<SyncStack>, p
         ),
         store,
         vec![GROUP.to_string()],
-        std::collections::HashMap::new(),
         stack.transports_for(peer),
-        None,
         peer_sync_session_deps(state),
     );
     state.peers.register_session(peer.to_string(), session, state.local_convergence());
-}
-
-/// A replica that holds nothing and will talk to anyone: the far end of a
-/// reconciliation whose only question is what the other side still tells it.
-struct HoldsNothing;
-
-impl ReplicaPort for HoldsNothing {
-    async fn may_disclose(&self, _peer: PeerKey, _group: GroupId) -> Result<bool, PortError> {
-        Ok(true)
-    }
-
-    /// On the group's original history, as every device in this test is.
-    async fn base_advertisement(
-        &self,
-        _peer: PeerKey,
-        group: GroupId,
-    ) -> Result<Vec<u8>, PortError> {
-        use yadorilink_replica_domain::base_negotiation::{AdvertisedBase, BaseAdvertisement};
-        use yadorilink_replica_domain::ids::FolderGroupId;
-        BaseAdvertisement::new(FolderGroupId(group.0), AdvertisedBase::Genesis, Vec::new())
-            .map(|advertisement| advertisement.encode())
-            .map_err(PortError::new)
-    }
-
-    async fn negotiate_base(
-        &self,
-        _peer: PeerKey,
-        _group: GroupId,
-        _ours: Vec<u8>,
-        _theirs: Vec<u8>,
-    ) -> Result<yadorilink_sync_protocol::BaseVerdict, PortError> {
-        Ok(yadorilink_sync_protocol::BaseVerdict::SameBase)
-    }
-
-    async fn servable(
-        &self,
-        _peer: PeerKey,
-        _group: GroupId,
-    ) -> Result<Vec<yadorilink_rbsr::ItemId>, PortError> {
-        Ok(Vec::new())
-    }
-
-    async fn load_bundles(
-        &self,
-        _peer: PeerKey,
-        _group: GroupId,
-        _hashes: Vec<yadorilink_rbsr::ItemId>,
-    ) -> Result<Vec<OpaqueBundle>, PortError> {
-        Ok(Vec::new())
-    }
-
-    async fn stage_bundles(
-        &self,
-        _peer: PeerKey,
-        _group: GroupId,
-        _bundles: Vec<OpaqueBundle>,
-    ) -> Result<Vec<yadorilink_rbsr::ItemId>, PortError> {
-        Ok(Vec::new())
-    }
-}
-
-/// Reconcile over `link` itself rather than a fresh dial, as the far end
-/// that holds nothing: whatever comes back as `want` is what the other side
-/// still disclosed over that connection.
-async fn reconcile_over(link: &PeerLink) -> Result<Reconciled, String> {
-    let group = GroupId(GROUP.into());
-    let run = async {
-        let mut lane = link.open_lane(Lane::Reconciliation).await.map_err(|e| e.to_string())?;
-        yadorilink_sync_protocol::session::open_lane(&mut lane, &group)
-            .await
-            .map_err(|e| e.to_string())?;
-        yadorilink_sync_protocol::reconcile(
-            &mut lane,
-            &HoldsNothing,
-            PeerKey(*link.peer().as_bytes()),
-            &group,
-            Role::Initiator,
-            &SessionConfig::default(),
-        )
-        .await
-        .map_err(|e| e.to_string())
-        .and_then(|outcome| match outcome {
-            yadorilink_sync_protocol::ReconcileOutcome::Reconciled(reconciled) => Ok(reconciled),
-            yadorilink_sync_protocol::ReconcileOutcome::MergeRequired => {
-                Err("the far end stands on a different history base".to_string())
-            }
-        })
-    };
-    tokio::time::timeout(STEP, run).await.map_err(|_| "timed out".to_string())?
 }
 
 /// Ask for a block over `link`. `Some` is the response header: the far end
@@ -369,46 +241,6 @@ async fn eventually(within: Duration, condition: impl Fn() -> bool) -> bool {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-}
-
-/// A revoked device learns nothing further through reconciliation: not by
-/// dialling again, not by being dialled, and not over the connection it
-/// already had.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_revoked_device_can_no_longer_reconcile() {
-    let mut pair = Established::new().await;
-    let group = FolderGroupId(GROUP.into());
-
-    let before =
-        reconcile_over(&pair.bob_link).await.expect("setup: the live connection reconciles");
-    assert_eq!(before.want.len(), 1, "setup: over the live connection bob learns alice's Change");
-
-    pair.revoke_bob();
-    pair.alice_learns_something_new("after-revocation.txt");
-
-    // Alice no longer names Bob, so she has nobody to dial.
-    let from_alice = pair.alice_stack.sync_with(BOB, &group).await;
-    assert!(
-        matches!(from_alice, Ok(SyncAttempt::NoAddress)),
-        "alice must not reconcile with a device she revoked, got {from_alice:?}"
-    );
-
-    // A fresh dial from Bob is refused at admission.
-    let fresh = tokio::time::timeout(STEP, pair.bob_stack.sync_with(ALICE, &group))
-        .await
-        .expect("a refused dial must not hang");
-    assert!(
-        !matches!(&fresh, Ok(SyncAttempt::Ran(summary)) if summary.wanted > 0),
-        "a revoked device must learn nothing over a new connection, got {fresh:?}"
-    );
-
-    // And over the connection Bob already had, Alice discloses nothing.
-    let over_old = reconcile_over(&pair.bob_link).await;
-    assert!(
-        over_old.as_ref().map_or(true, |reconciled| reconciled.want.is_empty()),
-        "a revoked device must learn nothing over the connection it already had, got {:?}",
-        over_old.map(|reconciled| reconciled.want.len())
-    );
 }
 
 /// A revoked device is sent no block, over the connection it already had.

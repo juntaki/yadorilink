@@ -240,7 +240,7 @@ public final class FolderDetailViewModel {
     public var fileStateTitle: String? {
         guard let availability else { return nil }
         guard availability.tracked else { return "Not synced" }
-        return availability.pinned ? "Always kept on this device" : availability.state.title
+        return availability.state.title
     }
 
     /// Every result is dropped if another file was chosen while it loaded,
@@ -286,12 +286,6 @@ public final class FolderDetailViewModel {
             case .freeUpSpace:
                 let outcome = try await client.evictFile(absolutePath: path)
                 return outcome.evicted ? "Freed up \(Format.bytes(outcome.bytesReclaimed)) from \(name)." : "\(name) is already online only."
-            case .keepOnDevice:
-                try await client.pinFile(absolutePath: path)
-                return "\(name) will always stay on this device."
-            case .stopKeeping:
-                try await client.unpinFile(absolutePath: path)
-                return "\(name) no longer always stays on this device."
             }
         }
         let availability = try? await client.fileAvailability(absolutePath: path)

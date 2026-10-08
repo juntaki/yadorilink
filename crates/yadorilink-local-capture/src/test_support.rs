@@ -43,20 +43,86 @@
 use std::sync::{Arc, Mutex};
 
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-use yadorilink_replica_domain::change::PolicyUnavailable;
 use yadorilink_replica_domain::file::FileRecord;
-use yadorilink_replica_domain::ids::ChangeHash;
+use yadorilink_replica_domain::ids::DeltaHash;
+use yadorilink_replica_domain::local_op::PolicyUnavailable;
 use yadorilink_replica_domain::session_state::{
-    ChangeContent, DirtyPath, LocalFileMetaColumns, MaterializationState, PreparedLocalMutation,
+    DirtyPath, LocalFileMetaColumns, MaterializationState, PreparedLocalMutation,
 };
 use yadorilink_root_authority::root_commit::RootCommitPermit;
-use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
+use yadorilink_sync_sqlite::dag_store::LocalAuthorKey;
 use yadorilink_sync_sqlite::SyncSqliteError;
 
 use crate::ports::LocalMutationStore;
 
+// SEAM-LOCAL, as the daemon's port impl has it: the authoring bodies below
+// route through the same seam module, so this fixture follows the switch
+// with the production impl.
+use yadorilink_daemon::replica_coordinator::local_commit;
+
 type LocalChangeAuthProvider =
     dyn Fn(&str) -> Result<(), PolicyUnavailable> + Send + Sync + 'static;
+
+/// The tip of every author's delta chain: the group's causal frontier, one
+/// entry per author that has written.
+pub(crate) fn native_group_heads(state: &ReplicaCoordinator, group_id: &str) -> Vec<DeltaHash> {
+    let group = yadorilink_replica_domain::ids::FolderGroupId(group_id.to_owned());
+    state
+        .database()
+        .read::<_, SyncSqliteError>(|conn| {
+            yadorilink_sync_sqlite::native_store::load_frontier(conn, &group)
+        })
+        .unwrap()
+        .values()
+        .map(|entry| entry.tip)
+        .collect()
+}
+
+/// Every native delta in the group, by author and sequence.
+pub(crate) fn native_deltas(
+    state: &ReplicaCoordinator,
+    group_id: &str,
+) -> Vec<yadorilink_replica_domain::signed_delta::NativeDelta> {
+    let bodies: Vec<Vec<u8>> = state
+        .database()
+        .read::<_, SyncSqliteError>(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT encoded_delta FROM native_delta_bodies WHERE group_id = ?1 \
+                 ORDER BY author, incarnation, seq",
+            )?;
+            let rows = stmt.query_map([group_id], |row| row.get::<_, Vec<u8>>(0))?;
+            let bodies = rows.collect::<Result<Vec<_>, _>>()?;
+            Ok(bodies)
+        })
+        .unwrap();
+    bodies
+        .iter()
+        .map(|body| {
+            yadorilink_replica_domain::signed_delta::NativeDelta::from_wire_bytes(body).unwrap()
+        })
+        .collect()
+}
+
+/// The provenance of every live native head at `path`.
+pub(crate) fn native_path_head_provenances(
+    state: &ReplicaCoordinator,
+    group_id: &str,
+    path: &str,
+) -> Vec<[u8; 32]> {
+    state
+        .database()
+        .read::<_, SyncSqliteError>(|conn| {
+            yadorilink_sync_sqlite::native_store::native_heads_at(
+                conn,
+                &yadorilink_replica_domain::ids::FolderGroupId(group_id.to_owned()),
+                &yadorilink_replica_domain::ids::SyncPath(path.to_owned()),
+            )
+        })
+        .unwrap()
+        .into_iter()
+        .map(|head| head.payload.provenance.0)
+        .collect()
+}
 
 pub(crate) struct TestReplica {
     inner: Arc<ReplicaCoordinator>,
@@ -74,8 +140,7 @@ pub(crate) struct TestReplica {
     /// branch should see; defaults to `Unknown`, matching this whole
     /// mechanism's own fail-closed contract for a scenario nothing has set
     /// up an expectation for.
-    windows_placeholder_inspect_result:
-        Mutex<yadorilink_filesystem_sync::placeholder_backend::PlaceholderStatus>,
+    windows_placeholder_inspect_result: Mutex<crate::ports::PlaceholderStatus>,
 }
 
 impl TestReplica {
@@ -85,7 +150,7 @@ impl TestReplica {
             local_change_auth_provider: Mutex::new(None),
             journaled_dirty_batch_entries: std::sync::atomic::AtomicUsize::new(0),
             windows_placeholder_inspect_result: Mutex::new(
-                yadorilink_filesystem_sync::placeholder_backend::PlaceholderStatus::Unknown,
+                crate::ports::PlaceholderStatus::Unknown,
             ),
         })
     }
@@ -94,21 +159,30 @@ impl TestReplica {
     /// returns for every subsequent call on this `TestReplica`, regardless
     /// of `path`/`expected_generation` -- coarse (not per-path), matching
     /// this fixture's one-scenario-per-test usage. Its only caller
-    /// (`local_change.rs`'s `untouched_placeholder_verdict_windows_tests`)
+    /// (`local_change.rs`'s `cfapi_placeholder_untouched_windows_tests`)
     /// is itself `#[cfg(all(test, windows))]`, so this has no caller at
     /// all on a non-Windows build -- not dead code, just untriggered on
     /// this platform.
     #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) fn set_windows_placeholder_inspect_result(
         &self,
-        result: yadorilink_filesystem_sync::placeholder_backend::PlaceholderStatus,
+        result: crate::ports::PlaceholderStatus,
     ) {
         *self.windows_placeholder_inspect_result.lock().unwrap_or_else(|p| p.into_inner()) = result;
     }
 
-    /// The wrapped `ReplicaCoordinator` directly -- for callers (e.g.
-    /// `dag_import::ensure_initial_import`) that take a concrete
-    /// `&ReplicaCoordinator`.
+    /// The replica's author handle for `author`'s device and
+    /// key (minted on first use, as the daemon opens it): the tests build
+    /// their handles `without_incarnation`, which authoring
+    /// refuses.
+    fn author(&self, author: &LocalAuthorKey) -> Result<Arc<LocalAuthorKey>, SyncSqliteError> {
+        self.inner
+            .open_local_author(author.device_id(), author.signing_key().clone())
+            .map_err(|error| SyncSqliteError::CorruptState(error.to_string()))
+    }
+
+    /// The wrapped `ReplicaCoordinator` directly -- for callers that
+    /// take a concrete `&ReplicaCoordinator`.
     pub(crate) fn coordinator(&self) -> &ReplicaCoordinator {
         &self.inner
     }
@@ -154,6 +228,36 @@ impl LocalMutationStore for TestReplica {
         self.file_index_repository().canonical_current_row(group_id, path)
     }
 
+    fn native_capture_witness(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<yadorilink_replica_domain::native_state::NativeCaptureWitness, SyncSqliteError>
+    {
+        self.file_index_repository().native_capture_witness(group_id, path)
+    }
+
+    fn native_capture_witnesses(
+        &self,
+        group_id: &str,
+    ) -> Result<
+        std::collections::HashMap<
+            String,
+            yadorilink_replica_domain::native_state::NativeCaptureWitness,
+        >,
+        SyncSqliteError,
+    > {
+        self.file_index_repository().native_capture_witnesses(group_id)
+    }
+
+    fn native_capture_is_fresh(
+        &self,
+        group_id: &str,
+        witness: &yadorilink_replica_domain::native_state::NativeCaptureWitness,
+    ) -> Result<bool, SyncSqliteError> {
+        self.file_index_repository().native_capture_is_fresh(group_id, witness)
+    }
+
     fn list_materialization_states(
         &self,
         group_id: &str,
@@ -192,7 +296,7 @@ impl LocalMutationStore for TestReplica {
         &self,
         path: &std::path::Path,
         expected_generation: u64,
-    ) -> yadorilink_filesystem_sync::placeholder_backend::PlaceholderStatus {
+    ) -> crate::ports::PlaceholderStatus {
         let _ = (path, expected_generation);
         *self.windows_placeholder_inspect_result.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -213,13 +317,39 @@ impl LocalMutationStore for TestReplica {
         self.materialization_intent_repository().materialization_intent_target(group_id, path)
     }
 
+    fn pre_image_content_targets(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Vec<Vec<u8>>, SyncSqliteError> {
+        self.database().read::<_, SyncSqliteError>(|conn| {
+            yadorilink_sync_sqlite::materialized_generation::pre_image_content_targets(
+                conn, group_id, path,
+            )
+        })
+    }
+
     fn paused_items(&self, group_id: &str) -> Result<Vec<String>, SyncSqliteError> {
         self.paused_item_repository().list(group_id)
     }
 
-    fn snapshot_install_held_paths(&self, group_id: &str) -> Result<Vec<String>, SyncSqliteError> {
-        self.snapshot_install_hold_repository().held_paths(group_id)
+    fn held_path_names(&self, group_id: &str) -> Result<Vec<String>, SyncSqliteError> {
+        self.held_path_repository().held_paths(group_id)
     }
+
+    fn group_frozen(&self, group_id: &str) -> Result<bool, SyncSqliteError> {
+        self.held_path_repository().group_frozen(group_id)
+    }
+
+    fn hold_unauthorable_local_edit(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<(), SyncSqliteError> {
+        self.held_path_repository().hold_unauthorable_local_edit(group_id, path)
+    }
+
+    fn wake_install_reconciliation(&self) {}
 
     fn has_unsettled_projection_obligation(
         &self,
@@ -275,28 +405,18 @@ impl LocalMutationStore for TestReplica {
         yadorilink_root_authority::fs_capabilities::probe_birth_time_granularity(sync_root)
     }
 
-    fn upsert_file_emitting_change(
+    fn disk_is_untouched_proven_write(
         &self,
         group_id: &str,
-        record: &FileRecord,
-        origin_device_id: &str,
-        content: ChangeContent<'_>,
-        meta: Option<&LocalFileMetaColumns>,
-        filesystem_identity: Option<&yadorilink_root_authority::fs_identity::FileIdentity>,
-        emission: crate::ports::LocalChangeEmission<'_>,
-    ) -> Result<ChangeHash, SyncSqliteError> {
-        self.local_emission_auth(group_id).map_err(SyncSqliteError::from)?;
-        self.file_index_repository().upsert_file_emitting_change(
+        path: &str,
+        sync_root: &std::path::Path,
+        out_path: &std::path::Path,
+    ) -> Result<bool, SyncSqliteError> {
+        self.sqlite().dag_disk_is_untouched_proven_write(
             group_id,
-            record,
-            origin_device_id,
-            content,
-            meta,
-            filesystem_identity,
-            yadorilink_sync_sqlite::file_index::ChangeEmissionContext {
-                emitter: emission.emitter,
-                permit: emission.permit,
-            },
+            path,
+            out_path,
+            yadorilink_root_authority::fs_capabilities::probe_birth_time_granularity(sync_root),
         )
     }
 
@@ -307,17 +427,17 @@ impl LocalMutationStore for TestReplica {
         evidence: &[Option<yadorilink_sync_sqlite::file_index::LocalCaptureActualStateEvidence>],
         origin_device_id: &str,
         emission: crate::ports::LocalChangeEmission<'_>,
-    ) -> Result<Vec<ChangeHash>, SyncSqliteError> {
+    ) -> Result<(), SyncSqliteError> {
         self.local_emission_auth(group_id).map_err(SyncSqliteError::from)?;
-        self.file_index_repository().commit_local_mutations_batch(
+        local_commit::commit_local_mutations_batch(
+            self.file_index_repository(),
             group_id,
             mutations,
             evidence,
             origin_device_id,
-            yadorilink_sync_sqlite::file_index::ChangeEmissionContext {
-                emitter: emission.emitter,
-                permit: emission.permit,
-            },
+            &*self.author(emission.author)?,
+            None,
+            emission.permit,
         )
     }
 
@@ -326,7 +446,7 @@ impl LocalMutationStore for TestReplica {
         group_id: &str,
         directory: &crate::ports::CapturedDirectory,
         origin_device_id: &str,
-        emitter: Option<&ChangeEmitter>,
+        emitter: Option<&LocalAuthorKey>,
         permit: &RootCommitPermit,
     ) -> Result<(), SyncSqliteError> {
         let Some(emitter) = emitter else {
@@ -347,36 +467,36 @@ impl LocalMutationStore for TestReplica {
             );
         };
         self.local_emission_auth(group_id).map_err(SyncSqliteError::from)?;
-        self.file_index_repository().upsert_file_emitting_change(
+        local_commit::commit_captured_directory(
+            self.file_index_repository(),
             group_id,
             &directory.record,
-            origin_device_id,
-            ChangeContent {
-                ops: vec![directory.op.clone()],
-                versions: std::slice::from_ref(&directory.version),
-            },
-            Some(&directory.meta),
+            &directory.op,
+            &directory.version,
+            &directory.meta,
             directory.identity.as_ref(),
-            yadorilink_sync_sqlite::file_index::ChangeEmissionContext { emitter, permit },
-        )?;
-        Ok(())
+            origin_device_id,
+            &*self.author(emitter)?,
+            None,
+            permit,
+        )
     }
 
     fn commit_directory_removal(
         &self,
         group_id: &str,
         root: &str,
-        tombstones: &[FileRecord],
+        tombstones: &[PreparedLocalMutation],
         origin_device_id: &str,
         observed_at_unix_nanos: i64,
-        emitter: Option<&ChangeEmitter>,
+        emitter: Option<&LocalAuthorKey>,
         permit: &RootCommitPermit,
     ) -> Result<(), SyncSqliteError> {
         let Some(emitter) = emitter else {
-            for record in tombstones {
+            for tombstone in tombstones {
                 self.file_index_repository().mark_deleted_at(
                     group_id,
-                    &record.path,
+                    &tombstone.record().path,
                     origin_device_id,
                     observed_at_unix_nanos,
                     permit,
@@ -385,31 +505,16 @@ impl LocalMutationStore for TestReplica {
             return Ok(());
         };
         self.local_emission_auth(group_id).map_err(SyncSqliteError::from)?;
-        let mutations: Vec<PreparedLocalMutation> = tombstones
-            .iter()
-            .map(|record| PreparedLocalMutation::Delete {
-                record: record.clone(),
-                op: yadorilink_replica_domain::change::Op::Delete {
-                    path: yadorilink_replica_domain::ids::SyncPath(record.path.clone()),
-                },
-            })
-            .collect();
-        let evidence =
-            vec![
-                Some(yadorilink_sync_sqlite::file_index::LocalCaptureActualStateEvidence::Absent);
-                mutations.len()
-            ];
-        self.file_index_repository().commit_recursive_operation(
+        local_commit::commit_directory_removal(
+            self.file_index_repository(),
             group_id,
-            yadorilink_replica_domain::recursive_operation::RecursiveOperationKind::RmTree {
-                root: yadorilink_replica_domain::ids::SyncPath(root.to_string()),
-            },
-            &mutations,
-            &evidence,
+            root,
+            tombstones,
             origin_device_id,
-            yadorilink_sync_sqlite::file_index::ChangeEmissionContext { emitter, permit },
-        )?;
-        Ok(())
+            &*self.author(emitter)?,
+            None,
+            permit,
+        )
     }
 
     fn commit_directory_rename(
@@ -423,21 +528,18 @@ impl LocalMutationStore for TestReplica {
         emission: crate::ports::LocalChangeEmission<'_>,
     ) -> Result<(), SyncSqliteError> {
         self.local_emission_auth(group_id).map_err(SyncSqliteError::from)?;
-        self.file_index_repository().commit_recursive_operation(
+        local_commit::commit_directory_rename(
+            self.file_index_repository(),
             group_id,
-            yadorilink_replica_domain::recursive_operation::RecursiveOperationKind::RenameTree {
-                from: yadorilink_replica_domain::ids::SyncPath(from.to_string()),
-                to: yadorilink_replica_domain::ids::SyncPath(to.to_string()),
-            },
+            from,
+            to,
             mutations,
             evidence,
             origin_device_id,
-            yadorilink_sync_sqlite::file_index::ChangeEmissionContext {
-                emitter: emission.emitter,
-                permit: emission.permit,
-            },
-        )?;
-        Ok(())
+            &*self.author(emission.author)?,
+            None,
+            emission.permit,
+        )
     }
 
     fn has_live_descendant_row(&self, group_id: &str, path: &str) -> Result<bool, SyncSqliteError> {
@@ -491,34 +593,6 @@ impl LocalMutationStore for TestReplica {
         )
     }
 
-    fn upsert_files_batch_emitting_change(
-        &self,
-        group_id: &str,
-        records: &[FileRecord],
-        origin_device_id: &str,
-        content: ChangeContent<'_>,
-        metas: &[Option<LocalFileMetaColumns>],
-        actual_state: &std::collections::HashMap<
-            String,
-            yadorilink_sync_sqlite::file_index::LocalCaptureActualStateEvidence,
-        >,
-        emission: crate::ports::LocalChangeEmission<'_>,
-    ) -> Result<Option<ChangeHash>, SyncSqliteError> {
-        self.local_emission_auth(group_id).map_err(SyncSqliteError::from)?;
-        self.file_index_repository().upsert_files_batch_emitting_change(
-            group_id,
-            records,
-            origin_device_id,
-            content,
-            metas,
-            actual_state,
-            yadorilink_sync_sqlite::file_index::ChangeEmissionContext {
-                emitter: emission.emitter,
-                permit: emission.permit,
-            },
-        )
-    }
-
     fn mark_deleted_at(
         &self,
         group_id: &str,
@@ -536,44 +610,28 @@ impl LocalMutationStore for TestReplica {
         )
     }
 
-    fn mark_deleted_emitting_change(
-        &self,
-        group_id: &str,
-        path: &str,
-        device_id: &str,
-        observed_at_unix_nanos: i64,
-        publish_absent_proof: bool,
-        emitter: &ChangeEmitter,
-        permit: &RootCommitPermit,
-    ) -> Result<ChangeHash, SyncSqliteError> {
-        self.local_emission_auth(group_id).map_err(SyncSqliteError::from)?;
-        self.file_index_repository().mark_deleted_emitting_change(
-            group_id,
-            path,
-            device_id,
-            observed_at_unix_nanos,
-            publish_absent_proof,
-            yadorilink_sync_sqlite::file_index::ChangeEmissionContext { emitter, permit },
-        )
-    }
-
     fn commit_write_through_deletion(
         &self,
         group_id: &str,
         copy_path: &str,
         source: &str,
+        native_witness: Option<yadorilink_replica_domain::native_state::NativeCaptureWitness>,
         device_id: &str,
         observed_at_unix_nanos: i64,
-        emitter: &ChangeEmitter,
+        emitter: &LocalAuthorKey,
         permit: &RootCommitPermit<'_>,
-    ) -> Result<ChangeHash, SyncSqliteError> {
-        self.file_index_repository().commit_write_through_deletion(
+    ) -> Result<(), SyncSqliteError> {
+        local_commit::commit_write_through_deletion(
+            self.file_index_repository(),
             group_id,
             copy_path,
             source,
+            native_witness,
             device_id,
             observed_at_unix_nanos,
-            yadorilink_sync_sqlite::file_index::ChangeEmissionContext { emitter, permit },
+            &*self.author(emitter)?,
+            None,
+            permit,
         )
     }
 
@@ -591,7 +649,7 @@ impl LocalMutationStore for TestReplica {
         group_id: &str,
         block_hashes: &[Vec<u8>],
     ) -> Result<(), SyncSqliteError> {
-        self.change_history_repository().record_group_block_provenance(group_id, block_hashes)
+        self.record_block_provenance(group_id, block_hashes)
     }
 
     fn record_dirty_path(

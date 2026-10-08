@@ -321,6 +321,7 @@ pub fn folder_summary(link: &LinkStatus, volumes: &[VolumeFreeSpace]) -> FolderS
         degraded: derived.degraded,
         degraded_reason: text(&derived.degraded_reason),
         volume: volumes.iter().find(|v| v.path == link.local_path).map(volume_summary),
+        provider: !link.provider_display_name.is_empty(),
     }
 }
 
@@ -373,7 +374,6 @@ pub fn conflict_summary(file: &ConflictedFileInfo) -> ConflictSummary {
             view::ConflictReason::ConcurrentEdit => ConflictReason::ConcurrentEdit,
             view::ConflictReason::FolderAtPath => ConflictReason::FolderAtPath,
         },
-        holds_compaction: file.holds_compaction,
     }
 }
 
@@ -438,14 +438,20 @@ pub fn file_versions(versions: &[FileVersionInfo]) -> Vec<FileVersion> {
 pub fn file_availability(status: &MaterializationStatusResponse) -> FileAvailability {
     FileAvailability {
         tracked: status.known,
-        state: match status.state() {
-            wire::MaterializationState::Hydrated => MaterializationState::Hydrated,
-            wire::MaterializationState::Placeholder => MaterializationState::Placeholder,
-            wire::MaterializationState::Hydrating => MaterializationState::Hydrating,
-            wire::MaterializationState::Evicting => MaterializationState::Evicting,
-            wire::MaterializationState::Unspecified => MaterializationState::Unknown,
+        // The UI vocabulary has one word for "the current content is on this
+        // device" and one for "it is not" (an older object that stands is not
+        // current content, so it is offered for download like a remote file).
+        state: match status.local_state.as_ref() {
+            None => MaterializationState::Unknown,
+            Some(local) => match local.transition() {
+                wire::LocalTransition::Hydrating => MaterializationState::Hydrating,
+                wire::LocalTransition::Evicting => MaterializationState::Evicting,
+                wire::LocalTransition::None if local.current_content_present => {
+                    MaterializationState::Hydrated
+                }
+                wire::LocalTransition::None => MaterializationState::Placeholder,
+            },
         },
-        pinned: status.pinned,
     }
 }
 

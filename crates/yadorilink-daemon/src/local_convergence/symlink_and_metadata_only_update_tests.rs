@@ -115,7 +115,7 @@ fn materialize_link(
             group_id: "group-1",
             windows_opt_in: false,
             origin_device_id: "device-a",
-            authoring_change_hash: None,
+            authoring: None,
             permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         },
         record,
@@ -126,7 +126,7 @@ fn materialize_link(
 
 /// Given a payload that is a symlink with a target, and a row naming
 /// that same version, `materialize_symlink_at` creates a real on-disk
-/// symlink, publishes its proof and stamps `Hydrated`.
+/// symlink, publishes its proof and stamps `Present`.
 #[cfg(unix)]
 #[test]
 fn materialize_symlink_at_creates_a_real_symlink_and_upserts_index() {
@@ -151,11 +151,11 @@ fn materialize_symlink_at_creates_a_real_symlink_and_upserts_index() {
     assert!(!state.get_file("group-1", "link.txt").unwrap().unwrap().deleted);
     // The symlink genuinely exists on disk under its exact name now --
     // `materialize_symlink_at`'s own stamp on this `WrittenExact`
-    // branch is what earns `Hydrated` here, not the schema's own
-    // `Placeholder` default.
+    // branch is what earns `Present` here, not the schema's own
+    // `Remote` default.
     assert_eq!(
         state.get_materialization_state("group-1", "link.txt").unwrap(),
-        Some(MaterializationState::Hydrated),
+        Some(MaterializationState::Present),
     );
 }
 
@@ -170,7 +170,7 @@ fn materialize_symlink_at_creates_a_real_symlink_and_upserts_index() {
 /// The refusal is the version guard on the commit, not the fence: this
 /// write is the only mutator, so the fence it bumped is still current.
 /// A row naming another version is a supersession, and publishing the
-/// payload's proof over it would stamp `Hydrated` on a row whose link
+/// payload's proof over it would stamp `Present` on a row whose link
 /// this write never produced.
 #[cfg(unix)]
 #[test]
@@ -194,7 +194,7 @@ fn materialize_symlink_at_writes_the_payload_target_over_a_row_naming_another() 
     );
     assert_ne!(
         state.get_materialization_state("group-1", "link.txt").unwrap(),
-        Some(MaterializationState::Hydrated),
+        Some(MaterializationState::Present),
         "a refused commit must stamp nothing"
     );
 }
@@ -237,7 +237,7 @@ fn materialize_symlink_at_refuses_a_root_whose_marker_no_longer_matches() {
             group_id: "group-1",
             windows_opt_in: false,
             origin_device_id: "device-a",
-            authoring_change_hash: None,
+            authoring: None,
             permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         },
         &record,
@@ -297,7 +297,7 @@ fn materialize_symlink_at_creates_no_directories_under_a_root_whose_marker_no_lo
             group_id: "group-1",
             windows_opt_in: false,
             origin_device_id: "device-a",
-            authoring_change_hash: None,
+            authoring: None,
             permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         },
         &record,
@@ -345,7 +345,7 @@ fn materialize_symlink_at_with_no_target_recorded_skips_disk_write_but_still_ind
             group_id: "group-1",
             windows_opt_in: false,
             origin_device_id: "device-a",
-            authoring_change_hash: None,
+            authoring: None,
             permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         },
         &record,
@@ -857,7 +857,7 @@ fn a_supersession_during_the_write_cannot_rename_what_is_written() {
     //
     // Row only: the closure rewrites the current row's mode and nothing
     // else. It does not touch disk and does not go near the mutation
-    // fence, because the race this test is about is a DAG/index-side
+    // fence, because the race this test is about is a native state/index-side
     // supersession, not a competing physical mutator.
     let weak = Arc::downgrade(&state);
     *state.test_observers.armed_upsert_supersession.lock().unwrap() =

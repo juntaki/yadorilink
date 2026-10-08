@@ -17,7 +17,7 @@ use std::sync::Arc;
 use crate::error::LocalCaptureError;
 use crate::reconcile_gate::ReconcileGate;
 use yadorilink_replica_domain::file::FileRecord;
-use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
+use yadorilink_sync_sqlite::dag_store::LocalAuthorKey;
 
 mod directory_capture;
 mod dirty_journal;
@@ -28,9 +28,11 @@ mod path_policy;
 mod paused_items;
 mod record_builder;
 mod scan;
+mod semantic_delete;
 
-pub use disk_observation::untouched_placeholder_verdict;
+pub use disk_observation::cfapi_placeholder_untouched;
 pub(crate) use scan::ReconcileMode;
+pub use semantic_delete::SemanticDelete;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use record_builder::{arm_content_read_race_hook, disarm_content_read_race_hook};
@@ -93,13 +95,13 @@ pub struct LocalChangeProcessor {
     state: Arc<dyn crate::ports::LocalMutationStore>,
     store: Arc<dyn crate::ports::BlockContentStore>,
     device_id: String,
-    /// When set, every accepted local mutation additionally appends a signed
-    /// change to the history DAG in the same transaction as its index write.
-    /// `None` (the default) preserves the pre-DAG behavior exactly — the
-    /// index write happens on its own, no change is emitted — so a build that
+    /// When set, every accepted local mutation additionally authors a signed
+    /// delta into native state in the same transaction as its index write.
+    /// `None` (the default) leaves the index write on its own, no delta is
+    /// emitted — so a build that
     /// hasn't provisioned a signing key is unaffected. The daemon injects the
     /// emitter once the device's signing key is loaded.
-    change_emitter: Option<Arc<ChangeEmitter>>,
+    change_emitter: Option<Arc<LocalAuthorKey>>,
     /// Required, not optional (unlike `change_emitter`): every one of this
     /// processor's mutation methods admits a `LinkOperation` against this
     /// lease and mints a `RootCommitPermit` from it, held for that
@@ -121,6 +123,10 @@ pub struct LocalChangeProcessor {
     /// them must not author directories at all, or it would author those.
     /// On for every backend today; see [`Self::without_directory_capture`].
     directory_capture: bool,
+    /// The `(group, path)`s a waiter is already queued to journal once
+    /// their path lock frees (see `journal_uncaptured_once_unlocked`): one
+    /// waiter per path, however many scans find the path busy meanwhile.
+    deferred_journal_waiters: Arc<std::sync::Mutex<std::collections::HashSet<(String, String)>>>,
 }
 
 impl LocalChangeProcessor {
@@ -137,6 +143,7 @@ impl LocalChangeProcessor {
             change_emitter: None,
             root_lease,
             reconcile_gate: ReconcileGate::default(),
+            deferred_journal_waiters: Arc::default(),
             directory_capture: true,
         }
     }
@@ -166,9 +173,9 @@ impl LocalChangeProcessor {
         Ok(self.root_lease.begin_operation()?)
     }
 
-    /// Enables change-history emission: from here on, accepted local
-    /// mutations dual-write a signed change alongside the index mutation.
-    pub fn with_change_emitter(mut self, emitter: Arc<ChangeEmitter>) -> Self {
+    /// Enables native delta emission: from here on, accepted local
+    /// mutations write a signed delta alongside the index mutation.
+    pub fn with_change_emitter(mut self, emitter: Arc<LocalAuthorKey>) -> Self {
         self.change_emitter = Some(emitter);
         self
     }
@@ -190,7 +197,7 @@ pub struct FlushOutcome {
 #[cfg(test)]
 pub(crate) mod scan_test_hooks;
 
-/// Pins `untouched_placeholder_verdict`'s Windows overload -- there is no
+/// Pins `cfapi_placeholder_untouched`'s Windows overload -- there is no
 /// size/mtime fallback on non-Unix platforms; every scenario below proves
 /// the verdict comes
 /// ONLY from `LocalMutationStore::inspect_windows_placeholder` (stubbed
@@ -202,10 +209,10 @@ pub(crate) mod scan_test_hooks;
 /// only macOS and Windows, so there is no longer a third platform to hedge
 /// for.
 #[cfg(all(test, windows))]
-mod untouched_placeholder_verdict_windows_tests {
-    use super::{untouched_placeholder_verdict, FileRecord};
+mod cfapi_placeholder_untouched_windows_tests {
+    use super::{cfapi_placeholder_untouched, FileRecord};
+    use crate::ports::PlaceholderStatus;
     use crate::test_support::TestReplica;
-    use yadorilink_filesystem_sync::placeholder_backend::PlaceholderStatus;
     use yadorilink_local_storage::{
         PlaceholderDiskIdentity, WINDOWS_CFAPI_GENERATION_PROVIDER_KIND,
     };
@@ -249,7 +256,7 @@ mod untouched_placeholder_verdict_windows_tests {
             metadata.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
                 as i64;
         let recorded = generation(7);
-        assert!(!untouched_placeholder_verdict(
+        assert!(!cfapi_placeholder_untouched(
             &replica,
             std::path::Path::new("placeholder.bin"),
             &metadata,
@@ -264,7 +271,7 @@ mod untouched_placeholder_verdict_windows_tests {
         replica.set_windows_placeholder_inspect_result(PlaceholderStatus::Untouched);
         let metadata = metadata_for(4096);
         let recorded = generation(7);
-        assert!(untouched_placeholder_verdict(
+        assert!(cfapi_placeholder_untouched(
             &replica,
             std::path::Path::new("placeholder.bin"),
             &metadata,
@@ -286,7 +293,7 @@ mod untouched_placeholder_verdict_windows_tests {
         replica.set_windows_placeholder_inspect_result(PlaceholderStatus::Unknown);
         let metadata = metadata_for(4096);
         let recorded = generation(7);
-        assert!(!untouched_placeholder_verdict(
+        assert!(!cfapi_placeholder_untouched(
             &replica,
             std::path::Path::new("placeholder.bin"),
             &metadata,
@@ -301,7 +308,7 @@ mod untouched_placeholder_verdict_windows_tests {
         replica.set_windows_placeholder_inspect_result(PlaceholderStatus::Unknown);
         let metadata = metadata_for(4096);
         let recorded = generation(7);
-        assert!(!untouched_placeholder_verdict(
+        assert!(!cfapi_placeholder_untouched(
             &replica,
             std::path::Path::new("placeholder.bin"),
             &metadata,
@@ -325,7 +332,7 @@ mod untouched_placeholder_verdict_windows_tests {
             identity: PlaceholderDiskIdentity { dev: 0, ino: 7 },
             provider_kind: yadorilink_local_storage::INTERNAL_INODE_PROVIDER_KIND.to_string(),
         };
-        assert!(!untouched_placeholder_verdict(
+        assert!(!cfapi_placeholder_untouched(
             &replica,
             std::path::Path::new("placeholder.bin"),
             &metadata,
@@ -339,7 +346,7 @@ mod untouched_placeholder_verdict_windows_tests {
         let replica = TestReplica::open_in_memory().unwrap();
         replica.set_windows_placeholder_inspect_result(PlaceholderStatus::Untouched);
         let metadata = metadata_for(4096);
-        assert!(!untouched_placeholder_verdict(
+        assert!(!cfapi_placeholder_untouched(
             &replica,
             std::path::Path::new("placeholder.bin"),
             &metadata,
@@ -360,7 +367,7 @@ mod untouched_placeholder_verdict_windows_tests {
         let metadata = metadata_for(4096);
         let recorded = generation(99);
         for _ in 0..2 {
-            assert!(untouched_placeholder_verdict(
+            assert!(cfapi_placeholder_untouched(
                 &replica,
                 std::path::Path::new("placeholder.bin"),
                 &metadata,
@@ -388,3 +395,6 @@ mod tests;
 /// that identity and confirms; nothing downstream can notice.
 #[cfg(test)]
 mod disk_observation_gate_tests;
+
+#[cfg(test)]
+mod remote_absence_tests;

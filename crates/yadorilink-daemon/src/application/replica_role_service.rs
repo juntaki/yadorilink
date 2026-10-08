@@ -4,8 +4,8 @@ use yadorilink_replica_domain::session_state::{MaterializationPolicy, RoleLossOp
 
 use super::model::{HandoffCommitResult, RoleLossCommitOutcome};
 use super::ports::{
-    HandoffReadinessPort, LinkRuntimePort, PlaceholderPipelineCapabilityPort,
-    ReplicaRoleRepository, RoleLossCoordination, RoleLossJournal,
+    HandoffReadinessPort, LinkRuntimePort, OnDemandCapabilityPort, ReplicaRoleRepository,
+    RoleLossCoordination, RoleLossJournal,
 };
 
 /// Past this many compensation attempts for the same role-loss operation,
@@ -41,7 +41,7 @@ pub(crate) struct ReplicaRoleService {
     readiness: Arc<dyn HandoffReadinessPort>,
     coordination: Arc<dyn RoleLossCoordination>,
     runtime: Arc<dyn LinkRuntimePort>,
-    placeholder_pipeline: Arc<dyn PlaceholderPipelineCapabilityPort>,
+    on_demand_capability: Arc<dyn OnDemandCapabilityPort>,
 }
 
 #[derive(Debug)]
@@ -87,7 +87,7 @@ impl ReplicaRoleService {
         readiness: Arc<dyn HandoffReadinessPort>,
         coordination: Arc<dyn RoleLossCoordination>,
         runtime: Arc<dyn LinkRuntimePort>,
-        placeholder_pipeline: Arc<dyn PlaceholderPipelineCapabilityPort>,
+        on_demand_capability: Arc<dyn OnDemandCapabilityPort>,
     ) -> Self {
         Self {
             device_id,
@@ -96,7 +96,7 @@ impl ReplicaRoleService {
             readiness,
             coordination,
             runtime,
-            placeholder_pipeline,
+            on_demand_capability,
         }
     }
 
@@ -110,7 +110,7 @@ impl ReplicaRoleService {
         &self,
         group_id: &str,
     ) -> Result<Option<String>, crate::sync_error::SyncError> {
-        self.repository.live_link_local_path_for_group(group_id)
+        self.repository.live_link_key_for_group(group_id)
     }
 
     fn prepare_ambiguity_recovery(
@@ -118,14 +118,14 @@ impl ReplicaRoleService {
         local_path: &str,
     ) -> Result<Option<AmbiguityRecovery>, crate::sync_error::SyncError> {
         let links = self.repository.list_links()?;
-        let Some(target) = links.iter().find(|l| l.local_path == local_path) else {
+        let Some(target) = links.iter().find(|l| l.key() == local_path) else {
             return Ok(None);
         };
         let group_id = target.group_id.clone();
         let live_paths: Vec<String> = links
             .iter()
             .filter(|l| l.group_id == group_id && !l.orphaned)
-            .map(|l| l.local_path.clone())
+            .map(|l| l.key().to_string())
             .collect();
         if live_paths.len() < 2 {
             return Ok(None);
@@ -235,7 +235,7 @@ impl ReplicaRoleService {
         else {
             return Err(format!("no link registered for folder group {group_id}"));
         };
-        if on_demand && !self.placeholder_pipeline.is_connected() {
+        if on_demand && !self.on_demand_capability.allows_on_demand(group_id) {
             return Err(
                 "on-demand (placeholder) materialization is not available in this build yet"
                     .to_string(),
@@ -589,7 +589,7 @@ impl ReplicaRoleService {
                 format!("refusing to unlink because the local link table could not be read: {e}")
             })?
             .into_iter()
-            .find(|l| l.local_path == local_path)
+            .find(|l| l.key() == local_path)
         else {
             return Ok(UnlinkCommit::RemoveNormally);
         };
@@ -914,6 +914,19 @@ impl ReplicaRoleService {
         local_path: &str,
         force: bool,
     ) -> Result<UnlinkOutcome, String> {
+        // Links are keyed by their exact recorded path; a path that matches no
+        // link must not report success while the real link stays live.
+        let linked = self
+            .repository
+            .list_links()
+            .map_err(|e| {
+                format!("refusing to unlink because the local link table could not be read: {e}")
+            })?
+            .iter()
+            .any(|l| l.key() == local_path);
+        if !linked {
+            return Err(format!("no folder is linked at {local_path}"));
+        }
         // If this is recovery from a legacy two-live-roots state, persist the
         // survivor's additive-scan protection BEFORE anything can remove the
         // departing link. A crash after the unlink commit must therefore

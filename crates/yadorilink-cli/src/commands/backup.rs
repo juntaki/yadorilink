@@ -74,14 +74,37 @@ operator-held copy"
 /// metadata) to `output_path`. It never contains a
 /// device id, a private key, or a session token, so it is written as plain
 /// JSON with no encryption step.
-pub async fn export(output_path: PathBuf) -> Result<(), CliError> {
+///
+/// The linked-folder list comes from the running daemon. When it cannot be
+/// read the export fails rather than silently writing a backup with no
+/// folders; `without_folders` is the explicit way to export anyway. An
+/// existing `output_path` is only replaced with `yes`, mirroring `import`.
+pub async fn export(
+    output_path: PathBuf,
+    yes: bool,
+    without_folders: bool,
+) -> Result<(), CliError> {
     let coordination_addr = device_config::load().ok().map(|cfg| cfg.coordination_addr);
-    let links = fetch_link_metadata().await;
+    let links = if without_folders { Ok(Vec::new()) } else { fetch_link_metadata().await };
+    write_export(&output_path, coordination_addr, links, yes)
+}
 
+fn write_export(
+    output_path: &std::path::Path,
+    coordination_addr: Option<String>,
+    links: Result<Vec<LinkEntry>, CliError>,
+    yes: bool,
+) -> Result<(), CliError> {
+    let links = links.map_err(|e| {
+        CliError::Other(format!(
+            "could not read the linked-folder list from the daemon ({e}); start the daemon and \
+retry, or re-run with --without-folders to export without it"
+        ))
+    })?;
     let backup = NonSensitiveBackup { coordination_addr, links };
     let contents = serde_json::to_string_pretty(&backup)
         .map_err(|e| CliError::Other(format!("serializing backup: {e}")))?;
-    std::fs::write(&output_path, contents)?;
+    write_output(output_path, &contents, yes)?;
 
     println!(
         "Wrote a non-sensitive backup to {}.\n\n\
@@ -91,6 +114,24 @@ metadata -- no device identity keys, no session tokens, no secrets. {}",
         recovery_guidance()
     );
     Ok(())
+}
+
+/// Writes `contents`, refusing to replace an existing file unless `yes`.
+fn write_output(path: &std::path::Path, contents: &str, yes: bool) -> Result<(), CliError> {
+    use std::io::Write;
+
+    if yes {
+        std::fs::write(path, contents)?;
+        return Ok(());
+    }
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut file) => Ok(file.write_all(contents.as_bytes())?),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(CliError::Other(format!(
+            "{} already exists; re-run with --yes to overwrite it",
+            path.display()
+        ))),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Applies a non-sensitive backup document to this device's local
@@ -143,21 +184,17 @@ backup), then re-run import to apply the saved non-sensitive settings"
     Ok(())
 }
 
-/// Best-effort read of the linked-folder list from the running daemon. An
-/// unreachable daemon (or any other failure) yields an empty list rather than
-/// aborting the export -- link metadata is a convenience, not a secret, and
-/// re-linking is always possible afterwards.
-async fn fetch_link_metadata() -> Vec<LinkEntry> {
-    match control_client::send(ReqPayload::ListLinks(ListLinksRequest {})).await {
-        Ok(resp) => match resp.payload {
-            Some(RespPayload::ListLinks(list)) => list
-                .links
-                .into_iter()
-                .map(|l| LinkEntry { local_path: l.local_path, group_id: l.group_id })
-                .collect(),
-            _ => Vec::new(),
-        },
-        Err(_) => Vec::new(),
+/// Reads the linked-folder list from the running daemon.
+async fn fetch_link_metadata() -> Result<Vec<LinkEntry>, CliError> {
+    let resp = control_client::send(ReqPayload::ListLinks(ListLinksRequest {})).await?;
+    match resp.payload {
+        Some(RespPayload::ListLinks(list)) => Ok(list
+            .links
+            .into_iter()
+            .map(|l| LinkEntry { local_path: l.local_path, group_id: l.group_id })
+            .collect()),
+        Some(RespPayload::Error(message)) => Err(CliError::Other(message)),
+        _ => Err(CliError::Other("unexpected daemon response".into())),
     }
 }
 

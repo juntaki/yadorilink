@@ -8,7 +8,7 @@
 //! rather than left as a per-call convention, where a forgotten stamp would
 //! silently produce a real-clock mtime.
 //!
-//! Extracted from `dst_network_fault_chaos.rs`'s `stamp_deterministic_
+//! Extracted from the retired network-fault scenario's `stamp_deterministic_
 //! mtime` + `deliver_local_write`/`remove_file_if_present` helpers.
 //!
 //! `#![cfg(turmoil)]`-gated like every DST scenario file.

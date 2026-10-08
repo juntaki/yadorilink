@@ -8,7 +8,7 @@
 //!   daemon's already-known device list (`PeerAuthorityState::peer_signing_key`/
 //!   `device_id_for_signing_key`, the iroh substrate reachability the
 //!   coordination plane reported, and grant-derived peers -- all
-//!   connectivity/identity bookkeeping, never anything DAG- or
+//!   connectivity/identity bookkeeping, never anything native-state- or
 //!   materialization-related);
 //! - decides who may open a connection on Track Send's own ALPN
 //!   ([`track_send_admission`]): a device with a live grant, or the
@@ -241,7 +241,7 @@ pub async fn run(
     config_dir: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (node, inbound) = loop {
-        if let Some(driver) = state.reconciliation_driver() {
+        if let Some(driver) = state.peer_session_driver() {
             let endpoint = driver.stack().endpoint();
             let Some(inbound) = endpoint.take_track_send_inbound() else {
                 return Err("Track Send's inbound queue was already taken".into());
@@ -276,6 +276,16 @@ pub async fn run(
 /// mutating command's own service. Read-only `inbox` is
 /// [`InboxQueries`] instead, in `QueryServices`, mirroring this crate's
 /// existing command/query split (e.g. `link_lifecycle` vs `link_status`).
+/// Rejects a path the daemon would otherwise resolve against its own working
+/// directory, which is unrelated to the directory the user typed it in.
+fn require_absolute(what: &str, path: &str) -> Result<(), String> {
+    if std::path::Path::new(path).is_absolute() {
+        Ok(())
+    } else {
+        Err(format!("the {what} must be an absolute path, got {path:?}"))
+    }
+}
+
 pub(crate) struct SendTransferService {
     state: Arc<DaemonState>,
 }
@@ -298,6 +308,7 @@ impl SendTransferService {
         source_path: &str,
         target_device: &str,
     ) -> Result<SendOfferOutcome, String> {
+        require_absolute("source path", source_path)?;
         let service = self.service()?;
         service
             .offer_send(std::path::Path::new(source_path), target_device)
@@ -310,6 +321,9 @@ impl SendTransferService {
         transfer_id: &str,
         destination_dir: Option<&str>,
     ) -> Result<ReceiveOutcome, String> {
+        if let Some(dir) = destination_dir {
+            require_absolute("destination directory", dir)?;
+        }
         let service = self.service()?;
         let destination_dir = destination_dir.map(std::path::Path::new);
         service.receive_transfer(transfer_id, destination_dir).await.map_err(|e| e.to_string())

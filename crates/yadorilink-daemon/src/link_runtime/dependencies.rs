@@ -15,24 +15,22 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use yadorilink_local_storage::BlockStore;
-use yadorilink_replica_domain::file::FileRecord;
 
 use crate::replica_coordinator::ReplicaCoordinator;
 
 /// The handful of operations this per-link dependency bundle cannot itself
 /// perform without reaching into daemon-wide coordination state that has no
-/// per-link narrowing: fanning a batch of changes out to every connected
-/// peer session (`broadcast_change`), marking daemon-wide write activity
+/// per-link narrowing: following up a durable local commit (publishing its
+/// checkpoint and waking reconciliation, `on_local_native_commit`), marking daemon-wide write activity
 /// for the idle-GC scheduler and the "Safe Update Windows" write-safe-point
 /// signal (`begin_write_activity`), and reading this device's change-history
 /// signing key (`device_signing_key`). Implemented by the daemon's runtime
 /// state itself, elsewhere in this crate, so [`LinkRuntimeDependencies`] can
 /// still reach these three without naming that type.
 pub(crate) trait LinkRuntimeHostPort: Send + Sync {
-    fn broadcast_change<'a>(
+    fn on_local_native_commit<'a>(
         &'a self,
         group_id: &'a str,
-        records: Vec<FileRecord>,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
     /// An opaque write-activity RAII guard, released on drop. Boxed and
@@ -48,13 +46,13 @@ pub(crate) trait LinkRuntimeHostPort: Send + Sync {
     /// have settled and staged Changes blocked behind them may now be
     /// admissible.
     ///
-    /// Deliberately separate from `broadcast_change`, and deliberately not
-    /// conditioned on any record: a flush that produces NO record still
-    /// clears the dirty rows that were the barrier. Announcing is about
-    /// telling peers what changed; this is about re-asking a question whose
-    /// answer may have changed. Tying the second to the first is what left
-    /// verified Changes staged forever -- `announce_local_change` returns at
-    /// `records.is_empty()`, before anything that could re-ask.
+    /// Deliberately separate from `on_local_native_commit`, and deliberately
+    /// not conditioned on any record: a flush that produces NO record still
+    /// clears the dirty rows that were the barrier. Following up a commit is
+    /// about telling peers what changed; this is about re-asking a question
+    /// whose answer may have changed. Tying the second to the first is what
+    /// left verified Changes staged forever -- `announce_local_change`
+    /// returns at `records.is_empty()`, before anything that could re-ask.
     ///
     /// The port exists so this crate's capture path does not depend on the
     /// admission coordinator; the daemon side decides what to do with it.
@@ -111,7 +109,7 @@ pub(crate) trait LinkRuntimeHostPort: Send + Sync {
 /// handle used to be.
 #[derive(Clone)]
 pub(crate) struct LinkRuntimeDependencies {
-    /// The one replica/DAG/materialization composition-root handle this
+    /// The one replica/native-state/materialization composition-root handle this
     /// bundle threads down into the per-link runtime machinery
     /// (`factory.rs`/`startup.rs`'s startup-readiness calls/`tasks.rs`/
     /// `operations/repair_materialization.rs`, `startup.rs`'s
@@ -127,8 +125,8 @@ pub(crate) struct LinkRuntimeDependencies {
 }
 
 impl LinkRuntimeDependencies {
-    pub(crate) async fn broadcast_change(&self, group_id: &str, records: Vec<FileRecord>) {
-        self.host.broadcast_change(group_id, records).await;
+    pub(crate) async fn on_local_native_commit(&self, group_id: &str) {
+        self.host.on_local_native_commit(group_id).await;
     }
 
     pub(crate) fn begin_write_activity(&self) -> Box<dyn Send + '_> {

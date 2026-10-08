@@ -5,8 +5,8 @@
 //! Before this module, scenarios either slept a fixed `FINAL_SETTLE`
 //! before the terminal oracle (firing "looks like a violation, is really
 //! mid-flight" false failures) or hand-rolled their own poll loop with a
-//! hand-widened gate constant (the canonical `dst_two_device_chaos.rs` /
-//! `dst_network_fault_chaos.rs` `while... FINAL_CONVERGENCE_TIMEOUT`
+//! hand-widened gate constant (the canonical loops of the retired two-device and
+//! network-fault scenarios, `while... FINAL_CONVERGENCE_TIMEOUT`
 //! loops, plus the `ROUND_PROGRESSION_GATE` 5s->45s archaeology). `settle`
 //! polls the convergence oracle on the *simulated* clock and returns the
 //! instant it observes convergence; on budget exhaustion it records a
@@ -63,8 +63,8 @@ pub async fn settle_until(budget: Duration, mut converged: impl FnMut() -> bool)
 }
 
 /// Settle on the flat convergence oracle (`check_convergence`) reporting no
-/// disagreement -- the direct replacement for `dst_two_device_chaos.rs` /
-/// `dst_network_fault_chaos.rs`'s terminal `FINAL_CONVERGENCE_TIMEOUT`
+/// disagreement -- the direct replacement for the retired two-device and
+/// network-fault scenarios' terminal `FINAL_CONVERGENCE_TIMEOUT`
 /// loop.
 pub async fn settle(
     devices: &[(&Path, &ReplicaCoordinator)],

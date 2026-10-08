@@ -34,10 +34,21 @@ fn block_on<F: Future>(future: F) -> F::Output {
     }
 }
 
+/// No test in this module may reach the OS keychain: it blocks on a permission dialog and leaks
+/// items. Both switches are constant, so setting them once for the whole test process is safe.
+fn hermetic_keychain() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        std::env::set_var("YADORILINK_DISABLE_OS_KEYRING", "1");
+        std::env::set_var("YADORILINK_CREDENTIAL_STORE", "file");
+    });
+}
+
 /// The tests share `YADORILINK_CONTROL_SOCKET`, a process-global variable.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn without_daemon<T>(body: impl FnOnce() -> T) -> T {
+    hermetic_keychain();
     let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     std::env::set_var("YADORILINK_CONTROL_SOCKET", dir.path().join("nobody-home.sock"));
@@ -47,6 +58,7 @@ fn without_daemon<T>(body: impl FnOnce() -> T) -> T {
 }
 
 fn client() -> Arc<ClientCore> {
+    hermetic_keychain();
     ClientCore::new(CoreConfig { daemon_launch: DaemonLaunch::SpawnBinary { path: None } })
 }
 

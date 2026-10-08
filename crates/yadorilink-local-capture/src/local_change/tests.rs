@@ -1,7 +1,6 @@
 #![cfg(test)]
 
 use super::*;
-use yadorilink_replica_domain::test_authoring::create_signed_for_tests;
 // This crate's own tests build a real fixture via this crate's own
 // `TestReplica` (a thin wrapper around `yadorilink-daemon`'s
 // `ReplicaCoordinator` -- see `test_support`'s own doc comment for why a
@@ -15,10 +14,10 @@ use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_filesystem_sync::watcher::{FsChangeEvent, FsChangeKind};
 use yadorilink_local_storage::unix_mode_from_metadata;
 use yadorilink_local_storage::SegmentBlockStore;
-use yadorilink_replica_domain::change::{encoded_op_len, Op};
 use yadorilink_replica_domain::file::RecordKind;
 use yadorilink_replica_domain::ids::SyncPath;
-use yadorilink_replica_domain::session_state::{ChangeContent, MaterializationState};
+use yadorilink_replica_domain::local_op::Op;
+use yadorilink_replica_domain::session_state::MaterializationState;
 use yadorilink_root_authority::fs_identity::disk_race_fingerprint;
 use yadorilink_root_authority::ignore_patterns::EffectiveIgnoreSet;
 use yadorilink_sync_sqlite::SyncSqliteError;
@@ -504,7 +503,7 @@ async fn build_toctou_fixture() -> (
 
     state.link_repository().add_link(&root.to_string_lossy(), TOCTOU_GROUP).unwrap();
     state.set_local_change_auth_provider(Arc::new(|_group_id| Ok(())));
-    let emitter = Arc::new(ChangeEmitter::new(
+    let emitter = Arc::new(LocalAuthorKey::for_tests(
         "device-a",
         ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]),
     ));
@@ -516,13 +515,13 @@ async fn build_toctou_fixture() -> (
     )
     .with_change_emitter(emitter);
     adopt_root(&state, TOCTOU_GROUP, &root);
-    // A real, DAG-admitted edit for TOCTOU_PATH itself -- both tests
+    // A real, natively admitted edit for TOCTOU_PATH itself -- both tests
     // using this fixture exercise a LIVE rescan
     // (`scan_existing_files_with_ignore`, the same entry point
     // `DebounceFlush::RescanRequired` reaches once a link is
     // established), and a live rescan is only ever reachable once the
     // group's startup scan has already run, which always establishes
-    // DAG history first (`ensure_initial_change_history`) -- so
+    // native history first (`ensure_initial_change_history`) -- so
     // `has_dag_history` must be `true` here to match production, not
     // an artifact of an otherwise-empty test fixture. Without this,
     // `reconcile_disk_with_ignore` takes its OTHER, non-chunked commit
@@ -530,9 +529,9 @@ async fn build_toctou_fixture() -> (
     // link case), which has no per-chunk pre-commit re-verification
     // to exercise at all. Going through `process_event` (rather than
     // a direct `upsert_file`) is also what gives this row a real,
-    // schema-required `authoring_change_hash` -- a DAG-backed current
-    // row with none is rejected outright once the group has any
-    // history at all (`files_require_authoring_identity_on_insert`).
+    // schema-required native authoring identity -- a current row with
+    // none is rejected outright once the group has any native history
+    // at all (`files_require_authoring_identity_on_insert`).
     let content = b"real content, written only after the hold clears".to_vec();
     std::fs::write(root.join(TOCTOU_PATH), &content).unwrap();
     processor
@@ -544,30 +543,25 @@ async fn build_toctou_fixture() -> (
         .await
         .unwrap();
     assert_eq!(
-        state.sqlite().dag_group_heads(TOCTOU_GROUP).unwrap().len(),
+        crate::test_support::native_group_heads(&state, TOCTOU_GROUP).len(),
         1,
-        "sanity: TOCTOU_PATH's own creation must have established exactly one DAG head"
+        "sanity: TOCTOU_PATH's own creation must have established exactly one native head"
     );
     // Now remove the just-indexed content -- everything below mutates
     // ONLY `materialization_state`/`held_reason`/`held_since_unix_
-    // nanos` (never `state`/`version_seq`/`authoring_change_hash`, the
+    // nanos` (never `state`/`version_seq`/`native_authoring_identity`, the
     // columns the trigger above actually watches), so the row's valid
     // authoring identity from the real edit just above survives
     // untouched.
     std::fs::remove_file(root.join(TOCTOU_PATH)).unwrap();
     let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
-    // `hold_record`'s own established shape: `Placeholder`, held, and
+    // `hold_record`'s own established shape: `Remote`, held, and
     // (deliberately) nothing written under this exact name yet, no
     // intent, no obligation -- the row this whole investigation's bug
     // family is about.
     state
         .materialization_state_repository()
-        .set_materialization_state(
-            TOCTOU_GROUP,
-            TOCTOU_PATH,
-            MaterializationState::Placeholder,
-            &permit,
-        )
+        .set_materialization_state(TOCTOU_GROUP, TOCTOU_PATH, MaterializationState::Remote, &permit)
         .unwrap();
     state
         .materialization_state_repository()
@@ -585,7 +579,7 @@ async fn build_toctou_fixture() -> (
     // `settle_obligation_against_local_presence_in_tx`). When it has
     // not (nothing publishable for this path), settle it here the way
     // `hold_record` itself would, against this row's genuine
-    // `Placeholder` state. Either way the fixture continues from "no
+    // `Remote` state. Either way the fixture continues from "no
     // open obligation", the precondition it always meant to establish.
     if let Some(obligation) =
         state.sqlite().dag_lookup_projection_obligation(TOCTOU_GROUP, TOCTOU_PATH).unwrap()
@@ -598,7 +592,7 @@ async fn build_toctou_fixture() -> (
                     TOCTOU_PATH,
                     obligation.invalidation_generation,
                     obligation.obligation_incarnation,
-                    yadorilink_sync_sqlite::projection_obligations::NonExactProofKind::Placeholder,
+                    yadorilink_sync_sqlite::projection_obligations::NonExactProofKind::ContentNotOwed,
                 )
                 .unwrap(),
             "sanity: settling the obligation against this row's genuine Placeholder state \
@@ -625,7 +619,7 @@ async fn build_toctou_fixture() -> (
 /// FIX ASSERTED (the CANDIDACY-time half -- see the sibling test
 /// below for the SEPARATE pre-commit-window half): the probe scenario. A path starts hazard-held
 /// (matching `hold_record`'s
-/// shape exactly: `Placeholder`, `held_reason` set, nothing on disk,
+/// shape exactly: `Remote`, `held_reason` set, nothing on disk,
 /// no intent, no obligation). A live rescan's tombstone-candidate loop
 /// reaches this path; the scan is paused right at LOOP ENTRY for this
 /// path -- BEFORE `recheck_tombstone_candidate` runs at all (this
@@ -634,7 +628,7 @@ async fn build_toctou_fixture() -> (
 /// recheck`. While paused, a concurrent task completes the held-to-
 /// materialize transition exactly the way a real `materialize`/
 /// `hydrate_file_with_timeout` success does: `clear_held`, write the
-/// real content under this exact name, stamp `Hydrated`. Resuming the
+/// real content under this exact name, stamp `Present`. Resuming the
 /// scan must NOT tombstone this path: `recheck_tombstone_candidate`
 /// only ever runs AFTER the hook releases it, so it reads the
 /// already-fresh, post-transition state directly -- proving the
@@ -704,7 +698,7 @@ async fn live_rescan_does_not_tombstone_a_path_that_completed_materializing_duri
             .set_materialization_state(
                 TOCTOU_GROUP,
                 TOCTOU_PATH,
-                MaterializationState::Hydrated,
+                MaterializationState::Present,
                 &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
@@ -770,8 +764,18 @@ async fn live_rescan_does_not_tombstone_a_path_materialized_between_its_candidac
     // disk) rather than being excluded there the way the sibling
     // test's still-held row is -- the whole point of this test is the
     // window AFTER that acceptance, not a race with the acceptance
-    // itself.
+    // itself. It is a `Present` object whose file is gone, the only shape
+    // whose absence is evidence of a delete.
     state.materialization_state_repository().clear_held(TOCTOU_GROUP, TOCTOU_PATH).unwrap();
+    state
+        .materialization_state_repository()
+        .set_materialization_state(
+            TOCTOU_GROUP,
+            TOCTOU_PATH,
+            MaterializationState::Present,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
 
     let snapshot_read = Arc::new(Latch::new());
     let release_scan = Arc::new(Latch::new());
@@ -817,7 +821,7 @@ async fn live_rescan_does_not_tombstone_a_path_materialized_between_its_candidac
             .set_materialization_state(
                 TOCTOU_GROUP,
                 TOCTOU_PATH,
-                MaterializationState::Hydrated,
+                MaterializationState::Present,
                 &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
@@ -911,9 +915,18 @@ async fn run_commit_gap_swap(
         build_toctou_fixture().await;
     // The fixture's held path is only here to give the chunk a
     // tombstone candidate, which is what the pre-chunk-commit seam
-    // fires for. Cleared so it legitimately passes its candidacy
-    // check and reaches that seam.
+    // fires for. Cleared, and made a `Present` object whose file is gone,
+    // so it legitimately passes its candidacy check and reaches that seam.
     state.materialization_state_repository().clear_held(TOCTOU_GROUP, TOCTOU_PATH).unwrap();
+    state
+        .materialization_state_repository()
+        .set_materialization_state(
+            TOCTOU_GROUP,
+            TOCTOU_PATH,
+            MaterializationState::Present,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
 
     std::fs::write(root.join(COMMIT_GAP_VICTIM_PATH), original).unwrap();
     std::fs::write(root.join(COMMIT_GAP_CONTROL_PATH), original).unwrap();
@@ -1119,7 +1132,7 @@ async fn a_scanned_offline_deletion_publishes_an_absent_actual_state_proof() {
 
     state.link_repository().add_link(&root.to_string_lossy(), OFFLINE_DELETE_GROUP).unwrap();
     state.set_local_change_auth_provider(Arc::new(|_group_id| Ok(())));
-    let emitter = Arc::new(ChangeEmitter::new(
+    let emitter = Arc::new(LocalAuthorKey::for_tests(
         "device-a",
         ed25519_dalek::SigningKey::from_bytes(&[23u8; 32]),
     ));
@@ -1133,7 +1146,7 @@ async fn a_scanned_offline_deletion_publishes_an_absent_actual_state_proof() {
     adopt_root(&state, OFFLINE_DELETE_GROUP, &root);
 
     // A real local emission for the path, so it enters the scan below
-    // exactly as a previously-synced file does: a DAG-backed current
+    // exactly as a previously-synced file does: a native-backed current
     // row with a genuine authoring identity, and an actual-state proof
     // describing the content that was on disk.
     std::fs::write(root.join(OFFLINE_DELETE_PATH), b"content that later goes away").unwrap();
@@ -2168,7 +2181,7 @@ async fn projection_fence_never_swallows_a_real_xattr_edit_racing_matching_conte
 /// by a newer version between the lane's snapshot and its proof commit:
 /// the lane has renamed the OLD version's full bytes into place, its
 /// intent (targeting those old bytes) is still open, and the row now
-/// names the NEWER version as a `Placeholder` with no recorded placeholder
+/// names the NEWER version as a `Remote` with no recorded placeholder
 /// identity. The settle writes nothing for the newer row, so this is
 /// where the path rests until something materializes the newer version.
 ///
@@ -2200,7 +2213,7 @@ async fn an_old_versions_bytes_under_a_newer_placeholder_row_are_the_open_intent
     let new_blocks = chunk(new_content);
 
     // The row as the replacement left it: the newer version, a
-    // `Placeholder`, no placeholder identity recorded.
+    // `Remote`, no placeholder identity recorded.
     state
         .file_index_repository()
         .upsert_file(
@@ -2220,7 +2233,7 @@ async fn an_old_versions_bytes_under_a_newer_placeholder_row_are_the_open_intent
         .set_materialization_state(
             "group-1",
             "superseded.bin",
-            MaterializationState::Placeholder,
+            MaterializationState::Remote,
             &permit,
         )
         .unwrap();
@@ -2319,7 +2332,7 @@ async fn rename_produces_identical_block_hashes_as_the_original() {
     proc.process_event(
         "group-1",
         &root,
-        &FsChangeEvent { path: original, kind: FsChangeKind::Removed },
+        &FsChangeEvent { path: original, kind: FsChangeKind::ObservedRemoval },
     )
     .await
     .unwrap();
@@ -2367,7 +2380,7 @@ async fn removed_file_is_marked_deleted_with_incremented_version() {
         proc.process_event(
             "group-1",
             &root,
-            &FsChangeEvent { path: file_path, kind: FsChangeKind::Removed },
+            &FsChangeEvent { path: file_path, kind: FsChangeKind::ObservedRemoval },
         )
         .await
         .unwrap(),
@@ -2406,14 +2419,11 @@ async fn a_removed_event_for_an_already_tombstoned_path_authors_nothing() {
         .unwrap(),
     );
     std::fs::remove_file(&path).unwrap();
-    let removed = FsChangeEvent { path: path.clone(), kind: FsChangeKind::Removed };
+    let removed = FsChangeEvent { path: path.clone(), kind: FsChangeKind::ObservedRemoval };
     assert!(expect_file_changed(proc.process_event(group, &root, &removed).await.unwrap()).deleted);
-    let tombstone_author = state
-        .file_index_repository()
-        .canonical_current_row(group, "index.lock")
-        .unwrap()
-        .unwrap()
-        .authoring_change_hash;
+    let tombstone_author =
+        state.file_index_repository().row_authoring(group, "index.lock").unwrap();
+    let tombstone_versions = state.sqlite().dag_list_versions(group, "index.lock").unwrap().len();
 
     // The same name comes and goes again without ever being captured,
     // then the deletion is reported again -- directly and through a
@@ -2427,7 +2437,7 @@ async fn a_removed_event_for_an_already_tombstoned_path_authors_nothing() {
             &root,
             yadorilink_filesystem_sync::debounce::DebounceFlush::Paths(vec![(
                 path.clone(),
-                FsChangeKind::Removed,
+                FsChangeKind::ObservedRemoval,
                 0,
             )]),
         )
@@ -2436,14 +2446,14 @@ async fn a_removed_event_for_an_already_tombstoned_path_authors_nothing() {
     assert!(flushed.records.is_empty(), "a repeated deletion must not author another tombstone");
 
     assert_eq!(
-        state
-            .file_index_repository()
-            .canonical_current_row(group, "index.lock")
-            .unwrap()
-            .unwrap()
-            .authoring_change_hash,
+        state.file_index_repository().row_authoring(group, "index.lock").unwrap(),
         tombstone_author,
-        "the path's tombstone must still be the one change that deleted it"
+        "the path's tombstone must still be the one delta that deleted it"
+    );
+    assert_eq!(
+        state.sqlite().dag_list_versions(group, "index.lock").unwrap().len(),
+        tombstone_versions,
+        "a repeated deletion must not add another version"
     );
 }
 
@@ -2459,7 +2469,7 @@ async fn deleting_never_indexed_ignored_paths_generates_no_tombstone() {
         .process_event_with_ignore(
             "group-1",
             &root,
-            &FsChangeEvent { path: user_ignored, kind: FsChangeKind::Removed },
+            &FsChangeEvent { path: user_ignored, kind: FsChangeKind::ObservedRemoval },
             &ignore_set,
         )
         .await
@@ -2472,7 +2482,7 @@ async fn deleting_never_indexed_ignored_paths_generates_no_tombstone() {
         .process_event_with_ignore(
             "group-1",
             &root,
-            &FsChangeEvent { path: built_in_ignored, kind: FsChangeKind::Removed },
+            &FsChangeEvent { path: built_in_ignored, kind: FsChangeKind::ObservedRemoval },
             &ignore_set,
         )
         .await
@@ -2481,325 +2491,11 @@ async fn deleting_never_indexed_ignored_paths_generates_no_tombstone() {
     assert!(state.file_index_repository().get_file("group-1", ".DS_Store").unwrap().is_none());
 }
 
-/// Placeholder creation is not treated
-/// as a local edit": a placeholder's own write must not be indexed as
-/// a genuine local change, or chunked (which would index wrong content
-/// — the placeholder's sparse bytes, not the file's real ones).
-/// Unix-only: exercises the `(dev, ino)` identity path specifically --
-/// `write_placeholder` only captures an identity on Unix (see its own
-/// doc comment), so this test's `.expect(...)` on that identity would
-/// panic on a platform where it always returns `None`.
-#[tokio::test]
-#[cfg(unix)]
-async fn placeholder_write_is_not_treated_as_a_local_edit() {
-    let (proc, state, _store_dir, root_dir) = processor();
-    let root = canonical_root(&root_dir);
-    adopt_root(&state, "group-1", &root);
-    let file_path = root.join("placeholder.bin");
-
-    // Simulate what `peer_session::materialize` does for an `OnDemand`
-    // folder: index a record, then mark it Placeholder, before the
-    // sparse file itself is written to disk.
-    state
-        .file_index_repository()
-        .upsert_file(
-            "group-1",
-            &FileRecord {
-                path: "placeholder.bin".into(),
-                size: 5_000_000,
-                mtime_unix_nanos: 0,
-                blocks: vec![yadorilink_replica_domain::file::BlockInfo {
-                    hash: vec![0xAB; 32],
-                    offset: 0,
-                    size: 5_000_000,
-                }],
-                deleted: false,
-            },
-            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-        )
-        .unwrap();
-    state
-        .materialization_state_repository()
-        .set_materialization_state(
-            "group-1",
-            "placeholder.bin",
-            MaterializationState::Placeholder,
-            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-        )
-        .unwrap();
-    let identity = yadorilink_local_storage::write_placeholder(&file_path, 5_000_000, 0)
-        .unwrap()
-        .expect("this test runs on unix, where an identity is always captured");
-    state
-        .materialization_state_repository()
-        .record_placeholder_generation(
-            "group-1",
-            "placeholder.bin",
-            identity,
-            yadorilink_local_storage::INTERNAL_INODE_PROVIDER_KIND,
-            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-        )
-        .unwrap();
-
-    let result = proc
-        .process_event(
-            "group-1",
-            &root,
-            &FsChangeEvent { path: file_path, kind: FsChangeKind::CreatedOrModified },
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(
-        result,
-        LocalChangeOutcome::None,
-        "a placeholder's own write must not be indexed as a local edit"
-    );
-    assert_eq!(
-        state.sqlite().dag_list_versions("group-1", "placeholder.bin").unwrap().len(),
-        1,
-        "no spurious local version bump"
-    );
-}
-
-/// The exact gap placeholder identity closes, that a size/mtime/sparse-file
-/// heuristic could never fix: an atomic-save editor
-/// replaces the placeholder with a real file of the SAME size, stamped
-/// to the SAME mtime -- indistinguishable from an untouched placeholder
-/// by size and mtime alone, but the rename mints a fresh inode. Unix-
-/// only, same reason as the sibling placeholder tests above.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(unix)]
-async fn atomic_replace_edit_at_the_placeholders_exact_size_and_mtime_is_captured() {
-    let (proc, state, _store_dir, root_dir) = processor();
-    let root = canonical_root(&root_dir);
-    adopt_root(&state, "group-1", &root);
-    let file_path = root.join("placeholder.bin");
-    let content_size: u64 = 64;
-
-    state
-        .file_index_repository()
-        .upsert_file(
-            "group-1",
-            &FileRecord {
-                path: "placeholder.bin".into(),
-                size: content_size,
-                mtime_unix_nanos: 0,
-                blocks: vec![yadorilink_replica_domain::file::BlockInfo {
-                    hash: vec![0xAB; 32],
-                    offset: 0,
-                    size: content_size as u32,
-                }],
-                deleted: false,
-            },
-            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-        )
-        .unwrap();
-    state
-        .materialization_state_repository()
-        .set_materialization_state(
-            "group-1",
-            "placeholder.bin",
-            MaterializationState::Placeholder,
-            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-        )
-        .unwrap();
-    let identity = yadorilink_local_storage::write_placeholder(&file_path, content_size, 0)
-        .unwrap()
-        .expect("this test runs on unix, where an identity is always captured");
-    state
-        .materialization_state_repository()
-        .record_placeholder_generation(
-            "group-1",
-            "placeholder.bin",
-            identity,
-            yadorilink_local_storage::INTERNAL_INODE_PROVIDER_KIND,
-            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-        )
-        .unwrap();
-
-    // Simulate an atomic-save editor: write the SAME-size real content
-    // to a sibling temp path, stamp it to the EXACT same mtime the
-    // placeholder carries, then rename it over the placeholder's own
-    // path -- an ordinary editor save flow, and the exact edit shape
-    // the old size/mtime/sparse heuristic could never distinguish from
-    // an untouched placeholder.
-    let tmp_path = root.join("placeholder.bin.editor-tmp");
-    std::fs::write(&tmp_path, vec![0x42u8; content_size as usize]).unwrap();
-    std::fs::File::open(&tmp_path).unwrap().set_modified(std::time::UNIX_EPOCH).unwrap();
-    std::fs::rename(&tmp_path, &file_path).unwrap();
-
-    let result = proc
-        .process_event(
-            "group-1",
-            &root,
-            &FsChangeEvent { path: file_path, kind: FsChangeKind::CreatedOrModified },
-        )
-        .await
-        .unwrap();
-
-    assert!(
-        matches!(result, LocalChangeOutcome::FileChanged(_)),
-        "an atomic-save edit landing at the placeholder's exact size and mtime must be \
-         captured, not discarded as a self-echo -- got {result:?}"
-    );
-}
-
-/// A sparse-file check catches an in-place edit (same inode, real bytes
-/// written directly into the placeholder's path rather than an atomic
-/// rename): real content allocates disk blocks. An identity-only
-/// comparison would LOSE that coverage, since an in-place write never
-/// changes the inode. This pins the requirement of BOTH identity match
-/// and continued sparseness.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(unix)]
-async fn in_place_edit_that_keeps_the_same_inode_is_still_captured() {
-    let (proc, state, _store_dir, root_dir) = processor();
-    let root = canonical_root(&root_dir);
-    adopt_root(&state, "group-1", &root);
-    let file_path = root.join("placeholder.bin");
-    let content_size: u64 = 64;
-
-    state
-        .file_index_repository()
-        .upsert_file(
-            "group-1",
-            &FileRecord {
-                path: "placeholder.bin".into(),
-                size: content_size,
-                mtime_unix_nanos: 0,
-                blocks: vec![yadorilink_replica_domain::file::BlockInfo {
-                    hash: vec![0xAB; 32],
-                    offset: 0,
-                    size: content_size as u32,
-                }],
-                deleted: false,
-            },
-            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-        )
-        .unwrap();
-    state
-        .materialization_state_repository()
-        .set_materialization_state(
-            "group-1",
-            "placeholder.bin",
-            MaterializationState::Placeholder,
-            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-        )
-        .unwrap();
-    let identity = yadorilink_local_storage::write_placeholder(&file_path, content_size, 0)
-        .unwrap()
-        .expect("this test runs on unix, where an identity is always captured");
-    state
-        .materialization_state_repository()
-        .record_placeholder_generation(
-            "group-1",
-            "placeholder.bin",
-            identity,
-            yadorilink_local_storage::INTERNAL_INODE_PROVIDER_KIND,
-            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-        )
-        .unwrap();
-
-    // Write real content directly into the placeholder's own path (no
-    // rename) -- the same inode as before, but no longer sparse, and
-    // restore the exact original mtime afterward so size AND mtime
-    // both still match the untouched placeholder too.
-    {
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new().write(true).open(&file_path).unwrap();
-        file.write_all(&vec![0x99u8; content_size as usize]).unwrap();
-        file.sync_all().unwrap();
-    }
-    std::fs::File::open(&file_path).unwrap().set_modified(std::time::UNIX_EPOCH).unwrap();
-
-    let result = proc
-        .process_event(
-            "group-1",
-            &root,
-            &FsChangeEvent { path: file_path, kind: FsChangeKind::CreatedOrModified },
-        )
-        .await
-        .unwrap();
-
-    assert!(
-        matches!(result, LocalChangeOutcome::FileChanged(_)),
-        "an in-place edit that keeps the same inode but writes real content must still be \
-         captured -- got {result:?}"
-    );
-}
-
-/// The defense-in-depth fallback: a placeholder with NO recorded
-/// identity at all (simulating `backfill_placeholder_generations`
-/// having not yet run, or having failed for this specific path) must
-/// still be recognized as untouched when it is still fully sparse at
-/// exactly the indexed size -- otherwise this exact event would
-/// chunk and index the placeholder's own sparse/all-zero bytes as a
-/// genuine local edit.
-#[tokio::test]
-#[cfg(unix)]
-async fn placeholder_with_no_recorded_identity_is_still_untouched_when_still_sparse() {
-    let (proc, state, _store_dir, root_dir) = processor();
-    let root = canonical_root(&root_dir);
-    adopt_root(&state, "group-1", &root);
-    let file_path = root.join("placeholder.bin");
-    let content_size: u64 = 4096;
-
-    state
-        .file_index_repository()
-        .upsert_file(
-            "group-1",
-            &FileRecord {
-                path: "placeholder.bin".into(),
-                size: content_size,
-                mtime_unix_nanos: 0,
-                blocks: vec![yadorilink_replica_domain::file::BlockInfo {
-                    hash: vec![0xAB; 32],
-                    offset: 0,
-                    size: content_size as u32,
-                }],
-                deleted: false,
-            },
-            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-        )
-        .unwrap();
-    state
-        .materialization_state_repository()
-        .set_materialization_state(
-            "group-1",
-            "placeholder.bin",
-            MaterializationState::Placeholder,
-            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-        )
-        .unwrap();
-    // Deliberately no `record_placeholder_generation` call -- this is
-    // the exact state a crashed-before-backfill (or backfill-failed)
-    // path is left in. The file itself is still the genuine, untouched
-    // sparse placeholder.
-    yadorilink_local_storage::write_placeholder(&file_path, content_size, 0).unwrap();
-
-    let result = proc
-        .process_event(
-            "group-1",
-            &root,
-            &FsChangeEvent { path: file_path, kind: FsChangeKind::CreatedOrModified },
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(
-        result,
-        LocalChangeOutcome::None,
-        "a still-sparse placeholder at the exact indexed size must be recognized as \
-         untouched even with no recorded identity -- got {result:?}"
-    );
-}
-
-/// Without an OS transparent-hydration provider, a `Placeholder` row's
+/// Without an OS transparent-hydration provider, a `Remote` row's
 /// on-disk file is an ordinary sparse file at an ordinary path --
 /// nothing stops a user (or an editor) from writing directly to it. If
 /// `build_record_for_created_or_modified` treated EVERY
-/// `CreatedOrModified` event on a `Placeholder` path as this crate's own
+/// `CreatedOrModified` event on a `Remote` path as this crate's own
 /// echo, a genuine user edit would be silently and permanently
 /// discarded: never chunked, never indexed, with a later `hydrate` then
 /// overwriting it with the stale synced content. This is the
@@ -2838,11 +2534,10 @@ async fn a_direct_edit_to_a_placeholder_file_is_captured_not_silently_discarded(
         .set_materialization_state(
             "group-1",
             "placeholder.bin",
-            MaterializationState::Placeholder,
+            MaterializationState::Remote,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
-    yadorilink_local_storage::write_placeholder(&file_path, 5_000_000, 0).unwrap();
 
     // A direct user edit: real content, deliberately a different
     // length than the placeholder's own 5,000,000-byte sparse stand-in
@@ -3188,8 +2883,8 @@ fn an_unmarked_root_that_still_holds_its_indexed_files_is_adopted_on_upgrade() {
     assert!(!indexed.deleted);
 }
 
-/// Indexes a `Hydrated`-but-missing file: a `FileRecord` with real block
-/// info marked `Hydrated`, whose bytes are NOT present on disk. This is the
+/// Indexes a `Present`-but-missing file: a `FileRecord` with real block
+/// info marked `Present`, whose bytes are NOT present on disk. This is the
 /// shape the startup Full scan sees for both a crash-mid-materialize (the
 /// rename never completed) and a genuine offline deletion — the two are told
 /// apart only by the materialization intent.
@@ -3217,14 +2912,14 @@ fn index_hydrated_missing_file(state: &ReplicaCoordinator, group: &str, path: &s
         .set_materialization_state(
             group,
             path,
-            MaterializationState::Hydrated,
+            MaterializationState::Present,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
 }
 
 /// The crux crash-safety guarantee: a crash mid-eager-materialize leaves a
-/// `Hydrated` row whose file is missing but whose write is still recorded by
+/// `Present` row whose file is missing but whose write is still recorded by
 /// an OPEN materialization intent. The startup Full scan must NOT tombstone
 /// it — it is reconstructable from the locally-present blocks and repair
 /// will heal it. Tombstoning here would propagate a `Delete` group-wide and
@@ -3260,7 +2955,7 @@ fn crash_mid_materialize_missing_file_with_open_intent_is_not_tombstoned() {
     assert!(!indexed.deleted, "the index row must be left intact for repair to reconstruct");
 }
 
-/// A hazard-held path -- `hold_record`'s established shape: `Placeholder`,
+/// A hazard-held path -- `hold_record`'s established shape: `Remote`,
 /// `held_reason` set, nothing written under this exact name, no
 /// materialization intent ever opened, and (simulating the settled state
 /// `HazardHeld` completion leaves behind) no projection obligation either
@@ -3293,7 +2988,7 @@ fn a_hazard_held_path_is_not_tombstoned_by_a_full_rescan() {
         .unwrap();
     state
         .materialization_state_repository()
-        .set_materialization_state("group-1", "CON.txt", MaterializationState::Placeholder, &permit)
+        .set_materialization_state("group-1", "CON.txt", MaterializationState::Remote, &permit)
         .unwrap();
     state
         .materialization_state_repository()
@@ -3315,7 +3010,7 @@ fn a_hazard_held_path_is_not_tombstoned_by_a_full_rescan() {
 
 /// A metadata-unprovable hold is recorded against a file that was on disk,
 /// so unlike a hazard hold it must not protect a missing file from being
-/// read as deleted -- even on a `Placeholder` row, which is exactly where a
+/// read as deleted -- even on a `Remote` row, which is exactly where a
 /// hazard hold's protection applies. Otherwise a user's delete of a held
 /// placeholder is dropped and the next pass writes the placeholder back.
 #[test]
@@ -3338,12 +3033,14 @@ fn a_metadata_unprovable_hold_does_not_suppress_a_real_delete() {
             &permit,
         )
         .unwrap();
+    // The user's file stood there (its metadata merely could not be proven),
+    // so the row names a local object: `Present`, and held.
     state
         .materialization_state_repository()
         .set_materialization_state(
             "group-1",
             "write-only.txt",
-            MaterializationState::Placeholder,
+            MaterializationState::Present,
             &permit,
         )
         .unwrap();
@@ -3370,7 +3067,7 @@ fn a_metadata_unprovable_hold_does_not_suppress_a_real_delete() {
 }
 
 /// The inverse of the test above, in the missed-delete direction: a
-/// row that is genuinely, currently `Hydrated` (a later, successful
+/// row that is genuinely, currently `Present` (a later, successful
 /// materialize really did write real content and stamp it) but still
 /// carries a STALE `held_reason` -- `clear_held`/`set_materialization_
 /// state` are separate calls, not one atomic operation, so a crash (or
@@ -3391,8 +3088,8 @@ fn a_stale_held_reason_on_a_genuinely_hydrated_row_does_not_suppress_a_real_dele
         .unwrap();
     // No intent, no obligation -- same as the genuine-offline-deletion
     // sibling test below; the only difference from the "must NOT
-    // tombstone" test above is that this row is `Hydrated`, not
-    // `Placeholder` (via `index_hydrated_missing_file`), with a stale
+    // tombstone" test above is that this row is `Present`, not
+    // `Remote` (via `index_hydrated_missing_file`), with a stale
     // `held_reason` left over from some earlier, now-irrelevant hold.
 
     let records = proc.scan_existing_files("group-1", &root).unwrap();
@@ -3433,7 +3130,7 @@ fn offline_deleted_hydrated_file_with_no_intent_is_still_tombstoned() {
 }
 
 /// Indexes a live, settled explicit Directory row at `path`: blockless,
-/// `Hydrated`, no intent and no obligation -- exactly what F4's directory
+/// `Present`, no intent and no obligation -- exactly what F4's directory
 /// lane leaves behind once it has materialized a peer's Directory version.
 fn index_settled_directory(state: &ReplicaCoordinator, group: &str, path: &str) {
     let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
@@ -3457,7 +3154,7 @@ fn index_settled_directory(state: &ReplicaCoordinator, group: &str, path: &str) 
         .unwrap();
     state
         .materialization_state_repository()
-        .set_materialization_state(group, path, MaterializationState::Hydrated, &permit)
+        .set_materialization_state(group, path, MaterializationState::Present, &permit)
         .unwrap();
 }
 
@@ -3535,72 +3232,6 @@ fn repair_errored_boot_suppresses_all_scan_tombstones() {
     assert!(
         healthy.iter().any(|r| r.path == "deferred.txt" && r.deleted),
         "the deferred deletion must propagate on a later healthy boot"
-    );
-}
-
-/// `scan_existing_files` must
-/// not skip a genuine placeholder (OnDemand sync) during a bulk scan —
-/// the bulk-loaded materialization-state map must still
-/// correctly prevent chunking a placeholder's sparse bytes, exactly as
-/// the old per-file `get_materialization_state` lookup did. Unix-only,
-/// same reason as `placeholder_write_is_not_treated_as_a_local_edit`.
-#[test]
-#[cfg(unix)]
-fn scan_existing_files_still_skips_placeholders_when_bulk_loading_materialization_state() {
-    let (proc, state, _store_dir, root_dir) = processor();
-    let root = canonical_root(&root_dir);
-
-    state
-        .file_index_repository()
-        .upsert_file(
-            "group-1",
-            &FileRecord {
-                path: "placeholder.bin".into(),
-                size: 2_000_000,
-                mtime_unix_nanos: 0,
-                blocks: vec![yadorilink_replica_domain::file::BlockInfo {
-                    hash: vec![0xCD; 32],
-                    offset: 0,
-                    size: 2_000_000,
-                }],
-                deleted: false,
-            },
-            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-        )
-        .unwrap();
-    state
-        .materialization_state_repository()
-        .set_materialization_state(
-            "group-1",
-            "placeholder.bin",
-            MaterializationState::Placeholder,
-            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-        )
-        .unwrap();
-    let identity =
-        yadorilink_local_storage::write_placeholder(&root.join("placeholder.bin"), 2_000_000, 0)
-            .unwrap()
-            .expect("this test runs on unix, where an identity is always captured");
-    state
-        .materialization_state_repository()
-        .record_placeholder_generation(
-            "group-1",
-            "placeholder.bin",
-            identity,
-            yadorilink_local_storage::INTERNAL_INODE_PROVIDER_KIND,
-            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-        )
-        .unwrap();
-    std::fs::write(root.join("ordinary.txt"), b"a real file").unwrap();
-
-    let records = proc.scan_existing_files("group-1", &root).unwrap();
-    let paths: Vec<&str> = records.iter().map(|r| r.path.as_str()).collect();
-    assert_eq!(paths, vec!["ordinary.txt"], "the placeholder must not be re-indexed by the scan");
-
-    assert_eq!(
-        state.sqlite().dag_list_versions("group-1", "placeholder.bin").unwrap().len(),
-        1,
-        "no spurious local version bump from the scan"
     );
 }
 
@@ -4157,16 +3788,13 @@ async fn a_mixed_outcome_batch_clears_only_the_successfully_processed_paths() {
     assert_eq!(dirty[0].path, "big.bin");
 }
 
-/// Stage-2 authoritative-mutation group commit: a batch of N independent
-/// path mutations (each its own file, no relation to the others) must
-/// still author N DISTINCT signed `Change`s, chained in the exact causal
-/// order sequential (one-transaction-per-path) authoring would have
-/// produced — `commit_local_mutations_batch` must never collapse them
-/// into one multi-op `Change` (that shape is `upsert_files_batch_emitting_change`'s,
-/// deliberately not reused here). Also pins the ordinary success path:
-/// every path's dirty-journal row clears once its batch actually commits.
+/// Authoritative-mutation group commit: a batch of N independent path
+/// mutations (each its own file, no relation to the others) is signed as one
+/// bounded multi-op delta, one op per path, on ONE linear head. Also pins the
+/// ordinary success path: every path's dirty-journal row clears once its batch
+/// actually commits.
 #[tokio::test]
-async fn batched_authoritative_commit_produces_n_distinct_changes_in_sequential_causal_order() {
+async fn batched_authoritative_commit_signs_one_multi_op_delta() {
     let (proc, state, _policy_healthy, _store_dir, root_dir) = processor_with_toggleable_policy();
     state.set_local_change_auth_provider(Arc::new(|_group_id| Ok(())));
     let root = canonical_root(&root_dir);
@@ -4190,9 +3818,9 @@ async fn batched_authoritative_commit_produces_n_distinct_changes_in_sequential_
     // `commit_local_mutations_batch`'s Upsert arm is the production hot
     // path for exactly this shape of local edit -- an ordinary,
     // non-symlink create/modify flush. Its `stamp_hydrated_after_local_
-    // emission_in_tx` call is what earns `Hydrated` here; deleting that
+    // emission_in_tx` call is what earns `Present` here; deleting that
     // call would leave every one of these rows on the schema's own
-    // `Placeholder` default despite genuinely matching disk.
+    // `Remote` default despite genuinely matching disk.
     for i in 0..N {
         let path = format!("f-{i:02}.txt");
         assert_eq!(
@@ -4200,55 +3828,30 @@ async fn batched_authoritative_commit_produces_n_distinct_changes_in_sequential_
                 .materialization_state_repository()
                 .get_materialization_state(group, &path)
                 .unwrap(),
-            Some(MaterializationState::Hydrated),
+            Some(MaterializationState::Present),
             "a batch-committed local edit must be stamped Hydrated, not left on the \
              schema's own Placeholder default"
         );
     }
 
-    let heads = state.sqlite().dag_group_heads(group).unwrap();
+    let heads = crate::test_support::native_group_heads(&state, group);
     assert_eq!(
         heads.len(),
         1,
         "a batch of independent path mutations must chain onto ONE linear head, not fork"
     );
 
-    // Walk the chain backward from the head, collecting N distinct
-    // hashes, each with exactly one op and exactly one parent (its
-    // predecessor in the chain) — proving the batch's causal order
-    // matches what committing each mutation sequentially would have
-    // produced.
-    let mut hash = heads[0];
-    let mut seen = std::collections::HashSet::new();
-    for step in 0..N {
-        let change = state.sqlite().dag_get_change(&hash).unwrap().expect("change must exist");
-        assert_eq!(
-            change.ops.len(),
-            1,
-            "each batched mutation must author its OWN single-op Change, never collapsed \
-             into one multi-op Change"
-        );
-        assert!(
-            seen.insert(hash),
-            "every mutation in the batch must produce a distinct Change hash"
-        );
-        if step == N - 1 {
-            // The batch's very first mutation authors onto whatever
-            // the group's history already was -- empty here (a fresh
-            // group), so this last hop legitimately has zero parents;
-            // every other hop must chain onto exactly its predecessor.
-            assert!(change.parents.len() <= 1);
-            break;
-        }
-        assert_eq!(
-            change.parents.len(),
-            1,
-            "each non-final Change in the chain must have exactly one parent, forming a \
-             linear chain"
-        );
-        hash = change.parents[0];
-    }
-    assert_eq!(seen.len(), N);
+    // A bulk capture signs the batch as ONE multi-op delta (the paths are
+    // unrelated), one op per path, chained onto its predecessor.
+    let deltas = crate::test_support::native_deltas(&state, group);
+    assert_eq!(deltas.len(), 1, "a batch of independent paths is one delta");
+    let delta = &deltas[0];
+    assert_eq!(delta.prev, None);
+    let signed_paths: std::collections::BTreeSet<_> =
+        delta.ops.iter().map(|op| op.path.as_str().to_owned()).collect();
+    let expected: std::collections::BTreeSet<_> = (0..N).map(|i| format!("f-{i:02}.txt")).collect();
+    assert_eq!(delta.ops.len(), N, "one op per path of the batch");
+    assert_eq!(signed_paths, expected, "every path of the batch is in the delta");
 }
 
 /// If the shared batch commit itself fails (standing in for a crash
@@ -4265,7 +3868,8 @@ async fn batch_commit_failure_leaves_nothing_committed_and_every_dirty_row_survi
     let state = Arc::new(TestReplica::open_in_memory().unwrap());
     state.set_local_change_auth_provider(Arc::new(|_group_id| Ok(())));
     let lease = Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests());
-    let emitter = Arc::new(ChangeEmitter::new("device-a", SigningKey::from_bytes(&[9u8; 32])));
+    let emitter =
+        Arc::new(LocalAuthorKey::for_tests("device-a", SigningKey::from_bytes(&[9u8; 32])));
     let proc = LocalChangeProcessor::new(state.clone(), store, "device-a".into(), lease.clone())
         .with_change_emitter(emitter);
     let root_dir = tempfile::tempdir().unwrap();
@@ -4383,9 +3987,8 @@ async fn a_peer_mutation_between_preparation_and_validation_excludes_the_stale_m
     // A concurrent peer materialization commits its own row for this
     // path while this device's mutation sat prepared but not yet
     // committed -- nothing was indexed for it before (preparation only
-    // reads/chunks, it never writes), so `index_state_at_prepare` is
-    // `None`; this peer write alone is enough to make Phase B's
-    // revalidation observe a change.
+    // reads/chunks, it never writes); native seeing this peer write
+    // arrive is enough to make Phase B's revalidation observe a change.
     let peer_record = FileRecord {
         path: "doc.txt".to_string(),
         size: 999,
@@ -4402,6 +4005,17 @@ async fn a_peer_mutation_between_preparation_and_validation_excludes_the_stale_m
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
+    // Native sees the same peer write arrive.
+    {
+        use yadorilink_daemon::test_support::remote_admission_fixture as peer;
+        peer::admit_remote_superseding_put(
+            &state,
+            group,
+            "device-b",
+            "doc.txt",
+            yadorilink_replica_domain::ids::VersionHash([9; 32]),
+        );
+    }
 
     let resolved = proc.flush_pending_batch(group, &mut pending).await.unwrap();
     assert!(
@@ -4417,300 +4031,18 @@ async fn a_peer_mutation_between_preparation_and_validation_excludes_the_stale_m
     assert!(state.dirty_path_repository().is_path_dirty(group, "doc.txt").unwrap());
 }
 
-/// A remote change admitted into the DAG *between* a local edit being
-/// captured and that edit being emitted must never become the local
-/// edit's causal parent.
-///
-/// The debounced watcher path captures an edit, then emits it up to a
-/// quiet period later. `emit_local_change` signs whatever
-/// `group_heads` says at EMISSION time, so a peer change admitted in
-/// that window is claimed as the parent of content whose author never
-/// saw it. At those parents the peer's change is the winner, and
-/// `resolve_path_heads` deliberately never emits a conflict copy for a
-/// winner, so the local edit supersedes it and the peer's content is
-/// destroyed with no copy anywhere. Every replica agrees, because it is
-/// a property of the signed DAG -- a silent lost update.
-///
-/// The ordering here is sequential `.await`s, never a sleep: the
-/// production path is already split into a capture phase
-/// (`process_event_with_ignore_at` with a caller-owned batch, which
-/// commits nothing) and an emit phase (`flush_pending_batch`), so a
-/// test sequences the two itself and injects R in between.
-///
-/// R is admitted through `dag_admit_change_with_versions`, which writes
-/// only the DAG tables and never `files`. That is exactly why the
-/// existing prepare/commit revalidation (disk fingerprint, index row,
-/// authoring hash) cannot see it: the frontier moves while everything
-/// that revalidation looks at stays still.
-#[tokio::test]
-async fn a_dag_only_peer_admission_between_capture_and_emit_is_not_the_local_edits_parent() {
-    use ed25519_dalek::SigningKey;
-    use std::sync::atomic::Ordering;
-    use yadorilink_replica_domain::change::{Op, PutOrigin};
-    use yadorilink_replica_domain::file::{FileMeta, FileVersion, VersionBlock};
-    use yadorilink_replica_domain::ids::{DeviceId, FolderGroupId, SyncPath};
-
-    let (proc, state, policy_healthy, _store_dir, root_dir) = processor_with_toggleable_policy();
-    policy_healthy.store(true, Ordering::SeqCst);
-    state.set_local_change_auth_provider(Arc::new(|_group_id| Ok(())));
-    let root = canonical_root(&root_dir);
-    let group = "group-1";
-    adopt_root(&state, group, &root);
-    let ignore_set = EffectiveIgnoreSet::from_user_patterns("");
-    let _permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
-
-    let path = root.join("doc.txt");
-    let event = |p: &std::path::Path| FsChangeEvent {
-        path: p.to_path_buf(),
-        kind: FsChangeKind::CreatedOrModified,
-    };
-    let mark_dirty = |state: &Arc<TestReplica>| {
-        state
-            .dirty_path_repository()
-            .record_dirty_path(
-                group,
-                "doc.txt",
-                dirty_kind_str(FsChangeKind::CreatedOrModified),
-                0,
-                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-            )
-            .unwrap();
-    };
-
-    // --- Base A: the content the user will go on to edit. -----------
-    std::fs::write(&path, b"base-A").unwrap();
-    mark_dirty(&state);
-    let mut pending = Vec::new();
-    proc.process_event_with_ignore_at(
-        group,
-        &root,
-        &event(&path),
-        &ignore_set,
-        Some(0),
-        Some(&mut pending),
-    )
-    .await
-    .unwrap();
-    assert_eq!(proc.flush_pending_batch(group, &mut pending).await.unwrap().len(), 1);
-
-    let heads_after_a = state.sqlite().dag_group_heads(group).unwrap();
-    assert_eq!(heads_after_a.len(), 1, "sanity: base A is the only head");
-    let a_hash = heads_after_a[0];
-    let change_a = state.sqlite().dag_get_change(&a_hash).unwrap().unwrap();
-
-    // --- T1: the user edits A's bytes. Captured, NOT yet emitted. ---
-    std::fs::write(&path, b"local-L-based-on-A").unwrap();
-    mark_dirty(&state);
-    let mut pending = Vec::new();
-    let outcome = proc
-        .process_event_with_ignore_at(
-            group,
-            &root,
-            &event(&path),
-            &ignore_set,
-            Some(0),
-            Some(&mut pending),
-        )
-        .await
-        .unwrap();
-    assert!(matches!(outcome, EventOutcome::Deferred));
-    assert_eq!(pending.len(), 1, "the edit must be captured but uncommitted");
-
-    // --- T2: a peer's change for the same path is admitted. ---------
-    // Authored on A, as a real peer edit of the same base would be.
-    let r_version = FileVersion::new(
-        Vec::<VersionBlock>::new(),
-        0,
-        FileMeta {
-            mtime_unix_nanos: 1,
-            unix_mode: None,
-            symlink_target: None,
-            record_kind: RecordKind::File,
-            xattrs: Vec::new(),
-        },
-    );
-    let r = create_signed_for_tests(
-        vec![a_hash],
-        change_a.lamport,
-        DeviceId("device-b".to_string()),
-        FolderGroupId(group.to_string()),
-        vec![Op::Put {
-            path: SyncPath("doc.txt".to_string()),
-            version: r_version.version_hash,
-            origin: PutOrigin::Direct,
-        }],
-        &SigningKey::from_bytes(&[42u8; 32]),
-    );
-    let r_hash = r.compute_hash();
-    state
-        .change_history_repository()
-        .dag_admit_change_with_versions(&r, std::slice::from_ref(&r_version))
-        .unwrap();
-
-    // The injection is only meaningful if it moved the frontier while
-    // leaving everything the commit-time revalidation inspects alone.
-    assert!(
-        state.sqlite().dag_group_heads(group).unwrap().contains(&r_hash),
-        "sanity: R must be a live head before the local edit is emitted"
-    );
-    assert_eq!(
-        state.file_index_repository().get_authoring_change_hash(group, "doc.txt").unwrap(),
-        Some(a_hash),
-        "sanity: R must not have touched the index, or revalidation would exclude L"
-    );
-
-    // --- T4: the captured edit is emitted. --------------------------
-    let resolved = proc.flush_pending_batch(group, &mut pending).await.unwrap();
-    assert_eq!(resolved.len(), 1, "the local edit must still commit, not be dropped");
-
-    let l_hash =
-        state.file_index_repository().get_authoring_change_hash(group, "doc.txt").unwrap().unwrap();
-    let l = state.sqlite().dag_get_change(&l_hash).unwrap().unwrap();
-
-    assert_eq!(
-        l.parents,
-        vec![a_hash],
-        "the local edit must be parented on the state its bytes were based on"
-    );
-    assert!(
-        !l.parents.contains(&r_hash),
-        "the local edit must not directly claim a change its author never saw"
-    );
-    // Not redundant with the previous two: a fix that merely filtered
-    // path-touching heads out of the parent list would still let L claim
-    // R transitively through any unrelated head descending from R.
-    assert!(
-        !state.change_history_repository().dag_is_ancestor(&r_hash, &l_hash).unwrap(),
-        "the local edit must not claim the unseen change even transitively"
-    );
-    let heads = state.sqlite().dag_group_heads(group).unwrap();
-    assert!(
-        heads.contains(&r_hash) && heads.contains(&l_hash),
-        "R and L must remain concurrent live heads so conflict resolution can \
-         preserve both contents -- got {heads:?}"
-    );
-}
-
-/// A peer's create of a path admitted between this device capturing its own
-/// create of the same, brand-new path and emitting it must not become the
-/// local create's parent either.
-///
-/// The sibling test above covers an edit of a path this device has already
-/// placed: its parents come from the recorded basis of the bytes it edited.
-/// A path this device has never placed has no recorded basis, and the
-/// emission falls back to the current frontier. If the peer's create landed
-/// in that window, the local create is signed as its descendant: at those
-/// parents the peer's version is superseded, not a concurrent loser, so no
-/// conflict copy is ever derived for it and its content exists nowhere once
-/// both replicas converge. Two devices creating the same new file at nearly
-/// the same moment is exactly this ordering.
-#[tokio::test]
-async fn a_peer_create_admitted_between_capture_and_emit_of_a_new_path_is_not_its_parent() {
-    use ed25519_dalek::SigningKey;
-    use std::sync::atomic::Ordering;
-    use yadorilink_replica_domain::change::{Op, PutOrigin};
-    use yadorilink_replica_domain::file::{FileMeta, FileVersion, VersionBlock};
-    use yadorilink_replica_domain::ids::{DeviceId, FolderGroupId, SyncPath};
-
-    let (proc, state, policy_healthy, _store_dir, root_dir) = processor_with_toggleable_policy();
-    policy_healthy.store(true, Ordering::SeqCst);
-    state.set_local_change_auth_provider(Arc::new(|_group_id| Ok(())));
-    let root = canonical_root(&root_dir);
-    let group = "group-1";
-    adopt_root(&state, group, &root);
-    let ignore_set = EffectiveIgnoreSet::from_user_patterns("");
-
-    // --- Local create of a path this device has never placed. Captured,
-    // NOT yet emitted.
-    let path = root.join("new.txt");
-    std::fs::write(&path, b"created locally").unwrap();
-    state
-        .dirty_path_repository()
-        .record_dirty_path(
-            group,
-            "new.txt",
-            dirty_kind_str(FsChangeKind::CreatedOrModified),
-            0,
-            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-        )
-        .unwrap();
-    let mut pending = Vec::new();
-    let outcome = proc
-        .process_event_with_ignore_at(
-            group,
-            &root,
-            &FsChangeEvent { path: path.clone(), kind: FsChangeKind::CreatedOrModified },
-            &ignore_set,
-            Some(0),
-            Some(&mut pending),
-        )
-        .await
-        .unwrap();
-    assert!(matches!(outcome, EventOutcome::Deferred));
-    assert_eq!(pending.len(), 1, "the create must be captured but uncommitted");
-
-    // --- A peer's own create of the same path is admitted. -------------
-    let r_version = FileVersion::new(
-        Vec::<VersionBlock>::new(),
-        0,
-        FileMeta {
-            mtime_unix_nanos: 1,
-            unix_mode: None,
-            symlink_target: None,
-            record_kind: RecordKind::File,
-            xattrs: Vec::new(),
-        },
-    );
-    let r = create_signed_for_tests(
-        vec![],
-        0,
-        DeviceId("device-b".to_string()),
-        FolderGroupId(group.to_string()),
-        vec![Op::Put {
-            path: SyncPath("new.txt".to_string()),
-            version: r_version.version_hash,
-            origin: PutOrigin::Direct,
-        }],
-        &SigningKey::from_bytes(&[42u8; 32]),
-    );
-    let r_hash = r.compute_hash();
-    state
-        .change_history_repository()
-        .dag_admit_change_with_versions(&r, std::slice::from_ref(&r_version))
-        .unwrap();
-    assert!(
-        state.sqlite().dag_group_heads(group).unwrap().contains(&r_hash),
-        "sanity: the peer's create must be a live head before the local create is emitted"
-    );
-
-    // --- The captured create is emitted. -------------------------------
-    let resolved = proc.flush_pending_batch(group, &mut pending).await.unwrap();
-    assert_eq!(resolved.len(), 1, "the local create must still commit, not be dropped");
-    let l_hash =
-        state.file_index_repository().get_authoring_change_hash(group, "new.txt").unwrap().unwrap();
-
-    assert!(
-        !state.change_history_repository().dag_is_ancestor(&r_hash, &l_hash).unwrap(),
-        "the local create was signed as a descendant of a peer's create its author never saw, \
-         so the peer's content is superseded with no conflict copy"
-    );
-}
-
-/// A peer's signed `Put` of `path`, admitted into the DAG only -- the way
+/// A peer's signed `Put` of `path`, admitted into native state only -- the way
 /// admission leaves it until reconciliation projects it: `files` is never
 /// written. Returns the change's hash.
 fn admit_peer_put_only_into_the_dag(
     state: &ReplicaCoordinator,
     group: &str,
     path: &str,
-    parents: Vec<yadorilink_replica_domain::ids::ChangeHash>,
+    parents: Vec<yadorilink_replica_domain::ids::DeltaHash>,
     max_parent_lamport: u64,
     size: u64,
-) -> yadorilink_replica_domain::ids::ChangeHash {
-    use ed25519_dalek::SigningKey;
-    use yadorilink_replica_domain::change::PutOrigin;
+) -> yadorilink_replica_domain::ids::DeltaHash {
     use yadorilink_replica_domain::file::{FileMeta, FileVersion, VersionBlock};
-    use yadorilink_replica_domain::ids::{DeviceId, FolderGroupId};
 
     let version = FileVersion::new(
         Vec::<VersionBlock>::new(),
@@ -4723,28 +4055,32 @@ fn admit_peer_put_only_into_the_dag(
             xattrs: Vec::new(),
         },
     );
-    let change = create_signed_for_tests(
-        parents,
-        max_parent_lamport,
-        DeviceId("device-b".to_string()),
-        FolderGroupId(group.to_string()),
-        vec![Op::Put {
-            path: SyncPath(path.to_string()),
-            version: version.version_hash,
-            origin: PutOrigin::Direct,
-        }],
-        &SigningKey::from_bytes(&[42u8; 32]),
-    );
-    let hash = change.compute_hash();
+    let _ = max_parent_lamport;
     state
-        .change_history_repository()
-        .dag_admit_change_with_versions(&change, std::slice::from_ref(&version))
+        .database()
+        .write(|conn| yadorilink_sync_sqlite::dag_store::put_file_version(conn, group, &version))
         .unwrap();
-    assert!(
-        state.sqlite().dag_group_heads(group).unwrap().contains(&hash),
-        "sanity: the peer's change must be a live head before the local write is emitted"
+    let basis = if parents.is_empty() {
+        yadorilink_daemon::test_support::remote_admission_fixture::Basis::Nothing
+    } else {
+        yadorilink_daemon::test_support::remote_admission_fixture::Basis::CurrentHeads
+    };
+    yadorilink_daemon::test_support::remote_admission_fixture::admit_remote_ops(
+        state,
+        group,
+        "device-b",
+        &[Op::Put { path: SyncPath(path.to_string()), version: version.version_hash }],
+        basis,
     );
-    hash
+    // What names the peer's head under native is its provenance: the hash of
+    // the delta that put it.
+    let provenances = crate::test_support::native_path_head_provenances(state, group, path);
+    assert_eq!(
+        provenances.len(),
+        1,
+        "sanity: the peer's write must be the live head before the local write is emitted"
+    );
+    yadorilink_replica_domain::ids::DeltaHash(provenances[0])
 }
 
 /// Asserts `local` did not claim `peer` as its causal past: both are live
@@ -4753,21 +4089,10 @@ fn assert_concurrent_live_heads(
     state: &ReplicaCoordinator,
     group: &str,
     path: &str,
-    peer: &yadorilink_replica_domain::ids::ChangeHash,
-    local: &yadorilink_replica_domain::ids::ChangeHash,
+    peer: &yadorilink_replica_domain::ids::DeltaHash,
+    local: &yadorilink_replica_domain::ids::DeltaHash,
 ) {
-    let history = state.change_history_repository();
-    assert!(
-        !history.dag_is_ancestor(peer, local).unwrap(),
-        "the local write was signed as a descendant of a peer's version of {path} its author \
-         never saw, so the peer's content is superseded with no conflict copy"
-    );
-    let heads: Vec<[u8; 32]> = history
-        .dag_path_live_heads(group, path)
-        .unwrap()
-        .into_iter()
-        .map(|h| h.change_hash)
-        .collect();
+    let heads = crate::test_support::native_path_head_provenances(state, group, path);
     assert!(heads.contains(&peer.0), "the peer's version must stay a live head of {path}");
     assert!(heads.contains(&local.0), "the local write must be a live head of {path}");
 }
@@ -4828,8 +4153,13 @@ async fn a_local_create_over_a_placement_scaffold_is_not_a_descendant_of_the_pee
     assert!(matches!(outcome, EventOutcome::Deferred));
     let resolved = proc.flush_pending_batch(group, &mut pending).await.unwrap();
     assert_eq!(resolved.len(), 1, "the local create must commit, not be dropped");
-    let l_hash =
-        state.file_index_repository().get_authoring_change_hash(group, "new.txt").unwrap().unwrap();
+    // The local write's head is the one at the path that is not the peer's.
+    let l_hash = yadorilink_replica_domain::ids::DeltaHash(
+        crate::test_support::native_path_head_provenances(&state, group, "new.txt")
+            .into_iter()
+            .find(|provenance| *provenance != r_hash.0)
+            .expect("the local create is a head beside the peer's"),
+    );
 
     assert_concurrent_live_heads(&state, group, "new.txt", &r_hash, &l_hash);
 }
@@ -4863,297 +4193,15 @@ async fn an_unbatched_local_create_is_not_a_descendant_of_an_admitted_peer_creat
         .await
         .unwrap(),
     );
-    let l_hash =
-        state.file_index_repository().get_authoring_change_hash(group, "new.txt").unwrap().unwrap();
+    // The local write's head is the one at the path that is not the peer's.
+    let l_hash = yadorilink_replica_domain::ids::DeltaHash(
+        crate::test_support::native_path_head_provenances(&state, group, "new.txt")
+            .into_iter()
+            .find(|provenance| *provenance != r_hash.0)
+            .expect("the local create is a head beside the peer's"),
+    );
 
     assert_concurrent_live_heads(&state, group, "new.txt", &r_hash, &l_hash);
-}
-
-/// The parent choice the test above pins, carried through to a second
-/// replica. No peer and no concurrency are needed to build the shape: one
-/// device editing two of its own paths is enough.
-///
-/// A1 is the change that put `doc.txt` on disk, so it is that path's
-/// materialized basis. The user then edits `other.txt`, producing A2 on the
-/// frontier and making it this author's tip. Then the user edits `doc.txt`
-/// — whose bytes still came from A1, because A2 never touched that path —
-/// so the local-edit path parents L on {A1}, exactly as the lost-update
-/// rule above requires. L is this author's next sequence, and its author's
-/// tip A2 is NOT one of its ancestors.
-///
-/// That is ordinary and must converge. It converges because author
-/// ordering is carried by name: L names A2 as its author's previous
-/// change, which is simply true, while its DAG parents stay the causal
-/// basis its bytes actually came from. A replica holding A1 and A2 admits
-/// L on the name and never asks about ancestry.
-///
-/// The alternative rules are both worse, and this test is what keeps
-/// either from creeping back. Requiring L to DESCEND A2 refuses an
-/// ordinary local edit on every replica but the one that wrote it —
-/// producing a change one device accepts and every other device rejects
-/// forever. Adding A2 as an extra DAG parent satisfies that rule at the
-/// price of the invariant the test above pins: L would claim ancestry over
-/// everything A2 merged, including a peer change its author never saw,
-/// which is a silent lost update.
-///
-/// Both halves live here rather than in the admission-side suites because
-/// only this crate drives the real authoring path — the capture/emit split
-/// that decides L's parents — and the admission side needs nothing but a
-/// second in-memory replica, which this crate's fixture already provides.
-#[tokio::test]
-async fn a_local_edit_onto_its_own_earlier_basis_is_admitted_by_a_peer_holding_this_authors_tip() {
-    use std::sync::atomic::Ordering;
-    use yadorilink_replica_domain::admission::AdmitOutcome;
-    use yadorilink_replica_domain::change::Op;
-    use yadorilink_replica_domain::ids::AuthorSeq;
-
-    let (proc, state, policy_healthy, _store_dir, root_dir) = processor_with_toggleable_policy();
-    policy_healthy.store(true, Ordering::SeqCst);
-    state.set_local_change_auth_provider(Arc::new(|_group_id| Ok(())));
-    let root = canonical_root(&root_dir);
-    let group = "group-1";
-    adopt_root(&state, group, &root);
-    let ignore_set = EffectiveIgnoreSet::from_user_patterns("");
-
-    let event = |p: &std::path::Path| FsChangeEvent {
-        path: p.to_path_buf(),
-        kind: FsChangeKind::CreatedOrModified,
-    };
-    let mark_dirty = |rel: &str| {
-        state
-            .dirty_path_repository()
-            .record_dirty_path(
-                group,
-                rel,
-                dirty_kind_str(FsChangeKind::CreatedOrModified),
-                0,
-                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-            )
-            .unwrap();
-    };
-
-    let doc = root.join("doc.txt");
-    let other = root.join("other.txt");
-
-    // --- A1: the change that puts `doc.txt` on disk. ----------------
-    std::fs::write(&doc, b"base-A").unwrap();
-    mark_dirty("doc.txt");
-    let mut batch = Vec::new();
-    proc.process_event_with_ignore_at(
-        group,
-        &root,
-        &event(&doc),
-        &ignore_set,
-        Some(0),
-        Some(&mut batch),
-    )
-    .await
-    .unwrap();
-    assert_eq!(proc.flush_pending_batch(group, &mut batch).await.unwrap().len(), 1);
-    let a1_hash =
-        state.file_index_repository().get_authoring_change_hash(group, "doc.txt").unwrap().unwrap();
-
-    // --- The user edits `doc.txt`. Captured, NOT yet emitted. -------
-    std::fs::write(&doc, b"local-L-based-on-A1").unwrap();
-    mark_dirty("doc.txt");
-    let mut pending = Vec::new();
-    let outcome = proc
-        .process_event_with_ignore_at(
-            group,
-            &root,
-            &event(&doc),
-            &ignore_set,
-            Some(0),
-            Some(&mut pending),
-        )
-        .await
-        .unwrap();
-    assert!(matches!(outcome, EventOutcome::Deferred));
-    assert_eq!(pending.len(), 1, "the edit must be captured but uncommitted");
-
-    // --- A2: the SAME device writes a different path meanwhile. -----
-    std::fs::write(&other, b"unrelated").unwrap();
-    mark_dirty("other.txt");
-    let mut batch = Vec::new();
-    proc.process_event_with_ignore_at(
-        group,
-        &root,
-        &event(&other),
-        &ignore_set,
-        Some(0),
-        Some(&mut batch),
-    )
-    .await
-    .unwrap();
-    assert_eq!(proc.flush_pending_batch(group, &mut batch).await.unwrap().len(), 1);
-    let a2_hash = state
-        .file_index_repository()
-        .get_authoring_change_hash(group, "other.txt")
-        .unwrap()
-        .unwrap();
-    assert_ne!(a1_hash, a2_hash);
-
-    // --- L: the captured `doc.txt` edit is emitted. -----------------
-    assert_eq!(proc.flush_pending_batch(group, &mut pending).await.unwrap().len(), 1);
-    let l_hash =
-        state.file_index_repository().get_authoring_change_hash(group, "doc.txt").unwrap().unwrap();
-
-    let a1 = state.sqlite().dag_get_change(&a1_hash).unwrap().unwrap();
-    let a2 = state.sqlite().dag_get_change(&a2_hash).unwrap().unwrap();
-    let l = state.sqlite().dag_get_change(&l_hash).unwrap().unwrap();
-
-    // All three are this one device's own changes, in one consecutive
-    // author chain, with nothing else in the group's history.
-    assert_eq!(
-        (a1.author_seq, a2.author_seq, l.author_seq),
-        (AuthorSeq(1), AuthorSeq(2), AuthorSeq(3))
-    );
-    assert_eq!(
-        l.parents,
-        vec![a1_hash],
-        "the local edit is parented on the basis its bytes came \
-         from, which is what the lost-update rule requires"
-    );
-    assert!(
-        !state.change_history_repository().dag_is_ancestor(&a2_hash, &l_hash).unwrap(),
-        "sanity: the author's own tip is not an ancestor of its next change"
-    );
-
-    // --- A second replica holding A1 and A2 is offered L. -----------
-    let peer = Arc::new(TestReplica::open_in_memory().unwrap());
-    let versions_of = |change: &yadorilink_replica_domain::change::Change| {
-        change
-            .ops
-            .iter()
-            .filter_map(|op| match op {
-                Op::Put { version, .. } | Op::Move { version, .. } => Some(*version),
-                Op::Delete { .. } => None,
-            })
-            .map(|vh| state.sqlite().dag_get_file_version(group, &vh).unwrap().unwrap())
-            .collect::<Vec<_>>()
-    };
-    for change in [&a1, &a2] {
-        let result = peer
-            .change_history_repository()
-            .dag_admit_change_with_versions(change, &versions_of(change))
-            .unwrap();
-        assert_eq!(
-            result.outcome,
-            AdmitOutcome::Applied,
-            "sanity: the peer must hold this author's chain up to its tip"
-        );
-    }
-
-    let verdict = peer
-        .change_history_repository()
-        .dag_admit_change_with_versions(&l, &versions_of(&l))
-        .unwrap();
-
-    assert_eq!(
-        l.author_prev,
-        Some(a2_hash),
-        "the edit names its author's previous change, which is the tip it does not descend"
-    );
-    assert_eq!(
-        verdict.outcome,
-        AdmitOutcome::Applied,
-        "an ordinary local edit converges: the author link is a name, not an ancestry claim"
-    );
-    assert!(
-        peer.change_history_repository().dag_has_change(&l_hash).unwrap(),
-        "and the peer holds it, rather than refusing it forever"
-    );
-}
-
-/// a peer commit whose new version's
-/// `FileRecord` fields (size/mtime/blocks/deleted) happen to be
-/// byte-identical to what preparation observed — but which is a
-/// genuinely different, freshly-authored `Change` — must still exclude
-/// the stale prepared mutation. A `FileRecord`-only comparison cannot
-/// see this at all (every field matches); only comparing the row's
-/// authoring identity too catches it.
-#[tokio::test]
-async fn a_peer_rewrite_with_byte_identical_file_record_fields_still_excludes_the_stale_mutation() {
-    use ed25519_dalek::SigningKey;
-
-    let (proc, state, _policy_healthy, _store_dir, root_dir) = processor_with_toggleable_policy();
-    state.set_local_change_auth_provider(Arc::new(|_group_id| Ok(())));
-    let root = canonical_root(&root_dir);
-    let group = "group-1";
-    adopt_root(&state, group, &root);
-
-    let path = root.join("doc.txt");
-    std::fs::write(&path, b"v1").unwrap();
-    let setup_flush = yadorilink_filesystem_sync::debounce::DebounceFlush::Paths(vec![(
-        path.clone(),
-        FsChangeKind::CreatedOrModified,
-        0,
-    )]);
-    proc.process_flush(group, &root, setup_flush).await.unwrap();
-    let record_after_setup =
-        state.file_index_repository().get_file(group, "doc.txt").unwrap().unwrap();
-
-    // Prepare a local modification, deferring it into the batch.
-    std::fs::write(&path, b"v2-local").unwrap();
-    state
-        .dirty_path_repository()
-        .record_dirty_path(
-            group,
-            "doc.txt",
-            dirty_kind_str(FsChangeKind::CreatedOrModified),
-            1,
-            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-        )
-        .unwrap();
-    let ignore_set = EffectiveIgnoreSet::from_user_patterns("");
-    let mut pending = Vec::new();
-    let outcome = proc
-        .process_event_with_ignore_at(
-            group,
-            &root,
-            &FsChangeEvent { path: path.clone(), kind: FsChangeKind::CreatedOrModified },
-            &ignore_set,
-            Some(1),
-            Some(&mut pending),
-        )
-        .await
-        .unwrap();
-    assert!(matches!(outcome, EventOutcome::Deferred));
-
-    // A peer republishes its own genuinely distinct signed Change for
-    // this path, but the resulting row's `FileRecord` fields are
-    // deliberately set byte-identical to what preparation above
-    // observed (`record_after_setup`) -- the `Op` content here is a
-    // throwaway placeholder; only the row's resulting authoring
-    // identity, not this op's own semantics, is what this test
-    // exercises.
-    let peer_emitter = ChangeEmitter::new("device-b", SigningKey::from_bytes(&[42u8; 32]));
-    state
-        .file_index_repository()
-        .upsert_file_emitting_change(
-            group,
-            &record_after_setup,
-            "device-b",
-            ChangeContent {
-                ops: vec![Op::Delete { path: SyncPath("peer-marker".to_string()) }],
-                versions: &[],
-            },
-            None,
-            None,
-            yadorilink_sync_sqlite::file_index::ChangeEmissionContext {
-                emitter: &peer_emitter,
-                permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-            },
-        )
-        .unwrap();
-
-    let resolved = proc.flush_pending_batch(group, &mut pending).await.unwrap();
-    assert!(
-        resolved.is_empty(),
-        "a prepared mutation must not commit once the row's authoring identity has changed, \
-         even when its FileRecord fields still coincide with what preparation observed"
-    );
-    assert!(state.dirty_path_repository().is_path_dirty(group, "doc.txt").unwrap());
 }
 
 /// A raw external write to the same path (an editor, not this daemon)
@@ -5354,7 +4402,7 @@ async fn a_batch_mixing_creates_and_deletes_commits_both_variants_together() {
     std::fs::write(&to_create, b"brand-new").unwrap();
 
     let flush = yadorilink_filesystem_sync::debounce::DebounceFlush::Paths(vec![
-        (to_delete, FsChangeKind::Removed, 1),
+        (to_delete, FsChangeKind::ObservedRemoval, 1),
         (to_modify, FsChangeKind::CreatedOrModified, 1),
         (to_create, FsChangeKind::CreatedOrModified, 1),
     ]);
@@ -5373,7 +4421,7 @@ async fn a_batch_mixing_creates_and_deletes_commits_both_variants_together() {
 
     // Every mutation authored its own signed Change (3 more on top of
     // the setup flush's 1), still chained onto one linear head.
-    let heads = state.sqlite().dag_group_heads(group).unwrap();
+    let heads = crate::test_support::native_group_heads(&state, group);
     assert_eq!(heads.len(), 1);
 }
 
@@ -5562,11 +4610,10 @@ async fn process_flush_paths_skips_placeholders_exactly_like_process_event() {
         .set_materialization_state(
             "group-1",
             "placeholder.bin",
-            MaterializationState::Placeholder,
+            MaterializationState::Remote,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
-    yadorilink_local_storage::write_placeholder(&file_path, 4_000_000, 0).unwrap();
 
     let flush = yadorilink_filesystem_sync::debounce::DebounceFlush::Paths(vec![(
         file_path,
@@ -6492,7 +5539,7 @@ fn processor_with_toggleable_policy() -> (
 ) {
     use ed25519_dalek::SigningKey;
     use std::sync::atomic::Ordering;
-    use yadorilink_replica_domain::change::PolicyUnavailable;
+    use yadorilink_replica_domain::local_op::PolicyUnavailable;
 
     let store_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
@@ -6510,7 +5557,8 @@ fn processor_with_toggleable_policy() -> (
         }));
     }
 
-    let emitter = Arc::new(ChangeEmitter::new("device-a", SigningKey::from_bytes(&[7u8; 32])));
+    let emitter =
+        Arc::new(LocalAuthorKey::for_tests("device-a", SigningKey::from_bytes(&[7u8; 32])));
     let proc = LocalChangeProcessor::new(
         state.clone(),
         store,
@@ -6523,8 +5571,8 @@ fn processor_with_toggleable_policy() -> (
 }
 
 /// While a group's policy is stale the auth provider returns
-/// `Err(PolicyUnavailable)`, and a local edit must then produce NO DAG
-/// change — appending a placeholder-auth change here would create a local
+/// `Err(PolicyUnavailable)`, and a local edit must then produce NO native
+/// delta — appending a placeholder-auth delta here would create a local
 /// head every valid-policy peer rejects, stranding an un-replicable
 /// branch. The edit must not be lost either: the path stays in the durable
 /// dirty-path journal so a later re-drive can emit it once policy heals.
@@ -6544,11 +5592,11 @@ async fn stale_policy_withholds_the_dag_change_but_keeps_the_path_journaled_dirt
     let outcome = proc.process_flush(group, &root, flush).await.unwrap();
 
     // No record is announced and — crucially — the group's history is still
-    // empty: no placeholder-auth change entered the DAG.
+    // empty: no placeholder-auth change entered native state.
     assert!(outcome.records.is_empty(), "a stale-policy edit must not announce a record");
     assert!(
-        state.sqlite().dag_group_heads(group).unwrap().is_empty(),
-        "no placeholder-auth change may enter the DAG while policy is stale"
+        crate::test_support::native_group_heads(&state, group).is_empty(),
+        "no placeholder-auth change may enter native state while policy is stale"
     );
     // The edit is not lost: it remains journaled dirty for re-drive.
     assert!(state.dirty_path_repository().is_path_dirty(group, "note.txt").unwrap());
@@ -6583,7 +5631,7 @@ async fn policy_invalid_group_id_stops_local_dag_emission_for_that_group() {
     // does once `policyInvalidGroupIds` is consumed.
     state.set_local_change_auth_provider(std::sync::Arc::new(|group_id| {
         if group_id == "policy-invalid-group" {
-            Err(yadorilink_replica_domain::change::PolicyUnavailable)
+            Err(yadorilink_replica_domain::local_op::PolicyUnavailable)
         } else {
             Ok(())
         }
@@ -6604,18 +5652,18 @@ async fn policy_invalid_group_id_stops_local_dag_emission_for_that_group() {
     assert!(
         outcome.records.is_empty(),
         "a local edit in a group the coordination plane flagged policy-invalid must be \
-         withheld, not DAG-committed like a healthy group's edit"
+         withheld, not committed to native state like a healthy group's edit"
     );
     assert!(
-        state.sqlite().dag_group_heads(group).unwrap().is_empty(),
-        "no change may enter the DAG for a policy-invalid group; the daemon funnels \
+        crate::test_support::native_group_heads(&state, group).is_empty(),
+        "no change may enter native state for a policy-invalid group; the daemon funnels \
          `policyInvalidGroupIds` through the same withholding staleness gate"
     );
 }
 
 /// A restart re-drive that fully clears the dirty journal must leave a
 /// second, immediately-following re-drive a true no-op: no records
-/// produced, no journal rows re-appear, and no duplicate DAG head. This
+/// produced, no journal rows re-appear, and no duplicate native head. This
 /// pins `redrive_dirty_journal`'s empty-journal short-circuit against
 /// Stage-1's batched journal/clear path specifically, since a batching
 /// bug that left a stray row behind (or resurrected one) would only
@@ -6638,7 +5686,7 @@ async fn redriving_an_already_cleared_dirty_journal_twice_in_a_row_is_a_no_op() 
         state.dirty_path_repository().list_dirty_paths(group).unwrap().is_empty(),
         "both paths must have succeeded and cleared their journal rows"
     );
-    let heads_after_flush = state.sqlite().dag_group_heads(group).unwrap();
+    let heads_after_flush = crate::test_support::native_group_heads(&state, group);
 
     let first_redrive = proc.redrive_dirty_journal(group, &root).await.unwrap();
     assert!(
@@ -6653,9 +5701,9 @@ async fn redriving_an_already_cleared_dirty_journal_twice_in_a_row_is_a_no_op() 
     );
     assert!(state.dirty_path_repository().list_dirty_paths(group).unwrap().is_empty());
     assert_eq!(
-        state.sqlite().dag_group_heads(group).unwrap(),
+        crate::test_support::native_group_heads(&state, group),
         heads_after_flush,
-        "re-driving an empty journal twice must never move the DAG head"
+        "re-driving an empty journal twice must never move the native head"
     );
 }
 
@@ -6682,7 +5730,7 @@ async fn healed_policy_reemits_the_withheld_edit_with_real_auth_and_clears_the_j
     // Stale phase: withheld, journaled dirty (asserted in full by the test
     // above; here it is only the precondition for the re-drive).
     proc.process_flush(group, &root, flush).await.unwrap();
-    assert!(state.sqlite().dag_group_heads(group).unwrap().is_empty());
+    assert!(crate::test_support::native_group_heads(&state, group).is_empty());
     assert!(state.dirty_path_repository().is_path_dirty(group, "note.txt").unwrap());
 
     // Policy heals; the backstop re-drive re-emits the withheld edit.
@@ -6690,10 +5738,13 @@ async fn healed_policy_reemits_the_withheld_edit_with_real_auth_and_clears_the_j
     let redriven = proc.redrive_dirty_journal(group, &root).await.unwrap();
     assert_eq!(redriven.records.len(), 1, "the healed re-drive emits the withheld edit");
 
-    let heads = state.sqlite().dag_group_heads(group).unwrap();
+    let heads = crate::test_support::native_group_heads(&state, group);
     assert_eq!(heads.len(), 1, "exactly one change now heads the group");
-    let _change =
-        state.sqlite().dag_get_change(&heads[0]).unwrap().expect("emitted change is stored");
+    assert_eq!(
+        crate::test_support::native_deltas(&state, group).len(),
+        1,
+        "the emitted delta is stored"
+    );
     // The journal row is cleared on the successful re-emission.
     assert!(!state.dirty_path_repository().is_path_dirty(group, "note.txt").unwrap());
     assert!(state.dirty_path_repository().list_dirty_paths(group).unwrap().is_empty());
@@ -6746,7 +5797,7 @@ async fn redrive_leaves_withheld_paths_untouched_until_the_policy_arrives() {
         WITHHELD,
         "every withheld path stays journaled"
     );
-    assert!(state.sqlite().dag_group_heads(group).unwrap().is_empty());
+    assert!(crate::test_support::native_group_heads(&state, group).is_empty());
 
     policy_healthy.store(true, Ordering::SeqCst);
     let redriven = proc.redrive_dirty_journal(group, &root).await.unwrap();
@@ -6755,16 +5806,16 @@ async fn redrive_leaves_withheld_paths_untouched_until_the_policy_arrives() {
 }
 
 /// A restart reconciliation scan that detects an offline edit while the
-/// group's policy is stale must NOT fall back to a DAG-silent index write.
+/// group's policy is stale must NOT fall back to a delta-silent index write.
 /// The historical fallback wrote the batch through the non-emitting
 /// `upsert_files_batch`, advancing the local index to match disk — so a
 /// later rescan saw no disk-vs-index diff and the change never entered the
-/// DAG, and (unlike the live `process_flush` path) nothing was journaled
-/// dirty to re-drive it either. The edit was stranded outside the DAG
+/// native state, and (unlike the live `process_flush` path) nothing was journaled
+/// dirty to re-drive it either. The edit was stranded outside native state
 /// forever. The scan must instead withhold the index write, leave the
 /// index unadvanced, and journal the path dirty, so the dirty-journal
-/// re-drive re-emits the change and the DAG head advances once policy
-/// heals. This test fails on the old silent fallback (the DAG head never
+/// re-drive re-emits the change and the native head advances once policy
+/// heals. This test fails on the old silent fallback (the native head never
 /// advances past the pre-edit head).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stale_policy_scan_withholds_index_write_then_reemits_offline_edit_once_healed() {
@@ -6776,7 +5827,7 @@ async fn stale_policy_scan_withholds_index_write_then_reemits_offline_edit_once_
     adopt_root(&state, group, &root);
     let file_path = root.join("report.txt");
 
-    // A healthy-policy live edit establishes the group's first DAG history.
+    // A healthy-policy live edit establishes the group's first native history.
     policy_healthy.store(true, Ordering::SeqCst);
     std::fs::write(&file_path, b"version one").unwrap();
     expect_file_changed(
@@ -6788,26 +5839,26 @@ async fn stale_policy_scan_withholds_index_write_then_reemits_offline_edit_once_
         .await
         .unwrap(),
     );
-    let heads_before = state.sqlite().dag_group_heads(group).unwrap();
-    assert_eq!(heads_before.len(), 1, "sanity: the live edit established one DAG head");
+    let heads_before = crate::test_support::native_group_heads(&state, group);
+    assert_eq!(heads_before.len(), 1, "sanity: the live edit established one native head");
 
     // Policy goes stale; the file is edited offline (daemon "stopped").
     policy_healthy.store(false, Ordering::SeqCst);
     std::fs::write(&file_path, b"version two, edited offline while policy was stale").unwrap();
 
     // The restart scan detects the offline edit, but policy is stale: it
-    // must withhold both the DAG change and the index write and journal the
+    // must withhold both the native delta and the index write and journal the
     // path dirty. The old silent fallback wrote the index here.
     let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
     let scan_records = proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
     assert!(
         scan_records.is_empty(),
-        "a stale-policy scan must announce nothing — no record ever entered the DAG"
+        "a stale-policy scan must announce nothing — no record ever entered native state"
     );
     assert_eq!(
-        state.sqlite().dag_group_heads(group).unwrap(),
+        crate::test_support::native_group_heads(&state, group),
         heads_before,
-        "no change may enter the DAG while policy is stale"
+        "no change may enter native state while policy is stale"
     );
     // The index must NOT have advanced to the offline content: advancing it
     // is exactly what poisoned re-derivation in the old silent fallback.
@@ -6832,11 +5883,11 @@ async fn stale_policy_scan_withholds_index_write_then_reemits_offline_edit_once_
         "the healed re-drive emits the previously withheld offline edit"
     );
 
-    let heads_after = state.sqlite().dag_group_heads(group).unwrap();
+    let heads_after = crate::test_support::native_group_heads(&state, group);
     assert_ne!(
         heads_after, heads_before,
-        "the offline edit must advance the DAG head once policy heals; the silent fallback \
-         left it stranded outside the DAG forever"
+        "the offline edit must advance the native head once policy heals; the silent fallback \
+         left it stranded outside native state forever"
     );
     let indexed = state.file_index_repository().get_file(group, "report.txt").unwrap().unwrap();
     assert_eq!(
@@ -6854,7 +5905,7 @@ async fn stale_policy_scan_withholds_index_write_then_reemits_offline_edit_once_
 /// with: a first-ever import whose full scan is policy-withheld on chunk
 /// zero recovers through the dirty-journal re-drive, and every path it
 /// recovers ends up with a usable actual-state generation -- the proof
-/// `Hydrated` now rests on -- rather than merely existing in the index.
+/// `Present` now rests on -- rather than merely existing in the index.
 ///
 /// This is the shape the small-folder startup race produced: the scan
 /// withholds, the re-drive commits per file, and the convergence
@@ -6923,13 +5974,12 @@ async fn policy_withheld_first_import_leaves_every_path_with_a_usable_generation
 /// Builds a processor with change-history emission wired against a
 /// plain, always-succeeding local-change auth (unlike
 /// `processor_with_toggleable_policy`'s stale/healed toggle) — plus
-/// direct access to the underlying `ReplicaCoordinator` and `ChangeEmitter`
-/// so a test can inspect DAG heads and re-run the DAG-import path the same
-/// way the daemon's restart sequence does.
+/// direct access to the underlying `ReplicaCoordinator` and `LocalAuthorKey`
+/// so a test can inspect native heads.
 fn processor_with_emitter() -> (
     LocalChangeProcessor,
     Arc<TestReplica>,
-    Arc<ChangeEmitter>,
+    Arc<LocalAuthorKey>,
     tempfile::TempDir,
     tempfile::TempDir,
 ) {
@@ -6938,7 +5988,8 @@ fn processor_with_emitter() -> (
     let store_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let state = Arc::new(TestReplica::open_in_memory().unwrap());
-    let emitter = Arc::new(ChangeEmitter::new("device-a", SigningKey::from_bytes(&[5u8; 32])));
+    let emitter =
+        Arc::new(LocalAuthorKey::for_tests("device-a", SigningKey::from_bytes(&[5u8; 32])));
     let proc = LocalChangeProcessor::new(
         state.clone(),
         store,
@@ -7005,7 +6056,7 @@ fn closed_disk_observation_if_unraced_suppresses_on_a_fingerprint_mismatch() {
 /// its projection obligation.
 ///
 /// Asserted: local capture publishes a usable exact
-/// actual-state proof in the SAME transaction as the DAG/index
+/// actual-state proof in the SAME transaction as the native state/index
 /// commit. This test asserts the durable state directly -- never a
 /// wall-clock/call-count proxy -- via the exact three preconditions
 /// `dag_zero_work_settlement_if_already_current` itself checks:
@@ -7015,7 +6066,7 @@ fn closed_disk_observation_if_unraced_suppresses_on_a_fingerprint_mismatch() {
 /// USABLE right now, not merely present-but-stale against the
 /// mutation fence), and (3) that row's `resolved_path_state_hash`
 /// equals what `dag_desired_resolved_path_state_hash` independently
-/// derives for the group's own current DAG-resolved state --
+/// derives for the group's own current native-resolved state --
 /// precisely the equality `dag_zero_work_settlement_if_already_
 /// current` gates a real settlement on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7065,7 +6116,7 @@ async fn local_capture_of_new_content_publishes_a_usable_exact_actual_state_proo
     let basis = state.sqlite().dag_lookup_materialized_generation(group, "report.txt").unwrap();
     let basis = basis.expect(
         "GREEN behavior missing: local capture of new content must publish a USABLE exact \
-         actual-state proof in the same transaction as its DAG/index commit -- if this is \
+         actual-state proof in the same transaction as its native state/index commit -- if this is \
          None, either the fix regressed to not publishing at all, or it published under a \
          stale/mismatched mutation-fence epoch",
     );
@@ -7082,24 +6133,13 @@ async fn local_capture_of_new_content_publishes_a_usable_exact_actual_state_proo
     // (3) The exact equality `dag_zero_work_settlement_if_already_
     // current` gates a real settlement on: the published proof's
     // resolved_path_state_hash must equal what the group's own
-    // CURRENT DAG-resolved desired state independently derives --
+    // CURRENT native-resolved desired state independently derives --
     // computed here via the same production hash builder
-    // (`dag_desired_resolved_path_state_hash`), not re-derived by
+    // (`native_desired_projected_path_state_hash`), not re-derived by
     // this test's own logic, so this assertion fails if either side
     // of that real equality check ever drifts.
-    let resolution = yadorilink_replica_engine::conflict::PathResolution::Present {
-        winner: 0,
-        conflict_copies: vec![],
-    };
-    let desired_hash = state
-        .sqlite()
-        .dag_desired_resolved_path_state_hash(
-            group,
-            "report.txt",
-            &resolution,
-            basis.version.as_ref(),
-        )
-        .unwrap();
+    let desired_hash =
+        state.sqlite().native_desired_projected_path_state_hash(group, "report.txt").unwrap();
     assert_eq!(
         basis.resolved_path_state_hash, desired_hash,
         "the published proof's resolved_path_state_hash must match the group's own current \
@@ -7140,21 +6180,22 @@ async fn local_capture_of_a_deletion_publishes_a_usable_exact_absent_proof() {
         proc.process_event(
             group,
             &root,
-            &FsChangeEvent { path: file_path.clone(), kind: FsChangeKind::Removed },
+            &FsChangeEvent { path: file_path.clone(), kind: FsChangeKind::ObservedRemoval },
         )
         .await
         .unwrap(),
     );
     assert!(tombstone.deleted, "sanity: the deletion must have been admitted as a tombstone");
 
-    // Admission's own universal invariant still holds for a deletion,
-    // exactly as it does for content capture.
+    // Exactly as for content capture
+    // (`local_capture_of_new_content_publishes_a_usable_exact_actual_state_proof`):
+    // admission opens the path's obligation and the same transaction closes
+    // it against the exact Absent proof, the resolved desired state.
     let obligation = state.sqlite().dag_lookup_projection_obligation(group, "report.txt").unwrap();
     assert!(
-        obligation.is_some(),
-        "a locally observed deletion must still create/bump a runnable projection \
-         obligation for its path -- this fix must never special-case local admission by \
-         suppressing obligation creation, deletion included"
+        obligation.is_none(),
+        "a locally observed deletion that published a usable exact Absent proof must leave \
+         no obligation behind: {obligation:?}"
     );
 
     let basis = state.sqlite().dag_lookup_materialized_generation(group, "report.txt").unwrap();
@@ -7173,15 +6214,8 @@ async fn local_capture_of_a_deletion_publishes_a_usable_exact_absent_proof() {
         "an absent object's proof must carry no filesystem identity"
     );
 
-    let desired_hash = state
-        .sqlite()
-        .dag_desired_resolved_path_state_hash(
-            group,
-            "report.txt",
-            &yadorilink_replica_engine::conflict::PathResolution::Absent,
-            None,
-        )
-        .unwrap();
+    let desired_hash =
+        state.sqlite().native_desired_projected_path_state_hash(group, "report.txt").unwrap();
     assert_eq!(
         basis.resolved_path_state_hash, desired_hash,
         "the published Absent proof's resolved_path_state_hash must match the group's own \
@@ -7257,19 +6291,13 @@ async fn a_second_local_capture_supersedes_the_first_captures_stale_proof() {
     // "a different row exists somewhere," but that the ONE row
     // `dag_lookup_materialized_generation` returns for this path is
     // unambiguously v2's, not v1's under a still-live guise.
-    let resolution = yadorilink_replica_engine::conflict::PathResolution::Present {
-        winner: 0,
-        conflict_copies: vec![],
-    };
-    let v1_hash_recomputed = state
-        .sqlite()
-        .dag_desired_resolved_path_state_hash(
+    let v1_hash_recomputed =
+        yadorilink_sync_sqlite::materialized_generation::compute_resolved_path_state_hash(
             group,
             "report.txt",
-            &resolution,
+            yadorilink_sync_sqlite::materialized_generation::MaterializedObjectKind::RegularFile,
             basis_v1.version.as_ref(),
-        )
-        .unwrap();
+        );
     assert_ne!(
         basis_v2.resolved_path_state_hash, v1_hash_recomputed,
         "v2's live proof must not happen to match v1's own content hash recomputed fresh -- \
@@ -7312,14 +6340,8 @@ async fn batched_local_capture_of_new_content_publishes_usable_exact_actual_stat
             basis.object_kind,
             yadorilink_sync_sqlite::materialized_generation::MaterializedObjectKind::RegularFile
         );
-        let resolution = yadorilink_replica_engine::conflict::PathResolution::Present {
-            winner: 0,
-            conflict_copies: vec![],
-        };
-        let desired_hash = state
-            .sqlite()
-            .dag_desired_resolved_path_state_hash(group, path, &resolution, basis.version.as_ref())
-            .unwrap();
+        let desired_hash =
+            state.sqlite().native_desired_projected_path_state_hash(group, path).unwrap();
         assert_eq!(
             basis.resolved_path_state_hash, desired_hash,
             "{path}'s batched proof must satisfy the same zero-work equality as the \
@@ -7328,23 +6350,17 @@ async fn batched_local_capture_of_new_content_publishes_usable_exact_actual_stat
     }
 }
 
-/// Reproduces the restart gap in the change-history DAG: a file edited
+/// Reproduces the restart gap in native state: a file edited
 /// while the daemon isn't running is picked up by the startup disk-vs-
 /// index reconciliation scan (`scan_existing_files_with_ignore`), which
-/// updates the local index via the batched, non-DAG-emitting writer
-/// (`LocalMutationStore::upsert_files_batch`) — never appending a change to the
-/// group's change-history DAG the way a live `process_event` call would.
-/// The restart sequence's other chance to backfill that change,
-/// re-running the idempotent initial import
-/// (`dag_import::ensure_initial_import`, exactly as
-/// `yadorilink-daemon`'s startup wiring (`link_runtime::startup`) does right after the scan),
-/// is gated on the group's DAG still being empty (see `dag_import`'s
-/// module doc) and so is a no-op once real history already exists. The
-/// on-disk file and the local index both show the new content, but the
-/// DAG head a change-history-aware peer negotiates against never moves.
+/// updates the local index through the same delta-emitting path a live
+/// `process_event` call uses. Were the scan to update only the local index,
+/// nothing later would backfill the missing delta: the on-disk file and the
+/// local index would both show the new content, but the native head a peer
+/// negotiates against would never move.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn offline_edit_after_existing_dag_history_must_append_new_head_on_restart() {
-    let (proc, state, emitter, _store_dir, root_dir) = processor_with_emitter();
+    let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
     let root = canonical_root(&root_dir);
     let group = "group-1";
     // As `offline_delete_after_existing_dag_history_must_append_delete_
@@ -7356,7 +6372,7 @@ async fn offline_edit_after_existing_dag_history_must_append_new_head_on_restart
     let file_path = root.join("report.txt");
 
     // A live edit while the daemon is running establishes the group's
-    // first DAG history, exactly as a normal local save does.
+    // first native history, exactly as a normal local save does.
     std::fs::write(&file_path, b"version one").unwrap();
     expect_file_changed(
         proc.process_event(
@@ -7367,8 +6383,8 @@ async fn offline_edit_after_existing_dag_history_must_append_new_head_on_restart
         .await
         .unwrap(),
     );
-    let heads_before = state.sqlite().dag_group_heads(group).unwrap();
-    assert_eq!(heads_before.len(), 1, "sanity: the live edit established one DAG head");
+    let heads_before = crate::test_support::native_group_heads(&state, group);
+    assert_eq!(heads_before.len(), 1, "sanity: the live edit established one native head");
 
     // The daemon is "stopped": the file is edited directly on disk, with
     // no processor call observing the edit as it happens.
@@ -7381,13 +6397,6 @@ async fn offline_edit_after_existing_dag_history_must_append_new_head_on_restart
     let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
     let scan_records = proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
     assert!(!scan_records.is_empty(), "sanity: the restart scan must notice the offline edit");
-    yadorilink_daemon::dag_import::ensure_initial_import(
-        state.coordinator(),
-        group,
-        &emitter,
-        None,
-    )
-    .unwrap();
 
     // The local index reflects the offline edit...
     let indexed = state.file_index_repository().get_file(group, "report.txt").unwrap().unwrap();
@@ -7397,14 +6406,14 @@ async fn offline_edit_after_existing_dag_history_must_append_new_head_on_restart
         "sanity: the local index was reconciled to the offline edit"
     );
 
-    // ...but the change-history DAG must have advanced past the
-    // pre-restart head too, so a peer that only negotiates via DAG heads
+    // ...but native state must have advanced past the
+    // pre-restart head too, so a peer that only negotiates via native heads
     // (never a legacy full-index sync) can still learn about the
     // offline edit.
-    let heads_after = state.sqlite().dag_group_heads(group).unwrap();
+    let heads_after = crate::test_support::native_group_heads(&state, group);
     assert_ne!(
         heads_after, heads_before,
-        "an offline edit picked up by the restart scan must append a new DAG change, not \
+        "an offline edit picked up by the restart scan must append a new native delta, not \
          just update the local index"
     );
 }
@@ -7413,10 +6422,10 @@ async fn offline_edit_after_existing_dag_history_must_append_new_head_on_restart
 /// append_new_head_on_restart`, for an offline deletion: the startup
 /// scan tombstones the local index row for a file removed while the
 /// daemon wasn't running, but that tombstone never becomes a `Delete`
-/// change in the group's history DAG.
+/// change in the group's native state.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn offline_delete_after_existing_dag_history_must_append_delete_change() {
-    let (proc, state, emitter, _store_dir, root_dir) = processor_with_emitter();
+    let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
     let root = canonical_root(&root_dir);
     let group = "group-1";
     let file_path = root.join("report.txt");
@@ -7435,8 +6444,8 @@ async fn offline_delete_after_existing_dag_history_must_append_delete_change() {
         .await
         .unwrap(),
     );
-    let heads_before = state.sqlite().dag_group_heads(group).unwrap();
-    assert_eq!(heads_before.len(), 1, "sanity: one DAG head after the initial live edit");
+    let heads_before = crate::test_support::native_group_heads(&state, group);
+    assert_eq!(heads_before.len(), 1, "sanity: one native head after the initial live edit");
 
     // The daemon is "stopped"; the file is deleted directly on disk.
     std::fs::remove_file(&file_path).unwrap();
@@ -7448,38 +6457,31 @@ async fn offline_delete_after_existing_dag_history_must_append_delete_change() {
         scan_records.iter().any(|r| r.path == "report.txt" && r.deleted),
         "sanity: the restart scan must tombstone the offline delete"
     );
-    yadorilink_daemon::dag_import::ensure_initial_import(
-        state.coordinator(),
-        group,
-        &emitter,
-        None,
-    )
-    .unwrap();
 
     let indexed = state.file_index_repository().get_file(group, "report.txt").unwrap().unwrap();
     assert!(indexed.deleted, "sanity: the local index reflects the offline delete");
 
-    let heads_after = state.sqlite().dag_group_heads(group).unwrap();
+    let heads_after = crate::test_support::native_group_heads(&state, group);
     assert_ne!(
         heads_after, heads_before,
         "an offline delete picked up by the restart scan must append a Delete change to \
-         the DAG, not just tombstone the local index row"
+         native state, not just tombstone the local index row"
     );
 }
 
 /// The restart scan now routes an offline edit through the same
-/// DAG-emitting path a live edit uses, so the change reaches the group's
+/// delta-emitting path a live edit uses, so the change reaches the group's
 /// history at scan time rather than updating the index only. Re-running
 /// the reconciliation must therefore be idempotent: neither a second scan
 /// of the unchanged file nor the dirty-journal redrive
 /// (`redrive_dirty_journal`, the daemon's restart backstop) may append a
-/// duplicate head or clear the already-emitted change. The DAG head must
+/// duplicate head or clear the already-emitted change. The native head must
 /// stay advanced past the pre-edit head and remain a single head — the
 /// redrive must never silently leave the group's history stuck, nor fork
 /// or drop the change it just emitted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dirty_journal_redrive_must_not_clear_a_change_missing_from_dag() {
-    let (proc, state, emitter, _store_dir, root_dir) = processor_with_emitter();
+    let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
     let root = canonical_root(&root_dir);
     let group = "group-1";
     // See `offline_edit_after_existing_dag_history_must_append_new_head_
@@ -7500,28 +6502,21 @@ async fn dirty_journal_redrive_must_not_clear_a_change_missing_from_dag() {
         .await
         .unwrap(),
     );
-    let heads_before = state.sqlite().dag_group_heads(group).unwrap();
+    let heads_before = crate::test_support::native_group_heads(&state, group);
 
     // Offline edit picked up by the restart scan, exactly as the
     // append-on-restart test above: the scan now routes the change through
-    // the same DAG-emitting path a live edit uses, so it appends the
+    // the same delta-emitting path a live edit uses, so it appends the
     // change to the group's history at scan time. The re-run initial
     // import is a no-op once real history exists.
     std::fs::write(&file_path, b"version two, edited while the daemon was stopped").unwrap();
     let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
     proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
-    yadorilink_daemon::dag_import::ensure_initial_import(
-        state.coordinator(),
-        group,
-        &emitter,
-        None,
-    )
-    .unwrap();
 
-    let heads_after_scan = state.sqlite().dag_group_heads(group).unwrap();
+    let heads_after_scan = crate::test_support::native_group_heads(&state, group);
     assert_ne!(
         heads_after_scan, heads_before,
-        "the restart scan must append the offline edit to the DAG at scan time, exactly \
+        "the restart scan must append the offline edit to native state at scan time, exactly \
          as the append-on-restart test proves"
     );
     assert_eq!(
@@ -7534,26 +6529,19 @@ async fn dirty_journal_redrive_must_not_clear_a_change_missing_from_dag() {
     // the (now unchanged) on-disk file finds nothing to emit, so it must
     // not append a duplicate head for the already-committed change.
     proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
-    yadorilink_daemon::dag_import::ensure_initial_import(
-        state.coordinator(),
-        group,
-        &emitter,
-        None,
-    )
-    .unwrap();
     assert_eq!(
-        state.sqlite().dag_group_heads(group).unwrap(),
+        crate::test_support::native_group_heads(&state, group),
         heads_after_scan,
         "re-running the scan on an already-emitted change must not append a duplicate head"
     );
 
     // The dirty-journal redrive must likewise neither clear the
-    // already-emitted change (reverting the DAG head to before the edit)
+    // already-emitted change (reverting the native head to before the edit)
     // nor re-append it as a duplicate — it must leave the emitted change
     // intact.
     proc.redrive_dirty_journal(group, &root).await.unwrap();
 
-    let heads_final = state.sqlite().dag_group_heads(group).unwrap();
+    let heads_final = crate::test_support::native_group_heads(&state, group);
     assert_eq!(
         heads_final, heads_after_scan,
         "the dirty-journal redrive must leave the already-emitted change intact — neither \
@@ -7568,52 +6556,57 @@ async fn dirty_journal_redrive_must_not_clear_a_change_missing_from_dag() {
 /// Walks the linear chain of changes from `head` back to (but excluding)
 /// `stop`, tip-first. Asserts every step has exactly one parent, i.e. the
 /// chain is linear — the shape a chunked reconciliation must produce so a
-/// crash can resume from the last committed chunk and the DAG never forks.
+/// crash can resume from the last committed chunk and native state never forks.
 fn linear_chain_back_to(
     state: &ReplicaCoordinator,
-    head: yadorilink_replica_domain::ids::ChangeHash,
-    stop: &yadorilink_replica_domain::ids::ChangeHash,
-) -> Vec<yadorilink_replica_domain::change::Change> {
+    head: yadorilink_replica_domain::ids::DeltaHash,
+    stop: &yadorilink_replica_domain::ids::DeltaHash,
+) -> Vec<yadorilink_replica_domain::signed_delta::NativeDelta> {
+    let by_hash: std::collections::HashMap<[u8; 32], _> =
+        crate::test_support::native_deltas(state, GROUP_FOR_CHAINS)
+            .into_iter()
+            .map(|delta| (delta.delta_hash().0, delta))
+            .collect();
     let mut chain = Vec::new();
     let mut cur = head;
     while &cur != stop {
-        let change = state.sqlite().dag_get_change(&cur).unwrap().unwrap();
-        assert_eq!(
-            change.parents.len(),
-            1,
-            "a chunked reconciliation must form a linear chain (exactly one parent per change)"
-        );
-        let parent = change.parents[0];
-        chain.push(change);
-        cur = parent;
+        let delta = by_hash.get(&cur.0).expect("the delta is stored").clone();
+        match delta.prev {
+            Some(prev) => cur = prev,
+            None => {
+                chain.push(delta);
+                break;
+            }
+        }
+        chain.push(delta);
     }
     chain
 }
 
+const GROUP_FOR_CHAINS: &str = "group-1";
+
 // Only called by the #[cfg(unix)] symlink/exec-bit atomicity tests below.
 #[cfg(unix)]
 fn version_hash_for_path(
-    change: &yadorilink_replica_domain::change::Change,
+    delta: &yadorilink_replica_domain::signed_delta::NativeDelta,
     path: &str,
 ) -> yadorilink_replica_domain::ids::VersionHash {
-    for op in &change.ops {
-        match op {
-            Op::Put { path: p, version, .. } if p.as_str() == path => {
-                return *version;
-            }
-            _ => {}
-        }
-    }
-    panic!("no put op for {path} in change");
+    delta
+        .ops
+        .iter()
+        .find(|op| op.path.as_str() == path)
+        .and_then(|op| op.put.as_ref())
+        .map(|put| put.version)
+        .unwrap_or_else(|| panic!("no put op for {path} in delta"))
 }
 
-/// A symlink picked up by the DAG-emitting startup scan must land its index
+/// A symlink picked up by the delta-emitting startup scan must land its index
 /// metadata columns (record kind / target / out-of-root) in the SAME
 /// committed state as the `FileVersion` the
 /// emitted change carries — no separate post-commit setter that a crash
 /// could tear from the emit. The old code applied those columns via
 /// `set_record_kind`/`set_symlink_*` AFTER the emit committed, so a crash
-/// in between left the DAG saying "symlink -> target" while the index row
+/// in between left native state saying "symlink -> target" while the index row
 /// still showed the old (or default) columns. This asserts consistency
 /// immediately after the single emitting scan call, with no setter run.
 #[cfg(unix)]
@@ -7624,17 +6617,10 @@ fn scan_emits_symlink_metadata_atomically_with_its_file_version() {
     let group = "group-1";
     let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
 
-    // Establish DAG history so the scan takes the emitting path.
+    // Establish native history so the scan takes the emitting path.
     std::fs::write(root.join("seed.txt"), b"seed").unwrap();
     proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
-    yadorilink_daemon::dag_import::ensure_initial_import(
-        state.coordinator(),
-        group,
-        proc.change_emitter.as_ref().unwrap(),
-        None,
-    )
-    .unwrap();
-    let heads_before = state.sqlite().dag_group_heads(group).unwrap();
+    let heads_before = crate::test_support::native_group_heads(&state, group);
 
     // Offline: a new symlink whose raw target escapes the root.
     std::os::unix::fs::symlink("../outside", root.join("link")).unwrap();
@@ -7654,9 +6640,9 @@ fn scan_emits_symlink_metadata_atomically_with_its_file_version() {
     assert!(state.file_index_repository().get_symlink_out_of_root(group, "link").unwrap());
     assert_eq!(state.file_index_repository().get_unix_mode(group, "link").unwrap(), None);
 
-    // ...and the DAG `FileVersion` the emitted change references agrees
+    // ...and the `FileVersion` the emitted delta references agrees
     // exactly (same single committed state, not a later reconciliation).
-    let heads_after = state.sqlite().dag_group_heads(group).unwrap();
+    let heads_after = crate::test_support::native_group_heads(&state, group);
     assert_ne!(heads_after, heads_before, "the symlink must have emitted a change");
     let chain = linear_chain_back_to(&state, heads_after[0], &heads_before[0]);
     let vh = version_hash_for_path(&chain[chain.len() - 1], "link");
@@ -7691,14 +6677,7 @@ fn scan_emits_unix_mode_atomically_with_its_file_version() {
 
     std::fs::write(root.join("seed.txt"), b"seed").unwrap();
     proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
-    yadorilink_daemon::dag_import::ensure_initial_import(
-        state.coordinator(),
-        group,
-        proc.change_emitter.as_ref().unwrap(),
-        None,
-    )
-    .unwrap();
-    let heads_before = state.sqlite().dag_group_heads(group).unwrap();
+    let heads_before = crate::test_support::native_group_heads(&state, group);
 
     // Offline: a new executable script.
     let script = root.join("run.sh");
@@ -7717,7 +6696,7 @@ fn scan_emits_unix_mode_atomically_with_its_file_version() {
     );
     assert_eq!(state.file_index_repository().get_symlink_target(group, "run.sh").unwrap(), None);
 
-    let heads_after = state.sqlite().dag_group_heads(group).unwrap();
+    let heads_after = crate::test_support::native_group_heads(&state, group);
     let chain = linear_chain_back_to(&state, heads_after[0], &heads_before[0]);
     let vh = version_hash_for_path(&chain[chain.len() - 1], "run.sh");
     let version = state.sqlite().dag_get_file_version(group, &vh).unwrap().unwrap();
@@ -7759,13 +6738,6 @@ fn scan_preserves_existing_xattrs_across_an_unrelated_offline_exec_bit_change() 
     )
     .unwrap();
     proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
-    yadorilink_daemon::dag_import::ensure_initial_import(
-        state.coordinator(),
-        group,
-        proc.change_emitter.as_ref().unwrap(),
-        None,
-    )
-    .unwrap();
     assert_eq!(
         state.file_index_repository().get_xattrs(group, "run.sh").unwrap(),
         vec![("user.yadorilink-test".to_string(), b"keep-me".to_vec())],
@@ -7798,13 +6770,13 @@ fn scan_preserves_existing_xattrs_across_an_unrelated_offline_exec_bit_change() 
 /// observing the path's disk identity, so the emitting commit had no
 /// actual-state evidence to write a proof from. The path kept the
 /// proof its PREVIOUS commit wrote, which names the PREVIOUS
-/// version. Proof and DAG then permanently name two different
+/// version. Proof and native state then permanently name two different
 /// versions for content that was correct on disk the whole time,
 /// `dag_zero_work_settlement_if_already_current` can never close the
 /// path's projection obligation, and on a device with no peer that
 /// obligation never closes by any other route either.
 ///
-/// The oracle is deliberately the version the DAG itself resolves
+/// The oracle is deliberately the version native state itself resolves
 /// this path to -- read back out of the change the scan emitted --
 /// never the version the proof happens to carry. Checking a proof
 /// against itself passes no matter how wrong the proof is.
@@ -7832,10 +6804,14 @@ async fn an_offline_metadata_only_change_publishes_a_proof_for_the_version_it_em
         .await
         .unwrap(),
     );
-    let heads_before = state.sqlite().dag_group_heads(group).unwrap();
+    let heads_before = crate::test_support::native_group_heads(&state, group);
     assert_eq!(heads_before.len(), 1, "sanity: the live capture established one head");
     let version_before = version_hash_for_path(
-        &state.sqlite().dag_get_change(&heads_before[0]).unwrap().unwrap(),
+        &linear_chain_back_to(
+            &state,
+            heads_before[0],
+            &yadorilink_replica_domain::ids::DeltaHash([0; 32]),
+        )[0],
         "run.sh",
     );
 
@@ -7845,7 +6821,7 @@ async fn an_offline_metadata_only_change_publishes_a_proof_for_the_version_it_em
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
 
-    let heads_after = state.sqlite().dag_group_heads(group).unwrap();
+    let heads_after = crate::test_support::native_group_heads(&state, group);
     assert_ne!(
         heads_after, heads_before,
         "sanity: the scan must have emitted a change for the offline mode change -- without \
@@ -7873,29 +6849,19 @@ async fn an_offline_metadata_only_change_publishes_a_proof_for_the_version_it_em
     );
 
     // The exact equality `dag_zero_work_settlement_if_already_current`
-    // gates a zero-work close on, computed against the DAG-resolved
+    // gates a zero-work close on, computed against the native-resolved
     // version rather than the proof's own.
-    let desired_hash = state
-        .sqlite()
-        .dag_desired_resolved_path_state_hash(
-            group,
-            "run.sh",
-            &yadorilink_replica_engine::conflict::PathResolution::Present {
-                winner: 0,
-                conflict_copies: vec![],
-            },
-            Some(&emitted_version),
-        )
-        .unwrap();
+    let desired_hash =
+        state.sqlite().native_desired_projected_path_state_hash(group, "run.sh").unwrap();
     assert_eq!(
         basis.resolved_path_state_hash, desired_hash,
         "the proof's resolved_path_state_hash must equal the desired-state hash of the \
-         version the DAG resolves this path to; while they differ the path's projection \
+         version native state resolves this path to; while they differ the path's projection \
          obligation cannot close and, with no peer, never will"
     );
 }
 
-/// The first scan of a not-yet-DAG-backed link must persist each row
+/// The first scan of a not-yet-native-backed link must persist each row
 /// AND the metadata it just observed for that row in one transaction.
 ///
 /// RED before this fix: the scan wrote every `FileRecord` in one batch
@@ -7955,7 +6921,7 @@ fn one_bulk_local_emission_leaves_no_runnable_obligations() {
     let records = proc.scan_existing_files_with_ignore(GROUP, &root, &ignore_set).unwrap();
     assert_eq!(records.len(), FILE_COUNT, "sanity: the scan must have authored every path");
     assert_eq!(
-        state.sqlite().dag_group_heads(GROUP).unwrap().len(),
+        crate::test_support::native_group_heads(&state, GROUP).len(),
         1,
         "sanity: one bulk emission must leave exactly one head"
     );
@@ -8087,7 +7053,7 @@ fn a_first_scan_commits_each_row_together_with_the_metadata_it_observed() {
     // transactions above, rather than the rows landing now and their
     // history being reconstructed from a second look at the same disk
     // later.
-    let heads_after_scan = state.sqlite().dag_group_heads(ATOMIC_GROUP).unwrap();
+    let heads_after_scan = crate::test_support::native_group_heads(&state, ATOMIC_GROUP);
     assert_eq!(
         heads_after_scan.len(),
         1,
@@ -8095,31 +7061,9 @@ fn a_first_scan_commits_each_row_together_with_the_metadata_it_observed() {
          converging on one head"
     );
 
-    // So the initial import has nothing left to bind. It stays as the
-    // recovery path for a database holding current rows that were
-    // never authored -- which this scan cannot produce.
-    let outcome = yadorilink_daemon::dag_import::ensure_initial_import(
-        state.coordinator(),
-        ATOMIC_GROUP,
-        proc.change_emitter.as_ref().unwrap(),
-        None,
-    )
-    .unwrap();
-    assert_eq!(
-        outcome,
-        yadorilink_daemon::dag_import::ImportOutcome::AlreadyInitialized,
-        "every row this scan committed already carries the authoring identity of the \
-         change the same transaction emitted, so there is nothing for the import to bind"
-    );
-    assert_eq!(
-        state.sqlite().dag_group_heads(ATOMIC_GROUP).unwrap(),
-        heads_after_scan,
-        "and it must therefore author nothing"
-    );
-
     proc.scan_existing_files_with_ignore(ATOMIC_GROUP, &root, &ignore_set).unwrap();
     assert_eq!(
-        state.sqlite().dag_group_heads(ATOMIC_GROUP).unwrap(),
+        crate::test_support::native_group_heads(&state, ATOMIC_GROUP),
         heads_after_scan,
         "a rescan of an untouched folder must author nothing: every mode and xattr the \
          first scan observed is already in the index, so there is no divergence to \
@@ -8189,7 +7133,7 @@ fn a_scan_with_no_emitter_still_commits_each_row_with_the_metadata_it_observed()
     scanned.expect("a scan with no emitter must still succeed");
 
     assert!(
-        state.sqlite().dag_group_heads(NO_EMITTER_GROUP).unwrap().is_empty(),
+        crate::test_support::native_group_heads(&state, NO_EMITTER_GROUP).is_empty(),
         "sanity: with no emitter this scan must have taken the index-only branch, which is \
          the one this test is about"
     );
@@ -8277,18 +7221,15 @@ fn two_concurrent_full_reconcile_requests_author_one_change_per_path() {
     // many signed changes name each path. Two concurrent passes used
     // to give every path two -- byte-identical versions every peer has
     // to fetch, verify and keep forever.
-    let heads = state.sqlite().dag_group_heads(GROUP).unwrap();
+    let heads = crate::test_support::native_group_heads(&state, GROUP);
     assert_eq!(heads.len(), 1, "sanity: the reconciles must converge on one head");
     let mut authorings: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut cur = Some(heads[0]);
-    while let Some(hash) = cur {
-        let change = state.sqlite().dag_get_change(&hash).unwrap().unwrap();
-        for op in &change.ops {
-            if let Op::Put { path, .. } = op {
-                *authorings.entry(path.as_str().to_string()).or_default() += 1;
+    for delta in crate::test_support::native_deltas(&state, GROUP) {
+        for op in &delta.ops {
+            if op.put.is_some() {
+                *authorings.entry(op.path.as_str().to_string()).or_default() += 1;
             }
         }
-        cur = change.parents.first().copied();
     }
 
     let duplicated: Vec<_> =
@@ -8414,7 +7355,7 @@ async fn a_historical_inadmissible_row_does_not_fail_a_reconciliation_chunk() {
 ///
 /// Asserted on the index rather than on the returned records, because
 /// the durable state is what matters -- a peer syncs from the index and
-/// DAG, not from this call's return value.
+/// native state, not from this call's return value.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_inadmissible_local_name_does_not_block_its_batch_mates() {
     let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
@@ -8484,14 +7425,7 @@ fn bulk_offline_reconcile_chunks_by_op_count_into_a_chain() {
     }
     // Seed history from the initial index, then take it offline.
     proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
-    yadorilink_daemon::dag_import::ensure_initial_import(
-        state.coordinator(),
-        group,
-        proc.change_emitter.as_ref().unwrap(),
-        None,
-    )
-    .unwrap();
-    let heads_before = state.sqlite().dag_group_heads(group).unwrap();
+    let heads_before = crate::test_support::native_group_heads(&state, group);
     assert_eq!(heads_before.len(), 1, "sanity: import converged on one head");
 
     // Offline-modify every file (different size => re-versioned by the scan).
@@ -8500,7 +7434,7 @@ fn bulk_offline_reconcile_chunks_by_op_count_into_a_chain() {
     }
     proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
 
-    let heads_after = state.sqlite().dag_group_heads(group).unwrap();
+    let heads_after = crate::test_support::native_group_heads(&state, group);
     assert_eq!(heads_after.len(), 1, "the chunk chain must converge on a single head");
     let chain = linear_chain_back_to(&state, heads_after[0], &heads_before[0]);
     assert!(
@@ -8514,7 +7448,7 @@ fn bulk_offline_reconcile_chunks_by_op_count_into_a_chain() {
             change.ops.len() <= RECONCILE_CHUNK_OP_LIMIT,
             "every chunk must stay within the op-count bound"
         );
-        let bytes: usize = change.ops.iter().map(encoded_op_len).sum();
+        let bytes: usize = change.to_wire_bytes().len();
         assert!(bytes <= RECONCILE_CHUNK_BYTE_LIMIT, "every chunk must stay within the byte bound");
         total_ops += change.ops.len();
     }
@@ -8525,9 +7459,9 @@ fn bulk_offline_reconcile_chunks_by_op_count_into_a_chain() {
 /// every peer announcement until the WHOLE scan's `Vec<FileRecord>` is
 /// returned, since `reconcile_disk_with_ignore`'s own chunk loop
 /// (proven by `bulk_offline_reconcile_chunks_by_op_count_into_a_chain`
-/// above) already commits each chunk durably to the DAG as it goes --
+/// above) already commits each chunk durably to native state as it goes --
 /// on a 15,000-file scan that would mean over a minute of zero
-/// peer-visible progress while the source device's own index/DAG
+/// peer-visible progress while the source device's own index/native state
 /// advances the entire time. Proves the streaming sibling
 /// surfaces each durably-committed chunk via `on_chunk_committed`
 /// DURING the scan (multiple callback invocations, each with a proper
@@ -8538,7 +7472,7 @@ fn bulk_offline_reconcile_chunks_by_op_count_into_a_chain() {
 /// records.
 #[test]
 fn streaming_reconciliation_surfaces_each_durable_chunk_before_the_whole_scan_returns() {
-    let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
+    let (proc, _state, _emitter, _store_dir, root_dir) = processor_with_emitter();
     let root = canonical_root(&root_dir);
     let group = "group-1";
     let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
@@ -8548,13 +7482,6 @@ fn streaming_reconciliation_surfaces_each_durable_chunk_before_the_whole_scan_re
         std::fs::write(root.join(format!("f{i}")), b"a").unwrap();
     }
     proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
-    yadorilink_daemon::dag_import::ensure_initial_import(
-        state.coordinator(),
-        group,
-        proc.change_emitter.as_ref().unwrap(),
-        None,
-    )
-    .unwrap();
 
     // Offline-modify every file so the second scan's diff is non-empty
     // and routes through the chunked change-emission path (the same
@@ -8613,21 +7540,14 @@ fn bulk_offline_reconcile_chunks_by_encoded_bytes_into_a_chain() {
         std::fs::write(root.join(name(i)), b"a").unwrap();
     }
     proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
-    yadorilink_daemon::dag_import::ensure_initial_import(
-        state.coordinator(),
-        group,
-        proc.change_emitter.as_ref().unwrap(),
-        None,
-    )
-    .unwrap();
-    let heads_before = state.sqlite().dag_group_heads(group).unwrap();
+    let heads_before = crate::test_support::native_group_heads(&state, group);
 
     for i in 0..n {
         std::fs::write(root.join(name(i)), b"abc").unwrap();
     }
     proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
 
-    let heads_after = state.sqlite().dag_group_heads(group).unwrap();
+    let heads_after = crate::test_support::native_group_heads(&state, group);
     let chain = linear_chain_back_to(&state, heads_after[0], &heads_before[0]);
     assert!(
         chain.len() >= 2,
@@ -8637,7 +7557,7 @@ fn bulk_offline_reconcile_chunks_by_encoded_bytes_into_a_chain() {
     );
     let mut total_ops = 0usize;
     for change in &chain {
-        let bytes: usize = change.ops.iter().map(encoded_op_len).sum();
+        let bytes: usize = change.to_wire_bytes().len();
         assert!(
             bytes <= RECONCILE_CHUNK_BYTE_LIMIT,
             "every chunk must stay within the byte bound, got {bytes}"
@@ -8850,7 +7770,7 @@ fn tombstone_suppression_is_scoped_to_the_failed_subtree() {
 /// scan is root-scoped and authoritative, so with two live roots on one
 /// group, root A's scan finds root B's indexed paths absent from its own
 /// `seen_paths` and tombstones them -- signed changes that ride the
-/// change-DAG to EVERY device. That is silent, group-wide, cross-device loss
+/// native state to EVERY device. That is silent, group-wide, cross-device loss
 /// of the user's own data.
 ///
 /// Asserts on the emitted RECORDS, not merely that the call is `Err`: an
@@ -9073,7 +7993,7 @@ fn the_survivors_first_post_recovery_scan_emits_no_tombstones() {
 
 /// A canonical wire path must have one separator spelling on every
 /// platform. A literal Unix backslash therefore cannot be represented:
-/// preserving it would make `a\b.txt` and `a/b.txt` distinct DAG paths
+/// preserving it would make `a\b.txt` and `a/b.txt` distinct native paths
 /// that address the same file when received on Windows.
 #[cfg(unix)]
 #[test]
@@ -9197,3 +8117,297 @@ mod directory_capture;
 
 #[path = "recursive_capture_tests.rs"]
 mod recursive_capture;
+
+/// A file whose block list cannot travel in one replication item can never be
+/// synced: peers would admit its head and never receive its version. Capture
+/// refuses it explicitly, writes nothing, and leaves the path unsettled so a
+/// later pass (after the file shrinks) can pick it up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_file_with_too_many_blocks_to_sync_is_refused_and_nothing_is_written() {
+    struct RestoreLimit;
+    impl Drop for RestoreLimit {
+        fn drop(&mut self) {
+            record_builder::override_syncable_block_limit(usize::MAX);
+        }
+    }
+    let (proc, state, _store_dir, root_dir) = processor();
+    let root = canonical_root(&root_dir);
+    adopt_root(&state, "group-1", &root);
+    let file_path = root.join("huge.bin");
+    // 4 blocks at the default 128 KiB block size.
+    std::fs::write(&file_path, vec![b'x'; 4 * 128 * 1024]).unwrap();
+
+    let _restore = RestoreLimit;
+    record_builder::override_syncable_block_limit(3);
+    let event = FsChangeEvent { path: file_path.clone(), kind: FsChangeKind::CreatedOrModified };
+    let outcome = proc.process_event("group-1", &root, &event).await.unwrap();
+
+    assert_eq!(outcome, LocalChangeOutcome::RetryLater);
+    assert!(state.get_file("group-1", "huge.bin").unwrap().is_none(), "no index row");
+    assert!(
+        state.sqlite().dag_list_versions("group-1", "huge.bin").unwrap().is_empty(),
+        "no version was authored"
+    );
+
+    // Within the limit the very same file is captured: the refusal is the limit's doing.
+    record_builder::override_syncable_block_limit(4);
+    let outcome = proc.process_event("group-1", &root, &event).await.unwrap();
+    expect_file_changed(outcome);
+}
+
+/// A scan reads a path without its lock and commits later, so a path
+/// another writer holds at commit time -- above all a write of a newer
+/// version, whose row is already ahead of disk -- is not authored from
+/// what the scan read: it is captured again under the lock once the
+/// writer lets it go. A path whose disk moved on since the read is
+/// captured again too, instead of authoring the bytes that are gone.
+mod scan_commit_lock {
+    use super::*;
+    use tokio::sync::OwnedMutexGuard;
+
+    const GROUP: &str = "scan-commit-lock";
+
+    type Held = Arc<Mutex<Vec<OwnedMutexGuard<()>>>>;
+
+    struct Fixture {
+        proc: LocalChangeProcessor,
+        state: Arc<TestReplica>,
+        root: std::path::PathBuf,
+        _store_dir: tempfile::TempDir,
+        _root_dir: tempfile::TempDir,
+    }
+
+    fn fixture() -> Fixture {
+        let (proc, state, _emitter, _store_dir, _root_dir) = processor_with_emitter();
+        let root = canonical_root(&_root_dir);
+        adopt_root(&state, GROUP, &root);
+        Fixture { proc, state, root, _store_dir, _root_dir }
+    }
+
+    impl Fixture {
+        async fn capture(&self, rel: &str) {
+            self.proc
+                .process_event(
+                    GROUP,
+                    &self.root,
+                    &FsChangeEvent {
+                        path: self.root.join(rel),
+                        kind: FsChangeKind::CreatedOrModified,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        fn scan(&self) -> Vec<String> {
+            let records = tokio::task::block_in_place(|| {
+                self.proc.scan_existing_files(GROUP, &self.root).unwrap()
+            });
+            records.into_iter().map(|record| record.path).collect()
+        }
+
+        fn versions(&self, rel: &str) -> usize {
+            self.state.sqlite().dag_list_versions(GROUP, rel).unwrap().len()
+        }
+
+        fn dirty(&self, rel: &str) -> bool {
+            self.state.dirty_path_repository().is_path_dirty(GROUP, rel).unwrap()
+        }
+
+        fn indexed_size(&self, rel: &str) -> u64 {
+            self.state.file_index_repository().get_file(GROUP, rel).unwrap().unwrap().size
+        }
+
+        async fn until_dirty(&self, rel: &str) {
+            for _ in 0..500 {
+                if self.dirty(rel) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("{rel} was never journaled for another capture");
+        }
+
+        async fn redrive(&self) {
+            self.proc.redrive_dirty_journal(GROUP, &self.root).await.unwrap();
+        }
+
+        /// While the scan runs, holds the lock of every path in `busy`
+        /// from the moment the scan is about to commit it.
+        fn hold_while_committing(&self, busy: &'static [&'static str]) -> Held {
+            let held: Held = Arc::default();
+            let (state, slot) = (Arc::clone(&self.state), Arc::clone(&held));
+            scan_test_hooks::set_pre_upsert_commit_recheck_hook(Some(Arc::new(
+                move |group: &str, path: &str| {
+                    if group == GROUP && busy.contains(&path) {
+                        let guard = state.path_lock(GROUP, path).try_lock_owned().unwrap();
+                        slot.lock().unwrap().push(guard);
+                    }
+                },
+            )));
+            held
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "the scan-hook slot guard serializes the tests sharing the process-wide \
+                  scan hook; holding it across awaits is the point"
+    )]
+    async fn a_path_written_while_the_scan_commits_is_captured_once_the_writer_releases_it() {
+        let _hook_slot = hold_scan_hook_slot();
+        let f = fixture();
+        std::fs::write(f.root.join("a.txt"), b"one").unwrap();
+        f.capture("a.txt").await;
+        assert_eq!(f.versions("a.txt"), 1);
+        std::fs::write(f.root.join("a.txt"), b"edited offline").unwrap();
+
+        let held = f.hold_while_committing(&["a.txt"]);
+        let scanned = f.scan();
+        scan_test_hooks::set_pre_upsert_commit_recheck_hook(None);
+
+        assert!(!scanned.contains(&"a.txt".to_string()), "authored under a held lock: {scanned:?}");
+        assert_eq!(f.versions("a.txt"), 1, "nothing authored while another writer holds it");
+        assert!(!f.dirty("a.txt"), "not journaled while the writer still holds the path");
+
+        held.lock().unwrap().clear();
+        f.until_dirty("a.txt").await;
+        f.redrive().await;
+
+        assert!(!f.dirty("a.txt"));
+        assert_eq!(f.versions("a.txt"), 2, "the edit is captured exactly once");
+        assert_eq!(f.indexed_size("a.txt"), b"edited offline".len() as u64);
+        assert!(f.scan().is_empty(), "a later scan finds nothing left to author");
+        assert_eq!(f.versions("a.txt"), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "the scan-hook slot guard serializes the tests sharing the process-wide \
+                  scan hook; holding it across awaits is the point"
+    )]
+    async fn a_file_changed_between_the_scan_read_and_its_commit_is_captured_again() {
+        let _hook_slot = hold_scan_hook_slot();
+        let f = fixture();
+        std::fs::write(f.root.join("a.txt"), b"one").unwrap();
+        f.capture("a.txt").await;
+        std::fs::write(f.root.join("a.txt"), b"read by the scan").unwrap();
+
+        let root = f.root.clone();
+        scan_test_hooks::set_pre_upsert_commit_recheck_hook(Some(Arc::new(
+            move |group: &str, path: &str| {
+                if group == GROUP && path == "a.txt" {
+                    std::fs::write(root.join("a.txt"), b"saved again before the commit").unwrap();
+                }
+            },
+        )));
+        let scanned = f.scan();
+        scan_test_hooks::set_pre_upsert_commit_recheck_hook(None);
+
+        assert!(!scanned.contains(&"a.txt".to_string()), "authored stale bytes: {scanned:?}");
+        assert_eq!(f.versions("a.txt"), 1);
+        assert!(f.dirty("a.txt"), "journaled for another capture");
+
+        f.redrive().await;
+
+        assert!(!f.dirty("a.txt"));
+        assert_eq!(f.versions("a.txt"), 2, "only what is on disk is authored, once");
+        assert_eq!(f.indexed_size("a.txt"), b"saved again before the commit".len() as u64);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "the scan-hook slot guard serializes the tests sharing the process-wide \
+                  scan hook; holding it across awaits is the point"
+    )]
+    async fn a_scan_commits_the_paths_it_can_lock_and_captures_the_others_later() {
+        let _hook_slot = hold_scan_hook_slot();
+        let f = fixture();
+        let names = ["a.txt", "b.txt", "c.txt", "d.txt"];
+        for name in names {
+            std::fs::write(f.root.join(name), name.as_bytes()).unwrap();
+        }
+
+        let held = f.hold_while_committing(&["b.txt", "d.txt"]);
+        let mut scanned = f.scan();
+        scan_test_hooks::set_pre_upsert_commit_recheck_hook(None);
+        scanned.sort();
+
+        assert_eq!(scanned, ["a.txt", "c.txt"], "only the paths it could lock are authored");
+        assert_eq!((f.versions("b.txt"), f.versions("d.txt")), (0, 0));
+
+        held.lock().unwrap().clear();
+        f.until_dirty("b.txt").await;
+        f.until_dirty("d.txt").await;
+        f.redrive().await;
+
+        for name in names {
+            assert_eq!(f.versions(name), 1, "{name} is authored exactly once");
+            assert!(!f.dirty(name));
+        }
+        assert!(f.scan().is_empty());
+    }
+
+    /// The lock registry folds names, so an offline case-only rename puts
+    /// the new name's upsert and the old name's delete under one lock in
+    /// one commit. The commit holds it once for both, and both land.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "the scan-hook slot guard serializes the tests sharing the process-wide \
+                  scan hook; holding it across awaits is the point"
+    )]
+    async fn an_offline_case_only_rename_commits_its_write_and_its_delete_together() {
+        let _hook_slot = hold_scan_hook_slot();
+        let f = fixture();
+        std::fs::write(f.root.join("Report.txt"), b"quarterly").unwrap();
+        f.capture("Report.txt").await;
+        std::fs::rename(f.root.join("Report.txt"), f.root.join("report.txt")).unwrap();
+
+        let mut scanned = f.scan();
+        scanned.sort();
+
+        assert_eq!(scanned, ["Report.txt", "report.txt"], "the write and the delete commit");
+        let row = |rel: &str| f.state.file_index_repository().get_file(GROUP, rel).unwrap();
+        assert!(row("Report.txt").is_some_and(|row| row.deleted), "the old name is deleted");
+        assert!(row("report.txt").is_some_and(|row| !row.deleted), "the new name is live");
+        assert!(!f.dirty("Report.txt") && !f.dirty("report.txt"));
+    }
+
+    /// However many scans find a path's lock busy, one waiter is queued to
+    /// journal it, and it journals it once when the lock frees.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "the scan-hook slot guard serializes the tests sharing the process-wide \
+                  scan hook; holding it across awaits is the point"
+    )]
+    async fn repeated_scans_of_a_busy_path_queue_one_journal_write() {
+        let _hook_slot = hold_scan_hook_slot();
+        let f = fixture();
+        std::fs::write(f.root.join("a.txt"), b"one").unwrap();
+        f.capture("a.txt").await;
+        std::fs::write(f.root.join("a.txt"), b"edited offline").unwrap();
+
+        let writer = f.state.path_lock(GROUP, "a.txt").try_lock_owned().unwrap();
+        for _ in 0..3 {
+            assert!(f.scan().is_empty());
+            assert_eq!(f.proc.deferred_journal_waiter_count(), 1);
+        }
+        drop(writer);
+        f.until_dirty("a.txt").await;
+        for _ in 0..500 {
+            if f.proc.deferred_journal_waiter_count() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(f.proc.deferred_journal_waiter_count(), 0, "the waiter unregisters");
+        let journaled = f.state.dirty_path_repository().list_dirty_paths(GROUP).unwrap();
+        assert_eq!(journaled.len(), 1);
+        assert_eq!(journaled[0].attempts, 1, "journaled once, not once per scan");
+    }
+}

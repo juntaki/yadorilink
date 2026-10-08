@@ -153,3 +153,28 @@ async fn a_request_the_server_never_answers_gives_up() {
     .expect("a request to a silent server must give up on its own");
     assert!(answer.unwrap_err().is_timeout());
 }
+
+#[test]
+fn coordination_addr_env_override_wins_over_compiled_default() {
+    assert_eq!(
+        resolve_coordination_addr(Some("http://override:1"), Some("https://compiled.example")),
+        "http://override:1"
+    );
+}
+
+#[test]
+fn coordination_addr_uses_compiled_default_without_env() {
+    assert_eq!(
+        resolve_coordination_addr(None, Some("https://compiled.example")),
+        "https://compiled.example"
+    );
+    assert_eq!(
+        resolve_coordination_addr(Some("  "), Some("https://compiled.example")),
+        "https://compiled.example"
+    );
+}
+
+#[test]
+fn coordination_addr_falls_back_to_loopback() {
+    assert_eq!(resolve_coordination_addr(None, None), "http://127.0.0.1:8787");
+}

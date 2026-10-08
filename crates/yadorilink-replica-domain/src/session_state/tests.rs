@@ -7,8 +7,8 @@ use crate::file::RecordKind;
 fn persisted_enum_values_are_exact() {
     assert_eq!(EnrollmentKind::from_db_str("create"), EnrollmentKind::Create);
     assert_eq!(EnrollmentKind::from_db_str("join"), EnrollmentKind::Join);
-    assert_eq!(MaterializationState::from_db_str("hydrated"), MaterializationState::Hydrated);
-    assert_eq!(MaterializationState::from_db_str("placeholder"), MaterializationState::Placeholder);
+    assert_eq!(MaterializationState::from_db_str("present"), MaterializationState::Present);
+    assert_eq!(MaterializationState::from_db_str("remote"), MaterializationState::Remote);
     assert_eq!(MaterializationPolicy::from_db_str("eager"), MaterializationPolicy::Eager);
     assert_eq!(MaterializationPolicy::from_db_str("ondemand"), MaterializationPolicy::OnDemand);
     assert_eq!(RecordKind::from_db_str("file"), RecordKind::File);

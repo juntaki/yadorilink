@@ -3,15 +3,13 @@
 use super::*;
 use yadorilink_replica_domain::file::FileRecord;
 
-/// `yadorilink_sqlite_runtime::init_schema` must run AFTER
-/// `init_dag_schema` (it assumes `changes`/`pruned_changes` already
-/// exist, per its own doc comment), matching the real production
-/// initialization order. Uses the REAL schema, not a stand-in, so
+/// `yadorilink_sqlite_runtime::init_schema` runs after the replica
+/// tables, matching the real production initialization order. Uses the REAL schema, not a stand-in, so
 /// these tests also prove the `admitted_at_unix_nanos` migration
 /// actually put the column on the table.
 fn conn() -> Connection {
     let c = Connection::open_in_memory().unwrap();
-    crate::dag_store::init_dag_schema(&c).unwrap();
+    crate::replica_tables::init_for_tests(&c).unwrap();
     yadorilink_sqlite_runtime::init_schema(&c).unwrap();
     c
 }
@@ -52,8 +50,6 @@ fn seed(
 /// Direct SQL for the same reason `seed` is: both of them stamp the
 /// wall clock and offer no way to choose the instant. Each real writer
 /// is driven end to end by its own test elsewhere --
-/// `an_unmodified_file_from_before_an_install_is_unavailable_below_the_
-/// floor` in `rebootstrap_store` for a base install, and
 /// `local_history_floor_tests` in `enrollment` and in `link` for the two
 /// link commits that can name a folder this device did not originate.
 fn seed_local_history_floor(conn: &Connection, group_id: &str, floor_unix_nanos: i64) {
@@ -204,9 +200,7 @@ fn a_row_with_no_admission_timestamp_reports_unavailable() {
 
 /// The `version_seq DESC` tie-break, on its own. Two rows for one path
 /// sharing an `admitted_at_unix_nanos` is not a corner case: a
-/// rebootstrap install writes a path's whole retained history in one
-/// pass and stamps every row with that install's single instant, and a
-/// coarse clock can do the same for two ordinary writes. The "at T"
+/// coarse clock can stamp two ordinary writes with the same instant. The "at T"
 /// side must resolve such a tie to the highest `version_seq` -- the
 /// path's current row -- or the plan reports a rollback that is not
 /// real.
@@ -247,23 +241,22 @@ fn a_group_with_no_history_before_the_target_reports_every_live_path_as_delete()
 
 /// The `min_version_seq <= 1` reading -- "this path's first version was
 /// admitted after T, so at T it did not exist here" -- is only sound
-/// while `version_seq` is this device's own admission history. A
-/// re-bootstrap install ends that: it empties `files` for the group and
-/// reinstalls the SOURCE device's numbering, so a file created years ago
-/// and never edited since arrives as `version_seq = 1`. Below the
+/// while `version_seq` is this device's own admission history. Joining
+/// an existing group ends that: every file the group already held arrives
+/// as `version_seq = 1`, however old. Below the
 /// recorded floor, that must read as "no answer here", not as "created
 /// after T".
 #[test]
 fn below_the_local_history_floor_an_unmodified_path_is_unavailable_not_delete() {
     let c = conn();
     seed_local_history_floor(&c, "g", 1_000);
-    // A never-edited file that the install carried in at version 1.
+    // A never-edited file that arrived at version 1.
     seed(&c, "g", "unmodified.txt", 1, "current", false, 10, Some(1_000));
 
     let plan = compute_rewind_plan(&c, "g", 500).unwrap();
     match action_for(&plan, "unmodified.txt") {
         Some(RewindPathAction::Unavailable { reason }) => {
-            assert!(reason.contains("re-bootstrap"), "reason should say why: {reason}");
+            assert!(reason.contains("joined the group"), "reason should say why: {reason}");
             assert!(
                 !reason.contains("retention"),
                 "retention cannot be the cause below the floor: {reason}"
@@ -275,7 +268,7 @@ fn below_the_local_history_floor_an_unmodified_path_is_unavailable_not_delete() 
 }
 
 /// The other half of the same boundary, which is what keeps the fix from
-/// being a blanket "never answer after a re-bootstrap": at or above the
+/// being a blanket "never answer in a joined group": at or above the
 /// floor the group's local history IS this device's own unbroken record,
 /// so the ordinary classifications still apply -- including the
 /// `version_seq = 1` inference the floor suspends below it.
@@ -283,7 +276,7 @@ fn below_the_local_history_floor_an_unmodified_path_is_unavailable_not_delete() 
 fn at_or_after_the_local_history_floor_paths_are_classified_normally() {
     let c = conn();
     seed_local_history_floor(&c, "g", 1_000);
-    // Carried in by the install itself.
+    // Carried in by the join itself.
     seed(&c, "g", "unmodified.txt", 1, "current", false, 10, Some(1_000));
     // Written locally afterwards, so its version 1 really is this
     // device's own first admission of the path.
@@ -293,7 +286,7 @@ fn at_or_after_the_local_history_floor_paths_are_classified_normally() {
     assert_eq!(
         action_for(&plan, "unmodified.txt"),
         Some(&RewindPathAction::Unchanged),
-        "a path whose installed row is at or before the target is ordinary evidence"
+        "a path whose arrived row is at or before the target is ordinary evidence"
     );
     assert_eq!(
         action_for(&plan, "created-later.txt"),
@@ -305,22 +298,22 @@ fn at_or_after_the_local_history_floor_paths_are_classified_normally() {
 }
 
 /// The floor is per group, like the plan itself. One group's
-/// re-bootstrap must not make another group's history unanswerable.
+/// floor must not make another group's history unanswerable.
 #[test]
 fn the_local_history_floor_is_scoped_to_its_own_group() {
     let c = conn();
-    seed_local_history_floor(&c, "rebootstrapped", 1_000);
-    seed(&c, "rebootstrapped", "a.txt", 1, "current", false, 10, Some(1_000));
+    seed_local_history_floor(&c, "floored", 1_000);
+    seed(&c, "floored", "a.txt", 1, "current", false, 10, Some(1_000));
     seed(&c, "untouched", "b.txt", 1, "current", false, 10, Some(1_000));
 
     assert!(matches!(
-        action_for(&compute_rewind_plan(&c, "rebootstrapped", 500).unwrap(), "a.txt"),
+        action_for(&compute_rewind_plan(&c, "floored", 500).unwrap(), "a.txt"),
         Some(RewindPathAction::Unavailable { .. })
     ));
     assert_eq!(
         action_for(&compute_rewind_plan(&c, "untouched", 500).unwrap(), "b.txt"),
         Some(&RewindPathAction::Delete),
-        "a group that never crossed a re-bootstrap keeps the ordinary inference"
+        "a group that never joined late keeps the ordinary inference"
     );
 }
 
@@ -373,7 +366,7 @@ fn the_metadata_bootstrap_scaffold_writers_stamp_too() {
     // Pooled-connection variant, through the repository.
     let db = std::sync::Arc::new(
         yadorilink_sqlite_runtime::SyncDatabase::open_in_memory(|conn| {
-            crate::dag_store::init_dag_schema(conn).map_err(|error| {
+            crate::replica_tables::init_for_tests(conn).map_err(|error| {
                 yadorilink_sqlite_runtime::DatabaseError::CorruptSchema(error.to_string())
             })?;
             yadorilink_sqlite_runtime::init_schema(conn)
@@ -433,11 +426,9 @@ fn stamps_the_local_admission_clock_at_the_write_chokepoint() {
     {
         let tx = c.transaction().unwrap();
         // Branch 1: brand-new path.
-        crate::file_index::upsert_file_in_tx(&tx, "g", &record("f.txt", 1, false), "", None)
-            .unwrap();
+        crate::file_index::upsert_file_in_tx(&tx, "g", &record("f.txt", 1, false), "").unwrap();
         // Branch 3: version bump over an existing current row.
-        crate::file_index::upsert_file_in_tx(&tx, "g", &record("f.txt", 2, false), "", None)
-            .unwrap();
+        crate::file_index::upsert_file_in_tx(&tx, "g", &record("f.txt", 2, false), "").unwrap();
         tx.commit().unwrap();
     }
     {
@@ -450,7 +441,7 @@ fn stamps_the_local_admission_clock_at_the_write_chokepoint() {
             [],
         )
         .unwrap();
-        crate::file_index::upsert_file_in_tx(&tx, "g", &record("scaffold.txt", 3, false), "", None)
+        crate::file_index::upsert_file_in_tx(&tx, "g", &record("scaffold.txt", 3, false), "")
             .unwrap();
         tx.commit().unwrap();
     }

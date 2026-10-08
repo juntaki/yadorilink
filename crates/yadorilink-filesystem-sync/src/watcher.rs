@@ -96,10 +96,16 @@ pub enum WatcherError {
 /// regardless of capacity).
 pub const DEFAULT_CHANNEL_CAPACITY: usize = 256;
 
+/// What a watcher (or a scan, or a journal replay) OBSERVED at a path. A
+/// removal here is an observation that an object this device had is gone;
+/// whether that is evidence of a delete depends on the row's state. A user's
+/// delete of the LOGICAL item (a platform provider's `deleteItem`) is not an
+/// observation and is not one of these: it is a separate type, handled by a
+/// separate entry point (`SemanticDelete` in `yadorilink-local-capture`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FsChangeKind {
     CreatedOrModified,
-    Removed,
+    ObservedRemoval,
 }
 
 #[derive(Debug, Clone)]
@@ -239,7 +245,7 @@ pub fn watch_folder_with_capacity_and_ignore(
             // A removal may be a watched directory's: the registrar drops
             // it (and what was below it) from the registered set, so the
             // directory is registered again if it is made anew.
-            if matches!(kind, FsChangeKind::Removed) {
+            if matches!(kind, FsChangeKind::ObservedRemoval) {
                 let _ = callback_new_dir_tx.send(RegistrarTrigger::Removed(path.clone()));
             }
             // Zero-field `phase T_*` marker: a timestamp anchor for offline
@@ -264,7 +270,7 @@ pub fn watch_folder_with_capacity_and_ignore(
         if let EventKind::Modify(ModifyKind::Name(rename_mode)) = event.kind {
             let pairs: Vec<(PathBuf, FsChangeKind)> = match rename_mode {
                 RenameMode::From => {
-                    event.paths.into_iter().map(|p| (p, FsChangeKind::Removed)).collect()
+                    event.paths.into_iter().map(|p| (p, FsChangeKind::ObservedRemoval)).collect()
                 }
                 RenameMode::To => {
                     event.paths.into_iter().map(|p| (p, FsChangeKind::CreatedOrModified)).collect()
@@ -274,7 +280,7 @@ pub fn watch_folder_with_capacity_and_ignore(
                     match (paths.next(), paths.next()) {
                         (Some(from), Some(to)) => {
                             vec![
-                                (from, FsChangeKind::Removed),
+                                (from, FsChangeKind::ObservedRemoval),
                                 (to, FsChangeKind::CreatedOrModified),
                             ]
                         }
@@ -303,7 +309,7 @@ pub fn watch_folder_with_capacity_and_ignore(
 
         let kind = match event.kind {
             EventKind::Create(_) | EventKind::Modify(_) => FsChangeKind::CreatedOrModified,
-            EventKind::Remove(_) => FsChangeKind::Removed,
+            EventKind::Remove(_) => FsChangeKind::ObservedRemoval,
             _ => return,
         };
         for path in event.paths {
@@ -494,7 +500,25 @@ fn spawn_new_directory_registrar(
     overflowed: Arc<AtomicBool>,
 ) {
     tokio::spawn(async move {
-        while let Some(first) = new_dir_rx.recv().await {
+        // When a registration failed, the next attempt and how many have
+        // failed in a row. The failure is not reported to anyone else: no
+        // event names the directory again, so without this it would stay
+        // unwatched for as long as the link runs.
+        let mut retry: Option<(tokio::time::Instant, u32)> = None;
+        loop {
+            let first = match retry {
+                Some((due, _)) => tokio::select! {
+                    trigger = new_dir_rx.recv() => match trigger {
+                        Some(trigger) => trigger,
+                        None => break,
+                    },
+                    () = tokio::time::sleep_until(due) => RegistrarTrigger::RetryRegistration,
+                },
+                None => match new_dir_rx.recv().await {
+                    Some(trigger) => trigger,
+                    None => break,
+                },
+            };
             // One pass serves every trigger queued while the last one ran:
             // registration starts from `root` whichever directory
             // triggered it, so running it once per queued trigger only
@@ -507,6 +531,7 @@ fn spawn_new_directory_registrar(
             for trigger in queued {
                 match trigger {
                     RegistrarTrigger::NewDirectory(path) => triggers.push(path),
+                    RegistrarTrigger::RetryRegistration => {}
                     RegistrarTrigger::Removed(path) => {
                         let mut watched =
                             watched_dirs.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -514,7 +539,7 @@ fn spawn_new_directory_registrar(
                     }
                 }
             }
-            if triggers.is_empty() {
+            if triggers.is_empty() && retry.is_none() {
                 continue;
             }
             if ROOT_WATCH == RootWatch::Recursive {
@@ -543,6 +568,7 @@ fn spawn_new_directory_registrar(
                 &ignore_set,
             ) {
                 Ok(newly_registered) if !newly_registered.is_empty() => {
+                    retry = None;
                     // Strictly after `watch` has succeeded for each of
                     // these subtrees, never concurrent with it.
                     for dir in &newly_registered {
@@ -550,6 +576,7 @@ fn spawn_new_directory_registrar(
                     }
                 }
                 Ok(_) => {
+                    retry = None;
                     // Nothing was newly registered anywhere in the tree
                     // (e.g. a redundant notification for an
                     // already-watched directory, or the watcher/guard is
@@ -559,11 +586,17 @@ fn spawn_new_directory_registrar(
                     // reconcile.
                 }
                 Err(err) => {
+                    let failures = retry.map_or(1, |(_, failures)| failures + 1);
+                    retry = Some((
+                        tokio::time::Instant::now() + registration_retry_delay(failures),
+                        failures,
+                    ));
                     tracing::debug!(
                         error = %err,
-                        trigger = %triggers[0].display(),
+                        trigger = ?triggers.first(),
                         triggers = triggers.len(),
-                        "failed to re-register the watched directory tree"
+                        failures,
+                        "failed to re-register the watched directory tree; will retry"
                     );
                     // Most often something in the new tree is already gone
                     // again (`mkdir` then `rmdir`). Re-report each new
@@ -659,6 +692,16 @@ enum RegistrarTrigger {
     /// Something at this path was removed; it may have been a watched
     /// directory.
     Removed(PathBuf),
+    /// A registration failed earlier and is due again.
+    RetryRegistration,
+}
+
+/// How long to wait before registration is tried again after `failures`
+/// failures in a row: doubling from 100 ms, never more than 30 s.
+fn registration_retry_delay(failures: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(100)
+        .saturating_mul(1u32 << failures.saturating_sub(1).min(12))
+        .min(std::time::Duration::from_secs(30))
 }
 
 /// How the root is watched.
@@ -828,9 +871,10 @@ fn register_new_directory_tree(
 
 /// Returns every directory under `start`'s subtree this call newly
 /// registered a watch on — empty when every directory in `start`'s
-/// subtree was already registered (`watched.insert` returning `false`
-/// throughout), so no OS-level `stop`/recreate cycle occurred and there
-/// is nothing for a caller to reconcile.
+/// subtree was already registered, so no OS-level `stop`/recreate cycle
+/// occurred and there is nothing for a caller to reconcile. A directory whose
+/// registration fails is left out of `watched`, so a later call tries it
+/// again.
 fn register_non_ignored_directories<W: Watcher>(
     watcher: &mut W,
     watched: &mut BTreeSet<PathBuf>,
@@ -895,8 +939,13 @@ fn record_non_ignored_directories(
         if !entry.file_type().is_dir() {
             continue;
         }
-        if watched.insert(entry.path().to_path_buf()) {
+        // Recorded only once the registration has succeeded. A directory
+        // recorded before its `watch` failed would be skipped by every later
+        // pass as already watched, and nothing under it would ever be
+        // reported again.
+        if !watched.contains(entry.path()) {
             on_new(entry.path())?;
+            watched.insert(entry.path().to_path_buf());
             newly_registered.push(entry.path().to_path_buf());
         }
     }

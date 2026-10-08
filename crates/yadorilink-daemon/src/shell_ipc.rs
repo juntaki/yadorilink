@@ -25,10 +25,10 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use yadorilink_ipc_proto::framing::{read_message, write_message};
 use yadorilink_ipc_proto::shellipc::shell_ipc_message::Payload;
 use yadorilink_ipc_proto::shellipc::{
-    ContextAction, ContextActionResponse, FolderFileEntry, HydrateResponse,
-    ListFolderFilesResponse, ListOnDemandFoldersResponse, LocalWriteKind, LocalWriteResponse,
-    MaterializationState as ShellMaterializationState, OnDemandFolder, ShellIpcMessage,
-    StatusResponse,
+    ContextAction, ContextActionResponse, DomainEvidence, FolderFileEntry, HydrateResponse,
+    HydrationPolicy, ListFolderFilesResponse, ListProviderFoldersResponse,
+    LocalState as ShellLocalState, LocalTransition as ShellLocalTransition, LocalWriteKind,
+    LocalWriteResponse, ProviderFolder, ShellIpcMessage, StatusResponse,
 };
 
 use crate::shell_context::ShellContext;
@@ -48,21 +48,106 @@ fn shell_entry_kind(
     }
 }
 
-fn to_shell_materialization_state(
+/// The local state a shell is told for a path: whether an object stands and,
+/// independently, whether the content of the CURRENT version is usable. A
+/// regular file's object is current only where a usable proof names the
+/// version the row holds now (`exact`); an older object stands without current
+/// content, which makes a platform provider ask for the contents while still
+/// knowing the object exists. `None` is unknown (no row).
+pub(crate) fn to_shell_local_state(
     state: Option<yadorilink_replica_domain::session_state::MaterializationState>,
-) -> ShellMaterializationState {
-    match state {
-        Some(yadorilink_replica_domain::session_state::MaterializationState::Hydrated) => {
-            ShellMaterializationState::Hydrated
-        }
-        Some(yadorilink_replica_domain::session_state::MaterializationState::Placeholder) => {
-            ShellMaterializationState::Placeholder
-        }
-        Some(
-            yadorilink_replica_domain::session_state::MaterializationState::Hydrating
-            | yadorilink_replica_domain::session_state::MaterializationState::Evicting,
-        ) => ShellMaterializationState::Hydrating,
-        None => ShellMaterializationState::Unspecified,
+    exact: bool,
+) -> Option<ShellLocalState> {
+    use crate::application::ports::LocalTransition;
+    crate::shell_status::local_presence(state, exact).map(|presence| ShellLocalState {
+        local_object_present: presence.object_present,
+        current_content_present: presence.current_content_present,
+        transition: match presence.transition {
+            LocalTransition::None => ShellLocalTransition::None,
+            LocalTransition::Hydrating => ShellLocalTransition::Hydrating,
+            LocalTransition::Evicting => ShellLocalTransition::Evicting,
+        } as i32,
+    })
+}
+
+/// The provider roots the host should register as domains: every declared root whose
+/// link is live, with its hydration policy and whether its namespace is queryable
+/// (`registration_ready`). A read error is an error, never an empty list.
+fn now_unix_nanos() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
+}
+
+fn provider_folders(
+    context: &ShellContext,
+) -> Result<Vec<ProviderFolder>, crate::sync_error::SyncError> {
+    use yadorilink_replica_domain::session_state::MaterializationPolicy;
+    let links = context.replica_coordinator.link_repository().list_links()?;
+    let mut folders = Vec::new();
+    for root in context.replica_coordinator.provider_repository().list_declared_roots()? {
+        // An orphaned link's authorization is gone: `list_declared_roots` never returns
+        // its root, and the policy comes from the live link.
+        let Some(link) = links.iter().find(|link| link.group_id == root.group_id && !link.orphaned)
+        else {
+            continue;
+        };
+        let root_id = hex::decode(&root.root_id).map_err(|_| {
+            crate::sync_error::SyncError::CorruptState("a provider root id is not hex".into())
+        })?;
+        folders.push(ProviderFolder {
+            root_id,
+            group_id: root.group_id.clone().into_bytes(),
+            display_name: root.display_name.clone(),
+            hydration_policy: match link.materialization_policy {
+                MaterializationPolicy::Eager => HydrationPolicy::Eager,
+                MaterializationPolicy::OnDemand => HydrationPolicy::OnDemand,
+            } as i32,
+            registration_ready: root.namespace_ready,
+            latest_evidence_seq: root.latest_evidence_seq,
+        });
+    }
+    Ok(folders)
+}
+
+/// The domains the daemon wants removed: the roots with a requested removal intent.
+fn provider_removals(
+    context: &ShellContext,
+) -> Vec<yadorilink_ipc_proto::shellipc::ProviderRemoval> {
+    context
+        .replica_coordinator
+        .provider_repository()
+        .removals()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|removal| removal.requested)
+        .filter_map(|removal| {
+            Some(yadorilink_ipc_proto::shellipc::ProviderRemoval {
+                root_id: hex::decode(&removal.root_id).ok()?,
+                display_name: removal.display_name,
+            })
+        })
+        .collect()
+}
+
+/// Persists one readiness evidence message for the root it names. An unknown root is
+/// logged and ignored; a write failure is logged (the evidence is simply not recorded,
+/// which can only keep a root not ready).
+fn record_provider_evidence(
+    context: &ShellContext,
+    root_id: &[u8],
+    what: &str,
+    record: impl FnOnce(
+        &yadorilink_sync_sqlite::provider::ProviderRepository,
+        &str,
+    ) -> Result<bool, yadorilink_sync_sqlite::SyncSqliteError>,
+) {
+    let root = hex::encode(root_id);
+    match record(context.replica_coordinator.provider_repository(), &root) {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(root_id = %root, "{what} for an unknown provider root ignored"),
+        Err(error) => tracing::warn!(root_id = %root, %error, "could not record {what}"),
     }
 }
 
@@ -76,6 +161,14 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut push_rx = context.telemetry.subscribe_status();
+    // Messages the daemon pushes to THIS connection (provider requests for the host app).
+    let (host_tx, mut host_rx) = tokio::sync::mpsc::unbounded_channel::<ShellIpcMessage>();
+    // Materializations this connection started; they end with it.
+    let materializations = MaterializeRequests::default();
+    let handshakes = Arc::new(provider_apply::Handshakes::default());
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<Delivery>();
+    // When this connection ends while it is the attached host, there is no host and no evidence.
+    let _host_gone = HostDisconnect { context: &context, tx: host_tx.clone() };
     loop {
         tokio::select! {
             biased;
@@ -84,10 +177,44 @@ where
                 match incoming? {
                     None => return Ok(()), // client disconnected
                     Some(msg) => {
+                        if let Some(Payload::ExtensionHandshake(handshake)) = &msg.payload {
+                            handshakes.note(&handshake.root_id);
+                        }
+                        if materialize_message(&context, &materializations, &reply_tx, &msg)
+                            || provider_apply::apply_message(
+                                &context, &materializations, &handshakes, &reply_tx, &msg,
+                            )
+                            || provider_channel_message(&context, &host_tx, &msg).await
+                        {
+                            continue;
+                        }
+                        if let Some(response) =
+                            provider_enumerate::answer(&context, &handshakes, &msg).await
+                        {
+                            write_message(&mut write_half, &response).await?;
+                            continue;
+                        }
                         if let Some(response) = handle_message(&context, msg).await {
                             write_message(&mut write_half, &response).await?;
                         }
                     }
+                }
+            }
+
+            delivery = reply_rx.recv() => {
+                if let Some(delivery) = delivery {
+                    let written = write_message(&mut write_half, &delivery.message).await;
+                    // The sender learns whether the framed write really completed.
+                    if let Some(done) = delivery.written {
+                        let _ = done.send(written.is_ok());
+                    }
+                    written?;
+                }
+            }
+
+            pushed = host_rx.recv() => {
+                if let Some(message) = pushed {
+                    write_message(&mut write_half, &message).await?;
                 }
             }
 
@@ -97,6 +224,146 @@ where
                 }
             }
         }
+    }
+}
+
+/// Detaches the host and forgets what it reported when the connection that was the host ends.
+struct HostDisconnect<'a> {
+    context: &'a ShellContext,
+    tx: tokio::sync::mpsc::UnboundedSender<ShellIpcMessage>,
+}
+
+impl Drop for HostDisconnect<'_> {
+    fn drop(&mut self) {
+        if self.context.provider_host.detach(&self.tx) {
+            self.context.membership.clear();
+        }
+    }
+}
+
+/// The provider channel's connection-level messages: the host's acknowledgements complete the
+/// publication step that is waiting for them, and the app's domain state attaches this
+/// connection as the host (replaying every pending publication, and detecting a rolled-back
+/// database). Returns true when the message was consumed here.
+async fn provider_channel_message(
+    context: &ShellContext,
+    host_tx: &tokio::sync::mpsc::UnboundedSender<ShellIpcMessage>,
+    msg: &ShellIpcMessage,
+) -> bool {
+    match &msg.payload {
+        // Only the attached host's acknowledgements complete a publication step: any other
+        // connection on the user-owned socket could otherwise declare an eviction done.
+        Some(Payload::ProviderEvictDone(done)) => {
+            if context.provider_host.is_attached(host_tx) {
+                context.provider_host.complete_evict(done);
+            }
+            true
+        }
+        Some(Payload::ProviderSignalDone(done)) => {
+            if context.provider_host.is_attached(host_tx) {
+                context.provider_host.complete_signal(done);
+            }
+            true
+        }
+        Some(Payload::ProviderMaterializedReport(report)) => {
+            // A report for a root the daemon does not know (a stale root_id after a rebootstrap)
+            // is ignored: no state, no answer.
+            let root = hex::encode(&report.root_id);
+            let repo = context.replica_coordinator.provider_repository();
+            // Only the attached host's reports are evidence: any other connection on the
+            // user-owned socket could claim anything. An unknown root is ignored too.
+            let known = repo.group_of_root(&root).ok().flatten().is_some();
+            if known && context.provider_host.is_attached(host_tx) {
+                if let Ok(Some(latest_issued)) = repo.latest_evidence_seq(&root) {
+                    let ack = context.membership.apply(report, latest_issued);
+                    context.provider_host.send_to_host(Payload::ProviderReportAck(ack));
+                }
+            }
+            true
+        }
+        // The Eager driver's query: what should the host ask the OS to download next.
+        Some(Payload::NextProviderDownloadsRequest(request)) => {
+            if context.provider_host.is_attached(host_tx) {
+                let handoff_root = context.handoff.get();
+                let inputs = crate::provider_eager::EagerInputs {
+                    coordinator: &context.replica_coordinator,
+                    membership: &context.membership,
+                    staging_dir: handoff_root.as_ref().map(|h| h.staging_dir()),
+                    host_attached: true,
+                };
+                let response = context.eager.next_downloads(&inputs, request);
+                let _ = host_tx.send(ShellIpcMessage {
+                    payload: Some(Payload::NextProviderDownloadsResponse(response)),
+                });
+            }
+            true
+        }
+        // The OS refused a download request before any fetch: hold the item back for a while.
+        Some(Payload::ProviderDownloadRejected(rejected)) => {
+            if context.provider_host.is_attached(host_tx) {
+                if let Ok(item) = ItemIdBytes::try_from(rejected.item_id.as_slice()) {
+                    context.eager.record_rejection(
+                        &context.replica_coordinator,
+                        &hex::encode(&rejected.root_id),
+                        &item,
+                    );
+                }
+            }
+            true
+        }
+        Some(Payload::ProviderDomainState(state)) => {
+            let root = hex::encode(&state.root_id);
+            let repo = context.replica_coordinator.provider_repository();
+            // An unknown or old root_id is ignored entirely: it neither attaches a host nor
+            // counts as evidence. The one exception is the report of an ORPHAN domain (registered
+            // for a root this database does not know): it is only recorded, for `status`, and
+            // changes nothing, so the domain stays available for recovery.
+            if repo.group_of_root(&root).ok().flatten().is_none() {
+                if state.evidence() == DomainEvidence::Orphan
+                    && context.provider_host.is_attached(host_tx)
+                {
+                    context.provider_host.note_orphan(&root);
+                }
+                return true;
+            }
+            // Rollback evidence and the replay of pending work are accepted only from the
+            // attached host connection; a second connection cannot take the host over.
+            let was_attached = context.provider_host.is_attached(host_tx);
+            if !context.provider_host.try_attach(host_tx.clone()) {
+                return false;
+            }
+            if !was_attached {
+                // A different host took over: what the previous one reported says nothing now.
+                context.membership.clear();
+            }
+            // The report of a removal is handled with the evidence below; it is neither a rollback
+            // check nor a replay.
+            if state.evidence() == DomainEvidence::Removed {
+                return false;
+            }
+            // The host remembers the highest revision it acknowledged; a daemon revision below it
+            // means this database was restored: the OS holds state the daemon no longer knows.
+            // The root is replaced (a new root_id); the host sees the old one vanish from the
+            // provider-folder snapshot and removes that domain.
+            if repo
+                .namespace_revision(&root)
+                .ok()
+                .flatten()
+                .is_some_and(|ours| state.last_acked_namespace_revision > ours)
+            {
+                context
+                    .publication
+                    .rebootstrap_root(&root, "the daemon's namespace revision is behind the host's")
+                    .await;
+                return true;
+            }
+            if state.evidence() == DomainEvidence::Registered {
+                // Reconnect replay: every pending item runs its evict and signal again.
+                context.publication.kick(&root);
+            }
+            false
+        }
+        _ => false,
     }
 }
 
@@ -117,12 +384,15 @@ async fn handle_message(context: &ShellContext, msg: ShellIpcMessage) -> Option<
             let status = resolve_status_detail(&context.replica_coordinator, &q.path);
             let materialization_state =
                 resolve_materialization_state(&context.replica_coordinator, &q.path);
+            let exact = crate::shell_status::resolve_content_is_current(
+                &context.replica_coordinator,
+                &q.path,
+            );
             Some(ShellIpcMessage {
                 payload: Some(Payload::StatusResponse(StatusResponse {
                     path: q.path,
                     state: status.state as i32,
-                    materialization_state: to_shell_materialization_state(materialization_state)
-                        as i32,
+                    local_state: to_shell_local_state(materialization_state, exact),
                     status_detail: status.detail.unwrap_or_default(),
                 })),
             })
@@ -185,29 +455,8 @@ async fn handle_message(context: &ShellContext, msg: ShellIpcMessage) -> Option<
                         },
                     }
                 }
-                // on-demand-sync spec "Context Menu Actions Include Pin and
-                // Evict": the same daemon operations `yadorilink pin`/`yadorilink
-                // evict` (control_socket) drive, exposed via the shell
-                // extension's context menu instead of the CLI.
-                Ok(ContextAction::PinItem) => {
-                    match context.queries.linked_path.resolve(&req.path) {
-                        Some((group_id, rel_path)) => {
-                            match context
-                                .application
-                                .materialization
-                                .pin(&group_id, &rel_path)
-                                .await
-                            {
-                                Ok(()) => ContextActionResponse { ok: true, error: String::new() },
-                                Err(e) => ContextActionResponse { ok: false, error: e.to_string() },
-                            }
-                        }
-                        None => ContextActionResponse {
-                            ok: false,
-                            error: "path is not under any linked folder".into(),
-                        },
-                    }
-                }
+                // The same daemon operation `yadorilink evict` (control_socket)
+                // drives, exposed via the shell extension's context menu.
                 Ok(ContextAction::EvictItem) => {
                     match context.queries.linked_path.resolve(&req.path) {
                         Some((group_id, rel_path)) => {
@@ -215,8 +464,8 @@ async fn handle_message(context: &ShellContext, msg: ShellIpcMessage) -> Option<
                                 // `Ok` alone does not mean the
                                 // file was actually freed -- `evict_file`
                                 // can return `Ok` while leaving it fully
-                                // materialized (pinned, busy, not yet
-                                // `Hydrated`, or changed on disk right
+                                // materialized (busy, not yet
+                                // `Present`, or changed on disk right
                                 // before the commit). `ok: true` here must
                                 // mean "the action was performed," not
                                 // merely "the request didn't error" -- see
@@ -230,8 +479,8 @@ async fn handle_message(context: &ShellContext, msg: ShellIpcMessage) -> Option<
                                 }
                                 Ok(_) => ContextActionResponse {
                                     ok: false,
-                                    error: "not evicted: the file may be pinned, busy, not fully \
-                                            synced, or was just modified"
+                                    error: "not evicted: the file may be busy, not fully synced, \
+                                            or was just modified"
                                         .into(),
                                 },
                                 Err(e) => ContextActionResponse { ok: false, error: e.to_string() },
@@ -264,35 +513,86 @@ async fn handle_message(context: &ShellContext, msg: ShellIpcMessage) -> Option<
         // remove every registered domain. `snapshot_available` makes the
         // distinction explicit on the wire instead of relying on the
         // client inferring it from a transport-level failure.
-        Some(Payload::ListOnDemandFoldersRequest(_)) => {
-            let response = match context.replica_coordinator.link_repository().list_links() {
-                Ok(links) => {
-                    let folders = links
-                        .into_iter()
-                        .filter(|l| {
-                            l.materialization_policy
-                                == yadorilink_replica_domain::session_state::MaterializationPolicy::OnDemand
-                                // An orphaned link's coordination-side
-                                // authorization is gone -- it must never be
-                                // handed to the platform virtual-filesystem
-                                // provider as a sync root to enumerate and
-                                // register placeholders for.
-                                && !l.orphaned
-                        })
-                        .map(|l| OnDemandFolder { local_path: l.local_path, group_id: l.group_id })
-                        .collect();
-                    ListOnDemandFoldersResponse { folders, snapshot_available: true }
-                }
-                Err(e) => {
+        Some(Payload::ListProviderFoldersRequest(request)) => {
+            // The host app tells the daemon where its app group container is (once; additive).
+            if !request.app_group_container.is_empty() {
+                context.handoff.adopt(&request.app_group_container);
+            }
+            let response = match provider_folders(context) {
+                Ok(folders) => ListProviderFoldersResponse {
+                    folders,
+                    snapshot_available: true,
+                    removals: provider_removals(context),
+                },
+                Err(error) => {
                     tracing::warn!(
-                        error = %e,
-                        "failed to list links for ListOnDemandFoldersRequest; reporting \
+                        %error,
+                        "failed to list provider roots for ListProviderFoldersRequest; reporting \
                          snapshot_available=false rather than an empty snapshot"
                     );
-                    ListOnDemandFoldersResponse { folders: Vec::new(), snapshot_available: false }
+                    ListProviderFoldersResponse {
+                        folders: Vec::new(),
+                        snapshot_available: false,
+                        removals: Vec::new(),
+                    }
                 }
             };
-            Some(ShellIpcMessage { payload: Some(Payload::ListOnDemandFoldersResponse(response)) })
+            Some(ShellIpcMessage { payload: Some(Payload::ListProviderFoldersResponse(response)) })
+        }
+        // Readiness evidence from the host app and the extension. No response: the
+        // evidence is persisted and the next listing/status reflects it.
+        Some(Payload::ProviderDomainState(state)) => {
+            let repo = context.replica_coordinator.provider_repository();
+            let group = repo.group_of_root(&hex::encode(&state.root_id)).ok().flatten();
+            // Only OBSERVED evidence changes the root: a registration, or the confirmed removal of a
+            // domain that was registered. "Unknown" (an unreadable list) and "not registered yet"
+            // are no-ops: the root is never rebootstrapped on a guess.
+            let evidence = state.evidence();
+            match evidence {
+                DomainEvidence::Registered => {
+                    record_provider_evidence(
+                        context,
+                        &state.root_id,
+                        "domain state",
+                        |repo, root| repo.set_domain_registered(root, true),
+                    );
+                }
+                // The removal of a domain: a requested removal is finished (state deleted, the
+                // preserved location recorded); a domain the user removed replaces the root.
+                DomainEvidence::Removed => {
+                    record_provider_evidence(
+                        context,
+                        &state.root_id,
+                        "domain removal",
+                        |repo, root| repo.domain_removed(root, &state.preserved_location),
+                    );
+                    // Prompt the host (this connection) to list again: it sees the replacement
+                    // root, or the finished removal.
+                    match group.and_then(|group| repo.declaration_for_group(&group).ok()) {
+                        Some(yadorilink_sync_sqlite::provider::ProviderDeclaration::Provider(
+                            root,
+                        )) => context.provider_host.push_folders_changed(&root.root_id),
+                        _ => context.provider_host.push_folders_changed(""),
+                    }
+                }
+                _ => {}
+            }
+            None
+        }
+        Some(Payload::ExtensionHandshake(handshake)) => {
+            record_provider_evidence(
+                context,
+                &handshake.root_id,
+                "extension handshake",
+                |repo, root| repo.record_extension_handshake(root, now_unix_nanos()),
+            );
+            None
+        }
+        Some(Payload::ProviderError(error)) => {
+            record_provider_evidence(context, &error.root_id, "provider error", |repo, root| {
+                repo.record_provider_error(root, &error.description)
+            });
+            None
         }
         // Every read below fails the whole listing closed
         // (`snapshot_available: false`, no entries) rather than collapsing
@@ -310,8 +610,7 @@ async fn handle_message(context: &ShellContext, msg: ShellIpcMessage) -> Option<
                 // it the same as "no such link" here, so its folder is
                 // never enumerated for placeholder registration either.
                 // Neither has a listing to confirm.
-                let Some(l) =
-                    links.into_iter().find(|l| l.local_path == req.local_path && !l.orphaned)
+                let Some(l) = links.into_iter().find(|l| l.key() == req.local_path && !l.orphaned)
                 else {
                     break 'listing Err("local_path is not a currently linked, live folder".into());
                 };
@@ -324,7 +623,7 @@ async fn handle_message(context: &ShellContext, msg: ShellIpcMessage) -> Option<
                     Err(e) => break 'listing Err(format!("failed to list files: {e}")),
                 };
                 // Only needed to mint/persist a Windows CfAPI
-                // generation for entries reported as `Placeholder`
+                // generation for entries reported as `Remote`
                 // below -- looked up once per link, not once per
                 // file. `None` (link not currently running) means
                 // every such entry's `placeholder_generation` stays
@@ -335,12 +634,19 @@ async fn handle_message(context: &ShellContext, msg: ShellIpcMessage) -> Option<
                 let runtime = context.links.runtime(&req.local_path);
                 let mut entries = Vec::new();
                 for (f, record_kind) in files.into_iter().filter(|(f, _)| !f.deleted) {
-                    let materialization_state = match context
+                    let local_state = match context
                         .replica_coordinator
                         .materialization_state_repository()
                         .get_materialization_state(&l.group_id, &f.path)
                     {
-                        Ok(s) => to_shell_materialization_state(s),
+                        Ok(s) => to_shell_local_state(
+                            s,
+                            record_kind != yadorilink_replica_domain::file::RecordKind::File
+                                || context
+                                    .replica_coordinator
+                                    .local_copy_names_current_version(&l.group_id, &f.path)
+                                    .unwrap_or(false),
+                        ),
                         Err(e) => {
                             break 'listing Err(format!(
                                 "failed to read the materialization state of {}: {e}",
@@ -348,36 +654,40 @@ async fn handle_message(context: &ShellContext, msg: ShellIpcMessage) -> Option<
                             ));
                         }
                     };
-                    let placeholder_generation =
-                        if materialization_state == ShellMaterializationState::Placeholder {
-                            runtime.as_ref().and_then(|runtime| {
-                                match runtime
-                                    .ensure_windows_placeholder_generation(&l.group_id, &f.path)
-                                {
-                                    Ok(generation) => Some(generation),
-                                    Err(error) => {
-                                        tracing::warn!(
-                                            group_id = %l.group_id,
-                                            path = %f.path,
-                                            error = %error,
-                                            "failed to mint/persist a Windows CfAPI \
-                                             placeholder generation; cfapi-host will retry \
-                                             creating this placeholder next poll"
-                                        );
-                                        None
-                                    }
+                    let needs_placeholder = local_state.as_ref().is_some_and(|s| {
+                        !s.current_content_present
+                            && s.transition == ShellLocalTransition::None as i32
+                    });
+                    let placeholder_generation = if cfg!(windows) && needs_placeholder {
+                        runtime.as_ref().and_then(|runtime| {
+                            match runtime
+                                .ensure_windows_placeholder_generation(&l.group_id, &f.path)
+                            {
+                                Ok(generation) => Some(generation),
+                                Err(error) => {
+                                    tracing::warn!(
+                                        group_id = %l.group_id,
+                                        path = %f.path,
+                                        error = %error,
+                                        "failed to mint/persist a Windows CfAPI \
+                                         placeholder generation; cfapi-host will retry \
+                                         creating this placeholder next poll"
+                                    );
+                                    None
                                 }
-                            })
-                        } else {
-                            None
-                        };
+                            }
+                        })
+                    } else {
+                        None
+                    };
                     entries.push(FolderFileEntry {
                         relative_path: f.path,
                         size: f.size,
                         mtime_unix_nanos: f.mtime_unix_nanos,
-                        materialization_state: materialization_state as i32,
+                        local_state,
                         placeholder_generation,
                         kind: shell_entry_kind(record_kind) as i32,
+                        item_id: Vec::new(),
                     });
                 }
                 Ok(entries)
@@ -409,10 +719,12 @@ async fn handle_message(context: &ShellContext, msg: ShellIpcMessage) -> Option<
             let response = 'resolve: {
                 let kind = match LocalWriteKind::try_from(req.kind) {
                     Ok(LocalWriteKind::CreatedOrModified) => {
-                        yadorilink_filesystem_sync::watcher::FsChangeKind::CreatedOrModified
+                        crate::link_runtime::operations::capture_local_change::LocalWrite::CreatedOrModified
                     }
+                    // The provider's `deleteItem` is the user deleting the
+                    // logical item, not an observation of a missing file.
                     Ok(LocalWriteKind::Deleted) => {
-                        yadorilink_filesystem_sync::watcher::FsChangeKind::Removed
+                        crate::link_runtime::operations::capture_local_change::LocalWrite::Deleted
                     }
                     Ok(LocalWriteKind::Unspecified) | Err(_) => {
                         break 'resolve LocalWriteResponse {
@@ -439,7 +751,7 @@ async fn handle_message(context: &ShellContext, msg: ShellIpcMessage) -> Option<
                 };
                 let Some(group_id) = links
                     .into_iter()
-                    .find(|l| l.local_path == req.local_path && !l.orphaned)
+                    .find(|l| l.key() == req.local_path && !l.orphaned)
                     .map(|l| l.group_id)
                 else {
                     break 'resolve LocalWriteResponse {
@@ -460,7 +772,50 @@ async fn handle_message(context: &ShellContext, msg: ShellIpcMessage) -> Option<
             };
             Some(ShellIpcMessage { payload: Some(Payload::LocalWriteResponse(response)) })
         }
+        // User activity on a provider root pauses its prefetch (one push) and is remembered.
+        Some(Payload::ProviderActivity(activity)) => {
+            let root = hex::encode(&activity.root_id);
+            let known = context
+                .replica_coordinator
+                .provider_repository()
+                .group_of_root(&root)
+                .ok()
+                .flatten()
+                .is_some();
+            if known
+                && context.prefetch.on_activity(
+                    &root,
+                    &activity.item_id,
+                    activity.activity_kind(),
+                    std::time::Instant::now(),
+                )
+            {
+                context
+                    .provider_host
+                    .send_to_host(crate::provider_prefetch::Action::Pause(root).into_payload());
+            }
+            None
+        }
+        Some(Payload::ProviderPrefetchDone(done)) => {
+            context.prefetch.on_done(
+                &hex::encode(&done.root_id),
+                done.hint_id,
+                done.result(),
+                std::time::Instant::now(),
+            );
+            None
+        }
         _ => None, // StatusResponse/StatusPush/ContextActionResponse/... are server->client only
+    }
+}
+
+/// Test seam for sibling modules: dispatches one message and reports whether a
+/// `LocalWriteResponse` said `ok`.
+#[cfg(test)]
+pub(crate) async fn handle_message_for_tests(context: &ShellContext, msg: ShellIpcMessage) -> bool {
+    match handle_message(context, msg).await.and_then(|m| m.payload) {
+        Some(Payload::LocalWriteResponse(r)) => r.ok,
+        _ => false,
     }
 }
 
@@ -470,6 +825,15 @@ mod item_pause_tests;
 mod list_folder_files_tests;
 #[cfg(test)]
 mod local_write_tests;
+#[cfg(test)]
+mod provider_tests;
+
+mod provider_apply;
+mod provider_enumerate;
+mod provider_materialize;
+use provider_materialize::{materialize_message, Delivery, MaterializeRequests};
+
+type ItemIdBytes = yadorilink_sync_sqlite::provider::ItemId;
 
 /// Reference client implementation: the shell extension's
 /// native shim (Rust via `windows-rs` on Windows per or an FFI

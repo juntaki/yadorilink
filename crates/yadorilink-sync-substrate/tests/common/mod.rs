@@ -40,7 +40,7 @@ pub fn serve_echo(link: PeerLink) -> tokio::task::JoinHandle<()> {
     })
 }
 
-/// Echo the reconciliation and bundle lanes; hold block streams open without
+/// Echo the service lane; hold block streams open without
 /// ever reading a byte, standing in for a receiver whose storage writer is
 /// blocked.
 // Used by `substrate_gates` only; `in_process_relay` compiles this module too.
@@ -49,7 +49,7 @@ pub fn serve_with_stalled_block_lane(link: PeerLink) -> tokio::task::JoinHandle<
     tokio::spawn(async move {
         while let Ok(lane) = link.accept_lane().await {
             match lane.lane() {
-                Lane::Reconciliation | Lane::History | Lane::Service => {
+                Lane::Service => {
                     tokio::spawn(async move {
                         let (mut send, mut recv) = lane.split();
                         let _ = tokio::io::copy(&mut recv, &mut send).await;

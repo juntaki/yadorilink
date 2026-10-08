@@ -621,7 +621,7 @@ fn revocation_after_a_checkpoint_was_issued_does_not_retroactively_invalidate_it
     // including after a later revocation -- because a LATER
     // revocation cannot un-sign an already-issued checkpoint. What a
     // later revocation actually prevents is the authority issuing the
-    // NEXT checkpoint -- see design doc §3.4 for the linearization
+    // NEXT checkpoint -- see the linearization
     // contract that makes this precise, and
     // `checkpoint_issuance_linearization` below for why a naive
     // read-then-sign issuance protocol does NOT give you this
@@ -671,4 +671,147 @@ fn checkpoint_hash_changes_if_either_the_checkpoint_or_the_signature_changes() {
     forged_sig[0] ^= 1;
     let h3 = checkpoint_hash(&encoded, &forged_sig);
     assert_ne!(h1, h3);
+}
+
+/// Every proof of one batch, the way a batch flush needs them.
+fn all_proofs(hashes: &[[u8; 32]]) -> Vec<MerkleProof> {
+    build_merkle_proofs(hashes)
+}
+
+fn hashes_for_proofs(count: usize) -> Vec<[u8; 32]> {
+    (0..count as u64)
+        .map(|i| {
+            let mut hash = [0u8; 32];
+            hash[..8].copy_from_slice(&i.to_be_bytes());
+            hash
+        })
+        .collect()
+}
+
+fn counted<T>(work: impl FnOnce() -> T) -> (T, u64) {
+    hash_count::reset();
+    let value = work();
+    (value, hash_count::get())
+}
+
+#[test]
+fn building_every_proof_of_a_batch_costs_a_linear_number_of_hashes() {
+    let small = hashes_for_proofs(1024);
+    let large = hashes_for_proofs(2048);
+    let (_, small_hashes) = counted(|| all_proofs(&small));
+    let (_, large_hashes) = counted(|| all_proofs(&large));
+    assert!(small_hashes <= 4 * 1024, "{small_hashes} hashes for 1024 leaves");
+    assert!(large_hashes <= 4 * 2048, "{large_hashes} hashes for 2048 leaves");
+    assert!(
+        large_hashes * 2 <= small_hashes * 5,
+        "doubling the batch took {small_hashes} -> {large_hashes} hashes"
+    );
+}
+
+#[test]
+fn verifying_every_proof_of_a_batch_costs_n_log_n_hashes() {
+    let (authority_sk, authority_vk) = keypair();
+    let key_id = fingerprint_signing_key(&authority_vk);
+    let (_, device_vk) = device_keypair();
+    let fp = fingerprint_signing_key(&device_vk);
+    let hashes = hashes_for_proofs(2048);
+    let checkpoint = base_checkpoint(fp, key_id, merkle_root(&hashes), hashes.len());
+    let sig = sign_checkpoint(&checkpoint, &authority_sk);
+    let proofs = all_proofs(&hashes);
+
+    let ((), spent) = counted(|| {
+        for (hash, proof) in hashes.iter().zip(&proofs) {
+            verify_change_admission(
+                "group-1",
+                "device-A",
+                &device_vk,
+                *hash,
+                proof,
+                &checkpoint,
+                &sig,
+                single_key_resolver(key_id, authority_vk),
+            )
+            .unwrap();
+        }
+    });
+    // One leaf hash plus one node hash per level for each leaf.
+    assert!(spent <= 2048 * (1 + 11), "{spent} hashes verifying 2048 proofs");
+}
+
+#[test]
+fn batch_proofs_equal_the_single_leaf_proofs_and_verify_for_every_batch_size() {
+    // Every size up to 64 (all odd/even level shapes, the single-leaf batch),
+    // then a deterministic spread of larger sizes.
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut sizes: Vec<usize> = (1..=64).collect();
+    for _ in 0..24 {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        sizes.push(65 + (state >> 33) as usize % 236);
+    }
+    for count in sizes {
+        let hashes = hashes_for_proofs(count);
+        let root = merkle_root(&hashes);
+        let proofs = build_merkle_proofs(&hashes);
+        assert_eq!(proofs.len(), count);
+        for (index, proof) in proofs.iter().enumerate() {
+            assert_eq!(proof, &build_merkle_proof(&hashes, index), "n={count} leaf {index}");
+            assert_eq!(recompute_root_from_proof(&hashes[index], proof), root);
+        }
+    }
+}
+
+#[test]
+fn the_batch_split_of_admission_gives_the_single_leaf_verdict_for_valid_and_invalid_inputs() {
+    let (authority_sk, authority_vk) = keypair();
+    let key_id = fingerprint_signing_key(&authority_vk);
+    let (_, device_vk) = device_keypair();
+    let fp = fingerprint_signing_key(&device_vk);
+    let hashes = hashes_for_proofs(7);
+    let checkpoint = base_checkpoint(fp, key_id, merkle_root(&hashes), hashes.len());
+    let signature = sign_checkpoint(&checkpoint, &authority_sk);
+    let mut bad_signature = signature;
+    bad_signature[0] ^= 1;
+    let mut wrong_root = checkpoint.clone();
+    wrong_root.merkle_root[0] ^= 1;
+    let mut wrong_count = checkpoint.clone();
+    wrong_count.leaf_count += 1;
+    let proofs = build_merkle_proofs(&hashes);
+    let mut short = proofs[3].clone();
+    short.siblings.pop();
+    let mut moved = proofs[3].clone();
+    moved.leaf_index = 4;
+
+    let cases = [
+        (&checkpoint, &signature, "group-1", hashes[3], &proofs[3]),
+        (&checkpoint, &bad_signature, "group-1", hashes[3], &proofs[3]),
+        (&checkpoint, &signature, "other-group", hashes[3], &proofs[3]),
+        (&checkpoint, &signature, "group-1", hashes[2], &proofs[3]),
+        (&checkpoint, &signature, "group-1", hashes[3], &short),
+        (&checkpoint, &signature, "group-1", hashes[3], &moved),
+        (&wrong_root, &signature, "group-1", hashes[3], &proofs[3]),
+        (&wrong_count, &signature, "group-1", hashes[3], &proofs[3]),
+    ];
+    for (n, (checkpoint, signature, group, hash, proof)) in cases.into_iter().enumerate() {
+        let single = verify_change_admission(
+            group,
+            "device-A",
+            &device_vk,
+            hash,
+            proof,
+            checkpoint,
+            signature,
+            single_key_resolver(key_id, authority_vk),
+        );
+        let batch = verify_checkpoint_authorization(
+            group,
+            "device-A",
+            &device_vk,
+            checkpoint,
+            signature,
+            single_key_resolver(key_id, authority_vk),
+        )
+        .and_then(|()| verify_change_inclusion(hash, proof, checkpoint));
+        assert_eq!(batch, single, "case {n}");
+        assert_eq!(single.is_ok(), n == 0, "case {n}: {single:?}");
+    }
 }

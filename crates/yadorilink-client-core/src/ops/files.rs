@@ -1,5 +1,5 @@
 //! Per-file operations inside linked folders: conflicts, trash, version
-//! history, and on-demand materialization (pin, unpin, hydrate, evict).
+//! history, and on-demand materialization (hydrate, evict).
 //!
 //! Paths are absolute paths under a linked folder; resolving what a person
 //! typed into one is the caller's job.
@@ -9,9 +9,8 @@ use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPay
 use yadorilink_ipc_proto::daemonctl::{
     ConflictedFileInfo, EvictRequest, EvictResponse, FileVersionInfo, HydrateRequest,
     ListConflictsRequest, ListTrashRequest, ListVersionsRequest, MaterializationStatusRequest,
-    MaterializationStatusResponse, PinRequest, RestoreTrashOperationRequest,
-    RestoreTrashOperationResponse, RestoreTrashRequest, RestoreVersionRequest, TrashedFileInfo,
-    UnpinRequest,
+    MaterializationStatusResponse, RestoreTrashOperationRequest, RestoreTrashOperationResponse,
+    RestoreTrashRequest, RestoreVersionRequest, TrashedFileInfo,
 };
 
 use crate::daemon::control;
@@ -102,18 +101,6 @@ pub async fn materialization_status(
     Ok(status)
 }
 
-/// Force-hydrates a placeholder file and keeps it hydrated.
-pub async fn pin_file(absolute_path: String) -> Result<(), CoreError> {
-    control::send(ReqPayload::Pin(PinRequest { absolute_path })).await?;
-    Ok(())
-}
-
-/// Allows a pinned file to become a placeholder again.
-pub async fn unpin_file(absolute_path: String) -> Result<(), CoreError> {
-    control::send(ReqPayload::Unpin(UnpinRequest { absolute_path })).await?;
-    Ok(())
-}
-
 /// Fetches a placeholder file's real content.
 pub async fn hydrate_file(absolute_path: String) -> Result<(), CoreError> {
     control::send(ReqPayload::Hydrate(HydrateRequest { absolute_path })).await?;
@@ -122,8 +109,8 @@ pub async fn hydrate_file(absolute_path: String) -> Result<(), CoreError> {
 
 /// Converts a hydrated file back into a placeholder to reclaim local disk
 /// space. Returns whether the file was actually dehydrated: a request that
-/// did nothing (the file is pinned, busy, not fully synced, or was just
-/// modified) must never read as success.
+/// did nothing (the file is busy, not fully synced, or was just modified)
+/// must never read as success.
 pub async fn evict_file(absolute_path: String) -> Result<bool, CoreError> {
     Ok(evict(absolute_path).await?.dehydrated)
 }

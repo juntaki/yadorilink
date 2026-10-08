@@ -56,7 +56,7 @@ impl WatchEvent {
         Self { path: path.into(), kind: FsChangeKind::CreatedOrModified }
     }
     fn removed(path: impl Into<String>) -> Self {
-        Self { path: path.into(), kind: FsChangeKind::Removed }
+        Self { path: path.into(), kind: FsChangeKind::ObservedRemoval }
     }
 }
 

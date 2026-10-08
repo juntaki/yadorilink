@@ -6,15 +6,19 @@ use std::path::{Path, PathBuf};
 use crate::error::LocalCaptureError;
 use yadorilink_filesystem_sync::debounce::DebounceFlush;
 use yadorilink_filesystem_sync::watcher::FsChangeKind;
+use yadorilink_replica_domain::file::FileRecord;
 
 use super::{FlushOutcome, LocalChangeProcessor};
 
-/// Serialized `FsChangeKind` as stored in the `local_dirty_paths` journal, so a
+/// Serialized `FsChangeKind` as stored (`"removed"` is an OBSERVED removal: the
+/// journal only ever records what was observed, so a replay after a restart
+/// is always an observed removal, never a semantic delete -- those are handled
+/// synchronously and are not journaled) in the `local_dirty_paths` journal, so a
 /// startup/backstop re-drive can reconstruct the exact `FsChangeEvent`.
 pub(super) fn dirty_kind_str(kind: FsChangeKind) -> &'static str {
     match kind {
         FsChangeKind::CreatedOrModified => "created_or_modified",
-        FsChangeKind::Removed => "removed",
+        FsChangeKind::ObservedRemoval => "removed",
     }
 }
 
@@ -23,7 +27,7 @@ pub(super) fn dirty_kind_str(kind: FsChangeKind) -> &'static str {
 /// out to be absent still self-corrects to a deletion inside `process_event`.
 pub(super) fn dirty_kind_from_str(s: &str) -> FsChangeKind {
     match s {
-        "removed" => FsChangeKind::Removed,
+        "removed" => FsChangeKind::ObservedRemoval,
         _ => FsChangeKind::CreatedOrModified,
     }
 }
@@ -31,6 +35,29 @@ pub(super) fn dirty_kind_from_str(s: &str) -> FsChangeKind {
 /// Why a path whose content changed while it was being read stays dirty.
 pub(super) const CHANGED_DURING_READ: &str =
     "content changed while it was being read; left for a later capture";
+
+fn journal_uncaptured(
+    state: &dyn crate::ports::LocalMutationStore,
+    root_lease: &yadorilink_root_authority::root_commit::RootLease,
+    group_id: &str,
+    rel_path: &str,
+    observed_at_unix_nanos: i64,
+) -> Result<(), LocalCaptureError> {
+    state.record_dirty_path(
+        group_id,
+        rel_path,
+        dirty_kind_str(FsChangeKind::CreatedOrModified),
+        observed_at_unix_nanos,
+        &root_lease.begin_operation()?.permit(),
+    )?;
+    state.mark_dirty_path_attempt(
+        group_id,
+        rel_path,
+        CHANGED_DURING_READ,
+        &root_lease.begin_operation()?.permit(),
+    )?;
+    Ok(())
+}
 
 impl LocalChangeProcessor {
     /// The key a flush of `path` under `root` journals it dirty by, or
@@ -51,20 +78,134 @@ impl LocalChangeProcessor {
         rel_path: &str,
         observed_at_unix_nanos: i64,
     ) -> Result<(), LocalCaptureError> {
-        self.state.record_dirty_path(
+        journal_uncaptured(
+            self.state.as_ref(),
+            &self.root_lease,
             group_id,
             rel_path,
-            dirty_kind_str(FsChangeKind::CreatedOrModified),
             observed_at_unix_nanos,
-            &self.begin_operation()?.permit(),
-        )?;
-        self.state.mark_dirty_path_attempt(
-            group_id,
-            rel_path,
-            CHANGED_DURING_READ,
-            &self.begin_operation()?.permit(),
-        )?;
-        Ok(())
+        )
+    }
+
+    /// Whether `blocks`, read at `rel_path`, are a pre-image of a write
+    /// still open over the path: an intent targets other content, and
+    /// `blocks` are content this daemon's own writes may have left there --
+    /// what the path was last proven to hold, or an earlier write the open
+    /// intent replaced before it was proven. The open write moved the row
+    /// and has not reached disk (it failed before its rename, or the daemon
+    /// stopped), so authoring these bytes would put older content over the
+    /// version being written; the write's own retry -- its intent stays
+    /// open, its obligation unsettled -- owns the path until it lands. A
+    /// real edit landing while such a write is open carries other bytes,
+    /// and is captured. (A user restoring exactly one of those contents in
+    /// that window is not told apart: the retry writes the newer version
+    /// over it, and the restored content stays in history.)
+    pub(super) fn is_pre_image_of_open_write(
+        &self,
+        group_id: &str,
+        rel_path: &str,
+        blocks: &[yadorilink_replica_domain::file::BlockInfo],
+    ) -> Result<bool, LocalCaptureError> {
+        let Some(intent_target) = self.state.materialization_intent_target(group_id, rel_path)?
+        else {
+            return Ok(false);
+        };
+        let disk_target = yadorilink_local_storage::intent_target_hash(blocks);
+        if intent_target == disk_target {
+            return Ok(false);
+        }
+        let pre_image =
+            self.state.pre_image_content_targets(group_id, rel_path)?.contains(&disk_target);
+        if pre_image {
+            tracing::info!(
+                group_id,
+                path = %rel_path,
+                "the bytes on disk are what an unfinished write is replacing; not a local edit"
+            );
+        }
+        Ok(pre_image)
+    }
+
+    /// [`Self::is_pre_image_of_open_write`] for a prepared upsert, checked
+    /// again under the path's lock right before it commits: a regular file
+    /// whose prepared bytes are the pre-image of a write open over the path
+    /// must not be authored. Anything else is not this check's business.
+    pub(super) fn authors_pre_image_of_open_write(
+        &self,
+        group_id: &str,
+        record: &FileRecord,
+        version: &yadorilink_replica_domain::file::FileVersion,
+    ) -> Result<bool, LocalCaptureError> {
+        if version.meta.record_kind != yadorilink_replica_domain::file::RecordKind::File {
+            return Ok(false);
+        }
+        self.is_pre_image_of_open_write(group_id, &record.path, &record.blocks)
+    }
+
+    /// Journals `rel_path` dirty once nothing holds its path lock, for a
+    /// pass that read the path while another writer held that lock and so
+    /// could neither author what it read nor journal it right away.
+    ///
+    /// Not right away, because the lock holder can be a write of a newer
+    /// version that has already moved the row ahead of the disk: a path
+    /// journaled dirty in that window reads to that write as a local edit
+    /// landing over its target, and it abandons the newer version. Taken
+    /// after the holder releases, the journal entry only asks for one more
+    /// capture under the lock, which compares the disk with whatever row
+    /// the holder left and authors exactly what differs.
+    ///
+    /// The waiter holds no other lock while it waits and takes this one by
+    /// itself, so it cannot take part in a lock-order cycle; the lock is
+    /// fair, so a path that is busy again and again is still journaled
+    /// once its turn comes.
+    pub(super) fn journal_uncaptured_once_unlocked(&self, group_id: &str, rel_path: &str) {
+        let key = (group_id.to_owned(), rel_path.to_owned());
+        let Some(waiter) = DeferredJournalWaiter::register(&self.deferred_journal_waiters, key)
+        else {
+            // A waiter for this path is already queued; it journals the
+            // path when the lock frees, which is all this pass needs.
+            return;
+        };
+        let lock = self.state.path_lock(group_id, rel_path);
+        let state = self.state.clone();
+        let root_lease = self.root_lease.clone();
+        let group_id = group_id.to_owned();
+        let rel_path = rel_path.to_owned();
+        // Runs under the path lock and unregisters before returning, so
+        // before the lock is released: a pass that finds the lock busy
+        // after that registers a waiter of its own. A waiter dropped without
+        // running (its task dropped at shutdown) unregisters too.
+        let journal = move || {
+            if let Err(error) = journal_uncaptured(
+                state.as_ref(),
+                &root_lease,
+                &group_id,
+                &rel_path,
+                super::now_unix_nanos(),
+            ) {
+                tracing::warn!(
+                    group_id,
+                    path = %rel_path,
+                    %error,
+                    "could not journal a path a scan left uncaptured; the next scan reads it again"
+                );
+            }
+            drop(waiter);
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    let _guard = lock.lock_owned().await;
+                    journal();
+                });
+            }
+            Err(_) => {
+                std::thread::spawn(move || {
+                    let _guard = lock.blocking_lock_owned();
+                    journal();
+                });
+            }
+        }
     }
 
     /// Re-drives every path still journaled dirty for `group_id` through the
@@ -73,7 +214,7 @@ impl LocalChangeProcessor {
     /// in-flight retry. Each `local_dirty_paths` row is turned back into the
     /// exact `FsChangeEvent` the debounce executor would have processed and run
     /// through `process_flush`, which re-reads the path, re-derives its record,
-    /// commits the index + change DAG, and (on success) clears the row. A path
+    /// commits the index + native state, and (on success) clears the row. A path
     /// whose on-disk content already matches the index resolves to `None` and
     /// is simply cleared — idempotent, never a spurious re-edit; one that still
     /// can't be processed stays journaled for the next attempt. Returns the
@@ -125,5 +266,39 @@ impl LocalChangeProcessor {
             })
             .collect();
         self.process_flush(group_id, root, DebounceFlush::Paths(paths)).await
+    }
+}
+
+type WaiterSet = std::sync::Arc<std::sync::Mutex<std::collections::HashSet<(String, String)>>>;
+
+/// One queued deferred journal write, registered in its processor's waiter
+/// set for as long as it exists.
+struct DeferredJournalWaiter {
+    waiters: WaiterSet,
+    key: (String, String),
+}
+
+impl DeferredJournalWaiter {
+    /// `None` when a waiter for `key` is already registered.
+    fn register(waiters: &WaiterSet, key: (String, String)) -> Option<Self> {
+        let inserted =
+            waiters.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(key.clone());
+        inserted.then(|| Self { waiters: waiters.clone(), key })
+    }
+}
+
+impl Drop for DeferredJournalWaiter {
+    fn drop(&mut self) {
+        self.waiters.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&self.key);
+    }
+}
+
+#[cfg(test)]
+impl LocalChangeProcessor {
+    /// How many deferred journal waiters exist right now: each holds a
+    /// handle on the waiter set, so this counts the waiters themselves,
+    /// not the paths they registered.
+    pub(super) fn deferred_journal_waiter_count(&self) -> usize {
+        std::sync::Arc::strong_count(&self.deferred_journal_waiters) - 1
     }
 }

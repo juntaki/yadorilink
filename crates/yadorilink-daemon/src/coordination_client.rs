@@ -308,6 +308,11 @@ pub enum RemoteEvidenceErrorCategory {
     /// parse) so a caller can tell "the plane is ahead of this build" apart
     /// from "the plane sent garbage".
     Unsupported,
+    /// The operation is recorded and approved but not finished (a device
+    /// removal whose credentials may already be stopped): neither committed
+    /// nor rejected. The outcome is unresolved; retry with the SAME operation
+    /// id to complete it.
+    Pending,
 }
 
 /// A remote-evidence lookup's failure: the category above, plus a
@@ -697,6 +702,7 @@ mod imp {
         operation_id: &str,
         name: &str,
         device_id: &str,
+        storage_mode: &str,
     ) -> super::EnrollmentPrepareOutcome {
         use super::EnrollmentPrepareOutcome;
 
@@ -706,6 +712,7 @@ mod imp {
             operation_id: &'a str,
             name: &'a str,
             creating_device_id: &'a str,
+            storage_mode: &'a str,
         }
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
@@ -715,7 +722,7 @@ mod imp {
 
         let response = match reqwest::Client::new()
             .post(format!("{addr}/shares/groups/prepare"))
-            .json(&Body { operation_id, name, creating_device_id: device_id })
+            .json(&Body { operation_id, name, creating_device_id: device_id, storage_mode })
             .send_authorized(auth)
             .await
         {
@@ -1225,6 +1232,28 @@ mod imp {
         }
     }
 
+    /// The JSON body of an authorization-checkpoint request. Ordinary
+    /// publication requests carry no `purpose`, so they are unchanged; a
+    /// seal names it explicitly.
+    fn checkpoint_request_body(
+        device_id: &str,
+        request_id: &str,
+        merkle_root: [u8; 32],
+        leaf_count: u64,
+        purpose: crate::checkpoint_source::CheckpointPurpose,
+    ) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "deviceId": device_id,
+            "requestId": request_id,
+            "merkleRootBase64": base64::engine::general_purpose::STANDARD.encode(merkle_root),
+            "leafCount": leaf_count,
+        });
+        if purpose == crate::checkpoint_source::CheckpointPurpose::Seal {
+            body["purpose"] = serde_json::Value::from("seal");
+        }
+        body
+    }
+
     /// Requests (or, for an already-decided `request_id`,
     /// replays) a signed `AuthorizationCheckpoint` for `device_id`'s
     /// pending batch, via coordination-worker's
@@ -1235,8 +1264,7 @@ mod imp {
     /// `checkpoint_source::pending_batch_request_id` — so a retry after a
     /// lost response reuses the SAME decided record rather than being
     /// judged (and potentially refused) as a brand new request against
-    /// possibly-changed writer status (design doc §3.4's corrected retry
-    /// semantics).
+    /// possibly-changed writer status.
     ///
     /// Best-effort like every other call in this module: `None` on any
     /// failure, including a legitimate 403 ("not currently a writer" —
@@ -1244,6 +1272,7 @@ mod imp {
     /// conflict — should never happen for a caller deriving `request_id`
     /// correctly, logged at `warn` since it indicates a caller bug rather
     /// than an expected outcome).
+    #[allow(clippy::too_many_arguments)]
     pub async fn request_authorization_checkpoint(
         addr: &str,
         auth: &CoordinationAuth,
@@ -1252,18 +1281,11 @@ mod imp {
         request_id: &str,
         merkle_root: [u8; 32],
         leaf_count: u64,
+        purpose: crate::checkpoint_source::CheckpointPurpose,
     ) -> Option<(
         yadorilink_replica_domain::authorization_checkpoint::AuthorizationCheckpoint,
         [u8; 64],
     )> {
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Body<'a> {
-            device_id: &'a str,
-            request_id: &'a str,
-            merkle_root_base64: String,
-            leaf_count: u64,
-        }
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Resp {
@@ -1285,12 +1307,7 @@ mod imp {
             bytes.try_into().ok()
         }
         let url = format!("{addr}/shares/groups/{group_id}/authorization-checkpoint");
-        let body = Body {
-            device_id,
-            request_id,
-            merkle_root_base64: base64::engine::general_purpose::STANDARD.encode(merkle_root),
-            leaf_count,
-        };
+        let body = checkpoint_request_body(device_id, request_id, merkle_root, leaf_count, purpose);
         let result = reqwest::Client::new().post(&url).json(&body).send_authorized(auth).await;
         match result {
             Ok(resp) if resp.status().is_success() => match resp.json::<Resp>().await {
@@ -1697,6 +1714,16 @@ mod imp {
         let status = match parsed.status.as_str() {
             "committed" => MembershipRemoteStatus::Committed,
             "definitely-rejected" => MembershipRemoteStatus::DefinitelyRejected,
+            // An approved removal that has not finished: neither outcome is
+            // known, and the same operation id completes it.
+            "removal-pending" => {
+                return Err(RemoteQueryError {
+                    category: RemoteEvidenceErrorCategory::Pending,
+                    message: format!(
+                        "membership operation {operation_id} is still pending; retry it with the same operation id"
+                    ),
+                });
+            }
             other => {
                 return Err(RemoteQueryError {
                     category: RemoteEvidenceErrorCategory::Unsupported,
@@ -2259,9 +2286,10 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::{
-            activate_invite_accept, coord_error_message, fetch_edge_state, prepare_create,
-            prepare_invite_accept, resolve_edge,
+            activate_invite_accept, checkpoint_request_body, coord_error_message, fetch_edge_state,
+            prepare_create, prepare_invite_accept, request_authorization_checkpoint, resolve_edge,
         };
+        use crate::checkpoint_source::CheckpointPurpose;
         use crate::coordination_client::{ActivateOutcome, EnrollmentPrepareOutcome};
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2273,6 +2301,42 @@ mod imp {
         /// that takes a string at all.
         fn test_auth() -> yadorilink_fapi_client::CoordinationAuth {
             yadorilink_fapi_client::test_support::offline_auth()
+        }
+
+        #[test]
+        fn a_seal_checkpoint_request_names_its_purpose_and_a_publication_one_does_not() {
+            let seal = checkpoint_request_body("dev", "req", [7; 32], 1, CheckpointPurpose::Seal);
+            assert_eq!(seal["purpose"], "seal");
+            let publication =
+                checkpoint_request_body("dev", "req", [7; 32], 3, CheckpointPurpose::Publication);
+            assert!(publication.get("purpose").is_none(), "publication requests are unchanged");
+            assert_eq!(publication["leafCount"], 3);
+        }
+
+        #[tokio::test]
+        async fn the_checkpoint_request_posts_the_seal_purpose_to_the_issuance_route() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/shares/groups/g1/authorization-checkpoint"))
+                .respond_with(ResponseTemplate::new(403))
+                .mount(&server)
+                .await;
+            let seal = request_authorization_checkpoint(
+                &server.uri(),
+                &test_auth(),
+                "g1",
+                "dev",
+                "req",
+                [1; 32],
+                1,
+                CheckpointPurpose::Seal,
+            )
+            .await;
+            assert!(seal.is_none());
+            let requests = server.received_requests().await.expect("recorded requests");
+            assert_eq!(requests.len(), 1);
+            let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+            assert_eq!(body["purpose"], "seal");
         }
 
         #[test]
@@ -2323,7 +2387,8 @@ mod imp {
                 .await;
 
             let outcome =
-                prepare_create(&server.uri(), &test_auth(), "op-1", "photos", "device-a").await;
+                prepare_create(&server.uri(), &test_auth(), "op-1", "photos", "device-a", "eager")
+                    .await;
             assert_eq!(
                 outcome,
                 EnrollmentPrepareOutcome::Prepared { group_id: "group-1".to_string() }

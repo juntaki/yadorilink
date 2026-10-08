@@ -61,7 +61,7 @@ use windows::Win32::Storage::CloudFilters::{
     CF_SYNC_POLICIES, CF_SYNC_REGISTRATION,
 };
 use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO};
-use yadorilink_ipc_proto::shellipc::MaterializationState;
+use yadorilink_ipc_proto::shellipc::LocalTransition;
 
 /// Fixed provider identity. Namespace-derived, like the
 /// overlay CLSIDs in `overlay.rs` — a real release would hand-pick and
@@ -238,10 +238,9 @@ pub fn unregister(local_path: &Path) -> WinResult<()> {
 /// path needed for a placeholder an earlier build created; the
 /// doc comment on `sync_placeholders` below covers what happens to one).
 ///
-/// Matches `yadorilink_filesystem_sync::placeholder_backend::
-/// PlaceholderGeneration`'s own scalar type (`pub struct
-/// PlaceholderGeneration(pub u64)`) -- only the WIRE FORMAT (this 9-byte
-/// blob) is Windows/CfAPI-specific, not the underlying value.
+/// The generation is a plain `u64` (the daemon records it as the
+/// placeholder identity's `ino` with `dev = 0`); only the WIRE FORMAT
+/// (this 9-byte blob) is Windows/CfAPI-specific, not the underlying value.
 fn encode_generation_identity(generation: u64) -> [u8; 9] {
     const VERSION_TAG: u8 = 1;
     let mut buf = [0u8; 9];
@@ -292,7 +291,7 @@ fn decode_generation_identity(bytes: &[u8]) -> Option<u64> {
 /// (open a `FILE_FLAG_OPEN_REPARSE_POINT` handle, `CfGetPlaceholderInfo`
 /// with a headroom buffer, raw HRESULT checks) are already proven working
 /// against real cfapi on a Windows 11 VM in `yadorilink-daemon::
-/// placeholder_inspect_windows`/`placeholder_backend_windows`.
+/// placeholder_inspect_windows`.
 pub fn dehydrate_placeholder(path: &Path, expected: u64) -> Result<(), String> {
     use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE};
     use windows_sys::Win32::Storage::CloudFilters::{
@@ -565,11 +564,11 @@ unsafe extern "system" fn fetch_data_callback(
 
 /// Convenience used by `yadorilink-cfapi-host`'s startup/poll loop: creates
 /// placeholders for every file the daemon reports as
-/// `MaterializationState::Placeholder` under `root` that don't already
-/// have one on disk. Files already `Hydrated`/`Hydrating` are skipped —
-/// they either already have real content or are actively being written
-/// by a non-cfapi-routed hydration in progress, neither of which needs a
-/// placeholder created.
+/// without current content (and with no transition under way) under `root`
+/// that don't already have a placeholder on disk. Files with current content
+/// or a hydration/eviction in progress are skipped — they either already have
+/// real content or are actively being written by a non-cfapi-routed
+/// transition, neither of which needs a placeholder created.
 /// Note: a path whose real CfAPI placeholder already exists on disk
 /// (the `full_path.exists()` skip below) never has its `FileIdentity`
 /// refreshed here even if the daemon reports a different
@@ -640,9 +639,9 @@ fn placeholder_candidates(
     entries: &[yadorilink_ipc_proto::shellipc::FolderFileEntry],
 ) -> impl Iterator<Item = &yadorilink_ipc_proto::shellipc::FolderFileEntry> {
     entries.iter().filter(|entry| {
-        MaterializationState::try_from(entry.materialization_state)
-            == Ok(MaterializationState::Placeholder)
-            && yadorilink_ipc_proto::shellipc::EntryKind::try_from(entry.kind)
+        entry.local_state.as_ref().is_some_and(|s| {
+            !s.current_content_present && s.transition() == LocalTransition::None
+        }) && yadorilink_ipc_proto::shellipc::EntryKind::try_from(entry.kind)
                 == Ok(yadorilink_ipc_proto::shellipc::EntryKind::File)
             && entry.placeholder_generation.is_some()
     })
@@ -651,17 +650,21 @@ fn placeholder_candidates(
 #[cfg(test)]
 mod tests {
     use super::decode_generation_identity;
-    use yadorilink_ipc_proto::shellipc::{EntryKind, FolderFileEntry, MaterializationState};
+    use yadorilink_ipc_proto::shellipc::{EntryKind, FolderFileEntry, LocalState, LocalTransition};
 
     fn entry(
         path: &str,
         kind: EntryKind,
-        state: MaterializationState,
+        current: bool,
         generation: Option<u64>,
     ) -> FolderFileEntry {
         FolderFileEntry {
             relative_path: path.into(),
-            materialization_state: state as i32,
+            local_state: Some(LocalState {
+                local_object_present: current,
+                current_content_present: current,
+                transition: LocalTransition::None as i32,
+            }),
             placeholder_generation: generation,
             kind: kind as i32,
             ..Default::default()
@@ -675,15 +678,15 @@ mod tests {
     #[test]
     fn placeholders_are_the_files_below_explicit_and_structural_directories() {
         use EntryKind::{Directory, File, Symlink};
-        use MaterializationState::{Hydrated, Placeholder};
+        let (current, absent) = (true, false);
         let entries = [
-            entry("album", Directory, Placeholder, Some(1)),
-            entry("album/cover.jpg", File, Placeholder, Some(2)),
+            entry("album", Directory, absent, Some(1)),
+            entry("album/cover.jpg", File, absent, Some(2)),
             // `trips` and `trips/2026` are structural: no entry of their own.
-            entry("trips/2026/beach.jpg", File, Placeholder, Some(3)),
-            entry("trips/2026/link", Symlink, Placeholder, Some(4)),
-            entry("hydrated.txt", File, Hydrated, None),
-            entry("not-minted-yet.txt", File, Placeholder, None),
+            entry("trips/2026/beach.jpg", File, absent, Some(3)),
+            entry("trips/2026/link", Symlink, absent, Some(4)),
+            entry("hydrated.txt", File, current, None),
+            entry("not-minted-yet.txt", File, absent, None),
         ];
         let paths: Vec<&str> = super::placeholder_candidates(&entries)
             .map(|entry| entry.relative_path.as_str())

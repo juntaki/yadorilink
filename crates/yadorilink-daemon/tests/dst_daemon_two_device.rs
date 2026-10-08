@@ -15,7 +15,7 @@
 //! (`peer_orchestrator::run_sim` / `SimDiscovery`) that takes a static
 //! netmap -- each peer's device id, public key, and pre-bound direct UDP
 //! endpoint -- supplied by this harness. Every stage below discovery
-//! (`PeerChannel`, `PeerSyncSession`, `broadcast_change` fan-out,
+//! (`PeerChannel`, `PeerSyncSession`, `on_local_native_commit` fan-out,
 //! materialization) is the identical production code path. What is
 //! stubbed/seamed so no real coordination network is touched (all
 //! `#[cfg(madsim)]`-gated, production unchanged): - Peer discovery: the
@@ -102,6 +102,7 @@ async fn boot_daemon(
 
     let probe: app::StateProbe = Arc::new(Mutex::new(None));
     let config = DaemonConfig {
+        provider_temp_root: None,
         config_dir: config_dir.path().to_path_buf(),
         block_store_root: block_store_dir.path().to_path_buf(),
         sync_db_path: config_dir.path().join("sync-state.sqlite3"),

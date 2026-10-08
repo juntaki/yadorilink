@@ -10,6 +10,7 @@ use yadorilink_ipc_proto::daemonctl::{
 
 use crate::daemon::control;
 use crate::error::CoreError;
+use crate::ops::paths;
 
 fn unexpected() -> CoreError {
     CoreError::Other("unexpected daemon response".into())
@@ -20,6 +21,9 @@ pub async fn send_file(
     source_path: String,
     target_device: String,
 ) -> Result<SendFileResponse, CoreError> {
+    // The daemon's working directory is not the user's, so it must never see
+    // a relative path.
+    let source_path = paths::absolute_path(&source_path)?;
     let resp =
         control::send(ReqPayload::SendFile(SendFileRequest { source_path, target_device })).await?;
     let Some(RespPayload::SendFile(result)) = resp.payload else {
@@ -44,9 +48,13 @@ pub async fn receive_transfer(
     transfer_id: String,
     destination_dir: Option<String>,
 ) -> Result<ReceiveTransferResponse, CoreError> {
+    let destination_dir = match destination_dir {
+        Some(dir) => paths::absolute_path(&dir)?,
+        None => String::new(),
+    };
     let resp = control::send(ReqPayload::ReceiveTransfer(ReceiveTransferRequest {
         transfer_id,
-        destination_dir: destination_dir.unwrap_or_default(),
+        destination_dir,
     }))
     .await?;
     let Some(RespPayload::ReceiveTransfer(result)) = resp.payload else {

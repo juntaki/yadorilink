@@ -2,7 +2,7 @@
 //! vocabulary (`case_ir::Op`) into a concrete filesystem mutation under a
 //! device's root directory, so a generator can drive a whole scenario
 //! straight from a serialized `Case` instead of every scenario hand-coding
-//! its own `std::fs` calls (as `dst_two_device_chaos` does today with its
+//! its own `std::fs` calls (as the retired two-device scenario does today with its
 //! private `deliver_local_write`/`remove_file_if_present` helpers).
 //!
 //! Determinism is the whole point: every mtime is stamped from the passed

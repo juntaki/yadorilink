@@ -1,7 +1,6 @@
 #![cfg(test)]
 
 use super::*;
-use std::ffi::OsString;
 use std::sync::Mutex;
 use yadorilink_root_authority::fs_identity::{FileIdentity, ObjectKind};
 
@@ -327,76 +326,47 @@ fn reconstruct_file_to_temp_then_persist_matches_reconstruct_file() {
     assert_eq!(fs::read(&out_path).unwrap(), content);
 }
 
-/// A placeholder reports the file's correct size via `stat`
-/// without its content actually occupying disk space or being fetched.
+/// Where no native provider exists a `Remote` row has no local object: the
+/// creation call writes nothing, records nothing and reports no object.
+#[cfg(not(windows))]
 #[test]
-fn write_placeholder_reports_correct_size_with_no_content() {
+fn without_a_native_provider_no_object_is_written_or_recorded() {
     let dir = tempfile::tempdir().unwrap();
     let out_path = dir.path().join("placeholder.bin");
 
-    write_placeholder(&out_path, 5_000_000, 1_700_000_000_000_000_000).unwrap();
+    let outcome = create_or_defer_placeholder(&out_path);
 
-    let metadata = fs::metadata(&out_path).unwrap();
-    assert_eq!(metadata.len(), 5_000_000);
-    // No real bytes were written — reading it back is all zeros, not
-    // whatever content a real 5MB file might have had.
-    let content = fs::read(&out_path).unwrap();
-    assert!(content.iter().all(|&b| b == 0));
+    assert_eq!(outcome, PlaceholderIdentityToRecord::Clear);
+    assert!(!outcome.is_deferred_to_a_separate_process());
+    assert!(!outcome.placed_an_object());
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0, "nothing may be created");
 }
 
-/// The identity `write_placeholder` returns for a freshly-written
-/// placeholder must actually match the placeholder's real on-disk
-/// identity, not merely be present -- a caller comparing against it
-/// later relies on this being the truth, not a synthetic value.
+/// An object already at the path is never touched by the creation call.
 #[test]
-#[cfg(unix)]
-fn write_placeholder_returns_the_real_on_disk_identity() {
-    use std::os::unix::fs::MetadataExt;
-
+fn an_existing_object_is_left_alone_by_placeholder_creation() {
     let dir = tempfile::tempdir().unwrap();
-    let out_path = dir.path().join("placeholder.bin");
+    let out_path = dir.path().join("occupied.bin");
+    fs::write(&out_path, b"user bytes").unwrap();
 
-    let identity = write_placeholder(&out_path, 4096, 0).unwrap().unwrap();
+    let _ = create_or_defer_placeholder(&out_path);
 
-    let metadata = fs::metadata(&out_path).unwrap();
-    assert_eq!(identity.dev, metadata.dev());
-    assert_eq!(identity.ino, metadata.ino());
+    assert_eq!(fs::read(&out_path).unwrap(), b"user bytes");
 }
 
-/// Two placeholders written to the SAME path in sequence (mirroring a
-/// peer sending an updated version, or a repeated eviction) must mint
-/// DIFFERENT identities -- each `write_placeholder` call creates a
-/// fresh temp file and renames it in, so the second call's inode can
-/// never equal the first's. This is the exact property the
-/// generation-staleness invariant depends on: an old identity must
-/// stop matching once its placeholder is superseded.
+/// A deferred creation (Windows, or the test hook) writes NOTHING to disk
+/// and mints a CfAPI generation to record only if absent.
 #[test]
-#[cfg(unix)]
-fn successive_placeholder_writes_to_the_same_path_mint_different_identities() {
+fn a_deferred_creation_writes_nothing_and_records_a_generation_if_absent() {
     let dir = tempfile::tempdir().unwrap();
-    let out_path = dir.path().join("placeholder.bin");
+    let out_path = dir.path().join("deferred.bin");
+    set_test_force_deferred_placeholder_for_path(&out_path, true);
 
-    let first = write_placeholder(&out_path, 100, 0).unwrap().unwrap();
-    let second = write_placeholder(&out_path, 100, 0).unwrap().unwrap();
+    let outcome = create_or_defer_placeholder(&out_path);
+    set_test_force_deferred_placeholder_for_path(&out_path, false);
 
-    assert_ne!(first, second, "a re-written placeholder must mint a fresh identity");
-}
-
-/// On Windows, `create_or_defer_placeholder` must write NOTHING
-/// to disk -- the real reparse-point placeholder is created later by
-/// `cfapi-host.exe`'s own poll, which `write_placeholder`'s prior
-/// unconditional sparse-file write would have pre-empted (that write
-/// made `full_path.exists()` true, and `sync_placeholders` skips any
-/// path that already exists).
-#[test]
-#[cfg(windows)]
-fn windows_create_or_defer_placeholder_writes_nothing_to_disk() {
-    let dir = tempfile::tempdir().unwrap();
-    let out_path = dir.path().join("placeholder.bin");
-
-    let outcome = create_or_defer_placeholder(&out_path, 5_000_000, 0).unwrap();
-
-    assert!(!out_path.exists(), "Windows must defer creation to cfapi-host, not pre-empt it");
+    assert!(!out_path.exists(), "creation is the provider's, not this call's");
+    assert!(outcome.is_deferred_to_a_separate_process());
     assert!(matches!(
         outcome,
         PlaceholderIdentityToRecord::RecordIfAbsent {
@@ -406,53 +376,19 @@ fn windows_create_or_defer_placeholder_writes_nothing_to_disk() {
     ));
 }
 
-/// The old bug this closes: `write_placeholder` returning `None` on
-/// Windows made every caller call `clear_placeholder_generation`,
-/// discarding any generation. `create_or_defer_placeholder` must always
-/// return `RecordIfAbsent`, never `Clear`, on Windows. It must also
-/// never return `RecordOverwrite` -- an unconditional overwrite would
-/// reintroduce the exact race this shape exists to prevent (see
-/// `PlaceholderIdentityToRecord`'s own doc comment).
+/// A re-create at the same path must not reuse a stale generation a live
+/// CfAPI comparison could mistake for the old placeholder.
 #[test]
-#[cfg(windows)]
-fn windows_create_or_defer_placeholder_never_clears() {
+fn successive_deferred_creations_mint_different_generations() {
     let dir = tempfile::tempdir().unwrap();
-    let out_path = dir.path().join("placeholder.bin");
+    let out_path = dir.path().join("deferred.bin");
+    set_test_force_deferred_placeholder_for_path(&out_path, true);
 
-    let outcome = create_or_defer_placeholder(&out_path, 100, 0).unwrap();
-
-    assert!(matches!(outcome, PlaceholderIdentityToRecord::RecordIfAbsent { .. }));
-}
-
-/// Mirrors `successive_placeholder_writes_to_the_same_path_mint_
-/// different_identities` for the Windows path: a re-create at the same
-/// path (an evict immediately followed by a re-materialize) must not
-/// reuse a stale generation a live CfAPI comparison could mistake for
-/// the OLD placeholder still being untouched.
-#[test]
-#[cfg(windows)]
-fn windows_successive_defers_at_the_same_path_mint_different_generations() {
-    let dir = tempfile::tempdir().unwrap();
-    let out_path = dir.path().join("placeholder.bin");
-
-    let first = create_or_defer_placeholder(&out_path, 100, 0).unwrap();
-    let second = create_or_defer_placeholder(&out_path, 100, 0).unwrap();
+    let first = create_or_defer_placeholder(&out_path);
+    let second = create_or_defer_placeholder(&out_path);
+    set_test_force_deferred_placeholder_for_path(&out_path, false);
 
     assert_ne!(first, second, "a re-deferred placeholder must mint a fresh generation");
-}
-
-#[test]
-fn failed_placeholder_rename_removes_its_temp_file() {
-    let dir = tempfile::tempdir().unwrap();
-    let out_path = dir.path().join("occupied");
-    fs::create_dir(&out_path).unwrap();
-
-    assert!(write_placeholder(&out_path, 1024, 0).is_err());
-
-    let entries: Vec<_> =
-        fs::read_dir(dir.path()).unwrap().map(|entry| entry.unwrap().file_name()).collect();
-    assert_eq!(entries, vec![OsString::from("occupied")]);
-    assert!(out_path.is_dir());
 }
 
 /// `materialize_symlink` creates a real, correctly-targeted symlink at

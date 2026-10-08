@@ -33,16 +33,16 @@ async fn peers_connect_over_the_yadori_alpn() {
         "dialled link must be attributed to the peer actually reached"
     );
 
-    let mut lane = link.open_lane(Lane::Reconciliation).await.expect("lane");
+    let mut lane = link.open_lane(Lane::Service).await.expect("lane");
     round_trip(&mut lane, b"hello").await;
 
     alice_task.abort();
 }
 
-/// Gate 2: all three lane classes carry traffic concurrently on one
-/// connection, with several streams open per bulk class.
+/// Gate 2: both lane classes carry traffic concurrently on one connection,
+/// with several streams open per class.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn all_three_lane_classes_carry_traffic_concurrently() {
+async fn both_lane_classes_carry_traffic_concurrently() {
     let book = SharedAddressBook::new();
     let (alice, mut alice_inbound) = spawn_node_in(iroh::SecretKey::generate(), &book).await;
     let (bob, _bob_inbound) = spawn_node_in(iroh::SecretKey::generate(), &book).await;
@@ -55,12 +55,11 @@ async fn all_three_lane_classes_carry_traffic_concurrently() {
 
     let link = bob.connect(alice_addr.peer()).await.expect("connect");
 
-    // One reconciliation stream, plus several streams in each bulk class:
-    // a lane is a class of streams, not a single stream.
-    let mut opened =
-        vec![(Lane::Reconciliation, link.open_lane(Lane::Reconciliation).await.expect("recon"))];
+    // Several streams in each class: a lane is a class of streams, not a
+    // single stream.
+    let mut opened = Vec::new();
     for _ in 0..3 {
-        opened.push((Lane::History, link.open_lane(Lane::History).await.expect("bundle")));
+        opened.push((Lane::Service, link.open_lane(Lane::Service).await.expect("service")));
     }
     for _ in 0..3 {
         opened.push((Lane::Block, link.open_lane(Lane::Block).await.expect("block")));
@@ -84,7 +83,7 @@ async fn all_three_lane_classes_carry_traffic_concurrently() {
 /// Gate 4: killing the connection mid-session leaves nothing behind. The old
 /// link is unusable and a reconnect starts from clean state.
 ///
-/// This is what lets the protocol above discard in-flight reconciliation state
+/// This is what lets the protocol above discard in-flight session state
 /// on disconnect instead of persisting it: correctness is re-derived from the
 /// durable sets, never from surviving session state.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -101,7 +100,7 @@ async fn a_killed_connection_leaves_no_session_state_behind() {
     });
 
     let first = bob.connect(alice_addr.peer()).await.expect("connect");
-    let mut lane = first.open_lane(Lane::Reconciliation).await.expect("lane");
+    let mut lane = first.open_lane(Lane::Service).await.expect("lane");
     round_trip(&mut lane, b"before-the-kill").await;
 
     // Exhaust the block lane's budget, so a budget that survived the kill
@@ -134,8 +133,7 @@ async fn a_killed_connection_leaves_no_session_state_behind() {
         );
     }
 
-    let mut lane =
-        second.open_lane(Lane::Reconciliation).await.expect("reconciliation lane on the new link");
+    let mut lane = second.open_lane(Lane::Service).await.expect("service lane on the new link");
     round_trip(&mut lane, b"after-the-reconnect").await;
 
     alice_task.abort();
@@ -167,7 +165,7 @@ async fn restarting_the_substrate_restores_the_alpn_and_identity() {
     });
 
     let link = bob.connect(first_addr.peer()).await.expect("connect");
-    let mut lane = link.open_lane(Lane::Reconciliation).await.expect("lane");
+    let mut lane = link.open_lane(Lane::Service).await.expect("lane");
     round_trip(&mut lane, b"before-restart").await;
 
     alice.shutdown().await;
@@ -193,33 +191,29 @@ async fn restarting_the_substrate_restores_the_alpn_and_identity() {
         .await
         .expect("reconnect must not hang on an unserved ALPN")
         .expect("the Yadori ALPN is served again after restart");
-    let mut lane = link.open_lane(Lane::Reconciliation).await.expect("lane");
+    let mut lane = link.open_lane(Lane::Service).await.expect("lane");
     round_trip(&mut lane, b"after-restart").await;
 
     second_task.abort();
 }
 
-/// Gate 3: the reconciliation lane stays responsive while both bulk lane
-/// classes are under full load.
+/// Gate 3: the service lane stays responsive while the block lane is under
+/// full load.
 ///
 /// This is the structural guarantee a single shared control stream lacks: there
-/// a bulk `ChangeBatch` could sit in front of a `HeadsAnnounce` indefinitely,
-/// with no transport error logged. Nothing in that design bounds the delay, so
-/// no timeout could substitute for separate lanes.
+/// a bulk transfer could sit in front of a small request indefinitely, with no
+/// transport error logged. Nothing in that design bounds the delay, so no
+/// timeout could substitute for separate lanes.
 ///
-/// The load here is deliberately both kinds at once, because splitting streams
-/// removes stream-level head-of-line blocking but leaves connection-level
-/// congestion and flow-control credit shared:
-///
-/// * every block stream is stalled — the receiver never reads one byte,
-///   standing in for a receiver whose storage writer is blocked
-/// * every bundle stream is moving real volume at the same time
+/// Splitting streams removes stream-level head-of-line blocking but leaves
+/// connection-level congestion and flow-control credit shared, so the load is
+/// every block stream stalled: the receiver never reads one byte, standing in
+/// for a receiver whose storage writer is blocked.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn reconciliation_stays_responsive_under_full_bulk_load() {
+async fn service_stays_responsive_under_full_block_load() {
     /// Enough to exhaust any plausible stream flow-control window several
     /// times over, so a block stream is genuinely blocked, not merely buffered.
     const STALLED_BYTES: usize = 64 * 1024 * 1024;
-    const BUNDLE_BYTES: usize = 8 * 1024 * 1024;
     const CHUNK: usize = 64 * 1024;
 
     /// Generous compared to a healthy loopback round trip, and still four
@@ -239,10 +233,10 @@ async fn reconciliation_stays_responsive_under_full_bulk_load() {
 
     let link = bob.connect(alice_addr.peer()).await.expect("connect");
 
-    // Prove the reconciliation lane works before any load exists, so a later
+    // Prove the service lane works before any load exists, so a later
     // failure is attributable to saturation and not to setup.
-    let mut reconciliation = link.open_lane(Lane::Reconciliation).await.expect("recon");
-    round_trip(&mut reconciliation, b"before-load").await;
+    let mut service = link.open_lane(Lane::Service).await.expect("service");
+    round_trip(&mut service, b"before-load").await;
 
     // Stall every block stream the budget allows. These tasks are expected to
     // block forever.
@@ -262,24 +256,6 @@ async fn reconciliation_stays_responsive_under_full_bulk_load() {
         }));
     }
 
-    // Concurrently push real volume through the bundle lane.
-    let mut bundles = Vec::new();
-    for _ in 0..4 {
-        let link = link.clone();
-        bundles.push(tokio::spawn(async move {
-            let bundle = link.open_lane(Lane::History).await.expect("bundle");
-            let payload = vec![0xcd_u8; BUNDLE_BYTES];
-            let (mut send, mut recv) = bundle.split();
-            let writer = tokio::spawn(async move {
-                let _ = send.write_all(&payload).await;
-                let _ = send.finish();
-            });
-            let mut sink = vec![0u8; BUNDLE_BYTES];
-            let _ = tokio::io::AsyncReadExt::read_exact(&mut recv, &mut sink).await;
-            let _ = writer.await;
-        }));
-    }
-
     // Give the load time to fill every window it can reach.
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(
@@ -289,21 +265,18 @@ async fn reconciliation_stays_responsive_under_full_bulk_load() {
 
     // The property under test.
     for seq in 1..=ROUND_TRIPS {
-        let payload = format!("reconciliation-range-fingerprint-{seq}").into_bytes();
-        tokio::time::timeout(DEADLINE, round_trip(&mut reconciliation, &payload))
-            .await
-            .unwrap_or_else(|_| {
+        let payload = format!("service-request-{seq}").into_bytes();
+        tokio::time::timeout(DEADLINE, round_trip(&mut service, &payload)).await.unwrap_or_else(
+            |_| {
                 panic!(
-                    "reconciliation round trip {seq} was starved by bulk load \
+                    "service round trip {seq} was starved by block load \
                      (waited {DEADLINE:?})"
                 )
-            });
+            },
+        );
     }
 
     for task in stalled {
-        task.abort();
-    }
-    for task in bundles {
         task.abort();
     }
     alice_task.abort();
@@ -312,7 +285,7 @@ async fn reconciliation_stays_responsive_under_full_bulk_load() {
 /// Control for the gate above: the same deadline, applied to a round trip that
 /// *is* starved, must fail.
 ///
-/// Without this, `reconciliation_stays_responsive_under_full_bulk_load` would
+/// Without this, `service_stays_responsive_under_full_block_load` would
 /// pass just as happily if the harness could not observe starvation at all.
 /// Here the round trip is issued on the stalled class itself, so it is starved
 /// by construction.
@@ -390,7 +363,7 @@ async fn a_devices_signing_key_is_its_endpoint_identity() {
         "the reached peer must be the one named, not merely someone at that address"
     );
 
-    let mut lane = link.open_lane(Lane::Reconciliation).await.expect("lane");
+    let mut lane = link.open_lane(Lane::Service).await.expect("lane");
     round_trip(&mut lane, b"identity").await;
     alice_task.abort();
 }

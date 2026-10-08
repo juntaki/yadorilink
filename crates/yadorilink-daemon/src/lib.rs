@@ -4,6 +4,8 @@
 pub mod adapters;
 pub mod app;
 pub mod application;
+pub mod author_identity;
+pub mod author_sidecar;
 pub mod background_custody;
 pub mod change_auth;
 pub mod change_policy;
@@ -14,13 +16,12 @@ pub mod control_socket;
 pub mod convergence;
 pub mod coordination_client;
 pub mod credential_store;
-pub mod daemon_runtime;
 pub mod daemon_state;
-pub mod dag_import;
 pub mod device_config;
 pub mod diagnostics_ipc;
 pub mod durability_service;
 pub mod error;
+pub mod fd_limit;
 pub mod gc;
 pub mod gc_state;
 pub mod governance_config;
@@ -30,10 +31,19 @@ pub mod hydration_single_flight;
 pub mod link_registry;
 pub mod link_runtime;
 pub mod local_convergence;
+pub mod machine_fingerprint;
 pub(crate) mod maintenance;
 pub mod maintenance_coordinator;
 pub mod materialization_intent;
 pub mod metrics;
+pub mod native_checkpoint_flush;
+pub mod native_rebootstrap;
+pub mod native_recovery;
+pub mod native_replication_driver;
+pub mod native_replication_runtime;
+pub mod native_replication_session;
+#[cfg(test)]
+mod native_test_support;
 #[cfg(test)]
 pub(crate) mod obligation_tick_metrics;
 pub mod path_witness_sink;
@@ -41,13 +51,12 @@ pub mod peer_connectivity_runtime;
 pub mod peer_orchestrator;
 pub mod peer_registry;
 #[cfg(windows)]
-pub mod placeholder_backend_windows;
-#[cfg(windows)]
 pub mod placeholder_dehydrate_windows;
 #[cfg(windows)]
 pub mod placeholder_inspect_windows;
+pub mod preserved_items;
 pub mod queries;
-pub mod rebootstrap_handler;
+pub mod receive_diag;
 pub mod recent_errors;
 pub mod recovery;
 pub mod recovery_diagnosis;
@@ -67,6 +76,17 @@ pub mod sync_adapter;
 pub mod sync_runtime;
 pub mod write_lease;
 // Exclusive OS locks on the block-store root and sync-state database.
+pub(crate) mod provider_eager;
+pub(crate) mod provider_evidence;
+pub(crate) mod provider_gate;
+pub(crate) mod provider_handoff;
+pub(crate) mod provider_host_link;
+pub(crate) mod provider_ingest;
+pub(crate) mod provider_prefetch;
+pub(crate) mod provider_projector;
+pub(crate) mod provider_publication;
+pub(crate) mod provider_status;
+pub(crate) mod provider_writer;
 pub mod resource_lock;
 pub mod send_transfer;
 pub mod shell_context;

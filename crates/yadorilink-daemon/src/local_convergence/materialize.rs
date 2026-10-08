@@ -2,7 +2,6 @@ use std::path::Path;
 
 use yadorilink_peer_session::PeerSessionError;
 use yadorilink_replica_domain::file::{FileRecord, RecordKind};
-use yadorilink_replica_domain::ids::ChangeHash;
 use yadorilink_replica_domain::session_state::MaterializationPolicy;
 use yadorilink_root_authority::root_commit::RootCommitPermit;
 
@@ -30,10 +29,14 @@ struct MaterializationPlan<'a> {
     payload: &'a MaterializationPayload,
     record: &'a FileRecord,
     origin_device_id: &'a str,
-    authoring_change_hash: Option<&'a ChangeHash>,
+    authoring: Option<&'a yadorilink_replica_domain::native_plan::NativeRowIdentity>,
     satisfied: Option<&'a BlockRequirement>,
     hazard_reason: Option<String>,
     permit: &'a RootCommitPermit<'a>,
+    /// The obligation engine's claim on this path, when this attempt was
+    /// handed one. The eager content write closes the obligation under it in
+    /// the same transaction as its proof.
+    claim: Option<super::obligation_claims::PathClaim<'a>>,
 }
 
 impl MaterializationPlan<'_> {
@@ -61,7 +64,7 @@ impl super::LocalConvergenceExecutor {
     /// own.
     ///
     /// This is the local half. It reads and writes this device's disk, index
-    /// and DAG, and it never talks to a peer: if the record names content this
+    /// and native state, and it never talks to a peer: if the record names content this
     /// device does not hold, it stops and says so ([`LocalMaterializeOutcome::
     /// NeedBlocks`]) rather than reaching for a transport. Obtaining those
     /// blocks is the session's half ([`PeerSyncSession::materialize`]), which
@@ -76,33 +79,31 @@ impl super::LocalConvergenceExecutor {
     /// like on disk *before* the request went out -- so a local write that
     /// landed during the fetch is still caught. It is a staleness signal, not
     /// a licence to skip anything.
-    // Mirrors `materialize`'s inputs plus the demand path and prefetch evidence.
+    // Each argument is an independent input to one attempt; the claim is the
+    // obligation engine's, carried to the lane that may close it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn materialize_local(
         &self,
         group_id: &str,
         payload: &MaterializationPayload,
-        // The path whose resolution DEMANDS this record's content. Equal to
-        // `record.path` for an ordinary record; for a conflict copy it is the
-        // source path the copy was derived from, because nobody pins a name
-        // only the resolution knows.
-        demand_path: &str,
         policy: MaterializationPolicy,
         origin_device_id: &str,
-        authoring_change_hash: Option<&ChangeHash>,
+        authoring: Option<&yadorilink_replica_domain::native_plan::NativeRowIdentity>,
         satisfied: Option<&BlockRequirement>,
+        claim: Option<super::obligation_claims::PathClaim<'_>>,
     ) -> Result<LocalMaterializeOutcome, PeerSessionError> {
         let root_commit_authority = self.root_lease_for(group_id)?;
         let root_commit_authority_op = root_commit_authority.begin_operation()?;
         let root_commit_permit = root_commit_authority_op.permit();
-        let plan = self.admit_materialization(
+        let mut plan = self.admit_materialization(
             group_id,
             payload,
             origin_device_id,
-            authoring_change_hash,
+            authoring,
             satisfied,
             &root_commit_permit,
         )?;
+        plan.claim = claim;
         let record = plan.record;
 
         // a tombstone (`deleted=true, blocks=[]`) materialized via
@@ -127,13 +128,7 @@ impl super::LocalConvergenceExecutor {
             // where it lives and which a device with no peer at all runs
             // directly.
             return self
-                .materialize_tombstone(
-                    group_id,
-                    record,
-                    origin_device_id,
-                    authoring_change_hash,
-                    plan.permit,
-                )
+                .materialize_tombstone(group_id, record, origin_device_id, plan.permit)
                 .await
                 .map(LocalMaterializeOutcome::Concluded);
         }
@@ -170,25 +165,9 @@ impl super::LocalConvergenceExecutor {
             return Ok(outcome);
         }
 
-        // A brand-new path was never pinned before; `is_pinned` on a
-        // not-yet-indexed row simply returns `false`, so this is safe to
-        // check unconditionally regardless of whether `record` is a new
-        // adoption or an update to a path already in the index.
-        //
-        // Asked of the path that DEMANDS this content, which for an ordinary
-        // record is this path itself. A conflict copy is never pinned by
-        // anyone -- nobody can pin a name only the resolution knows -- so
-        // asking about its own path refuses it always, and the source stays
-        // outstanding forever because a copy derived from it is unresolved.
-        let pinned = self.state.is_pinned(group_id, demand_path)?;
-
-        // an explicit pin always fetches (a deliberate,
-        // user-initiated request bypasses the eager-fetch admission
-        // budget, same as it already bypasses the materialization policy
-        // check itself). Plain policy-driven eager fetch is additionally
-        // gated on this session's per-group budget — see
-        // `MAX_EAGER_BLOCKS_PER_GROUP_PER_SESSION`'s doc comment; once
-        // exhausted, this falls through to the placeholder branch below
+        // Policy-driven eager fetch is gated on this session's per-group
+        // budget — see `MAX_EAGER_BLOCKS_PER_GROUP_PER_SESSION`'s doc comment;
+        // once exhausted, this falls through to the placeholder branch below
         // instead of continuing to fetch.
         // Admission is charged, not merely consulted: `admit_eager_blocks`
         // adds this record's blocks to the group's session budget. So it must
@@ -199,10 +178,9 @@ impl super::LocalConvergenceExecutor {
         // than half the ceiling it would fail the second time, dropping
         // content this device has just successfully fetched to a placeholder
         // for the rest of the session.
-        let eager_admitted = pinned
-            || (policy == MaterializationPolicy::Eager
-                && (satisfied.is_some()
-                    || self.admit_eager_blocks(group_id, record.blocks.len() as u64)));
+        let eager_admitted = policy == MaterializationPolicy::Eager
+            && (satisfied.is_some()
+                || self.admit_eager_blocks(group_id, record.blocks.len() as u64));
 
         if eager_admitted {
             self.materialize_eager_lane(&plan).await
@@ -219,7 +197,7 @@ impl super::LocalConvergenceExecutor {
         group_id: &'a str,
         payload: &'a MaterializationPayload,
         origin_device_id: &'a str,
-        authoring_change_hash: Option<&'a ChangeHash>,
+        authoring: Option<&'a yadorilink_replica_domain::native_plan::NativeRowIdentity>,
         satisfied: Option<&'a BlockRequirement>,
         root_commit_permit: &'a RootCommitPermit<'a>,
     ) -> Result<MaterializationPlan<'a>, PeerSessionError> {
@@ -319,10 +297,11 @@ impl super::LocalConvergenceExecutor {
             payload,
             record,
             origin_device_id,
-            authoring_change_hash,
+            authoring,
             satisfied,
             hazard_reason,
             permit: root_commit_permit,
+            claim: None,
         })
     }
 
@@ -338,7 +317,7 @@ impl super::LocalConvergenceExecutor {
             payload,
             record,
             origin_device_id,
-            authoring_change_hash,
+            authoring,
             permit: root_commit_permit,
             ..
         } = *plan;
@@ -350,7 +329,7 @@ impl super::LocalConvergenceExecutor {
                 group_id,
                 record,
                 origin_device_id,
-                authoring_change_hash,
+                authoring,
                 payload.version(),
                 root_commit_permit,
             ) {
@@ -407,12 +386,21 @@ impl super::LocalConvergenceExecutor {
         plan: &MaterializationPlan<'_>,
         reason: &str,
     ) -> Result<LocalMaterializeOutcome, PeerSessionError> {
+        let version_meta = &plan.payload.version().meta;
+        let columns = yadorilink_replica_domain::session_state::LocalFileMetaColumns {
+            record_kind: version_meta.record_kind,
+            symlink_target: version_meta.symlink_target.clone(),
+            symlink_out_of_root: false,
+            unix_mode: version_meta.unix_mode,
+            xattrs: version_meta.xattrs.clone(),
+        };
         self.hold(
             plan.group_id,
             plan.record,
             reason,
             plan.origin_device_id,
-            plan.authoring_change_hash,
+            plan.authoring,
+            &columns,
         )?;
         Ok(MaterializeResult::Settled(SettlementEvidence::HazardHeld { reason: reason.to_owned() })
             .into())

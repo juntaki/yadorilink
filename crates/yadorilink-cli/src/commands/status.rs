@@ -113,6 +113,9 @@ fn ambiguous_suffix(link: &LinkStatus) -> String {
 fn durability_suffix(link: &LinkStatus) -> String {
     match link.durability_status() {
         GroupDurabilityStatus::Protected | GroupDurabilityStatus::Protecting => String::new(),
+        GroupDurabilityStatus::Unknown if link.durability_check_pending => {
+            "  durability checking".to_string()
+        }
         GroupDurabilityStatus::Unknown | GroupDurabilityStatus::Unspecified => {
             "  durability unknown".to_string()
         }
@@ -218,6 +221,112 @@ fn overall_state_line(status: &StatusResponse) -> Option<String> {
             status.attention_reasons.join(", ")
         ))
     }
+}
+
+/// What rebootstraps set aside, when there is any; names `yadorilink preserved list` and
+/// `discard` when the total is above the configured size.
+/// The provider roots: why one is not ready, its Eager progress and stuck files, and the edits kept
+/// beside a file instead of replacing it.
+fn provider_root_lines(status: &StatusResponse) -> Vec<String> {
+    let mut lines = Vec::new();
+    for root in &status.provider_roots {
+        lines.push(format!(
+            "provider folder {} ({}): {}",
+            root.display_name, root.root_id, root.readiness
+        ));
+        if root.eager {
+            lines.push(format!(
+                "  downloading: {}, {} file(s) on this Mac, {} to fetch, {} in progress",
+                root.eager_state, root.eager_current, root.eager_remote, root.eager_hydrating
+            ));
+            for stuck in &root.stuck {
+                lines.push(format!(
+                    "  stuck: {} ({} failed attempt(s))",
+                    stuck.path, stuck.failures
+                ));
+            }
+        }
+        if root.pending_publications > 0 {
+            lines.push(format!(
+                "  waiting for the OS to take the new version (file in use or release pending): {}, oldest: {}",
+                root.pending_publications,
+                age_text(root.pending_oldest_ms)
+            ));
+        }
+        if root.unconfirmed_publications > 0 {
+            lines.push(format!(
+                "  released but not yet confirmed by the OS: {}, oldest: {}",
+                root.unconfirmed_publications,
+                age_text(root.unconfirmed_oldest_ms)
+            ));
+        }
+        if root.kept_edits > 0 {
+            lines.push(format!(
+                "  edits kept beside the file: {}, oldest: {}",
+                root.kept_edits,
+                age_text(root.kept_edits_oldest_ms)
+            ));
+        }
+    }
+    for removal in &status.provider_removals {
+        lines.push(if removal.removed {
+            if removal.preserved_location.is_empty() {
+                format!(
+                    "provider folder {} ({}): removed; the downloaded files were kept by the operating system",
+                    removal.display_name, removal.root_id
+                )
+            } else {
+                format!(
+                    "provider folder {} ({}): removed; the downloaded files are kept at {}",
+                    removal.display_name, removal.root_id, removal.preserved_location
+                )
+            }
+        } else {
+            format!(
+                "provider folder {} ({}): removing (waiting for the app to remove the domain)",
+                removal.display_name, removal.root_id
+            )
+        });
+    }
+    for orphan in &status.orphan_domains {
+        lines.push(format!(
+            "File Provider domain {orphan} belongs to no folder this database knows; it is kept so you can recover it"
+        ));
+    }
+    lines
+}
+
+/// An age in milliseconds as a short human text.
+fn age_text(ms: u64) -> String {
+    match ms / 1000 {
+        s if s < 120 => format!("{s}s"),
+        s if s < 7200 => format!("{}m", s / 60),
+        s if s < 172_800 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86_400),
+    }
+}
+
+fn preserved_line(status: &StatusResponse) -> Option<String> {
+    let preserved = status.preserved.as_ref()?;
+    if preserved.total == 0 && preserved.unreplayed_own_units == 0 {
+        return None;
+    }
+    let mut line = format!(
+        "Preserved: {} version(s) ({} bytes, {} with unavailable content, {} without a record), \
+         {} own change(s) not replayed",
+        preserved.total,
+        preserved.bytes,
+        preserved.content_unavailable,
+        preserved.record_unavailable,
+        preserved.unreplayed_own_units
+    );
+    if preserved.warn {
+        line.push_str(&format!(
+            "  -- above {} bytes: see `yadorilink preserved list`, discard what you no longer need",
+            preserved.warn_bytes
+        ));
+    }
+    Some(line)
 }
 
 /// `yadorilink status`'s configured-limits/current-rate summary
@@ -437,6 +546,18 @@ pub async fn status(watch: bool) -> Result<(), CliError> {
     }
 }
 
+/// `status --pending-items N`: the publications waiting on the OS, oldest first.
+pub async fn pending_items(limit: u32) -> Result<(), CliError> {
+    let items = yadorilink_client_core::ops::storage::list_provider_pending(limit).await?;
+    if items.is_empty() {
+        println!("No publication is waiting on the OS.");
+    }
+    for item in &items {
+        println!("  waiting: {} ({}): {}", item.path, item.root_id, age_text(item.age_ms));
+    }
+    Ok(())
+}
+
 async fn render_status_once() -> Result<(), CliError> {
     let status = yadorilink_client_core::ops::folders::status().await?;
     for line in status_lines(&status) {
@@ -453,6 +574,24 @@ fn status_lines(status: &StatusResponse) -> Vec<String> {
         lines.push(String::new());
     }
 
+    for group in &status.rebootstrapping_groups {
+        lines.push(format!(
+            "group={group}  replacing its state from a peer's sealed state (rebootstrap running); \
+             its folder is paused until it ends"
+        ));
+    }
+    if let Some(line) = preserved_line(status) {
+        lines.push(line);
+    }
+    lines.extend(provider_root_lines(status));
+    if status.undecided_uploads > 0 {
+        lines.push(format!(
+            "undecided uploads: {}, oldest: {}",
+            status.undecided_uploads,
+            age_text(status.undecided_uploads_oldest_ms)
+        ));
+    }
+
     if status.links.is_empty() {
         lines.push("No linked folders.".to_string());
     }
@@ -465,9 +604,15 @@ fn status_lines(status: &StatusResponse) -> Vec<String> {
         let durability = durability_suffix(link);
         let fetch_availability = fetch_availability_suffix(link);
         let ambiguous = ambiguous_suffix(link);
+        // A provider folder has no directory: it is named, never shown by its identity key.
+        let place = if link.provider_display_name.is_empty() {
+            link.local_path.clone()
+        } else {
+            format!("provider folder '{}'", link.provider_display_name)
+        };
         lines.push(format!(
-            "{}  group={}  {state}  conflicts={}{materialization}{held}{degraded}{transfer}{durability}{fetch_availability}{ambiguous}",
-            link.local_path, link.group_id, link.conflict_count
+            "{place}  group={}  {state}  conflicts={}{materialization}{held}{degraded}{transfer}{durability}{fetch_availability}{ambiguous}",
+            link.group_id, link.conflict_count
         ));
         lines.extend(held_file_detail_lines(link));
         lines.extend(complete_copies_detail_lines(link, &status.peers));

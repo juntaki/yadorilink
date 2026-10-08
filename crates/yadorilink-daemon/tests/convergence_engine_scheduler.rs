@@ -3,8 +3,8 @@
 //! full tick interval (or wait on the coarse `MaterializationWake`
 //! `Notify`) after every `run_once` call, REGARDLESS of whether that
 //! call's own group-processing attempts left a large, immediately-runnable
-//! backlog behind -- `MAX_PATHS_PER_RECONCILE_ATTEMPT` (8, deliberately
-//! unchanged here -- see `engine.rs`'s own doc comment on it) bounds one
+//! backlog behind -- `MAX_PATHS_PER_RECONCILE_ATTEMPT` (32; see
+//! `engine.rs`'s own doc comment on it) bounds one
 //! ATTEMPT's worst-case latency, but nothing forced the scheduler to
 //! actually rest once that attempt finished. `run_once`'s `RunOnceOutcome`/
 //! `run`'s own `yield_now`-not-sleep decision is what this file exercises;
@@ -13,8 +13,8 @@
 //! `materialization_jobs` scheduler.
 //!
 //! **Scope note**: a fully hermetic, single-tick-precise test of
-//! `process_group_via_obligations`'s own budget-selection boundary (e.g. "exactly 8 of 20
-//! claimed jobs reach `Planning`, the other 12 are never touched at all")
+//! `process_group_via_obligations`'s own budget-selection boundary (e.g. "exactly one window of the
+//! claimed jobs reach `Planning`, the rest are never touched at all")
 //! would need either a real connected peer session constructed with no
 //! concurrently-running background engine tick racing it, or a production
 //! seam to inject a fake `candidate_sessions` result -- `DaemonState::new`
@@ -42,10 +42,8 @@ use yadorilink_daemon::convergence::engine::{run_once_for_test, ConvergenceEngin
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_local_storage::SegmentBlockStore;
-use yadorilink_replica_domain::change::{Op, PutOrigin};
 use yadorilink_replica_domain::file::{FileMeta, FileVersion, RecordKind, VersionBlock};
-use yadorilink_replica_domain::ids::{BlockHash, DeviceId, FolderGroupId, SyncPath};
-use yadorilink_replica_domain::test_authoring::create_signed_for_tests;
+use yadorilink_replica_domain::ids::BlockHash;
 
 const GROUP: &str = "scheduler-test-group";
 
@@ -95,7 +93,7 @@ async fn zero_progress_never_reports_an_immediate_backlog() {
     state.replica_coordinator.link_repository().add_link(&local_path, GROUP).unwrap();
     LinkRuntimeController::new(state.clone()).start(local_path, GROUP.to_string()).unwrap();
 
-    let key = SigningKey::from_bytes(&[7u8; 32]);
+    let _key = SigningKey::from_bytes(&[7u8; 32]);
     for i in 0..20 {
         let path = format!("unreachable-{i:03}.txt");
         let version = FileVersion::new(
@@ -109,23 +107,17 @@ async fn zero_progress_never_reports_an_immediate_backlog() {
                 xattrs: Vec::new(),
             },
         );
-        let change = create_signed_for_tests(
-            vec![],
-            0,
-            DeviceId("sched-remote-ghost".to_string()),
-            FolderGroupId(GROUP.to_string()),
-            vec![Op::Put {
-                path: SyncPath(path),
-                version: version.version_hash,
-                origin: PutOrigin::Direct,
-            }],
-            &key,
+        let _change = yadorilink_daemon::test_support::remote_admission_fixture::admit_remote(
+            &state.replica_coordinator,
+            GROUP,
+            "sched-remote-ghost",
+            vec![yadorilink_daemon::test_support::remote_admission_fixture::put(
+                &path,
+                version.version_hash,
+                vec![],
+            )],
+            std::slice::from_ref(&version),
         );
-        state
-            .replica_coordinator
-            .change_history_repository()
-            .dag_admit_change_with_versions(&change, std::slice::from_ref(&version))
-            .unwrap();
     }
 
     // Several manual ticks, not just one -- proves this holds steadily,
@@ -142,13 +134,13 @@ async fn zero_progress_never_reports_an_immediate_backlog() {
 }
 
 /// Real two-device scenario: more small files than one attempt's budget
-/// (`MAX_PATHS_PER_RECONCILE_ATTEMPT`, 8) land on A before B ever links,
+/// (`MAX_PATHS_PER_RECONCILE_ATTEMPT`, 32) land on A before B ever links,
 /// so B's initial import enqueues more materialization jobs than one tick
 /// can budget. Before the scheduler fix, `run`'s loop slept a full
 /// `FALLBACK_POLL_INTERVAL` (1s, or however long until the next
 /// `MaterializationWake` notify) after every `run_once` call regardless
 /// of how much runnable backlog remained -- syncing N files older than
-/// the budget cost at least `ceil(N / 8) - 1` extra full seconds of pure
+/// the budget cost at least `ceil(N / 32) - 1` extra full seconds of pure
 /// sleep, on top of whatever real work each tick did. This asserts
 /// convergence well under that old floor, proving the scheduler is
 /// actually work-conserving now rather than merely happening to finish
@@ -156,10 +148,10 @@ async fn zero_progress_never_reports_an_immediate_backlog() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn more_files_than_the_attempt_budget_converge_without_artificial_per_tick_sleeps() {
     support::ensure_isolated_config_dir();
-    const FILE_COUNT: usize = 24;
+    const FILE_COUNT: usize = 96;
     // The old bug's own minimum floor for this file count, purely from
-    // sleeping a full second after every 8-file budget window instead of
-    // draining the remaining backlog immediately -- `ceil(24/8) - 1 = 2`
+    // sleeping a full second after every 32-file budget window instead of
+    // draining the remaining backlog immediately -- `ceil(96/32) - 1 = 2`
     // full seconds of dead sleep alone, before any real work. Chosen from
     // the fix's own mechanism, not tuned to this environment's throughput.
     const OLD_BUG_MINIMUM_SLEEP_FLOOR: Duration = Duration::from_secs(2);
@@ -221,6 +213,6 @@ async fn more_files_than_the_attempt_budget_converge_without_artificial_per_tick
          at or above the old bug's own {OLD_BUG_MINIMUM_SLEEP_FLOOR:?} minimum floor from \
          sleeping a full tick interval after every budget window regardless of remaining \
          backlog, suggesting that regression came back",
-        8,
+        32,
     );
 }

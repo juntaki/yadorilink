@@ -14,15 +14,13 @@ pub use block_serve_authorization::{BlockServeAuthorization, BlockServeAuthoriza
 #[cfg(any(test, feature = "test-support"))]
 pub use in_memory_channel::{
     in_memory_transports, InMemoryBlockStream, InMemoryPeerChannel, InMemoryServiceStream,
-    InMemorySnapshotFetch, InMemorySnapshotShelf,
 };
 pub use peer_message_channel::{
-    BlockStreamTransport, PeerBlockStream, PeerServiceStream, PreparedSnapshotStore,
-    ServiceStreamTransport, SessionTransports, SnapshotFetch,
+    BlockStreamTransport, PeerBlockStream, PeerServiceStream, ServiceStreamTransport,
+    SessionTransports,
 };
 pub use peer_replica_state::{
-    CurrentRowSnapshot, DagAdmission, ExactActualState, ExpectedAuthoring, FinishedProjectedUpsert,
-    OpenMaterializationIntent, PreparedProjectedDelete, PreparedProjectedUpsert,
-    MATERIALIZATION_IN_FLIGHT_STATE,
+    CurrentRowSnapshot, ExactActualState, ExpectedAuthoring, FinishedProjectedUpsert,
+    OpenMaterializationIntent, PreparedProjectedDelete, MATERIALIZATION_IN_FLIGHT_STATE,
 };
 pub use yadorilink_local_storage::BlockContentStore;

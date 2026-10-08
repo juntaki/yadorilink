@@ -9,6 +9,7 @@ pub(crate) mod handoff;
 pub(crate) mod link_lifecycle;
 pub(crate) mod materialization;
 pub(crate) mod membership;
+pub(crate) mod preserved;
 pub(crate) mod replica_role;
 pub(crate) mod reporting;
 pub(crate) mod runtime_control;
@@ -33,19 +34,23 @@ pub(crate) use handoff::{
 #[allow(unused_imports)]
 pub(crate) use link_lifecycle::{
     LinkCommand, LinkOutcome, LinkRepositoryPort, LinkWatcherPort, PendingEnrollmentLinkCommand,
+    ProviderLinkTarget,
 };
 #[allow(unused_imports)]
 pub(crate) use materialization::{
-    EvictOutcome, MaterializationPort, MaterializationStateSummary, MaterializationStatusSummary,
+    EvictOutcome, LocalPresence, LocalTransition, MaterializationPort,
+    MaterializationStatusSummary, TempAssembly, TempMaterialization, TempOutcome,
 };
 #[allow(unused_imports)]
 pub(crate) use membership::{
     HandoffTicketPort, MembershipCoordination, MembershipRepository, ReplicaReadinessPort,
 };
 #[allow(unused_imports)]
+pub(crate) use preserved::PreservedPort;
+#[allow(unused_imports)]
 pub(crate) use replica_role::{
-    HandoffReadinessPort, LinkRuntimePort, PlaceholderPipelineCapabilityPort,
-    ReplicaRoleRepository, RoleLossCoordination, RoleLossJournal,
+    HandoffReadinessPort, LinkRuntimePort, OnDemandCapabilityPort, ReplicaRoleRepository,
+    RoleLossCoordination, RoleLossJournal,
 };
 #[allow(unused_imports)]
 pub(crate) use reporting::{

@@ -12,7 +12,7 @@ const OPERATION: &str = "operation-1";
 fn open_full_test_db() -> Arc<SyncDatabase> {
     Arc::new(
         SyncDatabase::open_in_memory(|conn| {
-            crate::dag_store::init_dag_schema(conn).map_err(|e| {
+            crate::replica_tables::init_for_tests(conn).map_err(|e| {
                 yadorilink_sqlite_runtime::DatabaseError::CorruptSchema(e.to_string())
             })?;
             yadorilink_sqlite_runtime::init_schema(conn)
@@ -54,6 +54,7 @@ fn commit_join_to_local_setup_pending(repository: &EnrollmentRepository) -> Link
                 local_path: LOCAL_PATH.to_string(),
             },
             2,
+            None,
         )
         .expect("the link commit must succeed")
 }
@@ -88,7 +89,7 @@ fn recovery_rollback_of_a_rejoin_keeps_the_link_row_that_was_already_there() {
     let rows = links.list_links().unwrap();
     let row = rows
         .iter()
-        .find(|link| link.local_path == LOCAL_PATH)
+        .find(|link| link.key() == LOCAL_PATH)
         .expect("the link row that predates the join must survive recovery");
     assert_eq!(row.group_id, GROUP);
     assert!(row.orphaned, "the row goes back to the orphaned state it was in");

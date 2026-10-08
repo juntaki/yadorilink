@@ -3,7 +3,7 @@
 //! A peer can legitimately advertise a path it cannot currently serve — mid
 //! directory-rename churn, or a losing conflict copy whose blocks have not
 //! been written yet. The adopting device must record a retriable
-//! `Placeholder`, never a `Hydrated` row with no file behind it:
+//! `Remote`, never a `Present` row with no file behind it:
 //!
 //! ```text
 //!   Placeholder   retried later, and correct in the meantime
@@ -195,7 +195,7 @@ async fn a_record_whose_blocks_no_peer_can_supply_stays_a_retriable_placeholder(
                 .materialization_state_repository()
                 .get_materialization_state(GROUP, PATH)
                 .unwrap()
-                == Some(MaterializationState::Placeholder)
+                == Some(MaterializationState::Remote)
         },
         Duration::from_secs(60),
         || {
@@ -214,7 +214,7 @@ async fn a_record_whose_blocks_no_peer_can_supply_stays_a_retriable_placeholder(
                     .get_file(GROUP, PATH)
                     .unwrap()
                     .is_some(),
-                device_b.state.replica_coordinator.sqlite().dag_group_heads(GROUP).unwrap().len()
+                device_b.state.replica_coordinator.sqlite().native_group_heads(GROUP).unwrap().len()
             )
         },
     )

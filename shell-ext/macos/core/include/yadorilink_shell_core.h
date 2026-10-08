@@ -28,8 +28,9 @@ extern "C" {
 
 /*
  * Mirrors `YadoriLinkBadgeStatus` in src/lib.rs. Priority order (highest
- * first): `MaterializationState::Placeholder` (the "online-only" state)
- * takes priority over the raw sync state; `Hydrating` folds into `Syncing`.
+ * first): a known local state without current content and without a transition
+ * (the "online-only" state) takes priority over the raw sync state; a
+ * hydrating or evicting transition folds into `Syncing`.
  */
 typedef enum {
     YadoriLinkBadgeStatusUnspecified = 0,
@@ -43,14 +44,13 @@ typedef enum {
 /*
  * Mirrors `YadoriLinkContextAction` in src/lib.rs / `ContextAction` in
  * shellipc.proto. Pass the raw integer value to
- * yadorilink_send_context_action; values outside 0-4 are rejected
+ * yadorilink_send_context_action; any other value is rejected
  * (fail-soft, returns false).
  */
 typedef enum {
     YadoriLinkContextActionViewStatus = 0,
     YadoriLinkContextActionPauseItem = 1,
     YadoriLinkContextActionResumeItem = 2,
-    YadoriLinkContextActionPinItem = 3,
     YadoriLinkContextActionEvictItem = 4,
 } YadoriLinkContextAction;
 

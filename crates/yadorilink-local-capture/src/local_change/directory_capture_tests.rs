@@ -14,15 +14,14 @@ pub(super) const GROUP: &str = "group-1";
 /// Every op this device authored at `path`, oldest first: `put-dir`,
 /// `put-file`, `put-symlink` (by the kind of the version put) or `delete`.
 pub(super) fn ops_at(state: &TestReplica, path: &str) -> Vec<String> {
-    let changes = state.change_history_repository().dag_list_group_changes(GROUP).unwrap();
     let mut out = Vec::new();
-    for change in changes {
-        for op in &change.ops {
-            match op {
-                Op::Put { path: p, version, .. } if p.as_str() == path => {
+    for delta in crate::test_support::native_deltas(state, GROUP) {
+        for op in delta.ops.iter().filter(|op| op.path.as_str() == path) {
+            match &op.put {
+                Some(put) => {
                     let kind = state
                         .sqlite()
-                        .dag_get_file_version(GROUP, version)
+                        .dag_get_file_version(GROUP, &put.version)
                         .unwrap()
                         .map(|v| v.meta.record_kind);
                     out.push(match kind {
@@ -32,8 +31,7 @@ pub(super) fn ops_at(state: &TestReplica, path: &str) -> Vec<String> {
                         None => "put-unknown".to_string(),
                     });
                 }
-                Op::Delete { path: p } if p.as_str() == path => out.push("delete".into()),
-                _ => {}
+                None => out.push("delete".into()),
             }
         }
     }
@@ -95,7 +93,7 @@ async fn rmdir_of_an_explicit_directory_emits_delete() {
     event(&proc, &root, &root.join("empty"), FsChangeKind::CreatedOrModified).await;
 
     std::fs::remove_dir(root.join("empty")).unwrap();
-    event(&proc, &root, &root.join("empty"), FsChangeKind::Removed).await;
+    event(&proc, &root, &root.join("empty"), FsChangeKind::ObservedRemoval).await;
 
     assert_eq!(ops_at(&state, "empty"), ["put-dir", "delete"]);
     assert_eq!(live_kind(&state, "empty"), None);
@@ -145,7 +143,7 @@ async fn moving_a_directory_with_an_explicit_entry_out_of_the_root_deletes_its_w
 
     let outside = tempfile::tempdir().unwrap();
     std::fs::rename(root.join("d"), outside.path().join("d")).unwrap();
-    event(&proc, &root, &root.join("d"), FsChangeKind::Removed).await;
+    event(&proc, &root, &root.join("d"), FsChangeKind::ObservedRemoval).await;
 
     assert_eq!(ops_at(&state, "d"), ["put-dir", "delete"]);
     assert_eq!(ops_at(&state, "d/sub"), ["put-dir", "delete"]);
@@ -306,7 +304,7 @@ async fn dir_only_ignore_pattern_applies_on_rmdir_event() {
     proc.process_event_with_ignore(
         GROUP,
         &root,
-        &FsChangeEvent { path: root.join("build"), kind: FsChangeKind::Removed },
+        &FsChangeEvent { path: root.join("build"), kind: FsChangeKind::ObservedRemoval },
         &ignore_set,
     )
     .await
@@ -366,7 +364,7 @@ async fn rm_rf_does_not_delete_child_indexed_but_not_yet_materialized() {
     }
 
     std::fs::remove_dir_all(root.join("a")).unwrap();
-    event(&proc, &root, &root.join("a"), FsChangeKind::Removed).await;
+    event(&proc, &root, &root.join("a"), FsChangeKind::ObservedRemoval).await;
 
     assert_eq!(ops_at(&state, "a"), ["put-dir", "delete"]);
     assert_eq!(ops_at(&state, "a/x"), ["put-file", "delete"]);
@@ -396,8 +394,8 @@ async fn a_directory_and_its_child_removed_in_one_flush_are_each_deleted_once() 
         GROUP,
         &root,
         yadorilink_filesystem_sync::debounce::DebounceFlush::Paths(vec![
-            (root.join("a/x"), FsChangeKind::Removed, 1),
-            (root.join("a"), FsChangeKind::Removed, 1),
+            (root.join("a/x"), FsChangeKind::ObservedRemoval, 1),
+            (root.join("a"), FsChangeKind::ObservedRemoval, 1),
         ]),
     )
     .await
@@ -424,7 +422,7 @@ fn a_recorded_structural_directory_stays_structural_for_a_relinked_scan() {
         "device-a".into(),
         std::sync::Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()),
     )
-    .with_change_emitter(Arc::new(ChangeEmitter::new(
+    .with_change_emitter(Arc::new(LocalAuthorKey::for_tests(
         "device-a",
         ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]),
     )));
@@ -454,7 +452,7 @@ async fn a_link_without_directory_capture_authors_no_directory() {
     assert_eq!(ops_at(&state, "made/f.txt"), ["put-file"]);
 
     std::fs::remove_dir_all(root.join("made")).unwrap();
-    event(&proc, &root, &root.join("made"), FsChangeKind::Removed).await;
+    event(&proc, &root, &root.join("made"), FsChangeKind::ObservedRemoval).await;
     assert_eq!(ops_at(&state, "made/f.txt"), ["put-file", "delete"]);
 }
 
@@ -501,7 +499,7 @@ async fn a_directory_made_where_a_retained_one_was_removed_is_captured_as_explic
     assert_eq!(ops_at(&state, "a"), Vec::<String>::new(), "the retained directory itself");
 
     std::fs::remove_dir(root.join("a")).unwrap();
-    event(&proc, &root, &root.join("a"), FsChangeKind::Removed).await;
+    event(&proc, &root, &root.join("a"), FsChangeKind::ObservedRemoval).await;
     // A sibling first, so the new directory cannot reuse the old inode.
     std::fs::create_dir(root.join("spacer")).unwrap();
     std::fs::create_dir(root.join("a")).unwrap();
@@ -552,7 +550,7 @@ async fn rm_rf_does_not_delete_child_admitted_but_not_yet_projected() {
     }
 
     std::fs::remove_dir_all(root.join("a")).unwrap();
-    event(&proc, &root, &root.join("a"), FsChangeKind::Removed).await;
+    event(&proc, &root, &root.join("a"), FsChangeKind::ObservedRemoval).await;
 
     assert_eq!(ops_at(&state, "a"), ["put-dir", "delete"]);
     assert_eq!(ops_at(&state, "a/x"), ["put-file", "delete"]);
@@ -589,4 +587,116 @@ async fn a_special_bit_on_a_structural_directory_does_not_promote_it() {
     assert_eq!(ops_at(&state, "s"), ["put-dir"]);
     let row = state.file_index_repository().canonical_current_row(GROUP, "s").unwrap().unwrap();
     assert_eq!(row.snapshot.unix_mode, Some(0o700));
+}
+
+/// Takes away the permission to search `dir` and gives it back on drop, so a
+/// failed assertion does not leave a directory the temp-dir cleanup cannot
+/// remove. `None` when this process is not stopped by the permission (it
+/// runs as root), which makes the scenario impossible to set up.
+#[cfg(unix)]
+struct Unsearchable(std::path::PathBuf);
+
+#[cfg(unix)]
+impl Unsearchable {
+    fn new(dir: &Path) -> Option<Self> {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let guard = Self(dir.to_path_buf());
+        std::fs::symlink_metadata(dir.join("probe"))
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
+            .then_some(guard)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Unsearchable {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// A path that cannot be looked at (its directory is not searchable) is not
+/// a path that is gone. Reading the permission error as "removed" authored a
+/// delete, and propagated it to every peer, for a file that still exists.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_path_that_cannot_be_observed_is_not_captured_as_a_deletion() {
+    let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
+    let root = canonical_root(&root_dir);
+    adopt_root(&state, GROUP, &root);
+    std::fs::create_dir(root.join("p")).unwrap();
+    std::fs::write(root.join("p/f.txt"), b"still here").unwrap();
+    event(&proc, &root, &root.join("p/f.txt"), FsChangeKind::CreatedOrModified).await;
+    assert_eq!(ops_at(&state, "p/f.txt"), ["put-file"], "sanity: captured");
+    let Some(_unsearchable) = Unsearchable::new(&root.join("p")) else { return };
+
+    let outcome = proc
+        .process_event(
+            GROUP,
+            &root,
+            &FsChangeEvent { path: root.join("p/f.txt"), kind: FsChangeKind::ObservedRemoval },
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(outcome, LocalChangeOutcome::RetryLater), "got {outcome:?}");
+    assert_eq!(ops_at(&state, "p/f.txt"), ["put-file"], "no delete may be authored");
+    assert!(state
+        .file_index_repository()
+        .get_file(GROUP, "p/f.txt")
+        .unwrap()
+        .is_some_and(|row| !row.deleted));
+}
+
+/// The entries observed under a vanished directory are the ones no longer
+/// on disk. An entry whose lookup fails for any reason but absence is not
+/// known to be gone, so it is not deleted with the directory.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_entry_that_cannot_be_observed_is_not_part_of_a_directory_removal() {
+    let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
+    let root = canonical_root(&root_dir);
+    adopt_root(&state, GROUP, &root);
+    std::fs::create_dir(root.join("d")).unwrap();
+    std::fs::write(root.join("d/x"), b"x").unwrap();
+    for rel in ["d", "d/x"] {
+        event(&proc, &root, &root.join(rel), FsChangeKind::CreatedOrModified).await;
+    }
+    let Some(_unsearchable) = Unsearchable::new(&root.join("d")) else { return };
+
+    let locked = proc
+        .lock_observed_subtree(
+            GROUP,
+            &root,
+            "d",
+            &[],
+            None,
+            super::semantic_delete::Removal::Observed,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        locked.entries().is_empty(),
+        "entries the disk could not answer for are not observed as removed: {:?}",
+        locked.entries()
+    );
+}
+
+/// At commit time a delete prepared for an absent path must still find it
+/// absent, not merely unreadable.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_path_does_not_match_a_delete_prepared_for_an_absent_one() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("p")).unwrap();
+    let missing = dir.path().join("p/gone");
+    assert!(super::disk_observation::disk_matches_prepare(&missing, &None), "sanity: absent");
+    let Some(_unsearchable) = Unsearchable::new(&dir.path().join("p")) else { return };
+
+    assert!(
+        !super::disk_observation::disk_matches_prepare(&missing, &None),
+        "unreadable is not absent"
+    );
 }

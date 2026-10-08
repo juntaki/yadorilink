@@ -11,12 +11,11 @@
 //!
 //! ```text
 //!   small request / control metadata  →  Service   (this lane)
-//!   proof-carrying or history bulk    →  Bundle
 //!   content bytes                     →  Block
 //! ```
 //!
-//! So a rebootstrap *request* and the manifest answering it belong here; the
-//! objects that manifest names do not.
+//! So a version-present *request* and the answer to it belong here; the
+//! objects they name do not.
 
 use yadorilink_peer_session::ports::PeerServiceStream;
 use yadorilink_sync_substrate::LaneStream;

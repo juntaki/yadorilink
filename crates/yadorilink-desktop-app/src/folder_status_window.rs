@@ -18,9 +18,8 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use yadorilink_ipc_proto::daemonctl::{
-    ConflictedFileInfo, FileVersionInfo, LinkStatus, MaterializationState,
-    MaterializationStatusResponse, PeerStatus, RestoreTrashOperationResponse, StatusResponse,
-    TrashedFileInfo,
+    ConflictedFileInfo, FileVersionInfo, LinkStatus, MaterializationStatusResponse, PeerStatus,
+    RestoreTrashOperationResponse, StatusResponse, TrashedFileInfo,
 };
 
 use crate::onboarding::executor::EventSink;
@@ -30,14 +29,12 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Which mutating action an [`Event::ActionDone`] reports the outcome of --
 /// decides which section re-fetches once the action completes, and how the
 /// outcome message reads. One shared variant rather than one `*Done` event
-/// per action: none of these six need their own distinct result shape,
+/// per action: none of these need their own distinct result shape,
 /// only a human-readable outcome and which section to refresh.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ActionKind {
     TrashRestore,
     VersionRestore,
-    Pin,
-    Unpin,
     Hydrate,
     Evict,
 }
@@ -272,6 +269,15 @@ impl FolderStatusApp {
         self.status.as_ref()?.links.iter().find(|l| l.local_path == self.local_path)
     }
 
+    /// This folder's directory, or `None` for a provider-backed folder: it has no directory, so
+    /// nothing here may reveal, join or restore into a path.
+    fn folder_root(&self) -> Option<std::path::PathBuf> {
+        match self.link() {
+            Some(link) if !link.provider_display_name.is_empty() => None,
+            _ => Some(std::path::PathBuf::from(&self.local_path)),
+        }
+    }
+
     fn peers(&self) -> &[PeerStatus] {
         self.status.as_ref().map(|s| s.peers.as_slice()).unwrap_or_default()
     }
@@ -371,8 +377,6 @@ impl eframe::App for FolderStatusApp {
                                 spawn_trash_fetch(self.sink.clone(), self.local_path.clone())
                             }
                             ActionKind::VersionRestore
-                            | ActionKind::Pin
-                            | ActionKind::Unpin
                             | ActionKind::Hydrate
                             | ActionKind::Evict => {
                                 if let Some(path) = self.file_tools.absolute_path.clone() {
@@ -439,7 +443,7 @@ impl FolderStatusApp {
         ui.horizontal(|ui| {
             ui.heading(crate::status_model::folder_display_name(&self.local_path));
             // This window's own mutating actions are per-file (trash
-            // restore, version restore, pin/unpin, hydrate/evict); nothing
+            // restore, version restore, hydrate/evict); nothing
             // here touches sharing. The button opens the sharing window as
             // its own process (exactly what the tray's own "Share…" item
             // does) and never mints or changes anything itself.
@@ -609,9 +613,10 @@ impl FolderStatusApp {
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
                             ui.label(&file.path);
-                            if ui.button("Reveal this copy").clicked() {
-                                let full = std::path::Path::new(&self.local_path).join(&file.path);
-                                let _ = opener::reveal(&full);
+                            if let Some(root) = self.folder_root() {
+                                if ui.button("Reveal this copy").clicked() {
+                                    let _ = opener::reveal(root.join(&file.path));
+                                }
                             }
                         });
                         ui.label(egui::RichText::new(conflict_origin_line(&detail)).weak().small());
@@ -624,10 +629,10 @@ impl FolderStatusApp {
                                 .weak()
                                 .small(),
                             );
-                            if ui.small_button("Reveal current").clicked() {
-                                let full = std::path::Path::new(&self.local_path)
-                                    .join(&detail.current_path);
-                                let _ = opener::reveal(&full);
+                            if let Some(root) = self.folder_root() {
+                                if ui.small_button("Reveal current").clicked() {
+                                    let _ = opener::reveal(root.join(&detail.current_path));
+                                }
                             }
                         });
                         ui.label(
@@ -719,9 +724,11 @@ impl FolderStatusApp {
                             });
                         }
                     }
-                    if let Some(click) = restore_clicked {
+                    // A provider folder has no directory to restore into: the daemon restores through
+                    // the provider, not through a path, so no path-joined restore is offered.
+                    if let (Some(click), Some(root)) = (restore_clicked, self.folder_root()) {
                         self.action_in_flight = true;
-                        let local_path = self.local_path.clone();
+                        let local_path = root.to_string_lossy().to_string();
                         let absolute = move |path: &str| {
                             std::path::Path::new(&local_path)
                                 .join(path)
@@ -762,15 +769,15 @@ impl FolderStatusApp {
         });
     }
 
-    /// Version history + selective sync (on-demand pin/unpin/hydrate/
-    /// evict) for one file or folder the user explicitly picks -- there is
+    /// Version history + selective sync (on-demand hydrate/evict) for
+    /// one file or folder the user explicitly picks -- there is
     /// no daemon request to list every indexed path in a folder (see
     /// `actions::pick_file_in`'s own doc comment), so this panel operates
     /// on exactly one chosen entry rather than a full in-app file browser.
     /// A folder's selective sync acts on everything below it.
     #[allow(
         clippy::excessive_nesting,
-        reason = "one panel whose pin/unpin/hydrate/evict buttons and version-restore rows all close over the same `absolute_path` and `action_in_flight` guard; the depth is egui's nested-closure widget tree, and splitting per button would duplicate that shared borrow state"
+        reason = "one panel whose hydrate/evict buttons and version-restore rows all close over the same `absolute_path` and `action_in_flight` guard; the depth is egui's nested-closure widget tree, and splitting per button would duplicate that shared borrow state"
     )]
     fn render_file_tools(&mut self, ui: &mut egui::Ui) {
         egui::CollapsingHeader::new("Version history & selective sync").default_open(false).show(
@@ -781,10 +788,7 @@ impl FolderStatusApp {
                         crate::actions::pick_file_in(&self.local_path)
                     } else if ui
                         .button("Choose a folder…")
-                        .on_hover_text(
-                            "Pin, download or evict a folder as a whole. A pinned folder keeps \
-                             what is added to it later on this device too.",
-                        )
+                        .on_hover_text("Download or evict a folder as a whole.")
                         .clicked()
                     {
                         crate::actions::pick_folder_in(&self.local_path)
@@ -835,31 +839,12 @@ impl FolderStatusApp {
                 if let Some(materialization) = self.file_tools.materialization {
                     ui.label(egui::RichText::new("Selective sync").strong());
                     if materialization.known {
-                        let state_label = materialization_state_label(materialization.state());
-                        let pinned = if materialization.pinned { ", pinned" } else { "" };
-                        ui.label(format!("{state_label}{pinned}"));
+                        let state_label = yadorilink_ipc_proto::daemonctl::local_state_word(
+                            materialization.local_state.as_ref(),
+                        );
+                        ui.label(state_label);
                         ui.horizontal(|ui| {
                             let busy = self.action_in_flight;
-                            if ui.add_enabled(!busy, egui::Button::new("Pin")).clicked() {
-                                self.action_in_flight = true;
-                                let path = absolute_path.clone();
-                                spawn_action(self.sink.clone(), ActionKind::Pin, async move {
-                                    crate::actions::pin_file(path)
-                                        .await
-                                        .map(|()| "Pinned.".to_string())
-                                        .map_err(|e| e.to_string())
-                                });
-                            }
-                            if ui.add_enabled(!busy, egui::Button::new("Unpin")).clicked() {
-                                self.action_in_flight = true;
-                                let path = absolute_path.clone();
-                                spawn_action(self.sink.clone(), ActionKind::Unpin, async move {
-                                    crate::actions::unpin_file(path)
-                                        .await
-                                        .map(|()| "Unpinned.".to_string())
-                                        .map_err(|e| e.to_string())
-                                });
-                            }
                             if ui.add_enabled(!busy, egui::Button::new("Hydrate")).clicked() {
                                 self.action_in_flight = true;
                                 let path = absolute_path.clone();
@@ -881,8 +866,8 @@ impl FolderStatusApp {
                                             if dehydrated {
                                                 "Evicted (converted to a placeholder).".to_string()
                                             } else {
-                                                "Not evicted -- it may be pinned, busy, or not \
-                                                 fully synced."
+                                                "Not evicted -- it may be busy or not fully \
+                                                 synced."
                                                     .to_string()
                                             }
                                         })
@@ -1026,19 +1011,6 @@ fn folder_restore_message(outcome: &RestoreTrashOperationResponse) -> Result<Str
         .map(|failure| format!("{}: {}", failure.path, failure.error))
         .collect();
     Err(format!("{text} Could not restore {}.", failures.join("; ")))
-}
-
-/// `MaterializationState` proto enum -> the same wording
-/// `commands::materialization::status` already prints for each state,
-/// kept consistent between CLI and desktop app.
-fn materialization_state_label(state: MaterializationState) -> &'static str {
-    match state {
-        MaterializationState::Hydrated => "hydrated",
-        MaterializationState::Placeholder => "placeholder",
-        MaterializationState::Hydrating => "hydrating",
-        MaterializationState::Evicting => "evicting",
-        MaterializationState::Unspecified => "unknown",
-    }
 }
 
 /// "Deleted 3h ago by device-a  ·  v4  ·  1.2 MiB" -- a trashed file's

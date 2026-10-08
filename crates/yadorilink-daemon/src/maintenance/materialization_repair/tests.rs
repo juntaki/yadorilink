@@ -37,7 +37,7 @@ async fn a_panic_in_run_once_is_recovered_not_left_permanently_dead() {
     // itself lost its restart supervision. `build` constructs `state`
     // with no background tasks, so the task started below is the only
     // one that can possibly recover the injected panic.
-    let state = DaemonState::build("device-under-test".into(), sync_state, store).state;
+    let state = DaemonState::build("device-under-test".into(), sync_state, store);
     // Fast enough that the test doesn't sit through a real production
     // interval, without being so fast it races the panic injection
     // below (the very first sleep must still land after

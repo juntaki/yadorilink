@@ -1,3 +1,11 @@
+// Exactly one epoch. The restore's native head changes what the path is
+// desired to be, which is what keeps the old basis from being trusted
+// (its proof no longer matches the desired state), so authoring advances
+// nothing; the one physical write is one mutation. A second advance means
+// the commit went through an API that mints its own, which is precisely
+// the lane confusion this closes. Asserting the count is what pins that
+// down -- both shapes leave a usable proof behind, since the adopting one
+// publishes under the epoch it just minted.
 #![cfg(test)]
 
 /// The version a seeded row currently names -- these guard fixtures
@@ -186,12 +194,12 @@ async fn local_root_for_group_treats_an_orphaned_link_as_absent() {
 ///
 /// `observe_path` failing is a transient filesystem condition. The
 /// attempt has already bumped the mutation fence, so any earlier proof
-/// is stale; stamping `Hydrated` anyway would produce the one state
+/// is stale; stamping `Present` anyway would produce the one state
 /// `hydration_commit_decision` refuses to reconstruct over, and the
 /// path would stay refused forever. Abandoning the attempt instead
-/// drops the guard uncompleted, which reverts the row to `Placeholder`
+/// drops the guard uncompleted, which reverts the row to `Remote`
 /// -- so the next attempt runs normally and, once the observation
-/// succeeds, the path ends `Hydrated` WITH a usable generation.
+/// succeeds, the path ends `Present` WITH a usable generation.
 #[tokio::test]
 async fn an_unobservable_write_leaves_the_path_retryable_not_stuck() {
     let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
@@ -212,11 +220,6 @@ async fn an_unobservable_write_leaves_the_path_retryable_not_stuck() {
             &permit,
         )
         .unwrap();
-    let hash = yadorilink_replica_domain::ids::ChangeHash([7u8; 32]);
-    sync_state
-        .file_index_repository()
-        .set_authoring_change_hash("group-1", "doc.txt", &hash)
-        .unwrap();
     sync_state
         .materialization_state_repository()
         .set_materialization_state("group-1", "doc.txt", MaterializationState::Hydrating, &permit)
@@ -226,13 +229,12 @@ async fn an_unobservable_write_leaves_the_path_retryable_not_stuck() {
     // `hydrate_inner` does, then fails to observe what it wrote.
     sync_state.dag_bump_mutation_fence("group-1", "doc.txt", "hydration_write").unwrap();
     {
-        let _guard = crate::replica_coordinator::AccessHydration::armed_for_tests(
+        let _guard = crate::replica_coordinator::HydrationAttempt::armed_for_tests(
             sync_state.as_ref(),
             "group-1",
             "doc.txt",
-            Some(hash),
             current_version_hash_for(&sync_state, "group-1", "doc.txt"),
-            MaterializationState::Placeholder,
+            MaterializationState::Remote,
         );
         // never `complete()`d -- the observation failed
     }
@@ -242,7 +244,7 @@ async fn an_unobservable_write_leaves_the_path_retryable_not_stuck() {
             .materialization_state_repository()
             .get_materialization_state("group-1", "doc.txt")
             .unwrap(),
-        Some(MaterializationState::Placeholder),
+        Some(MaterializationState::Remote),
         "an attempt that could not prove its write must leave the row retryable, never \
          Hydrated-without-a-generation"
     );
@@ -280,7 +282,6 @@ async fn an_unobservable_write_leaves_the_path_retryable_not_stuck() {
         .commit_internal_materialized_state_if_fence_current(
             "group-1",
             "doc.txt",
-            None,
             &ExactMaterializedState::Object {
                 kind: yadorilink_replica_domain::file::RecordKind::File,
                 version: current_version_hash,
@@ -289,7 +290,6 @@ async fn an_unobservable_write_leaves_the_path_retryable_not_stuck() {
             mutation_generation,
             Some(ExpectedAuthoring {
                 state: MaterializationState::Hydrating,
-                authoring_change_hash: Some(&hash),
                 expected_version: Some(&current_version_hash),
             }),
             &permit,
@@ -313,7 +313,7 @@ async fn an_unobservable_write_leaves_the_path_retryable_not_stuck() {
             .materialization_state_repository()
             .get_materialization_state("group-1", "doc.txt")
             .unwrap(),
-        Some(MaterializationState::Hydrated),
+        Some(MaterializationState::Present),
         "the same commit that published the proof is what stamps the claim"
     );
 }
@@ -328,10 +328,10 @@ async fn an_unobservable_write_leaves_the_path_retryable_not_stuck() {
 /// whole duration the way `hydrate_inner` does today. A state-only
 /// CAS cannot tell "still my own in-flight attempt" apart from "a
 /// different attempt that happens to also be `Hydrating` right
-/// now" -- only binding to the authoring identity captured before
-/// marking `Hydrating` closes that.
+/// now" -- only binding to the version captured before marking
+/// `Hydrating` closes that.
 #[tokio::test]
-async fn hydration_state_guard_does_not_clobber_a_differently_authored_hydrating_row() {
+async fn hydration_state_guard_does_not_clobber_a_different_versions_hydrating_row() {
     let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
     sync_state.link_repository().add_link("/home/alice/Photos", "group-1").unwrap();
     let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
@@ -350,43 +350,49 @@ async fn hydration_state_guard_does_not_clobber_a_differently_authored_hydrating
             &permit,
         )
         .unwrap();
-    let old_hash = yadorilink_replica_domain::ids::ChangeHash([1u8; 32]);
-    sync_state
-        .file_index_repository()
-        .set_authoring_change_hash("group-1", "doc.txt", &old_hash)
-        .unwrap();
     sync_state
         .materialization_state_repository()
         .set_materialization_state("group-1", "doc.txt", MaterializationState::Hydrating, &permit)
         .unwrap();
 
-    // This (stale) attempt's own guard, capturing the OLD identity --
+    // This (stale) attempt's own guard, capturing the OLD version --
     // as `hydrate_inner` does before marking the row `Hydrating`.
-    let guard = crate::replica_coordinator::AccessHydration::armed_for_tests(
+    let old_version = current_version_hash_for(&sync_state, "group-1", "doc.txt");
+    let guard = crate::replica_coordinator::HydrationAttempt::armed_for_tests(
         sync_state.as_ref(),
         "group-1",
         "doc.txt",
-        Some(old_hash),
-        current_version_hash_for(&sync_state, "group-1", "doc.txt"),
-        MaterializationState::Placeholder,
+        old_version,
+        MaterializationState::Remote,
     );
 
     // A different, concurrent attempt supersedes the row with a
     // genuinely newer version and starts its OWN hydration --
-    // landing back at `Hydrating`, but for a different identity.
-    let new_hash = yadorilink_replica_domain::ids::ChangeHash([2u8; 32]);
+    // landing back at `Hydrating`, but for a different version.
     sync_state
         .file_index_repository()
-        .set_authoring_change_hash("group-1", "doc.txt", &new_hash)
+        .upsert_file(
+            "group-1",
+            &yadorilink_replica_domain::file::FileRecord {
+                path: "doc.txt".into(),
+                size: 0,
+                mtime_unix_nanos: 1,
+                blocks: vec![],
+                deleted: false,
+            },
+            &permit,
+        )
         .unwrap();
+    let new_version = current_version_hash_for(&sync_state, "group-1", "doc.txt");
+    assert_ne!(old_version, new_version, "fixture check: the row must really be a newer version");
     sync_state
         .materialization_state_repository()
         .set_materialization_state("group-1", "doc.txt", MaterializationState::Hydrating, &permit)
         .unwrap();
 
     // The stale attempt's guard now drops (never `complete()`d) --
-    // state alone matches (`Hydrating`), but the authoring identity
-    // does not, so this must be a no-op.
+    // state alone matches (`Hydrating`), but the version does not, so
+    // this must be a no-op.
     drop(guard);
 
     assert_eq!(
@@ -399,15 +405,15 @@ async fn hydration_state_guard_does_not_clobber_a_differently_authored_hydrating
          just because the state value happens to match"
     );
     assert_eq!(
-        sync_state.file_index_repository().get_authoring_change_hash("group-1", "doc.txt").unwrap(),
-        Some(new_hash),
-        "the newer version's identity must be untouched"
+        current_version_hash_for(&sync_state, "group-1", "doc.txt"),
+        new_version,
+        "the newer version must be untouched"
     );
 }
 
 /// Two concurrent `hydrate_inner` calls for the SAME path and the
-/// SAME version (same authoring hash) must not race destructively --
-/// the counter-scenario to the authoring-bound guard alone: authoring identity distinguishes one FILE
+/// SAME version must not race destructively -- the counter-scenario to
+/// the version-bound guard alone: a version distinguishes one FILE
 /// VERSION from another, not one in-flight ATTEMPT from another, so
 /// two attempts for the identical version are indistinguishable to
 /// that binding. `hydrate_inner` now holds `path_lock` for its whole
@@ -421,7 +427,7 @@ async fn hydration_state_guard_does_not_clobber_a_differently_authored_hydrating
 /// so the second call only ever starts after the first has
 /// committed; it re-marks the row `Hydrating` and redundantly
 /// reconstructs rather than short-circuiting via `AlreadyComplete`
-/// (there is no pre-lock fast path for an already-`Hydrated` row),
+/// (there is no pre-lock fast path for an already-`Present` row),
 /// but both attempts still converge on the same correct end state.
 /// Note: on the default single-threaded test
 /// runtime, with both blocks resolving synchronously from local
@@ -448,10 +454,7 @@ async fn concurrent_hydrations_of_the_same_version_do_not_race() {
     let content = b"concurrent hydration content";
     let hash = Sha256::digest(content).to_vec();
     store.put(content).unwrap();
-    sync_state
-        .change_history_repository()
-        .record_group_block_provenance("group-1", std::slice::from_ref(&hash))
-        .unwrap();
+    sync_state.record_block_provenance("group-1", std::slice::from_ref(&hash)).unwrap();
 
     let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
     sync_state
@@ -470,7 +473,7 @@ async fn concurrent_hydrations_of_the_same_version_do_not_race() {
         .unwrap();
     sync_state
         .materialization_state_repository()
-        .set_materialization_state("group-1", "doc.txt", MaterializationState::Placeholder, &permit)
+        .set_materialization_state("group-1", "doc.txt", MaterializationState::Remote, &permit)
         .unwrap();
 
     let state = DaemonState::new("device-a".into(), sync_state.clone(), store);
@@ -494,7 +497,7 @@ async fn concurrent_hydrations_of_the_same_version_do_not_race() {
             .materialization_state_repository()
             .get_materialization_state("group-1", "doc.txt")
             .unwrap(),
-        Some(MaterializationState::Hydrated),
+        Some(MaterializationState::Present),
         "the row must end up genuinely Hydrated, not stuck at Placeholder despite correct \
          disk content"
     );
@@ -532,10 +535,7 @@ async fn concurrent_hydrate_with_timeout_calls_for_the_same_path_both_succeed() 
     let content = b"single-flight hydration content";
     let hash = Sha256::digest(content).to_vec();
     store.put(content).unwrap();
-    sync_state
-        .change_history_repository()
-        .record_group_block_provenance("group-1", std::slice::from_ref(&hash))
-        .unwrap();
+    sync_state.record_block_provenance("group-1", std::slice::from_ref(&hash)).unwrap();
 
     let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
     sync_state
@@ -554,7 +554,7 @@ async fn concurrent_hydrate_with_timeout_calls_for_the_same_path_both_succeed() 
         .unwrap();
     sync_state
         .materialization_state_repository()
-        .set_materialization_state("group-1", "doc.txt", MaterializationState::Placeholder, &permit)
+        .set_materialization_state("group-1", "doc.txt", MaterializationState::Remote, &permit)
         .unwrap();
 
     let state = DaemonState::new("device-a".into(), sync_state.clone(), store);
@@ -578,7 +578,7 @@ async fn concurrent_hydrate_with_timeout_calls_for_the_same_path_both_succeed() 
             .materialization_state_repository()
             .get_materialization_state("group-1", "doc.txt")
             .unwrap(),
-        Some(MaterializationState::Hydrated),
+        Some(MaterializationState::Present),
     );
     assert_eq!(std::fs::read(root_dir.path().join("doc.txt")).unwrap(), content);
 }
@@ -606,10 +606,7 @@ async fn a_late_joining_caller_observes_the_leaders_result_as_a_follower() {
     let content = b"late follower content";
     let hash = Sha256::digest(content).to_vec();
     store.put(content).unwrap();
-    sync_state
-        .change_history_repository()
-        .record_group_block_provenance("group-1", std::slice::from_ref(&hash))
-        .unwrap();
+    sync_state.record_block_provenance("group-1", std::slice::from_ref(&hash)).unwrap();
 
     let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
     sync_state
@@ -628,7 +625,7 @@ async fn a_late_joining_caller_observes_the_leaders_result_as_a_follower() {
         .unwrap();
     sync_state
         .materialization_state_repository()
-        .set_materialization_state("group-1", "doc.txt", MaterializationState::Placeholder, &permit)
+        .set_materialization_state("group-1", "doc.txt", MaterializationState::Remote, &permit)
         .unwrap();
 
     let state = DaemonState::new("device-a".into(), sync_state.clone(), store);
@@ -671,9 +668,9 @@ async fn a_late_joining_caller_observes_the_leaders_result_as_a_follower() {
 /// `shell_ipc::handle_message`) is reachable for an arbitrary caller-
 /// supplied path with no upstream check on whether that path is
 /// already fully materialized -- a real client cannot be trusted to
-/// only ever ask for a genuine `Placeholder`. Before this fast path,
+/// only ever ask for a genuine `Remote`. Before this fast path,
 /// `hydrate_inner` would still unconditionally mark an already-
-/// `Hydrated` row `Hydrating` and reconstruct it from the *indexed*
+/// `Present` row `Hydrating` and reconstruct it from the *indexed*
 /// blocks, silently overwriting any content an editor wrote to disk
 /// after the row was last hydrated but before its own watcher event
 /// reached the index. Returns `(state, sync_state, root_dir,
@@ -694,10 +691,7 @@ async fn setup_legitimately_hydrated_doc(
     let indexed_content: &'static [u8] = b"indexed content from the last real hydration";
     let hash = Sha256::digest(indexed_content).to_vec();
     store.put(indexed_content).unwrap();
-    sync_state
-        .change_history_repository()
-        .record_group_block_provenance("group-1", std::slice::from_ref(&hash))
-        .unwrap();
+    sync_state.record_block_provenance("group-1", std::slice::from_ref(&hash)).unwrap();
     let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
     sync_state
         .file_index_repository()
@@ -715,7 +709,7 @@ async fn setup_legitimately_hydrated_doc(
         .unwrap();
     sync_state
         .materialization_state_repository()
-        .set_materialization_state("group-1", "doc.txt", MaterializationState::Placeholder, &permit)
+        .set_materialization_state("group-1", "doc.txt", MaterializationState::Remote, &permit)
         .unwrap();
 
     let state = DaemonState::new("device-a".into(), sync_state.clone(), store);
@@ -742,7 +736,7 @@ async fn setup_legitimately_hydrated_doc(
 ///    encodes version PRESENCE -- a proof published with no version
 ///    matches no desired resolution at all, so it can never settle the
 ///    path and the convergence engine re-materializes it forever.
-/// 2. No `Hydrated` without a usable proof. `dag_lookup_materialized_
+/// 2. No `Present` without a usable proof. `dag_lookup_materialized_
 ///    generation` is fail-closed (a generation published under a
 ///    superseded fence reads as absent), so a `Some` here is the whole
 ///    invariant this branch exists to guarantee.
@@ -770,10 +764,7 @@ async fn a_daemon_hydration_publishes_a_versioned_proof_under_its_own_single_epo
     let content: &[u8] = b"content this hydration will have to vouch for";
     let hash = Sha256::digest(content).to_vec();
     store.put(content).unwrap();
-    sync_state
-        .change_history_repository()
-        .record_group_block_provenance("group-1", std::slice::from_ref(&hash))
-        .unwrap();
+    sync_state.record_block_provenance("group-1", std::slice::from_ref(&hash)).unwrap();
     let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
     sync_state
         .file_index_repository()
@@ -791,7 +782,7 @@ async fn a_daemon_hydration_publishes_a_versioned_proof_under_its_own_single_epo
         .unwrap();
     sync_state
         .materialization_state_repository()
-        .set_materialization_state("group-1", "doc.txt", MaterializationState::Placeholder, &permit)
+        .set_materialization_state("group-1", "doc.txt", MaterializationState::Remote, &permit)
         .unwrap();
 
     // The version this hydration is about to materialize, read the same
@@ -827,7 +818,7 @@ async fn a_daemon_hydration_publishes_a_versioned_proof_under_its_own_single_epo
             .materialization_state_repository()
             .get_materialization_state("group-1", "doc.txt")
             .unwrap(),
-        Some(MaterializationState::Hydrated),
+        Some(MaterializationState::Present),
         "a hydration that reconstructed and observed its own write must claim Hydrated"
     );
 
@@ -880,7 +871,7 @@ async fn hydrate_of_an_already_hydrated_path_is_a_no_op_and_never_touches_disk()
             .materialization_state_repository()
             .get_materialization_state("group-1", "doc.txt")
             .unwrap(),
-        Some(MaterializationState::Hydrated),
+        Some(MaterializationState::Present),
         "the row's state must be left exactly as it was"
     );
 }
@@ -916,13 +907,13 @@ async fn hydrate_never_overwrites_a_local_edit_that_truncates_the_file_to_zero_b
             .materialization_state_repository()
             .get_materialization_state("group-1", "doc.txt")
             .unwrap(),
-        Some(MaterializationState::Hydrated),
+        Some(MaterializationState::Present),
         "the row's state must be left exactly as it was -- local capture picks this edit up \
          normally on its own next pass, exactly like any other local edit"
     );
 }
 
-/// A `Hydrated` row with no usable actual-state generation is REFUSED,
+/// A `Present` row with no usable actual-state generation is REFUSED,
 /// not reconstructed over.
 ///
 /// This replaces a test that asserted the opposite. Under the retired
@@ -930,12 +921,12 @@ async fn hydrate_never_overwrites_a_local_edit_that_truncates_the_file_to_zero_b
 /// "this device never wrote these bytes", so falling through to a real
 /// reconstruct was right. Under the generation invariant it means
 /// something the device cannot distinguish from a legitimate external
-/// edit -- `Hydrated` is a claim that a proof exists, and reconstructing
+/// edit -- `Present` is a claim that a proof exists, and reconstructing
 /// over content nothing vouches for would destroy exactly the local
 /// change the old mechanism was trying to protect.
 ///
 /// Producing this row is itself a defect (see the writer sites that
-/// stamp `Hydrated` only alongside a published proof); what this pins
+/// stamp `Present` only alongside a published proof); what this pins
 /// is that when one does exist, it fails closed and loudly rather than
 /// silently overwriting.
 #[tokio::test]
@@ -955,10 +946,7 @@ async fn hydrate_refuses_a_hydrated_row_with_no_usable_generation() {
     let indexed_content = b"indexed content from the last real hydration";
     let hash = Sha256::digest(indexed_content).to_vec();
     store.put(indexed_content).unwrap();
-    sync_state
-        .change_history_repository()
-        .record_group_block_provenance("group-1", std::slice::from_ref(&hash))
-        .unwrap();
+    sync_state.record_block_provenance("group-1", std::slice::from_ref(&hash)).unwrap();
     let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
     sync_state
         .file_index_repository()
@@ -980,7 +968,7 @@ async fn hydrate_refuses_a_hydrated_row_with_no_usable_generation() {
     // this device never actually, verifiably wrote the bytes itself.
     sync_state
         .materialization_state_repository()
-        .set_materialization_state("group-1", "doc.txt", MaterializationState::Hydrated, &permit)
+        .set_materialization_state("group-1", "doc.txt", MaterializationState::Present, &permit)
         .unwrap();
     // A genuinely empty leftover artifact, exactly like the confirmed
     // restart-mid-relay-sync race this shortcut was originally built
@@ -992,9 +980,13 @@ async fn hydrate_refuses_a_hydrated_row_with_no_usable_generation() {
     let result = hydrate_inner(&state, "group-1", "doc.txt", Some(&test_stall())).await;
 
     assert!(
-        matches!(result, Err(SyncError::CorruptState(ref m)) if m.contains("no usable actual-state generation")),
-        "a Hydrated row with no usable generation must be refused, not reconstructed over: \
-         got {result:?}"
+        matches!(result, Err(SyncError::HydrationFailed(_))),
+        "a Present row whose object no proof vouches for must be refused, not reconstructed \
+         over: got {result:?}"
+    );
+    assert!(
+        sync_state.dirty_path_repository().is_path_dirty("group-1", "doc.txt").unwrap(),
+        "the refused object must be journalled for local capture"
     );
     assert_eq!(
         std::fs::read(root_dir.path().join("doc.txt")).unwrap(),
@@ -1005,7 +997,7 @@ async fn hydrate_refuses_a_hydrated_row_with_no_usable_generation() {
     let _ = indexed_content;
 }
 
-/// A symlink or directory record is never a `Placeholder` waiting on
+/// A symlink or directory record is never a `Remote` waiting on
 /// `hydrate` -- it is always fully materialized the moment it's
 /// adopted (`peer_session::materialize_symlink_at`). Before this kind
 /// guard, `hydrate_inner` had no way to know a given path wasn't an
@@ -1092,10 +1084,7 @@ async fn hydrate_creates_no_directories_under_a_root_whose_marker_no_longer_matc
     let content = b"nested placeholder content";
     let hash = Sha256::digest(content).to_vec();
     store.put(content).unwrap();
-    sync_state
-        .change_history_repository()
-        .record_group_block_provenance("group-1", std::slice::from_ref(&hash))
-        .unwrap();
+    sync_state.record_block_provenance("group-1", std::slice::from_ref(&hash)).unwrap();
     let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
     sync_state
         .file_index_repository()
@@ -1116,7 +1105,7 @@ async fn hydrate_creates_no_directories_under_a_root_whose_marker_no_longer_matc
         .set_materialization_state(
             "group-1",
             "sub/nested/doc.txt",
-            MaterializationState::Placeholder,
+            MaterializationState::Remote,
             &permit,
         )
         .unwrap();
@@ -1160,10 +1149,7 @@ async fn hydrate_applies_the_recorded_unix_mode_after_reconstruct() {
     let content = b"#!/bin/sh\necho hi\n";
     let hash = Sha256::digest(content).to_vec();
     store.put(content).unwrap();
-    sync_state
-        .change_history_repository()
-        .record_group_block_provenance("group-1", std::slice::from_ref(&hash))
-        .unwrap();
+    sync_state.record_block_provenance("group-1", std::slice::from_ref(&hash)).unwrap();
     let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
     sync_state
         .file_index_repository()
@@ -1185,7 +1171,7 @@ async fn hydrate_applies_the_recorded_unix_mode_after_reconstruct() {
         .unwrap();
     sync_state
         .materialization_state_repository()
-        .set_materialization_state("group-1", "run.sh", MaterializationState::Placeholder, &permit)
+        .set_materialization_state("group-1", "run.sh", MaterializationState::Remote, &permit)
         .unwrap();
 
     let state = DaemonState::new("device-a".into(), sync_state.clone(), store);
@@ -1200,11 +1186,10 @@ async fn hydrate_applies_the_recorded_unix_mode_after_reconstruct() {
     );
 }
 
-/// A `Placeholder` row whose placeholder this device really wrote: the
-/// block is in the store, the sparse stand-in is on disk, and its
-/// identity is recorded exactly as the materialization lane records it.
+/// A `Remote` row: the block is in the store and nothing stands at the path,
+/// exactly as the on-demand lane leaves it.
 #[cfg(unix)]
-async fn setup_real_placeholder_doc(
+async fn setup_remote_doc(
 ) -> (Arc<DaemonState>, Arc<ReplicaCoordinator>, tempfile::TempDir, &'static [u8]) {
     let store = Arc::new(SegmentBlockStore::new(tempfile::tempdir().unwrap().keep()).unwrap());
     let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
@@ -1220,10 +1205,7 @@ async fn setup_real_placeholder_doc(
     let indexed_content: &'static [u8] = b"the remote content this placeholder stands in for";
     let hash = Sha256::digest(indexed_content).to_vec();
     store.put(indexed_content).unwrap();
-    sync_state
-        .change_history_repository()
-        .record_group_block_provenance("group-1", std::slice::from_ref(&hash))
-        .unwrap();
+    sync_state.record_block_provenance("group-1", std::slice::from_ref(&hash)).unwrap();
     let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
     sync_state
         .file_index_repository()
@@ -1239,41 +1221,22 @@ async fn setup_real_placeholder_doc(
             &permit,
         )
         .unwrap();
-    let identity = yadorilink_local_storage::write_placeholder(
-        &root_dir.path().join("doc.txt"),
-        indexed_content.len() as u64,
-        0,
-    )
-    .unwrap()
-    .expect("a unix placeholder has an inode identity");
-    let repo = sync_state.materialization_state_repository();
-    repo.set_materialization_state(
-        "group-1",
-        "doc.txt",
-        MaterializationState::Placeholder,
-        &permit,
-    )
-    .unwrap();
-    repo.record_placeholder_generation(
-        "group-1",
-        "doc.txt",
-        identity,
-        yadorilink_local_storage::INTERNAL_INODE_PROVIDER_KIND,
-        &permit,
-    )
-    .unwrap();
+    sync_state
+        .materialization_state_repository()
+        .set_materialization_state("group-1", "doc.txt", MaterializationState::Remote, &permit)
+        .unwrap();
 
     let state = DaemonState::new("device-a".into(), sync_state.clone(), store);
     state.install_test_root_commit_authority("group-1");
     (state, sync_state, root_dir, indexed_content)
 }
 
-/// The positive control for the two tests below: a placeholder nobody has
-/// touched hydrates.
+/// The positive control for the two tests below: a `Remote` row with nothing
+/// at its path hydrates.
 #[cfg(unix)]
 #[tokio::test]
-async fn an_untouched_placeholder_hydrates() {
-    let (state, sync_state, root_dir, content) = setup_real_placeholder_doc().await;
+async fn a_remote_row_with_nothing_at_the_path_hydrates() {
+    let (state, sync_state, root_dir, content) = setup_remote_doc().await;
 
     hydrate_inner(&state, "group-1", "doc.txt", Some(&test_stall())).await.unwrap();
 
@@ -1283,24 +1246,23 @@ async fn an_untouched_placeholder_hydrates() {
             .materialization_state_repository()
             .get_materialization_state("group-1", "doc.txt")
             .unwrap(),
-        Some(MaterializationState::Hydrated)
+        Some(MaterializationState::Present)
     );
 }
 
-/// An edit written into a placeholder before a hydration attempt starts,
-/// and not yet journalled by the watcher, is not overwritten.
+/// An edit written at a `Remote` row's path before a hydration attempt
+/// starts, and not yet journalled by the watcher, is not overwritten.
 ///
 /// The attempt has nothing on disk to take as its baseline but the edit
-/// itself, so comparing disk against itself cannot protect it. What the
-/// attempt can compare against is the placeholder this device wrote: the
-/// identity it recorded, and the placeholder still being sparse. A file
-/// that is no longer that placeholder is an uncaptured local edit, so the
-/// attempt refuses and journals it for capture.
+/// itself, so comparing disk against itself cannot protect it. A `Remote`
+/// row has no object, so anything standing there that is not already exactly
+/// the version the row names is an uncaptured local edit, and the attempt
+/// refuses and journals it for capture.
 #[cfg(unix)]
 #[tokio::test]
 async fn an_edit_made_before_the_attempt_started_is_never_overwritten() {
     for rename_save in [false, true] {
-        let (state, sync_state, root_dir, _content) = setup_real_placeholder_doc().await;
+        let (state, sync_state, root_dir, _content) = setup_remote_doc().await;
         let out_path = root_dir.path().join("doc.txt");
         let edit = b"a local edit the watcher has not journalled yet";
         if rename_save {
@@ -1328,7 +1290,7 @@ async fn an_edit_made_before_the_attempt_started_is_never_overwritten() {
                 .materialization_state_repository()
                 .get_materialization_state("group-1", "doc.txt")
                 .unwrap(),
-            Some(MaterializationState::Hydrated),
+            Some(MaterializationState::Present),
             "rename_save={rename_save}: the row claims Hydrated over a local edit"
         );
         assert!(
@@ -1340,17 +1302,16 @@ async fn an_edit_made_before_the_attempt_started_is_never_overwritten() {
 }
 
 /// A crash after an attempt renamed the hydrated file into place and before
-/// it committed leaves a `Placeholder` row over a file that is no longer the
-/// placeholder -- but whose bytes are exactly the ones the row names. That is
-/// not a local edit, and refusing it would refuse forever: the next attempt
-/// settles it.
+/// it committed leaves a `Remote` row over a file whose bytes are exactly the
+/// ones the row names. That is not a local edit, and refusing it would refuse
+/// forever: the next attempt settles it.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_crash_between_the_rename_and_the_commit_settles_on_the_next_attempt() {
-    let (state, sync_state, root_dir, content) = setup_real_placeholder_doc().await;
+    let (state, sync_state, root_dir, content) = setup_remote_doc().await;
     let out_path = root_dir.path().join("doc.txt");
-    // What the interrupted attempt left: the assembled file renamed over
-    // the placeholder, a new inode with real allocated bytes.
+    // What the interrupted attempt left: the assembled file renamed into
+    // place.
     let tmp = root_dir.path().join(".doc.txt.hydrating");
     std::fs::write(&tmp, content).unwrap();
     std::fs::rename(&tmp, &out_path).unwrap();
@@ -1363,7 +1324,7 @@ async fn a_crash_between_the_rename_and_the_commit_settles_on_the_next_attempt()
             .materialization_state_repository()
             .get_materialization_state("group-1", "doc.txt")
             .unwrap(),
-        Some(MaterializationState::Hydrated),
+        Some(MaterializationState::Present),
         "the interrupted hydration must settle, not refuse forever"
     );
     assert!(
@@ -1380,40 +1341,6 @@ async fn a_crash_between_the_rename_and_the_commit_settles_on_the_next_attempt()
     );
 }
 
-/// A placeholder the user deleted before a hydration attempt started, and
-/// whose removal the watcher has not journalled yet, is not recreated.
-///
-/// This device recorded writing a placeholder there, so an empty path is
-/// a local delete, not a path that never had content: hydrating would put
-/// the file back, and the watcher's late remove event would then find it
-/// present and never tombstone it.
-#[cfg(unix)]
-#[tokio::test]
-async fn a_placeholder_deleted_before_the_attempt_started_is_not_recreated() {
-    let (state, sync_state, root_dir, _content) = setup_real_placeholder_doc().await;
-    let out_path = root_dir.path().join("doc.txt");
-    std::fs::remove_file(&out_path).unwrap();
-
-    let result = hydrate_inner(&state, "group-1", "doc.txt", Some(&test_stall())).await;
-
-    assert!(result.is_err(), "hydration recreated a deleted placeholder: {result:?}");
-    assert!(
-        std::fs::symlink_metadata(&out_path).is_err(),
-        "hydration undid a local delete by writing the file back"
-    );
-    assert_ne!(
-        sync_state
-            .materialization_state_repository()
-            .get_materialization_state("group-1", "doc.txt")
-            .unwrap(),
-        Some(MaterializationState::Hydrated),
-    );
-    assert!(
-        sync_state.dirty_path_repository().is_path_dirty("group-1", "doc.txt").unwrap(),
-        "the refused delete must be journalled for local capture"
-    );
-}
-
 /// The crash-recovery arm accepts a file whose bytes are the ones the row
 /// names only when its mode is too: an interrupted attempt's leftover that
 /// the user has since `chmod`ed carries a local change, and the attempt's
@@ -1424,7 +1351,7 @@ async fn a_placeholder_deleted_before_the_attempt_started_is_not_recreated() {
 async fn a_mode_change_on_a_crash_leftover_is_not_reverted() {
     use std::os::unix::fs::PermissionsExt as _;
     for chmodded in [false, true] {
-        let (state, sync_state, root_dir, content) = setup_real_placeholder_doc().await;
+        let (state, sync_state, root_dir, content) = setup_remote_doc().await;
         let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
         sync_state
             .file_index_repository()
@@ -1446,7 +1373,7 @@ async fn a_mode_change_on_a_crash_leftover_is_not_reverted() {
             .materialization_state_repository()
             .get_materialization_state("group-1", "doc.txt")
             .unwrap()
-            == Some(MaterializationState::Hydrated);
+            == Some(MaterializationState::Present);
         let dirty = sync_state.dirty_path_repository().is_path_dirty("group-1", "doc.txt").unwrap();
         if chmodded {
             assert!(result.is_err(), "hydration settled over a local mode change: {result:?}");
@@ -1955,8 +1882,8 @@ async fn preflight_disk_pressure_rejects_and_marks_degraded_when_it_would_breach
     let root = tempfile::tempdir().unwrap();
     seed_link(&state, root.path(), false, 1000);
 
-    let err = preflight_disk_pressure(&state, GROUP, PATH, root.path(), 1000, Some(u64::MAX / 2))
-        .unwrap_err();
+    let err =
+        preflight_disk_pressure(&state, PATH, root.path(), 1000, Some(u64::MAX / 2)).unwrap_err();
     assert!(matches!(err, SyncError::DiskPressure { .. }));
     assert!(state.is_link_degraded(&root.path().to_string_lossy()));
 }
@@ -1969,128 +1896,54 @@ async fn preflight_disk_pressure_allows_a_write_under_headroom() {
     let root = tempfile::tempdir().unwrap();
     seed_link(&state, root.path(), false, 1000);
 
-    preflight_disk_pressure(&state, GROUP, PATH, root.path(), 1000, Some(0)).unwrap();
+    preflight_disk_pressure(&state, PATH, root.path(), 1000, Some(0)).unwrap();
     assert!(!state.is_link_degraded(&root.path().to_string_lossy()));
 }
 
-/// Under disk pressure, an `OnDemand` link's eviction
-/// sweep runs *before* the preflight fails — evicting an
-/// already-hydrated, unpinned file back to a placeholder. Doesn't
-/// assert the overall preflight then succeeds (that depends on freeing
-/// enough *real* bytes to satisfy an intentionally enormous forced
-/// headroom, not practical to stage in a test); asserts the sweep
-/// itself ran, which is the behavior this actually adds.
+/// Disk pressure never evicts anything: a hydrated file on an OnDemand link
+/// stays hydrated when the volume is under pressure. Eviction is manual.
 #[tokio::test]
-async fn preflight_disk_pressure_runs_eviction_sweep_for_on_demand_link_first() {
-    let _pipeline_connected =
-        yadorilink_filesystem_sync::placeholder_backend::OverrideForTest::enable();
+async fn preflight_disk_pressure_never_evicts_a_file() {
+    // With the on-demand pipeline connected, so nothing is refused for
+    // that reason alone and the assertion is not vacuous.
     let (state, _store_dir) = test_state();
+    state.set_test_on_demand_allowed(true);
     let root = tempfile::tempdir().unwrap();
     let record = seed_link(&state, root.path(), true, 1000);
     state.install_test_root_commit_authority(GROUP);
-    let block_hash = state.block_store.put(&vec![0u8; 1000]).unwrap();
-    // Materialize it as "hydrated" on disk and record an access time so
-    // it's a real eviction candidate (least-recently-used).
     std::fs::write(root.path().join(PATH), vec![0u8; 1000]).unwrap();
+    let block = put_block(&state, GROUP, &vec![0u8; 1000]);
+    assert_eq!(record.blocks, vec![block], "fixture check: the stored block is the file's");
     let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
     state
         .replica_coordinator
         .materialization_state_repository()
-        .set_materialization_state(GROUP, PATH, MaterializationState::Hydrated, &permit)
+        .set_materialization_state(GROUP, PATH, MaterializationState::Present, &permit)
         .unwrap();
-    state
-        .replica_coordinator
-        .file_index_repository()
-        .touch_last_accessed(GROUP, PATH, 100)
-        .unwrap();
-    // On a Windows build, `evict_to_placeholder`'s Windows arm requires
-    // a recorded CfAPI placeholder identity for this row (see that
-    // function's own doc comment) -- a real precondition this test must
-    // seed, same as `dst_eviction_crash_recovery.rs` does, since this
-    // row was indexed directly rather than through a real create/hydrate
-    // lifecycle. Harmless on non-Windows: `evict_to_placeholder`'s
-    // non-Windows arm never reads it.
-    state
-        .replica_coordinator
-        .materialization_state_repository()
-        .record_placeholder_generation(
-            GROUP,
-            PATH,
-            yadorilink_local_storage::PlaceholderDiskIdentity { dev: 0, ino: 1 },
-            yadorilink_local_storage::WINDOWS_CFAPI_GENERATION_PROVIDER_KIND,
-            &permit,
-        )
-        .unwrap();
-    // Bypasses the real `cfapi-host.exe` pipe round trip on a Windows
-    // build -- this test asserts on the custody/lease gate, not on the
-    // native dehydrate mechanism, and no live CfAPI provider process
-    // runs in this unit test. No-op on non-Windows. See
-    // `set_test_windows_dehydrate_confirmed_for_path`'s own doc comment.
-    crate::replica_coordinator::set_test_windows_dehydrate_confirmed_for_path(
-        &root.path().join(PATH),
-        true,
+
+    let result =
+        preflight_disk_pressure(&state, PATH, root.path(), record.size, Some(u64::MAX / 2));
+
+    assert!(matches!(result, Err(SyncError::DiskPressure { .. })), "got {result:?}");
+    assert_eq!(
+        std::fs::read(root.path().join(PATH)).unwrap(),
+        vec![0u8; 1000],
+        "the file's bytes must be untouched"
     );
-    // An instantaneous peer confirmation is deliberately insufficient for
-    // physical CAS deletion until durable remote custody leases exist.
-    state.set_custody_confirmer(std::sync::Arc::new(
-        |_: &str, _: &str, _: &yadorilink_replica_domain::ids::VersionHash, _: &[VersionBlock]| {
-            true
-        },
-    ));
-
-    let _ =
-        preflight_disk_pressure(&state, GROUP, PATH, root.path(), record.size, Some(u64::MAX / 2));
-
+    for block in &record.blocks {
+        assert!(
+            state.block_store.exists(&hex::encode(&block.hash)).unwrap(),
+            "the file's blocks must be untouched"
+        );
+    }
     assert_eq!(
         state
             .replica_coordinator
             .materialization_state_repository()
             .get_materialization_state(GROUP, PATH)
             .unwrap(),
-        Some(MaterializationState::Placeholder),
-        "the disk-pressure-triggered eviction sweep should have evicted the only candidate"
-    );
-    assert!(
-        state.block_store.exists(&block_hash).unwrap(),
-        "without a durable remote custody lease, placeholdering must retain the CAS block"
-    );
-}
-
-/// a pinned file is never evicted by the disk-pressure sweep,
-/// even when it's the only OnDemand content on a pressured volume.
-#[tokio::test]
-async fn preflight_disk_pressure_never_evicts_a_pinned_file() {
-    // Otherwise the on-demand-pipeline gate alone would make this
-    // assertion pass vacuously (nothing evicted because eviction is
-    // refused outright, not because pinning was honored) -- see
-    // `preflight_disk_pressure`'s own doc comment for the gate this
-    // enables past.
-    let _pipeline_connected =
-        yadorilink_filesystem_sync::placeholder_backend::OverrideForTest::enable();
-    let (state, _store_dir) = test_state();
-    let root = tempfile::tempdir().unwrap();
-    let record = seed_link(&state, root.path(), true, 1000);
-    state.install_test_root_commit_authority(GROUP);
-    std::fs::write(root.path().join(PATH), vec![0u8; 1000]).unwrap();
-    let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
-    state
-        .replica_coordinator
-        .materialization_state_repository()
-        .set_materialization_state(GROUP, PATH, MaterializationState::Hydrated, &permit)
-        .unwrap();
-    state.replica_coordinator.file_index_repository().set_pinned(GROUP, PATH, true).unwrap();
-
-    let _ =
-        preflight_disk_pressure(&state, GROUP, PATH, root.path(), record.size, Some(u64::MAX / 2));
-
-    assert_eq!(
-        state
-            .replica_coordinator
-            .materialization_state_repository()
-            .get_materialization_state(GROUP, PATH)
-            .unwrap(),
-        Some(MaterializationState::Hydrated),
-        "a pinned file must never be evicted by the disk-pressure trigger"
+        Some(MaterializationState::Present),
+        "disk pressure must never evict a file"
     );
 }
 
@@ -2103,7 +1956,7 @@ async fn preflight_disk_pressure_rejection_leaves_no_partial_temp_file() {
     let root = tempfile::tempdir().unwrap();
     seed_link(&state, root.path(), false, 1000);
 
-    let _ = preflight_disk_pressure(&state, GROUP, PATH, root.path(), 1000, Some(u64::MAX / 2));
+    let _ = preflight_disk_pressure(&state, PATH, root.path(), 1000, Some(u64::MAX / 2));
 
     // The root-identity marker `seed_link`'s adoption wrote is
     // legitimate infrastructure, not a partial materialization
@@ -2156,15 +2009,14 @@ async fn disk_pressure_on_one_link_does_not_affect_another() {
         .unwrap();
 
     let err_a =
-        preflight_disk_pressure(&state, GROUP, PATH, root_a.path(), 1000, Some(u64::MAX / 2))
-            .unwrap_err();
+        preflight_disk_pressure(&state, PATH, root_a.path(), 1000, Some(u64::MAX / 2)).unwrap_err();
     assert!(matches!(err_a, SyncError::DiskPressure { .. }));
     assert!(state.is_link_degraded(&root_a.path().to_string_lossy()));
 
     // The second link's volume was never checked, let alone marked —
     // a completely independent `preflight_disk_pressure` call for it
     // (0 headroom required) still succeeds.
-    preflight_disk_pressure(&state, "group-2", "other.bin", root_b.path(), 500, Some(0)).unwrap();
+    preflight_disk_pressure(&state, "other.bin", root_b.path(), 500, Some(0)).unwrap();
     assert!(!state.is_link_degraded(&root_b.path().to_string_lossy()));
 }
 
@@ -2203,8 +2055,7 @@ fn put_block(state: &DaemonState, group_id: &str, data: &[u8]) -> BlockInfo {
     let hash_bytes = hex::decode(&hash).unwrap();
     state
         .replica_coordinator
-        .change_history_repository()
-        .record_group_block_provenance(group_id, std::slice::from_ref(&hash_bytes))
+        .record_block_provenance(group_id, std::slice::from_ref(&hash_bytes))
         .unwrap();
     BlockInfo { hash: hash_bytes, offset: 0, size: data.len() as u32 }
 }
@@ -2285,32 +2136,153 @@ async fn restore_to_version_of_a_fully_local_version_succeeds_and_creates_a_new_
     assert_eq!(versions[0].version_seq, 3, "the restored content is the newest version");
     assert_eq!(versions[0].blocks, vec![v1_block]);
     assert_eq!(versions[0].state, yadorilink_replica_domain::session_state::VersionState::Current);
-    let author = state
-        .replica_coordinator
-        .file_index_repository()
-        .get_authoring_change_hash(GROUP, PATH)
-        .unwrap();
-    assert!(author.is_some(), "restore must publish its own DAG author identity");
-    assert!(state
-        .replica_coordinator
-        .change_history_repository()
-        .dag_has_change_or_pruned(GROUP, &author.unwrap())
-        .unwrap());
+    let authoring = state.replica_coordinator.row_authoring(GROUP, PATH).unwrap();
+    assert!(authoring.is_some(), "restore must show the native head it put");
     // Version 1 itself is completely untouched.
     let original_v1 = versions.iter().find(|v| v.version_seq == 1).unwrap();
     assert_eq!(original_v1.size, 19);
-    // `commit_restore_operation`'s explicit `Hydrated` stamp is what
+    // `commit_restore_operation`'s explicit `Present` stamp is what
     // earns this -- the restored content genuinely matches disk, but
     // nothing marks that automatically; the schema's own default is
-    // `Placeholder`.
+    // `Remote`.
     assert_eq!(
         state
             .replica_coordinator
             .materialization_state_repository()
             .get_materialization_state(GROUP, PATH)
             .unwrap(),
-        Some(MaterializationState::Hydrated)
+        Some(MaterializationState::Present)
     );
+}
+
+/// A state with `PATH` at two versions (v1 "version one content", v2
+/// "version two content!!"), the group linked at the returned root, and
+/// nothing on disk yet.
+fn restore_fixture() -> (Arc<DaemonState>, tempfile::TempDir, tempfile::TempDir) {
+    let (state, store_dir) = test_state();
+    state.set_device_signing_key(ed25519_dalek::SigningKey::from_bytes(&[23u8; 32]));
+    state.replica_coordinator.set_local_policy_head_provider(Arc::new(|_| Ok([0u8; 32])));
+    let root = tempfile::tempdir().unwrap();
+    let local_path = root.path().to_string_lossy().to_string();
+    state.replica_coordinator.link_repository().add_link(&local_path, GROUP).unwrap();
+    state.install_test_root_commit_authority(GROUP);
+    yadorilink_root_authority::root_identity::VerifiedRoot::open(
+        root.path(),
+        GROUP,
+        state.replica_coordinator.as_ref(),
+    )
+    .unwrap();
+    let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+    for (data, size) in [(&b"version one content"[..], 19), (&b"version two content!!"[..], 21)] {
+        let block = put_block(&state, GROUP, data);
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .upsert_file_with_origin(
+                GROUP,
+                &record_with_blocks(PATH, vec![block], size),
+                "device-a",
+                &permit,
+            )
+            .unwrap();
+    }
+    (state, store_dir, root)
+}
+
+fn restore_journal_rows(state: &DaemonState) -> usize {
+    state
+        .replica_coordinator
+        .restore_operation_repository()
+        .list_restore_operations(GROUP)
+        .unwrap()
+        .len()
+}
+
+/// A restore replaces whatever is at the path. An edit the capture pipeline
+/// has not recorded yet (debounce window, lagging watcher) is not in any
+/// version, so replacing it destroys it for good.
+#[tokio::test]
+async fn restore_does_not_overwrite_an_uncaptured_local_edit() {
+    let (state, _store_dir, root) = restore_fixture();
+    std::fs::write(root.path().join(PATH), b"typed just now, never captured").unwrap();
+
+    let result = restore_to_version(&state, GROUP, PATH, 1).await;
+
+    assert!(matches!(result, Err(SyncError::PathChangedLocally(_))), "got {result:?}");
+    assert_eq!(
+        std::fs::read(root.path().join(PATH)).unwrap(),
+        b"typed just now, never captured",
+        "the uncaptured edit must survive a declined restore"
+    );
+    assert!(
+        state.replica_coordinator.dirty_path_repository().is_path_dirty(GROUP, PATH).unwrap(),
+        "the declined path must be journaled so capture takes the edit"
+    );
+    assert_eq!(restore_journal_rows(&state), 0, "a declined restore leaves no journal row");
+    assert_eq!(
+        state.replica_coordinator.sqlite().dag_list_versions(GROUP, PATH).unwrap().len(),
+        2,
+        "a declined restore authors no version"
+    );
+}
+
+/// A file created at a trashed path after the delete is as uncaptured as an
+/// edit: the row for the path is a tombstone, so nothing records it.
+#[tokio::test]
+async fn restore_of_a_trashed_file_does_not_overwrite_a_new_local_file_at_its_path() {
+    let (state, _store_dir, root) = restore_fixture();
+    let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+    state
+        .replica_coordinator
+        .file_index_repository()
+        .upsert_file_with_origin(
+            GROUP,
+            &yadorilink_replica_domain::file::FileRecord {
+                path: PATH.to_string(),
+                size: 0,
+                mtime_unix_nanos: 0,
+                blocks: vec![],
+                deleted: true,
+            },
+            "device-a",
+            &permit,
+        )
+        .unwrap();
+    std::fs::write(root.path().join(PATH), b"a new file made here after the delete").unwrap();
+
+    let result = restore_trashed(&state, GROUP, PATH).await;
+
+    assert!(matches!(result, Err(SyncError::PathChangedLocally(_))), "got {result:?}");
+    assert_eq!(
+        std::fs::read(root.path().join(PATH)).unwrap(),
+        b"a new file made here after the delete"
+    );
+}
+
+/// The assembly of the restored bytes takes time too. A save landing after
+/// the checks that preceded it and before the rename is renamed over unless
+/// the disk is looked at once more right before the rename.
+#[tokio::test]
+async fn restore_does_not_rename_over_a_save_that_lands_during_assembly() {
+    let (state, _store_dir, root) = restore_fixture();
+    super::RESTORE_BEFORE_PERSIST_HOOK.lock().unwrap().push((
+        // Keyed by the absolute destination (unique per test root), so concurrent restores of the
+        // same relative path cannot take each other's hook.
+        root.path().join(PATH).display().to_string(),
+        Box::new(|out_path| std::fs::write(out_path, b"saved during the restore").unwrap()),
+    ));
+
+    let result = restore_to_version(&state, GROUP, PATH, 1).await;
+
+    assert!(matches!(result, Err(SyncError::PathChangedLocally(_))), "got {result:?}");
+    assert_eq!(std::fs::read(root.path().join(PATH)).unwrap(), b"saved during the restore");
+    assert!(state.replica_coordinator.dirty_path_repository().is_path_dirty(GROUP, PATH).unwrap());
+    let stray: Vec<_> = std::fs::read_dir(root.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| !name.starts_with(".yadorilink-root") && name != PATH)
+        .collect();
+    assert!(stray.is_empty(), "the abandoned temp file is removed: {stray:?}");
 }
 
 /// `restore_to_version_inner`'s physical write (`reconstruct_file`)
@@ -2474,13 +2446,356 @@ async fn hydrate_reproves_a_row_whose_proof_names_a_superseded_version() {
     }
 }
 
-/// The other half: when the bytes are NOT what the row now names, the
-/// proof cannot be healed and the path must not be reconstructed over
-/// either -- a stale write of this device's own and a local edit
-/// nobody has journalled are the same observation from here.
+/// The other half: when the bytes are NOT what the row now names, the proof
+/// cannot be healed. What happens next is decided by evidence. Bytes that are
+/// still, untouched, this device's own earlier write (the proof's identity
+/// confirms it) are replaced by the newer version: they are no edit. Bytes
+/// that moved off the proof are an edit nobody has journalled, and are never
+/// reconstructed over.
 #[tokio::test]
-async fn hydrate_refuses_a_superseded_proof_whose_bytes_do_not_match_the_row() {
-    let (state, _store_dir) = test_state();
+async fn hydrate_replaces_an_untouched_older_write_with_the_newer_version() {
+    let (state, root, _store_dir) = superseded_proof_fixture().await;
+    let v2 = b"genuinely different content for this path";
+
+    hydrate(&state, GROUP, PATH)
+        .await
+        .expect("an untouched write of this device's own is replaced, not refused");
+
+    assert_eq!(std::fs::read(root.path().join(PATH)).unwrap(), v2);
+    assert!(
+        state
+            .replica_coordinator
+            .sqlite()
+            .dag_usable_proof_names_current_version(GROUP, PATH)
+            .unwrap(),
+        "the newer version must be proven in the same commit as its stamp"
+    );
+    assert!(!state.replica_coordinator.dirty_path_repository().is_path_dirty(GROUP, PATH).unwrap());
+}
+
+#[tokio::test]
+async fn hydrate_refuses_a_superseded_proof_whose_bytes_were_edited_since() {
+    let (state, root, _store_dir) = superseded_proof_fixture().await;
+    let edited = b"a local edit made after the prior cycle's proof";
+    std::fs::write(root.path().join(PATH), edited).unwrap();
+
+    let err = hydrate(&state, GROUP, PATH)
+        .await
+        .expect_err("bytes that moved off the proof are an edit and must not read as done");
+
+    assert!(matches!(err, SyncError::HydrationFailed(_)), "got {err}");
+    assert_eq!(
+        std::fs::read(root.path().join(PATH)).unwrap(),
+        edited,
+        "and it must not reconstruct over bytes it cannot tell from an unjournalled edit"
+    );
+    assert!(
+        state.replica_coordinator.dirty_path_repository().is_path_dirty(GROUP, PATH).unwrap(),
+        "the refused edit must be journalled for local capture"
+    );
+}
+
+/// A newer version arriving over existing bytes leaves the row `Present`, and
+/// what protects those bytes is evidence, not state: the proof that vouches
+/// for them (identity unchanged since the daemon wrote them) makes them its
+/// own untouched write, so neither local capture nor the repair sweep reads
+/// them as an edit to author or to quarantine; once they are touched, they
+/// are an edit again.
+#[tokio::test]
+async fn a_newer_version_over_old_bytes_leaves_the_row_present_and_the_bytes_protected_by_evidence()
+{
+    let (state, root, _store_dir) = superseded_proof_fixture().await;
+    let coordinator = &state.replica_coordinator;
+    let v1 = b"the bytes a prior cycle proved";
+    assert_eq!(
+        coordinator
+            .materialization_state_repository()
+            .get_materialization_state(GROUP, PATH)
+            .unwrap(),
+        Some(MaterializationState::Present),
+        "the newer row stays Present over the object that stands there"
+    );
+    assert!(!coordinator.sqlite().dag_usable_proof_names_current_version(GROUP, PATH).unwrap());
+    let on_disk = root.path().join(PATH);
+    assert!(coordinator.dag_disk_is_untouched_proven_write(GROUP, PATH, &on_disk).unwrap());
+
+    // Local capture: the older bytes are not an edit.
+    let processor = yadorilink_local_capture::LocalChangeProcessor::new(
+        coordinator.clone(),
+        Arc::new(crate::adapters::block_store_ports::BlockStorePortsAdapter::new(
+            state.block_store.clone(),
+        )),
+        "device-under-test".to_string(),
+        Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()),
+    );
+    let canonical_root = root.path().canonicalize().unwrap();
+    let authored = processor.scan_existing_files(GROUP, &canonical_root).unwrap();
+    assert!(
+        !authored.iter().any(|record| record.path == PATH),
+        "capture authored the older version over the newer one: {authored:?}"
+    );
+
+    // The repair sweep: no bogus conflict copy, bytes untouched.
+    yadorilink_filesystem_sync::materialization_repair::repair_interrupted_materializations(
+        coordinator.as_ref(),
+        &crate::adapters::block_store_ports::BlockStorePortsAdapter::new(state.block_store.clone()),
+        &canonical_root,
+        GROUP,
+        yadorilink_filesystem_sync::materialization_repair::RepairMode::Startup,
+        &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(&on_disk).unwrap(), v1);
+    let entries: Vec<_> = std::fs::read_dir(root.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| !name.starts_with('.'))
+        .collect();
+    assert_eq!(entries, vec![PATH.to_string()], "repair fabricated a conflict copy");
+
+    // Once the bytes are touched they are no longer the daemon's own write.
+    std::fs::write(&on_disk, b"an edit").unwrap();
+    assert!(!coordinator.dag_disk_is_untouched_proven_write(GROUP, PATH, &on_disk).unwrap());
+    let authored = processor.scan_existing_files(GROUP, &canonical_root).unwrap();
+    assert!(authored.iter().any(|record| record.path == PATH), "an edit must be captured");
+}
+
+/// A restart finds rows stranded in `Hydrating` or `Evicting`. Whether the
+/// object is still there decides the state: `Remote` means no local object,
+/// so an object that remains (V1 bytes under a newer V2 row after an access
+/// hydration crashed past its fence bump, or an eviction that crashed before
+/// the unlink) makes the row `Present`; nothing on disk makes it `Remote`.
+#[tokio::test]
+async fn a_restart_reconciles_stranded_transient_rows_against_the_disk() {
+    for stranded in [MaterializationState::Hydrating, MaterializationState::Evicting] {
+        for object_remains in [true, false] {
+            let (state, root, _store_dir) = superseded_proof_fixture().await;
+            let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+            // The attempt's own fence bump retired the V1 proof.
+            state
+                .replica_coordinator
+                .dag_bump_mutation_fence(GROUP, PATH, "hydration_write")
+                .unwrap();
+            state
+                .replica_coordinator
+                .materialization_state_repository()
+                .set_materialization_state(GROUP, PATH, stranded, &permit)
+                .unwrap();
+            if !object_remains {
+                std::fs::remove_file(root.path().join(PATH)).unwrap();
+            }
+
+            let (hydrating, evicting) = state.replica_coordinator.reset_stale_transient_states();
+            hydrating.unwrap();
+            evicting.unwrap();
+
+            let expected = if object_remains {
+                MaterializationState::Present
+            } else {
+                MaterializationState::Remote
+            };
+            assert_eq!(
+                state
+                    .replica_coordinator
+                    .materialization_state_repository()
+                    .get_materialization_state(GROUP, PATH)
+                    .unwrap(),
+                Some(expected),
+                "{stranded:?} with the object remaining={object_remains}"
+            );
+        }
+    }
+}
+
+/// An eviction that crashed after detaching the object leaves it under its
+/// quarantine name with the path empty. The restart puts it back, so the row
+/// is `Present` over the object again rather than `Remote` over nothing.
+#[tokio::test]
+async fn a_restart_restores_an_object_a_crashed_eviction_had_detached() {
+    let (state, root, _store_dir) = superseded_proof_fixture().await;
+    let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+    state
+        .replica_coordinator
+        .materialization_state_repository()
+        .set_materialization_state(GROUP, PATH, MaterializationState::Evicting, &permit)
+        .unwrap();
+    let out = root.path().join(PATH);
+    let q =
+        yadorilink_filesystem_sync::materialization_eviction::eviction_quarantine_path(&out, PATH)
+            .unwrap();
+    std::fs::rename(&out, &q).unwrap();
+
+    let (hydrating, evicting) = state.replica_coordinator.reset_stale_transient_states();
+    hydrating.unwrap();
+    evicting.unwrap();
+
+    assert!(out.exists() && !q.exists(), "the detached object must be back at its path");
+    assert_eq!(
+        state
+            .replica_coordinator
+            .materialization_state_repository()
+            .get_materialization_state(GROUP, PATH)
+            .unwrap(),
+        Some(MaterializationState::Present)
+    );
+}
+
+/// A platform provider that reads "current content present" stops asking for
+/// the contents. `Present` over an older version's bytes is an object that
+/// stands without current content, until a usable proof names the current
+/// version; the two facts are reported apart.
+#[tokio::test]
+async fn present_over_older_bytes_is_not_reported_to_a_shell_as_current() {
+    use crate::shell_ipc::to_shell_local_state;
+    let facts = |state: Option<yadorilink_ipc_proto::shellipc::LocalState>| {
+        let state = state.expect("a present row has a local state");
+        (state.local_object_present, state.current_content_present)
+    };
+    let (state, root, _store_dir) = superseded_proof_fixture().await;
+    let coordinator = &state.replica_coordinator;
+    let present = Some(MaterializationState::Present);
+    let abs = root.path().join(PATH).canonicalize().unwrap().to_string_lossy().to_string();
+
+    let exact = crate::shell_status::resolve_content_is_current(coordinator, &abs);
+    assert!(!exact, "the proof names the older version");
+    assert_eq!(facts(to_shell_local_state(present, exact)), (true, false));
+
+    // Once the current version is hydrated, the proof names it.
+    hydrate(&state, GROUP, PATH).await.unwrap();
+    let exact = crate::shell_status::resolve_content_is_current(coordinator, &abs);
+    assert!(exact);
+    assert_eq!(facts(to_shell_local_state(present, exact)), (true, true));
+    // A row that is gone has neither fact; no row is unknown, never current.
+    assert_eq!(
+        facts(to_shell_local_state(Some(MaterializationState::Remote), true)),
+        (false, false)
+    );
+    assert!(to_shell_local_state(None, true).is_none());
+}
+
+/// An eviction that crashed before its rename leaves the complete, current
+/// file with its proof retired by the fence bump. After the restart the row is
+/// `Present`, and the startup repair heals the proof because the bytes exactly
+/// match the version, so the shell is not told the file is cloud-only.
+#[tokio::test]
+async fn a_crash_before_the_eviction_rename_is_healed_to_an_exact_present_row() {
+    let (state, root, _store_dir) = superseded_proof_fixture().await;
+    let coordinator = &state.replica_coordinator;
+    let v2 = b"genuinely different content for this path";
+    let out = root.path().join(PATH);
+    std::fs::write(&out, v2).unwrap();
+    let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+    coordinator.dag_bump_mutation_fence(GROUP, PATH, "eviction_to_placeholder").unwrap();
+    coordinator
+        .materialization_state_repository()
+        .set_materialization_state(GROUP, PATH, MaterializationState::Evicting, &permit)
+        .unwrap();
+
+    let (hydrating, evicting) = coordinator.reset_stale_transient_states();
+    hydrating.unwrap();
+    evicting.unwrap();
+    yadorilink_filesystem_sync::materialization_repair::repair_interrupted_materializations(
+        coordinator.as_ref(),
+        &crate::adapters::block_store_ports::BlockStorePortsAdapter::new(state.block_store.clone()),
+        &root.path().canonicalize().unwrap(),
+        GROUP,
+        yadorilink_filesystem_sync::materialization_repair::RepairMode::Startup,
+        &permit,
+    )
+    .unwrap();
+
+    assert_eq!(
+        coordinator
+            .materialization_state_repository()
+            .get_materialization_state(GROUP, PATH)
+            .unwrap(),
+        Some(MaterializationState::Present)
+    );
+    assert!(
+        coordinator.sqlite().dag_usable_proof_names_current_version(GROUP, PATH).unwrap(),
+        "the proof must be healed from the exactly matching bytes"
+    );
+    let abs = out.canonicalize().unwrap().to_string_lossy().to_string();
+    assert!(crate::shell_status::resolve_content_is_current(coordinator, &abs));
+}
+
+/// A restart whose restore of a quarantined object fails must not reset the
+/// row: the row stays `Evicting`, the retry marker, and the next start retries
+/// and restores the object.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failed_quarantine_restore_keeps_the_row_transient_until_it_succeeds() {
+    use std::os::unix::fs::PermissionsExt;
+    let (state, root, _store_dir) = superseded_proof_fixture().await;
+    let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+    let repo = state.replica_coordinator.materialization_state_repository();
+    repo.set_materialization_state(GROUP, PATH, MaterializationState::Evicting, &permit).unwrap();
+    let out = root.path().join(PATH);
+    let q =
+        yadorilink_filesystem_sync::materialization_eviction::eviction_quarantine_path(&out, PATH)
+            .unwrap();
+    std::fs::rename(&out, &q).unwrap();
+    // The directory refuses new entries, so neither the link nor the move aside can happen.
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let _ = state.replica_coordinator.reset_stale_transient_states();
+    let after_failure = repo.get_materialization_state(GROUP, PATH).unwrap();
+
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(after_failure, Some(MaterializationState::Evicting), "the retry marker was lost");
+    let _ = state.replica_coordinator.reset_stale_transient_states();
+    assert!(out.exists() && !q.exists(), "the next start must restore the object");
+    assert_eq!(
+        repo.get_materialization_state(GROUP, PATH).unwrap(),
+        Some(MaterializationState::Present)
+    );
+}
+
+/// Only a CONFIRMED outcome lets a stranded row be reset. A group with no
+/// live root, or a quarantine name that cannot be inspected, is not "recovered":
+/// the `Evicting` marker stays and the next start decides again.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unknown_root_or_an_uninspectable_quarantine_keeps_the_evicting_marker() {
+    use std::os::unix::fs::PermissionsExt;
+    // An uninspectable quarantine name: its directory cannot be searched.
+    let (state, root, _store_dir) = superseded_proof_fixture().await;
+    let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+    let repo = state.replica_coordinator.materialization_state_repository();
+    repo.set_materialization_state(GROUP, PATH, MaterializationState::Evicting, &permit).unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+    let _ = state.replica_coordinator.reset_stale_transient_states();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        repo.get_materialization_state(GROUP, PATH).unwrap(),
+        Some(MaterializationState::Evicting),
+        "an uninspectable quarantine name was read as recovered"
+    );
+
+    // An unknown live root: the link is gone.
+    let (state, _root, _store_dir) = superseded_proof_fixture().await;
+    let repo = state.replica_coordinator.materialization_state_repository();
+    repo.set_materialization_state(GROUP, PATH, MaterializationState::Evicting, &permit).unwrap();
+    let local_path = state
+        .replica_coordinator
+        .link_repository()
+        .live_link_local_path_for_group(GROUP)
+        .unwrap()
+        .unwrap();
+    state.replica_coordinator.link_repository().remove_link(&local_path).unwrap();
+    let _ = state.replica_coordinator.reset_stale_transient_states();
+    assert_eq!(
+        repo.get_materialization_state(GROUP, PATH).unwrap(),
+        Some(MaterializationState::Evicting),
+        "an unknown live root was read as recovered"
+    );
+}
+
+/// A path whose V1 bytes are on disk under a usable V1 proof, with the row
+/// moved on to V2 (a genuine content supersession; the fence is untouched, so
+/// the V1 proof is still usable and still about other content).
+async fn superseded_proof_fixture() -> (Arc<DaemonState>, tempfile::TempDir, tempfile::TempDir) {
+    let (state, store_dir) = test_state();
     let root = tempfile::tempdir().unwrap();
     let local_path = root.path().to_string_lossy().to_string();
     state.replica_coordinator.link_repository().add_link(&local_path, GROUP).unwrap();
@@ -2514,9 +2829,6 @@ async fn hydrate_refuses_a_superseded_proof_whose_bytes_do_not_match_the_row() {
         &permit,
     );
 
-    // A genuine content supersession: the row names new bytes that are
-    // not on disk. The fence is untouched, so the V1 proof is still
-    // usable and still wrong.
     let v2 = b"genuinely different content for this path";
     let v2_block = put_block(&state, GROUP, v2);
     state
@@ -2529,19 +2841,7 @@ async fn hydrate_refuses_a_superseded_proof_whose_bytes_do_not_match_the_row() {
             &permit,
         )
         .unwrap();
-
-    let err = hydrate(&state, GROUP, PATH)
-        .await
-        .expect_err("a Hydrated row whose proof is about other content must not read as done");
-    assert!(
-        err.to_string().contains("moved off"),
-        "the refusal must name what is actually wrong, not a generic failure: {err}"
-    );
-    assert_eq!(
-        std::fs::read(root.path().join(PATH)).unwrap(),
-        v1,
-        "and it must not reconstruct over bytes it cannot tell from an unjournalled edit"
-    );
+    (state, root, store_dir)
 }
 
 /// Restore is an internal physical mutator: it bumps the fence, writes
@@ -2549,7 +2849,7 @@ async fn hydrate_refuses_a_superseded_proof_whose_bytes_do_not_match_the_row() {
 /// used to bump that epoch and then throw it away, committing its index
 /// write through the external-adoption API -- which mints a SECOND
 /// epoch on its way to recording the write, and took no version at all.
-/// The result was a `Hydrated` row whose proof named no version and sat
+/// The result was a `Present` row whose proof named no version and sat
 /// one epoch behind the fence: unusable on both counts, so the path
 /// stayed outstanding no matter how correct the bytes on disk were.
 #[tokio::test]
@@ -2598,9 +2898,9 @@ async fn restore_publishes_a_versioned_proof_under_the_epoch_its_own_write_bumpe
     let fence_after = state.replica_coordinator.dag_snapshot_mutation_fence(GROUP, PATH).unwrap();
     assert_eq!(
         fence_after,
-        fence_before + 2,
-        "restore retires the old basis when it authors its change and then performs one \
-         physical mutation, so it must advance the fence exactly twice \
+        fence_before + 1,
+        "restore authors a native head and then performs one physical mutation, so it \
+         must advance the fence exactly once \
          (before: {fence_before}, after: {fence_after})"
     );
 
@@ -2639,7 +2939,7 @@ async fn restore_publishes_a_versioned_proof_under_the_epoch_its_own_write_bumpe
             .materialization_state_repository()
             .get_materialization_state(GROUP, PATH)
             .unwrap(),
-        Some(MaterializationState::Hydrated),
+        Some(MaterializationState::Present),
         "and the claim that rests on it must be stamped in the same commit"
     );
 }
@@ -2752,18 +3052,18 @@ async fn restoring_a_symlink_version_recreates_a_real_symlink_not_an_empty_regul
 /// A targetless symlink version (`symlink_target == None` on a
 /// `RecordKind::Symlink` row) looks, at first glance, like it would hit
 /// `restore_to_version_inner`'s write-nothing `None` dispatch arm and
-/// still get stamped `Hydrated` by `commit_restore_operation` -- an
+/// still get stamped `Present` by `commit_restore_operation` -- an
 /// all-platform twin of the Windows-not-opted-in write-nothing case.
 /// It is not reachable: `record_restore_operation_emitting_change`,
 /// which runs earlier in the same restore, validates the identical
 /// `symlink_target` field via `FileVersion::verify_hash` and rejects a
 /// targetless symlink before either the disk-write dispatch or the
-/// `Hydrated` stamp is ever reached. This test proves that directly
+/// `Present` stamp is ever reached. This test proves that directly
 /// (a version constructed by directly manipulating the file index, the
 /// only way to get a targetless symlink row queryable at all, since
 /// every validated construction path refuses one) rather than trusting
 /// that reasoning alone -- a regression here would mean an unstamped,
-/// unwritten row silently starts claiming `Hydrated`.
+/// unwritten row silently starts claiming `Present`.
 #[tokio::test]
 async fn restoring_a_targetless_symlink_version_fails_before_any_write_or_stamp() {
     let (state, _store_dir) = test_state();
@@ -2906,9 +3206,9 @@ async fn hydrate_after_a_symlink_restore_does_not_destroy_it() {
         .unwrap();
 
     restore_to_version(&state, GROUP, PATH, 1).await.unwrap();
-    // Deliberately `Placeholder`, not `Hydrated`, so this test isolates
+    // Deliberately `Remote`, not `Present`, so this test isolates
     // the kind guard specifically rather than being saved by the
-    // separate already-`Hydrated` fast path: if `record_kind` were
+    // separate already-`Present` fast path: if `record_kind` were
     // still stale (`File`) because the restore commit hadn't updated
     // it, the kind guard would silently do nothing and hydration would
     // fall through to `reconstruct_file` with this symlink's empty
@@ -2916,7 +3216,7 @@ async fn hydrate_after_a_symlink_restore_does_not_destroy_it() {
     state
         .replica_coordinator
         .materialization_state_repository()
-        .set_materialization_state(GROUP, PATH, MaterializationState::Placeholder, &permit)
+        .set_materialization_state(GROUP, PATH, MaterializationState::Remote, &permit)
         .unwrap();
 
     hydrate_inner(&state, GROUP, PATH, Some(&test_stall())).await.unwrap();
@@ -3153,7 +3453,7 @@ async fn most_recent_superseded_version_seq_picks_the_newest_non_current_version
 /// `PATH` indexed and nothing on disk yet. `on_policy_read` runs every time
 /// the restore asks for the group's policy head, which it does once, from
 /// inside its own operation: after admission and the block fetch, before
-/// the journal/DAG write, the fence bump, the physical write and the
+/// the journal/native write, the fence bump, the physical write and the
 /// commit. It is the only seam a test has into the middle of a restore.
 fn restore_under_a_real_lease(
     on_policy_read: impl Fn(&yadorilink_root_authority::root_commit::RootLease) + Send + Sync + 'static,
@@ -3225,7 +3525,7 @@ fn swap_root_lock(root: &std::path::Path) {
 /// A live restore must be ONE root-authorized operation. When the
 /// root is swapped after the restore was admitted and its blocks fetched,
 /// but before anything is written, nothing may be committed anywhere:
-/// no journal row and DAG change, no bytes on disk, no new index version,
+/// no journal row and native delta, no bytes on disk, no new index version,
 /// no proof. Before the fix the restore held no `LinkOperation` and
 /// checked no permit, so it wrote and committed straight through.
 #[tokio::test]
@@ -3240,11 +3540,7 @@ async fn a_restore_commits_nothing_once_its_root_is_swapped_mid_restore() {
     assert!(lease.begin_operation().is_ok(), "fixture check: the lease must start out good");
     *root_path.lock().unwrap() = Some(root.path().to_path_buf());
     let fence_before = state.replica_coordinator.dag_snapshot_mutation_fence(GROUP, PATH).unwrap();
-    let author_before = state
-        .replica_coordinator
-        .file_index_repository()
-        .get_authoring_change_hash(GROUP, PATH)
-        .unwrap();
+    let heads_before = state.replica_coordinator.sqlite().native_group_heads(GROUP).unwrap();
 
     let result = restore_to_version(&state, GROUP, PATH, 1).await;
 
@@ -3260,13 +3556,9 @@ async fn a_restore_commits_nothing_once_its_root_is_swapped_mid_restore() {
     let versions = state.replica_coordinator.sqlite().dag_list_versions(GROUP, PATH).unwrap();
     assert_eq!(versions.len(), 2, "no index version may be committed under a lost root");
     assert_eq!(
-        state
-            .replica_coordinator
-            .file_index_repository()
-            .get_authoring_change_hash(GROUP, PATH)
-            .unwrap(),
-        author_before,
-        "no DAG change may be authored under a lost root"
+        state.replica_coordinator.sqlite().native_group_heads(GROUP).unwrap(),
+        heads_before,
+        "no delta may be authored under a lost root"
     );
     assert!(
         state
@@ -3331,21 +3623,21 @@ async fn a_restore_holds_its_link_operation_until_its_last_commit() {
     );
 }
 
-/// A crash while an access hydration held a row that was `Hydrated`
+/// A crash while an access hydration held a row that was `Present`
 /// on entry must not cost that row its local-edit protection.
 ///
 /// The metadata-repair fallthrough is the ordinary way into this lane
-/// from `Hydrated`: the row's version moved on a mode bump, the bytes on
+/// from `Present`: the row's version moved on a mode bump, the bytes on
 /// disk are already the ones it names, and the attempt CASes the row to
 /// `Hydrating` before it rewrites anything. A crash there -- during the
 /// block resolution, before the fence bump -- leaves `Hydrating` with no
 /// intent and the prior proof still standing against an unmoved fence.
 /// While the daemon is down the user saves an edit to the file. On the
-/// way back up the startup reset used to demote the row to `Placeholder`,
-/// and a `Placeholder` is exactly what access hydration reconstructs over
+/// way back up the startup reset used to demote the row to `Remote`,
+/// and a `Remote` is exactly what access hydration reconstructs over
 /// without asking: the next fetch or pin, arriving before the startup
 /// scan has journalled the edit, wrote the stale indexed bytes over it.
-/// Left `Hydrated` -- the state this attempt's own guard would have
+/// Left `Present` -- the state this attempt's own guard would have
 /// reverted to had it failed instead of crashed -- the proof still
 /// stands, disk no longer matches, and hydrate refuses.
 #[tokio::test]
@@ -3391,7 +3683,7 @@ async fn a_crash_mid_access_hydration_from_hydrated_keeps_an_offline_edit_protec
             .materialization_state_repository()
             .get_materialization_state(GROUP, PATH)
             .unwrap(),
-        Some(MaterializationState::Hydrated),
+        Some(MaterializationState::Present),
         "setup: the attempt enters from Hydrated"
     );
 
@@ -3404,13 +3696,7 @@ async fn a_crash_mid_access_hydration_from_hydrated_keeps_an_offline_edit_protec
         .unwrap();
     let guard = state
         .replica_coordinator
-        .begin_access_hydration(
-            GROUP,
-            PATH,
-            Some(MaterializationState::Hydrated),
-            canonical.authoring_change_hash,
-            canonical.version_hash(),
-        )
+        .begin_hydration(GROUP, PATH, Some(MaterializationState::Present), canonical.version_hash())
         .unwrap()
         .expect("the entry CAS lands");
     std::mem::forget(guard);
@@ -3439,24 +3725,26 @@ async fn a_crash_mid_access_hydration_from_hydrated_keeps_an_offline_edit_protec
     );
     assert_eq!(
         after_reset,
-        Some(MaterializationState::Hydrated),
+        Some(MaterializationState::Present),
         "the reset must give back the Hydrated the attempt entered from, not demote it"
     );
 }
 
-/// A convergence rehydration that entered from `Hydrated` and
-/// failed after its fence bump must not leave the row `Hydrated` with no
-/// usable proof.
+/// A convergence rehydration that entered from `Present` and failed after
+/// its fence bump leaves the row `Present` over the object that is still
+/// there, with no usable proof -- and the next access hydration re-drives the
+/// path instead of refusing it.
 ///
-/// The bump invalidates the proof the row stood on, so reverting to the
-/// entry state claims content nothing vouches for. That pair is the one
-/// access hydration refuses as `CorruptState` without touching disk, so
-/// every open or pin of the path failed until something re-drove the
-/// convergence lane. Driven through the owner's guard in the lane's
-/// order: the entry CAS, the `peer_hydration_write` bump, then a failure
-/// (a reconstruct I/O error, or the metadata apply) dropping the guard.
+/// The bump invalidates the proof the row stood on, but `Present` makes no
+/// claim that the object equals any version, so reverting to the entry state
+/// claims nothing false. The object nothing vouches for takes hydration's
+/// admission, which replaces it only because it is exactly the version the
+/// row names. Driven through the materialization guard in the lane's order: the entry
+/// CAS, the `hydration_write` bump, then a failure (a reconstruct I/O
+/// error, or the metadata apply) dropping the guard.
 #[tokio::test]
-async fn a_convergence_rehydration_that_fails_after_its_fence_bump_leaves_no_proofless_hydrated() {
+async fn a_convergence_rehydration_that_fails_after_its_fence_bump_leaves_present_without_a_proof()
+{
     let (state, _store_dir) = test_state();
     let root = tempfile::tempdir().unwrap();
     let local_path = root.path().to_string_lossy().to_string();
@@ -3500,13 +3788,7 @@ async fn a_convergence_rehydration_that_fails_after_its_fence_bump_leaves_no_pro
         .unwrap();
     let mut guard = state
         .replica_coordinator
-        .begin_convergence_hydration(
-            GROUP,
-            PATH,
-            Some(MaterializationState::Hydrated),
-            canonical.authoring_change_hash,
-            canonical.version_hash(),
-        )
+        .begin_hydration(GROUP, PATH, Some(MaterializationState::Present), canonical.version_hash())
         .unwrap()
         .expect("the entry CAS lands");
     guard.begin_physical_write().unwrap();
@@ -3519,13 +3801,11 @@ async fn a_convergence_rehydration_that_fails_after_its_fence_bump_leaves_no_pro
         .materialization_state_repository()
         .get_materialization_state(GROUP, PATH)
         .unwrap();
-    let usable = sqlite.dag_usable_proof_names_current_version(GROUP, PATH).unwrap();
+    assert_eq!(after, Some(MaterializationState::Present));
     assert!(
-        after != Some(MaterializationState::Hydrated) || usable,
-        "a rehydration that failed after its fence bump left the row Hydrated with no usable \
-         proof (state {after:?})"
+        !sqlite.dag_usable_proof_names_current_version(GROUP, PATH).unwrap(),
+        "the fence bump must have retired the proof the row stood on"
     );
-    assert_eq!(after, Some(MaterializationState::Placeholder));
     hydrate(&state, GROUP, PATH)
         .await
         .expect("the next access hydration must re-drive the path, not refuse it as corrupt");
@@ -3553,10 +3833,7 @@ async fn hydrate_one_with_metadata(
     let content = b"hydrated with replicated metadata";
     let hash = Sha256::digest(content).to_vec();
     store.put(content).unwrap();
-    sync_state
-        .change_history_repository()
-        .record_group_block_provenance("group-1", std::slice::from_ref(&hash))
-        .unwrap();
+    sync_state.record_block_provenance("group-1", std::slice::from_ref(&hash)).unwrap();
     let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
     sync_state
         .file_index_repository()
@@ -3579,7 +3856,7 @@ async fn hydrate_one_with_metadata(
     sync_state.file_index_repository().set_xattrs("group-1", "doc.txt", xattrs, &permit).unwrap();
     sync_state
         .materialization_state_repository()
-        .set_materialization_state("group-1", "doc.txt", MaterializationState::Placeholder, &permit)
+        .set_materialization_state("group-1", "doc.txt", MaterializationState::Remote, &permit)
         .unwrap();
     let state = DaemonState::new("device-a".into(), sync_state.clone(), store);
     state.install_test_root_commit_authority("group-1");
@@ -3698,7 +3975,7 @@ async fn a_restore_whose_xattrs_cannot_be_confirmed_publishes_no_proof() {
             .materialization_state_repository()
             .get_materialization_state(GROUP, PATH)
             .unwrap(),
-        Some(MaterializationState::Hydrated),
+        Some(MaterializationState::Present),
         "the row must not claim to hold content it has no proof for"
     );
 }
@@ -3725,7 +4002,7 @@ async fn a_restore_to_an_owner_unreadable_mode_reaches_a_proof_with_its_xattr() 
             .materialization_state_repository()
             .get_materialization_state(GROUP, PATH)
             .unwrap(),
-        Some(MaterializationState::Hydrated)
+        Some(MaterializationState::Present)
     );
     let out_path = root.path().join(PATH);
     assert_eq!(std::fs::metadata(&out_path).unwrap().permissions().mode() & 0o777, 0o200);
@@ -3733,5 +4010,295 @@ async fn a_restore_to_an_owner_unreadable_mode_reaches_a_proof_with_its_xattr() 
     assert_eq!(
         yadorilink_local_storage::read_replicated_xattrs(&std::fs::File::open(&out_path).unwrap()),
         xattrs
+    );
+}
+
+/// A group a rebootstrap freezes is not hydrated: the entry refuses it before
+/// any block is fetched or any file is written, and the row stays retryable.
+#[tokio::test]
+async fn hydration_in_a_group_a_rebootstrap_freezes_is_refused_at_the_entry() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
+    let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
+    let root_dir = tempfile::tempdir().unwrap();
+    sync_state.link_repository().add_link(&root_dir.path().to_string_lossy(), "group-1").unwrap();
+    yadorilink_root_authority::root_identity::VerifiedRoot::open(
+        root_dir.path(),
+        "group-1",
+        sync_state.as_ref(),
+    )
+    .unwrap();
+    let content = b"content the row names";
+    let hash = Sha256::digest(content).to_vec();
+    store.put(content).unwrap();
+    sync_state.record_block_provenance("group-1", std::slice::from_ref(&hash)).unwrap();
+    let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+    sync_state
+        .file_index_repository()
+        .upsert_file(
+            "group-1",
+            &yadorilink_replica_domain::file::FileRecord {
+                path: "d/doc.txt".into(),
+                size: content.len() as u64,
+                mtime_unix_nanos: 0,
+                blocks: vec![BlockInfo { hash, offset: 0, size: content.len() as u32 }],
+                deleted: false,
+            },
+            &permit,
+        )
+        .unwrap();
+    sync_state
+        .materialization_state_repository()
+        .set_materialization_state("group-1", "d/doc.txt", MaterializationState::Remote, &permit)
+        .unwrap();
+    let state = DaemonState::new("device-a".into(), sync_state.clone(), store);
+    state.install_test_root_commit_authority("group-1");
+    crate::test_support::freeze_group(&sync_state, "group-1");
+
+    let outcome = hydrate_with_timeout(&state, "group-1", "d/doc.txt", HYDRATION_TIMEOUT).await;
+
+    assert!(
+        matches!(&outcome, Err(SyncError::HydrationFailed(why)) if why.contains("rebootstrap")),
+        "{outcome:?}"
+    );
+    assert!(!root_dir.path().join("d/doc.txt").exists(), "a file was written under the freeze");
+    assert_eq!(
+        sync_state
+            .materialization_state_repository()
+            .get_materialization_state("group-1", "d/doc.txt")
+            .unwrap(),
+        Some(MaterializationState::Remote)
+    );
+}
+
+/// A restore is refused in a frozen group as hydration is, before it reads a
+/// version or touches the disk.
+#[tokio::test]
+async fn a_restore_in_a_group_a_rebootstrap_freezes_is_refused() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
+    let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
+    let root_dir = tempfile::tempdir().unwrap();
+    sync_state.link_repository().add_link(&root_dir.path().to_string_lossy(), "group-1").unwrap();
+    yadorilink_root_authority::root_identity::VerifiedRoot::open(
+        root_dir.path(),
+        "group-1",
+        sync_state.as_ref(),
+    )
+    .unwrap();
+    let state = DaemonState::new("device-a".into(), sync_state.clone(), store);
+    state.install_test_root_commit_authority("group-1");
+    crate::test_support::freeze_group(&sync_state, "group-1");
+
+    for path in ["d/doc.txt", "d", "elsewhere.txt"] {
+        let outcome = restore_to_version(&state, "group-1", path, 1).await;
+        assert!(
+            matches!(&outcome, Err(SyncError::HydrationFailed(why)) if why.contains("rebootstrap")),
+            "{path}: {outcome:?}"
+        );
+    }
+    // Once the freeze ends the restore reaches its own lookup and finds no such version.
+    crate::test_support::unfreeze_group(&sync_state, "group-1");
+    assert!(matches!(
+        restore_to_version(&state, "group-1", "elsewhere.txt", 1).await,
+        Err(SyncError::NotFound(_))
+    ));
+}
+
+/// Hydration claims its space in the account every other write on the volume
+/// shares: with other writes holding most of the free space above the
+/// headroom, a hydration that would not fit beside them fails cleanly, and
+/// fits once they are done.
+#[tokio::test]
+async fn hydration_preflight_counts_the_space_other_writes_hold() {
+    const MIB: u64 = 1024 * 1024;
+    let (state, _store_dir) = test_state();
+    let root = tempfile::tempdir().unwrap();
+    seed_link(&state, root.path(), false, 1000);
+    // Room for 64 MiB above the headroom, whatever else the host is doing.
+    let free = yadorilink_local_storage::free_space::classify_volume(root.path(), Some(0)).unwrap();
+    let headroom = Some(free.available_bytes.saturating_sub(64 * MIB));
+    let other_writes = crate::local_convergence::reserve_volume_headroom(
+        root.path(),
+        &root.path().join("other"),
+        48 * MIB,
+        headroom,
+    )
+    .unwrap();
+
+    let refused = preflight_disk_pressure(&state, PATH, root.path(), 32 * MIB, headroom);
+    assert!(matches!(refused, Err(SyncError::DiskPressure { .. })), "got {refused:?}");
+    drop(other_writes);
+    let admitted = preflight_disk_pressure(&state, PATH, root.path(), 32 * MIB, headroom);
+    assert!(admitted.is_ok(), "got {admitted:?}");
+}
+
+// ---- placing hydrated bytes over an existing object ----
+
+/// Moves the row of `doc.txt` to a newer version whose bytes are `content` (blocks stored with
+/// this group's provenance), leaving the old version's object on disk under its stale proof.
+fn move_doc_to_newer_version(state: &DaemonState, sync_state: &ReplicaCoordinator, content: &[u8]) {
+    let block = put_block(state, "group-1", content);
+    let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+    sync_state
+        .file_index_repository()
+        .upsert_file(
+            "group-1",
+            &record_with_blocks("doc.txt", vec![block], content.len() as u64),
+            &permit,
+        )
+        .unwrap();
+}
+
+fn set_swap_gap_hook(out_path: &std::path::Path, hook: Arc<dyn Fn() + Send + Sync>) {
+    SWAP_GAP_HOOKS
+        .lock()
+        .unwrap()
+        .get_or_insert_with(Default::default)
+        .insert(out_path.display().to_string(), hook);
+}
+
+fn directory_names(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// A newer version replaces an older proven object: the new bytes land, no
+/// displaced object or temp file stays, and the write intent is gone.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_newer_version_replaces_the_old_object() {
+    let (state, sync_state, root_dir, _old) = setup_legitimately_hydrated_doc().await;
+    let newer = b"the newer version's bytes, longer than the old ones";
+    move_doc_to_newer_version(&state, &sync_state, newer);
+
+    hydrate_inner(&state, "group-1", "doc.txt", Some(&test_stall())).await.unwrap();
+
+    assert_eq!(std::fs::read(root_dir.path().join("doc.txt")).unwrap(), newer);
+    assert_eq!(
+        directory_names(root_dir.path()),
+        [".yadorilink-root", "doc.txt"],
+        "a displaced object or temp stayed"
+    );
+    assert!(!sync_state
+        .materialization_intent_repository()
+        .has_materialization_intent("group-1", "doc.txt")
+        .unwrap());
+}
+
+/// A placement that fails (here: a non-empty directory raced into the name) keeps the write
+/// intent open and publishes nothing: the bytes may or may not have moved, and only repair may
+/// settle the path.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failed_placement_keeps_the_write_intent_open() {
+    let (state, sync_state, root_dir, _old) = setup_legitimately_hydrated_doc().await;
+    move_doc_to_newer_version(
+        &state,
+        &sync_state,
+        b"the newer version's bytes, longer than the old ones",
+    );
+    let out = root_dir.path().join("doc.txt");
+    {
+        let target = out.clone();
+        set_swap_gap_hook(
+            &out,
+            Arc::new(move || {
+                std::fs::remove_file(&target).unwrap();
+                std::fs::create_dir(&target).unwrap();
+                std::fs::write(target.join("inner"), b"x").unwrap();
+            }),
+        );
+    }
+
+    let result = hydrate_inner(&state, "group-1", "doc.txt", Some(&test_stall())).await;
+
+    assert!(result.is_err());
+    assert!(
+        sync_state
+            .materialization_intent_repository()
+            .has_materialization_intent("group-1", "doc.txt")
+            .unwrap(),
+        "the write intent was cleared by a failed placement"
+    );
+}
+
+/// A crash after the fence bump leaves the write intent open: the old bytes stand under a stale
+/// proof, and the open intent is what tells capture and repair they are the pre-image of an
+/// unfinished write rather than a local edit.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_crash_after_the_fence_bump_leaves_the_write_intent_open() {
+    let (state, sync_state, root_dir, old) = setup_legitimately_hydrated_doc().await;
+    let newer = b"the newer version's bytes, longer than the old ones";
+    move_doc_to_newer_version(&state, &sync_state, newer);
+    set_swap_gap_hook(
+        &root_dir.path().join("doc.txt"),
+        Arc::new(|| panic!("simulated process death")),
+    );
+
+    let attempt = {
+        let state = state.clone();
+        tokio::spawn(async move {
+            hydrate_inner(&state, "group-1", "doc.txt", Some(&test_stall())).await
+        })
+    };
+    assert!(attempt.await.unwrap_err().is_panic());
+
+    assert!(
+        sync_state
+            .materialization_intent_repository()
+            .has_materialization_intent("group-1", "doc.txt")
+            .unwrap(),
+        "no write intent survived the crash"
+    );
+    assert_eq!(
+        sync_state
+            .materialization_intent_repository()
+            .materialization_intent_target("group-1", "doc.txt")
+            .unwrap()
+            .as_deref(),
+        Some(
+            yadorilink_local_storage::intent_target_hash(&[put_block(&state, "group-1", newer)])
+                .as_slice()
+        ),
+        "the intent does not name the version being written"
+    );
+    assert_eq!(
+        std::fs::read(root_dir.path().join("doc.txt")).unwrap(),
+        old,
+        "the old bytes were touched"
+    );
+}
+
+/// A failure after the new bytes were placed keeps the write intent open: the bytes stand under a
+/// stale proof, and clearing the intent would leave nothing saying an unfinished write put them
+/// there.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failure_after_the_placement_keeps_the_write_intent_open() {
+    let (state, sync_state, root_dir, _old) = setup_legitimately_hydrated_doc().await;
+    let newer = b"the newer version's bytes, longer than the old ones";
+    move_doc_to_newer_version(&state, &sync_state, newer);
+    FAIL_AFTER_PLACE
+        .lock()
+        .unwrap()
+        .get_or_insert_with(Default::default)
+        .insert(root_dir.path().join("doc.txt").display().to_string());
+
+    let result = hydrate_inner(&state, "group-1", "doc.txt", Some(&test_stall())).await;
+
+    assert!(result.is_err());
+    assert_eq!(std::fs::read(root_dir.path().join("doc.txt")).unwrap(), newer, "the bytes landed");
+    assert!(
+        sync_state
+            .materialization_intent_repository()
+            .has_materialization_intent("group-1", "doc.txt")
+            .unwrap(),
+        "the write intent was cleared after the bytes were placed"
     );
 }

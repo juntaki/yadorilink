@@ -1,10 +1,10 @@
-//! Every production line that stamps `MaterializationState::Hydrated`,
+//! Every production line that stamps `MaterializationState::Present`,
 //! pinned by name.
 //!
-//! `Hydrated` is an exact claim about disk, and the invariant this
-//! workspace maintains is that it is never observable without a usable
-//! actual-state generation naming the same version in the same durable
-//! commit. Producers were brought to that one at a time -- peer hydration,
+//! `Present` says only that a local object stands at the path; whether that
+//! object IS the row's version is the business of the actual-state
+//! generation, and a stamp that claims exactness is only meaningful with a
+//! usable generation naming the same version in the same durable commit. Producers were brought to that one at a time -- peer hydration,
 //! daemon hydration, both repair lanes, the eager batch, restore, local
 //! capture -- and each was a real defect before it was fixed. What none of
 //! that prevents is the next writer: `set_materialization_state` is a
@@ -40,6 +40,18 @@ const SANCTIONED: &[Sanctioned] = &[
               all when the CAS or the row guard fails",
     },
     Sanctioned {
+        file: "crates/yadorilink-daemon/src/replica_coordinator/materialization_owner/lanes.rs",
+        why: "records a version whose content is not fetched over an object that already \
+              stands at the path (`Present` says only that an object exists, never that it \
+              equals the version): it publishes no proof and claims none",
+    },
+    Sanctioned {
+        file: "crates/yadorilink-daemon/src/local_convergence/materialize/eager.rs",
+        why: "the reconstruct-failed arm puts a row back to what the path still holds (an \
+              older object stays `Present`, an empty path is `Remote`): it publishes no \
+              proof and claims none",
+    },
+    Sanctioned {
         file: "crates/yadorilink-sync-sqlite/src/restore_operation.rs",
         why: "restore's recovery lane, in the same transaction as the adoption that published \
               its proof; the live lane goes through the internal commit above instead",
@@ -50,7 +62,7 @@ const SANCTIONED: &[Sanctioned] = &[
 /// coverage.
 ///
 /// `upsert_file_in_tx` copies `materialization_state` forward from the row
-/// it supersedes, so a writer can leave a path reading `Hydrated` without
+/// it supersedes, so a writer can leave a path reading `Present` without
 /// containing the word anywhere -- the symlink lane did exactly that, and
 /// no grep over setter calls would ever have found it. That shape is
 /// covered by tests against the writers themselves, not from here.
@@ -123,7 +135,7 @@ fn code_only(line: &str) -> &str {
 /// inline test module about 700 lines in and roughly 13,000 lines of
 /// production code after it, so the guard read 4% of the file it most
 /// needed to read and reported success. It missed a real production
-/// `Hydrated` stamp sitting at line ~15,000.
+/// `Present` stamp sitting at line ~15,000.
 ///
 /// `scripts/check-mutation-boundary.py` had already been bitten by
 /// exactly this and says so in its own docstring. This is that algorithm,
@@ -226,14 +238,14 @@ fn is_test_only_module_file(path: &Path) -> bool {
 }
 
 /// Every production call to a materialization-state setter that passes
-/// `Hydrated`, as `(repo-relative file, 1-based line)`.
+/// `Present`, as `(repo-relative file, 1-based line)`.
 /// The setters that can put a row into a state. `transition_*` is
 /// included because it takes the target state as an argument like the
 /// plain setter does, so a stamp can hide there just as easily.
 const SETTERS: &[&str] = &["set_materialization_state", "transition_materialization_state"];
 
 /// Every production call to a materialization-state setter that passes
-/// `Hydrated`, as `(repo-relative file, 1-based line)`.
+/// `Present`, as `(repo-relative file, 1-based line)`.
 fn hydrated_stamps(root: &Path) -> Vec<(String, usize)> {
     let mut found = Vec::new();
     for path in production_sources(root) {
@@ -256,7 +268,7 @@ fn hydrated_stamps(root: &Path) -> Vec<(String, usize)> {
                 .collect::<Vec<_>>()
                 .join("\n");
             let call_end = window.find(");").map_or(window.len(), |at| at + 2);
-            if window[..call_end].contains("MaterializationState::Hydrated") {
+            if window[..call_end].contains("MaterializationState::Present") {
                 let relative = path
                     .strip_prefix(root)
                     .expect("scanned under the workspace root")
@@ -280,8 +292,8 @@ fn no_production_writer_stamps_hydrated_outside_the_sanctioned_set() {
     assert!(
         unsanctioned.is_empty(),
         "these production writers stamp Hydrated without being part of the sanctioned set:\n{}\n\n\
-         Hydrated is an exact claim about disk and is only meaningful alongside the proof that \
-         earns it, published in the SAME durable commit. A writer that performed its own write \
+         Present is an exact claim about disk only alongside the proof that earns it, \
+         published in the SAME durable commit. A writer that performed its own write \
          belongs on commit_internal_materialized_state_if_fence_current; one that observed a \
          write someone else performed belongs on the local-capture adoption path. If this stamp \
          genuinely belongs, add its file to SANCTIONED with the reason.",

@@ -274,6 +274,145 @@ struct JoinOperationBody<'a> {
 /// the link back, so no phantom full replica is left counted. An AMBIGUOUS
 /// activate leaves the link and its marker for the daemon's reconciliation
 /// sweep. Returns the new group id.
+/// What creating a provider-backed folder produced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderFolderCreated {
+    pub group_id: String,
+    pub root_id: String,
+    /// The request was a retry of one that had already completed.
+    pub already_existed: bool,
+}
+
+/// Runs one provider-folder request under its durable retry identity: the token of the same payload is
+/// reused across restarts, written before the request is sent, and forgotten only on success or a
+/// definitive refusal.
+async fn with_durable_token<F, Fut>(
+    signature: String,
+    send: F,
+) -> Result<ProviderFolderCreated, CoreError>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<ProviderFolderCreated, CoreError>>,
+{
+    let store = super::provider_pending::PendingStore::at(
+        super::provider_pending::PendingStore::default_path(),
+    );
+    let token = store.token_for(&signature).map_err(|e| {
+        CoreError::Other(format!("could not record the request before sending it: {e}"))
+    })?;
+    let result = send(token).await;
+    if result.is_ok()
+        || result.as_ref().is_err_and(super::provider_pending::is_definitive_rejection)
+    {
+        store.clear(&signature);
+    }
+    result
+}
+
+/// Creates a NEW group and a provider-backed folder (no directory: the File Provider domain is the
+/// folder). The request's retry identity is kept on disk, so repeating the SAME request (even after
+/// this process was restarted) is answered with the folder it already made.
+pub async fn create_provider_folder(
+    group_name: String,
+    display_name: String,
+    on_demand: bool,
+) -> Result<ProviderFolderCreated, CoreError> {
+    let signature =
+        super::provider_pending::signature("create", "", &group_name, &display_name, on_demand);
+    with_durable_token(signature, |token| {
+        create_provider_folder_with_token(group_name, display_name, token, on_demand)
+    })
+    .await
+}
+
+async fn create_provider_folder_with_token(
+    group_name: String,
+    display_name: String,
+    request_token: String,
+    on_demand: bool,
+) -> Result<ProviderFolderCreated, CoreError> {
+    let response = control::send(ReqPayload::CreateAndLinkCommand(CreateAndLinkCommandRequest {
+        group_name,
+        local_path: String::new(),
+        on_demand,
+        acknowledge_risks: false,
+        provider_display_name: display_name,
+        request_token,
+    }))
+    .await?;
+    match response.payload {
+        Some(RespPayload::CreateAndLinkCommand(response)) => match response.result {
+            Some(create_and_link_command_response::Result::Outcome(outcome)) => {
+                Ok(ProviderFolderCreated {
+                    group_id: outcome.group_id,
+                    root_id: outcome.provider_root_id,
+                    already_existed: outcome.already_linked,
+                })
+            }
+            Some(create_and_link_command_response::Result::Error(error)) => {
+                Err(CoreError::from_command_error(error))
+            }
+            None => Err(CoreError::Other("daemon returned an empty create result".into())),
+        },
+        _ => Err(CoreError::Other("unexpected daemon response to create-and-link".into())),
+    }
+}
+
+/// Joins an EXISTING group as a provider-backed folder (see [`create_provider_folder`]).
+pub async fn join_provider_folder(
+    group_id: String,
+    group_name: String,
+    display_name: String,
+    on_demand: bool,
+) -> Result<ProviderFolderCreated, CoreError> {
+    let signature = super::provider_pending::signature(
+        "join",
+        &group_id,
+        &group_name,
+        &display_name,
+        on_demand,
+    );
+    with_durable_token(signature, |token| {
+        join_provider_folder_with_token(group_id, group_name, display_name, token, on_demand)
+    })
+    .await
+}
+
+async fn join_provider_folder_with_token(
+    group_id: String,
+    group_name: String,
+    display_name: String,
+    request_token: String,
+    on_demand: bool,
+) -> Result<ProviderFolderCreated, CoreError> {
+    let response = control::send(ReqPayload::JoinAndLinkCommand(JoinAndLinkCommandRequest {
+        group_id,
+        group_name,
+        local_path: String::new(),
+        on_demand,
+        acknowledge_risks: false,
+        provider_display_name: display_name,
+        request_token,
+    }))
+    .await?;
+    match response.payload {
+        Some(RespPayload::JoinAndLinkCommand(response)) => match response.result {
+            Some(join_and_link_command_response::Result::Outcome(outcome)) => {
+                Ok(ProviderFolderCreated {
+                    group_id: outcome.group_id,
+                    root_id: outcome.provider_root_id,
+                    already_existed: outcome.already_linked,
+                })
+            }
+            Some(join_and_link_command_response::Result::Error(error)) => {
+                Err(CoreError::from_command_error(error))
+            }
+            None => Err(CoreError::Other("daemon returned an empty join result".into())),
+        },
+        _ => Err(CoreError::Other("unexpected daemon response to join-and-link".into())),
+    }
+}
+
 pub async fn create_and_link(
     group_name: String,
     absolute_path: PathBuf,
@@ -285,6 +424,8 @@ pub async fn create_and_link(
         local_path: absolute_path.to_string_lossy().to_string(),
         on_demand,
         acknowledge_risks,
+        provider_display_name: String::new(),
+        request_token: String::new(),
     }))
     .await?;
     match response.payload {
@@ -858,6 +999,8 @@ pub async fn join_resolved_with_outcome(
         local_path,
         on_demand,
         acknowledge_risks: acknowledged,
+        provider_display_name: String::new(),
+        request_token: String::new(),
     }))
     .await?;
     match response.payload {

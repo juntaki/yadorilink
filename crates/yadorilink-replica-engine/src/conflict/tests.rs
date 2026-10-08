@@ -1,7 +1,6 @@
 #![cfg(test)]
 
 use super::*;
-use yadorilink_replica_domain::test_authoring::create_signed_for_tests;
 
 /// A fixed "now" far beyond any of the small epoch-relative mtimes
 /// used throughout this test module, so `MAX_FUTURE_MTIME_SKEW_NANOS`
@@ -12,154 +11,6 @@ const FAR_FUTURE_NOW: i64 = 2_000_000_000 * 1_000_000_000;
 
 const HASH_A: &[u8] = b"content-a-loser-bytes";
 const HASH_B: &[u8] = b"content-b-winner-bytes";
-
-/// `path_effects_of_change` is the write-side normalization a store
-/// persists so it never has to decode a change and rescan its ops to
-/// answer "what does this change do to path P". It is only safe to
-/// persist if it agrees, for every path, with the per-path fold
-/// (`path_head_from_change`) that every remaining reader still uses --
-/// a disagreement would not fail loudly, it would resolve some path
-/// differently depending on which of the two answered.
-///
-/// So this checks the two against each other over generated changes
-/// that deliberately include the shapes where a hand-written
-/// single-pass rewrite diverges: a self-move, a `Put` and a `Delete`
-/// for the same path in one change, a move whose source was also put
-/// by the same change, a re-assertion (which moves naming identity
-/// off the signer), and a conflict-copy put (which must NOT).
-#[test]
-fn path_effects_agree_with_the_per_path_fold_for_every_touched_path() {
-    use ed25519_dalek::SigningKey;
-    use yadorilink_replica_domain::change::{Op, PutOrigin};
-    use yadorilink_replica_domain::ids::{
-        ChangeHash, DeviceId, FolderGroupId, SyncPath, VersionHash,
-    };
-
-    fn p(s: &str) -> SyncPath {
-        SyncPath(s.to_string())
-    }
-    fn v(byte: u8) -> VersionHash {
-        VersionHash([byte; 32])
-    }
-
-    let key = SigningKey::from_bytes(&[7u8; 32]);
-    let device = DeviceId("device-signer".to_string());
-    let other = DeviceId("device-original-author".to_string());
-    let group = FolderGroupId("group-effects".to_string());
-
-    let op_pool: Vec<Vec<Op>> = vec![
-        // A plain put.
-        vec![Op::Put { path: p("a.txt"), version: v(1), origin: PutOrigin::Direct }],
-        // A plain delete.
-        vec![Op::Delete { path: p("a.txt") }],
-        // An ordinary move: removing effect at `from`, content at `to`.
-        vec![Op::Move { from: p("a.txt"), to: p("b.txt"), version: v(2) }],
-        // A self-move: the `to` arm wins, so this lands content.
-        vec![Op::Move { from: p("a.txt"), to: p("a.txt"), version: v(3) }],
-        // Put and delete for one path in one change.
-        vec![
-            Op::Put { path: p("a.txt"), version: v(4), origin: PutOrigin::Direct },
-            Op::Delete { path: p("a.txt") },
-        ],
-        // A move whose source this same change also put.
-        vec![
-            Op::Put { path: p("a.txt"), version: v(5), origin: PutOrigin::Direct },
-            Op::Move { from: p("a.txt"), to: p("c.txt"), version: v(6) },
-        ],
-        // A re-assertion: naming identity moves off the signer.
-        vec![Op::Put {
-            path: p("a.txt"),
-            version: v(7),
-            origin: PutOrigin::Reasserted {
-                original_change: ChangeHash([9u8; 32]),
-                naming_device_id: other.clone(),
-            },
-        }],
-        // A conflict-copy put: naming identity stays on the carrier.
-        vec![Op::Put {
-            path: p("a.txt"),
-            version: v(8),
-            origin: PutOrigin::ConflictCopy {
-                source_path: p("b.txt"),
-                losing_change: ChangeHash([10u8; 32]),
-            },
-        }],
-        // Several unrelated paths at once.
-        vec![
-            Op::Put { path: p("x/1.txt"), version: v(11), origin: PutOrigin::Direct },
-            Op::Delete { path: p("x/2.txt") },
-            Op::Move { from: p("x/3.txt"), to: p("x/4.txt"), version: v(12) },
-        ],
-    ];
-
-    // Every subset-of-two combination as well, so ops from different
-    // shapes interleave under the canonical op ordering.
-    let mut op_sets: Vec<Vec<Op>> = op_pool.clone();
-    for a in &op_pool {
-        for b in &op_pool {
-            let mut combined = a.clone();
-            combined.extend(b.iter().cloned());
-            op_sets.push(combined);
-        }
-    }
-
-    let every_path =
-        ["a.txt", "b.txt", "c.txt", "x/1.txt", "x/2.txt", "x/3.txt", "x/4.txt", "absent.txt"];
-
-    for ops in op_sets {
-        let change = create_signed_for_tests(vec![], 0, device.clone(), group.clone(), ops, &key);
-        let effects = path_effects_of_change(&change);
-
-        // No path appears twice.
-        let mut seen = std::collections::HashSet::new();
-        for (path, _) in &effects {
-            assert!(seen.insert(path.clone()), "path {path} appeared twice in the effects");
-        }
-
-        for path in every_path {
-            let folded = path_head_from_change(&change, path);
-            let normalized = effects.iter().find(|(p, _)| p == path).map(|(_, h)| h);
-            match (&folded, normalized) {
-                (None, None) => {}
-                (Some(f), Some(n)) => {
-                    assert_eq!(f.change_hash, n.change_hash, "change_hash for {path}");
-                    assert_eq!(f.lamport, n.lamport, "lamport for {path}");
-                    assert_eq!(f.device_id, n.device_id, "device_id for {path}");
-                    assert_eq!(
-                        f.naming_device_id, n.naming_device_id,
-                        "naming_device_id for {path}"
-                    );
-                    assert_eq!(
-                        f.content.as_ref().map(|c| c.version_hash),
-                        n.content.as_ref().map(|c| c.version_hash),
-                        "content for {path}"
-                    );
-                    assert_eq!(
-                        f.content.as_ref().map(|c| c.mtime_unix_nanos),
-                        n.content.as_ref().map(|c| c.mtime_unix_nanos),
-                        "mtime for {path}"
-                    );
-                }
-                (Some(_), None) => {
-                    panic!("the fold found a head at {path} that normalization missed")
-                }
-                (None, Some(_)) => {
-                    panic!("normalization invented a head at {path} the fold does not see")
-                }
-            }
-        }
-
-        // `change_touches_path` is the other read-side twin: the set of
-        // normalized paths must be exactly the set it reports touched.
-        for path in every_path {
-            assert_eq!(
-                change_touches_path(&change, path),
-                effects.iter().any(|(p, _)| p == path),
-                "touch disagreement at {path}"
-            );
-        }
-    }
-}
 
 #[test]
 fn conflict_copy_source_path_inverts_generated_names() {
@@ -481,21 +332,47 @@ fn is_conflict_copy_of_rejects_a_conflict_copy_in_a_different_directory() {
     ));
 }
 
-// Ancestry-grounded `(lamport, change_hash)` conflict resolution.
+// `(rank, change_hash)` winner order among live heads.
 
 #[test]
-fn higher_lamport_wins_regardless_of_hash() {
-    // a has the higher lamport, so a wins and b is the loser, even
+fn higher_rank_wins_regardless_of_hash() {
+    // a has the higher rank, so a wins and b is the loser, even
     // though b's hash sorts higher.
     assert!(!dag_conflict_loser_is_a(9, b"\x00\x00", 8, b"\xff\xff"));
     assert!(dag_conflict_loser_is_a(8, b"\xff\xff", 9, b"\x00\x00"));
 }
 
 #[test]
-fn equal_lamport_breaks_on_change_hash() {
-    // Same lamport: the lexicographically smaller change hash loses.
+fn equal_rank_breaks_on_change_hash() {
+    // Same rank: the lexicographically smaller change hash loses.
     assert!(dag_conflict_loser_is_a(5, b"\x01", 5, b"\x02"));
     assert!(!dag_conflict_loser_is_a(5, b"\x02", 5, b"\x01"));
+}
+
+/// The visible winner of two live content heads whose rank and change
+/// hash disagree is the higher rank, the order `(lamport, change_hash)`
+/// had before the display rank replaced the clock: the head with the
+/// smaller hash keeps the name, and the other becomes the copy.
+#[test]
+fn the_visible_winner_follows_rank_before_hash() {
+    let head = |hash: u8, rank: u64, device: &str, version: u8| PathHead {
+        change_hash: [hash; 32],
+        rank,
+        device_id: device.to_string(),
+        naming_device_id: device.to_string(),
+        content: Some(PathHeadContent { version_hash: [version; 32], mtime_unix_nanos: 0 }),
+    };
+    let heads = [head(0x10, 7, "device-a", 1), head(0xF0, 3, "device-b", 2)];
+    for order in [[0, 1], [1, 0]] {
+        let permuted = [heads[order[0]].clone(), heads[order[1]].clone()];
+        match resolve_path_heads("p.txt", &permuted) {
+            PathResolution::Present { winner, conflict_copies } => {
+                assert_eq!(permuted[winner].change_hash, [0x10; 32], "higher rank keeps the name");
+                assert_eq!(conflict_copies.len(), 1);
+            }
+            PathResolution::Absent => panic!("two content heads leave the path present"),
+        }
+    }
 }
 
 #[test]
@@ -538,7 +415,7 @@ fn losing_change_name_is_a_pure_function_of_its_fields() {
 
 #[test]
 fn losing_change_name_matches_the_underlying_primitive() {
-    // The DAG entry point is exactly the existing naming primitive
+    // The head-based entry point is exactly the existing naming primitive
     // with the argument order that reads naturally for a change, so
     // the two can never drift apart.
     let vh = [1u8, 2, 3, 4];
@@ -643,7 +520,7 @@ fn conflict_copy_path_is_injective_over_distinct_hashes_devices_and_timestamps()
     // can carry held equal, including an mtime inside the SAME truncated
     // second, so the content hash is the only thing left to tell two
     // losers apart. This is the real shape of a concurrent conflict --
-    // and for a DAG-resolved conflict the stamp is a fixed placeholder
+    // and for a native-resolved conflict the stamp is a fixed placeholder
     // anyway, so the hash is the only disambiguator that exists at all.
     let same_second = base + 999_999_999;
     assert_eq!(
@@ -881,12 +758,12 @@ fn every_distinct_concurrent_content_class_survives_resolution_at_a_distinct_pat
             let device = format!("device-{}", slot % 2);
             heads.push(PathHead {
                 change_hash: change_hash(combo * SLOTS + slot),
-                lamport,
+                rank: lamport,
                 device_id: device.clone(),
                 naming_device_id: device,
                 content: (kind < 3).then(|| PathHeadContent {
                     version_hash: content(kind),
-                    // The placeholder a DAG-resolved head always carries:
+                    // The placeholder a native-resolved head always carries:
                     // the stamp cannot disambiguate anything here, which
                     // is exactly the situation the name has to survive.
                     mtime_unix_nanos: 0,
@@ -987,13 +864,9 @@ fn every_distinct_concurrent_content_class_survives_resolution_at_a_distinct_pat
 /// conflict copy, in either arrival order.
 #[test]
 fn concurrent_identical_mkdir_resolves_without_conflict_copy() {
-    use ed25519_dalek::SigningKey;
-    use yadorilink_replica_domain::change::{Op, PutOrigin};
     use yadorilink_replica_domain::file::{FileVersion, RecordKind};
-    use yadorilink_replica_domain::ids::{DeviceId, FolderGroupId, SyncPath};
 
-    let group = FolderGroupId("group-mkdir".to_string());
-    let mkdir = |device: &str, key_byte: u8, observed_size: u64, observed_mtime: i64| {
+    let mkdir = |device: &str, change_byte: u8, observed_size: u64, observed_mtime: i64| {
         let version = FileVersion::from_index_row(
             Vec::new(),
             observed_size,
@@ -1003,26 +876,21 @@ fn concurrent_identical_mkdir_resolves_without_conflict_copy() {
             None,
             Vec::new(),
         );
-        create_signed_for_tests(
-            vec![],
-            0,
-            DeviceId(device.to_string()),
-            group.clone(),
-            vec![Op::Put {
-                path: SyncPath("photos".to_string()),
-                version: version.version_hash,
-                origin: PutOrigin::Direct,
-            }],
-            &SigningKey::from_bytes(&[key_byte; 32]),
-        )
+        PathHead {
+            change_hash: [change_byte; 32],
+            rank: 1,
+            device_id: device.to_string(),
+            naming_device_id: device.to_string(),
+            content: Some(PathHeadContent {
+                version_hash: version.version_hash.0,
+                mtime_unix_nanos: 0,
+            }),
+        }
     };
     let on_mac = mkdir("device-mac", 1, 96, 1_700_000_000_000_000_001);
     let on_linux = mkdir("device-linux", 2, 4096, 1_700_000_123_000_000_000);
 
-    let heads = [
-        path_head_from_change(&on_mac, "photos").unwrap(),
-        path_head_from_change(&on_linux, "photos").unwrap(),
-    ];
+    let heads = [on_mac, on_linux];
     let reversed = [heads[1].clone(), heads[0].clone()];
 
     let resolved = resolve_path_heads("photos", &heads);

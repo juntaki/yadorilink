@@ -22,7 +22,8 @@ use std::sync::{Arc, Weak};
 use yadorilink_filesystem_sync::debounce::{self, DebounceFlush};
 use yadorilink_filesystem_sync::watcher::{FsChangeEvent, FsChangeKind};
 use yadorilink_ipc_proto::shellipc::{
-    MaterializationState as ShellMaterializationState, StatusPush, SyncState as ShellSyncState,
+    LocalState as ShellLocalState, LocalTransition as ShellLocalTransition, StatusPush,
+    SyncState as ShellSyncState,
 };
 use yadorilink_local_capture::{LocalChangeOutcome, LocalChangeProcessor};
 use yadorilink_peer_session::peer_session::PendingLocalFlushOutcome;
@@ -72,6 +73,14 @@ pub struct LinkFlushHandle {
     /// the same `SyncRootLock` `LinkRuntime` itself holds a clone of -- see
     /// `RootLease`'s own doc.
     root_lease: Arc<RootLease>,
+}
+
+/// What a platform provider reports for one path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalWrite {
+    CreatedOrModified,
+    /// The user deleted the logical item; see `SemanticDelete`.
+    Deleted,
 }
 
 impl LinkFlushHandle {
@@ -206,7 +215,14 @@ impl LinkFlushHandle {
         if path.symlink_metadata().is_ok() {
             return flushed;
         }
-        self.flush_one_path(group_id, rel_path, path, FsChangeKind::Removed, now_unix_nanos()).await
+        self.flush_one_path(
+            group_id,
+            rel_path,
+            path,
+            FsChangeKind::ObservedRemoval,
+            now_unix_nanos(),
+        )
+        .await
     }
 
     /// Runs one path through this link's ordinary flush executor -- which
@@ -440,6 +456,51 @@ impl LinkFlushHandle {
         }
     }
 
+    /// Folds the whole folder into the index once, as a rebootstrap's final capture pass does
+    /// and as the scan after a rebootstrap does: pending debounced edits first, then a full
+    /// reconciliation of the disk. `Err` says why the index may not know all of the user's
+    /// edits: nothing may be assumed captured then.
+    pub(crate) async fn capture_whole_group(&self, group_id: &str) -> Result<(), String> {
+        let _op = self.root_lease.begin_operation().map_err(|e| e.to_string())?;
+        let deps = self.deps.upgrade().ok_or("the daemon is stopping")?;
+        let _write_activity = deps.begin_write_activity();
+        let paused = {
+            use yadorilink_local_capture::ports::LocalMutationStore;
+            deps.replica_coordinator.paused_items(group_id).map_err(|e| e.to_string())?
+        };
+        if !paused.is_empty() {
+            return Err(format!("{} item(s) are paused by the user", paused.len()));
+        }
+        let emit_tombstones = !deps
+            .replica_coordinator
+            .link_repository()
+            .suppress_tombstones_for_group(group_id)
+            .map_err(|e| e.to_string())?;
+        if !emit_tombstones {
+            return Err("this group's deletions are withheld until its roots are reconciled".into());
+        }
+        self.flush_all_pending_local_changes(group_id).await;
+        let ignore_set =
+            yadorilink_root_authority::ignore_patterns::EffectiveIgnoreSet::load_for_link_root(
+                &self.root,
+            )
+            .map_err(|e| e.to_string())?;
+        let outcome = self
+            .processor
+            .process_flush_with_ignore(
+                group_id,
+                &self.root,
+                DebounceFlush::RescanRequired,
+                &ignore_set,
+                emit_tombstones,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        deps.note_capture_settled(group_id);
+        announce_local_change(&deps, &self.local_path, group_id, outcome.records).await;
+        Ok(())
+    }
+
     /// The disk-reconcile backstop sweep's per-link operation (see
     /// the daemon's own `LinkRuntimeController::run_disk_reconcile_backstop_sweep`'s own doc for why
     /// it exists and why it is add-only): admits a `LinkOperation` from
@@ -645,23 +706,39 @@ impl LinkFlushHandle {
         &self,
         group_id: &str,
         rel_path: &str,
-        kind: FsChangeKind,
+        write: LocalWrite,
     ) -> Result<LocalChangeOutcome, String> {
         let path = self.canonical_root.join(rel_path);
         let Some(deps) = self.deps.upgrade() else {
             return Err("link is shutting down".to_string());
         };
+        // A provider root authors and tombstones nothing from the filesystem.
+        crate::provider_gate::require_filesystem_root(&deps.replica_coordinator, group_id)
+            .map_err(|e| e.to_string())?;
         let _op = self
             .root_lease
             .begin_operation()
             .map_err(|_| "link is not currently accepting local writes".to_string())?;
         let _write_activity = deps.begin_write_activity();
-        let event = FsChangeEvent { path, kind };
-        let outcome = self
-            .processor
-            .process_event(group_id, &self.root, &event)
-            .await
-            .map_err(|e| e.to_string())?;
+        // A platform provider reporting a delete is the user deleting the
+        // item, whatever its local state: unlike a watcher's observed
+        // absence, it is authored even for an item with no local object, and
+        // covers only what was visible when the delete arrived.
+        let outcome = match write {
+            LocalWrite::Deleted => {
+                match self.processor.begin_semantic_delete(group_id, &self.root, rel_path) {
+                    Ok(delete) => {
+                        self.processor.process_semantic_delete(group_id, &self.root, &delete).await
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            LocalWrite::CreatedOrModified => {
+                let event = FsChangeEvent { path, kind: FsChangeKind::CreatedOrModified };
+                self.processor.process_event(group_id, &self.root, &event).await
+            }
+        }
+        .map_err(|e| e.to_string())?;
         let records = match &outcome {
             LocalChangeOutcome::FileChanged(record) => vec![record.clone()],
             LocalChangeOutcome::FilesChanged(records) => records.clone(),
@@ -722,7 +799,7 @@ impl LinkFlushHandle {
     /// `cfapi-host.exe` might have already created a real placeholder
     /// carrying the EARLIER (now-orphaned) generation -- permanently
     /// `Unknown`/`Dirty` for that path until it transitions out of
-    /// `Placeholder` and back. `record_placeholder_generation_if_absent`
+    /// `Remote` and back. `record_placeholder_generation_if_absent`
     /// does the check-then-write in ONE `database.write` closure, so this
     /// is no longer racy: whichever caller's mint actually gets persisted,
     /// every caller (including ones that lost the race) gets back that
@@ -810,7 +887,7 @@ pub(crate) async fn announce_local_change(
     // requires the group's single authoritative live link. Never turn a link
     // table read failure or a raced unlink into permission to broadcast.
     if link_should_propagate(&deps.replica_coordinator, local_path, group_id) {
-        deps.broadcast_change(group_id, records.clone()).await;
+        deps.on_local_native_commit(group_id).await;
     }
 
     for record in &records {
@@ -826,17 +903,21 @@ pub(crate) async fn announce_local_change(
         // this path never produces a placeholder (that's
         // `PeerSyncSession::materialize`'s job, for records adopted
         // *from* a peer, not local ones).
-        let materialization_state = if record.deleted {
-            ShellMaterializationState::Unspecified
+        let local_state = if record.deleted {
+            None
         } else {
-            ShellMaterializationState::Hydrated
+            Some(ShellLocalState {
+                local_object_present: true,
+                current_content_present: true,
+                transition: ShellLocalTransition::None as i32,
+            })
         };
         // No connected shell extension is not an error — the push channel
         // simply has no subscribers yet.
         deps.telemetry.push_status(StatusPush {
             path: absolute_path,
             state: shell_state as i32,
-            materialization_state: materialization_state as i32,
+            local_state,
         });
     }
 }

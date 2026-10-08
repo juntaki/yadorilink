@@ -51,7 +51,8 @@ struct ListDevicesResponse {
 }
 
 /// Registers this device and persists the one canonical pre-release
-/// `device.json` shape, returning the assigned `device_id`.
+/// `device.json` shape, returning the assigned `device_id`. A daemon that is
+/// already running is restarted so it starts as this registered device.
 pub async fn register_device(device_name: String) -> Result<String, CoreError> {
     let auth = require_auth().await?;
     let signing_keypair =
@@ -77,6 +78,9 @@ pub async fn register_device(device_name: String) -> Result<String, CoreError> {
         signing_public_key: signing_public_key_base64,
         config_version: device_config::CONFIG_VERSION,
     })?;
+    // A running daemon read `device.json` at startup and would keep acting as
+    // an unregistered device until restarted.
+    crate::ops::daemon::restart_if_running().await?;
     Ok(resp.device_id)
 }
 

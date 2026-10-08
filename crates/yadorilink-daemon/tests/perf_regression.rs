@@ -185,7 +185,7 @@ async fn large_file_hydration_does_not_block_concurrent_async_work() {
         .set_materialization_state(
             GROUP,
             "large.bin",
-            MaterializationState::Placeholder,
+            MaterializationState::Remote,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
@@ -210,14 +210,10 @@ async fn large_file_hydration_does_not_block_concurrent_async_work() {
     let session_transports_source = yadorilink_peer_session::ports::SessionTransports {
         blocks: transports_source.clone(),
         service: transports_source.clone(),
-        prepared_snapshots: Arc::new(yadorilink_lane_ports::PreparedSnapshots::new()),
-        snapshot_fetch: transports_source,
     };
     let session_transports_dest = yadorilink_peer_session::ports::SessionTransports {
         blocks: transports_dest.clone(),
         service: transports_dest.clone(),
-        prepared_snapshots: Arc::new(yadorilink_lane_ports::PreparedSnapshots::new()),
-        snapshot_fetch: transports_dest,
     };
 
     // The serving side needs its own link for the group, exactly as the
@@ -261,10 +257,12 @@ async fn large_file_hydration_does_not_block_concurrent_async_work() {
     );
     let source_signing = yadorilink_transport::DeviceSigningKeyPair::generate().signing;
     source_state.set_device_signing_key(source_signing.clone());
-    let source_emitter = yadorilink_sync_sqlite::dag_store::ChangeEmitter::new(
-        "device-source".to_string(),
+    let source_emitter = yadorilink_daemon::test_support::local_seam::replica_author_key(
+        &source_state.replica_coordinator,
+        "device-source",
         source_signing,
-    );
+    )
+    .unwrap();
     // One checkpoint issuer for both devices: `coordination_client_config`
     // is a `OnceLock`, so the authority has to be chosen before either side
     // needs one.
@@ -273,28 +271,17 @@ async fn large_file_hydration_does_not_block_concurrent_async_work() {
         &[GROUP.to_string()],
     )
     .await;
-    source_state
-        .replica_coordinator
-        .upsert_file_emitting_change(
-            GROUP,
-            &source_record,
-            "device-source",
-            yadorilink_replica_domain::session_state::ChangeContent {
-                ops: vec![yadorilink_replica_domain::change::Op::Put {
-                    path: yadorilink_replica_domain::ids::SyncPath("large.bin".to_string()),
-                    version: source_version.version_hash,
-                    origin: yadorilink_replica_domain::change::PutOrigin::Direct,
-                }],
-                versions: std::slice::from_ref(&source_version),
-            },
-            None,
-            None,
-            yadorilink_daemon::replica_coordinator::ReplicaChangeEmission {
-                emitter: &source_emitter,
-                permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-            },
-        )
-        .unwrap();
+    yadorilink_daemon::test_support::local_seam::commit_local_upsert(
+        &source_state.replica_coordinator,
+        GROUP,
+        &source_record,
+        "device-source",
+        &source_version,
+        None,
+        &source_emitter,
+        &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+    )
+    .unwrap();
     // `chunk_file` above only writes these blocks into the source's own CAS
     // store -- it does not record group provenance for them, which the real
     // local-write path (`local_change.rs`) always does alongside a chunk
@@ -304,10 +291,7 @@ async fn large_file_hydration_does_not_block_concurrent_async_work() {
     // not_found, and hydration would exhaust its retries and time out
     // instead of exercising the concurrent-async-work property under test.
     let block_hashes: Vec<Vec<u8>> = blocks.iter().map(|block| block.hash.clone()).collect();
-    source_sync_state
-        .change_history_repository()
-        .record_group_block_provenance(GROUP, &block_hashes)
-        .unwrap();
+    source_sync_state.record_block_provenance(GROUP, &block_hashes).unwrap();
     // Pending is not servable. This fixture triggers neither of production's
     // flush triggers (a new local mutation's broadcast, or a reconnect), so
     // it has to ask.
@@ -326,10 +310,8 @@ async fn large_file_hydration_does_not_block_concurrent_async_work() {
         replica_engine_source,
         source_store,
         vec![GROUP.to_string()],
-        std::collections::HashMap::from([(GROUP.to_string(), source_dir.path().to_path_buf())]),
         session_transports_source,
-        None,
-        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::test_permissive(),
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::denied(),
     );
     node_source.serve_with("device-dest", session_source.clone());
     // Production sessions always receive the daemon-wide mandatory stage-2
@@ -363,10 +345,8 @@ async fn large_file_hydration_does_not_block_concurrent_async_work() {
         replica_engine_dest,
         dest_peer_store,
         vec![GROUP.to_string()],
-        std::collections::HashMap::from([(GROUP.to_string(), dest_root.path().to_path_buf())]),
         session_transports_dest,
-        None,
-        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::test_permissive(),
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::denied(),
     );
     node_dest.serve_with("device-source", session_dest.clone());
     session_dest.set_block_serve_engine(dest_state.block_serve_engine.clone());

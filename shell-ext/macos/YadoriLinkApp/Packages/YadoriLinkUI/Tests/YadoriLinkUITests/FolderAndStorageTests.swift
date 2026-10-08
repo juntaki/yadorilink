@@ -11,7 +11,6 @@ struct WordingTests {
         #expect(FolderMode.onDemand.title == "On-Demand")
         #expect(FileAction.download.title == "Download now")
         #expect(FileAction.freeUpSpace.title == "Free up space")
-        #expect(FileAction.keepOnDevice.title == "Always keep on this device")
     }
 
     @Test func everyCaseHasWords() {
@@ -55,13 +54,12 @@ struct WordingTests {
 @Suite("File actions")
 struct FileActionTests {
     @Test func onlyApplicableActionsPerState() {
-        func actions(_ state: MaterializationState, pinned: Bool = false, tracked: Bool = true) -> [FileAction] {
-            FileAction.available(for: FileAvailability(tracked: tracked, state: state, pinned: pinned))
+        func actions(_ state: MaterializationState, tracked: Bool = true) -> [FileAction] {
+            FileAction.available(for: FileAvailability(tracked: tracked, state: state))
         }
-        #expect(actions(.placeholder) == [.download, .keepOnDevice])
-        #expect(actions(.hydrated) == [.freeUpSpace, .keepOnDevice])
-        #expect(actions(.hydrated, pinned: true) == [.stopKeeping])
-        #expect(actions(.hydrating) == [.keepOnDevice])
+        #expect(actions(.placeholder) == [.download])
+        #expect(actions(.hydrated) == [.freeUpSpace])
+        #expect(actions(.hydrating) == [])
         #expect(actions(.evicting) == [])
         #expect(actions(.unknown) == [])
         #expect(actions(.hydrated, tracked: false) == [])
@@ -102,12 +100,12 @@ struct FolderDetailTests {
         let (app, client) = try await startedApp(.healthy)
         let photos = app.snapshot!.folders.first { $0.name == "Photos" }!
         let path = "/Users/me/Photos/a.jpg"
-        client.setAvailability(FileAvailability(tracked: true, state: .placeholder, pinned: false), for: path)
+        client.setAvailability(FileAvailability(tracked: true, state: .placeholder), for: path)
         let model = FolderDetailViewModel(client: client, folder: photos)
         await model.selectFile(path)
-        #expect(model.fileActions == [.download, .keepOnDevice])
+        #expect(model.fileActions == [.download])
         await model.perform(.download)
-        #expect(model.fileActions == [.freeUpSpace, .keepOnDevice])
+        #expect(model.fileActions == [.freeUpSpace])
         #expect(model.notice == Notice(kind: .success, text: "Downloaded a.jpg."))
     }
 
@@ -174,8 +172,8 @@ struct FolderDetailTests {
         let client = FakeYadoriLinkClient(scenario: .healthy, latency: 0.05)
         let photos = Fixtures.healthyFolders.first { $0.name == "Photos" }!
         let a = "/Users/me/Photos/a.jpg", b = "/Users/me/Photos/b.jpg"
-        client.setAvailability(FileAvailability(tracked: true, state: .placeholder, pinned: false), for: a)
-        client.setAvailability(FileAvailability(tracked: true, state: .hydrated, pinned: true), for: b)
+        client.setAvailability(FileAvailability(tracked: true, state: .placeholder), for: a)
+        client.setAvailability(FileAvailability(tracked: true, state: .hydrated), for: b)
         let model = FolderDetailViewModel(client: client, folder: photos)
         await model.selectFile(a)
 
@@ -185,7 +183,7 @@ struct FolderDetailTests {
         await download
 
         #expect(model.selectedFile == b)
-        #expect(model.availability == FileAvailability(tracked: true, state: .hydrated, pinned: true))
+        #expect(model.availability == FileAvailability(tracked: true, state: .hydrated))
     }
 
     @Test func versionLinesAreReadable() async throws {

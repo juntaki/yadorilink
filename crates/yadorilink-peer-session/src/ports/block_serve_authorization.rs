@@ -8,14 +8,14 @@ use crate::error::PeerSessionError;
 /// [`BlockServeAuthorizationPort::authorize_block_serve`]'s verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockServeAuthorization {
-    /// Referenced (by the live record or the DAG/retained-version
+    /// Referenced (by the live record or native state/retained-version
     /// fallback) and provenance-verified -- the request may proceed to
     /// dispatch/serve. `declared_size` is the block's own size from the
     /// live `FileRecord`'s block list when it's referenced there, `None`
-    /// when the reference was only established via the DAG/retained-
+    /// when the reference was only established via native state/retained-
     /// version path.
     Allowed { declared_size: Option<u32> },
-    /// Not referenced by the requested file's live record, DAG history, or
+    /// Not referenced by the requested file's live record, native heads, or
     /// retained versions.
     NotReferenced,
     /// Referenced, but this peer has no verified provenance for the group.

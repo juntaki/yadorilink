@@ -349,7 +349,6 @@ async fn serve_lane(
                 .serve_service_stream(group.as_str(), Box::new(LaneServiceStream::new(stream)))
                 .await
         }
-        _ => {}
     }
 }
 

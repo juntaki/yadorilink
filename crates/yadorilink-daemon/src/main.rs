@@ -27,5 +27,6 @@ fn print_version_and_exit_if_requested() {
 async fn main() -> anyhow::Result<()> {
     print_version_and_exit_if_requested();
     tracing_subscriber::fmt::init();
+    yadorilink_daemon::fd_limit::raise_nofile_soft_limit();
     yadorilink_daemon::app::run(yadorilink_daemon::app::DaemonConfig::from_env()).await
 }

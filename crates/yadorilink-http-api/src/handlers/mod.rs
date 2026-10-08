@@ -21,7 +21,7 @@ pub mod reads;
 pub mod writes;
 
 use serde_json::{json, Value};
-use yadorilink_ipc_proto::daemonctl::{LinkStatus, MaterializationState, PeerStatus};
+use yadorilink_ipc_proto::daemonctl::{LinkStatus, LocalState, PeerStatus};
 
 pub fn link_status_json(l: &LinkStatus) -> Value {
     json!({
@@ -67,12 +67,13 @@ pub fn peer_status_json(p: &PeerStatus) -> Value {
     })
 }
 
-pub fn materialization_state_word(s: MaterializationState) -> &'static str {
-    match s {
-        MaterializationState::Hydrated => "hydrated",
-        MaterializationState::Placeholder => "placeholder",
-        MaterializationState::Hydrating => "hydrating",
-        MaterializationState::Evicting => "evicting",
-        MaterializationState::Unspecified => "unknown",
-    }
+/// A path's local state as JSON: the two independent facts, the transition
+/// and the one derived word (see `local_state_word`).
+pub fn local_state_json(s: Option<&LocalState>) -> Value {
+    json!({
+        "local_object_present": s.is_some_and(|s| s.local_object_present),
+        // Never true unless the daemon said so.
+        "current_content_present": s.is_some_and(|s| s.current_content_present),
+        "word": yadorilink_ipc_proto::daemonctl::local_state_word(s),
+    })
 }

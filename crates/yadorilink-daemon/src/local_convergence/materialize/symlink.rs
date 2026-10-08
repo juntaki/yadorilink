@@ -17,12 +17,44 @@ impl super::super::LocalConvergenceExecutor {
             payload,
             record,
             origin_device_id,
-            authoring_change_hash,
+            authoring,
             permit: root_commit_permit,
             ..
         } = *plan;
         if let Some(reason) = &plan.hazard_reason {
             return self.hold_for_hazard(plan, reason);
+        }
+        // The same last line of defence the content, placeholder and
+        // tombstone lanes have: creating the link renames it over whatever
+        // is at the path, which destroys a file edited since capture last
+        // looked. Decline and retry; once captured, the edit meets this
+        // symlink as a concurrent change instead of vanishing. A link
+        // already holding the payload's target has nothing to replace.
+        let out_path = self.local_file_path(group_id, &record.path)?;
+        let already_this_link =
+            payload.version().meta.symlink_target.as_deref().is_some_and(|target| {
+                std::fs::read_link(&out_path).is_ok_and(|on_disk| {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::ffi::OsStrExt as _;
+                        on_disk.as_os_str().as_bytes() == target
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        on_disk.to_string_lossy().as_bytes() == target
+                    }
+                })
+            });
+        if !already_this_link
+            && self.removal_would_destroy_unrecorded_state(group_id, &record.path, &out_path)?
+        {
+            tracing::info!(
+                group_id,
+                path = %record.path,
+                "declining a symlink whose target holds local state this device has not \
+                 captured yet; replacing it would destroy it silently"
+            );
+            return Ok(MaterializeResult::RetryRequired.into());
         }
         // A path that's no longer hazardous (e.g. a previously
         // colliding sibling was itself renamed/removed since the last
@@ -40,21 +72,21 @@ impl super::super::LocalConvergenceExecutor {
         // writer-gate cost discussion near this crate's no-op-write
         // instrumentation), and breaks the intent repository's own
         // documented "empty in steady state" invariant for good. Same
-        // reasoning and gating as `hydrate_file_with_timeout_locked`'s
+        // reasoning and gating as `hydration::hydrate_inner`'s
         // identical `was_held` check.
         //
         // When it was held, the intent is opened BEFORE the hold is
-        // cleared, not after: a held row is `Placeholder` with
+        // cleared, not after: a held row is `Remote` with
         // `held_reason` set -- the SET `held_reason` is itself what
         // protects it from the tombstone loop while held. The instant the
         // hold clears, the row looks like an ordinary, unprotected
-        // `Placeholder` row until `materialize_symlink_at` either writes
+        // `Remote` row until `materialize_symlink_at` either writes
         // the symlink and opens its own intent, or (a `PolicySkipped`
         // outcome -- no recorded target, or Windows-without-opt-in) opens
         // no intent at all and just returns. Without this guard, a
         // `PolicySkipped` exit -- or any transient failure
         // `materialize_symlink_at` itself could raise before reaching its
-        // own intent-guard open -- lands the row at `Placeholder`,
+        // own intent-guard open -- lands the row at `Remote`,
         // `held_reason` NULL, no intent, and (this row never carries a
         // projection obligation once hazard settlement deleted it) no
         // obligation either: none of the tombstone loop's three vetoes.
@@ -105,7 +137,7 @@ impl super::super::LocalConvergenceExecutor {
                 group_id,
                 windows_opt_in,
                 origin_device_id,
-                authoring_change_hash,
+                authoring,
                 permit: root_commit_permit,
             },
             record,
@@ -139,11 +171,11 @@ impl super::super::LocalConvergenceExecutor {
             SymlinkMaterializeOutcome::PolicySkipped => {
                 // A policy-skipped
                 // symlink row was left at `materialization_state`'s
-                // schema default of `Hydrated` (the row commit inside
+                // schema default of `Present` (the row commit inside
                 // `materialize_symlink_at` never demotes it, unlike
                 // the analogous Placeholder pattern used for a
                 // not-fully-fetched regular file just below). A
-                // `Hydrated` row with nothing physically on disk and
+                // `Present` row with nothing physically on disk and
                 // no materialization intent is exactly what the
                 // periodic repair sweep (`repair_interrupted_
                 // materializations`) reads as an offline deletion --
@@ -152,25 +184,25 @@ impl super::super::LocalConvergenceExecutor {
                 // GROUP-WIDE PROPAGATING tombstone `Change`, deleting
                 // this path from every peer even though the policy
                 // skip was meant to be a benign, local-only decision.
-                // Demoting to `Placeholder` here (mirroring the
+                // Demoting to `Remote` here (mirroring the
                 // regular-file "not really materialized yet" pattern)
                 // keeps the repair sweep's own `materialization_state
                 // != Hydrated` pre-filter from ever examining this row
                 // in the first place. See `repair_one_interrupted_
                 // symlink`'s matching policy check for the
                 // defense-in-depth half of this fix, covering a
-                // legacy row already stuck at `Hydrated` before this
+                // legacy row already stuck at `Present` before this
                 // retry has a chance to correct it.
                 self.state.set_materialization_state(
                     group_id,
                     &record.path,
-                    MaterializationState::Placeholder,
+                    MaterializationState::Remote,
                     root_commit_permit,
                 )?;
                 Ok(MaterializeResult::RetryRequired.into())
             }
             SymlinkMaterializeOutcome::CommitRejected => {
-                // Deliberately NOT the `Placeholder` demotion above.
+                // Deliberately NOT the `Remote` demotion above.
                 // A real symlink was written here; only the record of
                 // it was refused. Demoting would tell the repair
                 // sweep this path holds no content while it actually

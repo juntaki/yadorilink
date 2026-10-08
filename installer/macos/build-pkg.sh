@@ -11,9 +11,8 @@
 #  scripts/generate-swift-bindings.sh to build it)
 #  -> /Applications/YadoriLink.app
 #
-# The server-side yadorilink-coordination binary is deliberately NOT
-# included — this is an end-user desktop installer, not a server
-# deployment artifact.
+# The coordination service is deliberately NOT included — this is an
+# end-user desktop installer, not a server deployment artifact.
 #
 # SIGNING: release builds must set YADORILINK_RELEASE_BUILD=1 and provide
 # YADORILINK_APP_SIGN_IDENTITY (a Developer ID Application identity, used to
@@ -176,6 +175,12 @@ mkdir -p "$STAGE_DIR/usr/local/bin" "$STAGE_DIR/Applications"
 
 cp "$YADORILINK_BIN" "$STAGE_DIR/usr/local/bin/yadorilink"
 cp "$YADORILINK_DAEMON_BIN" "$STAGE_DIR/usr/local/bin/yadorilink-daemon"
+# AGPL-3.0 licence text and the pointer to the corresponding source, shipped
+# with the CLI, daemon and app this package installs.
+# Source ref: the release workflow's tag/commit, else this checkout's commit.
+SOURCE_REF="${YADORILINK_SOURCE_REF:-$(git -C "$REPO_ROOT" rev-parse HEAD)}"
+"$REPO_ROOT/scripts/ci/write-source-notice.sh" "$SOURCE_REF" \
+    "$STAGE_DIR/usr/local/share/doc/yadorilink"
 # The eframe status app (yadorilink-status-app) is not shipped on macOS:
 # YadoriLink.app is the menu bar app there.
 chmod 755 \

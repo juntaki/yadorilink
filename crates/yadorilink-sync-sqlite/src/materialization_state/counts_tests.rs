@@ -7,7 +7,7 @@ const GROUP: &str = "g";
 fn open_full_test_db() -> Arc<SyncDatabase> {
     Arc::new(
         SyncDatabase::open_in_memory(|conn| {
-            crate::dag_store::init_dag_schema(conn).map_err(|e| {
+            crate::replica_tables::init_for_tests(conn).map_err(|e| {
                 yadorilink_sqlite_runtime::DatabaseError::CorruptSchema(e.to_string())
             })?;
             crate::materialized_generation::init_materialized_generation_schema(conn).map_err(
@@ -39,13 +39,32 @@ fn seed(db: &SyncDatabase, path: &str, record_kind: RecordKind, state: Materiali
 #[test]
 fn materialization_counts_do_not_count_directories() {
     let db = open_full_test_db();
-    seed(&db, "a.txt", RecordKind::File, MaterializationState::Hydrated);
-    seed(&db, "b.txt", RecordKind::File, MaterializationState::Placeholder);
-    seed(&db, "link", RecordKind::Symlink, MaterializationState::Hydrated);
-    seed(&db, "album", RecordKind::Directory, MaterializationState::Hydrated);
-    seed(&db, "empty", RecordKind::Directory, MaterializationState::Placeholder);
+    seed(&db, "a.txt", RecordKind::File, MaterializationState::Present);
+    seed(&db, "b.txt", RecordKind::File, MaterializationState::Remote);
+    seed(&db, "link", RecordKind::Symlink, MaterializationState::Present);
+    seed(&db, "album", RecordKind::Directory, MaterializationState::Present);
+    seed(&db, "empty", RecordKind::Directory, MaterializationState::Remote);
 
     let counts = MaterializationStateRepository::new(db).materialization_counts(GROUP).unwrap();
 
     assert_eq!((counts.hydrated, counts.placeholder, counts.hydrating), (2, 1, 0));
+}
+
+/// A directory reads as the least materialized state of the files below it.
+#[test]
+fn a_directory_takes_the_least_materialized_state_below_it() {
+    let db = open_full_test_db();
+    seed(&db, "album", RecordKind::Directory, MaterializationState::Remote);
+    seed(&db, "album/a.jpg", RecordKind::File, MaterializationState::Present);
+    seed(&db, "empty", RecordKind::Directory, MaterializationState::Remote);
+    let materialization = MaterializationStateRepository::new(db.clone());
+    let state =
+        |prefix: &str| materialization.directory_materialization_state(GROUP, prefix).unwrap();
+    assert_eq!(state("album"), MaterializationState::Present);
+    assert_eq!(state("empty"), MaterializationState::Present, "nothing to fetch");
+    seed(&db, "album/sub/b.jpg", RecordKind::File, MaterializationState::Remote);
+    assert_eq!(state("album"), MaterializationState::Remote);
+    assert_eq!(state(""), MaterializationState::Remote);
+    seed(&db, "album/c.jpg", RecordKind::File, MaterializationState::Hydrating);
+    assert_eq!(state("album"), MaterializationState::Hydrating);
 }

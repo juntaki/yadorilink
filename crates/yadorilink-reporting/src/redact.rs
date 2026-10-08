@@ -74,11 +74,13 @@ static BEARER_TOKEN: LazyLock<Regex> =
 static WIREGUARD_KEY: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b[A-Za-z0-9+/]{43}=").unwrap());
 static WINDOWS_HOME: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)[A-Za-z]:\\Users\\[^\\\s]+").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i)[A-Za-z]:[\\/]+Users[\\/]+[^\\/\s]+").unwrap());
 static UNIX_HOME: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?:/Users|/home)/[^/\s]+").unwrap());
 static WINDOWS_ABSOLUTE_PATH: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"[A-Za-z]:\\[^\s\x00"]+"#).unwrap());
+    LazyLock::new(|| Regex::new(r#"[A-Za-z]:\\+[^\s\x00"]+"#).unwrap());
+static WINDOWS_UNC_PATH: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"\\\\[^\\\s\x00"]+\\[^\s\x00"]+"#).unwrap());
 static UNIX_ABSOLUTE_PATH: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"/(?:[^/\s\x00]+/)+[^/\s\x00]+").unwrap());
 static EMAIL_ADDRESS: LazyLock<Regex> =
@@ -93,24 +95,91 @@ static IP_ADDRESS: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// The patterns that match a whole value on their own. Paths are handled
+/// separately by [`redact_paths`], which has to look past the regex match.
 fn patterns() -> Vec<Pattern> {
     vec![
         Pattern { category: RedactionCategory::PrivateKeyBlock, regex: &PRIVATE_KEY_BLOCK },
         Pattern { category: RedactionCategory::CredentialedUrl, regex: &CREDENTIALED_URL },
         Pattern { category: RedactionCategory::BearerToken, regex: &BEARER_TOKEN },
         Pattern { category: RedactionCategory::WireguardKey, regex: &WIREGUARD_KEY },
-        Pattern { category: RedactionCategory::HomeDirectory, regex: &WINDOWS_HOME },
-        Pattern { category: RedactionCategory::HomeDirectory, regex: &UNIX_HOME },
         Pattern { category: RedactionCategory::EmailAddress, regex: &EMAIL_ADDRESS },
         Pattern { category: RedactionCategory::UuidLikeId, regex: &UUID_LIKE },
         Pattern { category: RedactionCategory::IpAddress, regex: &IP_ADDRESS },
-        // Absolute paths run last: home-directory paths are a more
-        // specific sub-case already handled above, but any REMAINING
-        // absolute path (e.g. a synced folder outside $HOME) still
-        // needs catching.
-        Pattern { category: RedactionCategory::AbsolutePath, regex: &WINDOWS_ABSOLUTE_PATH },
-        Pattern { category: RedactionCategory::AbsolutePath, regex: &UNIX_ABSOLUTE_PATH },
     ]
+}
+
+/// Replaces every path `starts` finds with `placeholder`, extending each
+/// match to the end of the whole path ([`path_end`]) rather than stopping at
+/// the first space or separator the regex gave up on. Returns the new text
+/// and how many paths were replaced.
+fn redact_paths(text: &str, starts: &[&Regex], placeholder: &str) -> (String, usize) {
+    let mut matches: Vec<(usize, usize)> = Vec::new();
+    for regex in starts {
+        for m in regex.find_iter(text) {
+            matches.push((m.start(), path_end(text, m.end())));
+        }
+    }
+    matches.sort_unstable();
+
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    let mut count = 0;
+    for (start, end) in matches {
+        if start < cursor {
+            // Already inside a path an earlier match extended over.
+            continue;
+        }
+        out.push_str(&text[cursor..start]);
+        out.push_str(placeholder);
+        cursor = end;
+        count += 1;
+    }
+    out.push_str(&text[cursor..]);
+    (out, count)
+}
+
+/// Where the path whose regex match ends at `from` really ends.
+///
+/// Folder and file names are exactly what must not survive, and they contain
+/// spaces ("Tax Returns/2025.pdf"), so the path is taken to run through
+/// spaces up to a clear delimiter: the end of the line, a double quote or
+/// backtick, an apostrophe that is not part of a name, an already-inserted
+/// placeholder, or a `,`/`;`/`:` followed by whitespace with no further path
+/// separator after it on the line (so "x.log: permission denied" ends the
+/// path but "Smith, John/notes.pdf" does not). Over-redacting the words after
+/// a path is accepted; leaking a folder name is not.
+fn path_end(text: &str, from: usize) -> usize {
+    let rest = &text[from..];
+    let continues = rest.starts_with(['/', '\\', ' ']);
+    if !continues {
+        return from;
+    }
+    for (offset, c) in rest.char_indices() {
+        let after = &rest[offset + c.len_utf8()..];
+        let stop = match c {
+            '\n' | '\r' | '"' | '`' => true,
+            '\'' => !after.starts_with(|n: char| n.is_alphanumeric()),
+            '[' => rest[offset..].starts_with("[REDACTED_"),
+            ',' | ';' | ':' => {
+                after.starts_with(char::is_whitespace) && !line_has_separator(after)
+                    || after.is_empty()
+            }
+            _ => false,
+        };
+        if stop {
+            return from + offset;
+        }
+    }
+    text.len()
+}
+
+/// Whether a path separator occurs in `text` before the end of its line or
+/// the next quote.
+fn line_has_separator(text: &str) -> bool {
+    text.chars()
+        .take_while(|c| !matches!(c, '\n' | '\r' | '"' | '`'))
+        .any(|c| c == '/' || c == '\\')
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -141,6 +210,23 @@ pub fn redact(text: &str) -> (String, RedactionSummary) {
             result =
                 pattern.regex.replace_all(&result, pattern.category.placeholder()).into_owned();
             summary.categories.push((pattern.category, count));
+        }
+    }
+    // Paths run after the value patterns, so those are already placeholders
+    // (which end a path), and home-directory paths run before the generic
+    // ones so they keep their own category. Either way the whole path goes,
+    // not only its user segment.
+    for (category, starts) in [
+        (RedactionCategory::HomeDirectory, vec![&*WINDOWS_HOME, &*UNIX_HOME]),
+        (
+            RedactionCategory::AbsolutePath,
+            vec![&*WINDOWS_ABSOLUTE_PATH, &*WINDOWS_UNC_PATH, &*UNIX_ABSOLUTE_PATH],
+        ),
+    ] {
+        let (replaced, count) = redact_paths(&result, &starts, category.placeholder());
+        if count > 0 {
+            result = replaced;
+            summary.categories.push((category, count));
         }
     }
     (result, summary)

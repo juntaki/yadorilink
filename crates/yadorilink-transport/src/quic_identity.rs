@@ -3,14 +3,12 @@
 //!
 //! ## Why the signing key, and not the transport key
 //!
-//! A TLS handshake is authenticated by *signing* the transcript. X25519 is a
-//! Diffie-Hellman key, not a signature scheme, so the device's WireGuard
-//! static key cannot authenticate a QUIC connection at all -- there is no
-//! operation it can perform that proves possession over a transcript. Of the
-//! keys a device already holds, exactly one is signature-capable, already
-//! mandatory on every device, and already distributed to peers through the
-//! netmap: the Ed25519 device signing key. Reusing it is therefore not a
-//! shortcut; it is the only option that does not invent a third identity.
+//! A TLS handshake is authenticated by *signing* the transcript. An X25519
+//! key is a Diffie-Hellman key, not a signature scheme, so it cannot
+//! authenticate a QUIC connection. The one key every device holds that is
+//! signature-capable and already distributed to peers through the netmap is
+//! the Ed25519 device signing key, so that is the transport identity; no
+//! separate transport key exists.
 //!
 //! Reusing one key for two jobs -- offline authorship of history entries and
 //! live transport authentication -- is safe here because TLS 1.3 domain-
@@ -32,12 +30,11 @@
 //!
 //! ## Why mutual authentication is not a configuration knob
 //!
-//! What is being replaced -- the WireGuard Noise-IK handshake -- authenticates
-//! *both* endpoints before any payload moves, and nothing above this layer
-//! re-encrypts sync data. TLS, by contrast, defaults to authenticating only
-//! the server, and the client-authentication half is the one routinely left
-//! out. Leaving it out here would not merely produce a weaker connection: it
-//! would let an unauthenticated caller receive plaintext file content from a
+//! The handshake authenticates *both* endpoints before any payload moves, and
+//! nothing above this layer re-encrypts sync data. TLS by default
+//! authenticates only the server, and the client-authentication half is the
+//! one routinely left out. Leaving it out here would let an unauthenticated
+//! caller receive plaintext file content from a
 //! device that believes it is talking to a netmap peer. So the server side of
 //! this module always requires and verifies a client raw public key, and this
 //! module offers no way to ask for anything less.

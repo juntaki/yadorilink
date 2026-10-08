@@ -8,9 +8,9 @@
 //! and does not learn which transport it is on.
 //!
 //! Its own lane, rather than sharing one, is the whole reason [`Lane::Block`]
-//! was reserved: a block body is large and slow, and a reconciliation round
-//! stuck behind one would make discovery latency a function of transfer size.
-//! Three lanes, three independent flow-control domains, one connection.
+//! was reserved: a block body is large and slow, and a service RPC stuck
+//! behind one would make its latency a function of transfer size. Two lanes,
+//! two independent flow-control domains, one connection.
 
 use yadorilink_peer_session::ports::PeerBlockStream;
 use yadorilink_sync_substrate::LaneStream;

@@ -36,7 +36,7 @@ fn enrollment_link_spec(operation_id: &str, local_path: &str) -> EnrollmentLinkR
         group_id: "group-1".to_string(),
         absolute_path: std::path::PathBuf::from(local_path),
         on_demand: false,
-        acknowledge_risks: true,
+        provider: None,
     }
 }
 
@@ -217,8 +217,16 @@ impl LinkRepositoryPort for RemoveLinkAlwaysFails {
     ) -> Result<Vec<String>, crate::sync_error::SyncError> {
         self.inner.live_link_paths_for_group(group_id)
     }
-    fn list_link_paths(&self) -> Result<Vec<String>, crate::sync_error::SyncError> {
-        self.inner.list_link_paths()
+    fn live_link_keys_for_group(
+        &self,
+        group_id: &str,
+    ) -> Result<Vec<String>, crate::sync_error::SyncError> {
+        self.inner.live_link_keys_for_group(group_id)
+    }
+    fn list_link_paths_and_groups(
+        &self,
+    ) -> Result<Vec<(String, String)>, crate::sync_error::SyncError> {
+        self.inner.list_link_paths_and_groups()
     }
     fn commit_plain_link(
         &self,
@@ -232,8 +240,9 @@ impl LinkRepositoryPort for RemoveLinkAlwaysFails {
         local_path: &str,
         group_id: &str,
         marker: &PendingEnrollmentLinkCommand,
+        provider: Option<&crate::application::ports::ProviderLinkTarget>,
     ) -> Result<LinkRowWrite, crate::sync_error::SyncError> {
-        self.inner.commit_link_with_pending_enrollment(local_path, group_id, marker)
+        self.inner.commit_link_with_pending_enrollment(local_path, group_id, marker, provider)
     }
     fn undo_plain_link(
         &self,
@@ -283,7 +292,6 @@ impl LinkWatcherPort for WatcherStartAlwaysFails {
         _local_path: &'a str,
         _group_id: &'a str,
         _on_demand: bool,
-        _max_local_size_bytes: Option<i64>,
     ) -> BoxFuture<'a, Result<(), crate::error::DaemonError>> {
         Box::pin(async move {
             Err(crate::error::DaemonError::Config("simulated watcher start failure".to_string()))
@@ -321,7 +329,7 @@ async fn commit_plain_classifies_a_genuinely_uncommittable_rollback_failure_as_c
     let local_path = dir.path().to_path_buf();
     let local_path_str = local_path.to_string_lossy().to_string();
 
-    let result = adapter.commit_plain("group-1", &local_path, false, true).await;
+    let result = adapter.commit_plain("group-1", &local_path, false).await;
 
     assert!(
         matches!(result, Err(EnrollmentLinkError::CommitUncertain { .. })),
@@ -369,9 +377,8 @@ fn plain_link_command(local_path: &str) -> LinkCommand {
         local_path: local_path.to_string(),
         group_id: RELINK_GROUP.to_string(),
         on_demand: false,
-        max_local_size_bytes: None,
-        acknowledge_risks: true,
         pending_enrollment: None,
+        provider: None,
     }
 }
 
@@ -569,6 +576,7 @@ impl crate::application::ports::EnrollmentCoordination for AlreadyMemberCoordina
         _operation_id: &'a str,
         _group_name: &'a str,
         _device_id: &'a str,
+        _storage_mode: &'a str,
     ) -> BoxFuture<'a, crate::application::model::EnrollmentPrepareResult> {
         unreachable!("create is not part of these tests")
     }
@@ -676,7 +684,7 @@ async fn a_repeated_share_join_of_a_linked_folder_succeeds_without_touching_it()
             group_name: "Photos".to_string(),
             absolute_path: std::path::PathBuf::from(&local_path),
             on_demand: false,
-            acknowledge_risks: true,
+            provider: None,
         })
         .await;
 
@@ -721,7 +729,7 @@ async fn a_failed_relink_restores_the_existing_row_instead_of_deleting_it() {
         .list_links()
         .unwrap()
         .into_iter()
-        .find(|l| l.local_path == local_path)
+        .find(|l| l.key() == local_path)
         .expect("the existing row must survive the failed re-link");
     assert!(row.orphaned, "the row must be restored to its prior (orphaned) state");
     assert_eq!(
@@ -824,7 +832,6 @@ impl LinkWatcherPort for RacingWatcher {
         local_path: &'a str,
         _group_id: &'a str,
         _on_demand: bool,
-        _max_local_size_bytes: Option<i64>,
     ) -> BoxFuture<'a, Result<(), crate::error::DaemonError>> {
         Box::pin(async move {
             let order = self.starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -893,4 +900,54 @@ async fn two_concurrent_links_of_one_new_folder_never_delete_the_row_the_winner_
         "the row the running link depends on must survive the losing call \
          (first: {first:?}, second: {second:?})"
     );
+}
+
+/// A folder around the recovery area, or inside it, is refused at link time: the
+/// area holds the user's files outside every synced folder and must never be
+/// read back as new ones.
+#[tokio::test]
+async fn a_link_that_contains_or_lies_within_the_recovery_area_is_refused() {
+    let _env = crate::test_support::CONFIG_ENV_MUTEX.lock().await;
+    let base = tempfile::tempdir().unwrap();
+    let base_path = base.path().canonicalize().unwrap();
+    let state_dir = base_path.join("state");
+    std::fs::create_dir_all(state_dir.join("recovery").join("inside")).unwrap();
+    std::env::set_var("YADORILINK_CONFIG_DIR", &state_dir);
+
+    let state = test_state();
+    let lifecycle = LinkLifecycleService::new(
+        Arc::new(super::super::link_lifecycle::DaemonLinkRepositoryAdapter::new(state.clone())),
+        Arc::new(WatcherStartAlwaysFails),
+    );
+    let around = lifecycle.link(plain_link_command(&base_path.to_string_lossy())).await;
+    let within = lifecycle
+        .link(plain_link_command(&state_dir.join("recovery").join("inside").to_string_lossy()))
+        .await;
+    let (_other_dir, other_path) = relink_root();
+    let elsewhere = lifecycle.link(plain_link_command(&other_path)).await;
+    std::env::remove_var("YADORILINK_CONFIG_DIR");
+
+    for (name, outcome) in [("around", around), ("within", within)] {
+        assert!(
+            matches!(&outcome, Err(crate::error::DaemonError::Config(why)) if why.contains("recovery area")),
+            "{name}: {outcome:?}"
+        );
+    }
+    assert!(
+        !matches!(&elsewhere, Err(crate::error::DaemonError::Config(why)) if why.contains("recovery area")),
+        "an unrelated folder was refused for the recovery area: {elsewhere:?}"
+    );
+    assert!(state.replica_coordinator.link_repository().list_links().unwrap().is_empty());
+}
+
+#[test]
+fn the_recovery_area_overlap_check_compares_resolved_and_folded_paths() {
+    use crate::device_config::link_overlaps_recovery_area as overlaps;
+    use std::path::Path;
+    let recovery = Path::new("/nonexistent-root/State/recovery");
+    assert!(overlaps(Path::new("/nonexistent-root/state/RECOVERY/x"), recovery), "inside, folded");
+    assert!(overlaps(Path::new("/nonexistent-root"), recovery), "around");
+    assert!(overlaps(recovery, recovery), "the same folder");
+    assert!(!overlaps(Path::new("/nonexistent-root/state/recovery2"), recovery), "a sibling");
+    assert!(!overlaps(Path::new("/nonexistent-root/state/documents"), recovery));
 }

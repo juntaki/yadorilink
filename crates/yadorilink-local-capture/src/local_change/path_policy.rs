@@ -32,7 +32,7 @@ pub(super) fn relative_key(root: &Path, path: &Path) -> Option<String> {
 ///
 /// A thin wrapper over
 /// [`yadorilink_root_authority::reserved_namespace::wire_path_admission_refusal`]
-/// -- the single predicate DAG admission itself reads
+/// -- the single predicate native admission itself reads
 /// (`dag_store::serving_authorization_index::validate_no_reserved_paths`,
 /// on both the receiving and local-authoring call sites) -- turned into a
 /// short reason string for the skip warnings.
@@ -111,13 +111,13 @@ pub(super) fn skip_reason_for_inadmissible_wire_path(rel_path: &str) -> Option<&
 ///   path" (skip/suppress/no-op) rather than silently proceeding with a
 ///   corrupted string that might collide with something else.
 ///
-/// This is a bounded mitigation, not a full fix: this crate's index/DAG/
+/// This is a bounded mitigation, not a full fix: this crate's index/native state/
 /// wire representation is still fundamentally a UTF-8 `String`, so a
 /// genuinely non-UTF-8 name still cannot be synced at all — it is now
 /// refused outright rather than silently corrupted, which is strictly
 /// better (no silent collision) but not the same as actually supporting
 /// such names. The full fix — raw-byte (Unix) / WTF-16 (Windows) path
-/// representation threaded through the wire protocol, DAG encoding, and
+/// representation threaded through the wire protocol, delta encoding, and
 /// every index primary key — is a substantially larger redesign, tracked
 /// as an open residual rather than attempted here.
 pub(super) fn path_to_wire_relative_string(rel: &Path) -> Option<String> {

@@ -4,11 +4,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use yadorilink_ipc_proto::daemonctl::{
     ActiveTransferProgress, ConflictedFileInfo, FetchAvailability as WireFetch, FileVersionInfo,
     GroupDurabilityStatus, HandoffResult, HeldFile as WireHeldFile, InboxFileSummary,
-    InboxTransfer, LinkStatus, LocalStorageState as WireLocal, MaterializationState as WireMat,
-    MaterializationStatusResponse, MembershipHandoffResult, MintedInviteInfo,
-    PeerReachability as WireReach, PeerStatus, RecentSyncError, ReplicaMembershipCommandOutcome,
-    RouteKind as WireRoute, StatusResponse, TrashedFileInfo, UnreachableCategory as WireUnreach,
-    UpdateConfigResponse, UpdateInstallResponse, UpdateStatusResponse, VolumeFreeSpace,
+    InboxTransfer, LinkStatus, LocalState as WireLocalState, LocalStorageState as WireLocal,
+    LocalTransition as WireTransition, MaterializationStatusResponse, MembershipHandoffResult,
+    MintedInviteInfo, PeerReachability as WireReach, PeerStatus, RecentSyncError,
+    ReplicaMembershipCommandOutcome, RouteKind as WireRoute, StatusResponse, TrashedFileInfo,
+    UnreachableCategory as WireUnreach, UpdateConfigResponse, UpdateInstallResponse,
+    UpdateStatusResponse, VolumeFreeSpace,
 };
 use yadorilink_local_storage::free_space::VolumeFreeSpace as Space;
 use yadorilink_local_storage::link_preflight::{
@@ -343,11 +344,9 @@ fn conflict_summary_names_the_file_it_conflicts_with() {
         mtime_unix_nanos: 0,
         kind: 0,
         reason: 0,
-        holds_compaction: false,
     });
     assert_eq!(summary.current_path, "notes.txt");
     assert_eq!(summary.reason, ConflictReason::ConcurrentEdit);
-    assert!(!summary.holds_compaction);
     assert_eq!(summary.size, 0);
     assert_eq!(summary.modified_at, None);
     assert_eq!(summary.loser_device_id, None);
@@ -396,24 +395,40 @@ fn trash_file_and_materialization_turn_unset_values_into_none() {
     });
     assert_eq!(in_folder.deleted_by_operation.as_deref(), Some("device-a:0a0b"));
 
-    let unknown = file_availability(&MaterializationStatusResponse {
-        known: false,
-        state: WireMat::Unspecified as i32,
-        pinned: false,
-    });
-    assert_eq!(
-        unknown,
-        FileAvailability { tracked: false, state: MaterializationState::Unknown, pinned: false }
-    );
-    let pinned = file_availability(&MaterializationStatusResponse {
+    let unknown =
+        file_availability(&MaterializationStatusResponse { known: false, local_state: None });
+    assert_eq!(unknown, FileAvailability { tracked: false, state: MaterializationState::Unknown });
+    let hydrating = file_availability(&MaterializationStatusResponse {
         known: true,
-        state: WireMat::Hydrating as i32,
-        pinned: true,
+        local_state: Some(WireLocalState {
+            local_object_present: false,
+            current_content_present: false,
+            transition: WireTransition::Hydrating as i32,
+        }),
     });
     assert_eq!(
-        pinned,
-        FileAvailability { tracked: true, state: MaterializationState::Hydrating, pinned: true }
+        hydrating,
+        FileAvailability { tracked: true, state: MaterializationState::Hydrating }
     );
+    // An older object that stands is not current content.
+    let stale = file_availability(&MaterializationStatusResponse {
+        known: true,
+        local_state: Some(WireLocalState {
+            local_object_present: true,
+            current_content_present: false,
+            transition: WireTransition::None as i32,
+        }),
+    });
+    assert_eq!(stale.state, MaterializationState::Placeholder);
+    let current = file_availability(&MaterializationStatusResponse {
+        known: true,
+        local_state: Some(WireLocalState {
+            local_object_present: true,
+            current_content_present: true,
+            transition: WireTransition::None as i32,
+        }),
+    });
+    assert_eq!(current.state, MaterializationState::Hydrated);
 }
 
 #[test]
@@ -589,7 +604,11 @@ fn preflight_issues_follow_the_reports_own_order() {
             PreflightIssue::ReservedName { path: ".yadorilink-x".into() },
         ]
     );
-    assert_eq!(result.issues.len(), report.warnings().len());
+    // A nested link is listed as an issue but is a prohibition, not a warning.
+    assert_eq!(
+        result.issues.len(),
+        report.warnings().len() + report.structural_prohibitions().len()
+    );
 
     let missing = preflight_result(&PathBuf::from("/gone"), &LinkPreflightReport::default());
     assert_eq!(missing.issues, vec![PreflightIssue::PathMissing]);
@@ -768,20 +787,4 @@ fn conflict_summary_says_when_a_folder_took_the_name() {
     });
     assert_eq!(summary.current_path, "album");
     assert_eq!(summary.reason, ConflictReason::FolderAtPath);
-}
-
-/// A conflict the folder's history compaction is waiting on says so, and
-/// is otherwise an ordinary conflict: no separate kind of entry, no
-/// different reason.
-#[test]
-fn conflict_summary_says_when_compaction_waits_for_it() {
-    let summary = conflict_summary(&ConflictedFileInfo {
-        local_path: "/f/Docs".into(),
-        path: "notes (conflicted copy, 2026-01-01-000000, device-b).txt".into(),
-        holds_compaction: true,
-        ..Default::default()
-    });
-    assert_eq!(summary.current_path, "notes.txt");
-    assert_eq!(summary.reason, ConflictReason::ConcurrentEdit);
-    assert!(summary.holds_compaction);
 }

@@ -27,6 +27,10 @@ pub enum ChangeError {
     HashMismatch,
     #[error("file version block sizes do not sum to the declared total size")]
     BlockSizeMismatch,
+    /// The version's canonical encoding is larger than one replication item
+    /// can carry, so it could never be delivered to a peer.
+    #[error("file version too large to sync: encoded size {encoded_bytes} exceeds {max_bytes}")]
+    VersionTooLarge { encoded_bytes: usize, max_bytes: usize },
     #[error("structurally invalid change or file version: {0}")]
     Malformed(String),
     #[error("change signature does not verify against the claimed device key")]
@@ -101,6 +105,9 @@ impl<'a> Reader<'a> {
     pub fn string(&mut self) -> Result<String, ChangeError> {
         let bytes = self.len_bytes()?;
         String::from_utf8(bytes).map_err(|e| ChangeError::Encoding(e.to_string()))
+    }
+    pub fn array16(&mut self) -> Result<[u8; 16], ChangeError> {
+        Ok(self.take(16)?.try_into().unwrap())
     }
     pub fn array32(&mut self) -> Result<[u8; 32], ChangeError> {
         Ok(self.take(32)?.try_into().unwrap())

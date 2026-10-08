@@ -2,7 +2,7 @@
 
 use super::{
     majority_author, origin_first_indices, parse_reconcile_paths, rotation_indices,
-    MAX_PATHS_PER_RECONCILE_ATTEMPT,
+    MAX_JOBS_PER_TICK_PER_GROUP, MAX_PATHS_PER_RECONCILE_ATTEMPT, MAX_RECONCILE_PATHS_OVERRIDE,
 };
 
 #[test]
@@ -194,4 +194,24 @@ fn majority_author_picks_the_most_frequent_with_a_deterministic_tie_break() {
     // Equal counts: the lexicographically smallest id wins, so every
     // replica running this election lands on the same preference.
     assert_eq!(majority_author(vec!["b".into(), "a".into()]), Some("a".to_string()));
+}
+
+#[test]
+fn the_reconcile_window_override_is_clamped_below_the_claim_cap() {
+    for big in ["65", "128", "1000"] {
+        assert_eq!(parse_reconcile_paths(Some(big)), MAX_RECONCILE_PATHS_OVERRIDE, "{big}");
+    }
+    assert_eq!(parse_reconcile_paths(Some("64")), MAX_RECONCILE_PATHS_OVERRIDE);
+    assert_eq!(parse_reconcile_paths(Some("0")), MAX_PATHS_PER_RECONCILE_ATTEMPT);
+    // No cliff: a window never covers the whole per-group claim.
+    const _: () = assert!(MAX_RECONCILE_PATHS_OVERRIDE < MAX_JOBS_PER_TICK_PER_GROUP as usize);
+}
+
+#[test]
+fn the_default_window_equals_the_default_write_concurrency() {
+    // The window must not be the binding limit of the settle by default.
+    assert_eq!(
+        MAX_PATHS_PER_RECONCILE_ATTEMPT,
+        crate::local_convergence::reconcile_native::DEFAULT_RECEIVE_WRITE_CONCURRENCY
+    );
 }

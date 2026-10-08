@@ -1,5 +1,5 @@
 //! Crash-recovery startup repair, crash-safe restore-journal reconciliation,
-//! and offline-edit quarantine: `repair_interrupted_materializations[_emitting_deletes]`/
+//! and offline-edit quarantine: `repair_interrupted_materializations`/
 //! `_inner`, `reconstruct_file_journaled`, `reconcile_restore_operations`, and
 //! `quarantine_dirty_disk_file`. This module depends only on
 //! `MaterializationExecutionPort`, so nothing here ever names a concrete
@@ -21,16 +21,11 @@
 
 use std::path::Path;
 
-use sha2::{Digest, Sha256};
-
 use yadorilink_local_storage::{
     apply_file_metadata, create_or_defer_placeholder, disk_bytes_match_indexed_blocks,
     disk_matches_expected_object, intent_target_hash, reconstruct_file,
     verify_write_target_within_root, BlockContentStore, DiskContentComparison, ExpectedObject,
-    PlaceholderDiskIdentity, PlaceholderIdentityToRecord, INTERNAL_INODE_PROVIDER_KIND,
 };
-use yadorilink_replica_domain::admission::ChangeEmitter;
-use yadorilink_replica_domain::conflict::conflict_copy_path;
 use yadorilink_replica_domain::file::RecordKind;
 use yadorilink_replica_domain::session_state::MaterializationState;
 use yadorilink_root_authority::root_commit::RootCommitPermit;
@@ -53,13 +48,13 @@ pub struct MaterializationRepairReport {
     /// `reconstruct_file`, no peer round-trip needed.
     pub reconstructed: Vec<String>,
     /// On-disk bytes still matched the index exactly, but the path had no
-    /// usable actual-state generation behind its `Hydrated` claim — the
+    /// usable actual-state generation behind its `Present` claim — the
     /// proof was re-observed and republished. No bytes were touched. This
     /// is the only path that can heal that state: `hydrate` refuses it and
     /// `pin` cannot detect it.
     pub reproven: Vec<String>,
     /// Content on disk was missing/mismatched and at least one block was
-    /// also missing locally — demoted from `Hydrated` to `Placeholder` so
+    /// also missing locally — demoted from `Present` to `Remote` so
     /// normal on-demand hydration re-fetches it from a peer.
     pub demoted_to_placeholder: Vec<String>,
     /// Existing disk bytes differed from the indexed block identity and might
@@ -68,7 +63,7 @@ pub struct MaterializationRepairReport {
     /// here before the canonical path was repaired — `(original_path,
     /// quarantine_path)`.
     pub quarantined_dirty: Vec<(String, String)>,
-    /// A `Hydrated` record whose on-disk file was missing *and* had no
+    /// A `Present` record whose on-disk file was missing *and* had no
     /// in-progress materialization intent journaled — i.e. the write had
     /// already completed and the file was then deleted (or renamed away)
     /// while the daemon was stopped. These are NOT reconstructed from the
@@ -84,19 +79,18 @@ pub struct MaterializationRepairReport {
     /// next path instead of aborting. The startup caller treats a
     /// non-empty list like a failed pass.
     pub failed: Vec<String>,
-    /// Paths a snapshot install had replaced whose disk this pass brought
-    /// into agreement with the installed row and released (see
-    /// `crate::snapshot_install_reconcile`). Anything under one of them the
-    /// replaced row could not account for is in `quarantined_dirty`.
-    pub snapshot_install_reconciled: Vec<String>,
+    /// Held paths whose disk this pass brought into agreement with the row
+    /// and released (see `crate::held_path_reconcile`). Anything under
+    /// one of them the row could not account for is in `quarantined_dirty`.
+    pub held_path_reconciled: Vec<String>,
 }
 
-/// Whether one `repair_interrupted_materializations[_emitting_deletes]`
+/// Whether one `repair_interrupted_materializations`
 /// pass runs at daemon startup, before any watcher/live-capture pipeline
 /// exists for this link, or on the periodic live cadence, while ordinary
 /// local edits can be racing it.
 ///
-/// The distinction matters for exactly one thing: what a `Hydrated`
+/// The distinction matters for exactly one thing: what a `Present`
 /// record whose on-disk bytes have no in-progress materialization intent
 /// means. At startup, before any watcher exists, this can only be an
 /// offline user edit or deletion made while the daemon was stopped --
@@ -135,12 +129,12 @@ impl MaterializationRepairReport {
             && self.quarantined_dirty.is_empty()
             && self.offline_deleted.is_empty()
             && self.failed.is_empty()
-            && self.snapshot_install_reconciled.is_empty()
+            && self.held_path_reconciled.is_empty()
     }
 }
 
 /// startup self-heal for a file whose local index already
-/// recorded a `Hydrated` materialization state (and the new version/block
+/// recorded a `Present` materialization state (and the new version/block
 /// list) *before* the crash, but whose on-disk content was never fully
 /// (re)written — the exact window `PeerSyncSession::materialize`'s
 /// eager-fetch branch leaves open: like every other materialization write
@@ -159,14 +153,14 @@ impl MaterializationRepairReport {
 /// invariant forbids.
 ///
 /// Runs once at daemon startup for every configured link, mirroring the
-/// placement and rationale of the reset-stale-`Hydrating`-to-`Placeholder`
+/// placement and rationale of the reset-stale-`Hydrating`-to-`Remote`
 /// pass `yadorilink-daemon`'s `app.rs` also runs once at startup (via
 /// `ReplicaCoordinator::materialization_state_repository`'s
-/// `reset_stale_hydrating_to_placeholder`) — the two together cover both
-/// materialization states (`Hydrating`, handled there; `Hydrated`, handled
+/// `reset_stale_hydrating`) — the two together cover both
+/// materialization states (`Hydrating`, handled there; `Present`, handled
 /// here) that a crash can leave in a state inconsistent with reality.
 ///
-/// This same check (a `Hydrated` record whose on-disk state doesn't match)
+/// This same check (a `Present` record whose on-disk state doesn't match)
 /// can also arise during live operation, not just from a crash — this
 /// function's caller in `yadorilink-daemon`'s
 /// `adapters::runtime::link_runtime_controller` also invokes it on a
@@ -174,7 +168,7 @@ impl MaterializationRepairReport {
 /// alongside the direct fixes to `try_apply_metadata_only_update` and the
 /// debounce batch executor that address the actual root causes.
 ///
-/// For every `Hydrated`, non-deleted, ordinary-`File`-kind record in
+/// For every `Present`, non-deleted, ordinary-`File`-kind record in
 /// `group_id` (symlinks/directories carry no block-based content to
 /// verify or reconstruct, so are skipped entirely): if the on-disk file at
 /// `root.join(path)` is missing, or its bytes do not match the indexed block
@@ -189,7 +183,7 @@ impl MaterializationRepairReport {
 /// durably stored, content-addressed, independent of that failed write),
 /// the file is reconstructed again with no peer round-trip needed. Only
 /// when a block is also missing locally is the record demoted to
-/// `Placeholder`, so it is never left claiming hydrated content that
+/// `Remote`, so it is never left claiming hydrated content that
 /// isn't actually there.
 /// Returns `Err` — never an empty `Ok` report — when `root`'s identity cannot
 /// be established (see [`yadorilink_root_authority::root_identity`]). That distinction is the whole
@@ -207,155 +201,14 @@ pub fn repair_interrupted_materializations(
     permit: &RootCommitPermit,
 ) -> Result<MaterializationRepairReport, MaterializationExecutionError> {
     let root = state.open_root(root, group_id)?;
-    repair_interrupted_materializations_inner(state, store, &root, group_id, None, mode, permit)
-}
-
-/// Same as [`repair_interrupted_materializations`], but additionally tombstones
-/// and emits a `Delete` change — through the same change-emitting seam the disk
-/// reconcile scan uses — for every `Hydrated`-but-missing file that has *no*
-/// in-progress materialization intent (a file that was materialized cleanly and
-/// then deleted or renamed away while the daemon was stopped). Used by callers
-/// that already have the group's `ChangeEmitter` in hand and want the deletion
-/// propagated immediately rather than deferred to the startup reconcile scan.
-/// The plain [`repair_interrupted_materializations`] leaves such a row for that
-/// scan instead, so a caller without an emitter never resurrects the file
-/// either — it just does not itself emit the tombstone.
-///
-/// Deliberately not yet wired into a production caller: the live sweep/startup
-/// path (`yadorilink-daemon`'s `link_runtime::factory` at startup and
-/// `adapters::runtime::link_runtime_controller`'s periodic task) runs the
-/// plain variant, which never resurrects an offline delete and defers the tombstone to the
-/// disk reconcile scan that immediately follows in the same startup barrier —
-/// that scan owns the group's `ChangeEmitter` and emits the `Delete` through
-/// the identical seam. Routing repair itself through the emitting variant would
-/// only move that emission a few milliseconds earlier while duplicating the
-/// scan's own per-subtree deletion guards, so the plain variant stays the sole
-/// live caller. This entry point is retained as the tested, ready seam for a
-/// future caller that wants the tombstone emitted at repair time rather than
-/// deferred, and as the direct target for the crash-vs-offline-delete
-/// disambiguation tests, which assert the emitted-`Delete` behavior end to end.
-pub fn repair_interrupted_materializations_emitting_deletes(
-    state: &dyn MaterializationExecutionPort,
-    store: &dyn BlockContentStore,
-    root: &Path,
-    group_id: &str,
-    delete_emitter: &ChangeEmitter,
-    mode: RepairMode,
-    permit: &RootCommitPermit,
-) -> Result<MaterializationRepairReport, MaterializationExecutionError> {
-    let root = state.open_root(root, group_id)?;
-    repair_interrupted_materializations_inner(
-        state,
-        store,
-        &root,
-        group_id,
-        Some(delete_emitter),
-        mode,
-        permit,
-    )
-}
-
-/// Backfills a persisted placeholder identity for every path this
-/// group's index still shows as `Placeholder` with none recorded --
-/// closes a crash window in placeholder creation: `write_placeholder` durably writes the sparse
-/// placeholder
-/// file, then its identity is recorded in a SEPARATE commit
-/// (`record_placeholder_generation`), and a crash between the two
-/// leaves exactly this state. Run at startup, before any watcher can
-/// observe such a row: without a recorded identity to compare against,
-/// `local_change.rs`'s dirty-detection falls through to the full
-/// chunk-and-compare path for ANY `CreatedOrModified` event on it --
-/// including this crate's own harmless placeholder-refresh echo --
-/// which would chunk and index the placeholder's own sparse/all-zero
-/// bytes as if they were the file's real content, corrupting the file
-/// group-wide on the very first watcher tick after a mistimed crash.
-///
-/// For each such path, re-derives an identity from whatever is on disk
-/// RIGHT NOW, but ONLY when it still looks exactly like the placeholder
-/// this process would itself have written (regular file, exact indexed
-/// `size`) -- a path that no longer matches (diverged, or removed) is
-/// left with no generation. That is not a gap: the existing fail-closed
-/// behavior (fall through to full chunk-and-compare) is exactly correct
-/// there, since something genuinely unaccounted-for happened to it while
-/// this device was down.
-pub fn backfill_placeholder_generations(
-    state: &dyn MaterializationExecutionPort,
-    root: &Path,
-    group_id: &str,
-    permit: &RootCommitPermit,
-) -> Result<usize, MaterializationExecutionError> {
-    let root = state.open_root(root, group_id)?;
-    let root = root.path();
-    let mut backfilled = 0usize;
-    // Deliberately does NOT `?`-propagate a single path's failure out of
-    // this loop: a transient error on
-    // one candidate (a DB read hiccup, say) must not abandon every OTHER
-    // candidate this same pass could otherwise have safely backfilled.
-    // `local_change.rs`'s own `untouched_placeholder_verdict` also carries
-    // an independent, identity-free fallback for exactly the paths this
-    // loop leaves unbackfilled (a still-fully-sparse object at the exact
-    // indexed size), so a path skipped here is not left as exposed as it
-    // would be without that second layer.
-    // A path a snapshot install holds has no placeholder of its row on disk
-    // yet -- whatever is there belongs to the row the install replaced --
-    // so recording its identity would vouch for the wrong object. Its
-    // reconciliation records the identity of the placeholder it places.
-    let held: std::collections::HashSet<String> =
-        state.list_snapshot_install_holds(group_id)?.into_iter().map(|hold| hold.path).collect();
-    for path in state.list_placeholder_paths_missing_generation(group_id)? {
-        if held.contains(&path) {
-            continue;
-        }
-        let record = match state.get_file(group_id, &path) {
-            Ok(Some(record)) => record,
-            Ok(None) => continue,
-            Err(e) => {
-                tracing::warn!(
-                    group_id,
-                    path = %path,
-                    error = %e,
-                    "failed to read the index row for a placeholder-generation backfill candidate; \
-                     skipping this path this boot"
-                );
-                continue;
-            }
-        };
-        if record.deleted {
-            continue;
-        }
-        let out_path = root.join(&path);
-        let Ok(metadata) = std::fs::symlink_metadata(&out_path) else { continue };
-        if !metadata.is_file() || metadata.len() != record.size {
-            continue;
-        }
-        let Some(identity) = PlaceholderDiskIdentity::from_metadata(&metadata) else { continue };
-        if let Err(e) = state.record_placeholder_identity(
-            group_id,
-            &path,
-            PlaceholderIdentityToRecord::RecordOverwrite {
-                identity,
-                provider_kind: INTERNAL_INODE_PROVIDER_KIND,
-            },
-            permit,
-        ) {
-            tracing::warn!(
-                group_id,
-                path = %path,
-                error = %e,
-                "failed to record a backfilled placeholder identity; skipping this path this boot"
-            );
-            continue;
-        }
-        backfilled += 1;
-    }
-    Ok(backfilled)
+    repair_interrupted_materializations_inner(state, store, &root, group_id, mode, permit)
 }
 
 /// Takes a [`VerifiedRoot`] for the same reason
 /// `local_change::reconcile_disk_with_ignore` does, and it is the same bug:
 /// this pass independently grew its own root guard, and that guard
 /// independently checked only that the path existed. An unmounted volume leaves
-/// its mountpoint behind, so `fs::metadata` succeeded, every `Hydrated` file
+/// its mountpoint behind, so `fs::metadata` succeeded, every `Present` file
 /// looked missing, and the classification below turned the folder into
 /// offline-delete tombstones (and, before that, rewrote every file as a
 /// placeholder). Requiring the proof in the signature is what stops a third
@@ -375,20 +228,16 @@ fn repair_interrupted_materializations_inner(
     store: &dyn BlockContentStore,
     root: &VerifiedRoot,
     group_id: &str,
-    delete_emitter: Option<&ChangeEmitter>,
     mode: RepairMode,
     permit: &RootCommitPermit,
 ) -> Result<MaterializationRepairReport, MaterializationExecutionError> {
     let mut report = MaterializationRepairReport::default();
     let root = root.path();
-    // Paths a snapshot install replaced first, before any row is looked
-    // at: until a held path's disk is reconciled nothing else may write it,
-    // and the rows below are the installed ones, which describe nothing
-    // that is on disk yet.
-    let install = crate::snapshot_install_reconcile::reconcile_snapshot_install_holds(
-        state, root, group_id, permit,
-    )?;
-    report.snapshot_install_reconciled = install.released;
+    // Held paths first, before any row is looked at: until a held path's
+    // disk is reconciled nothing else may write it, and its row describes
+    // nothing that is on disk yet.
+    let install = crate::held_path_reconcile::reconcile_held_paths(state, root, group_id, permit)?;
+    report.held_path_reconciled = install.released;
     report.quarantined_dirty.extend(install.preserved);
     report.failed.extend(install.failed);
     // Per-sweep cost attribution (see the summary `warn!` at this
@@ -446,7 +295,7 @@ fn repair_interrupted_materializations_inner(
     // row. This loop is keyed on materialization-state rows, so it never visits
     // such an intent, and it is left in place. That is fail-SAFE: an orphaned
     // intent whose path has no index row cannot drive a spurious reconstruct
-    // (the reconstruct arms below all require a present `Hydrated` record), and
+    // (the reconstruct arms below all require a present `Present` record), and
     // the disk-reconcile tombstone loop only iterates indexed rows, so the
     // orphan does not block any current deletion either. Its only effect is that
     // if the SAME path is later reused, the scan defers tombstoning it once (see
@@ -465,9 +314,18 @@ fn repair_interrupted_materializations_inner(
     // (a database or invariant failure, a lost root) aborts the pass, as
     // every failure used to.
     let mut failed = Vec::new();
+    // A path still held after the reconciliation above is not this sweep's:
+    // what stands there belongs to no row this device placed, the hold's
+    // reconciliation is its one writer, and a `Present` row over such an
+    // object would otherwise read as divergent bytes to quarantine.
+    let held_paths: std::collections::HashSet<String> =
+        state.list_held_paths(group_id)?.into_iter().map(|hold| hold.path).collect();
     let mut repair_one_path = |path: String,
                                snapshot_mstate: MaterializationState|
      -> Result<(), MaterializationExecutionError> {
+        if held_paths.contains(&path) {
+            return Ok(());
+        }
         // Cheap pre-filter on the snapshot: skip rows that are obviously not
         // candidates without paying to take their lock. This snapshot can go
         // stale before the lock is acquired, so every check it informs is
@@ -516,7 +374,7 @@ fn repair_interrupted_materializations_inner(
             return Ok(());
         }
         if row.record_kind.unwrap_or_default() == RecordKind::Symlink {
-            // Not only `RecordKind::File`: a symlink row left `Hydrated`
+            // Not only `RecordKind::File`: a symlink row left `Present`
             // by a crash between the index commit and the physical
             // symlink write (see `materialize_symlink_at`'s matching
             // intent guard) must be examined by repair too, or "new
@@ -532,7 +390,6 @@ fn repair_interrupted_materializations_inner(
                 root,
                 group_id,
                 &path,
-                delete_emitter,
                 mode,
                 permit,
                 &outstanding_intents,
@@ -552,7 +409,6 @@ fn repair_interrupted_materializations_inner(
                 root,
                 group_id,
                 &path,
-                delete_emitter,
                 mode,
                 permit,
                 &outstanding_intents,
@@ -579,11 +435,11 @@ fn repair_interrupted_materializations_inner(
             diag_disk_matched += 1;
             // The healthy case writes NOTHING. This sweep runs on a
             // periodic cadence over every materialization-state row in the
-            // replica, so a row that is already `Hydrated` with a proof
+            // replica, so a row that is already `Present` with a proof
             // naming its own version and no intent outstanding must cost
             // exactly the read that established that.
             let proof_stands = state.has_usable_materialized_generation(group_id, &path)?;
-            if proof_stands && row_state == MaterializationState::Hydrated && !intent_outstanding {
+            if proof_stands && row_state == MaterializationState::Present && !intent_outstanding {
                 return Ok(());
             }
             proof_stands
@@ -620,10 +476,10 @@ fn repair_interrupted_materializations_inner(
             // Everything else is one guarded transaction. It used to be
             // three -- publish, then stamp, then clear -- and the path
             // lock does not span them: it serializes daemon-internal work,
-            // while a supersession arrives from the DAG side. Between the
+            // while a supersession arrives from the native admission side. Between the
             // publish and the stamp the row could move from the version
             // whose bytes were just compared to a newer one, and the stamp
-            // then claimed `Hydrated` for content that had been superseded.
+            // then claimed `Present` for content that had been superseded.
             //
             // The guard is re-evaluated inside the commit against the live
             // row, so a row that moved writes nothing at all -- intent
@@ -665,7 +521,6 @@ fn repair_interrupted_materializations_inner(
                 },
                 yadorilink_peer_session::ports::ExpectedAuthoring {
                     state: row_state,
-                    authoring_change_hash: row.current_authoring.as_ref(),
                     expected_version: Some(&version),
                 },
                 permit,
@@ -690,6 +545,22 @@ fn repair_interrupted_materializations_inner(
                      leaving it for the next pass"
                 );
             }
+            return Ok(());
+        }
+
+        // Bytes that are not the row's version but are, untouched, what this
+        // device itself wrote and still holds a proof for: an older version
+        // under a newer row (`Present` says only that an object exists). They
+        // are no edit and no interrupted write -- quarantining them would
+        // fabricate a conflict copy, and journalling them as a local change
+        // would author the older version over the newer one. Bringing the
+        // newer version in is the materialization lane's job, not this
+        // sweep's. A path with an intent open is an interrupted write and
+        // still takes the arms below.
+        if on_disk_size.is_some()
+            && !intent_outstanding
+            && state.disk_is_untouched_proven_write(group_id, &path, &out_path)?
+        {
             return Ok(());
         }
 
@@ -753,56 +624,13 @@ fn repair_interrupted_materializations_inner(
             return Ok(());
         }
         if on_disk_size.is_none() && !has_intent {
-            match delete_emitter {
-                Some(emitter) => match state.mark_deleted_emitting_change(
-                    group_id,
-                    &path,
-                    emitter.device_id(),
-                    repair_now_unix_nanos(),
-                    // No proof: this is the offline-delete repair scanner,
-                    // not local_change.rs's own watcher-driven capture --
-                    // it has no matching path-lock-scoped revalidation
-                    // discipline to satisfy adopt_observed_actual_
-                    // generation_in_tx's own preconditions. Always safe to
-                    // decline; the Convergence Engine's existing
-                    // fail-closed path handles it exactly as before.
-                    false,
-                    emitter,
-                    permit,
-                ) {
-                    Ok(_) => {
-                        tracing::info!(
-                            group_id,
-                            path = %path,
-                            "a Hydrated file was missing with no materialization intent; \
-                             classified it as an offline deletion and emitted a tombstone \
-                             rather than resurrecting it from the index"
-                        );
-                        report.offline_deleted.push(path);
-                    }
-                    // The group's policy has not loaded this run, so the emit
-                    // withheld the tombstone (see `upsert_file_emitting_change`)
-                    // rather than stamp a placeholder-auth change. Leave the row
-                    // for the reconcile scan to re-emit once policy heals; the
-                    // key property — the file is NOT resurrected — already holds
-                    // because this arm never reconstructs.
-                    Err(MaterializationExecutionError::PolicyUnavailable) => {
-                        report.offline_deleted.push(path);
-                    }
-                    Err(e) => return Err(e),
-                },
-                None => {
-                    // No emitter: the startup pass runs before the group's
-                    // change emitter/auth exist. Leave the row `Hydrated` and
-                    // the file missing exactly as they are — the startup
-                    // reconcile scan, which runs inside the group startup
-                    // barrier through the same change-emitting seam and with its
-                    // own root-availability and per-subtree deletion guards,
-                    // tombstones the path. NOT reconstructing here is the whole
-                    // fix; the scan does the propagation.
-                    report.offline_deleted.push(path);
-                }
-            }
+            // Leave the row `Present` and the file missing exactly as they
+            // are: the startup reconcile scan, which runs inside the group
+            // startup barrier through the local-authoring seam and with its
+            // own root-availability and per-subtree deletion guards,
+            // tombstones the path. NOT reconstructing here is the whole fix;
+            // the scan does the propagation.
+            report.offline_deleted.push(path);
             return Ok(());
         }
 
@@ -858,8 +686,8 @@ fn repair_interrupted_materializations_inner(
         // `quarantine_dirty_disk_file`'s rename succeeds (which makes the
         // canonical path go missing) but before `reconstruct_file_
         // journaled` gets a chance to open ITS OWN intent leaves the row
-        // `Hydrated`, the path missing, no intent, and -- this being a
-        // purely local repair-sweep action, not driven by any DAG
+        // `Present`, the path missing, no intent, and -- this being a
+        // purely local repair-sweep action, not driven by any native
         // admission or local emission -- no projection obligation either:
         // the next pass would misread repair's own in-progress recovery
         // as an offline deletion and tombstone a file repair itself just
@@ -876,7 +704,7 @@ fn repair_interrupted_materializations_inner(
         //
         // The quarantine rename below is its own physical mutation, so the
         // same step also bumps the fence for it, after the intent. This
-        // whole function has no DAG-frontier proof to publish under, so
+        // whole function has no native-frontier proof to publish under, so
         // every physical mutation below only ever invalidates via a bump,
         // never publishes. `path_lock` is held for this whole loop
         // iteration via `_path_guard` above.
@@ -896,7 +724,7 @@ fn repair_interrupted_materializations_inner(
                     // a newly-created local path before repairing the
                     // canonical file, so the daemon's startup dirty-journal
                     // re-drive promotes these bytes through the ordinary
-                    // local-change/index/DAG path even if the filesystem
+                    // local-change/index/native state path even if the filesystem
                     // watcher was not running when repair moved the file.
                     state.record_dirty_path(
                         group_id,
@@ -955,7 +783,7 @@ fn repair_interrupted_materializations_inner(
             // block; the content is still durably present. Do not
             // `?`-propagate: that would abort the whole repair sweep for every
             // remaining path. Instead demote this one row to a retriable
-            // `Placeholder` (the blocks stay in the store) and continue, so a
+            // `Remote` (the blocks stay in the store) and continue, so a
             // later reconcile re-drives the assembly from those same blocks on
             // a non-faulting read. Only a genuinely-missing block (the `else`
             // arm) is an unavoidable placeholder.
@@ -992,7 +820,6 @@ fn repair_interrupted_materializations_inner(
                         &path,
                         &out_path,
                         row_state,
-                        row.current_authoring.as_ref(),
                         row.current_version,
                         repair_mutation_generation,
                         permit,
@@ -1015,11 +842,27 @@ fn repair_interrupted_materializations_inner(
                         error = %e,
                         "repair reconstruct failed with all blocks present; leaving retriable placeholder"
                     );
+                    // The failure can come after the bytes were renamed into
+                    // place (the mode or the replicated xattrs could not be
+                    // applied). The path was emptied before this write (the
+                    // divergent object, if any, was quarantined), so an object
+                    // standing there now is this attempt's: it is no `Remote`
+                    // row. The row keeps its state and the intent stays open,
+                    // which is what keeps the path from reading as an offline
+                    // delete and what makes the next pass retry the metadata.
+                    if std::fs::symlink_metadata(&out_path).is_ok() {
+                        tracing::warn!(
+                            group_id,
+                            path = %path,
+                            "the rebuilt object stands but its metadata could not be applied; \
+                             keeping the row and the intent for the next pass"
+                        );
+                        return Ok(());
+                    }
                     if !state.open_repair_placeholder_demotion(
                         group_id,
                         &path,
                         row_state,
-                        row.current_authoring.as_ref(),
                         row.current_version.as_ref(),
                         permit,
                     )? {
@@ -1039,11 +882,7 @@ fn repair_interrupted_materializations_inner(
                         &path,
                         "repair_reconstruct_failed_placeholder",
                     )?;
-                    let placeholder_outcome = create_or_defer_placeholder(
-                        &out_path,
-                        record.size,
-                        record.mtime_unix_nanos,
-                    )?;
+                    let placeholder_outcome = create_or_defer_placeholder(&out_path);
                     let placeholder_deferred =
                         placeholder_outcome.is_deferred_to_a_separate_process();
                     state.record_placeholder_identity(
@@ -1070,14 +909,16 @@ fn repair_interrupted_materializations_inner(
                         // both are real syscalls against a path nothing
                         // has actually created yet in this case.
                     } else {
-                        // From the caller's row snapshot, for the same
-                        // reason `reconstruct_file_journaled` takes them
-                        // that way.
-                        apply_file_metadata(&out_path, row.unix_mode, &row.xattrs)?;
-                        // A Placeholder is not an in-progress write; drop any intent
-                        // (`reconstruct_file_journaled` never clears its own) so a
-                        // later offline delete of this path is not misread as a
-                        // crash to reconstruct.
+                        if placeholder_outcome.placed_an_object() {
+                            // From the caller's row snapshot, for the same
+                            // reason `reconstruct_file_journaled` takes them
+                            // that way.
+                            apply_file_metadata(&out_path, row.unix_mode, &row.xattrs)?;
+                        }
+                        // A `Remote` row is not an in-progress write; drop any
+                        // intent (`reconstruct_file_journaled` never clears its
+                        // own) so a later offline delete of this path is not
+                        // misread as a crash to reconstruct.
                         state.clear_materialization_intent(group_id, &path, permit)?;
                     }
                     report.demoted_to_placeholder.push(path);
@@ -1088,7 +929,6 @@ fn repair_interrupted_materializations_inner(
                 group_id,
                 &path,
                 row_state,
-                row.current_authoring.as_ref(),
                 row.current_version.as_ref(),
                 permit,
             )? {
@@ -1103,8 +943,7 @@ fn repair_interrupted_materializations_inner(
             // No blocks were even present locally -- this is its own,
             // independent physical write, its own bump.
             state.dag_bump_mutation_fence(group_id, &path, "repair_missing_blocks_placeholder")?;
-            let placeholder_outcome =
-                create_or_defer_placeholder(&out_path, record.size, record.mtime_unix_nanos)?;
+            let placeholder_outcome = create_or_defer_placeholder(&out_path);
             let placeholder_deferred = placeholder_outcome.is_deferred_to_a_separate_process();
             state.record_placeholder_identity(group_id, &path, placeholder_outcome, permit)?;
             if placeholder_deferred {
@@ -1114,14 +953,11 @@ fn repair_interrupted_materializations_inner(
                 // `apply_unix_mode`/`apply_xattrs` are skipped too (real
                 // syscalls against a path nothing has actually created).
             } else {
-                // A placeholder is a fresh file too, so it needs the recorded exec
-                // bit applied for the same reason the reconstruct path does — the
-                // live peer materialize path stamps its own placeholders
-                // identically, and hydration re-applies the bit once real content
-                // lands, so it survives the placeholder → hydrated transition.
-                apply_file_metadata(&out_path, row.unix_mode, &row.xattrs)?;
-                // See the reconstruct-failure arm above: a Placeholder carries no
-                // in-progress intent.
+                if placeholder_outcome.placed_an_object() {
+                    apply_file_metadata(&out_path, row.unix_mode, &row.xattrs)?;
+                }
+                // See the reconstruct-failure arm above: a `Remote` row carries
+                // no in-progress intent.
                 state.clear_materialization_intent(group_id, &path, permit)?;
             }
             report.demoted_to_placeholder.push(path);
@@ -1216,7 +1052,6 @@ fn repair_one_interrupted_single_object(
     root: &Path,
     group_id: &str,
     path: &str,
-    delete_emitter: Option<&ChangeEmitter>,
     mode: RepairMode,
     permit: &RootCommitPermit,
     // See the caller's own `outstanding_intents` comment: the whole-pass
@@ -1256,7 +1091,7 @@ fn repair_one_interrupted_single_object(
         // write this" means. See that function's matching `materialization_
         // state` demotion for the other half of this fix (closes the window
         // for a fresh row; this closes it for a legacy row already stuck at
-        // `Hydrated` from before that fix shipped).
+        // `Present` from before that fix shipped).
         #[cfg(unix)]
         let policy_permits_write = true;
         #[cfg(windows)]
@@ -1267,11 +1102,11 @@ fn repair_one_interrupted_single_object(
         // `has_unsettled_obligation`. A combined version of this check
         // (`!policy_permits_write && has_unsettled_obligation`) was tried and
         // reverted: a LEGACY row that predates `materialize_symlink_at`'s own
-        // demote-to-`Placeholder` fix has no obligation row at all --
+        // demote-to-`Remote` fix has no obligation row at all --
         // `bootstrap_obligations_from_legacy_unapplied_changes` only backfills
         // rows behind an unapplied `changes` entry, and the repair-candidate
         // scan only ever selects `placeholder`/`hydrating` rows, never
-        // `Hydrated` ones -- so combining this check with `has_unsettled_
+        // `Present` ones -- so combining this check with `has_unsettled_
         // obligation` silently reopened the exact bug this function exists to
         // prevent, for every such legacy row: the check no longer fired, so
         // repair fell through to the offline-deletion classification below and
@@ -1321,7 +1156,7 @@ fn repair_one_interrupted_single_object(
         // what is left is whatever the interrupted attempt did not
         // finish. This used to drop the intent and stop -- publishing no
         // proof at all, on a lane where no other pass publishes one
-        // either. A symlink row could therefore sit `Hydrated` with its
+        // either. A symlink row could therefore sit `Present` with its
         // proof already dead (the live path bumps the fence before
         // writing) and no intent left to mark it, which nothing would
         // ever heal: the file arm's re-proving lane is `RecordKind::File`
@@ -1331,8 +1166,7 @@ fn repair_one_interrupted_single_object(
         let proof_stands = state.has_usable_materialized_generation(group_id, path)?;
         let intent_outstanding = outstanding_intents.contains(path);
         let row_state = row.materialization_state;
-        if proof_stands && row_state == Some(MaterializationState::Hydrated) && !intent_outstanding
-        {
+        if proof_stands && row_state == Some(MaterializationState::Present) && !intent_outstanding {
             return Ok(());
         }
         let (Some(version), Some(state_now)) = (row.current_version, row_state) else {
@@ -1350,7 +1184,6 @@ fn repair_one_interrupted_single_object(
             },
             yadorilink_peer_session::ports::ExpectedAuthoring {
                 state: state_now,
-                authoring_change_hash: row.current_authoring.as_ref(),
                 expected_version: Some(&version),
             },
             permit,
@@ -1377,7 +1210,7 @@ fn repair_one_interrupted_single_object(
     let has_intent = intent_kind.is_some();
     // A live, per-path read (see `MaterializationExecutionPort::has_
     // unsettled_projection_obligation`'s own doc comment) -- covers any
-    // OTHER route that can leave a row `Hydrated` with nothing on disk and
+    // OTHER route that can leave a row `Present` with nothing on disk and
     // no intent, on every platform, not just the Windows policy-skip case
     // above -- a freshly-admitted row this pass runs before the first
     // materialize attempt, `restore_to_version`'s own symlink dispatch
@@ -1417,26 +1250,9 @@ fn repair_one_interrupted_single_object(
         // the symlink was then deleted while the daemon was stopped.
         // Reconstructing it from the index would silently resurrect that
         // offline deletion.
-        match delete_emitter {
-            Some(emitter) => match state.mark_deleted_emitting_change(
-                group_id,
-                path,
-                emitter.device_id(),
-                repair_now_unix_nanos(),
-                // See the sibling call site's own comment just above in
-                // this file for why this is always `false` here.
-                false,
-                emitter,
-                permit,
-            ) {
-                Ok(_) => report.offline_deleted.push(path.to_string()),
-                Err(MaterializationExecutionError::PolicyUnavailable) => {
-                    report.offline_deleted.push(path.to_string())
-                }
-                Err(e) => return Err(e),
-            },
-            None => report.offline_deleted.push(path.to_string()),
-        }
+        // Left for the startup reconcile scan to tombstone, as in the file
+        // arm.
+        report.offline_deleted.push(path.to_string());
         return Ok(());
     }
     if on_disk_exists && !has_intent && mode == RepairMode::Live {
@@ -1530,7 +1346,6 @@ fn repair_one_interrupted_single_object(
         &out_path,
         version,
         row.materialization_state,
-        row.current_authoring.as_ref(),
         mutation_generation,
         permit,
     )?;
@@ -1603,13 +1418,13 @@ fn rebuild_interrupted_symlink<'a>(
 /// Assembles `record`'s indexed blocks onto disk at `out_path` under a durable
 /// materialization intent, so a crash *during this write itself* is recoverable
 /// (the intent is still present on the next repair pass) rather than being
-/// misread as an offline deletion of a `Hydrated` file. Brackets the write with
+/// misread as an offline deletion of a `Present` file. Brackets the write with
 /// `MaterializationExecutionPort::open_materialization_intent_guard`'s
 /// returned guard — the same single seam the live peer materialize path uses
 /// (through its own `yadorilink-peer-session::ports::OpenMaterializationIntent`
 /// marker) — so the intent is durable before the temp-write-then-rename
 /// begins. It is left open on every outcome: the caller's proof commit clears
-/// it atomically with the proof and the `Hydrated` stamp. This module never
+/// it atomically with the proof and the `Present` stamp. This module never
 /// names the concrete guard type (`yadorilink-daemon`'s
 /// `MaterializationIntentGuard`) — only the opaque
 /// `Box<dyn OpenMaterializationIntent + Send + '_>` the port method returns.
@@ -1637,6 +1452,19 @@ struct JournaledReconstruction<'a> {
     permit: &'a RootCommitPermit<'a>,
 }
 
+// Test-only: makes the next reconstructs on this thread fail right after
+// their bytes were renamed into place, as a failed mode or xattr apply does.
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static FAIL_AFTER_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Arms (or disarms) the failure described on `FAIL_AFTER_RENAME`.
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_fail_after_rename_for_test(armed: bool) {
+    FAIL_AFTER_RENAME.with(|cell| cell.set(armed));
+}
+
 fn reconstruct_file_journaled(
     request: JournaledReconstruction<'_>,
 ) -> Result<(), MaterializationExecutionError> {
@@ -1650,11 +1478,17 @@ fn reconstruct_file_journaled(
     // the success path drops it uncleared too: the intent stays open through
     // the bytes, the mode and the xattrs, and is cleared only by the caller's
     // proof commit (`settle_repair_reconstruct`), in the same transaction that
-    // publishes the proof and stamps `Hydrated`. Clearing it any earlier
+    // publishes the proof and stamps `Present`. Clearing it any earlier
     // opens a window with neither an intent nor a proof, in which a crash or
     // a failed metadata write or commit leaves nothing recording that this
     // write was ever in flight.
     reconstruct_file(request.store, request.out_path, request.blocks, request.mtime_unix_nanos)?;
+    #[cfg(any(test, feature = "test-support"))]
+    if FAIL_AFTER_RENAME.with(std::cell::Cell::get) {
+        return Err(MaterializationExecutionError::CorruptState(
+            "injected failure after the rename".to_string(),
+        ));
+    }
     // `reconstruct_file` assembles into a fresh temp file, which gets default
     // permissions — so the assembled result does NOT carry the exec bit the
     // index recorded for this path, and a repaired POSIX executable would come
@@ -1715,7 +1549,7 @@ pub struct RestoreRecoveryReport {
 
 /// Which materialization states this sweep is allowed to act on.
 ///
-/// `Hydrated` is the original case: the index claims exact content, so a
+/// `Present` is the original case: the index claims exact content, so a
 /// disk that does not match it is a divergence only this pass can
 /// diagnose.
 ///
@@ -1737,9 +1571,9 @@ fn is_repair_candidate_state(
     path: &str,
 ) -> bool {
     match state {
-        MaterializationState::Hydrated => true,
+        MaterializationState::Present => true,
         MaterializationState::Hydrating => outstanding_intents.contains(path),
-        MaterializationState::Placeholder | MaterializationState::Evicting => false,
+        MaterializationState::Remote | MaterializationState::Evicting => false,
     }
 }
 
@@ -1921,13 +1755,12 @@ pub fn reconcile_restore_operations(
 /// `repair_interrupted_materializations` before it would otherwise overwrite a
 /// path whose journaled local edit means the on-disk bytes may be a newer user
 /// edit the watcher had not yet indexed. The quarantine name follows the same
-/// `(conflicted copy, ...)` convention as DAG conflict copies
+/// `(conflicted copy, ...)` convention as conflict copies
 /// (`yadorilink_replica_domain::conflict::conflict_copy_path`), so it reads naturally to the user
-/// and the watcher re-syncs it as an ordinary new file. The disambiguator is a
-/// cheap `Sha256` of the on-disk `(size, mtime)` rather than a full re-read of
-/// the file's bytes — enough to keep two genuinely different pending edits
-/// (which differ in mtime on every save) from colliding on one name — and the
-/// move itself is a `rename` (atomic, no large copy). A fixed `"local-recovered"`
+/// and the watcher re-syncs it as an ordinary new file. The move is the one
+/// held-path recovery uses (`held_path_reconcile::move_aside`): the name's
+/// disambiguator digests the bytes themselves, and the rename never replaces
+/// an earlier copy already under the name chosen. A fixed `"local-recovered"`
 /// device component names the origin without threading this device's id in.
 /// The rename target is verified to stay within `root`, exactly like every
 /// other write path in this module.
@@ -1937,7 +1770,7 @@ fn quarantine_dirty_disk_file(
     ledger: &dyn yadorilink_local_storage::StructuralDirectoryLedger,
 ) -> Result<Option<(String, i64)>, MaterializationExecutionError> {
     let src = root.join(rel_path);
-    let meta = match std::fs::metadata(&src) {
+    let meta = match std::fs::symlink_metadata(&src) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
@@ -1948,13 +1781,63 @@ fn quarantine_dirty_disk_file(
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_nanos() as i64)
         .unwrap_or(0);
-    let mut hasher = Sha256::new();
-    hasher.update(meta.len().to_le_bytes());
-    hasher.update(mtime_unix_nanos.to_le_bytes());
-    let disamb = hasher.finalize();
-    let quarantine_rel = conflict_copy_path(rel_path, mtime_unix_nanos, "local-recovered", &disamb);
-    let dst = root.join(&quarantine_rel);
-    verify_write_target_within_root(&dst, root, ledger)?;
-    std::fs::rename(&src, &dst)?;
+    let quarantine_rel =
+        crate::held_path_reconcile::move_aside(root, rel_path, &src, ledger, "local-recovered")?;
     Ok(Some((quarantine_rel, mtime_unix_nanos)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Quarantining moves bytes aside and creates no directory.
+    struct NoLedger;
+    impl yadorilink_local_storage::StructuralDirectoryLedger for NoLedger {
+        fn record_intent(
+            &self,
+            rel_path: &str,
+        ) -> Result<(), yadorilink_local_storage::StorageError> {
+            panic!("quarantining created a directory: {rel_path}")
+        }
+        fn complete(
+            &self,
+            rel_path: &str,
+            _identity: &yadorilink_root_authority::fs_identity::FileIdentity,
+        ) -> Result<(), yadorilink_local_storage::StorageError> {
+            panic!("quarantining created a directory: {rel_path}")
+        }
+        fn abandon(&self, rel_path: &str) -> Result<(), yadorilink_local_storage::StorageError> {
+            panic!("quarantining created a directory: {rel_path}")
+        }
+    }
+
+    /// Two different unsaved edits quarantined from one path agree on size
+    /// and modification time when a tool restores timestamps or the
+    /// filesystem's clock is coarse. Named from those alone, the second
+    /// copy took the first one's name and the rename replaced it.
+    #[test]
+    fn a_second_quarantine_does_not_replace_an_earlier_conflict_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let mut quarantined = Vec::new();
+        for content in [b"first edit!".as_slice(), b"other edit!".as_slice()] {
+            let src = root.path().join("doc.txt");
+            std::fs::write(&src, content).unwrap();
+            std::fs::File::options().write(true).open(&src).unwrap().set_modified(mtime).unwrap();
+            let (copy, _observed_at) =
+                quarantine_dirty_disk_file(root.path(), "doc.txt", &NoLedger).unwrap().unwrap();
+            quarantined.push(copy);
+        }
+
+        assert_ne!(quarantined[0], quarantined[1], "two different edits must get two names");
+        assert_eq!(std::fs::read(root.path().join(&quarantined[0])).unwrap(), b"first edit!");
+        assert_eq!(std::fs::read(root.path().join(&quarantined[1])).unwrap(), b"other edit!");
+        assert!(!root.path().join("doc.txt").exists(), "the original was moved aside");
+    }
+
+    #[test]
+    fn quarantining_an_absent_path_moves_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(quarantine_dirty_disk_file(root.path(), "doc.txt", &NoLedger).unwrap().is_none());
+    }
 }

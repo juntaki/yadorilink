@@ -21,7 +21,7 @@ const KIND_HANDOFF_LEASE: u8 = 2;
 const KIND_HANDOFF_TICKET: u8 = 3;
 const KIND_HANDOFF_LEASE_RELEASE: u8 = 4;
 const KIND_HANDOFF_TICKET_RELEASE: u8 = 5;
-// 6 was the legacy re-bootstrap request/response, removed. Not reused.
+// 6 was a retired request/response, removed. Not reused.
 const KIND_GROUP_DURABILITY_SUMMARY: u8 = 7;
 
 /// Ceilings, applied before allocation.
@@ -153,7 +153,7 @@ pub struct GroupDurabilitySummary {
     ///
     /// Load-bearing, not informational. An index row exists from the moment
     /// its change is projected, which is long before the content behind it
-    /// has been fetched — so a peer that has caught up on the DAG and
+    /// has been fetched — so a peer that has caught up on native state and
     /// downloaded nothing at all produces exactly the same
     /// [`Self::current_digest`] as one holding every byte. Without this, a
     /// device that joined a folder a minute ago and is still transferring

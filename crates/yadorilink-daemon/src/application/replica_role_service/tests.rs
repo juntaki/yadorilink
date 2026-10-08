@@ -50,7 +50,7 @@ impl ReplicaRoleRepository for FakeRepository {
         Ok(self.links.lock().unwrap().clone())
     }
 
-    fn live_link_local_path_for_group(
+    fn live_link_key_for_group(
         &self,
         group_id: &str,
     ) -> Result<Option<String>, crate::sync_error::SyncError> {
@@ -60,7 +60,7 @@ impl ReplicaRoleRepository for FakeRepository {
             .unwrap()
             .iter()
             .find(|l| l.group_id == group_id)
-            .map(|l| l.local_path.clone()))
+            .map(|l| l.key().to_string()))
     }
 
     fn recheck_digest_then_set_materialization_policy(
@@ -372,34 +372,37 @@ impl LinkRuntimePort for FakeRuntime {
     }
 }
 
+const FAKE_LINK_PATH: &str = "/home/alice/Photos";
+
 fn link(group_id: &str, policy: MaterializationPolicy) -> FolderLink {
     FolderLink {
-        local_path: "/home/alice/Photos".to_string(),
+        location: yadorilink_replica_domain::session_state::LinkLocation::Folder(
+            FAKE_LINK_PATH.to_string(),
+        ),
         group_id: group_id.to_string(),
         paused: false,
         materialization_policy: policy,
-        max_local_size_bytes: None,
         orphaned: false,
     }
 }
 
-/// Fixed-answer [`PlaceholderPipelineCapabilityPort`] fake -- defaults to
+/// Fixed-answer [`OnDemandCapabilityPort`] fake -- defaults to
 /// connected since none of this module's own unit tests exercise the
 /// disconnected-gate rejection itself (that's covered by the daemon
 /// integration tests in `tests/role_loss_saga.rs`/
 /// `tests/storage_mode_orchestration.rs`).
-struct FakePlaceholderPipeline {
+struct FakeOnDemandCapability {
     connected: bool,
 }
 
-impl Default for FakePlaceholderPipeline {
+impl Default for FakeOnDemandCapability {
     fn default() -> Self {
         Self { connected: true }
     }
 }
 
-impl PlaceholderPipelineCapabilityPort for FakePlaceholderPipeline {
-    fn is_connected(&self) -> bool {
+impl OnDemandCapabilityPort for FakeOnDemandCapability {
+    fn allows_on_demand(&self, _group_id: &str) -> bool {
         self.connected
     }
 }
@@ -419,11 +422,45 @@ fn service(
         readiness,
         coordination,
         runtime,
-        Arc::new(FakePlaceholderPipeline::default()),
+        Arc::new(FakeOnDemandCapability::default()),
     )
 }
 
 // ===== set_storage_mode =====
+
+/// The production gate answers "not connected": a request to switch a
+/// folder to on-demand is refused before any coordination write or local
+/// policy flip, so no root ever runs on-demand without a provider.
+#[tokio::test]
+async fn on_demand_is_refused_while_the_on_demand_capability_is_not_connected() {
+    let repository = Arc::new(
+        FakeRepository::default().with_link(link("group-1", MaterializationPolicy::Eager)),
+    );
+    let coordination = Arc::new(FakeCoordination::configured());
+    let svc = ReplicaRoleService::new(
+        "device-a".to_string(),
+        repository.clone(),
+        Arc::new(FakeRoleLoss::default()),
+        Arc::new(FakeReadiness::default()),
+        coordination.clone(),
+        Arc::new(FakeRuntime::default()),
+        Arc::new(FakeOnDemandCapability { connected: false }),
+    );
+
+    let error = svc
+        .set_storage_mode("group-1", true)
+        .await
+        .expect_err("on-demand must be refused while the pipeline is not connected");
+
+    assert!(error.contains("not available in this build"), "got {error}");
+    assert_eq!(*coordination.set_storage_mode_calls.lock().unwrap(), 0);
+    assert!(repository
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|call| !matches!(call, Call::SetPolicy(_))));
+}
 
 #[tokio::test]
 async fn promotion_writes_coordination_before_the_local_flip() {
@@ -778,4 +815,82 @@ async fn reconciliation_deletes_settled_rows_and_compensates_in_flight_ones() {
     let retained = role_loss.row("op-unreachable").expect("a failed revert must keep its row");
     assert_eq!(retained.state, RoleLossOperationState::Compensating);
     assert_eq!(retained.attempts, 1);
+}
+
+// ===== provider-backed folders keep the same coordination guards =====
+
+fn provider_link(group_id: &str) -> FolderLink {
+    FolderLink {
+        location: yadorilink_replica_domain::session_state::LinkLocation::Provider {
+            locator: "provider://token-1".to_string(),
+            root_id: "abcdef01".repeat(4),
+        },
+        group_id: group_id.to_string(),
+        paused: false,
+        materialization_policy: MaterializationPolicy::Eager,
+        orphaned: false,
+    }
+}
+
+/// A provider folder is a link like any other for the durability guards: the last full replica
+/// cannot be unlinked without `--force`, and a forced unlink latches the durability status.
+#[tokio::test]
+async fn the_last_full_provider_folder_cannot_be_unlinked_without_force() {
+    let repository = Arc::new(FakeRepository::default().with_link(provider_link("group-1")));
+    let readiness = Arc::new(FakeReadiness::default());
+    readiness.digest_and_peer.lock().unwrap().push_back(None);
+    readiness.digest_and_peer.lock().unwrap().push_back(None);
+    let svc = service(
+        repository.clone(),
+        Arc::new(FakeRoleLoss::default()),
+        readiness,
+        Arc::new(FakeCoordination::configured()),
+        Arc::new(FakeRuntime::default()),
+    );
+
+    let refused = svc.ensure_unlink_keeps_a_full_replica("provider://token-1", false).await;
+    assert!(refused.is_err(), "the last full replica was unlinked without the guard");
+    let forced = svc.ensure_unlink_keeps_a_full_replica("provider://token-1", true).await.unwrap();
+    assert_eq!(forced, UnlinkCommit::RemoveNormally);
+    assert!(repository.calls.lock().unwrap().contains(&Call::Latch("group-1".to_string())));
+}
+
+/// Demoting a provider folder to on-demand goes through the same handoff: with a confirmed peer
+/// the coordination plane is written before the local flip, exactly as for a plain folder.
+#[tokio::test]
+async fn demoting_a_provider_folder_opens_the_role_loss_journal_like_any_other() {
+    let repository = Arc::new(FakeRepository::default().with_link(provider_link("group-1")));
+    let role_loss = Arc::new(FakeRoleLoss::default());
+    let readiness = Arc::new(FakeReadiness::default());
+    readiness.full_replica.store(true, Ordering::SeqCst);
+    readiness
+        .digest_and_peer
+        .lock()
+        .unwrap()
+        .push_back(Some(([1u8; 32], Some("device-b".to_string()))));
+    readiness.lease.lock().unwrap().push_back(Some("lease-1".to_string()));
+    let coordination = Arc::new(FakeCoordination::configured());
+    coordination.commit_result.lock().unwrap().push_back(RoleLossCommitOutcome::Committed(
+        HandoffCommitResult {
+            target_device_id: "device-b".to_string(),
+            membership_generation: 3,
+            lease_id: Some("lease-1".to_string()),
+        },
+    ));
+    let svc = service(
+        repository,
+        role_loss.clone(),
+        readiness,
+        coordination,
+        Arc::new(FakeRuntime::default()),
+    );
+
+    assert!(svc.set_storage_mode("group-1", true).await.is_ok());
+    let calls = role_loss.calls.lock().unwrap();
+    assert!(
+        calls.contains(&Call::OpenOperation("op-1".to_string())),
+        "no journal for a provider folder"
+    );
+    assert!(calls.contains(&Call::MarkWorkerCommitted("op-1".to_string())));
+    assert!(calls.contains(&Call::SettleSuccess("op-1".to_string())));
 }

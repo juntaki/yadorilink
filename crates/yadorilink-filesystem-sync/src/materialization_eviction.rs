@@ -1,6 +1,6 @@
-//! Manual/automatic eviction: reduces a hydrated file back to a placeholder
-//! and, on an on-demand device, reclaims its now-cached blocks once a full
-//! replica's custody is confirmed.
+//! Manual eviction: removes a present local object so its row becomes
+//! `Remote` and, on an on-demand device, reclaims its now-cached blocks once
+//! a full replica's custody is confirmed.
 //!
 //! Every `state.<method>` call in this module goes through `&dyn
 //! MaterializationExecutionPort`, never a concrete storage type, so this
@@ -11,7 +11,6 @@
 use std::path::Path;
 
 use yadorilink_local_storage::disk_bytes_match_indexed_blocks;
-use yadorilink_local_storage::free_space::{self, FreeSpaceState};
 use yadorilink_local_storage::verify_write_target_within_root;
 use yadorilink_local_storage::BlockReclamationStore;
 use yadorilink_replica_domain::file::RecordKind;
@@ -23,77 +22,225 @@ use crate::block_liveness::BlockLivenessGate;
 use crate::materialization_execution::{
     AbandonedEviction, MaterializationExecutionError, MaterializationExecutionPort,
 };
-use yadorilink_replica_domain::session_state::EvictableFile;
 
 /// Reuses `yadorilink-root-authority`'s `disk_race_fingerprint` rather than a
 /// local `(size, mtime)` pair: size+mtime alone lets a same-size local edit
 /// landing within the filesystem's mtime granularity slip past the
 /// pre-eviction revalidation below undetected -- and unlike the hydration
 /// race this same fingerprint also closes, eviction's outcome on a false
-/// match is more destructive: `write_placeholder` below replaces the
-/// user's just-edited bytes with a sparse hole, not merely stale remote
-/// content.
+/// match is more destructive: removing the object below destroys the
+/// user's just-edited bytes, not merely stale remote content.
 type DiskIdentity = Option<yadorilink_root_authority::fs_identity::DiskRaceFingerprint>;
 
 fn disk_identity(path: &Path) -> Result<DiskIdentity, MaterializationExecutionError> {
     Ok(yadorilink_root_authority::fs_identity::disk_race_fingerprint(path))
 }
 
-/// Reduces the already-`Hydrated` file at `out_path` to a placeholder.
+/// A point between eviction's last check of the object and its removal, at
+/// which a test can act on the disk the way a concurrent user would. Per
+/// thread, so concurrently running tests never see each other's hooks.
+#[cfg(any(test, feature = "test-support"))]
+type PreRemovalHook = Box<dyn FnMut(&Path)>;
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static PRE_REMOVAL_HOOK: std::cell::RefCell<Option<PreRemovalHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `hook` with the object's path at the point described on
+/// [`PreRemovalHook`], until the returned guard is dropped.
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_pre_removal_hook_for_test(
+    hook: impl FnMut(&Path) + 'static,
+) -> PreRemovalHookGuardForTest {
+    PRE_REMOVAL_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    PreRemovalHookGuardForTest(())
+}
+
+/// Clears the hook installed by [`set_pre_removal_hook_for_test`] on drop.
+#[cfg(any(test, feature = "test-support"))]
+pub struct PreRemovalHookGuardForTest(());
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for PreRemovalHookGuardForTest {
+    fn drop(&mut self) {
+        PRE_REMOVAL_HOOK.with(|slot| slot.borrow_mut().take());
+    }
+}
+
+/// Where eviction detaches an object before removing it, beside the object
+/// so the rename stays on one volume. A reserved artefact name: invisible to
+/// the watcher, the scan and capture.
+pub fn eviction_quarantine_path(
+    out_path: &Path,
+    rel_path: &str,
+) -> Result<std::path::PathBuf, MaterializationExecutionError> {
+    use sha2::{Digest, Sha256};
+    let id = hex::encode(Sha256::digest(format!("evict\0{rel_path}").as_bytes()));
+    let name = yadorilink_root_authority::reserved_namespace::artefact_component_name(
+        yadorilink_root_authority::reserved_namespace::ArtefactKind::Preimage,
+        &id,
+    )
+    .map_err(|e| MaterializationExecutionError::CorruptState(e.to_string()))?;
+    Ok(out_path.with_file_name(name))
+}
+
+/// Startup recovery of an eviction a crash stopped after it detached the
+/// object (see [`eviction_quarantine_path`]): the object goes back to its
+/// path if the path is free; if something stands there now, the detached
+/// object is kept as a recoverable conflict copy for capture to see. Nothing
+/// is ever deleted here.
+pub fn recover_eviction_quarantine(
+    state: &dyn MaterializationExecutionPort,
+    root: &Path,
+    group_id: &str,
+    rel_path: &str,
+) -> Result<(), MaterializationExecutionError> {
+    let out_path = root.join(rel_path);
+    let q = eviction_quarantine_path(&out_path, rel_path)?;
+    // Only a CONFIRMED absence counts as recovered; anything else (a
+    // permission or I/O error) is an error and keeps the caller's marker.
+    match std::fs::symlink_metadata(&q) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    }
+    restore_detached(state, root, group_id, rel_path, &q, &out_path)
+}
+
+/// Puts a detached object back at `out_path` without replacing anything: a
+/// hard link fails if the name is taken, and only then is the quarantine name
+/// dropped. When the name is taken, or links are unsupported, the object is
+/// moved aside as a conflict copy instead.
+fn restore_detached(
+    state: &dyn MaterializationExecutionPort,
+    root: &Path,
+    group_id: &str,
+    rel_path: &str,
+    q: &Path,
+    out_path: &Path,
+) -> Result<(), MaterializationExecutionError> {
+    match std::fs::hard_link(q, out_path) {
+        Ok(()) => {
+            trace_step("linked");
+            directory_barrier(out_path)?;
+            std::fs::remove_file(q)?;
+            trace_step("unlinked");
+            directory_barrier(out_path)?;
+            Ok(())
+        }
+        Err(_) => {
+            let ledger =
+                crate::materialization_execution::GroupStructuralLedger::new(state, group_id);
+            crate::held_path_reconcile::move_aside(root, rel_path, q, &ledger, "local-preserved")
+                .map(|_| ())
+        }
+    }
+}
+
+// Test-only trace of the steps eviction and its restore take, in order.
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static RESTORE_TRACE: std::cell::RefCell<Vec<&'static str>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Takes (and clears) this thread's restore trace.
+#[cfg(any(test, feature = "test-support"))]
+pub fn take_restore_trace_for_test() -> Vec<&'static str> {
+    RESTORE_TRACE.with(|t| std::mem::take(&mut *t.borrow_mut()))
+}
+
+// Test-only: makes the Nth (1-based) directory barrier on this thread fail.
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static FAIL_BARRIER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static BARRIERS_SEEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Arms the failure described on `FAIL_BARRIER` (`None` disarms) and resets
+/// the barrier count.
+#[cfg(any(test, feature = "test-support"))]
+pub fn fail_directory_barrier_for_test(nth: Option<usize>) {
+    FAIL_BARRIER.with(|c| c.set(nth));
+    BARRIERS_SEEN.with(|c| c.set(0));
+}
+
+/// Makes the parent directory's entries durable and records the barrier. The
+/// link and the quarantine name are the only two references to a detached
+/// object, so each step that changes one must be durable before the step that
+/// drops the other.
+fn directory_barrier(path: &Path) -> Result<(), MaterializationExecutionError> {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        let seen = BARRIERS_SEEN.with(|c| {
+            c.set(c.get() + 1);
+            c.get()
+        });
+        if FAIL_BARRIER.with(std::cell::Cell::get) == Some(seen) {
+            return Err(MaterializationExecutionError::CorruptState(
+                "injected directory sync failure".to_string(),
+            ));
+        }
+    }
+    yadorilink_local_storage::sync_parent_dir(path)?;
+    trace_step("synced");
+    Ok(())
+}
+
+pub(crate) fn trace_step(_step: &'static str) {
+    #[cfg(any(test, feature = "test-support"))]
+    RESTORE_TRACE.with(|t| t.borrow_mut().push(_step));
+}
+
+fn fire_pre_removal_hook(_out_path: &Path) {
+    #[cfg(any(test, feature = "test-support"))]
+    PRE_REMOVAL_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(_out_path);
+        }
+    });
+}
+
+/// Removes the present object at `out_path` so its row can become `Remote`.
 ///
-/// Non-Windows: `create_or_defer_placeholder`
-/// via `write_placeholder`, which IS the disk truth, so minting a fresh
-/// on-disk identity on every eviction is correct.
+/// Without a native provider: the object is removed outright, so nothing
+/// stands in the user tree for the evicted file; the caller has just verified
+/// byte for byte that what is removed is the version being evicted.
 ///
-/// Windows: deliberately does NOT call `create_or_defer_placeholder`.
-/// That function's Windows arm always MINTS A FRESH generation, which is
-/// right for CREATING a placeholder that doesn't exist yet, but
-/// wrong here: this file's placeholder object already exists on disk (it
-/// went `Placeholder` -> `Hydrated` at some point), and
-/// `CfDehydratePlaceholder` does not reassign `FileIdentity` -- minting a
-/// new generation here would record an identity in the index that no
-/// longer matches what's actually on disk, breaking the same ABA guard
-/// Windows dirty detection and this call's own `expected_generation` check
-/// both depend on staying accurate. Instead this reads the identity
-/// ALREADY recorded for this row (unchanged by dehydration) and confirms
-/// real on-disk dehydration via `MaterializationExecutionPort::
-/// dehydrate_windows_placeholder` before returning.
+/// Windows: the object is a CfAPI placeholder this device created, and
+/// `CfDehydratePlaceholder` keeps its `FileIdentity`, so the identity ALREADY
+/// recorded for this row is read before dehydration, the native dehydrate is
+/// confirmed through `MaterializationExecutionPort::dehydrate_windows_
+/// placeholder`, and the same identity is re-affirmed. Minting a fresh
+/// generation here would record an identity that no longer matches what is
+/// on disk. With no identity recorded there is no provider object to
+/// dehydrate, and the eviction fails closed (`EvictionRejected`) rather than
+/// leave a `Remote` row over a fully materialized file; the caller rolls the
+/// row back to `Present`.
 ///
-/// If no identity is recorded at all (a legacy/never-cfapi-created
-/// `Hydrated` row, or one whose recorded provider isn't the Windows CfAPI
-/// generation provider), there is no existing placeholder object to
-/// dehydrate -- creating a fresh one here would be wrong:
-/// `sync_placeholders` (cfapi-host's poll
-/// loop) skips any path that already `exists()` on disk, so a
-/// `Placeholder` row with no real placeholder object underneath it would
-/// sit stranded, permanently claiming to be dehydrated while the real
-/// file stays fully materialized. Fails closed instead (`EvictionRejected`),
-/// which the caller's existing placeholder-write-error branch already
-/// rolls back to `Hydrated` for.
-///
-/// Actual commit order on Windows is `Evicting -> native dehydrate
-/// confirmed -> Placeholder -> identity re-affirmed -> blocks reclaimed`
-/// (the `Placeholder` transition happens before the returned
-/// `RecordOverwrite` is applied by `evict_file`'s caller, not after) --
-/// safe only because the value `RecordOverwrite` carries is READ before
-/// dehydration and never changes, so there is no window where the row
-/// could read as `Placeholder` with a wrong or absent identity.
-fn evict_to_placeholder(
+/// Commit order on Windows is `Evicting -> native dehydrate confirmed ->
+/// Remote -> identity re-affirmed -> blocks reclaimed`: safe only because the
+/// value the returned outcome carries is READ before dehydration and never
+/// changes, so there is no window where the row reads `Remote` with a wrong
+/// or absent identity.
+fn evict_to_remote(
     state: &dyn MaterializationExecutionPort,
     group_id: &str,
     path: &str,
     out_path: &Path,
-    size: u64,
-    mtime_unix_nanos: i64,
-) -> Result<yadorilink_local_storage::PlaceholderIdentityToRecord, MaterializationExecutionError> {
+    root: &Path,
+    approved: &ApprovedObject<'_>,
+) -> Result<Removal, MaterializationExecutionError> {
     #[cfg(windows)]
     {
-        let _ = (size, mtime_unix_nanos);
+        let _ = (root, approved);
         let recorded = state.get_recorded_placeholder_identity(group_id, path)?;
         let Some((identity, provider_kind)) = recorded else {
             return Err(MaterializationExecutionError::EvictionRejected(format!(
                 "{path} has no recorded Windows placeholder identity to dehydrate; refusing to \
-                 evict rather than strand a Placeholder row with no real placeholder object \
+                 evict rather than strand a Remote row with no real placeholder object \
                  underneath it"
             )));
         };
@@ -108,15 +255,126 @@ fn evict_to_placeholder(
         // Identity is unchanged by dehydration -- re-affirmed, not
         // replaced, since `CfDehydratePlaceholder` never reassigns
         // `FileIdentity`.
-        Ok(yadorilink_local_storage::PlaceholderIdentityToRecord::RecordOverwrite {
-            identity,
-            provider_kind: yadorilink_local_storage::WINDOWS_CFAPI_GENERATION_PROVIDER_KIND,
-        })
+        Ok(Removal::Removed(
+            yadorilink_local_storage::PlaceholderIdentityToRecord::RecordOverwrite {
+                identity,
+                provider_kind: yadorilink_local_storage::WINDOWS_CFAPI_GENERATION_PROVIDER_KIND,
+            },
+        ))
     }
     #[cfg(not(windows))]
     {
-        let _ = (state, group_id, path);
-        Ok(yadorilink_local_storage::create_or_defer_placeholder(out_path, size, mtime_unix_nanos)?)
+        fire_pre_removal_hook(out_path);
+        // Detach first, then look: a path-based unlink would destroy whatever
+        // is at the path at that instant, and an editor can save between the
+        // last check and the unlink. A rename moves exactly the object that
+        // has the name, so what is deleted is exactly what is examined.
+        let q = eviction_quarantine_path(out_path, path)?;
+        // Never replacing: whatever already has the quarantine name (a
+        // leftover of a crashed eviction, or a user's file) is recovered
+        // first, as a conflict copy because the path is occupied, and the
+        // rename is tried once more. Still taken: fail closed.
+        let mut attempts = 0;
+        loop {
+            match yadorilink_local_storage::rename_no_replace(out_path, &q) {
+                Ok(()) => break,
+                // Something else removed it first: not this eviction's removal.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(Removal::Competing)
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempts == 0 => {
+                    attempts += 1;
+                    recover_eviction_quarantine(state, root, group_id, path)?;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(MaterializationExecutionError::EvictionRejected(format!(
+                        "{path}: its quarantine name is occupied"
+                    )))
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        trace_step("detached");
+        // The detach is durable before anything is decided about the object:
+        // a crash from here leaves it under one of the two names.
+        if let Err(error) = directory_barrier(out_path) {
+            restore_detached(state, root, group_id, path, &q, out_path)?;
+            return Err(error);
+        }
+        let approved_object = approved.matches(&q)
+            && disk_bytes_match_indexed_blocks(&q, approved.blocks).unwrap_or(false);
+        if !approved_object {
+            restore_detached(state, root, group_id, path, &q, out_path)?;
+            return Ok(Removal::Diverged);
+        }
+        trace_step("verified");
+        match std::fs::remove_file(&q) {
+            Ok(()) => {}
+            Err(error) => {
+                restore_detached(state, root, group_id, path, &q, out_path)?;
+                return Err(error.into());
+            }
+        }
+        trace_step("unlinked");
+        // Nothing settles `Remote` and no block is reclaimed until the unlink
+        // is durable: a crash could otherwise bring the object back under its
+        // quarantine name while the row already says `Remote`. A failed sync
+        // leaves the row `Evicting` and returns the error; startup re-decides
+        // (the object back under the quarantine name -> restored; absent ->
+        // `Remote`).
+        if let Err(error) = directory_barrier(out_path) {
+            return Ok(Removal::Unconfirmed(error));
+        }
+        Ok(Removal::Removed(yadorilink_local_storage::PlaceholderIdentityToRecord::Clear))
+    }
+}
+
+/// What eviction found when it removed the object.
+enum Removal {
+    /// This eviction removed the object it had approved.
+    Removed(yadorilink_local_storage::PlaceholderIdentityToRecord),
+    /// The object was unlinked but the unlink could not be made durable.
+    Unconfirmed(MaterializationExecutionError),
+    /// The object was already gone: a competing removal, not this eviction's.
+    Competing,
+    /// The object that was detached is not the one that was approved (a save
+    /// landed in between); it has been put back, or kept as a recoverable
+    /// copy, untouched.
+    Diverged,
+}
+
+/// The object eviction approved by its last check: which file it was and
+/// which bytes it held.
+struct ApprovedObject<'a> {
+    #[cfg(unix)]
+    inode: Option<(u64, u64)>,
+    blocks: &'a [yadorilink_replica_domain::file::BlockInfo],
+}
+
+impl<'a> ApprovedObject<'a> {
+    fn observe(_path: &Path, blocks: &'a [yadorilink_replica_domain::file::BlockInfo]) -> Self {
+        Self {
+            #[cfg(unix)]
+            inode: Self::inode_of(_path),
+            blocks,
+        }
+    }
+
+    #[cfg(unix)]
+    fn inode_of(path: &Path) -> Option<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path).ok().map(|m| (m.dev(), m.ino()))
+    }
+
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    fn matches(&self, _detached: &Path) -> bool {
+        true
+    }
+
+    #[cfg(unix)]
+    fn matches(&self, detached: &Path) -> bool {
+        self.inode.is_some() && Self::inode_of(detached) == self.inode
     }
 }
 
@@ -132,26 +390,24 @@ pub struct EvictionOutcome {
     pub bytes_reclaimed: u64,
     /// The file became a placeholder but its blocks were retained (custody
     /// unconfirmed, this is a full replica, or the blocks still back other
-    /// locally hydrated/pinned content) rather than freed.
+    /// locally hydrated content) rather than freed.
     pub blocks_retained: bool,
     /// The on-disk file was reduced to a placeholder — the materialized
     /// working-tree copy was freed. `false` means this call left the file
-    /// materialized (an early-return path: no longer current, pinned,
-    /// not `Hydrated`, path dirty, or its on-disk identity changed), so it
-    /// freed no working-tree bytes and an eviction sweep must not count it.
+    /// materialized (an early-return path: no longer current, not
+    /// `Present`, path dirty, or its on-disk identity changed), so it freed
+    /// no working-tree bytes.
     pub dehydrated: bool,
 }
 
 /// The handles a materialization/eviction operation needs: the index, the
 /// block-liveness gate, the block store, and the linked folder's local root.
-/// Shared by [`evict_file`], [`run_eviction_sweep`], and
-/// [`run_disk_pressure_eviction_sweep`].
+/// Taken by [`evict_file`].
 pub struct MaterializationContext<'a> {
     pub state: &'a dyn MaterializationExecutionPort,
     pub liveness_gate: &'a BlockLivenessGate,
-    // Narrowed to the reclamation surface: every caller sharing this context
-    // (`evict_file`, `run_eviction_sweep`, `run_disk_pressure_eviction_sweep`)
-    // only ever forwards `store` into `MaterializationExecutionPort::
+    // Narrowed to the reclamation surface: `evict_file` only ever forwards
+    // `store` into `MaterializationExecutionPort::
     // reclaim_cached_blocks`, never calls a content method
     // (`put`/`get`/`present_blocks`) on it directly.
     pub store: &'a dyn BlockReclamationStore,
@@ -163,11 +419,9 @@ pub struct MaterializationContext<'a> {
     pub permit: &'a RootCommitPermit<'a>,
 }
 
-/// Evicts one hydrated, unpinned file back to a placeholder and, on an
-/// on-demand device, reclaims its now-cached blocks from the block store to
-/// free real disk space — the sync state (version, block list) is untouched.
-/// Rejects a pinned file (spec "Pinned files cannot be evicted") without
-/// touching it.
+/// Evicts one hydrated file back to a placeholder and, on an on-demand
+/// device, reclaims its now-cached blocks from the block store to free real
+/// disk space — the sync state (version, block list) is untouched.
 ///
 /// Block reclamation is gated fail-closed by two rules:
 /// - `is_full_replica`: a full replica is the group's durable holder and MUST
@@ -180,7 +434,7 @@ pub struct MaterializationContext<'a> {
 ///   sole holder of content.
 ///
 /// Even when custody is confirmed, only blocks that no longer back any
-/// locally hydrated or pinned file are freed; a block still shared with such
+/// locally hydrated file are freed; a block still shared with such
 /// a file is kept so its bytes stay materializable on disk.
 ///
 /// Physical reclamation is currently fail-closed in production: until the
@@ -193,7 +447,7 @@ pub struct MaterializationContext<'a> {
 /// `PeerSyncSession::materialize` and for the same reason: this device's
 /// own watcher would otherwise race the state transition (see
 /// `local_change::process_event`'s placeholder-aware self-echo
-/// suppression, which only works if the index already says `Placeholder`
+/// suppression, which only works if the index already says `Remote`
 /// by the time the watcher processes the resulting filesystem event).
 pub fn evict_file(
     ctx: MaterializationContext<'_>,
@@ -205,16 +459,13 @@ pub fn evict_file(
     let MaterializationContext { state, liveness_gate, store, root, permit } = ctx;
     let reference_write = liveness_gate.begin_reference_write();
     state.verify_root(root, group_id)?;
-    // One snapshot-shaped read replacing the three unconditional pre-lock
-    // CRUD reads (`is_pinned`/`get_current_version_record`/`get_record_kind`)
-    // this function used to make individually — see
+    // One snapshot-shaped read replacing the unconditional pre-lock CRUD
+    // reads (`get_current_version_record`/`get_record_kind`) this function
+    // used to make individually — see
     // `MaterializationExecutionPort::eviction_eligibility_snapshot`'s doc
     // comment for why this changes nothing about consistency, only call
     // count.
     let eligibility = state.eviction_eligibility_snapshot(group_id, path)?;
-    if eligibility.pinned {
-        return Err(MaterializationExecutionError::EvictionRejected(path.to_string()));
-    }
     // Read the current row's blocks AND metadata as ONE atomic snapshot, so
     // the `change::VersionHash` the custody query carries describes a version
     // some single row actually held — never a hybrid stitched across
@@ -246,6 +497,7 @@ pub fn evict_file(
         &crate::materialization_execution::GroupStructuralLedger::new(state, group_id),
     )?;
     let initial_disk_identity = disk_identity(&out_path)?;
+    let approved_object = ApprovedObject::observe(&out_path, &record.blocks);
     // `#[cfg(test)]` alone would only select this crate's OWN test build --
     // a downstream crate's tests (one that constructs a confirming custody
     // double and expects eviction to reach physical block deletion) link
@@ -258,19 +510,18 @@ pub fn evict_file(
     // their own tests.
     //
     // This is a DIFFERENT feature than this crate's general `test-support`
-    // (which gates unrelated test doubles like `OverrideForTest`/
+    // (which gates unrelated test doubles like `set_test_on_demand_allowed`/
     // `FakeCommitAdapter`): `yadorilink-daemon` and `yadorilink-cli` both
-    // need `test-support` for those, but their own tests
-    // (`preflight_disk_pressure_runs_eviction_sweep_for_on_demand_link_first`,
-    // `eviction_without_remote_lease_never_reaches_physical_reclaim`)
-    // specifically assert that an instantaneous custody confirmation
+    // need `test-support` for those, but their own test
+    // (`eviction_without_remote_lease_never_reaches_physical_reclaim`)
+    // specifically asserts that an instantaneous custody confirmation
     // *without* a durable remote lease must NOT authorize physical block
-    // deletion -- i.e. they need the real, fails-closed
+    // deletion -- i.e. it needs the real, fails-closed
     // `verify_reclaim_custody`, not the bypass. Folding this into the
     // shared `test-support` feature previously made every consumer of that
     // feature (not just the ones that opt into
     // `evict-custody-test-bypass`) silently skip the durable-lease gate,
-    // which is exactly the regression these two tests caught.
+    // which is exactly the regression that test caught.
     let verified_custody = (!is_full_replica)
         .then(|| {
             #[cfg(any(test, feature = "evict-custody-test-bypass"))]
@@ -310,15 +561,14 @@ pub fn evict_file(
         !current.deleted && current.to_file_version().version_hash == evicting_version.version_hash
     });
     if !still_current
-        || revalidation.pinned
-        || revalidation.materialization_state != Some(MaterializationState::Hydrated)
+        || revalidation.materialization_state != Some(MaterializationState::Present)
         || revalidation.path_dirty
         || disk_identity(&out_path)? != initial_disk_identity
         || !disk_bytes_match_indexed_blocks(&out_path, &record.blocks)?
     {
         // Bail out before writing the placeholder: the file is left fully
-        // materialized, so `dehydrated` stays `false` (the default) and an
-        // automatic sweep must not count it as having freed any bytes.
+        // materialized, so `dehydrated` stays `false` (the default): nothing
+        // was freed.
         return Ok(EvictionOutcome { blocks_retained: true, ..Default::default() });
     }
 
@@ -328,13 +578,13 @@ pub fn evict_file(
     // external edit is detected, and detecting one means this attempt has
     // changed nothing at all -- no fence bump, no write, the existing
     // actual-state generation still valid. Returning from here leaves the
-    // row `Hydrated` with that proof intact, which is the truth.
+    // row `Present` with that proof intact, which is the truth.
     //
     // Rejecting from INSIDE `Evicting` and then rolling forward to
-    // `Placeholder` is a data-loss race: the rejected file is the user's
+    // `Remote` is a data-loss race: the rejected file is the user's
     // freshly edited content, `path_lock` kept the watcher from capturing
     // the edit, and once this releases the lock a `hydrate` that wins the
-    // race against the queued watcher event sees a `Placeholder` row whose
+    // race against the queued watcher event sees a `Remote` row whose
     // on-disk bytes are stable, satisfies its own commit check, and
     // reconstructs the indexed blocks straight over the edit.
     state.verify_root(root, group_id)?;
@@ -358,38 +608,54 @@ pub fn evict_file(
     // every failure closes the row with `abandon_eviction` rather than
     // leave it `Evicting`.
     let eviction_fence = state.open_eviction(group_id, path, permit)?;
-    let placeholder_result: Result<
-        yadorilink_local_storage::PlaceholderIdentityToRecord,
-        MaterializationExecutionError,
-    > = {
+    let placeholder_result: Result<Removal, MaterializationExecutionError> = {
         // The mutator's own physical write (hydrated content ->
         // placeholder) -- bumped before it, inside `path_lock` (held by
         // `_path_guard` for this whole function). No frontier proof to
         // publish under here, so this only ever invalidates. Everything
         // after this point has touched, or may have touched, the file.
-        eviction_fence.and_then(|_| {
-            evict_to_placeholder(
+        eviction_fence
+            .and_then(|_| evict_to_remote(state, group_id, path, &out_path, root, &approved_object))
+    };
+    let placeholder_outcome = match placeholder_result {
+        Ok(Removal::Removed(outcome)) => outcome,
+        // The row stays `Evicting` (not rolled back, not settled).
+        Ok(Removal::Unconfirmed(error)) => return Err(error),
+        Ok(not_removed @ (Removal::Competing | Removal::Diverged)) => {
+            // (`Unconfirmed` returned above.)
+            // Nothing of this eviction's was removed. The row goes back to
+            // `Present` (no proof: the fence was bumped), and what happened
+            // to the object is journaled for capture: a competing removal
+            // stays delete evidence, a save stays an edit.
+            let kind = match not_removed {
+                Removal::Competing => "removed",
+                _ => "created_or_modified",
+            };
+            abandon_failed_eviction(
                 state,
                 group_id,
                 path,
-                &out_path,
-                record.size,
-                record.mtime_unix_nanos,
-            )
-        })
-    };
-    let placeholder_outcome = match placeholder_result {
-        Ok(outcome) => outcome,
+                &evicting_version.version_hash,
+                AbandonedEviction::NotWritten,
+                permit,
+            )?;
+            let observed_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as i64)
+                .unwrap_or(0);
+            state.record_dirty_path(group_id, path, kind, observed_at, permit)?;
+            return Ok(EvictionOutcome { blocks_retained: true, ..Default::default() });
+        }
         Err(MaterializationExecutionError::EvictionOutcomeAmbiguous(reason)) => {
             // Unlike every other error
             // here, this one does NOT mean "the file is still fully
             // materialized" -- the native dehydrate call's outcome could
             // not be confirmed (see the variant's own doc comment), so it
             // may have already succeeded on disk. Rolling back to
-            // `Hydrated` here would be actively wrong in that case (a
-            // dehydrated placeholder mislabeled `Hydrated`, no longer
-            // reconciled by anything). Resolve it to `Placeholder` now, as
-            // `reset_stale_evicting_to_placeholder`'s startup recovery
+            // `Present` here would be actively wrong in that case (a
+            // dehydrated placeholder mislabeled `Present`, no longer
+            // reconciled by anything). Resolve it to `Remote` now, as
+            // `reset_stale_evicting`'s startup recovery
             // would, which is safe regardless of which outcome actually
             // happened (Windows eviction never mints a fresh identity, so the already-recorded one
             // stays correct either
@@ -417,7 +683,7 @@ pub fn evict_file(
             // Windows arm reports a dehydrate that may have happened as
             // the ambiguous variant above, and the non-Windows write fails
             // only before its rename. So the path still holds whatever it
-            // held before the write, and the row goes back to `Hydrated`,
+            // held before the write, and the row goes back to `Present`,
             // its entry state -- with a fresh proof when the bytes still
             // verify as the version revalidated above (the bump
             // invalidated the old one), without one when a local edit or
@@ -454,9 +720,9 @@ pub fn evict_file(
             return Err(error);
         }
     };
-    // `Evicting` -> `Placeholder` only if the row is still `Evicting`,
+    // `Evicting` -> `Remote` only if the row is still `Evicting`,
     // then the placeholder's identity. The placeholder is on disk by now,
-    // so a failed settle resolves the row to `Placeholder` rather than
+    // so a failed settle resolves the row to `Remote` rather than
     // leave it `Evicting`.
     let settled = match state.settle_eviction(group_id, path, placeholder_outcome, permit) {
         Ok(settled) => settled,
@@ -519,8 +785,7 @@ pub fn evict_file(
 /// the caller then returns the eviction's error, and a row this leaves
 /// `Evicting` is still resolved by the startup reset. Any other failure
 /// (the database refused, the root was lost) is returned, and the caller
-/// returns it in place of its own path-local error, so a sweep aborts on it
-/// instead of going on to meet it again at every later candidate.
+/// returns it in place of its own path-local error.
 fn abandon_failed_eviction(
     state: &dyn MaterializationExecutionPort,
     group_id: &str,
@@ -545,247 +810,4 @@ fn abandon_failed_eviction(
         Err(error) => return Err(error),
     }
     Ok(())
-}
-
-/// Logs a failed eviction of one sweep candidate and answers whether the
-/// sweep may go on to the next one: only when the failure is local to that
-/// path. Anything else (a database or invariant failure, a lost root)
-/// aborts the sweep.
-///
-/// A lost root is re-checked here rather than read off the error: an owner
-/// transaction that finds the root lost reports it as an I/O error, the
-/// same variant a path-local failure uses, so the permit is verified before
-/// the sweep moves on, and its failure is returned in place of `error`.
-fn sweep_may_continue_past(
-    group_id: &str,
-    path: &str,
-    error: &MaterializationExecutionError,
-    permit: &RootCommitPermit<'_>,
-) -> Result<bool, MaterializationExecutionError> {
-    if !error.is_path_local() {
-        return Ok(false);
-    }
-    permit.verify()?;
-    tracing::warn!(
-        group_id,
-        path = %path,
-        error = %error,
-        "eviction sweep could not evict this candidate; continuing with the next"
-    );
-    Ok(true)
-}
-
-/// Runs one pass of the automatic eviction sweep for a single
-/// `OnDemand` folder group with a configured disk-usage cap: evicts
-/// least-recently-accessed unpinned hydrated files until usage is back at
-/// or under `max_local_size_bytes`. Returns the paths evicted, in the
-/// order they were evicted (least-recently-accessed first).
-///
-/// No-ops (returns an empty list) if `max_local_size_bytes` is `None` —
-/// the daemon-level caller is expected to only invoke this for folder
-/// groups that actually have a cap configured, but this is a safe no-op
-/// either way, matching the "no cap configured = no automatic eviction"
-/// requirement even if called unconditionally by mistake.
-///
-/// Before ranking candidates, best-effort fills in `last_accessed_unix`
-/// from each file's on-disk `atime` for files that have *never* recorded
-/// one at all — chiefly, a file that was already
-/// fully materialized before this device ever supported on-demand sync at
-/// all, per the "existing materialized content is preserved on upgrade"
-/// requirement, so hydration's own `touch_last_accessed` call never ran
-/// for it). Deliberately does **not** overwrite an *existing* recorded
-/// value: atime also advances on writes (not just reads), so once a real
-/// access timestamp is on record, trusting it over a possibly
-/// write-inflated atime is the safer default, accepting the trade-off
-/// this implies for files hydrated once, then only
-/// ever read (never re-hydrated) afterward.
-///
-/// Errors reading a given file's metadata (e.g. it vanished) are ignored
-/// for that one file rather than failing the whole sweep, and so is a
-/// candidate whose eviction fails for a reason local to its path
-/// ([`MaterializationExecutionError::is_path_local`]); any other failure
-/// aborts the sweep.
-///
-/// Without remote custody leases, eviction still replaces hydrated working-tree
-/// files with placeholders, but retains their content-addressed blocks. This
-/// releases the materialized copy without treating retained cache blocks as
-/// physically reclaimed custody-backed storage.
-pub fn run_eviction_sweep(
-    ctx: MaterializationContext<'_>,
-    group_id: &str,
-    is_full_replica: bool,
-    max_local_size_bytes: Option<i64>,
-    custody: &dyn FullReplicaCustody,
-) -> Result<Vec<String>, MaterializationExecutionError> {
-    let MaterializationContext { state, liveness_gate, store, root, permit } = ctx;
-    // A full replica is the group's durable holder and never evicts.
-    if is_full_replica {
-        return Ok(vec![]);
-    }
-    let Some(cap) = max_local_size_bytes else {
-        return Ok(vec![]);
-    };
-    let cap = cap.max(0) as u64;
-
-    let mut candidates = state.list_evictable_files(group_id)?;
-    refresh_missing_last_accessed(state, root, group_id, &candidates);
-    // Re-read now that any refreshed access times have been persisted, so
-    // the LRU ordering below reflects them.
-    candidates = state.list_evictable_files(group_id)?;
-
-    // usage must include pinned-but-hydrated content too, even
-    // though `candidates` (eviction *candidates*) deliberately excludes
-    // pinned files — otherwise the sweep undercounts real disk usage and
-    // can stop while still over the configured cap.
-    let mut current_usage = state.hydrated_usage_bytes(group_id)?;
-    let mut evicted = Vec::new();
-
-    for candidate in candidates {
-        if current_usage <= cap {
-            break;
-        }
-        // `evict_file` always runs the path-state and disk-identity checks.
-        // It may replace the working-tree file with a placeholder even when
-        // remote custody cannot authorize physical CAS deletion; in that case
-        // it explicitly retains every block. It may also early-return having
-        // freed nothing (the candidate is no longer current, was pinned or
-        // rehydrated, went dirty, or its on-disk identity changed) — only a
-        // call that actually dehydrated the working-tree copy reduces the
-        // hydrated-usage figure this sweep tracks, so gate the accounting on
-        // it rather than assuming every candidate was reclaimed.
-        let outcome = match evict_file(
-            MaterializationContext { state, liveness_gate, store, root, permit },
-            group_id,
-            &candidate.path,
-            false,
-            custody,
-        ) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                if sweep_may_continue_past(group_id, &candidate.path, &error, permit)? {
-                    continue;
-                }
-                return Err(error);
-            }
-        };
-        if !outcome.dehydrated {
-            continue;
-        }
-        current_usage = current_usage.saturating_sub(candidate.size);
-        evicted.push(candidate.path);
-    }
-    Ok(evicted)
-}
-
-/// Best-effort refresh of `last_accessed_unix` from on-disk `atime` for
-/// evictable candidates that have never recorded one — the same fallback
-/// `run_eviction_sweep` performs (see its doc comment), factored out so the
-/// disk-pressure-triggered sweep below reuses it verbatim instead
-/// of duplicating the LRU-freshening logic.
-fn refresh_missing_last_accessed(
-    state: &dyn MaterializationExecutionPort,
-    root: &Path,
-    group_id: &str,
-    candidates: &[EvictableFile],
-) {
-    for candidate in candidates {
-        if candidate.last_accessed_unix.is_some() {
-            continue;
-        }
-        let Ok(metadata) = std::fs::metadata(root.join(&candidate.path)) else { continue };
-        let Ok(accessed) = metadata.accessed() else { continue };
-        let Ok(unix_secs) = accessed.duration_since(std::time::UNIX_EPOCH) else { continue };
-        let _ = state.touch_last_accessed(group_id, &candidate.path, unix_secs.as_secs() as i64);
-    }
-}
-
-/// Runs the automatic eviction sweep
-/// in response to disk-space pressure on the volume hosting `root`,
-/// independent of whether `group_id`'s link has any `max_local_size_bytes`
-/// cap configured at all — the disk-pressure trigger `run_eviction_sweep`
-/// above's cap-based one doesn't cover, per the `on-demand-sync` spec's
-/// "disk-space pressure triggers a sweep regardless of configured cap".
-///
-/// Reuses, rather than reimplements, the exact same
-/// `list_evictable_files` LRU-ordering and pinned-file exclusion
-/// `run_eviction_sweep` already relies on — the only difference is the
-/// stopping condition (volume free-space classification instead of a
-/// configured byte cap). Evicts least-recently-accessed unpinned hydrated
-/// files until the volume's free-space classification would no longer be
-/// `Low`/`Critical` (estimated from bytes freed so far, without re-`stat`ing
-/// the volume after every single eviction), or there are no more evictable
-/// candidates. A no-op (`Ok(vec![])`) if the volume is already `Ok`, or if
-/// its free space can't currently be determined at all (e.g. `root` doesn't
-/// exist yet) — nothing to evict for in either case. Returns the paths
-/// evicted, in eviction order, so a caller (e.g. the daemon's
-/// hydration/materialization preflight) can re-check headroom afterward and
-/// let the original operation proceed if enough space was reclaimed.
-/// Without crash-durable remote custody leases, candidates may still become
-/// placeholders while their CAS blocks remain retained.
-pub fn run_disk_pressure_eviction_sweep(
-    ctx: MaterializationContext<'_>,
-    group_id: &str,
-    is_full_replica: bool,
-    headroom_override_bytes: Option<u64>,
-    custody: &dyn FullReplicaCustody,
-) -> Result<Vec<String>, MaterializationExecutionError> {
-    let MaterializationContext { state, liveness_gate, store, root, permit } = ctx;
-    // A full replica is the group's durable holder and never evicts.
-    if is_full_replica {
-        return Ok(vec![]);
-    }
-    let Ok(space) = free_space::classify_volume(root, headroom_override_bytes) else {
-        return Ok(vec![]);
-    };
-    if space.classify() == FreeSpaceState::Ok {
-        return Ok(vec![]);
-    }
-
-    let mut candidates = state.list_evictable_files(group_id)?;
-    refresh_missing_last_accessed(state, root, group_id, &candidates);
-    // Re-read now that any refreshed access times have been persisted, so
-    // the LRU ordering below reflects them (same discipline as
-    // `run_eviction_sweep` above).
-    candidates = state.list_evictable_files(group_id)?;
-
-    // The "no longer Low/Critical" boundary is the same `> 2x headroom`
-    // threshold `classify` itself uses for `Ok` — stop once enough has been
-    // freed (estimated, not re-queried per file) to cross it.
-    let target_available = space.headroom_bytes.saturating_mul(2);
-    let mut freed: u64 = 0;
-    let mut evicted = Vec::new();
-    for candidate in candidates {
-        if space.available_bytes.saturating_add(freed) > target_available {
-            break;
-        }
-        // Placeholdering releases the materialized working-tree copy. The
-        // inner eviction operation separately requires verified custody before
-        // deleting any content-addressed block. When `evict_file` early-returns
-        // without writing the placeholder (candidate no longer current, pinned,
-        // rehydrated, dirty, or on-disk identity changed) it freed no bytes, so
-        // only count the working-tree copy against `freed` when it actually
-        // dehydrated — otherwise the sweep over-estimates reclaimed space and
-        // can stop while the volume is still under pressure.
-        let outcome = match evict_file(
-            MaterializationContext { state, liveness_gate, store, root, permit },
-            group_id,
-            &candidate.path,
-            false,
-            custody,
-        ) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                if sweep_may_continue_past(group_id, &candidate.path, &error, permit)? {
-                    continue;
-                }
-                return Err(error);
-            }
-        };
-        if !outcome.dehydrated {
-            continue;
-        }
-        freed = freed.saturating_add(candidate.size);
-        evicted.push(candidate.path);
-    }
-    Ok(evicted)
 }

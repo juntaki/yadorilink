@@ -27,6 +27,9 @@ fn now_unix() -> i64 {
 /// no IPC proto -- see the composition root for what backs each one in
 /// production.
 pub(crate) struct EnrollmentService {
+    /// Serializes provider-folder creations, so two requests with one token cannot both pass the
+    /// retry check.
+    provider_creation: tokio::sync::Mutex<()>,
     device_id: String,
     repository: Arc<dyn EnrollmentRepository>,
     coordination: Arc<dyn EnrollmentCoordination>,
@@ -41,7 +44,55 @@ pub(crate) struct CreateAndLinkCommand {
     pub(crate) group_name: String,
     pub(crate) absolute_path: PathBuf,
     pub(crate) on_demand: bool,
-    pub(crate) acknowledge_risks: bool,
+    /// `Some` for a provider-backed folder: `absolute_path` is ignored and the folder is keyed by
+    /// the request token.
+    pub(crate) provider: Option<ProviderCreation>,
+}
+
+/// A provider-backed folder to create: a display name and the client's retry identity.
+#[derive(Debug, Clone)]
+pub(crate) struct ProviderCreation {
+    pub(crate) display_name: String,
+    pub(crate) request_token: String,
+}
+
+impl ProviderCreation {
+    /// The synthetic link key. Never a path.
+    fn locator(&self) -> String {
+        format!("provider://{}", self.request_token)
+    }
+}
+
+/// A stable operation id for a provider creation, derived like invite acceptance: a retry of the
+/// same token reaches the same journal row and the same (idempotent) remote prepare.
+fn provider_operation_id(token: &str, digest: &str, device_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"provider-link\0");
+    hasher.update(token.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(digest.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(device_id.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// The digest a token is bound to: the same token with a different request is refused.
+fn creation_digest(
+    creation: &ProviderCreation,
+    group: &str,
+    on_demand: bool,
+    kind: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for part in
+        [creation.display_name.as_str(), group, kind, if on_demand { "on-demand" } else { "eager" }]
+    {
+        hasher.update(part.as_bytes());
+        hasher.update(b"\0");
+    }
+    hex::encode(hasher.finalize())
 }
 
 /// High-level join-and-link command.
@@ -50,7 +101,7 @@ pub(crate) struct JoinAndLinkCommand {
     pub(crate) group_name: String,
     pub(crate) absolute_path: PathBuf,
     pub(crate) on_demand: bool,
-    pub(crate) acknowledge_risks: bool,
+    pub(crate) provider: Option<ProviderCreation>,
 }
 
 /// High-level cross-account invite-accept command. `code` is the plaintext
@@ -60,7 +111,6 @@ pub(crate) struct AcceptInviteCommand {
     pub(crate) code: String,
     pub(crate) absolute_path: PathBuf,
     pub(crate) on_demand: bool,
-    pub(crate) acknowledge_risks: bool,
 }
 
 /// A stable operation id derived from `(code, device_id)` rather than a
@@ -202,7 +252,13 @@ impl EnrollmentService {
         coordination: Arc<dyn EnrollmentCoordination>,
         links: Arc<dyn EnrollmentLinkPort>,
     ) -> Self {
-        Self { device_id, repository, coordination, links }
+        Self {
+            provider_creation: tokio::sync::Mutex::new(()),
+            device_id,
+            repository,
+            coordination,
+            links,
+        }
     }
 
     pub(crate) async fn create_and_link(
@@ -213,22 +269,57 @@ impl EnrollmentService {
             return Err(EnrollmentError::LocalIdentityUnavailable);
         }
         let storage_mode = if command.on_demand { "on-demand" } else { "eager" };
+        let mut command = command;
+        let _provider_guard = match &command.provider {
+            Some(_) => Some(self.provider_creation.lock().await),
+            None => None,
+        };
+        let provider_target = match &command.provider {
+            Some(creation) => {
+                let digest =
+                    creation_digest(creation, &command.group_name, command.on_demand, "create");
+                if let Some(existing) = self.provider_retry(creation, &digest)? {
+                    return Ok(existing);
+                }
+                command.absolute_path = PathBuf::from(creation.locator());
+                Some(crate::application::ports::ProviderLinkTarget {
+                    display_name: creation.display_name.clone(),
+                    empty_owner: true,
+                    on_demand: command.on_demand,
+                    creation_digest: digest,
+                })
+            }
+            None => None,
+        };
+        let fixed_id = match (&command.provider, &provider_target) {
+            (Some(c), Some(target)) => {
+                let id = provider_operation_id(
+                    &c.request_token,
+                    &target.creation_digest,
+                    &self.device_id,
+                );
+                self.refuse_foreign_provider_operation(&c.locator(), &id)?;
+                Some(id)
+            }
+            _ => None,
+        };
 
         // 1. Journal ALWAYS opens before the first remote prepare call --
         // if this write itself fails, nothing is ever sent to the
         // coordination plane (fail closed).
-        let operation_id = self.open_enrollment_operation(
+        let (operation_id, resumed_prepared) = self.open_enrollment_operation(
             yadorilink_replica_domain::session_state::EnrollmentKind::Create,
             None,
             Some(command.group_name.clone()),
             &command.absolute_path,
             storage_mode,
+            fixed_id,
         )?;
 
         // 2. Prepare, under the SAME operation_id.
         let group_id = match self
             .coordination
-            .prepare_create(&operation_id, &command.group_name, &self.device_id)
+            .prepare_create(&operation_id, &command.group_name, &self.device_id, storage_mode)
             .await
         {
             EnrollmentPrepareResult::Prepared { group_id } => group_id,
@@ -252,7 +343,9 @@ impl EnrollmentService {
         // here leaves the row `PreparePending`; the next sweep resends the
         // same prepare (idempotent by operation_id) and recovers the same
         // group_id.
-        if !self.repository.mark_prepared(&operation_id, &group_id, now_unix())? {
+        if !resumed_prepared
+            && !self.repository.mark_prepared(&operation_id, &group_id, now_unix())?
+        {
             return Err(EnrollmentError::PreparationAmbiguous {
                 operation_id,
                 detail: "remote prepare succeeded but local Prepared transition could not be \
@@ -269,7 +362,7 @@ impl EnrollmentService {
             group_id: group_id.clone(),
             absolute_path: command.absolute_path,
             on_demand: command.on_demand,
-            acknowledge_risks: command.acknowledge_risks,
+            provider: provider_target,
         };
 
         // 4. `link()` commits the local link + pending_enrollments marker +
@@ -326,13 +419,48 @@ impl EnrollmentService {
         }
         tracing::debug!(group_name = %command.group_name, group_id = %command.group_id, "starting join-and-link enrollment");
         let storage_mode = if command.on_demand { "on-demand" } else { "eager" };
+        let mut command = command;
+        let _provider_guard = match &command.provider {
+            Some(_) => Some(self.provider_creation.lock().await),
+            None => None,
+        };
+        let provider_target = match &command.provider {
+            Some(creation) => {
+                let digest =
+                    creation_digest(creation, &command.group_id, command.on_demand, "join");
+                if let Some(existing) = self.provider_retry(creation, &digest)? {
+                    return Ok(existing);
+                }
+                command.absolute_path = PathBuf::from(creation.locator());
+                Some(crate::application::ports::ProviderLinkTarget {
+                    display_name: creation.display_name.clone(),
+                    empty_owner: false,
+                    on_demand: command.on_demand,
+                    creation_digest: digest,
+                })
+            }
+            None => None,
+        };
+        let fixed_id = match (&command.provider, &provider_target) {
+            (Some(c), Some(target)) => {
+                let id = provider_operation_id(
+                    &c.request_token,
+                    &target.creation_digest,
+                    &self.device_id,
+                );
+                self.refuse_foreign_provider_operation(&c.locator(), &id)?;
+                Some(id)
+            }
+            _ => None,
+        };
 
-        let operation_id = self.open_enrollment_operation(
+        let (operation_id, resumed_prepared) = self.open_enrollment_operation(
             yadorilink_replica_domain::session_state::EnrollmentKind::Join,
             Some(command.group_id.clone()),
             None,
             &command.absolute_path,
             storage_mode,
+            fixed_id,
         )?;
 
         match self
@@ -354,7 +482,9 @@ impl EnrollmentService {
             }
         };
 
-        if !self.repository.mark_prepared(&operation_id, &command.group_id, now_unix())? {
+        if !resumed_prepared
+            && !self.repository.mark_prepared(&operation_id, &command.group_id, now_unix())?
+        {
             return Err(EnrollmentError::PreparationAmbiguous {
                 operation_id,
                 detail: "remote prepare succeeded but local Prepared transition could not be \
@@ -371,7 +501,7 @@ impl EnrollmentService {
             group_id: command.group_id.clone(),
             absolute_path: command.absolute_path,
             on_demand: command.on_demand,
-            acknowledge_risks: command.acknowledge_risks,
+            provider: provider_target,
         };
         match self.links.commit(link_request).await {
             Ok(LinkOutcome::Linked) => {}
@@ -479,16 +609,7 @@ impl EnrollmentService {
         };
 
         let local_path = command.absolute_path.clone();
-        match self
-            .links
-            .commit_plain(
-                &group_id,
-                &command.absolute_path,
-                command.on_demand,
-                command.acknowledge_risks,
-            )
-            .await
-        {
+        match self.links.commit_plain(&group_id, &command.absolute_path, command.on_demand).await {
             Ok(()) => {}
             Err(EnrollmentLinkError::NotCommitted { detail }) => {
                 // Confirmed nothing was committed locally -- safe to
@@ -603,6 +724,50 @@ impl EnrollmentService {
     /// collision -- mirrors `replica_membership_service.rs`'s
     /// `open_membership_operation`. Fails closed (no coordination call
     /// ever attempted) if the durable write itself keeps failing.
+    /// A retry of an already-completed provider creation: the same token and request answer with
+    /// the existing link; the same token with a different request is refused.
+    fn provider_retry(
+        &self,
+        creation: &ProviderCreation,
+        digest: &str,
+    ) -> Result<Option<EnrollmentOutcome>, EnrollmentError> {
+        let locator = creation.locator();
+        let Some(link) = self.repository.list_links()?.into_iter().find(|l| l.key() == locator)
+        else {
+            return Ok(None);
+        };
+        if self.repository.creation_digest(&locator)?.as_deref() != Some(digest) {
+            return Err(EnrollmentError::PreparationRejected {
+                detail: "this request token was already used for a different request".to_string(),
+            });
+        }
+        Ok(Some(EnrollmentOutcome {
+            operation_id: provider_operation_id(&creation.request_token, digest, &self.device_id),
+            group_id: link.group_id,
+            local_path: PathBuf::from(locator),
+            awaiting_approval: false,
+            already_linked: true,
+        }))
+    }
+
+    /// The operation id binds the token to its request (display name, group, policy), so a resume
+    /// reaches only a row of the SAME request. A journal row already open on this token's link key
+    /// under a different id is a different request on a used token: refused, never resumed.
+    fn refuse_foreign_provider_operation(
+        &self,
+        locator: &str,
+        expected_id: &str,
+    ) -> Result<(), EnrollmentError> {
+        let open = self.repository.scan_open_operations()?;
+        if open.valid.iter().any(|op| op.local_path == locator && op.operation_id != expected_id) {
+            return Err(EnrollmentError::PreparationRejected {
+                detail: "this request token is already in use by a different, unfinished request"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
     fn open_enrollment_operation(
         &self,
         kind: yadorilink_replica_domain::session_state::EnrollmentKind,
@@ -610,11 +775,12 @@ impl EnrollmentService {
         group_name: Option<String>,
         local_path: &std::path::Path,
         storage_mode: &str,
-    ) -> Result<String, EnrollmentError> {
+        fixed_id: Option<String>,
+    ) -> Result<(String, bool), EnrollmentError> {
         const MAX_ID_ATTEMPTS: usize = 4;
         let mut last_operation_id = String::new();
         for _ in 0..MAX_ID_ATTEMPTS {
-            let operation_id = Uuid::new_v4().to_string();
+            let operation_id = fixed_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
             last_operation_id.clone_from(&operation_id);
             let now = now_unix();
             let operation = EnrollmentOperation {
@@ -632,7 +798,26 @@ impl EnrollmentService {
                 updated_at_unix: now,
             };
             match self.repository.try_insert_operation(&operation) {
-                Ok(true) => return Ok(operation_id),
+                Ok(true) => return Ok((operation_id, false)),
+                // A request-derived id names a row: a retry of the same request. Resume it only
+                // while its prepare is still in flight; anything further along is the recovery
+                // sweep's to settle.
+                Ok(false) if fixed_id.is_some() => {
+                    return match self.repository.operation(&operation_id)? {
+                        Some(row) if row.state == EnrollmentOperationState::PreparePending => {
+                            Ok((operation_id, false))
+                        }
+                        Some(row) if row.state == EnrollmentOperationState::Prepared => {
+                            Ok((operation_id, true))
+                        }
+                        _ => Err(EnrollmentError::PreparationAmbiguous {
+                            operation_id,
+                            detail: "an earlier attempt with this request token is still being \
+                                     recovered; retry shortly"
+                                .to_string(),
+                        }),
+                    };
+                }
                 // A fresh UUID already names a row -- retry under another
                 // one; the existing row is untouched.
                 Ok(false) => continue,

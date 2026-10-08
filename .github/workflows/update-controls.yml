@@ -45,6 +45,8 @@ jobs:
     environment: release-signing
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master @ 2026-06-30
         with:
@@ -88,7 +90,7 @@ jobs:
 
           # Fetch the current signed manifest (exact bytes) from the stable
           # edge URL — this is what clients currently see, so we mutate from it.
-          url="https://yadorilink.juntaki.com/updates/${CHANNEL}/manifest.json"
+          url="https://control.yadori.link/updates/${CHANNEL}/manifest.json"
           if ! curl -fsSL "$url" -o current-manifest.json; then
             echo "Could not fetch current manifest at $url. Publish the channel first." >&2
             exit 1

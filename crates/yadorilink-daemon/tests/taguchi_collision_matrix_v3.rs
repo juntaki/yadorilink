@@ -257,7 +257,7 @@ fn sync_work_state(device: &TestDevice, group_id: &str) -> SyncWorkState {
     let coordinator = &device.state.replica_coordinator;
     let mut heads: Vec<String> = coordinator
         .sqlite()
-        .dag_group_heads(group_id)
+        .native_group_heads(group_id)
         .unwrap()
         .iter()
         .map(|head| head.to_hex())
@@ -268,7 +268,7 @@ fn sync_work_state(device: &TestDevice, group_id: &str) -> SyncWorkState {
         .list_materialization_states(group_id)
         .unwrap()
         .into_iter()
-        .filter(|(_, state)| *state != MaterializationState::Hydrated)
+        .filter(|(_, state)| *state != MaterializationState::Present)
         .map(|(path, _)| path)
         .collect();
     unhydrated.sort();
@@ -277,63 +277,21 @@ fn sync_work_state(device: &TestDevice, group_id: &str) -> SyncWorkState {
     SyncWorkState { heads, unhydrated, pending_obligations }
 }
 
-/// Whether `device` still owes a retroactive conflict-copy repair at its
-/// current frontier, planned the same way its repair loop plans it
-/// (`plan_retroactive_merge`, read-only, in one snapshot).
-///
-/// The repair loop's own progress is invisible to the other checks here:
-/// while it plans, and while a lower rank's failover window runs (5s per
-/// rank), the frontier does not move and no counter changes. Asking the
-/// planner directly does not depend on how long either of those takes.
-/// Returns the frontier the plan was built against, and whether that plan
-/// has anything left to author. A path whose obligation can never fit in
-/// one carrier counts as settled, as the repair loop treats it.
-fn owes_retroactive_repair(device: &TestDevice, group_id: &str) -> (Vec<String>, bool) {
-    use yadorilink_sync_sqlite::retroactive_conflict::{
-        plan_retroactive_merge, RetroactiveMergeOutcome,
-    };
-    let outcome = device
-        .state
-        .replica_coordinator
-        .database()
-        .read_snapshot::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
-            plan_retroactive_merge(conn, group_id)
-        })
-        .unwrap();
-    let (frontier, owes) = match &outcome {
-        RetroactiveMergeOutcome::Plan(plan) => (plan.frontier.heads(), !plan.direct_ops.is_empty()),
-        RetroactiveMergeOutcome::PathObligationTooLarge(blocked) => {
-            (blocked.frontier().heads(), false)
-        }
-    };
-    let mut frontier: Vec<String> = frontier.iter().map(|head| head.to_hex()).collect();
-    frontier.sort();
-    (frontier, owes)
-}
-
 /// How long every device must hold one unchanged, shared frontier with no
-/// outstanding work before the tree counts as settled. The retroactive
-/// repair is checked separately (see [`owes_retroactive_repair`]), so this
-/// only has to outlast a hydration or projection that has not started yet.
+/// outstanding work before the tree counts as settled. It only has to outlast
+/// a hydration or projection that has not started yet.
 const QUIESCENCE_WINDOW: Duration = Duration::from_secs(3);
 
 /// Waits until the devices have stopped moving: every device reports the same
 /// DAG frontier, nothing fetchable is left unhydrated or unprojected, that has
-/// held unchanged for [`QUIESCENCE_WINDOW`], and no device's planner still
-/// owes a retroactive repair at that frontier.
+/// held unchanged for [`QUIESCENCE_WINDOW`].
 ///
-/// Equal on-disk snapshots are not enough to call a row converged. Two
-/// states pass that check on the way there:
-/// - a not-yet-hydrated file is a placeholder of the right size and all zero
-///   bytes, so devices that all still hold a placeholder at a path hash
-///   equal, and each fills in its bytes at its own time afterwards;
-/// - after the per-path resolution lands, a retroactive repair carrier can
-///   still follow (`authored retroactive conflict-copy merge resolution`),
-///   adding conflict copies of versions that were concurrent earlier in the
-///   DAG. Before it arrives the devices can already agree on a smaller tree.
-///
-/// Either one let the snapshot wait pass on an intermediate tree, and the
-/// final comparison then caught devices part-way to the real end state.
+/// Equal on-disk snapshots are not enough to call a row converged: a
+/// not-yet-hydrated file is a placeholder of the right size and all zero
+/// bytes, so devices that all still hold a placeholder at a path hash equal,
+/// and each fills in its bytes at its own time afterwards. That let the
+/// snapshot wait pass on an intermediate tree, and the final comparison then
+/// caught devices part-way to the real end state.
 ///
 /// `revoked_device` is true when a device was revoked mid-row. Content only
 /// the revoked device ever held can no longer be fetched from anyone, so
@@ -342,44 +300,58 @@ const QUIESCENCE_WINDOW: Duration = Duration::from_secs(3);
 /// a path left unhydrated only when no remaining device holds it hydrated,
 /// so nobody left could serve it. Anything some remaining device does hold
 /// must still hydrate everywhere, the same as in any other row.
+///
+/// `case_fold` is true for the case-fold rows. There a device holds back
+/// whichever differently-cased sibling of the colliding name it did not index
+/// first (a held entry is never materialized under any alternate name), so
+/// that one path stays unhydrated, with at most one projection obligation
+/// each, for good. Only those colliding names get this allowance; every other
+/// path must hydrate and project as in any other row.
 async fn wait_for_quiescence(
     devices: &[&TestDevice],
     group_id: &str,
     timeout: Duration,
     revoked_device: bool,
+    case_fold: bool,
 ) {
+    let colliding = target_path(4, 0).to_string_lossy().to_lowercase();
+    let held = |path: &String| case_fold && path.to_lowercase() == colliding;
     let started = tokio::time::Instant::now();
     let mut stable: Option<(Vec<SyncWorkState>, tokio::time::Instant)> = None;
     loop {
         let states: Vec<SyncWorkState> =
             devices.iter().map(|d| sync_work_state(d, group_id)).collect();
+        // The work that must drain: unhydrated paths other than held
+        // case-fold names, and obligations beyond one per held name.
+        let outstanding: Vec<(Vec<&String>, u64)> = states
+            .iter()
+            .map(|state| {
+                let held_count = state.unhydrated.iter().filter(|p| held(p)).count() as u64;
+                (
+                    state.unhydrated.iter().filter(|p| !held(p)).collect(),
+                    state.pending_obligations.saturating_sub(held_count),
+                )
+            })
+            .collect();
         let reference_heads = &states[0].heads;
         let same_frontier = states.iter().all(|state| &state.heads == reference_heads);
         let nothing_fetchable_outstanding = if revoked_device {
             // A path unhydrated anywhere must be unhydrated everywhere: if
             // some remaining device holds it hydrated, the rest can still
             // fetch it and will change underneath the snapshot.
-            states.iter().all(|state| {
-                state.unhydrated.iter().all(|path| {
-                    states.iter().all(|other| other.unhydrated.binary_search(path).is_ok())
+            outstanding.iter().all(|(unhydrated, _)| {
+                unhydrated.iter().all(|path| {
+                    outstanding.iter().all(|(other, _)| other.binary_search(path).is_ok())
                 })
             })
         } else {
-            states.iter().all(|state| state.unhydrated.is_empty() && state.pending_obligations == 0)
+            outstanding.iter().all(|(unhydrated, pending)| unhydrated.is_empty() && *pending == 0)
         };
         if same_frontier && nothing_fetchable_outstanding {
             match &stable {
                 Some((held, since)) if held == &states => {
                     if since.elapsed() >= QUIESCENCE_WINDOW {
-                        let plans: Vec<_> =
-                            devices.iter().map(|d| owes_retroactive_repair(d, group_id)).collect();
-                        if plans.iter().all(|(frontier, owes)| frontier == reference_heads && !owes)
-                        {
-                            return;
-                        }
-                        // Settled-looking, but a repair carrier is still
-                        // owed at this frontier. Start the window over.
-                        stable = Some((states.clone(), tokio::time::Instant::now()));
+                        return;
                     }
                 }
                 _ => stable = Some((states.clone(), tokio::time::Instant::now())),
@@ -391,16 +363,17 @@ async fn wait_for_quiescence(
             let detail = devices
                 .iter()
                 .zip(states.iter())
-                .map(|(d, state)| {
-                    let (plan_frontier, owes_repair) = owes_retroactive_repair(d, group_id);
-                    format!(
-                        "{}: {state:?} plan_frontier={plan_frontier:?} owes_repair={owes_repair}",
-                        d.device_id
-                    )
-                })
+                .map(|(d, state)| format!("{}: {state:?}", d.device_id))
                 .collect::<Vec<_>>()
                 .join("; ");
-            panic!("devices never quiesced within {timeout:?}: {detail}");
+            let why = if !same_frontier {
+                "frontiers never became equal"
+            } else if !nothing_fetchable_outstanding {
+                "frontiers equal but fetchable work (unhydrated/pending obligations) never drained"
+            } else {
+                "frontiers equal and work drained but the state kept changing"
+            };
+            panic!("devices never settled within {timeout:?} ({why}): {detail}");
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -662,6 +635,55 @@ fn assert_no_content_silently_lost(
     }
 }
 
+/// How many canonical (non-conflict-copy) entries a device may end with for the
+/// case-fold collision.
+///
+/// op_level 4: every device renames what it sees onto `renamed-shared.bin` and
+/// writes the colliding name again when it sees nothing there. Whether a later
+/// device sees that rewrite before it acts (and so renames it too) depends on
+/// how fast the devices converge, so the colliding name either survives as a
+/// second canonical entry or is consumed by a rename. Both are correct, provided
+/// nothing is lost: every version stays reachable as the canonical entry or a
+/// conflict copy, and every device agrees on which (checked by the caller).
+fn canonical_count_ok(op_level: u8, count: usize) -> bool {
+    if op_level == 4 {
+        count == 1 || count == 2
+    } else {
+        count == 1
+    }
+}
+
+fn tree_dump(devices: &[&TestDevice]) -> String {
+    devices
+        .iter()
+        .enumerate()
+        .map(|(i, d)| format!("device-{i}={:?}", recursive_snapshot(d.root.path())))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Fails a case-fold row whose devices quiesced (equal frontiers, no outstanding
+/// work) yet whose trees never held the agreed shape for a stable window: a
+/// settled-but-different divergence, not a slow resync.
+fn panic_settled_but_different(
+    row_name: &str,
+    devices: &[&TestDevice],
+    group_id: &str,
+    params: &str,
+) -> ! {
+    let trees = tree_dump(devices);
+    let work = devices
+        .iter()
+        .map(|d| format!("{}: {:?}", d.device_id, sync_work_state(d, group_id)))
+        .collect::<Vec<_>>()
+        .join("; ");
+    panic!(
+        "{row_name}: devices quiesced (equal frontiers, no outstanding work) but the case-fold \
+         tree check never held for a stable 5s window within 60s -- a settled-but-different \
+         divergence, not a slow resync ({params}):\ntrees: {trees}\nsync work: {work}"
+    );
+}
+
 /// Runs one Taguchi-array row: sets up devices per Factor D, applies
 /// Factor A's partition/reconnect timing around two rounds of Factor-B/C-
 /// driven operations (staggered per Factor E), applies Factor D's churn
@@ -789,13 +811,12 @@ async fn run_taguchi_v3_row(
     let timeout =
         if churn_level == 3 { Duration::from_secs(200) } else { Duration::from_secs(150) };
 
-    // Not for path_level 4 yet. Row 13 was seen holding two different DAG
-    // frontiers, with work still outstanding, for the whole 150s budget
-    // (not yet root-caused). Until that is understood, the
-    // case-fold rows keep only their own, looser check below.
-    if path_level != 4 {
-        wait_for_quiescence(&active_refs, group_id, timeout, excluded_idx.is_some()).await;
-    }
+    // Every row, case-fold included, must reach true quiescence before any
+    // tree comparison: equal frontiers, nothing fetchable left unhydrated or
+    // unprojected, held for a stable window. A case-fold collision resolves
+    // per-device (see below) but the sync work itself still has to drain.
+    wait_for_quiescence(&active_refs, group_id, timeout, excluded_idx.is_some(), path_level == 4)
+        .await;
 
     // path_level 4 (case-fold) is deliberately excluded from the strict
     // full-snapshot convergence check below: per `hazard.rs`'s "hold"
@@ -839,44 +860,55 @@ async fn run_taguchi_v3_row(
                 .filter(|(k, _)| !is_conflict_copy(k) && k.to_lowercase() != colliding)
                 .collect()
         }
-        let expected_canonical_count = if op_level == 4 { 2 } else { 1 };
-        wait_until_with_context(
-            || {
-                active_refs.iter().all(|d| {
-                    let snap = recursive_snapshot(d.root.path());
-                    snap.keys().filter(|k| !is_conflict_copy(k)).count() == expected_canonical_count
-                }) && {
-                    let reference = conflict_copy_content(active_refs[0].root.path());
-                    active_refs[1..]
-                        .iter()
-                        .all(|d| conflict_copy_content(d.root.path()) == reference)
-                } && {
-                    let reference = non_colliding_canonical(active_refs[0].root.path());
-                    active_refs[1..]
-                        .iter()
-                        .all(|d| non_colliding_canonical(d.root.path()) == reference)
-                }
-            },
-            timeout,
-            || {
-                active_refs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, d)| format!("device-{i}={:?}", recursive_snapshot(d.root.path())))
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            },
-        )
-        .await;
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        let converged = || {
+            active_refs.iter().all(|d| {
+                let snap = recursive_snapshot(d.root.path());
+                canonical_count_ok(op_level, snap.keys().filter(|k| !is_conflict_copy(k)).count())
+            }) && {
+                let reference = conflict_copy_content(active_refs[0].root.path());
+                active_refs[1..].iter().all(|d| conflict_copy_content(d.root.path()) == reference)
+            } && {
+                let reference = non_colliding_canonical(active_refs[0].root.path());
+                active_refs[1..].iter().all(|d| non_colliding_canonical(d.root.path()) == reference)
+            }
+        };
+        wait_until_with_context(converged, timeout, || tree_dump(&active_refs)).await;
+        // The wait above can pass on a transiently equal state. Require the
+        // whole check to keep holding for a stable window before the final
+        // assertions, and fail loudly if that window never occurs: the devices
+        // have quiesced (above), so a tree that keeps changing or never
+        // agrees is a real divergence, not a slow resync.
+        let settle_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let mut stable_since = tokio::time::Instant::now();
+        let mut settled = false;
+        while tokio::time::Instant::now() < settle_deadline {
+            if !converged() {
+                stable_since = tokio::time::Instant::now();
+            } else if stable_since.elapsed() >= Duration::from_secs(5) {
+                settled = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        if !settled {
+            panic_settled_but_different(
+                row_name,
+                &active_refs,
+                group_id,
+                &format!(
+                    "partition_level={partition_level}, op_level={op_level}, \
+                     churn_level={churn_level}, stagger_level={stagger_level}"
+                ),
+            );
+        }
 
         for (i, device) in active_refs.iter().enumerate() {
             let snap = recursive_snapshot(device.root.path());
             let canonical_count = snap.keys().filter(|k| !is_conflict_copy(k)).count();
-            assert_eq!(
-                canonical_count, expected_canonical_count,
+            assert!(
+                canonical_count_ok(op_level, canonical_count),
                 "{row_name}: device-{i} has {canonical_count} canonical (non-conflict-copy) \
-                 entries for the case-fold collision, expected {expected_canonical_count} (partition_level={partition_level}, \
+                 entries for the case-fold collision (partition_level={partition_level}, \
                  op_level={op_level}, churn_level={churn_level}, stagger_level={stagger_level}): {snap:?}"
             );
         }

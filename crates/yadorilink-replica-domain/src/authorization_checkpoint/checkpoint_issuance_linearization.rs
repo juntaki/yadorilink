@@ -66,7 +66,7 @@ fn a_naive_read_then_write_issuance_can_issue_a_checkpoint_for_an_already_revoke
     );
     assert_eq!(state.role, Role::Viewer, "the revoke DID commit before issuance completed");
     // issued == true AND role == Viewer simultaneously is exactly the
-    // forbidden state design doc §3.4 rules out: CheckpointIssue
+    // forbidden state the linearization contract rules out: CheckpointIssue
     // succeeded even though Revoke precedes its actual completion.
 }
 

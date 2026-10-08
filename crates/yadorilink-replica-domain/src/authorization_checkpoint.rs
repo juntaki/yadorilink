@@ -4,7 +4,7 @@
 //! the ONE canonical Rust implementation of checkpoint construction and
 //! verification, used identically by local checkpoint flush (daemon-side
 //! authoring), peer receive (verifying a `PublishedChange` carried in a
-//! `ChangeBatch`), rebootstrap witness verification, and tests. Moved
+//! `ChangeBatch`), and tests. Moved
 //! here from `yadorilink-daemon` because none of this depends on the
 //! daemon's storage or runtime — only `yadorilink_daemon::change_policy`'s
 //! `GroupPolicyState::resolve_authority_key` (supplied to
@@ -260,7 +260,33 @@ pub enum CheckpointAdmissionError {
     MerkleProofDoesNotMatchCheckpoint,
 }
 
+/// Counts the Merkle leaf and node hashes this thread computes, so a test can
+/// assert how a batch operation scales with its size.
+#[cfg(any(test, feature = "test-support"))]
+pub mod hash_count {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNT: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(super) fn bump() {
+        COUNT.with(|count| count.set(count.get() + 1));
+    }
+
+    /// Hashes computed on this thread since the last [`reset`].
+    pub fn get() -> u64 {
+        COUNT.with(Cell::get)
+    }
+
+    pub fn reset() {
+        COUNT.with(|count| count.set(0));
+    }
+}
+
 fn leaf_hash(change_hash: &[u8; 32]) -> [u8; 32] {
+    #[cfg(any(test, feature = "test-support"))]
+    hash_count::bump();
     let mut hasher = Sha256::new();
     hasher.update([MERKLE_LEAF_PREFIX]);
     hasher.update(change_hash);
@@ -268,6 +294,8 @@ fn leaf_hash(change_hash: &[u8; 32]) -> [u8; 32] {
 }
 
 fn node_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    #[cfg(any(test, feature = "test-support"))]
+    hash_count::bump();
     let mut hasher = Sha256::new();
     hasher.update([MERKLE_NODE_PREFIX]);
     hasher.update(left);
@@ -320,7 +348,8 @@ fn expected_proof_depth(leaf_count: usize) -> usize {
 
 /// Builds the audit path for `change_hashes[leaf_index]`, matching
 /// [`merkle_root`]'s tree shape exactly (including the odd-level
-/// duplication rule).
+/// duplication rule). Hashes the whole tree, so a caller that needs the
+/// path of many leaves of one batch uses [`build_merkle_proofs`] instead.
 pub fn build_merkle_proof(change_hashes: &[[u8; 32]], leaf_index: usize) -> MerkleProof {
     assert!(leaf_index < change_hashes.len());
     let mut level: Vec<[u8; 32]> = change_hashes.iter().map(leaf_hash).collect();
@@ -336,6 +365,37 @@ pub fn build_merkle_proof(change_hashes: &[[u8; 32]], leaf_index: usize) -> Merk
         index /= 2;
     }
     MerkleProof { leaf_index, leaf_count: change_hashes.len(), siblings }
+}
+
+/// The audit path of every leaf of one batch, in leaf order:
+/// `build_merkle_proofs(h)[i] == build_merkle_proof(h, i)`. Each tree level is
+/// hashed once, so the whole batch costs one hash per tree node rather than a
+/// whole tree per leaf.
+pub fn build_merkle_proofs(change_hashes: &[[u8; 32]]) -> Vec<MerkleProof> {
+    let leaf_count = change_hashes.len();
+    let mut proofs: Vec<MerkleProof> = (0..leaf_count)
+        .map(|leaf_index| MerkleProof {
+            leaf_index,
+            leaf_count,
+            siblings: Vec::with_capacity(expected_proof_depth(leaf_count)),
+        })
+        .collect();
+    let mut level: Vec<[u8; 32]> = change_hashes.iter().map(leaf_hash).collect();
+    // `index` of leaf `i` at the current level is `i >> depth`.
+    let mut depth = 0;
+    while level.len() > 1 {
+        if level.len() % 2 == 1 {
+            level.push(*level.last().unwrap());
+        }
+        for (leaf, proof) in proofs.iter_mut().enumerate() {
+            let index = leaf >> depth;
+            let sibling_index = if index.is_multiple_of(2) { index + 1 } else { index - 1 };
+            proof.siblings.push(level[sibling_index]);
+        }
+        level = level.chunks(2).map(|pair| node_hash(&pair[0], &pair[1])).collect();
+        depth += 1;
+    }
+    proofs
 }
 
 fn recompute_root_from_proof(change_hash: &[u8; 32], proof: &MerkleProof) -> [u8; 32] {
@@ -484,7 +544,7 @@ pub fn decode_checkpoint(bytes: &[u8]) -> Result<AuthorizationCheckpoint, Checkp
 /// function itself performs no such check: production code never calls
 /// it without having just verified, live, that `checkpoint.device_id` is
 /// currently a writer — that check is the ENTIRE security property this
-/// design provides and belongs to the authority alone to enforce (§3.4's
+/// design provides and belongs to the authority alone to enforce (the
 /// linearization contract governs exactly when that check may happen
 /// relative to a concurrent revoke).
 pub fn sign_checkpoint(checkpoint: &AuthorizationCheckpoint, signing_key: &SigningKey) -> [u8; 64] {
@@ -521,7 +581,7 @@ pub fn checkpoint_hash(checkpoint_encoded: &[u8], signature: &[u8; 64]) -> [u8; 
 /// signature (verified below) is what actually vouches for that
 /// fingerprint. This function does NOT verify the Change's own signature
 /// against `author_signing_public_key` — that is
-/// `yadorilink_replica_domain::change::Change::verify_signature`'s job;
+/// `yadorilink_replica_domain::local_op::Change::verify_signature`'s job;
 /// callers must call both, in either order, before treating a
 /// remotely-received Change as admissible (see that crate's receive-path
 /// caller for the required order and why signature verification and
@@ -558,6 +618,30 @@ pub fn verify_change_admission(
     checkpoint_signature: &[u8; 64],
     resolve_authority_key: impl FnOnce(&[u8; 32], &[u8; 32]) -> Option<VerifyingKey>,
 ) -> Result<(), CheckpointAdmissionError> {
+    verify_checkpoint_authorization(
+        expected_group_id,
+        author_device_id,
+        author_signing_public_key,
+        checkpoint,
+        checkpoint_signature,
+        resolve_authority_key,
+    )?;
+    verify_change_inclusion(change_hash, proof, checkpoint)
+}
+
+/// The checks of [`verify_change_admission`] that depend only on the
+/// checkpoint, not on which Change it is asked about: the authority's
+/// signature (through `resolve_authority_key`), and that the checkpoint names
+/// this group, device and signing key. A caller admitting every Change of one
+/// batch runs this once, then [`verify_change_inclusion`] per Change.
+pub fn verify_checkpoint_authorization(
+    expected_group_id: &str,
+    author_device_id: &str,
+    author_signing_public_key: &VerifyingKey,
+    checkpoint: &AuthorizationCheckpoint,
+    checkpoint_signature: &[u8; 64],
+    resolve_authority_key: impl FnOnce(&[u8; 32], &[u8; 32]) -> Option<VerifyingKey>,
+) -> Result<(), CheckpointAdmissionError> {
     let authority_key = resolve_authority_key(&checkpoint.signer_key_id, &checkpoint.policy_head)
         .ok_or(CheckpointAdmissionError::UnknownOrInvalidSignerKey)?;
 
@@ -575,6 +659,18 @@ pub fn verify_change_admission(
     if checkpoint.signing_key_fingerprint != fingerprint_signing_key(author_signing_public_key) {
         return Err(CheckpointAdmissionError::SigningKeyFingerprintMismatch);
     }
+    Ok(())
+}
+
+/// The per-Change half of [`verify_change_admission`]: that `proof` places
+/// `change_hash` under the root of `checkpoint`, in a batch of the size the
+/// checkpoint committed to. The checkpoint itself must already have passed
+/// [`verify_checkpoint_authorization`]. Costs one hash per tree level.
+pub fn verify_change_inclusion(
+    change_hash: [u8; 32],
+    proof: &MerkleProof,
+    checkpoint: &AuthorizationCheckpoint,
+) -> Result<(), CheckpointAdmissionError> {
     if checkpoint.leaf_count != proof.leaf_count as u64 {
         return Err(CheckpointAdmissionError::LeafCountMismatch);
     }
@@ -593,7 +689,7 @@ pub fn verify_change_admission(
 #[cfg(test)]
 mod tests;
 
-/// Design-doc §3.4: models the checkpoint-issuance/revoke race as a pure
+/// Models the checkpoint-issuance/revoke race as a pure
 /// state machine, independent of the coordination plane's actual
 /// language/storage (TypeScript/D1). This is executable evidence for the
 /// required contract -- "CheckpointIssue succeeds XOR Revoke precedes it

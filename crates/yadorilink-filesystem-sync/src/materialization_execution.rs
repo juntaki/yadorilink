@@ -20,7 +20,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use yadorilink_local_storage::{BlockReclamationStore, GcReport, PlaceholderDiskIdentity};
-use yadorilink_replica_domain::admission::ChangeEmitter;
 use yadorilink_replica_domain::file::{FileRecord, RecordKind};
 use yadorilink_replica_domain::session_state::MaterializationState;
 use yadorilink_replica_engine::custody::VerifiedCustody;
@@ -28,9 +27,7 @@ use yadorilink_root_authority::root_commit::RootCommitPermit;
 use yadorilink_root_authority::root_identity::VerifiedRoot;
 
 use crate::block_liveness::BlockPhysicalDeletionGuard;
-use yadorilink_replica_domain::session_state::{
-    EvictableFile, RestoreCommitOutcome, RestoreOperation,
-};
+use yadorilink_replica_domain::session_state::{RestoreCommitOutcome, RestoreOperation};
 
 /// What an open materialization intent is for, as the materialization owner
 /// classifies it ([`MaterializationExecutionPort::materialization_intent_kind`]).
@@ -54,19 +51,19 @@ pub enum AbandonedEviction {
     /// the path lock that the file is still the one it revalidated before
     /// the open (same disk identity, bytes matching the evicted version's
     /// blocks), and observed its `identity`. The row goes back to
-    /// `Hydrated` with a proof of that version published under the live
+    /// `Present` with a proof of that version published under the live
     /// fence.
     Intact { identity: yadorilink_root_authority::fs_identity::FileIdentity },
     /// The placeholder write did not happen, but the file no longer
     /// verifies (a local edit or removal landed during the attempt) or
-    /// could not be observed. The row goes back to `Hydrated` without a
+    /// could not be observed. The row goes back to `Present` without a
     /// proof: an edit is the watcher's and the dirty-path journal's to
     /// capture, and the repair sweep re-proves bytes that do match.
     NotWritten,
     /// The placeholder may be on disk: the native dehydrate's outcome is
     /// unknown ([`MaterializationExecutionError::EvictionOutcomeAmbiguous`]),
     /// or the placeholder was written and the settle failed. The row goes
-    /// to `Placeholder`, the resolution the startup reset gives a stale
+    /// to `Remote`, the resolution the startup reset gives a stale
     /// `Evicting` row, which is safe whether or not the write landed.
     PlaceholderMayExist,
 }
@@ -88,13 +85,12 @@ pub trait OpenMaterializationIntent: Send {
 }
 
 /// The unconditional, pre-lock reads `evict_file` performs to decide
-/// whether a path is even a candidate for eviction at all -- pinned status,
-/// the atomic current-version snapshot, and the record's kind. Grouped into
-/// one semantic read because `evict_file` always performs all three
-/// together, in this order, with no intervening mutation between them.
+/// whether a path is even a candidate for eviction at all -- the atomic
+/// current-version snapshot and the record's kind. Grouped into one
+/// semantic read because `evict_file` always performs both together, with
+/// no intervening mutation between them.
 #[derive(Debug, Clone)]
 pub struct EvictionEligibilitySnapshot {
-    pub pinned: bool,
     pub current_version: Option<yadorilink_replica_domain::session_state::CurrentVersionRecord>,
     pub record_kind: Option<RecordKind>,
 }
@@ -107,13 +103,12 @@ pub struct EvictionEligibilitySnapshot {
 #[derive(Debug, Clone)]
 pub struct EvictionRevalidationSnapshot {
     pub current_version: Option<yadorilink_replica_domain::session_state::CurrentVersionRecord>,
-    pub pinned: bool,
     pub materialization_state: Option<MaterializationState>,
     pub path_dirty: bool,
 }
 
 /// The reads `repair_interrupted_materializations_inner`'s per-path loop
-/// re-performs under the path lock, before deciding whether a `Hydrated`
+/// re-performs under the path lock, before deciding whether a `Present`
 /// row is a genuine interrupted-materialization candidate.
 #[derive(Debug, Clone, Default)]
 pub struct RepairRowSnapshot {
@@ -121,8 +116,8 @@ pub struct RepairRowSnapshot {
     pub record_kind: Option<RecordKind>,
     pub file: Option<FileRecord>,
     /// The raw symlink target the same row records, for a caller
-    /// verifying a symlink by kind -- see the note on `current_authoring`
-    /// for why it is carried rather than read separately.
+    /// verifying a symlink by kind -- carried rather than read separately,
+    /// so it comes from the same statement as `current_version`.
     pub symlink_target: Option<Vec<u8>>,
     /// The version the current row names. Carried on the snapshot rather
     /// than fetched where it is used: every proof this repair pass
@@ -131,9 +126,6 @@ pub struct RepairRowSnapshot {
     /// A separate accessor would add a read to every row of a sweep that
     /// runs at whole-replica scale.
     pub current_version: Option<yadorilink_replica_domain::ids::VersionHash>,
-    /// The authoring identity of that same row, from the same statement as
-    /// `current_version`.
-    pub current_authoring: Option<yadorilink_replica_domain::ids::ChangeHash>,
     /// The mode and the replicated xattrs this row records, from that
     /// same statement.
     ///
@@ -196,20 +188,20 @@ pub enum MaterializationExecutionError {
     /// server's own logic ran to completion and its answer is trusted),
     /// this variant must NOT be treated as "the file is still fully
     /// materialized" -- `evict_file` must not roll the row back to
-    /// `Hydrated`. It resolves the row to `Placeholder` instead
+    /// `Present`. It resolves the row to `Remote` instead
     /// ([`AbandonedEviction::PlaceholderMayExist`]), the resolution
-    /// `reset_stale_evicting_to_placeholder`'s startup recovery gives a
+    /// `reset_stale_evicting`'s startup recovery gives a
     /// stale `Evicting` row, which is safe regardless of which of the two
     /// real outcomes actually happened (see that function's own doc
     /// comment; Windows eviction never mints a fresh identity,
-    /// which is exactly what makes resolving to `Placeholder` safe in
+    /// which is exactly what makes resolving to `Remote` safe in
     /// both cases).
     #[error("eviction outcome for {0:?} could not be confirmed")]
     EvictionOutcomeAmbiguous(String),
 
     /// The group's policy has not loaded this run, so a change-emitting
     /// write withheld its emission rather than stamp a placeholder-auth
-    /// change. See `yadorilink_replica_domain::change::PolicyUnavailable`.
+    /// change. See `yadorilink_replica_domain::local_op::PolicyUnavailable`.
     #[error("no verified policy is currently loaded for this group")]
     PolicyUnavailable,
 
@@ -354,26 +346,6 @@ pub trait MaterializationExecutionPort: Send + Sync {
         group_id: &str,
     ) -> Result<bool, MaterializationExecutionError>;
 
-    /// Hydrated, unpinned, non-deleted files for `group_id`, ordered
-    /// least-recently-accessed first -- the automatic eviction sweep's
-    /// candidate list, in eviction order.
-    fn list_evictable_files(
-        &self,
-        group_id: &str,
-    ) -> Result<Vec<EvictableFile>, MaterializationExecutionError>;
-
-    /// Total on-disk size of every hydrated file (pinned or not) -- the
-    /// eviction sweep's usage figure, which must include pinned files even
-    /// though `list_evictable_files` excludes them as candidates.
-    fn hydrated_usage_bytes(&self, group_id: &str) -> Result<u64, MaterializationExecutionError>;
-
-    fn touch_last_accessed(
-        &self,
-        group_id: &str,
-        path: &str,
-        unix_ts: i64,
-    ) -> Result<(), MaterializationExecutionError>;
-
     /// Every file's materialization state for a group, in one query.
     fn list_materialization_states(
         &self,
@@ -420,7 +392,7 @@ pub trait MaterializationExecutionPort: Send + Sync {
     /// which is fine there -- see that method's own doc comment -- because
     /// its worst case is merely deferring a moot cleanup by one pass. This
     /// method instead gates the tombstone-vs-reconstruct DECISION itself, on
-    /// only the rare rows that are already `Hydrated`-but-disk-mismatched,
+    /// only the rare rows that are already `Present`-but-disk-mismatched,
     /// where a stale miss could let a real, still-unsettled path fall
     /// through to be wrongly resolved. On that small a candidate set, one
     /// extra authoritative read per row costs nothing worth trading
@@ -453,25 +425,6 @@ pub trait MaterializationExecutionPort: Send + Sync {
         permit: &RootCommitPermit,
     ) -> Result<(), MaterializationExecutionError>;
 
-    /// Tombstones a path and appends the signed `Delete` change describing
-    /// it, in one transaction. Returns `Err(PolicyUnavailable)` when the
-    /// group's policy has not loaded this run, in which case the emission
-    /// was withheld, not attempted-and-failed.
-    // Port trait method with ~40 call sites workspace-wide; grouping these
-    // into a params struct would be a call-site-touching refactor well
-    // beyond a toolchain-drift lint cleanup.
-    #[allow(clippy::too_many_arguments)]
-    fn mark_deleted_emitting_change(
-        &self,
-        group_id: &str,
-        path: &str,
-        device_id: &str,
-        observed_at_unix_nanos: i64,
-        publish_absent_proof: bool,
-        emitter: &ChangeEmitter,
-        permit: &RootCommitPermit,
-    ) -> Result<yadorilink_replica_domain::ids::ChangeHash, MaterializationExecutionError>;
-
     fn record_dirty_path(
         &self,
         group_id: &str,
@@ -483,7 +436,7 @@ pub trait MaterializationExecutionPort: Send + Sync {
 
     /// Whether `(group_id, path)`'s standing proof is a proof about the
     /// version the row currently names -- the whole of what
-    /// `MaterializationState::Hydrated` claims exists, not just its
+    /// `MaterializationState::Present` claims exists, not just its
     /// presence. Fail-closed: a generation published under a superseded
     /// mutation fence is NOT usable, nor is one that names a version the
     /// path has moved off, nor a versionless one, nor no generation at
@@ -492,6 +445,18 @@ pub trait MaterializationExecutionPort: Send + Sync {
         &self,
         group_id: &str,
         path: &str,
+    ) -> Result<bool, MaterializationExecutionError>;
+
+    /// Whether the regular file at `out_path` is, untouched, what a usable
+    /// proof says this device wrote at `path` -- whichever version the row
+    /// now names. `Present` says only that an object exists; this is the
+    /// evidence that separates an older version's bytes still standing under
+    /// a newer row from an edit. Fail-closed: any doubt is `false`.
+    fn disk_is_untouched_proven_write(
+        &self,
+        group_id: &str,
+        path: &str,
+        out_path: &Path,
     ) -> Result<bool, MaterializationExecutionError>;
 
     /// The recovery lane's own commit, for a path this pass has verified
@@ -506,7 +471,7 @@ pub trait MaterializationExecutionPort: Send + Sync {
     /// anchored on an epoch its caller bumped before its own write;
     /// recovery mutated nothing and owns no such epoch. The re-proving
     /// call is fence-free but deliberately leaves `materialization_state`
-    /// alone, which is right for a row already `Hydrated` and not enough
+    /// alone, which is right for a row already `Present` and not enough
     /// for one still in the transient state an interrupted
     /// materialization left.
     ///
@@ -530,11 +495,11 @@ pub trait MaterializationExecutionPort: Send + Sync {
     /// `materialization_state = 'placeholder'`, so it deliberately returns
     /// nothing once a row has hydrated), no production call site clears
     /// `placeholder_dev`/`placeholder_ino`/`placeholder_provider_kind` on the
-    /// `Placeholder` -> `Hydrated` transition -- they are simply left in
+    /// `Remote` -> `Present` transition -- they are simply left in
     /// place until an explicit clear ([`Self::record_placeholder_identity`]'s
     /// `Clear` arm).
     /// The Windows eviction path relies on exactly that: it reads a
-    /// `Hydrated` file's still-recorded generation here as the expected
+    /// `Present` file's still-recorded generation here as the expected
     /// identity to pass into the native dehydrate call -- an extra
     /// defense-in-depth check on top of the disk-content revalidation
     /// `evict_file` already performs, not a substitute for it.
@@ -553,7 +518,7 @@ pub trait MaterializationExecutionPort: Send + Sync {
     /// `shell-ext/windows/src/cfapi.rs::dehydrate_placeholder`'s own doc
     /// comment). The guard is mandatory: eviction refuses a row with no
     /// recorded identity before reaching this call. `materialization_eviction::
-    /// evict_to_placeholder`'s Windows arm gates the `Placeholder`
+    /// evict_to_placeholder`'s Windows arm gates the `Remote`
     /// transition and block reclamation on this call's success; its
     /// non-Windows arm never calls it at all.
     ///
@@ -581,18 +546,13 @@ pub trait MaterializationExecutionPort: Send + Sync {
         ))
     }
 
-    /// Every still-`Placeholder` path in `group_id` with no recorded
-    /// identity -- see `MaterializationStateRepository::
-    /// list_placeholder_paths_missing_generation`'s own doc comment for
-    /// the crash window this exists to close.
-    /// Every path of `group_id` a HistoryBase snapshot install replaced
-    /// and has not yet reconciled on disk, with what the replaced row had
-    /// placed there. See `crate::snapshot_install_reconcile`.
-    fn list_snapshot_install_holds(
+    /// Every held path of `group_id` whose disk has not yet been
+    /// reconciled. See `crate::held_path_reconcile`.
+    fn list_held_paths(
         &self,
         group_id: &str,
     ) -> Result<
-        Vec<yadorilink_replica_domain::session_state::SnapshotInstallHold>,
+        Vec<yadorilink_replica_domain::session_state::HeldPath>,
         MaterializationExecutionError,
     >;
 
@@ -600,7 +560,7 @@ pub trait MaterializationExecutionPort: Send + Sync {
     /// what is on disk under it (remove, move aside, or place a
     /// placeholder), invalidating any proof or in-flight writer that read
     /// the path before. Called once, before the first such change.
-    fn begin_snapshot_install_disk_write(
+    fn begin_held_path_disk_write(
         &self,
         group_id: &str,
         path: &str,
@@ -611,7 +571,7 @@ pub trait MaterializationExecutionPort: Send + Sync {
     /// schedules the installed row's projection when it is live. Returns
     /// whether it was released: `false` when an install renewed the hold
     /// since, which leaves it held.
-    fn release_snapshot_install_hold(
+    fn release_held_path(
         &self,
         group_id: &str,
         path: &str,
@@ -626,7 +586,7 @@ pub trait MaterializationExecutionPort: Send + Sync {
     /// and releases `path`'s hold -- all in one transaction, and only while
     /// that hold is at `generation`. Returns the copy name, or `None` when
     /// nothing moved (and nothing was recorded). See
-    /// `yadorilink_sync_sqlite::snapshot_install_hold`.
+    /// `yadorilink_sync_sqlite::held_path`.
     fn relocate_held_entry_beside_directory(
         &self,
         group_id: &str,
@@ -634,11 +594,6 @@ pub trait MaterializationExecutionPort: Send + Sync {
         generation: i64,
         removable: Option<&yadorilink_root_authority::fs_identity::FileIdentity>,
     ) -> Result<Option<String>, MaterializationExecutionError>;
-
-    fn list_placeholder_paths_missing_generation(
-        &self,
-        group_id: &str,
-    ) -> Result<Vec<String>, MaterializationExecutionError>;
 
     /// Phase 1 of a structural `mkdir` of `path` (a directory this device
     /// is about to create only to hold a descendant): records the intent
@@ -673,7 +628,7 @@ pub trait MaterializationExecutionPort: Send + Sync {
 
     /// Whether a live current index row of `group_id` lies strictly below
     /// `path`: whether the rows the index holds need `path` as a directory.
-    /// The snapshot-install reconciliation's view of the namespace, since
+    /// The held-path reconciliation's view of the namespace, since
     /// an installed base's rows are what its disk has to match.
     fn index_has_live_descendant(
         &self,
@@ -831,7 +786,7 @@ pub trait MaterializationExecutionPort: Send + Sync {
     /// Bumps `path`'s filesystem-side mutation fence, invalidating any
     /// actual-state proof
     /// `path_materialized_generations` may hold for it. `evict_file` has no
-    /// DAG-frontier proof of its own to publish under (it is a pure
+    /// native-frontier proof of its own to publish under (it is a pure
     /// disk-state transition, hydrated content -> placeholder), so it only
     /// ever calls this, never a publish -- same treatment as on-demand
     /// hydration (`ReplicaCoordinator::dag_bump_mutation_fence` in
@@ -859,7 +814,7 @@ pub trait MaterializationExecutionPort: Send + Sync {
     ) -> Result<Result<i64, MaterializationExecutionError>, MaterializationExecutionError>;
 
     /// Settle half of `evict_file`'s placeholder write: moves the row
-    /// `Evicting` -> `Placeholder` only if it is still `Evicting`
+    /// `Evicting` -> `Remote` only if it is still `Evicting`
     /// (`false`, with nothing else written, when it is not), then records
     /// the identity the placeholder write reported. Two transactions.
     fn settle_eviction(
@@ -875,7 +830,7 @@ pub trait MaterializationExecutionPort: Send + Sync {
     /// not stay `Evicting` until the next daemon start. Acts only while
     /// the row is still `Evicting` (`false`, with nothing written, when it
     /// is not), and moves it to the state `abandoned` names -- or to
-    /// `Placeholder` when the row no longer names `version`, the version
+    /// `Remote` when the row no longer names `version`, the version
     /// the eviction revalidated, since that row's content was never on
     /// disk. One transaction, with the permit verified inside it: under a
     /// lost root nothing is written and the row is left for the startup
@@ -902,8 +857,8 @@ pub trait MaterializationExecutionPort: Send + Sync {
     ) -> Result<(), MaterializationExecutionError>;
 
     /// First step of the repair sweep's placeholder demotion, before the
-    /// placeholder write: moves the row to `Placeholder` only while it is
-    /// still in `row_state` with `authoring` and, when named, `version`
+    /// placeholder write: moves the row to `Remote` only while it is
+    /// still in `row_state` and, when named, `version`
     /// (one transaction). `false` means the row moved off what the lane
     /// read, and the lane must write nothing for it: not the placeholder
     /// it would size for the version it read, not its identity, and not
@@ -913,7 +868,6 @@ pub trait MaterializationExecutionPort: Send + Sync {
         group_id: &str,
         path: &str,
         row_state: MaterializationState,
-        authoring: Option<&yadorilink_replica_domain::ids::ChangeHash>,
         version: Option<&yadorilink_replica_domain::ids::VersionHash>,
         permit: &RootCommitPermit,
     ) -> Result<bool, MaterializationExecutionError>;
@@ -934,7 +888,7 @@ pub trait MaterializationExecutionPort: Send + Sync {
     /// Settle half of the repair sweep's journaled reconstruct of a regular
     /// file written under `mutation_generation`: publishes the proof for
     /// `version` with the identity now at `out_path`, guarded on the row
-    /// still being in `row_state` with `authoring` and `version`; when
+    /// still being in `row_state` with `version`; when
     /// nothing was published (no version, no identity, a failed or refused
     /// commit), demotes that same row to `Hydrating`, leaving the intent
     /// open so the next repair pass finds a candidate to prove. Logs every
@@ -948,7 +902,6 @@ pub trait MaterializationExecutionPort: Send + Sync {
         path: &str,
         out_path: &Path,
         row_state: MaterializationState,
-        authoring: Option<&yadorilink_replica_domain::ids::ChangeHash>,
         version: Option<yadorilink_replica_domain::ids::VersionHash>,
         mutation_generation: i64,
         permit: &RootCommitPermit,
@@ -972,7 +925,7 @@ pub trait MaterializationExecutionPort: Send + Sync {
     /// Settle half of the repair sweep's journaled rebuild of a `kind`
     /// object: publishes the proof for `version` with the identity observable at
     /// `out_path` under `mutation_generation`, guarded on the row still
-    /// being in `row_state` with `authoring` and `version` when a state was
+    /// being in `row_state` with `version` when a state was
     /// found. `false` when the fence was lost or the row superseded.
     // Mirrors the lane's own inputs one for one, like
     // `settle_repair_reconstruct`.
@@ -985,7 +938,6 @@ pub trait MaterializationExecutionPort: Send + Sync {
         out_path: &Path,
         version: yadorilink_replica_domain::ids::VersionHash,
         row_state: Option<MaterializationState>,
-        authoring: Option<&yadorilink_replica_domain::ids::ChangeHash>,
         mutation_generation: i64,
         permit: &RootCommitPermit,
     ) -> Result<bool, MaterializationExecutionError>;

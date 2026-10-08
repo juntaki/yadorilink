@@ -310,33 +310,23 @@ fn seed_block(device: &Device, group: &str, path: &str, data: Vec<u8>) -> Seeded
     let signing_key = device.state.device_signing_key().expect(
         "new_device calls ensure_device_signing_key, so every seed_block caller already has one",
     );
-    let emitter = yadorilink_sync_sqlite::dag_store::ChangeEmitter::new(
-        device.device_id.clone(),
+    let emitter = yadorilink_daemon::test_support::local_seam::replica_author_key(
+        &device.state.replica_coordinator,
+        &device.device_id,
         signing_key,
-    );
-    device
-        .state
-        .replica_coordinator
-        .upsert_file_emitting_change(
-            group,
-            &record,
-            &device.device_id,
-            yadorilink_replica_domain::session_state::ChangeContent {
-                ops: vec![yadorilink_replica_domain::change::Op::Put {
-                    path: yadorilink_replica_domain::ids::SyncPath(path.to_string()),
-                    version: version.version_hash,
-                    origin: yadorilink_replica_domain::change::PutOrigin::Direct,
-                }],
-                versions: std::slice::from_ref(&version),
-            },
-            None,
-            None,
-            yadorilink_daemon::replica_coordinator::ReplicaChangeEmission {
-                emitter: &emitter,
-                permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-            },
-        )
-        .unwrap();
+    )
+    .unwrap();
+    yadorilink_daemon::test_support::local_seam::commit_local_upsert(
+        &device.state.replica_coordinator,
+        group,
+        &record,
+        &device.device_id,
+        &version,
+        None,
+        &emitter,
+        &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+    )
+    .unwrap();
     // `record_group_block_provenance`'s doc comment: without this, the
     // block-serving path refuses this block as never having been obtained
     // through the group. `upsert_file_emitting_change` records the
@@ -346,8 +336,7 @@ fn seed_block(device: &Device, group: &str, path: &str, data: Vec<u8>) -> Seeded
     device
         .state
         .replica_coordinator
-        .change_history_repository()
-        .record_group_block_provenance(group, std::slice::from_ref(&hash))
+        .record_block_provenance(group, std::slice::from_ref(&hash))
         .unwrap();
 
     SeededBlock {

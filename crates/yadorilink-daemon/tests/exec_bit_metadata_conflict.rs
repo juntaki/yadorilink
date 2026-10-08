@@ -38,7 +38,7 @@ use support::{
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_local_storage::SegmentBlockStore;
-use yadorilink_replica_domain::ids::ChangeHash;
+use yadorilink_replica_domain::ids::DeltaHash;
 use yadorilink_transport::QuicPeerChannel;
 
 /// This device's own indexed owner-exec bit for `path`, read directly from
@@ -219,8 +219,8 @@ async fn two_unconnected_devices(test_name: &str) -> (TestDevice, TestDevice, St
 /// accessor `monkey_chaos.rs`/`retroactive_repair_seed_matrix.rs` already use
 /// for per-device DAG-state debug context.
 #[cfg(unix)]
-fn dag_heads(device: &TestDevice, group_id: &str) -> Vec<ChangeHash> {
-    device.state.replica_coordinator.sqlite().dag_group_heads(group_id).unwrap()
+fn dag_heads(device: &TestDevice, group_id: &str) -> Vec<DeltaHash> {
+    support::native_group_head_set(&device.state, group_id)
 }
 
 /// A device's real (non-artifact) entries, keyed by name, valued by content —

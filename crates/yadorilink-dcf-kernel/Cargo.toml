@@ -1,0 +1,20 @@
+[package]
+name = "yadorilink-dcf-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# Pure and generic: no workspace crate, no I/O, no async. The kernel is
+# instantiated by admission, by authoring self-checks and by reference tests
+# over their own change types.
+[dependencies]
+
+# Complexity benchmarks of the kernel rules.
+[[bench]]
+name = "kernel_bench"
+harness = false
+
+[lints]
+workspace = true

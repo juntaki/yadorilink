@@ -1,7 +1,7 @@
 //! Deterministic regression: durability must not stay stuck in
 //! `Protecting` when content has no obtainable holder.
 //!
-//! Root cause: a full-replica device's `Placeholder` row can legitimately
+//! Root cause: a full-replica device's `Remote` row can legitimately
 //! have NO obtainable holder among current membership -- its sole
 //! provenance-verified holder left the group, and every other current
 //! peer explicitly refuses the fetch (`FetchOutcome::Rejected`, "no
@@ -24,7 +24,7 @@
 //! the exact state a "never got a chance to fetch it" full replica would
 //! be in: `hydration::evict` (the same real production operation
 //! `topology_soak_lane.rs`'s own `op_evict` exercises) demotes the row
-//! to `Placeholder`, then the underlying block bytes are deleted
+//! to `Remote`, then the underlying block bytes are deleted
 //! directly from N's own block store. The direct deletion is necessary
 //! and deliberate, not a shortcut: `gc::run_sweep` never reclaims a
 //! still-CURRENT version's blocks (a full replica is supposed to keep
@@ -79,7 +79,7 @@ const TEST_SWEEP_INTERVAL: Duration = Duration::from_secs(3);
 /// itself a starvation bug, fixed alongside this one).
 const CONVERGENCE_BOUND: Duration = Duration::from_secs(60);
 
-// This scenario forces eviction with `set_test_placeholder_pipeline_connected`,
+// This scenario forces eviction with `set_test_on_demand_allowed`,
 // which satisfies `hydration::evict`'s own pipeline-connected gate, but not
 // `evict_to_placeholder`'s Windows-only requirement (materialization_eviction.rs)
 // of a recorded CfAPI placeholder identity and a real cfapi-host dehydration --
@@ -225,7 +225,7 @@ async fn unobtainable_content_converges_to_at_risk_not_stuck_protecting() {
     // Manually evict it on N -- the same real production operation
     // `topology_soak_lane.rs`'s `op_evict` exercises, bypassing the
     // custody gate entirely for a full-replica device (see this file's
-    // own module doc comment). Demotes the row to `Placeholder`, but
+    // own module doc comment). Demotes the row to `Remote`, but
     // does NOT by itself remove the underlying bytes from N's own block
     // store -- and `gc::run_sweep` never will either, for a file that's
     // still the group's CURRENT version: GC only reclaims blocks with NO
@@ -246,7 +246,7 @@ async fn unobtainable_content_converges_to_at_risk_not_stuck_protecting() {
     // every block is confirmed gone closes the same race this file's own
     // history already hit once with the GC-based approach.
     n.state.set_materialization_repair_sweep_interval(Duration::from_secs(3600));
-    n.state.set_test_placeholder_pipeline_connected(true);
+    n.state.set_test_on_demand_allowed(true);
     let mut fully_removed = false;
     for _ in 0..10 {
         yadorilink_daemon::hydration::evict(&n.state, &group_id, unique_path)

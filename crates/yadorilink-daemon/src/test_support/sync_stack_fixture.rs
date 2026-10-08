@@ -26,28 +26,20 @@
 //! # The authority key
 //!
 //! `authority_key` and `GROUP` live here rather than being borrowed from a
-//! test module, because [`FixtureAuthenticator`] and
+//! test module, because [`FixtureCheckpointSource`] and
 //! [`honest_bundle_carrying`] have to agree on both or nothing verifies.
-//! Keeping the signer and the thing that accepts its signature in one file
-//! is what makes that agreement checkable by reading.
 
 use std::sync::Arc;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use yadorilink_lane_ports::sim_fault::EndpointId;
 use yadorilink_local_storage::SegmentBlockStore;
-use yadorilink_peer_session::peer_session::ChangeAuthenticator;
+use yadorilink_replica_domain::author::fixtures;
 use yadorilink_replica_domain::authorization_checkpoint::{
-    build_merkle_proof, encode_merkle_proof, fingerprint_signing_key, merkle_root, sign_checkpoint,
-    AuthorizationCheckpoint,
+    fingerprint_signing_key, sign_checkpoint, AuthorizationCheckpoint,
 };
-use yadorilink_replica_domain::change::{Change, Op};
 use yadorilink_replica_domain::file::{FileMeta, FileVersion, RecordKind, VersionBlock};
-use yadorilink_replica_domain::ids::{BlockHash, ChangeHash, DeviceId, FolderGroupId, SyncPath};
-use yadorilink_replica_domain::test_authoring::create_signed_for_tests;
-use yadorilink_sync_sqlite::verified_change_store::{
-    self, VerifiedChangeBundle, VerifiedCheckpoint,
-};
+use yadorilink_replica_domain::ids::{BlockHash, DeviceId};
 
 use crate::daemon_state::DaemonState;
 use crate::replica_coordinator::ReplicaCoordinator;
@@ -62,9 +54,10 @@ pub const GROUP: &str = "g";
 /// verifies on another.
 pub const DEVICE: &str = "device-A";
 
-/// The key the fixture's Changes are signed with.
+/// The key the fixture's deltas are signed with: the
+/// fixture key of [`DEVICE`].
 pub fn author_key() -> SigningKey {
-    SigningKey::from_bytes(&[9u8; 32])
+    fixtures::signing_key(&DeviceId(DEVICE.into()))
 }
 
 /// The key whose signature over a checkpoint makes a fixture bundle honest.
@@ -72,24 +65,70 @@ pub fn authority_key() -> SigningKey {
     SigningKey::from_bytes(&[7u8; 32])
 }
 
-/// Resolves the fixture authority key for the fixture group, and nothing else.
-///
-/// Deliberately not `NetmapChangeAuthenticator`: resolving a real signer
-/// requires a verified group-policy chain, which has its own tests and is not
-/// what a stack-level scenario is about. Production uses the real one.
-#[derive(Debug)]
-pub struct FixtureAuthenticator;
+/// The fixture group's verified policy granting each of `writers` (a
+/// device id and its signing key) the writer role, in order, signed by
+/// [`authority_key`]: the chain a coordination plane serves once it has
+/// enrolled those devices as the group's writers.
+pub fn fixture_group_policy_granting(
+    writers: &[(&str, VerifyingKey)],
+) -> crate::change_policy::GroupPolicyState {
+    use crate::change_policy::policy_signing::grant_record_at_epoch;
+    let mut records = Vec::with_capacity(writers.len());
+    let mut prev = [0u8; 32];
+    for (index, (device, key)) in writers.iter().enumerate() {
+        let record = grant_record_at_epoch(
+            &authority_key(),
+            GROUP,
+            index as u64 + 1,
+            prev,
+            0,
+            device,
+            fingerprint_signing_key(key),
+            crate::change_policy::WriterRole::Editor,
+        );
+        prev = record.record_hash.as_slice().try_into().expect("a 32-byte record hash");
+        records.push(record);
+    }
+    crate::change_policy::verify_group_policy_log(
+        &authority_key().verifying_key().to_bytes(),
+        &crate::change_policy::GroupPolicyLog {
+            group_id: GROUP.to_string(),
+            current_seq: records.len() as u64,
+            current_epoch: 0,
+            policy_head: prev.to_vec(),
+            records,
+        },
+    )
+    .expect("the fixture group's policy verifies")
+}
 
-impl ChangeAuthenticator for FixtureAuthenticator {
-    fn resolve_authority_key(
-        &self,
-        group_id: &str,
-        signer_key_id: &[u8; 32],
-        _policy_head: &[u8; 32],
-    ) -> Option<VerifyingKey> {
-        let authority = authority_key().verifying_key();
-        let expected = fingerprint_signing_key(&authority);
-        (group_id == GROUP && *signer_key_id == expected).then_some(authority)
+/// Makes every one of `states` a writer of the fixture group on every one
+/// of them, as the coordination plane's policy does once it grants them:
+/// installs [`fixture_group_policy_granting`] for all of them on each, and
+/// stands in a coordination plane for each device's seal authorizations
+/// ([`FixtureCheckpointSource`] at the policy's current point), so a base
+/// a cross-Base recovery merges is sealed under a genuine authorization.
+pub fn grant_fixture_writers(states: &[&DaemonState]) {
+    let writers: Vec<(String, VerifyingKey)> = states
+        .iter()
+        .map(|state| {
+            let key = state.device_signing_key().expect("the fixture device has a signing key");
+            (state.device_id.clone(), key.verifying_key())
+        })
+        .collect();
+    let named: Vec<(&str, VerifyingKey)> =
+        writers.iter().map(|(device, key)| (device.as_str(), *key)).collect();
+    let policy = fixture_group_policy_granting(&named);
+    let point =
+        (policy.to_watermark().highest_verified_seq, policy.to_watermark().highest_verified_head);
+    for state in states {
+        state.authority.replace_group_policy_states(std::collections::HashMap::from([(
+            GROUP.to_string(),
+            policy.clone(),
+        )]));
+        *state.test_seal_checkpoint_source.lock().unwrap_or_else(|p| p.into_inner()) = Some(
+            Arc::new(FixtureCheckpointSource::for_device(state).at_policy_point(point.0, point.1)),
+        );
     }
 }
 
@@ -176,52 +215,6 @@ pub fn pin(local: &DaemonState, peer_name: &str, peer_key: u8) {
     );
 }
 
-/// The Changes this device can serve for `group` -- what "it has it" means.
-pub fn possessed(state: &DaemonState, group: &FolderGroupId) -> Vec<ChangeHash> {
-    state
-        .replica_coordinator
-        .database()
-        .read::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
-            verified_change_store::servable_change_hashes(conn, group)
-        })
-        .unwrap()
-}
-
-pub fn init_staging_schema(state: &DaemonState) {
-    state
-        .replica_coordinator
-        .database()
-        .write::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
-            verified_change_store::init_verified_change_schema(conn)
-        })
-        .unwrap();
-}
-
-/// Stages a verified bundle on `state`, as an admitted Change.
-///
-/// `seq` is the staging sequence the caller is responsible for advancing;
-/// two bundles staged under one `seq` is a fixture bug, not a product one.
-pub fn stage(state: &DaemonState, bundle: VerifiedChangeBundle, seq: i64) {
-    state
-        .replica_coordinator
-        .database()
-        .write_immediate::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
-            verified_change_store::stage_verified_bundles(conn, std::slice::from_ref(&bundle), seq)
-        })
-        .unwrap();
-}
-
-pub fn change_touching(paths: &[&str]) -> Change {
-    create_signed_for_tests(
-        vec![],
-        0,
-        DeviceId(DEVICE.into()),
-        FolderGroupId(GROUP.into()),
-        paths.iter().map(|path| Op::Delete { path: SyncPath((*path).into()) }).collect(),
-        &author_key(),
-    )
-}
-
 /// A real, structurally valid file version of `size` bytes in one block.
 ///
 /// The version hash is derived from the content, as it is everywhere else --
@@ -242,78 +235,6 @@ pub fn file_version(size: u32, seed: u8) -> FileVersion {
     )
 }
 
-/// A Change that writes content, and so refers to a file version.
-///
-/// Most fixtures here use `Op::Delete`, which refers to nothing -- which is
-/// exactly why a bundle missing its versions once passed every test and only
-/// surfaced in a scale run.
-pub fn change_putting(path: &str, version: &FileVersion) -> Change {
-    create_signed_for_tests(
-        vec![],
-        0,
-        DeviceId(DEVICE.into()),
-        FolderGroupId(GROUP.into()),
-        vec![Op::Put {
-            path: SyncPath(path.into()),
-            version: version.version_hash,
-            origin: yadorilink_replica_domain::change::PutOrigin::Direct,
-        }],
-        &author_key(),
-    )
-}
-
-/// A genuinely signed, genuinely provable bundle -- the same construction an
-/// honest peer would produce.
-pub fn honest_bundle(change: Change) -> VerifiedChangeBundle {
-    honest_bundle_carrying(change, Vec::new())
-}
-
-/// The same, for a Change that refers to file versions. The caller passes
-/// exactly the set the Change refers to; anything else is what the contract
-/// under test rejects.
-pub fn honest_bundle_carrying(change: Change, versions: Vec<FileVersion>) -> VerifiedChangeBundle {
-    let hash = change.compute_hash();
-    let leaves = vec![hash.0];
-    let authority = authority_key();
-
-    let checkpoint = AuthorizationCheckpoint {
-        group_id: GROUP.to_string(),
-        device_id: DEVICE.to_string(),
-        signing_key_fingerprint: fingerprint_signing_key(&author_key().verifying_key()),
-        merkle_root: merkle_root(&leaves),
-        leaf_count: 1,
-        checkpoint_seq: 1,
-        signer_key_id: fingerprint_signing_key(&authority.verifying_key()),
-        policy_epoch: 0,
-        policy_seq: 1,
-        policy_head: [0u8; 32],
-        issued_at_unix: 1,
-    };
-    let signature = sign_checkpoint(&checkpoint, &authority);
-    let encoded_checkpoint =
-        yadorilink_replica_domain::authorization_checkpoint::canonical_signing_bytes(&checkpoint);
-    let checkpoint_hash = yadorilink_replica_domain::authorization_checkpoint::checkpoint_hash(
-        &encoded_checkpoint,
-        &signature,
-    );
-
-    VerifiedChangeBundle {
-        encoded: change.to_wire_bytes(),
-        change,
-        checkpoint: VerifiedCheckpoint {
-            checkpoint_hash,
-            group_id: FolderGroupId(GROUP.into()),
-            device_id: DEVICE.into(),
-            checkpoint_seq: 1,
-            encoded: encoded_checkpoint,
-            signature: signature.to_vec(),
-            author_signing_public_key: author_key().verifying_key().to_bytes(),
-        },
-        merkle_proof: encode_merkle_proof(&build_merkle_proof(&leaves, 0)),
-        versions,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Local capture: what a device writes to disk, as a Change it signed itself.
 // ---------------------------------------------------------------------------
@@ -326,11 +247,11 @@ pub fn honest_bundle_carrying(change: Change, versions: Vec<FileVersion>) -> Ver
 //
 // ```text
 // filesystem event
-//   -> LocalChangeProcessor + ChangeEmitter   (a Change this device signed)
+//   -> LocalChangeProcessor + LocalAuthorKey   (a Change this device signed)
 //   -> Pending
 //   -> flush_pending_checkpoint               (Pending -> Published)
 //   -> note_local_commit_for_group
-//   -> ReconciliationDriver -> SyncStack -> RBSR
+//   -> PeerSessionDriver -> SyncStack -> RBSR
 // ```
 //
 // The `Pending` step is not a formality: a Pending Change is not servable
@@ -342,9 +263,8 @@ use std::pin::Pin;
 use std::sync::Mutex;
 
 use yadorilink_local_capture::LocalChangeProcessor;
-use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
 
-use crate::checkpoint_source::{flush_pending_checkpoint, CheckpointSource, FlushOutcome};
+use crate::checkpoint_source::CheckpointSource;
 
 /// This device's own local-capture processor, signing with the device key
 /// `DaemonState` already holds.
@@ -365,7 +285,14 @@ pub fn local_capture(state: &Arc<DaemonState>) -> Arc<LocalChangeProcessor> {
             state.device_id.clone(),
             Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()),
         )
-        .with_change_emitter(Arc::new(ChangeEmitter::new(state.device_id.clone(), signing))),
+        .with_change_emitter(Arc::new(
+            crate::test_support::local_seam::replica_author_key(
+                &state.replica_coordinator,
+                &state.device_id,
+                signing,
+            )
+            .unwrap(),
+        )),
     )
 }
 
@@ -377,12 +304,14 @@ pub fn local_capture(state: &Arc<DaemonState>) -> Arc<LocalChangeProcessor> {
 /// Published by calling that with a stand-in issuer exercises the primitive;
 /// attaching evidence directly would skip the thing under test.
 ///
-/// The one key it signs with is [`authority_key`], which is what
-/// [`FixtureAuthenticator`] resolves -- so a Change published here verifies
-/// on the peer without any second arrangement.
+/// The one key it signs with is [`authority_key`], which is what the fixture
+/// group's policy resolves -- so a Change published here verifies on the peer
+/// without any second arrangement.
 pub struct FixtureCheckpointSource {
     device_signing_public_key: VerifyingKey,
     next_seq: Mutex<u64>,
+    /// The policy point (`policy_seq`, `policy_head`) every checkpoint pins.
+    policy_point: (u64, [u8; 32]),
 }
 
 impl FixtureCheckpointSource {
@@ -396,7 +325,17 @@ impl FixtureCheckpointSource {
                 .expect("the fixture's device has a signing key")
                 .verifying_key(),
             next_seq: Mutex::new(0),
+            policy_point: (1, [0u8; 32]),
         }
+    }
+
+    /// This source pinning the policy point `(seq, head)` in every
+    /// checkpoint: the point a plane that granted the device writes checks
+    /// against, which a seal authorization must name for its verifier to
+    /// find the sealer's grant there.
+    pub fn at_policy_point(mut self, seq: u64, head: [u8; 32]) -> Self {
+        self.policy_point = (seq, head);
+        self
     }
 }
 
@@ -408,6 +347,7 @@ impl CheckpointSource for FixtureCheckpointSource {
         _request_id: &'a str,
         merkle_root: [u8; 32],
         leaf_count: u64,
+        _purpose: crate::checkpoint_source::CheckpointPurpose,
     ) -> Pin<Box<dyn Future<Output = Option<(AuthorizationCheckpoint, [u8; 64])>> + Send + 'a>>
     {
         Box::pin(async move {
@@ -426,43 +366,14 @@ impl CheckpointSource for FixtureCheckpointSource {
                 checkpoint_seq: seq,
                 signer_key_id: fingerprint_signing_key(&authority.verifying_key()),
                 policy_epoch: 0,
-                policy_seq: 1,
-                policy_head: [0u8; 32],
+                policy_seq: self.policy_point.0,
+                policy_head: self.policy_point.1,
                 issued_at_unix: 1,
             };
             let signature = sign_checkpoint(&checkpoint, &authority);
             Some((checkpoint, signature))
         })
     }
-}
-
-/// Moves this device's Pending Changes for `group` to Published, through the
-/// production primitive.
-///
-/// Named as a step a scenario takes rather than folded into `author`, because
-/// it is a step production takes too -- `broadcast_change` flushes the
-/// pending checkpoint before raising the local commit -- and a scenario that
-/// skips it has Changes RBSR will not serve.
-pub async fn publish_local_pending(
-    state: &Arc<DaemonState>,
-    source: &dyn CheckpointSource,
-    group: &str,
-) -> FlushOutcome {
-    let signing = state.device_signing_key().expect("the fixture's device has a signing key");
-    let authority = authority_key().verifying_key();
-    let expected = fingerprint_signing_key(&authority);
-    flush_pending_checkpoint(
-        &state.replica_coordinator.database(),
-        source,
-        group,
-        &state.device_id,
-        &signing.verifying_key(),
-        &move |key_id: &[u8; 32], _policy_head: &[u8; 32]| {
-            (*key_id == expected).then_some(authority)
-        },
-    )
-    .await
-    .expect("the fixture's own checkpoint must verify against its own authority")
 }
 
 /// Links `root` as this device's folder for [`GROUP`], the way linking it
@@ -535,10 +446,9 @@ pub fn link_folder(state: &DaemonState, root: &std::path::Path) -> std::path::Pa
 ///   -> LocalChangeProcessor::process_flush
 ///   -> Pending
 ///   -> flush_pending_checkpoint -> Published
-///   -> ReconciliationDriver::note_local_change
 /// ```
 ///
-/// The last two steps are what `DaemonState::broadcast_change` does in
+/// The last two steps are what `DaemonState::on_local_native_commit` does in
 /// production, in that order, and they are here rather than in the scenario
 /// because a scenario that forgot either would produce a Change RBSR cannot
 /// serve and a failure that reads like a network problem.
@@ -608,6 +518,13 @@ impl WatchedFolder {
     }
 
     /// Writes `contents` at `relative` and tells the watcher.
+    ///
+    /// The file's mtime is set to [`deterministic_mtime`] of the path and
+    /// contents before the watcher hears of it. A file's mtime is part of
+    /// its version identity, so leaving the wall-clock time the write
+    /// happened to run at would give the same scenario different version
+    /// and Change hashes on every run, and anything ordered by those hashes
+    /// could then differ between two runs of one seed.
     pub async fn write(&self, relative: &str, contents: &[u8]) {
         use yadorilink_filesystem_sync::watcher::FsChangeKind;
         let path = self.path().join(relative);
@@ -615,6 +532,11 @@ impl WatchedFolder {
             std::fs::create_dir_all(parent).expect("the file's parent directory");
         }
         std::fs::write(&path, contents).expect("write the file the device should notice");
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .and_then(|file| file.set_modified(deterministic_mtime(relative, contents)))
+            .expect("pin the written file's mtime");
         self.notify(path, FsChangeKind::CreatedOrModified).await;
     }
 
@@ -623,20 +545,88 @@ impl WatchedFolder {
         use yadorilink_filesystem_sync::watcher::FsChangeKind;
         let path = self.path().join(relative);
         std::fs::remove_file(&path).expect("remove the file the device should notice");
-        self.notify(path, FsChangeKind::Removed).await;
+        self.notify(path, FsChangeKind::ObservedRemoval).await;
     }
+
+    /// Creates the directory `relative` (and any missing parents) and tells
+    /// the watcher about the directory itself, as `mkdir -p` would be
+    /// reported.
+    ///
+    /// Distinct from the parent a [`Self::write`] creates silently: a
+    /// directory the watcher reported is one the user made, so capture can
+    /// author it as an explicit entry and record the filesystem object it
+    /// is. A later [`Self::rename_tree`] is paired by that identity; a
+    /// directory nobody reported has none to pair by.
+    pub async fn mkdir(&self, relative: &str) {
+        use yadorilink_filesystem_sync::watcher::FsChangeKind;
+        let path = self.path().join(relative);
+        std::fs::create_dir_all(&path).expect("create the directory the device should notice");
+        self.notify(path, FsChangeKind::CreatedOrModified).await;
+    }
+
+    /// Removes the directory `relative` and everything below it, as
+    /// `rm -rf` does, and reports each removed path to the watcher in the
+    /// order `rm -rf` removes them: every entry before the directory that
+    /// held it.
+    ///
+    /// One event per removed path, because that is what a recursive watcher
+    /// produces for `rm -rf`, and capture groups the burst back into one
+    /// recursive delete from those events and what is (no longer) on disk.
+    /// A primitive that reported only the top directory would test a
+    /// grouping the OS never asks for.
+    pub async fn remove_tree(&self, relative: &str) {
+        use yadorilink_filesystem_sync::watcher::FsChangeKind;
+        let root = self.path().join(relative);
+        let mut removed = Vec::new();
+        collect_post_order(&root, &mut removed);
+        std::fs::remove_dir_all(&root).expect("remove the tree the device should notice");
+        for path in removed {
+            self.notify(path, FsChangeKind::ObservedRemoval).await;
+        }
+    }
+
+    /// Renames the directory `from` to `to` in one `rename(2)` and reports
+    /// both sides, as a recursive watcher reports a directory move: the old
+    /// path gone, the new one present, and nothing for the entries inside,
+    /// which moved with their directory without being touched.
+    ///
+    /// `to`'s parent must exist. Both events are sent back to back, so they
+    /// reach capture in one debounced flush, which is where capture pairs a
+    /// vanished directory with an appearing one.
+    pub async fn rename_tree(&self, from: &str, to: &str) {
+        use yadorilink_filesystem_sync::watcher::FsChangeKind;
+        let (source, destination) = (self.path().join(from), self.path().join(to));
+        std::fs::rename(&source, &destination).expect("rename the tree the device should notice");
+        self.notify(source, FsChangeKind::ObservedRemoval).await;
+        self.notify(destination, FsChangeKind::CreatedOrModified).await;
+    }
+}
+
+/// Every path under `path` and `path` itself, each entry before the
+/// directory holding it. Symlinks are listed, never followed.
+fn collect_post_order(path: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let metadata = std::fs::symlink_metadata(path).expect("stat a path of the tree");
+    if metadata.is_dir() {
+        let mut children: Vec<_> = std::fs::read_dir(path)
+            .expect("list a directory of the tree")
+            .map(|entry| entry.expect("a directory entry of the tree").path())
+            .collect();
+        // Sorted, so a seed replays the same event order on every host.
+        children.sort();
+        for child in children {
+            collect_post_order(&child, out);
+        }
+    }
+    out.push(path.to_path_buf());
 }
 
 /// Links a fresh folder for `state` and starts the capture pipeline over it.
 ///
-/// `driver` is this device's own reconciliation driver: the executor raises
-/// the local-commit event on it after publishing, which is the one push
-/// production makes. Nothing in the returned handle calls `sync_with`.
 pub fn watch_folder(
     state: &Arc<DaemonState>,
-    driver: &Arc<crate::sync_adapter::ReconciliationDriver>,
+    _driver: &Arc<crate::sync_adapter::PeerSessionDriver>,
 ) -> WatchedFolder {
-    watch_folder_over(state, driver, own_temp_dir(), false)
+    watch_folder_over(state, own_temp_dir(), false)
 }
 
 /// [`watch_folder`], with the folder also registered as the group's link
@@ -645,14 +635,14 @@ pub fn watch_folder(
 /// folder's debouncer.
 ///
 /// A change that flush forces through capture is announced the way
-/// production announces it, and `broadcast_change` finds no coordination
+/// production announces it, and `on_local_native_commit` finds no coordination
 /// plane here to publish it with: it stays Pending until the caller
 /// publishes it (`publish_local_pending`).
 pub fn watch_folder_with_pending_flush(
     state: &Arc<DaemonState>,
-    driver: &Arc<crate::sync_adapter::ReconciliationDriver>,
+    _driver: &Arc<crate::sync_adapter::PeerSessionDriver>,
 ) -> WatchedFolder {
-    watch_folder_over(state, driver, own_temp_dir(), true)
+    watch_folder_over(state, own_temp_dir(), true)
 }
 
 /// [`watch_folder`], over a directory the caller already has.
@@ -662,10 +652,10 @@ pub fn watch_folder_with_pending_flush(
 /// handle onto an existing one.
 pub fn watch_folder_at(
     state: &Arc<DaemonState>,
-    driver: &Arc<crate::sync_adapter::ReconciliationDriver>,
+    _driver: &Arc<crate::sync_adapter::PeerSessionDriver>,
     root: &std::path::Path,
 ) -> WatchedFolder {
-    watch_folder_over(state, driver, (None, root.to_path_buf()), false)
+    watch_folder_over(state, (None, root.to_path_buf()), false)
 }
 
 /// A fresh directory and the path to reach it by, separately, because the
@@ -676,9 +666,27 @@ fn own_temp_dir() -> (Option<tempfile::TempDir>, std::path::PathBuf) {
     (Some(root), path)
 }
 
+/// The mtime [`WatchedFolder::write`] gives a file: a fixed epoch plus whole
+/// seconds taken from an FNV-1a hash of the path and contents.
+///
+/// A function of what was written rather than of when or on which device,
+/// so a replay reproduces it exactly. Different contents at one path get
+/// different mtimes (barring a 2^30 collision), so capture never sees an
+/// edit as an unchanged size-and-mtime pair -- which a per-folder counter
+/// would allow when two devices each make their first write to one path.
+/// Whole seconds, so a filesystem with coarse timestamps stores it intact.
+fn deterministic_mtime(relative: &str, contents: &[u8]) -> std::time::SystemTime {
+    const EPOCH_SECS: u64 = 1_700_000_000;
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in relative.as_bytes().iter().chain([&0u8]).chain(contents) {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    std::time::UNIX_EPOCH + std::time::Duration::from_secs(EPOCH_SECS + (hash & ((1 << 30) - 1)))
+}
+
 fn watch_folder_over(
     state: &Arc<DaemonState>,
-    driver: &Arc<crate::sync_adapter::ReconciliationDriver>,
     (owned_root, root): (Option<tempfile::TempDir>, std::path::PathBuf),
     register_pending_flush: bool,
 ) -> WatchedFolder {
@@ -735,11 +743,8 @@ fn watch_folder_over(
         dependencies
     });
     drop((flush_request_tx, flush_all_request_tx));
-    let source = FixtureCheckpointSource::for_device(state);
-    let (executor_state, executor_driver) = (state.clone(), driver.clone());
     let capture_root = canonical.clone();
     tokio::spawn(async move {
-        let group = yadorilink_replica_domain::ids::FolderGroupId(GROUP.into());
         while let Some(flush) = flush_rx.recv().await {
             let Ok(outcome) = processor.process_flush(GROUP, &capture_root, flush).await else {
                 continue;
@@ -747,12 +752,6 @@ fn watch_folder_over(
             if outcome.records.is_empty() {
                 continue;
             }
-            // Exactly what `broadcast_change` does, in this order. Publishing
-            // first is not a nicety: a Pending Change is not servable, so
-            // raising the commit before the flush would wake a driver that
-            // has nothing to offer.
-            publish_local_pending(&executor_state, &source, GROUP).await;
-            executor_driver.note_local_change(&group);
         }
     });
 
@@ -763,67 +762,16 @@ fn watch_folder_over(
 mod tests {
     use super::*;
 
-    /// The agreement the whole module depends on: what the bundle builder
-    /// signs, the authenticator accepts -- checked through the real verifier,
-    /// not by comparing the two constants. Split across two modules this
-    /// held by coincidence; here it holds by test.
+    /// The mtime `write` stamps is a function of what was written: a rerun
+    /// reproduces it, and an edit of the same size does not share it.
     #[test]
-    fn a_bundle_this_module_builds_verifies_under_the_authenticator_it_ships_with() {
-        let bundle = honest_bundle(change_touching(&["a.txt"]));
-
-        let verified =
-            crate::sync_adapter::verify::verify_bundle(&bundle, GROUP, &|key_id, head| {
-                FixtureAuthenticator.resolve_authority_key(GROUP, key_id, head)
-            });
-
-        assert_eq!(
-            verified.expect("the fixture's own bundle must verify under its own authenticator"),
-            bundle.change.compute_hash()
-        );
-    }
-
-    /// And rejects anything else, so a scenario cannot pass on a bundle no
-    /// real policy chain would have authorized.
-    #[test]
-    fn the_authenticator_rejects_another_group_and_another_signer() {
-        let expected = fingerprint_signing_key(&authority_key().verifying_key());
-
-        assert_eq!(
-            FixtureAuthenticator.resolve_authority_key("another-group", &expected, &[0u8; 32]),
-            None
-        );
-        assert_eq!(
-            FixtureAuthenticator.resolve_authority_key(GROUP, &[0xAA; 32], &[0u8; 32]),
-            None
-        );
-    }
-
-    /// A device starts with nothing servable, so a scenario asserting that a
-    /// Change arrived is not reading a row the fixture planted.
-    // `device` builds a real `DaemonState`, which supervises tasks.
-    #[tokio::test]
-    async fn a_fresh_device_possesses_nothing() {
-        let (state, _dir) = device("device-fresh", 1);
-        init_staging_schema(&state);
-
-        assert!(possessed(&state, &FolderGroupId(GROUP.into())).is_empty());
-    }
-
-    /// Staging is what makes a Change servable, and the fixture's own
-    /// staging path is the one every scenario authors through.
-    // `device` builds a real `DaemonState`, which supervises tasks.
-    #[tokio::test]
-    async fn a_staged_bundle_becomes_servable() {
-        let (state, _dir) = device("device-author", 2);
-        init_staging_schema(&state);
-        let group = FolderGroupId(GROUP.into());
-
-        let version = file_version(4096, 0x11);
-        let change = change_putting("a.bin", &version);
-        let hash = change.compute_hash();
-        stage(&state, honest_bundle_carrying(change, vec![version]), 1);
-
-        assert!(possessed(&state, &group).contains(&hash));
+    fn deterministic_mtime_depends_only_on_path_and_contents() {
+        let first = deterministic_mtime("docs/a.bin", &[0x11; 8]);
+        assert_eq!(first, deterministic_mtime("docs/a.bin", &[0x11; 8]));
+        assert_ne!(first, deterministic_mtime("docs/a.bin", &[0x99; 8]));
+        assert_ne!(first, deterministic_mtime("docs/b.bin", &[0x11; 8]));
+        let secs = first.duration_since(std::time::UNIX_EPOCH).unwrap();
+        assert_eq!(secs.subsec_nanos(), 0, "whole seconds survive coarse timestamps");
     }
 
     /// The endpoint a scenario partitions is the endpoint the device will

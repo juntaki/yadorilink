@@ -4,10 +4,8 @@
 //! themselves live on the daemon's `ReplicaCoordinator`.
 
 use crate::error::PeerSessionError;
-use yadorilink_replica_domain::change::Change;
 use yadorilink_replica_domain::file::FileVersion;
 use yadorilink_replica_domain::file::{FileRecord, RecordKind};
-use yadorilink_replica_domain::ids::ChangeHash;
 use yadorilink_replica_domain::session_state::MaterializationState;
 
 /// The materialization state a physical write leaves on a row for the
@@ -21,14 +19,14 @@ use yadorilink_replica_domain::session_state::MaterializationState;
 /// Three lanes write it: the projected-upserts batch, the unbatched
 /// eager/pinned content write, and the symlink write.
 ///
-/// `Hydrating`, not `Hydrated`. The row is committed before the bytes are
+/// `Hydrating`, not `Present`. The row is committed before the bytes are
 /// published, deliberately -- that ordering is what lets an intent
 /// distinguish a crash mid-write from an offline deletion, and what the
 /// local watcher's self-echo suppression depends on. But the window is
 /// not brief: a batch writes up to a bounded number of paths, and for the
 /// whole of it every row in the batch claimed to hold content that was
 /// still in a temp file. `Hydrating` says what is true -- a write for
-/// this version is in flight -- and leaves `Hydrated` to the commit that
+/// this version is in flight -- and leaves `Present` to the commit that
 /// can prove it.
 pub const MATERIALIZATION_IN_FLIGHT_STATE: MaterializationState = MaterializationState::Hydrating;
 
@@ -38,18 +36,17 @@ pub const MATERIALIZATION_IN_FLIGHT_STATE: MaterializationState = Materializatio
 /// Two producers read their payload out of this device's own index rather
 /// than receiving it: the local materialization audit, and peer
 /// hydration, which is asked to place the row it is given. A wire record
-/// comes with its own metadata and a DAG projection derives everything
+/// comes with its own metadata and a native projection derives everything
 /// from the resolved version, but these two have to go and read the row
 /// -- and both used to read it more than once. The audit read it eight
 /// times -- `get_files_by_paths` for the content, then
 /// `get_record_kind`, `get_symlink_target`, `get_symlink_out_of_root`,
-/// `get_unix_mode`, `get_xattrs`, `get_origin_device_id` and
-/// `get_authoring_change_hash` one at a time; hydration read the version
-/// and then the authoring hash, in two transactions, under a comment
-/// claiming it was one. Neither had any isolation spanning its reads. A
-/// writer landing in between produced a payload whose content came from
-/// one incarnation of the row and whose metadata or authoring identity
-/// came from another: a value that was never true of anything, from which
+/// `get_unix_mode`, `get_xattrs` and `get_origin_device_id` one at a time;
+/// hydration read the version and then a second column, in two
+/// transactions, under a comment claiming it was one. Neither had any
+/// isolation spanning its reads. A writer landing in between produced a
+/// payload whose content came from one incarnation of the row and whose
+/// metadata came from another: a value that was never true of anything, from which
 /// a `version_hash` could then be derived that named no version any row
 /// had ever held.
 ///
@@ -57,8 +54,7 @@ pub const MATERIALIZATION_IN_FLIGHT_STATE: MaterializationState = Materializatio
 /// on its own while the payload itself can be stitched together this way.
 /// So this is ONE statement, and the fields that decide a version
 /// (`record`'s blocks/size/mtime, plus `record_kind`, `unix_mode`,
-/// `symlink_target`, `xattrs`) and the identity that names it
-/// (`authoring_change_hash`) cannot come from different moments by
+/// `symlink_target`, `xattrs`) cannot come from different moments by
 /// construction.
 ///
 /// This is a producer's read, not a guard's. A caller that wants one
@@ -74,12 +70,6 @@ pub struct CurrentRowSnapshot {
     pub unix_mode: Option<u32>,
     pub xattrs: Vec<(String, Vec<u8>)>,
     pub origin_device_id: Option<String>,
-    /// `None` for a row that has no authoring identity yet -- the
-    /// bootstrap scaffold, and a device rebootstrapped from a checkpoint
-    /// snapshot. A legitimate, transient shape the audit skips rather
-    /// than treating as corruption; see
-    /// `reconcile_local_materialization_audit`.
-    pub authoring_change_hash: Option<ChangeHash>,
     /// The materialization state this same incarnation carries -- so a
     /// caller that is about to CAS the state forward can name the value
     /// it actually observed instead of writing blind.
@@ -103,100 +93,9 @@ impl CurrentRowSnapshot {
     }
 }
 
-/// One path's already-block-fetched-and-reconstructed-to-temp upsert,
-/// ready for a bounded batch publish (receiver-side materialization
-/// batching). Carries everything `ReplicaCoordinator::
-/// open_projected_upserts_batch` needs to commit this path's optimistic
-/// (not-yet-on-disk) `Hydrated` row+intent -- built entirely from work
-/// that needs no path lock (resolving the DAG winner, fetching blocks,
-/// reconstructing to a temp file via
-/// `yadorilink_local_storage::reconstruct_file_to_temp`), so a caller can
-/// prepare several of these concurrently/independently before ever
-/// acquiring any path's lock.
-///
-/// The crash-ordering invariant this preserves is identical to a single
-/// unbatched `materialize()` call's: the row+intent (`open_projected_
-/// upserts_batch`) must commit BEFORE `tmp_path` is published to
-/// `out_path`, and the fingerprint+intent-clear (`finalize_projected_
-/// mutations_batch`) must commit only AFTER that publish -- just batched
-/// across up to a bounded number of paths in each of those two steps,
-/// instead of committing one path's steps at a time.
-pub struct PreparedProjectedUpsert {
-    pub rel_path: String,
-    pub tmp_path: std::path::PathBuf,
-    pub out_path: std::path::PathBuf,
-    pub record: FileRecord,
-    pub origin_device_id: String,
-    pub authoring_change_hash: Option<ChangeHash>,
-    pub target_version_hash: Vec<u8>,
-    /// The incoming wire metadata (record kind / symlink target /
-    /// symlink-out-of-root / unix mode / xattrs) this upsert's `FileVersion`
-    /// carries, captured once here at prepare time rather than re-fetched
-    /// during revalidation -- a `FileVersion`'s metadata is part of its own
-    /// content-addressed identity (see `version_hash`'s own hashing), so it
-    /// can never differ between the prepare and commit steps for the same
-    /// version and needs no re-lookup. `open_projected_upserts_batch`
-    /// applies this atomically alongside the row/intent it commits, so
-    /// revalidation itself (`revalidate_ordinary_upsert`) stays pure
-    /// read-only -- no `writer_gate` acquisition of its own per candidate.
-    pub metadata: yadorilink_replica_domain::session_state::LocalFileMetaColumns,
-    /// The same conflict-copy-fixpoint-derived synthetic head
-    /// `reconcile_group_paths` would have passed as `combined_heads`'s own
-    /// `derived_head` argument for this path, if any -- `Some` only for a
-    /// path that is itself a conflict-copy output (its content comes from
-    /// a *losing* change materialized under a derived name, never from any
-    /// DAG change that directly touches this exact path). Required for a
-    /// caller's own re-resolution to see this path as `Present` at all: a
-    /// pure conflict-copy path has no direct change touching it, so
-    /// `combined_heads` with `derived_head: None` returns empty for it.
-    pub derived_head: Option<yadorilink_replica_engine::conflict::PathHead>,
-    /// Cross-file provenance batching: every block hash `ensure_
-    /// blocks_present_collecting` newly fetched and durably `store.put`
-    /// while preparing THIS candidate -- never flushed by the prepare
-    /// step itself. `try_commit_ordinary_batch` collects these
-    /// (deduplicated) across every candidate in its own bounded commit
-    /// chunk and issues ONE `record_group_block_provenance` call for the
-    /// whole chunk, instead of one call per file. Empty for a candidate
-    /// that needed no new fetches (every block was already local and
-    /// provenanced).
-    pub newly_fetched_block_hashes: Vec<Vec<u8>>,
-    /// The exact version this upsert's temp file was built from.
-    ///
-    /// Not `target_version_hash` above, which is a digest over the block
-    /// list for the materialization intent and is a different value
-    /// entirely. This is the `FileVersion`'s own identity, carried from
-    /// the moment the payload was produced.
-    ///
-    /// The proof for a write must name what the write put on disk, and
-    /// the only thing that knows that is the payload. Reading it from the
-    /// row instead -- at any point, however early -- asks a question
-    /// about the row rather than about the bytes, and the row can move
-    /// underneath while keeping its authoring identity.
-    /// The whole version, not just its hash: the exactness gate also
-    /// compares the replicated xattrs on disk against what the write was
-    /// supposed to apply, and those must come from the payload for the
-    /// same reason the identity does.
-    pub written_version: FileVersion,
-    /// The path's own resolved frontier, as `revalidate_ordinary_upsert`
-    /// read it under this batch's path lock immediately before the write
-    /// -- the frontier this physical write actually realizes.
-    ///
-    /// Empty until revalidation fills it in. It used to be one
-    /// group-wide `dag_group_heads()` read shared by the whole batch,
-    /// which is a different claim: the group's frontier at some moment
-    /// near the writes, rather than the resolution each individual write
-    /// carried out. Those diverge exactly when they matter -- a batch
-    /// spans many paths and takes real time, and a change admitted for an
-    /// unrelated path moves the group frontier without changing what any
-    /// of these writes realized.
-    pub realized_causal_basis: Vec<ChangeHash>,
-}
-
-/// One [`PreparedProjectedUpsert`]'s outcome once its temp file has been
-/// published to `out_path` -- everything `ReplicaCoordinator::
-/// finalize_projected_mutations_batch` needs is just the path and the
-/// fingerprint of what's now durably on disk; the row/intent were already
-/// committed by `open_projected_upserts_batch`.
+/// One upsert's outcome once its temp file has been published to `out_path` --
+/// everything `ReplicaCoordinator::finalize_projected_mutations_batch` needs is
+/// just the path and the fingerprint of what's now durably on disk.
 pub struct FinishedProjectedUpsert {
     pub rel_path: String,
     /// What this path was written as.
@@ -217,16 +116,10 @@ pub struct FinishedProjectedUpsert {
     /// observation failed -- the proof is still published, without an
     /// identity, since usability is decided by the fence, not by this.
     pub observed_identity: Option<yadorilink_root_authority::fs_identity::FileIdentity>,
-    /// The frontier this write realized, carried from the candidate's own
-    /// revalidation -- see `PreparedProjectedUpsert::realized_causal_basis`.
-    pub causal_basis: Vec<ChangeHash>,
-    /// The authoring identity the row carried when this candidate was
-    /// revalidated, and the state the open-batch transaction left it in.
-    /// The finalizer commits only while the row still satisfies both: a
-    /// path superseded during the batch's writes gets no proof and keeps
-    /// its intent, rather than being stamped for a version it has moved
-    /// off.
-    pub expected_authoring: Option<ChangeHash>,
+    /// The state the open-batch transaction left the row in. The finalizer
+    /// commits only while the row is still in it: a path superseded during
+    /// the batch's writes gets no proof and keeps its intent, rather than
+    /// being stamped for a version it has moved off.
     pub expected_state: MaterializationState,
 }
 
@@ -243,7 +136,6 @@ pub struct PreparedProjectedDelete {
     pub out_path: std::path::PathBuf,
     pub record: FileRecord,
     pub origin_device_id: String,
-    pub authoring_change_hash: Option<ChangeHash>,
 }
 
 /// An open, durably-recorded materialization intent for one path, returned
@@ -261,7 +153,7 @@ pub trait OpenMaterializationIntent: Send {
 /// could publish a placeholder as if it were real content; that false
 /// combination is unrepresentable by this type, not merely discouraged.
 /// A scheduler-level settlement
-/// (`SettlementEvidence::PolicyPlaceholder`/`HazardHeld`/`IgnoreExcluded`)
+/// (`SettlementEvidence::PolicyRemote`/`HazardHeld`/`IgnoreExcluded`)
 /// has no `ExactActualState` value to convert to at all -- see
 /// `SettlementEvidence::as_exact_actual_state` in `peer_session`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -299,36 +191,11 @@ pub enum ExactActualState {
 pub struct ExpectedAuthoring<'a> {
     /// The state the row must still be in, normally `Hydrating`.
     pub state: MaterializationState,
-    /// The authoring hash it must still carry. `None` means it must still
-    /// carry none, which is not the same as "any".
-    pub authoring_change_hash: Option<&'a ChangeHash>,
-    /// The version the current row must still name, checked explicitly
-    /// rather than inferred from the authoring hash. `None` skips it.
+    /// The version the current row must still name. `None` skips it.
     ///
     /// Any caller whose version was read in an earlier transaction than
     /// the commit -- which includes every writer that fetches or
     /// reconstructs content in between -- passes it, because a
-    /// supersession can keep the authoring hash while changing the content
-    /// the version is derived from.
+    /// supersession can change the content the version is derived from.
     pub expected_version: Option<&'a yadorilink_replica_domain::ids::VersionHash>,
-}
-
-/// One Change ready for DAG admission through
-/// `ReplicaCoordinator::dag_admit_change_batch_with_versions`.
-///
-/// A named struct rather than a tuple because it carries two independent
-/// booleans that mean completely different things, and a positional swap
-/// between them would be a silent security regression rather than a
-/// compile error.
-pub struct DagAdmission<'a> {
-    pub change: &'a Change,
-    pub versions: &'a [FileVersion],
-    /// Whether the Change has already been projected onto the filesystem.
-    /// Always `false` on the remote-admission path (admission is
-    /// durable-but-not-yet-projected; the Convergence Engine projects
-    /// later).
-    /// This Change's already-verified `AuthorizationCheckpoint` evidence,
-    /// written atomically with the Change's own admission, so a crash
-    /// never strands a remote Change as an accidental Pending row.
-    pub evidence: yadorilink_replica_engine::ports::ChangeEvidence,
 }

@@ -1,5 +1,5 @@
 //! `RootLease`/`LinkOperation`: the capability every daemon-originated local
-//! filesystem/index/DAG/materialization-state mutation must hold, and the
+//! filesystem/index/native state/materialization-state mutation must hold, and the
 //! RAII guard that proves it for an operation's *whole* duration.
 //!
 //! # Why a held guard, not a momentary check
@@ -19,7 +19,7 @@
 //!
 //! `RootLease`/`LinkOperation` closes this structurally: [`RootLease::
 //! begin_operation`] returns a [`LinkOperation`] the caller MUST hold from
-//! before its first filesystem write through its last DB/DAG commit — not
+//! before its first filesystem write through its last DB/native commit — not
 //! drop immediately. [`RootCommitPermit`] can only be constructed from a
 //! live `&LinkOperation` ([`LinkOperation::permit`]), so a caller with a
 //! permit in hand is, by construction (the borrow checker, not a runtime
@@ -63,7 +63,7 @@ use crate::sync_root_lock::SyncRootLock;
 /// single-process ownership of this root, this link's group id and startup
 /// generation, and the stop/drain gate every [`LinkOperation`] admits
 /// through. Shared (`Arc<RootLease>`) by every subsystem that can mutate
-/// this link's filesystem/index/DAG/materialization state — see this
+/// this link's filesystem/index/native state/materialization state — see this
 /// module's own doc for the full list.
 pub struct RootLease {
     /// `None` only for [`RootLease::for_tests`] — see that constructor's
@@ -110,7 +110,7 @@ impl RootLease {
     /// recreate root-swap hazard `SyncRootLock::verify_still_owns`'s own
     /// doc describes). The caller MUST hold the returned [`LinkOperation`]
     /// for this operation's whole duration — from before its first
-    /// filesystem write through its last DB/DAG commit — not drop it
+    /// filesystem write through its last DB/native commit — not drop it
     /// immediately after admission. Holding it for less than that
     /// reintroduces exactly the gap this module exists to close.
     pub fn begin_operation(&self) -> Result<LinkOperation<'_>, RootAuthorityError> {
@@ -263,6 +263,28 @@ impl<'a> RootCommitPermit<'a> {
     /// slot), so there is nothing left for a runtime check to race.
     pub fn verify(&self) -> Result<(), RootAuthorityError> {
         self.op.reverify()
+    }
+
+    /// This permit's root-identity check, owned, for a commit that runs in a
+    /// transaction shared with other operations and so cannot borrow the
+    /// permit. It checks exactly what [`Self::verify`] checks. The operation
+    /// the permit borrows must stay held until that commit has finished: the
+    /// stop fence is the operation's, not the check's.
+    pub fn owned_check(&self) -> OwnedPermitCheck {
+        OwnedPermitCheck(self.op.lease.root_lock.as_ref().map(SyncRootLock::identity_check))
+    }
+}
+
+/// See [`RootCommitPermit::owned_check`].
+#[derive(Debug, Clone)]
+pub struct OwnedPermitCheck(Option<crate::sync_root_lock::RootIdentityCheck>);
+
+impl OwnedPermitCheck {
+    pub fn verify(&self) -> Result<(), RootAuthorityError> {
+        match &self.0 {
+            Some(check) => check.verify(),
+            None => Ok(()),
+        }
     }
 }
 

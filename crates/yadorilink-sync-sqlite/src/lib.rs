@@ -15,9 +15,8 @@
 //! materialization job is needed) -- callers decide, this crate only
 //! persists already-decided writes atomically.
 
-pub mod authorization_witness_gc;
-pub mod base_advertisement;
-pub mod change_history;
+pub mod author_incarnation;
+pub mod content_write_open;
 pub mod dag_store;
 pub mod desired_state;
 pub mod dirty_path;
@@ -26,40 +25,94 @@ mod error;
 pub mod exact_materialized_commit;
 pub mod file_identity_codec;
 pub mod file_index;
-mod frontier;
+pub mod group_authority;
 pub mod handoff_lease;
+pub mod held_path;
 pub mod link;
+pub mod local_author;
 pub mod local_capture_provenance;
+pub mod materialization_basis;
 mod materialization_intent_repository;
 mod materialization_state;
 pub mod materialized_generation;
 pub mod membership_operation;
+pub mod native_admission;
+pub mod native_authoring;
+pub mod native_bootstrap;
+pub mod native_bootstrap_codec;
+#[cfg(test)]
+mod native_bulk_authoring_tests;
+#[cfg(test)]
+mod native_capture_profile_tests;
+pub mod native_checkpoint_authorization;
+pub mod native_checkpoint_frontier;
+pub mod native_checkpoint_install;
+pub mod native_closure;
+#[cfg(test)]
+mod native_conflict_name_independence;
+pub mod native_desired_state;
+pub mod native_history_floor;
+#[cfg(test)]
+mod native_keep_tests;
+#[cfg(test)]
+mod native_path_planner_tests;
+#[cfg(test)]
+mod native_plan_read_first_tests;
+#[cfg(test)]
+mod native_planner_scaling_tests;
+#[cfg(test)]
+mod native_prepare_count_tests;
+pub mod native_projection_binding;
+pub mod native_publication;
+pub mod native_rebootstrap;
+pub mod native_rebootstrap_install;
+pub mod native_rebootstrap_recovery;
+pub mod native_rebootstrap_replay;
+pub mod native_rebootstrap_target;
+pub mod native_recovery_items;
+pub mod native_recursive_operation;
+pub mod native_replication;
+pub(crate) mod native_row_witness;
+#[cfg(test)]
+mod native_scaling_tests;
+pub mod native_store;
+#[cfg(test)]
+mod native_store_reference;
+pub mod native_summary_cache;
+#[cfg(test)]
+mod native_summary_scaling_tests;
+mod new_path_rows;
+#[cfg(test)]
+mod new_path_rows_tests;
+mod new_path_settlement;
+#[cfg(test)]
+mod new_path_settlement_tests;
 pub mod offline_group_policy_log;
 pub mod offline_peer_authorization;
 pub mod paused_items;
 pub mod policy_watermark;
 pub mod projection_obligations;
-pub mod rebootstrap_store;
-pub mod remote_admission;
-mod replica_history;
+pub mod provider;
+pub mod provider_enumerate;
+pub mod provider_projector;
+pub mod provider_provenance;
+pub mod provider_write;
+mod replica_schema;
+pub mod replica_tables;
 pub mod restore_operation;
-pub mod retroactive_conflict;
 pub mod rewind_plan;
 pub mod role_loss_operation;
-pub mod snapshot_install_hold;
+pub mod stable_projection_binding;
 mod store;
 pub mod structural_origin;
 mod types;
-pub mod verified_change_store;
 pub mod write_through;
 
-pub use change_history::{
-    ChangeHistoryRepository, ImportAppendOutcome, PendingAdmission, REMOTE_ADMISSION_BATCH_SIZE,
-};
 pub use dirty_path::DirtyPathRepository;
 pub use enrollment::EnrollmentRepository;
 pub use error::SyncSqliteError;
 pub use handoff_lease::HandoffLeaseRepository;
+pub use held_path::HeldPathRepository;
 pub use materialization_intent_repository::MaterializationIntentRepository;
 pub use materialization_state::{
     ContentHash, MaterializationCounts, MaterializationStateRepository,
@@ -72,10 +125,9 @@ pub use offline_peer_authorization::{
 };
 pub use paused_items::PausedItemRepository;
 pub use policy_watermark::{PolicyWatermark, PolicyWatermarkRepository};
-pub use rebootstrap_store::RebootstrapStoreRepository;
+pub use replica_schema::{init_replica_schema, ReplicaSchemaError};
 pub use restore_operation::RestoreOperationRepository;
 pub use role_loss_operation::RoleLossOperationRepository;
-pub use snapshot_install_hold::SnapshotInstallHoldRepository;
 
 /// A plain duplicate rather than a shared cross-crate helper: five lines,
 /// no state, not worth its own module.

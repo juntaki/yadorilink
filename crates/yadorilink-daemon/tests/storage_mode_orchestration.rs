@@ -167,14 +167,13 @@ async fn demoting_setup(
                                     // `role_loss_saga.rs`'s identical `demoting_setup` override for why a
                                     // daemon integration test needs this instead of the production probe
                                     // (unconditionally `false`) or a thread-local override.
-    b.state.set_test_placeholder_pipeline_connected(true);
+    b.state.set_test_on_demand_allowed(true);
 
     let content = b"the file device-a confirms holding";
     let hash = a.state.block_store.put(content).unwrap();
     a.state
         .replica_coordinator
-        .change_history_repository()
-        .record_group_block_provenance(GROUP, &[hex::decode(hash.as_str()).unwrap()])
+        .record_block_provenance(GROUP, &[hex::decode(hash.as_str()).unwrap()])
         .unwrap();
     b.state.block_store.put(content).unwrap();
     let bytes = hex::decode(hash.as_str()).unwrap();
@@ -187,8 +186,7 @@ async fn demoting_setup(
     // lease is ever issued, regardless of the mocked Worker endpoint below.
     b.state
         .replica_coordinator
-        .change_history_repository()
-        .record_group_block_provenance(GROUP, std::slice::from_ref(&bytes))
+        .record_block_provenance(GROUP, std::slice::from_ref(&bytes))
         .unwrap();
     let record = record_referencing("only.bin", bytes, content.len() as u64);
     a.state
@@ -480,8 +478,7 @@ async fn demotion_refused_when_a_target_is_confirmed_but_this_device_has_no_conf
     let hash = a.state.block_store.put(content).unwrap();
     a.state
         .replica_coordinator
-        .change_history_repository()
-        .record_group_block_provenance(GROUP, &[hex::decode(hash.as_str()).unwrap()])
+        .record_block_provenance(GROUP, &[hex::decode(hash.as_str()).unwrap()])
         .unwrap();
     let bytes = hex::decode(hash.as_str()).unwrap();
     let record = record_referencing("only.bin", bytes, content.len() as u64);
@@ -555,7 +552,7 @@ async fn demotion_of_an_empty_group_needs_no_lease() {
     // unmatched-request assertion, proving none is ever made.
 
     let b = new_daemon("device-b"); // starts Eager, with zero files in GROUP
-    b.state.set_test_placeholder_pipeline_connected(true);
+    b.state.set_test_on_demand_allowed(true);
     b.state.set_coordination_client_config(
         server.uri(),
         yadorilink_fapi_client::test_support::offline_auth(),

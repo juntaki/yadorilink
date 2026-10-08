@@ -148,33 +148,6 @@ impl MembershipOperationRepository {
         })
     }
 
-    /// Every membership-operation row currently in one of `states`, split
-    /// into successfully decoded rows and rows that failed to decode --
-    /// see [`MembershipOperationScan`]'s own doc comment for why a single
-    /// malformed row must never abort the whole scan.
-    pub fn scan_membership_operations_in_states(
-        &self,
-        states: &[MembershipOperationState],
-    ) -> Result<MembershipOperationScan, SyncSqliteError> {
-        if states.is_empty() {
-            return Ok(MembershipOperationScan::default());
-        }
-        let placeholders = states.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
-        let sql = format!(
-            "SELECT operation_id, action, commit_mode, removed_device_id, group_ids, target_device_ids, \
-                    lease_ids, state, durability_scope, latch_group_ids, last_error, created_at_unix, \
-                    updated_at_unix \
-             FROM membership_operations WHERE state IN ({placeholders}) \
-             ORDER BY created_at_unix"
-        );
-        let state_strs: Vec<&str> = states.iter().map(|s| s.as_db_str()).collect();
-        self.database.read::<_, SyncSqliteError>(|conn| {
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query(rusqlite::params_from_iter(state_strs.iter()))?;
-            Self::collect_membership_operation_scan(rows)
-        })
-    }
-
     /// Every `membership_operations` row, with NO state filter at all --
     /// unlike [`Self::scan_membership_operations_in_states`], whose
     /// `WHERE state IN (...)` allow-list silently excludes a row whose

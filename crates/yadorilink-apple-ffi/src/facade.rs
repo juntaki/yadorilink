@@ -179,14 +179,6 @@ impl ClientCore {
         let core = self.inner.clone();
         bridge(async move { core.file_availability(absolute_path).await }).await
     }
-    pub async fn pin_file(&self, absolute_path: String) -> Result<(), DesktopError> {
-        let core = self.inner.clone();
-        bridge(async move { core.pin_file(absolute_path).await }).await
-    }
-    pub async fn unpin_file(&self, absolute_path: String) -> Result<(), DesktopError> {
-        let core = self.inner.clone();
-        bridge(async move { core.unpin_file(absolute_path).await }).await
-    }
     pub async fn hydrate_file(&self, absolute_path: String) -> Result<(), DesktopError> {
         let core = self.inner.clone();
         bridge(async move { core.hydrate_file(absolute_path).await }).await
@@ -439,6 +431,29 @@ impl ClientCore {
         bridge(async move {
             core.join_group_and_link(group_id, group_name, local_path, mode, acknowledge_risks)
                 .await
+        })
+        .await
+    }
+    pub async fn create_provider_folder(
+        &self,
+        group_name: String,
+        display_name: String,
+        mode: FolderMode,
+    ) -> Result<ProviderFolderOutcome, DesktopError> {
+        let core = self.inner.clone();
+        bridge(async move { core.create_provider_folder(group_name, display_name, mode).await })
+            .await
+    }
+    pub async fn join_provider_folder(
+        &self,
+        group_id: String,
+        group_name: String,
+        display_name: String,
+        mode: FolderMode,
+    ) -> Result<ProviderFolderOutcome, DesktopError> {
+        let core = self.inner.clone();
+        bridge(async move {
+            core.join_provider_folder(group_id, group_name, display_name, mode).await
         })
         .await
     }

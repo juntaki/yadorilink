@@ -13,7 +13,8 @@ RESOLVED, and worth reading before touching the schema gate below.
     it was fair to suspect an accidental regression rather than a completed
     consolidation.
 
-    It is not a regression. `index.rs::check_schema_version_supported`
+    It is not a regression. `yadorilink-sqlite-runtime`'s
+    `check_schema_version_supported`
     refuses `on_disk_version > SCHEMA_VERSION` AND
     `on_disk_version != 0 && on_disk_version < SCHEMA_VERSION` -- an exact
     match, with only an unstamped (brand new) database allowed through. That
@@ -102,15 +103,6 @@ FORBIDDEN = {
         "pub fn new_with_dependencies",
         "pub fn new_with_forwarding",
     ),
-    # `version_vector.rs` itself was fully deleted (not just emptied) once the
-    # authoring-identity migration to change-hash/DAG ancestry completed; see
-    # the `RETIRED_FILES_MUST_NOT_EXIST` check below for its replacement.
-    "crates/yadorilink-replica-engine/src/rebootstrap_snapshot.rs": (
-        "MAX_VERSION_COUNTERS",
-        "counter_count",
-        "version.counters()",
-        'b"YLNKsnp\\x01"',
-    ),
 }
 
 # Files a completed migration retired outright. Their compatibility fallback
@@ -120,6 +112,10 @@ FORBIDDEN = {
 RETIRED_FILES_MUST_NOT_EXIST = (
     "crates/yadorilink-sync-core",
     "crates/yadorilink-sync-core/src/version_vector.rs",
+    # The signed-change re-bootstrap snapshot (version-vector counters, the
+    # `YLNKsnp` domain tag) was removed with the signed-change model; its
+    # reappearance is the forbidden marker, not any string inside it.
+    "crates/yadorilink-replica-engine/src/rebootstrap_snapshot.rs",
     # The facade that wrapped `PeerSyncSession` and forwarded to it. Its
     # dependency setters are what let a session be reconfigured after
     # construction.
@@ -159,31 +155,7 @@ REQUIRED = {
         "crypto.alpn_protocols = vec![YADORILINK_P2P_ALPN.to_vec()];",
     ),
     "crates/yadorilink-replica-domain/src/file.rs": (
-        # `CurrentFileRecord` was renamed to `FileRecord` once the legacy
-        # version-vector-carrying `FileRecord` it disambiguated against was
-        # deleted outright, freeing the shorter name.
         "pub struct FileRecord",
-        "pub struct FileProjection",
-        "pub origin_device_id: String",
-        "pub authoring_change_hash: ChangeHash",
-    ),
-    "crates/yadorilink-sync-sqlite/src/file_index.rs": (
-        "invalid authoring_change_hash",
-    ),
-    # `rebootstrap_snapshot_v2.rs` was folded back into `rebootstrap_snapshot.rs`
-    # once it became the sole canonical implementation; the file's own domain
-    # tag is what tracks its generation now, not a `_v2`-style filename. The
-    # exact tag byte is intentionally NOT pinned here -- it is expected to
-    # keep advancing on every incompatible encoding change (see the file's
-    # module doc), and a guard that pins the current byte would fail every
-    # time that counter is correctly advanced (see the `schema_meta` check
-    # below for the same lesson learned the hard way). `check_snapshot_domain_tag`
-    # verifies the *shape* of the tag and that it is the sole domain used for
-    # both encode and decode instead.
-    "crates/yadorilink-replica-engine/src/rebootstrap_snapshot.rs": (
-        "out.extend_from_slice(SNAPSHOT_DOMAIN)",
-        "reader.expect(SNAPSHOT_DOMAIN)",
-        "the retired version-vector section",
     ),
     # The retired-payload rejection that `resource_lock.rs` used to perform
     # row by row now follows from `check_schema_version_supported` refusing
@@ -203,7 +175,7 @@ REQUIRED = {
         "pub fn check_replica_schema_generation",
         "if tables > 0 {",
     ),
-    "crates/yadorilink-daemon/src/replica_coordinator.rs": (
+    "crates/yadorilink-sync-sqlite/src/replica_schema.rs": (
         "check_replica_schema_generation(conn)?;",
     ),
     # Present AND without `default` -- see the FORBIDDEN entry above.
@@ -266,34 +238,6 @@ def check_forbidden_tree_wide() -> list[str]:
                         f"{rel}: retired identifier reintroduced: {needle!r}"
                     )
     return failures
-
-
-SNAPSHOT_DOMAIN_RE = re.compile(
-    r'const SNAPSHOT_DOMAIN: &\[u8; 8\] = b"YLNKsnp\\x[0-9a-fA-F]{2}";'
-)
-
-
-def check_snapshot_domain_tag() -> list[str]:
-    """Verify the re-bootstrap snapshot format still declares exactly one
-    domain tag, used symmetrically for encode and decode.
-
-    Deliberately does NOT pin the tag's current byte: that byte is meant to
-    keep advancing every time the encoding changes incompatibly (see the
-    file's own module doc), so pinning it here would make this guard fail on
-    every legitimate advance -- the same mistake the `schema_meta` check used
-    to make (see `check_schema_meta_initialization`).
-    """
-    relative_path = "crates/yadorilink-replica-engine/src/rebootstrap_snapshot.rs"
-    path = ROOT / relative_path
-    if not path.exists():
-        return [f"missing required exact-generation file: {relative_path}"]
-    text = path.read_text(encoding="utf-8")
-    if not SNAPSHOT_DOMAIN_RE.search(text):
-        return [
-            f"{relative_path}: no single `SNAPSHOT_DOMAIN: &[u8; 8] = b\"YLNKsnp\\xNN\"` "
-            "constant found (an exact-generation domain tag is required)"
-        ]
-    return []
 
 
 SCHEMA_META_INSERT_RE = re.compile(
@@ -387,8 +331,6 @@ def main() -> int:
     for relative_path in RETIRED_FILES_MUST_NOT_EXIST:
         if (ROOT / relative_path).exists():
             failures.append(f"retired file still exists: {relative_path}")
-
-    failures.extend(check_snapshot_domain_tag())
 
     coordination_root = ROOT / "coordination-worker"
     if coordination_root.exists():

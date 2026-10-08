@@ -310,7 +310,7 @@ async fn safe_demotion_succeeds_when_a_real_peer_durably_holds_everything() {
     // (platform-native, out of scope here) on-demand pipeline probe,
     // matching `storage_mode_orchestration.rs`'s own established use of
     // this exact override for its own demoting device.
-    n.state.set_test_placeholder_pipeline_connected(true);
+    n.state.set_test_on_demand_allowed(true);
     let handle = support::control_socket_client::start(n.state.clone()).await;
     let resp = support::control_socket_client::send(
         &handle,
@@ -516,7 +516,7 @@ async fn version_change_during_lease_issuance_refuses_the_demotion() {
     // counted. Counting it on the wiremock instead would be vacuous: zero
     // there is guaranteed whether or not N commits.
 
-    n.state.set_test_placeholder_pipeline_connected(true);
+    n.state.set_test_on_demand_allowed(true);
     let handle = support::control_socket_client::start(n.state.clone()).await;
     let log_offset_before_demotion = log_capture.lock().unwrap_or_else(|p| p.into_inner()).len();
     let resp = support::control_socket_client::send(

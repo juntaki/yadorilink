@@ -9,6 +9,8 @@ use super::*;
 fn base_link() -> LinkStatus {
     LinkStatus {
         local_path: "/tmp/photos".into(),
+        provider_root_id: String::new(),
+        provider_display_name: String::new(),
         group_id: "group-1".into(),
         paused: false,
         conflict_count: 0,
@@ -29,6 +31,7 @@ fn base_link() -> LinkStatus {
         transfer_eta_seconds: 0,
         durability_status: GroupDurabilityStatus::Protected as i32,
         durability_evidence: DurabilityEvidence::CorroboratedIndex as i32,
+        durability_check_pending: false,
         policy_stale: false,
         ambiguous: false,
         ambiguous_local_paths: Vec::new(),
@@ -185,6 +188,16 @@ fn durability_unknown_renders_its_own_suffix() {
     let mut link = base_link();
     link.durability_status = GroupDurabilityStatus::Unknown as i32;
     assert_eq!(durability_suffix(&link), "  durability unknown");
+}
+
+/// While the first custody check has not run yet the status is "checking",
+/// not "unknown": nothing failed to confirm, nothing has been asked.
+#[test]
+fn durability_check_pending_renders_checking_not_unknown() {
+    let mut link = base_link();
+    link.durability_status = GroupDurabilityStatus::Unknown as i32;
+    link.durability_check_pending = true;
+    assert_eq!(durability_suffix(&link), "  durability checking");
 }
 
 /// A group with a confirmed missing durable holder renders its own,
@@ -695,5 +708,123 @@ fn status_lines_for_a_busy_daemon_are_pinned_verbatim() {
             "Recent errors:",
             "  disk_full  ()  0",
         ]
+    );
+}
+
+/// Nothing preserved renders nothing; preserved data renders one line, and a total above the
+/// configured size names the commands that deal with it.
+#[test]
+fn preserved_data_renders_one_line_and_warns_above_the_threshold() {
+    use yadorilink_ipc_proto::daemonctl::PreservedSummary;
+    let mut status = base_status();
+    assert_eq!(preserved_line(&status), None);
+    status.preserved = Some(PreservedSummary::default());
+    assert_eq!(preserved_line(&status), None);
+
+    status.preserved = Some(PreservedSummary {
+        total: 2,
+        bytes: 10,
+        content_unavailable: 1,
+        unreplayed_own_units: 3,
+        warn_bytes: 100,
+        ..Default::default()
+    });
+    let line = preserved_line(&status).unwrap();
+    assert!(line.contains("2 version(s)") && line.contains("3 own change(s)"), "{line}");
+    assert!(!line.contains("preserved list"));
+
+    status.preserved.as_mut().unwrap().warn = true;
+    let line = preserved_line(&status).unwrap();
+    assert!(line.contains("yadorilink preserved list") && line.contains("discard"), "{line}");
+}
+
+/// A group whose rebootstrap runs says so, so a paused folder is explained.
+#[test]
+fn a_rebootstrapping_group_is_named() {
+    let mut status = base_status();
+    status.rebootstrapping_groups = vec!["g1".into()];
+    let lines = status_lines(&status);
+    assert!(lines.iter().any(|line| line.contains("group=g1") && line.contains("rebootstrap")));
+}
+
+/// Retained uploads of undecided operations are on the status, with the age of the oldest; none, no line.
+#[test]
+fn undecided_uploads_are_reported_with_their_age() {
+    let mut status = base_status();
+    assert!(!status_lines(&status).iter().any(|l| l.contains("undecided uploads")));
+    status.undecided_uploads = 3;
+    status.undecided_uploads_oldest_ms = 5 * 3_600_000;
+    let lines = status_lines(&status);
+    assert!(lines.iter().any(|l| l == "undecided uploads: 3, oldest: 5h"), "{lines:?}");
+}
+
+/// A provider root says why it is not ready; an Eager root shows its progress and stuck files; kept
+/// edits show their count and age.
+#[test]
+fn provider_roots_are_explained() {
+    use yadorilink_ipc_proto::daemonctl::{ProviderRootStatus, StuckFile};
+    let mut status = base_status();
+    status.provider_roots = vec![ProviderRootStatus {
+        root_id: "abcdef01".into(),
+        display_name: "Photos".into(),
+        readiness: "enable File Provider".into(),
+        eager: true,
+        eager_state: "running".into(),
+        eager_remote: 7,
+        eager_hydrating: 2,
+        eager_current: 40,
+        stuck: vec![StuckFile { path: "a/b.bin".into(), failures: 5 }],
+        kept_edits: 3,
+        kept_edits_oldest_ms: 3 * 3_600_000,
+        pending_publications: 2,
+        pending_oldest_ms: 90_000,
+        unconfirmed_publications: 1,
+        unconfirmed_oldest_ms: 5 * 3_600_000,
+    }];
+    let lines = status_lines(&status);
+    let has = |needle: &str| lines.iter().any(|l| l.contains(needle));
+    assert!(has("provider folder Photos (abcdef01): enable File Provider"), "{lines:?}");
+    assert!(has("downloading: running, 40 file(s) on this Mac, 7 to fetch, 2 in progress"));
+    assert!(has("stuck: a/b.bin (5 failed attempt(s))"));
+    assert!(has("edits kept beside the file: 3, oldest: 3h"));
+    assert!(has("file in use or release pending): 2, oldest: 90s"), "{lines:?}");
+    assert!(has("released but not yet confirmed by the OS: 1, oldest: 5h"));
+    assert!(!status_lines(&base_status()).iter().any(|l| l.contains("provider folder")));
+}
+
+/// A provider folder is named, never shown by its identity key; a removal says where the
+/// OS kept the downloaded files; an orphan domain is reported as kept.
+#[test]
+fn provider_folders_removals_and_orphans_are_rendered_without_a_path() {
+    use yadorilink_ipc_proto::daemonctl::ProviderRemovalStatus;
+    let mut status = base_status();
+    let mut link = base_link();
+    link.local_path = "provider://token-1".into();
+    link.provider_display_name = "Photos".into();
+    status.links = vec![link];
+    status.provider_removals = vec![
+        ProviderRemovalStatus {
+            root_id: "aaaaaaaa".into(),
+            display_name: "Old".into(),
+            removed: true,
+            preserved_location: "/Users/u/kept".into(),
+        },
+        ProviderRemovalStatus {
+            root_id: "bbbbbbbb".into(),
+            display_name: "Going".into(),
+            removed: false,
+            preserved_location: String::new(),
+        },
+    ];
+    status.orphan_domains = vec!["cccccccc".into()];
+    let lines = status_lines(&status);
+    let has = |needle: &str| lines.iter().any(|l| l.contains(needle));
+    assert!(has("provider folder 'Photos'  group=group-1"), "{lines:?}");
+    assert!(!has("provider://"), "the identity key leaked into the output: {lines:?}");
+    assert!(has("removed; the downloaded files are kept at /Users/u/kept"), "{lines:?}");
+    assert!(has("Going (bbbbbbbb): removing"), "{lines:?}");
+    assert!(
+        has("domain cccccccc belongs to no folder this database knows; it is kept"),
+        "{lines:?}"
     );
 }

@@ -17,43 +17,14 @@ use tokio::runtime::Runtime;
 use yadorilink_ipc_proto::framing::{read_message, write_message};
 use yadorilink_ipc_proto::shellipc::shell_ipc_message::Payload;
 use yadorilink_ipc_proto::shellipc::{
-    EntryKind, HydrateRequest, ListFolderFilesRequest, ListOnDemandFoldersRequest,
-    LocalWriteKind as ProtoLocalWriteKind, LocalWriteRequest, MaterializationState,
-    ShellIpcMessage, StatusQuery, SyncState,
+    HydrationPolicy, ListProviderFoldersRequest, ShellIpcMessage,
 };
 
-/// Status queries (used to build a single `NSFileProviderItem`) get the
-/// same short budget `core::ipc_client` uses — a badge/status read must
-/// never block a synchronous OS callback noticeably.
-const STATUS_TIMEOUT: Duration = Duration::from_millis(200);
-/// Folder/file-list enumeration is a bigger read (a whole group's file
-/// list — see shellipc.proto's `ListFolderFilesResponse` doc comment)
-/// but is still a local, in-memory index lookup on the daemon side, not
-/// network I/O — a generous-but-still-bounded budget one order of
-/// magnitude above a status read, matching the "context actions can do
-/// real work" 2s figure `core::ipc_client::ACTION_TIMEOUT` uses as its
-/// own reference point.
+/// Folder discovery is a local, in-memory read on the daemon side, but it is still bounded: the host
+/// must never wait on a daemon that does not answer.
 const ENUMERATION_TIMEOUT: Duration = Duration::from_secs(5);
-/// Hydration is real network I/O against a remote peer — a bounded-timeout
-/// decision gives the *daemon-side* dispatch a 30s budget
-/// (`yadorilink_daemon::hydration::HYDRATION_TIMEOUT`). The client-side wait
-/// here must be at least that long (otherwise we'd time out the IPC
-/// round trip before the daemon's own deadline fires and gets a chance to
-/// return a clean "no peer had this block" error), plus a small margin
-/// for the extra hop's own overhead. `fetchContents(for:...)` is
-/// synchronous from the *opening application's* point of view, so this
-/// is still a bounded wait, just a much longer tier than status/action —
-/// a multi-second timeout vs. ~200ms for status.
-const HYDRATION_TIMEOUT: Duration = Duration::from_secs(35);
-/// A local-write notification (`createItem`/`modifyItem`/
-/// `deleteItem`) makes the daemon read the live file from disk, chunk/hash
-/// it, and commit an index+DAG write -- real local I/O, no network round
-/// trip (peer broadcast afterward is fire-and-forget from this call's
-/// point of view), so a longer budget than `ENUMERATION_TIMEOUT`'s cheap
-/// in-memory lookup, but well short of `HYDRATION_TIMEOUT`'s network wait.
-const WRITE_NOTIFY_TIMEOUT: Duration = Duration::from_secs(10);
 
-fn runtime() -> &'static Runtime {
+pub(crate) fn runtime() -> &'static Runtime {
     static RUNTIME: OnceLock<Runtime> = OnceLock::new();
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_current_thread()
@@ -108,7 +79,7 @@ fn socket_path() -> PathBuf {
         .join("shell.sock")
 }
 
-async fn connect() -> std::io::Result<UnixStream> {
+pub(crate) async fn connect() -> std::io::Result<UnixStream> {
     UnixStream::connect(socket_path()).await
 }
 
@@ -126,71 +97,120 @@ pub fn real_home_dir_string() -> String {
     real_home_dir().to_string_lossy().into_owned()
 }
 
+/// One provider-backed root, as plain JSON for the Swift side (no build-time dependency
+/// on the proto's generated numbering). `root_id` is the lowercase hex of the daemon's
+/// 16-byte root id and is the File Provider domain identifier; there is no local path.
 #[derive(serde::Serialize, Debug, Clone, PartialEq, Eq)]
-pub struct OnDemandFolderInfo {
-    pub local_path: String,
+pub struct ProviderFolderInfo {
+    pub root_id: String,
     pub group_id: String,
+    pub display_name: String,
+    /// `"on_demand" | "eager" | "unspecified"`.
+    pub hydration_policy: String,
+    /// false => the host must NOT register a new domain and must NOT delete an existing
+    /// one: the OS caches an empty root listing registered before the namespace is
+    /// queryable.
+    pub registration_ready: bool,
+    /// The latest handoff sequence the daemon issued (the host reads it before it enumerates the
+    /// materialized set).
+    pub latest_evidence_seq: u64,
 }
 
-/// Discovers every OnDemand-linked folder group ("how does the
-/// extension learn which OnDemand folder groups exist" question) via the
-/// `ListOnDemandFoldersRequest`/`Response` pair already added to
-/// shellipc.proto (see this crate's module doc — added by the parallel
-/// Windows cfapi work for the identical need, reused here rather than
-/// inventing a second protocol surface). The daemon's own handler
-/// (`shell_ipc.rs`'s `ListOnDemandFoldersRequest` arm) answers straight
-/// from the persisted link table (`link_repository().list_links()`,
-/// filtered to `OnDemand` and not orphaned) — this response IS the
-/// authoritative desired-registration-state snapshot, not a cache of it.
+/// A domain the daemon wants removed (a durable intent): the ONLY authority to remove one.
+#[derive(serde::Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ProviderRemovalInfo {
+    pub root_id: String,
+    pub display_name: String,
+}
+
+/// The daemon's confirmed answer: the desired domains and the domains to remove.
+#[derive(serde::Serialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct ProviderSnapshot {
+    pub folders: Vec<ProviderFolderInfo>,
+    pub removals: Vec<ProviderRemovalInfo>,
+}
+
+fn hydration_policy_str(policy: HydrationPolicy) -> &'static str {
+    match policy {
+        HydrationPolicy::OnDemand => "on_demand",
+        HydrationPolicy::Eager => "eager",
+        HydrationPolicy::Unspecified => "unspecified",
+    }
+}
+
+/// Discovers every provider-backed root via `ListProviderFoldersRequest`/`Response`. The
+/// daemon's answer is the authoritative desired-registration-state snapshot.
 ///
-/// `None` on any failure (unreachable daemon, timeout, malformed
-/// response, or an explicit `snapshot_available: false` from the daemon
-/// itself — see `shellipc.proto`'s own doc comment on that field) —
-/// deliberately distinct from `Some(vec![])`, a *confirmed* "no OnDemand
-/// folders exist right now" snapshot. The caller
-/// (`DomainRegistration.registerOnDemandDomains`, which reconciles by
-/// both registering missing domains AND removing stale ones) must treat
-/// `None` as "cannot currently reconcile, leave existing registrations
-/// untouched" — collapsing this into an empty `Vec` the way earlier code
-/// did would make a transient daemon-unreachable moment look identical to
-/// "every domain should be removed," which is exactly the fail-open
-/// mistake a snapshot-based reconciliation must not make.
-pub fn list_on_demand_folders() -> Option<Vec<OnDemandFolderInfo>> {
+/// `None` on any failure (unreachable daemon, timeout, malformed response, or an explicit
+/// `snapshot_available: false`), deliberately distinct from `Some(vec![])`, a *confirmed*
+/// "no provider roots exist". The caller (the host's `ProviderDriver`, which both registers
+/// missing domains AND removes stale ones) must treat `None` as "cannot reconcile, leave
+/// existing registrations untouched".
+pub fn list_provider_folders(app_group_container: &str) -> Option<ProviderSnapshot> {
     runtime().block_on(async {
-        tokio::time::timeout(ENUMERATION_TIMEOUT, list_on_demand_folders_inner()).await.ok()?
+        tokio::time::timeout(ENUMERATION_TIMEOUT, list_provider_folders_inner(app_group_container))
+            .await
+            .ok()?
     })
 }
 
-async fn list_on_demand_folders_inner() -> Option<Vec<OnDemandFolderInfo>> {
+async fn list_provider_folders_inner(app_group_container: &str) -> Option<ProviderSnapshot> {
     let mut stream = connect().await.ok()?;
-    list_on_demand_folders_over(&mut stream).await
+    list_provider_folders_over(&mut stream, app_group_container).await
 }
 
-/// The stream-generic core of `list_on_demand_folders_inner`, split out
-/// so this load-bearing None-vs-Some distinction is testable against an
-/// in-memory duplex stream instead of a real Unix socket + daemon —
-/// mirrors `yadorilink-daemon`'s own `shell_ipc.rs::query_over<S>` split.
-async fn list_on_demand_folders_over<S>(stream: &mut S) -> Option<Vec<OnDemandFolderInfo>>
+/// The stream-generic core of `list_provider_folders_inner`, split out so the load-bearing
+/// None-vs-Some distinction is testable against an in-memory duplex stream.
+async fn list_provider_folders_over<S>(
+    stream: &mut S,
+    app_group_container: &str,
+) -> Option<ProviderSnapshot>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let msg = ShellIpcMessage {
-        payload: Some(Payload::ListOnDemandFoldersRequest(ListOnDemandFoldersRequest {})),
+        payload: Some(Payload::ListProviderFoldersRequest(ListProviderFoldersRequest {
+            app_group_container: app_group_container.to_string(),
+        })),
     };
     write_message(stream, &msg).await.ok()?;
     match read_message::<ShellIpcMessage>(stream).await {
-        Ok(Some(ShellIpcMessage { payload: Some(Payload::ListOnDemandFoldersResponse(r)) }))
+        Ok(Some(ShellIpcMessage { payload: Some(Payload::ListProviderFoldersResponse(r)) }))
             if r.snapshot_available =>
         {
-            Some(
+            let removals = r
+                .removals
+                .iter()
+                .map(|removal| ProviderRemovalInfo {
+                    root_id: hex_lower(&removal.root_id),
+                    display_name: removal.display_name.clone(),
+                })
+                .collect();
+            let folders = {
                 r.folders
                     .into_iter()
-                    .map(|f| OnDemandFolderInfo { local_path: f.local_path, group_id: f.group_id })
-                    .collect(),
-            )
+                    .map(|f| ProviderFolderInfo {
+                        hydration_policy: hydration_policy_str(
+                            HydrationPolicy::try_from(f.hydration_policy)
+                                .unwrap_or(HydrationPolicy::Unspecified),
+                        )
+                        .to_string(),
+                        root_id: hex_lower(&f.root_id),
+                        group_id: String::from_utf8_lossy(&f.group_id).into_owned(),
+                        display_name: f.display_name,
+                        registration_ready: f.registration_ready,
+                        latest_evidence_seq: f.latest_evidence_seq,
+                    })
+                    .collect()
+            };
+            Some(ProviderSnapshot { folders, removals })
         }
         _ => None,
     }
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -199,9 +219,9 @@ mod tests {
 
     /// A duplex "server" half that writes `response` (if any) back after
     /// reading whatever request arrives, then closes -- enough to drive
-    /// `list_on_demand_folders_over` through each branch without a real
+    /// `list_provider_folders_over` through each branch without a real
     /// daemon.
-    async fn respond_with(response: Option<ShellIpcMessage>) -> Option<Vec<OnDemandFolderInfo>> {
+    async fn respond_with(response: Option<ShellIpcMessage>) -> Option<ProviderSnapshot> {
         let (mut client, mut server) = tokio::io::duplex(4096);
         let server_task = tokio::spawn(async move {
             let _ = read_message::<ShellIpcMessage>(&mut server).await;
@@ -213,42 +233,76 @@ mod tests {
             // "server closed the connection without answering") sees EOF
             // rather than hanging.
         });
-        let result = list_on_demand_folders_over(&mut client).await;
+        let result = list_provider_folders_over(&mut client, "/group").await;
         server_task.await.unwrap();
         result
     }
 
-    fn response(folders: Vec<OnDemandFolderInfo>, snapshot_available: bool) -> ShellIpcMessage {
+    fn wire(f: &ProviderFolderInfo) -> yadorilink_ipc_proto::shellipc::ProviderFolder {
+        yadorilink_ipc_proto::shellipc::ProviderFolder {
+            root_id: vec![0xab; 16],
+            group_id: f.group_id.clone().into_bytes(),
+            display_name: f.display_name.clone(),
+            hydration_policy: HydrationPolicy::OnDemand as i32,
+            registration_ready: f.registration_ready,
+            latest_evidence_seq: f.latest_evidence_seq,
+        }
+    }
+
+    fn response(folders: Vec<ProviderFolderInfo>, snapshot_available: bool) -> ShellIpcMessage {
         ShellIpcMessage {
-            payload: Some(Payload::ListOnDemandFoldersResponse(
-                yadorilink_ipc_proto::shellipc::ListOnDemandFoldersResponse {
-                    folders: folders
-                        .into_iter()
-                        .map(|f| yadorilink_ipc_proto::shellipc::OnDemandFolder {
-                            local_path: f.local_path,
-                            group_id: f.group_id,
-                        })
-                        .collect(),
+            payload: Some(Payload::ListProviderFoldersResponse(
+                yadorilink_ipc_proto::shellipc::ListProviderFoldersResponse {
+                    folders: folders.iter().map(wire).collect(),
                     snapshot_available,
+                    removals: vec![yadorilink_ipc_proto::shellipc::ProviderRemoval {
+                        root_id: vec![0xcd; 16],
+                        display_name: "Gone".to_string(),
+                    }],
                 },
             )),
         }
     }
 
+    fn folder(ready: bool) -> ProviderFolderInfo {
+        ProviderFolderInfo {
+            root_id: "ab".repeat(16),
+            group_id: "group-a".to_string(),
+            display_name: "A".to_string(),
+            hydration_policy: "on_demand".to_string(),
+            registration_ready: ready,
+            latest_evidence_seq: 3,
+        }
+    }
+
     #[tokio::test]
     async fn confirmed_nonempty_snapshot_is_some() {
-        let folders = vec![OnDemandFolderInfo {
-            local_path: "/Users/x/A".to_string(),
-            group_id: "group-a".to_string(),
-        }];
+        let folders = vec![folder(true), folder(false)];
         let result = respond_with(Some(response(folders.clone(), true))).await;
-        assert_eq!(result, Some(folders));
+        let snapshot = result.expect("a confirmed snapshot");
+        assert_eq!(snapshot.folders, folders);
+        // The removal intents ride along: they are the only authority to remove a domain.
+        assert_eq!(
+            snapshot.removals,
+            [ProviderRemovalInfo { root_id: "cd".repeat(16), display_name: "Gone".to_string() }]
+        );
+    }
+
+    /// `registration_ready` crosses the JSON contract as-is: false must reach the host so
+    /// it neither registers nor deletes the domain.
+    #[test]
+    fn the_json_contract_carries_root_id_and_registration_ready() {
+        let json = serde_json::to_value(folder(false)).unwrap();
+        assert_eq!(json["root_id"], "ab".repeat(16));
+        assert_eq!(json["registration_ready"], false);
+        assert_eq!(json["latest_evidence_seq"], 3);
+        assert!(json.get("local_path").is_none());
     }
 
     #[tokio::test]
     async fn confirmed_empty_snapshot_is_some_empty() {
         let result = respond_with(Some(response(vec![], true))).await;
-        assert_eq!(result, Some(vec![]));
+        assert_eq!(result.map(|s| s.folders), Some(vec![]));
     }
 
     /// The exact daemon-side bug this whole change closes: a response
@@ -277,451 +331,4 @@ mod tests {
         let result = respond_with(Some(wrong)).await;
         assert_eq!(result, None);
     }
-
-    async fn respond_to_hydrate(response: Option<ShellIpcMessage>) -> Result<(), String> {
-        let (mut client, mut server) = tokio::io::duplex(4096);
-        let server_task = tokio::spawn(async move {
-            let _ = read_message::<ShellIpcMessage>(&mut server).await;
-            if let Some(response) = response {
-                let _ = write_message(&mut server, &response).await;
-            }
-        });
-        let result = hydrate_over(&mut client, "/a").await;
-        server_task.await.unwrap();
-        result
-    }
-
-    fn hydrate_response(ok: bool, error: &str) -> ShellIpcMessage {
-        ShellIpcMessage {
-            payload: Some(Payload::HydrateResponse(
-                yadorilink_ipc_proto::shellipc::HydrateResponse { ok, error: error.to_string() },
-            )),
-        }
-    }
-
-    #[tokio::test]
-    async fn hydrate_ok_response_is_ok() {
-        assert_eq!(respond_to_hydrate(Some(hydrate_response(true, ""))).await, Ok(()));
-    }
-
-    /// The exact gap this whole change closes: a daemon-reported failure
-    /// detail (e.g. "no peer currently holds this content") must survive
-    /// all the way to `hydrate_over`'s own return value, not collapse
-    /// into a generic bool the way `HydrateResponse.error` used to be
-    /// discarded before this change.
-    #[tokio::test]
-    async fn hydrate_failure_response_preserves_the_daemons_own_error_detail() {
-        let result = respond_to_hydrate(Some(hydrate_response(
-            false,
-            "no peer currently holds this content",
-        )))
-        .await;
-        assert_eq!(result, Err("no peer currently holds this content".to_string()));
-    }
-
-    #[tokio::test]
-    async fn hydrate_failure_response_with_no_detail_still_reports_an_error() {
-        let result = respond_to_hydrate(Some(hydrate_response(false, ""))).await;
-        assert_eq!(result, Err("the daemon reported a hydration failure".to_string()));
-    }
-
-    #[tokio::test]
-    async fn hydrate_connection_closed_without_a_response_is_an_error() {
-        let result = respond_to_hydrate(None).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn hydrate_wrong_payload_type_is_an_error() {
-        let wrong = response(vec![], true);
-        let result = respond_to_hydrate(Some(wrong)).await;
-        assert!(result.is_err());
-    }
-}
-
-#[derive(serde::Serialize)]
-pub struct FileEntryInfo {
-    pub relative_path: String,
-    pub size: u64,
-    pub mtime_unix_nanos: i64,
-    /// Mirrors `shellipc.proto`'s `MaterializationState` names
-    /// (`"hydrated" | "placeholder" | "hydrating" | "unspecified"`) as a
-    /// plain lowercase string, so the Swift side has no build-time
-    /// dependency on the proto's generated numbering (matching
-    /// `core::lib::YadoriLinkBadgeStatus`'s stated rationale for keeping the
-    /// FFI/JSON contract independent of `prost`'s numbering).
-    pub materialization_state: String,
-    /// `"file" | "directory" | "symlink"`, as a plain string for the same
-    /// reason as `materialization_state`. An explicit directory is listed as
-    /// its own entry; the Swift side must not also make a file of it.
-    pub kind: String,
-}
-
-fn entry_kind_str(kind: EntryKind) -> &'static str {
-    match kind {
-        // An unset kind is a sender that never classified the entry, which
-        // only ever meant a file.
-        EntryKind::Unspecified | EntryKind::File => "file",
-        EntryKind::Directory => "directory",
-        EntryKind::Symlink => "symlink",
-    }
-}
-
-fn materialization_state_str(s: MaterializationState) -> &'static str {
-    match s {
-        MaterializationState::Hydrated => "hydrated",
-        MaterializationState::Placeholder => "placeholder",
-        MaterializationState::Hydrating => "hydrating",
-        MaterializationState::Unspecified => "unspecified",
-    }
-}
-
-/// Enumerates every (non-deleted) file in the folder group rooted at
-/// `local_path` (must match a `local_path` from `list_on_demand_folders`)
-/// — backs `NSFileProviderEnumerator.enumerateItems(for:startingAt:)`.
-/// `ListFolderFilesResponse` is a flat list (shellipc.proto: "not
-/// paginated, not directory-scoped"), so the Swift enumerator buckets
-/// these into directory levels itself; this function just relays the
-/// daemon's answer.
-///
-/// `None` on any failure to confirm the listing (unreachable daemon,
-/// timeout, malformed response, or an explicit `snapshot_available: false`
-/// from the daemon), deliberately distinct from `Some(vec![])`, a
-/// *confirmed* empty folder — same contract as `list_on_demand_folders`.
-/// The File Provider treats a successful enumeration as authoritative, so
-/// the Swift caller must end the enumeration with an error on `None`,
-/// never report an empty folder.
-pub fn list_folder_files(local_path: &str) -> Option<Vec<FileEntryInfo>> {
-    runtime().block_on(async {
-        tokio::time::timeout(ENUMERATION_TIMEOUT, list_folder_files_inner(local_path)).await.ok()?
-    })
-}
-
-async fn list_folder_files_inner(local_path: &str) -> Option<Vec<FileEntryInfo>> {
-    let mut stream = connect().await.ok()?;
-    list_folder_files_over(&mut stream, local_path).await
-}
-
-/// The stream-generic core of `list_folder_files_inner`, split out (like
-/// `list_on_demand_folders_over`) so the `None`-vs-`Some(vec![])`
-/// distinction is testable against an in-memory duplex stream.
-async fn list_folder_files_over<S>(stream: &mut S, local_path: &str) -> Option<Vec<FileEntryInfo>>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    let msg = ShellIpcMessage {
-        payload: Some(Payload::ListFolderFilesRequest(ListFolderFilesRequest {
-            local_path: local_path.to_string(),
-        })),
-    };
-    write_message(stream, &msg).await.ok()?;
-    match read_message::<ShellIpcMessage>(stream).await {
-        Ok(Some(ShellIpcMessage { payload: Some(Payload::ListFolderFilesResponse(r)) }))
-            if r.snapshot_available =>
-        {
-            Some(
-                r.entries
-                    .into_iter()
-                    .map(|e| FileEntryInfo {
-                        kind: entry_kind_str(e.kind()).to_string(),
-                        relative_path: e.relative_path,
-                        size: e.size,
-                        mtime_unix_nanos: e.mtime_unix_nanos,
-                        materialization_state: materialization_state_str(
-                            MaterializationState::try_from(e.materialization_state)
-                                .unwrap_or(MaterializationState::Unspecified),
-                        )
-                        .to_string(),
-                    })
-                    .collect(),
-            )
-        }
-        _ => None,
-    }
-}
-
-#[cfg(test)]
-mod list_folder_files_tests {
-    use super::*;
-
-    async fn respond_with(response: Option<ShellIpcMessage>) -> Option<Vec<FileEntryInfo>> {
-        let (mut client, mut server) = tokio::io::duplex(4096);
-        let server_task = tokio::spawn(async move {
-            let _ = read_message::<ShellIpcMessage>(&mut server).await;
-            if let Some(response) = response {
-                let _ = write_message(&mut server, &response).await;
-            }
-        });
-        let result = list_folder_files_over(&mut client, "/Users/x/A").await;
-        server_task.await.unwrap();
-        result
-    }
-
-    fn response(relative_paths: &[&str], snapshot_available: bool) -> ShellIpcMessage {
-        ShellIpcMessage {
-            payload: Some(Payload::ListFolderFilesResponse(
-                yadorilink_ipc_proto::shellipc::ListFolderFilesResponse {
-                    entries: relative_paths
-                        .iter()
-                        .map(|p| yadorilink_ipc_proto::shellipc::FolderFileEntry {
-                            relative_path: p.to_string(),
-                            size: 1,
-                            mtime_unix_nanos: 2,
-                            materialization_state: MaterializationState::Placeholder as i32,
-                            placeholder_generation: None,
-                            kind: EntryKind::File as i32,
-                        })
-                        .collect(),
-                    snapshot_available,
-                },
-            )),
-        }
-    }
-
-    fn paths(entries: Option<Vec<FileEntryInfo>>) -> Option<Vec<String>> {
-        entries.map(|e| e.into_iter().map(|e| e.relative_path).collect())
-    }
-
-    #[tokio::test]
-    async fn confirmed_listing_is_some() {
-        let result = respond_with(Some(response(&["a.txt"], true))).await;
-        assert_eq!(paths(result), Some(vec!["a.txt".to_string()]));
-    }
-
-    #[tokio::test]
-    async fn confirmed_empty_listing_is_some_empty() {
-        assert_eq!(paths(respond_with(Some(response(&[], true))).await), Some(vec![]));
-    }
-
-    /// The daemon could not confirm the listing (e.g. a DB read
-    /// failure) — never "the folder is empty".
-    #[tokio::test]
-    async fn unconfirmed_listing_is_none() {
-        assert!(respond_with(Some(response(&[], false))).await.is_none());
-    }
-
-    #[tokio::test]
-    async fn connection_closed_without_a_response_is_none() {
-        assert!(respond_with(None).await.is_none());
-    }
-
-    /// The Swift catalog builds its directory tree from this string, so an
-    /// explicit directory must arrive as `"directory"`, and an unset kind
-    /// as `"file"`.
-    #[tokio::test]
-    async fn every_entry_carries_its_kind() {
-        let mut message = response(&["album", "album/a.txt", "album/latest", "old.txt"], true);
-        let Some(Payload::ListFolderFilesResponse(r)) = &mut message.payload else {
-            unreachable!()
-        };
-        for (entry, kind) in r.entries.iter_mut().zip([
-            EntryKind::Directory,
-            EntryKind::File,
-            EntryKind::Symlink,
-            EntryKind::Unspecified,
-        ]) {
-            entry.kind = kind as i32;
-        }
-        let kinds: Vec<String> =
-            respond_with(Some(message)).await.unwrap().into_iter().map(|e| e.kind).collect();
-        assert_eq!(kinds, ["directory", "file", "symlink", "file"]);
-    }
-
-    #[tokio::test]
-    async fn wrong_payload_type_is_none() {
-        let wrong = ShellIpcMessage {
-            payload: Some(Payload::HydrateResponse(
-                yadorilink_ipc_proto::shellipc::HydrateResponse { ok: false, error: String::new() },
-            )),
-        };
-        assert!(respond_with(Some(wrong)).await.is_none());
-    }
-}
-
-#[derive(serde::Serialize)]
-pub struct StatusInfo {
-    pub sync_state: String,
-    pub materialization_state: String,
-}
-
-/// Same query `core::ipc_client::query_status` makes, reimplemented here
-/// (rather than shared — see this crate's Cargo.toml doc comment) so
-/// `item(for:request:completionHandler:)` can build one
-/// `NSFileProviderItem` per file without a second, FinderSync-specific
-/// dependency. Bounded to `STATUS_TIMEOUT`; fails soft to all-empty/
-/// unspecified fields on any error.
-pub fn query_status(path: &str) -> StatusInfo {
-    runtime().block_on(async {
-        tokio::time::timeout(STATUS_TIMEOUT, query_status_inner(path)).await.unwrap_or(StatusInfo {
-            sync_state: "unspecified".to_string(),
-            materialization_state: "unspecified".to_string(),
-        })
-    })
-}
-
-async fn query_status_inner(path: &str) -> StatusInfo {
-    let unspecified = || StatusInfo {
-        sync_state: "unspecified".to_string(),
-        materialization_state: "unspecified".to_string(),
-    };
-    let Ok(mut stream) = connect().await else { return unspecified() };
-    let msg = ShellIpcMessage {
-        payload: Some(Payload::StatusQuery(StatusQuery { path: path.to_string() })),
-    };
-    if write_message(&mut stream, &msg).await.is_err() {
-        return unspecified();
-    }
-    match read_message::<ShellIpcMessage>(&mut stream).await {
-        Ok(Some(ShellIpcMessage { payload: Some(Payload::StatusResponse(r)) })) => StatusInfo {
-            sync_state: sync_state_str(
-                SyncState::try_from(r.state).unwrap_or(SyncState::Unspecified),
-            )
-            .to_string(),
-            materialization_state: materialization_state_str(
-                MaterializationState::try_from(r.materialization_state)
-                    .unwrap_or(MaterializationState::Unspecified),
-            )
-            .to_string(),
-        },
-        _ => unspecified(),
-    }
-}
-
-fn sync_state_str(s: SyncState) -> &'static str {
-    match s {
-        SyncState::Synced => "synced",
-        SyncState::Syncing => "syncing",
-        SyncState::Pending => "pending",
-        SyncState::Error => "error",
-        SyncState::Unspecified => "unspecified",
-    }
-}
-
-thread_local! {
-    /// The specific reason the most recent `hydrate` call on THIS thread
-    /// returned `false`, if any -- distinct from `hydrate`'s own bare
-    /// `bool` return, which the P0-B investigation found collapses
-    /// "daemon unreachable," "timed out," "write failed," and a
-    /// daemon-reported failure (`HydrateResponse.error`, e.g. "no peer
-    /// currently holds this content") into one indistinguishable signal
-    /// before it ever reaches the OS callback. `fetchContents`'s
-    /// completion handler can report a more specific `NSFileProviderError`
-    /// using this, once the Swift side is wired to ask for it (see
-    /// `lib.rs::yadorilink_fp_last_hydrate_error`'s own doc comment for
-    /// why that wiring is deliberately not done as part of this change).
-    /// Thread-local, not global, since `runtime()` runs every call on its
-    /// own single background thread -- matches this crate's own
-    /// `OverrideForTest`-style reasoning elsewhere in this codebase for
-    /// why per-call state should never leak across unrelated calls.
-    static LAST_HYDRATE_ERROR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
-}
-
-/// The detail `LAST_HYDRATE_ERROR` recorded for the most recent `hydrate`
-/// call, if it failed. See that thread-local's own doc comment.
-pub fn last_hydrate_error() -> Option<String> {
-    LAST_HYDRATE_ERROR.with(|cell| cell.borrow().clone())
-}
-
-/// Requests hydration of `path` (backs `fetchContents(for:version:
-/// request:completionHandler:)`). Bounded to `HYDRATION_TIMEOUT`;
-/// returns `false` on timeout, an unreachable daemon, or a
-/// `HydrateResponse{ok: false,..}` — the caller is expected to complete
-/// the OS callback with a clear I/O error in that case, never hang.
-/// `last_hydrate_error()` carries WHY, for a caller that wants more than
-/// the bare bool.
-pub fn hydrate(path: &str) -> bool {
-    let result = runtime().block_on(async {
-        match tokio::time::timeout(HYDRATION_TIMEOUT, hydrate_inner(path)).await {
-            Ok(result) => result,
-            Err(_) => Err("timed out waiting for the daemon".to_string()),
-        }
-    });
-    let ok = result.is_ok();
-    LAST_HYDRATE_ERROR.with(|cell| *cell.borrow_mut() = result.err());
-    ok
-}
-
-async fn hydrate_inner(path: &str) -> Result<(), String> {
-    let mut stream = connect().await.map_err(|e| format!("could not reach the daemon: {e}"))?;
-    hydrate_over(&mut stream, path).await
-}
-
-async fn hydrate_over<S>(stream: &mut S, path: &str) -> Result<(), String>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    let msg = ShellIpcMessage {
-        payload: Some(Payload::HydrateRequest(HydrateRequest { path: path.to_string() })),
-    };
-    write_message(stream, &msg).await.map_err(|e| format!("could not reach the daemon: {e}"))?;
-    match read_message::<ShellIpcMessage>(stream).await {
-        Ok(Some(ShellIpcMessage { payload: Some(Payload::HydrateResponse(r)) })) => {
-            if r.ok {
-                Ok(())
-            } else if r.error.is_empty() {
-                Err("the daemon reported a hydration failure".to_string())
-            } else {
-                Err(r.error)
-            }
-        }
-        Ok(_) => Err("the daemon's response was not a hydrate response".to_string()),
-        Err(e) => Err(format!("could not reach the daemon: {e}")),
-    }
-}
-
-/// Which File Provider callback produced this notification --
-/// `createItem`/`modifyItem` both collapse to the same
-/// `CreatedOrModified` signal (the daemon re-observes the live file from
-/// disk either way, never trusting the callback's own `contents`/
-/// `changedFields`), and `deleteItem` to `Deleted`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LocalWriteKind {
-    CreatedOrModified,
-    Deleted,
-}
-
-/// Notifies the daemon that a local write already landed on disk under
-/// `local_path`/`relative_path` (backs `createItem`/`modifyItem`/
-/// `deleteItem`). Carries no content or metadata -- only the signal that
-/// something changed and what kind; the daemon re-observes the live file
-/// itself. Returns `false` on timeout, an unreachable daemon, or a
-/// `LocalWriteResponse{ok: false, ..}` -- the caller is expected to
-/// complete the OS callback with a clear error in that case, never hang
-/// or silently report success for a write the daemon never actually
-/// admitted.
-pub fn notify_local_write(local_path: &str, relative_path: &str, kind: LocalWriteKind) -> bool {
-    runtime().block_on(async {
-        tokio::time::timeout(
-            WRITE_NOTIFY_TIMEOUT,
-            notify_local_write_inner(local_path, relative_path, kind),
-        )
-        .await
-        .unwrap_or(false)
-    })
-}
-
-async fn notify_local_write_inner(
-    local_path: &str,
-    relative_path: &str,
-    kind: LocalWriteKind,
-) -> bool {
-    let Ok(mut stream) = connect().await else { return false };
-    let proto_kind = match kind {
-        LocalWriteKind::CreatedOrModified => ProtoLocalWriteKind::CreatedOrModified,
-        LocalWriteKind::Deleted => ProtoLocalWriteKind::Deleted,
-    };
-    let msg = ShellIpcMessage {
-        payload: Some(Payload::LocalWriteRequest(LocalWriteRequest {
-            local_path: local_path.to_string(),
-            relative_path: relative_path.to_string(),
-            kind: proto_kind as i32,
-        })),
-    };
-    if write_message(&mut stream, &msg).await.is_err() {
-        return false;
-    }
-    matches!(
-        read_message::<ShellIpcMessage>(&mut stream).await,
-        Ok(Some(ShellIpcMessage { payload: Some(Payload::LocalWriteResponse(r)) })) if r.ok
-    )
 }

@@ -93,7 +93,12 @@ RECONSTRUCT_FORWARDER_FILE = "crates/yadorilink-daemon/src/local_convergence/typ
 RECONSTRUCT_FORWARDER = "reconstruct_file_off_runtime"
 PERSIST_FORWARDER = "persist_reconstructed_file_off_runtime"
 FORWARDER_OF = {RECONSTRUCT_TOKEN: RECONSTRUCT_FORWARDER, PERSIST_TOKEN: PERSIST_FORWARDER}
-RECONSTRUCT_SITE_TOKENS = (RECONSTRUCT_TOKEN, PERSIST_TOKEN, RECONSTRUCT_FORWARDER + "(")
+RECONSTRUCT_SITE_TOKENS = (
+    RECONSTRUCT_TOKEN,
+    PERSIST_TOKEN,
+    RECONSTRUCT_FORWARDER + "(",
+    PERSIST_FORWARDER + "(",
+)
 
 # The sanctioned content-write seam files (each upholds one of the three
 # crash-safe disciplines described above). A content-write call anywhere else
@@ -106,21 +111,19 @@ RECONSTRUCT_ALLOWED_FILES = {
     "crates/yadorilink-daemon/src/hydration.rs",
     # Intent-journal seam (live peer materialize), via the forwarder.
     "crates/yadorilink-daemon/src/local_convergence/materialize/eager.rs",
-    # Hydrating->Hydrated flip (convergence hydrate), via the forwarder.
-    "crates/yadorilink-daemon/src/local_convergence/hydrate.rs",
 }
 
 # Pinned total number of production content-write call sites across the
 # sanctioned files. Bump this ONLY when adding a reviewed, provably crash-safe
 # content-write site (and confirm it is bracketed by one of the three
 # disciplines). Current sites:
-#   materialization_repair.rs: reconstruct_file_journaled                 (1)
-#   hydration.rs:              daemon hydrate (its publish) + restore     (2)
-#   materialize/eager.rs:      reconstruct_content, first try + retry     (2)
-#   local_convergence/hydrate.rs: hydrate_file                            (1)
-# The last three used to be direct calls in peer-session's peer_session.rs;
-# they now reach the writer through the daemon's off-runtime forwarder.
-EXPECTED_RECONSTRUCT_CALLS = 6
+#   materialization_repair.rs:    reconstruct_file_journaled                 (1)
+#   hydration.rs:                 daemon hydrate publish + restore publish   (2)
+#   materialize/eager.rs:         eager write publish (via the forwarder)    (1)
+# Hydration, restore and the eager peer-update write assemble into a temp file,
+# re-check the disk under the path lock and only then publish it with
+# `persist_reconstructed_file`, so the publish is the content-write site.
+EXPECTED_RECONSTRUCT_CALLS = 4
 
 # Test code is recognised the same way the materialization-semantic guard
 # recognises it, by loading that script's scanner instead of keeping another

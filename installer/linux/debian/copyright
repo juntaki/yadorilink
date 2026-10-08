@@ -4,8 +4,8 @@ Source: https://github.com/juntaki/yadorilink
 
 Files: *
 Copyright: 2026 Jumpei Takiyasu
-License: MIT
+License: AGPL-3.0-only
 
-License: MIT
- See /usr/share/doc/yadorilink/LICENSE-MIT (installed from this
- repository's LICENSE-MIT at build time).
+License: AGPL-3.0-only
+ See /usr/share/doc/yadorilink/LICENSE (installed from this
+ repository's LICENSE at build time).

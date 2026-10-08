@@ -74,10 +74,9 @@ fn an_unknown_kind_is_refused_not_guessed() {
     ));
 }
 
-/// The legacy re-bootstrap request/response (kind 6) is gone: it installed a
-/// peer's base on the strength of its frontier alone, without verifying the
-/// witnesses the base carries. A peer that still sends it is refused like
-/// any other unknown kind, in both directions, rather than answered.
+/// Kind 6, a retired request/response, is gone. A peer that still sends it
+/// is refused like any other unknown kind, in both directions, rather than
+/// answered.
 #[test]
 fn the_retired_rebootstrap_kind_is_refused_both_ways() {
     let mut request = vec![RPC_VERSION, 6];

@@ -9,6 +9,8 @@ pub mod diagnostics;
 pub mod files;
 pub mod folders;
 pub mod links;
+pub mod paths;
+pub(crate) mod provider_pending;
 pub mod shares;
 pub mod storage;
 pub mod transfers;

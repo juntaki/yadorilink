@@ -1,9 +1,9 @@
-//! `on-demand-sync` CLI commands: pin/unpin/evict a file
+//! On-demand CLI commands: evict a file or show its materialization state
 //! by its local path, resolved by the daemon against its registered links
 //! (the same absolute-path resolution the shell-IPC hydration path uses).
 
 use yadorilink_client_core::ops::files;
-use yadorilink_ipc_proto::daemonctl::MaterializationState;
+use yadorilink_ipc_proto::daemonctl::local_state_word;
 
 use crate::error::CliError;
 
@@ -18,23 +18,9 @@ fn absolute_path(local_path: &str) -> Result<String, CliError> {
     })
 }
 
-pub async fn pin(local_path: String) -> Result<(), CliError> {
-    let absolute_path = absolute_path(&local_path)?;
-    files::pin_file(absolute_path).await?;
-    println!("Pinned {local_path}");
-    Ok(())
-}
-
-pub async fn unpin(local_path: String) -> Result<(), CliError> {
-    let absolute_path = absolute_path(&local_path)?;
-    files::unpin_file(absolute_path).await?;
-    println!("Unpinned {local_path}");
-    Ok(())
-}
-
 /// Reads `EvictResponse.dehydrated` and only ever claims success
 /// when it's `true` -- a request that daemon-side silently did nothing
-/// (the file is pinned, busy, not yet fully synced, or was just modified)
+/// (the file is busy, not yet fully synced, or was just modified)
 /// used to print "Evicted" regardless, an unconditional success claim this
 /// daemon never actually backed up. See `EvictResponse`'s own proto doc
 /// comment for the exact gap this closes.
@@ -44,8 +30,8 @@ pub async fn evict(local_path: String) -> Result<(), CliError> {
         println!("Evicted {local_path} (converted to a placeholder)");
     } else {
         println!(
-            "{local_path} was not evicted -- it may be pinned, busy, not fully synced, or \
-             was just modified. Nothing was freed."
+            "{local_path} was not evicted -- it may be busy, not fully synced, or was just \
+             modified. Nothing was freed."
         );
     }
     Ok(())
@@ -58,15 +44,8 @@ pub async fn status(local_path: String) -> Result<(), CliError> {
     let absolute_path = absolute_path(&local_path)?;
     let status = files::materialization_status(absolute_path).await?;
     if status.known {
-        let state = match status.state() {
-            MaterializationState::Hydrated => "hydrated",
-            MaterializationState::Placeholder => "placeholder",
-            MaterializationState::Hydrating => "hydrating",
-            MaterializationState::Evicting => "evicting",
-            MaterializationState::Unspecified => "unknown",
-        };
-        let pinned = if status.pinned { ", pinned" } else { "" };
-        println!("{local_path}: {state}{pinned}");
+        let state = local_state_word(status.local_state.as_ref());
+        println!("{local_path}: {state}");
     } else {
         println!("{local_path}: not currently tracked (not indexed, or not under a linked folder)");
     }

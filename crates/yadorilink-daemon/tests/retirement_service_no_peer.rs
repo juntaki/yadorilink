@@ -9,7 +9,7 @@
 //! the source.
 //!
 //! Conflict/history state is fabricated by admitting hand-crafted `Change`s
-//! directly through `change_history_repository()`, the same technique
+//! directly through the history store, the same technique
 //! `yadorilink-peer-session`'s own
 //! `audit_retires_an_ephemeral_conflict_copy_once_its_loser_window_closes`
 //! test uses -- no second live device or session is needed to produce a
@@ -27,10 +27,7 @@ use yadorilink_daemon::convergence::retirement_service::ConvergenceRetirementSer
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::local_convergence::types::RetirementAttempt;
 use yadorilink_local_storage::SegmentBlockStore;
-use yadorilink_replica_domain::change::{Change, Op, PutOrigin};
 use yadorilink_replica_domain::file::{FileMeta, FileRecord, FileVersion, RecordKind};
-use yadorilink_replica_domain::ids::{DeviceId, FolderGroupId, SyncPath};
-use yadorilink_replica_domain::test_authoring::create_signed_for_tests;
 
 const GROUP: &str = "retirement-no-peer";
 
@@ -81,42 +78,30 @@ fn empty_version(mtime: i64) -> FileVersion {
 fn admit(
     device: &Device,
     device_id: &str,
-    signing_key: &SigningKey,
+    _signing_key: &SigningKey,
     path: &str,
     version: &FileVersion,
-) -> Change {
-    let change = create_signed_for_tests(
-        vec![],
-        0,
-        DeviceId(device_id.into()),
-        FolderGroupId(GROUP.into()),
-        vec![Op::Put {
-            path: SyncPath(path.into()),
-            version: version.version_hash,
-            origin: PutOrigin::Direct,
-        }],
-        signing_key,
-    );
-    device
-        .state
-        .replica_coordinator
-        .change_history_repository()
-        .dag_admit_change_with_versions(&change, std::slice::from_ref(version))
-        .unwrap();
-    change
+) -> yadorilink_replica_domain::signed_delta::NativeDelta {
+    yadorilink_daemon::test_support::remote_admission_fixture::admit_remote(
+        &device.state.replica_coordinator,
+        GROUP,
+        device_id,
+        vec![yadorilink_daemon::test_support::remote_admission_fixture::put(
+            path,
+            version.version_hash,
+            vec![],
+        )],
+        std::slice::from_ref(version),
+    )
 }
 
 /// Indexes a live, empty copy-shaped file at `path` and writes the matching
 /// (empty) bytes to disk -- the precondition every scenario below shares:
 /// "this device already materialized a conflict copy", the state
-/// `retire_unjustified_ephemeral_conflict_copies` audits. `authoring_change`
-/// only needs to reference SOME change already admitted for this group --
-/// the schema's `files_require_authoring_identity_on_insert` trigger only
-/// checks that the hash resolves to a real row in `changes`, not that the
-/// change's own ops touch `path` (that carried-by-history relationship is
-/// what `dag_group_history_paths` -- derived from `Op::Put`, not this
-/// column -- separately decides for retirement's own history check).
-fn plant_copy(device: &Device, path: &str, authoring_change: &Change) {
+/// `retire_unjustified_ephemeral_conflict_copies` audits. The row carries no
+/// native identity of its own: whether a path is carried by admitted history
+/// is decided from the delta log (the ops' own paths), never from the row.
+fn plant_copy(device: &Device, path: &str) {
     let record = FileRecord {
         path: path.to_string(),
         size: 0,
@@ -128,15 +113,34 @@ fn plant_copy(device: &Device, path: &str, authoring_change: &Change) {
         .state
         .replica_coordinator
         .file_index_repository()
-        .upsert_file_with_origin_and_author(
+        .upsert_file_with_origin(
             GROUP,
             &record,
             &device.state.device_id,
-            &authoring_change.compute_hash(),
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
-    std::fs::write(device.root.path().join(path), b"").unwrap();
+    let on_disk = device.root.path().join(path);
+    std::fs::write(&on_disk, b"").unwrap();
+    // The row records the file's mode, as the daemon's own write of a copy does. A row with no
+    // mode makes the file's mode read as a local chmod, which is user content to keep.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&on_disk).unwrap().permissions().mode();
+        device
+            .state
+            .replica_coordinator
+            .database()
+            .write::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+                conn.execute(
+                    "UPDATE files SET unix_mode = ?3 WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
+                    rusqlite::params![GROUP, path, mode & 0o7777],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
 }
 
 fn is_live(device: &Device, path: &str) -> bool {
@@ -164,7 +168,7 @@ fn assert_no_peer_sessions(device: &Device) {
 async fn no_peer_sessions_retires_an_unjustified_ephemeral_copy() {
     support::ensure_isolated_config_dir();
     let device = setup_device("device-solo");
-    let change_w = admit(&device, "device-w", &key(1), "shared.bin", &empty_version(1_000));
+    admit(&device, "device-w", &key(1), "shared.bin", &empty_version(1_000));
 
     let copy_path = yadorilink_replica_engine::conflict::conflict_copy_path_for_losing_change(
         "shared.bin",
@@ -172,7 +176,7 @@ async fn no_peer_sessions_retires_an_unjustified_ephemeral_copy() {
         1_001,
         &[9u8; 32],
     );
-    plant_copy(&device, &copy_path, &change_w);
+    plant_copy(&device, &copy_path);
     assert_no_peer_sessions(&device);
 
     let outcome = ConvergenceRetirementService::new(device.state.clone())
@@ -187,38 +191,73 @@ async fn no_peer_sessions_retires_an_unjustified_ephemeral_copy() {
     );
 }
 
-/// A genuine concurrent pair on "shared.bin": the loser is still live, so
-/// its conflict copy is justified by the CURRENT frontier and must be
-/// retained even though nothing carries it in history yet (matching
-/// `retire_unjustified_ephemeral_conflict_copies`'s own "still-live loser"
-/// case).
+/// A genuine concurrent pair on "shared.bin": the loser is still live, so the
+/// conflict copy native's plan places for it is justified by the CURRENT state
+/// and must be retained even though nothing else vouches for it.
 #[tokio::test]
 async fn no_peer_sessions_retains_a_currently_justified_copy() {
+    use yadorilink_replica_domain::native_plan::{NativePlannedNode, NativeRowIdentity};
+
     support::ensure_isolated_config_dir();
     let device = setup_device("device-solo");
-    let version_w = empty_version(1_000);
-    let version_l = empty_version(1_001);
-    let change_w = admit(&device, "device-a", &key(1), "shared.bin", &version_w);
-    let change_l = admit(&device, "device-b", &key(2), "shared.bin", &version_l);
+    let (version_a, version_b) = (empty_version(1_000), empty_version(1_001));
+    device
+        .state
+        .replica_coordinator
+        .database()
+        .write(|conn| {
+            for version in [&version_a, &version_b] {
+                yadorilink_sync_sqlite::dag_store::put_file_version(conn, GROUP, version)?;
+            }
+            Ok::<_, yadorilink_sync_sqlite::SyncSqliteError>(())
+        })
+        .unwrap();
+    let files = device.state.replica_coordinator.file_index_repository();
+    // Neither write observes the other: a genuine concurrent pair.
+    for (name, version) in [("device-a", &version_a), ("device-b", &version_b)] {
+        yadorilink_daemon::test_support::remote_admission_fixture::admit_remote_put(
+            &device.state.replica_coordinator,
+            GROUP,
+            name,
+            "shared.bin",
+            version,
+        );
+    }
 
-    let (loser_device_id, loser_version) =
-        if yadorilink_replica_engine::conflict::dag_conflict_loser_is_a(
-            change_w.lamport,
-            &change_w.compute_hash().0,
-            change_l.lamport,
-            &change_l.compute_hash().0,
-        ) {
-            ("device-a", &version_w)
-        } else {
-            ("device-b", &version_l)
-        };
-    let copy_path = yadorilink_replica_engine::conflict::conflict_copy_path_for_losing_change(
-        "shared.bin",
-        loser_device_id,
-        loser_version.meta.mtime_unix_nanos,
-        &loser_version.version_hash.0,
-    );
-    plant_copy(&device, &copy_path, &change_w);
+    // The plan's own copy of the loser: the name and the head behind it.
+    let plan = files.native_plan_level(GROUP, "").unwrap();
+    let (copy_path, copy_head) = plan
+        .nodes
+        .iter()
+        .find_map(|(path, node)| match node {
+            NativePlannedNode::Entry { head, .. } if path.as_str() != "shared.bin" => {
+                Some((path.as_str().to_owned(), head.clone()))
+            }
+            _ => None,
+        })
+        .expect("the concurrent pair places a copy");
+    // The row shows the version its head names, mtime included.
+    let shown = [&version_a, &version_b]
+        .into_iter()
+        .find(|version| version.version_hash == copy_head.version())
+        .expect("the copy shows one of the two versions");
+    let record = FileRecord {
+        path: copy_path.clone(),
+        size: 0,
+        mtime_unix_nanos: shown.meta.mtime_unix_nanos,
+        blocks: vec![],
+        deleted: false,
+    };
+    files
+        .upsert_file_with_origin_and_authoring(
+            GROUP,
+            &record,
+            &device.state.device_id,
+            Some(&NativeRowIdentity::of(&copy_head)),
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
+    std::fs::write(device.root.path().join(&copy_path), b"").unwrap();
     assert_no_peer_sessions(&device);
 
     let outcome = ConvergenceRetirementService::new(device.state.clone())
@@ -253,8 +292,8 @@ async fn no_peer_sessions_retains_a_dag_carried_copy_shaped_path() {
     // Directly carried: an admitted change's own op targets the copy-shaped
     // path, exactly like a real user file that happens to match the naming
     // convention.
-    let carrier = admit(&device, "device-w", &key(1), &copy_path, &empty_version(1_002));
-    plant_copy(&device, &copy_path, &carrier);
+    admit(&device, "device-w", &key(1), &copy_path, &empty_version(1_002));
+    plant_copy(&device, &copy_path);
     assert_no_peer_sessions(&device);
 
     let outcome = ConvergenceRetirementService::new(device.state.clone())

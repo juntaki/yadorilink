@@ -38,6 +38,51 @@ pub fn config_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Where a rebootstrap keeps what it saves of the user's own changes: under the
+/// daemon's state directory, outside every folder it syncs.
+pub fn recovery_root() -> PathBuf {
+    config_dir().join("recovery")
+}
+
+/// Where the versions a rebootstrap set aside stay until the user restores or discards them:
+/// under the daemon's state directory, outside every folder it syncs and apart from
+/// [`recovery_root`], whose areas end with their rebootstrap.
+pub fn recovery_items_root() -> PathBuf {
+    config_dir().join("recovery-items")
+}
+
+/// Whether linking `local_path` would put the recovery area inside the folder or
+/// the folder inside the recovery area. The area holds the user's files in a form
+/// the sync must never read back as changes, so no linked folder may contain it
+/// or lie within it (compared resolved and case-folded, like the other link
+/// topology checks).
+pub fn link_overlaps_recovery_area(
+    local_path: &std::path::Path,
+    recovery_root: &std::path::Path,
+) -> bool {
+    let resolve = |path: &std::path::Path| {
+        // The area may not exist yet: resolve its nearest existing ancestor.
+        let mut existing = path;
+        let mut rest = Vec::new();
+        while !existing.exists() {
+            let Some(parent) = existing.parent() else { break };
+            if let Some(name) = existing.file_name() {
+                rest.push(name.to_owned());
+            }
+            existing = parent;
+        }
+        let mut resolved = existing.canonicalize().unwrap_or_else(|_| existing.to_path_buf());
+        for name in rest.into_iter().rev() {
+            resolved.push(name);
+        }
+        PathBuf::from(yadorilink_root_authority::canonical_fold::canonical_fold(
+            &resolved.to_string_lossy(),
+        ))
+    };
+    let (link, recovery) = (resolve(local_path), resolve(recovery_root));
+    link.starts_with(&recovery) || recovery.starts_with(&link)
+}
+
 pub fn config_path() -> PathBuf {
     config_dir().join("device.json")
 }

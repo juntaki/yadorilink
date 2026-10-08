@@ -147,8 +147,7 @@ pub trait RootVerificationStatePort: Send + Sync {
 
     /// Whether `record` is represented on disk (under `root`) by the same
     /// kind and content the index believes it has: directory-for-directory,
-    /// matching symlink target, or matching file bytes (placeholder size
-    /// only, or full content, depending on materialization state). Kept as
+    /// matching symlink target, or matching file bytes. Kept as
     /// one port method rather than several finer-grained state accessors
     /// because its file-content branch needs a real disk-byte comparison
     /// against indexed block hashes — a capability that lives in
@@ -159,6 +158,15 @@ pub trait RootVerificationStatePort: Send + Sync {
     fn indexed_path_is_corroborated(
         &self,
         root: &Path,
+        group_id: &str,
+        record: &FileRecord,
+    ) -> Result<bool, RootAuthorityError>;
+
+    /// Whether `record`'s row has no local object by definition (`Remote`):
+    /// its absence from disk is expected, so it needs no corroboration, and it
+    /// cannot supply any either.
+    fn indexed_path_expects_no_object(
+        &self,
         group_id: &str,
         record: &FileRecord,
     ) -> Result<bool, RootAuthorityError>;
@@ -505,13 +513,25 @@ fn adoption_evidence(
     state: &dyn RootVerificationStatePort,
 ) -> Result<AdoptionEvidence, RootAuthorityError> {
     let mut has_live_rows = false;
+    let mut has_disk_backed_row = false;
     for record in state.live_files(group_id)? {
         has_live_rows = true;
-        if !state.indexed_path_is_corroborated(root, group_id, &record)? {
+        // A row with no object to find does not count against the root, but
+        // it is no evidence for it either unless an object that matches it
+        // happens to stand on disk.
+        if state.indexed_path_is_corroborated(root, group_id, &record)? {
+            has_disk_backed_row = true;
+        } else if !state.indexed_path_expects_no_object(group_id, &record)? {
             return Ok(AdoptionEvidence::IndexedFilesAllMissing);
         }
     }
-    Ok(if has_live_rows { AdoptionEvidence::Corroborated } else { AdoptionEvidence::IndexEmpty })
+    Ok(match (has_live_rows, has_disk_backed_row) {
+        (false, _) => AdoptionEvidence::IndexEmpty,
+        // Only rows without objects: nothing on disk says this directory is
+        // the link's folder, so it is not adopted automatically.
+        (true, false) => AdoptionEvidence::IndexedFilesAllMissing,
+        (true, true) => AdoptionEvidence::Corroborated,
+    })
 }
 
 /// An opaque 256-bit nonce. Not derived from the path, the group, the device,

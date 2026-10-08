@@ -9,7 +9,7 @@ use super::*;
 /// fail — every retry would leave another one behind.
 ///
 /// The artefact is reserved-namespace shaped, so it is excluded from
-/// indexing and can never be signed into the DAG; this is disk litter,
+/// indexing and can never be signed into native state; this is disk litter,
 /// not a sync-correctness defect. It is still the caller's directory,
 /// and the rule this module enforces everywhere else is that a probe
 /// leaves nothing behind.
@@ -35,7 +35,7 @@ fn a_probe_artefact_whose_write_fails_is_not_left_behind() {
 /// the caller's directory must classify as reserved — see
 /// `probe_artefact_name`'s doc for the concrete harm an unreserved name
 /// caused (a probe artefact racing the watcher/scan/local-change
-/// indexing path and, worst case, getting signed into the DAG). Checked
+/// indexing path and, worst case, getting signed into native state). Checked
 /// against `create_probe_artefact`, `reserve_probe_artefact_path` and a
 /// full `probe_all` run (which exercises every probe in this module),
 /// not only `probe_artefact_name` in isolation, so this fails if any

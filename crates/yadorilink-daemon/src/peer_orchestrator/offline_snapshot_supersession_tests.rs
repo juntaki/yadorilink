@@ -140,7 +140,6 @@ async fn register_session(
     device_id: &str,
     shares: &[&str],
 ) -> Arc<yadorilink_peer_session::peer_session::PeerSyncSession> {
-    let root = tempfile::tempdir().unwrap().keep();
     let (transports, _peer_transports) =
         crate::test_support::session_transports_pair("device-a", device_id).await;
     let peer_store = Arc::new(crate::adapters::block_store_ports::BlockStorePortsAdapter::new(
@@ -158,9 +157,7 @@ async fn register_session(
         replica_engine,
         peer_store,
         shares.iter().map(|group| (*group).to_string()).collect(),
-        shares.iter().map(|group| ((*group).to_string(), root.clone())).collect(),
         transports,
-        Some(state.forward_tx.clone()),
         super::peer_sync_session_deps(state),
     );
     state.peers.register_session(device_id.to_string(), session.clone(), state.local_convergence());

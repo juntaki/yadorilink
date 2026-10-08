@@ -10,8 +10,8 @@
 //! Under Network Fault Coverage" requirement's three scenarios): 1.
 //! Placeholders hydrate to the correct content despite faults — no data
 //! loss, no corruption (Phase A). 2. No placeholder is left stuck
-//! mid-hydration: after heal + quiesce every index row is `Placeholder` or
-//! `Hydrated`, never `Hydrating`, and `check_structural` finds no live row
+//! mid-hydration: after heal + quiesce every index row is `Remote` or
+//! `Present`, never `Hydrating`, and `check_structural` finds no live row
 //! without a file (Phase A). 3. A conflicting write that lands while a
 //! path's hydration is in flight preserves both sides — the losing write
 //! becomes a conflict copy and the hydrated content is not lost (Phase B).
@@ -57,10 +57,10 @@ use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_local_capture::ports::LocalMutationStore;
 use yadorilink_local_storage::{BlockStore, SegmentBlockStore};
 use yadorilink_peer_session::peer_session::PeerSyncSession;
-use yadorilink_replica_domain::change::{Change, Op as ChangeOp, PutOrigin};
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord, RecordKind};
 use yadorilink_replica_domain::file::{FileMeta, FileVersion, VersionBlock};
 use yadorilink_replica_domain::ids::{BlockHash, DeviceId, FolderGroupId, SyncPath};
+use yadorilink_replica_domain::local_op::{Change, Op as ChangeOp};
 use yadorilink_replica_domain::session_state::MaterializationState;
 use yadorilink_replica_domain::test_authoring::create_signed_for_tests;
 
@@ -232,7 +232,7 @@ struct SeededFile {
 }
 
 /// A file whose full content lives on the holder (device A): its blocks are
-/// in A's store and materialized on A's disk, with a `Hydrated` index row
+/// in A's store and materialized on A's disk, with a `Present` index row
 /// authored by a real retained backfill change.
 fn seed_holder_file(dev: &Device, path: &str, content: &[u8]) -> Result<SeededFile, String> {
     let hash_hex = dev.store.put(content).map_err(|e| e.to_string())?;
@@ -264,11 +264,7 @@ fn seed_holder_file(dev: &Device, path: &str, content: &[u8]) -> Result<SeededFi
         0,
         DeviceId(dev.id.clone()),
         FolderGroupId(GROUP_ID.to_string()),
-        vec![ChangeOp::Put {
-            path: SyncPath(path.to_string()),
-            version: version.version_hash,
-            origin: PutOrigin::Direct,
-        }],
+        vec![ChangeOp::Put { path: SyncPath(path.to_string()), version: version.version_hash }],
         &signing_key(dev),
     );
     // Parentless by design: each seeded file is an independent root, so the
@@ -294,7 +290,7 @@ fn seed_holder_file(dev: &Device, path: &str, content: &[u8]) -> Result<SeededFi
         .set_materialization_state(
             GROUP_ID,
             path,
-            MaterializationState::Hydrated,
+            MaterializationState::Present,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .map_err(|e| e.to_string())?;
@@ -317,7 +313,7 @@ fn seed_holder_file(dev: &Device, path: &str, content: &[u8]) -> Result<SeededFi
 
 /// Seeds a placeholder on the hydrating device (device B): the same index
 /// row the holder has (same version + blocks + authoring change, admitted
-/// into B's own DAG so the identity is verifiable), a `Placeholder` state,
+/// into B's own DAG so the identity is verifiable), a `Remote` state,
 /// an empty on-disk file (so `check_structural` sees a live row *with* a
 /// backing file, matching production's sparse placeholder), and **no**
 /// blocks in B's store — the content must be fetched to hydrate.
@@ -342,7 +338,7 @@ fn seed_placeholder(dev: &Device, seeded: &SeededFile) -> Result<(), String> {
         .set_materialization_state(
             GROUP_ID,
             &record.path,
-            MaterializationState::Placeholder,
+            MaterializationState::Remote,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .map_err(|e| e.to_string())?;
@@ -458,9 +454,9 @@ async fn quic_channel_pair(
     )
 }
 
-/// Retries `hydrate_file_with_timeout` until the path reaches `Hydrated` or
+/// Retries `hydrate_file_with_timeout` until the path reaches `Present` or
 /// `HYDRATE_DEADLINE` of simulated time elapses. Each failed attempt
-/// reverts the row to `Placeholder` (never leaving it at `Hydrating`), so
+/// reverts the row to `Remote` (never leaving it at `Hydrating`), so
 /// a retry after the network heals starts clean. Returns whether it
 /// hydrated.
 async fn hydrate_with_retry(dev: &Device, path: &str) -> bool {
@@ -472,7 +468,7 @@ async fn hydrate_with_retry(dev: &Device, path: &str) -> bool {
             .get_materialization_state(GROUP_ID, path)
             .ok()
             .flatten()
-            == Some(MaterializationState::Hydrated)
+            == Some(MaterializationState::Present)
         {
             return true;
         }
@@ -484,7 +480,7 @@ async fn hydrate_with_retry(dev: &Device, path: &str) -> bool {
             .get_materialization_state(GROUP_ID, path)
             .ok()
             .flatten()
-            == Some(MaterializationState::Hydrated)
+            == Some(MaterializationState::Present)
         {
             return true;
         }
@@ -543,22 +539,6 @@ async fn run_scenario(seed: u64, fault_profile: HydrationFaultProfile) -> Result
     let b_contested = seed_holder_file(&device_b, CONFLICT_PATH, &b_content)?;
     let a_hash = hex::encode(&a_contested.record.blocks[0].hash);
     let b_hash = hex::encode(&b_contested.record.blocks[0].hash);
-    // Import each device's current index (the contested path only) into a
-    // signed root change. Each root is authored + signed by its own device; the
-    // peer verifies it against that device's key, pinned in `connect`.
-    yadorilink_daemon::dag_import::ensure_initial_import(
-        device_a.state.as_ref(),
-        GROUP_ID,
-        &dst_dag_migrate_b2::emitter_for(&device_a.id),
-    )
-    .map_err(|e| e.to_string())?;
-    yadorilink_daemon::dag_import::ensure_initial_import(
-        device_b.state.as_ref(),
-        GROUP_ID,
-        &dst_dag_migrate_b2::emitter_for(&device_b.id),
-    )
-    .map_err(|e| e.to_string())?;
-
     // Phase A placeholders (seeded AFTER the import, so they never enter the
     // DAG). Device A holds the content; device B holds an unhydrated
     // placeholder it must fetch over the block path.
@@ -806,7 +786,7 @@ async fn run_scenario(seed: u64, fault_profile: HydrationFaultProfile) -> Result
     //
     // **Bold note:** whether the losing side surfaces as a materialized
     // *conflict copy* on both devices is deliberately not a hard assertion
-    // here. A bare-`PeerSyncSession` pair has no daemon `broadcast_change`
+    // here. A bare-`PeerSyncSession` pair has no daemon `on_local_native_commit`
     // to re-announce a conflict copy as its own new path, so under
     // adversarial fault timing the two sessions may linearly converge on
     // one winner (the loser staying a recoverable placeholder / in-store)
@@ -883,7 +863,7 @@ async fn run_scenario(seed: u64, fault_profile: HydrationFaultProfile) -> Result
                 .get_materialization_state(GROUP_ID, &record.path)
                 .ok()
                 .flatten()
-                != Some(MaterializationState::Hydrated)
+                != Some(MaterializationState::Present)
             {
                 continue;
             }

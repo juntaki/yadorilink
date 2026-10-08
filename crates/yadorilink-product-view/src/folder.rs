@@ -28,6 +28,16 @@ pub use yadorilink_ipc_proto::daemonctl::LocalStorageState;
 /// `status_model::folder_display_name` used to carry independently;
 /// `status_model.rs` now delegates to this function (see that file) so the
 /// two never drift apart.
+/// The folder's name for display: a provider folder's own name (it has no path), else the last
+/// segment of its path.
+pub fn link_name(link: &LinkStatus) -> String {
+    if link.provider_display_name.is_empty() {
+        display_name(&link.local_path)
+    } else {
+        link.provider_display_name.clone()
+    }
+}
+
 pub fn display_name(local_path: &str) -> String {
     std::path::Path::new(local_path)
         .file_name()
@@ -101,7 +111,7 @@ impl FolderState {
 
 /// Live-transfer byte/block progress for one folder, passed through from
 /// the daemon's own already-computed rollup — never re-derived from
-/// anything lower-level (no block/DAG inspection here). `Some` iff
+/// anything lower-level (no block/native-state inspection here). `Some` iff
 /// `LinkStatus.has_active_transfer`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FolderTransfer {
@@ -157,7 +167,7 @@ impl From<&LinkStatus> for FolderSummary {
 
         FolderSummary {
             group_id: link.group_id.clone(),
-            name: display_name(&link.local_path),
+            name: link_name(link),
             local_path: link.local_path.clone(),
             mode: FolderMode::from_link(link),
             state: FolderState::from_link(link),
@@ -185,8 +195,8 @@ impl From<&LinkStatus> for FolderSummary {
 impl FolderSummary {
     /// `files_hydrated + files_placeholder + files_hydrating` — the "one
     /// number" total a UI can compute trivially at the call site (deliberately
-    /// not a stored field; see §1.1's "not carried over" note for why baking
-    /// it in risks it going stale relative to the three source counts).
+    /// not a stored field: baking it in risks it going stale relative to the
+    /// three source counts).
     pub fn files_total(&self) -> u64 {
         self.files_hydrated + self.files_placeholder + self.files_hydrating
     }

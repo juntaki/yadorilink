@@ -1,12 +1,11 @@
 //! Mutating endpoints. Every one of these is a direct translation of
 //! an existing `DaemonControlRequest` variant that already has a CLI
-//! counterpart (`yadorilink pause`/`resume`/`pin`/`unpin`/`evict`/`restore`)
-//! -- no new daemon capability is introduced. `/api/resume` and
-//! `/api/unpin` are added here because they are the direct, symmetric IPC
-//! counterparts of `/api/pause` and `/api/pin` (`ResumeRequest`/
-//! `UnpinRequest` already exist and are already dispatched by
-//! `control_socket.rs`): without them, a caller could pause or pin a folder
-//! through this API but never reverse it through the same API. This crate
+//! counterpart (`yadorilink pause`/`resume`/`evict`/`restore`) -- no new
+//! daemon capability is introduced. `/api/resume` is added here because it
+//! is the direct, symmetric IPC counterpart of `/api/pause` (`ResumeRequest`
+//! already exists and is already dispatched by `control_socket.rs`):
+//! without it, a caller could pause a folder through this API but never
+//! reverse it through the same API. This crate
 //! only ever adds an endpoint when it has a direct existing IPC
 //! counterpart to translate -- it does not introduce new daemon
 //! capabilities.
@@ -18,7 +17,7 @@ use serde_json::{json, Value};
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
 use yadorilink_ipc_proto::daemonctl::{
-    EvictRequest, PauseRequest, PinRequest, RestoreVersionRequest, ResumeRequest, UnpinRequest,
+    EvictRequest, PauseRequest, RestoreVersionRequest, ResumeRequest,
 };
 
 use crate::error::ApiError;
@@ -70,37 +69,6 @@ pub async fn resume(
         .await?;
     match resp.payload {
         Some(RespPayload::Resume(_)) => Ok(Json(json!({ "ok": true }))),
-        _ => Err(unexpected()),
-    }
-}
-
-/// `POST /api/pin` `{"path": "<absolute file or folder path>"}`. A folder
-/// is pinned as a whole: what is below it now and what arrives later.
-pub async fn pin(
-    State(state): State<AppState>,
-    Json(body): Json<LocalPathBody>,
-) -> Result<Json<Value>, ApiError> {
-    let path = require_path(&body)?;
-    let resp =
-        state.control.send(ReqPayload::Pin(PinRequest { absolute_path: path.to_string() })).await?;
-    match resp.payload {
-        Some(RespPayload::Pin(_)) => Ok(Json(json!({ "ok": true }))),
-        _ => Err(unexpected()),
-    }
-}
-
-/// `POST /api/unpin` `{"path": "<absolute file or folder path>"}`.
-pub async fn unpin(
-    State(state): State<AppState>,
-    Json(body): Json<LocalPathBody>,
-) -> Result<Json<Value>, ApiError> {
-    let path = require_path(&body)?;
-    let resp = state
-        .control
-        .send(ReqPayload::Unpin(UnpinRequest { absolute_path: path.to_string() }))
-        .await?;
-    match resp.payload {
-        Some(RespPayload::Unpin(_)) => Ok(Json(json!({ "ok": true }))),
         _ => Err(unexpected()),
     }
 }

@@ -4,12 +4,11 @@ use super::*;
 use crate::materialized_generation::lookup_materialized_generation;
 use crate::materialized_generation::MaterializedObjectKind;
 
-/// `init_schema` must run AFTER `init_dag_schema`, which it assumes
-/// has already created `changes`/`pruned_changes` -- the same order
+/// `init_schema` runs after the replica tables -- the same order
 /// production initializes in.
 fn conn() -> rusqlite::Connection {
     let c = rusqlite::Connection::open_in_memory().unwrap();
-    crate::dag_store::init_dag_schema(&c).unwrap();
+    crate::replica_tables::init_for_tests(&c).unwrap();
     crate::materialized_generation::init_materialized_generation_schema(&c).unwrap();
     yadorilink_sqlite_runtime::init_schema(&c).unwrap();
     c
@@ -19,7 +18,7 @@ fn seed_current_file(conn: &rusqlite::Connection, group_id: &str, path: &str) {
     conn.execute(
         "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json, deleted, \
          state, version_seq, materialization_state) \
-         VALUES (?1, ?2, 0, 0, '[]', 0, 'current', 1, 'placeholder')",
+         VALUES (?1, ?2, 0, 0, '[]', 0, 'current', 1, 'remote')",
         rusqlite::params![group_id, path],
     )
     .unwrap();
@@ -71,7 +70,7 @@ fn seed_current_row_sized(conn: &rusqlite::Connection, path: &str, size: i64) {
     conn.execute(
         "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json, deleted, \
          state, version_seq, materialization_state, record_kind) \
-         VALUES ('g', ?1, ?2, 0, '[]', 0, 'current', 1, 'hydrated', 'file')",
+         VALUES ('g', ?1, ?2, 0, '[]', 0, 'current', 1, 'present', 'file')",
         rusqlite::params![path, size],
     )
     .unwrap();
@@ -86,7 +85,6 @@ fn publish_proof_for(conn: &rusqlite::Connection, path: &str, version: &VersionH
         conn,
         "g",
         path,
-        &[],
         MaterializedObjectKind::RegularFile,
         Some(version),
         None,
@@ -142,7 +140,6 @@ fn a_versionless_present_generation_reads_as_absent() {
         &c,
         "g",
         "p",
-        &[],
         MaterializedObjectKind::RegularFile,
         None,
         None,
@@ -172,7 +169,6 @@ fn an_absent_generation_is_still_usable_without_a_version() {
         &c,
         "g",
         "gone",
-        &[],
         MaterializedObjectKind::Absent,
         None,
         None,
@@ -190,10 +186,10 @@ fn an_absent_generation_is_still_usable_without_a_version() {
 /// transaction, so by the time it commits, the row may have moved.
 /// The publish, the promotion and the intent clear used to be three
 /// separate transactions with a guard on only the first; a
-/// supersession landing between them stamped `Hydrated` on the new
+/// supersession landing between them stamped `Present` on the new
 /// version while the only proof described the old one. The path lock
 /// does not help: it serializes daemon-internal work, and a
-/// supersession comes from the DAG side.
+/// supersession comes from the native admission side.
 #[test]
 fn a_row_superseded_since_the_caller_verified_it_commits_nothing() {
     let mut c = conn();
@@ -212,13 +208,8 @@ fn a_row_superseded_since_the_caller_verified_it_commits_nothing() {
         &tx,
         "g",
         "p",
-        Some(&[]),
         &object([4u8; 32]),
-        ExpectedAuthoring {
-            state: MaterializationState::Placeholder,
-            authoring_change_hash: None,
-            expected_version: Some(&stale),
-        },
+        ExpectedAuthoring { state: MaterializationState::Remote, expected_version: Some(&stale) },
         0,
     )
     .unwrap();
@@ -230,7 +221,7 @@ fn a_row_superseded_since_the_caller_verified_it_commits_nothing() {
     );
     assert_eq!(
         materialization_state(&tx, "g", "p"),
-        "placeholder",
+        "remote",
         "and must not stamp the claim on a version it never verified"
     );
     assert!(
@@ -258,17 +249,12 @@ fn a_verified_row_is_published_promoted_and_cleared_in_one_step() {
         &tx,
         "g",
         "p",
-        Some(&[]),
         &ExactMaterializedState::Object {
             kind: RecordKind::File,
             version,
             identity: Box::new(None),
         },
-        ExpectedAuthoring {
-            state: MaterializationState::Placeholder,
-            authoring_change_hash: None,
-            expected_version: Some(&version),
-        },
+        ExpectedAuthoring { state: MaterializationState::Remote, expected_version: Some(&version) },
         0,
     )
     .unwrap();
@@ -278,7 +264,7 @@ fn a_verified_row_is_published_promoted_and_cleared_in_one_step() {
         .unwrap()
         .expect("the proof must be usable immediately");
     assert_eq!(basis.version, Some(version), "and must name the version the row derives");
-    assert_eq!(materialization_state(&tx, "g", "p"), "hydrated");
+    assert_eq!(materialization_state(&tx, "g", "p"), "present");
     assert!(!intent_open(&tx, "g", "p"), "a finished materialization clears its intent");
     assert_eq!(
         crate::materialized_generation::snapshot_mutation_fence(&tx, "g", "p").unwrap(),
@@ -299,13 +285,8 @@ fn recovering_without_an_expected_version_is_refused() {
         &tx,
         "g",
         "p",
-        Some(&[]),
         &object([5u8; 32]),
-        ExpectedAuthoring {
-            state: MaterializationState::Placeholder,
-            authoring_change_hash: None,
-            expected_version: None,
-        },
+        ExpectedAuthoring { state: MaterializationState::Remote, expected_version: None },
         0,
     )
     .expect_err("an unguarded recovery commit must be refused");
@@ -325,7 +306,6 @@ fn an_internal_commit_publishes_stamps_and_clears_together() {
         &tx,
         "g",
         "p",
-        Some(&[]),
         &object([4u8; 32]),
         n,
         None,
@@ -341,7 +321,7 @@ fn an_internal_commit_publishes_stamps_and_clears_together() {
         Some(VersionHash([4u8; 32])),
         "the proof must name the version that was written"
     );
-    assert_eq!(materialization_state(&c, "g", "p"), "hydrated");
+    assert_eq!(materialization_state(&c, "g", "p"), "present");
     assert!(!intent_open(&c, "g", "p"), "a landed proof settles its intent");
 }
 
@@ -363,7 +343,6 @@ fn a_fence_lost_internal_commit_writes_nothing_at_all() {
         &tx,
         "g",
         "p",
-        Some(&[]),
         &object([5u8; 32]),
         n,
         None,
@@ -388,7 +367,7 @@ fn a_fence_lost_internal_commit_writes_nothing_at_all() {
     );
     assert_eq!(
         materialization_state(&c, "g", "p"),
-        "placeholder",
+        "remote",
         "a lost CAS must not stamp a claim this writer cannot prove"
     );
     assert!(
@@ -401,14 +380,13 @@ fn a_fence_lost_internal_commit_writes_nothing_at_all() {
 /// still current.
 ///
 /// The bytes this attempt wrote are for a version the path no longer
-/// wants. Stamping `Hydrated` would claim exactness for content that
-/// is already stale, which is the failure the authoring CAS has always
+/// wants. Stamping `Present` would claim exactness for content that
+/// is already stale, which is the failure the guard has always
 /// existed to prevent -- folding it into this transaction is what
 /// keeps the check and the commit from being two steps.
-/// The version guard's RED half. The row is still `Hydrating` and
-/// still carries the same authoring hash, so the authoring check
-/// alone passes -- but the content the version is derived from has
-/// moved on. A caller whose version came from an earlier snapshot
+/// The version guard's RED half. The row is still `Hydrating`, so the
+/// state check alone passes -- but the content the version is derived
+/// from has moved on. A caller whose version came from an earlier snapshot
 /// must be refused, and must write nothing.
 #[test]
 fn a_current_row_that_no_longer_names_the_expected_version_refuses_the_commit() {
@@ -431,12 +409,10 @@ fn a_current_row_that_no_longer_names_the_expected_version_refuses_the_commit() 
         &tx,
         "g",
         "p",
-        Some(&[]),
         &object([5u8; 32]),
         n,
         Some(ExpectedAuthoring {
             state: MaterializationState::Hydrating,
-            authoring_change_hash: None,
             expected_version: Some(&stale_version),
         }),
         0,
@@ -492,12 +468,10 @@ fn a_current_row_that_still_names_the_expected_version_commits() {
         &tx,
         "g",
         "p",
-        Some(&[]),
         &exact,
         n,
         Some(ExpectedAuthoring {
             state: MaterializationState::Hydrating,
-            authoring_change_hash: None,
             expected_version: Some(&live_version),
         }),
         0,
@@ -519,7 +493,7 @@ fn a_reprove_whose_row_was_superseded_publishes_nothing() {
     let mut c = conn();
     seed_current_file(&c, "g", "p");
     c.execute(
-        "UPDATE files SET materialization_state = 'hydrated' WHERE group_id = 'g' AND path = 'p'",
+        "UPDATE files SET materialization_state = 'present' WHERE group_id = 'g' AND path = 'p'",
         [],
     )
     .unwrap();
@@ -530,11 +504,9 @@ fn a_reprove_whose_row_was_superseded_publishes_nothing() {
         &tx,
         "g",
         "p",
-        Some(&[]),
         &object([6u8; 32]),
         Some(ExpectedAuthoring {
-            state: MaterializationState::Hydrated,
-            authoring_change_hash: None,
+            state: MaterializationState::Present,
             expected_version: Some(&stale_version),
         }),
         0,
@@ -555,28 +527,23 @@ fn a_superseded_attempt_is_refused_even_with_a_current_fence() {
     seed_current_file(&c, "g", "p");
     open_intent(&c, "g", "p");
     c.execute(
-        "UPDATE files SET materialization_state = 'hydrating' WHERE group_id = 'g' AND path = 'p'",
+        "UPDATE files SET materialization_state = 'remote' WHERE group_id = 'g' AND path = 'p'",
         [],
     )
     .unwrap();
     let tx = c.transaction().unwrap();
     let n = crate::materialized_generation::bump_mutation_fence(&tx, "g", "p", "test", 0).unwrap();
 
-    // The row carries no authoring hash, so a guard demanding one is
-    // the supersession this attempt must lose to.
-    let other = ChangeHash([7u8; 32]);
+    // The row has moved off `Hydrating` since this attempt began, so a guard
+    // still demanding that state is the supersession this attempt must lose
+    // to.
     let outcome = commit_internal_materialized_state_if_fence_current(
         &tx,
         "g",
         "p",
-        Some(&[]),
         &object([8u8; 32]),
         n,
-        Some(ExpectedAuthoring {
-            state: MaterializationState::Hydrating,
-            authoring_change_hash: Some(&other),
-            expected_version: None,
-        }),
+        Some(ExpectedAuthoring { state: MaterializationState::Hydrating, expected_version: None }),
         0,
     )
     .unwrap();
@@ -591,7 +558,7 @@ fn a_superseded_attempt_is_refused_even_with_a_current_fence() {
     );
     assert_eq!(
         materialization_state(&c, "g", "p"),
-        "hydrating",
+        "remote",
         "the row must be left exactly as it was found"
     );
     assert!(intent_open(&c, "g", "p"), "a superseded attempt still had a write in flight");
@@ -611,7 +578,6 @@ fn re_proving_publishes_under_the_live_fence_without_bumping_it() {
         &tx,
         "g",
         "p",
-        Some(&[]),
         &object([6u8; 32]),
         None,
         0,
@@ -637,170 +603,16 @@ fn re_proving_publishes_under_the_live_fence_without_bumping_it() {
     );
 }
 
-fn set_group_heads(conn: &rusqlite::Connection, heads: &[ChangeHash]) {
-    conn.execute("DELETE FROM group_heads WHERE group_id = 'g'", []).unwrap();
-    for head in heads {
-        conn.execute(
-            "INSERT INTO group_heads (group_id, change_hash) VALUES ('g', ?1)",
-            rusqlite::params![&head.0[..]],
-        )
-        .unwrap();
-    }
-}
-
-fn proof_basis(conn: &rusqlite::Connection, path: &str) -> Vec<ChangeHash> {
-    let proof = lookup_materialized_generation(conn, "g", path).unwrap().expect("a usable proof");
-    crate::dag_store::lookup_causal_basis_members(conn, &proof.causal_basis_id.0)
-        .unwrap()
-        .expect("an interned basis")
-}
-
-/// A peer re-puts bytes this device already has on disk -- a
-/// conflict-copy merge resolution naming the copy this device wrote
-/// itself -- and the zero-work pre-check closes the obligation without
-/// touching disk. The proof's causal basis is what the next local edit of
-/// the path is parented on, so it has to name the frontier the close just
-/// accepted as reflected on disk. Left on the older frontier, a user
-/// deleting that copy here signs the delete concurrent with the peer's
-/// put, the put wins, and the copy comes back on every device.
-#[test]
-fn a_zero_work_close_re_anchors_the_proof_on_the_frontier_it_accepted() {
-    let mut c = conn();
-    let (old_a, old_b, resolution) =
-        (ChangeHash([1; 32]), ChangeHash([2; 32]), ChangeHash([3; 32]));
-    let version = VersionHash([7; 32]);
-    // Placed from the concurrent frontier {A, B}.
-    crate::materialized_generation::record_materialized_generation(
-        &c,
-        "g",
-        "copy",
-        &[old_a, old_b],
-        MaterializedObjectKind::RegularFile,
-        Some(&version),
-        None,
-        0,
-    )
-    .unwrap();
-    let fence_before = snapshot_mutation_fence(&c, "g", "copy").unwrap();
-    // The peer's resolution is admitted on top: a new head, and a fresh
-    // obligation for the path.
-    set_group_heads(&c, &[resolution]);
-    crate::projection_obligations::bump_projection_obligations_for_touched_paths(
-        &c,
-        "g",
-        &["copy"],
-        0,
-    )
-    .unwrap();
-    let obligation = crate::projection_obligations::lookup_projection_obligation(&c, "g", "copy")
-        .unwrap()
-        .unwrap();
-    let desired = crate::materialized_generation::compute_resolved_path_state_hash(
-        "g",
-        "copy",
-        MaterializedObjectKind::RegularFile,
-        Some(&version),
-    );
-
-    let tx = c.transaction().unwrap();
-    let closed = complete_zero_work_obligation_rebasing_proof(
-        &tx,
-        "g",
-        "copy",
-        obligation.invalidation_generation,
-        obligation.obligation_incarnation,
-        &desired,
-        1,
-    )
-    .unwrap();
-    tx.commit().unwrap();
-
-    assert!(closed, "disk already holds the resolved state, so the obligation closes");
-    assert_eq!(
-        proof_basis(&c, "copy"),
-        vec![resolution],
-        "the proof must name the frontier the close accepted, not the one the bytes were \
-         first placed from"
-    );
-    let proof = lookup_materialized_generation(&c, "g", "copy").unwrap().unwrap();
-    assert_eq!(proof.version, Some(version), "the same object stays proven");
-    assert_eq!(
-        snapshot_mutation_fence(&c, "g", "copy").unwrap(),
-        fence_before,
-        "nothing was mutated on disk, so the fence must not move"
-    );
-}
-
-/// A close the CAS refuses -- here, the proof describes a different
-/// version than the path now wants -- must leave the proof exactly as it
-/// was: re-anchoring a proof for bytes the path has moved off would
-/// parent the next local edit on changes disk never reflected.
-#[test]
-fn a_refused_zero_work_close_leaves_the_proof_on_its_own_frontier() {
-    let mut c = conn();
-    let (old_a, old_b, newer) = (ChangeHash([1; 32]), ChangeHash([2; 32]), ChangeHash([3; 32]));
-    let placed = VersionHash([7; 32]);
-    crate::materialized_generation::record_materialized_generation(
-        &c,
-        "g",
-        "copy",
-        &[old_a, old_b],
-        MaterializedObjectKind::RegularFile,
-        Some(&placed),
-        None,
-        0,
-    )
-    .unwrap();
-    set_group_heads(&c, &[newer]);
-    crate::projection_obligations::bump_projection_obligations_for_touched_paths(
-        &c,
-        "g",
-        &["copy"],
-        0,
-    )
-    .unwrap();
-    let obligation = crate::projection_obligations::lookup_projection_obligation(&c, "g", "copy")
-        .unwrap()
-        .unwrap();
-    let wanted = crate::materialized_generation::compute_resolved_path_state_hash(
-        "g",
-        "copy",
-        MaterializedObjectKind::RegularFile,
-        Some(&VersionHash([8; 32])),
-    );
-
-    let tx = c.transaction().unwrap();
-    let closed = complete_zero_work_obligation_rebasing_proof(
-        &tx,
-        "g",
-        "copy",
-        obligation.invalidation_generation,
-        obligation.obligation_incarnation,
-        &wanted,
-        1,
-    )
-    .unwrap();
-    tx.commit().unwrap();
-
-    assert!(!closed, "the proof does not describe the wanted state");
-    let mut expected = vec![old_a, old_b];
-    expected.sort();
-    assert_eq!(proof_basis(&c, "copy"), expected);
-}
-
 /// A proof that already names the current frontier has nothing to
 /// re-anchor: the close leaves it untouched, generation included.
 #[test]
 fn a_zero_work_close_on_the_current_frontier_keeps_the_proof_generation() {
     let mut c = conn();
-    let head = ChangeHash([4; 32]);
     let version = VersionHash([7; 32]);
-    set_group_heads(&c, &[head]);
     let before = crate::materialized_generation::record_materialized_generation(
         &c,
         "g",
         "copy",
-        &[head],
         MaterializedObjectKind::RegularFile,
         Some(&version),
         None,
@@ -840,4 +652,268 @@ fn a_zero_work_close_on_the_current_frontier_keeps_the_proof_generation() {
     assert!(closed);
     let after = lookup_materialized_generation(&c, "g", "copy").unwrap().unwrap();
     assert_eq!(after.generation_id, before.generation_id);
+}
+
+/// A path mid-write: row, open intent, an armed obligation, and the fence
+/// the writer bumped before its write. Returns the bumped fence and the
+/// claim a worker would hold on the obligation.
+fn a_write_in_flight(
+    c: &rusqlite::Connection,
+) -> (i64, crate::projection_obligations::ObligationClaimToken) {
+    seed_current_file(c, "g", "p");
+    open_intent(c, "g", "p");
+    crate::projection_obligations::bump_projection_obligations_for_touched_paths(c, "g", &["p"], 0)
+        .unwrap();
+    let claim = claim_on(c);
+    let fence =
+        crate::materialized_generation::bump_mutation_fence(c, "g", "p", "mine", 0).unwrap();
+    (fence, claim)
+}
+
+fn claim_on(c: &rusqlite::Connection) -> crate::projection_obligations::ObligationClaimToken {
+    let o = crate::projection_obligations::lookup_projection_obligation(c, "g", "p")
+        .unwrap()
+        .expect("an armed obligation");
+    crate::projection_obligations::ObligationClaimToken {
+        invalidation_generation: o.invalidation_generation,
+        obligation_incarnation: o.obligation_incarnation,
+    }
+}
+
+fn obligation_open(c: &rusqlite::Connection) -> bool {
+    crate::projection_obligations::lookup_projection_obligation(c, "g", "p").unwrap().is_some()
+}
+
+fn any_proof_row(c: &rusqlite::Connection) -> bool {
+    crate::materialized_generation::lookup_materialized_generation_diagnostic(c, "g", "p")
+        .unwrap()
+        .is_some()
+}
+
+fn commit_closing(
+    c: &mut rusqlite::Connection,
+    fence: i64,
+    claim: crate::projection_obligations::ObligationClaimToken,
+) -> (InternalMaterializedCommit, bool) {
+    let tx = c.transaction().unwrap();
+    let outcome = commit_internal_materialized_state_closing_obligation(
+        &tx,
+        "g",
+        "p",
+        &object([4u8; 32]),
+        fence,
+        None,
+        claim,
+        0,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    outcome
+}
+
+/// The proof, the stamp, the intent clear and the completion are one
+/// commit when the fence and the claim both hold.
+#[test]
+fn the_folded_commit_publishes_and_closes_a_current_claim_together() {
+    let mut c = conn();
+    let (fence, claim) = a_write_in_flight(&c);
+
+    let (commit, closed) = commit_closing(&mut c, fence, claim);
+
+    assert!(matches!(commit, InternalMaterializedCommit::Published(_)));
+    assert!(closed, "a current claim closes in the same commit");
+    assert_eq!(
+        lookup_materialized_generation(&c, "g", "p").unwrap().unwrap().version,
+        Some(VersionHash([4u8; 32]))
+    );
+    assert_eq!(materialization_state(&c, "g", "p"), "present");
+    assert!(!intent_open(&c, "g", "p"));
+    assert!(!obligation_open(&c));
+}
+
+/// A fence moved after the write publishes nothing: no proof row at all,
+/// no stamp, the intent open.
+#[test]
+fn a_lost_fence_publishes_nothing_in_the_folded_commit() {
+    let mut c = conn();
+    let (fence, claim) = a_write_in_flight(&c);
+    crate::materialized_generation::bump_mutation_fence(&c, "g", "p", "competing", 0).unwrap();
+
+    let (commit, _) = commit_closing(&mut c, fence, claim);
+
+    assert!(matches!(commit, InternalMaterializedCommit::FenceLost { .. }));
+    assert!(!any_proof_row(&c), "no proof row at all, usable or not");
+    assert_eq!(materialization_state(&c, "g", "p"), "remote");
+    assert!(intent_open(&c, "g", "p"));
+}
+
+/// ...and closes nothing, although the claim itself is still current: a
+/// lost proof never completes the obligation.
+#[test]
+fn a_lost_fence_leaves_the_claimed_obligation_open() {
+    let mut c = conn();
+    let (fence, claim) = a_write_in_flight(&c);
+    crate::materialized_generation::bump_mutation_fence(&c, "g", "p", "competing", 0).unwrap();
+
+    let (_, closed) = commit_closing(&mut c, fence, claim);
+
+    assert!(!closed);
+    assert!(obligation_open(&c), "the obligation stays open for the re-driven write");
+    assert_eq!(claim_on(&c), claim, "and under the claim it had");
+}
+
+/// A claim a newer admission overtook (the generation moved; row and fence
+/// did not) keeps the proof, which is exactly true, and closes nothing.
+#[test]
+fn an_overtaken_generation_keeps_the_proof_and_leaves_the_obligation_open() {
+    let mut c = conn();
+    let (fence, claim) = a_write_in_flight(&c);
+    crate::projection_obligations::bump_projection_obligations_for_touched_paths(
+        &c,
+        "g",
+        &["p"],
+        1,
+    )
+    .unwrap();
+
+    let (commit, closed) = commit_closing(&mut c, fence, claim);
+
+    assert!(matches!(commit, InternalMaterializedCommit::Published(_)), "the proof is kept");
+    assert!(!closed, "a stale generation closes nothing");
+    assert!(obligation_open(&c));
+    assert!(claim_on(&c).invalidation_generation > claim.invalidation_generation);
+    assert_eq!(materialization_state(&c, "g", "p"), "present");
+    assert!(!intent_open(&c, "g", "p"));
+}
+
+/// The same for a claim on an incarnation of the obligation row that has
+/// since been removed and re-armed, at the same generation number.
+#[test]
+fn an_overtaken_incarnation_keeps_the_proof_and_leaves_the_obligation_open() {
+    let mut c = conn();
+    let (fence, claim) = a_write_in_flight(&c);
+    c.execute("DELETE FROM projection_obligations WHERE group_id = 'g' AND path = 'p'", [])
+        .unwrap();
+    crate::projection_obligations::bump_projection_obligations_for_touched_paths(
+        &c,
+        "g",
+        &["p"],
+        1,
+    )
+    .unwrap();
+    let rearmed = claim_on(&c);
+    assert_eq!(rearmed.invalidation_generation, claim.invalidation_generation);
+    assert_ne!(rearmed.obligation_incarnation, claim.obligation_incarnation);
+
+    let (commit, closed) = commit_closing(&mut c, fence, claim);
+
+    assert!(matches!(commit, InternalMaterializedCommit::Published(_)));
+    assert!(!closed, "a stale incarnation closes nothing");
+    assert_eq!(claim_on(&c), rearmed);
+}
+
+/// A row superseded while the write was in flight publishes nothing and
+/// closes nothing.
+#[test]
+fn a_superseded_row_publishes_and_closes_nothing_in_the_folded_commit() {
+    let mut c = conn();
+    let (fence, claim) = a_write_in_flight(&c);
+    let tx = c.transaction().unwrap();
+    let (commit, closed) = commit_internal_materialized_state_closing_obligation(
+        &tx,
+        "g",
+        "p",
+        &object([4u8; 32]),
+        fence,
+        Some(ExpectedAuthoring { state: MaterializationState::Hydrating, expected_version: None }),
+        claim,
+        0,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+
+    assert!(matches!(commit, InternalMaterializedCommit::AuthoringSuperseded));
+    assert!(!closed);
+    assert!(!any_proof_row(&c));
+    assert!(intent_open(&c, "g", "p"));
+    assert!(obligation_open(&c));
+}
+
+/// The identity bytes of a head at `path` with `provenance`, as a row
+/// stores the head it was written from.
+fn row_identity_bytes(provenance: [u8; 32], path: &str) -> Vec<u8> {
+    let device = b"device-peer";
+    let mut out = provenance.to_vec();
+    out.extend_from_slice(&1u64.to_be_bytes());
+    out.extend_from_slice(&[0u8; 16]);
+    out.extend_from_slice(&(device.len() as u16).to_be_bytes());
+    out.extend_from_slice(device);
+    out.extend_from_slice(path.as_bytes());
+    out
+}
+
+/// A claim overtaken by an admission may come with a head these bytes do
+/// not reflect, so the kept proof names the head the row was written from,
+/// not the path's heads at commit time.
+#[test]
+fn an_overtaken_claim_keeps_the_proof_on_the_basis_of_the_written_head() {
+    let mut c = conn();
+    let (fence, claim) = a_write_in_flight(&c);
+    let written_head = [8u8; 32];
+    c.execute(
+        "UPDATE files SET native_authoring_identity = ?1 WHERE group_id = 'g' AND path = 'p'",
+        rusqlite::params![row_identity_bytes(written_head, "p")],
+    )
+    .unwrap();
+    crate::projection_obligations::bump_projection_obligations_for_touched_paths(
+        &c,
+        "g",
+        &["p"],
+        1,
+    )
+    .unwrap();
+
+    let (commit, closed) = commit_closing(&mut c, fence, claim);
+
+    assert!(!closed);
+    let expected = crate::materialization_basis::of_unplaced_heads(&[written_head]);
+    let InternalMaterializedCommit::Published(published) = commit else { panic!("kept") };
+    assert_eq!(published.basis, expected);
+    assert_eq!(
+        lookup_materialized_generation(&c, "g", "p").unwrap().unwrap().basis,
+        expected,
+        "the stored basis is the written head's"
+    );
+}
+
+/// With no head recorded on the row, the kept proof claims no frontier at
+/// all rather than the one read at commit time.
+#[test]
+fn an_overtaken_claim_without_a_written_head_keeps_the_proof_on_no_frontier() {
+    let mut c = conn();
+    let (fence, claim) = a_write_in_flight(&c);
+    crate::projection_obligations::bump_projection_obligations_for_touched_paths(
+        &c,
+        "g",
+        &["p"],
+        1,
+    )
+    .unwrap();
+
+    commit_closing(&mut c, fence, claim);
+
+    let stored = lookup_materialized_generation(&c, "g", "p").unwrap().unwrap().basis;
+    assert!(!crate::materialization_basis::is_current(&c, "g", "p", &stored).unwrap());
+}
+
+/// A current claim leaves the basis exactly as the publication read it.
+#[test]
+fn a_current_claim_keeps_the_basis_read_at_publication() {
+    let mut c = conn();
+    let (fence, claim) = a_write_in_flight(&c);
+
+    commit_closing(&mut c, fence, claim);
+
+    let stored = lookup_materialized_generation(&c, "g", "p").unwrap().unwrap().basis;
+    assert!(crate::materialization_basis::is_current(&c, "g", "p", &stored).unwrap());
 }

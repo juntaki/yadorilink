@@ -10,7 +10,7 @@ const GROUP: &str = "g";
 fn open_full_test_db() -> Arc<SyncDatabase> {
     Arc::new(
         SyncDatabase::open_in_memory(|conn| {
-            dag_store::init_dag_schema(conn).map_err(|e| {
+            crate::replica_tables::init_for_tests(conn).map_err(|e| {
                 yadorilink_sqlite_runtime::DatabaseError::CorruptSchema(e.to_string())
             })?;
             crate::materialized_generation::init_materialized_generation_schema(conn).map_err(

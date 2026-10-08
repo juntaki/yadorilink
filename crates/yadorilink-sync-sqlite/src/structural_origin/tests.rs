@@ -8,7 +8,7 @@ const GROUP: &str = "g";
 
 fn open() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
-    crate::dag_store::init_dag_schema(&conn).unwrap();
+    crate::replica_tables::init_for_tests(&conn).unwrap();
     conn
 }
 

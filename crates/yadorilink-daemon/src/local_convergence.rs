@@ -2,7 +2,7 @@
 //!
 //! Some of what a device owes a folder is decided entirely by its own state.
 //! Whether an ephemeral conflict copy is still justified by the current
-//! frontier is a question about this device's DAG, its file index and its
+//! frontier is a question about this device's native state, its file index and its
 //! disk; no peer is consulted, and none can answer it.
 //!
 //! That work lived on `PeerSyncSession`, which had two consequences. A device
@@ -18,7 +18,7 @@
 //! Here that work has no peer to fabricate:
 //!
 //! ```text
-//!   LocalConvergenceExecutor   this device's DAG, index, roots and disk
+//!   LocalConvergenceExecutor   this device's native state, index, roots and disk
 //!   PeerSyncSession            a real peer, real transports, and one of these
 //! ```
 //!
@@ -35,13 +35,11 @@ use yadorilink_local_storage::{
 };
 use yadorilink_peer_session::PeerSessionError;
 use yadorilink_replica_domain::file::FileRecord;
-use yadorilink_replica_domain::ids::ChangeHash;
 use yadorilink_replica_domain::session_state::LinkGate;
 use yadorilink_root_authority::root_commit::{RootCommitPermit, RootLease};
 
 use yadorilink_peer_session::hazard;
 use yadorilink_peer_session::peer_session::RootCommitAuthorityProvider;
-use yadorilink_replica_engine::conflict::{resolve_path_heads, PathHead, PathResolution};
 use yadorilink_root_authority::ignore_patterns::{
     is_ignore_file_relative_path, EffectiveIgnoreSet,
 };
@@ -85,37 +83,142 @@ pub struct LocalConvergenceExecutor {
     /// bookkeeping can stand back while it does.
     pub(crate) block_write_activity_provider:
         Arc<dyn yadorilink_peer_session::peer_session::BlockWriteActivityProvider>,
-    /// Free-space policy for this device's own writes. Both are about the
-    /// disk under this device's feet, which no peer has an opinion about.
-    /// Test-only, one-shot failure injection, armed on ONE executor.
-    ///
-    /// These were process-global statics. A one-shot flag plus a global
-    /// scope is a race between every test in the binary: the arming test
-    /// does not necessarily reach the consumption point first, so an
-    /// unrelated concurrent hydration takes the failure meant for it. That
-    /// is exactly what turned up -- a test asserting its own injected
-    /// metadata-apply failure found no content on disk, because another
-    /// test's post-hold-clear arming had already failed its write. Per
-    /// executor, an arming can only ever be consumed by the attempt the
-    /// arming test drives.
+    /// Test-only, one-shot: runs between the assembly of an eager write's
+    /// temp file and the final local-edit check that precedes its rename, so
+    /// a test can land a local write in exactly that window.
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) force_hydration_failure_after_hold_cleared: std::sync::atomic::AtomicBool,
-    /// Consumed by `hydrate_file_with_timeout_locked` right where
-    /// `apply_unix_mode`/`apply_xattrs` would run -- simulates a real,
-    /// repeatable failure there (a chmod `EPERM`, an xattr `EOPNOTSUPP`) that
-    /// a permission trick or filesystem capability gap isn't reliably
-    /// reproducible for in a portable test. Proves the commit (CAS-to-
-    /// `Hydrated` and the transition intent guard's clear) that now runs
-    /// BEFORE this point survives such a failure intact: the row stays
-    /// `Hydrated` with its already-durable content, and the intent guard is
-    /// already cleared, rather than the whole attempt reverting to
-    /// `Placeholder` with a permanently dangling intent the way it would if
-    /// this failure fired before that commit.
+    pub(crate) between_assemble_and_persist_hook: StdMutex<Option<AssembleHook>>,
+    /// Test-only: pins how many own-name entries a pass settles at once
+    /// (`0` leaves the configured value in force).
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) force_hydration_failure_during_metadata_apply: std::sync::atomic::AtomicBool,
+    pub(crate) receive_write_concurrency_override: std::sync::atomic::AtomicUsize,
+    /// Test-only: pins the collectors' flush cap (`0` leaves the configured value).
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) collector_flush_cap_override: std::sync::atomic::AtomicUsize,
+    /// Test-only: pins whether a pass batches its files' completions
+    /// (`0` leaves the configured value, `1` batches, `2` commits per file).
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) batch_completion_override: std::sync::atomic::AtomicU8,
+    /// Test-only: pins whether a pass batches its files' metadata step
+    /// (0 = environment, 1 = on, 2 = off).
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) batch_metadata_override: std::sync::atomic::AtomicU8,
+    /// Test-only: pins whether a pass batches its files' open step
+    /// (0 = environment, 1 = on, 2 = off).
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) batch_open_override: std::sync::atomic::AtomicU8,
+    /// Test-only: the path whose write never reaches its completion, so a
+    /// test can hold a run's other files queued behind a sibling still running.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) completion_straggler: StdMutex<Option<String>>,
+    /// Test-only: the longest a queued completion waits for its batch, in
+    /// milliseconds (`0` leaves the default).
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) completion_max_latency_override_ms: std::sync::atomic::AtomicU64,
+    /// Test-only: observes eager writes while their path locks are held.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) overlap_probe: StdMutex<Option<Arc<OverlapProbe>>>,
+    /// Test-only: the free space the headroom preflight sees, in place of the
+    /// volume's real one.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fake_available_bytes: StdMutex<Option<u64>>,
+    /// Test-only: names the volume this executor's writes are accounted on.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) volume_key_override: StdMutex<Option<String>>,
+    /// Test-only: runs where the preflight asks the volume for its free space.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) free_space_probe: StdMutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     pub(crate) headroom_override_bytes: StdMutex<Option<u64>>,
     pub(crate) headroom_enforced: std::sync::atomic::AtomicBool,
 }
+
+/// Where an eager write is observed by an [`OverlapProbe`].
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ProbeSeam {
+    /// Temp file written and synced, rename not yet done.
+    BeforeRename,
+    /// Renamed and synced into place, nothing committed.
+    BeforeCommit,
+}
+
+/// Records which eager writes are at a seam at the same time, and holds each
+/// there until `want` of them have been and `hold` is released, so a test can
+/// tell a concurrent run from a serial one. A serial run never reaches `want`;
+/// the wait then ends after `patience` and the write continues. Each write
+/// holds its path lock for the whole time.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) struct OverlapProbe {
+    seam: ProbeSeam,
+    want: usize,
+    patience: std::time::Duration,
+    hold: std::sync::atomic::AtomicBool,
+    in_flight: std::sync::atomic::AtomicUsize,
+    max_in_flight: std::sync::atomic::AtomicUsize,
+    /// `(path, entered)` in the order the writes reached the seam and left it.
+    events: StdMutex<Vec<(String, bool)>>,
+}
+
+#[cfg(test)]
+impl OverlapProbe {
+    pub(crate) fn new(seam: ProbeSeam, want: usize, patience_ms: u64) -> Arc<Self> {
+        Arc::new(Self {
+            seam,
+            want,
+            patience: std::time::Duration::from_millis(patience_ms),
+            hold: std::sync::atomic::AtomicBool::new(false),
+            in_flight: Default::default(),
+            max_in_flight: Default::default(),
+            events: Default::default(),
+        })
+    }
+
+    /// Keeps every write at the seam until [`Self::release`].
+    pub(crate) fn hold_until_released(&self) {
+        self.hold.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn release(&self) {
+        self.hold.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn in_flight(&self) -> usize {
+        self.in_flight.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn max_in_flight(&self) -> usize {
+        self.max_in_flight.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn events(&self) -> Vec<(String, bool)> {
+        self.events.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl OverlapProbe {
+    pub(crate) async fn pass(&self, seam: ProbeSeam, path: &str) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if seam != self.seam {
+            return;
+        }
+        let now = self.in_flight.fetch_add(1, SeqCst) + 1;
+        self.max_in_flight.fetch_max(now, SeqCst);
+        self.events.lock().unwrap_or_else(|p| p.into_inner()).push((path.to_owned(), true));
+        let deadline = std::time::Instant::now() + self.patience;
+        while (self.hold.load(SeqCst) || self.max_in_flight.load(SeqCst) < self.want)
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        self.events.lock().unwrap_or_else(|p| p.into_inner()).push((path.to_owned(), false));
+        self.in_flight.fetch_sub(1, SeqCst);
+    }
+}
+
+/// A one-shot closure run with the path whose content was just assembled.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) type AssembleHook = Box<dyn FnOnce(&Path) + Send>;
 
 /// Whether this executor runs the materialize-time disk-headroom preflight,
 /// and against what reserve.
@@ -144,21 +247,17 @@ impl HeadroomPolicy {
     }
 }
 
-#[cfg(test)]
-mod published_fixture;
-
-#[cfg(test)]
-mod block_provenance_batching_tests;
 pub use yadorilink_peer_session::convergence_driver::ConvergenceDriver;
 
 mod hydrate;
 pub mod types;
 use types::*;
 pub mod call_timer;
+mod completion_window;
 mod knobs;
 mod materialize;
-#[cfg(test)]
-mod ordinary_batch_tests;
+pub mod obligation_claims;
+mod receive_write_gate;
 
 /// A file this device is still writing must never be overwritten with
 /// this device's own older version of it.
@@ -169,6 +268,21 @@ mod growing_file_projection_tests;
 /// back; a disk that moved on is captured instead.
 #[cfg(test)]
 mod own_head_recapture_tests;
+
+/// A peer's content written here end to end, and a write touched after its
+/// pre-write commit publishing nothing.
+#[cfg(test)]
+mod receive_content_write_tests;
+
+/// A removal is projected only over what it superseded; an
+/// unobserved local edit survives as a head.
+#[cfg(test)]
+mod delete_projection_tests;
+
+/// A path a rebootstrap protects is written, removed, moved and authored by
+/// nothing but the rebootstrap, on every lane.
+#[cfg(test)]
+mod rebootstrap_freeze_tests;
 
 /// What the namespace makes a reconcile do on disk -- relocating a file a
 /// live descendant displaces, putting it back, adopting and removing
@@ -181,12 +295,6 @@ mod projection_attempt_tests;
 
 #[cfg(test)]
 mod retirement_audit_guard_tests;
-
-/// The materialization audit's payload *producer*, which is the one
-/// materialization input this device reads out of its own index rather
-/// than receiving from a peer or deriving from a resolved DAG version.
-#[cfg(test)]
-mod materialization_audit_payload_tests;
 
 /// `materialize_symlink_at` and
 /// `try_apply_metadata_only_update`, exercised directly against a
@@ -206,13 +314,42 @@ mod symlink_and_metadata_only_update_tests;
 mod eager_admission_tests;
 
 #[cfg(test)]
+mod completion_window_tests;
+
+#[cfg(test)]
+mod offloaded_commit_tests;
+
+#[cfg(test)]
+mod batched_open_tests;
+
+#[cfg(test)]
+mod receive_batched_completion_tests;
+
+#[cfg(test)]
+mod metadata_window_tests;
+
+#[cfg(test)]
+mod receive_batched_metadata_tests;
+
+#[cfg(test)]
+mod native_prefetch_tests;
+
+#[cfg(test)]
+mod prefetch_overlap_tests;
+
+/// The plain own-name entries of a pass are written concurrently, with the
+/// serial order's guarantees kept.
+#[cfg(test)]
+mod receive_window_concurrency_tests;
+
+#[cfg(test)]
 mod hazard_reason_tests;
 
 #[cfg(test)]
-mod require_physical_kind_matches_tests;
+mod hazard_index_equivalence_tests;
 
 #[cfg(test)]
-mod path_safety_tests;
+mod require_physical_kind_matches_tests;
 
 #[cfg(test)]
 mod frontier_freshness_tests;
@@ -225,12 +362,10 @@ mod frontier_freshness_tests;
 /// `IGNORE_SET_REFRESH_INTERVAL`, so this stays fast and deterministic.
 #[cfg(test)]
 mod ignore_set_liveness_tests;
-/// Settling what an installed base leaves at a path with no head in
-/// `Gamma` (P9-B).
-#[cfg(test)]
-mod installed_base_settle_tests;
 mod namespace_steps;
 mod reconcile;
+pub(crate) use reconcile::{reserve_volume_headroom, HeadroomReservation};
+pub(crate) mod reconcile_native;
 
 /// What `LocalConvergenceExecutor::own_capture_on_disk` found about a
 /// head's relation to the disk it would be projected onto.
@@ -257,7 +392,22 @@ impl OwnCaptureOnDisk {
     }
 }
 
-/// Whether `materialize_dag_content_head` applies the recapture rule to an
+/// How a materialization's head is elected, and re-elected under the path
+/// lock. The steps after the election read the elected [`Head`] only.
+#[derive(Clone, Copy)]
+pub(crate) enum Election<'a> {
+    /// The node native's plan puts at the physical path. Fresh only while a
+    /// re-plan under the path lock still puts exactly this node there (head,
+    /// kind, placement and the source it stands for); any difference declines,
+    /// and the next pass plans afresh.
+    Native { expected: &'a yadorilink_replica_domain::native_plan::NativePlannedNode },
+    /// `head` written at a name the reconciler chose because its own name is
+    /// held by a directory that stays. Fresh while the plan still puts exactly
+    /// this head at its source path.
+    NativeHold { head: &'a yadorilink_replica_domain::native_plan::NativeLocatedHead },
+}
+
+/// Whether a materialization applies the recapture rule to an
 /// own captured head the disk has moved on from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OwnCaptureRule {
@@ -345,11 +495,29 @@ impl LocalConvergenceExecutor {
             eager_admission: StdMutex::new(HashMap::new()),
             block_write_activity_provider,
             #[cfg(any(test, feature = "test-support"))]
-            force_hydration_failure_after_hold_cleared: std::sync::atomic::AtomicBool::new(false),
+            between_assemble_and_persist_hook: StdMutex::new(None),
             #[cfg(any(test, feature = "test-support"))]
-            force_hydration_failure_during_metadata_apply: std::sync::atomic::AtomicBool::new(
-                false,
-            ),
+            receive_write_concurrency_override: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(any(test, feature = "test-support"))]
+            collector_flush_cap_override: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(any(test, feature = "test-support"))]
+            batch_completion_override: std::sync::atomic::AtomicU8::new(0),
+            #[cfg(any(test, feature = "test-support"))]
+            batch_metadata_override: std::sync::atomic::AtomicU8::new(0),
+            #[cfg(any(test, feature = "test-support"))]
+            batch_open_override: std::sync::atomic::AtomicU8::new(0),
+            #[cfg(any(test, feature = "test-support"))]
+            completion_max_latency_override_ms: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-support"))]
+            completion_straggler: StdMutex::new(None),
+            #[cfg(any(test, feature = "test-support"))]
+            overlap_probe: StdMutex::new(None),
+            #[cfg(any(test, feature = "test-support"))]
+            fake_available_bytes: StdMutex::new(None),
+            #[cfg(any(test, feature = "test-support"))]
+            volume_key_override: StdMutex::new(None),
+            #[cfg(any(test, feature = "test-support"))]
+            free_space_probe: StdMutex::new(None),
             headroom_override_bytes: StdMutex::new(headroom.override_bytes),
             headroom_enforced: std::sync::atomic::AtomicBool::new(headroom.enforced),
         })
@@ -401,31 +569,6 @@ impl LocalConvergenceExecutor {
         let canonical = std::fs::canonicalize(raw_root).ok()?;
         cache.insert(group_id.to_string(), (raw_root.to_path_buf(), canonical.clone()));
         Some(canonical)
-    }
-
-    /// Whether `path`, which has no head in `Gamma`, is settled absent: the
-    /// group stands on an installed base, the index holds no live row at
-    /// the path, and nothing is on disk there. Without a base, no heads
-    /// means this device's history may simply be behind, and nothing is
-    /// claimed.
-    pub(crate) fn absent_under_installed_base(
-        &self,
-        group_id: &str,
-        path: &str,
-    ) -> Result<bool, PeerSessionError> {
-        let base = self
-            .state
-            .rebootstrap_store_repository()
-            .history_base(group_id)
-            .map_err(crate::sync_error::SyncError::from)
-            .map_err(PeerSessionError::from)?;
-        if base.is_none() {
-            return Ok(false);
-        }
-        if self.state.get_file(group_id, path)?.is_some_and(|row| !row.deleted) {
-            return Ok(false);
-        }
-        self.observably_absent_on_disk(group_id, path)
     }
 
     /// Where `path` lives on this device's disk for `group_id`.
@@ -503,18 +646,23 @@ impl LocalConvergenceExecutor {
     /// land after it, and a capture can fail on a file that is still being
     /// written. Which bytes count as "captured" depends on the row:
     ///
-    /// * `Hydrated`: the row claims disk holds its version, so any
-    ///   divergence is an unauthored edit -- including a row with no blocks,
-    ///   whose version says the file is empty.
-    /// * `Placeholder` for which this device did not write the placeholder
-    ///   on disk (no recorded placeholder, or the object is no longer that
-    ///   untouched placeholder): a capture whose own disk observation raced
-    ///   leaves exactly this, naming what it read while disk moved on. Real
-    ///   bytes that match neither the row's version nor `incoming` (the
-    ///   version about to be written, if any) are an uncaptured edit.
-    ///   An untouched placeholder is left out: disagreeing with its row is
-    ///   its whole point, and reading another provider's placeholder could
-    ///   trigger its hydration.
+    /// * `Present` with a usable proof: the daemon wrote what is here. The
+    ///   daemon's own write, untouched since, is captured whichever version
+    ///   it holds (`Present` never says the object equals the row's version;
+    ///   the proof does). Anything that moved off the proof must still equal
+    ///   the row, so any divergence is an unauthored edit -- including a row
+    ///   with no blocks, whose version says the file is empty.
+    /// * `Present` with no proof, or `Remote` with an object at the path: no
+    ///   evidence vouches for what is there. A capture whose own disk
+    ///   observation raced leaves exactly this, naming what it read while
+    ///   disk moved on. Real bytes that match neither the row's version nor
+    ///   `incoming` (the version about to be written, if any) are an
+    ///   uncaptured edit. A native provider's untouched placeholder (Windows
+    ///   only) is left out: disagreeing with its row is its whole point, and
+    ///   reading it could trigger its hydration.
+    ///
+    /// * No row at all: a regular file here is a new local file capture has
+    ///   not reached, unless its bytes are `incoming`'s.
     ///
     /// Every other state keeps its own handling. A missing path, a
     /// symlink, a directory or a tombstoned row is not this check's
@@ -533,7 +681,17 @@ impl LocalConvergenceExecutor {
         if !lstat.is_file() {
             return Ok(false);
         }
-        let Some(local_row) = self.state.get_file(group_id, rel_path)? else { return Ok(false) };
+        let Some(local_row) = self.state.get_file(group_id, rel_path)? else {
+            // A regular file where this device has no row at all was created
+            // here after the capture that preceded this call, so nothing has
+            // recorded it. Bytes equal to what is about to be written are
+            // not lost by writing them.
+            return match incoming {
+                Some(incoming) => Ok(disk_content_comparison(out_path, incoming)?
+                    == DiskContentComparison::PresentButDifferent),
+                None => Ok(true),
+            };
+        };
         if local_row.deleted {
             return Ok(false);
         }
@@ -541,24 +699,118 @@ impl LocalConvergenceExecutor {
             disk_content_comparison(out_path, blocks)
                 .map(|found| found == DiskContentComparison::PresentButDifferent)
         };
-        match self.state.get_materialization_state(group_id, rel_path).ok().flatten() {
-            Some(MaterializationState::Hydrated) => Ok(differs_from(&local_row.blocks)?),
-            Some(MaterializationState::Placeholder) => {
-                if self.is_untouched_placeholder_of_this_device(
-                    group_id, rel_path, out_path, &lstat, &local_row,
-                ) {
-                    return Ok(false);
-                }
-                if !differs_from(&local_row.blocks)? {
-                    return Ok(false);
-                }
-                match incoming {
-                    Some(incoming) => Ok(differs_from(incoming)?),
-                    None => Ok(true),
+        let state = self.state.get_materialization_state(group_id, rel_path).ok().flatten();
+        if !matches!(state, Some(MaterializationState::Present | MaterializationState::Remote)) {
+            return Ok(false);
+        }
+        if state == Some(MaterializationState::Remote)
+            && self.is_untouched_placeholder_of_this_device(
+                group_id, rel_path, out_path, &lstat, &local_row,
+            )
+        {
+            return Ok(false);
+        }
+        if state == Some(MaterializationState::Present)
+            && self.state.dag_has_usable_materialized_generation(group_id, rel_path)?
+        {
+            // A proof vouches for what is here. `Present` alone never says the
+            // object equals the row's version, so ask the evidence: the
+            // daemon's own write, untouched since, is not an edit whichever
+            // version it holds (an older version's bytes under a newer row);
+            // anything that moved off the proof must still equal the row.
+            if self.state.dag_disk_is_untouched_proven_write(group_id, rel_path, out_path)? {
+                return Ok(false);
+            }
+            return Ok(differs_from(&local_row.blocks)?);
+        }
+        // An object no proof vouches for (`Remote` over bytes, or `Present`
+        // without evidence): a capture whose own disk observation raced
+        // leaves exactly this, naming what it read while disk moved on. Real
+        // bytes that match neither the row's version nor `incoming` are an
+        // uncaptured edit.
+        if !differs_from(&local_row.blocks)? {
+            return Ok(false);
+        }
+        match incoming {
+            Some(incoming) => Ok(differs_from(incoming)?),
+            None => Ok(true),
+        }
+    }
+
+    /// Whether removing `rel_path` on a projected removal would destroy
+    /// local state capture has not recorded: bytes that are not the row's
+    /// ([`Self::disk_holds_uncaptured_local_bytes`]), a mode or replicated
+    /// xattrs that are not the row's, a regular file whose materialization
+    /// state is unknown, a symlink whose target
+    /// is not the row's, or an object of another kind than the row's where
+    /// the removal would unlink it. A removal supersedes only the version
+    /// the row records; anything else on disk is a local change its author
+    /// never observed, left for capture to record as a head of its own. A
+    /// directory is never this check's finding: a removal only ever removes
+    /// an empty one.
+    pub(crate) fn removal_would_destroy_unrecorded_state(
+        &self,
+        group_id: &str,
+        rel_path: &str,
+        out_path: &Path,
+    ) -> Result<bool, PeerSessionError> {
+        use yadorilink_replica_domain::file::RecordKind;
+        if self.disk_holds_uncaptured_local_bytes(group_id, rel_path, out_path, None)? {
+            return Ok(true);
+        }
+        let Ok(lstat) = std::fs::symlink_metadata(out_path) else { return Ok(false) };
+        if lstat.is_dir() {
+            return Ok(false);
+        }
+        let Some(row) = self.state.current_row_snapshot(group_id, rel_path)? else {
+            return Ok(false);
+        };
+        if row.record.deleted {
+            return Ok(false);
+        }
+        Ok(match row.record_kind {
+            RecordKind::File if lstat.is_file() => {
+                use yadorilink_replica_domain::session_state::MaterializationState;
+                // A version covers mode and replicated xattrs as well as
+                // bytes, so a local chmod or xattr change capture has not
+                // recorded is as unobserved by the remover as a content
+                // edit. An untouched placeholder is left out as above; any
+                // state this cannot vouch for (missing, or mid-hydration or
+                // eviction) is refused rather than removed unchecked.
+                match row.materialization_state {
+                    Some(MaterializationState::Present) => {
+                        !mode_and_xattrs_match_disk(out_path, &row.to_file_version())?
+                    }
+                    Some(MaterializationState::Remote) => {
+                        !self.is_untouched_placeholder_of_this_device(
+                            group_id,
+                            rel_path,
+                            out_path,
+                            &lstat,
+                            &row.record,
+                        ) && !mode_and_xattrs_match_disk(out_path, &row.to_file_version())?
+                    }
+                    _ => true,
                 }
             }
-            _ => Ok(false),
-        }
+            RecordKind::File => lstat.file_type().is_symlink(),
+            RecordKind::Directory => true,
+            RecordKind::Symlink => {
+                if !lstat.file_type().is_symlink() {
+                    true
+                } else {
+                    let target = std::fs::read_link(out_path)?;
+                    #[cfg(unix)]
+                    let on_disk = {
+                        use std::os::unix::ffi::OsStrExt as _;
+                        target.as_os_str().as_bytes().to_vec()
+                    };
+                    #[cfg(not(unix))]
+                    let on_disk = target.to_string_lossy().as_bytes().to_vec();
+                    row.symlink_target.as_deref() != Some(on_disk.as_slice())
+                }
+            }
+        })
     }
 
     /// Whether projecting `head` at `rel_path` would write this device's
@@ -605,14 +857,14 @@ impl LocalConvergenceExecutor {
         &self,
         group_id: &str,
         rel_path: &str,
-        head: &PathHead,
+        head: &Head,
         version: &yadorilink_replica_domain::file::FileVersion,
     ) -> Result<OwnCaptureOnDisk, PeerSessionError> {
         use yadorilink_local_storage::{disk_content_comparison, DiskContentComparison};
         use yadorilink_replica_domain::file::RecordKind;
         use yadorilink_replica_domain::session_state::MaterializationState;
         if head.device_id != self.local_device_id
-            || !self.state.is_local_capture(group_id, rel_path, &ChangeHash(head.change_hash))?
+            || !self.state.is_local_capture_head(group_id, rel_path, head)?
         {
             return Ok(OwnCaptureOnDisk::NotACapture);
         }
@@ -631,7 +883,7 @@ impl LocalConvergenceExecutor {
                 let removed = live_row
                     && (kind == RecordKind::Directory
                         || self.state.get_materialization_state(group_id, rel_path).ok().flatten()
-                            == Some(MaterializationState::Hydrated));
+                            == Some(MaterializationState::Present));
                 return Ok(if removed {
                     OwnCaptureOnDisk::Removed
                 } else {
@@ -661,7 +913,7 @@ impl LocalConvergenceExecutor {
             _ if !file_type.is_file() => false,
             _ => {
                 if self.state.get_materialization_state(group_id, rel_path).ok().flatten()
-                    == Some(MaterializationState::Placeholder)
+                    == Some(MaterializationState::Remote)
                 {
                     if let Some(row) = self.state.get_file(group_id, rel_path)? {
                         if self.is_untouched_placeholder_of_this_device(
@@ -680,41 +932,10 @@ impl LocalConvergenceExecutor {
         Ok(if moved_on { OwnCaptureOnDisk::MovedOn } else { OwnCaptureOnDisk::Holds })
     }
 
-    /// Whether the object at a `Placeholder` row's path is still a
-    /// placeholder (as opposed to real bytes someone wrote there). On unix
-    /// that is the `(dev, ino)` this device recorded when it wrote the
-    /// placeholder, still sparse; with nothing recorded, a sparse file of
-    /// the row's size. A placeholder of another provider is taken at its
-    /// word (reading it could hydrate it), and so is any state this
-    /// cannot read.
-    #[cfg(unix)]
-    fn is_untouched_placeholder_of_this_device(
-        &self,
-        group_id: &str,
-        rel_path: &str,
-        _out_path: &Path,
-        lstat: &std::fs::Metadata,
-        row: &FileRecord,
-    ) -> bool {
-        use std::os::unix::fs::MetadataExt as _;
-        match self
-            .state
-            .materialization_state_repository()
-            .get_placeholder_generation(group_id, rel_path)
-        {
-            Ok(Some(recorded)) => {
-                recorded.provider_kind != yadorilink_local_storage::INTERNAL_INODE_PROVIDER_KIND
-                    || (yadorilink_local_storage::PlaceholderDiskIdentity::from_metadata(lstat)
-                        == Some(recorded.identity)
-                        && lstat.blocks() == 0)
-            }
-            Ok(None) => lstat.len() == row.size && lstat.blocks() == 0,
-            Err(_) => true,
-        }
-    }
-
-    /// On Windows, the same fail-closed rule local capture applies
-    /// (`untouched_placeholder_verdict`): only a CfAPI placeholder this
+    /// Whether the object at a `Remote` row's path is still a native
+    /// provider placeholder rather than real bytes someone wrote there. On
+    /// Windows, the same fail-closed rule local capture applies
+    /// (`cfapi_placeholder_untouched`): only a CfAPI placeholder this
     /// device recorded a generation for, still reporting `Untouched`, is
     /// taken as untouched. A row with no recorded generation is by
     /// construction not a placeholder this device wrote -- it is what a
@@ -733,7 +954,7 @@ impl LocalConvergenceExecutor {
         _row: &FileRecord,
     ) -> bool {
         use std::os::windows::fs::MetadataExt as _;
-        use yadorilink_filesystem_sync::placeholder_backend::PlaceholderStatus;
+        use yadorilink_local_capture::ports::PlaceholderStatus;
         const FILE_ATTRIBUTE_OFFLINE: u32 = 0x0000_1000;
         const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x0004_0000;
         const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
@@ -762,9 +983,10 @@ impl LocalConvergenceExecutor {
         }
     }
 
-    /// Elsewhere a placeholder is the platform provider's object, and
-    /// reading it is not free of side effects: always taken at its word.
-    #[cfg(not(any(unix, windows)))]
+    /// Where no native provider exists, no object is a provider placeholder:
+    /// whatever stands at a path is user bytes, so nothing is taken at its
+    /// word.
+    #[cfg(not(windows))]
     fn is_untouched_placeholder_of_this_device(
         &self,
         _group_id: &str,
@@ -773,7 +995,7 @@ impl LocalConvergenceExecutor {
         _lstat: &std::fs::Metadata,
         _row: &FileRecord,
     ) -> bool {
-        true
+        false
     }
 
     pub fn local_file_path(&self, group_id: &str, path: &str) -> Result<PathBuf, PeerSessionError> {
@@ -793,7 +1015,6 @@ impl LocalConvergenceExecutor {
         group_id: &str,
         record: &FileRecord,
         origin_device_id: &str,
-        authoring_change_hash: Option<&ChangeHash>,
         root_commit_permit: &RootCommitPermit<'_>,
     ) -> Result<MaterializeResult, PeerSessionError> {
         // Recomputed here rather than passed in: a hazardous name is a fact
@@ -877,49 +1098,7 @@ impl LocalConvergenceExecutor {
                 // once (clearing any prior hold) and a peer's
                 // periodic resend redelivers it after a fresh
                 // collision appears.
-                //
-                // "Already converged" only holds if the row's
-                // authoring identity actually matches this exact
-                // incoming tombstone. Defense-in-depth, not a live
-                // production fix: `apply_locked_record`'s
-                // `ChangeOrdering::Before` branch is this sub-case's
-                // only conceivable caller, and its only current
-                // caller (`rematerialize_one_record`, the
-                // materialization audit) already filters out every
-                // `deleted` record before this could ever run --
-                // `reconcile_local_materialization_audit`'s own
-                // `if record.deleted { continue; }` plus its
-                // `list_materialization_repair_candidates` query's
-                // `AND f.deleted = 0` -- so this branch is unreachable
-                // by any caller in this codebase today. Kept correct
-                // anyway for a future caller (a strictly newer
-                // descendant tombstone -- e.g. a later device
-                // re-tombstones an already-deleted path, minting a new
-                // change on top of the one this row was last stamped
-                // with) that reaches it without the same filtering:
-                // fast-pathing to `Settled` without updating
-                // `authoring_change_hash` would leave the row's
-                // authoring identity stuck at the OLD tombstone
-                // forever, with every future `dag_compare_authoring`
-                // call against it re-entering this same branch. NOTE:
-                // this write trusts its caller for causal ordering --
-                // it does not itself verify the supplied hash is
-                // newer, only that it differs, so any FUTURE caller of
-                // this branch must guarantee ordering the same way
-                // `ChangeOrdering::Before` does before ever reaching
-                // here. Advancing the column is otherwise safe: it
-                // only touches the index column, never disk or
-                // `deleted`, so it carries none of the "index says
-                // deleted, disk has content" risk this whole branch
-                // exists to avoid.
                 Some(row) if has_real_row && row.deleted => {
-                    if let Some(hash) = authoring_change_hash {
-                        let current =
-                            self.state.get_authoring_change_hash(group_id, &record.path)?;
-                        if current.as_ref() != Some(hash) {
-                            self.state.set_authoring_change_hash(group_id, &record.path, hash)?;
-                        }
-                    }
                     // "Already absent" has to be observed, not inferred
                     // from the row: see `observably_absent_on_disk`. By
                     // exact name, because this name collides with a live
@@ -969,7 +1148,7 @@ impl LocalConvergenceExecutor {
         // crash between the `remove_file` below and `persist_
         // materialized_record`'s own index commit leaves this row at
         // whatever `materialization_state` it had BEFORE this
-        // tombstone (typically `Hydrated`, from being genuinely
+        // tombstone (typically `Present`, from being genuinely
         // materialized until a moment ago) with the file now
         // genuinely missing and `record.deleted` still `false` in the
         // index -- exactly the "Hydrated + missing + no intent" shape
@@ -1020,43 +1199,39 @@ impl LocalConvergenceExecutor {
         // only then clear the intent -- see the settle operations' own doc
         // comments. A retained directory settles the same way: the entry is
         // deleted, only the directory stays.
-        match authoring_change_hash {
-            Some(hash) => {
-                self.state.settle_tombstone_delete(
-                    delete_intent_guard,
-                    group_id,
-                    record,
-                    origin_device_id,
-                    hash,
-                    &|| self.root_lease_for(group_id),
-                )?;
-            }
-            // No DAG change authors this tombstone -- this call's only
-            // caller with `None` is `retire_unjustified_ephemeral_conflict_
-            // copies`, deleting a path no admitted change ever touched (a
-            // pure local artifact of the projection fixpoint, per that
-            // function's own doc comment). `persist_row_under_fresh_operation`
-            // would upsert a 'current' row via `upsert_file_with_origin`,
-            // which the schema's `files_require_authoring_identity_on_*`
-            // triggers unconditionally reject once this group has ANY DAG
-            // history (see `dc3b5c36`'s "every current row" invariant,
-            // added months after this retirement call already existed with
-            // `None` -- a confirmed, reproduced regression: every retry
-            // hits the same trigger, forever, since nothing about a purely
-            // local decision can ever satisfy "verified authoring
-            // identity"). There is no fact to assert here, so erase the
-            // row instead of asserting a tombstone -- exactly
-            // `erase_local_only_file`'s ("not a tombstone, an erasure",
-            // mirroring `FileIndexRepository::remove_file`'s own existing
-            // ignore-sweep use) documented semantics.
-            None => {
-                self.state.settle_retired_copy_erase(
-                    delete_intent_guard,
-                    group_id,
-                    &record.path,
-                    root_commit_permit,
-                )?;
-            }
+        // A native removal names no authoring of its own: the tombstone keeps
+        // the identity of the row it removes, so the deletion stays recorded
+        // and the last live content stays recoverable from trash.
+        let inherits = self.state.row_authoring(group_id, &record.path)?.is_some();
+        if inherits {
+            self.state.settle_tombstone_delete(
+                delete_intent_guard,
+                group_id,
+                record,
+                origin_device_id,
+                None,
+                &|| self.root_lease_for(group_id),
+            )?;
+        } else {
+            // The path carries no native head: it is a pure local artifact
+            // (an ephemeral conflict copy of the projection fixpoint) that no
+            // admitted delta ever touched, and
+            // `persist_row_under_fresh_operation` would upsert a 'current'
+            // row via `upsert_file_with_origin`, which the schema's
+            // `files_require_authoring_identity_on_*` triggers reject once
+            // this group has native history: nothing about a purely local
+            // decision can ever satisfy "verified authoring identity". There
+            // is no fact to assert here, so erase the row instead of
+            // asserting a tombstone -- exactly `erase_local_only_file`'s
+            // ("not a tombstone, an erasure", mirroring
+            // `FileIndexRepository::remove_file`'s own existing ignore-sweep
+            // use) documented semantics.
+            self.state.settle_retired_copy_erase(
+                delete_intent_guard,
+                group_id,
+                &record.path,
+                root_commit_permit,
+            )?;
         }
         if let TombstoneRemoval::Retained { reason, removable } = removal {
             self.keep_directory_a_delete_found_not_empty(
@@ -1245,38 +1420,6 @@ impl LocalConvergenceExecutor {
         )
     }
 
-    /// A tombstone already recorded for `rel_path` while a directory still
-    /// stands at its name: either the directory an earlier delete aimed at
-    /// and retained, which is removed now if it has since become empty, or
-    /// a directory no delete aimed at -- one standing where the index held
-    /// a file, or one made after the delete and not captured -- which is
-    /// kept for good, however empty. `None` when no directory is there.
-    /// Never a retry: what is on disk decides the answer at once.
-    pub(crate) fn settle_directory_at_deleted_path(
-        &self,
-        group_id: &str,
-        rel_path: &str,
-    ) -> Result<Option<SettlementEvidence>, PeerSessionError> {
-        let out_path = self.local_file_path(group_id, rel_path)?;
-        if !std::fs::symlink_metadata(&out_path).is_ok_and(|meta| meta.is_dir()) {
-            return Ok(None);
-        }
-        if let Some(evidence) = self.remove_retained_directory_if_empty(group_id, rel_path)? {
-            return Ok(Some(evidence));
-        }
-        // A directory this device made only to hold descendants (a file's
-        // parent, or the container a relocated file left behind) goes once
-        // nothing needs it.
-        if let Some(evidence) = self.prune_directory_made_for_descendants(group_id, rel_path)? {
-            return Ok(Some(evidence));
-        }
-        let reason = self.retained_directory_reason_for(group_id, rel_path)?;
-        self.state
-            .keep_retained_directory(group_id, rel_path, reason, None)
-            .map_err(crate::sync_error::SyncError::from)?;
-        Ok(Some(SettlementEvidence::Retained { reason: reason.to_string() }))
-    }
-
     /// Removes the directory at `rel_path` if it is the very object an
     /// earlier delete aimed at and retained, and it is now empty
     /// (`ExactAbsent`); if it is that object but still not empty, keeps it
@@ -1358,7 +1501,7 @@ impl LocalConvergenceExecutor {
         // Reverse order: every descendant sorts after its ancestor.
         for ancestor in ancestors.into_iter().rev() {
             let path_lock = self.state.path_lock(group_id, &ancestor);
-            let _guard = path_lock.lock().await;
+            let _guard = crate::receive_diag::lock_path(&path_lock).await;
             let outcome = (|| -> Result<Option<SettlementEvidence>, PeerSessionError> {
                 if self
                     .state
@@ -1434,111 +1577,6 @@ impl LocalConvergenceExecutor {
         }
     }
 
-    /// The live heads for `path`: the changes touching it that are
-    /// causally maximal in the currently admitted DAG.
-    ///
-    /// One read of a derived index. Which touchers are still live is
-    /// decided once, when a change is admitted, and recorded; resolving a
-    /// path reads that decision rather than re-deriving it. Nothing here
-    /// decodes an encoded change, walks ancestry, or costs anything
-    /// proportional to the group's history length.
-    ///
-    /// This used to walk the group's ancestry backwards from its current
-    /// heads, decoding every visited change and scanning its ops, keeping
-    /// the ones that touched `path` and discarding the rest. That cost
-    /// the whole of the group's history per path resolved, however rarely
-    /// the path itself had been written: on a 10,000-file import admitted
-    /// as one-op changes, resolving eight paths cost ~92,000 change
-    /// decodes.
-    ///
-    /// Note for whoever reads this next: an intermediate form kept that
-    /// walk's shape but found candidates through an index of "every
-    /// change that ever touched this path", then re-checked reachability
-    /// and supersession on every read. It removed the history-length
-    /// dependence but left a per-read ancestry check proportional to how
-    /// often the path had been written. A per-tick memo was then added on
-    /// top, sharing one result between fetch-origin selection and
-    /// missing-content detection, and was removed again when the per-read
-    /// cost itself went away -- at which point it bought nothing and cost
-    /// a freshness invariant plus a parallel set of entry points through
-    /// four modules. Both steps point the same way: make the per-call
-    /// cost go away rather than arrange for the call to happen fewer
-    /// times.
-    pub(crate) fn store_live_heads_for_path(
-        &self,
-        group_id: &str,
-        path: &str,
-    ) -> Result<Vec<PathHead>, PeerSessionError> {
-        // `Gamma`'s heads, not the path frontier's alone: after an epoch
-        // reset a path nothing on the new base has touched is carried only
-        // by the installed base, and its row is that base's.
-        self.state.dag_path_gamma_heads(group_id, path)
-    }
-
-    /// The conflict-copy paths `path`'s own resolution derives right now.
-    ///
-    /// Empty when the path resolves to `Absent` or has no concurrent losing
-    /// content head. See [`PeerSyncSession::conflict_copy_paths_for`] for why
-    /// this is asked from outside at all.
-    pub fn conflict_copy_paths_for(
-        &self,
-        group_id: &str,
-        path: &str,
-    ) -> Result<Vec<String>, PeerSessionError> {
-        use yadorilink_replica_engine::conflict::{resolve_path_heads, PathResolution};
-        let heads = self.combined_heads(group_id, path, None)?;
-        match resolve_path_heads(path, &heads) {
-            PathResolution::Present { conflict_copies, .. } => {
-                Ok(conflict_copies.into_iter().map(|copy| copy.path).collect())
-            }
-            _ => Ok(Vec::new()),
-        }
-    }
-
-    pub fn combined_heads(
-        &self,
-        group_id: &str,
-        path: &str,
-        derived_head: Option<&PathHead>,
-    ) -> Result<Vec<PathHead>, PeerSessionError> {
-        let direct = self.store_live_heads_for_path(group_id, path)?;
-
-        // The stored heads are already causally maximal among themselves
-        // -- that is what makes them stored heads -- so with nothing to
-        // merge in, they are the answer, and no ancestry question arises
-        // at all. This is the hot path: every ordinary resolution takes
-        // it.
-        let Some(derived) = derived_head else {
-            return Ok(direct);
-        };
-
-        // A derived head is a head this device reasoned its way to rather
-        // than read, so its causal relation to the stored ones is the one
-        // thing not already settled. Only that relation is asked about:
-        // each comparison is against the derived head, never between two
-        // stored heads, so the work is bounded by the path's live width
-        // and by nothing else.
-        let mut live = Vec::new();
-        let mut derived_superseded = false;
-        for head in &direct {
-            let head_hash = ChangeHash(head.change_hash);
-            let derived_hash = ChangeHash(derived.change_hash);
-            if self.state.dag_is_ancestor(&head_hash, &derived_hash)? {
-                // This stored head is in the derived head's past: the
-                // derived head replaces it.
-                continue;
-            }
-            if self.state.dag_is_ancestor(&derived_hash, &head_hash)? {
-                derived_superseded = true;
-            }
-            live.push(head.clone());
-        }
-        if !derived_superseded {
-            live.push(derived.clone());
-        }
-        Ok(live)
-    }
-
     /// Standalone entry point for the retirement step alone -- see
     /// `retire_unjustified_ephemeral_conflict_copies`'s own doc comment for
     /// what it does and why. `engine_wrapper.rs`'s event-driven retirement
@@ -1558,7 +1596,7 @@ impl LocalConvergenceExecutor {
     /// means for a generation-tracked caller.
     ///
     /// Whole-pass frontier freshness: `frontier_before` is this device's
-    /// own admitted DAG heads for `group_id`, read right after the
+    /// own admitted native heads for `group_id`, read right after the
     /// `RetirementAuditGuard` is acquired (before any copy is examined);
     /// `frontier_after` is the same read again right after the retirement
     /// pass returns (after every mutation it made is durable). If they
@@ -1581,17 +1619,20 @@ impl LocalConvergenceExecutor {
         &self,
         group_id: &str,
     ) -> Result<RetirementAttempt, PeerSessionError> {
-        if !matches!(self.state.link_gate_for_group(group_id)?, LinkGate::Live { .. }) {
+        if !matches!(
+            self.state.directory_link_gate_for_group(group_id)?,
+            Some(LinkGate::Live { .. })
+        ) {
             return Ok(RetirementAttempt::Settled { retired: 0 });
         }
         let Some(_guard) = RetirementAuditGuard::try_acquire(&self.state, group_id) else {
             return Ok(RetirementAttempt::Busy);
         };
-        let frontier_before = self.state.dag_group_heads(group_id)?;
+        let frontier_before = self.state.native_author_frontier(group_id)?;
         let audit_attempt_id = next_audit_attempt_id();
         let (outcome, retired_generations) =
             self.retire_unjustified_ephemeral_conflict_copies(group_id, audit_attempt_id).await?;
-        let frontier_after = self.state.dag_group_heads(group_id)?;
+        let frontier_after = self.state.native_author_frontier(group_id)?;
         if frontier_changed_during_pass(&frontier_before, &frontier_after) {
             // The deletions already happened and are not undone, but
             // `frontier_before` is no longer provably this group's causal
@@ -1618,11 +1659,46 @@ impl LocalConvergenceExecutor {
         let root_commit_permit = root_commit_authority_op.permit();
         self.state.publish_retired_copy_absence(
             group_id,
-            &frontier_before,
             &retired_generations,
             &root_commit_permit,
         );
         Ok(outcome)
+    }
+
+    /// The live rows of `group_id` whose filename carries the conflict-copy
+    /// marker. Reads only the rows the marker index selects, so the cost
+    /// follows the number of copies and not the size of the group.
+    pub(crate) fn live_conflict_copy_shaped(
+        &self,
+        group_id: &str,
+    ) -> Result<Vec<FileRecord>, PeerSessionError> {
+        Ok(self
+            .state
+            .list_live_conflict_copy_candidates(group_id)?
+            .into_iter()
+            .filter(|r| {
+                !r.deleted && yadorilink_replica_domain::conflict::is_conflict_copy_path(&r.path)
+            })
+            .collect())
+    }
+
+    /// The whole-group read this pass used to make: every row decoded, then
+    /// filtered, with the group's native head paths read up front. Kept as
+    /// the oracle the indexed read is compared against.
+    #[cfg(test)]
+    pub(crate) fn live_conflict_copy_shaped_by_full_scan(
+        &self,
+        group_id: &str,
+    ) -> Result<(Vec<FileRecord>, std::collections::HashSet<String>), PeerSessionError> {
+        let copy_shaped = self
+            .state
+            .list_files(group_id)?
+            .into_iter()
+            .filter(|r| {
+                !r.deleted && yadorilink_replica_domain::conflict::is_conflict_copy_path(&r.path)
+            })
+            .collect();
+        Ok((copy_shaped, self.state.native_head_paths(group_id)?))
     }
 
     /// Removes locally-materialized conflict copies that are pure artifacts
@@ -1685,25 +1761,18 @@ impl LocalConvergenceExecutor {
         let root_commit_authority = self.root_lease_for(group_id)?;
         let root_commit_authority_op = root_commit_authority.begin_operation()?;
         let root_commit_permit = root_commit_authority_op.permit();
-        let LinkGate::Live { .. } = self.state.link_gate_for_group(group_id)? else {
+        let Some(LinkGate::Live { .. }) = self.state.directory_link_gate_for_group(group_id)?
+        else {
             return Ok((RetirementAttempt::Settled { retired: 0 }, retired_generations));
         };
-        let copy_shaped: Vec<FileRecord> = self
-            .state
-            .list_files(group_id)?
-            .into_iter()
-            .filter(|r| {
-                !r.deleted && yadorilink_replica_domain::conflict::is_conflict_copy_path(&r.path)
-            })
-            .collect();
+        let copy_shaped = self.live_conflict_copy_shaped(group_id)?;
         if copy_shaped.is_empty() {
             return Ok((RetirementAttempt::Settled { retired: 0 }, retired_generations));
         }
         let mut retired = 0usize;
         let mut retry_required = false;
-        let history = self.state.dag_group_history_paths(group_id)?;
         for record in copy_shaped {
-            if history.contains(&record.path) {
+            if self.state.native_path_has_heads(group_id, &record.path)? {
                 continue;
             }
             if self.state.is_path_dirty(group_id, &record.path)? {
@@ -1719,17 +1788,36 @@ impl LocalConvergenceExecutor {
                 continue;
             }
             let base = yadorilink_replica_domain::conflict::conflict_copy_source_path(&record.path);
-            let inputs = self.combined_heads(group_id, &base, None)?;
-            let justified = match resolve_path_heads(&base, &inputs) {
-                PathResolution::Present { conflict_copies, .. } => {
-                    conflict_copies.iter().any(|cc| cc.path == record.path)
+            // NativeState decides which copies exist: a copy is justified
+            // while its plan puts an entry of the source at that name, and
+            // a level that cannot be planned yet is never evidence that a
+            // copy may go.
+            // The copy's own name and its source are planned together: the placements a copy
+            // needs are recorded around its source, not around the copy's name.
+            let planned = self.state.native_plan_nodes(
+                group_id,
+                namespace_steps::parent_of(&record.path),
+                &std::collections::BTreeSet::from([record.path.clone(), base.to_owned()]),
+            );
+            let justified = match planned {
+                Ok(plan) => plan.nodes.get(&yadorilink_replica_domain::ids::SyncPath(record.path.clone())).is_some_and(|node| {
+                    matches!(node, yadorilink_replica_domain::native_plan::NativePlannedNode::Entry { head, .. }
+                        if head.source_path.as_str() == base)
+                }),
+                Err(error) => {
+                    // Keeping the copy is the safe answer, but a planner
+                    // failure that never clears would otherwise read as
+                    // a copy that is simply still justified.
+                    tracing::warn!(
+                        group_id,
+                        path = %record.path,
+                        %error,
+                        "native plan unavailable; keeping the conflict copy"
+                    );
+                    true
                 }
-                PathResolution::Absent => false,
             };
-            // The per-path resolver knows only conflict copies. A file the
-            // namespace relocates -- or keeps at its copy name because a
-            // directory holds its own -- lives only at that copy.
-            if justified || self.copy_justified_by_namespace(group_id, &base, &record.path)? {
+            if justified {
                 continue;
             }
             // This device's own debounce accumulator, flushed before the
@@ -1749,13 +1837,26 @@ impl LocalConvergenceExecutor {
                 // not this audit's to delete. A later audit re-examines it.
                 continue;
             }
-            if self.state.dag_group_history_paths(group_id)?.contains(&record.path) {
+            if !self
+                .state
+                .database()
+                .read::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+                    yadorilink_sync_sqlite::native_store::native_heads_at(
+                        conn,
+                        &yadorilink_replica_domain::ids::FolderGroupId(group_id.to_owned()),
+                        &yadorilink_replica_domain::ids::SyncPath(record.path.clone()),
+                    )
+                })
+                .map_err(crate::sync_error::SyncError::from)
+                .map_err(PeerSessionError::from)?
+                .is_empty()
+            {
                 // The flush just made a real local edit of this path durable
                 // -- it is user content now, not an ephemeral artifact.
                 continue;
             }
             let path_lock = self.state.path_lock(group_id, &record.path);
-            let _guard = path_lock.lock().await;
+            let _guard = crate::receive_diag::lock_path(&path_lock).await;
             let still_live =
                 self.state.get_file(group_id, &record.path)?.map(|r| !r.deleted).unwrap_or(false);
             if !still_live {
@@ -1778,7 +1879,6 @@ impl LocalConvergenceExecutor {
                     group_id,
                     &tombstone,
                     &self.local_device_id,
-                    None,
                     &root_commit_permit,
                 )
                 .await
@@ -1921,7 +2021,7 @@ impl LocalConvergenceExecutor {
     }
 
     /// The zero-work-close pre-check for one path: without any block fetch
-    /// or disk write, resolves `path`'s current DAG heads (the SAME
+    /// or disk write, resolves `path`'s current native heads (the SAME
     /// resolution `reconcile_group_paths` performs internally, just for
     /// one path and with none of its write-side effects) and asks the
     /// zero-work port method whether disk already, verifiably, holds that
@@ -1941,22 +2041,10 @@ impl LocalConvergenceExecutor {
         if self.is_locally_ignored(group_id, path) {
             return Ok(None);
         }
-        // Cheapest question first. `dag_zero_work_settlement_if_already_current`
-        // below cannot return anything but `None` without a usable
-        // `path_materialized_generations` record for this path -- that
-        // fence-checked point lookup is the first thing it does -- yet every
-        // input it needs to be ASKED costs a full per-path DAG ancestry walk
-        // (`combined_heads` -> `store_live_heads_for_path`), which fetches and
-        // wire-decodes each change it passes, per path, with no memoization
-        // across paths or across ticks.
-        //
-        // On a replica catching up to a bulk import that is every path, and the
-        // walk is at its deepest: the scheduler's pre-check loop runs this for
-        // its whole claimed batch on every tick, so the device spends entire
-        // ticks resolving heads only to hand them to a check that was always
-        // going to decline. Measured on a 91k-path catch-up: ~6.6s per tick to
-        // advance 8 paths, with the receiving device producing no files at all
-        // for 36 minutes.
+        // Cheapest question first: the settlement check cannot return anything
+        // but `None` without a usable `path_materialized_generations` record
+        // for this path, and resolving the path's heads to ask it costs far
+        // more than that point lookup.
         //
         // Asking the O(1) question first cannot change any answer -- it is the
         // same conjunct, evaluated earlier -- and a record that appears just
@@ -1965,39 +2053,8 @@ impl LocalConvergenceExecutor {
         if !self.state.dag_has_usable_materialized_generation(group_id, path)? {
             return Ok(None);
         }
-        let inputs = self.combined_heads(group_id, path, None)?;
-        if inputs.is_empty() {
-            return Ok(None);
-        }
-        let resolution = resolve_path_heads(path, &inputs);
-        let PathResolution::Present { winner, conflict_copies } = &resolution else {
-            // An `Absent` resolution has its own, already-covered
-            // publication path (retirement's tombstone evidence); this
-            // pre-check only ever short-circuits a real, present write.
-            return Ok(None);
-        };
-        // The evidence below speaks for the winner's content at `path`
-        // only. A resolution with concurrent losers also owes each loser's
-        // content at its conflict-copy path, which that evidence says
-        // nothing about: closing here would retire the obligation with the
-        // losing content never written anywhere on this device. That is
-        // exactly the case where this device's own edit won against an
-        // admitted remote edit -- the winner is already on disk, so the
-        // check would confirm, and the remote edit would be lost locally
-        // while the peer keeps both. The ordinary attempt resolves and
-        // writes the copies.
-        if !conflict_copies.is_empty() {
-            return Ok(None);
-        }
-        if inputs[*winner].content.is_none() {
-            return Ok(None);
-        }
-        match self.state.dag_zero_work_settlement_if_already_current(group_id, path)? {
-            Some((exact_state, mutation_generation)) => Ok(Some(
-                SettlementEvidence::from_exact_actual_state(exact_state, mutation_generation),
-            )),
-            None => Ok(None),
-        }
+        // The question is native's.
+        self.native_zero_work_settlement(group_id, path)
     }
 
     /// This group's root-commit authority, for a mutation that needs one.

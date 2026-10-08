@@ -55,11 +55,11 @@ async fn this_device_is_never_listed_offline_even_when_the_service_says_so() {
         .mount(&server)
         .await;
     let _guard = crate::coordination::http_client::COORDINATION_ADDR_ENV_LOCK.lock().await;
-    std::env::set_var("YADORILINK_COORDINATION_HTTP_ADDR", server.uri());
+    std::env::set_var("YADORILINK_COORDINATION_ADDR", server.uri());
     let devices =
         fetch_devices(&yadorilink_fapi_client::test_support::offline_auth(), Some("this-device"))
             .await;
-    std::env::remove_var("YADORILINK_COORDINATION_HTTP_ADDR");
+    std::env::remove_var("YADORILINK_COORDINATION_ADDR");
     let devices = devices.unwrap();
 
     assert!(devices.iter().find(|d| d.device_id == "this-device").unwrap().online);

@@ -37,7 +37,7 @@ fn tls_material(
     let certified = rcgen::generate_simple_self_signed(vec![TEST_SERVER_NAME.to_string()])
         .expect("generate self-signed certificate");
     let cert = certified.cert.der().clone();
-    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(certified.signing_key.serialize_der().into());
     (cert, key)
 }
 

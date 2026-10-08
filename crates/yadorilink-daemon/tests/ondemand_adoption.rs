@@ -12,9 +12,9 @@
 //!   re-offer   hearing about a version already held must not start a fetch —
 //!              otherwise every reconnect hydrates the whole folder
 //!
-//!   pin        a pinned path IS something asking, so it must still fetch —
-//!              otherwise "on-demand does not fetch" has swallowed the one
-//!              request the folder exists to serve
+//!   newer      a newer version of a file that was opened is tracked, not
+//!              downloaded — opening asks for one version, not for every
+//!              later one
 //! ```
 //!
 //! All three are asserted on the index and the block store rather than on the
@@ -49,8 +49,18 @@ impl TestDevice {
         self.root.path().join(relative)
     }
 
+    /// The row this device has genuinely indexed for `path`.
+    ///
+    /// Adopting a peer's path first writes an empty bootstrap scaffold that the
+    /// real row later replaces. A bare `get_file` returns that scaffold, so a
+    /// caller waiting for "the file was adopted" could read a row naming no
+    /// content at all; only a real current row counts.
     fn record(&self, path: &str) -> Option<yadorilink_replica_domain::file::FileRecord> {
-        self.state.replica_coordinator.file_index_repository().get_file(GROUP, path).ok().flatten()
+        let index = self.state.replica_coordinator.file_index_repository();
+        if !index.has_real_current_row(GROUP, path).ok()? {
+            return None;
+        }
+        index.get_file(GROUP, path).ok().flatten()
     }
 
     fn materialization_state(&self, path: &str) -> Option<MaterializationState> {
@@ -81,6 +91,8 @@ fn setup_device(name: &str) -> TestDevice {
     let (sync_state, index_dir) = support::open_file_backed_replica_coordinator();
     let state = DaemonState::new(name.to_string(), Arc::new(sync_state), store.clone());
     support::ensure_device_signing_key(&state);
+    // The on-demand capability of this device's (plain) roots, for the legacy lane these tests exercise.
+    state.set_test_on_demand_allowed(true);
     TestDevice {
         device_id: name.to_string(),
         state,
@@ -91,19 +103,6 @@ fn setup_device(name: &str) -> TestDevice {
     }
 }
 
-/// Declares a placeholder provider present for the calling thread.
-///
-/// An on-demand link refuses to start unless one is connected, which in a
-/// real build is a platform filesystem extension. These tests are about what
-/// the sync path fetches, not about the extension. The override is
-/// thread-local and `LinkRuntimeController::start` runs synchronously on the
-/// test's own thread, so the guard has to outlive every `start_watching`
-/// call in a test — hence returning it rather than dropping it here.
-fn placeholder_provider_present() -> yadorilink_filesystem_sync::placeholder_backend::OverrideForTest
-{
-    yadorilink_filesystem_sync::placeholder_backend::OverrideForTest::enable()
-}
-
 /// Registers the link with `policy` and starts watching.
 ///
 /// The policy is set between `add_link` and `start` on purpose: an on-demand
@@ -111,7 +110,7 @@ fn placeholder_provider_present() -> yadorilink_filesystem_sync::placeholder_bac
 /// these tests say it must not.
 fn start_watching(device: &TestDevice, policy: MaterializationPolicy) {
     let local_path = device.root.path().to_string_lossy().to_string();
-    device.state.set_test_placeholder_pipeline_connected(true);
+    device.state.set_test_on_demand_allowed(true);
     device.state.replica_coordinator.link_repository().add_link(&local_path, GROUP).unwrap();
     device
         .state
@@ -133,10 +132,22 @@ async fn pair(a: &TestDevice, b: &TestDevice) {
     .await;
 }
 
-/// An on-demand folder adopts a peer's new file without fetching its blocks.
+/// The adoption waits must not take the bootstrap scaffold for the adopted row.
+#[tokio::test]
+async fn the_bootstrap_scaffold_is_not_an_adopted_record() {
+    let device = setup_device("scaffold");
+    device
+        .state
+        .replica_coordinator
+        .file_index_repository()
+        .ensure_bootstrap_row_for_metadata(GROUP, PATH)
+        .unwrap();
+
+    assert!(device.record(PATH).is_none(), "a scaffold row names no content and is not adopted");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_ondemand_folder_adopts_a_peers_file_without_fetching_its_blocks() {
-    let _provider = placeholder_provider_present();
     let device_a = setup_device("device-a");
     let device_b = setup_device("device-b");
 
@@ -158,7 +169,7 @@ async fn an_ondemand_folder_adopts_a_peers_file_without_fetching_its_blocks() {
     assert!(!record.blocks.is_empty(), "the adopted record must name the content it stands for");
     assert_eq!(
         device_b.materialization_state(PATH),
-        Some(MaterializationState::Placeholder),
+        Some(MaterializationState::Remote),
         "an on-demand adoption must land as a placeholder"
     );
     assert_eq!(
@@ -176,7 +187,6 @@ async fn an_ondemand_folder_adopts_a_peers_file_without_fetching_its_blocks() {
 /// reconnecting.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn re_offering_a_version_already_held_does_not_hydrate_a_placeholder() {
-    let _provider = placeholder_provider_present();
     let device_a = setup_device("device-a");
     let device_b = setup_device("device-b");
 
@@ -211,7 +221,7 @@ async fn re_offering_a_version_already_held_does_not_hydrate_a_placeholder() {
     );
     assert_eq!(
         device_b.materialization_state(PATH),
-        Some(MaterializationState::Placeholder),
+        Some(MaterializationState::Remote),
         "re-offering an unchanged version must leave the placeholder a placeholder"
     );
     assert_eq!(
@@ -221,24 +231,15 @@ async fn re_offering_a_version_already_held_does_not_hydrate_a_placeholder() {
     );
 }
 
-/// An already-pinned path keeps following its peer, on the same folder that
-/// refuses to fetch anything else.
-///
-/// The complement of the two tests above, and the reason they cannot be
-/// satisfied by never fetching at all. A pin is a deliberate, user-initiated
-/// request -- exactly the "something asks" that on-demand reserves content
-/// transfer for -- and it does not expire when the file changes.
-///
-/// The reconciliation pass is the only thing that can honor it for a NEW
-/// version: `hydration::pin` fetches the version that existed when the user
-/// asked, and nothing re-runs it afterwards. The pass obtains its content up
-/// front and then maps a record that still needs blocks to `RetryRequired`
-/// without ever reaching for the transport itself -- so a pinned record the
-/// pass declined to obtain would retry forever, and the pin would silently
-/// stop meaning anything the moment the file was edited.
+/// A file that was opened on an on-demand device stays `Present` over its old
+/// bytes when its peer publishes a newer version: the newer version is
+/// tracked, not downloaded, and nothing is written at the path. `Present`
+/// says only that an object exists -- the proof, not the state, tells that
+/// the bytes there are no longer the row's version. Opening is a request for
+/// the version that existed when it was made; it does not turn the path into
+/// one this device keeps up to date.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_already_pinned_path_follows_a_new_version_in_an_on_demand_folder() {
-    let _provider = placeholder_provider_present();
+async fn a_present_file_stays_present_over_its_old_bytes_when_its_peer_publishes_a_newer_version() {
     let device_a = setup_device("device-a");
     let device_b = setup_device("device-b");
 
@@ -246,204 +247,116 @@ async fn an_already_pinned_path_follows_a_new_version_in_an_on_demand_folder() {
     start_watching(&device_b, MaterializationPolicy::OnDemand);
     pair(&device_a, &device_b).await;
 
-    let first = vec![0x33u8; 256 * 1024];
-    std::fs::write(device_a.path(PATH), &first).unwrap();
+    let opened_content = vec![0x35u8; 256 * 1024];
+    std::fs::write(device_a.path(PATH), &opened_content).unwrap();
     wait_until_with_context(
         || device_b.record(PATH).is_some(),
         Duration::from_secs(30),
         || "the on-demand folder never adopted the peer's file".into(),
     )
     .await;
-    assert_eq!(
-        device_b.blocks_held(&device_b.record(PATH).expect("just waited for it")),
-        0,
-        "the adoption must start from no content, or this test cannot tell a pin's fetch from \
-         the eager fetching the other two tests forbid"
-    );
 
-    // Through the product's own entry point, not the raw index flag: `pin`
-    // is what a user's request reaches, and it hydrates the version that
-    // exists at that moment as part of being asked.
-    yadorilink_daemon::hydration::pin(&device_b.state, GROUP, PATH).await.unwrap();
-    let pinned = device_b.record(PATH).expect("the pinned path must still be indexed");
-    assert_eq!(
-        device_b.blocks_held(&pinned),
-        pinned.blocks.len(),
-        "pinning must hydrate the version that existed when the user asked"
-    );
+    // The open: the same entry point a platform provider's fetch reaches.
+    yadorilink_daemon::hydration::hydrate(&device_b.state, GROUP, PATH).await.unwrap();
+    let present = device_b.record(PATH).expect("the opened path must still be indexed");
+    assert_eq!(device_b.blocks_held(&present), present.blocks.len(), "opening must fetch it");
+    assert_eq!(device_b.materialization_state(PATH), Some(MaterializationState::Present));
 
-    // A NEW version of the same pinned path. Different bytes, so it needs
-    // blocks this device cannot already have.
-    let second = vec![0x34u8; 256 * 1024];
-    std::fs::write(device_a.path(PATH), &second).unwrap();
-
+    std::fs::write(device_a.path(PATH), vec![0x36u8; 256 * 1024]).unwrap();
     wait_until_with_context(
-        || {
-            device_b.record(PATH).is_some_and(|record| {
-                record.blocks != pinned.blocks
-                    && device_b.blocks_held(&record) == record.blocks.len()
-            })
-        },
+        || device_b.record(PATH).is_some_and(|record| record.blocks != present.blocks),
         Duration::from_secs(30),
-        || {
-            let record = device_b.record(PATH);
-            let held = record.as_ref().map(|r| device_b.blocks_held(r));
-            let moved = record.as_ref().is_some_and(|r| r.blocks != pinned.blocks);
-            format!(
-                "a pinned path stopped following its peer: new_version={moved} blocks_held={held:?}. \
-                 On-demand reserves fetching for a deliberate request, and a pin stays one across \
-                 edits -- a pin that silently stops applying when the file changes is worse than \
-                 no pin at all."
-            )
-        },
+        || "the newer version was never tracked by the on-demand device".into(),
     )
     .await;
+
+    let newer = device_b.record(PATH).expect("just waited for it");
+    assert_eq!(device_b.blocks_held(&newer), 0, "the newer version was downloaded unasked");
+    assert_eq!(
+        device_b.materialization_state(PATH),
+        Some(MaterializationState::Present),
+        "an object still stands at the path, so the row stays Present"
+    );
+    assert_eq!(
+        std::fs::read(device_b.path(PATH)).unwrap(),
+        opened_content,
+        "nothing may be written over the opened bytes"
+    );
+    assert!(
+        !device_b
+            .state
+            .replica_coordinator
+            .sqlite()
+            .dag_usable_proof_names_current_version(GROUP, PATH)
+            .unwrap(),
+        "Present over old bytes is not evidence that the bytes equal the current version"
+    );
 }
 
-/// A pinned path's conflict copy is obtained, and its source stops being
-/// outstanding.
-///
-/// The two rules this file states pull in opposite directions the moment a
-/// pinned path forks. On-demand says fetch nothing that was not asked for;
-/// conflict-copy correctness says a copy must materialize everywhere, or the
-/// resolution that produced it can never complete. A conflict copy is not
-/// something anyone pins -- it exists only because resolving the pinned
-/// source produced it -- so it inherits the source's demand rather than
-/// carrying one of its own.
-///
-/// Get that wrong by keying the on-demand filter on the copy's OWN path and
-/// the copy is refused, materialization reports `RetryRequired`, and the
-/// engine keeps the source outstanding forever because a copy derived from
-/// it is unresolved: unbounded work, zero progress, on the on-demand path
-/// only. Asserting that the copy appeared is not enough to catch that --
-/// what has to be asserted is that the SOURCE stops needing another attempt.
-///
-/// Three devices, and the shape matters. Two writers author their own
-/// version of one path before either has seen the other, which is the only
-/// way the path genuinely forks; the on-demand reader then pairs with both
-/// and holds NEITHER version's blocks. That is what makes the assertion
-/// unambiguous. With the reader as one of the two writers, whichever side
-/// wins decides whether obtaining the copy is a real fetch or a rename of
-/// content the reader already authored -- and which side wins alternates
-/// between runs here, so the test would have passed for the wrong reason
-/// about half the time.
+/// A path that forks while an on-demand device holds none of its content
+/// settles on that device without fetching anything: the source and the
+/// conflict copy its resolution derives are both tracked as Remote, with no
+/// block of either held.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_pinned_paths_conflict_copy_is_obtained_and_its_source_settles() {
-    let _provider = placeholder_provider_present();
+async fn a_forked_path_settles_on_an_on_demand_device_without_fetching() {
     let writer_a = setup_device("device-a");
     let writer_b = setup_device("device-b");
     let reader = setup_device("device-r");
 
-    // A linked group with no policy is fail-closed: local emission is
-    // withheld entirely, so an unpaired device captures nothing at all. The
-    // pairing helper installs this on the way past, which is too late here --
-    // the whole point is that both writers author BEFORE they meet.
     let groups = [GROUP.to_string()];
     for device in [&writer_a, &writer_b, &reader] {
         support::install_bootstrap_policy(&device.state, &groups);
     }
 
-    std::fs::write(writer_a.path(PATH), vec![0x41u8; 256 * 1024]).unwrap();
-    std::fs::write(writer_b.path(PATH), vec![0x42u8; 256 * 1024]).unwrap();
+    std::fs::write(writer_a.path(PATH), vec![0x43u8; 256 * 1024]).unwrap();
+    std::fs::write(writer_b.path(PATH), vec![0x44u8; 256 * 1024]).unwrap();
     start_watching(&writer_a, MaterializationPolicy::Eager);
     start_watching(&writer_b, MaterializationPolicy::Eager);
     start_watching(&reader, MaterializationPolicy::OnDemand);
     wait_until_with_context(
         || writer_a.record(PATH).is_some() && writer_b.record(PATH).is_some(),
         Duration::from_secs(30),
-        || {
-            format!(
-                "both writers must author their own version before meeting, or the path never \
-                 forks: a={:?} b={:?}",
-                writer_a.record(PATH).is_some(),
-                writer_b.record(PATH).is_some(),
-            )
-        },
+        || "both writers must author their own version before meeting".into(),
     )
     .await;
 
     pair(&reader, &writer_a).await;
     pair(&reader, &writer_b).await;
 
-    // Adopted as a placeholder, with nothing fetched -- this file's own first
-    // property, restated here because the rest of the test depends on it: the
-    // reader holds neither version's blocks.
+    // An on-demand device holds no object for either side of the fork, so the
+    // copy is found in the index, not on disk.
+    let copy_name = || {
+        reader
+            .state
+            .replica_coordinator
+            .file_index_repository()
+            .list_files(GROUP)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.path)
+            .find(|name| name.contains("conflicted copy") && reader.record(name).is_some())
+    };
     wait_until_with_context(
-        || reader.record(PATH).is_some_and(|record| reader.blocks_held(&record) == 0),
+        || {
+            copy_name().is_some()
+                && reader.materialization_state(PATH) == Some(MaterializationState::Remote)
+        },
         Duration::from_secs(60),
         || {
             format!(
-                "the on-demand reader never adopted the forked path as a placeholder: \
-                 record={:?}",
-                reader.record(PATH).map(|r| reader.blocks_held(&r))
+                "the forked path never settled as Remote on the on-demand device: source \
+                 state={:?}, entries={:?}",
+                reader.materialization_state(PATH),
+                copy_name()
             )
         },
     )
     .await;
 
-    // Pinning is the request. It covers the path, and with it every copy the
-    // path's own resolution derives.
-    //
-    // Retried through `HydrationFailed`, which `hydrate`'s own doc comment
-    // states is a transient a real consumer must retry: this pins the moment
-    // the placeholder appears, while the fork's resolution is still settling.
-    // Not retrying would be asserting that the very first attempt lands in
-    // exactly the right window.
-    let mut pin_attempts = 0;
-    loop {
-        match yadorilink_daemon::hydration::pin(&reader.state, GROUP, PATH).await {
-            Ok(()) => break,
-            Err(error) if pin_attempts < 5 => {
-                pin_attempts += 1;
-                tracing::warn!(%error, pin_attempts, "pin failed, retrying");
-            }
-            Err(error) => panic!(
-                "pinning a path the reader has already adopted must \
-                 eventually succeed, after {pin_attempts} retries: {error}"
-            ),
-        }
+    let copy = copy_name().expect("just waited for it");
+    for path in [PATH, copy.as_str()] {
+        let record = reader.record(path).expect("indexed");
+        assert_eq!(reader.blocks_held(&record), 0, "{path}: fetched content nobody asked for");
+        assert_eq!(reader.materialization_state(path), Some(MaterializationState::Remote));
     }
-
-    // The copy must actually arrive with its content -- not merely be named.
-    // Whichever version lost, its blocks live on the writer that authored it
-    // and nowhere else, so this is always a real fetch.
-    wait_until_with_context(
-        || {
-            support::real_entry_names(reader.root.path()).iter().any(|name| {
-                name.contains("conflicted copy")
-                    && reader
-                        .record(name)
-                        .is_some_and(|record| reader.blocks_held(&record) == record.blocks.len())
-            })
-        },
-        Duration::from_secs(60),
-        || {
-            format!(
-                "a pinned path's conflict copy never obtained its content on the on-demand \
-                 device. Entries: {:?}. A copy inherits its source's demand; refusing it leaves \
-                 the source permanently unresolvable.",
-                support::real_entry_names(reader.root.path())
-            )
-        },
-    )
-    .await;
-
-    // And the source stops being outstanding. Without this the test would
-    // pass while the engine re-drove the same path forever.
-    wait_until_with_context(
-        || {
-            reader
-                .materialization_state(PATH)
-                .is_some_and(|state| state != MaterializationState::Hydrating)
-        },
-        Duration::from_secs(60),
-        || {
-            format!(
-                "the pinned source never settled: state={:?}. A source whose derived copy cannot \
-                 be obtained is retried forever -- unbounded work, zero progress.",
-                reader.materialization_state(PATH)
-            )
-        },
-    )
-    .await;
 }

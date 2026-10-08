@@ -11,7 +11,7 @@ redaction logic, so it deliberately contains synthetic, non-secret values shaped
 like real credentials (e.g. a base64 WireGuard-style key built from the bytes
 0x00..0x1F). They are not real secrets.
 """
-paths = ['''crates/yadorilink-reporting/src/redact\.rs''']
+paths = ['''crates/yadorilink-reporting/src/redact(\.rs|/tests\.rs)''']
 
 [[allowlists]]
 description = """

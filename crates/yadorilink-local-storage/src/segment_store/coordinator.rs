@@ -59,7 +59,7 @@ use crate::traits::{ContentHash, LocallyHashedBlock};
 
 /// Proof that one block is durable: it names where the bytes are, and it
 /// exists only on the far side of the segment `fsync` and the index
-/// transaction that recorded it. Nothing upstream -- a `FileRecord`, a DAG
+/// transaction that recorded it. Nothing upstream -- a `FileRecord`, a native state
 /// change, group provenance -- may become authoritative before its blocks'
 /// receipts are in hand.
 #[derive(Debug, Clone, PartialEq, Eq)]

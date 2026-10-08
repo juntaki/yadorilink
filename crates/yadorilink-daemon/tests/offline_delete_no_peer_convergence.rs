@@ -83,7 +83,7 @@ fn materialized_proofs(conn: &rusqlite::Connection) -> i64 {
 }
 
 fn dag_backed(conn: &rusqlite::Connection) -> bool {
-    count(conn, "SELECT COUNT(*) FROM changes") > 0
+    count(conn, "SELECT COUNT(*) FROM native_heads") > 0
 }
 
 fn current_rows(conn: &rusqlite::Connection) -> i64 {
@@ -248,7 +248,7 @@ async fn start_link(device: Device, local_path: &str, group_id: &str) -> Device 
     // restart harnesses apply here too.
     let mut attempts = 0;
     loop {
-        let _override = yadorilink_filesystem_sync::placeholder_backend::OverrideForTest::enable();
+        device.state.set_test_on_demand_allowed(true);
         match LinkRuntimeController::new(device.state.clone())
             .start(local_path.to_string(), group_id.to_string())
         {
@@ -268,18 +268,26 @@ async fn restart(device: Device, local_path: &str, group_id: &str) -> Device {
     start_link(device, local_path, group_id).await
 }
 
-/// How the DAG currently resolves `path`, and whether anything has ever
-/// touched it. An empty head set is "never existed", which is NOT the same
-/// as "deleted" even though `resolve_path_heads` folds both to `Absent`.
+/// How the DAG currently resolves `path`, and how many present heads it
+/// has. A generation-11 delete leaves no head, so an empty head set alone
+/// does not tell "deleted" from "never existed"; [`removed_by_history`]
+/// does.
 fn dag_resolution(device: &Device, group_id: &str, path: &str) -> (PathResolution, usize) {
-    let heads = device
-        .state
-        .replica_coordinator
-        .change_history_repository()
-        .dag_path_live_heads(group_id, path)
-        .unwrap();
+    let heads = support::native_path_heads(&device.state, group_id, path);
     let resolution = resolve_path_heads(path, &heads);
     (resolution, heads.len())
+}
+
+/// The version `path`'s single present head lands.
+fn shown_version(device: &Device, group_id: &str, path: &str) -> [u8; 32] {
+    let heads = support::native_path_heads(&device.state, group_id, path);
+    assert_eq!(heads.len(), 1, "one head at {path}: {heads:?}");
+    heads[0].content.as_ref().expect("a present head lands content").version_hash
+}
+
+/// Whether a held delta removed `path`'s head and put nothing there.
+fn removed_by_history(device: &Device, group_id: &str, path: &str, _shown: &[u8; 32]) -> bool {
+    support::native_path_removed(&device.state, group_id, path)
 }
 
 /// A file removed from the folder while the daemon was stopped has to
@@ -358,6 +366,7 @@ async fn a_file_deleted_while_stopped_settles_without_a_peer() {
         "sanity: the path must resolve to present content before it is deleted, got \
          {before:?} over {before_heads} head(s)"
     );
+    let shown = shown_version(&device, group_id, DELETED_PATH);
 
     // Stage 2: stop, delete from disk behind the daemon's back, start.
     // `stop` has already awaited the in-flight scan, so nothing is
@@ -387,7 +396,8 @@ async fn a_file_deleted_while_stopped_settles_without_a_peer() {
             .sqlite()
             .dag_lookup_materialized_generation(group_id, DELETED_PATH)
             .unwrap();
-        let settled = heads > 0
+        let settled = heads == 0
+            && removed_by_history(&device, group_id, DELETED_PATH, &shown)
             && resolution == PathResolution::Absent
             && obligation.is_none()
             && basis.as_ref().map(|b| b.object_kind) == Some(MaterializedObjectKind::Absent);
@@ -400,7 +410,12 @@ async fn a_file_deleted_while_stopped_settles_without_a_peer() {
     assert!(!deleted.exists(), "sanity: the deleted file must not have been re-created");
 
     let (resolution, heads) = dag_resolution(&device, group_id, DELETED_PATH);
-    assert!(heads > 0, "sanity: the path must still have live heads -- it was never a new path");
+    assert_eq!(heads, 0, "the deletion superseded the only head at {DELETED_PATH}");
+    assert!(
+        removed_by_history(&device, group_id, DELETED_PATH, &shown),
+        "an admitted change must have removed the version the path held -- a headless path \
+         with no removal is a path that was never written, not a deleted one"
+    );
     assert_eq!(
         resolution,
         PathResolution::Absent,

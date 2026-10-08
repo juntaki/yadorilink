@@ -114,14 +114,6 @@ final class LiveYadoriLinkClient: YadoriLinkClient {
         try await mapped { YadoriLinkModel.FileAvailability(try await core.fileAvailability(absolutePath: absolutePath)) }
     }
 
-    func pinFile(absolutePath: String) async throws {
-        try await mapped { try await core.pinFile(absolutePath: absolutePath) }
-    }
-
-    func unpinFile(absolutePath: String) async throws {
-        try await mapped { try await core.unpinFile(absolutePath: absolutePath) }
-    }
-
     func hydrateFile(absolutePath: String) async throws {
         try await mapped { try await core.hydrateFile(absolutePath: absolutePath) }
     }
@@ -341,6 +333,27 @@ final class LiveYadoriLinkClient: YadoriLinkClient {
                 localPath: localPath,
                 mode: YadoriLinkFFI.FolderMode(mode),
                 acknowledgeRisks: acknowledgeRisks
+            ))
+        }
+    }
+
+    func createProviderFolder(groupName: String, displayName: String, mode: YadoriLinkModel.FolderMode) async throws -> YadoriLinkModel.ProviderFolderOutcome {
+        try await mapped {
+            YadoriLinkModel.ProviderFolderOutcome(try await core.createProviderFolder(
+                groupName: groupName,
+                displayName: displayName,
+                mode: YadoriLinkFFI.FolderMode(mode)
+            ))
+        }
+    }
+
+    func joinProviderFolder(groupId: String, groupName: String, displayName: String, mode: YadoriLinkModel.FolderMode) async throws -> YadoriLinkModel.ProviderFolderOutcome {
+        try await mapped {
+            YadoriLinkModel.ProviderFolderOutcome(try await core.joinProviderFolder(
+                groupId: groupId,
+                groupName: groupName,
+                displayName: displayName,
+                mode: YadoriLinkFFI.FolderMode(mode)
             ))
         }
     }

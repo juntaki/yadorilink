@@ -7,7 +7,7 @@ use yadorilink_replica_engine::conflict::{
 fn content_head(hash_byte: u8, lamport: u64, device: &str, mtime: i64) -> PathHead {
     PathHead {
         change_hash: [hash_byte; 32],
-        lamport,
+        rank: lamport,
         device_id: device.to_string(),
         naming_device_id: device.to_string(),
         content: Some(PathHeadContent { version_hash: [hash_byte; 32], mtime_unix_nanos: mtime }),
@@ -17,7 +17,7 @@ fn content_head(hash_byte: u8, lamport: u64, device: &str, mtime: i64) -> PathHe
 fn tombstone_head(hash_byte: u8, lamport: u64, device: &str) -> PathHead {
     PathHead {
         change_hash: [hash_byte; 32],
-        lamport,
+        rank: lamport,
         device_id: device.to_string(),
         naming_device_id: device.to_string(),
         content: None,
@@ -107,7 +107,7 @@ fn three_way_content_conflict_yields_two_copies() {
 fn content_head_vh(change: u8, lamport: u64, device: &str, version_hash: u8) -> PathHead {
     PathHead {
         change_hash: [change; 32],
-        lamport,
+        rank: lamport,
         device_id: device.to_string(),
         naming_device_id: device.to_string(),
         content: Some(PathHeadContent { version_hash: [version_hash; 32], mtime_unix_nanos: 0 }),

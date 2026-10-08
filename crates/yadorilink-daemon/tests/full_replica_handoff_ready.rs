@@ -65,8 +65,7 @@ fn put_and_record(daemon: &Daemon, data: &[u8]) -> Vec<u8> {
     daemon
         .state
         .replica_coordinator
-        .change_history_repository()
-        .record_group_block_provenance(GROUP, std::slice::from_ref(&hash_bytes))
+        .record_block_provenance(GROUP, std::slice::from_ref(&hash_bytes))
         .unwrap();
     hash_bytes
 }
@@ -202,7 +201,7 @@ async fn not_ready_when_no_single_peer_holds_every_file() {
     b.state
         .replica_coordinator
         .link_repository()
-        .set_materialization_policy(&b_link.local_path, MaterializationPolicy::OnDemand)
+        .set_materialization_policy(b_link.key(), MaterializationPolicy::OnDemand)
         .unwrap();
 
     // file1: held (indexed + stored) by C, and indexed by B. D never indexes

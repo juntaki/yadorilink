@@ -15,10 +15,9 @@ struct NoopHost;
 impl LinkRuntimeHostPort for NoopHost {
     fn note_capture_settled(&self, _group_id: &str) {}
 
-    fn broadcast_change<'a>(
+    fn on_local_native_commit<'a>(
         &'a self,
         _group_id: &'a str,
-        _records: Vec<yadorilink_replica_domain::file::FileRecord>,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async {})
     }

@@ -73,7 +73,6 @@ impl EnrollmentLinkPort for DaemonEnrollmentLinkAdapter {
         group_id: &'a str,
         absolute_path: &'a std::path::Path,
         on_demand: bool,
-        acknowledge_risks: bool,
     ) -> BoxFuture<'a, Result<(), EnrollmentLinkError>> {
         Box::pin(async move {
             let local_path = absolute_path.to_string_lossy().to_string();
@@ -83,9 +82,8 @@ impl EnrollmentLinkPort for DaemonEnrollmentLinkAdapter {
                     local_path: local_path.clone(),
                     group_id: group_id.to_string(),
                     on_demand,
-                    max_local_size_bytes: None,
-                    acknowledge_risks,
                     pending_enrollment: None,
+                    provider: None,
                 })
                 .await
             {
@@ -137,13 +135,12 @@ fn enrollment_link_to_command(link: EnrollmentLinkRequest) -> LinkCommand {
         local_path: link.absolute_path.to_string_lossy().to_string(),
         group_id: link.group_id.clone(),
         on_demand: link.on_demand,
-        max_local_size_bytes: None,
-        acknowledge_risks: link.acknowledge_risks,
         pending_enrollment: Some(PendingEnrollmentLinkCommand {
             operation_id: link.operation_id,
             kind: link.kind,
             device_id: link.device_id,
         }),
+        provider: link.provider,
     }
 }
 

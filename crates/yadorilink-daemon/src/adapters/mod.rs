@@ -101,8 +101,8 @@ pub(crate) fn build_application_services(state: Arc<DaemonState>) -> Arc<Applica
         Arc::new(coordination::role_loss::HttpRoleLossCoordination::new(state.clone()));
     let link_runtime =
         Arc::new(runtime::link_watch::DaemonLinkRuntimeAdapter::new(controller.clone()));
-    let placeholder_pipeline = Arc::new(
-        runtime::placeholder_pipeline::DaemonPlaceholderPipelineAdapter::new(state.clone()),
+    let on_demand_capability = Arc::new(
+        runtime::on_demand_capability::DaemonOnDemandCapabilityAdapter::new(state.clone()),
     );
     let replica_role = Arc::new(ReplicaRoleService::new(
         state.device_id.clone(),
@@ -111,7 +111,7 @@ pub(crate) fn build_application_services(state: Arc<DaemonState>) -> Arc<Applica
         handoff_readiness,
         role_loss_coordination,
         link_runtime,
-        placeholder_pipeline,
+        on_demand_capability,
     ));
 
     let pause_resume = Arc::new(runtime::runtime_control::DaemonPauseResumeAdapter::new(
@@ -119,6 +119,7 @@ pub(crate) fn build_application_services(state: Arc<DaemonState>) -> Arc<Applica
         controller.clone(),
     ));
     let gc = Arc::new(runtime::runtime_control::DaemonGcAdapter::new(state.clone()));
+    let preserved = Arc::new(runtime::preserved::DaemonPreservedAdapter::new(state.clone()));
     let lifecycle = Arc::new(runtime::runtime_control::DaemonLifecycleAdapter::new(state.clone()));
     let durability = Arc::new(runtime::handoff::DaemonDurabilityCommandAdapter::new(state.clone()));
     let handoff = Arc::new(runtime::handoff::DaemonHandoffCommandAdapter::new(state.clone()));
@@ -145,6 +146,7 @@ pub(crate) fn build_application_services(state: Arc<DaemonState>) -> Arc<Applica
         replica_role,
         pause_resume,
         gc,
+        preserved,
         lifecycle,
         durability,
         handoff,

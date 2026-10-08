@@ -508,7 +508,7 @@ const NORMALIZATION_PROBE_LEAF_NAME: &str = "nfc-probe-\u{e9}";
 ///    by the directory's own name without needing a reserved name of its
 ///    own. An unreserved probe name is ordinary content to every one of
 ///    those entry points for the whole window between creation and cleanup,
-///    and can be signed into the DAG and replicated to peers if a scan wins
+///    and can be signed into native state and replicated to peers if a scan wins
 ///    that race. See `fs_capabilities::probe_artefact_name`'s doc comment,
 ///    which records the same defect and the same fix for that module's
 ///    probes.

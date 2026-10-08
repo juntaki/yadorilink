@@ -396,7 +396,7 @@ fn owner_exec_reader_accepts_ordinary_metadata() {
     let _ = unix_mode_from_metadata(&fs::metadata(&path).unwrap());
 }
 
-/// Crash-safety property 4: a source's `FileRecord`/DAG
+/// Crash-safety property 4: a source's `FileRecord`/native state
 /// publication can only ever reference blocks this function actually
 /// returned as `Ok(Vec<BlockInfo>)` -- there is no other way for a
 /// caller to get a block list to publish with. If a batch's durable

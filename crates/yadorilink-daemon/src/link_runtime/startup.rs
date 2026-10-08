@@ -3,7 +3,7 @@
 //! barrier `LinkRuntimeFactory::build` arms before any fallible setup step,
 //! and the spawned executor task in [`super::tasks`] resolves once its own
 //! scan+redrive loop completes or exhausts its retries) and
-//! `build_change_processor`/`ensure_initial_change_history` (wiring a
+//! `build_change_processor`/`open_group_author` (wiring a
 //! link's `LocalChangeProcessor` with change-history emission once this
 //! device has both a registered identity and a signing key).
 //!
@@ -17,19 +17,14 @@ use yadorilink_local_capture::LocalChangeProcessor;
 
 use crate::link_runtime::dependencies::LinkRuntimeDependencies;
 
-/// Builds a linked folder's local-change processor, wiring in change-history
-/// (change-DAG) emission when this device has both a registered identity and
-/// a signing key.
+/// Builds a linked folder's local-change processor, wiring in native delta
+/// emission when this device has both a registered identity and a signing
+/// key.
 ///
-/// Emission is enabled only *after* the group's existing on-disk index has
-/// been established as the root of its change history
-/// (`ensure_initial_import`). That ordering is required: the import must
-/// precede the first live mutation or any admitted peer change so history
-/// starts at the observed present rather than fabricating a past. Behavior
-/// is byte-identical to before change history existed only for a genuinely
-/// *unregistered* device (empty `device_id`) — a *registered* device with no
-/// signing key wired is a fail-closed condition instead, not a legitimate
-/// no-emitter path; see `ensure_initial_change_history`'s own doc comment.
+/// Emission is left off only for a genuinely *unregistered* device (empty
+/// `device_id`) -- a *registered* device with no signing key wired is a
+/// fail-closed condition instead, not a legitimate no-emitter path; see
+/// `open_group_author`'s own doc comment.
 pub(crate) fn build_change_processor(
     deps: &Arc<LinkRuntimeDependencies>,
     group_id: &str,
@@ -43,26 +38,25 @@ pub(crate) fn build_change_processor(
         deps.device_id.clone(),
         root_lease,
     );
-    // Emission needs a stable device id to attribute changes to. A device
-    // with no identity leaves emission off — behavior byte-identical to
-    // before change history existed. A registered device with no signing
-    // key is NOT handled here: `ensure_initial_change_history` below fails
+    // Emission needs a stable device id to attribute deltas to. A device
+    // with no identity leaves emission off. A registered device with no signing
+    // key is NOT handled here: `open_group_author` below fails
     // closed for that case instead of silently leaving emission off.
     if deps.device_id.is_empty() {
         return Ok(processor);
     }
-    Ok(processor.with_change_emitter(ensure_initial_change_history(deps, group_id)?))
+    Ok(processor.with_change_emitter(open_group_author(deps, group_id)?))
 }
 
-pub(crate) fn ensure_initial_change_history(
+pub(crate) fn open_group_author(
     deps: &Arc<LinkRuntimeDependencies>,
     group_id: &str,
-) -> Result<Arc<yadorilink_sync_sqlite::dag_store::ChangeEmitter>, SyncError> {
+) -> Result<Arc<yadorilink_sync_sqlite::dag_store::LocalAuthorKey>, SyncError> {
     // A *registered* device (non-empty `device_id`, checked by the caller)
     // with no signing key wired is a fail-closed condition, not a legitimate
-    // no-emitter path: without a `ChangeEmitter`, local edits get indexed but
-    // never recorded as DAG `Change`s, so this device's own edits would never
-    // reach a peer through change-history sync at all -- silent data loss
+    // no-emitter path: without a `LocalAuthorKey`, local edits get indexed but
+    // never recorded as native deltas, so this device's own edits would never
+    // reach a peer at all -- silent data loss
     // from the group's perspective, not merely "emission off." Only a
     // genuinely *unregistered* device (empty `device_id`, handled entirely by
     // `build_change_processor`'s own early return above) is exempt.
@@ -72,55 +66,37 @@ pub(crate) fn ensure_initial_change_history(
             deps.device_id
         ))
     })?;
-    let emitter = Arc::new(yadorilink_sync_sqlite::dag_store::ChangeEmitter::new(
-        deps.device_id.clone(),
-        signing_key,
-    ));
-    // Idempotent, so it is safe both before and after the asynchronous initial
-    // disk scan. The post-scan call matters for a newly linked, populated
-    // folder: the first call sees an empty index, while the batched scan writes
-    // index rows without going through the per-change DAG emitter.
-    // The folder this group is linked at, so the import can see whether
-    // the files it is about to put into history are already sitting on
-    // disk -- which, for an import, they are by definition.
-    //
-    // Through the repository's own unambiguous lookup, not a scan of every
-    // link picking the first match. "One group has at most one live root"
-    // is an invariant this codebase enforces in several places, and it is
-    // exactly the invariant an actual-state proof depends on: the proof
-    // says content is already in place, and which filesystem was looked at
-    // is the entire content of that claim. Two live roots for one group
-    // must fail rather than silently pick one, and a database error must
-    // not read as "no root" -- that would quietly downgrade every import
-    // to proofless, which is the bug this whole path exists to fix.
-    let root = deps
+    // This replica's current author incarnation (opened with the sidecar
+    // check when the signing key was wired; opened here otherwise).
+    let emitter = deps
         .replica_coordinator
-        .link_repository()
-        .live_link_local_path_for_group(group_id)?
-        .map(std::path::PathBuf::from);
-    match crate::dag_import::ensure_initial_import(
-        deps.replica_coordinator.as_ref(),
-        group_id,
-        &emitter,
-        root.as_deref(),
-    ) {
-        Ok(outcome) => {
-            tracing::debug!(?outcome, group_id, "change-history initial import checked");
-            Ok(emitter)
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                group_id,
-                "change-history initial import failed; emission disabled for this folder"
-            );
-            Err(e)
-        }
+        .open_local_author(&deps.device_id, signing_key)
+        .map_err(|error| {
+            SyncError::CorruptState(format!(
+                "registered device {} cannot open its author identity: {error}",
+                deps.device_id
+            ))
+        })?;
+    // Native is the only authority: a group with no history yet is recorded as
+    // native, and one that already holds indexed rows without a
+    // native record is refused rather than projected under rules it was never
+    // authored under (there is no migration; recreate the database).
+    if !deps.replica_coordinator.adopt_native_authority_if_fresh(group_id)? {
+        return Err(SyncError::CorruptState(format!(
+            "group {group_id} holds state from before native authority and cannot be started; \
+             recreate this device's database to use it"
+        )));
     }
+    // What the plan names but the index does not hold is owed a projection, and
+    // nothing persisted says so if the obligation was lost with the last run.
+    if let Err(error) = deps.replica_coordinator.arm_native_plan_gaps(group_id) {
+        tracing::warn!(group_id, %error, "could not arm planned entries that have no row");
+    }
+    Ok(emitter)
 }
 
 /// Resolves a group's startup-readiness barrier exactly once, fail-*closed*.
-/// Mirrors `AccessHydration`: an explicit success call (`mark_ready`)
+/// Mirrors `HydrationAttempt`: an explicit success call (`mark_ready`)
 /// publishes the good state, while `Drop` on the unfinished path — an early
 /// return, a panic that unwinds the executor, or a task abort — transitions the
 /// group to `Failed` instead of Ready. A startup that does not complete

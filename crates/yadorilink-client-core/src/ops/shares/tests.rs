@@ -265,9 +265,9 @@ fn a_role_change_refuses_a_role_the_coordination_plane_would_refuse() {
 async fn change_role_resolved_issues_no_request_at_all_for_a_refused_role() {
     let server = MockServer::start().await;
     let _guard = crate::coordination::http_client::COORDINATION_ADDR_ENV_LOCK.lock().await;
-    std::env::set_var("YADORILINK_COORDINATION_HTTP_ADDR", server.uri());
+    std::env::set_var("YADORILINK_COORDINATION_ADDR", server.uri());
     let result = change_role_resolved("group-1", "device-1", "owner").await;
-    std::env::remove_var("YADORILINK_COORDINATION_HTTP_ADDR");
+    std::env::remove_var("YADORILINK_COORDINATION_ADDR");
 
     assert!(result.is_err(), "an unchangeable role must be refused, not sent");
     assert_eq!(server.received_requests().await.unwrap().len(), 0);
@@ -377,10 +377,10 @@ async fn resolve_against_mocked_listings(
         .await;
 
     let _guard = crate::coordination::http_client::COORDINATION_ADDR_ENV_LOCK.lock().await;
-    std::env::set_var("YADORILINK_COORDINATION_HTTP_ADDR", server.uri());
+    std::env::set_var("YADORILINK_COORDINATION_ADDR", server.uri());
     let result =
         resolve_group_id(&yadorilink_fapi_client::test_support::offline_auth(), group_name).await;
-    std::env::remove_var("YADORILINK_COORDINATION_HTTP_ADDR");
+    std::env::remove_var("YADORILINK_COORDINATION_ADDR");
     (server, result)
 }
 
@@ -545,11 +545,11 @@ async fn members_as_presented(
         .mount(&server)
         .await;
     let _guard = crate::coordination::http_client::COORDINATION_ADDR_ENV_LOCK.lock().await;
-    std::env::set_var("YADORILINK_COORDINATION_HTTP_ADDR", server.uri());
+    std::env::set_var("YADORILINK_COORDINATION_ADDR", server.uri());
     let result =
         fetch_members(&yadorilink_fapi_client::test_support::offline_auth(), "g1", own_device_id)
             .await;
-    std::env::remove_var("YADORILINK_COORDINATION_HTTP_ADDR");
+    std::env::remove_var("YADORILINK_COORDINATION_ADDR");
     result.unwrap()
 }
 

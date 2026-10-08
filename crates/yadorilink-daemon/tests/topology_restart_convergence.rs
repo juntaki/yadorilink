@@ -313,22 +313,14 @@ fn pipeline_probe(nodes: &[(&str, &TopologyNode)], group_id: &str) -> String {
             let c = &node.state.replica_coordinator;
             let heads = c
                 .sqlite()
-                .dag_group_heads(group_id)
+                .native_group_heads(group_id)
                 .map(|mut h| {
                     h.sort();
                     h.iter().map(|x| hex::encode(x.0)[..8].to_string()).collect::<Vec<_>>()
                 })
                 .unwrap_or_else(|e| vec![format!("err({e})")]);
-            let staged = c
-                .sqlite()
-                .dag_staged_hashes(group_id)
-                .map(|h| h.iter().map(|x| hex::encode(x.0)[..8].to_string()).collect::<Vec<_>>())
-                .unwrap_or_else(|e| vec![format!("err({e})")]);
-            let servable = c
-                .sqlite()
-                .dag_servable_hashes(group_id)
-                .map(|h| h.iter().map(|x| hex::encode(x.0)[..8].to_string()).collect::<Vec<_>>())
-                .unwrap_or_else(|e| vec![format!("err({e})")]);
+            let staged: Vec<String> = Vec::new();
+            let servable: Vec<String> = Vec::new();
             let index = c
                 .file_index_repository()
                 .list_files(group_id)
@@ -532,6 +524,58 @@ async fn m_restart_recovers_and_resyncs_with_both_peers() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn w_restart_recovers_and_resyncs_with_both_peers() {
     on_demand_node_restart_recovers_and_resyncs(true).await;
+}
+
+/// A third device that is OFFLINE while another changes a file catches up when it returns: M
+/// authors while W is down, N receives it live, and W, once restarted against its own on-disk
+/// state, learns the change and can hydrate the bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_device_that_was_offline_catches_up_when_it_returns() {
+    init_tracing();
+    support::ensure_isolated_config_dir();
+    let fake = FakeCoordination::start().await;
+    fake.enable_signed_policy();
+    let group_id = "topology-offline-third-group";
+
+    let (n, m, mut w, mut handles) = stand_up_canonical_topology(&fake, group_id).await;
+
+    support::topology::shutdown_substrate(&w).await;
+    handles.take_and_shutdown(&w.device_id).await;
+
+    let name = "written-while-w-was-offline.txt";
+    let content = b"authored while the third device was offline";
+    std::fs::write(m.root.path().join(name), content).unwrap();
+    wait_until_with_context(
+        || std::fs::read(n.root.path().join(name)).ok().as_deref() == Some(content as &[u8]),
+        Duration::from_secs(60),
+        || "N never received the change made while W was offline".to_string(),
+    )
+    .await;
+
+    w = restart_node(w).await;
+    register_with_fake(&fake, &w.state, &w.device_id, &[group_id]).await;
+    let runtime = support::topology::spawn_orchestrator(fake.addr(), &w);
+    support::topology::advertise_substrate_endpoints(&[&n, &m, &w]).await;
+    handles.insert(w.device_id.clone(), runtime);
+
+    wait_until_with_context(
+        || {
+            w.state
+                .replica_coordinator
+                .file_index_repository()
+                .list_files(group_id)
+                .map(|files| files.iter().any(|f| f.path == name && !f.deleted))
+                .unwrap_or(false)
+        },
+        Duration::from_secs(180),
+        || "the returning device never learned the change made while it was offline".to_string(),
+    )
+    .await;
+    yadorilink_daemon::hydration::hydrate(&w.state, group_id, name)
+        .await
+        .expect("the returning device should hydrate the change it missed");
+
+    handles.shutdown();
 }
 
 /// A restart while a large transfer

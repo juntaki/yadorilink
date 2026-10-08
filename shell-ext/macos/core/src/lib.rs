@@ -14,11 +14,12 @@ mod ipc_client;
 use std::ffi::{c_char, c_int, CStr};
 use std::panic::catch_unwind;
 
-use yadorilink_ipc_proto::shellipc::{ContextAction, MaterializationState, SyncState};
+use yadorilink_ipc_proto::shellipc::{ContextAction, LocalTransition, SyncState};
 
 /// Mirrors the four spec'd overlay states plus on-demand-sync's
 /// "online-only" placeholder overlay, as a flat C enum Swift can switch
-/// on directly. `MaterializationState::Placeholder` takes priority over the
+/// on directly. A known local state with no current content and no transition
+/// under way (the "online-only" state) takes priority over the
 /// raw `SyncState`, since "online-only" is the visually distinct badge the
 /// spec calls for on an unhydrated file regardless of its underlying
 /// convergence state; `Hydrating` is folded into `Syncing` (content
@@ -46,7 +47,6 @@ pub enum YadoriLinkContextAction {
     ViewStatus = 0,
     PauseItem = 1,
     ResumeItem = 2,
-    PinItem = 3,
     EvictItem = 4,
 }
 
@@ -58,7 +58,6 @@ impl TryFrom<c_int> for YadoriLinkContextAction {
             0 => Ok(YadoriLinkContextAction::ViewStatus),
             1 => Ok(YadoriLinkContextAction::PauseItem),
             2 => Ok(YadoriLinkContextAction::ResumeItem),
-            3 => Ok(YadoriLinkContextAction::PinItem),
             4 => Ok(YadoriLinkContextAction::EvictItem),
             _ => Err(()),
         }
@@ -71,7 +70,6 @@ impl From<YadoriLinkContextAction> for ContextAction {
             YadoriLinkContextAction::ViewStatus => ContextAction::ViewStatus,
             YadoriLinkContextAction::PauseItem => ContextAction::PauseItem,
             YadoriLinkContextAction::ResumeItem => ContextAction::ResumeItem,
-            YadoriLinkContextAction::PinItem => ContextAction::PinItem,
             YadoriLinkContextAction::EvictItem => ContextAction::EvictItem,
         }
     }
@@ -91,7 +89,14 @@ unsafe fn path_from_c_str(path: *const c_char) -> Option<String> {
 }
 
 fn combine_status(info: ipc_client::StatusInfo) -> YadoriLinkBadgeStatus {
-    if info.materialization_state == MaterializationState::Placeholder {
+    let in_transition = info.local_state.as_ref().is_some_and(|s| {
+        s.transition() == LocalTransition::Hydrating || s.transition() == LocalTransition::Evicting
+    });
+    if info
+        .local_state
+        .as_ref()
+        .is_some_and(|s| !s.current_content_present && s.transition() == LocalTransition::None)
+    {
         return YadoriLinkBadgeStatus::OnlineOnly;
     }
     match info.sync_state {
@@ -100,7 +105,7 @@ fn combine_status(info: ipc_client::StatusInfo) -> YadoriLinkBadgeStatus {
         SyncState::Pending => YadoriLinkBadgeStatus::Pending,
         SyncState::Error => YadoriLinkBadgeStatus::Error,
         SyncState::Unspecified => {
-            if info.materialization_state == MaterializationState::Hydrating {
+            if in_transition {
                 YadoriLinkBadgeStatus::Syncing
             } else {
                 YadoriLinkBadgeStatus::Unspecified
@@ -127,7 +132,7 @@ pub unsafe extern "C" fn yadorilink_query_status(path: *const c_char) -> c_int {
 }
 
 /// Sends a context-menu action for `path` to the daemon.
-/// `action` is a `YadoriLinkContextAction` discriminant (0-4); passed as a
+/// `action` is a `YadoriLinkContextAction` discriminant; passed as a
 /// plain `c_int` rather than the enum type itself so the C/Swift ABI
 /// doesn't depend on how Rust happens to lay out a `#[repr(C)]`
 /// fieldless enum on a given target — a bare `int` is unambiguous on
@@ -152,4 +157,48 @@ pub unsafe extern "C" fn yadorilink_send_context_action(
     };
     let Ok(action) = YadoriLinkContextAction::try_from(action) else { return false };
     catch_unwind(|| ipc_client::send_context_action(&path, action.into())).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod combine_status_tests {
+    use super::*;
+    use yadorilink_ipc_proto::shellipc::LocalState;
+
+    fn info(local: Option<(bool, bool, LocalTransition)>, sync: SyncState) -> ipc_client::StatusInfo {
+        ipc_client::StatusInfo {
+            sync_state: sync,
+            local_state: local.map(|(object, current, transition)| LocalState {
+                local_object_present: object,
+                current_content_present: current,
+                transition: transition as i32,
+            }),
+        }
+    }
+
+    #[test]
+    fn only_a_known_state_without_current_content_is_online_only() {
+        let none = LocalTransition::None;
+        assert_eq!(
+            combine_status(info(Some((false, false, none)), SyncState::Synced)),
+            YadoriLinkBadgeStatus::OnlineOnly
+        );
+        // An older object that stands is not current content either.
+        assert_eq!(
+            combine_status(info(Some((true, false, none)), SyncState::Synced)),
+            YadoriLinkBadgeStatus::OnlineOnly
+        );
+        assert_eq!(
+            combine_status(info(Some((true, true, none)), SyncState::Synced)),
+            YadoriLinkBadgeStatus::Synced
+        );
+        // Unknown is no badge, never online-only.
+        assert_eq!(
+            combine_status(info(None, SyncState::Unspecified)),
+            YadoriLinkBadgeStatus::Unspecified
+        );
+        assert_eq!(
+            combine_status(info(Some((false, false, LocalTransition::Hydrating)), SyncState::Unspecified)),
+            YadoriLinkBadgeStatus::Syncing
+        );
+    }
 }

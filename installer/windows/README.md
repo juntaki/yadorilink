@@ -20,6 +20,54 @@ Cloud-Filter-API registration script) and runs it as-is, plus a new
 as a logon Scheduled Task the same way `install.ps1` already does for
 `yadorilink-cfapi-host.exe`.
 
+## Installing a release (most people)
+
+Download `yadorilink-setup-unsigned.exe` (or `yadorilink-setup.exe` once releases
+are signed) and its `.sha256` from
+[GitHub Releases](https://github.com/juntaki/yadorilink/releases), run it,
+and accept the UAC prompt. Windows 10 or 11, x64, and administrator rights
+are required.
+
+**The current release installer is unsigned** (`yadorilink-setup-unsigned.exe`):
+SmartScreen will warn, so verify its SHA-256 first. See "Current status" and
+"Known limitation" below.
+
+The installer registers a `YadoriLinkDaemon` Scheduled Task so the daemon
+starts at every logon. First run, in a terminal:
+
+```powershell
+yadorilink login
+yadorilink device register --name "my-pc"
+yadorilink share create my-share --path C:\Users\me\Documents\some-folder
+yadorilink status
+```
+
+If something needs attention, `yadorilink status` and `yadorilink doctor`
+show what the daemon sees, and `yadorilink preserved list` / `restore` /
+`retry` / `discard` manage items set aside when a folder group was reset.
+
+Release builds connect to the YadoriLink coordination service by default;
+set `YADORILINK_COORDINATION_ADDR` to use another one. Builds from source
+default to `http://127.0.0.1:8787` unless the build was made with
+`YADORILINK_DEFAULT_COORDINATION_ADDR` set.
+
+**Updating.** Update every device to the same release: run the newer
+`yadorilink-setup.exe`.
+
+**Uninstalling.** Settings → Apps → Installed apps → yadorilink →
+Uninstall. This does not touch your synced files, `%APPDATA%\yadorilink`, or
+your stored credentials.
+
+**Pre-1.0 reset.** Releases before 1.0 do not promise compatibility
+migrations. If a version incompatibility prevents startup, remove
+YadoriLink's local application state and credentials and set up again; your
+synced folders and their files are not deleted. Run `yadorilink daemon
+stop`, then remove the `%APPDATA%\yadorilink` folder and the `yadorilink`
+entries in Windows Credential Manager (or run
+`yadorilink forget-local-credentials`).
+
+The rest of this file is for building the installer from source.
+
 ## Prerequisites
 
 - Windows 10/11 x64.
@@ -53,7 +101,9 @@ cd ..\..
 powershell -ExecutionPolicy Bypass -File installer\windows\build-installer.ps1
 ```
 
-Official release installers must use `-Release` and `-SignToolName`. That mode
+Official release installers must use `-Release` with either `-SignToolName`
+(signed) or, while no certificate exists, `-Unsigned` (release workflow only;
+the result is published under the name `yadorilink-setup-unsigned.exe`). That mode
 rebuilds the workspace with
 `yadorilink-daemon/enforce-release-trust-root`, so a package cannot silently
 reuse an ordinary daemon binary that lacks the release trust-root startup
@@ -117,10 +167,43 @@ last step.
 
 ## Signing and checksums
 
-Release installers must be Authenticode-signed. Interim unsigned builds are
-allowed only for local/manual testing and must be distributed with the
-generated `.sha256` sidecar. Windows SmartScreen will show an "unknown
-publisher" warning for unsigned builds.
+Release installers are Authenticode-signed once a code-signing certificate is
+configured. Until then the release installer is built with `-Release
+-Unsigned` and published as `yadorilink-setup-unsigned.exe`, always with its
+`.sha256` sidecar. Windows SmartScreen shows an "unknown publisher" warning
+for unsigned builds.
+
+### Current status: the installer is unsigned
+
+No Windows code-signing certificate exists yet, so the release installer is
+**not Authenticode-signed**. It is published as `yadorilink-setup-unsigned.exe`
+(with `yadorilink-setup-unsigned.exe.sha256`) so it cannot be mistaken for a
+signed one. Consequences:
+
+- Windows SmartScreen shows "Windows protected your PC" / "unknown publisher".
+  Choose **More info -> Run anyway** only after the checksum below matches.
+- Verify the download against the SHA-256 published next to it on the release
+  page (also listed in `SHA256SUMS-windows`):
+
+  ```powershell
+  $expected = (Get-Content .\yadorilink-setup-unsigned.exe.sha256).Split()[0]
+  $actual = (Get-FileHash -Algorithm SHA256 .\yadorilink-setup-unsigned.exe).Hash.ToLowerInvariant()
+  if ($actual -ne $expected) { throw "checksum mismatch" }
+  ```
+
+Releases built after a certificate is configured are signed and published as
+`yadorilink-setup.exe`.
+
+### Known limitation: history rebuild is not supported on Windows
+
+If a device stays offline so long that it can no longer catch up from its
+peers and needs a rebuild of its synced history from a trusted checkpoint,
+that rebuild is **not supported on Windows yet**. The daemon refuses to start
+it, before touching any file in the folder, and reports `the rebootstrap is
+blocked: DurabilityUnsupported`. The folder is left as it was. Windows has no
+verified way to make a directory change durable, which the rebuild's safety
+barrier requires. Devices that stay reasonably in sync are not affected; on
+macOS and Linux the rebuild works.
 
 ## Testing
 

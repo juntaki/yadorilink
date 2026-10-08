@@ -119,7 +119,7 @@ extension YadoriLinkModel.ConflictReason {
 
 extension YadoriLinkModel.ConflictSummary {
     init(_ value: YadoriLinkFFI.ConflictSummary) {
-        self.init(localPath: value.localPath, path: value.path, size: value.size, modifiedAt: value.modifiedAt, currentPath: value.currentPath, loserDeviceId: value.loserDeviceId, conflictTimestamp: value.conflictTimestamp, kind: YadoriLinkModel.EntryKind(value.kind), reason: YadoriLinkModel.ConflictReason(value.reason), holdsCompaction: value.holdsCompaction)
+        self.init(localPath: value.localPath, path: value.path, size: value.size, modifiedAt: value.modifiedAt, currentPath: value.currentPath, loserDeviceId: value.loserDeviceId, conflictTimestamp: value.conflictTimestamp, kind: YadoriLinkModel.EntryKind(value.kind), reason: YadoriLinkModel.ConflictReason(value.reason))
     }
 }
 
@@ -249,7 +249,7 @@ extension YadoriLinkModel.FetchAvailability {
 
 extension YadoriLinkModel.FileAvailability {
     init(_ value: YadoriLinkFFI.FileAvailability) {
-        self.init(tracked: value.tracked, state: YadoriLinkModel.MaterializationState(value.state), pinned: value.pinned)
+        self.init(tracked: value.tracked, state: YadoriLinkModel.MaterializationState(value.state))
     }
 }
 
@@ -300,7 +300,7 @@ extension YadoriLinkModel.FolderState {
 
 extension YadoriLinkModel.FolderSummary {
     init(_ value: YadoriLinkFFI.FolderSummary) {
-        self.init(localPath: value.localPath, groupId: value.groupId, name: value.name, mode: YadoriLinkModel.FolderMode(value.mode), state: YadoriLinkModel.FolderState(value.state), paused: value.paused, conflictCount: value.conflictCount, hydratedFileCount: value.hydratedFileCount, placeholderFileCount: value.placeholderFileCount, hydratingFileCount: value.hydratingFileCount, heldFileCount: value.heldFileCount, skippedSymlinkCount: value.skippedSymlinkCount, transfer: value.transfer.map { YadoriLinkModel.FolderTransferProgress($0) }, durability: YadoriLinkModel.DurabilityStatus(value.durability), durabilityEvidence: YadoriLinkModel.DurabilityEvidence(value.durabilityEvidence), localStorage: YadoriLinkModel.LocalStorageState(value.localStorage), fetchAvailability: YadoriLinkModel.FetchAvailability(value.fetchAvailability), fullReplicaDeviceIds: value.fullReplicaDeviceIds, policyStale: value.policyStale, ambiguous: value.ambiguous, ambiguousLocalPaths: value.ambiguousLocalPaths, degraded: value.degraded, degradedReason: value.degradedReason, volume: value.volume.map { YadoriLinkModel.VolumeSummary($0) })
+        self.init(localPath: value.localPath, groupId: value.groupId, name: value.name, mode: YadoriLinkModel.FolderMode(value.mode), state: YadoriLinkModel.FolderState(value.state), paused: value.paused, conflictCount: value.conflictCount, hydratedFileCount: value.hydratedFileCount, placeholderFileCount: value.placeholderFileCount, hydratingFileCount: value.hydratingFileCount, heldFileCount: value.heldFileCount, skippedSymlinkCount: value.skippedSymlinkCount, transfer: value.transfer.map { YadoriLinkModel.FolderTransferProgress($0) }, durability: YadoriLinkModel.DurabilityStatus(value.durability), durabilityEvidence: YadoriLinkModel.DurabilityEvidence(value.durabilityEvidence), localStorage: YadoriLinkModel.LocalStorageState(value.localStorage), fetchAvailability: YadoriLinkModel.FetchAvailability(value.fetchAvailability), fullReplicaDeviceIds: value.fullReplicaDeviceIds, policyStale: value.policyStale, ambiguous: value.ambiguous, ambiguousLocalPaths: value.ambiguousLocalPaths, degraded: value.degraded, degradedReason: value.degradedReason, volume: value.volume.map { YadoriLinkModel.VolumeSummary($0) }, provider: value.provider)
     }
 }
 
@@ -577,6 +577,12 @@ extension YadoriLinkModel.PreflightIssue {
 extension YadoriLinkModel.PreflightResult {
     init(_ value: YadoriLinkFFI.PreflightResult) {
         self.init(resolvedPath: value.resolvedPath, pathExists: value.pathExists, isDirectory: value.isDirectory, entryCount: value.entryCount, ignoredEntryCount: value.ignoredEntryCount, totalSizeBytes: value.totalSizeBytes, scanTruncated: value.scanTruncated, freeSpace: value.freeSpace.map { YadoriLinkModel.FreeSpace($0) }, issues: value.issues.map { YadoriLinkModel.PreflightIssue($0) }, requiresAcknowledgement: value.requiresAcknowledgement)
+    }
+}
+
+extension YadoriLinkModel.ProviderFolderOutcome {
+    init(_ value: YadoriLinkFFI.ProviderFolderOutcome) {
+        self.init(groupId: value.groupId, rootId: value.rootId, displayName: value.displayName, mode: YadoriLinkModel.FolderMode(value.mode), alreadyExisted: value.alreadyExisted)
     }
 }
 
@@ -909,7 +915,7 @@ extension YadoriLinkFFI.ConflictReason {
 
 extension YadoriLinkFFI.ConflictSummary {
     init(_ value: YadoriLinkModel.ConflictSummary) {
-        self.init(localPath: value.localPath, path: value.path, size: value.size, modifiedAt: value.modifiedAt, currentPath: value.currentPath, loserDeviceId: value.loserDeviceId, conflictTimestamp: value.conflictTimestamp, kind: YadoriLinkFFI.EntryKind(value.kind), reason: YadoriLinkFFI.ConflictReason(value.reason), holdsCompaction: value.holdsCompaction)
+        self.init(localPath: value.localPath, path: value.path, size: value.size, modifiedAt: value.modifiedAt, currentPath: value.currentPath, loserDeviceId: value.loserDeviceId, conflictTimestamp: value.conflictTimestamp, kind: YadoriLinkFFI.EntryKind(value.kind), reason: YadoriLinkFFI.ConflictReason(value.reason))
     }
 }
 
@@ -1039,7 +1045,7 @@ extension YadoriLinkFFI.FetchAvailability {
 
 extension YadoriLinkFFI.FileAvailability {
     init(_ value: YadoriLinkModel.FileAvailability) {
-        self.init(tracked: value.tracked, state: YadoriLinkFFI.MaterializationState(value.state), pinned: value.pinned)
+        self.init(tracked: value.tracked, state: YadoriLinkFFI.MaterializationState(value.state))
     }
 }
 
@@ -1090,7 +1096,7 @@ extension YadoriLinkFFI.FolderState {
 
 extension YadoriLinkFFI.FolderSummary {
     init(_ value: YadoriLinkModel.FolderSummary) {
-        self.init(localPath: value.localPath, groupId: value.groupId, name: value.name, mode: YadoriLinkFFI.FolderMode(value.mode), state: YadoriLinkFFI.FolderState(value.state), paused: value.paused, conflictCount: value.conflictCount, hydratedFileCount: value.hydratedFileCount, placeholderFileCount: value.placeholderFileCount, hydratingFileCount: value.hydratingFileCount, heldFileCount: value.heldFileCount, skippedSymlinkCount: value.skippedSymlinkCount, transfer: value.transfer.map { YadoriLinkFFI.FolderTransferProgress($0) }, durability: YadoriLinkFFI.DurabilityStatus(value.durability), durabilityEvidence: YadoriLinkFFI.DurabilityEvidence(value.durabilityEvidence), localStorage: YadoriLinkFFI.LocalStorageState(value.localStorage), fetchAvailability: YadoriLinkFFI.FetchAvailability(value.fetchAvailability), fullReplicaDeviceIds: value.fullReplicaDeviceIds, policyStale: value.policyStale, ambiguous: value.ambiguous, ambiguousLocalPaths: value.ambiguousLocalPaths, degraded: value.degraded, degradedReason: value.degradedReason, volume: value.volume.map { YadoriLinkFFI.VolumeSummary($0) })
+        self.init(localPath: value.localPath, groupId: value.groupId, name: value.name, mode: YadoriLinkFFI.FolderMode(value.mode), state: YadoriLinkFFI.FolderState(value.state), paused: value.paused, conflictCount: value.conflictCount, hydratedFileCount: value.hydratedFileCount, placeholderFileCount: value.placeholderFileCount, hydratingFileCount: value.hydratingFileCount, heldFileCount: value.heldFileCount, skippedSymlinkCount: value.skippedSymlinkCount, transfer: value.transfer.map { YadoriLinkFFI.FolderTransferProgress($0) }, durability: YadoriLinkFFI.DurabilityStatus(value.durability), durabilityEvidence: YadoriLinkFFI.DurabilityEvidence(value.durabilityEvidence), localStorage: YadoriLinkFFI.LocalStorageState(value.localStorage), fetchAvailability: YadoriLinkFFI.FetchAvailability(value.fetchAvailability), fullReplicaDeviceIds: value.fullReplicaDeviceIds, policyStale: value.policyStale, ambiguous: value.ambiguous, ambiguousLocalPaths: value.ambiguousLocalPaths, degraded: value.degraded, degradedReason: value.degradedReason, volume: value.volume.map { YadoriLinkFFI.VolumeSummary($0) }, provider: value.provider)
     }
 }
 
@@ -1367,6 +1373,12 @@ extension YadoriLinkFFI.PreflightIssue {
 extension YadoriLinkFFI.PreflightResult {
     init(_ value: YadoriLinkModel.PreflightResult) {
         self.init(resolvedPath: value.resolvedPath, pathExists: value.pathExists, isDirectory: value.isDirectory, entryCount: value.entryCount, ignoredEntryCount: value.ignoredEntryCount, totalSizeBytes: value.totalSizeBytes, scanTruncated: value.scanTruncated, freeSpace: value.freeSpace.map { YadoriLinkFFI.FreeSpace($0) }, issues: value.issues.map { YadoriLinkFFI.PreflightIssue($0) }, requiresAcknowledgement: value.requiresAcknowledgement)
+    }
+}
+
+extension YadoriLinkFFI.ProviderFolderOutcome {
+    init(_ value: YadoriLinkModel.ProviderFolderOutcome) {
+        self.init(groupId: value.groupId, rootId: value.rootId, displayName: value.displayName, mode: YadoriLinkFFI.FolderMode(value.mode), alreadyExisted: value.alreadyExisted)
     }
 }
 

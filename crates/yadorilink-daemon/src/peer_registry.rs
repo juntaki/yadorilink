@@ -79,22 +79,6 @@ impl PeerReachability {
             Self::Unreachable(_) => "unreachable",
         }
     }
-
-    /// The route slug ("direct" | "relay") when connected, otherwise empty.
-    pub fn route_str(self) -> &'static str {
-        match self {
-            Self::Connected(route) => route.as_str(),
-            _ => "",
-        }
-    }
-
-    /// The failure-category slug when unreachable, otherwise empty.
-    pub fn unreachable_category_str(self) -> &'static str {
-        match self {
-            Self::Unreachable(category) => category.as_str(),
-            _ => "",
-        }
-    }
 }
 
 /// One peer's live runtime: the session, and the convergence executor
@@ -180,11 +164,6 @@ impl PeerRegistry {
             .iter()
             .map(|(id, runtime)| (id.clone(), runtime.session.clone()))
             .collect()
-    }
-
-    /// Count of currently live sessions.
-    pub fn session_count(&self) -> usize {
-        self.lock_sessions().len()
     }
 
     /// Installs `session` as the current session for `device_id`,

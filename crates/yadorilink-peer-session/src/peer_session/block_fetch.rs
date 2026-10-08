@@ -451,7 +451,7 @@ impl PeerSyncSession {
     /// per-request wrap, only `materialize_dag_content_head`'s
     /// whole-batch `DEFAULT_HYDRATION_TIMEOUT` (30s) around the *entire*
     /// `ensure_blocks_present` call. A confirmed, reproduced regression
-    /// (see `fix/conflict-copy-convergence-obligation-20260723`): the
+    /// (reproduced): the
     /// Convergence Engine's own concurrent audit calls measurably hit this
     /// exact 30s ceiling on individual attempts, and with up to
     /// `MAX_PEERS_PER_TICK` (2) candidates tried sequentially per tick,

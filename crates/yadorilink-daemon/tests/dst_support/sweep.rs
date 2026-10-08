@@ -8,8 +8,8 @@
 //! eager materialize's live-but-fileless index row plus an orphaned
 //! `.yadorilink-tmp.*` file -- surfaced as `StructuralIndexDiskMismatch` /
 //! `Corruption` violations that were pure harness artifacts (the
-//! canonical inline account is in `dst_two_device_chaos.rs` /
-//! `dst_network_fault_chaos.rs`; reproduction: seed 3298840595).
+//! canonical inline account is in the retired two-device and
+//! network-fault scenarios; reproduction: seed 3298840595).
 //!
 //! `run_self_healing` invokes the exact same production sweep code at each
 //! quiescent point and before the terminal oracle checks. Every repair it
@@ -168,7 +168,7 @@ mod tests {
             .set_materialization_state(
                 GROUP_ID,
                 "pre-crash.bin",
-                MaterializationState::Hydrated,
+                MaterializationState::Present,
                 &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();

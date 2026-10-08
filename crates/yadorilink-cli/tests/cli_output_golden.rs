@@ -69,7 +69,7 @@ impl Env {
             .env("YADORILINK_CREDENTIAL_FILE", self.root().join("credentials.json"))
             // A coordination address nothing listens on: every case here must
             // fail (or finish) before it would contact the coordination plane.
-            .env("YADORILINK_COORDINATION_HTTP_ADDR", "http://127.0.0.1:9");
+            .env("YADORILINK_COORDINATION_ADDR", "http://127.0.0.1:9");
         command
     }
 
@@ -142,7 +142,6 @@ async fn link_directly(env: &Env, folder: &Path, group_id: &str) {
             local_path: folder.canonicalize().unwrap().to_string_lossy().to_string(),
             group_id: group_id.to_owned(),
             on_demand: false,
-            max_local_size_bytes: None,
             acknowledge_risks: true,
             pending_enrollment_operation_id: String::new(),
             pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
@@ -221,8 +220,6 @@ fn daemon_commands_report_daemon_not_running_with_exit_code_4() {
         &["trash", "list"],
         &["conflicts", "list"],
         &["versions", "/nowhere"],
-        &["pin", "/nowhere"],
-        &["unpin", "/nowhere"],
         &["evict", "/nowhere"],
         &["materialization-status", "/nowhere"],
         &["update", "status"],

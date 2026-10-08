@@ -129,7 +129,6 @@ fn encode_bundle_json(snapshot: DiagnosticsBundleSnapshot) -> serde_json::Value 
         .iter()
         .enumerate()
         .map(|(i, link)| {
-            let (path, _) = yadorilink_reporting::redact_diagnostics_text(&link.local_path);
             json!({
                 // Sequential, per-bundle pseudonyms -- not a hash of the
                 // real group_id/local_path -- deliberately, to give
@@ -141,7 +140,10 @@ fn encode_bundle_json(snapshot: DiagnosticsBundleSnapshot) -> serde_json::Value 
                 "link_id": format!("link:{:03}", i + 1),
                 "group_id": format!("group:{:03}", i + 1),
                 "state": link.state_label,
-                "path": path,
+                // The folder path is user data (names of clients, matters,
+                // people); pattern redaction cannot promise to remove all of
+                // it, so only a token that distinguishes the links is kept.
+                "path": format!("path:{:03}", i + 1),
             })
         })
         .collect();

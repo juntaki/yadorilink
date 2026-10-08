@@ -69,13 +69,13 @@ async fn eager_adoption_waits_for_the_block_deletion_gate_before_committing_a_re
         let __state = device_b.state.clone();
         let __store = device_b.store.clone();
         let __roots = device_b.sync_roots();
-        let __deps = PeerSyncSessionDeps {
+        let __ports = ExecutorPorts {
             root_commit_authority_provider: AlwaysValidRootCommitAuthorityProvider::shared(),
             block_write_activity_provider: Arc::new(BlockingActivityProvider {
                 attempted: attempted_tx,
                 release: release.clone(),
             }),
-            ..yadorilink_peer_session::peer_session::PeerSyncSessionDeps::standalone()
+            ..ExecutorPorts::denied()
         };
         let __replica_engine =
             yadorilink_daemon::replica_coordinator::engine_ports::build_peer_replica_engine(
@@ -91,21 +91,17 @@ async fn eager_adoption_waits_for_the_block_deletion_gate_before_committing_a_re
                 __replica_engine,
                 __store.clone(),
                 vec![GROUP.to_string()],
-                __roots.clone(),
                 yadorilink_peer_session::ports::SessionTransports {
                     blocks: peer_transports.clone(),
                     service: peer_transports.clone(),
-                    prepared_snapshots: device_b.prepared_snapshots.clone(),
-                    snapshot_fetch: peer_transports,
                 },
-                None,
-                __deps.clone(),
+                PeerSyncSessionDeps::denied(),
             ),
             &device_b.device_id.clone(),
             __state,
             __store,
             __roots,
-            &__deps,
+            &__ports,
         )
     };
 
@@ -197,13 +193,13 @@ async fn ondemand_adoption_waits_for_the_block_deletion_gate_before_committing_a
         let __state = device_b.state.clone();
         let __store = device_b.store.clone();
         let __roots = device_b.sync_roots();
-        let __deps = PeerSyncSessionDeps {
+        let __ports = ExecutorPorts {
             root_commit_authority_provider: AlwaysValidRootCommitAuthorityProvider::shared(),
             block_write_activity_provider: Arc::new(BlockingActivityProvider {
                 attempted: attempted_tx,
                 release: release.clone(),
             }),
-            ..yadorilink_peer_session::peer_session::PeerSyncSessionDeps::standalone()
+            ..ExecutorPorts::denied()
         };
         let __replica_engine =
             yadorilink_daemon::replica_coordinator::engine_ports::build_peer_replica_engine(
@@ -219,21 +215,17 @@ async fn ondemand_adoption_waits_for_the_block_deletion_gate_before_committing_a
                 __replica_engine,
                 __store.clone(),
                 vec![GROUP.to_string()],
-                __roots.clone(),
                 yadorilink_peer_session::ports::SessionTransports {
                     blocks: peer_transports.clone(),
                     service: peer_transports.clone(),
-                    prepared_snapshots: device_b.prepared_snapshots.clone(),
-                    snapshot_fetch: peer_transports,
                 },
-                None,
-                __deps.clone(),
+                PeerSyncSessionDeps::denied(),
             ),
             &device_b.device_id.clone(),
             __state,
             __store,
             __roots,
-            &__deps,
+            &__ports,
         )
     };
 
@@ -299,14 +291,14 @@ async fn ondemand_adoption_waits_for_the_block_deletion_gate_before_committing_a
             .materialization_state_repository()
             .get_materialization_state(GROUP, "ondemand-restored.txt")
             .unwrap(),
-        Some(MaterializationState::Placeholder)
+        Some(MaterializationState::Remote)
     );
 }
 
 /// spec "Opening a placeholder triggers
 /// hydration": `PeerSyncSession::hydrate_file` must fetch a placeholder's
 /// blocks on demand and materialize its real content, transitioning to
-/// `Hydrated` — the on-access path, independent of ordinary index
+/// `Present` — the on-access path, independent of ordinary index
 /// reconciliation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg_attr(
@@ -361,10 +353,10 @@ async fn hydrate_file_fetches_and_materializes_placeholder_content() {
             .materialization_state_repository()
             .get_materialization_state(GROUP, "report.pdf")
             .unwrap(),
-        Some(yadorilink_replica_domain::session_state::MaterializationState::Placeholder)
+        Some(yadorilink_replica_domain::session_state::MaterializationState::Remote)
     );
 
-    session_b.convergence.hydrate_file(&session_b.driver(), GROUP, "report.pdf").await.unwrap();
+    session_b.hydrate_file(GROUP, "report.pdf").await.unwrap();
 
     assert_eq!(
         device_b
@@ -372,7 +364,7 @@ async fn hydrate_file_fetches_and_materializes_placeholder_content() {
             .materialization_state_repository()
             .get_materialization_state(GROUP, "report.pdf")
             .unwrap(),
-        Some(yadorilink_replica_domain::session_state::MaterializationState::Hydrated)
+        Some(yadorilink_replica_domain::session_state::MaterializationState::Present)
     );
     assert_eq!(std::fs::read(&placeholder_path).unwrap(), content);
 
@@ -387,49 +379,34 @@ async fn hydrate_file_fetches_and_materializes_placeholder_content() {
 
 /// Convergence rehydration (`hydrate_file`, and the audit's `Equal`/`After`
 /// rehydrate arms that share its body) judges what it finds at the path
-/// when it starts, exactly as access hydration does: an edit written into
-/// this device's placeholder, or a delete of it, made before the attempt
-/// and not yet journalled by the watcher, is left for local capture rather
-/// than replaced by the remote content.
+/// when it starts, exactly as access hydration does: an edit written at a
+/// `Remote` row's path before the attempt and not yet journalled by the
+/// watcher is left for local capture rather than replaced by the remote
+/// content. (An empty path is not a local change: a `Remote` row has no
+/// object, and hydrating it is the normal case.)
 ///
-/// Its baseline re-check alone cannot see either: it samples the edit (or
-/// the absence) as its own baseline and finds it unchanged.
+/// Its baseline re-check alone cannot see the edit: it samples the edit as
+/// its own baseline and finds it unchanged.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hydrate_file_leaves_a_local_change_made_before_it_started() {
-    for local_change in ["write", "rename_save", "delete"] {
+    for local_change in ["write", "rename_save"] {
         let device_b = Device::new("device-b").await;
         let root_b = device_b.root_path().to_string_lossy().to_string();
         link_with_completed_startup(&device_b.state, &root_b);
 
-        // The row, its blocks, and this device's own placeholder for it,
-        // with the identity recorded exactly as the materialization lane
-        // records it.
+        // The row and its blocks; the row is `Remote`, with nothing at the
+        // path, exactly as the on-demand lane leaves it.
         let content = vec![0x77u8; 300_000];
         device_b.producer().commit_create(GROUP, "report.pdf", &content, 0);
         let out_path = device_b.root_path().join("report.pdf");
         let _ = std::fs::remove_file(&out_path);
-        let identity =
-            yadorilink_local_storage::write_placeholder(&out_path, content.len() as u64, 0)
-                .unwrap()
-                .expect("a unix placeholder has an inode identity");
         let permit = RootCommitPermit::for_tests();
-        let repo = device_b.state.materialization_state_repository();
-        repo.set_materialization_state(
-            GROUP,
-            "report.pdf",
-            MaterializationState::Placeholder,
-            &permit,
-        )
-        .unwrap();
-        repo.record_placeholder_generation(
-            GROUP,
-            "report.pdf",
-            identity,
-            yadorilink_local_storage::INTERNAL_INODE_PROVIDER_KIND,
-            &permit,
-        )
-        .unwrap();
+        device_b
+            .state
+            .materialization_state_repository()
+            .set_materialization_state(GROUP, "report.pdf", MaterializationState::Remote, &permit)
+            .unwrap();
 
         let edit = b"a local edit the watcher has not journalled yet";
         match local_change {
@@ -439,36 +416,28 @@ async fn hydrate_file_leaves_a_local_change_made_before_it_started() {
                 std::fs::write(&tmp, edit).unwrap();
                 std::fs::rename(&tmp, &out_path).unwrap();
             }
-            _ => std::fs::remove_file(&out_path).unwrap(),
+            _ => unreachable!("only the two edit shapes are driven"),
         }
 
         let session_b = spawn_session(&device_b, "device-a");
-        let result =
-            session_b.convergence.hydrate_file(&session_b.driver(), GROUP, "report.pdf").await;
+        let result = session_b.hydrate_file(GROUP, "report.pdf").await;
 
         assert!(
             result.is_err(),
             "{local_change}: hydration replaced a local change made before it started: {result:?}"
         );
-        if local_change == "delete" {
-            assert!(
-                std::fs::symlink_metadata(&out_path).is_err(),
-                "{local_change}: hydration recreated a deleted placeholder"
-            );
-        } else {
-            assert_eq!(
-                std::fs::read(&out_path).unwrap(),
-                edit,
-                "{local_change}: hydration overwrote an edit made before it started"
-            );
-        }
+        assert_eq!(
+            std::fs::read(&out_path).unwrap(),
+            edit,
+            "{local_change}: hydration overwrote an edit made before it started"
+        );
         assert_ne!(
             device_b
                 .state
                 .materialization_state_repository()
                 .get_materialization_state(GROUP, "report.pdf")
                 .unwrap(),
-            Some(MaterializationState::Hydrated),
+            Some(MaterializationState::Present),
             "{local_change}: the row claims Hydrated over a local change"
         );
         assert!(
@@ -500,7 +469,7 @@ async fn hydrate_file_bumps_the_mutation_fence_before_its_physical_write() {
     // No peer: the fence is a property of this device's own physical write,
     // and a wire here would only be a way to put blocks in this device's
     // store and a row in its index. Authoring locally does both, then the
-    // row is put back to `Placeholder` with nothing on disk — the state
+    // row is put back to `Remote` with nothing on disk — the state
     // hydration starts from — so `hydrate_file` finds every block already
     // present and goes straight to the write under test.
     let content = vec![0x77u8; 300_000];
@@ -513,7 +482,7 @@ async fn hydrate_file_bumps_the_mutation_fence_before_its_physical_write() {
         .set_materialization_state(
             GROUP,
             "report.pdf",
-            MaterializationState::Placeholder,
+            MaterializationState::Remote,
             &RootCommitPermit::for_tests(),
         )
         .unwrap();
@@ -521,7 +490,7 @@ async fn hydrate_file_bumps_the_mutation_fence_before_its_physical_write() {
     let session_b = spawn_session(&device_b, "device-a");
     let fence_before = device_b.state.dag_snapshot_mutation_fence(GROUP, "report.pdf").unwrap();
 
-    session_b.convergence.hydrate_file(&session_b.driver(), GROUP, "report.pdf").await.unwrap();
+    session_b.hydrate_file(GROUP, "report.pdf").await.unwrap();
 
     let fence_after = device_b.state.dag_snapshot_mutation_fence(GROUP, "report.pdf").unwrap();
     assert!(
@@ -575,19 +544,14 @@ async fn hydrate_file_without_any_connected_peer_fails_immediately() {
         .set_materialization_state(
             GROUP,
             "unreachable.bin",
-            yadorilink_replica_domain::session_state::MaterializationState::Placeholder,
+            yadorilink_replica_domain::session_state::MaterializationState::Remote,
             &RootCommitPermit::for_tests(),
         )
         .unwrap();
 
     let err = tokio::time::timeout(
         Duration::from_secs(5),
-        session_b.convergence.hydrate_file_with_timeout(
-            &session_b.driver(),
-            GROUP,
-            "unreachable.bin",
-            Duration::from_millis(500),
-        ),
+        session_b.hydrate_file_with_timeout(GROUP, "unreachable.bin", Duration::from_millis(500)),
     )
     .await
     .expect("hydrate_file must respect its own bounded timeout, not hang past it")
@@ -601,7 +565,7 @@ async fn hydrate_file_without_any_connected_peer_fails_immediately() {
             .materialization_state_repository()
             .get_materialization_state(GROUP, "unreachable.bin")
             .unwrap(),
-        Some(yadorilink_replica_domain::session_state::MaterializationState::Placeholder)
+        Some(yadorilink_replica_domain::session_state::MaterializationState::Remote)
     );
 }
 
@@ -657,7 +621,7 @@ async fn evict_then_rehydrate_round_trips_to_identical_content() {
     let path_on_b = device_b.root_path().join("archive.zip");
     adopt_as_placeholder(&device_b, &record);
 
-    session_b.convergence.hydrate_file(&session_b.driver(), GROUP, "archive.zip").await.unwrap();
+    session_b.hydrate_file(GROUP, "archive.zip").await.unwrap();
     assert_eq!(std::fs::read(&path_on_b).unwrap(), content);
 
     struct RejectCustody;
@@ -682,46 +646,64 @@ async fn evict_then_rehydrate_round_trips_to_identical_content() {
     }
 
     let permit = RootCommitPermit::for_tests();
-    yadorilink_filesystem_sync::materialization_eviction::evict_file(
-        yadorilink_filesystem_sync::materialization_eviction::MaterializationContext {
-            state: device_b.state.as_ref(),
-            liveness_gate: &yadorilink_filesystem_sync::block_liveness::BlockLivenessGate::default(
-            ),
-            store: device_b.store.as_ref(),
-            root: &device_b.root_path(),
-            permit: &permit,
-        },
-        GROUP,
-        "archive.zip",
-        false,
-        // Custody unconfirmed here: this exercises the placeholder transition
-        // and subsequent re-hydration, not block reclamation, so the cached
-        // blocks are retained (fail closed) and re-hydration is a local no-op.
-        &RejectCustody,
-    )
-    .unwrap();
+    // A live session may still be reconciling the path and hold its path
+    // lock for a moment after the hydration returned: eviction then reports
+    // `EvictionRejected` (a designed, retryable refusal), so retry briefly.
+    let mut attempts = 0;
+    loop {
+        let outcome = {
+            yadorilink_filesystem_sync::materialization_eviction::evict_file(
+                yadorilink_filesystem_sync::materialization_eviction::MaterializationContext {
+                    state: device_b.state.as_ref(),
+                    liveness_gate:
+                        &yadorilink_filesystem_sync::block_liveness::BlockLivenessGate::default(),
+                    store: device_b.store.as_ref(),
+                    root: &device_b.root_path(),
+                    permit: &permit,
+                },
+                GROUP,
+                "archive.zip",
+                false,
+                // Custody unconfirmed here: this exercises the placeholder transition
+                // and subsequent re-hydration, not block reclamation, so the cached
+                // blocks are retained (fail closed) and re-hydration is a local no-op.
+                &RejectCustody,
+            )
+        };
+        match outcome {
+            Err(yadorilink_filesystem_sync::materialization_execution::MaterializationExecutionError::EvictionRejected(_))
+                if attempts < 100 =>
+            {
+                attempts += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            other => {
+                other.unwrap();
+                break;
+            }
+        }
+    }
     assert_eq!(
         device_b
             .state
             .materialization_state_repository()
             .get_materialization_state(GROUP, "archive.zip")
             .unwrap(),
-        Some(yadorilink_replica_domain::session_state::MaterializationState::Placeholder)
+        Some(yadorilink_replica_domain::session_state::MaterializationState::Remote)
     );
-    assert_ne!(
-        std::fs::read(&path_on_b).unwrap(),
-        content,
-        "evicted file must no longer hold real content"
+    assert!(
+        std::fs::symlink_metadata(&path_on_b).is_err(),
+        "an evicted file must no longer stand in the user tree"
     );
 
-    session_b.convergence.hydrate_file(&session_b.driver(), GROUP, "archive.zip").await.unwrap();
+    session_b.hydrate_file(GROUP, "archive.zip").await.unwrap();
     assert_eq!(
         device_b
             .state
             .materialization_state_repository()
             .get_materialization_state(GROUP, "archive.zip")
             .unwrap(),
-        Some(yadorilink_replica_domain::session_state::MaterializationState::Hydrated)
+        Some(yadorilink_replica_domain::session_state::MaterializationState::Present)
     );
     assert_eq!(
         std::fs::read(&path_on_b).unwrap(),
@@ -801,7 +783,7 @@ async fn three_devices_on_demand_hydration_is_per_device_not_group_wide() {
                 .materialization_state_repository()
                 .get_materialization_state(GROUP, "presentation.pptx")
                 .unwrap(),
-            Some(yadorilink_replica_domain::session_state::MaterializationState::Placeholder)
+            Some(yadorilink_replica_domain::session_state::MaterializationState::Remote)
         );
         let record = device
             .state
@@ -820,18 +802,14 @@ async fn three_devices_on_demand_hydration_is_per_device_not_group_wide() {
     }
 
     // Opening it on B hydrates only B.
-    session_b
-        .convergence
-        .hydrate_file(&session_b.driver(), GROUP, "presentation.pptx")
-        .await
-        .unwrap();
+    session_b.hydrate_file(GROUP, "presentation.pptx").await.unwrap();
     assert_eq!(
         device_b
             .state
             .materialization_state_repository()
             .get_materialization_state(GROUP, "presentation.pptx")
             .unwrap(),
-        Some(yadorilink_replica_domain::session_state::MaterializationState::Hydrated)
+        Some(yadorilink_replica_domain::session_state::MaterializationState::Present)
     );
     assert_eq!(std::fs::read(&path_on_b).unwrap(), content);
 
@@ -842,7 +820,7 @@ async fn three_devices_on_demand_hydration_is_per_device_not_group_wide() {
             .materialization_state_repository()
             .get_materialization_state(GROUP, "presentation.pptx")
             .unwrap(),
-        Some(yadorilink_replica_domain::session_state::MaterializationState::Placeholder)
+        Some(yadorilink_replica_domain::session_state::MaterializationState::Remote)
     );
     assert!(
         std::fs::read(&path_on_c).map(|bytes| bytes != content).unwrap_or(true),
@@ -913,16 +891,10 @@ async fn hydration_chaos_no_reachable_peer_times_out_cleanly() {
         .set_materialization_state(
             GROUP,
             "orphaned.bin",
-            yadorilink_replica_domain::session_state::MaterializationState::Placeholder,
+            yadorilink_replica_domain::session_state::MaterializationState::Remote,
             &RootCommitPermit::for_tests(),
         )
         .unwrap();
-    yadorilink_local_storage::write_placeholder(
-        &device_b.root_path().join("orphaned.bin"),
-        5_000,
-        0,
-    )
-    .unwrap();
 
     // Nothing ever answers for "device-nobody", so the block request
     // `hydrate_file_with_timeout` makes can only end in its own timeout.
@@ -930,13 +902,7 @@ async fn hydration_chaos_no_reachable_peer_times_out_cleanly() {
 
     let started = tokio::time::Instant::now();
     let result = session_b
-        .convergence
-        .hydrate_file_with_timeout(
-            &session_b.driver(),
-            GROUP,
-            "orphaned.bin",
-            Duration::from_millis(300),
-        )
+        .hydrate_file_with_timeout(GROUP, "orphaned.bin", Duration::from_millis(300))
         .await;
     let elapsed = started.elapsed();
 
@@ -953,7 +919,7 @@ async fn hydration_chaos_no_reachable_peer_times_out_cleanly() {
             .materialization_state_repository()
             .get_materialization_state(GROUP, "orphaned.bin")
             .unwrap(),
-        Some(yadorilink_replica_domain::session_state::MaterializationState::Placeholder)
+        Some(yadorilink_replica_domain::session_state::MaterializationState::Remote)
     );
 }
 
@@ -998,16 +964,10 @@ async fn hydration_rejects_block_bytes_that_do_not_hash_to_the_request() {
         .set_materialization_state(
             GROUP,
             "tampered.bin",
-            yadorilink_replica_domain::session_state::MaterializationState::Placeholder,
+            yadorilink_replica_domain::session_state::MaterializationState::Remote,
             &RootCommitPermit::for_tests(),
         )
         .unwrap();
-    yadorilink_local_storage::write_placeholder(
-        &device_b.root_path().join("tampered.bin"),
-        expected.len() as u64,
-        0,
-    )
-    .unwrap();
 
     // The peer this test plays itself, as a real substrate endpoint in
     // device_b's world -- see `Device::fake_peer`.
@@ -1036,15 +996,8 @@ async fn hydration_rejects_block_bytes_that_do_not_hash_to_the_request() {
         .await;
     });
 
-    let result = session_b
-        .convergence
-        .hydrate_file_with_timeout(
-            &session_b.driver(),
-            GROUP,
-            "tampered.bin",
-            Duration::from_secs(3),
-        )
-        .await;
+    let result =
+        session_b.hydrate_file_with_timeout(GROUP, "tampered.bin", Duration::from_secs(3)).await;
     await_responder(responder).await;
 
     assert!(
@@ -1063,7 +1016,7 @@ async fn hydration_rejects_block_bytes_that_do_not_hash_to_the_request() {
             .materialization_state_repository()
             .get_materialization_state(GROUP, "tampered.bin")
             .unwrap(),
-        Some(yadorilink_replica_domain::session_state::MaterializationState::Placeholder)
+        Some(yadorilink_replica_domain::session_state::MaterializationState::Remote)
     );
 }
 
@@ -1114,15 +1067,8 @@ async fn hydration_rejects_a_found_header_declaring_more_than_the_maximum_block_
     });
 
     let started = Instant::now();
-    let result = session_b
-        .convergence
-        .hydrate_file_with_timeout(
-            &session_b.driver(),
-            GROUP,
-            "oversized.bin",
-            Duration::from_secs(3),
-        )
-        .await;
+    let result =
+        session_b.hydrate_file_with_timeout(GROUP, "oversized.bin", Duration::from_secs(3)).await;
     let elapsed = started.elapsed();
     await_responder(responder).await;
 
@@ -1149,7 +1095,7 @@ async fn hydration_rejects_a_found_header_declaring_more_than_the_maximum_block_
             .materialization_state_repository()
             .get_materialization_state(GROUP, "oversized.bin")
             .unwrap(),
-        Some(MaterializationState::Placeholder)
+        Some(MaterializationState::Remote)
     );
 }
 
@@ -1199,15 +1145,8 @@ async fn hydration_rejects_a_found_header_bound_to_a_different_hash() {
         .await;
     });
 
-    let result = session_b
-        .convergence
-        .hydrate_file_with_timeout(
-            &session_b.driver(),
-            GROUP,
-            "mislabelled.bin",
-            Duration::from_secs(3),
-        )
-        .await;
+    let result =
+        session_b.hydrate_file_with_timeout(GROUP, "mislabelled.bin", Duration::from_secs(3)).await;
     await_responder(responder).await;
 
     assert!(
@@ -1283,13 +1222,12 @@ async fn a_rejection_stops_the_requester_where_dont_have_does_not() {
     });
 
     for path in ["racy.bin", "denied.bin"] {
-        let result = session_b
-            .convergence
-            .hydrate_file_with_timeout(&session_b.driver(), GROUP, path, Duration::from_secs(10))
-            .await;
+        // The bulk fetch family (the receive engine's own lane) is what re-asks a DontHave.
+        let result =
+            session_b.materialize_via_convergence(GROUP, path, Duration::from_secs(10)).await;
         assert!(
             matches!(result, Err(yadorilink_peer_session::PeerSessionError::HydrationFailed(_))),
-            "no answer here supplies content, so hydrating {path} must fail; got {result:?}"
+            "no answer here supplies content, so obtaining {path} must fail; got {result:?}"
         );
     }
     responder.abort();
@@ -1352,11 +1290,9 @@ async fn hydration_block_request_is_refused_for_a_group_the_peer_does_not_author
         .set_materialization_state(
             GROUP,
             "secret.bin",
-            yadorilink_replica_domain::session_state::MaterializationState::Placeholder,
+            yadorilink_replica_domain::session_state::MaterializationState::Remote,
             &RootCommitPermit::for_tests(),
         )
-        .unwrap();
-    yadorilink_local_storage::write_placeholder(&device_b.root_path().join("secret.bin"), 5_000, 0)
         .unwrap();
 
     // A's session (which will *answer* B's block requests) is constructed
@@ -1365,15 +1301,13 @@ async fn hydration_block_request_is_refused_for_a_group_the_peer_does_not_author
     let _session_a = spawn_session_with_groups(&device_a, "device-b", vec![]);
     let session_b = spawn_session_with_groups(&device_b, "device-a", vec![GROUP.to_string()]);
 
-    let result = session_b
-        .convergence
-        .hydrate_file_with_timeout(&session_b.driver(), GROUP, "secret.bin", Duration::from_secs(3))
-        .await;
+    let result =
+        session_b.hydrate_file_with_timeout(GROUP, "secret.bin", Duration::from_secs(3)).await;
 
     assert!(result.is_err(), "hydration must fail when the peer does not authorize the group");
     assert_ne!(
-        std::fs::read(device_b.root_path().join("secret.bin")).unwrap(),
-        content,
+        std::fs::read(device_b.root_path().join("secret.bin")).ok().as_deref(),
+        Some(content.as_slice()),
         "content must never be leaked across an unauthorized group boundary"
     );
     let hash_hex = hex::encode(&record.blocks[0].hash);
@@ -1452,7 +1386,7 @@ async fn held_files_blocks_are_still_served_to_a_requesting_peer() {
     // path is not.
     let path_on_c = device_c.root_path().join("photo.jpg");
     adopt_as_placeholder(&device_c, &record);
-    session_c.convergence.hydrate_file(&session_c.driver(), GROUP, "photo.jpg").await.unwrap();
+    session_c.hydrate_file(GROUP, "photo.jpg").await.unwrap();
     assert_eq!(
         std::fs::read(&path_on_c).unwrap(),
         content,
@@ -1520,11 +1454,7 @@ async fn unlimited_rate_limiters_impose_no_measurable_delay_on_a_real_transfer()
     adopt_as_placeholder(&device_b, &record);
     let replicated_path = device_b.root_path().join("unthrottled.bin");
     let start = std::time::Instant::now();
-    session_b
-        .convergence
-        .hydrate_file(&session_b.driver(), GROUP, "unthrottled.bin")
-        .await
-        .unwrap();
+    session_b.hydrate_file(GROUP, "unthrottled.bin").await.unwrap();
     let elapsed = start.elapsed();
     assert_eq!(std::fs::read(&replicated_path).unwrap(), vec![0x22u8; 50_000]);
     // 10s, and the number is chosen against two floors rather than picked
@@ -1594,7 +1524,7 @@ async fn configured_download_rate_caps_real_block_transfer_throughput() {
     adopt_as_placeholder(&device_b, &record);
     let replicated_path = device_b.root_path().join("throttled.bin");
     let start = std::time::Instant::now();
-    session_b.convergence.hydrate_file(&session_b.driver(), GROUP, "throttled.bin").await.unwrap();
+    session_b.hydrate_file(GROUP, "throttled.bin").await.unwrap();
     let elapsed = start.elapsed();
     assert_eq!(std::fs::read(&replicated_path).unwrap(), vec![0x33u8; size]);
 
@@ -1663,7 +1593,7 @@ async fn compressible_content_round_trips_between_two_real_sessions() {
     let session_b = spawn_session(&device_b, "device-a");
 
     adopt_as_placeholder(&device_b, &record);
-    session_b.convergence.hydrate_file(&session_b.driver(), GROUP, "app.log").await.unwrap();
+    session_b.hydrate_file(GROUP, "app.log").await.unwrap();
 
     let replicated = std::fs::read(device_b.root_path().join("app.log")).unwrap();
     assert_eq!(
@@ -1714,16 +1644,10 @@ async fn hydration_rejects_a_decompression_bomb_block_response() {
         .set_materialization_state(
             GROUP,
             "bomb.bin",
-            yadorilink_replica_domain::session_state::MaterializationState::Placeholder,
+            yadorilink_replica_domain::session_state::MaterializationState::Remote,
             &RootCommitPermit::for_tests(),
         )
         .unwrap();
-    yadorilink_local_storage::write_placeholder(
-        &device_b.root_path().join("bomb.bin"),
-        expected.len() as u64,
-        0,
-    )
-    .unwrap();
 
     // A classic zstd-bomb shape: a large, trivially-compressible buffer
     // (all zeros) compresses down to a tiny payload but claims to expand
@@ -1767,10 +1691,8 @@ async fn hydration_rejects_a_decompression_bomb_block_response() {
     });
 
     let start = std::time::Instant::now();
-    let result = session_b
-        .convergence
-        .hydrate_file_with_timeout(&session_b.driver(), GROUP, "bomb.bin", Duration::from_secs(5))
-        .await;
+    let result =
+        session_b.hydrate_file_with_timeout(GROUP, "bomb.bin", Duration::from_secs(5)).await;
     let elapsed = start.elapsed();
     await_responder(responder).await;
 
@@ -1795,7 +1717,7 @@ async fn hydration_rejects_a_decompression_bomb_block_response() {
             .materialization_state_repository()
             .get_materialization_state(GROUP, "bomb.bin")
             .unwrap(),
-        Some(yadorilink_replica_domain::session_state::MaterializationState::Placeholder)
+        Some(yadorilink_replica_domain::session_state::MaterializationState::Remote)
     );
 }
 
@@ -1837,16 +1759,10 @@ async fn hydration_rejects_a_corrupt_compressed_block_response() {
         .set_materialization_state(
             GROUP,
             "corrupt.bin",
-            yadorilink_replica_domain::session_state::MaterializationState::Placeholder,
+            yadorilink_replica_domain::session_state::MaterializationState::Remote,
             &RootCommitPermit::for_tests(),
         )
         .unwrap();
-    yadorilink_local_storage::write_placeholder(
-        &device_b.root_path().join("corrupt.bin"),
-        expected.len() as u64,
-        0,
-    )
-    .unwrap();
 
     // The peer this test plays itself, as a real substrate endpoint in
     // device_b's world -- see `Device::fake_peer`.
@@ -1872,15 +1788,8 @@ async fn hydration_rejects_a_corrupt_compressed_block_response() {
         .await;
     });
 
-    let result = session_b
-        .convergence
-        .hydrate_file_with_timeout(
-            &session_b.driver(),
-            GROUP,
-            "corrupt.bin",
-            Duration::from_secs(3),
-        )
-        .await;
+    let result =
+        session_b.hydrate_file_with_timeout(GROUP, "corrupt.bin", Duration::from_secs(3)).await;
     await_responder(responder).await;
 
     assert!(
@@ -1988,20 +1897,15 @@ async fn fetch_window_grows_under_real_traffic_and_shrinks_after_timeouts_then_r
     );
     device_a.publish_pending();
 
-    let auth = dag_authenticator(&[&device_a, &device_b]);
-    let _session_a = spawn_session_with_authenticator(&device_a, "device-b", auth.clone());
-    let session_b = spawn_session_with_authenticator(&device_b, "device-a", auth.clone());
+    let _session_a = spawn_session(&device_a, "device-b");
+    let session_b = spawn_session(&device_b, "device-a");
 
     let placeholder_path = device_b.root_path().join("big-archive.tar");
     adopt_as_placeholder(&device_b, &record);
 
     let initial_window = session_b.session.fetch_window();
 
-    session_b
-        .convergence
-        .hydrate_file(&session_b.driver(), GROUP, "big-archive.tar")
-        .await
-        .unwrap();
+    session_b.hydrate_file(GROUP, "big-archive.tar").await.unwrap();
     assert_eq!(std::fs::read(&placeholder_path).unwrap(), content);
 
     let grown_window = session_b.session.fetch_window();
@@ -2046,11 +1950,7 @@ async fn fetch_window_grows_under_real_traffic_and_shrinks_after_timeouts_then_r
     );
     device_a.publish_pending();
     adopt_as_placeholder(&device_b, &record2);
-    session_b
-        .convergence
-        .hydrate_file(&session_b.driver(), GROUP, "second-archive.tar")
-        .await
-        .unwrap();
+    session_b.hydrate_file(GROUP, "second-archive.tar").await.unwrap();
     assert_eq!(std::fs::read(device_b.root_path().join("second-archive.tar")).unwrap(), content2);
 
     let recovered_window = session_b.session.fetch_window();

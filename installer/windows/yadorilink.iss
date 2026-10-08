@@ -36,6 +36,10 @@
 #ifndef ShellExtDir
   #define ShellExtDir "..\..\shell-ext\windows\target\release"
 #endif
+; Directory holding the generated SOURCE.txt (build-installer.ps1 creates it).
+#ifndef NoticeDir
+  #define NoticeDir "..\..\target\installer-notice"
+#endif
 #define InstallPs1Source "..\..\shell-ext\windows\install.ps1"
 
 ; Optional release signing. Pass e.g.
@@ -96,6 +100,9 @@ Filename: "{app}\yadorilink-status-app.exe"; Parameters: "--window onboarding"; 
   Flags: postinstall nowait skipifsilent runasoriginaluser; Check: IsFreshInstall
 
 [Files]
+; AGPL-3.0 licence text and the pointer to the corresponding source.
+Source: "..\..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#NoticeDir}\SOURCE.txt"; DestDir: "{app}"; Flags: ignoreversion
 ; The five end-user binaries, installed flat into {app}.
 Source: "{#BinDir}\yadorilink.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BinDir}\yadorilink-daemon.exe"; DestDir: "{app}"; Flags: ignoreversion

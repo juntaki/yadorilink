@@ -21,15 +21,15 @@ fn harness() -> (Arc<LocalConvergenceExecutor>, tempfile::TempDir) {
     state.link_repository().add_link(&root.path().to_string_lossy(), GROUP).unwrap();
     let store: Arc<dyn yadorilink_peer_session::ports::BlockContentStore> =
         Arc::new(SegmentBlockStore::new(tempfile::tempdir().unwrap().keep()).unwrap());
-    let deps = yadorilink_peer_session::peer_session::PeerSyncSessionDeps::test_permissive();
+    let ports = crate::test_support::peer_session_fixture::ExecutorPorts::permissive();
     let convergence = LocalConvergenceExecutor::new(
         state,
         "device-a".to_string(),
-        deps.root_commit_authority_provider.clone(),
-        deps.pending_local_change_flush.clone(),
+        ports.root_commit_authority_provider.clone(),
+        ports.pending_local_change_flush.clone(),
         HashMap::from([(GROUP.to_string(), root.path().to_path_buf())]),
         store,
-        deps.block_write_activity_provider.clone(),
+        ports.block_write_activity_provider.clone(),
         super::HeadroomPolicy::disabled(),
     );
     (convergence, root)

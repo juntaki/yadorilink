@@ -1,9 +1,9 @@
 //! `RestoreOperationRepository` owns the `restore_operations` table -- the
 //! crash-safe journal of a restore whose replacement file and index update
 //! have not both been durably committed yet.
-//! `record_restore_operation_emitting_change` (`restore_operations` + DAG
-//! change emission) and `commit_restore_operation` (`restore_operations` +
-//! `files` + DAG state) are two of the ownership doc's "Known
+//! `record_restore_operation_emitting_change` (`restore_operations` + native
+//! delta authoring) and `commit_restore_operation` (`restore_operations` +
+//! `files` + native state) are two of the ownership doc's "Known
 //! cross-cluster atomic operations" -- reaching directly into `dag_store`
 //! free functions and raw `files`-table SQL inside their own transaction,
 //! exactly as
@@ -16,13 +16,14 @@ use std::sync::Arc;
 
 use rusqlite::OptionalExtension;
 
-use crate::dag_store::{self, ChangeEmitter};
+use crate::dag_store::{self};
 use crate::error::SyncSqliteError;
-use crate::file_index::{apply_local_meta_columns_in_tx, upsert_file_in_tx};
+use crate::file_index::{apply_local_meta_columns_in_tx, upsert_file_with_authoring_in_tx};
 use crate::materialization_state::MaterializationStateRepository;
-use yadorilink_replica_domain::change::{Op, PutOrigin};
 use yadorilink_replica_domain::file::{FileRecord, FileVersion, RecordKind};
-use yadorilink_replica_domain::ids::{ChangeHash, SyncPath};
+use yadorilink_replica_domain::ids::SyncPath;
+use yadorilink_replica_domain::local_op::Op;
+use yadorilink_replica_domain::native_plan::NativeRowIdentity;
 use yadorilink_replica_domain::session_state::{LocalFileMetaColumns, MaterializationState};
 use yadorilink_replica_domain::session_state::{
     RestoreCommitOutcome, RestoreOperation, RestoreOperationState,
@@ -36,6 +37,34 @@ use yadorilink_sqlite_runtime::SyncDatabase;
 fn now_unix_nanos() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as i64).unwrap_or(0)
+}
+
+/// Authors the restore's `op` as a native delta by `author`, in the restoring
+/// transaction: what it supersedes is what the path's row shows now. A restore
+/// is a local edit of the path, and native has to show it.
+fn author_restore(
+    tx: &rusqlite::Transaction,
+    group_id: &str,
+    author: &crate::local_author::LocalAuthor<'_>,
+    op: Op,
+) -> Result<Option<NativeRowIdentity>, SyncSqliteError> {
+    let mut native = None;
+    if let Op::Put { path, .. } = &op {
+        let authored = crate::native_authoring::author_op(
+            tx,
+            &yadorilink_replica_domain::ids::FolderGroupId(group_id.to_owned()),
+            author,
+            &op,
+            path,
+        )?;
+        native = authored.put_at(path).cloned();
+        // Witnessed now, while the head is live: the row commits after the
+        // disk write, by which time another head may have superseded it.
+        if let Some(identity) = native.as_ref() {
+            crate::file_index::record_native_authoring_witness(tx, group_id, identity)?;
+        }
+    }
+    Ok(native)
 }
 
 /// Where a recorded restore's entry is written: by the restore itself at
@@ -67,9 +96,9 @@ impl RestoreOperationRepository {
                  (operation_id, group_id, path, target_version_seq,
                   expected_current_version_seq, state, size,
                   mtime_unix_nanos, blocks_json, origin_device_id,
-                  authoring_change_hash, created_at_unix_nanos,
+                  created_at_unix_nanos,
                   record_kind, symlink_target, symlink_out_of_root, unix_mode, xattrs_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 rusqlite::params![
                     operation.operation_id,
                     operation.group_id,
@@ -81,7 +110,6 @@ impl RestoreOperationRepository {
                     operation.record.mtime_unix_nanos,
                     &blocks_json,
                     operation.origin_device_id,
-                    operation.authoring_change_hash.as_ref().map(|hash| hash.0.as_slice()),
                     now_unix_nanos(),
                     operation.meta.record_kind.as_db_str(),
                     operation.meta.symlink_target.as_deref(),
@@ -94,78 +122,72 @@ impl RestoreOperationRepository {
         })
     }
 
-    /// Authors the restore's `Put`, stores its exact `FileVersion`, and
-    /// persists the crash-recovery journal in one transaction. The disk
-    /// replacement happens only after this returns, so every recovery path
-    /// already has the durable author identity it must publish.
-    ///
-    /// `auth` is the already-resolved authorization stamp for `group_id` --
-    /// see [`crate::file_index::FileIndexRepository::upsert_file_emitting_change`]'s
-    /// doc comment for why it is a parameter here rather than resolved
-    /// internally (`local_change_auth_provider` lives on `SyncState`, not on
-    /// any repository).
-    ///
-    /// `permit` is verified inside the transaction, so a restore whose root
-    /// was lost after admission authors no change and journals nothing.
-    pub fn record_restore_operation_emitting_change(
+    /// Records a restore and authors its `Put` as a signed change by
+    /// `author`, admitted here in the same transaction. Its basis at the restored path is the head the path's
+    /// row shows in that transaction (nothing when the path is empty): the
+    /// restore replaces exactly the version the user restored over, and any
+    /// other head there stays live beside it.
+    pub fn record_authored_restore_operation(
         &self,
         operation: &RestoreOperation,
         version: &FileVersion,
-        emitter: &ChangeEmitter,
+        author: &crate::local_author::LocalAuthor<'_>,
         permit: &RootCommitPermit,
-    ) -> Result<ChangeHash, SyncSqliteError> {
-        self.record_restore(operation, version, emitter, permit, None).map(|(hash, _)| hash)
+    ) -> Result<(), SyncSqliteError> {
+        self.record_restore(operation, version, permit, None, |tx, op| {
+            author_restore(tx, &operation.group_id, author, op)
+        })
+        .map(|_| ())
     }
 
     /// Authors the restore's `Put` as
-    /// [`Self::record_restore_operation_emitting_change`] does, and decides
-    /// in the same transaction whether the restore writes its entry itself.
-    ///
-    /// It does when `disk_allows_in_place` (the caller's reading of the
-    /// disk: no synced file or symlink is an ancestor, and nothing of the
-    /// other shape occupies the path) and the namespace, with this change
-    /// admitted, keeps the entry at its own path. Only then is the journal
-    /// row written. Otherwise the ordinary projection places the entry --
-    /// the obligation the change opened drives it -- and there is no
-    /// journal row at all: no instant exists at which a crash could leave
-    /// startup recovery a row for a write that was never going to happen.
+    /// [`Self::record_authored_restore_operation`] does, and decides in the
+    /// same transaction whether the restore writes its entry itself: it does
+    /// when `disk_allows_in_place` (the caller's reading of the disk) and
+    /// the namespace, with this change admitted, keeps the entry at its own
+    /// path. Only then is the journal row written.
     pub fn record_restore_placing(
         &self,
         operation: &RestoreOperation,
         version: &FileVersion,
-        emitter: &ChangeEmitter,
+        author: &crate::local_author::LocalAuthor<'_>,
         permit: &RootCommitPermit,
         disk_allows_in_place: bool,
-    ) -> Result<(ChangeHash, RestorePlacement), SyncSqliteError> {
-        self.record_restore(operation, version, emitter, permit, Some(disk_allows_in_place))
+    ) -> Result<RestorePlacement, SyncSqliteError> {
+        self.record_restore(operation, version, permit, Some(disk_allows_in_place), |tx, op| {
+            author_restore(tx, &operation.group_id, author, op)
+        })
     }
 
     fn record_restore(
         &self,
         operation: &RestoreOperation,
         version: &FileVersion,
-        emitter: &ChangeEmitter,
         permit: &RootCommitPermit,
         disk_allows_in_place: Option<bool>,
-    ) -> Result<(ChangeHash, RestorePlacement), SyncSqliteError> {
+        author: impl Fn(
+            &rusqlite::Transaction,
+            Op,
+        ) -> Result<Option<NativeRowIdentity>, SyncSqliteError>,
+    ) -> Result<RestorePlacement, SyncSqliteError> {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
             permit.verify()?;
             let path = SyncPath(operation.path.clone());
-            let change = dag_store::emit_local_change(
+            let native_identity = author(
                 tx,
-                &operation.group_id,
-                vec![Op::Put { path, version: version.version_hash, origin: PutOrigin::Direct }],
-                emitter,
+                Op::Put { path, version: version.version_hash },
             )?;
             dag_store::put_file_version(tx, &operation.group_id, version)?;
-            let change_hash = change.compute_hash();
             let placement = match disk_allows_in_place {
                 None => RestorePlacement::InPlace,
                 Some(false) => RestorePlacement::Projection,
                 Some(true) => {
-                    use crate::desired_state::{desired_path_state, DesiredPathState};
-                    let desired =
-                        desired_path_state(tx, &operation.group_id, &operation.path)?;
+                    use crate::desired_state::DesiredPathState;
+                    let desired = crate::native_desired_state::native_desired_path_state(
+                        tx,
+                        &operation.group_id,
+                        &operation.path,
+                    )?;
                     if matches!(
                         (version.meta.record_kind, desired),
                         (RecordKind::Directory, DesiredPathState::ExplicitDirectory { .. })
@@ -181,7 +203,7 @@ impl RestoreOperationRepository {
                 }
             };
             if placement == RestorePlacement::Projection {
-                return Ok((change_hash, placement));
+                return Ok(placement);
             }
             // The restored content is not on disk yet. What keeps that
             // visible is the restore journal row written just below plus the
@@ -196,9 +218,9 @@ impl RestoreOperationRepository {
                  (operation_id, group_id, path, target_version_seq,
                   expected_current_version_seq, state, size, mtime_unix_nanos,
                   blocks_json, origin_device_id,
-                  authoring_change_hash, created_at_unix_nanos,
+                  authoring_native_identity, created_at_unix_nanos,
                   record_kind, symlink_target, symlink_out_of_root, unix_mode, xattrs_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?17, ?11, ?12, ?13, ?14, ?15, ?16)",
                 rusqlite::params![
                     operation.operation_id,
                     operation.group_id,
@@ -210,16 +232,16 @@ impl RestoreOperationRepository {
                     operation.record.mtime_unix_nanos,
                     blocks_json,
                     operation.origin_device_id,
-                    change_hash.0.as_slice(),
                     now_unix_nanos(),
                     operation.meta.record_kind.as_db_str(),
                     operation.meta.symlink_target.as_deref(),
                     operation.meta.symlink_out_of_root,
                     crate::file_index::encode_unix_mode_column(operation.meta.unix_mode),
                     crate::file_index::encode_xattrs_column(&operation.meta.xattrs),
+                    native_identity.as_ref().map(NativeRowIdentity::to_bytes),
                 ],
             )?;
-            Ok((change_hash, placement))
+            Ok(placement)
         })
     }
 
@@ -251,7 +273,7 @@ impl RestoreOperationRepository {
             let mut stmt = conn.prepare(
                 "SELECT operation_id, group_id, path, target_version_seq, state,
                         size, mtime_unix_nanos, blocks_json, origin_device_id,
-                        expected_current_version_seq, authoring_change_hash,
+                        expected_current_version_seq,
                         record_kind, symlink_target, symlink_out_of_root, unix_mode, xattrs_json
                  FROM restore_operations WHERE group_id = ?1
                  ORDER BY created_at_unix_nanos, operation_id",
@@ -310,7 +332,7 @@ impl RestoreOperationRepository {
                 .query_row(
                     "SELECT operation_id, group_id, path, target_version_seq, state,
                             size, mtime_unix_nanos, blocks_json, origin_device_id,
-                            expected_current_version_seq, authoring_change_hash,
+                            expected_current_version_seq,
                             record_kind, symlink_target, symlink_out_of_root, unix_mode, xattrs_json
                      FROM restore_operations WHERE operation_id = ?1",
                     [operation_id],
@@ -359,12 +381,26 @@ impl RestoreOperationRepository {
                     return Ok(RestoreCommitOutcome::FenceLost);
                 }
             }
-            upsert_file_in_tx(
+            let native: Option<Vec<u8>> = tx.query_row(
+                "SELECT authoring_native_identity FROM restore_operations WHERE operation_id = ?1",
+                [operation_id],
+                |row| row.get(0),
+            )?;
+            let native = native
+                .map(|bytes| {
+                    NativeRowIdentity::from_bytes(&bytes).map_err(|error| {
+                        SyncSqliteError::CorruptState(format!(
+                            "native identity of restore {operation_id}: {error}"
+                        ))
+                    })
+                })
+                .transpose()?;
+            upsert_file_with_authoring_in_tx(
                 tx,
                 &operation.group_id,
                 &operation.record,
                 &operation.origin_device_id,
-                operation.authoring_change_hash.as_ref(),
+                native.as_ref(),
             )?;
             // The atomic, in-transaction counterpart to `upsert_file_in_tx`
             // every other local content emission already applies its own
@@ -380,8 +416,8 @@ impl RestoreOperationRepository {
                 &operation.meta,
             )?;
             // Explicit, not implicit via the schema's own column default
-            // (`Placeholder` as of v25). `reconcile_restore_operations`'s
-            // `Hydrated` is published only together with the proof that
+            // (`Remote` as of v25). `reconcile_restore_operations`'s
+            // `Present` is published only together with the proof that
             // earns it. The one record-kind arm that writes nothing --
             // a Windows symlink with no opt-in -- observes no identity, so
             // it now simply does not claim to hold content, instead of
@@ -416,7 +452,6 @@ impl RestoreOperationRepository {
                                     tx,
                                     &operation.group_id,
                                     &operation.path,
-                                    None,
                                     &crate::exact_materialized_commit::ExactMaterializedState::Object {
                                         kind: operation.meta.record_kind,
                                         version: restored_version,
@@ -467,7 +502,7 @@ impl RestoreOperationRepository {
                                 tx,
                                 &operation.group_id,
                                 &operation.path,
-                                MaterializationState::Hydrated,
+                                MaterializationState::Present,
                             )?;
                         }
                     }
@@ -520,27 +555,15 @@ pub(crate) fn restore_operation_from_row(
             deleted: false,
         },
         origin_device_id: row.get(8)?,
-        authoring_change_hash: row
-            .get::<_, Option<Vec<u8>>>(10)?
-            .map(|bytes| {
-                bytes.try_into().map(ChangeHash).map_err(|bytes: Vec<u8>| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        10,
-                        rusqlite::types::Type::Blob,
-                        format!("invalid authoring change hash length: {}", bytes.len()).into(),
-                    )
-                })
-            })
-            .transpose()?,
         meta: LocalFileMetaColumns {
-            record_kind: RecordKind::from_db_str(&row.get::<_, String>(11)?),
-            symlink_target: row.get(12)?,
-            symlink_out_of_root: row.get(13)?,
-            unix_mode: crate::file_index::decode_unix_mode_column(row.get(14)?),
-            xattrs: crate::file_index::decode_xattrs_column(&row.get::<_, String>(15)?).map_err(
+            record_kind: RecordKind::from_db_str(&row.get::<_, String>(10)?),
+            symlink_target: row.get(11)?,
+            symlink_out_of_root: row.get(12)?,
+            unix_mode: crate::file_index::decode_unix_mode_column(row.get(13)?),
+            xattrs: crate::file_index::decode_xattrs_column(&row.get::<_, String>(14)?).map_err(
                 |error| {
                     rusqlite::Error::FromSqlConversionFailure(
-                        15,
+                        14,
                         rusqlite::types::Type::Text,
                         Box::new(error),
                     )
@@ -566,9 +589,3 @@ pub(crate) fn restore_operation_from_row(
 /// either.
 #[cfg(test)]
 mod fence_lost_atomicity_tests;
-
-/// A restore authors its change long before it writes the bytes, and the
-/// path's materialized basis must not outlive that gap as if it were
-/// current.
-#[cfg(test)]
-mod basis_currency_tests;

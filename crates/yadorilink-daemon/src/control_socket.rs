@@ -29,19 +29,19 @@ use yadorilink_ipc_proto::daemonctl::{
     LatchGroupDurabilityUnknownResponse, LimitsSetResponse, LimitsShowResponse, LinkRequest,
     LinkResponse, LinkStatus, ListConflictsResponse, ListConnectionTracesResponse,
     ListInboxResponse, ListLinksResponse, ListQueueItemsResponse, ListRecoveryOperationsResponse,
-    ListTrashResponse, ListVersionsResponse, LocalStorageState,
-    MaterializationState as WireMaterializationState, MaterializationStatusResponse,
-    MembershipHandoffResult, MintInviteCommandResponse, MintedInviteInfo,
-    ObtainHandoffTicketResponse, PauseResponse, PeerStatus, PendingEnrollmentKind, PinResponse,
-    QueueItem, ReceiveTransferResponse, RecentSyncError, ReleaseHandoffTicketResponse,
-    RemoveDeviceCommandResponse, RemovePendingEnrollmentResponse, ReplicaMembershipCommandOutcome,
-    ReportingConsentState, ReportingStatusResponse, RequestHandoffLeaseResponse,
-    RestoreTrashOperationFailure, RestoreTrashOperationResponse, RestoreTrashResponse,
-    RestoreVersionResponse, ResumeResponse, RevokeDeviceCommandResponse, RevokeEdgeCommandResponse,
-    RewindActionCounts as WireRewindActionCounts, RewindPathEntry as WireRewindPathEntry,
-    RewindPreviewResponse, RewindRenameCandidate as WireRewindRenameCandidate, SendFileResponse,
-    SetStorageModeResponse, ShowQueueItemResponse, ShutdownResponse, StatusResponse, TaskLiveness,
-    TrashedFileInfo, UnlinkResponse, UnpinResponse, VolumeFreeSpace,
+    ListTrashResponse, ListVersionsResponse, LocalState as WireLocalState, LocalStorageState,
+    LocalTransition as WireLocalTransition, MaterializationStatusResponse, MembershipHandoffResult,
+    MintInviteCommandResponse, MintedInviteInfo, ObtainHandoffTicketResponse, PauseResponse,
+    PeerStatus, PendingEnrollmentKind, QueueItem, ReceiveTransferResponse, RecentSyncError,
+    ReleaseHandoffTicketResponse, RemoveDeviceCommandResponse, RemovePendingEnrollmentResponse,
+    ReplicaMembershipCommandOutcome, ReportingConsentState, ReportingStatusResponse,
+    RequestHandoffLeaseResponse, RestoreTrashOperationFailure, RestoreTrashOperationResponse,
+    RestoreTrashResponse, RestoreVersionResponse, ResumeResponse, RevokeDeviceCommandResponse,
+    RevokeEdgeCommandResponse, RewindActionCounts as WireRewindActionCounts,
+    RewindPathEntry as WireRewindPathEntry, RewindPreviewResponse,
+    RewindRenameCandidate as WireRewindRenameCandidate, SendFileResponse, SetStorageModeResponse,
+    ShowQueueItemResponse, ShutdownResponse, StatusResponse, TaskLiveness, TrashedFileInfo,
+    UnlinkResponse, VolumeFreeSpace,
 };
 use yadorilink_ipc_proto::framing::{read_message, write_message};
 #[cfg(windows)]
@@ -474,12 +474,70 @@ async fn handle_request(
             }
         }
 
+        // What a rebootstrap set aside: list it, restore a version as one ordinary write,
+        // discard an item.
+        Some(ReqPayload::ListPreserved(_)) => match context.application.preserved.list().await {
+            Ok(items) => {
+                RespPayload::ListPreserved(yadorilink_ipc_proto::daemonctl::ListPreservedResponse {
+                    items: items.into_iter().map(preserved_item_to_proto).collect(),
+                })
+            }
+            Err(e) => RespPayload::Error(e.to_string()),
+        },
+        Some(ReqPayload::RestorePreserved(r)) => {
+            match context.application.preserved.restore(r.group_id, r.item_id).await {
+                Ok(()) => RespPayload::RestorePreserved(
+                    yadorilink_ipc_proto::daemonctl::RestorePreservedResponse {},
+                ),
+                Err(e) => RespPayload::Error(e.to_string()),
+            }
+        }
+        Some(ReqPayload::RetryPreserved(r)) => {
+            match context.application.preserved.retry(r.group_id, r.item_id).await {
+                Ok(()) => RespPayload::RetryPreserved(
+                    yadorilink_ipc_proto::daemonctl::RetryPreservedResponse {},
+                ),
+                Err(e) => RespPayload::Error(e.to_string()),
+            }
+        }
+        Some(ReqPayload::DiscardPreserved(r)) => {
+            match context.application.preserved.discard(r.group_id, r.item_id).await {
+                Ok(()) => RespPayload::DiscardPreserved(
+                    yadorilink_ipc_proto::daemonctl::DiscardPreservedResponse {},
+                ),
+                Err(e) => RespPayload::Error(e.to_string()),
+            }
+        }
+
+        Some(ReqPayload::ListProviderPending(r)) => RespPayload::ListProviderPending(
+            yadorilink_ipc_proto::daemonctl::ListProviderPendingResponse {
+                items: context.provider_status.pending_items(r.limit),
+            },
+        ),
+
         Some(ReqPayload::Status(_)) => match context.queries.runtime_status.snapshot() {
             Ok(view) => {
                 let mut response = encode_runtime_status(view);
+                response.provider_roots = context.provider_status.snapshot();
+                (response.provider_removals, response.orphan_domains) =
+                    context.provider_status.extras();
                 let (overall_state, attention_reasons) = overall_status(&response);
                 response.overall_state = overall_state.as_str().to_string();
                 response.attention_reasons = attention_reasons;
+                let preserved = context.application.preserved.summary();
+                response.preserved = Some(yadorilink_ipc_proto::daemonctl::PreservedSummary {
+                    total: preserved.total,
+                    content_unavailable: preserved.content_unavailable,
+                    record_unavailable: preserved.record_unavailable,
+                    bytes: preserved.bytes,
+                    unreplayed_own_units: preserved.unreplayed_own_units,
+                    warn_bytes: preserved.warn_bytes,
+                    warn: preserved.warn,
+                });
+                response.rebootstrapping_groups =
+                    context.application.preserved.rebootstrapping_groups();
+                (response.undecided_uploads, response.undecided_uploads_oldest_ms) =
+                    context.application.preserved.undecided_uploads();
                 RespPayload::Status(response)
             }
             Err(e) => RespPayload::Error(e.to_string()),
@@ -519,28 +577,6 @@ async fn handle_request(
             None => RespPayload::Error("path is not under any linked folder".into()),
         },
 
-        Some(ReqPayload::Pin(r)) => match context.queries.linked_path.resolve(&r.absolute_path) {
-            Some((group_id, path)) => {
-                let application = context.application.clone();
-                match application.materialization.pin(&group_id, &path).await {
-                    Ok(()) => RespPayload::Pin(PinResponse {}),
-                    Err(e) => RespPayload::Error(e.to_string()),
-                }
-            }
-            None => RespPayload::Error("path is not under any linked folder".into()),
-        },
-
-        Some(ReqPayload::Unpin(r)) => match context.queries.linked_path.resolve(&r.absolute_path) {
-            Some((group_id, path)) => {
-                let application = context.application.clone();
-                match application.materialization.unpin(&group_id, &path).await {
-                    Ok(()) => RespPayload::Unpin(UnpinResponse {}),
-                    Err(e) => RespPayload::Error(e.to_string()),
-                }
-            }
-            None => RespPayload::Error("path is not under any linked folder".into()),
-        },
-
         Some(ReqPayload::Evict(r)) => match context.queries.linked_path.resolve(&r.absolute_path) {
             Some((group_id, path)) => {
                 let application = context.application.clone();
@@ -557,28 +593,39 @@ async fn handle_request(
         },
 
         Some(ReqPayload::MaterializationStatus(r)) => {
-            match context.queries.linked_path.resolve(&r.absolute_path) {
-                Some((group_id, path)) => {
-                    let application = context.application.clone();
-                    match application.materialization.status(&group_id, &path) {
-                        Ok(Some(status)) => {
-                            RespPayload::MaterializationStatus(MaterializationStatusResponse {
-                                known: true,
-                                state: materialization_state_to_proto(status.state) as i32,
-                                pinned: status.pinned,
-                            })
+            // A provider folder's items live in the OS's File Provider location, and the daemon
+            // does not track their local state per item: name that, rather than "not linked".
+            if context.queries.linked_path.resolve(&r.absolute_path).is_none()
+                && context.queries.linked_path.resolve_provider(&r.absolute_path).is_some()
+            {
+                RespPayload::Error(
+                    "this item is in a File Provider folder: the OS holds its local state. \
+                     `ls -lO <path>` shows `dataless` for an item that is not downloaded; \
+                     `yadorilink status` shows a folder's download progress"
+                        .into(),
+                )
+            } else {
+                match context.queries.linked_path.resolve(&r.absolute_path) {
+                    Some((group_id, path)) => {
+                        let application = context.application.clone();
+                        match application.materialization.status(&group_id, &path) {
+                            Ok(Some(status)) => {
+                                RespPayload::MaterializationStatus(MaterializationStatusResponse {
+                                    known: true,
+                                    local_state: Some(local_state_to_proto(status.state)),
+                                })
+                            }
+                            Ok(None) => {
+                                RespPayload::MaterializationStatus(MaterializationStatusResponse {
+                                    known: false,
+                                    local_state: None,
+                                })
+                            }
+                            Err(e) => RespPayload::Error(e.to_string()),
                         }
-                        Ok(None) => {
-                            RespPayload::MaterializationStatus(MaterializationStatusResponse {
-                                known: false,
-                                state: WireMaterializationState::Unspecified as i32,
-                                pinned: false,
-                            })
-                        }
-                        Err(e) => RespPayload::Error(e.to_string()),
                     }
+                    None => RespPayload::Error("path is not under any linked folder".into()),
                 }
-                None => RespPayload::Error("path is not under any linked folder".into()),
             }
         }
 
@@ -970,19 +1017,27 @@ async fn handle_request(
 
         Some(ReqPayload::CreateAndLinkCommand(r)) => {
             let application = context.application.clone();
-            let result = application
-                .enrollment
-                .create_and_link(crate::application::CreateAndLinkCommand {
-                    group_name: r.group_name,
-                    absolute_path: r.local_path.into(),
-                    on_demand: r.on_demand,
-                    acknowledge_risks: r.acknowledge_risks,
-                })
-                .await;
+            let refusal = provider_refusal(&r.provider_display_name);
+            let result = match refusal {
+                Some(detail) => {
+                    Err(crate::application::EnrollmentError::PreparationRejected { detail })
+                }
+                None => {
+                    application
+                        .enrollment
+                        .create_and_link(crate::application::CreateAndLinkCommand {
+                            group_name: r.group_name,
+                            absolute_path: r.local_path.into(),
+                            on_demand: r.on_demand,
+                            provider: provider_creation(&r.provider_display_name, &r.request_token),
+                        })
+                        .await
+                }
+            };
             RespPayload::CreateAndLinkCommand(CreateAndLinkCommandResponse {
                 result: Some(match result {
                     Ok(outcome) => create_and_link_command_response::Result::Outcome(
-                        enrollment_outcome_to_proto(outcome),
+                        enrollment_outcome_to_proto(context, outcome),
                     ),
                     Err(error) => create_and_link_command_response::Result::Error(
                         enrollment_error_to_proto(error),
@@ -993,20 +1048,28 @@ async fn handle_request(
 
         Some(ReqPayload::JoinAndLinkCommand(r)) => {
             let application = context.application.clone();
-            let result = application
-                .enrollment
-                .join_and_link(crate::application::JoinAndLinkCommand {
-                    group_id: r.group_id,
-                    group_name: r.group_name,
-                    absolute_path: r.local_path.into(),
-                    on_demand: r.on_demand,
-                    acknowledge_risks: r.acknowledge_risks,
-                })
-                .await;
+            let refusal = provider_refusal(&r.provider_display_name);
+            let result = match refusal {
+                Some(detail) => {
+                    Err(crate::application::EnrollmentError::PreparationRejected { detail })
+                }
+                None => {
+                    application
+                        .enrollment
+                        .join_and_link(crate::application::JoinAndLinkCommand {
+                            group_id: r.group_id,
+                            group_name: r.group_name,
+                            absolute_path: r.local_path.into(),
+                            on_demand: r.on_demand,
+                            provider: provider_creation(&r.provider_display_name, &r.request_token),
+                        })
+                        .await
+                }
+            };
             RespPayload::JoinAndLinkCommand(JoinAndLinkCommandResponse {
                 result: Some(match result {
                     Ok(outcome) => join_and_link_command_response::Result::Outcome(
-                        enrollment_outcome_to_proto(outcome),
+                        enrollment_outcome_to_proto(context, outcome),
                     ),
                     Err(error) => join_and_link_command_response::Result::Error(
                         enrollment_error_to_proto(error),
@@ -1023,13 +1086,12 @@ async fn handle_request(
                     code: r.code,
                     absolute_path: r.local_path.into(),
                     on_demand: r.on_demand,
-                    acknowledge_risks: r.acknowledge_risks,
                 })
                 .await;
             RespPayload::AcceptInviteCommand(AcceptInviteCommandResponse {
                 result: Some(match result {
                     Ok(outcome) => accept_invite_command_response::Result::Outcome(
-                        enrollment_outcome_to_proto(outcome),
+                        enrollment_outcome_to_proto(context, outcome),
                     ),
                     Err(error) => accept_invite_command_response::Result::Error(
                         enrollment_error_to_proto(error),
@@ -1206,10 +1268,52 @@ fn membership_error_to_proto(
     }
 }
 
+/// Why a provider folder cannot be created now, `None` when it can (or the request is not for one).
+/// Provider folders are a macOS feature behind the provider-roots switch; refused before anything is written.
+fn provider_refusal(display_name: &str) -> Option<String> {
+    if display_name.is_empty() {
+        return None;
+    }
+    if !cfg!(target_os = "macos") {
+        return Some("provider folders are not supported on this platform".to_string());
+    }
+    if !crate::provider_gate::provider_roots_enabled() {
+        return Some("provider folders are not enabled in this build".to_string());
+    }
+    None
+}
+
+/// The provider-folder part of a create/join request, `None` for a plain folder.
+fn provider_creation(
+    display_name: &str,
+    request_token: &str,
+) -> Option<crate::application::ProviderCreation> {
+    (!display_name.is_empty()).then(|| crate::application::ProviderCreation {
+        display_name: display_name.to_string(),
+        request_token: request_token.to_string(),
+    })
+}
+
 fn enrollment_outcome_to_proto(
+    context: &crate::control_context::ControlContext,
     outcome: crate::application::EnrollmentOutcome,
 ) -> EnrollmentCommandOutcome {
+    // The root of a provider folder: its link's key is the locator the outcome names.
+    let key = outcome.local_path.to_string_lossy().to_string();
+    let provider_root_id = context
+        .queries
+        .link_status
+        .list_links()
+        .ok()
+        .and_then(|views| {
+            views.into_iter().find_map(|v| match v.provider {
+                Some((root_id, _)) if v.local_path == key => Some(root_id),
+                _ => None,
+            })
+        })
+        .unwrap_or_default();
     EnrollmentCommandOutcome {
+        provider_root_id,
         operation_id: outcome.operation_id,
         group_id: outcome.group_id,
         local_path: outcome.local_path.to_string_lossy().to_string(),
@@ -1298,10 +1402,34 @@ fn decode_link_command(r: LinkRequest) -> Result<crate::application::LinkCommand
         local_path: r.local_path,
         group_id: r.group_id,
         on_demand: r.on_demand,
-        max_local_size_bytes: r.max_local_size_bytes,
-        acknowledge_risks: r.acknowledge_risks,
         pending_enrollment,
+        provider: None,
     })
+}
+
+fn preserved_item_to_proto(
+    item: crate::preserved_items::PreservedItem,
+) -> yadorilink_ipc_proto::daemonctl::PreservedItem {
+    use crate::preserved_items::PreservedKind;
+    yadorilink_ipc_proto::daemonctl::PreservedItem {
+        kind: match item.kind {
+            PreservedKind::RemoteOnly => "remote_only",
+            PreservedKind::BeyondClosureCutoff => "beyond_closure_cutoff",
+            PreservedKind::OwnUnit => "own_unit",
+        }
+        .to_owned(),
+        group_id: item.group_id,
+        group_removed: item.group_removed,
+        item_id: item.item_id,
+        path: item.path,
+        paths: item.paths,
+        content: item.content,
+        size: item.size,
+        blocks_held: item.blocks_held,
+        blocks_total: item.blocks_total,
+        recovery_id: item.recovery_id,
+        originals_quarantined: item.originals_quarantined,
+    }
 }
 
 /// `RewindPreview` (daemon) -> `RewindPreviewResponse` (proto).
@@ -1465,7 +1593,6 @@ fn conflicted_file_view_to_proto(
                 yadorilink_ipc_proto::daemonctl::ConflictReason::FolderAtPath
             }
         } as i32,
-        holds_compaction: view.holds_compaction,
     }
 }
 
@@ -1507,15 +1634,16 @@ fn reachability_to_proto(
     }
 }
 
-fn materialization_state_to_proto(
-    state: crate::application::ports::MaterializationStateSummary,
-) -> WireMaterializationState {
-    use crate::application::ports::MaterializationStateSummary as Daemon;
-    match state {
-        Daemon::Hydrated => WireMaterializationState::Hydrated,
-        Daemon::Placeholder => WireMaterializationState::Placeholder,
-        Daemon::Hydrating => WireMaterializationState::Hydrating,
-        Daemon::Evicting => WireMaterializationState::Evicting,
+fn local_state_to_proto(state: crate::application::ports::LocalPresence) -> WireLocalState {
+    use crate::application::ports::LocalTransition as Daemon;
+    WireLocalState {
+        local_object_present: state.object_present,
+        current_content_present: state.current_content_present,
+        transition: match state.transition {
+            Daemon::None => WireLocalTransition::None,
+            Daemon::Hydrating => WireLocalTransition::Hydrating,
+            Daemon::Evicting => WireLocalTransition::Evicting,
+        } as i32,
     }
 }
 
@@ -1665,6 +1793,13 @@ fn encode_runtime_status(
         recent_errors,
         overall_state: String::new(),
         attention_reasons: Vec::new(),
+        preserved: None,
+        rebootstrapping_groups: Vec::new(),
+        undecided_uploads: 0,
+        undecided_uploads_oldest_ms: 0,
+        provider_roots: Vec::new(),
+        provider_removals: Vec::new(),
+        orphan_domains: Vec::new(),
     }
 }
 
@@ -1684,7 +1819,10 @@ pub(crate) fn encode_link_status(view: crate::queries::link_status::LinkStatusVi
     let held_file_count = held_files.len() as u64;
     let durability_status = durability_status_to_proto(view.durability_status);
     let durability_evidence = durability_evidence_to_proto(view.durability_evidence);
+    let (provider_root_id, provider_display_name) = view.provider.unwrap_or_default();
     LinkStatus {
+        provider_root_id,
+        provider_display_name,
         local_path: view.local_path,
         group_id: view.group_id,
         paused: view.paused,
@@ -1709,6 +1847,7 @@ pub(crate) fn encode_link_status(view: crate::queries::link_status::LinkStatusVi
         transfer_eta_seconds: view.transfer.and_then(|t| t.eta_seconds).unwrap_or(0),
         durability_status: durability_status as i32,
         durability_evidence: durability_evidence as i32,
+        durability_check_pending: view.durability_check_pending,
         policy_stale: view.policy_stale,
         // A folder group linked at more than one folder refuses to sync
         // entirely (each folder's scan would delete the other's files on
@@ -1786,6 +1925,11 @@ impl OverallState {
 /// message," and an earlier version of this function never read those
 /// two fields at all -- a group with zero durable copies anywhere
 /// (`AtRisk`) could read `Overall: healthy`.
+#[cfg(test)]
+pub(crate) fn attention_reasons_for_tests(response: &StatusResponse) -> Vec<String> {
+    overall_status(response).1
+}
+
 fn overall_status(response: &StatusResponse) -> (OverallState, Vec<String>) {
     use yadorilink_ipc_proto::daemonctl::{FetchAvailability, GroupDurabilityStatus};
 
@@ -1796,10 +1940,18 @@ fn overall_status(response: &StatusResponse) -> (OverallState, Vec<String>) {
         if link.degraded {
             degraded_reasons.push(format!("degraded:{}", link.group_id));
         }
+        // A group linked at several folders syncs nothing at all, which is not
+        // something a rollup may call healthy next to the `NOT SYNCING` detail.
+        if link.ambiguous {
+            degraded_reasons.push(format!("ambiguous:{}", link.group_id));
+        }
         match link.durability_status() {
             GroupDurabilityStatus::AtRisk => {
                 degraded_reasons.push(format!("durability_at_risk:{}", link.group_id));
             }
+            // Not asked yet is "checking" (see `LinkStatus.durability_check_pending`):
+            // transient, and nothing a user could act on.
+            GroupDurabilityStatus::Unknown if link.durability_check_pending => {}
             GroupDurabilityStatus::Unknown | GroupDurabilityStatus::Unspecified => {
                 attention_reasons.push(format!("durability_unknown:{}", link.group_id));
             }
@@ -1820,6 +1972,22 @@ fn overall_status(response: &StatusResponse) -> (OverallState, Vec<String>) {
         if link.held_file_count > 0 {
             attention_reasons.push(format!("held:{}", link.group_id));
         }
+    }
+    for root in &response.provider_roots {
+        // A provider folder the user can act on: not ready (enable File Provider, an error), files
+        // that keep failing to download, edits kept beside a file waiting to be merged.
+        if root.readiness != "ready" && root.readiness != "preparing the folder" {
+            attention_reasons.push(format!("provider_not_ready:{}", root.root_id));
+        }
+        if !root.stuck.is_empty() {
+            attention_reasons.push(format!("provider_stuck:{}", root.root_id));
+        }
+        if root.kept_edits > 0 {
+            attention_reasons.push(format!("kept_edits:{}", root.root_id));
+        }
+    }
+    for orphan in &response.orphan_domains {
+        attention_reasons.push(format!("provider_orphan_domain:{orphan}"));
     }
     for volume in &response.volumes {
         match volume.state.as_str() {

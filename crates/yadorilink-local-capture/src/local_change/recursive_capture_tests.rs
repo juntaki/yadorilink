@@ -14,47 +14,41 @@ use super::directory_capture::{
 };
 use super::*;
 use yadorilink_filesystem_sync::debounce::DebounceFlush;
-use yadorilink_replica_domain::change::Change;
 use yadorilink_replica_domain::recursive_operation::{
-    EffectSetHash, RecursiveOperationKind, RecursiveOperationRef,
+    RecursiveOperationKind, RecursiveOperationRef,
 };
-use yadorilink_sync_sqlite::dag_store::RecursiveOperationCompleteness;
+use yadorilink_replica_domain::signed_delta::NativeDelta as Change;
+use yadorilink_sync_sqlite::native_recursive_operation::NativeOperationCompleteness;
 
 /// The part size capture cuts a recursive operation into.
 const PART_OP_LIMIT: usize = 256;
 
 fn changes(state: &TestReplica) -> Vec<Change> {
-    state.change_history_repository().dag_list_group_changes(GROUP).unwrap()
+    crate::test_support::native_deltas(state, GROUP)
 }
 
-/// Every change carrying a recursive-operation part, in part order.
+/// Every delta carrying a recursive-operation part, in part order.
 fn parts(state: &TestReplica) -> Vec<Change> {
     let mut parts: Vec<Change> =
-        changes(state).into_iter().filter(|c| c.recursive_operation.is_some()).collect();
-    parts.sort_by_key(|c| c.recursive_operation.as_ref().unwrap().part_index);
+        changes(state).into_iter().filter(|c| c.recursive_part.is_some()).collect();
+    parts.sort_by_key(|c| c.recursive_part.unwrap().part_index);
     parts
 }
 
-/// The paths each op kind of `parts` acts on: `delete` and `put`.
+/// The paths the parts remove (`delete`) and put (`put`).
 fn effect_paths(parts: &[Change]) -> BTreeMap<&'static str, BTreeSet<String>> {
     let mut out: BTreeMap<&'static str, BTreeSet<String>> = BTreeMap::new();
     for part in parts {
         for op in &part.ops {
-            match op {
-                Op::Delete { path } => {
-                    assert!(
-                        out.entry("delete").or_default().insert(path.as_str().to_string()),
-                        "{path:?} deleted twice"
-                    );
-                }
-                Op::Put { path, .. } => {
-                    assert!(
-                        out.entry("put").or_default().insert(path.as_str().to_string()),
-                        "{path:?} put twice"
-                    );
-                }
-                Op::Move { .. } => panic!("a recursive operation is authored as deletes and puts"),
-            }
+            let (kind, what) = match &op.put {
+                Some(_) => ("put", "put"),
+                None => ("delete", "deleted"),
+            };
+            assert!(
+                out.entry(kind).or_default().insert(op.path.as_str().to_string()),
+                "{:?} {what} twice",
+                op.path
+            );
         }
     }
     out
@@ -64,30 +58,39 @@ fn set(paths: &[&str]) -> BTreeSet<String> {
     paths.iter().map(|p| p.to_string()).collect()
 }
 
-/// Asserts `parts` are all the parts of one operation of `kind`, complete
-/// here, and returns its reference.
+/// Asserts `parts` are all the parts of one operation, complete here, and
+/// returns its reference. Native does not record whether the operation was a
+/// delete or a rename; `_kind` documents what the test authored.
 fn assert_one_complete_operation(
     state: &TestReplica,
     parts: &[Change],
-    kind: RecursiveOperationKind,
+    _kind: RecursiveOperationKind,
 ) -> RecursiveOperationRef {
     assert!(!parts.is_empty(), "no recursive-operation part was authored");
-    let first = parts[0].recursive_operation.clone().unwrap();
-    assert_eq!(first.kind, kind);
+    let first = parts[0].recursive_part.unwrap();
     assert_eq!(first.part_count as usize, parts.len(), "every part is here");
     for (index, part) in parts.iter().enumerate() {
-        let descriptor = part.recursive_operation.as_ref().unwrap();
+        let descriptor = part.recursive_part.unwrap();
         assert_eq!(descriptor.part_index as usize, index);
-        assert_eq!(descriptor.descriptor(), first.descriptor(), "parts disagree");
+        assert_eq!(
+            (descriptor.operation_id, descriptor.part_count),
+            (first.operation_id, first.part_count),
+            "parts disagree"
+        );
     }
-    let all_ops: Vec<Op> = parts.iter().flat_map(|p| p.ops.iter().cloned()).collect();
-    assert_eq!(EffectSetHash::of_effects(&all_ops), first.effect_set_hash);
     let operation = RecursiveOperationRef {
-        author: parts[0].device_id.clone(),
+        author: parts[0].author.device.clone(),
         operation_id: first.operation_id,
     };
-    let recorded = state.sqlite().dag_recursive_operation(GROUP, &operation).unwrap().unwrap();
-    assert_eq!(recorded.completeness(), RecursiveOperationCompleteness::Complete);
+    let completeness = state
+        .database()
+        .read::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+            yadorilink_sync_sqlite::native_recursive_operation::completeness(
+                conn, GROUP, &operation,
+            )
+        })
+        .unwrap();
+    assert_eq!(completeness, NativeOperationCompleteness::Complete);
     operation
 }
 
@@ -101,9 +104,9 @@ async fn flush(proc: &LocalChangeProcessor, root: &Path, paths: &[(&str, FsChang
     .unwrap();
 }
 
-/// `rm -rf d` over more entries than one part carries: one point delete
-/// per observed explicit entry, `d` included, cut into ceil(n / limit)
-/// parts of one operation.
+/// `rm -rf d` over more entries than one part carries, deleting exactly
+/// every head under `d`: one operation cut into ceil(n / limit) parts, each
+/// naming the operation, which together remove every observed entry once.
 #[test]
 fn rm_rf_emits_point_deletes_for_observed_set_in_ceil_chunks() {
     let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
@@ -124,24 +127,26 @@ fn rm_rf_emits_point_deletes_for_observed_set_in_ceil_chunks() {
         &proc,
         &root,
         &root.join("d"),
-        FsChangeKind::Removed,
+        FsChangeKind::ObservedRemoval,
     ));
 
     let parts = parts(&state);
-    assert_eq!(parts.len(), expected.len().div_ceil(PART_OP_LIMIT));
-    assert!(parts.iter().all(|p| p.ops.len() <= PART_OP_LIMIT));
+    assert!(expected.len() > PART_OP_LIMIT, "the entries need more than one part");
+    assert_eq!(parts.len(), expected.len().div_ceil(PART_OP_LIMIT), "ceil(n / limit) parts");
+    assert_eq!(
+        effect_paths(&parts).get("delete"),
+        Some(&expected.iter().cloned().collect::<BTreeSet<_>>()),
+        "every entry is removed exactly once"
+    );
     assert_one_complete_operation(
         &state,
         &parts,
         RecursiveOperationKind::RmTree { root: SyncPath("d".into()) },
     );
-    let effects = effect_paths(&parts);
-    assert_eq!(effects.get("delete"), Some(&expected.iter().cloned().collect()));
-    assert_eq!(effects.get("put"), None);
-    // No delete of the tree was authored outside the operation.
+    // No removal of the tree was authored outside the operation.
     for change in changes(&state) {
-        if change.recursive_operation.is_none() {
-            assert!(!change.ops.iter().any(|op| matches!(op, Op::Delete { .. })));
+        if change.recursive_part.is_none() {
+            assert!(change.ops.iter().all(|op| op.put.is_some()));
         }
     }
     for rel in &expected {
@@ -149,9 +154,8 @@ fn rm_rf_emits_point_deletes_for_observed_set_in_ceil_chunks() {
     }
 }
 
-/// Every entry in the tree was authored by a change of its own; the
-/// operation's parts consume every one of them, so nothing but the parts
-/// is left a head.
+/// Every entry in the tree was put by a delta of its own; the operation's
+/// parts remove every one of them, so no head of the tree is left.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rm_rf_multi_op_change_parents_cover_every_touched_basis() {
     let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
@@ -167,7 +171,7 @@ async fn rm_rf_multi_op_change_parents_cover_every_touched_basis() {
     }
 
     std::fs::remove_dir_all(root.join("d")).unwrap();
-    event(&proc, &root, &root.join("d"), FsChangeKind::Removed).await;
+    event(&proc, &root, &root.join("d"), FsChangeKind::ObservedRemoval).await;
 
     let parts = parts(&state);
     assert_one_complete_operation(
@@ -175,23 +179,17 @@ async fn rm_rf_multi_op_change_parents_cover_every_touched_basis() {
         &parts,
         RecursiveOperationKind::RmTree { root: SyncPath("d".into()) },
     );
-    let part_hashes: BTreeSet<_> = parts.iter().map(|p| p.compute_hash()).collect();
-    let heads: BTreeSet<_> = state.sqlite().dag_group_heads(GROUP).unwrap().into_iter().collect();
-    for change in changes(&state) {
-        let touches_tree = change.ops.iter().any(|op| match op {
-            Op::Put { path, .. } | Op::Delete { path } => {
-                path.as_str() == "d" || path.as_str().starts_with("d/")
-            }
-            Op::Move { .. } => true,
-        });
-        let hash = change.compute_hash();
-        if touches_tree && !part_hashes.contains(&hash) {
-            assert!(
-                !heads.contains(&hash),
-                "a version the delete observed is still a head beside it: {change:?}"
-            );
-        }
+    for rel in ["d", "d/e", "d/a", "d/b", "d/e/c"] {
+        assert!(
+            crate::test_support::native_path_head_provenances(&state, GROUP, rel).is_empty(),
+            "a version the delete observed is still a head at {rel}"
+        );
     }
+    assert_eq!(
+        crate::test_support::native_path_head_provenances(&state, GROUP, "outside").len(),
+        1,
+        "a path outside the tree is untouched"
+    );
 }
 
 /// The children's own `Removed` events and their directory's arrive in one
@@ -214,9 +212,9 @@ async fn a_directory_and_its_children_removed_in_one_flush_are_one_operation() {
         &proc,
         &root,
         &[
-            ("a/x", FsChangeKind::Removed),
-            ("a/y", FsChangeKind::Removed),
-            ("a", FsChangeKind::Removed),
+            ("a/x", FsChangeKind::ObservedRemoval),
+            ("a/y", FsChangeKind::ObservedRemoval),
+            ("a", FsChangeKind::ObservedRemoval),
         ],
     )
     .await;
@@ -256,8 +254,12 @@ async fn rename_of_explicit_directory_is_one_recursive_rename_operation() {
     }
 
     std::fs::rename(root.join("d"), root.join("e")).unwrap();
-    flush(&proc, &root, &[("d", FsChangeKind::Removed), ("e", FsChangeKind::CreatedOrModified)])
-        .await;
+    flush(
+        &proc,
+        &root,
+        &[("d", FsChangeKind::ObservedRemoval), ("e", FsChangeKind::CreatedOrModified)],
+    )
+    .await;
 
     let parts = parts(&state);
     assert_one_complete_operation(
@@ -321,8 +323,12 @@ async fn rename_of_structural_directory_does_not_promote_destination() {
     event(&proc, &root, &root.join("s/f.txt"), FsChangeKind::CreatedOrModified).await;
 
     std::fs::rename(root.join("s"), root.join("t")).unwrap();
-    flush(&proc, &root, &[("s", FsChangeKind::Removed), ("t", FsChangeKind::CreatedOrModified)])
-        .await;
+    flush(
+        &proc,
+        &root,
+        &[("s", FsChangeKind::ObservedRemoval), ("t", FsChangeKind::CreatedOrModified)],
+    )
+    .await;
 
     let parts = parts(&state);
     assert_one_complete_operation(
@@ -357,8 +363,12 @@ async fn rename_directory_vs_concurrent_child_keeps_child_in_old_namespace() {
     }
 
     std::fs::rename(root.join("d"), root.join("e")).unwrap();
-    flush(&proc, &root, &[("d", FsChangeKind::Removed), ("e", FsChangeKind::CreatedOrModified)])
-        .await;
+    flush(
+        &proc,
+        &root,
+        &[("d", FsChangeKind::ObservedRemoval), ("e", FsChangeKind::CreatedOrModified)],
+    )
+    .await;
 
     let effects = effect_paths(&parts(&state));
     assert_eq!(effects.get("delete"), Some(&set(&["d", "d/f.txt"])));
@@ -433,7 +443,7 @@ async fn a_virtual_filesystem_delete_of_a_structural_folder_expands_to_point_del
     }
 
     std::fs::remove_dir_all(root.join("s")).unwrap();
-    event(&proc, &root, &root.join("s"), FsChangeKind::Removed).await;
+    event(&proc, &root, &root.join("s"), FsChangeKind::ObservedRemoval).await;
 
     let parts = parts(&state);
     assert_one_complete_operation(
@@ -462,8 +472,12 @@ async fn a_rename_does_not_author_an_entry_at_an_ignored_new_name() {
 
     std::fs::write(root.join(".yadorilinkignore"), b"e/secret.txt\n").unwrap();
     std::fs::rename(root.join("d"), root.join("e")).unwrap();
-    flush(&proc, &root, &[("d", FsChangeKind::Removed), ("e", FsChangeKind::CreatedOrModified)])
-        .await;
+    flush(
+        &proc,
+        &root,
+        &[("d", FsChangeKind::ObservedRemoval), ("e", FsChangeKind::CreatedOrModified)],
+    )
+    .await;
 
     let effects = effect_paths(&parts(&state));
     assert_eq!(effects.get("delete"), Some(&set(&["d", "d/kept.txt", "d/secret.txt"])));
@@ -491,15 +505,19 @@ async fn an_rm_rf_split_across_flushes_is_still_one_operation() {
     }
 
     std::fs::remove_dir_all(root.join("a")).unwrap();
-    flush(&proc, &root, &[("a/x", FsChangeKind::Removed), ("a/sub/z", FsChangeKind::Removed)])
-        .await;
+    flush(
+        &proc,
+        &root,
+        &[("a/x", FsChangeKind::ObservedRemoval), ("a/sub/z", FsChangeKind::ObservedRemoval)],
+    )
+    .await;
     flush(
         &proc,
         &root,
         &[
-            ("a/y", FsChangeKind::Removed),
-            ("a/sub", FsChangeKind::Removed),
-            ("a", FsChangeKind::Removed),
+            ("a/y", FsChangeKind::ObservedRemoval),
+            ("a/sub", FsChangeKind::ObservedRemoval),
+            ("a", FsChangeKind::ObservedRemoval),
         ],
     )
     .await;
@@ -515,9 +533,9 @@ async fn an_rm_rf_split_across_flushes_is_still_one_operation() {
         Some(&set(&["a", "a/sub", "a/x", "a/y", "a/sub/z"]))
     );
     for change in changes(&state) {
-        if change.recursive_operation.is_none() {
+        if change.recursive_part.is_none() {
             assert!(
-                !change.ops.iter().any(|op| matches!(op, Op::Delete { .. })),
+                change.ops.iter().all(|op| op.put.is_some()),
                 "a delete of the tree was authored outside the operation: {change:?}"
             );
         }
@@ -551,28 +569,91 @@ async fn an_offline_folder_delete_is_one_recursive_operation() {
     let parts = parts(&state);
     let mut by_operation: BTreeMap<[u8; 16], Vec<Change>> = BTreeMap::new();
     for part in parts {
-        by_operation
-            .entry(part.recursive_operation.as_ref().unwrap().operation_id.0)
-            .or_default()
-            .push(part);
+        by_operation.entry(part.recursive_part.unwrap().operation_id.0).or_default().push(part);
     }
-    let mut roots = BTreeMap::new();
+    let mut removed = BTreeSet::new();
     for operation in by_operation.values() {
-        let kind = operation[0].recursive_operation.as_ref().unwrap().kind.clone();
-        assert_one_complete_operation(&state, operation, kind.clone());
-        let RecursiveOperationKind::RmTree { root } = kind else { panic!("{kind:?}") };
-        roots.insert(root.as_str().to_string(), effect_paths(operation).get("delete").cloned());
+        // Native does not record the operation's root; the set it removed
+        // tells the two folders apart.
+        assert_one_complete_operation(
+            &state,
+            operation,
+            RecursiveOperationKind::RmTree { root: SyncPath(String::new()) },
+        );
+        removed.insert(effect_paths(operation).get("delete").cloned().unwrap());
     }
-    assert_eq!(
-        roots,
-        BTreeMap::from([
-            ("a".to_string(), Some(set(&["a", "a/sub", "a/x", "a/sub/y"]))),
-            ("s".to_string(), Some(set(&["s/z"]))),
-        ])
-    );
+    assert_eq!(removed, BTreeSet::from([set(&["a", "a/sub", "a/x", "a/sub/y"]), set(&["s/z"])]));
     assert_eq!(ops_at(&state, "loose"), ["put-file", "delete"]);
     assert_eq!(live_kind(&state, "a/sub/y"), None);
     assert_eq!(live_kind(&state, "s/z"), None);
+}
+
+/// An offline folder removal acts on what its pass read: the content each row
+/// displayed. A peer's head that replaced the captured heads of one of its
+/// paths while the pass ran is a version the removal never saw, and its
+/// admission owes the path a projection: the removal withholds that path (it
+/// is not eligible for a tombstone while a projection is owed), removes the
+/// rest, and leaves the peer's head live to be projected again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "the scan-hook slot guard serializes the tests sharing the process-wide \
+              scan hook; holding it across awaits is the point"
+)]
+async fn an_offline_folder_delete_withholds_a_path_a_peer_head_replaced_meanwhile() {
+    let _hook_slot = hold_scan_hook_slot();
+    let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
+    let root = canonical_root(&root_dir);
+    adopt_root(&state, GROUP, &root);
+    std::fs::create_dir(root.join("r")).unwrap();
+    for rel in ["r/x", "r/y"] {
+        std::fs::write(root.join(rel), rel.as_bytes()).unwrap();
+    }
+    for rel in ["r", "r/x", "r/y"] {
+        event(&proc, &root, &root.join(rel), FsChangeKind::CreatedOrModified).await;
+    }
+
+    std::fs::remove_dir_all(root.join("r")).unwrap();
+    let peer_version = yadorilink_replica_domain::ids::VersionHash([9; 32]);
+    {
+        let hook_state = Arc::clone(&state);
+        scan_test_hooks::set_pre_chunk_commit_recheck_hook(Some(Arc::new(
+            move |gid: &str, path: &str| {
+                if gid == GROUP && path == "r/x" {
+                    use yadorilink_daemon::test_support::remote_admission_fixture as peer;
+                    peer::admit_remote_superseding_put(
+                        &hook_state,
+                        GROUP,
+                        "device-b",
+                        "r/x",
+                        peer_version,
+                    );
+                }
+            },
+        )));
+    }
+    let records = proc.scan_existing_files(GROUP, &root);
+    scan_test_hooks::set_pre_chunk_commit_recheck_hook(None);
+    let records = records.unwrap();
+
+    assert!(
+        !records.iter().any(|r| r.path == "r/x"),
+        "a path with a projection owed is not tombstoned: {records:?}"
+    );
+    // The row stays: the owed projection decides what the path becomes.
+    assert!(live_kind(&state, "r/x").is_some());
+    // The removal never saw the peer's head: it is still native's head there.
+    let now = state.file_index_repository().native_capture_witness(GROUP, "r/x").unwrap();
+    assert_eq!(now.shown_head.map(|head| head.payload.version), Some(peer_version));
+    let parts = parts(&state);
+    assert_one_complete_operation(
+        &state,
+        &parts,
+        RecursiveOperationKind::RmTree { root: SyncPath("r".into()) },
+    );
+    // The removal never touched `r/x`: the operation removes the rest and the
+    // peer's head stays.
+    assert_eq!(effect_paths(&parts).get("delete"), Some(&set(&["r", "r/y"])));
 }
 
 /// A rename writes its new paths, `to` itself included, so it takes their
@@ -593,7 +674,7 @@ async fn a_directory_rename_waits_for_the_destination_lock() {
         flush(
             &proc,
             &root,
-            &[("a", FsChangeKind::Removed), ("b", FsChangeKind::CreatedOrModified)],
+            &[("a", FsChangeKind::ObservedRemoval), ("b", FsChangeKind::CreatedOrModified)],
         ),
     )
     .await;
@@ -601,8 +682,12 @@ async fn a_directory_rename_waits_for_the_destination_lock() {
     assert_eq!(ops_at(&state, "b"), Vec::<String>::new());
 
     drop(held);
-    flush(&proc, &root, &[("a", FsChangeKind::Removed), ("b", FsChangeKind::CreatedOrModified)])
-        .await;
+    flush(
+        &proc,
+        &root,
+        &[("a", FsChangeKind::ObservedRemoval), ("b", FsChangeKind::CreatedOrModified)],
+    )
+    .await;
     assert_eq!(effect_paths(&parts(&state)).get("put"), Some(&set(&["b"])));
 }
 
@@ -637,7 +722,7 @@ async fn a_directory_rename_takes_its_locks_in_canonical_order() {
         flush(
             &proc,
             &root,
-            &[("zeta", FsChangeKind::Removed), ("alpha", FsChangeKind::CreatedOrModified)],
+            &[("zeta", FsChangeKind::ObservedRemoval), ("alpha", FsChangeKind::CreatedOrModified)],
         ),
     )
     .await;
@@ -672,7 +757,7 @@ async fn a_directory_over_a_held_file_row_does_not_replace_it() {
         .unwrap();
     state
         .materialization_state_repository()
-        .set_materialization_state(GROUP, "a", MaterializationState::Placeholder, &permit)
+        .set_materialization_state(GROUP, "a", MaterializationState::Remote, &permit)
         .unwrap();
     state.materialization_state_repository().set_held(GROUP, "a", "case_collision", 0).unwrap();
 
@@ -681,4 +766,153 @@ async fn a_directory_over_a_held_file_row_does_not_replace_it() {
 
     assert_eq!(ops_at(&state, "a"), Vec::<String>::new());
     assert_eq!(live_kind(&state, "a"), Some(RecordKind::File));
+}
+
+/// The lock registry keys every path by its case/normalization fold, so
+/// `Photos` and `photos` are one lock. A rename that only changes case
+/// listed both names and took that lock twice, waiting on itself forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_case_only_directory_rename_takes_each_lock_once() {
+    let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
+    let root = canonical_root(&root_dir);
+    adopt_root(&state, GROUP, &root);
+    std::fs::create_dir(root.join("Photos")).unwrap();
+    std::fs::write(root.join("Photos/a.txt"), b"a").unwrap();
+    for rel in ["Photos", "Photos/a.txt"] {
+        event(&proc, &root, &root.join(rel), FsChangeKind::CreatedOrModified).await;
+    }
+
+    let locked = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        proc.lock_observed_subtree(
+            GROUP,
+            &root,
+            "Photos",
+            &[],
+            Some("photos"),
+            super::semantic_delete::Removal::Observed,
+        ),
+    )
+    .await
+    .expect("locking the observed subtree waited on a lock it already held");
+
+    assert!(locked.is_ok());
+}
+
+/// Locks are taken in the order of their keys, the fold, so another holder
+/// that orders by the same key cannot form a cycle with this one. Ordered by
+/// the raw strings, `Zeta.txt` (upper case sorts first) would come before
+/// `alpha.txt`, which folds first; a holder of `alpha.txt` waiting for
+/// `Zeta.txt` then deadlocks against it.
+#[test]
+fn path_locks_are_taken_in_fold_order_and_once_per_lock() {
+    assert_eq!(
+        super::flush::path_lock_order(["Zeta.txt", "alpha.txt", "Alpha.TXT", "beta/B"]),
+        ["alpha.txt", "beta/B", "Zeta.txt"],
+        "ordered by fold, and the case variant of `alpha.txt` is the same lock"
+    );
+    assert_eq!(super::flush::path_lock_order(["Photos", "photos"]), ["Photos"]);
+}
+
+/// Provider items follow the semantic rename in the SAME transaction: the renamed
+/// directory's item and its descendants' items keep their ids, the parent index moves
+/// with them, and a sibling that merely shares the name prefix is untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_directory_rename_keeps_provider_item_ids_and_moves_the_parent_index() {
+    let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
+    let root = canonical_root(&root_dir);
+    adopt_root(&state, GROUP, &root);
+    std::fs::create_dir_all(root.join("d/sub")).unwrap();
+    std::fs::create_dir_all(root.join("dd")).unwrap();
+    std::fs::write(root.join("d/f.txt"), b"moved").unwrap();
+    std::fs::write(root.join("dd/g.txt"), b"stays").unwrap();
+    for rel in ["d", "d/sub", "d/f.txt", "dd", "dd/g.txt"] {
+        event(&proc, &root, &root.join(rel), FsChangeKind::CreatedOrModified).await;
+    }
+    let provider = state.provider_repository();
+    let root_id = provider.declare_state_only_for_tests(GROUP, "Docs").unwrap();
+    let id = |path: &str| provider.mint_item(&root_id, path).unwrap();
+    let (d, sub, file, sibling) = (id("d"), id("d/sub"), id("d/f.txt"), id("dd/g.txt"));
+
+    std::fs::rename(root.join("d"), root.join("e")).unwrap();
+    flush(
+        &proc,
+        &root,
+        &[("d", FsChangeKind::ObservedRemoval), ("e", FsChangeKind::CreatedOrModified)],
+    )
+    .await;
+
+    assert_eq!(
+        provider.item_for_path(&root_id, "e").unwrap(),
+        Some(d),
+        "the directory's id changed"
+    );
+    assert_eq!(provider.item_for_path(&root_id, "e/sub").unwrap(), Some(sub));
+    assert_eq!(provider.item_for_path(&root_id, "e/f.txt").unwrap(), Some(file));
+    assert_eq!(provider.item_for_path(&root_id, "d").unwrap(), None);
+    assert_eq!(provider.item_for_path(&root_id, "dd/g.txt").unwrap(), Some(sibling));
+    let below_e: Vec<String> =
+        provider.list_children(&root_id, "e").unwrap().into_iter().map(|(n, _)| n).collect();
+    assert_eq!(below_e, ["f.txt", "sub"], "the parent index did not follow the rename");
+    assert!(provider.list_children(&root_id, "d").unwrap().is_empty());
+}
+
+/// A recursive delete retires the items below it in the same transaction as the
+/// tombstones, so the parent index never lists a deleted child.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_recursive_delete_retires_provider_items_with_the_tombstones() {
+    let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
+    let root = canonical_root(&root_dir);
+    adopt_root(&state, GROUP, &root);
+    std::fs::create_dir_all(root.join("d")).unwrap();
+    std::fs::write(root.join("d/f.txt"), b"x").unwrap();
+    std::fs::write(root.join("keep.txt"), b"y").unwrap();
+    for rel in ["d", "d/f.txt", "keep.txt"] {
+        event(&proc, &root, &root.join(rel), FsChangeKind::CreatedOrModified).await;
+    }
+    let provider = state.provider_repository();
+    let root_id = provider.declare_state_only_for_tests(GROUP, "Docs").unwrap();
+    let doomed = provider.mint_item(&root_id, "d/f.txt").unwrap();
+    let kept = provider.mint_item(&root_id, "keep.txt").unwrap();
+
+    std::fs::remove_dir_all(root.join("d")).unwrap();
+    flush(&proc, &root, &[("d", FsChangeKind::ObservedRemoval)]).await;
+
+    assert_eq!(provider.path_for_item(&root_id, &doomed).unwrap(), Some(("d/f.txt".into(), false)));
+    assert!(provider.list_children(&root_id, "d").unwrap().is_empty());
+    assert_eq!(provider.item_for_path(&root_id, "keep.txt").unwrap(), Some(kept));
+}
+
+/// An ordinary edit goes through the REAL version-replacement write path (the current row
+/// is superseded, then the new one inserted) and must keep the item's id; a delete retires
+/// it and a recreated file is a new item.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_edit_keeps_the_provider_item_id_and_a_delete_then_create_mints_a_new_one() {
+    let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
+    let root = canonical_root(&root_dir);
+    adopt_root(&state, GROUP, &root);
+    std::fs::write(root.join("f.txt"), b"one").unwrap();
+    event(&proc, &root, &root.join("f.txt"), FsChangeKind::CreatedOrModified).await;
+    let provider = state.provider_repository();
+    let root_id = provider.declare_state_only_for_tests(GROUP, "Docs").unwrap();
+    let id = provider.mint_item(&root_id, "f.txt").unwrap();
+
+    for body in [&b"two"[..], b"three, longer"] {
+        std::fs::write(root.join("f.txt"), body).unwrap();
+        event(&proc, &root, &root.join("f.txt"), FsChangeKind::CreatedOrModified).await;
+        assert_eq!(
+            provider.item_for_path(&root_id, "f.txt").unwrap(),
+            Some(id),
+            "an edit retired the item"
+        );
+    }
+
+    std::fs::remove_file(root.join("f.txt")).unwrap();
+    event(&proc, &root, &root.join("f.txt"), FsChangeKind::ObservedRemoval).await;
+    assert_eq!(provider.item_for_path(&root_id, "f.txt").unwrap(), None);
+
+    std::fs::write(root.join("f.txt"), b"again").unwrap();
+    event(&proc, &root, &root.join("f.txt"), FsChangeKind::CreatedOrModified).await;
+    let again = provider.mint_item(&root_id, "f.txt").unwrap();
+    assert_ne!(again, id, "a recreated path reused the deleted item's id");
 }

@@ -65,24 +65,20 @@ pub(crate) async fn session_transports_pair(
         yadorilink_peer_session::ports::SessionTransports {
             blocks: transports_a.clone(),
             service: transports_a.clone(),
-            prepared_snapshots: std::sync::Arc::new(yadorilink_lane_ports::PreparedSnapshots::new()),
-            snapshot_fetch: transports_a,
         },
         yadorilink_peer_session::ports::SessionTransports {
             blocks: transports_b.clone(),
             service: transports_b.clone(),
-            prepared_snapshots: std::sync::Arc::new(yadorilink_lane_ports::PreparedSnapshots::new()),
-            snapshot_fetch: transports_b,
         },
     )
 }
 
 /// Seeds the proof a prior materialization cycle left behind for `path`:
 /// the fence that cycle bumped before its write, and the one commit that
-/// publishes the proof, stamps `Hydrated`, and clears the intent. Returns
+/// publishes the proof, stamps `Present`, and clears the intent. Returns
 /// the version it proved, which is the version the row names right now.
 ///
-/// Fixtures need this because `Hydrated` is a claim about two things at
+/// Fixtures need this because `Present` is a claim about two things at
 /// once -- the stamp, and a usable actual-state proof naming the version
 /// the row derives -- and every reader that trusts the claim checks both.
 /// Seeding only the stamp produces a combination production can no longer
@@ -126,7 +122,6 @@ pub fn seed_prior_cycle_proof(
         .commit_internal_materialized_state_if_fence_current(
             group_id,
             path,
-            None,
             &ExactMaterializedState::Object {
                 kind: yadorilink_replica_domain::file::RecordKind::File,
                 version,
@@ -145,18 +140,68 @@ pub fn seed_prior_cycle_proof(
     version
 }
 
+/// Freezes `group_id` the way a rebootstrap that reached the `Preserved` barrier does.
+#[cfg(any(test, feature = "test-support"))]
+pub fn freeze_group(coordinator: &crate::replica_coordinator::ReplicaCoordinator, group_id: &str) {
+    coordinator
+        .database()
+        .write::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+            yadorilink_sync_sqlite::native_rebootstrap::set_journal_for_test(
+                conn,
+                &yadorilink_replica_domain::ids::FolderGroupId(group_id.to_owned()),
+                "preserved",
+                FROZEN_RECOVERY_ID,
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// Ends the freeze [`freeze_group`] set, as finishing a replayed rebootstrap does.
+#[cfg(any(test, feature = "test-support"))]
+pub fn unfreeze_group(
+    coordinator: &crate::replica_coordinator::ReplicaCoordinator,
+    group_id: &str,
+) {
+    coordinator
+        .database()
+        .write::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+            let group = yadorilink_replica_domain::ids::FolderGroupId(group_id.to_owned());
+            yadorilink_sync_sqlite::native_rebootstrap::set_journal_for_test(
+                conn,
+                &group,
+                "replaying",
+                FROZEN_RECOVERY_ID,
+            );
+            assert!(yadorilink_sync_sqlite::native_rebootstrap::finish_rebootstrap(
+                conn,
+                &group,
+                FROZEN_RECOVERY_ID
+            )?);
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[cfg(any(test, feature = "test-support"))]
+const FROZEN_RECOVERY_ID: &str = "recovery-under-test";
+
+/// Local authoring for tests through the production local-capture port: a
+/// save or a delete committed the way the watcher's flush commits it.
+#[cfg(any(test, feature = "test-support"))]
+pub mod local_seam;
+
+/// A peer's native delta admitted through native admission, in one
+/// synchronous write, as a test's setup step.
+#[cfg(any(test, feature = "test-support"))]
+pub mod remote_admission_fixture;
+
 /// The two-device assembly stack-level scenarios start from: real devices,
 /// a netmap pin, and honestly signed bundles. Lives here rather than beside
 /// the tests that first needed it because `#[cfg(test)]` is crate-local, and
 /// a scenario under `tests/` compiles against this crate as a library.
 #[cfg(any(test, feature = "test-support"))]
 pub mod sync_stack_fixture;
-
-/// Where a Change got to on one device, layer by layer, and whether its
-/// stopping point is something the test is about. Read its header before
-/// asserting on layers 4-6.
-#[cfg(any(test, feature = "test-support"))]
-pub mod layer_probe;
 
 /// A second network between simulated devices, so a partition scenario can
 /// tell "sync stopped" from "the devices are isolated". Shared by this

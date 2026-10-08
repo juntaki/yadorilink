@@ -335,25 +335,15 @@ public final class FakeYadoriLinkClient: YadoriLinkClient, @unchecked Sendable {
 
     public func fileAvailability(absolutePath: String) async throws -> FileAvailability {
         try await enter()
-        return lock.withLock { _availability[absolutePath] ?? FileAvailability(tracked: true, state: .placeholder, pinned: false) }
+        return lock.withLock { _availability[absolutePath] ?? FileAvailability(tracked: true, state: .placeholder) }
     }
 
     private func setAvailability(_ path: String, _ change: (inout FileAvailability) -> Void) {
         lock.withLock {
-            var a = _availability[path] ?? FileAvailability(tracked: true, state: .placeholder, pinned: false)
+            var a = _availability[path] ?? FileAvailability(tracked: true, state: .placeholder)
             change(&a)
             _availability[path] = a
         }
-    }
-
-    public func pinFile(absolutePath: String) async throws {
-        try await enter()
-        setAvailability(absolutePath) { $0.pinned = true; $0.state = .hydrated }
-    }
-
-    public func unpinFile(absolutePath: String) async throws {
-        try await enter()
-        setAvailability(absolutePath) { $0.pinned = false }
     }
 
     public func hydrateFile(absolutePath: String) async throws {
@@ -626,6 +616,37 @@ public final class FakeYadoriLinkClient: YadoriLinkClient, @unchecked Sendable {
     public func joinGroupAndLink(groupId: String, groupName: String, localPath: String, mode: FolderMode, acknowledgeRisks: Bool) async throws -> LinkOutcome {
         try await enter(signedIn: true)
         return try mutate { try $0.link(groupId: groupId, name: groupName, localPath: localPath, mode: mode, acknowledgeRisks: acknowledgeRisks) }
+    }
+
+    /// The payloads each provider-folder request carried, in order (tests assert a retry repeats one).
+    public private(set) var providerRequests: [String] = []
+    /// When set, the next provider-folder request fails with it (a retry then succeeds).
+    public var failNextProviderRequest: DesktopError?
+
+    private func providerFolder(kind: String, groupId: String, groupName: String, displayName: String, mode: FolderMode) async throws -> ProviderFolderOutcome {
+        try await enter(signedIn: true)
+        let signature = "\(kind)|\(groupId)|\(groupName)|\(displayName)|\(mode)"
+        return try mutate { fake in
+            fake.providerRequests.append(signature)
+            if let error = fake.failNextProviderRequest { fake.failNextProviderRequest = nil; throw error }
+            // The client layer's durable identity makes a repeat of a completed request an answer, not a copy.
+            if let existing = fake._snapshot.folders.first(where: { $0.provider && $0.localPath == "provider://\(signature)" }) {
+                return ProviderFolderOutcome(groupId: existing.groupId, rootId: "root", displayName: existing.name, mode: existing.mode, alreadyExisted: true)
+            }
+            var folder = Fixtures.folder(displayName, path: "provider://\(signature)", groupId: groupId, mode: mode, replicas: [])
+            folder.provider = true
+            fake._snapshot.folders.append(folder)
+            fake._account.hasLinkedFolders = true
+            return ProviderFolderOutcome(groupId: groupId, rootId: "root", displayName: displayName, mode: mode, alreadyExisted: false)
+        }
+    }
+
+    public func createProviderFolder(groupName: String, displayName: String, mode: FolderMode) async throws -> ProviderFolderOutcome {
+        try await providerFolder(kind: "create", groupId: "g-new", groupName: groupName, displayName: displayName, mode: mode)
+    }
+
+    public func joinProviderFolder(groupId: String, groupName: String, displayName: String, mode: FolderMode) async throws -> ProviderFolderOutcome {
+        try await providerFolder(kind: "join", groupId: groupId, groupName: groupName, displayName: displayName, mode: mode)
     }
 
     public func linkFolder(localPath: String, groupId: String, mode: FolderMode, acknowledgeRisks: Bool) async throws -> LinkOutcome {

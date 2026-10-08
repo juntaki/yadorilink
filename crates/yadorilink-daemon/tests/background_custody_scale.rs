@@ -61,7 +61,6 @@ use yadorilink_local_storage::io_diag;
 use yadorilink_local_storage::SegmentBlockStore;
 use yadorilink_peer_session::custody_diag;
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
-use yadorilink_replica_domain::session_state::MaterializationState;
 use yadorilink_root_authority::root_commit::RootCommitPermit;
 
 const GROUP: &str = "scale-group";
@@ -112,8 +111,7 @@ fn hold_file(daemon: &Daemon, path: &str, data: &[u8]) -> FileRecord {
     daemon
         .state
         .replica_coordinator
-        .change_history_repository()
-        .record_group_block_provenance(GROUP, std::slice::from_ref(&hash))
+        .record_block_provenance(GROUP, std::slice::from_ref(&hash))
         .unwrap();
     let record = FileRecord {
         path: path.to_string(),
@@ -129,12 +127,17 @@ fn hold_file(daemon: &Daemon, path: &str, data: &[u8]) -> FileRecord {
         .file_index_repository()
         .upsert_file(GROUP, &record, &permit)
         .unwrap();
-    daemon
-        .state
-        .replica_coordinator
-        .materialization_state_repository()
-        .set_materialization_state(GROUP, path, MaterializationState::Hydrated, &permit)
-        .unwrap();
+    let on_disk = daemon._root.path().join(path);
+    std::fs::write(&on_disk, data).unwrap();
+    // `Present` alone says only that an object exists; the proof is what a
+    // device's claim to hold the row's version stands on.
+    yadorilink_daemon::test_support::seed_prior_cycle_proof(
+        &daemon.state.replica_coordinator,
+        GROUP,
+        path,
+        &on_disk,
+        &permit,
+    );
     record
 }
 

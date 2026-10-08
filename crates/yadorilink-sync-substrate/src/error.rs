@@ -37,4 +37,9 @@ pub enum SubstrateError {
     /// A Track Send stream could not be opened, accepted or finished.
     #[error("track send stream failed: {0}")]
     TrackSend(String),
+
+    /// A native-replication stream could not be opened, accepted, read or
+    /// finished.
+    #[error("native replication stream failed: {0}")]
+    NativeReplication(String),
 }

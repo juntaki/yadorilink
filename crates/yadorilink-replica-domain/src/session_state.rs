@@ -5,9 +5,10 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::change::Op;
 use crate::file::{BlockInfo, FileRecord, FileVersion, RecordKind, VersionBlock};
-use crate::ids::{ChangeHash, VersionHash};
+use crate::ids::VersionHash;
+use crate::local_op::Op;
+use crate::native_state::NativeCaptureWitness;
 
 fn unknown_persisted_enum(kind: &str, value: &str) -> ! {
     panic!("corrupt local state: unknown persisted {kind} value {value:?}")
@@ -15,17 +16,23 @@ fn unknown_persisted_enum(kind: &str, value: &str) -> ! {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MaterializationState {
-    Hydrated,
-    Placeholder,
+    /// No local object exists in the user tree for this path.
+    Remote,
+    /// A local object is being produced.
     Hydrating,
+    /// A physical local object exists. This does NOT mean the object equals
+    /// the current version: exactness lives in the version and
+    /// materialization evidence, never in this state.
+    Present,
+    /// The local object is being removed.
     Evicting,
 }
 
 impl MaterializationState {
     pub fn as_db_str(self) -> &'static str {
         match self {
-            Self::Hydrated => "hydrated",
-            Self::Placeholder => "placeholder",
+            Self::Present => "present",
+            Self::Remote => "remote",
             Self::Hydrating => "hydrating",
             Self::Evicting => "evicting",
         }
@@ -33,8 +40,8 @@ impl MaterializationState {
 
     pub fn from_db_str(value: &str) -> Self {
         match value {
-            "hydrated" => Self::Hydrated,
-            "placeholder" => Self::Placeholder,
+            "present" => Self::Present,
+            "remote" => Self::Remote,
             "hydrating" => Self::Hydrating,
             "evicting" => Self::Evicting,
             other => unknown_persisted_enum("materialization state", other),
@@ -63,6 +70,53 @@ impl MaterializationPolicy {
             other => unknown_persisted_enum("materialization policy", other),
         }
     }
+}
+
+/// What serves a root's local copy: a declared, per-root kind (not a global
+/// switch). `None` is the direct-filesystem path (Linux, headless, tests) and a
+/// permanent declared kind; a provider kind means the OS owns the local copy and
+/// the root is usable only while its provider is ready. A kind is never a
+/// fallback for another: a not-ready provider root fails closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProviderKind {
+    None,
+    MacFileProvider,
+}
+
+impl ProviderKind {
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::MacFileProvider => "mac_file_provider",
+        }
+    }
+
+    pub fn from_db_str(value: &str) -> Self {
+        match value {
+            "none" => Self::None,
+            "mac_file_provider" => Self::MacFileProvider,
+            other => unknown_persisted_enum("provider kind", other),
+        }
+    }
+}
+
+/// Why a provider root is not ready.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NotReady {
+    /// The host has not reported the domain registered (or reported it removed).
+    DomainNotRegistered,
+    /// Registered, but the extension has not completed a handshake since: the
+    /// first-run state ("enable File Provider").
+    ExtensionNotEnabled,
+    /// The extension reported an explicit, fatal provider condition.
+    ProviderError(String),
+}
+
+/// A root's provider readiness, from persisted evidence only (no timers).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Readiness {
+    Ready,
+    NotReady(NotReady),
 }
 
 /// Whether a folder group's link currently accepts peer-applied writes at
@@ -214,63 +268,6 @@ impl std::fmt::Display for StartupFailed {
 
 impl std::error::Error for StartupFailed {}
 
-/// The result of one retroactive-conflict repair attempt against one
-/// SQLite snapshot. The caller (the daemon's repair loop) needs this
-/// three-way distinction, not just success/failure, to decide whether
-/// `committed_frontier` is safe to cache: caching it suppresses
-/// re-examining this exact frontier until a new head arrives, which is
-/// correct for `NothingToDo` and `PermanentlyBlocked` (both describe a
-/// frontier that produces the same result every time it's re-examined) but
-/// would be wrong for an ordinary transient `Err` (a database error
-/// unrelated to this frontier's own content, which deserves an
-/// unconditional retry on the very next poll). Why a retroactive repair
-/// plan could not be committed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PlanStaleReason {
-    /// New history landed: the plan named a frontier that is no longer the
-    /// group's.
-    FrontierMoved,
-    /// The frontier is unchanged, but re-deriving the plan's own obligations
-    /// against current state produces a different answer.
-    ObligationsChanged,
-}
-
-#[derive(Debug)]
-pub enum RetroactiveRepairOutcome {
-    /// Authored and committed a merge-resolution carrier for these paths.
-    Repaired { repaired_paths: Vec<String>, committed_frontier: Vec<ChangeHash> },
-    /// This device is not elected for any currently-eligible path, or every
-    /// eligible path was already repaired.
-    NothingToDo { committed_frontier: Vec<ChangeHash> },
-    /// `path` has an eligible obligation, but it alone exceeds the bounded
-    /// change size and splitting one path's obligation across multiple
-    /// carriers is not implemented -- retrying against this exact frontier
-    /// can only ever reproduce this same result.
-    PermanentlyBlocked { path: String, committed_frontier: Vec<ChangeHash> },
-    /// A repair exists, but this device's deterministic rank has not reached
-    /// the driver's current failover threshold (or it is not authorized).
-    AwaitingFailover { local_rank: Option<usize>, committed_frontier: Vec<ChangeHash> },
-    /// The state the plan was built against moved before it could be
-    /// committed, so nothing was written.
-    ///
-    /// Not a failure: it is the ordinary case this design trades for not
-    /// holding the writer gate across planning. Deliberately *not* named for
-    /// the frontier — the frontier is only the cheapest of the assumptions a
-    /// plan makes, and durable conflict-copy provenance and the
-    /// retained-history boundary both move without disturbing it. The frontier
-    /// examined is deliberately absent from this variant: caching it would
-    /// suppress the very re-plan this outcome asks for.
-    PlanStale { reason: PlanStaleReason },
-}
-
-/// The DAG-facing content of a local edit: the ops to sign into the
-/// emitted `Change`, and the `FileVersion`s those ops reference (written
-/// to `file_versions` in the same transaction as the change/index update).
-pub struct ChangeContent<'a> {
-    pub ops: Vec<Op>,
-    pub versions: &'a [FileVersion],
-}
-
 /// One path's fully-prepared local mutation for a bounded batched commit
 /// (`commit_local_mutations_batch`) — content already read, chunked, and
 /// hashed; the `FileRecord`/`Op`/`FileVersion`/metadata it will become
@@ -280,13 +277,28 @@ pub struct ChangeContent<'a> {
 /// `yadorilink-local-capture` (which prepares these and knows the caller's
 /// per-path lock) owns that half, revalidating a mutation is still current
 /// before including it in a batch. Each variant still becomes its own
-/// signed DAG `Change` when committed — a batch of N of these must never
-/// collapse into one multi-op `Change` (that changes causal/apply
+/// signed change when committed — a batch of N of these must never
+/// collapse into one multi-op change (that changes causal/apply
 /// granularity for what were N independent local edits).
+///
+/// `native_witness` is what native state showed at `record.path` when the
+/// mutation was prepared: a commit refuses the mutation when the row no
+/// longer shows it, since a head that replaced the row in between was never
+/// seen by the writer and must not be superseded.
 #[derive(Debug, Clone)]
 pub enum PreparedLocalMutation {
-    Upsert { record: FileRecord, op: Op, version: FileVersion, meta: Option<LocalFileMetaColumns> },
-    Delete { record: FileRecord, op: Op },
+    Upsert {
+        record: FileRecord,
+        op: Op,
+        version: FileVersion,
+        meta: Option<LocalFileMetaColumns>,
+        native_witness: Option<NativeCaptureWitness>,
+    },
+    Delete {
+        record: FileRecord,
+        op: Op,
+        native_witness: Option<NativeCaptureWitness>,
+    },
 }
 
 impl PreparedLocalMutation {
@@ -302,6 +314,17 @@ impl PreparedLocalMutation {
         match self {
             PreparedLocalMutation::Upsert { op, .. } => op,
             PreparedLocalMutation::Delete { op, .. } => op,
+        }
+    }
+
+    /// What native state showed at `record.path` when the mutation was
+    /// captured. The commit refuses the mutation when the row no longer
+    /// shows it. `None` means no earlier observation exists (the commit
+    /// then reads the row as it stands in its own transaction).
+    pub fn native_witness(&self) -> Option<&NativeCaptureWitness> {
+        match self {
+            PreparedLocalMutation::Upsert { native_witness, .. } => native_witness.as_ref(),
+            PreparedLocalMutation::Delete { native_witness, .. } => native_witness.as_ref(),
         }
     }
 }
@@ -328,13 +351,13 @@ pub struct LocalFileMetaColumns {
 
 /// One user-recoverable durability root — one retained version at `path`
 /// (current, superseded, or trashed) a full-replica handoff must be able to
-/// hand off. `version_hash` is the [`crate::change::VersionHash`] — the
+/// hand off. `version_hash` is the [`crate::local_op::VersionHash`] — the
 /// SHA-256 of this version's canonical `FileVersion` encoding (its ordered
 /// block list with each block's size, its total size, and its metadata:
 /// mtime, exec bit, symlink target, record kind) — computed by
 /// reconstructing a `FileVersion` from this row via
 /// [`FileVersion::from_index_row`] and calling `compute_hash()`. This is
-/// the SAME hash the change-DAG itself uses to identify a version;
+/// the SAME hash used elsewhere to identify a version;
 /// durability never invents a separate wire identifier. `blocks` is
 /// carried alongside (not folded away once the hash is known) because a
 /// peer confirmation still needs the ordered block list — with per-block
@@ -430,7 +453,7 @@ pub fn durability_roots_digest(roots: &[DurabilityRoot]) -> [u8; 32] {
 /// `unmaterialized_current_count` is what stops the comparison from being
 /// vacuous. A `files` row exists as soon as its change is projected, long
 /// before the content behind it has been fetched — so a peer that has
-/// caught up on the DAG and downloaded nothing at all has an identical
+/// caught up on metadata and downloaded nothing at all has an identical
 /// `current_digest`. Without this count, a second device that joined a
 /// minute ago and is still transferring would corroborate instantly, and
 /// the group would report itself protected while exactly one device held
@@ -464,7 +487,7 @@ pub struct RootSetSummary {
     /// digest a positive may rest on.
     pub current_digest: [u8; 32],
     pub current_count: u64,
-    /// How many `state = 'current'` rows are not yet `Hydrated` — still a
+    /// How many `state = 'current'` rows are not yet `Present` — still a
     /// placeholder, or mid-hydration. Non-zero means the device this
     /// summary describes does not yet hold all of the group's current
     /// content, whatever its index lists.
@@ -533,7 +556,7 @@ pub struct ConflictCopyFile {
 }
 
 /// One journaled local edit awaiting durable processing into the index +
-/// change DAG — see the `local_dirty_paths` table.
+/// replicated state — see the `local_dirty_paths` table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirtyPath {
     pub path: String,
@@ -555,14 +578,44 @@ pub struct RoleLossOperationParams<'a> {
     pub now_unix: i64,
 }
 
+/// Where a link's content lives. A folder link has a real directory; a provider link has none (its
+/// authority is the group and the OS-managed domain), so it can NEVER yield a path: the only way to
+/// get one is [`FolderLink::folder_path`], which is `None` for a provider link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkLocation {
+    Folder(String),
+    /// The synthetic key of a provider link (never a path) and the root it declared.
+    Provider {
+        locator: String,
+        root_id: String,
+    },
+}
+
+impl LinkLocation {
+    /// The directory, for a folder link only.
+    pub fn folder_path(&self) -> Option<&str> {
+        match self {
+            Self::Folder(path) => Some(path),
+            Self::Provider { .. } => None,
+        }
+    }
+
+    /// The link's identity string (the `links` key): a path for a folder link, the locator for a
+    /// provider link. For display and keying only, NEVER for a filesystem call.
+    pub fn key(&self) -> &str {
+        match self {
+            Self::Folder(path) => path,
+            Self::Provider { locator, .. } => locator,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FolderLink {
-    pub local_path: String,
+    pub location: LinkLocation,
     pub group_id: String,
     pub paused: bool,
     pub materialization_policy: MaterializationPolicy,
-    /// Automatic-eviction disk-usage cap in bytes, if configured.
-    pub max_local_size_bytes: Option<i64>,
     /// Whether this link's coordination-side authorization has been
     /// confirmed permanently gone (its group/ACL row was cancelled or
     /// removed server-side) -- distinct from `paused`, which is a
@@ -573,6 +626,18 @@ pub struct FolderLink {
     /// files are never touched or deleted; only its participation in sync
     /// stops.
     pub orphaned: bool,
+}
+
+impl FolderLink {
+    /// The directory of a folder link; `None` for a provider link.
+    pub fn folder_path(&self) -> Option<&str> {
+        self.location.folder_path()
+    }
+
+    /// The `links` key (see [`LinkLocation::key`]).
+    pub fn key(&self) -> &str {
+        self.location.key()
+    }
 }
 
 /// What committing a link did to the `links` row for its path, so that a
@@ -1183,11 +1248,6 @@ pub struct RestoreOperation {
     pub state: RestoreOperationState,
     pub record: FileRecord,
     pub origin_device_id: String,
-    /// The signed DAG change authored for this restore before the filesystem
-    /// replacement begins. Recovery publishes the journaled row with this
-    /// identity, so a crash cannot make a restored edit inherit its source
-    /// version's author.
-    pub authoring_change_hash: Option<ChangeHash>,
     /// The restored version's own classification columns — carried
     /// alongside `record` (a bare `FileRecord`, which has no room for
     /// these) so `commit_restore_operation` can apply them to the
@@ -1234,44 +1294,16 @@ impl RestoreOperationState {
     }
 }
 
-/// One candidate for the automatic eviction sweep, in the order
-/// `list_evictable_files` returns them: least-recently-accessed first.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EvictableFile {
-    pub path: String,
-    pub size: u64,
-    pub last_accessed_unix: Option<i64>,
-}
-
 #[cfg(test)]
 mod tests;
 
-/// What a row replaced by a HistoryBase snapshot install had placed at its
-/// path: the only object on disk the install's reconciliation may treat as
-/// superseded rather than as something to preserve.
+/// A path whose object on disk belongs to no row this device placed and has
+/// not yet been reconciled: a local edit native could not author there.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PriorPlacement {
-    pub record_kind: RecordKind,
-    /// The replaced row was a `Placeholder`: what it left on disk is a
-    /// placeholder of `size` bytes, not content.
-    pub placeholder: bool,
-    pub size: u64,
-    pub blocks: Vec<BlockInfo>,
-    pub unix_mode: Option<u32>,
-    pub xattrs: Vec<(String, Vec<u8>)>,
-    pub symlink_target: Option<Vec<u8>>,
-}
-
-/// A path a HistoryBase snapshot install replaced in the index and has not
-/// yet reconciled on disk.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SnapshotInstallHold {
+pub struct HeldPath {
     pub path: String,
-    /// `None` when the replaced index had no live row at this path, so
-    /// nothing this device placed can be under its name.
-    pub prior: Option<PriorPlacement>,
-    /// Moves every time an install holds the path again. A reconciliation
-    /// releases the hold only at the generation it read, so it cannot
-    /// release a hold a later install renewed for a row it never saw.
+    /// Moves every time the path is held again. A reconciliation releases the
+    /// hold only at the generation it read, so it cannot release a hold that
+    /// was renewed for a row it never saw.
     pub generation: i64,
 }

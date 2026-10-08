@@ -120,20 +120,11 @@ macro_rules! worker_addr_or_skip {
             Some(addr) => {
                 // The marker only proves `YADORILINK_WIRE_CONTRACT_ADDR` was
                 // set -- the real request traffic is driven by
-                // `coordination_http_addr` / `coordination_addr`, which read
-                // DIFFERENT env vars with their own hardcoded loopback
-                // fallbacks (`http_client.rs`). The launching script sets all
-                // of them to the same value, but nothing enforced that
-                // agreement: on a persistent runner, a stray leftover service
-                // already bound to a fallback port would let every test print
-                // this marker while silently talking to the wrong server.
-                assert_eq!(
-                    yadorilink_client_core::coordination::http_client::coordination_http_addr(),
-                    addr,
-                    "YADORILINK_COORDINATION_HTTP_ADDR must resolve to the same address as \
-                     YADORILINK_WIRE_CONTRACT_ADDR, or every request below silently targets \
-                     the wrong service"
-                );
+                // `coordination_addr`, which reads its own env var. The
+                // launching script sets both to the same value, but nothing
+                // enforced that agreement: a stray leftover service bound to
+                // the default address would let every test print this marker
+                // while silently talking to the wrong server.
                 assert_eq!(
                     yadorilink_client_core::coordination::http_client::coordination_addr(),
                     addr,
@@ -523,6 +514,7 @@ async fn create_an_active_group(
         &operation_id,
         &name,
         device_id,
+        "eager",
     )
     .await;
     let group_id = match prepared {

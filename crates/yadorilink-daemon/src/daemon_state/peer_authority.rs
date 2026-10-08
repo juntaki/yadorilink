@@ -19,8 +19,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
-use sha2::Digest;
-use yadorilink_replica_engine::repair_election::AuthorizedWriter;
 use yadorilink_sync_sqlite::OfflinePeerAuthorization;
 
 use super::offline_authorization::{
@@ -649,23 +647,6 @@ impl PeerAuthorityState {
         self.membership_generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1
     }
 
-    /// Every peer the netmap authorizes for `group_id`.
-    ///
-    /// The enumeration half of [`peer_is_writer`](Self::peer_is_writer), for
-    /// callers that have a group and need the peers rather than the other way
-    /// round -- the reconciliation driver, which on a local-possession change
-    /// has to reach everyone entitled to hear about it.
-    pub fn authorized_peers_for_group(&self, group_id: &str) -> Vec<String> {
-        self.peer_netmap_metadata
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .writers
-            .iter()
-            .filter(|(_, gid)| gid == group_id)
-            .map(|(device, _)| device.clone())
-            .collect()
-    }
-
     /// Every group the netmap authorizes `device_id` for. The other
     /// enumeration direction, for a peer that has just become reachable.
     pub fn authorized_groups_for_peer(&self, device_id: &str) -> Vec<String> {
@@ -676,43 +657,6 @@ impl PeerAuthorityState {
             .iter()
             .filter(|(dev, _)| dev == device_id)
             .map(|(_, group)| group.clone())
-            .collect()
-    }
-
-    /// Every `(peer, group)` pairing the netmap currently authorizes.
-    ///
-    /// The whole of what [`authorized_peers_for_group`](Self::authorized_peers_for_group)
-    /// and [`authorized_groups_for_peer`](Self::authorized_groups_for_peer)
-    /// answer one slice of. For a caller that has no particular peer or group
-    /// in hand because its question is about all of them — a reconciliation
-    /// driver starting up, which has missed every transition that happened
-    /// before it existed.
-    pub fn authorized_peers_and_groups(&self) -> Vec<(String, String)> {
-        self.peer_netmap_metadata
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .writers
-            .iter()
-            .cloned()
-            .collect()
-    }
-
-    /// Every netmap writer of `group_id` whose signing key is known, as the
-    /// repair election's `AuthorizedWriter`s, read under ONE metadata guard
-    /// so the writer set and the keys come from the same snapshot. Order is
-    /// unspecified; the caller sorts.
-    pub(crate) fn netmap_authorized_writers(&self, group_id: &str) -> Vec<AuthorizedWriter> {
-        let metadata = self.peer_netmap_metadata.lock().unwrap_or_else(|p| p.into_inner());
-        metadata
-            .writers
-            .iter()
-            .filter(|(_, writer_group)| writer_group == group_id)
-            .filter_map(|(device_id, _)| {
-                metadata.signing_keys.get(device_id).map(|key| AuthorizedWriter {
-                    device_id: device_id.clone(),
-                    signing_key_fingerprint: sha2::Sha256::digest(key).into(),
-                })
-            })
             .collect()
     }
 
@@ -872,7 +816,7 @@ impl PeerAuthorityState {
     /// that constructs a real `DaemonState` (which always starts the
     /// `convergence-engine-scheduler` background task, `maintenance_
     /// coordinator::start`) and injects `FileRecord`s directly rather than
-    /// through a real signed `Change`/DAG admission. Without a verified
+    /// through real signed-delta/native admission. Without a verified
     /// policy entry, `resolve_group_policy` resolves the group to
     /// `Withhold` the moment it is linked (`group_is_introduced` is true).
     /// The thing that actually revokes authorization here is

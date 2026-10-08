@@ -64,6 +64,8 @@ fn ambiguous_activation_never_rolls_back() {
 #[derive(Default)]
 struct FakeEnrollmentRepository {
     operations: Mutex<HashMap<String, EnrollmentOperation>>,
+    links: Mutex<Vec<yadorilink_replica_domain::session_state::FolderLink>>,
+    digests: Mutex<HashMap<String, String>>,
 }
 
 impl EnrollmentRepository for FakeEnrollmentRepository {
@@ -113,13 +115,20 @@ impl EnrollmentRepository for FakeEnrollmentRepository {
         Ok(true)
     }
 
+    fn creation_digest(
+        &self,
+        locator: &str,
+    ) -> Result<Option<String>, crate::sync_error::SyncError> {
+        Ok(self.digests.lock().unwrap().get(locator).cloned())
+    }
+
     fn list_links(
         &self,
     ) -> Result<
         Vec<yadorilink_replica_domain::session_state::FolderLink>,
         crate::sync_error::SyncError,
     > {
-        Ok(Vec::new())
+        Ok(self.links.lock().unwrap().clone())
     }
 
     fn scan_pending(
@@ -148,7 +157,10 @@ impl EnrollmentRepository for FakeEnrollmentRepository {
         yadorilink_replica_domain::session_state::EnrollmentOperationScan,
         crate::sync_error::SyncError,
     > {
-        Ok(yadorilink_replica_domain::session_state::EnrollmentOperationScan::default())
+        Ok(yadorilink_replica_domain::session_state::EnrollmentOperationScan {
+            valid: self.operations.lock().unwrap().values().cloned().collect(),
+            invalid: Vec::new(),
+        })
     }
 
     fn settle_activated_and_close(
@@ -249,6 +261,7 @@ impl EnrollmentCoordination for FakeCoordination {
         _operation_id: &'a str,
         _group_name: &'a str,
         _device_id: &'a str,
+        _storage_mode: &'a str,
     ) -> super::super::ports::BoxFuture<'a, EnrollmentPrepareResult> {
         Box::pin(async move {
             self.calls.lock().unwrap().push(EnrollmentCall::PrepareCreate);
@@ -378,14 +391,21 @@ struct FakeLinkPort {
     commit: Mutex<std::collections::VecDeque<Result<LinkOutcome, EnrollmentLinkError>>>,
     rollback: Mutex<std::collections::VecDeque<Result<(), String>>>,
     commit_plain: Mutex<std::collections::VecDeque<Result<(), EnrollmentLinkError>>>,
+    /// What each commit asked for: (operation id, link key, provider target).
+    requests: Mutex<Vec<(String, PathBuf, Option<super::super::ports::ProviderLinkTarget>)>>,
 }
 
 impl EnrollmentLinkPort for FakeLinkPort {
     fn commit<'a>(
         &'a self,
-        _request: EnrollmentLinkRequest,
+        request: EnrollmentLinkRequest,
     ) -> super::super::ports::BoxFuture<'a, Result<LinkOutcome, EnrollmentLinkError>> {
         Box::pin(async move {
+            self.requests.lock().unwrap().push((
+                request.operation_id.clone(),
+                request.absolute_path.clone(),
+                request.provider.clone(),
+            ));
             self.calls.lock().unwrap().push(EnrollmentCall::LinkCommit);
             self.commit.lock().unwrap().pop_front().expect("missing fake commit result")
         })
@@ -407,7 +427,6 @@ impl EnrollmentLinkPort for FakeLinkPort {
         _group_id: &'a str,
         _absolute_path: &'a std::path::Path,
         _on_demand: bool,
-        _acknowledge_risks: bool,
     ) -> super::super::ports::BoxFuture<'a, Result<(), EnrollmentLinkError>> {
         Box::pin(async move {
             self.calls.lock().unwrap().push(EnrollmentCall::LinkCommitPlain);
@@ -429,7 +448,7 @@ fn create_command() -> CreateAndLinkCommand {
         group_name: "photos".to_string(),
         absolute_path: PathBuf::from("/home/alice/Photos"),
         on_demand: false,
-        acknowledge_risks: false,
+        provider: None,
     }
 }
 
@@ -687,7 +706,6 @@ fn accept_invite_command() -> AcceptInviteCommand {
         code: "invite-code-abc".to_string(),
         absolute_path: PathBuf::from("/home/bob/Shared"),
         on_demand: false,
-        acknowledge_risks: false,
     }
 }
 
@@ -1006,7 +1024,7 @@ fn join_command() -> JoinAndLinkCommand {
         group_name: "photos".to_string(),
         absolute_path: PathBuf::from("/home/alice/Photos"),
         on_demand: false,
-        acknowledge_risks: true,
+        provider: None,
     }
 }
 
@@ -1076,4 +1094,216 @@ async fn a_rejoin_of_an_active_membership_is_reported_as_already_linked() {
     assert!(!outcome.awaiting_approval);
     assert!(repository.operations.lock().unwrap().is_empty());
     assert_eq!(*links.calls.lock().unwrap(), vec![EnrollmentCall::LinkCommit]);
+}
+
+fn provider_create_command(display_name: &str, token: &str) -> CreateAndLinkCommand {
+    CreateAndLinkCommand {
+        group_name: "photos".to_string(),
+        absolute_path: PathBuf::new(),
+        on_demand: false,
+        provider: Some(ProviderCreation {
+            display_name: display_name.to_string(),
+            request_token: token.to_string(),
+        }),
+    }
+}
+
+/// A provider folder is created through the SAME journaled saga: the link request carries the
+/// synthetic locator and a provider target (an owner-created group is an empty one), and the journal
+/// operation id is derived from the request token.
+#[tokio::test]
+async fn a_provider_creation_runs_the_journaled_saga_under_a_token_derived_operation() {
+    let repository = Arc::new(FakeEnrollmentRepository::default());
+    let coordination = Arc::new(FakeCoordination::configured());
+    coordination
+        .prepare
+        .lock()
+        .unwrap()
+        .push_back(EnrollmentPrepareResult::Prepared { group_id: "group-1".to_string() });
+    coordination.activate.lock().unwrap().push_back(EnrollmentActivationResult::Activated);
+    let links = Arc::new(FakeLinkPort::default());
+    links.commit.lock().unwrap().push_back(Ok(LinkOutcome::Linked));
+
+    let outcome = service(repository, coordination, links.clone())
+        .create_and_link(provider_create_command("Photos", "token-1"))
+        .await
+        .expect("created");
+
+    assert_eq!(outcome.local_path, PathBuf::from("provider://token-1"));
+    assert_eq!(
+        outcome.operation_id,
+        provider_operation_id("token-1", &digest_of("Photos", "photos", "create"), "device-a")
+    );
+    let requests = links.requests.lock().unwrap();
+    let (operation_id, key, target) = &requests[0];
+    assert_eq!(
+        *operation_id,
+        provider_operation_id("token-1", &digest_of("Photos", "photos", "create"), "device-a")
+    );
+    assert_eq!(*key, PathBuf::from("provider://token-1"));
+    let target = target.as_ref().expect("a provider target");
+    assert_eq!(target.display_name, "Photos");
+    assert!(target.empty_owner, "an owner-created group has nothing to install");
+}
+
+/// A retry of a completed creation answers with the existing folder and touches nothing (no
+/// prepare, no link); the same token with a different request is refused.
+#[tokio::test]
+async fn a_retried_token_is_idempotent_and_bound_to_its_request() {
+    use yadorilink_replica_domain::session_state::{
+        FolderLink, LinkLocation, MaterializationPolicy,
+    };
+    let repository = Arc::new(FakeEnrollmentRepository::default());
+    let creation = ProviderCreation {
+        display_name: "Photos".to_string(),
+        request_token: "token-9".to_string(),
+    };
+    repository.links.lock().unwrap().push(FolderLink {
+        location: LinkLocation::Provider {
+            locator: creation.locator(),
+            root_id: "root-1".to_string(),
+        },
+        group_id: "group-1".to_string(),
+        paused: false,
+        materialization_policy: MaterializationPolicy::Eager,
+        orphaned: false,
+    });
+    repository
+        .digests
+        .lock()
+        .unwrap()
+        .insert(creation.locator(), creation_digest(&creation, "photos", false, "create"));
+    let coordination = Arc::new(FakeCoordination::configured());
+    let links = Arc::new(FakeLinkPort::default());
+    let svc = service(repository, coordination.clone(), links.clone());
+
+    let again = svc
+        .create_and_link(provider_create_command("Photos", "token-9"))
+        .await
+        .expect("a retry answers with the existing folder");
+    assert!(again.already_linked);
+    assert_eq!(again.group_id, "group-1");
+    assert!(
+        coordination.calls.lock().unwrap().is_empty(),
+        "a retry reached the coordination plane"
+    );
+    assert!(links.calls.lock().unwrap().is_empty(), "a retry committed another link");
+
+    let different = svc.create_and_link(provider_create_command("Other", "token-9")).await;
+    assert!(matches!(different, Err(EnrollmentError::PreparationRejected { .. })), "{different:?}");
+}
+
+fn journal_row_for(token: &str, state: EnrollmentOperationState) -> EnrollmentOperation {
+    EnrollmentOperation {
+        operation_id: provider_operation_id(
+            token,
+            &digest_of("Photos", "photos", "create"),
+            "device-a",
+        ),
+        kind: yadorilink_replica_domain::session_state::EnrollmentKind::Create,
+        group_id: None,
+        group_name: Some("photos".to_string()),
+        device_id: "device-a".to_string(),
+        local_path: format!("provider://{token}"),
+        storage_mode: "eager".to_string(),
+        state,
+        last_error: None,
+        attempts: 0,
+        created_at_unix: 0,
+        updated_at_unix: 0,
+    }
+}
+
+/// A crash left the journal row of this token mid-prepare: the retry resumes THAT row (same
+/// operation id, so the coordination plane answers the same prepare) instead of opening a second one;
+/// a row further along is the recovery sweep's, and the retry says so instead of racing it.
+#[tokio::test]
+async fn a_retry_after_a_crash_resumes_the_journal_row_of_its_token() {
+    for (state, resumes) in [
+        (EnrollmentOperationState::PreparePending, true),
+        (EnrollmentOperationState::Prepared, true),
+        (EnrollmentOperationState::ActivationPending, false),
+    ] {
+        let repository = Arc::new(FakeEnrollmentRepository::default());
+        repository.operations.lock().unwrap().insert(
+            provider_operation_id("token-c", &digest_of("Photos", "photos", "create"), "device-a"),
+            journal_row_for("token-c", state),
+        );
+        let coordination = Arc::new(FakeCoordination::configured());
+        coordination
+            .prepare
+            .lock()
+            .unwrap()
+            .push_back(EnrollmentPrepareResult::Prepared { group_id: "group-1".to_string() });
+        coordination.activate.lock().unwrap().push_back(EnrollmentActivationResult::Activated);
+        let links = Arc::new(FakeLinkPort::default());
+        links.commit.lock().unwrap().push_back(Ok(LinkOutcome::Linked));
+
+        let result = service(repository.clone(), coordination.clone(), links.clone())
+            .create_and_link(provider_create_command("Photos", "token-c"))
+            .await;
+
+        if resumes {
+            let outcome = result.unwrap_or_else(|e| panic!("{state:?}: {e}"));
+            assert_eq!(
+                outcome.operation_id,
+                provider_operation_id(
+                    "token-c",
+                    &digest_of("Photos", "photos", "create"),
+                    "device-a"
+                )
+            );
+            assert_eq!(
+                repository.operations.lock().unwrap().len(),
+                1,
+                "{state:?}: a second row was opened"
+            );
+            assert_eq!(links.requests.lock().unwrap().len(), 1, "{state:?}");
+        } else {
+            assert!(
+                matches!(result, Err(EnrollmentError::PreparationAmbiguous { .. })),
+                "{state:?}: {result:?}"
+            );
+            assert!(
+                links.requests.lock().unwrap().is_empty(),
+                "{state:?}: raced the recovery sweep"
+            );
+            assert!(
+                coordination.calls.lock().unwrap().is_empty(),
+                "{state:?}: reached the coordination plane"
+            );
+        }
+    }
+}
+
+/// The creation digest of a provider create request as the tests build it.
+fn digest_of(display_name: &str, group: &str, kind: &str) -> String {
+    let creation = ProviderCreation {
+        display_name: display_name.to_string(),
+        request_token: "unused".to_string(),
+    };
+    creation_digest(&creation, group, false, kind)
+}
+
+/// (review) A journal row left open on a token by a request with a different payload (here another display
+/// name) is never resumed by a retry that changed the request: it is refused.
+#[tokio::test]
+async fn a_resume_with_a_changed_payload_is_refused() {
+    let repository = Arc::new(FakeEnrollmentRepository::default());
+    let original =
+        provider_operation_id("token-d", &digest_of("Photos", "photos", "create"), "device-a");
+    let mut row = journal_row_for("token-d", EnrollmentOperationState::Prepared);
+    row.operation_id = original.clone();
+    repository.operations.lock().unwrap().insert(original, row);
+    let coordination = Arc::new(FakeCoordination::configured());
+    let links = Arc::new(FakeLinkPort::default());
+
+    let result = service(repository.clone(), coordination.clone(), links.clone())
+        .create_and_link(provider_create_command("Other name", "token-d"))
+        .await;
+
+    assert!(matches!(result, Err(EnrollmentError::PreparationRejected { .. })), "{result:?}");
+    assert!(coordination.calls.lock().unwrap().is_empty());
+    assert!(links.requests.lock().unwrap().is_empty());
+    assert_eq!(repository.operations.lock().unwrap().len(), 1, "a second row was opened");
 }

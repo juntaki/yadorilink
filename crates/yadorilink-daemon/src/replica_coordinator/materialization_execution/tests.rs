@@ -8,7 +8,6 @@ use yadorilink_filesystem_sync::materialization_repair::{
     repair_interrupted_materializations, RepairMode,
 };
 use yadorilink_local_storage::{BlockStore as _, SegmentBlockStore};
-use yadorilink_peer_session::ports::PreparedProjectedUpsert;
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord, RecordKind};
 use yadorilink_replica_domain::ids::VersionHash;
 use yadorilink_replica_domain::session_state::{LocalFileMetaColumns, MaterializationState};
@@ -42,12 +41,8 @@ impl FullReplicaCustody for NeverConfirms {
     }
 }
 
-/// A custody oracle that panics if it is ever consulted -- proves
-/// `evict_file` rejects a pinned file WITHOUT reading any version or
-/// custody state at all, not merely that it happens to reject one an
-/// oracle would also have refused. A plain rejection assertion with a permissive oracle (`AlwaysConfirmed`)
-/// cannot distinguish "checked pinned first" from "checked custody
-/// first, which also would have failed."
+/// A custody oracle that panics if it is ever consulted: proves an
+/// eviction never asks for custody, not merely that it ignored the answer.
 struct PanicsIfConsulted;
 
 impl FullReplicaCustody for PanicsIfConsulted {
@@ -58,63 +53,12 @@ impl FullReplicaCustody for PanicsIfConsulted {
         _: &VersionHash,
         _: &[yadorilink_replica_domain::file::VersionBlock],
     ) -> Option<CustodyStamp> {
-        panic!("a pinned file's eviction must be rejected before custody is ever consulted");
+        panic!("custody must not be consulted for this eviction");
     }
 
     fn confirmation_still_valid(&self, _: &str, _: &CustodyStamp) -> bool {
-        panic!("a pinned file's eviction must be rejected before custody is ever consulted");
+        panic!("custody must not be consulted for this eviction");
     }
-}
-
-/// A pinned file must never be evicted -- `EvictionEligibilitySnapshot::pinned`
-/// is the very first check `evict_file` performs, before it reads any
-/// version or custody state. `PanicsIfConsulted` locks down that
-/// ordering directly rather than merely observing rejection.
-#[test]
-fn evict_rejects_a_pinned_file() {
-    let state = ReplicaCoordinator::open_in_memory().unwrap();
-    let root = tempfile::tempdir().unwrap();
-    adopt_root(&state, "group-a", root.path());
-    let store_dir = tempfile::tempdir().unwrap();
-    let store = SegmentBlockStore::new(store_dir.path()).unwrap();
-    let content = b"pinned content must never be evicted";
-    let record = store_and_record(&store, "a.bin", content);
-    let permit = RootCommitPermit::for_tests();
-    upsert_hydrated_file(&state, "group-a", &record, &permit);
-    state.file_index_repository().set_pinned("group-a", "a.bin", true).unwrap();
-    std::fs::write(root.path().join("a.bin"), content).unwrap();
-
-    let result = evict_file(
-        MaterializationContext {
-            state: &state,
-            liveness_gate: &BlockLivenessGate::default(),
-            store: &store,
-            root: root.path(),
-            permit: &permit,
-        },
-        "group-a",
-        "a.bin",
-        false,
-        &PanicsIfConsulted,
-    );
-
-    assert!(
-        matches!(result, Err(MaterializationExecutionError::EvictionRejected(_))),
-        "a pinned file must be rejected outright, got {result:?}"
-    );
-    assert_eq!(
-        std::fs::read(root.path().join("a.bin")).unwrap(),
-        content,
-        "the pinned file's own bytes must be untouched"
-    );
-    assert_eq!(
-        state
-            .materialization_state_repository()
-            .get_materialization_state("group-a", "a.bin")
-            .unwrap(),
-        Some(MaterializationState::Hydrated),
-        "the row must be left exactly as it was"
-    );
 }
 
 /// On an on-demand (non-full-replica) device, an evicted file's
@@ -128,12 +72,12 @@ fn evict_rejects_a_pinned_file() {
 /// oracle-specific handling this build cannot actually reach.
 ///
 /// `#[cfg(not(windows))]`: this is the only test in this module that
-/// drives a `Hydrated` row all the way through `evict_file` to a
+/// drives a `Present` row all the way through `evict_file` to a
 /// successful placeholder write, so it is the only one that actually
 /// reaches `materialization_eviction::evict_to_placeholder`'s Windows
 /// arm (every other eviction test here either rejects earlier --
-/// pinned, diverged-on-disk -- or, like the cross-group tests below,
-/// leaves its row at the schema-v25 `Placeholder` default, which bails
+/// diverged-on-disk -- or, like the cross-group tests below,
+/// leaves its row at the schema-v25 `Remote` default, which bails
 /// out of `evict_file` before `evict_to_placeholder` is ever called).
 /// On Windows that arm does not locally write a placeholder at all --
 /// by design (see `evict_to_placeholder`'s own doc comment) it asks
@@ -194,19 +138,62 @@ fn evict_on_an_on_demand_device_frees_the_file_but_never_purges_its_blocks_today
             .materialization_state_repository()
             .get_materialization_state("group-a", "a.bin")
             .unwrap(),
-        Some(MaterializationState::Placeholder)
+        Some(MaterializationState::Remote)
     );
-    // The working-tree file itself must actually have become a
-    // placeholder -- not merely have its index row updated.
-    assert_ne!(
-        std::fs::read(root.path().join("a.bin")).unwrap(),
-        content,
-        "the real content must no longer be materialized on disk"
+    // The working-tree object itself must actually be gone -- not merely
+    // have its index row updated: a `Remote` row has no local object, and no
+    // stand-in is written in its place.
+    assert!(
+        std::fs::symlink_metadata(root.path().join("a.bin")).is_err(),
+        "the evicted object must no longer stand in the user tree"
     );
+}
+
+/// A full replica is the group's durable holder: evicting a file there frees
+/// the working-tree copy but never reclaims a block, and never even asks
+/// whether another replica holds the version (`PanicsIfConsulted`).
+/// `#[cfg(not(windows))]` for the same reason as the on-demand test above:
+/// it drives a successful placeholder write.
+#[cfg(not(windows))]
+#[test]
+fn evict_on_a_full_replica_keeps_every_block_without_consulting_custody() {
+    let state = ReplicaCoordinator::open_in_memory().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    adopt_root(&state, "group-a", root.path());
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = SegmentBlockStore::new(store_dir.path()).unwrap();
+    let content = b"the durable holder's copy of this version";
+    let record = store_and_record(&store, "a.bin", content);
+    let hash = hex::encode(&record.blocks[0].hash);
+    let permit = RootCommitPermit::for_tests();
+    upsert_hydrated_file(&state, "group-a", &record, &permit);
+    std::fs::write(root.path().join("a.bin"), content).unwrap();
+
+    let outcome = evict_file(
+        MaterializationContext {
+            state: &state,
+            liveness_gate: &BlockLivenessGate::default(),
+            store: &store,
+            root: root.path(),
+            permit: &permit,
+        },
+        "group-a",
+        "a.bin",
+        true, // full replica
+        &PanicsIfConsulted,
+    )
+    .unwrap();
+
+    assert!(outcome.dehydrated, "the working-tree copy is freed");
+    assert!(outcome.blocks_retained, "a full replica never reclaims a block");
+    assert_eq!((outcome.blocks_reclaimed, outcome.bytes_reclaimed), (0, 0));
+    assert!(store.exists(&hash).unwrap(), "the block must stay in the block store");
     assert_eq!(
-        std::fs::metadata(root.path().join("a.bin")).unwrap().len(),
-        content.len() as u64,
-        "the placeholder must still report the file's real size"
+        state
+            .materialization_state_repository()
+            .get_materialization_state("group-a", "a.bin")
+            .unwrap(),
+        Some(MaterializationState::Remote)
     );
 }
 
@@ -267,140 +254,8 @@ fn evict_aborts_when_disk_content_diverges_from_the_indexed_version() {
             .materialization_state_repository()
             .get_materialization_state("group-a", "a.bin")
             .unwrap(),
-        Some(MaterializationState::Hydrated),
+        Some(MaterializationState::Present),
         "the row must be left exactly as it was, not stuck mid-transition"
-    );
-}
-
-/// Reproduces the placeholder-identity crash window --
-/// `write_placeholder` durably writes the
-/// sparse placeholder file, then its identity is recorded in a
-/// SEPARATE commit; a crash between the two leaves a `Placeholder`
-/// row with no recorded identity, even though the placeholder file on
-/// disk is genuinely untouched. Without a startup repair pass, the
-/// very next watcher tick on that path would fall through to the
-/// full chunk-and-compare path (no generation to compare against) and
-/// index the placeholder's own sparse/all-zero bytes as if they were
-/// real content -- `backfill_placeholder_generations` exists
-/// specifically to close this before any watcher gets a chance to
-/// observe the row. Unix-only: exercises the real captured-identity
-/// path, matching the other `#[cfg(unix)]` placeholder tests.
-#[test]
-#[cfg(unix)]
-fn backfill_placeholder_generations_recovers_the_write_placeholder_crash_window() {
-    let state = ReplicaCoordinator::open_in_memory().unwrap();
-    let root = tempfile::tempdir().unwrap();
-    adopt_root(&state, "group-a", root.path());
-    let permit = RootCommitPermit::for_tests();
-    let size = 4096u64;
-    state
-        .file_index_repository()
-        .upsert_file(
-            "group-a",
-            &FileRecord {
-                path: "a.bin".into(),
-                size,
-                mtime_unix_nanos: 0,
-                blocks: vec![BlockInfo { hash: vec![0xAB; 32], offset: 0, size: size as u32 }],
-                deleted: false,
-            },
-            &permit,
-        )
-        .unwrap();
-    state
-        .materialization_state_repository()
-        .set_materialization_state("group-a", "a.bin", MaterializationState::Placeholder, &permit)
-        .unwrap();
-    // Simulates exactly what `write_placeholder` leaves behind: a real
-    // sparse file at the indexed size, durably on disk -- but,
-    // crucially, NO `record_placeholder_generation` call ever ran
-    // (the simulated crash).
-    let identity = yadorilink_local_storage::write_placeholder(&root.path().join("a.bin"), size, 0)
-        .unwrap()
-        .expect("this test runs on unix, where an identity is always captured");
-    assert_eq!(
-        state
-            .materialization_state_repository()
-            .get_placeholder_generation("group-a", "a.bin")
-            .unwrap(),
-        None,
-        "precondition: the crash window leaves no identity recorded"
-    );
-
-    let backfilled =
-        yadorilink_filesystem_sync::materialization_repair::backfill_placeholder_generations(
-            &state,
-            root.path(),
-            "group-a",
-            &permit,
-        )
-        .unwrap();
-
-    assert_eq!(backfilled, 1);
-    let recorded = state
-        .materialization_state_repository()
-        .get_placeholder_generation("group-a", "a.bin")
-        .unwrap()
-        .expect("the identity must now be recorded");
-    assert_eq!(
-        recorded.identity, identity,
-        "the backfilled identity must match the real on-disk object, not a synthetic value"
-    );
-    assert_eq!(recorded.provider_kind, yadorilink_local_storage::INTERNAL_INODE_PROVIDER_KIND);
-}
-
-/// A path whose on-disk content no longer matches the indexed size
-/// (a genuine local edit landed during the crash-to-restart window,
-/// however unlikely) must NOT be backfilled -- fabricating an
-/// identity for it would wrongly certify a file this process never
-/// actually wrote as "still untouched." Leaving it with no identity
-/// keeps it on the existing fail-closed full chunk-and-compare path,
-/// which is the correct outcome for genuinely divergent content.
-#[test]
-fn backfill_placeholder_generations_skips_a_path_whose_disk_size_no_longer_matches() {
-    let state = ReplicaCoordinator::open_in_memory().unwrap();
-    let root = tempfile::tempdir().unwrap();
-    adopt_root(&state, "group-a", root.path());
-    let permit = RootCommitPermit::for_tests();
-    state
-        .file_index_repository()
-        .upsert_file(
-            "group-a",
-            &FileRecord {
-                path: "a.bin".into(),
-                size: 4096,
-                mtime_unix_nanos: 0,
-                blocks: vec![BlockInfo { hash: vec![0xAB; 32], offset: 0, size: 4096 }],
-                deleted: false,
-            },
-            &permit,
-        )
-        .unwrap();
-    state
-        .materialization_state_repository()
-        .set_materialization_state("group-a", "a.bin", MaterializationState::Placeholder, &permit)
-        .unwrap();
-    // Content of a DIFFERENT size than the index believes -- not the
-    // placeholder this process would have written.
-    std::fs::write(root.path().join("a.bin"), b"a genuine local edit, not a placeholder").unwrap();
-
-    let backfilled =
-        yadorilink_filesystem_sync::materialization_repair::backfill_placeholder_generations(
-            &state,
-            root.path(),
-            "group-a",
-            &permit,
-        )
-        .unwrap();
-
-    assert_eq!(backfilled, 0);
-    assert_eq!(
-        state
-            .materialization_state_repository()
-            .get_placeholder_generation("group-a", "a.bin")
-            .unwrap(),
-        None,
-        "a diverged path must be left with no identity, staying on the fail-closed path"
     );
 }
 
@@ -426,8 +281,8 @@ fn adopt_root(state: &ReplicaCoordinator, group_id: &str, root: &Path) {
 }
 
 /// Test-only convenience: `upsert_file` alone no longer leaves a fresh
-/// row `Hydrated` (schema v25 defaults `materialization_state` to
-/// `Placeholder` instead -- see `SCHEMA_VERSION`'s own doc comment).
+/// row `Present` (schema v25 defaults `materialization_state` to
+/// `Remote` instead -- see `SCHEMA_VERSION`'s own doc comment).
 /// Every test in this module that upserts a record to simulate an
 /// already-fully-materialized row (the overwhelming majority here --
 /// this module is about repair/eviction over already-hydrated content)
@@ -443,7 +298,7 @@ fn upsert_hydrated_file(
     state.file_index_repository().upsert_file(group_id, record, permit).unwrap();
     state
         .materialization_state_repository()
-        .set_materialization_state(group_id, &record.path, MaterializationState::Hydrated, permit)
+        .set_materialization_state(group_id, &record.path, MaterializationState::Present, permit)
         .unwrap();
 }
 
@@ -476,10 +331,7 @@ impl FullReplicaCustody for AlwaysConfirmed {
     }
 }
 
-fn assert_cross_group_reference_retains_shared_block(
-    other_state: MaterializationState,
-    pinned: bool,
-) {
+fn assert_cross_group_reference_retains_shared_block(other_state: MaterializationState) {
     let state = ReplicaCoordinator::open_in_memory().unwrap();
     let root = tempfile::tempdir().unwrap();
     adopt_root(&state, "group-a", root.path());
@@ -497,7 +349,6 @@ fn assert_cross_group_reference_retains_shared_block(
         .materialization_state_repository()
         .set_materialization_state("group-b", "group-b.bin", other_state, &permit)
         .unwrap();
-    state.file_index_repository().set_pinned("group-b", "group-b.bin", pinned).unwrap();
     std::fs::write(root.path().join("group-a.bin"), content).unwrap();
 
     evict_file(
@@ -520,17 +371,12 @@ fn assert_cross_group_reference_retains_shared_block(
 
 #[test]
 fn eviction_must_not_delete_block_used_by_hydrated_file_in_another_group() {
-    assert_cross_group_reference_retains_shared_block(MaterializationState::Hydrated, false);
+    assert_cross_group_reference_retains_shared_block(MaterializationState::Present);
 }
 
 #[test]
 fn eviction_must_not_delete_block_retained_for_uncustodied_placeholder_in_another_group() {
-    assert_cross_group_reference_retains_shared_block(MaterializationState::Placeholder, false);
-}
-
-#[test]
-fn eviction_must_not_delete_block_used_by_pinned_file_in_another_group() {
-    assert_cross_group_reference_retains_shared_block(MaterializationState::Hydrated, true);
+    assert_cross_group_reference_retains_shared_block(MaterializationState::Remote);
 }
 
 #[test]
@@ -783,7 +629,7 @@ fn a_repair_reconstruct_whose_proof_commit_fails_keeps_its_intent_open() {
 }
 
 /// The kept intent has to be one some lane still decides. A proof commit
-/// that fails without a crash left the row `Placeholder`, which is never a
+/// that fails without a crash left the row `Remote`, which is never a
 /// repair candidate, so the intent stayed open with full bytes on disk and
 /// no pass ever visited it again -- and every scan kept deferring an
 /// offline delete of that path. The failed settle now leaves the row in
@@ -850,7 +696,7 @@ fn a_repair_reconstruct_whose_proof_commit_failed_is_proven_by_the_next_pass() {
             .materialization_state_repository()
             .get_materialization_state(GROUP, "doc.txt")
             .unwrap(),
-        Some(MaterializationState::Hydrated)
+        Some(MaterializationState::Present)
     );
     assert!(
         !state
@@ -862,7 +708,7 @@ fn a_repair_reconstruct_whose_proof_commit_failed_is_proven_by_the_next_pass() {
 }
 
 /// The success counterpart: the proof commit is what clears the intent, in
-/// the same transaction that publishes the proof and stamps `Hydrated`.
+/// the same transaction that publishes the proof and stamps `Present`.
 #[test]
 fn a_repair_reconstruct_clears_its_intent_with_the_proof_it_commits() {
     let store_dir = tempfile::tempdir().unwrap();
@@ -899,7 +745,7 @@ fn a_repair_reconstruct_clears_its_intent_with_the_proof_it_commits() {
             .materialization_state_repository()
             .get_materialization_state("group-1", "doc.txt")
             .unwrap(),
-        Some(MaterializationState::Hydrated)
+        Some(MaterializationState::Present)
     );
     assert!(!state
         .materialization_intent_repository()
@@ -1091,7 +937,7 @@ fn repair_proves_an_explicit_directory_already_on_disk() {
 }
 
 /// The offline-deletion counterpart of the crash-recovery test above:
-/// a symlink row says `Hydrated` with a recorded target, but there is
+/// a symlink row says `Present` with a recorded target, but there is
 /// no on-disk symlink and no open intent -- the write had already
 /// completed (intent cleared) and the symlink was deleted while the
 /// daemon was stopped. Repair must classify this as an offline
@@ -1158,7 +1004,7 @@ fn repair_does_not_resurrect_an_offline_deleted_symlink() {
 
 /// A crash inside a single-path tombstone delete, after its
 /// `remove_file` and before its settle: the row is still live and
-/// `Hydrated`, the file is gone, and the delete's own intent is open. That
+/// `Present`, the file is gone, and the delete's own intent is open. That
 /// intent is a delete, not an interrupted write, so the missing file is the
 /// state it was heading to. Repair must not rebuild the file from blocks;
 /// it leaves the path and the intent to the outstanding delete. Run for
@@ -1304,7 +1150,7 @@ fn repair_does_not_recreate_a_symlink_its_interrupted_tombstone_delete_removed()
     assert_eq!(report.reconstructed, Vec::<String>::new());
 }
 
-/// The generic defense-in-depth fix: a `Hydrated` row that is missing
+/// The generic defense-in-depth fix: a `Present` row that is missing
 /// on disk, has no open intent, but still has an OUTSTANDING projection
 /// obligation must not be classified as an offline deletion either --
 /// the Convergence Engine has not finished deciding this path's fate
@@ -1387,7 +1233,7 @@ fn repair_does_not_classify_as_offline_deleted_while_a_projection_obligation_is_
     );
 }
 
-/// `RepairMode::Live`'s whole reason to exist: a `Hydrated` record
+/// `RepairMode::Live`'s whole reason to exist: a `Present` record
 /// whose on-disk bytes are present but diverge from the index, with
 /// NO open materialization intent, must NOT be treated the same way
 /// `RepairMode::Startup` does (quarantine + heal from the index) --
@@ -1495,7 +1341,7 @@ fn startup_repair_still_quarantines_a_present_divergent_file_with_no_open_intent
     );
 }
 
-/// `RepairMode::Live`'s missing-file counterpart: a `Hydrated` record
+/// `RepairMode::Live`'s missing-file counterpart: a `Present` record
 /// whose file is missing, with no open intent, must not be classified
 /// as an offline deletion the way `Startup` mode does -- it may be a
 /// live delete in progress. Hand it to the dirty-journal backstop
@@ -1571,7 +1417,7 @@ fn repair_demotes_to_placeholder_when_blocks_are_also_missing_locally() {
             .materialization_state_repository()
             .get_materialization_state("group-1", "missing.bin")
             .unwrap(),
-        Some(MaterializationState::Placeholder)
+        Some(MaterializationState::Remote)
     );
 }
 
@@ -1587,8 +1433,8 @@ enum SupersedeOn {
 /// A block store that supersedes the repair's row to a new version in the
 /// middle of the repair's iteration -- after the lane took its row snapshot
 /// under the path lock, before it demotes the row to a placeholder. It does
-/// what the lock-free rebootstrap install (`replace_group_files_from_
-/// snapshot`) does to a live current row: a new version, left `Placeholder`.
+/// what a lock-free supersession does to a live current row: a new version,
+/// left `Remote`.
 struct SupersedingStore<'a> {
     inner: &'a SegmentBlockStore,
     state: &'a ReplicaCoordinator,
@@ -1607,7 +1453,7 @@ impl SupersedingStore<'_> {
             .set_materialization_state(
                 self.group_id,
                 &v2.path,
-                MaterializationState::Placeholder,
+                MaterializationState::Remote,
                 &permit,
             )
             .unwrap();
@@ -1720,7 +1566,7 @@ fn assert_a_superseded_repair_writes_no_v1_placeholder(on: SupersedeOn) {
             .materialization_state_repository()
             .get_materialization_state(GROUP, "doc.bin")
             .unwrap(),
-        Some(MaterializationState::Placeholder),
+        Some(MaterializationState::Remote),
         "the V2 row keeps the state its own writer gave it"
     );
     assert!(
@@ -1823,10 +1669,51 @@ fn repair_leaves_the_intent_open_when_the_windows_placeholder_write_is_deferred(
     );
 }
 
-/// A bounded batch's `open_projected_upserts_batch` commits the
-/// row+intent for every upsert in one transaction, before ANY of their
-/// temp files publish to their final path (see that method's own doc
-/// comment). A crash in exactly that window -- after this commits, but
+/// Leaves `rel_path` as a materialization in flight: its intent open and its row
+/// in the transient in-flight state, with nothing yet published to disk. This
+/// is the window a crash can land in, which repair has to resolve.
+fn open_optimistic_row(
+    state: &ReplicaCoordinator,
+    group_id: &str,
+    rel_path: &str,
+    record: &FileRecord,
+    unix_mode: Option<u32>,
+) {
+    let metadata = LocalFileMetaColumns {
+        record_kind: RecordKind::File,
+        symlink_target: None,
+        symlink_out_of_root: false,
+        unix_mode,
+        xattrs: Vec::new(),
+    };
+    let target = yadorilink_local_storage::intent_target_hash(&record.blocks);
+    state
+        .database()
+        .write_immediate::<_, yadorilink_sync_sqlite::SyncSqliteError>(|tx| {
+            yadorilink_sync_sqlite::MaterializationIntentRepository::begin_materialization_intent_in_tx(
+                tx, group_id, rel_path, &target, 0,
+            )?;
+            yadorilink_sync_sqlite::file_index::upsert_file_in_tx(tx, group_id, record, "device-b")?;
+            yadorilink_sync_sqlite::MaterializationStateRepository::set_materialization_state_in_tx(
+                tx,
+                group_id,
+                rel_path,
+                yadorilink_peer_session::ports::MATERIALIZATION_IN_FLIGHT_STATE,
+            )?;
+            yadorilink_sync_sqlite::file_index::apply_local_meta_columns_in_tx(
+                tx, group_id, rel_path, &metadata,
+            )?;
+            yadorilink_sync_sqlite::MaterializationStateRepository::clear_held_in_tx(
+                tx, group_id, rel_path,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// A bounded batch commits the row+intent for every upsert in one
+/// transaction, before ANY of their temp files publish to their final
+/// path. A crash in exactly that window -- after this commits, but
 /// before `try_commit_ordinary_batch`'s own per-path `persist_
 /// reconstructed_file` call ever runs for this candidate -- must look
 /// identical to an unbatched `materialize()`'s own crash-after-intent-
@@ -1845,40 +1732,7 @@ fn a_crash_after_the_batch_commits_a_rows_intent_but_before_its_disk_publish_is_
     adopt_root(&state, "group-1", root.path());
     let permit = RootCommitPermit::for_tests();
 
-    let prepared = PreparedProjectedUpsert {
-        rel_path: "batched.txt".to_string(),
-        tmp_path: root.path().join(".never-published.tmp"),
-        out_path: root.path().join("batched.txt"),
-        record: record.clone(),
-        origin_device_id: "device-b".to_string(),
-        authoring_change_hash: None,
-        target_version_hash: yadorilink_local_storage::intent_target_hash(&record.blocks),
-        metadata: LocalFileMetaColumns {
-            record_kind: RecordKind::File,
-            symlink_target: None,
-            symlink_out_of_root: false,
-            unix_mode: None,
-            xattrs: Vec::new(),
-        },
-        derived_head: None,
-        newly_fetched_block_hashes: Vec::new(),
-        realized_causal_basis: Vec::new(),
-        // These fixtures build their record directly rather than from
-        // a version, so derive the one that record names -- the same
-        // canonical derivation the production payload carries.
-        written_version: yadorilink_replica_domain::file::FileVersion::from_index_row(
-            record.blocks.clone(),
-            record.size,
-            record.mtime_unix_nanos,
-            RecordKind::File,
-            None,
-            None,
-            Vec::new(),
-        ),
-    };
-    state
-        .open_projected_upserts_batch("group-1", std::slice::from_ref(&prepared), &permit)
-        .unwrap();
+    open_optimistic_row(&state, "group-1", "batched.txt", &record, None);
     assert!(
         !root.path().join("batched.txt").exists(),
         "sanity: this test's whole point is that the disk publish never happened"
@@ -1906,12 +1760,20 @@ fn a_crash_after_the_batch_commits_a_rows_intent_but_before_its_disk_publish_is_
 /// The ordinary batch's other crash window: `try_commit_ordinary_batch` has already
 /// published this candidate's temp file to its final path, but crashes
 /// before its own `finalize_projected_mutations_batch` call -- so the
-/// row stays `Hydrated` with a dangling open intent and no recorded
+/// row stays `Present` with a dangling open intent and no recorded
 /// fingerprint. The published bytes already match the index, so repair
 /// must recognize this as already-complete and just drop the stale
 /// intent (matching an unbatched `materialize()`'s identical crash-
 /// after-rename-before-intent-clear window) -- never quarantine or
 /// otherwise disturb the correct, already-durable file.
+///
+/// The eager content write has the same window: its bytes are durable
+/// and its one commit -- proof, stamp, intent clear and the claimed
+/// obligation's completion -- never ran. The path's obligation is open
+/// across the crash, and repair leaves it open: closing it is a claim's
+/// business, never repair's. The next claim then closes it against the
+/// proof repair restored, with no physical work, and a second repair finds
+/// nothing to do.
 #[test]
 fn a_crash_after_the_batchs_disk_publish_but_before_finalize_only_clears_the_stale_intent() {
     let store_dir = tempfile::tempdir().unwrap();
@@ -1923,40 +1785,16 @@ fn a_crash_after_the_batchs_disk_publish_but_before_finalize_only_clears_the_sta
     adopt_root(&state, "group-1", root.path());
     let permit = RootCommitPermit::for_tests();
 
-    let prepared = PreparedProjectedUpsert {
-        rel_path: "batched2.txt".to_string(),
-        tmp_path: root.path().join(".pending.tmp"),
-        out_path: root.path().join("batched2.txt"),
-        record: record.clone(),
-        origin_device_id: "device-b".to_string(),
-        authoring_change_hash: None,
-        target_version_hash: yadorilink_local_storage::intent_target_hash(&record.blocks),
-        metadata: LocalFileMetaColumns {
-            record_kind: RecordKind::File,
-            symlink_target: None,
-            symlink_out_of_root: false,
-            unix_mode: None,
-            xattrs: Vec::new(),
-        },
-        derived_head: None,
-        newly_fetched_block_hashes: Vec::new(),
-        realized_causal_basis: Vec::new(),
-        // These fixtures build their record directly rather than from
-        // a version, so derive the one that record names -- the same
-        // canonical derivation the production payload carries.
-        written_version: yadorilink_replica_domain::file::FileVersion::from_index_row(
-            record.blocks.clone(),
-            record.size,
-            record.mtime_unix_nanos,
-            RecordKind::File,
-            None,
-            None,
-            Vec::new(),
-        ),
-    };
+    open_optimistic_row(&state, "group-1", "batched2.txt", &record, None);
     state
-        .open_projected_upserts_batch("group-1", std::slice::from_ref(&prepared), &permit)
+        .sqlite()
+        .dag_bump_projection_obligations_for_touched_paths("group-1", &["batched2.txt"], 0)
         .unwrap();
+    let claimed = state
+        .sqlite()
+        .dag_lookup_projection_obligation("group-1", "batched2.txt")
+        .unwrap()
+        .expect("an armed obligation");
     // Stands in for `try_commit_ordinary_batch`'s own `persist_
     // reconstructed_file` publish, which this test does not need to
     // exercise again (already covered by `yadorilink-local-storage`'s
@@ -1989,6 +1827,49 @@ fn a_crash_after_the_batchs_disk_publish_but_before_finalize_only_clears_the_sta
          match the index"
     );
     assert_eq!(std::fs::read(root.path().join("batched2.txt")).unwrap(), content);
+    assert_eq!(
+        state.sqlite().dag_lookup_projection_obligation("group-1", "batched2.txt").unwrap(),
+        Some(claimed.clone()),
+        "repair must leave the obligation exactly as the crash left it"
+    );
+
+    let version = state
+        .database()
+        .read::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+            yadorilink_sync_sqlite::read_canonical_current_row(conn, "group-1", "batched2.txt")
+        })
+        .unwrap()
+        .expect("the row")
+        .version_hash();
+    assert!(
+        state
+            .complete_zero_work_obligation(
+                "group-1",
+                "batched2.txt",
+                claimed.invalidation_generation,
+                claimed.obligation_incarnation,
+                &yadorilink_peer_session::ports::ExactActualState::Object {
+                    kind: RecordKind::File,
+                    version,
+                    identity: Box::new(None),
+                },
+            )
+            .unwrap(),
+        "the next claim closes the obligation against the proof repair restored"
+    );
+
+    let again = repair_interrupted_materializations(
+        &state,
+        &store,
+        root.path(),
+        "group-1",
+        RepairMode::Startup,
+        &permit,
+    )
+    .unwrap();
+    assert!(again.reconstructed.is_empty() && again.quarantined_dirty.is_empty());
+    assert!(again.offline_deleted.is_empty(), "a second repair finds nothing to do");
+    assert_eq!(std::fs::read(root.path().join("batched2.txt")).unwrap(), content);
 }
 
 /// The version a row names is a hash over the mode and the xattrs as
@@ -2010,35 +1891,7 @@ fn repair_does_not_prove_a_version_whose_mode_disk_never_got() {
     let root = tempfile::tempdir().unwrap();
     adopt_root(&state, GROUP, root.path());
     let permit = RootCommitPermit::for_tests();
-    let prepared = PreparedProjectedUpsert {
-        rel_path: "run.sh".to_string(),
-        tmp_path: root.path().join(".pending.tmp"),
-        out_path: root.path().join("run.sh"),
-        record: record.clone(),
-        origin_device_id: "device-b".to_string(),
-        authoring_change_hash: None,
-        target_version_hash: yadorilink_local_storage::intent_target_hash(&record.blocks),
-        metadata: LocalFileMetaColumns {
-            record_kind: RecordKind::File,
-            symlink_target: None,
-            symlink_out_of_root: false,
-            unix_mode: Some(0o755),
-            xattrs: Vec::new(),
-        },
-        derived_head: None,
-        newly_fetched_block_hashes: Vec::new(),
-        realized_causal_basis: Vec::new(),
-        written_version: yadorilink_replica_domain::file::FileVersion::from_index_row(
-            record.blocks.clone(),
-            record.size,
-            record.mtime_unix_nanos,
-            RecordKind::File,
-            Some(0o755),
-            None,
-            Vec::new(),
-        ),
-    };
-    state.open_projected_upserts_batch(GROUP, std::slice::from_ref(&prepared), &permit).unwrap();
+    open_optimistic_row(&state, GROUP, "run.sh", &record, Some(0o755));
     // The crash: the bytes landed, the exec bit never did.
     let out_path = root.path().join("run.sh");
     std::fs::write(&out_path, content).unwrap();
@@ -2067,9 +1920,9 @@ fn repair_does_not_prove_a_version_whose_mode_disk_never_got() {
     assert!(proven, "and then proves what it wrote");
 }
 
-/// Sets up a file row already transitioned to `Placeholder` -- matching
+/// Sets up a file row already transitioned to `Remote` -- matching
 /// every real caller, which always pairs `record_placeholder_generation`
-/// with that same transition (never calls it on a `Hydrated` row).
+/// with that same transition (never calls it on a `Present` row).
 fn setup_placeholder_file(
     group_id: &str,
     path: &str,
@@ -2082,7 +1935,7 @@ fn setup_placeholder_file(
         .unwrap();
     state
         .materialization_state_repository()
-        .set_materialization_state(group_id, path, MaterializationState::Placeholder, &permit)
+        .set_materialization_state(group_id, path, MaterializationState::Remote, &permit)
         .unwrap();
     (state, permit)
 }
@@ -2098,10 +1951,8 @@ fn recorded(
 
 /// A recorded placeholder identity survives an in-process
 /// "restart" (a fresh read through the repository, not merely an
-/// in-memory cache) -- the exact property `write_placeholder_backend`'s
-/// `PlaceholderGeneration` doc comment names as the second missing
-/// piece of a connected on-demand pipeline. `provider_kind` round-trips
-/// too, not merely the `(dev, ino)` pair.
+/// in-memory cache). `provider_kind` round-trips too, not merely the
+/// `(dev, ino)` pair.
 #[test]
 fn recorded_placeholder_generation_is_readable_after_being_recorded() {
     let (state, permit) = setup_placeholder_file("group-1", "doc.txt");
@@ -2221,7 +2072,7 @@ fn unrecorded_placeholder_generation_reads_back_as_none() {
 }
 
 /// A row that has since left
-/// `Placeholder` (hydrated, say) must never expose its old identity
+/// `Remote` (hydrated, say) must never expose its old identity
 /// through this getter, even though nothing explicitly cleared it --
 /// gated on the row's own current `materialization_state`, not merely
 /// on the recorded columns being non-NULL.
@@ -2233,7 +2084,7 @@ fn placeholder_generation_is_hidden_once_the_row_leaves_placeholder_state() {
     repo.record_placeholder_generation("group-1", "doc.txt", identity, "internal-inode", &permit)
         .unwrap();
 
-    repo.set_materialization_state("group-1", "doc.txt", MaterializationState::Hydrated, &permit)
+    repo.set_materialization_state("group-1", "doc.txt", MaterializationState::Present, &permit)
         .unwrap();
 
     assert_eq!(repo.get_placeholder_generation("group-1", "doc.txt").unwrap(), None);
@@ -2241,13 +2092,13 @@ fn placeholder_generation_is_hidden_once_the_row_leaves_placeholder_state() {
 
 /// The opposite property from the test above, on the OTHER
 /// accessor -- `get_recorded_placeholder_identity` must keep exposing
-/// a row's identity after it leaves `Placeholder` for `Hydrated`,
-/// since Windows eviction reads a `Hydrated` file's still-recorded
+/// a row's identity after it leaves `Remote` for `Present`,
+/// since Windows eviction reads a `Present` file's still-recorded
 /// generation as the expected identity for its native dehydrate call.
 /// If this ever regressed to also gating on `materialization_state =
 /// 'placeholder'` (e.g. by accidentally sharing `get_placeholder_
 /// generation`'s query), `evict_to_placeholder`'s Windows arm would
-/// treat every genuinely-placeholdered `Hydrated` file as having "no
+/// treat every genuinely-placeholdered `Present` file as having "no
 /// recorded identity" and refuse to evict it at all.
 #[test]
 fn recorded_placeholder_identity_survives_the_hydrated_transition() {
@@ -2263,7 +2114,7 @@ fn recorded_placeholder_identity_survives_the_hydrated_transition() {
     )
     .unwrap();
 
-    repo.set_materialization_state("group-1", "doc.txt", MaterializationState::Hydrated, &permit)
+    repo.set_materialization_state("group-1", "doc.txt", MaterializationState::Present, &permit)
         .unwrap();
 
     // The dirty-detection accessor hides it (previous test) ...
@@ -2353,21 +2204,11 @@ fn list_placeholder_generations_includes_only_recorded_paths() {
         .unwrap();
     state
         .materialization_state_repository()
-        .set_materialization_state(
-            "group-1",
-            "has-one.bin",
-            MaterializationState::Placeholder,
-            &permit,
-        )
+        .set_materialization_state("group-1", "has-one.bin", MaterializationState::Remote, &permit)
         .unwrap();
     state
         .materialization_state_repository()
-        .set_materialization_state(
-            "group-1",
-            "has-none.bin",
-            MaterializationState::Placeholder,
-            &permit,
-        )
+        .set_materialization_state("group-1", "has-none.bin", MaterializationState::Remote, &permit)
         .unwrap();
     let identity = yadorilink_local_storage::PlaceholderDiskIdentity { dev: 9, ino: 99 };
     state
@@ -2399,9 +2240,8 @@ fn list_placeholder_generations_includes_only_recorded_paths() {
 /// and repair would then check a guard built from the first against
 /// bytes chosen by the second.
 ///
-/// The path lock does not close that. The mainline DAG appliers take
-/// it, but a whole-group row replacement does not, and it can run
-/// while a live repair pass is between reads.
+/// The path lock does not close that: native admission does not take it,
+/// so a supersession can land while a live repair pass is between reads.
 mod repair_row_snapshot {
     use super::*;
 
@@ -2518,7 +2358,7 @@ mod repair_row_snapshot {
     }
 }
 
-/// Eviction and sweep failures that are local to one path. A read-only
+/// Eviction and repair-sweep failures that are local to one path. A read-only
 /// parent directory makes the placeholder write fail before its rename,
 /// after the eviction has already marked the row `Evicting` and bumped the
 /// path's fence; an unreadable file makes the repair sweep's byte compare
@@ -2528,7 +2368,6 @@ mod repair_row_snapshot {
 mod path_local_failure_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
-    use yadorilink_filesystem_sync::materialization_eviction::run_eviction_sweep;
     use yadorilink_filesystem_sync::materialization_execution::AbandonedEviction;
 
     const GROUP: &str = "group-path-local-failure";
@@ -2574,7 +2413,7 @@ mod path_local_failure_tests {
     /// row out of it, so the file stays reported as in flight, is no longer
     /// an eviction candidate and is not a repair candidate. The write never
     /// landed and the bytes still verify, so the row goes back to
-    /// `Hydrated` with a proof published under the bumped fence.
+    /// `Present` with a proof published under the bumped fence.
     #[test]
     fn an_eviction_whose_placeholder_write_fails_goes_back_to_hydrated_with_a_proof() {
         let state = ReplicaCoordinator::open_in_memory().unwrap();
@@ -2609,7 +2448,7 @@ mod path_local_failure_tests {
         assert_eq!(std::fs::read(root.path().join("dir/a.bin")).unwrap(), content);
         assert_eq!(
             row_state(&state, "dir/a.bin"),
-            Some(MaterializationState::Hydrated),
+            Some(MaterializationState::Present),
             "a failed eviction must not leave its row Evicting"
         );
         assert!(
@@ -2621,48 +2460,6 @@ mod path_local_failure_tests {
             .unwrap(),
             "the verified bytes are proven again under the fence the attempt bumped"
         );
-    }
-
-    /// One path whose eviction fails is that path's problem: the sweep
-    /// goes on to the next candidate instead of returning the error.
-    #[test]
-    fn an_eviction_sweep_continues_past_one_paths_failed_eviction() {
-        let state = ReplicaCoordinator::open_in_memory().unwrap();
-        let root = tempfile::tempdir().unwrap();
-        adopt_root(&state, GROUP, root.path());
-        let store_dir = tempfile::tempdir().unwrap();
-        let store = SegmentBlockStore::new(store_dir.path()).unwrap();
-        let permit = RootCommitPermit::for_tests();
-        hydrated_on_disk(&state, &store, root.path(), "dir/a.bin", b"least recently used", &permit);
-        hydrated_on_disk(&state, &store, root.path(), "b.bin", b"used after a.bin", &permit);
-        state.file_index_repository().touch_last_accessed(GROUP, "dir/a.bin", 1).unwrap();
-        state.file_index_repository().touch_last_accessed(GROUP, "b.bin", 2).unwrap();
-        let dir = root.path().join("dir");
-        if !make_dir_unwritable(&dir) {
-            return;
-        }
-
-        let result = run_eviction_sweep(
-            MaterializationContext {
-                state: &state,
-                liveness_gate: &BlockLivenessGate::default(),
-                store: &store,
-                root: root.path(),
-                permit: &permit,
-            },
-            GROUP,
-            false,
-            Some(0),
-            &NeverConfirms,
-        );
-        set_mode(&dir, 0o755);
-
-        assert_eq!(
-            result.expect("one path's failed eviction must not fail the sweep"),
-            vec!["b.bin".to_owned()]
-        );
-        assert_eq!(row_state(&state, "b.bin"), Some(MaterializationState::Placeholder));
-        assert_eq!(row_state(&state, "dir/a.bin"), Some(MaterializationState::Hydrated));
     }
 
     /// The repair sweep, the same way: an unreadable file stops only its
@@ -2697,26 +2494,22 @@ mod path_local_failure_tests {
         let report = result.expect("one path's read failure must not fail the sweep");
         assert_eq!(report.reproven, vec!["b.bin".to_owned()]);
         assert_eq!(report.failed, vec!["a.bin".to_owned()], "and the failed path is reported");
-        assert_eq!(row_state(&state, "a.bin"), Some(MaterializationState::Hydrated));
+        assert_eq!(row_state(&state, "a.bin"), Some(MaterializationState::Present));
     }
 
     /// A failed eviction's own failure is logged only when it, too, belongs
     /// to the path. When closing the row fails for a reason the whole
     /// transaction shares (a database failure), the eviction returns that
-    /// error rather than the path-local one it was already carrying, so the
-    /// sweep aborts instead of reaching the same failure on every candidate.
+    /// error rather than the path-local one it was already carrying.
     #[test]
-    fn a_failed_evictions_transaction_wide_abandon_failure_aborts_the_sweep() {
+    fn a_failed_evictions_transaction_wide_abandon_failure_is_what_it_returns() {
         let state = ReplicaCoordinator::open_in_memory().unwrap();
         let root = tempfile::tempdir().unwrap();
         adopt_root(&state, GROUP, root.path());
         let store_dir = tempfile::tempdir().unwrap();
         let store = SegmentBlockStore::new(store_dir.path()).unwrap();
         let permit = RootCommitPermit::for_tests();
-        hydrated_on_disk(&state, &store, root.path(), "dir/a.bin", b"least recently used", &permit);
-        hydrated_on_disk(&state, &store, root.path(), "b.bin", b"used after a.bin", &permit);
-        state.file_index_repository().touch_last_accessed(GROUP, "dir/a.bin", 1).unwrap();
-        state.file_index_repository().touch_last_accessed(GROUP, "b.bin", 2).unwrap();
+        hydrated_on_disk(&state, &store, root.path(), "dir/a.bin", b"cannot be replaced", &permit);
         let dir = root.path().join("dir");
         if !make_dir_unwritable(&dir) {
             return;
@@ -2726,7 +2519,7 @@ mod path_local_failure_tests {
             .abandon_eviction_fails
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
-        let result = run_eviction_sweep(
+        let result = evict_file(
             MaterializationContext {
                 state: &state,
                 liveness_gate: &BlockLivenessGate::default(),
@@ -2735,47 +2528,38 @@ mod path_local_failure_tests {
                 permit: &permit,
             },
             GROUP,
+            "dir/a.bin",
             false,
-            Some(0),
             &NeverConfirms,
         );
         set_mode(&dir, 0o755);
 
         assert!(
             matches!(result, Err(MaterializationExecutionError::CorruptState(_))),
-            "the abandon's transaction-wide failure must abort the sweep: {result:?}"
-        );
-        assert_eq!(
-            row_state(&state, "b.bin"),
-            Some(MaterializationState::Hydrated),
-            "no later candidate may be evicted once the sweep aborts"
+            "the abandon's transaction-wide failure is what the eviction returns: {result:?}"
         );
     }
 
     /// Group-wide failures are told apart at their source, not by the
     /// error's variant: every eviction re-verifies the root before it
     /// touches anything, so a root that lost its identity (unmounted,
-    /// replaced) fails the first candidate as a root-authority error and
-    /// the sweep aborts, instead of failing every candidate as a
-    /// path-local I/O error.
+    /// replaced) fails as a root-authority error, not as a path-local I/O
+    /// error, and changes nothing.
     #[test]
-    fn an_eviction_sweep_under_a_lost_root_aborts_at_the_first_candidate() {
+    fn an_eviction_under_a_lost_root_fails_as_a_root_authority_error() {
         let state = ReplicaCoordinator::open_in_memory().unwrap();
         let root = tempfile::tempdir().unwrap();
         adopt_root(&state, GROUP, root.path());
         let store_dir = tempfile::tempdir().unwrap();
         let store = SegmentBlockStore::new(store_dir.path()).unwrap();
         let permit = RootCommitPermit::for_tests();
-        hydrated_on_disk(&state, &store, root.path(), "a.bin", b"least recently used", &permit);
-        hydrated_on_disk(&state, &store, root.path(), "b.bin", b"used after a.bin", &permit);
-        state.file_index_repository().touch_last_accessed(GROUP, "a.bin", 1).unwrap();
-        state.file_index_repository().touch_last_accessed(GROUP, "b.bin", 2).unwrap();
+        hydrated_on_disk(&state, &store, root.path(), "a.bin", b"on a root that is gone", &permit);
         std::fs::remove_file(
             root.path().join(yadorilink_replica_domain::reserved_paths::ROOT_MARKER_FILE_NAME),
         )
         .unwrap();
 
-        let result = run_eviction_sweep(
+        let result = evict_file(
             MaterializationContext {
                 state: &state,
                 liveness_gate: &BlockLivenessGate::default(),
@@ -2784,18 +2568,16 @@ mod path_local_failure_tests {
                 permit: &permit,
             },
             GROUP,
+            "a.bin",
             false,
-            Some(0),
             &NeverConfirms,
         );
 
         assert!(
             matches!(result, Err(MaterializationExecutionError::RootAuthority(_))),
-            "a lost root must abort the sweep: {result:?}"
+            "a lost root must fail as a root-authority error: {result:?}"
         );
-        for path in ["a.bin", "b.bin"] {
-            assert_eq!(row_state(&state, path), Some(MaterializationState::Hydrated));
-        }
+        assert_eq!(row_state(&state, "a.bin"), Some(MaterializationState::Present));
     }
 
     /// A held root lease whose root this process no longer owns: the lock
@@ -2821,11 +2603,10 @@ mod path_local_failure_tests {
         operation
     }
 
-    /// A root lost while the eviction sweep runs surfaces from the first
-    /// owner transaction as an I/O error. The sweep must stop there, not
-    /// meet the same lost root at every remaining candidate.
+    /// A root lost while an eviction runs fails the eviction at its first
+    /// owner transaction, and changes nothing.
     #[test]
-    fn an_eviction_sweep_stops_when_its_root_is_lost_mid_sweep() {
+    fn an_eviction_whose_root_is_lost_mid_operation_fails_and_changes_nothing() {
         let state = ReplicaCoordinator::open_in_memory().unwrap();
         let root = tempfile::tempdir().unwrap();
         adopt_root(&state, GROUP, root.path());
@@ -2833,13 +2614,10 @@ mod path_local_failure_tests {
         let store = SegmentBlockStore::new(store_dir.path()).unwrap();
         let setup_permit = RootCommitPermit::for_tests();
         hydrated_on_disk(&state, &store, root.path(), "a.bin", b"first", &setup_permit);
-        hydrated_on_disk(&state, &store, root.path(), "b.bin", b"second", &setup_permit);
-        state.file_index_repository().touch_last_accessed(GROUP, "a.bin", 1).unwrap();
-        state.file_index_repository().touch_last_accessed(GROUP, "b.bin", 2).unwrap();
         let locked = tempfile::tempdir().unwrap();
         let operation = lost_root_operation(locked.path());
 
-        let result = run_eviction_sweep(
+        let result = evict_file(
             MaterializationContext {
                 state: &state,
                 liveness_gate: &BlockLivenessGate::default(),
@@ -2848,21 +2626,16 @@ mod path_local_failure_tests {
                 permit: &operation.permit(),
             },
             GROUP,
+            "a.bin",
             false,
-            Some(0),
             &NeverConfirms,
         );
 
-        assert!(
-            matches!(result, Err(MaterializationExecutionError::RootAuthority(_))),
-            "a root lost mid-sweep must abort the sweep: {result:?}"
-        );
-        for path in ["a.bin", "b.bin"] {
-            assert_eq!(row_state(&state, path), Some(MaterializationState::Hydrated));
-        }
+        assert!(result.is_err(), "a root lost mid-operation must fail the eviction: {result:?}");
+        assert_eq!(row_state(&state, "a.bin"), Some(MaterializationState::Present));
     }
 
-    /// The repair sweep, the same way.
+    /// The repair sweep stops at a root lost mid-sweep.
     #[test]
     fn a_repair_sweep_stops_when_its_root_is_lost_mid_sweep() {
         let state = ReplicaCoordinator::open_in_memory().unwrap();
@@ -2941,7 +2714,7 @@ mod path_local_failure_tests {
 
         let permit = RootCommitPermit::for_tests();
         assert!(abandon(&state, "a.bin", &version, AbandonedEviction::NotWritten, &permit).unwrap());
-        assert_eq!(row_state(&state, "a.bin"), Some(MaterializationState::Hydrated));
+        assert_eq!(row_state(&state, "a.bin"), Some(MaterializationState::Present));
         assert!(!has_proof(&state, "a.bin"), "bytes that did not verify earn no proof");
     }
 
@@ -2961,11 +2734,11 @@ mod path_local_failure_tests {
             &permit
         )
         .unwrap());
-        assert_eq!(row_state(&state, "a.bin"), Some(MaterializationState::Placeholder));
+        assert_eq!(row_state(&state, "a.bin"), Some(MaterializationState::Remote));
     }
 
     /// The row moved to another version while it was `Evicting`: whatever
-    /// the file holds, it is not that version, so no claim of `Hydrated`
+    /// the file holds, it is not that version, so no claim of `Present`
     /// and no proof, even for bytes that verified against the old one.
     #[test]
     fn an_abandoned_eviction_of_a_row_now_naming_another_version_resolves_to_placeholder() {
@@ -2988,7 +2761,7 @@ mod path_local_failure_tests {
             &permit
         )
         .unwrap());
-        assert_eq!(row_state(&state, "a.bin"), Some(MaterializationState::Placeholder));
+        assert_eq!(row_state(&state, "a.bin"), Some(MaterializationState::Remote));
         assert!(!has_proof(&state, "a.bin"));
     }
 
@@ -3001,13 +2774,13 @@ mod path_local_failure_tests {
         let permit = RootCommitPermit::for_tests();
         state
             .materialization_state_repository()
-            .set_materialization_state(GROUP, "a.bin", MaterializationState::Placeholder, &permit)
+            .set_materialization_state(GROUP, "a.bin", MaterializationState::Remote, &permit)
             .unwrap();
 
         assert!(
             !abandon(&state, "a.bin", &version, AbandonedEviction::NotWritten, &permit).unwrap()
         );
-        assert_eq!(row_state(&state, "a.bin"), Some(MaterializationState::Placeholder));
+        assert_eq!(row_state(&state, "a.bin"), Some(MaterializationState::Remote));
     }
 
     /// Root swap: the permit is verified inside the abandon's transaction,
@@ -3155,7 +2928,6 @@ fn recover_restore_with_metadata(
             state: yadorilink_replica_domain::session_state::RestoreOperationState::DiskCommitted,
             record: record_with_blocks("doc.txt", content, hash),
             origin_device_id: "device-a".to_string(),
-            authoring_change_hash: None,
             meta: LocalFileMetaColumns {
                 record_kind: RecordKind::File,
                 symlink_target: None,
@@ -3212,4 +2984,352 @@ fn restore_recovery_proves_a_file_whose_metadata_matches() {
         &state, "group-1", "doc.txt"
     )
     .unwrap());
+}
+
+/// Eviction's removal races a user. The hook acts after eviction's last check
+/// of the object and before it detaches it.
+#[cfg(not(windows))]
+mod eviction_race_tests {
+    use super::*;
+    use yadorilink_filesystem_sync::materialization_eviction::set_pre_removal_hook_for_test;
+
+    struct Setup {
+        state: ReplicaCoordinator,
+        root: tempfile::TempDir,
+        store: SegmentBlockStore,
+        _store_dir: tempfile::TempDir,
+        permit: RootCommitPermit<'static>,
+    }
+
+    fn setup(content: &[u8]) -> Setup {
+        let state = ReplicaCoordinator::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        adopt_root(&state, "group-a", root.path());
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = SegmentBlockStore::new(store_dir.path()).unwrap();
+        let record = store_and_record(&store, "a.bin", content);
+        let permit = RootCommitPermit::for_tests();
+        upsert_hydrated_file(&state, "group-a", &record, &permit);
+        std::fs::write(root.path().join("a.bin"), content).unwrap();
+        Setup { state, root, store, _store_dir: store_dir, permit }
+    }
+
+    fn evict(s: &Setup) -> yadorilink_filesystem_sync::materialization_eviction::EvictionOutcome {
+        evict_file(
+            MaterializationContext {
+                state: &s.state,
+                liveness_gate: &BlockLivenessGate::default(),
+                store: &s.store,
+                root: s.root.path(),
+                permit: &s.permit,
+            },
+            "group-a",
+            "a.bin",
+            true,
+            &PanicsIfConsulted,
+        )
+        .unwrap()
+    }
+
+    fn state_of(s: &Setup) -> Option<MaterializationState> {
+        s.state
+            .materialization_state_repository()
+            .get_materialization_state("group-a", "a.bin")
+            .unwrap()
+    }
+
+    fn entries(s: &Setup) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(s.root.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| !n.starts_with('.'))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The user deletes the file after eviction's last check. That is not an
+    /// eviction's own removal: the row must come back `Present` and the
+    /// delete must stay evidence (journaled for capture), not be swallowed as
+    /// an echo.
+    #[test]
+    fn a_user_delete_that_beats_the_removal_is_not_settled_as_an_eviction() {
+        let s = setup(b"content the user deletes mid-eviction");
+        let _hook = set_pre_removal_hook_for_test(|path| std::fs::remove_file(path).unwrap());
+
+        let outcome = evict(&s);
+
+        assert!(!outcome.dehydrated, "a competing delete is not this eviction's removal");
+        assert_eq!(state_of(&s), Some(MaterializationState::Present));
+        assert!(
+            s.state.dirty_path_repository().is_path_dirty("group-a", "a.bin").unwrap(),
+            "the user's delete must stay journaled as a removal"
+        );
+    }
+
+    /// An editor saves (atomic replace, new bytes) after eviction's last
+    /// check. Eviction must not destroy the save: it is back at its path, the
+    /// row is not `Remote`, and nothing is left under a quarantine name.
+    #[test]
+    fn a_save_that_lands_before_the_removal_is_preserved() {
+        let s = setup(b"content the editor is about to replace");
+        let saved: &[u8] = b"the editor's save, never captured";
+        let _hook = set_pre_removal_hook_for_test(move |path| {
+            let tmp = path.with_file_name("a.bin.saving");
+            std::fs::write(&tmp, saved).unwrap();
+            std::fs::rename(&tmp, path).unwrap();
+        });
+
+        let outcome = evict(&s);
+
+        assert!(!outcome.dehydrated);
+        assert_eq!(std::fs::read(s.root.path().join("a.bin")).unwrap(), saved);
+        assert_eq!(state_of(&s), Some(MaterializationState::Present));
+        assert_eq!(entries(&s), vec!["a.bin".to_string()]);
+    }
+
+    /// Putting a detached object back links it to its path and then drops the
+    /// quarantine name. The link must be durable before the name that is the
+    /// only other reference to the object is unlinked, or a power loss can
+    /// keep the unlink and lose the link, and with it the object.
+    #[test]
+    fn a_restore_makes_the_link_durable_before_it_unlinks_the_quarantine_name_and_the_unlink_after()
+    {
+        let s = setup(b"content the editor is about to replace");
+        let _ = yadorilink_filesystem_sync::materialization_eviction::take_restore_trace_for_test();
+        let _hook = set_pre_removal_hook_for_test(move |path| {
+            let tmp = path.with_file_name("a.bin.saving");
+            std::fs::write(&tmp, b"a save").unwrap();
+            std::fs::rename(&tmp, path).unwrap();
+        });
+
+        evict(&s);
+
+        assert_eq!(
+            yadorilink_filesystem_sync::materialization_eviction::take_restore_trace_for_test(),
+            vec!["detached", "synced", "linked", "synced", "unlinked", "synced"]
+        );
+    }
+
+    /// Eviction's own detach: rename -> directory sync -> verify -> unlink ->
+    /// directory sync. Each barrier is what makes the step before it durable
+    /// before the next step can be the only thing left of the object.
+    #[test]
+    fn eviction_orders_its_detach_barriers_around_the_verification_and_the_unlink() {
+        let s = setup(b"content to evict, in order");
+        let _ = yadorilink_filesystem_sync::materialization_eviction::take_restore_trace_for_test();
+
+        assert!(evict(&s).dehydrated);
+
+        assert_eq!(
+            yadorilink_filesystem_sync::materialization_eviction::take_restore_trace_for_test(),
+            vec!["detached", "synced", "verified", "unlinked", "synced"]
+        );
+    }
+
+    /// Something already stands at the quarantine name (a leftover, or a user
+    /// file with that name). Eviction must not replace it: it is recovered
+    /// first, as a conflict copy because the path is occupied, and the
+    /// eviction then proceeds.
+    #[test]
+    fn an_object_at_the_quarantine_name_is_never_overwritten() {
+        let s = setup(b"content to evict");
+        let out = s.root.path().join("a.bin");
+        let q = yadorilink_filesystem_sync::materialization_eviction::eviction_quarantine_path(
+            &out, "a.bin",
+        )
+        .unwrap();
+        std::fs::write(&q, b"a leftover that must survive").unwrap();
+        let _ = yadorilink_filesystem_sync::materialization_eviction::take_restore_trace_for_test();
+
+        let outcome = evict(&s);
+        // The conflict copy is durable (`synced`) before the eviction goes on.
+        assert_eq!(
+            yadorilink_filesystem_sync::materialization_eviction::take_restore_trace_for_test(),
+            vec!["synced", "detached", "synced", "verified", "unlinked", "synced"]
+        );
+
+        assert!(outcome.dehydrated);
+        let kept = std::fs::read_dir(s.root.path())
+            .unwrap()
+            .filter_map(|e| std::fs::read(e.unwrap().path()).ok())
+            .any(|bytes| bytes == b"a leftover that must survive");
+        assert!(kept, "the object at the quarantine name was destroyed");
+    }
+
+    /// Where no atomic no-replace move exists the eviction is NOT performed:
+    /// there is no check-then-rename or link-then-unlink fallback, since either
+    /// can destroy an object it never looked at. The row stays `Present` over
+    /// the untouched file.
+    #[test]
+    fn without_an_atomic_no_replace_move_the_eviction_fails_closed() {
+        let s = setup(b"content that must stay put");
+        yadorilink_local_storage::materialize_write::set_test_no_atomic_rename(true);
+        let result = evict_file(
+            MaterializationContext {
+                state: &s.state,
+                liveness_gate: &BlockLivenessGate::default(),
+                store: &s.store,
+                root: s.root.path(),
+                permit: &s.permit,
+            },
+            "group-a",
+            "a.bin",
+            true,
+            &PanicsIfConsulted,
+        );
+        yadorilink_local_storage::materialize_write::set_test_no_atomic_rename(false);
+
+        assert!(result.is_err(), "the eviction must not be performed: {result:?}");
+        assert_eq!(
+            std::fs::read(s.root.path().join("a.bin")).unwrap(),
+            b"content that must stay put"
+        );
+        assert_eq!(state_of(&s), Some(MaterializationState::Present));
+    }
+
+    /// Nothing settles `Remote` until the unlink is durable. A directory sync
+    /// that fails after the unlink (the barrier numbered 2; the first is the
+    /// detach's, before it) returns the error and leaves the row `Evicting`,
+    /// so startup re-decides.
+    #[test]
+    fn a_failed_sync_after_the_unlink_leaves_the_row_evicting() {
+        // The only barrier after the unlink is the final one.
+        let failing = 2;
+        {
+            let s = setup(b"content whose unlink cannot be made durable");
+            yadorilink_filesystem_sync::materialization_eviction::fail_directory_barrier_for_test(
+                Some(failing),
+            );
+            let result = evict_file(
+                MaterializationContext {
+                    state: &s.state,
+                    liveness_gate: &BlockLivenessGate::default(),
+                    store: &s.store,
+                    root: s.root.path(),
+                    permit: &s.permit,
+                },
+                "group-a",
+                "a.bin",
+                true,
+                &PanicsIfConsulted,
+            );
+            yadorilink_filesystem_sync::materialization_eviction::fail_directory_barrier_for_test(
+                None,
+            );
+
+            assert!(result.is_err(), "barrier {failing}: the error must be returned");
+            assert_eq!(state_of(&s), Some(MaterializationState::Evicting), "barrier {failing}");
+        }
+    }
+
+    /// A crash after eviction detached the object and before it removed it
+    /// leaves the object under its quarantine name. Startup recovery puts it
+    /// back (or, if the path is taken, keeps it as a recoverable copy).
+    #[test]
+    fn a_quarantine_leftover_is_recovered_at_startup() {
+        let s = setup(b"content a crash stranded in quarantine");
+        let out = s.root.path().join("a.bin");
+        let q = yadorilink_filesystem_sync::materialization_eviction::eviction_quarantine_path(
+            &out, "a.bin",
+        )
+        .unwrap();
+        std::fs::rename(&out, &q).unwrap();
+
+        yadorilink_filesystem_sync::materialization_eviction::recover_eviction_quarantine(
+            &s.state,
+            s.root.path(),
+            "group-a",
+            "a.bin",
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(&out).unwrap(),
+            b"content a crash stranded in quarantine",
+            "the stranded object must be restored to its path"
+        );
+        assert!(!q.exists());
+    }
+}
+
+/// An unmarked root is adopted automatically only on disk evidence. A `Remote`
+/// row's absence is expected, but it cannot vouch that this directory is the
+/// link's folder: an index of nothing but `Remote` rows over an empty
+/// mountpoint (an unmounted volume) must not be adopted without an explicit
+/// readoption.
+#[test]
+fn an_unmarked_empty_root_is_not_adopted_for_an_index_of_only_remote_rows() {
+    let state = ReplicaCoordinator::open_in_memory().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    state.link_repository().add_link(&root.path().to_string_lossy(), "group-a").unwrap();
+    let permit = RootCommitPermit::for_tests();
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = SegmentBlockStore::new(store_dir.path()).unwrap();
+    let record = store_and_record(&store, "a.bin", b"remote only");
+    state.file_index_repository().upsert_file("group-a", &record, &permit).unwrap();
+    state
+        .materialization_state_repository()
+        .set_materialization_state("group-a", "a.bin", MaterializationState::Remote, &permit)
+        .unwrap();
+
+    assert!(
+        VerifiedRoot::open(root.path(), "group-a", &state).is_err(),
+        "an empty unmarked root was adopted on no disk evidence at all"
+    );
+}
+
+/// A reconstruct that fails AFTER its bytes were renamed into place (the mode
+/// or the replicated xattrs could not be applied) leaves an object standing.
+/// The repair must not call that `Remote` and clear its intent: the object is
+/// there, the metadata is owed, and the intent is what keeps the path from
+/// reading as an offline delete and what makes the next pass retry.
+#[cfg(unix)]
+#[test]
+fn a_repair_reconstruct_that_fails_after_its_rename_keeps_the_object_and_the_intent() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = SegmentBlockStore::new(store_dir.path()).unwrap();
+    let content = b"rebuilt, then its metadata could not be applied";
+    let hash = hex::decode(store.put(content).unwrap()).unwrap();
+    let state = ReplicaCoordinator::open_in_memory().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    adopt_root(&state, "group-1", root.path());
+    let permit = RootCommitPermit::for_tests();
+    upsert_hydrated_file(&state, "group-1", &record_with_blocks("doc.txt", content, hash), &permit);
+    state
+        .materialization_intent_repository()
+        .begin_materialization_intent("group-1", "doc.txt", &[0; 32], &permit)
+        .unwrap();
+
+    yadorilink_filesystem_sync::materialization_repair::set_fail_after_rename_for_test(true);
+    let _ = repair_interrupted_materializations(
+        &state,
+        &store,
+        root.path(),
+        "group-1",
+        RepairMode::Startup,
+        &permit,
+    )
+    .unwrap();
+    yadorilink_filesystem_sync::materialization_repair::set_fail_after_rename_for_test(false);
+
+    assert!(
+        std::fs::symlink_metadata(root.path().join("doc.txt")).is_ok(),
+        "setup: the bytes must have been renamed into place before the metadata failed"
+    );
+    assert_ne!(
+        state
+            .materialization_state_repository()
+            .get_materialization_state("group-1", "doc.txt")
+            .unwrap(),
+        Some(MaterializationState::Remote),
+        "an object stands at the path: the row cannot be Remote"
+    );
+    assert!(
+        state
+            .materialization_intent_repository()
+            .has_materialization_intent("group-1", "doc.txt")
+            .unwrap(),
+        "the intent must stay open so the next pass retries the metadata"
+    );
 }
