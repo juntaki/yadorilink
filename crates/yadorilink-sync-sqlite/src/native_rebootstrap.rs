@@ -811,6 +811,22 @@ pub fn group_frozen(conn: &Connection, group_id: &str) -> Result<bool, SyncSqlit
         .is_some())
 }
 
+/// Whether this device's own deltas of `group_id` are withheld from peers: the group is frozen
+/// and the target is not installed yet. The incarnation that authors them is about to be closed
+/// at the target's position and what it authored past that is replayed as the new incarnation's,
+/// so a peer that took one of them now would hold it under a closed author next to its replay.
+/// From the install on there is no old delta to serve and the replay's own are published.
+pub fn own_deltas_withheld(conn: &Connection, group_id: &str) -> Result<bool, SyncSqliteError> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT 1 FROM native_rebootstrap_journal WHERE group_id = ?1 \
+             AND state IN ('capturing', 'preserving', 'preserved', 'quarantining')",
+        )?
+        .query_row([group_id], |_| Ok(()))
+        .optional()?
+        .is_some())
+}
+
 /// Whether any group is frozen: the question every enforcement point asks first, so an idle
 /// replica pays one probe of a table that is empty.
 pub fn any_group_frozen(conn: &Connection) -> Result<bool, SyncSqliteError> {
