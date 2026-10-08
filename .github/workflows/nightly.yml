@@ -76,7 +76,7 @@ jobs:
       - name: Daemon coverage (serial)
         if: always()
         run: |
-          cargo llvm-cov -p yadorilink-daemon --tests --no-report -- \
+          cargo llvm-cov --no-fail-fast -p yadorilink-daemon --tests --no-report -- \
             --test-threads=1 \
             --skip random_concurrent_operations_converge_to_an_identical_file_set \
             --skip replay_known_failing_seeds

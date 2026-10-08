@@ -103,7 +103,7 @@ jobs:
             timeout: 90
             python: true
             run: >-
-              cargo test -p yadorilink-daemon --test '*' --
+              cargo test --no-fail-fast -p yadorilink-daemon --test '*' --
               --test-threads=1
               --skip random_concurrent_operations_converge_to_an_identical_file_set
               --skip replay_known_failing_seeds
@@ -135,7 +135,7 @@ jobs:
           - lane: auth runtime
             timeout: 25
             run: >-
-              cargo test -p yadorilink-fapi-client
+              cargo test --no-fail-fast -p yadorilink-fapi-client
               --test cross_process_rotation --test five_minute_boundary
               -- --test-threads=1
     steps:
@@ -223,7 +223,7 @@ jobs:
       - name: Daemon filesystem and runtime tests
         if: always()
         run: >-
-          cargo test -p yadorilink-daemon --tests --
+          cargo test --no-fail-fast -p yadorilink-daemon --tests --
           --test-threads=1
           --skip random_concurrent_operations_converge_to_an_identical_file_set
           --skip replay_known_failing_seeds
@@ -261,7 +261,7 @@ jobs:
       - name: Daemon filesystem and runtime tests
         if: always()
         run: >-
-          cargo test -p yadorilink-daemon --tests --
+          cargo test --no-fail-fast -p yadorilink-daemon --tests --
           --test-threads=1
           --skip random_concurrent_operations_converge_to_an_identical_file_set
           --skip replay_known_failing_seeds
