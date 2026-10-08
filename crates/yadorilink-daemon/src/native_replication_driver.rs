@@ -228,11 +228,11 @@ impl ReplicationEnv {
         // snapshot, so a peer's request (whose cost grows with what it names)
         // never holds the writer gate other work waits on.
         if session::answer_writes(&message) {
-            let mut message = Some(message);
+            // The closure may run again: the database retries a transient lock, and
+            // `to_sqlite` keeps such an error recognisable for exactly that.
             self.db
                 .write(|conn| {
-                    let message = message.take().expect("a write is run once");
-                    session::answer_message(conn, &access, message).map_err(to_sqlite)
+                    session::answer_message(conn, &access, message.clone()).map_err(to_sqlite)
                 })
                 .map_err(ReplicationError::Storage)
         } else {
@@ -245,9 +245,16 @@ impl ReplicationEnv {
     }
 }
 
-/// A database closure's error type: the session error, flattened.
+/// A database closure's error type: the session error, flattened. A storage error is passed
+/// through as it is, not turned into text: the database retries a closure only when its error
+/// is a transient `SQLITE_LOCKED`/`SQLITE_BUSY`, and flattening that into a string made a table
+/// lock another connection held for a moment fail the whole answer, so the peer's round failed
+/// and was retried only after the unproductive-round backoff (seconds).
 fn to_sqlite(error: ReplicationError) -> yadorilink_sync_sqlite::SyncSqliteError {
-    yadorilink_sync_sqlite::SyncSqliteError::CorruptState(error.to_string())
+    match error {
+        ReplicationError::Storage(error) => error,
+        other => yadorilink_sync_sqlite::SyncSqliteError::CorruptState(other.to_string()),
+    }
 }
 
 /// Writes `bytes` and finishes the stream, all within [`STREAM_STEP`]: a

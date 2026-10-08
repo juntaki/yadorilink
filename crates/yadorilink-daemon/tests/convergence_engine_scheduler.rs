@@ -133,6 +133,56 @@ async fn zero_progress_never_reports_an_immediate_backlog() {
     }
 }
 
+
+/// Counts, per local device, the engine loop's iterations that ran a window of work and then
+/// went straight into the next iteration instead of waiting (the loop logs
+/// `engine loop draining an immediate backlog without waiting` for exactly those).
+#[derive(Clone, Default)]
+struct DrainRecorder(Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<Duration>>>>);
+
+impl DrainRecorder {
+    /// The own-work time of each iteration of `device` that drained without waiting.
+    fn drained(&self, device: &str) -> Vec<Duration> {
+        self.0.lock().unwrap().get(device).cloned().unwrap_or_default()
+    }
+}
+
+#[derive(Default)]
+struct DrainFields {
+    device: Option<String>,
+    wall_ms: Option<u64>,
+    is_drain: bool,
+}
+
+impl tracing::field::Visit for DrainFields {
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        if field.name() == "run_once_wall_ms" {
+            self.wall_ms = Some(value);
+        }
+    }
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        match field.name() {
+            "local_device_id" => self.device = Some(format!("{value:?}").trim_matches('"').into()),
+            "message" => {
+                self.is_drain =
+                    format!("{value:?}") == "engine loop draining an immediate backlog without waiting"
+            }
+            _ => {}
+        }
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for DrainRecorder {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        let mut fields = DrainFields::default();
+        event.record(&mut fields);
+        if let (true, Some(device), Some(wall_ms)) = (fields.is_drain, fields.device, fields.wall_ms)
+        {
+            self.0.lock().unwrap().entry(device).or_default().push(Duration::from_millis(wall_ms));
+        }
+    }
+}
+
 /// Real two-device scenario: more small files than one attempt's budget
 /// (`MAX_PATHS_PER_RECONCILE_ATTEMPT`, 32) land on A before B ever links,
 /// so B's initial import enqueues more materialization jobs than one tick
@@ -148,13 +198,24 @@ async fn zero_progress_never_reports_an_immediate_backlog() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn more_files_than_the_attempt_budget_converge_without_artificial_per_tick_sleeps() {
     support::ensure_isolated_config_dir();
+    use tracing_subscriber::layer::SubscriberExt;
+    let drains = DrainRecorder::default();
+    let _ = tracing::subscriber::set_global_default(
+        tracing_subscriber::registry().with(drains.clone()).with(
+            tracing_subscriber::filter::Targets::new()
+                .with_target("yadorilink_daemon::convergence", tracing::Level::DEBUG),
+        ),
+    );
     const FILE_COUNT: usize = 96;
-    // The old bug's own minimum floor for this file count, purely from
-    // sleeping a full second after every 32-file budget window instead of
-    // draining the remaining backlog immediately -- `ceil(96/32) - 1 = 2`
-    // full seconds of dead sleep alone, before any real work. Chosen from
-    // the fix's own mechanism, not tuned to this environment's throughput.
-    const OLD_BUG_MINIMUM_SLEEP_FLOOR: Duration = Duration::from_secs(2);
+    // The old bug slept a full tick interval after every 32-file budget
+    // window instead of draining the remaining backlog immediately:
+    // `ceil(96/32) - 1 = 2` full seconds of dead sleep before any real work.
+    // The windows' own work is not a constant (half a second each in a debug
+    // build on a slow disk), so a wall-clock bound on the whole convergence
+    // is a throughput threshold; what the bug changes is whether an
+    // iteration that ran a window goes straight into the next one, so that
+    // is what is asserted, from the loop's own record of it.
+    const WINDOWS_THAT_MUST_DRAIN: usize = 2;
 
     let (state_a, root_a, _store_a) = new_device("sched-a");
     let (state_b, root_b, _store_b) = new_device("sched-b");
@@ -206,13 +267,17 @@ async fn more_files_than_the_attempt_budget_converge_without_artificial_per_tick
         },
     )
     .await;
-    let elapsed = started.elapsed();
+    let _ = started;
+    // 96 files over a 32-file budget are three windows; each of the first two leaves runnable
+    // backlog behind it and so must not wait for the next wake or poll. (The files appear on
+    // disk during the third window, whose iteration is the one that legitimately waits.)
+    let drained = drains.drained("sched-b");
     assert!(
-        elapsed < OLD_BUG_MINIMUM_SLEEP_FLOOR,
-        "{FILE_COUNT} files (over the {}-file attempt budget) took {elapsed:?} to converge -- \
-         at or above the old bug's own {OLD_BUG_MINIMUM_SLEEP_FLOOR:?} minimum floor from \
-         sleeping a full tick interval after every budget window regardless of remaining \
-         backlog, suggesting that regression came back",
-        32,
+        drained.len() >= WINDOWS_THAT_MUST_DRAIN,
+        "{FILE_COUNT} files (over the 32-file attempt budget) converged, but only {} of the \
+         first {WINDOWS_THAT_MUST_DRAIN} windows went straight into the next one (own work of \
+         those that did: {drained:?}): the loop is waiting out a tick interval after budget \
+         windows with backlog left, the regression the scheduler fix removed",
+        drained.len(),
     );
 }
