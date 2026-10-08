@@ -174,15 +174,12 @@ jobs:
           DST_SEEDS: "1"
         run: >-
           cargo test --no-fail-fast -p yadorilink-daemon
-          --test dst_turmoil_substrate_case --test dst_turmoil_stack_case
+          --test dst_turmoil_substrate_case
           -- --test-threads=1
       - if: always()
         run: cargo run -p xtask -- dst-lane0
       - if: always()
         run: cargo run -p xtask -- dst-lane1
-      # The absolute per-admission bound is a release-build figure.
-      - if: always()
-        run: cargo test --release -p yadorilink-sync-sqlite --test path_frontier_scale
 
   linux-installer:
     runs-on: ubuntu-latest

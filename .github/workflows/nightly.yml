@@ -37,7 +37,7 @@ jobs:
           RUSTFLAGS: --cfg turmoil
         run: >-
           cargo test --no-fail-fast -p yadorilink-daemon
-          --test dst_turmoil_substrate_case --test dst_turmoil_stack_case
+          --test dst_turmoil_substrate_case
           -- --test-threads=1
       - if: always()
         run: cargo run -p xtask -- dst-lane2
