@@ -393,7 +393,7 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     // and corrupt them. Deterministic acquisition order (config dir → block
     // store → DB) prevents cross-instance deadlock; on conflict the
     // already-acquired lock is released (RAII) as `run` returns the error.
-    let _data_resource_locks =
+    let mut data_resource_locks =
         crate::resource_lock::DataResourceLocks::acquire(&block_store_root, &sync_db_path)?;
 
     let provider_temp_root = config.provider_temp_root;
@@ -427,6 +427,7 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
         Arc::new(ReplicaCoordinator::open(&sync_db_path).inspect_err(|e| {
             record_startup_error_best_effort("daemon_startup", "sync-state", e.to_string());
         })?);
+    data_resource_locks.lock_created_sync_db(&sync_db_path)?;
     yadorilink_sqlite_runtime::record_database_created(&sync_db_path)?;
 
     // Both resets run (each its own transaction) before either result is

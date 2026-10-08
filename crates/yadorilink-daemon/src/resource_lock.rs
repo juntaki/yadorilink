@@ -137,34 +137,67 @@ impl ResourceLock {
         // Then the live-inode flock, where it is safe. If this conflicts the
         // sidecar handle above is dropped as we return `Err`, releasing it.
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        let live_inode = {
-            // Open (creating if absent, exactly as SQLite would) the real
-            // database inode and flock the whole file. `truncate(false)` is
-            // load-bearing: we must never truncate the live database. Verified
-            // not to disturb SQLite's own WAL-mode locking on Linux local
-            // filesystems, because `flock` and SQLite's POSIX `fcntl`
-            // byte-range locks are independent there. We do NOT chmod the file.
-            let live = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&canonical_db)
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "failed to open sync database {} for inode lock: {e}",
-                        canonical_db.display()
-                    )
-                })?;
-            take_exclusive_lock(&live, &label, &canonical_db)?;
-            Some(live)
-        };
+        let live_inode = Self::lock_live_inode(&canonical_db, &label)?;
 
         Ok(Self {
             _sidecar: sidecar,
             #[cfg(any(target_os = "linux", target_os = "android"))]
             _live_inode: live_inode,
         })
+    }
+
+    /// Flock the live database inode if the database exists. Never creates it.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn lock_live_inode(canonical_db: &Path, label: &str) -> anyhow::Result<Option<std::fs::File>> {
+        // Open the real database inode and flock the whole file. This
+        // must NEVER create it: an absent database is how startup tells a
+        // new install from a lost one (`refuse_lost_database`), and an
+        // empty file made here would pass that check and let the first
+        // idle sweep delete every surviving block. A database that does
+        // not exist yet has no hard link or file bind mount to alias, so
+        // the sidecar alone covers it. `truncate(false)` is load-bearing:
+        // we must never truncate the live database. Verified not to
+        // disturb SQLite's own WAL-mode locking on Linux local
+        // filesystems, because `flock` and SQLite's POSIX `fcntl`
+        // byte-range locks are independent there. We do NOT chmod the file.
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(false)
+            .truncate(false)
+            .open(canonical_db)
+        {
+            Ok(live) => {
+                take_exclusive_lock(&live, label, canonical_db)?;
+                Ok(Some(live))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(anyhow::anyhow!(
+                "failed to open sync database {} for inode lock: {e}",
+                canonical_db.display()
+            )),
+        }
+    }
+
+    /// Take the live-inode flock once the database has been created. A
+    /// database that was absent at `lock_sync_db` time had no inode to lock
+    /// then; without this the first session would not be protected against a
+    /// hard-link or file-bind-mount alias of the file it just created.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(crate) fn lock_created_live_inode(&mut self, db_path: &Path) -> anyhow::Result<()> {
+        if self._live_inode.is_none() {
+            let canonical_db = canonicalize_file_target(db_path).map_err(|e| {
+                anyhow::anyhow!("failed to resolve sync database {}: {e}", db_path.display())
+            })?;
+            let label = format!("sync database {}", canonical_db.display());
+            self._live_inode = Self::lock_live_inode(&canonical_db, &label)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    pub(crate) fn lock_created_live_inode(&mut self, _db_path: &Path) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 
@@ -186,6 +219,12 @@ impl DataResourceLocks {
         let block_store = ResourceLock::lock_block_store(block_store_root)?;
         let sync_db = ResourceLock::lock_sync_db(sync_db_path)?;
         Ok(Self { _block_store: block_store, _sync_db: sync_db })
+    }
+
+    /// Call after the sync database has been opened (and so created, on a
+    /// new install) to extend the lock to the live inode.
+    pub(crate) fn lock_created_sync_db(&mut self, sync_db_path: &Path) -> anyhow::Result<()> {
+        self._sync_db.lock_created_live_inode(sync_db_path)
     }
 }
 
