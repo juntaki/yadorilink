@@ -1400,6 +1400,47 @@ impl super::LocalConvergenceExecutor {
                     // A path held because its file was unreadable settles
                     // here once it is readable again; the hold goes with it.
                     self.state.clear_metadata_unprovable_hold(group_id, target_path)?;
+                    // The bytes are the version's, but the row may still be the
+                    // unfinished write that put them there: an earlier attempt
+                    // renamed the file in and was refused at its commit (another
+                    // mutator advanced the fence), leaving the row in flight with
+                    // its intent open and no proof. Settling now would report the
+                    // path done, and what closes an obligation on the strength of
+                    // this settlement -- or, for a conflict copy, nothing at all,
+                    // since a copy owns no obligation -- would leave it unproven
+                    // for good. Finish it the way the repair sweep finishes a
+                    // write whose bytes are already right: one guarded commit.
+                    if self.state.get_materialization_state(group_id, target_path)?
+                        == Some(yadorilink_replica_domain::session_state::MaterializationState::Hydrating)
+                    {
+                        let authority = self.root_lease_for(group_id)?;
+                        let authority_op = authority.begin_operation()?;
+                        let permit = authority_op.permit();
+                        let recovered = yadorilink_filesystem_sync::materialization_execution::MaterializationExecutionPort::commit_recovered_materialized_state(
+                            self.state.as_ref(),
+                            group_id,
+                            target_path,
+                            yadorilink_peer_session::ports::ExactActualState::Object {
+                                kind: RecordKind::File,
+                                version: version_hash,
+                                identity: Box::new(
+                                    yadorilink_root_authority::fs_identity::FileIdentity::observe_path(
+                                        &out_path,
+                                    )
+                                    .ok(),
+                                ),
+                            },
+                            yadorilink_peer_session::ports::ExpectedAuthoring {
+                                state: yadorilink_peer_session::ports::MATERIALIZATION_IN_FLIGHT_STATE,
+                                expected_version: Some(&version_hash),
+                            },
+                            &permit,
+                        )
+                        .map_err(|error| PeerSessionError::from(crate::sync_error::SyncError::from(error)))?;
+                        if !recovered {
+                            return Ok(MaterializeResult::RetryRequired);
+                        }
+                    }
                     return Ok(MaterializeResult::Settled(SettlementEvidence::ExactObject {
                         kind: RecordKind::File,
                         version: version_hash,

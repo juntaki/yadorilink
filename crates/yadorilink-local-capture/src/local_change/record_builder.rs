@@ -747,6 +747,28 @@ impl LocalChangeProcessor {
                             // behavior exactly.
                             return Ok((LocalChangeOutcome::None, None, None));
                         }
+                        // A row that records no mode (a version from a platform with
+                        // no permission bits) says nothing the file's own mode can
+                        // diverge from, and the daemon's write of that version gives
+                        // the file the platform's default one. While a write of
+                        // exactly this content is open, that is the write's own
+                        // echo, not a chmod: the unfinished write (its proof is not
+                        // recorded yet, so `is_untouched_proven_write` cannot say so)
+                        // must not be authored back as a local edit.
+                        if indexed_unix_mode.is_none()
+                            && on_disk_xattrs == indexed_xattrs
+                            && self
+                                .state
+                                .materialization_intent_target(group_id, &rel_path)?
+                                .is_some_and(|target| {
+                                    target
+                                        == yadorilink_local_storage::intent_target_hash(
+                                            &existing.blocks,
+                                        )
+                                })
+                        {
+                            return Ok((LocalChangeOutcome::None, None, None));
+                        }
                         // A mode or xattr set that differs from the row is a
                         // local edit only if someone made it. The daemon's own
                         // untouched write of an older version still carries
@@ -1035,13 +1057,19 @@ impl LocalChangeProcessor {
             if intent_target == yadorilink_local_storage::intent_target_hash(&blocks) {
                 if let Ok(metadata) = std::fs::metadata(path) {
                     let on_disk_unix_mode = unix_mode_from_metadata(&metadata);
-                    let (indexed_unix_mode, indexed_xattrs) = indexed_mode_and_xattrs(
-                        self.state.canonical_current_row(group_id, &rel_path)?,
-                    );
+                    let indexed_row = self.state.canonical_current_row(group_id, &rel_path)?;
+                    let has_row = indexed_row.is_some();
+                    let (indexed_unix_mode, indexed_xattrs) = indexed_mode_and_xattrs(indexed_row);
                     let on_disk_xattrs = std::fs::File::open(path)
                         .map(|f| read_replicated_xattrs(&f))
                         .unwrap_or_default();
-                    if on_disk_unix_mode == indexed_unix_mode && on_disk_xattrs == indexed_xattrs {
+                    // A row that records no mode has none for the disk to diverge from
+                    // while the write that owns the intent is still open. (No row at
+                    // all is a different thing: nothing says what the file should be.)
+                    if (on_disk_unix_mode == indexed_unix_mode
+                        || (has_row && indexed_unix_mode.is_none()))
+                        && on_disk_xattrs == indexed_xattrs
+                    {
                         return Ok((LocalChangeOutcome::None, None, None));
                     }
                 }

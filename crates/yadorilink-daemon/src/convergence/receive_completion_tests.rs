@@ -481,12 +481,34 @@ fn repair(
 /// missing with nothing left to retry it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_source_stays_owed_until_its_failed_conflict_copy_is_written() {
+    a_source_stays_owed_until_its_failed_conflict_copy_is_written_at(40, 41).await;
+}
+
+/// The same scenario at modification times that give the pair different version hashes. The
+/// higher hash holds the name, so these put the winner on each side of the pair (and on each
+/// side in the platform that used to fail): a retry of the failed copy must prove the copy
+/// whichever version it is a copy of, and must not be disturbed by the link's watcher
+/// meeting the unfinished copy write on disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_source_stays_owed_until_its_failed_conflict_copy_is_written_1000_1100() {
+    a_source_stays_owed_until_its_failed_conflict_copy_is_written_at(1000, 1100).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_source_stays_owed_until_its_failed_conflict_copy_is_written_4000_4100() {
+    a_source_stays_owed_until_its_failed_conflict_copy_is_written_at(4000, 4100).await;
+}
+
+async fn a_source_stays_owed_until_its_failed_conflict_copy_is_written_at(
+    ours_mtime: i64,
+    theirs_mtime: i64,
+) {
     let (f, engine) = ready_fixture().await;
     let name = "doc.txt";
     let ours = content_of(ONE_BLOCK, 21);
     let theirs = content_of(ONE_BLOCK, 23);
-    let ours_version = f.content_version(&ours, 1000);
-    let theirs_version = f.content_version(&theirs, 1100);
+    let ours_version = f.content_version(&ours, ours_mtime);
+    let theirs_version = f.content_version(&theirs, theirs_mtime);
     // Two concurrent puts of the same path: one stands at the name, the
     // other at a conflict copy beside it.
     f.admit(name, &ours_version);
