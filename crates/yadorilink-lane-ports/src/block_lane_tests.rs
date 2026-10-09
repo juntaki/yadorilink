@@ -83,6 +83,9 @@ async fn a_header_larger_than_the_callers_ceiling_is_refused_before_allocating()
         let link = inbound.recv().await.unwrap();
         let lane = link.accept_lane().await.unwrap();
         let mut stream = LaneBlockStream::new(lane);
+        // Read the client's request first: replying and ending this task before
+        // the client has finished writing resets the stream under its write.
+        stream.recv_message(1024).await.unwrap();
         // Well-formed, and far larger than the reader below will accept.
         stream.send_message(&vec![0u8; 8192]).await.unwrap();
         stream.send_body(&[]).await.unwrap();

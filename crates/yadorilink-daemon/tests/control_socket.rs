@@ -1275,13 +1275,22 @@ mod unix_socket_tests {
             )
             .unwrap();
 
-        let resp = send(
-            &socket_path,
+        // `busy` is transient by design: eviction never waits for a path lock,
+        // so a background task that still holds it just after the watch stopped
+        // gets a refusal that clears on its own. Retry for a bounded time.
+        let evict_request = || {
             ReqPayload::Evict(EvictRequest {
                 absolute_path: folder.join("report.pdf").to_string_lossy().to_string(),
-            }),
-        )
-        .await;
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut resp = send(&socket_path, evict_request()).await;
+        while matches!(&resp.payload, Some(RespPayload::Error(e)) if e.contains("is busy"))
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            resp = send(&socket_path, evict_request()).await;
+        }
         assert!(
             matches!(resp.payload, Some(RespPayload::Evict(_))),
             "indexed hydrated file should evict successfully, got {:?}",
