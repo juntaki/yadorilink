@@ -46,7 +46,7 @@ async fn ready_fixture() -> (Fixture, Arc<ConvergenceEngine>) {
     // Settles the group's one-time work first, so the parked attempt below
     // claims only the path under test.
     let warm = b"warm-up";
-    let version = f.content_version(warm, 1);
+    let version = f.content_version(warm, 100);
     f.admit("warm.txt", &version);
     drive_until(&f, &engine, "the warm-up path closes", |f| obligation(f, "warm.txt").is_none())
         .await;
@@ -170,7 +170,7 @@ async fn admit_and_park(
     name: &str,
     content: &[u8],
 ) -> (FileVersion, ProjectionObligation, Arc<BeforeCompletionHook>, tokio::task::JoinHandle<bool>) {
-    let version = f.content_version(content, 10);
+    let version = f.content_version(content, 1000);
     f.admit(name, &version);
     let claimed = obligation(f, name).expect("the admission arms an obligation");
     let hook = BeforeCompletionHook::new();
@@ -333,7 +333,7 @@ async fn same_path_admission_while_parked_is_independently_rejected_by_generatio
     let (written, claimed, hook, pass) = admit_and_park(&f, &engine, name, &first).await;
 
     let second = content_of(ONE_BLOCK, 11);
-    let newer = f.content_version(&second, 20);
+    let newer = f.content_version(&second, 2000);
     let observing = crate::test_support::remote_admission_fixture::current_heads(
         &f.state.replica_coordinator,
         GROUP,
@@ -378,7 +378,7 @@ async fn unrelated_path_head_movement_must_not_discard_an_already_settled_attemp
     let content = content_of(ONE_BLOCK, 13);
     let (version, _, hook, pass) = admit_and_park(&f, &engine, name, &content).await;
 
-    let unrelated = f.content_version(&content_of(ONE_BLOCK, 15), 30);
+    let unrelated = f.content_version(&content_of(ONE_BLOCK, 15), 3000);
     f.admit("y-unrelated.txt", &unrelated);
     hook.resume();
     pass.await.unwrap();
@@ -435,7 +435,7 @@ async fn a_crash_after_the_commit_leaves_nothing_to_repair_or_reproject() {
     let (f, engine) = ready_fixture().await;
     let name = "landed.bin";
     let content = content_of(ONE_BLOCK, 19);
-    let version = f.content_version(&content, 10);
+    let version = f.content_version(&content, 1000);
     f.admit(name, &version);
     drive_until(&f, &engine, "the path closes", |f| obligation(f, name).is_none()).await;
     assert_eq!(proven_version(&f, name), Some(version.version_hash));
@@ -485,8 +485,8 @@ async fn a_source_stays_owed_until_its_failed_conflict_copy_is_written() {
     let name = "doc.txt";
     let ours = content_of(ONE_BLOCK, 21);
     let theirs = content_of(ONE_BLOCK, 23);
-    let ours_version = f.content_version(&ours, 40);
-    let theirs_version = f.content_version(&theirs, 41);
+    let ours_version = f.content_version(&ours, 1000);
+    let theirs_version = f.content_version(&theirs, 1100);
     // Two concurrent puts of the same path: one stands at the name, the
     // other at a conflict copy beside it.
     f.admit(name, &ours_version);
@@ -559,8 +559,8 @@ async fn a_name_that_looks_like_a_copy_keeps_its_original_owed(limit: usize) {
     let source = "report.txt";
     let copy = "report (conflicted copy, device-b).txt";
     let (a, b) = (content_of(ONE_BLOCK, 31), content_of(ONE_BLOCK, 33));
-    f.admit(source, &f.content_version(&a, 50));
-    f.admit(copy, &f.content_version(&b, 51));
+    f.admit(source, &f.content_version(&a, 5000));
+    f.admit(copy, &f.content_version(&b, 5100));
     let executor = f.state.peers.local_convergence("device-peer").unwrap();
     executor.receive_write_concurrency_override.store(limit, std::sync::atomic::Ordering::Relaxed);
     let (state, root) = (f.state.clone(), f.root.clone());
@@ -621,7 +621,7 @@ fn admit_window(f: &Fixture, prefix: &str, count: usize, len: usize) -> Window {
     // With the mode the written file has, so a watcher that looks at it while the
     // window waits finds nothing of its own to author.
     let versions: Vec<FileVersion> =
-        contents.iter().map(|c| f.content_version_with_mode(c, 10, Some(0o644))).collect();
+        contents.iter().map(|c| f.content_version_with_mode(c, 1000, Some(0o644))).collect();
     for (name, version) in names.iter().zip(&versions) {
         f.admit(name, version);
     }
@@ -852,7 +852,7 @@ async fn a_crash_after_the_temp_fsyncs_of_a_window_is_rebuilt_from_the_blocks() 
 async fn a_crash_after_the_directory_syncs_before_the_batch_is_finished_by_repair() {
     let f = fixture(true).await;
     let engine = Arc::new(ConvergenceEngine::new(f.state.clone()));
-    f.admit("warm.txt", &f.content_version(b"warm-up", 1));
+    f.admit("warm.txt", &f.content_version(b"warm-up", 100));
     drive_until(&f, &engine, "the warm-up path closes", |f| obligation(f, "warm.txt").is_none())
         .await;
     f.state.replica_coordinator.test_observers.close_batch_sizes.lock().unwrap().clear();
@@ -1011,7 +1011,7 @@ fn end_state(f: &Fixture, window: &Window) -> Vec<String> {
 async fn a_crash_between_the_metadata_commit_and_the_open(mode: u8) -> (Vec<String>, Vec<String>) {
     let f = fixture(true).await;
     let engine = Arc::new(ConvergenceEngine::new(f.state.clone()));
-    f.admit("warm.txt", &f.content_version(b"warm-up", 1));
+    f.admit("warm.txt", &f.content_version(b"warm-up", 100));
     drive_until(&f, &engine, "the warm-up path closes", |f| obligation(f, "warm.txt").is_none())
         .await;
     executor(&f).batch_metadata_override.store(mode, std::sync::atomic::Ordering::Relaxed);
@@ -1173,7 +1173,7 @@ fn open_batches(f: &Fixture) -> Vec<usize> {
 async fn a_crash_after_the_open_before_any_byte(mode: u8) -> (Vec<String>, Vec<String>) {
     let f = fixture(true).await;
     let engine = Arc::new(ConvergenceEngine::new(f.state.clone()));
-    f.admit("warm.txt", &f.content_version(b"warm-up", 1));
+    f.admit("warm.txt", &f.content_version(b"warm-up", 100));
     drive_until(&f, &engine, "the warm-up path closes", |f| obligation(f, "warm.txt").is_none())
         .await;
     executor(&f).batch_open_override.store(mode, std::sync::atomic::Ordering::Relaxed);
