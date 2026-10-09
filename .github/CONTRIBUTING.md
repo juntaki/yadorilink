@@ -71,14 +71,14 @@ cargo build --release
 
 The project is licensed under AGPL-3.0-only (see `LICENSE`).
 
-Contributions are accepted under the terms in [CLA.md](CLA.md): your
-contribution is licensed to everyone under AGPL-3.0-only, you keep your
-copyright, and you grant the project maintainer a perpetual, worldwide,
-non-exclusive, royalty-free, irrevocable licence to use, modify, distribute
-and sublicense it under AGPL-3.0-only or any other licence terms the
-maintainer chooses.
+Contributions are accepted under the [Contributor License Agreement](CLA.md)
+(current text: [v1.0](legal/CLA-v1.0.md)). You keep the copyright in your
+contribution. You grant the maintainer a broad copyright and patent licence,
+including the right to sublicense it under AGPL-3.0-only or other licence
+terms, commercial ones included.
 
-You must explicitly agree to those terms before a pull request can be merged:
-the contributor licence check comments on your first pull request with the
-sentence to reply with. The agreement is recorded once per GitHub account.
-Maintainers and automation accounts are exempt.
+You must explicitly agree before a pull request can be merged: the contributor
+licence check comments on your first pull request with the sentence to reply
+with (`I have read and agree to the YadoriLink CLA v1.0`). The agreement is
+recorded once per GitHub account and version. Maintainers and automation
+accounts are exempt.

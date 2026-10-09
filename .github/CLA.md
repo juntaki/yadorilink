@@ -1,34 +1,15 @@
-# Contributor Licence Agreement
+# Contributor License Agreement
 
-This agreement covers contributions you submit to the YadoriLink project
-("the Project"), maintained by Jumpei Takiyasu ("the Maintainer"). A
-"contribution" is any code, documentation or other material you submit for
-inclusion in the Project, for example in a pull request.
+Contributions to YadoriLink are accepted under the current YadoriLink
+Individual Contributor License Agreement.
 
-By agreeing to this document you confirm and agree that:
+Current version: [YadoriLink Individual Contributor License Agreement v1.0](legal/CLA-v1.0.md)
 
-1. **Your right to contribute.** You wrote the contribution, or you otherwise
-   have the right to submit it under these terms. If your employer or another
-   party has rights in it, you have their permission.
-2. **You keep your copyright.** You remain the owner of the copyright in your
-   contribution.
-3. **Licence to everyone.** Your contribution is licensed to everyone under
-   the GNU Affero General Public License v3.0 only (AGPL-3.0-only), the licence
-   of the Project (see `LICENSE`).
-4. **Additional grant to the Maintainer.** You grant the Maintainer a
-   perpetual, worldwide, non-exclusive, royalty-free, irrevocable licence to
-   use, reproduce, modify, distribute and sublicense your contribution, and
-   derivative works of it, under AGPL-3.0-only or under any other licence
-   terms the Maintainer chooses.
-5. **No warranty.** You provide your contribution as is, without warranties
-   of any kind, except that the statements in section 1 are true.
+Contributors must accept the current agreement before their contributions can
+be merged. To accept, comment on your pull request with:
 
-## How to agree
+> I have read and agree to the YadoriLink CLA v1.0
 
-When you open your first pull request, the contributor licence check asks you
-to reply with this sentence:
-
-> I have read the CLA Document and I hereby sign the CLA
-
-Your agreement is recorded against your GitHub account and applies to your
-later pull requests until this document changes.
+Historical versions of the agreement, if any, remain available under
+[`legal/`](legal/). A new material version requires a new acceptance for
+subsequent contributions.
