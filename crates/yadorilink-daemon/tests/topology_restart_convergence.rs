@@ -406,9 +406,9 @@ async fn on_demand_node_restart_recovers_and_resyncs(restart_w: bool) {
         || format!("the bystander On-Demand peer never saw {label}'s pre-restart DAG record"),
     )
     .await;
-    yadorilink_daemon::hydration::hydrate(bystander_hydrate_before, group_id, &before_name)
-        .await
-        .expect("bystander hydration of the pre-restart baseline should succeed");
+    // The record can be listed while still the bootstrap scaffold, and the lane then
+    // replaces it; a hydrate that sampled the scaffold fails closed and is retried.
+    support::topology::hydrate_with_retries(bystander_hydrate_before, group_id, &before_name).await;
 
     let restart_device_id = if restart_w { w.device_id.clone() } else { m.device_id.clone() };
     let n_session_before: Arc<PeerSyncSession> =
@@ -509,9 +509,9 @@ async fn on_demand_node_restart_recovers_and_resyncs(restart_w: bool) {
         || format!("bystander peer never saw {label}'s post-restart DAG record"),
     )
     .await;
-    yadorilink_daemon::hydration::hydrate(bystander_state_after, group_id, &after_name)
-        .await
-        .expect("bystander hydration of the post-restart content should succeed");
+    // The record can be listed while still the bootstrap scaffold, and the lane then
+    // replaces it; a hydrate that sampled the scaffold fails closed and is retried.
+    support::topology::hydrate_with_retries(bystander_state_after, group_id, &after_name).await;
 
     handles.shutdown();
 }
@@ -571,9 +571,9 @@ async fn a_device_that_was_offline_catches_up_when_it_returns() {
         || "the returning device never learned the change made while it was offline".to_string(),
     )
     .await;
-    yadorilink_daemon::hydration::hydrate(&w.state, group_id, name)
-        .await
-        .expect("the returning device should hydrate the change it missed");
+    // The record can be listed while still the bootstrap scaffold, and the lane then
+    // replaces it; a hydrate that sampled the scaffold fails closed and is retried.
+    support::topology::hydrate_with_retries(&w.state, group_id, name).await;
 
     handles.shutdown();
 }

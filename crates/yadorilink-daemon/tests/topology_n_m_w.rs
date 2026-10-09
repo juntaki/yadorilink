@@ -90,9 +90,9 @@ async fn happy_path_direct_convergence_and_hydration() {
         || "W never saw shared.txt's DAG record".to_string(),
     )
     .await;
-    yadorilink_daemon::hydration::hydrate(&w.state, group_id, "shared.txt")
-        .await
-        .expect("hydration should succeed once a connected peer holds the content");
+    // The record can be listed while still the bootstrap scaffold, and the lane then
+    // replaces it; a hydrate that sampled the scaffold fails closed and is retried.
+    support::topology::hydrate_with_retries(&w.state, group_id, "shared.txt").await;
     assert_eq!(
         std::fs::read(w.root.path().join("shared.txt")).unwrap(),
         b"hello from M",
@@ -144,9 +144,9 @@ async fn happy_path_direct_convergence_and_hydration() {
         || "M never saw from-w.txt's DAG record".to_string(),
     )
     .await;
-    yadorilink_daemon::hydration::hydrate(&m.state, group_id, "from-w.txt")
-        .await
-        .expect("hydration should succeed once a connected peer holds the content");
+    // The record can be listed while still the bootstrap scaffold, and the lane then
+    // replaces it; a hydrate that sampled the scaffold fails closed and is retried.
+    support::topology::hydrate_with_retries(&m.state, group_id, "from-w.txt").await;
     assert_eq!(
         std::fs::read(m.root.path().join("from-w.txt")).unwrap(),
         b"hello from W",
