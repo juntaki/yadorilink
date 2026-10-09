@@ -62,7 +62,9 @@ async fn rapid_restart(
     w
 }
 
-#[tokio::test]
+// Multi-thread: the link runtime's live flush loop uses `block_in_place`, which
+// panics on a current-thread runtime when the real watcher delivers an event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rapid_restart_recovers_within_bound() {
     init_tracing();
     support::ensure_isolated_config_dir();
