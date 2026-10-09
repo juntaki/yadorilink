@@ -1107,7 +1107,7 @@ jobs:
           # beta tag whose gate has not been acknowledged.
           if [ "${GATE_ACK:-}" != "$TAG" ]; then
             echo "beta-release-gate not acknowledged for $TAG." >&2
-            echo "Set repo variable BETA_RELEASE_GATE_ACK=$TAG after completing docs/BETA_RELEASE_GATE.md." >&2
+            echo "Set repo variable BETA_RELEASE_GATE_ACK=$TAG after completing the beta release gate checklist." >&2
             exit 1
           fi
 

@@ -1261,7 +1261,7 @@ impl DaemonState {
     /// entry; this device's own materialization completeness alone never
     /// produces it (only `Protecting`, for a full-replica device still
     /// catching up locally) -- see `crate::durability_service`'s own
-    /// durability-model doc comment. This method itself never performs a live peer
+    /// module documentation. This method itself never performs a live peer
     /// round-trip (too costly to run on every `status` call); it only ever
     /// reads what the background sweep already cached.
     pub fn group_durability_status(&self, group_id: &str) -> GroupDurabilityStatus {

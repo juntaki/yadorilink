@@ -15,9 +15,9 @@ IDs are the stable source of truth; file line numbers are intentionally omitted.
 
 - Target state: every current version in an active group before demote, unlink, revoke, or device removal.
 - Destructive operations: loss of an eager ACL edge or local eager link.
-- Enforcement symbol: `ensure_unlink_keeps_a_full_replica`, `full_replica_handoff_ready`, and Worker lease-guarded role-loss commit services.
+- Enforcement symbol: `ensure_unlink_keeps_a_full_replica`, `full_replica_handoff_ready`, and coordination-service lease-guarded role-loss commit services.
 - Test IDs: `last_full_replica_cannot_unlink`, `unlink_refused_when_no_other_replica_is_ready`, `demotion_refused_when_the_target_cannot_grant_a_lease`.
-- Runtime diagnosis: handoff readiness response, durability status, role-loss journal state, and Worker audit events.
+- Runtime diagnosis: handoff readiness response, durability status, role-loss journal state, and coordination-service audit events.
 
 ## DL-3: Physical Deletion Is Global
 
@@ -37,8 +37,8 @@ IDs are the stable source of truth; file line numbers are intentionally omitted.
 
 ## DL-5: Crash Leaves A Recoverable State
 
-- Target state: block/index materialization and Worker/local role-loss operations.
-- Destructive operations: process termination between block write, index commit, filesystem rename, Worker commit, and local commit.
+- Target state: block/index materialization and service/local role-loss operations.
+- Destructive operations: process termination between block write, index commit, filesystem rename, service commit, and local commit.
 - Enforcement symbol: `repair_interrupted_materializations`, `RoleLossOperation`, and `run_role_loss_reconciliation_sweep`.
 - Test IDs: `repair_reconstructs_locally_after_a_simulated_crash_before_rename`, `demote_local_failure_after_worker_commit_is_compensated_and_rolled_back`, `prepared_reconcile_restores_worker_eager_after_response_loss`.
 - Runtime diagnosis: materialization repair logs and persisted role-loss journal state/attempt count.
@@ -46,10 +46,10 @@ IDs are the stable source of truth; file line numbers are intentionally omitted.
 ## DL-6: Role Loss Never Silently Removes The Last Holder
 
 - Target state: demote, unlink, revoke, and multi-group device removal commits.
-- Destructive operations: lease-free role loss, stale readiness, partial multi-group commit, and ambiguous Worker response.
-- Enforcement symbol: `commit_handoff_role_loss`, atomic Worker device removal, and `RoleLossCommitOutcome`.
+- Destructive operations: lease-free role loss, stale readiness, partial multi-group commit, and ambiguous coordination-service response.
+- Enforcement symbol: `commit_handoff_role_loss`, atomic coordination-service device removal, and `RoleLossCommitOutcome`.
 - Test IDs: `ambiguous_demote_keeps_prepared_journal`, `ambiguous_unlink_keeps_prepared_journal`, `demotion_writes_the_worker_exactly_once_via_role_loss_commit`.
-- Runtime diagnosis: CLI role-loss result, Worker audit event, and persisted role-loss journal.
+- Runtime diagnosis: CLI role-loss result, coordination-service audit event, and persisted role-loss journal.
 
 ## DL-7: Forced Durability Unknown Survives Restart
 

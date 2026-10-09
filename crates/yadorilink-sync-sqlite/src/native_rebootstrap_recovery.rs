@@ -308,8 +308,8 @@ fn fsync_file(file: &fs::File, path: &Path) -> io::Result<()> {
 /// directory-durability implementation below (`durable_rename` with
 /// `MOVEFILE_WRITE_THROUGH`, plus a directory-handle `FlushFileBuffers`) but
 /// still refuses a rebootstrap with `Blocked(DurabilityUnsupported)`. Set it to
-/// `true` ONLY after every check in `docs/design/windows-directory-durability.md`
-/// ("Validation required before the flip") has passed on a real Windows host.
+/// `true` ONLY after the write-through rename and directory-handle flush have
+/// been validated end to end (including crash recovery) on a real Windows host.
 pub const WINDOWS_DIRECTORY_DURABILITY_VALIDATED: bool = false;
 
 /// Whether this platform can make a directory-entry change (a create or a

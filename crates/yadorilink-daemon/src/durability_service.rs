@@ -395,7 +395,7 @@ fn default_custody_confirmation_sweep_interval() -> Duration {
 /// genuinely-protected group to `Unknown`. Deliberately NOT
 /// unbounded: past this bound the evidence is old enough that "was
 /// protected" stops standing in for "is protected now" — see this module's
-/// durability-model doc for why stale evidence must never be reported as
+/// crate-level `DURABILITY.md` for why stale evidence must never be reported as
 /// current.
 const CUSTODY_CONFIRMATION_STALENESS_BOUND: Duration = Duration::from_secs(270);
 

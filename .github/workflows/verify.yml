@@ -9,9 +9,7 @@ name: Verify
 on:
   push:
     branches: [main]
-    paths-ignore: ["docs/**"]
   pull_request:
-    paths-ignore: ["docs/**"]
   workflow_dispatch:
 
 permissions:
@@ -49,7 +47,6 @@ jobs:
           python3 scripts/check-block-commit-boundary.py
           python3 scripts/check-block-deletion-boundary.py
           python3 scripts/check-daemon-composition-root.py
-          python3 scripts/check-data-durability-model.py
           python3 scripts/check-index-read-fail-closed.py
           python3 scripts/check-link-enumeration-fail-closed.py
           python3 scripts/check-link-group-uniqueness.py

@@ -1747,7 +1747,7 @@ fn a_platform_without_directory_durability_starts_nothing() {
 
 #[test]
 fn the_windows_gate_stays_closed_until_validated_on_a_windows_host() {
-    // Flipping this needs the checks in docs/design/windows-directory-durability.md.
+    // Flipping this requires validating directory durability on a real Windows host.
     const { assert!(!crate::native_rebootstrap_recovery::WINDOWS_DIRECTORY_DURABILITY_VALIDATED) };
 }
 
