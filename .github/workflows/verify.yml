@@ -21,6 +21,11 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   quality:
@@ -150,7 +155,18 @@ jobs:
           python-version: "3.12"
       - if: matrix.python
         run: python3 -m pip install --quiet --disable-pip-version-check cryptography
-      - run: ${{ matrix.run }}
+      - run: .github/checks/run-logged.sh ${{ matrix.run }}
+      - name: Test report
+        if: always()
+        run: python3 .github/checks/summarize-test-log.py test-output.log
+      - name: Upload the test log
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-log-linux-${{ matrix.lane }}
+          path: test-output.log
+          if-no-files-found: ignore
+          retention-days: 7
 
   # Deterministic simulation: one seed per scenario. Multi-seed sweeps are
   # nightly.
@@ -170,13 +186,13 @@ jobs:
           RUSTFLAGS: --cfg turmoil
           DST_SEEDS: "1"
         run: >-
-          cargo test --no-fail-fast -p yadorilink-daemon
+          .github/checks/run-logged.sh cargo test --no-fail-fast -p yadorilink-daemon
           --test dst_turmoil_substrate_case
           -- --test-threads=1
       - name: Simulation harness lints and conformance
         if: always()
         run: >-
-          cargo test -p yadorilink-daemon
+          .github/checks/run-logged.sh cargo test -p yadorilink-daemon
           --test dst_fidelity_lint
           --test watcher_decompose_conformance
       - name: Simulation harness unit tests
@@ -184,7 +200,7 @@ jobs:
         env:
           RUSTFLAGS: --cfg turmoil
         run: >-
-          cargo test -p yadorilink-daemon
+          .github/checks/run-logged.sh cargo test -p yadorilink-daemon
           --test dst_watcher_debounce
           -- dst_support::
       - name: Turmoil scenarios, one seed, reduced op budget
@@ -195,8 +211,19 @@ jobs:
           DST_OPS_BUDGET: "4"
         run: |
           for scenario in dst_turmoil_substrate_case dst_watcher_debounce; do
-            cargo test -p yadorilink-daemon --test "$scenario"
+            .github/checks/run-logged.sh cargo test -p yadorilink-daemon --test "$scenario"
           done
+      - name: Test report
+        if: always()
+        run: python3 .github/checks/summarize-test-log.py test-output.log
+      - name: Upload the test log
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-log-simulation
+          path: test-output.log
+          if-no-files-found: ignore
+          retention-days: 7
 
   linux-installer:
     runs-on: ubuntu-latest
@@ -250,7 +277,7 @@ jobs:
       - name: Workspace tests
         if: matrix.lane == 'workspace' && always()
         run: >-
-          cargo test --no-fail-fast --workspace --exclude yadorilink-daemon --exclude yadorilink-desktop-app
+          .github/checks/run-logged.sh cargo test --no-fail-fast --workspace --exclude yadorilink-daemon --exclude yadorilink-desktop-app
           --
           --skip rotation_without_the_lock_destroys_the_grant
           --skip rotation_under_the_lock_keeps_the_grant_alive
@@ -259,7 +286,7 @@ jobs:
       - name: Daemon filesystem and runtime tests
         if: matrix.lane == 'daemon'
         run: >-
-          cargo test --no-fail-fast -p yadorilink-daemon --tests --
+          .github/checks/run-logged.sh cargo test --no-fail-fast -p yadorilink-daemon --tests --
           --test-threads=1
           --skip random_concurrent_operations_converge_to_an_identical_file_set
           --skip replay_known_failing_seeds
@@ -268,6 +295,17 @@ jobs:
         run: |
           cargo build --release --manifest-path platforms/macos/app/core/Cargo.toml
           cargo build --release --manifest-path platforms/macos/app/fileprovider-core/Cargo.toml
+      - name: Test report
+        if: always()
+        run: python3 .github/checks/summarize-test-log.py test-output.log
+      - name: Upload the test log
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-log-macos-${{ matrix.lane }}
+          path: test-output.log
+          if-no-files-found: ignore
+          retention-days: 7
 
   windows:
     name: windows (${{ matrix.lane }})
@@ -302,7 +340,7 @@ jobs:
       - name: Workspace tests
         if: matrix.lane == 'workspace' && always()
         run: >-
-          cargo test --no-fail-fast --workspace --exclude yadorilink-daemon --exclude yadorilink-desktop-app
+          .github/checks/run-logged.sh cargo test --no-fail-fast --workspace --exclude yadorilink-daemon --exclude yadorilink-desktop-app
           -- --test-threads=4
           --skip rotation_without_the_lock_destroys_the_grant
           --skip rotation_under_the_lock_keeps_the_grant_alive
@@ -311,7 +349,7 @@ jobs:
       - name: Daemon filesystem and runtime tests
         if: matrix.lane == 'daemon'
         run: >-
-          cargo test --no-fail-fast -p yadorilink-daemon --tests --
+          .github/checks/run-logged.sh cargo test --no-fail-fast -p yadorilink-daemon --tests --
           --test-threads=1
           --skip random_concurrent_operations_converge_to_an_identical_file_set
           --skip replay_known_failing_seeds
@@ -319,3 +357,14 @@ jobs:
         if: matrix.lane == 'shell'
         working-directory: platforms/windows/shell
         run: cargo build --release
+      - name: Test report
+        if: always()
+        run: python3 .github/checks/summarize-test-log.py test-output.log
+      - name: Upload the test log
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-log-windows-${{ matrix.lane }}
+          path: test-output.log
+          if-no-files-found: ignore
+          retention-days: 7
