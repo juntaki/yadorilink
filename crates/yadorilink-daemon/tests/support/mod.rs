@@ -155,6 +155,9 @@ pub fn ensure_isolated_config_dir() {
         // binary.
         let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
         std::env::set_var("YADORILINK_CONFIG_DIR", dir.path());
+        // These harnesses run no cfapi-host.exe: without a provider, a Windows
+        // `Remote` row would stay a recorded identity with nothing on disk.
+        yadorilink_local_storage::materialize_write::set_test_native_provider_absent(true);
     });
 }
 

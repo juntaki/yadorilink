@@ -782,7 +782,12 @@ pub fn create_or_defer_placeholder(out_path: &Path) -> PlaceholderIdentityToReco
     #[cfg(not(any(test, feature = "test-support")))]
     let deferred = false;
     let _ = out_path;
-    if deferred || cfg!(windows) {
+    #[cfg(any(test, feature = "test-support"))]
+    let native_provider_exists =
+        cfg!(windows) && !TEST_NATIVE_PROVIDER_ABSENT.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(any(test, feature = "test-support")))]
+    let native_provider_exists = cfg!(windows);
+    if deferred || native_provider_exists {
         return PlaceholderIdentityToRecord::RecordIfAbsent {
             identity: PlaceholderDiskIdentity {
                 dev: 0,
@@ -792,6 +797,23 @@ pub fn create_or_defer_placeholder(out_path: &Path) -> PlaceholderIdentityToReco
         };
     }
     PlaceholderIdentityToRecord::Clear
+}
+
+/// Test-only: declares that this process runs without a native provider
+/// (on Windows, no `cfapi-host.exe`), so [`create_or_defer_placeholder`]
+/// answers [`PlaceholderIdentityToRecord::Clear`] as it does on any platform
+/// without one. A pure-Rust harness has no host to create the deferred
+/// object, and a `Remote` row whose placeholder never appears can neither be
+/// hydrated (a recorded identity with nothing on disk means "removed
+/// locally") nor receive its content. A per-path force
+/// ([`set_test_force_deferred_placeholder_for_path`]) still wins.
+#[cfg(any(test, feature = "test-support"))]
+static TEST_NATIVE_PROVIDER_ABSENT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_test_native_provider_absent(absent: bool) {
+    TEST_NATIVE_PROVIDER_ABSENT.store(absent, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Test-only failure-injection flag, consumed by [`create_or_defer_placeholder`]
