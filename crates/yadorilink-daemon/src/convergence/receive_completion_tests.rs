@@ -647,7 +647,6 @@ fn long_deadline(f: &Fixture) {
 /// Parks one engine pass with every file of `window` renamed into place and
 /// held before its completion, and returns the hook and the pass.
 async fn park_window(
-    f: &Fixture,
     engine: &Arc<ConvergenceEngine>,
     window: &Window,
 ) -> (Arc<BeforeCompletionHook>, tokio::task::JoinHandle<bool>) {
@@ -656,18 +655,10 @@ async fn park_window(
     let pass = tokio::spawn(async move {
         drive_obligations_once_for_test_with_hooks(&engine2, 128, 256, &hook2).await
     });
-    let waited = std::time::Instant::now();
-    while !window
-        .names
-        .iter()
-        .zip(&window.contents)
-        .all(|(name, content)| f.read(name).as_deref() == Some(&content[..]))
-    {
-        assert!(waited.elapsed() < Duration::from_secs(30), "the window never reached its seam");
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    // Every file is parked, not just written: they park after their last check.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Wait for every file to be parked at the completion seam, not for a
+    // guessed delay: bytes on disk say nothing about how far each future got.
+    hook.wait_parked_count(window.names.len(), Duration::from_secs(30)).await;
+    assert_eq!(hook.parked_count(), window.names.len(), "exactly one park per window file");
     (hook, pass)
 }
 
@@ -694,7 +685,7 @@ async fn a_window_of_claimed_files_closes_all_its_obligations_in_one_transaction
     let (f, engine) = ready_fixture().await;
     long_deadline(&f);
     let window = admit_window(&f, "w", 4, ONE_BLOCK);
-    let (hook, pass) = park_window(&f, &engine, &window).await;
+    let (hook, pass) = park_window(&engine, &window).await;
     assert_window_durable_and_nothing_committed(&f, &window);
     release_all(&hook, pass).await;
 
@@ -713,7 +704,7 @@ async fn a_claim_overtaken_in_a_batch_leaves_only_that_obligation_open() {
     let (f, engine) = ready_fixture().await;
     long_deadline(&f);
     let window = admit_window(&f, "s", 3, ONE_BLOCK);
-    let (hook, pass) = park_window(&f, &engine, &window).await;
+    let (hook, pass) = park_window(&engine, &window).await;
     f.state
         .replica_coordinator
         .sqlite()
@@ -743,7 +734,7 @@ async fn a_fence_moved_in_a_batch_refuses_only_that_file() {
     let (f, engine) = ready_fixture().await;
     long_deadline(&f);
     let window = admit_window(&f, "f", 3, ONE_BLOCK);
-    let (hook, pass) = park_window(&f, &engine, &window).await;
+    let (hook, pass) = park_window(&engine, &window).await;
     let raced = &window.names[2];
     f.state.replica_coordinator.dag_bump_mutation_fence(GROUP, raced, "local_capture").unwrap();
     release_all(&hook, pass).await;
@@ -858,7 +849,7 @@ async fn a_crash_after_the_directory_syncs_before_the_batch_is_finished_by_repai
     f.state.replica_coordinator.test_observers.close_batch_sizes.lock().unwrap().clear();
     long_deadline(&f);
     let window = admit_window(&f, "c", 3, multi_block());
-    let (_hook, pass) = park_window(&f, &engine, &window).await;
+    let (_hook, pass) = park_window(&engine, &window).await;
     assert_window_durable_and_nothing_committed(&f, &window);
 
     pass.abort();
@@ -925,7 +916,7 @@ async fn a_crash_in_the_middle_of_the_batch_transaction_commits_none_of_it() {
         .close_batch_fails_before_commit
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let window = admit_window(&f, "m", 3, ONE_BLOCK);
-    let (hook, pass) = park_window(&f, &engine, &window).await;
+    let (hook, pass) = park_window(&engine, &window).await;
     release_all(&hook, pass).await;
 
     assert!(!batch_sizes(&f).is_empty(), "the batch transaction ran");
