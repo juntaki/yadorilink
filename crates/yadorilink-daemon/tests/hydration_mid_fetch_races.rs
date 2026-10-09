@@ -98,11 +98,18 @@ struct EditingBlockStore {
     inner: Arc<SegmentBlockStore>,
     armed: Mutex<Option<ArmedEdit>>,
     fired: std::sync::atomic::AtomicBool,
+    /// Runs once, before the first block this device stores: an event of the world that is to
+    /// land exactly mid-fetch (see [`Self::arm_on_first_store`]).
+    on_first_store: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl EditingBlockStore {
     fn arm(&self, at: EditPoint, path: PathBuf, bytes: &[u8]) {
         *self.armed.lock().unwrap() = Some(ArmedEdit { at, path, bytes: bytes.to_vec() });
+    }
+
+    fn arm_on_first_store(&self, event: impl FnOnce() + Send + 'static) {
+        *self.on_first_store.lock().unwrap() = Some(Box::new(event));
     }
 
     fn fired(&self) -> bool {
@@ -120,6 +127,11 @@ impl EditingBlockStore {
 
     fn on_store(&self) {
         self.maybe_edit(|at| matches!(at, EditPoint::FirstBlockStored));
+        let event = self.on_first_store.lock().unwrap().take();
+        if let Some(event) = event {
+            event();
+            self.fired.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 }
 
@@ -215,6 +227,7 @@ fn setup_device(name: &str) -> TestDevice {
         inner: Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap()),
         armed: Mutex::new(None),
         fired: std::sync::atomic::AtomicBool::new(false),
+        on_first_store: Mutex::new(None),
     });
     let (sync_state, index_dir) = support::open_file_backed_replica_coordinator();
     let state = DaemonState::new(name.to_string(), Arc::new(sync_state), store.clone());
@@ -506,89 +519,86 @@ async fn a_version_superseded_during_a_fetch_is_never_reported_hydrated() {
     let content = vec![0x77u8; 8_000_000];
     publish_and_adopt(&device_a, &device_b, &content).await;
 
-    let hydrating = device_b.state.clone();
-    let hydrate = tokio::spawn(async move { hydration::hydrate(&hydrating, GROUP, PATH).await });
-    wait_until_with_context(
-        || device_b.materialization_state(PATH) == Some(MaterializationState::Hydrating),
-        Duration::from_secs(30),
-        || "the hydration attempt never started".into(),
-    )
-    .await;
-
-    // What a peer's newer version landing on this row does: a native head that
-    // supersedes the one being hydrated, and the row now showing it.
-    // Same kind and metadata as the row, so the row it becomes shows exactly
-    // this version; only the content and mtime differ.
-    let files = device_b.state.replica_coordinator.file_index_repository();
-    let shown = yadorilink_replica_domain::session_state::CurrentVersionRecord::from(
-        files.canonical_current_row(GROUP, PATH).unwrap().unwrap().snapshot,
-    )
-    .to_file_version();
-    let mut meta = shown.meta.clone();
-    meta.mtime_unix_nanos = 7;
-    let newer = FileVersion::new(vec![], 0, meta);
-    device_b
-        .state
-        .replica_coordinator
-        .database()
-        .write(|conn| {
-            yadorilink_sync_sqlite::dag_store::put_file_version(conn, GROUP, &newer)?;
-            Ok::<_, yadorilink_sync_sqlite::SyncSqliteError>(())
-        })
-        .unwrap();
-    {
-        use yadorilink_daemon::test_support::remote_admission_fixture as peer;
-        let observing = device_b
-            .state
+    // The supersession lands from inside the store, when the fetch stores its first block: a
+    // peer's newer version arriving mid-fetch at an exact point of the attempt, not at
+    // whatever point a poll for the `Hydrating` row happens to catch (an 8 MB loopback
+    // fetch can be over before the poll and the injection are).
+    let superseding = device_b.state.clone();
+    device_b.store.arm_on_first_store(move || {
+        // What a peer's newer version landing on this row does: a native head that
+        // supersedes the one being hydrated, and the row now showing it.
+        // Same kind and metadata as the row, so the row it becomes shows exactly
+        // this version; only the content and mtime differ.
+        let files = superseding.replica_coordinator.file_index_repository();
+        let shown = yadorilink_replica_domain::session_state::CurrentVersionRecord::from(
+            files.canonical_current_row(GROUP, PATH).unwrap().unwrap().snapshot,
+        )
+        .to_file_version();
+        let mut meta = shown.meta.clone();
+        meta.mtime_unix_nanos = 7;
+        let newer = FileVersion::new(vec![], 0, meta);
+        superseding
             .replica_coordinator
             .database()
-            .read(|conn| {
-                yadorilink_sync_sqlite::native_store::native_heads_at(
-                    conn,
-                    &yadorilink_replica_domain::ids::FolderGroupId(GROUP.to_owned()),
-                    &yadorilink_replica_domain::ids::SyncPath(PATH.to_owned()),
-                )
+            .write(|conn| {
+                yadorilink_sync_sqlite::dag_store::put_file_version(conn, GROUP, &newer)?;
+                Ok::<_, yadorilink_sync_sqlite::SyncSqliteError>(())
             })
+            .unwrap();
+        {
+            use yadorilink_daemon::test_support::remote_admission_fixture as peer;
+            let observing = superseding
+                .replica_coordinator
+                .database()
+                .read(|conn| {
+                    yadorilink_sync_sqlite::native_store::native_heads_at(
+                        conn,
+                        &yadorilink_replica_domain::ids::FolderGroupId(GROUP.to_owned()),
+                        &yadorilink_replica_domain::ids::SyncPath(PATH.to_owned()),
+                    )
+                })
+                .unwrap()
+                .into_iter()
+                .map(|head| head.payload.provenance)
+                .collect();
+            peer::admit_remote(
+                &superseding.replica_coordinator,
+                GROUP,
+                "device-x",
+                vec![peer::put(PATH, newer.version_hash, observing)],
+                std::slice::from_ref(&newer),
+            );
+        }
+        let head = match files
+            .native_plan_level(GROUP, "")
             .unwrap()
+            .nodes
             .into_iter()
-            .map(|head| head.payload.provenance)
-            .collect();
-        peer::admit_remote(
-            &device_b.state.replica_coordinator,
-            GROUP,
-            "device-x",
-            vec![peer::put(PATH, newer.version_hash, observing)],
-            std::slice::from_ref(&newer),
-        );
-    }
-    let head = match files
-        .native_plan_level(GROUP, "")
-        .unwrap()
-        .nodes
-        .into_iter()
-        .find(|(path, _)| path.as_str() == PATH)
-        .map(|(_, node)| node)
-    {
-        Some(NativePlannedNode::Entry { head, .. }) => head,
-        other => panic!("the newer version must be planned at {PATH}: {other:?}"),
-    };
-    files
-        .upsert_file_with_origin_and_authoring(
-            GROUP,
-            &FileRecord {
-                path: PATH.to_owned(),
-                size: 0,
-                mtime_unix_nanos: 7,
-                blocks: vec![],
-                deleted: false,
-            },
-            "device-x",
-            Some(&NativeRowIdentity::of(&head)),
-            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-        )
-        .unwrap();
+            .find(|(path, _)| path.as_str() == PATH)
+            .map(|(_, node)| node)
+        {
+            Some(NativePlannedNode::Entry { head, .. }) => head,
+            other => panic!("the newer version must be planned at {PATH}: {other:?}"),
+        };
+        files
+            .upsert_file_with_origin_and_authoring(
+                GROUP,
+                &FileRecord {
+                    path: PATH.to_owned(),
+                    size: 0,
+                    mtime_unix_nanos: 7,
+                    blocks: vec![],
+                    deleted: false,
+                },
+                "device-x",
+                Some(&NativeRowIdentity::of(&head)),
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+    });
 
-    let result = hydrate.await.unwrap();
+    let result = hydration::hydrate(&device_b.state, GROUP, PATH).await;
+    assert!(device_b.store.fired(), "the fetch never stored a block, so nothing superseded it");
 
     assert!(
         result.is_err(),
