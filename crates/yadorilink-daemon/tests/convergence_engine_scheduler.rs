@@ -133,7 +133,6 @@ async fn zero_progress_never_reports_an_immediate_backlog() {
     }
 }
 
-
 /// Counts, per local device, the engine loop's iterations that ran a window of work and then
 /// went straight into the next iteration instead of waiting (the loop logs
 /// `engine loop draining an immediate backlog without waiting` for exactly those).
@@ -164,8 +163,8 @@ impl tracing::field::Visit for DrainFields {
         match field.name() {
             "local_device_id" => self.device = Some(format!("{value:?}").trim_matches('"').into()),
             "message" => {
-                self.is_drain =
-                    format!("{value:?}") == "engine loop draining an immediate backlog without waiting"
+                self.is_drain = format!("{value:?}")
+                    == "engine loop draining an immediate backlog without waiting"
             }
             _ => {}
         }
@@ -176,7 +175,8 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for DrainRecorder {
     fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
         let mut fields = DrainFields::default();
         event.record(&mut fields);
-        if let (true, Some(device), Some(wall_ms)) = (fields.is_drain, fields.device, fields.wall_ms)
+        if let (true, Some(device), Some(wall_ms)) =
+            (fields.is_drain, fields.device, fields.wall_ms)
         {
             self.0.lock().unwrap().entry(device).or_default().push(Duration::from_millis(wall_ms));
         }

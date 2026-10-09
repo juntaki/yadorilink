@@ -628,8 +628,20 @@ async fn late_small_requests_from_another_peer_and_group_cut_ahead_of_a_large_ba
     // source. Let that traffic finish first, with the gate open, then close the gate: from
     // there on the only requests are the ones this test makes.
     store.release(usize::MAX / 2);
+    let synced = |device: &Device| {
+        large_backlog
+            .iter()
+            .all(|block| device.state.block_store.exists(&block.hash_hex).unwrap_or(false))
+    };
+    support::wait_until_with_context(
+        || synced(&peer_a) && synced(&peer_b),
+        Duration::from_secs(60),
+        || "the peers never finished fetching the seeded files themselves".to_owned(),
+    )
+    .await;
+    // Their last requests are answered by now; wait for the source to see no more.
     let mut last = (store.entered_count(), Instant::now());
-    while last.1.elapsed() < Duration::from_secs(2) {
+    while last.1.elapsed() < Duration::from_secs(1) {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let now = store.entered_count();
         if now != last.0 {

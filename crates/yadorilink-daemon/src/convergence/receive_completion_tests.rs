@@ -945,7 +945,10 @@ async fn a_crash_in_the_middle_of_the_batch_transaction_commits_none_of_it() {
         if window.names.iter().all(|n| hydrated(&f, n) && !intent_open(&f, n)) {
             break;
         }
-        assert!(swept.elapsed() < Duration::from_secs(30), "the repair sweep never reached every path");
+        assert!(
+            swept.elapsed() < Duration::from_secs(30),
+            "the repair sweep never reached every path"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     drive_until(&f, &engine, "the window closes", |f| {
