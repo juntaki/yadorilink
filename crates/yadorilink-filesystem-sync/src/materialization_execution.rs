@@ -515,7 +515,7 @@ pub trait MaterializationExecutionPort: Send + Sync {
     /// success or failure. `expected_generation`: the generation
     /// [`Self::get_recorded_placeholder_identity`] returned for this row,
     /// passed through as a defense-in-depth ABA guard (see
-    /// `shell-ext/windows/src/cfapi.rs::dehydrate_placeholder`'s own doc
+    /// `platforms/windows/shell/src/cfapi.rs::dehydrate_placeholder`'s own doc
     /// comment). The guard is mandatory: eviction refuses a row with no
     /// recorded identity before reaching this call. `materialization_eviction::
     /// evict_to_placeholder`'s Windows arm gates the `Remote`

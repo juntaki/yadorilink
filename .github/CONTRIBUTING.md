@@ -44,14 +44,14 @@ cargo audit
 For platform-specific shell extensions:
 
 ```bash
-cd shell-ext/windows
+cd platforms/windows/shell
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo build --release
 ```
 
 ```bash
-cd shell-ext/macos/core
+cd platforms/macos/app/core
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo build --release

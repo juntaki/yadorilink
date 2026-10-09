@@ -2,7 +2,7 @@
 #
 # platforms/windows/package/winget/update-winget-manifest.sh
 #
-# Regenerates installer/windows/winget/manifests/j/juntaki/YadoriLink/<version>/
+# Regenerates platforms/windows/package/winget/manifests/j/juntaki/YadoriLink/<version>/
 # for a new release: copies the previous version's three manifest files,
 # substitutes PackageVersion/InstallerUrl/InstallerSha256, and leaves
 # everything else (description, switches, ProductCode, ...) untouched --
@@ -16,7 +16,7 @@
 # release-signing discipline (required reviewers, no unattended
 # production credentials) says should stay human-gated -- run it by hand
 # and commit the result as a normal, reviewed change (see
-# installer/windows/winget/README.md's Status section).
+# platforms/windows/package/winget/README.md's Status section).
 #
 # Usage:
 #   platforms/windows/package/winget/update-winget-manifest.sh --version 0.2.0 --installer-sha256 <64-hex-chars>
@@ -25,7 +25,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
-MANIFESTS_ROOT="$REPO_ROOT/installer/windows/winget/manifests/j/juntaki/YadoriLink"
+MANIFESTS_ROOT="$REPO_ROOT/platforms/windows/package/winget/manifests/j/juntaki/YadoriLink"
 
 VERSION="" SHA256=""
 while [ $# -gt 0 ]; do
@@ -73,5 +73,5 @@ for f in "$PREV_DIR"/*.yaml; do
 done
 
 echo "Wrote $NEW_DIR (from $PREV_DIR). Review the diff, then validate:"
-echo "  python3 -c \"import yaml,json,jsonschema; ...\"  # see installer/windows/winget/README.md"
+echo "  python3 -c \"import yaml,json,jsonschema; ...\"  # see platforms/windows/package/winget/README.md"
 echo "  winget validate --manifest $NEW_DIR   # on a real Windows machine"

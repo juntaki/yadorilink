@@ -210,7 +210,7 @@ jobs:
           cache-key: linux-installer
           token: ${{ github.token }}
       - name: Unsigned installer builds
-        run: ./installer/linux/build-deb.sh
+        run: ./platforms/linux/package/build-deb.sh
 
   # macOS and Windows run three lanes each, in parallel, so a long workspace
   # run no longer queues the daemon and shell-extension work behind it. The
@@ -266,8 +266,8 @@ jobs:
       - name: Shell extensions
         if: matrix.lane == 'shell'
         run: |
-          cargo build --release --manifest-path shell-ext/macos/core/Cargo.toml
-          cargo build --release --manifest-path shell-ext/macos/fileprovider-core/Cargo.toml
+          cargo build --release --manifest-path platforms/macos/app/core/Cargo.toml
+          cargo build --release --manifest-path platforms/macos/app/fileprovider-core/Cargo.toml
 
   windows:
     name: windows (${{ matrix.lane }})
@@ -317,5 +317,5 @@ jobs:
           --skip replay_known_failing_seeds
       - name: Shell extension
         if: matrix.lane == 'shell'
-        working-directory: shell-ext/windows
+        working-directory: platforms/windows/shell
         run: cargo build --release

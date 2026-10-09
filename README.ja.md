@@ -33,8 +33,8 @@ macOS、Windows、Linux で動作します。
 
 各ファイルの隣に `.sha256` チェックサムがあります。インストール手順、初回起動、
 更新、アンインストールは各プラットフォームの README にあります:
-[macOS](installer/macos/README.md)、[Windows](installer/windows/README.md)、
-[Linux](installer/linux/README.md)。
+[macOS](platforms/macos/package/README.md)、[Windows](platforms/windows/package/README.md)、
+[Linux](platforms/linux/package/README.md)。
 
 **Windows:** インストーラーは現時点でコード署名されていないため、Windows
 SmartScreen が「発行元不明」の警告を表示します。「実行」を選ぶ前に、ダウンロード
@@ -129,11 +129,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 - `crates/yadorilink-cli` — コマンドラインインターフェース
 - `crates/yadorilink-transport` — デバイス間の接続
 - `crates/yadorilink-desktop-app` — デスクトップアプリ
-- `shell-ext/macos` — Finder 連携
-- `shell-ext/windows` — エクスプローラー連携
+- `platforms/macos/app` — Finder 連携
+- `platforms/windows/shell` — エクスプローラー連携
 
 プラットフォームごとのパッケージとインストールについては
-[`installer/`](installer/) 以下の README を参照してください。
+[`platforms/`](platforms/) 以下の README を参照してください。
 
 ## セキュリティ
 

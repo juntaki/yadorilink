@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-APP_DIR = REPO_ROOT / "shell-ext/macos/YadoriLinkApp"
+APP_DIR = REPO_ROOT / "platforms/macos/app/YadoriLinkApp"
 DEFAULT_GENERATED = APP_DIR / "FFI/Generated"
 MIRROR = APP_DIR / "Packages/YadoriLinkUI/Sources/YadoriLinkModel/Types.swift"
 

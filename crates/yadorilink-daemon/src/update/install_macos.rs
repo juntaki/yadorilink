@@ -2,7 +2,7 @@
 //! notarized `.pkg` artifact.
 //!
 //! Scope note (per this change's own review guidance): this repo's macOS
-//! build (`installer/macos/build-pkg.sh`) does not yet ship a privileged
+//! build (`platforms/macos/package/build-pkg.sh`) does not yet ship a privileged
 //! helper tool, and today's interim builds are frequently unsigned (a
 //! real-signed `.app` inside an unsigned `.pkg`, see that script's header
 //! comment). A daemon process running as the logged-in user has no
@@ -36,7 +36,7 @@ use super::verify::CommandRunner;
 /// --cask` and a manual `.pkg` double-click both run `installer -pkg ...
 /// -target /` and land the exact same files in the exact same places.
 /// This marker, written by the Cask itself rather than by
-/// `installer/macos/scripts/postinstall` (which runs identically either
+/// `platforms/macos/package/scripts/postinstall` (which runs identically either
 /// way and so cannot distinguish them), is the only reliable signal.
 pub const HOMEBREW_MARKER_PATH: &str = "/etc/yadorilink/install_source";
 

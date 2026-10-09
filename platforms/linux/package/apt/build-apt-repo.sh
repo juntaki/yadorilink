@@ -8,7 +8,7 @@
 # installed on this project's CI runners, and this project already
 # prefers a hand-authored control file over a generator tool for exactly
 # this kind of small, auditable metadata — see
-# installer/linux/build-deb.sh's own header comment on that same choice).
+# platforms/linux/package/build-deb.sh's own header comment on that same choice).
 #
 # Produces, under $OUT_DIR:
 #   pool/main/y/yadorilink/yadorilink_<version>_<arch>.deb   (one per input .deb)
@@ -24,7 +24,7 @@
 # Requires on PATH: dpkg-scanpackages (dpkg-dev), gzip, gpg. The signing
 # key identified by --gpg-key-id must already be present in the calling
 # GPG keyring (imported by the caller — see
-# installer/linux/apt/README.md's "Signing key custody" section for where
+# platforms/linux/package/apt/README.md's "Signing key custody" section for where
 # that key comes from and why this script never generates one itself).
 
 set -euo pipefail
@@ -64,7 +64,7 @@ for d in "${DEBS[@]}"; do
   base="$(basename "$d")"
   cp "$d" "$POOL_DIR/$base"
   # Debian package filenames are `<name>_<version>_<arch>.deb` by
-  # convention (exactly what installer/linux/build-deb.sh produces) --
+  # convention (exactly what platforms/linux/package/build-deb.sh produces) --
   # this is the same shape `dpkg-deb --build` always emits, not a
   # yadorilink-specific one, so parsing it back out here is safe.
   arch="${base%.deb}"; arch="${arch##*_}"
@@ -85,7 +85,7 @@ done
 
 # --- 3. Release: hand-authored, apt's documented field set -----------------
 # `Date` uses the RFC 2822 format `apt`'s own sources require (`date -R`,
-# UTC) -- the same format installer/linux/build-deb.sh's changelog uses
+# UTC) -- the same format platforms/linux/package/build-deb.sh's changelog uses
 # for its own Debian-policy-required date field.
 ARCH_LIST="$(printf '%s\n' "${!ARCHES_SEEN[@]}" | sort | tr '\n' ' ')"
 ARCH_LIST="${ARCH_LIST% }"

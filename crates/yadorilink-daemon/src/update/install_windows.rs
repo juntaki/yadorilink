@@ -38,7 +38,7 @@ impl InstallSource {
 /// `manager::install_now`'s dispatch.
 ///
 /// This repo does not currently produce an MSIX/Store package
-/// (`installer/windows/verify-installer.ps1`'s own documented gap), so in
+/// (`platforms/windows/package/verify-installer.ps1`'s own documented gap), so in
 /// practice every real build today detects as `Standalone`; this function
 /// exists so that gap is a detection question answered at runtime, not an
 /// assumption baked into the update flow that would need revisiting once
@@ -52,7 +52,7 @@ pub fn detect_install_source(current_exe_path: &Path) -> InstallSource {
     }
 }
 
-/// Registry location the Inno Setup installer (`installer/windows/yadorilink.iss`)
+/// Registry location the Inno Setup installer (`platforms/windows/package/yadorilink.iss`)
 /// writes to when it is invoked with a `/PACKAGEMANAGER=<name>` command-line
 /// parameter. `HKEY_LOCAL_MACHINE` (not `HKCU`) because the installer itself
 /// always runs elevated (`PrivilegesRequired=admin`) and the value must be
@@ -79,7 +79,7 @@ pub const PACKAGE_MANAGER_MARKER_VALUE: &str = "InstallSource";
 ///
 /// **Not yet verified against a real Windows machine or a real WinGet
 /// install** — matching this module's own header comment about
-/// `detect_install_source`'s verification status. `installer/windows/README.md`
+/// `detect_install_source`'s verification status. `platforms/windows/package/README.md`
 /// tracks this as an open verification item.
 #[cfg(windows)]
 pub fn detect_package_manager_marker() -> Option<String> {
@@ -159,7 +159,7 @@ pub enum InstallOutcome {
 
 /// Runs the signed standalone Windows installer in silent update mode
 /// (Inno Setup's standard `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART`
-/// flags — the same installer `installer/windows/yadorilink.iss`
+/// flags — the same installer `platforms/windows/package/yadorilink.iss`
 /// produces). `PrivilegesRequired=admin` in that script means Windows
 /// will prompt for elevation when this spawns, exactly like a
 /// user-initiated re-run of the installer would; this deliberately does

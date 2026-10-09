@@ -147,18 +147,18 @@ jobs:
         with:
           # Tag builds publish what they build: never write the shared cache.
           save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-          workspaces: shell-ext/windows
+          workspaces: platforms/windows/shell
 
       - name: Check formatting
-        working-directory: shell-ext/windows
+        working-directory: platforms/windows/shell
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        working-directory: shell-ext/windows
+        working-directory: platforms/windows/shell
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Build
-        working-directory: shell-ext/windows
+        working-directory: platforms/windows/shell
         run: cargo build --release
 
   shell-ext-macos-rust:
@@ -185,18 +185,18 @@ jobs:
         with:
           # Tag builds publish what they build: never write the shared cache.
           save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-          workspaces: shell-ext/macos/${{ matrix.crate }}
+          workspaces: platforms/macos/app/${{ matrix.crate }}
 
       - name: Check formatting
-        working-directory: shell-ext/macos/${{ matrix.crate }}
+        working-directory: platforms/macos/app/${{ matrix.crate }}
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        working-directory: shell-ext/macos/${{ matrix.crate }}
+        working-directory: platforms/macos/app/${{ matrix.crate }}
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Build
-        working-directory: shell-ext/macos/${{ matrix.crate }}
+        working-directory: platforms/macos/app/${{ matrix.crate }}
         run: cargo build --release
 
   cargo-audit:
@@ -256,7 +256,7 @@ jobs:
             "release/linux/yadorilink-${version}-linux-${arch}-binaries.tar.gz"
 
       - name: Build Debian package
-        run: ./installer/linux/build-deb.sh
+        run: ./platforms/linux/package/build-deb.sh
 
       - name: Install lintian
         run: sudo apt-get update && sudo apt-get install -y lintian
@@ -264,18 +264,18 @@ jobs:
       - name: Verify Debian package
         run: |
           set -euo pipefail
-          deb_file="$(find installer/linux/dist -maxdepth 1 -name '*.deb' -print -quit)"
+          deb_file="$(find platforms/linux/package/dist -maxdepth 1 -name '*.deb' -print -quit)"
           if [ -z "$deb_file" ]; then
-            echo "No .deb file found under installer/linux/dist" >&2
+            echo "No .deb file found under platforms/linux/package/dist" >&2
             exit 1
           fi
-          ./installer/linux/verify-deb.sh "$deb_file"
+          ./platforms/linux/package/verify-deb.sh "$deb_file"
 
       - name: Collect Linux artifacts
         run: |
           set -euo pipefail
           mkdir -p release/linux
-          cp installer/linux/dist/*.deb installer/linux/dist/*.deb.sha256 release/linux/
+          cp platforms/linux/package/dist/*.deb platforms/linux/package/dist/*.deb.sha256 release/linux/
           version="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
           arch="$(uname -m)"
           python3 .github/release/generate-release-checksums.py \
@@ -290,7 +290,7 @@ jobs:
           if-no-files-found: error
 
   # Multi-arch (amd64+arm64) yadorilink-daemon image, published to GHCR --
-  # see installer/docker/Dockerfile's header for what it contains and why.
+  # see platforms/docker/Dockerfile's header for what it contains and why.
   # Gated like windows-release-artifacts/macos-signed-artifacts: this pushes
   # to a registry (not just an unpublished build-health artifact), so fork
   # PRs must never reach it. Unlike those two jobs this needs no protected
@@ -345,7 +345,7 @@ jobs:
       - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
-          file: installer/docker/Dockerfile
+          file: platforms/docker/Dockerfile
           platforms: linux/amd64,linux/arm64
           build-args: |
             YADORILINK_DEFAULT_COORDINATION_ADDR=https://control.yadori.link
@@ -382,7 +382,7 @@ jobs:
         run: cargo build --workspace --release
 
       - name: Build Windows shell extension
-        working-directory: shell-ext/windows
+        working-directory: platforms/windows/shell
         run: cargo build --release
 
       - name: Package Windows binary archive
@@ -393,8 +393,8 @@ jobs:
           Copy-Item target/release/yadorilink.exe,
                     target/release/yadorilink-daemon.exe,
                     target/release/yadorilink-status-app.exe -Destination release/windows/bin
-          Copy-Item shell-ext/windows/target/release/yadorilink_shell_ext.dll,
-                    shell-ext/windows/target/release/yadorilink-cfapi-host.exe -Destination release/windows/bin
+          Copy-Item platforms/windows/shell/target/release/yadorilink_shell_ext.dll,
+                    platforms/windows/shell/target/release/yadorilink-cfapi-host.exe -Destination release/windows/bin
           bash .github/release/write-source-notice.sh $env:YADORILINK_SOURCE_REF release/windows/bin
           $zipPath = "release/windows/yadorilink-$version-windows-x86_64-binaries.zip"
           Compress-Archive -Path release/windows/bin/* -DestinationPath $zipPath -Force
@@ -402,18 +402,18 @@ jobs:
 
       - name: Build Windows installer (unsigned build-health)
         shell: pwsh
-        run: powershell -ExecutionPolicy Bypass -File installer\windows\build-installer.ps1
+        run: powershell -ExecutionPolicy Bypass -File platforms\windows\package\build-installer.ps1
 
       - name: Verify Windows installer (build health)
         shell: pwsh
-        run: powershell -ExecutionPolicy Bypass -File installer\windows\verify-installer.ps1 -Path installer\windows\Output\yadorilink-setup.exe
+        run: powershell -ExecutionPolicy Bypass -File platforms\windows\package\verify-installer.ps1 -Path platforms\windows\package\Output\yadorilink-setup.exe
 
       - name: Collect Windows artifacts
         shell: pwsh
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"$').Matches[0].Groups[1].Value
-          Copy-Item installer/windows/Output/yadorilink-setup.exe,
-                    installer/windows/Output/yadorilink-setup.exe.sha256 -Destination release/windows
+          Copy-Item platforms/windows/package/Output/yadorilink-setup.exe,
+                    platforms/windows/package/Output/yadorilink-setup.exe.sha256 -Destination release/windows
           $artifacts = @(
             "release/windows/yadorilink-$version-windows-x86_64-binaries.zip",
             "release/windows/yadorilink-setup.exe"
@@ -510,7 +510,7 @@ jobs:
           YADORILINK_RELEASE_MANIFEST_KEY_ID: ${{ vars.RELEASE_MANIFEST_KEY_ID }}
           YADORILINK_RELEASE_MANIFEST_PUBLIC_KEY_HEX: ${{ vars.RELEASE_MANIFEST_PUBLIC_KEY_HEX }}
         run: |
-          powershell -ExecutionPolicy Bypass -File installer\windows\build-installer.ps1 `
+          powershell -ExecutionPolicy Bypass -File platforms\windows\package\build-installer.ps1 `
             -ShellExtDir release-input -Release -Unsigned
           if ($LASTEXITCODE -ne 0) { throw "unsigned installer build failed" }
 
@@ -525,7 +525,7 @@ jobs:
                        Sort-Object FullName -Descending | Select-Object -First 1).FullName
           if (-not $signtool) { throw 'signtool.exe not found in the Windows 10 SDK' }
           $signCmd = "`"$signtool`" sign /fd sha256 /sha1 $env:WIN_CERT_THUMBPRINT /tr http://timestamp.digicert.com /td sha256 `$f"
-          powershell -ExecutionPolicy Bypass -File installer\windows\build-installer.ps1 `
+          powershell -ExecutionPolicy Bypass -File platforms\windows\package\build-installer.ps1 `
             -ShellExtDir release-input -Release `
             -SignToolName yadorilink -SignToolCommand $signCmd
 
@@ -549,7 +549,7 @@ jobs:
                     target\release\yadorilink-daemon.exe,
                     target\release\yadorilink-status-app.exe -Destination signed-bin
           # The shell extension isn't part of this workspace and carries no
-          # update-manifest trust root of its own (see shell-ext/windows's
+          # update-manifest trust root of its own (see platforms/windows/shell's
           # separate build in this workflow) -- reusing the build-health
           # job's copy here is not a trust-root regression.
           Copy-Item release-input\yadorilink_shell_ext.dll,
@@ -576,10 +576,10 @@ jobs:
         if: steps.signing.outputs.signed != 'true'
         shell: pwsh
         run: |
-          $exe = 'installer\windows\Output\yadorilink-setup.exe'
+          $exe = 'platforms\windows\package\Output\yadorilink-setup.exe'
           # Report-only (no -Release): checksum verified, signature status
           # printed as unsigned.
-          powershell -ExecutionPolicy Bypass -File installer\windows\verify-installer.ps1 -Path $exe
+          powershell -ExecutionPolicy Bypass -File platforms\windows\package\verify-installer.ps1 -Path $exe
           if ($LASTEXITCODE -ne 0) { throw "verify-installer.ps1 failed for $exe" }
           $sig = Get-AuthenticodeSignature -LiteralPath $exe
           if ($sig.Status -ne 'NotSigned') { throw "expected an unsigned installer, Authenticode status is $($sig.Status)" }
@@ -599,14 +599,14 @@ jobs:
         if: steps.signing.outputs.signed == 'true'
         shell: pwsh
         run: |
-          $exe = 'installer\windows\Output\yadorilink-setup.exe'
+          $exe = 'platforms\windows\package\Output\yadorilink-setup.exe'
           $signtool = (Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe' |
                        Sort-Object FullName -Descending | Select-Object -First 1).FullName
           & $signtool verify /pa /all $exe
           if ($LASTEXITCODE -ne 0) { throw "signtool verify failed for $exe" }
           $sig = Get-AuthenticodeSignature -LiteralPath $exe
           if ($sig.Status -ne 'Valid') { throw "installer Authenticode status is $($sig.Status)" }
-          powershell -ExecutionPolicy Bypass -File installer\windows\verify-installer.ps1 -Path $exe -Release
+          powershell -ExecutionPolicy Bypass -File platforms\windows\package\verify-installer.ps1 -Path $exe -Release
 
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"$').Matches[0].Groups[1].Value
           New-Item -ItemType Directory -Force -Path release/windows | Out-Null
@@ -786,7 +786,7 @@ jobs:
           YADORILINK_NOTARY_KEY: ${{ env.NOTARY_KEY_PATH }}
           YADORILINK_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
           YADORILINK_NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
-        run: ./installer/macos/build-pkg.sh
+        run: ./platforms/macos/package/build-pkg.sh
 
       - name: Package binary archive from the trust-root-enforced build
         env:
@@ -833,7 +833,7 @@ jobs:
         run: |
           set -euo pipefail
           version="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
-          pkg="installer/macos/dist/yadorilink-${version}.pkg"
+          pkg="platforms/macos/package/dist/yadorilink-${version}.pkg"
           test -f "$pkg" || { echo "signed pkg not found: $pkg" >&2; exit 1; }
           pkgutil --check-signature "$pkg"
           spctl -a -vvv -t install "$pkg"
@@ -844,7 +844,7 @@ jobs:
           # fails for a user who is offline or behind a filtering network.
           # --release is what turns signature, Gatekeeper and stapling into
           # hard failures rather than reported observations.
-          ./installer/macos/verify-pkg.sh --release "$pkg"
+          ./platforms/macos/package/verify-pkg.sh --release "$pkg"
           mkdir -p release/macos
           cp "$pkg" "$pkg.sha256" release/macos/
           python3 .github/release/generate-release-checksums.py \
@@ -1287,13 +1287,13 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "$APT_SIGNING_KEY" ]; then
-            echo "::warning::APT_SIGNING_KEY not configured in the release-signing Environment; skipping APT repository publish. See installer/linux/apt/README.md's 'Signing key custody' section."
+            echo "::warning::APT_SIGNING_KEY not configured in the release-signing Environment; skipping APT repository publish. See platforms/linux/package/apt/README.md's 'Signing key custody' section."
             echo "enabled=false" >> "$GITHUB_OUTPUT"
           else
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           fi
 
-      # installer/linux/apt/README.md: this is the "stable" apt suite --
+      # platforms/linux/package/apt/README.md: this is the "stable" apt suite --
       # only immutable, gated beta-release tags publish here, never the
       # rolling nightly build (an apt repo's stable suite is not the place
       # for unvetted dev builds).
@@ -1312,16 +1312,16 @@ jobs:
           key_id="$(gpg --batch --with-colons --list-secret-keys | awk -F: '/^sec/{print $5; exit}')"
 
           # arm64 packages join this invocation once ARM64 validation
-          # (installer/linux/README.md) lands a real arm64 linux-artifacts
+          # (platforms/linux/package/README.md) lands a real arm64 linux-artifacts
           # build; today only amd64 exists.
           bash platforms/linux/package/apt/build-apt-repo.sh --out-dir apt-repo --gpg-key-id "$key_id" -- dist/yadorilink_*_amd64.deb
 
           gpg --batch --armor --export "$key_id" > apt-repo/yadorilink-archive-keyring.asc
-          cp installer/linux/apt/install.sh apt-repo/install.sh
+          cp platforms/linux/package/apt/install.sh apt-repo/install.sh
 
           ARMORED_PUBLIC_KEY_PATH="$(pwd)/apt-repo/yadorilink-archive-keyring.asc" \
-            bash installer/linux/apt/build-keyring-deb.sh
-          cp installer/linux/apt/dist/yadorilink-archive-keyring_*_all.deb apt-repo/
+            bash platforms/linux/package/apt/build-keyring-deb.sh
+          cp platforms/linux/package/apt/dist/yadorilink-archive-keyring_*_all.deb apt-repo/
 
           if [ -n "${CLOUDFLARE_API_TOKEN:-}" ] && [ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
             # Publish order matters and failures must not be silently
@@ -1357,7 +1357,7 @@ jobs:
 
       - name: Tear down APT signing key
         if: always()
-        run: rm -rf "${RUNNER_TEMP}/apt-gnupg" installer/linux/apt/dist
+        run: rm -rf "${RUNNER_TEMP}/apt-gnupg" platforms/linux/package/apt/dist
 
       - name: Notify the Homebrew tap of a new release
         env:
@@ -1380,10 +1380,10 @@ jobs:
               -f source_sha256="$source_sha256"
           fi
 
-      # WinGet: deliberately does NOT commit installer/windows/winget/ here
+      # WinGet: deliberately does NOT commit platforms/windows/package/winget/ here
       # or run platforms/windows/package/winget/update-winget-manifest.sh itself -- same
       # human-gated-release-step reasoning as not auto-opening the
-      # winget-pkgs PR (installer/windows/winget/README.md's "Submission"
+      # winget-pkgs PR (platforms/windows/package/winget/README.md's "Submission"
       # section): an unattended workflow committing generated files back
       # to this repo isn't something this project's release-signing
       # discipline (required reviewers, no unattended production
@@ -1399,13 +1399,13 @@ jobs:
             {
               echo "### WinGet manifest inputs for v${VERSION}"
               echo
-              echo "Regenerate \`installer/windows/winget/manifests/j/juntaki/YadoriLink/${VERSION}/\` with:"
+              echo "Regenerate \`platforms/windows/package/winget/manifests/j/juntaki/YadoriLink/${VERSION}/\` with:"
               echo
               echo '```'
               echo "platforms/windows/package/winget/update-winget-manifest.sh --version ${VERSION} --installer-sha256 ${exe_sha256}"
               echo '```'
               echo
-              echo "by hand (see \`installer/windows/winget/README.md\`'s Status section for why this workflow doesn't run it itself). Submission to microsoft/winget-pkgs stays a manual, human-gated step (same README's Submission section)."
+              echo "by hand (see \`platforms/windows/package/winget/README.md\`'s Status section for why this workflow doesn't run it itself). Submission to microsoft/winget-pkgs stays a manual, human-gated step (same README's Submission section)."
             } >> "$GITHUB_STEP_SUMMARY"
           else
             echo "::warning::No signed yadorilink-setup.exe checksum found (Windows installer is unsigned or missing); skipping WinGet manifest input summary."

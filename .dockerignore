@@ -1,6 +1,6 @@
 # .dockerignore
 #
-# Keeps the docker build context (installer/docker/Dockerfile's `COPY . .`,
+# Keeps the docker build context (platforms/docker/Dockerfile's `COPY . .`,
 # invoked from the repo root) from shipping build artifacts, VCS history,
 # and local-only machine configuration into the build.
 
@@ -20,6 +20,6 @@ __pycache__/
 .cargo/
 
 # Docker/packaging output directories from other installers, not inputs.
-installer/*/dist/
-installer/*/.stage/
-installer/macos/.xcode-build/
+platforms/*/package/dist/
+platforms/*/package/.stage/
+platforms/macos/package/.xcode-build/

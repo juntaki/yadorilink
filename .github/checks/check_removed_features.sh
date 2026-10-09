@@ -68,10 +68,11 @@ FEATURES=(
 # honest instead of being edited around a grep.
 #
 # Includes the shell extensions' native source: the removed implementations
-# are Rust identifiers, and shell-ext ships Rust (and Swift) of its own.
+# are Rust identifiers, and the platform integrations ship Rust (and Swift) of
+# their own.
 CODE_ROOTS=(
   crates
-  shell-ext
+  platforms
 )
 
 # Extra roots scanned together with CODE_ROOTS for the removed-implementation
@@ -367,7 +368,7 @@ MD
   # A checkout may carry only some of the scanned roots. A missing root must
   # not hide violations under the roots that are present.
   make_kept_tree "$tmp/partial"
-  rm -rf "$tmp/partial/shell-ext"
+  rm -rf "$tmp/partial/platforms"
   printf '%s\n' "pub struct RelayHub;" >"$tmp/partial/crates/sync/src/hub.rs"
   if ! (cd "$tmp/partial" && scan) >"$tmp/out" 2>&1 \
       && grep -qF "  crates/sync/src/hub.rs:" "$tmp/out"; then

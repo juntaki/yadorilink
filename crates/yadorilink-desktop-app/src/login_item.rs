@@ -1,5 +1,5 @@
 //! Toggles this app's
-//! own login-item registration. Mirrors the *mechanism* `installer/macos/
+//! own login-item registration. Mirrors the *mechanism* `platforms/macos/package/
 //! scripts/postinstall` already uses for `yadorilink-daemon` itself (a
 //! per-user `LaunchAgent` plist under `~/Library/LaunchAgents`, loaded via
 //! `launchctl bootstrap gui/$UID`) rather than the newer `SMAppService`
@@ -7,7 +7,7 @@
 //! codebase (real-VM-verified per the daemon's own postinstall step) and
 //! this app's `Info.plist`/bundle story isn't set up for `SMAppService`'s
 //! bundle-identifier-based registration. Windows equivalent (a Scheduled
-//! Task, mirroring `installer/windows/daemon-task.ps1`) is not implemented
+//! Task, mirroring `platforms/windows/package/daemon-task.ps1`) is not implemented
 //! here — see this file's Windows stub for why.
 
 #[derive(Debug, thiserror::Error)]
@@ -34,7 +34,7 @@ mod macos {
     }
 
     /// Registers this app to launch at login, matching the shape of
-    /// `installer/macos/scripts/postinstall`'s own daemon plist (`Label`,
+    /// `platforms/macos/package/scripts/postinstall`'s own daemon plist (`Label`,
     /// `ProgramArguments`, `RunAtLoad`) minus `KeepAlive` — the status app
     /// should relaunch at the next login, not be treated as an essential
     /// service the OS force-restarts if it exits (a user quitting the tray

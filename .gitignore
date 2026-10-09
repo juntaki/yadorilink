@@ -1,5 +1,5 @@
 /target
-# shell-ext/windows and shell-ext/macos/*/core are separate Cargo
+# platforms/windows/shell and platforms/macos/app/*/core are separate Cargo
 # workspaces (nested under this repo but not members of the root
 # workspace, since they're platform-specific and don't build on every
 # dev machine) — a non-anchored pattern catches their own target/ dirs
@@ -22,10 +22,10 @@ __pycache__/
 node_modules/
 .wrangler/
 
-# Xcode build products (shell-ext/macos's FIFinderSync extension host app)
+# Xcode build products (platforms/macos/app's FIFinderSync extension host app)
 # Leading **/ needed: a pattern with a slash in the middle (not just at
 # the end) is anchored to the .gitignore's own directory otherwise, so
-# without it these never matched xcodeproj dirs nested under shell-ext/.
+# without it these never matched xcodeproj dirs nested under platforms/.
 .build/
 DerivedData/
 **/*.xcodeproj/xcuserdata/
@@ -40,35 +40,35 @@ DerivedData/
 # a volume with more free space) — not portable to other machines.
 # Leading **/ needed for the same reason as the Xcode patterns above: a
 # slash in the middle of the pattern otherwise anchors it to this
-# .gitignore's own directory, so shell-ext's nested Cargo workspaces
-# (shell-ext/macos/*/core/.cargo/config.toml) never matched without it.
+# .gitignore's own directory, so the platform integrations' nested Cargo workspaces
+# (platforms/macos/app/*/core/.cargo/config.toml) never matched without it.
 **/.cargo/config.toml
 
-# installer/macos/build-pkg.sh's scratch/output dirs (rebuilt from
+# platforms/macos/package/build-pkg.sh's scratch/output dirs (rebuilt from
 # scratch on every run; the built .pkg is a local artifact, not checked
-# in — see installer/macos/README.md for how to build it).
-installer/macos/.stage/
-installer/macos/.xcode-build/
-installer/macos/dist/
-installer/macos/.component.plist
-installer/macos/.Distribution.generated.xml
+# in — see platforms/macos/package/README.md for how to build it).
+platforms/macos/package/.stage/
+platforms/macos/package/.xcode-build/
+platforms/macos/package/dist/
+platforms/macos/package/.component.plist
+platforms/macos/package/.Distribution.generated.xml
 
-# installer/windows/yadorilink.iss's ISCC output dir (the built
+# platforms/windows/package/yadorilink.iss's ISCC output dir (the built
 # yadorilink-setup.exe is a local artifact, not checked in — see
-# installer/windows/README.md for how to build it).
-installer/windows/Output/
+# platforms/windows/package/README.md for how to build it).
+platforms/windows/package/Output/
 
-# installer/linux/build-deb.sh's scratch/output dirs (rebuilt from
+# platforms/linux/package/build-deb.sh's scratch/output dirs (rebuilt from
 # scratch on every run; the built .deb is a local artifact, not checked
-# in — see installer/linux/README.md for how to build it).
-installer/linux/.stage/
-installer/linux/dist/
+# in — see platforms/linux/package/README.md for how to build it).
+platforms/linux/package/.stage/
+platforms/linux/package/dist/
 
-# installer/linux/apt/build-keyring-deb.sh's scratch/output dirs — same
-# rebuilt-from-scratch, not-checked-in shape as installer/linux/.stage/
-# and installer/linux/dist/ above.
-installer/linux/apt/.stage/
-installer/linux/apt/dist/
+# platforms/linux/package/apt/build-keyring-deb.sh's scratch/output dirs — same
+# rebuilt-from-scratch, not-checked-in shape as platforms/linux/package/.stage/
+# and platforms/linux/package/dist/ above.
+platforms/linux/package/apt/.stage/
+platforms/linux/package/apt/dist/
 
 # Generated per-release artifacts (scripts/generate-release-sbom.py,
 # scripts/generate-release-evidence.py,
@@ -97,4 +97,4 @@ installer/linux/apt/dist/
 
 # The client core static library platforms/macos/generate-swift-bindings.sh builds
 # for the macOS app; the generated Swift next to it is checked in.
-shell-ext/macos/YadoriLinkApp/FFI/lib/
+platforms/macos/app/YadoriLinkApp/FFI/lib/

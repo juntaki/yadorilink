@@ -3,9 +3,9 @@
 # Builds the Swift binding of the client layer for the macOS app.
 #
 #  1. `yadorilink-apple-ffi` as a static library (release, aarch64-apple-darwin),
-#     copied to shell-ext/macos/YadoriLinkApp/FFI/lib/ (not checked in).
+#     copied to platforms/macos/app/YadoriLinkApp/FFI/lib/ (not checked in).
 #  2. The Swift sources and C headers UniFFI generates from that library, into
-#     shell-ext/macos/YadoriLinkApp/FFI/Generated/ (checked in, so the Xcode
+#     platforms/macos/app/YadoriLinkApp/FFI/Generated/ (checked in, so the Xcode
 #     project and reviews see them), plus the module map the two headers
 #     need.
 #  3. The app's field-for-field mapping between the binding and the Swift
@@ -51,9 +51,9 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-FFI_DIR="$REPO_ROOT/shell-ext/macos/YadoriLinkApp/FFI"
+FFI_DIR="$REPO_ROOT/platforms/macos/app/YadoriLinkApp/FFI"
 GENERATED_DIR="$FFI_DIR/Generated"
-MAPPING_FILE="$REPO_ROOT/shell-ext/macos/YadoriLinkApp/App/Live/FFIMapping.swift"
+MAPPING_FILE="$REPO_ROOT/platforms/macos/app/YadoriLinkApp/App/Live/FFIMapping.swift"
 TARGET="aarch64-apple-darwin"
 
 # Xcode runs build scripts with a minimal PATH.

@@ -698,7 +698,7 @@ pub struct PlaceholderDiskIdentity {
 /// opaque `u64` generation token, not a `(dev, ino)` pair: `dev` is always
 /// `0` (an unused sentinel) and `ino` carries the generation. See
 /// `yadorilink-daemon`'s `placeholder_inspect_windows` module (the real
-/// CfAPI-backed reader of this value) and `shell-ext/windows/src/cfapi.rs`'s
+/// CfAPI-backed reader of this value) and `platforms/windows/shell/src/cfapi.rs`'s
 /// `encode_generation_identity` (the writer, over on the CfAPI side of the
 /// process boundary) for the wire format this token is stored in as a
 /// placeholder's actual `FileIdentity` on disk -- unrelated to how it's
