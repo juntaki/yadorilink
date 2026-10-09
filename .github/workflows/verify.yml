@@ -63,7 +63,7 @@ jobs:
           python3 scripts/check-pre-release-compatibility-debt.py
           bash scripts/check_removed_features.sh --self-test
           bash scripts/check_removed_features.sh
-      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+      - uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2.87.25
         if: always()
         with:
           tool: cargo-audit,cargo-deny
