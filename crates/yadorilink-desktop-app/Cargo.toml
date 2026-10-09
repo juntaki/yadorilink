@@ -56,7 +56,7 @@ tracing-subscriber.workspace = true
 # only macOS and Windows are exercised/shipped here (spec's two target
 # platforms), matching this workspace's existing "no Linux desktop target"
 # scope (shell-ext/ is macOS+Windows only too).
-tray-icon = "0.25.1"
+tray-icon = "0.26.0"
 tao = "0.37"
 # Cross-platform "reveal this path in the native file manager" helper for
 # the Open Folder / reveal-diagnostics-bundle actions -- avoids
