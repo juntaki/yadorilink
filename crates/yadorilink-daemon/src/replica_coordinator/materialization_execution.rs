@@ -164,31 +164,7 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         expected: yadorilink_peer_session::ports::ExpectedAuthoring<'_>,
         permit: &RootCommitPermit,
     ) -> Result<bool, MaterializationExecutionError> {
-        let exact = exact_materialized_state_from(state).ok_or_else(|| {
-            SyncError::from(yadorilink_sync_sqlite::SyncSqliteError::InvalidInput(format!(
-                "{group_id}/{path}: a structural directory is no entry a row can be recovered to"
-            )))
-        })?;
-        let guard = expected_authoring_from(expected);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as i64)
-            .unwrap_or(0);
-        let outcome = self
-            .database
-            .write_immediate::<_, yadorilink_sync_sqlite::SyncSqliteError>(|tx| {
-                let outcome =
-                    yadorilink_sync_sqlite::exact_materialized_commit::commit_recovered_materialized_state(
-                        tx, group_id, path, &exact, guard, now,
-                    )?;
-                permit.verify()?;
-                Ok(outcome)
-            })
-            .map_err(SyncError::from)?;
-        Ok(matches!(
-            outcome,
-            yadorilink_sync_sqlite::exact_materialized_commit::RecoveredMaterializedCommit::Published(_)
-        ))
+        self.commit_recovered_state(group_id, path, state, expected, permit)
     }
 
     fn has_usable_materialized_generation(
@@ -866,3 +842,83 @@ pub(crate) fn set_test_windows_dehydrate_confirmed_for_path(path: &Path, armed: 
 
 #[cfg(test)]
 mod tests;
+
+impl ReplicaCoordinator {
+    /// The recovery commit behind [`MaterializationExecutionPort::commit_recovered_materialized_state`]
+    /// and [`Self::finish_matching_in_flight_write`]: one guarded transaction that publishes the
+    /// proof of the version the caller compared the bytes on disk against, sets the row
+    /// `Present` and clears the intent, or writes nothing when the row has moved.
+    fn commit_recovered_state(
+        &self,
+        group_id: &str,
+        path: &str,
+        state: yadorilink_peer_session::ports::ExactActualState,
+        expected: yadorilink_peer_session::ports::ExpectedAuthoring<'_>,
+        permit: &RootCommitPermit,
+    ) -> Result<bool, MaterializationExecutionError> {
+        let exact = exact_materialized_state_from(state).ok_or_else(|| {
+            SyncError::from(yadorilink_sync_sqlite::SyncSqliteError::InvalidInput(format!(
+                "{group_id}/{path}: a structural directory is no entry a row can be recovered to"
+            )))
+        })?;
+        let guard = expected_authoring_from(expected);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        let outcome = self
+            .database
+            .write_immediate::<_, yadorilink_sync_sqlite::SyncSqliteError>(|tx| {
+                let outcome =
+                    yadorilink_sync_sqlite::exact_materialized_commit::commit_recovered_materialized_state(
+                        tx, group_id, path, &exact, guard, now,
+                    )?;
+                permit.verify()?;
+                Ok(outcome)
+            })
+            .map_err(SyncError::from)?;
+        Ok(matches!(
+            outcome,
+            yadorilink_sync_sqlite::exact_materialized_commit::RecoveredMaterializedCommit::Published(_)
+        ))
+    }
+
+    /// Settles a regular file whose bytes on disk are the `version` of its row, when an earlier
+    /// attempt left the row in flight: the attempt renamed the bytes in and was refused at its
+    /// commit (another mutator advanced the fence), so the row is still `Hydrating` with its
+    /// intent open and no proof. One guarded recovery commit finishes it, the way the repair
+    /// sweep finishes a write whose bytes are already right. A row in any other state is
+    /// already settled as far as this is concerned. `false`, with nothing written, when the
+    /// commit was refused because the row moved.
+    pub(crate) fn finish_matching_in_flight_write(
+        &self,
+        group_id: &str,
+        path: &str,
+        version: &yadorilink_replica_domain::ids::VersionHash,
+        identity: Option<yadorilink_root_authority::fs_identity::FileIdentity>,
+        permit: &RootCommitPermit,
+    ) -> Result<bool, MaterializationExecutionError> {
+        let in_flight = self
+            .materialization_state_repository()
+            .get_materialization_state(group_id, path)
+            .map_err(SyncError::from)?
+            == Some(yadorilink_replica_domain::session_state::MaterializationState::Hydrating);
+        if !in_flight {
+            return Ok(true);
+        }
+        self.commit_recovered_state(
+            group_id,
+            path,
+            yadorilink_peer_session::ports::ExactActualState::Object {
+                kind: yadorilink_replica_domain::file::RecordKind::File,
+                version: *version,
+                identity: Box::new(identity),
+            },
+            yadorilink_peer_session::ports::ExpectedAuthoring {
+                state: yadorilink_peer_session::ports::MATERIALIZATION_IN_FLIGHT_STATE,
+                expected_version: Some(version),
+            },
+            permit,
+        )
+    }
+}

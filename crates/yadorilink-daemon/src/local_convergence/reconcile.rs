@@ -939,11 +939,8 @@ impl super::LocalConvergenceExecutor {
         Ok(Some(Head::of_native(head)))
     }
 
-    /// Whether the row of `target_path` is settled for the `version_hash` whose bytes are
-    /// on disk at `out_path`: a row still in flight (an earlier attempt renamed the bytes in
-    /// and was refused at its commit) is finished with one guarded commit, the way the repair
-    /// sweep finishes a write whose bytes are already right. `false` when that commit was
-    /// refused (the row moved), so the caller retries instead of settling.
+    /// See [`ReplicaCoordinator::finish_matching_in_flight_write`]; `false` means the caller
+    /// retries instead of settling.
     fn finish_matching_in_flight_write(
         &self,
         group_id: &str,
@@ -951,33 +948,18 @@ impl super::LocalConvergenceExecutor {
         version_hash: &yadorilink_replica_domain::ids::VersionHash,
         out_path: &Path,
     ) -> Result<bool, PeerSessionError> {
-        if self.state.get_materialization_state(group_id, target_path)?
-            != Some(yadorilink_replica_domain::session_state::MaterializationState::Hydrating)
-        {
-            return Ok(true);
-        }
         let authority = self.root_lease_for(group_id)?;
         let authority_op = authority.begin_operation()?;
         let permit = authority_op.permit();
-        yadorilink_filesystem_sync::materialization_execution::MaterializationExecutionPort::commit_recovered_materialized_state(
-            self.state.as_ref(),
-            group_id,
-            target_path,
-            yadorilink_peer_session::ports::ExactActualState::Object {
-                kind: RecordKind::File,
-                version: *version_hash,
-                identity: Box::new(
-                    yadorilink_root_authority::fs_identity::FileIdentity::observe_path(out_path)
-                        .ok(),
-                ),
-            },
-            yadorilink_peer_session::ports::ExpectedAuthoring {
-                state: yadorilink_peer_session::ports::MATERIALIZATION_IN_FLIGHT_STATE,
-                expected_version: Some(version_hash),
-            },
-            &permit,
-        )
-        .map_err(|error| PeerSessionError::from(crate::sync_error::SyncError::from(error)))
+        self.state
+            .finish_matching_in_flight_write(
+                group_id,
+                target_path,
+                version_hash,
+                yadorilink_root_authority::fs_identity::FileIdentity::observe_path(out_path).ok(),
+                &permit,
+            )
+            .map_err(|error| PeerSessionError::from(crate::sync_error::SyncError::from(error)))
     }
 
     async fn recapture_instead_of_projecting(
