@@ -58,18 +58,35 @@ async fn receiving_files_through_the_engine_moves_the_budget_counters() {
     }
     // Lower bounds: nothing else arms these, but the lib's other tests run in
     // this process and may add to them while they are armed.
-    for op in [Op::FileFsync, Op::Rename, Op::DirFsync] {
+    for op in [Op::FileFsync, Op::Rename] {
         assert!(io_diag::stat(op).calls >= FILES, "{op:?} must count each received file");
     }
-    assert!(io_diag::distinct_parent_dirs() >= 1);
+    // The parent-directory sync exists only where the platform has one to do:
+    // `sync_parent_directory` is a deliberate no-op off Unix, and the counters
+    // must say so rather than pretend.
+    #[cfg(unix)]
+    {
+        assert!(
+            io_diag::stat(Op::DirFsync).calls >= FILES,
+            "DirFsync must count each received file"
+        );
+        assert!(io_diag::distinct_parent_dirs() >= 1);
+    }
+    #[cfg(not(unix))]
+    {
+        assert_eq!(io_diag::stat(Op::DirFsync).calls, 0, "no directory sync off Unix");
+        assert_eq!(io_diag::distinct_parent_dirs(), 0);
+    }
     // The receive's own commits: the content-write open and close
     // transactions in the lanes, once per file each.
     let splits = yadorilink_sqlite_runtime::writer_gate_stats::split_site_stats();
     let lane_commits: Vec<_> = splits
         .iter()
         .filter(|s| {
-            s.site.ends_with("materialization_owner/lanes.rs")
-                || s.site.contains("materialization_owner/lanes.rs:")
+            // `file!()` uses the host's separator, so normalise it.
+            let site = s.site.replace('\\', "/");
+            site.ends_with("materialization_owner/lanes.rs")
+                || site.contains("materialization_owner/lanes.rs:")
         })
         .filter(|s| s.commit_calls >= FILES && s.commit_nanos > 0)
         .collect();
@@ -79,9 +96,10 @@ async fn receiving_files_through_the_engine_moves_the_budget_counters() {
     );
     let locks = receive_diag::lock_site_stats();
     assert!(
-        locks
-            .iter()
-            .any(|s| s.site.contains("local_convergence/reconcile.rs") && s.acquisitions >= FILES),
+        locks.iter().any(|s| {
+            s.site.replace('\\', "/").contains("local_convergence/reconcile.rs")
+                && s.acquisitions >= FILES
+        }),
         "the materialize path-lock site must count each acquisition: {locks:?}"
     );
     receive_diag::reset();

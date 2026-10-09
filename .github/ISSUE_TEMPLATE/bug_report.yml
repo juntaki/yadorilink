@@ -7,7 +7,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for reporting a bug. Do not include credentials, tokens, private keys, recovery codes, or file contents. For vulnerabilities, email the address in SECURITY.md instead of opening a public issue.
+        Thanks for reporting a bug. Do not include credentials, tokens, private keys, recovery codes, or file contents. For vulnerabilities, email the address in .github/SECURITY.md instead of opening a public issue.
   - type: textarea
     id: summary
     attributes:

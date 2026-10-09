@@ -128,6 +128,23 @@ async fn a_path_one_device_ignores_still_reaches_the_peers_behind_it() {
         },
     )
     .await;
+    // Indexed is not yet on disk: a path enters the index before its content is projected, so
+    // wait for the projection on both devices before reading it back.
+    wait_until_with_context(
+        || {
+            device_b.path("ordinary.txt").exists()
+                && std::fs::read(device_c.path("ordinary.txt")).is_ok_and(|bytes| bytes == b"plain")
+        },
+        Duration::from_secs(60),
+        || {
+            format!(
+                "ordinary.txt was indexed but never projected: on b={} on c={:?}",
+                device_b.path("ordinary.txt").exists(),
+                std::fs::read(device_c.path("ordinary.txt")).map_err(|error| error.kind()),
+            )
+        },
+    )
+    .await;
     assert_eq!(
         std::fs::read(device_c.path("ordinary.txt")).unwrap(),
         b"plain",

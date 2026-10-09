@@ -50,7 +50,7 @@ const OPS_PER_RUN: usize = 15;
 /// than a quick smoke check now that each run is known-cheap (~ms) and
 /// the point of a chaos/DST-style test is exploring many interleavings,
 /// not confirming the plumbing works once. Override with `DST_VARIATIONS`
-/// for a per-PR-sized fast run or a much larger heat-run/nightly sweep.
+/// for a per-PR-sized fast run or a much larger soak-run/nightly sweep.
 const PARALLEL_VARIATIONS: usize = 500;
 
 /// One simulated run's observable history: what happened, in order, at
@@ -214,7 +214,7 @@ fn describe_flush(flush: &debounce::DebounceFlush) -> String {
 ///
 /// `DST_VARIATIONS` overrides how many seeds this run explores (default
 /// `PARALLEL_VARIATIONS`) — a small fixed count is enough for a fast
-/// per-PR check, a much larger one (thousands) for a heat-run/nightly
+/// per-PR check, a much larger one (thousands) for a soak-run/nightly
 /// sweep; each simulated run
 /// costs low-single-digit milliseconds since simulated time is
 /// fast-forwarded, so scaling this up is cheap. Bounded to

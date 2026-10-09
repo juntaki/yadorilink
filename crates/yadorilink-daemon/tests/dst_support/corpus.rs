@@ -314,8 +314,8 @@ pub fn known_prefix(
 /// can never turn on corpus replay for a run that would otherwise have
 /// skipped it, and it can never turn it off for a plain, untargeted run.
 ///
-/// `DST_SKIP_CORPUS_REPLAY` exists specifically for a driver (like `cargo
-/// xtask dst-targeted`) that wants a fast repeated single-seed measurement
+/// `DST_SKIP_CORPUS_REPLAY` exists specifically for a driver (such as a
+/// targeted-repeat runner) that wants a fast repeated single-seed measurement
 /// without also having to set `DST_BASE_SEED`/`DST_VARIATIONS` itself, and
 /// without silently depending on those two env vars continuing to imply
 /// "skip corpus" as an accident of scenario-specific wiring rather than a

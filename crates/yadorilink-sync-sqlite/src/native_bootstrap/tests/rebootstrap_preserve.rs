@@ -1744,3 +1744,22 @@ fn a_platform_without_directory_durability_starts_nothing() {
     assert!(rebootstrap_status(&w.b, &group()).unwrap().is_none(), "a journal was started");
     assert!(files_below(area.path()).is_empty(), "something was written to the recovery root");
 }
+
+#[test]
+fn the_windows_gate_stays_closed_until_validated_on_a_windows_host() {
+    // Flipping this requires validating directory durability on a real Windows host.
+    const { assert!(!crate::native_rebootstrap_recovery::WINDOWS_DIRECTORY_DURABILITY_VALIDATED) };
+}
+
+#[test]
+fn a_durable_write_renames_then_flushes_the_directory_that_holds_the_new_name() {
+    use crate::native_rebootstrap_recovery::{test_hooks::ORDER, write_durable};
+    let dir = private_tempdir();
+    ORDER.with(|o| o.borrow_mut().clear());
+    write_durable(dir.path(), "final", b"bytes").unwrap();
+    let order = ORDER.with(|o| o.borrow().clone());
+    assert_eq!(order.len(), 2, "{order:?}");
+    assert!(order[0].starts_with("rename:.tmp-") && order[0].ends_with("->final"), "{order:?}");
+    assert_eq!(order[1], format!("syncdir:{}", dir.path().display()));
+    assert_eq!(fs::read(dir.path().join("final")).unwrap(), b"bytes");
+}

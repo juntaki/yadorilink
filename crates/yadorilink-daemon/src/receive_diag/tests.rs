@@ -3,7 +3,10 @@ use super::*;
 /// This file's own lock sites: other tests running in the process while the
 /// instrument is armed record theirs too.
 fn own_sites() -> Vec<LockSiteStat> {
-    lock_site_stats().into_iter().filter(|s| s.site.contains("receive_diag/tests.rs")).collect()
+    lock_site_stats()
+        .into_iter()
+        .filter(|s| s.site.replace('\\', "/").contains("receive_diag/tests.rs"))
+        .collect()
 }
 
 /// Serialises the tests that arm the process-global instruments, so one

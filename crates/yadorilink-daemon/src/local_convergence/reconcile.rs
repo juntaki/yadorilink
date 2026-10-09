@@ -939,6 +939,29 @@ impl super::LocalConvergenceExecutor {
         Ok(Some(Head::of_native(head)))
     }
 
+    /// See [`ReplicaCoordinator::finish_matching_in_flight_write`]; `false` means the caller
+    /// retries instead of settling.
+    fn finish_matching_in_flight_write(
+        &self,
+        group_id: &str,
+        target_path: &str,
+        version_hash: &yadorilink_replica_domain::ids::VersionHash,
+        out_path: &Path,
+    ) -> Result<bool, PeerSessionError> {
+        let authority = self.root_lease_for(group_id)?;
+        let authority_op = authority.begin_operation()?;
+        let permit = authority_op.permit();
+        self.state
+            .finish_matching_in_flight_write(
+                group_id,
+                target_path,
+                version_hash,
+                yadorilink_root_authority::fs_identity::FileIdentity::observe_path(out_path).ok(),
+                &permit,
+            )
+            .map_err(|error| PeerSessionError::from(crate::sync_error::SyncError::from(error)))
+    }
+
     async fn recapture_instead_of_projecting(
         &self,
         group_id: &str,
@@ -1400,6 +1423,24 @@ impl super::LocalConvergenceExecutor {
                     // A path held because its file was unreadable settles
                     // here once it is readable again; the hold goes with it.
                     self.state.clear_metadata_unprovable_hold(group_id, target_path)?;
+                    // The bytes are the version's, but the row may still be the
+                    // unfinished write that put them there: an earlier attempt
+                    // renamed the file in and was refused at its commit (another
+                    // mutator advanced the fence), leaving the row in flight with
+                    // its intent open and no proof. Settling now would report the
+                    // path done, and what closes an obligation on the strength of
+                    // this settlement -- or, for a conflict copy, nothing at all,
+                    // since a copy owns no obligation -- would leave it unproven
+                    // for good. Finish it the way the repair sweep finishes a
+                    // write whose bytes are already right: one guarded commit.
+                    if !self.finish_matching_in_flight_write(
+                        group_id,
+                        target_path,
+                        &version_hash,
+                        &out_path,
+                    )? {
+                        return Ok(MaterializeResult::RetryRequired);
+                    }
                     return Ok(MaterializeResult::Settled(SettlementEvidence::ExactObject {
                         kind: RecordKind::File,
                         version: version_hash,

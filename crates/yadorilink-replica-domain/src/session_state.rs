@@ -657,7 +657,7 @@ pub enum LinkRowWrite {
 
 /// A durable journal row for an in-flight full-replica role-loss operation
 /// (demote/unlink) this device is driving as the SOURCE device. Written
-/// before the coordination-worker role-loss commit
+/// before the coordination service role-loss commit
 /// (`coordination_client::commit_handoff_role_loss`) and only removed once
 /// the operation's outcome is fully settled, so a crash — or a local
 /// failure landing AFTER the Worker commit already succeeded — is always
@@ -753,7 +753,7 @@ impl RoleLossAction {
 /// full state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoleLossOperationState {
-    /// Journal row written; the coordination-worker role-loss commit has
+    /// Journal row written; the coordination service role-loss commit has
     /// not yet been attempted (or its outcome is not yet known to this
     /// process — e.g. a crash mid-request). The reconciliation sweep
     /// treats a `Prepared` row found at startup the same as
@@ -763,7 +763,7 @@ pub enum RoleLossOperationState {
     /// (a no-op if the Worker never committed, a correcting revert if it
     /// did) — see that sweep's doc comment.
     Prepared,
-    /// The coordination-worker role-loss commit succeeded; the matching
+    /// The coordination service role-loss commit succeeded; the matching
     /// local policy/link change has not yet been attempted (or its outcome
     /// is not yet known — the crash-between-Worker-commit-and-local-commit
     /// case the whole journal exists for).

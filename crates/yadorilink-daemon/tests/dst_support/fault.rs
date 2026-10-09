@@ -11,7 +11,7 @@
 //! *decision engine* -- pure, synchronous, and fully unit-testable without
 //! a live session: given the next outbound message's simulated timestamp
 //! it returns what should happen to it. The caller (a migrated scenario's
-//! send path, or heat-run's fault injector) wraps its actual channel
+//! send path, or a soak run's fault injector) wraps its actual channel
 //! `send` around `decide`. `#![cfg(turmoil)]`-gated like every DST scenario
 //! file.
 

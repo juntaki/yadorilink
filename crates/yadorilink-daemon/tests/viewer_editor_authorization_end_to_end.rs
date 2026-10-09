@@ -20,7 +20,7 @@
 //! This file drives the real pipeline: a real signed role-carrying grant
 //! record (`support::fake_coordination::FakeCoordination::grant_role`,
 //! built with this crate's own `change_policy::policy_signing::
-//! grant_record` -- the exact shape `coordination-worker`'s
+//! grant_record` -- the exact shape the coordination service's
 //! `recordGrantWithRole` produces) is served over a real HTTP/WebSocket
 //! netmap subscription, fetched and verified by a real daemon
 //! (`peer_orchestrator::run`), and enforced by the fake coordination
@@ -52,7 +52,7 @@
 //! invalidate an already-established session's authority promptly, not
 //! merely on its next reconnect. `support::fake_coordination::
 //! FakeCoordination::downgrade_role` drives the exact chained
-//! Revoke-then-Grant record pair `coordination-worker`'s live role-change
+//! Revoke-then-Grant record pair the coordination service's live role-change
 //! endpoint produces for a downgrade (a plain Revoke, bumping the group's
 //! `auth_epoch`, immediately followed by a Grant at the new, lower role).
 //!   (f) an Editor-granted device's session is proven live (a real edit
@@ -161,7 +161,7 @@ async fn setup_two_devices(
     register_with_fake(fake, &daemon_a.state, device_a_id, &[group_id]).await;
     register_with_fake(fake, &daemon_b.state, device_b_id, &[group_id]).await;
     // Device B's role grant -- a real signed `ACTION_GRANT_WITH_ROLE`
-    // record, matching `coordination-worker`'s own `recordGrantWithRole`
+    // record, matching the coordination service's own `recordGrantWithRole`
     // shape. Issued before either daemon's orchestrator connects, so each
     // device's very first netmap frame already carries the full chain.
     fake.grant_role(device_b_id, group_id, b_role);

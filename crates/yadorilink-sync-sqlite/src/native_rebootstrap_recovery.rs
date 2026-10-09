@@ -255,6 +255,9 @@ pub(crate) mod test_hooks {
         /// An fsync of a file under a path containing this text fails once.
         pub static FAIL_FILE_SYNC_CONTAINING: RefCell<Option<String>> =
             const { RefCell::new(None) };
+        /// Every durable rename and directory flush, in the order asked for:
+        /// `rename:<from file name>-><to file name>` and `syncdir:<path>`.
+        pub static ORDER: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
         /// Stands in for a platform without directory-entry durability.
         pub static NO_DIRECTORY_DURABILITY: Cell<bool> = const { Cell::new(false) };
     }
@@ -262,7 +265,9 @@ pub(crate) mod test_hooks {
     pub fn maybe_corrupt(path: &Path, bytes: &[u8]) -> Vec<u8> {
         let mut out = bytes.to_vec();
         let hit = CORRUPT_PATH_CONTAINING.with(|text| {
-            text.borrow().as_deref().is_some_and(|t| path.to_string_lossy().contains(t))
+            text.borrow()
+                .as_deref()
+                .is_some_and(|t| path.to_string_lossy().replace('\\', "/").contains(t))
         });
         if hit {
             match out.first_mut() {
@@ -278,7 +283,10 @@ fn fsync_file(file: &fs::File, path: &Path) -> io::Result<()> {
     #[cfg(test)]
     {
         let fail = test_hooks::FAIL_FILE_SYNC_CONTAINING.with(|text| {
-            let hit = text.borrow().as_deref().is_some_and(|t| path.to_string_lossy().contains(t));
+            let hit = text
+                .borrow()
+                .as_deref()
+                .is_some_and(|t| path.to_string_lossy().replace('\\', "/").contains(t));
             if hit {
                 *text.borrow_mut() = None;
             }
@@ -296,17 +304,23 @@ fn fsync_file(file: &fs::File, path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// The one-line flip for Windows. While `false`, a Windows build contains the
+/// directory-durability implementation below (`durable_rename` with
+/// `MOVEFILE_WRITE_THROUGH`, plus a directory-handle `FlushFileBuffers`) but
+/// still refuses a rebootstrap with `Blocked(DurabilityUnsupported)`. Set it to
+/// `true` ONLY after the write-through rename and directory-handle flush have
+/// been validated end to end (including crash recovery) on a real Windows host.
+pub const WINDOWS_DIRECTORY_DURABILITY_VALIDATED: bool = false;
+
 /// Whether this platform can make a directory-entry change (a create or a
 /// rename) durable, which the preserved barrier depends on.
 ///
-/// Unix: `fsync` on a directory descriptor does so. Elsewhere there is no
-/// verified equivalent: `FlushFileBuffers` on a directory handle (opened with
-/// `FILE_FLAG_BACKUP_SEMANTICS`) is not documented to flush directory entries,
-/// and no write-through rename has been verified on a Windows host. Until one
-/// is, a rebootstrap that must not lose local data refuses to start there
-/// rather than rely on `sync_dir`, which does nothing on such a platform.
+/// Unix: `fsync` on a directory descriptor does so. Windows: implemented (see
+/// `durable_rename`, `sync_dir`) but fail-closed until
+/// [`WINDOWS_DIRECTORY_DURABILITY_VALIDATED`] is flipped after validation on a
+/// Windows host. Any other platform has nothing and refuses.
 pub const fn platform_supports_directory_durability() -> bool {
-    cfg!(unix)
+    cfg!(unix) || (cfg!(windows) && WINDOWS_DIRECTORY_DURABILITY_VALIDATED)
 }
 
 /// [`platform_supports_directory_durability`], with a test seam to stand in for
@@ -323,6 +337,11 @@ pub(crate) fn directory_durability_available() -> bool {
 }
 
 /// Flushes the directory entry changes of `dir`.
+///
+/// Unix: `fsync` of the directory. Windows: `FlushFileBuffers` on a directory
+/// handle (`FILE_FLAG_BACKUP_SEMANTICS`). Microsoft does not document that this
+/// flushes directory entries, so on Windows it is best effort for a create and
+/// is never the only thing a rename relies on (see [`durable_rename`]).
 pub(crate) fn sync_dir(dir: &Path) -> Result<(), AreaError> {
     #[cfg(unix)]
     {
@@ -333,11 +352,119 @@ pub(crate) fn sync_dir(dir: &Path) -> Result<(), AreaError> {
             .open(dir)?
             .sync_all()?;
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    windows_dir::flush_directory_handle(dir)?;
+    #[cfg(not(any(unix, windows)))]
     let _ = dir;
     #[cfg(test)]
-    test_hooks::DIR_SYNCS.with(|dirs| dirs.borrow_mut().push(dir.to_path_buf()));
+    {
+        test_hooks::DIR_SYNCS.with(|dirs| dirs.borrow_mut().push(dir.to_path_buf()));
+        test_hooks::ORDER
+            .with(|order| order.borrow_mut().push(format!("syncdir:{}", dir.display())));
+    }
     Ok(())
+}
+
+/// Renames `from` over `to` (same directory) and makes the new entry durable
+/// before returning.
+///
+/// Unix: `rename`, then `fsync` of the directory (unchanged). Windows:
+/// `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`, then the
+/// directory-handle flush. The caller has already fsynced the file's contents.
+pub(crate) fn durable_rename(from: &Path, to: &Path) -> Result<(), AreaError> {
+    #[cfg(test)]
+    test_hooks::ORDER.with(|order| {
+        let name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned());
+        order.borrow_mut().push(format!(
+            "rename:{}->{}",
+            name(from).unwrap_or_default(),
+            name(to).unwrap_or_default()
+        ));
+    });
+    #[cfg(windows)]
+    windows_dir::move_write_through(from, to)?;
+    #[cfg(not(windows))]
+    fs::rename(from, to)?;
+    match to.parent() {
+        Some(parent) => sync_dir(parent),
+        None => Ok(()),
+    }
+}
+
+#[cfg(windows)]
+mod windows_dir {
+    //! Never executed in this repository's CI or on the development hosts: it
+    //! is compiled for Windows and awaits validation on a real Windows host.
+    use std::fs;
+    use std::io;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::path::Path;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const SHARE_ALL: u32 = 0x7; // READ | WRITE | DELETE
+
+    fn wide(path: &Path) -> io::Result<Vec<u16>> {
+        let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if wide.contains(&0) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"));
+        }
+        Ok(wide.into_iter().chain(Some(0)).collect())
+    }
+
+    pub(super) fn move_write_through(from: &Path, to: &Path) -> io::Result<()> {
+        let (from, to) = (wide(from)?, wide(to)?);
+        // SAFETY: both buffers are NUL-terminated and outlive the call.
+        let ok = unsafe {
+            MoveFileExW(
+                from.as_ptr(),
+                to.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// `FlushFileBuffers` needs write access; a directory handle needs
+    /// `FILE_FLAG_BACKUP_SEMANTICS`. A link is refused, as `O_NOFOLLOW` does on Unix.
+    pub(super) fn flush_directory_handle(dir: &Path) -> io::Result<()> {
+        if fs::symlink_metadata(dir)?.file_type().is_symlink() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "a link is not followed"));
+        }
+        fs::OpenOptions::new()
+            .access_mode(GENERIC_WRITE)
+            .share_mode(SHARE_ALL)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(dir)?
+            .sync_all()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        // Compiles everywhere Windows builds; its pass/fail is only observable on a
+        // Windows host (part of the validation list in the design note).
+        #[test]
+        fn a_write_through_move_replaces_and_a_directory_handle_flushes() {
+            let dir = tempfile::tempdir().unwrap();
+            let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+            fs::write(&a, b"new").unwrap();
+            fs::write(&b, b"old").unwrap();
+            move_write_through(&a, &b).unwrap();
+            assert_eq!(fs::read(&b).unwrap(), b"new");
+            assert!(!a.exists());
+            flush_directory_handle(dir.path()).unwrap();
+        }
+    }
 }
 
 fn record_file_name(version: &VersionHash) -> String {
@@ -372,8 +499,7 @@ pub(crate) fn write_durable(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), 
         drop(file);
         #[cfg(windows)]
         windows_acl::restrict_to_current_user(&temp, false)?;
-        fs::rename(&temp, dir.join(name))?;
-        sync_dir(dir)
+        durable_rename(&temp, &dir.join(name))
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp);

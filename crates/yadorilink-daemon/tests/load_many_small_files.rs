@@ -24,14 +24,13 @@ const FILE_COUNT: usize = 200;
 const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(180);
 const INCREMENTAL_UPDATE_TIMEOUT: Duration = Duration::from_secs(60);
 
-// Not run in CI (see scripts/heat-run.sh) -- same rationale as
+// Not run in CI -- same rationale as
 // live_burst_batching.rs's identically-tagged test: a real-wall-clock
 // load/performance smoke test's value comes from running it many times
 // locally to build statistical confidence, not gating every CI push on
 // a single run's luck against whatever else is contending for that
-// runner's CPU. Run locally with `cargo test -- --ignored` or
-// `scripts/heat-run.sh`.
-#[ignore = "load/performance smoke test -- run via scripts/heat-run.sh, not in CI"]
+// runner's CPU. Run locally with `cargo test -- --ignored`, repeatedly.
+#[ignore = "load/performance smoke test -- run locally with --ignored, not in CI"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn many_small_files_survive_initial_sync_and_incremental_update() {
     let _ = tracing_subscriber::fmt::try_init();

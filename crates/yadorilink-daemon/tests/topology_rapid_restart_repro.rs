@@ -23,7 +23,8 @@ use std::time::{Duration, Instant};
 use support::fake_coordination::FakeCoordination;
 use support::register_with_fake;
 use support::topology::{
-    fully_connected, restart_node, spawn_orchestrator, stand_up_canonical_topology, TopologyNode,
+    advertise_substrate_endpoints, fully_connected, restart_node, shutdown_substrate,
+    spawn_orchestrator, stand_up_canonical_topology, TopologyNode,
 };
 use yadorilink_daemon::peer_registry::PeerReachability;
 
@@ -43,6 +44,7 @@ fn init_tracing() {
 /// the soak's random op mix around it.
 async fn rapid_restart(
     fake: &FakeCoordination,
+    peers: [&TopologyNode; 2],
     mut w: TopologyNode,
     handles: &mut support::topology::TopologyHandles,
     group_id: &str,
@@ -51,10 +53,19 @@ async fn rapid_restart(
 ) -> TopologyNode {
     for i in 0..restarts {
         tracing::info!(i, device_id = %w.device_id, "repro: restarting w");
+        // Close the substrate first, while the runtime its tasks live on is
+        // still running -- see `shutdown_substrate`.
+        shutdown_substrate(&w).await;
         handles.take_and_shutdown(&w.device_id).await;
         let restarted = restart_node(w).await;
         register_with_fake(fake, &restarted.state, &restarted.device_id, &[group_id]).await;
         let runtime = spawn_orchestrator(fake.addr(), &restarted);
+        // The fake coordination plane does not fan substrate addresses out, so
+        // the restarted node knows nobody's address and nobody knows its new
+        // one until the harness says so (as production's endpoint report ->
+        // netmap route would). Without this the new generation has no session
+        // with anyone, ever.
+        advertise_substrate_endpoints(&[peers[0], peers[1], &restarted]).await;
         handles.insert(restarted.device_id.clone(), runtime);
         w = restarted;
         tokio::time::sleep(gap).await;
@@ -62,7 +73,9 @@ async fn rapid_restart(
     w
 }
 
-#[tokio::test]
+// Multi-thread: the link runtime's live flush loop uses `block_in_place`, which
+// panics on a current-thread runtime when the real watcher delivers an event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rapid_restart_recovers_within_bound() {
     init_tracing();
     support::ensure_isolated_config_dir();
@@ -78,7 +91,8 @@ async fn rapid_restart_recovers_within_bound() {
     let pre_restart_session =
         n.state.peers.session(&w.device_id).expect("n must have a session with w before restart");
 
-    w = rapid_restart(&fake, w, &mut handles, &group_id, 6, Duration::from_millis(1500)).await;
+    w = rapid_restart(&fake, [&n, &m], w, &mut handles, &group_id, 6, Duration::from_millis(1500))
+        .await;
 
     // Matches the fixed `topology_soak_lane.rs` invariant 2 exactly:
     // recovered means either a NEW session was registered, or the SAME

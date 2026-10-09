@@ -30,14 +30,14 @@ const BURST_FILE_COUNT: usize = 300;
 /// or regression while tolerating real host oversubscription.
 const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(180);
 
-// Not run in CI (see scripts/heat-run.sh): a load/performance smoke test's
+// Not run in CI: a load/performance smoke test's
 // value is in running it many times to build statistical confidence, not
 // once per push -- and its real-wall-clock convergence wait makes it
 // inherently sensitive to whatever else is contending for the runner's
 // CPU at that moment, so a shared CI runner produces failures unrelated
 // to any actual regression. Run
-// locally with `cargo test -- --ignored` or `scripts/heat-run.sh`.
-#[ignore = "load/performance smoke test -- run via scripts/heat-run.sh, not in CI"]
+// locally with `cargo test -- --ignored`, repeatedly.
+#[ignore = "load/performance smoke test -- run locally with --ignored, not in CI"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn live_burst_of_many_small_files_converges_via_debounced_batching() {
     let coordination_addr = support::start_coordination_server().await;

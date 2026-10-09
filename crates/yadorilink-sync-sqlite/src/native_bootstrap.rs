@@ -445,7 +445,7 @@ pub fn verify_native_bootstrap(
     // The author states, and the context the frontier they hold fixes (an
     // author's context is its frontier position).
     let states = payload.author_states().map_err(|detail| refuse(detail.into()))?;
-    verify_bundle_closures(&payload.closures, &states, group_id, policy).map_err(&refuse)?;
+    verify_bundle_closures(&payload.closures, &states, group_id, policy).map_err(refuse)?;
     let frontier = frontier_of_states(&states);
     let mut state = NativeState::new();
     for (author, entry) in &frontier {

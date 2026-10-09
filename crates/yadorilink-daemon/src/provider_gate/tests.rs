@@ -372,7 +372,8 @@ fn only_the_known_files_construct_a_verified_root() {
                     code.contains("VerifiedRoot::open(") || code.contains("VerifiedRoot::verify(")
                 });
                 if constructs {
-                    let rel = path.strip_prefix(&repo_root).unwrap().to_string_lossy().to_string();
+                    let rel =
+                        path.strip_prefix(&repo_root).unwrap().to_string_lossy().replace('\\', "/");
                     found.push(rel.replace("/./", "/"));
                 }
             }

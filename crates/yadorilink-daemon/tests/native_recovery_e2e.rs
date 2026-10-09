@@ -174,7 +174,10 @@ async fn an_existing_device_takes_no_sealed_state_while_its_peers_can_still_repl
     .await
     .unwrap()
     .expect_err("no peer has truncated the history, so no rebootstrap starts");
-    assert!(error.contains("did not start"), "{error}");
+    // Where rebootstrap is refused outright the gate answers before the peers are weighed.
+    let expected =
+        if rebootstrap_is_refused_here() { "DurabilityUnsupported" } else { "did not start" };
+    assert!(error.contains(expected), "{error}");
     assert_eq!(native_state(&b, GROUP), before, "the refused bundle changed nothing");
     assert!(!tree(&b).contains_key("doc.txt"));
     assert!(tree(&b).contains_key("local.txt"));
@@ -197,6 +200,9 @@ async fn an_existing_device_asks_for_a_sealed_state_when_its_peer_cannot_replay(
         captured(&a, GROUP).await;
     }
     assert!(collect_replication_log(&a, GROUP) > 0, "superseded deltas were collected");
+    if rebootstrap_refused_and_state_intact(&a, &b).await {
+        return;
+    }
 
     pair(&a, &b, GROUP).await;
     converge_to(&[&a, &b], &[("kept.txt", b"kept"), ("doc.txt", b"three")], "recovered").await;
@@ -235,6 +241,9 @@ async fn a_lagging_device_catches_up_from_a_recovered_peer_once_the_author_is_go
     // The author goes away; `c` reconciles with the recovered peer alone.
     partition(&a, &b).await;
     assert!(tree(&c).contains_key("x.txt"), "`c` still shows the file it last saw");
+    if rebootstrap_refused_and_state_intact(&b, &c).await {
+        return;
+    }
     pair(&c, &b, GROUP).await;
     converge_to(&[&b, &c], &[], "the lagging device caught up").await;
     converge_state(&[&b, &c], GROUP, "one native state").await;
@@ -416,6 +425,45 @@ fn journal_state(node: &TopologyNode) -> Option<RebootstrapState> {
     read(node, |conn| rebootstrap_status(conn, &group())).map(|status| status.state)
 }
 
+/// Whether this platform refuses every rebootstrap (it cannot make a directory entry durable).
+/// Decided by the capability the product itself consults, never by the target OS, so a platform
+/// that gains the capability takes the success path of every test below unchanged.
+fn rebootstrap_is_refused_here() -> bool {
+    !yadorilink_sync_sqlite::native_rebootstrap_recovery::platform_supports_directory_durability()
+}
+
+/// The fail-closed contract of a platform that cannot rebootstrap, for a device `node` whose
+/// peer `server` holds the state it lacks. Returns `false` at once where rebootstrap is
+/// supported, and the caller runs its success path. Otherwise it offers `server`'s sealed state
+/// to `node`, observes the explicit `DurabilityUnsupported` refusal, checks that nothing of
+/// `node` changed (native state, files, journal, freeze), and returns `true`: the caller ends
+/// there instead of waiting for a rebootstrap that cannot happen.
+async fn rebootstrap_refused_and_state_intact(server: &TopologyNode, node: &TopologyNode) -> bool {
+    use yadorilink_daemon::native_recovery::{DaemonRecovery, RecoveryPort};
+    if !rebootstrap_is_refused_here() {
+        return false;
+    }
+    let (state_before, files_before) = (native_state(node, GROUP), tree(node));
+    let group = FolderGroupId(GROUP.to_owned());
+    let bundle = DaemonRecovery::new(shared(server))
+        .serve(&group)
+        .await
+        .expect("the up-to-date peer can seal its state");
+    let node_state = shared(node).clone();
+    let error = tokio::task::spawn_blocking(move || {
+        DaemonRecovery::new(&node_state).apply(&group, &bundle)
+    })
+    .await
+    .unwrap()
+    .expect_err("a platform without directory durability must refuse the rebootstrap");
+    assert!(error.contains("DurabilityUnsupported"), "{error}");
+    assert_eq!(native_state(node, GROUP), state_before, "the refusal changed the native state");
+    assert_eq!(tree(node), files_before, "the refusal changed the files");
+    assert_eq!(journal_state(node), None, "a refused rebootstrap leaves no journal");
+    assert!(!read(node, |conn| group_frozen(conn, GROUP)), "a refused rebootstrap freezes nothing");
+    true
+}
+
 /// A user's edit that is on disk but in no index when the rebootstrap begins is folded into the
 /// plan by its one final capture pass, authored under the freeze as the capture capability
 /// allows, and replayed on top of the replacing state: it reaches the peer as an ordinary new
@@ -424,6 +472,9 @@ fn journal_state(node: &TopologyNode) -> Option<RebootstrapState> {
 async fn an_unsaved_edit_when_the_rebootstrap_begins_is_captured_and_replayed() {
     setup();
     let (a, b) = lagging_pair("capt").await;
+    if rebootstrap_refused_and_state_intact(&a, &b).await {
+        return;
+    }
     edit_when_the_rebootstrap_begins(&b, "edit.txt", b"unsaved");
 
     pair(&a, &b, GROUP).await;
@@ -443,6 +494,9 @@ async fn an_unsaved_edit_when_the_rebootstrap_begins_is_captured_and_replayed() 
 async fn a_rebootstrap_stopped_before_its_replay_resumes_after_a_restart() {
     setup();
     let (a, b) = lagging_pair("resu").await;
+    if rebootstrap_refused_and_state_intact(&a, &b).await {
+        return;
+    }
     let stopped = Arc::new(AtomicBool::new(false));
     let seen = stopped.clone();
     b.state.set_rebootstrap_hook_for_test(Some({
@@ -518,6 +572,9 @@ async fn lagging_device_holding_a_version_the_group_dropped(
 async fn a_version_the_group_dropped_is_kept_listed_restored_and_discarded() {
     setup();
     let (_a, b, c) = lagging_device_holding_a_version_the_group_dropped("item").await;
+    if rebootstrap_refused_and_state_intact(&b, &c).await {
+        return;
+    }
     pair(&c, &b, GROUP).await;
     converge_to(&[&b, &c], &[], "the lagging device caught up").await;
 
@@ -553,6 +610,9 @@ async fn a_version_the_group_dropped_is_kept_listed_restored_and_discarded() {
 async fn a_block_missing_at_the_barrier_is_fetched_from_a_peer() {
     setup();
     let (_a, b, c) = lagging_device_holding_a_version_the_group_dropped("fetch").await;
+    if rebootstrap_refused_and_state_intact(&b, &c).await {
+        return;
+    }
     forget_block_after_the_final_capture(&c);
 
     pair(&c, &b, GROUP).await;
@@ -585,6 +645,9 @@ fn forget_block_after_the_final_capture(node: &TopologyNode) {
 async fn an_item_without_all_its_blocks_completes_when_they_arrive() {
     setup();
     let (a, b, c) = lagging_device_holding_a_version_the_group_dropped("part").await;
+    if rebootstrap_refused_and_state_intact(&b, &c).await {
+        return;
+    }
     let hash = a.state.block_store.put(b"first").unwrap();
     a.state.block_store.delete(&hash).unwrap();
     forget_block_after_the_final_capture(&c);
@@ -620,6 +683,9 @@ async fn an_item_without_all_its_blocks_completes_when_they_arrive() {
 async fn items_of_a_removed_group_are_kept_listed_and_discardable() {
     setup();
     let (_a, b, c) = lagging_device_holding_a_version_the_group_dropped("gone").await;
+    if rebootstrap_refused_and_state_intact(&b, &c).await {
+        return;
+    }
     pair(&c, &b, GROUP).await;
     converge_to(&[&b, &c], &[], "the lagging device caught up").await;
     let item_id = preserved_items::list(shared(&c)).await.unwrap()[0].item_id.clone();
@@ -645,6 +711,9 @@ async fn items_of_a_removed_group_are_kept_listed_and_discardable() {
 async fn own_changes_a_viewer_cannot_replay_are_set_aside_and_listed() {
     setup();
     let (a, b) = lagging_pair("view").await;
+    if rebootstrap_refused_and_state_intact(&a, &b).await {
+        return;
+    }
     // The device loses its write role the moment its rebootstrap begins.
     let (states, device) = (vec![a.state.clone(), b.state.clone()], b.device_id.clone());
     let root = b.root.path().to_path_buf();
@@ -677,6 +746,9 @@ async fn own_changes_a_viewer_cannot_replay_are_set_aside_and_listed() {
 async fn a_held_own_unit_is_retried_once_the_device_is_a_writer_again() {
     setup();
     let (a, b) = lagging_pair("retry").await;
+    if rebootstrap_refused_and_state_intact(&a, &b).await {
+        return;
+    }
     let (states, device) = (vec![a.state.clone(), b.state.clone()], b.device_id.clone());
     let root = b.root.path().to_path_buf();
     let done = Arc::new(AtomicBool::new(false));

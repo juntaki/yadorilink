@@ -41,7 +41,7 @@ use crate::recovery::RecoveryOperationKey;
 /// (`Unavailable`) -- collapsing the two, as an early draft of the
 /// `role_loss_operation_receipts` write path itself briefly did in reverse
 /// (treating a post-hoc state re-check as proof of success -- see that
-/// fix's own doc comment in `coordination-worker/src/db/queries.ts`), is
+/// fix's own doc comment in the coordination service), is
 /// exactly the class of bug this type exists to make impossible to write
 /// by accident: nothing in this enum can be constructed by silently
 /// downgrading `Unavailable` into `RecordNotFound`.

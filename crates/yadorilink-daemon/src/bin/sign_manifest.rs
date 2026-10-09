@@ -1,7 +1,7 @@
 //! Offline release-manifest signing tool.
 //!
 //! Maintainer-only — never shipped as part of an end-user install (see
-//! `installer/macos/build-pkg.sh`/`installer/windows/yadorilink.iss`,
+//! `platforms/macos/package/build-pkg.sh`/`platforms/windows/package/yadorilink.iss`,
 //! neither of which package this binary). Reuses
 //! `yadorilink_daemon::update::manifest`'s exact types and wire format
 //! rather than a second, independent implementation, so a manifest this

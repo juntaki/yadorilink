@@ -4,7 +4,7 @@
 //! `materialization_eviction.rs`'s ONLY way to get a confirmed answer
 //! that a Windows placeholder's local content was actually dehydrated
 //! before it commits the row to `Remote` and reclaims blocks. See
-//! `shell-ext/windows/src/dehydrate_server.rs`'s own module doc for why
+//! `platforms/windows/shell/src/dehydrate_server.rs`'s own module doc for why
 //! this is a real cross-process RPC (daemon dials cfapi-host), unlike
 //! `placeholder_inspect_windows.rs`'s direct-call bet for the read-only
 //! dirty-detection query.
@@ -12,7 +12,7 @@
 //! Mirrors `shell_ipc::client::query_status`'s Windows client (bounded retry
 //! on `ERROR_PIPE_BUSY`), and additionally verifies that the pipe is served by
 //! a process running as the current user before sending anything, as
-//! `shell-ext/windows/src/ipc_client.rs` does.
+//! `platforms/windows/shell/src/ipc_client.rs` does.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -35,7 +35,7 @@ const RETRY_DELAY: Duration = Duration::from_millis(50);
 /// them to become async -- but this module's own client call is
 /// inherently async (named-pipe I/O). Bridges the two with a dedicated,
 /// lazily-started, single-threaded runtime blocked on per call, the exact
-/// same pattern `shell-ext/windows/src/ipc_client.rs`'s own doc comment
+/// same pattern `platforms/windows/shell/src/ipc_client.rs`'s own doc comment
 /// documents for the identical problem on the shell-extension side
 /// ("COM shell-extension callbacks are inherently synchronous, so this
 /// module owns one... runtime and blocks on it per call"). A dedicated
@@ -120,7 +120,7 @@ impl std::fmt::Display for DehydrateError {
 
 impl std::error::Error for DehydrateError {}
 
-/// `\\.\pipe\yadorilink-cfapi-host-<user>` -- must match `shell-ext/windows/
+/// `\\.\pipe\yadorilink-cfapi-host-<user>` -- must match `platforms/windows/shell/
 /// src/dehydrate_server.rs::pipe_name` exactly.
 fn pipe_name() -> String {
     #[cfg(debug_assertions)]

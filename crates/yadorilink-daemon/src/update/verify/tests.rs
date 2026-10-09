@@ -94,7 +94,7 @@ fn matching_checksum_verifies() {
     hasher.update(b"real bytes");
     let expected = hex::encode(hasher.finalize());
     assert!(verify_checksum(&path, &expected).is_ok());
-    // Case-insensitivity, matching scripts/ci/generate-release-checksums.py.
+    // Case-insensitivity, matching .github/release/generate-release-checksums.py.
     assert!(verify_checksum(&path, &expected.to_uppercase()).is_ok());
 }
 

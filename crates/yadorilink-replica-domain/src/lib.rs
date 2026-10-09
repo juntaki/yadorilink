@@ -2,8 +2,8 @@
 //! signed canonical `Change`, and deterministic conflict policy. No
 //! filesystem, network, database, or async runtime dependency: everything
 //! here is a synchronous, deterministic function of its inputs. The
-//! boundary is declared in `architecture.toml` (this crate is the base of
-//! the `domain` layer) and enforced by `scripts/check-architecture.py`.
+//! boundary is declared in `.config/architecture.toml` (this crate is the base of
+//! the `domain` layer) and enforced by `.github/checks/check-architecture.py`.
 
 pub mod admission;
 pub mod author;

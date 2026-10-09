@@ -4,7 +4,7 @@
 //! longer makes a direct Worker call, and there is nothing left for it to
 //! compensate. Exercised over the real control socket, mirroring
 //! `unlink_and_removal_durability.rs`'s own integration style, against a
-//! `wiremock` stand-in for coordination-worker.
+//! `wiremock` stand-in for the coordination service.
 //!
 //! Covers:
 //!   - a DEMOTION writes the coordination plane exactly once, through the

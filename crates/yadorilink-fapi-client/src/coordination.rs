@@ -9,14 +9,14 @@
 //! only one of them is about types.
 //!
 //! The first is arithmetic. An access token on this plane lives **five
-//! minutes** (`coordination-worker/src/auth/provider/config.ts`). A value
+//! minutes** (the coordination service). A value
 //! captured at startup is a daemon that is authenticated until its first coffee
 //! break. A token therefore cannot be a value a subsystem *holds*; it has to be
 //! something it *asks for*, and the asking is what refreshes it.
 //!
 //! The second is that a token alone is not a credential. The Coordination API
 //! is a DPoP resource server
-//! (`coordination-worker/src/auth/provider/resource.ts`): it wants
+//! (the coordination service): it wants
 //! `Authorization: DPoP <token>` **and** a proof signed by the key that token
 //! was issued against, bound to this request's method and URL and to this
 //! token. A caller holding only the token cannot construct a request that will

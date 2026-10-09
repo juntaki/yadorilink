@@ -7,7 +7,7 @@
 //! # Why this calls `CfGetPlaceholderInfo` from the DAEMON process, not
 //! `yadorilink-cfapi-host.exe`
 //!
-//! `shell-ext/windows/src/cfapi.rs`'s `fetch_data_callback` and this
+//! `platforms/windows/shell/src/cfapi.rs`'s `fetch_data_callback` and this
 //! module's own `inspect_placeholder` both end up calling into the Cloud
 //! Filter API against the same on-disk placeholders, but from two
 //! DIFFERENT OS processes. The filter driver refuses ordinary file
@@ -49,7 +49,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 use yadorilink_local_capture::ports::PlaceholderStatus;
 
-/// The generation-identity wire format `shell-ext/windows/src/cfapi.rs`'s
+/// The generation-identity wire format `platforms/windows/shell/src/cfapi.rs`'s
 /// `encode_generation_identity` writes as a placeholder's `FileIdentity`,
 /// and this function decodes: 1 version-tag byte (`1`, "generation-token
 /// v1") followed by an 8-byte little-endian `u64`. Self-describing on

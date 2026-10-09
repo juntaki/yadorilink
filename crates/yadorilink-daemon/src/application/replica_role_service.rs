@@ -58,7 +58,7 @@ pub(crate) enum UnlinkCommit {
     /// digest re-check; the caller must not remove it again. Carries the
     /// coordination-plane handoff-commit result, paired with this device's
     /// own locally-computed root digest (never sent to or read back from
-    /// coordination-worker), when that path actually ran one (`Some`).
+    /// the coordination service), when that path actually ran one (`Some`).
     AlreadyRemoved(Option<(HandoffCommitResult, [u8; 32])>),
     /// No atomic removal happened (on-demand cache, no link row, or a forced
     /// bypass); the caller performs the plain `remove_link`.
@@ -219,7 +219,7 @@ impl ReplicaRoleService {
         clippy::too_many_lines,
         clippy::excessive_nesting,
         reason = "one demotion fix-saga: readiness gate, mandatory peer lease, durable role-loss \
-                  journal open, coordination-worker commit, and the digest-recheck local policy \
+                  journal open, the coordination service commit, and the digest-recheck local policy \
                   flip must stay in a single function because every early return is a compensation \
                   decision that depends on how far the saga got (role_loss_operation_id / \
                   lease_acquisition_failed); the nesting is the RoleLossCommitOutcome match inside \
@@ -268,7 +268,7 @@ impl ReplicaRoleService {
             // materialization-policy flip) on top of the same
             // coordination-plane commit.
             // Fix-saga: filled in inside the `Some(lease_id)` arm below,
-            // right before the coordination-worker commit, and consulted
+            // right before the coordination service commit, and consulted
             // after the local recheck below to close out (success) or
             // compensate (failure) the journal row it names.
             let mut role_loss_operation_id: Option<String> = None;
@@ -438,7 +438,7 @@ impl ReplicaRoleService {
             // between.
             //
             // Fix-saga: when `role_loss_operation_id` is `Some`, the
-            // coordination-worker role-loss commit above already succeeded, so a
+            // the coordination service role-loss commit above already succeeded, so a
             // failure here (digest mismatch OR a storage error -- both handled
             // identically) must not just return an error and leave the Worker
             // and this device disagreeing about full-replica status. Compensate
@@ -605,7 +605,7 @@ impl ReplicaRoleService {
             let digest_at_check = proof.root_digest();
             let ready_peer_device_id = proof.into_peer_device_id();
             // This device giving up its own eager status is exactly the
-            // role-loss shape coordination-worker's handoff-commit endpoint
+            // role-loss shape the coordination service's handoff-commit endpoint
             // guards: confirm the named target is currently Active+eager and
             // commit the role loss (`storage_mode` narrows to on-demand)
             // atomically, coordination-side, before this device also removes
@@ -621,7 +621,7 @@ impl ReplicaRoleService {
             // eventual `UnlinkResponse`.
             //
             // Fix-saga: filled in inside the `Some(lease_id)` arm below,
-            // right before the coordination-worker commit, and consulted
+            // right before the coordination service commit, and consulted
             // after the local recheck further down to close out (success)
             // or compensate (failure) the journal row it names.
             let mut role_loss_operation_id: Option<String> = None;
@@ -713,7 +713,7 @@ impl ReplicaRoleService {
                                         // here purely for the caller's
                                         // `HandoffResult.root_digest`
                                         // output -- never itself sent to
-                                        // coordination-worker.
+                                        // the coordination service.
                                         RoleLossCommitOutcome::Committed(result) => {
                                             self.role_loss.mark_worker_committed(
                                                 &operation_id,
@@ -857,7 +857,7 @@ impl ReplicaRoleService {
                             ),
                         });
                     }
-                    // No coordination-worker commit happened (empty root set,
+                    // No coordination service commit happened (empty root set,
                     // or no coordination-plane config) -- exactly the
                     // pre-existing behavior: the root set moved between the
                     // peer confirmation and the atomic re-check, so fall
@@ -973,7 +973,7 @@ impl ReplicaRoleService {
         }
     }
 
-    /// Compensates a role-loss operation whose coordination-worker commit
+    /// Compensates a role-loss operation whose coordination service commit
     /// succeeded (or may have succeeded) but whose matching local change
     /// never completed: a digest mismatch or storage error in the local
     /// recheck-then-commit, or a crash before that local step ran. The SAFE

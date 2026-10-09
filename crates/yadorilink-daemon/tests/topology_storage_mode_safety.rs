@@ -2,7 +2,7 @@
 //! the real canonical N/M/W topology (real `peer_orchestrator`, real
 //! transport, real control socket) composed with `storage_mode_
 //! orchestration.rs`'s own established `wiremock` stand-in for
-//! coordination-worker. The role-level demotion/unlink handoff gate in `replica_role_service.rs`
+//! the coordination service. The role-level demotion/unlink handoff gate in `replica_role_service.rs`
 //! is the real, CURRENTLY-SHIPPED backend-authoritative safety operation
 //! ("Unsafe eviction/local-copy removal is backend-gated"). The PER-FILE
 //! block-reclaim custody path (`P2pCustodyConfirmer::confirms_present`,
@@ -16,13 +16,13 @@
 //! out of scope for this pass until that feature actually ships.
 //!
 //! **Why compose two fakes, not one**: `FakeCoordination` (the netmap
-//! WebSocket subscription) and coordination-worker's plain HTTP API are
+//! WebSocket subscription) and the coordination service's plain HTTP API are
 //! genuinely separate production boundaries --
 //! `DaemonHandoffReadinessAdapter`'s own doc comment states readiness
 //! confirmation and lease acquisition go over the real peer-to-peer
-//! session, NEVER coordination-worker's HTTP API, while the final
+//! session, NEVER the coordination service's HTTP API, while the final
 //! role-loss COMMIT (and a promotion's storage-mode write) genuinely does
-//! go to coordination-worker over HTTP (`HttpRoleLossCoordination`). No new
+//! go to the coordination service over HTTP (`HttpRoleLossCoordination`). No new
 //! unified fake is introduced; both existing fakes are simply pointed at
 //! the same real topology nodes.
 //!
@@ -43,7 +43,7 @@
 //! **The TOCTOU seam**: `DaemonState::request_handoff_lease` (the
 //! confirmed TARGET's own handling of an incoming P2P `HandoffLeaseRequest`)
 //! already computes `attested_digest` (this device's root-set digest)
-//! BEFORE calling coordination-worker's `/handoff/lease` route, then
+//! BEFORE calling the coordination service's `/handoff/lease` route, then
 //! re-derives `pinned_digest` via an atomic local pin AFTER that HTTP round
 //! trip returns, and declines the lease if they differ -- a real,
 //! already-existing production TOCTOU guard. `wiremock`'s own responder
@@ -221,7 +221,7 @@ async fn hydrate_with_retries(state: &Arc<DaemonState>, group_id: &str, path: &s
 /// (the topology's own eager anchor) then demotes to on-demand once M is a
 /// REAL, content-complete full replica -- proven via N's own real
 /// `set_storage_mode` control-socket request, the real P2P
-/// readiness/lease exchange with M, and a real (mocked) coordination-worker
+/// readiness/lease exchange with M, and a real (mocked) coordination service
 /// role-loss commit. Asserts both the returned result AND the actual
 /// resulting system state: N's local policy, the Worker's exact call
 /// pattern (role-loss commit only, never the plain storage-mode route --

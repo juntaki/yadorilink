@@ -747,12 +747,12 @@ async fn release_owned_handoff_lease_releases_local_pin_and_worker_lease() {
 
 /// The digest-mismatch abort path: if the group's durability-root set
 /// changes between the readiness digest `request_handoff_lease` captures
-/// up front and the atomic local pin that follows the coordination-worker
+/// up front and the atomic local pin that follows the coordination service
 /// round trip, the mismatch must be caught, both halves of the
 /// now-meaningless lease released, and `None` returned — never a lease
 /// that claims to pin a set it no longer actually matches. The mismatch
 /// is engineered deterministically, not via a timing race: the mock
-/// coordination-worker handler below only runs once the real HTTP
+/// the coordination service handler below only runs once the real HTTP
 /// request has actually been sent — which is strictly after
 /// `full_replica_handoff_ready_digest` already ran synchronously earlier
 /// in `request_handoff_lease` — and it inserts a new file into the group
@@ -827,7 +827,7 @@ async fn request_handoff_lease_aborts_and_releases_both_pins_on_a_digest_mismatc
     assert_eq!(local_leases[0].lease_id, "lease-xyz");
     assert_eq!(local_leases[0].state, HandoffLeaseState::Released);
 
-    // The coordination-worker's copy must have been released too — the
+    // The coordination service's copy must have been released too — the
     // release endpoint (and only it, once) was actually called.
     let requests = server.received_requests().await.unwrap();
     let release_calls = requests

@@ -126,6 +126,19 @@ impl InstrumentedBlockStore {
         state.entered.len()
     }
 
+    /// Starts the gate over: reads that already entered are forgotten and every later read
+    /// waits for a permit again.
+    fn close_gate_and_forget_entered(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.permits = 0;
+        state.entered.clear();
+        self.changed.notify_all();
+    }
+
+    fn entered_count(&self) -> usize {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).entered.len()
+    }
+
     fn entered_position(&self, hash_hex: &str) -> Option<usize> {
         self.state
             .lock()
@@ -607,6 +620,35 @@ async fn late_small_requests_from_another_peer_and_group_cut_ahead_of_a_large_ba
     let other_peer = seed_block(&source, GROUP_A, "small-other-peer.bin", seeded_data(9_002, 1024));
     source.state.flush_pending_checkpoint_for_group_for_test(GROUP_A).await;
     source.state.flush_pending_checkpoint_for_group_for_test(GROUP_B).await;
+
+    // The peers are ordinary daemons: once they are linked and the files are seeded they fetch
+    // the seeded blocks themselves, and those fetches would fill each peer's request window
+    // (and the source's dispatch slots) in a timing the test does not control, so that a
+    // "late" request waits in the requester behind them rather than being ordered by the
+    // source. Let that traffic finish first, with the gate open, then close the gate: from
+    // there on the only requests are the ones this test makes.
+    store.release(usize::MAX / 2);
+    let synced = |device: &Device| {
+        large_backlog
+            .iter()
+            .all(|block| device.state.block_store.exists(&block.hash_hex).unwrap_or(false))
+    };
+    support::wait_until_with_context(
+        || synced(&peer_a) && synced(&peer_b),
+        Duration::from_secs(60),
+        || "the peers never finished fetching the seeded files themselves".to_owned(),
+    )
+    .await;
+    // Their last requests are answered by now; wait for the source to see no more.
+    let mut last = (store.entered_count(), Instant::now());
+    while last.1.elapsed() < Duration::from_secs(1) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let now = store.entered_count();
+        if now != last.0 {
+            last = (now, Instant::now());
+        }
+    }
+    store.close_gate_and_forget_entered();
 
     let session_a = session_to(&peer_a, &source.device_id);
     let session_b = session_to(&peer_b, &source.device_id);

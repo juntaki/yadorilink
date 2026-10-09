@@ -30,8 +30,6 @@ members = [
     "crates/yadorilink-http-api",
     "crates/yadorilink-product-view",
     "crates/yadorilink-fapi-client",
-    # DST replay + lane runner.
-    "xtask",
 ]
 
 [workspace.lints.rust]
@@ -40,7 +38,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(turmoil)"] }
 
 [workspace.lints.clippy]
 # `excessive_nesting` is warn-by-default already; it only starts firing once
-# `excessive-nesting-threshold` is set in clippy.toml. `too_many_lines` is
+# `excessive-nesting-threshold` is set in .clippy.toml. `too_many_lines` is
 # pedantic, so it has to be enabled explicitly here.
 too_many_lines = "warn"
 

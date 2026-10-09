@@ -134,7 +134,7 @@ pub struct SubstrateReachability {
 }
 
 /// A Track Send rendezvous grant from `POST /send/authorization` --
-/// coordination-worker's `routes/send.ts`, backed by the `send_authorizations`
+/// the coordination service's `routes/send.ts`, backed by the `send_authorizations`
 /// table (see that migration's own doc comment for what this primitive is
 /// and, deliberately, is not: never an extension of folder-group/ACL
 /// membership). Names the exact sender+receiver pair it authorizes and
@@ -236,7 +236,7 @@ pub enum EnrollmentPrepareOutcome {
 /// The classified result of a coordination-plane enrollment CANCEL call --
 /// mirrors [`EnrollmentPrepareOutcome`]. Unlike prepare, the Worker's own
 /// cancel routes treat "already gone"/"already active" as an ordinary 2xx
-/// no-op (see `coordination-worker`'s own idempotent-cancel contract), so a
+/// no-op (see the coordination service's own idempotent-cancel contract), so a
 /// 404 here is NOT a routine "already cancelled" -- it means this
 /// operation_id's identity itself doesn't match what the Worker expects,
 /// same as a 409.
@@ -448,7 +448,7 @@ pub struct EnrollmentOperationRecord {
 /// existence IS the evidence: a receipt means the underlying acl mutation
 /// committed, full stop, there is no separate `status` field the way
 /// enrollment/membership have one. See
-/// `coordination-worker/src/db/queries.ts`'s `commitRoleLossGuarded` for
+/// the coordination service's `commitRoleLossGuarded` for
 /// why this receipt is reliable (a `changes()`-chained, replay-idempotent
 /// UPSERT) rather than a best-effort side record.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -537,9 +537,9 @@ mod imp {
 
     /// The response body an activate call's 2xx response carries: which
     /// non-error outcome (`ActivateCreateResult`/`ActivateJoinResult`/
-    /// `ActivateInviteAcceptResult` on the coordination-worker side) it
+    /// `ActivateInviteAcceptResult` on the coordination service side) it
     /// landed on. A response that fails to parse (an older
-    /// coordination-worker build that still replies with an empty 204, or
+    /// the coordination service build that still replies with an empty 204, or
     /// any other unexpected body) is treated as a plain `Success` -- the
     /// status code alone already confirms the row is active, and "already
     /// active" vs. "freshly activated" makes no difference to any caller of
@@ -558,9 +558,9 @@ mod imp {
     const ACTIVATE_RESULT_ALREADY_AWAITING_APPROVAL: &str = "already_awaiting_approval";
 
     /// Shared by `activate_create`/`activate_join`/`activate_invite_accept`:
-    /// every one of those coordination-worker routes is 404 on a
+    /// every one of those coordination service routes is 404 on a
     /// permanently-gone row and otherwise 2xx with a `{"result": ...}` body
-    /// -- see `coordination-worker/src/routes/shares.ts`'s activate
+    /// -- see the coordination service's activate
     /// handlers.
     async fn post_activate<B: Serialize>(
         url: String,
@@ -616,7 +616,7 @@ mod imp {
         device_id: &'a str,
     }
 
-    /// Confirms a previously-prepared CREATE enrollment (coordination-worker's
+    /// Confirms a previously-prepared CREATE enrollment (the coordination service's
     /// `POST /shares/groups/:groupId/activate`), turning a Pending group +
     /// its creator's Pending eager membership into the real thing. Called
     /// both by the CLI's own create flow (immediately, via its own HTTP
@@ -1175,7 +1175,7 @@ mod imp {
         }
     }
 
-    /// Requests a full-replica-handoff lease from coordination-worker
+    /// Requests a full-replica-handoff lease from the coordination service
     /// (`POST /shares/groups/:groupId/handoff/lease`), called by the handoff
     /// TARGET immediately after its own local readiness check confirms it
     /// holds every root of the group. Carries no digest or other
@@ -1256,7 +1256,7 @@ mod imp {
 
     /// Requests (or, for an already-decided `request_id`,
     /// replays) a signed `AuthorizationCheckpoint` for `device_id`'s
-    /// pending batch, via coordination-worker's
+    /// pending batch, via the coordination service's
     /// `POST /shares/groups/:groupId/authorization-checkpoint`
     /// (`src/routes/shares.ts`). `request_id` MUST be
     /// deterministic in the caller for a given `(group_id, device_id,
@@ -1404,7 +1404,7 @@ mod imp {
     /// content-derived value, matching every other call in this module — just
     /// the opaque `lease_id` plus `(group_id, target_device_id)`. Best-effort
     /// like `find_handoff_lease`/`request_handoff_lease`: a failure here just
-    /// means the lease is instead cleaned up later by coordination-worker's
+    /// means the lease is instead cleaned up later by the coordination service's
     /// own TTL sweep, so it is logged at debug and swallowed rather than
     /// surfaced to the caller.
     pub async fn release_handoff_lease(
@@ -1434,7 +1434,7 @@ mod imp {
     }
 
     /// Commits a source device's full-replica-handoff role loss
-    /// (`POST /shares/groups/:groupId/handoff/commit`) — coordination-worker
+    /// (`POST /shares/groups/:groupId/handoff/commit`) — the coordination service
     /// atomically confirms `target_device_id` is currently an Active, eager
     /// full replica before committing `action` (`"demote"`: this device's own
     /// ACL edge narrows to on-demand; `"revoke"`: some other device's edge is
@@ -1732,7 +1732,7 @@ mod imp {
             }
         };
         // The Worker's own `MembershipOperationAction`/`MembershipOperationMode`
-        // wire types (`coordination-worker/src/db/types.ts`) are each a
+        // wire types (the coordination service) are each a
         // closed two-value set -- an unrecognized value here means a newer
         // Worker deploy this build predates, `Unsupported`, not a shape
         // violation. Checked on both the top-level `action` and the nested
@@ -2104,7 +2104,7 @@ mod imp {
     }
 
     /// Reports this device's storage mode for a folder group
-    /// (`POST /shares/groups/:groupId/storage-mode`) -- coordination-worker's
+    /// (`POST /shares/groups/:groupId/storage-mode`) -- the coordination service's
     /// single writer of `storage_mode` for a PROMOTION (on-demand -> eager).
     /// A DEMOTION instead writes `storage_mode` through
     /// `commit_handoff_role_loss`'s role-loss commit, which additionally
@@ -2361,7 +2361,7 @@ mod imp {
         }
 
         /// Regression test: `POST /shares/groups/prepare`'s real success
-        /// body is `{"groupId": ..., "state": ...}` (coordination-worker's
+        /// body is `{"groupId": ..., "state": ...}` (the coordination service's
         /// `prepareCreateFolderGroup`/`PendingEnrollmentResult`) --
         /// `prepare_create`'s inner `Response` struct was missing
         /// `#[serde(rename_all = "camelCase")]`, so it failed to parse a

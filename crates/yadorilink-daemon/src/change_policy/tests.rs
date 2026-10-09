@@ -662,7 +662,7 @@ fn revoke_removes_a_grant_from_the_writer_set_regardless_of_its_role() {
 /// shared fold) correctly ends up with the device holding the NEW
 /// granted role, not stuck "revoked" and not in any other inconsistent
 /// state. This is the exact record shape
-/// `coordination-worker`'s downgrade endpoint produces: it was not
+/// the coordination service's downgrade endpoint produces: it was not
 /// obvious from reading the fold alone that a same-seq-adjacent
 /// Revoke-then-Grant pair for one device converges correctly rather
 /// than leaving some artifact of the intermediate revoked state.
@@ -799,9 +799,9 @@ fn an_out_of_range_role_value_is_rejected() {
 
 // --- Cross-implementation golden-vector tests -----------------------
 //
-// These pin the EXACT byte layout `coordination-worker/src/policy/
+// These pin the EXACT byte layout the coordination service
 // service.ts::canonicalSigningBytes` must also produce -- see that
-// file's own module doc comment and `coordination-worker/test/
+// file's own module doc comment and the coordination service
 // policy.test.ts`'s identical assertion. If either side's encoding
 // drifts from the other, every Grant record either side signs fails
 // `verify_strict` on the other -- the exact incident that motivated
@@ -812,7 +812,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// The role-carrying Grant preimage, byte for byte. Must equal
-/// `coordination-worker/test/policy.test.ts`'s "a role-carrying grant
+/// the coordination service's "a role-carrying grant
 /// produces a distinct, versioned signing-bytes shape" assertion.
 ///
 /// `ACTION_GRANT_WITH_ROLE` is the only Grant shape either side can

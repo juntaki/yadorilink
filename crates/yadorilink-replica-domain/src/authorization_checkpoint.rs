@@ -305,8 +305,8 @@ fn node_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
 
 /// Builds a checkpoint's `merkle_root` from a batch's Change hashes, in
 /// the exact order the authority will build it — a client-side reference
-/// implementation for tests and for the coordination-worker's own
-/// TypeScript mirror (`coordination-worker/src/policy/checkpoint.ts`),
+/// implementation for tests and for the coordination service's own
+/// TypeScript mirror (the coordination service),
 /// which must reproduce this bit-for-bit or its signed root will never
 /// match what a device computes locally. An odd level is completed by
 /// duplicating its last node — the common Bitcoin-style convention,
@@ -419,7 +419,7 @@ fn write_len_prefixed(buf: &mut Vec<u8>, bytes: &[u8]) {
 
 /// The exact preimage an [`AuthorizationCheckpoint`]'s signature covers.
 /// A real cross-implementation contract — see
-/// `coordination-worker/src/policy/checkpoint.ts::canonicalSigningBytes`,
+/// the coordination service,
 /// which must reproduce this bit-for-bit, and
 /// `change_policy.rs::ACTION_GRANT_WITH_ROLE`'s doc comment for why this
 /// kind of preimage shape must never change silently once anything has
@@ -538,7 +538,7 @@ pub fn decode_checkpoint(bytes: &[u8]) -> Result<AuthorizationCheckpoint, Checkp
 }
 
 /// Signs `checkpoint` with `signing_key` — the caller (test code, or the
-/// coordination-worker's own Web Crypto mirror) is responsible for making
+/// the coordination service's own Web Crypto mirror) is responsible for making
 /// sure `checkpoint.signer_key_id` actually names `signing_key` and that
 /// `signing_key` is the group's live authority key at `policy_head`. This
 /// function itself performs no such check: production code never calls
@@ -694,7 +694,7 @@ mod tests;
 /// language/storage (TypeScript/D1). This is executable evidence for the
 /// required contract -- "CheckpointIssue succeeds XOR Revoke precedes it
 /// and CheckpointIssue fails" -- rather than a test against production
-/// code alone. The coordination-worker's real issuance endpoint must
+/// code alone. The coordination service's real issuance endpoint must
 /// satisfy the same contract this module proves a naive read-then-write
 /// implementation does NOT.
 #[cfg(test)]

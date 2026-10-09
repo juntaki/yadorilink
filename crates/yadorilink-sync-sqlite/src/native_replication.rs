@@ -221,11 +221,15 @@ pub fn deltas_to_serve_within(
     let mut served = Served::default();
     let mut bytes = 0usize;
     let since = since_index(since);
+    let withheld_device = withheld_own_device(conn, group_id)?;
     for entry in native_store::load_frontier(conn, group_id)? {
         if served.entries.len() >= limit || bytes >= max_bytes {
             break;
         }
         let (author, position) = entry;
+        if withheld_device.as_ref() == Some(&author.device) {
+            continue;
+        }
         let from = since.position(&author);
         if position.seq.get() <= from {
             continue;
@@ -311,6 +315,7 @@ pub fn entries_for_hashes(
     hashes: &[DeltaHash],
 ) -> Result<Vec<DeltaBatchEntry>, SyncSqliteError> {
     let mut entries = Vec::new();
+    let withheld_device = withheld_own_device(conn, group_id)?;
     for hash in hashes {
         let Some(body) = native_store::fetch_delta_body_by_hash(conn, group_id, hash)? else {
             continue;
@@ -326,6 +331,9 @@ pub fn entries_for_hashes(
         };
         let Ok(checkpoint_signature) = <[u8; 64]>::try_from(signature.as_slice()) else { continue };
         let Ok(delta) = NativeDelta::from_wire_bytes(&body) else { continue };
+        if withheld_device.as_ref() == Some(&delta.author.device) {
+            continue;
+        }
         entries.push(DeltaBatchEntry {
             encoded_delta: body,
             checkpoint_hash,
@@ -337,6 +345,18 @@ pub fn entries_for_hashes(
         });
     }
     Ok(entries)
+}
+
+/// This device, while a rebootstrap of `group_id` withholds its own deltas from peers (see
+/// [`crate::native_rebootstrap::own_deltas_withheld`]); `None` otherwise.
+fn withheld_own_device(
+    conn: &Connection,
+    group_id: &FolderGroupId,
+) -> Result<Option<yadorilink_replica_domain::ids::DeviceId>, SyncSqliteError> {
+    if !crate::native_rebootstrap::own_deltas_withheld(conn, group_id.as_str())? {
+        return Ok(None);
+    }
+    Ok(Some(crate::author_incarnation::current_author(conn)?.device))
 }
 
 /// The content versions `delta`'s puts name that this replica holds, as

@@ -1,5 +1,5 @@
 //! Deterministic, seed-driven `Case` generator: the "grow an ever-widening
-//! variety of scenarios from a seed" core of the heat-run framework.
+//! variety of scenarios from a seed" core of the soak-run framework.
 //!
 //! Two strategies share one well-formedness engine:
 //!   1. `generate_case(seed)` — a pure random walk from a single seed.
@@ -686,7 +686,7 @@ pub fn generate_case(seed: u64) -> Case {
     let mut fault_schedule = Vec::new();
     let n_faults = rng.random_range(0..3);
     for _ in 0..n_faults {
-        // Random pass emphasizes the transport/disk injectors the heat run
+        // Random pass emphasizes the transport/disk injectors the soak run
         // actually wires; the full fault vocabulary is exercised by the
         // pairwise pass.
         let kind = if rng.random_bool(0.5) { FaultKind::Net } else { FaultKind::Disk };

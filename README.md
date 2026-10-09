@@ -40,8 +40,8 @@ Windows device that was offline so long that it needs its synced history
 rebuilt is not supported yet: the daemon refuses with `the rebootstrap is
 blocked: DurabilityUnsupported` and leaves the folder untouched. Install steps, first run,
 updates, and uninstalling are in the platform READMEs:
-[macOS](installer/macos/README.md), [Windows](installer/windows/README.md),
-[Linux](installer/linux/README.md).
+[macOS](platforms/macos/package/README.md), [Windows](platforms/windows/package/README.md),
+[Linux](platforms/linux/package/README.md).
 
 Release builds connect to the YadoriLink coordination service
 automatically. To use a different coordination service, set
@@ -131,19 +131,19 @@ Main components:
 - `crates/yadorilink-cli` — command-line interface
 - `crates/yadorilink-transport` — peer connectivity
 - `crates/yadorilink-desktop-app` — desktop app
-- `shell-ext/macos` — Finder integration
-- `shell-ext/windows` — Explorer integration
+- `platforms/macos/app` — Finder integration
+- `platforms/windows/shell` — Explorer integration
 
 Platform packaging details are in the READMEs under
-[`installer/`](installer/).
+[`platforms/`](platforms/).
 
 ## Security
 
-See [SECURITY.md](SECURITY.md).
+See [SECURITY.md](.github/SECURITY.md).
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+See [CONTRIBUTING.md](.github/CONTRIBUTING.md).
 
 ## License
 
@@ -151,5 +151,5 @@ Licensed under the [GNU Affero General Public License v3.0 only](LICENSE)
 (AGPL-3.0-only).
 
 The hosted coordination service at `control.yadori.link` is governed by the
-[Privacy Policy](PRIVACY_POLICY.md) and the [Terms of Service](TERMS_OF_SERVICE.md)
-(canonical text: <https://yadori.link/privacy/> and <https://yadori.link/terms/>).
+[Privacy Policy](https://yadori.link/privacy/) and the
+[Terms of Service](https://yadori.link/terms/).

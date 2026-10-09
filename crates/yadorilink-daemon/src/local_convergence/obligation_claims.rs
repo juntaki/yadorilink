@@ -38,12 +38,16 @@ use yadorilink_sync_sqlite::projection_obligations::ObligationClaimToken;
 pub struct BeforeCompletionHook {
     parked: tokio::sync::Notify,
     proceed: tokio::sync::Notify,
+    /// How many workers have parked here so far. A test that drives several
+    /// files at once waits on this count rather than guessing a delay.
+    parked_count: std::sync::atomic::AtomicUsize,
 }
 
 impl BeforeCompletionHook {
     /// Called from inside the worker: announces that it has parked, then
     /// waits for the test to call [`Self::resume`].
     pub(crate) async fn pause(&self) {
+        self.parked_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.parked.notify_one();
         self.proceed.notified().await;
     }
@@ -54,7 +58,30 @@ impl BeforeCompletionHook {
 #[cfg(any(test, feature = "test-support"))]
 impl BeforeCompletionHook {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self { parked: tokio::sync::Notify::new(), proceed: tokio::sync::Notify::new() })
+        Arc::new(Self {
+            parked: tokio::sync::Notify::new(),
+            proceed: tokio::sync::Notify::new(),
+            parked_count: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// How many workers have parked on this hook so far.
+    pub fn parked_count(&self) -> usize {
+        self.parked_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Resolves once at least `n` workers have parked on this hook. Panics
+    /// after `timeout`, naming how many had parked.
+    pub async fn wait_parked_count(&self, n: usize, timeout: std::time::Duration) {
+        let started = std::time::Instant::now();
+        while self.parked_count() < n {
+            assert!(
+                started.elapsed() < timeout,
+                "only {} of {n} workers parked within {timeout:?}",
+                self.parked_count()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
     }
 
     /// Resolves once a worker has parked on this hook.

@@ -14,7 +14,7 @@
 //! and early returns. The exception is `open_content_write`, which commits
 //! its steps, still in that order, as one transaction (see its doc). No method takes a path lock (the caller holds it) or
 //! performs a physical write (the lane keeps it, between an open and a
-//! settle). `scripts/check-materialization-semantic-boundary.py` pins every
+//! settle). `.github/checks/check-materialization-semantic-boundary.py` pins every
 //! raw call that remains, here and in the lanes.
 
 use yadorilink_local_storage::PlaceholderIdentityToRecord;

@@ -46,7 +46,7 @@ async fn ready_fixture() -> (Fixture, Arc<ConvergenceEngine>) {
     // Settles the group's one-time work first, so the parked attempt below
     // claims only the path under test.
     let warm = b"warm-up";
-    let version = f.content_version(warm, 1);
+    let version = f.content_version(warm, 100);
     f.admit("warm.txt", &version);
     drive_until(&f, &engine, "the warm-up path closes", |f| obligation(f, "warm.txt").is_none())
         .await;
@@ -170,7 +170,7 @@ async fn admit_and_park(
     name: &str,
     content: &[u8],
 ) -> (FileVersion, ProjectionObligation, Arc<BeforeCompletionHook>, tokio::task::JoinHandle<bool>) {
-    let version = f.content_version(content, 10);
+    let version = f.content_version(content, 1000);
     f.admit(name, &version);
     let claimed = obligation(f, name).expect("the admission arms an obligation");
     let hook = BeforeCompletionHook::new();
@@ -333,7 +333,7 @@ async fn same_path_admission_while_parked_is_independently_rejected_by_generatio
     let (written, claimed, hook, pass) = admit_and_park(&f, &engine, name, &first).await;
 
     let second = content_of(ONE_BLOCK, 11);
-    let newer = f.content_version(&second, 20);
+    let newer = f.content_version(&second, 2000);
     let observing = crate::test_support::remote_admission_fixture::current_heads(
         &f.state.replica_coordinator,
         GROUP,
@@ -378,7 +378,7 @@ async fn unrelated_path_head_movement_must_not_discard_an_already_settled_attemp
     let content = content_of(ONE_BLOCK, 13);
     let (version, _, hook, pass) = admit_and_park(&f, &engine, name, &content).await;
 
-    let unrelated = f.content_version(&content_of(ONE_BLOCK, 15), 30);
+    let unrelated = f.content_version(&content_of(ONE_BLOCK, 15), 3000);
     f.admit("y-unrelated.txt", &unrelated);
     hook.resume();
     pass.await.unwrap();
@@ -435,7 +435,7 @@ async fn a_crash_after_the_commit_leaves_nothing_to_repair_or_reproject() {
     let (f, engine) = ready_fixture().await;
     let name = "landed.bin";
     let content = content_of(ONE_BLOCK, 19);
-    let version = f.content_version(&content, 10);
+    let version = f.content_version(&content, 1000);
     f.admit(name, &version);
     drive_until(&f, &engine, "the path closes", |f| obligation(f, name).is_none()).await;
     assert_eq!(proven_version(&f, name), Some(version.version_hash));
@@ -481,12 +481,34 @@ fn repair(
 /// missing with nothing left to retry it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_source_stays_owed_until_its_failed_conflict_copy_is_written() {
+    a_source_stays_owed_until_its_failed_conflict_copy_is_written_at(40, 41).await;
+}
+
+/// The same scenario at modification times that give the pair different version hashes. The
+/// higher hash holds the name, so these put the winner on each side of the pair (and on each
+/// side in the platform that used to fail): a retry of the failed copy must prove the copy
+/// whichever version it is a copy of, and must not be disturbed by the link's watcher
+/// meeting the unfinished copy write on disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_source_stays_owed_until_its_failed_conflict_copy_is_written_1000_1100() {
+    a_source_stays_owed_until_its_failed_conflict_copy_is_written_at(1000, 1100).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_source_stays_owed_until_its_failed_conflict_copy_is_written_4000_4100() {
+    a_source_stays_owed_until_its_failed_conflict_copy_is_written_at(4000, 4100).await;
+}
+
+async fn a_source_stays_owed_until_its_failed_conflict_copy_is_written_at(
+    ours_mtime: i64,
+    theirs_mtime: i64,
+) {
     let (f, engine) = ready_fixture().await;
     let name = "doc.txt";
     let ours = content_of(ONE_BLOCK, 21);
     let theirs = content_of(ONE_BLOCK, 23);
-    let ours_version = f.content_version(&ours, 40);
-    let theirs_version = f.content_version(&theirs, 41);
+    let ours_version = f.content_version(&ours, ours_mtime);
+    let theirs_version = f.content_version(&theirs, theirs_mtime);
     // Two concurrent puts of the same path: one stands at the name, the
     // other at a conflict copy beside it.
     f.admit(name, &ours_version);
@@ -559,8 +581,8 @@ async fn a_name_that_looks_like_a_copy_keeps_its_original_owed(limit: usize) {
     let source = "report.txt";
     let copy = "report (conflicted copy, device-b).txt";
     let (a, b) = (content_of(ONE_BLOCK, 31), content_of(ONE_BLOCK, 33));
-    f.admit(source, &f.content_version(&a, 50));
-    f.admit(copy, &f.content_version(&b, 51));
+    f.admit(source, &f.content_version(&a, 5000));
+    f.admit(copy, &f.content_version(&b, 5100));
     let executor = f.state.peers.local_convergence("device-peer").unwrap();
     executor.receive_write_concurrency_override.store(limit, std::sync::atomic::Ordering::Relaxed);
     let (state, root) = (f.state.clone(), f.root.clone());
@@ -621,7 +643,7 @@ fn admit_window(f: &Fixture, prefix: &str, count: usize, len: usize) -> Window {
     // With the mode the written file has, so a watcher that looks at it while the
     // window waits finds nothing of its own to author.
     let versions: Vec<FileVersion> =
-        contents.iter().map(|c| f.content_version_with_mode(c, 10, Some(0o644))).collect();
+        contents.iter().map(|c| f.content_version_with_mode(c, 1000, Some(0o644))).collect();
     for (name, version) in names.iter().zip(&versions) {
         f.admit(name, version);
     }
@@ -647,7 +669,6 @@ fn long_deadline(f: &Fixture) {
 /// Parks one engine pass with every file of `window` renamed into place and
 /// held before its completion, and returns the hook and the pass.
 async fn park_window(
-    f: &Fixture,
     engine: &Arc<ConvergenceEngine>,
     window: &Window,
 ) -> (Arc<BeforeCompletionHook>, tokio::task::JoinHandle<bool>) {
@@ -656,18 +677,10 @@ async fn park_window(
     let pass = tokio::spawn(async move {
         drive_obligations_once_for_test_with_hooks(&engine2, 128, 256, &hook2).await
     });
-    let waited = std::time::Instant::now();
-    while !window
-        .names
-        .iter()
-        .zip(&window.contents)
-        .all(|(name, content)| f.read(name).as_deref() == Some(&content[..]))
-    {
-        assert!(waited.elapsed() < Duration::from_secs(30), "the window never reached its seam");
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    // Every file is parked, not just written: they park after their last check.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Wait for every file to be parked at the completion seam, not for a
+    // guessed delay: bytes on disk say nothing about how far each future got.
+    hook.wait_parked_count(window.names.len(), Duration::from_secs(30)).await;
+    assert_eq!(hook.parked_count(), window.names.len(), "exactly one park per window file");
     (hook, pass)
 }
 
@@ -694,7 +707,7 @@ async fn a_window_of_claimed_files_closes_all_its_obligations_in_one_transaction
     let (f, engine) = ready_fixture().await;
     long_deadline(&f);
     let window = admit_window(&f, "w", 4, ONE_BLOCK);
-    let (hook, pass) = park_window(&f, &engine, &window).await;
+    let (hook, pass) = park_window(&engine, &window).await;
     assert_window_durable_and_nothing_committed(&f, &window);
     release_all(&hook, pass).await;
 
@@ -713,7 +726,7 @@ async fn a_claim_overtaken_in_a_batch_leaves_only_that_obligation_open() {
     let (f, engine) = ready_fixture().await;
     long_deadline(&f);
     let window = admit_window(&f, "s", 3, ONE_BLOCK);
-    let (hook, pass) = park_window(&f, &engine, &window).await;
+    let (hook, pass) = park_window(&engine, &window).await;
     f.state
         .replica_coordinator
         .sqlite()
@@ -743,7 +756,7 @@ async fn a_fence_moved_in_a_batch_refuses_only_that_file() {
     let (f, engine) = ready_fixture().await;
     long_deadline(&f);
     let window = admit_window(&f, "f", 3, ONE_BLOCK);
-    let (hook, pass) = park_window(&f, &engine, &window).await;
+    let (hook, pass) = park_window(&engine, &window).await;
     let raced = &window.names[2];
     f.state.replica_coordinator.dag_bump_mutation_fence(GROUP, raced, "local_capture").unwrap();
     release_all(&hook, pass).await;
@@ -852,13 +865,13 @@ async fn a_crash_after_the_temp_fsyncs_of_a_window_is_rebuilt_from_the_blocks() 
 async fn a_crash_after_the_directory_syncs_before_the_batch_is_finished_by_repair() {
     let f = fixture(true).await;
     let engine = Arc::new(ConvergenceEngine::new(f.state.clone()));
-    f.admit("warm.txt", &f.content_version(b"warm-up", 1));
+    f.admit("warm.txt", &f.content_version(b"warm-up", 100));
     drive_until(&f, &engine, "the warm-up path closes", |f| obligation(f, "warm.txt").is_none())
         .await;
     f.state.replica_coordinator.test_observers.close_batch_sizes.lock().unwrap().clear();
     long_deadline(&f);
     let window = admit_window(&f, "c", 3, multi_block());
-    let (_hook, pass) = park_window(&f, &engine, &window).await;
+    let (_hook, pass) = park_window(&engine, &window).await;
     assert_window_durable_and_nothing_committed(&f, &window);
 
     pass.abort();
@@ -925,7 +938,7 @@ async fn a_crash_in_the_middle_of_the_batch_transaction_commits_none_of_it() {
         .close_batch_fails_before_commit
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let window = admit_window(&f, "m", 3, ONE_BLOCK);
-    let (hook, pass) = park_window(&f, &engine, &window).await;
+    let (hook, pass) = park_window(&engine, &window).await;
     release_all(&hook, pass).await;
 
     assert!(!batch_sizes(&f).is_empty(), "the batch transaction ran");
@@ -943,7 +956,23 @@ async fn a_crash_in_the_middle_of_the_batch_transaction_commits_none_of_it() {
         .test_observers
         .close_batch_fails_before_commit
         .store(false, std::sync::atomic::Ordering::SeqCst);
-    repair(&f);
+    // The restart's repair sweep. It `try_lock`s each path and leaves a path whose lock is held to
+    // its next pass (it runs on a live cadence, not only at startup), and the fixture's own
+    // watcher can hold one for a moment; a skipped path stays `Hydrating` with its intent open.
+    // The window's obligation does not wait for that pass (the engine closes it regardless), so
+    // the sweep is re-run until it has reached every path, as the cadence would.
+    let swept = std::time::Instant::now();
+    loop {
+        repair(&f);
+        if window.names.iter().all(|n| hydrated(&f, n) && !intent_open(&f, n)) {
+            break;
+        }
+        assert!(
+            swept.elapsed() < Duration::from_secs(30),
+            "the repair sweep never reached every path"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     drive_until(&f, &engine, "the window closes", |f| {
         window.names.iter().all(|n| obligation(f, n).is_none())
     })
@@ -1011,7 +1040,7 @@ fn end_state(f: &Fixture, window: &Window) -> Vec<String> {
 async fn a_crash_between_the_metadata_commit_and_the_open(mode: u8) -> (Vec<String>, Vec<String>) {
     let f = fixture(true).await;
     let engine = Arc::new(ConvergenceEngine::new(f.state.clone()));
-    f.admit("warm.txt", &f.content_version(b"warm-up", 1));
+    f.admit("warm.txt", &f.content_version(b"warm-up", 100));
     drive_until(&f, &engine, "the warm-up path closes", |f| obligation(f, "warm.txt").is_none())
         .await;
     executor(&f).batch_metadata_override.store(mode, std::sync::atomic::Ordering::Relaxed);
@@ -1173,7 +1202,7 @@ fn open_batches(f: &Fixture) -> Vec<usize> {
 async fn a_crash_after_the_open_before_any_byte(mode: u8) -> (Vec<String>, Vec<String>) {
     let f = fixture(true).await;
     let engine = Arc::new(ConvergenceEngine::new(f.state.clone()));
-    f.admit("warm.txt", &f.content_version(b"warm-up", 1));
+    f.admit("warm.txt", &f.content_version(b"warm-up", 100));
     drive_until(&f, &engine, "the warm-up path closes", |f| obligation(f, "warm.txt").is_none())
         .await;
     executor(&f).batch_open_override.store(mode, std::sync::atomic::Ordering::Relaxed);

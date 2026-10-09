@@ -1,25 +1,20 @@
 # .dockerignore
 #
-# Keeps the docker build context (installer/docker/Dockerfile's `COPY . .`,
+# Keeps the docker build context (platforms/docker/Dockerfile's `COPY . .`,
 # invoked from the repo root) from shipping build artifacts, VCS history,
 # and local-only machine configuration into the build.
 
 .git/
 target/
 target-*/
-node_modules/
-.wrangler/
 .xcode-build/
 __pycache__/
 *.pyc
 
-# Local machine config / agent tooling -- never part of a container build.
-.claude/
-.codex/
-.opencode/
+# Local machine config -- never part of a container build.
 .cargo/
 
-# Docker/packaging output directories from other installers, not inputs.
-installer/*/dist/
-installer/*/.stage/
-installer/macos/.xcode-build/
+# Packaging output directories from other platforms, not inputs.
+platforms/*/package/dist/
+platforms/*/package/.stage/
+platforms/macos/package/.xcode-build/

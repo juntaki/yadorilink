@@ -2127,6 +2127,76 @@ async fn projection_fence_never_swallows_a_real_chmod_racing_matching_content() 
     expect_file_changed(outcome);
 }
 
+/// The unfinished write of a version whose row records no mode (one from a platform with no
+/// permission bits): the daemon gives the file the platform's default mode, which differs from
+/// the row's `None` only because the row says nothing. With a write of exactly this content
+/// still open, that is the write's own echo -- before this was suppressed, the abandoned write
+/// of a conflict copy was authored back as a chmod edit of the copy, and the path's winner
+/// then depended on the hash of that spurious version.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_open_write_of_a_modeless_row_is_not_authored_back_as_a_chmod() {
+    let (proc, state, store, _store_dir, root_dir) = processor_with_counting_store();
+    let root = canonical_root(&root_dir);
+    adopt_root(&state, "group-1", &root);
+
+    let content_a = b"content A, written by this device for a row that records no mode\n";
+    let scratch = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(scratch.path(), content_a).unwrap();
+    let blocks_a = yadorilink_local_storage::chunk_file(store.as_ref(), scratch.path()).unwrap();
+    let target_hash = yadorilink_local_storage::intent_target_hash(&blocks_a);
+
+    let file_path = root.join("modeless.bin");
+    std::fs::write(&file_path, content_a).unwrap();
+    let mtime_secs = 1_000u64;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&file_path)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime_secs))
+        .unwrap();
+
+    state
+        .file_index_repository()
+        .upsert_file(
+            "group-1",
+            &FileRecord {
+                path: "modeless.bin".to_string(),
+                size: content_a.len() as u64,
+                mtime_unix_nanos: (mtime_secs * 1_000_000_000) as i64,
+                blocks: blocks_a.clone(),
+                deleted: false,
+            },
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
+    state
+        .coordinator()
+        .materialization_intent_repository()
+        .begin_materialization_intent(
+            "group-1",
+            "modeless.bin",
+            &target_hash,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
+
+    let outcome = proc
+        .process_event(
+            "group-1",
+            &root,
+            &FsChangeEvent { path: file_path.clone(), kind: FsChangeKind::CreatedOrModified },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        LocalChangeOutcome::None,
+        "the default mode of an unfinished write is not a chmod of a row that records none"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn projection_fence_never_swallows_a_real_xattr_edit_racing_matching_content() {

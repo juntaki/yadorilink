@@ -458,12 +458,24 @@ impl Machine {
 
     fn replay(&self, recovery_id: &str) -> Result<(), RebootstrapError> {
         // The policy that decides whether own intent may be replayed is loaded a moment after
-        // a restart; a unit is never given up for want of it.
-        if matches!(
-            self.state.resolve_group_policy(self.group.as_str()),
-            GroupPolicyResolution::Withhold
-        ) {
-            return Err(RebootstrapError::Waiting("the group's policy is not loaded yet".into()));
+        // a restart; a unit is never given up for want of it. Loaded is not the same as
+        // complete: right after a restart the policy can be present with the chain of grants
+        // not applied yet, naming no writer at all, and judging a unit against that set
+        // would set the whole unit aside for good (the authority is asked once per unit and
+        // an unreplayed unit stays unreplayed). No writer is not an answer to wait out
+        // either, so it waits like the missing policy does, and is looked at again.
+        match self.state.resolve_group_policy(self.group.as_str()) {
+            GroupPolicyResolution::Withhold => {
+                return Err(RebootstrapError::Waiting(
+                    "the group's policy is not loaded yet".into(),
+                ));
+            }
+            GroupPolicyResolution::Verified(policy) if policy.current_writers().is_empty() => {
+                return Err(RebootstrapError::Waiting(
+                    "the group's policy names no writer yet".into(),
+                ));
+            }
+            _ => {}
         }
         let key = self
             .state

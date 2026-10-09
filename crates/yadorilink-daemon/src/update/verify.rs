@@ -8,9 +8,9 @@
 //! for this version); this module protects the artifact bytes
 //! themselves, using exactly the same checks this repo's release
 //! tooling already performs by hand
-//! (`scripts/ci/generate-release-checksums.py`'s SHA-256 sidecar
-//! convention, `installer/macos/verify-pkg.sh`'s `pkgutil`/`spctl`
-//! checks, `installer/windows/verify-installer.ps1`'s
+//! (`.github/release/generate-release-checksums.py`'s SHA-256 sidecar
+//! convention, `platforms/macos/package/verify-pkg.sh`'s `pkgutil`/`spctl`
+//! checks, `platforms/windows/package/verify-installer.ps1`'s
 //! `Get-AuthenticodeSignature` check) — reused here as the fail-closed,
 //! automatic gate before an update is ever installed, rather than
 //! reinventing a second verification scheme.
@@ -36,7 +36,7 @@ pub enum VerifyError {
 }
 
 /// Streams `path` through SHA-256 (matching
-/// `scripts/ci/generate-release-checksums.py`'s own `sha256_of` — read in
+/// `.github/release/generate-release-checksums.py`'s own `sha256_of` — read in
 /// fixed-size chunks rather than loading the whole artifact into memory)
 /// and compares against `expected_hex` (case-insensitive, matching that
 /// script's own comparison).
@@ -77,7 +77,7 @@ impl CommandRunner for SystemCommandRunner {
 }
 
 /// macOS platform-signature verification: reuses exactly the
-/// checks `installer/macos/verify-pkg.sh` already performs by hand —
+/// checks `platforms/macos/package/verify-pkg.sh` already performs by hand —
 /// `pkgutil --check-signature` (any signed status) plus `spctl -a -vvv -t
 /// install` (Gatekeeper's own install-time verdict) — and additionally
 /// requires the signing authority line to contain `expected_identity`
@@ -137,7 +137,7 @@ pub fn verify_macos_signature(
 
 /// Windows platform-signature verification: shells out to
 /// PowerShell's `Get-AuthenticodeSignature`, mirroring
-/// `installer/windows/verify-installer.ps1` exactly, and requires
+/// `platforms/windows/package/verify-installer.ps1` exactly, and requires
 /// `Status` to be `Valid` plus (when pinned) the signer certificate
 /// subject to contain `expected_identity`. Fails closed on any non-`Valid`
 /// status, missing PowerShell, or unparseable output.

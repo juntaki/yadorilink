@@ -137,7 +137,7 @@ fn code_only(line: &str) -> &str {
 /// needed to read and reported success. It missed a real production
 /// `Present` stamp sitting at line ~15,000.
 ///
-/// `scripts/check-mutation-boundary.py` had already been bitten by
+/// `.github/checks/check-mutation-boundary.py` had already been bitten by
 /// exactly this and says so in its own docstring. This is that algorithm,
 /// ported rather than re-invented.
 fn production_lines(source: &str) -> Vec<(usize, &str)> {

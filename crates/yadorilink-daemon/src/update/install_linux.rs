@@ -2,7 +2,7 @@
 //!
 //! Unlike macOS/Windows, this repo does not currently ship a self-update
 //! *installer* for Linux at all — `manager::dispatch_install` has no
-//! artifact-handoff path for `"linux"` (`installer/linux/build-deb.sh`'s
+//! artifact-handoff path for `"linux"` (`platforms/linux/package/build-deb.sh`'s
 //! `.deb` is the only Linux install target, and there is no
 //! `install_linux::install` mirroring `install_macos`/`install_windows`).
 //! This module exists purely so `PlatformInfo::install_source` reports the
@@ -17,7 +17,7 @@
 //! own `.deb` would need to write: dpkg already tracks exactly this fact
 //! for any package it manages, including installs that predate this
 //! detection code, so there is nothing to keep in sync with
-//! `installer/linux/debian/postinst`.
+//! `platforms/linux/package/debian/postinst`.
 //!
 //! Crucially, this is scoped to the *exact binary currently running*
 //! (`dpkg-query -S <canonicalized current_exe>`), not "is the `yadorilink`

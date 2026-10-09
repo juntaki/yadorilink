@@ -4,7 +4,7 @@
 //! and `tests/token_response_contract.rs` (which needs a server that discovery
 //! accepts, so the only thing under test is the token response).
 //!
-//! Captured from `coordination-worker` under its own provider test harness --
+//! Captured from the coordination service under its own provider test harness --
 //! its Authorization Server answering `/.well-known/openid-configuration` with
 //! `AS_ISSUER` set -- rather than invented here. A fixture more generous than
 //! the real document would let these tests pass while the product fails.

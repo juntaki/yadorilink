@@ -20,7 +20,7 @@
 //! content, NOT merely differing file counts -- so the assertion below
 //! compares full snapshots, never just `.len`.
 //!
-//! Run this file repeatedly (e.g. via a heat-run script) across the
+//! Run this file repeatedly (e.g. via a repeated-run script) across the
 //! device-count / timing grid to characterize the conflict resolver's
 //! convergence behavior. Do not weaken the core assertion to a
 //! file-count check -- that would silently hide the exact class of bug

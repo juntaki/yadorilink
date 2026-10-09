@@ -173,7 +173,7 @@ pub async fn sign_out() -> Result<(), CoreError> {
 
 /// "restart daemon": a clean `Shutdown` request. The daemon is
 /// registered to restart itself (macOS `LaunchAgent` `KeepAlive`/Windows
-/// Scheduled Task `-AtLogOn`, see `installer/`) for anything other than a
+/// Scheduled Task `-AtLogOn`, see `platforms/windows/package`) for anything other than a
 /// clean exit; a graceful `Shutdown` is exactly what `yadorilink daemon
 /// stop` already sends, and relies on the same supervisor to bring it back
 /// — this app does not itself spawn a new daemon process (that would

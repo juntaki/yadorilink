@@ -838,7 +838,7 @@ async fn handle_request(
             match application.replica_role.set_storage_mode(&r.group_id, r.on_demand).await {
                 // `root_digest` is this device's own locally-computed
                 // durability-root digest at commit time -- never sent to or
-                // read back from coordination-worker (see
+                // read back from the coordination service (see
                 // `HandoffCommitResult`'s doc comment), same as
                 // `UnlinkResponse`'s construction above.
                 Ok(handoff_result) => RespPayload::SetStorageMode(SetStorageModeResponse {

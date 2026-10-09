@@ -155,6 +155,9 @@ pub fn ensure_isolated_config_dir() {
         // binary.
         let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
         std::env::set_var("YADORILINK_CONFIG_DIR", dir.path());
+        // These harnesses run no cfapi-host.exe: without a provider, a Windows
+        // `Remote` row would stay a recorded identity with nothing on disk.
+        yadorilink_local_storage::materialize_write::set_test_native_provider_absent(true);
     });
 }
 
@@ -433,6 +436,7 @@ pub fn real_entry_names(dir: &std::path::Path) -> Vec<String> {
 /// is in use.
 #[allow(dead_code)]
 pub fn open_file_backed_replica_coordinator() -> (ReplicaCoordinator, tempfile::TempDir) {
+    ensure_isolated_config_dir();
     let dir = tempfile::tempdir().unwrap();
     let state = ReplicaCoordinator::open(dir.path().join("index.db")).unwrap();
     (state, dir)

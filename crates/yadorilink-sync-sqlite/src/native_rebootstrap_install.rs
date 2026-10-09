@@ -510,7 +510,7 @@ fn quarantine(
                 )));
             }
         }
-        let observed = ctx.root.observe(path).map_err(&failed)?;
+        let observed = ctx.root.observe(path).map_err(failed)?;
         let status = match &observed {
             Observed::Absent => match recorded {
                 // The removal happened and its record did not.
@@ -524,18 +524,18 @@ fn quarantine(
             Observed::File { sha256: digest, .. } => {
                 if recorded.is_none() && versions.iter().any(|v| v.has_bytes && v.sha256 == *digest)
                 {
-                    ctx.root.remove(path, &observed).map_err(&failed)?;
+                    ctx.root.remove(path, &observed).map_err(failed)?;
                     QuarantineStatus::Removed
                 } else {
                     // An edit nobody has captured: it goes into the area, and is
                     // referenced, before the original leaves.
-                    let bytes = ctx.root.read_file(path).map_err(&failed)?;
+                    let bytes = ctx.root.read_file(path).map_err(failed)?;
                     if sha256(&bytes) != *digest {
                         return Err(failed(format!("{path} changed while it was being read")));
                     }
                     keep_late_edit(area, digest, &bytes)?;
                     reference(path, digest)?;
-                    ctx.root.remove(path, &observed).map_err(&failed)?;
+                    ctx.root.remove(path, &observed).map_err(failed)?;
                     QuarantineStatus::RemovedLateEdit { sha256: *digest }
                 }
             }
@@ -545,13 +545,13 @@ fn quarantine(
                         .iter()
                         .any(|v| v.symlink_target.as_deref() == Some(target.as_slice()))
                 {
-                    ctx.root.remove(path, &observed).map_err(&failed)?;
+                    ctx.root.remove(path, &observed).map_err(failed)?;
                     QuarantineStatus::Removed
                 } else {
                     let digest = sha256(target);
                     keep_late_edit(area, &digest, target)?;
                     reference(path, &digest)?;
-                    ctx.root.remove(path, &observed).map_err(&failed)?;
+                    ctx.root.remove(path, &observed).map_err(failed)?;
                     QuarantineStatus::RemovedLateEdit { sha256: digest }
                 }
             }
