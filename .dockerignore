@@ -7,19 +7,14 @@
 .git/
 target/
 target-*/
-node_modules/
-.wrangler/
 .xcode-build/
 __pycache__/
 *.pyc
 
-# Local machine config / agent tooling -- never part of a container build.
-.claude/
-.codex/
-.opencode/
+# Local machine config -- never part of a container build.
 .cargo/
 
-# Docker/packaging output directories from other installers, not inputs.
+# Packaging output directories from other platforms, not inputs.
 platforms/*/package/dist/
 platforms/*/package/.stage/
 platforms/macos/package/.xcode-build/

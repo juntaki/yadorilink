@@ -78,7 +78,7 @@ fn decode_checkpoint_rejects_trailing_bytes() {
 /// the resulting Ed25519 signature -- the actual contract the coordination
 /// Worker's TypeScript `checkpoint.ts::canonicalSigningBytes`/`signDecision`
 /// must reproduce bit-for-bit. See
-/// `coordination-worker/test/checkpoint-signing-golden.test.ts` for
+/// the coordination service for
 /// the TS side of this SAME vector; a mismatch on either the byte
 /// layout or the signature means Rust's `verify_change_admission`
 /// would reject every checkpoint the Worker ever issues.
@@ -128,7 +128,7 @@ fn checkpoint_signing_golden_vector() {
         hex(&bytes),
         expected_bytes,
         "canonical_signing_bytes must stay byte-identical to the cross-implementation \
-         golden vector in coordination-worker/test/checkpoint-signing-golden.test.ts"
+         golden vector in the coordination service"
     );
 
     let signature = sign_checkpoint(&checkpoint, &authority_sk);

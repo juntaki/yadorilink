@@ -2458,7 +2458,7 @@ impl DaemonState {
     }
 
     /// Advances a role-loss-operation journal row to `WorkerCommitted` —
-    /// called immediately after the coordination-worker role-loss commit
+    /// called immediately after the coordination service role-loss commit
     /// succeeds, so a crash from this point on is reconciled by the
     /// startup + periodic sweep (`ReplicaRoleService::reconcile_role_loss`)
     /// instead of left as a split state.
@@ -2476,7 +2476,7 @@ impl DaemonState {
         }
     }
 
-    /// Deletes a role-loss-operation journal row whose coordination-worker
+    /// Deletes a role-loss-operation journal row whose coordination service
     /// commit never happened (the Worker call itself failed or was refused)
     /// — nothing was committed on either side, so the row never protected
     /// anything real.
@@ -2495,7 +2495,7 @@ impl DaemonState {
     }
 
     /// Closes out a role-loss-operation journal row on the normal success
-    /// path: the coordination-worker commit AND the matching local
+    /// path: the coordination service commit AND the matching local
     /// policy/link change both landed. Advances to `LocalCommitted` then
     /// deletes the row — the same outcome as before this journal existed,
     /// just with a journal row written and cleaned up around it.
@@ -2725,7 +2725,7 @@ impl DaemonState {
     /// everything I hold" and "I hold everything the group currently has" are
     /// the same fact from either side).
     ///
-    /// On a positive local check, calls coordination-worker to actually issue
+    /// On a positive local check, calls the coordination service to actually issue
     /// the lease (giving a real `lease_id`), then — ONLY THEN — atomically
     /// re-enumerates this device's exact `(path, version_seq)` root rows AND
     /// records the local pin for them in one transaction
@@ -2765,7 +2765,7 @@ impl DaemonState {
     /// lease with no active cleanup attempt.
     ///
     /// Neither digest nor any pinned `(path, version_seq)` row is ever sent
-    /// to coordination-worker: the lease request/release calls carry only
+    /// to the coordination service: the lease request/release calls carry only
     /// `(group_id, target_device_id[, lease_id])`
     /// (`coordination_client::request_handoff_lease`/`release_handoff_
     /// lease`'s own doc comments) — the Worker adjudicates
@@ -2783,7 +2783,7 @@ impl DaemonState {
     /// construction at this point) — used by [`HandoffLeaseResponder for
     /// DaemonState`] to answer an incoming peer-to-peer `HandoffLeaseRequest`
     /// with this device's own `root_digest`, exchanged directly with the
-    /// requesting peer and never sent to coordination-worker.
+    /// requesting peer and never sent to the coordination service.
     pub async fn request_handoff_lease(
         &self,
         group_id: &str,
@@ -2922,7 +2922,7 @@ impl DaemonState {
     /// `HandoffLeaseGrant` exchange (`peer_session.rs`), and returns the
     /// resulting lease id only if the target's own attested `root_digest`
     /// matches `my_digest` — compared here, daemon-local, never sent to or
-    /// asked of coordination-worker.
+    /// asked of the coordination service.
     ///
     /// `target_peer_device_id` must name a peer this device currently has a
     /// live session with (normally the exact peer
@@ -3100,7 +3100,7 @@ impl DaemonState {
     /// The proof names the peer that confirmed coverage — `None` inside it
     /// for a vacuously-ready empty root set, where there is no "the
     /// confirming peer" because nothing needed confirming. Call sites that
-    /// must name a concrete handoff TARGET for coordination-worker's
+    /// must name a concrete handoff TARGET for the coordination service's
     /// role-loss commit endpoint
     /// (`crate::coordination_client::commit_handoff_role_loss`) read it from
     /// there. Only the non-excluding form is offered, matching

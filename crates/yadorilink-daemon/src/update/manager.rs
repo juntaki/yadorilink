@@ -188,9 +188,9 @@ impl UpdateManager {
     /// against a local mock server without touching production config.
     /// The built-in default points at the coordination Worker's own
     /// `/updates/:channel/manifest.json` route (R2-backed, see
-    /// `coordination-worker/src/routes/updates.ts`), served from this
+    /// the coordination service), served from this
     /// Worker's one configured production route
-    /// (`coordination-worker/wrangler.jsonc`'s `routes` entry) -- not a
+    /// (the coordination service's `routes` entry) -- not a
     /// placeholder domain.
     pub fn new(config_dir: impl AsRef<Path>, current_version: semver::Version) -> Self {
         let manifest_url = std::env::var("YADORILINK_UPDATE_MANIFEST_URL").unwrap_or_else(|_| {

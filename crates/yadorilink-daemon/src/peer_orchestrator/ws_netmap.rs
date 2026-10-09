@@ -146,7 +146,7 @@ struct WsSubstrateReachability {
 
 /// A Track Send rendezvous-grant notice, a distinct message type
 /// on this same subscription (`{ type: "send_authorization", ... }`) --
-/// see `coordination-worker`'s `NetmapDeviceObject.deliverSendAuthorization`
+/// see the coordination service's `NetmapDeviceObject.deliverSendAuthorization`
 /// for the server side and `crate::send_transfer`'s own module doc
 /// comment for the full design. Tells this device to expect an inbound
 /// Track Send (`yadorilink/send/v1`) connection from `from` (a same-account device with

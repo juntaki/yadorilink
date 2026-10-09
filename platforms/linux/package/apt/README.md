@@ -3,7 +3,7 @@
 Builds and serves a real APT repository for the `.deb` `platforms/linux/package/build-deb.sh`
 already produces: signed `Release`/`InRelease` metadata, `Packages`
 indices, and a `pool/` of `.deb` files, hosted on the same Cloudflare
-Worker + R2 infrastructure `coordination-worker` already runs for the
+Worker + R2 infrastructure the coordination service already runs for the
 update manifest (`src/routes/apt.ts`, bucket `yadorilink-apt`).
 
 ## Install
@@ -77,7 +77,7 @@ half (`platforms/linux/package/apt/build-keyring-deb.sh`,
   and `Release.gpg`, and a real `apt-get update && apt-get install
   yadorilink` against the resulting repo succeeded in a clean Ubuntu 24.04
   container.
-- `oss-public/.github/workflows/release.yml`'s "Build and publish the APT
+- `.github/workflows/release.yml`'s "Build and publish the APT
   repository" step, gated exactly like the existing manifest-signing step:
   it requires `APT_SIGNING_KEY` as a `release-signing` Environment secret
   and fails **closed** (skips publishing, does not error the release) when

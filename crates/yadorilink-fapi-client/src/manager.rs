@@ -4,7 +4,7 @@
 //! # The problem it exists to solve
 //!
 //! The access token's lifetime is **five minutes**
-//! (`coordination-worker/src/auth/provider/config.ts`). A daemon that reads a
+//! (the coordination service). A daemon that reads a
 //! token at startup and passes it around as a value is authenticated for five
 //! minutes and broken for the rest of the day. So the token is not a value
 //! that callers hold; it is something they ask for, and the asking is what

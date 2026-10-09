@@ -3,7 +3,7 @@
 //!
 //! # Why this test costs five and a half minutes and is worth it
 //!
-//! `coordination-worker/src/auth/provider/config.ts` sets
+//! the coordination service sets
 //! `accessToken: 300` seconds. Every other test in this workspace proves
 //! things about the token cache's *arithmetic* -- that a token inside the skew
 //! is not served, that a missing `expires_in` is treated as short. None of

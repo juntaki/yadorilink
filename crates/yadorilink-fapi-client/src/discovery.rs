@@ -7,7 +7,7 @@
 //! # This is a profile requirement, not a capability negotiation
 //!
 //! This client talks to exactly one Authorization Server: the one configured in
-//! `coordination-worker/src/auth/provider/config.ts`. Its discovery document is
+//! the coordination service. Its discovery document is
 //! not an unknown quantity to be probed and accommodated -- it is a fixed
 //! profile this repository owns. So [`Metadata::unmet_profile_requirements`]
 //! asks "does this server match the profile?", never "what can this server do

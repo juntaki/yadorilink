@@ -6,7 +6,7 @@
 //! of surfacing race conditions that a fixed test sequence wouldn't
 //! happen to hit. Not a regression test for one specific bug — a
 //! generic invariant check ("every device converges to the identical
-//! final file set") run repeatedly (see `scripts/heat-run.sh`) to build
+//! final file set") run repeatedly to build
 //! confidence beyond what scripted tests alone can.
 //!
 //! Seeded via `MONKEY_CHAOS_SEED` (or a freshly generated seed, logged at
@@ -17,7 +17,7 @@
 //! seed is also appended to the checked-in corpus at
 //! `tests/dst_corpus/monkey_chaos_seeds.txt`, which `replay_known_failing_
 //! seeds` below always re-runs, so a found race becomes a permanent
-//! regression check rather than a one-off heat-run finding. Every action
+//! regression check rather than a one-off soak-run finding. Every action
 //! taken is still logged via `tracing::info!` so a failure's exact
 //! operation sequence is reconstructable from `--nocapture` output too.
 
@@ -105,7 +105,7 @@ fn corpus_path() -> std::path::PathBuf {
 
 /// Seeds from a prior failing run, persisted so they're always re-run
 /// (see `replay_known_failing_seeds`) instead of only surfacing once on
-/// whichever heat-run happened to find them. Blank lines and `#`-prefixed
+/// whichever soak-run happened to find them. Blank lines and `#`-prefixed
 /// comments are ignored so the corpus file can carry context per seed.
 fn load_corpus_seeds() -> Vec<u64> {
     let Ok(contents) = std::fs::read_to_string(corpus_path()) else {
@@ -1009,7 +1009,7 @@ async fn random_concurrent_operations_converge_to_an_identical_file_set() {
 
 /// Re-runs every seed recorded in `tests/dst_corpus/monkey_chaos_seeds.txt`
 /// (see the module doc comment), so a race this chaos test previously
-/// found stays covered by CI/heat-run as a permanent regression check
+/// found stays covered by CI/soak-run as a permanent regression check
 /// instead of only surfacing again if a future run happens to pick the
 /// same interleaving. A no-op (and instantly passing) while the corpus is
 /// empty.

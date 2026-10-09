@@ -48,7 +48,7 @@ use crate::onboarding::machine::OpStatus;
 use crate::share_access;
 
 /// The app's view of where the account is in the deletion lifecycle -- the
-/// UI-facing projection of coordination-worker's `DeletionStatus`.
+/// UI-facing projection of the coordination service's `DeletionStatus`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Lifecycle {
     Active,

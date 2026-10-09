@@ -59,7 +59,7 @@ const POLICY_DOMAIN_TAG: &[u8; 8] = b"ylpolic1";
 const ACTION_REVOKE: u32 = 1;
 const ACTION_ROTATE_AUTHORITY: u32 = 2;
 /// A Grant record; its signing preimage ends with an explicit role byte.
-/// Byte-for-byte contract with `coordination-worker/src/policy/service.ts::
+/// Byte-for-byte contract with the coordination service
 /// canonicalSigningBytes`.
 ///
 /// Type 0 was the role-less Grant and is retired -- do not reuse the

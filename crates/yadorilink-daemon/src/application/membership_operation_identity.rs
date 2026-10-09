@@ -17,7 +17,7 @@ use super::model::{MembershipRemoteRequest, MembershipRemoteRequestGroup};
 /// The local journal row's own request, in the SAME shape a Worker lookup's
 /// `record.request` comes back as. `group_ids`/`target_device_ids`/
 /// `lease_ids` are sorted by `group_id` to match
-/// `coordination-worker/src/membership/operations.ts`'s own
+/// the coordination service's own
 /// `canonicalRequest` ordering (fingerprinting/storage order-independent by
 /// construction) -- comparing the RAW, unsorted local arrays against the
 /// Worker's canonical order would report a false mismatch for a
@@ -46,7 +46,7 @@ pub(crate) fn expected_membership_remote_request(
 
 /// Translates the daemon's own 4-way `MembershipCommitMode` into the
 /// coordination plane's coarser `MembershipOperationMode` wire vocabulary
-/// (`coordination-worker/src/db/types.ts`) -- the Worker tracks
+/// (the coordination service) -- the Worker tracks
 /// `mode: "guarded"` for every revoke (plain OR ticket-bound: see
 /// `revokeAccess`/`commitHandoffRoleLoss` in `shares/service.ts`) and for a
 /// ticket-bound device removal (`removeDeviceWithHandoffLeases`), and only

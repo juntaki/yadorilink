@@ -21,7 +21,7 @@
 //! the verdict types, and the replay/bisection runner. Replaying a `Case`
 //! is inherently scenario-specific (each scenario interprets its `Case`
 //! differently), so the runner takes a scenario-provided `replay` closure
-//! -- the same seam `DST full-stack heat-run framework`'s supervisor reuses.
+//! -- the same seam a long-running soak supervisor reuses.
 //!
 //! `#![cfg(turmoil)]`-gated like every DST scenario file.
 

@@ -472,7 +472,7 @@ message UnlinkRequest {
   bool force = 2;
 }
 message UnlinkResponse {
-  // Set only when this unlink actually went through coordination-worker's
+  // Set only when this unlink actually went through the coordination service's
   // handoff role-loss commit (see `HandoffResult`'s own doc comment above)
   // -- i.e. this device was an eager full replica giving up that status and
   // a coordination-plane commit actually happened. Absent for every other
@@ -1023,9 +1023,9 @@ message LatchGroupDurabilityUnknownResponse {}
 // `CheckFullReplicaHandoffReadyRequest` above) confirms some other
 // connected full-replica peer holds every root this device holds -- i.e.
 // this device itself now qualifies as a confirmed whole-group replica.
-// On success, asks coordination-worker for a time-bounded lease -- an opaque
+// On success, asks the coordination service for a time-bounded lease -- an opaque
 // reservation scoped to `(group_id, target_device_id)`, carrying no file
-// path, block hash, or version digest, since coordination-worker adjudicates
+// path, block hash, or version digest, since the coordination service adjudicates
 // only account/device/group/storage-mode/membership facts, never file
 // content -- pinning the exact versions just verified against this device's
 // own retention/GC (`SyncState::record_handoff_lease`, entirely local
@@ -1098,11 +1098,11 @@ message ReleaseHandoffTicketRequest {
 message ReleaseHandoffTicketResponse {}
 
 // The outcome of a completed full-replica-handoff role-loss commit --
-// coordination-worker's atomic confirmation that the named target device is
+// the coordination service's atomic confirmation that the named target device is
 // currently an Active, eager (full-replica) member of the group before
 // committing the source's role loss (demote to on-demand, or full revoke).
 // Not itself sent over this control socket as a request/response payload --
-// the commit call is CLI-to-coordination-worker HTTP, mirroring
+// the commit call is CLI-to-coordination-service HTTP, mirroring
 // `SetStorageModeRequest`'s own doc comment on why the coordination-plane
 // write happens outside this socket -- this message exists so the CLI has
 // one shared, typed shape for the result to construct from that JSON
@@ -1113,7 +1113,7 @@ message ReleaseHandoffTicketResponse {}
 // for a vacuously-ready empty root set, where there is nothing to pin and no
 // concrete target is required. `root_digest` is this SOURCE device's own
 // locally-computed
-// durability-root digest at commit time -- coordination-worker never sees,
+// durability-root digest at commit time -- the coordination service never sees,
 // stores, or verifies it (it adjudicates membership/eligibility only, never
 // file content); the field is populated entirely client-side and carried
 // here purely so a caller has one place to read the digest a completed

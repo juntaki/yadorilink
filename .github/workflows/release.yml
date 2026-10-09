@@ -1057,7 +1057,7 @@ jobs:
       - macos-signed-artifacts
     runs-on: ubuntu-latest
     # The production manifest key exists only in this protected environment.
-    # Required reviewers keep signing an explicit operation in the public repo.
+    # Required reviewers keep signing an explicit operation in this repo.
     environment: release-signing
     permissions:
       contents: write

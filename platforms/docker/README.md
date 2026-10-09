@@ -67,7 +67,7 @@ verification pass; `linux/arm64` was not — see below.
 
 ## GHCR visibility
 
-`oss-public/.github/workflows/release.yml`'s `docker-artifacts` job pushes
+`.github/workflows/release.yml`'s `docker-artifacts` job pushes
 to `ghcr.io/juntaki/yadorilink-daemon` using the workflow's own
 `GITHUB_TOKEN` (`packages: write`, scoped to that one job run — not a
 managed secret). **A new GHCR package defaults to private** on its first

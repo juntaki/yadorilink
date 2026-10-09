@@ -4,7 +4,7 @@
 //! # Why this is a requirement list and not a tolerance list
 //!
 //! This client is not a generic OAuth client. It talks to exactly one
-//! Authorization Server -- the one in `coordination-worker/` -- and that
+//! Authorization Server -- the one in the coordination service -- and that
 //! server's discovery document is not an unknown quantity: it is a fixed
 //! profile produced by a configuration this repository owns
 //! (`src/auth/provider/config.ts`). Interoperating with some *other* server is

@@ -9,9 +9,9 @@
 //! What is NOT asserted here is the server's half -- the single consume, the
 //! indistinguishable poll, the key that was captured at `start`. Those are
 //! properties of the Worker and are asserted against the real Worker in
-//! `coordination-worker/test/provider/bootstrap.test.ts`; a mock server here
+//! the coordination service; a mock server here
 //! could only re-state this crate's guess about them. The two halves meet on a
-//! real wire in `scripts/check-coordination-wire-contract.sh`.
+//! real wire in the CLI's coordination wire-contract test.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -235,7 +235,7 @@ async fn the_handle_is_presented_only_to_the_poll_and_never_appears_anywhere_els
 /// Every poll carries a fresh, key-bound proof alongside the handle -- not
 /// merely the handle by itself. What the SERVER does with it (refuse a
 /// mismatched key, refuse a stolen handle with no key at all) is asserted in
-/// `coordination-worker/test/provider/bootstrap.test.ts`, per this file's own
+/// the coordination service, per this file's own
 /// header; what this client controls is that the proof is sent at all, that
 /// it names the pending key, and that two polls do not resend the same one.
 #[tokio::test]

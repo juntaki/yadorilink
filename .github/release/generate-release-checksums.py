@@ -4,7 +4,7 @@
 Every downloadable release
 artifact (Windows installer, macOS .pkg, source tarball, etc.) must have a
 published checksum. This script is the single, cross-platform (Python,
-already required by scripts/check-*.py in this repo) source of truth for
+already required by the CI check scripts) source of truth for
 that: it can write a combined manifest (SHA256SUMS-style, one line per
 file) and/or per-file `<name>.sha256` sidecars (matching the sidecar format
 `platforms/windows/package/build-installer.ps1` and `platforms/macos/package/build-pkg.sh`

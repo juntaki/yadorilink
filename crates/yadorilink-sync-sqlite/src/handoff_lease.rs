@@ -18,19 +18,19 @@ pub type PinnedVersion = (String, i64);
 
 /// A local, target-side handoff-lease pin -- the record that a
 /// full-replica-handoff TARGET has pinned an exact version set against
-/// retention expiry while its own coordination-worker-confirmed handoff is
+/// retention expiry while its own coordination-service-confirmed handoff is
 /// in progress.
 ///
-/// Lifecycle: a target requests a lease from coordination-worker after its
+/// Lifecycle: a target requests a lease from the coordination service after its
 /// own local readiness check succeeds (`Provisional`); the source's
 /// role-loss commit endpoint confirms it (`Confirmed`) atomically with
 /// committing the role loss coordination-side; on any failure of that
 /// commit — or if nothing ever reaches it — the lease is `Released` (an
-/// explicit failure) or `Expired` (a coordination-worker TTL sweep, the
+/// explicit failure) or `Expired` (a coordination service TTL sweep, the
 /// backstop for a target or source that crashes mid-handoff). Both
 /// terminal-failure states stop the lease from pinning anything; retention
 /// resumes normally for whatever it named. This type is only the local,
-/// target-side half of the protocol: coordination-worker's own
+/// target-side half of the protocol: the coordination service's own
 /// `handoff_leases` table is the authoritative, race-safe home for the
 /// lease's actual state transitions (issued, confirmed, released, expired)
 /// — this local copy exists purely so this device's own retention sweep has
@@ -64,7 +64,7 @@ pub enum HandoffLeaseState {
     /// Explicitly released — the role-loss commit failed, or the local
     /// caller gave up. No longer pins anything.
     Released,
-    /// Never confirmed within its TTL; swept by coordination-worker's TTL
+    /// Never confirmed within its TTL; swept by the coordination service's TTL
     /// sweep. No longer pins anything.
     Expired,
 }
@@ -240,7 +240,7 @@ impl HandoffLeaseRepository {
     /// `'released'`/`'expired'` once it no longer protects anything. A no-op
     /// (`Ok(false)`) if `lease_id` is not recorded locally (e.g. this device
     /// restarted and lost its marker — the lease still terminates on the
-    /// coordination-worker side via its own TTL sweep either way, so a
+    /// the coordination service side via its own TTL sweep either way, so a
     /// missing local row is not itself a correctness problem, only a
     /// slightly earlier resumption of normal retention for whatever it would
     /// have pinned).
@@ -286,7 +286,7 @@ impl HandoffLeaseRepository {
     /// time check is authoritative; the state column is bookkeeping for
     /// visibility, not the enforcement mechanism itself) — this is what lets
     /// `expire_superseded_and_trashed_versions` stay correct even if the
-    /// coordination-worker/local TTL sweeps haven't run yet.
+    /// coordination-service/local TTL sweeps haven't run yet.
     ///
     /// `now_unix_seconds` (not nanos, unlike most timestamps elsewhere in
     /// this crate): `handoff_leases.expires_at_unix` holds a target-local

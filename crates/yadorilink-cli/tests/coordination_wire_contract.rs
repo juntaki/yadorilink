@@ -46,8 +46,8 @@
 //!
 //! The only thing the harness stands in for is Google, which a local run
 //! genuinely cannot reach; the seam is outbound-only and lives in
-//! `coordination-worker/test/contract/dev-entry.ts`, which is never bundled
-//! into a deploy. The harness plays the USER AGENT for the two browser legs --
+//! the test-only entry point of the coordination service, which is never
+//! bundled into a deploy. The harness plays the USER AGENT for the two browser legs --
 //! a cookie jar and a redirect chain -- and every byte it sends is one a
 //! browser would send.
 //!
@@ -1191,11 +1191,11 @@ async fn the_authorization_server_refuses_every_request_that_is_wrong_in_exactly
     // issuer rather than from whatever the client dialled. This harness
     // overrides `AS_ISSUER` to the address it listens on -- deliberately, so
     // that no translation layer sits between the client and the server and can
-    // hide a mismatch (`scripts/check-coordination-wire-contract.sh`) -- so the
+    // hide a mismatch -- so the
     // two are indistinguishable and C4 proves only the narrower claim: a proof
     // for one PATH is not spendable at another.
     //
-    // The origin half is proved where it can be: `coordination-worker/test/
+    // The origin half is proved where it can be: the coordination service
     // auth-resource-server.test.ts`, "refuses a proof whose htu names a
     // different origin, however convincing the Host header", where the issuer
     // and the request URL are set independently. Asserting the inequality here

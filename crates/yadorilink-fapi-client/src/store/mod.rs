@@ -11,7 +11,7 @@
 //! save leaves a store that looks configured and is not.
 //!
 //! The **access token is never persisted**. It lives for five minutes
-//! (`coordination-worker/src/auth/provider/config.ts`), it is a process-local
+//! (the coordination service), it is a process-local
 //! cache in [`crate::CredentialManager`], and writing it to disk would put a
 //! bearer-shaped credential at rest to save one HTTP round trip per process
 //! start.

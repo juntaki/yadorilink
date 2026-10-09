@@ -55,7 +55,7 @@ pub fn detect_install_source() -> String {
 /// state (this crate's test suite runs multi-threaded; a global env-var
 /// override here would race exactly like the scan-hook tests this
 /// workspace already isolates for that reason — see
-/// `oss-public/.github/workflows/release.yml`'s "Scan-hook lib tests"
+/// `.github/workflows/release.yml`'s "Scan-hook lib tests"
 /// step).
 fn detect_install_source_at(path: &Path) -> String {
     match std::fs::read_to_string(path) {

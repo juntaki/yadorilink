@@ -26,9 +26,9 @@ can be fixed by editing this manifest:
    placeholder (`000...0`, obviously fake, chosen so a manifest built from
    this file by mistake fails loudly rather than silently).
 2. **The Windows Authenticode signing cert isn't configured yet.**
-   `oss-public/.github/workflows/release.yml`'s `windows-signed-artifacts`
+   `.github/workflows/release.yml`'s `windows-signed-artifacts`
    job requires `WINDOWS_CODE_SIGN_PFX_BASE64`/`_PASSWORD` as
-   `release-signing` Environment secrets (see `docs/RELEASE_SIGNING.md`);
+   `release-signing` Environment secrets;
    as of this writing those two secrets are not present in that
    Environment (verified via `gh api repos/juntaki/yadorilink/environments/release-signing/secrets`
    — only the seven `MACOS_*` secrets exist). Submitting an *unsigned*

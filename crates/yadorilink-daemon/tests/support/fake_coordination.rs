@@ -98,7 +98,7 @@ struct Inner {
     /// `yadorilink_daemon::change_policy::verify_group_policy_log` accepts --
     /// built with that same crate's own `change_policy::policy_signing::
     /// grant_record` helper, so a record built here is byte-identical
-    /// (preimage, hash chain, signature) to one `coordination-worker`'s real
+    /// (preimage, hash chain, signature) to what the coordination service's real
     /// `recordGrantWithRole` (`src/policy/service.ts`) would produce, not a
     /// hand-rolled approximation of the wire format. A group with no entry
     /// here has never had `grant_role` called for it -- `signed_policy_logs`
@@ -106,7 +106,7 @@ struct Inner {
     /// non-role-aware test already depends on.
     group_policy_chains: HashMap<String, Vec<yadorilink_daemon::change_policy::PolicyRecord>>,
     /// Per-subscriber, per-group "already sent up to this seq" watermark --
-    /// mirrors `coordination-worker`'s own per-WebSocket `policyWatermarks`
+    /// mirrors the coordination service's own per-WebSocket `policyWatermarks`
     /// (`durable-objects/netmap-device.ts`): a group's policy chain is never
     /// resent in full to a subscriber that has already seen a prefix of it,
     /// only the tail beyond what it was last sent, because the daemon's own
@@ -126,7 +126,7 @@ struct Inner {
     /// Per `(group_id, device_id)` issuance counter for
     /// `serve_authorization_checkpoint` -- `AuthorizationCheckpoint::
     /// checkpoint_seq` must strictly increase per issuing device, matching
-    /// `coordination-worker`'s own per-device issuance counter.
+    /// the coordination service's own per-device issuance counter.
     checkpoint_seqs: HashMap<(String, String), u64>,
     /// Canned responses for the three handoff routes, keyed by
     /// `(route, group_id)`.
@@ -186,12 +186,12 @@ pub struct HandoffRequest {
 }
 
 /// One in-flight (or already-consumed) Track Send grant this fake has
-/// issued. Mirrors coordination-worker's `send_authorizations` table just
+/// issued. Mirrors the coordination service's `send_authorizations` table just
 /// enough for real daemon-side E2E coverage: identity binding and atomic
 /// single-use consumption. Deliberately does not model account scoping
 /// (this fake has no account concept for anything else either -- every
 /// registered device is implicitly "the same account") or a real TTL sweep
-/// -- those properties are exhaustively covered by coordination-worker's
+/// -- those properties are exhaustively covered by the coordination service's
 /// own `test/send-authorization.test.ts` against the real Worker; this
 /// fake's job is only to exercise the DAEMON side end to end.
 #[derive(Clone)]
@@ -294,8 +294,8 @@ impl FakeCoordination {
     /// a real, signed `ACTION_GRANT_WITH_ROLE` record to that group's policy
     /// chain and pushing a fresh netmap update -- the fake-coordination
     /// counterpart to a real `share grant --role viewer|editor` request
-    /// landing on `coordination-worker`'s `recordGrantWithRole`
-    /// (`coordination-worker/src/policy/service.ts`). Built with
+    /// landing on the coordination service's `recordGrantWithRole`
+    /// (the coordination service). Built with
     /// `yadorilink_daemon::change_policy::policy_signing::grant_record`, the
     /// SAME helper this crate's own unit tests
     /// (`daemon_state.rs`'s `local_change_auth_provider_withholds_a_viewers_
@@ -358,7 +358,7 @@ impl FakeCoordination {
     }
 
     /// Changes `device_id`'s role for `group_id` the same way
-    /// `coordination-worker`'s live role-change endpoint (`changeDeviceRole`,
+    /// the coordination service's live role-change endpoint (`changeDeviceRole`,
     /// `src/shares/service.ts`) does for a DOWNGRADE: a plain `Revoke`
     /// record (bumping the group's `auth_epoch`, exactly like an ordinary
     /// revoke) immediately followed by a `GrantWithRole` record at
@@ -892,7 +892,7 @@ fn policy_record_to_wire_json(
 /// Builds the `groupPolicyLogs` array for one subscriber's netmap frame:
 /// every group it belongs to, each with the group's CURRENT head coordinates
 /// (`currentSeq`/`currentEpoch`/`policyHeadBase64`, always the group's real
-/// current state, matching `coordination-worker`'s own `toWirePolicyLog`) but
+/// current state, matching the coordination service's own `toWirePolicyLog`) but
 /// only the record TAIL this specific subscriber has not already been sent
 /// (`policy_send_watermarks`, matching that same Worker's per-connection
 /// `policyWatermarks` filtering in `pushNetmapSerializedSafely`). A group
@@ -1210,7 +1210,7 @@ async fn serve_handoff(
 
 /// Serves `POST /shares/groups/:groupId/authorization-checkpoint` for real
 /// -- `yadorilink_daemon::coordination_client::request_authorization_
-/// checkpoint`'s server side, `coordination-worker`'s `routes/shares.ts`
+/// checkpoint`'s server side, the coordination service's `routes/shares.ts`
 /// (phase 2e) mirrored just enough to exercise `checkpoint_source::
 /// flush_pending_checkpoint` end to end against real daemon code, not an
 /// in-process bypass. Reuses `verify_group_policy_log` (the SAME verifier
@@ -1360,7 +1360,7 @@ async fn serve_authorization_checkpoint(
 }
 
 /// Serves `POST /send/authorization` for real -- Track Send's rendezvous
-/// grant, `coordination-worker`'s `routes/send.ts` mirrored just enough to
+/// grant, the coordination service's `routes/send.ts` mirrored just enough to
 /// exercise `coordination_client::request_send_authorization` and the
 /// `send_authorization` netmap-subscription push end to end against real
 /// daemon code, not an in-process bypass. See `FakeSendAuthorization`'s own
@@ -1421,7 +1421,7 @@ async fn serve_send_authorization_issue(
     }
 
     // Delivered synchronously, before this responds -- matching
-    // coordination-worker's own "push happens inside the request handler"
+    // the coordination service's own "push happens inside the request handler"
     // convention (see `routes/send.ts`'s own comment).
     push_send_authorization(
         &inner,
@@ -1513,7 +1513,7 @@ async fn serve_send_authorization_consume(
 
 /// Pushes a `{type:"send_authorization",...}` frame to `receiver_device_id`'s
 /// live subscription, if it has one -- a no-op wake otherwise, matching
-/// `coordination-worker`'s own "content-blind, never stored" delivery
+/// the coordination service's own "content-blind, never stored" delivery
 /// contract for this push.
 fn push_send_authorization(
     inner: &Arc<Mutex<Inner>>,

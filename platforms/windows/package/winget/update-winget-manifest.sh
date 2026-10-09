@@ -10,7 +10,7 @@
 # release.
 #
 # This is deliberately NOT wired to run automatically in
-# oss-public/.github/workflows/release.yml and commit its own output: an
+# .github/workflows/release.yml and commit its own output: an
 # unattended release workflow committing generated files back to this
 # repository is exactly the kind of unattended action this project's
 # release-signing discipline (required reviewers, no unattended

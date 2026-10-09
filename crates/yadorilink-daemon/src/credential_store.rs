@@ -4,7 +4,7 @@
 //! `token_store.rs` that read the access token the CLI had written. Two
 //! implementations of one contract is one too many, and the contract itself
 //! was wrong: an access token lives five minutes
-//! (`coordination-worker/src/auth/provider/config.ts`), so a daemon that reads
+//! (the coordination service), so a daemon that reads
 //! one at startup is authenticated until its first coffee break.
 //!
 //! The store is now [`yadorilink_fapi_client::store`] and the thing that keeps

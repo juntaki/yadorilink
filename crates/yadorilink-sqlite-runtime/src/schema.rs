@@ -312,7 +312,7 @@ fn create_tables_and_links_triggers(conn: &Connection) -> Result<(), DatabaseErr
         CREATE UNIQUE INDEX IF NOT EXISTS idx_restore_operations_path
             ON restore_operations(group_id, path);
 
-        -- A coordination-worker-issued full-replica-handoff lease this
+        -- A coordination-service-issued full-replica-handoff lease this
         -- device (as the handoff TARGET) is currently holding, pinning the
         -- exact `(path, version_seq)` rows its own local readiness check
         -- verified at request time against this device's retention sweep
@@ -338,7 +338,7 @@ fn create_tables_and_links_triggers(conn: &Connection) -> Result<(), DatabaseErr
 
         -- A durable journal of an in-flight full-replica role-loss
         -- operation (demote/unlink) this device is driving as the
-        -- SOURCE device: the coordination-worker role-loss commit
+        -- SOURCE device: the coordination service role-loss commit
         -- (`commit_handoff_role_loss`) and this device's own matching
         -- local policy/link change are two separate commits, and a
         -- crash -- or a local failure landing AFTER the Worker commit

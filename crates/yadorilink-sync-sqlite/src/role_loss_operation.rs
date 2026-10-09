@@ -25,7 +25,7 @@ impl RoleLossOperationRepository {
     }
 
     /// Opens a new role-loss-operation journal row in `Prepared` state,
-    /// BEFORE the coordination-worker role-loss commit the caller is about
+    /// BEFORE the coordination service role-loss commit the caller is about
     /// to attempt — see [`RoleLossOperation`]'s doc comment. Replaces any
     /// existing row with the same `operation_id` (callers here always
     /// generate a fresh random id per attempt, so this is
