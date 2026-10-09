@@ -4,7 +4,7 @@
 //! one iroh endpoint, one router, native-replication traffic told apart by its
 //! own ALPN ([`YADORI_NATIVE_REPLICATION_ALPN`]), never handed to the sync
 //! protocol's handler or vice versa. This crate has zero workspace
-//! dependencies (`architecture.toml`), so -- exactly as Track Send's own
+//! dependencies (`.config/architecture.toml`), so -- exactly as Track Send's own
 //! module doc says of its wire format -- nothing here reads protocol 5's
 //! bytes; this module only ever hands a caller above this crate a plain
 //! bidirectional-stream connection. Decoding protocol 5 messages and

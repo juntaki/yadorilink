@@ -1,6 +1,6 @@
 name: Contributor licence
 
-# Requires every external pull request author to explicitly agree to CLA.md
+# Requires every external pull request author to explicitly agree to .github/CLA.md
 # before the "CLA" status check passes. Signatures are stored in a dedicated
 # branch of this repository, never on the default branch.
 
@@ -30,7 +30,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           path-to-signatures: signatures/cla.json
-          path-to-document: https://github.com/${{ github.repository }}/blob/main/CLA.md
+          path-to-document: https://github.com/${{ github.repository }}/blob/main/.github/CLA.md
           branch: cla-signatures
           allowlist: juntaki,dependabot[bot],github-actions[bot]
           lock-pullrequest-aftermerge: false

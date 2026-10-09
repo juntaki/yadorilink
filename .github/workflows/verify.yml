@@ -70,7 +70,7 @@ jobs:
       - if: always()
         run: cargo audit
       - if: always()
-        run: cargo deny check
+        run: cargo deny --config .config/deny.toml check
 
   # Platform-independent logic is verified once, on Linux, split into lanes
   # that run in parallel. Lanes that measure wall clock or bind real sockets

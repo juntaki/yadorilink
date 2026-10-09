@@ -27,6 +27,6 @@ fi
 # `--fail` turns any unresolved/unaccepted license into a non-zero exit so a new
 # dependency carrying an unexpected license is caught rather than silently
 # omitted from the notice.
-cargo about generate --fail about.hbs -o "$out"
+cargo about generate --fail -c "$repo_root/.config/about/about.toml" "$repo_root/.config/about/about.hbs" -o "$out"
 
 echo "Wrote third-party license notice: $out"

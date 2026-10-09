@@ -137,11 +137,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ## セキュリティ
 
-[SECURITY.md](SECURITY.md) を参照してください。
+[SECURITY.md](.github/SECURITY.md) を参照してください。
 
 ## コントリビュート
 
-[CONTRIBUTING.md](CONTRIBUTING.md) を参照してください。
+[CONTRIBUTING.md](.github/CONTRIBUTING.md) を参照してください。
 
 ## ライセンス
 

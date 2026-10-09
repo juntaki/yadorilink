@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Check the workspace against `architecture.toml`.
+"""Check the workspace against `.config/architecture.toml`.
 
-One checker, one manifest. `architecture.toml` states the intended
+One checker, one manifest. `.config/architecture.toml` states the intended
 structure -- ordered layers, exact dependency allowlists for the crates
 whose isolation carries weight, and the forbidden packages, symbols,
 patterns, confinements and call-site allowlists that the layer order alone
@@ -40,7 +40,7 @@ import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-MANIFEST = ROOT / "architecture.toml"
+MANIFEST = ROOT / ".config" / "architecture.toml"
 
 COMMENT_LINE = re.compile(r"^\s*//")
 CFG_TEST_ATTR = re.compile(r"#\[cfg\(\s*test\s*\)\]")
@@ -296,7 +296,7 @@ def check_layers(
         if crate not in rank:
             failures.append(
                 f"workspace member {crate!r} is in no layer -- every crate must be "
-                "placed in architecture.toml before it can be depended on"
+                "placed in .config/architecture.toml before it can be depended on"
             )
 
     for crate in sorted(rank):
@@ -1028,7 +1028,7 @@ def main() -> int:
         for failure in failures:
             print(f"- {failure}", file=sys.stderr)
         print(
-            f"\n{len(failures)} violation(s). See architecture.toml for the rule each "
+            f"\n{len(failures)} violation(s). See .config/architecture.toml for the rule each "
             "one names and the reason it exists.",
             file=sys.stderr,
         )

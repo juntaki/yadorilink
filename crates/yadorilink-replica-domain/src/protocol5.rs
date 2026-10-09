@@ -1,7 +1,7 @@
 //! Protocol 5 — native causal-state's wire message layer.
 //!
 //! **Transport-neutral by construction, not just by convention.** This
-//! crate's own `workspace_dependencies = []` rule (`architecture.toml`)
+//! crate's own `workspace_dependencies = []` rule (`.config/architecture.toml`)
 //! makes a dependency from here onto `yadorilink-sync-substrate` (the
 //! `domain`-layer crate this crate sits below can never see an upper-layer
 //! crate) a compile-time impossibility, not a promise this module could

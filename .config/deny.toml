@@ -1,5 +1,5 @@
 # cargo-deny configuration.
-# Run locally with: cargo deny check advisories bans licenses sources
+# Run locally with: cargo deny --config .config/deny.toml check advisories bans licenses sources
 
 [advisories]
 version = 2

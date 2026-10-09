@@ -1,6 +1,6 @@
 # cargo-audit configuration.
 #
-# Triaged vulnerability exceptions. Mirrors the same two IDs `deny.toml`'s
+# Triaged vulnerability exceptions. Mirrors the same two IDs `.config/deny.toml`'s
 # `[advisories] ignore` carries for the workspace's cargo-deny check; see that
 # file's comment for the dependency-path and impact-assessment rationale.
 # Both are quick-xml DoS advisories pulled in

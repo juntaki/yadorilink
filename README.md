@@ -139,11 +139,11 @@ Platform packaging details are in the READMEs under
 
 ## Security
 
-See [SECURITY.md](SECURITY.md).
+See [SECURITY.md](.github/SECURITY.md).
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+See [CONTRIBUTING.md](.github/CONTRIBUTING.md).
 
 ## License
 

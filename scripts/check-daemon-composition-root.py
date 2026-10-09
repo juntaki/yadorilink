@@ -13,7 +13,7 @@ and the external integration-test binaries under `tests/`, so never
 module files (e.g. `control_socket/migration_safety_tests.rs`), which the
 parent declares `#[cfg(test)] mod name;` or which open with `#![cfg(test)]`.
 
-This stays a separate script rather than an `architecture.toml` rule
+This stays a separate script rather than an `.config/architecture.toml` rule
 because what it enforces is not a boundary between crates or paths but a
 three-tier per-file call allowlist with `#[cfg(test)]` span awareness,
 specific to one crate's startup sequence.

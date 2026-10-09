@@ -4,7 +4,7 @@
 # artifacts (list of dependencies grouped by license, plus the full text of
 # every required license):
 #
-#   cargo about generate about.hbs -o THIRD-PARTY-LICENSES.html
+#   cargo about generate -c .config/about/about.toml .config/about/about.hbs -o THIRD-PARTY-LICENSES.html
 #   # or, from anywhere: scripts/generate-third-party-licenses.sh
 #
 # `accepted` lists every license that may legitimately appear in the dependency
@@ -13,7 +13,7 @@
 # multi-licensed crates (e.g. `X OR MIT`) render under a permissive license and
 # we never emit a copyleft variant when a permissive alternative is offered.
 #
-# This list is intentionally broader than deny.toml's policy: deny.toml gates
+# This list is intentionally broader than .config/deny.toml's policy: .config/deny.toml gates
 # what we allow into the tree (permissive globally + narrow per-crate
 # exceptions), while this list only governs which license texts the notice can
 # render for what is already present.
