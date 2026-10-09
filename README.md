@@ -151,5 +151,5 @@ Licensed under the [GNU Affero General Public License v3.0 only](LICENSE)
 (AGPL-3.0-only).
 
 The hosted coordination service at `control.yadori.link` is governed by the
-[Privacy Policy](PRIVACY_POLICY.md) and the [Terms of Service](TERMS_OF_SERVICE.md)
-(canonical text: <https://yadori.link/privacy/> and <https://yadori.link/terms/>).
+[Privacy Policy](https://yadori.link/privacy/) and the
+[Terms of Service](https://yadori.link/terms/).

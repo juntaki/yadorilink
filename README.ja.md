@@ -148,5 +148,5 @@ cargo clippy --workspace --all-targets -- -D warnings
 [GNU Affero General Public License v3.0 only](LICENSE) (AGPL-3.0-only) の下で提供されます。
 
 ホスト型コーディネーションサービス (`control.yadori.link`) には
-[プライバシーポリシー](PRIVACY_POLICY.md) と [利用規約](TERMS_OF_SERVICE.md) が適用されます
-(正本: <https://yadori.link/ja/privacy/>、<https://yadori.link/ja/terms/>)。
+[プライバシーポリシー](https://yadori.link/ja/privacy/) と
+[利用規約](https://yadori.link/ja/terms/) が適用されます。
