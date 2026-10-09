@@ -83,8 +83,10 @@ async fn receiving_files_through_the_engine_moves_the_budget_counters() {
     let lane_commits: Vec<_> = splits
         .iter()
         .filter(|s| {
-            s.site.ends_with("materialization_owner/lanes.rs")
-                || s.site.contains("materialization_owner/lanes.rs:")
+            // `file!()` uses the host's separator, so normalise it.
+            let site = s.site.replace('\\', "/");
+            site.ends_with("materialization_owner/lanes.rs")
+                || site.contains("materialization_owner/lanes.rs:")
         })
         .filter(|s| s.commit_calls >= FILES && s.commit_nanos > 0)
         .collect();
@@ -94,9 +96,10 @@ async fn receiving_files_through_the_engine_moves_the_budget_counters() {
     );
     let locks = receive_diag::lock_site_stats();
     assert!(
-        locks
-            .iter()
-            .any(|s| s.site.contains("local_convergence/reconcile.rs") && s.acquisitions >= FILES),
+        locks.iter().any(|s| {
+            s.site.replace('\\', "/").contains("local_convergence/reconcile.rs")
+                && s.acquisitions >= FILES
+        }),
         "the materialize path-lock site must count each acquisition: {locks:?}"
     );
     receive_diag::reset();
