@@ -63,9 +63,6 @@ order = [
   "interface",
 ]
 
-# Workspace members that are build tooling rather than product code and are
-# deliberately outside the layer model.
-exempt = ["xtask"]
 
 [layer.contract]
 purpose = """
@@ -653,7 +650,6 @@ name = "peer_connectivity_transport_is_iroh_only"
 test_spans = "exclude"
 paths = [
   "crates/*/src/**/*.rs",
-  "xtask/src/**/*.rs",
 ]
 allowed_paths = [
   # The legacy QUIC transport's own crate: where these types are defined and

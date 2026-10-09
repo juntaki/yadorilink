@@ -3,7 +3,7 @@
 //! budget") can shrink the per-run workload without every scenario growing its
 //! own env var.
 //!
-//! The xtask `dst-lane1` runner sets `DST_OPS_BUDGET`; a scenario computing how
+//! The one-seed simulation lane sets `DST_OPS_BUDGET`; a scenario computing how
 //! many ops to generate calls `lane::op_budget(default)` instead of hard-coding
 //! its default, so lane 1 gets a fast smoke while lane 2 (which does not set
 //! the var) keeps the scenario's own default.

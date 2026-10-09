@@ -176,10 +176,30 @@ jobs:
           cargo test --no-fail-fast -p yadorilink-daemon
           --test dst_turmoil_substrate_case
           -- --test-threads=1
-      - if: always()
-        run: cargo run -p xtask -- dst-lane0
-      - if: always()
-        run: cargo run -p xtask -- dst-lane1
+      - name: Simulation harness lints and conformance
+        if: always()
+        run: >-
+          cargo test -p yadorilink-daemon
+          --test dst_fidelity_lint
+          --test watcher_decompose_conformance
+      - name: Simulation harness unit tests
+        if: always()
+        env:
+          RUSTFLAGS: --cfg turmoil
+        run: >-
+          cargo test -p yadorilink-daemon
+          --test dst_watcher_debounce
+          -- dst_support::
+      - name: Turmoil scenarios, one seed, reduced op budget
+        if: always()
+        env:
+          RUSTFLAGS: --cfg turmoil
+          DST_VARIATIONS: "1"
+          DST_OPS_BUDGET: "4"
+        run: |
+          for scenario in dst_turmoil_substrate_case dst_watcher_debounce; do
+            cargo test -p yadorilink-daemon --test "$scenario"
+          done
 
   linux-installer:
     runs-on: ubuntu-latest

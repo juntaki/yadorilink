@@ -39,8 +39,14 @@ jobs:
           cargo test --no-fail-fast -p yadorilink-daemon
           --test dst_turmoil_substrate_case
           -- --test-threads=1
-      - if: always()
-        run: cargo run -p xtask -- dst-lane2
+      - name: Turmoil scenario sweeps
+        if: always()
+        env:
+          RUSTFLAGS: --cfg turmoil
+        run: |
+          for scenario in dst_turmoil_substrate_case dst_watcher_debounce; do
+            cargo test -p yadorilink-daemon --test "$scenario"
+          done
 
   chaos:
     runs-on: ubuntu-latest
