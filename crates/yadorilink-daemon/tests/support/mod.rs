@@ -436,6 +436,7 @@ pub fn real_entry_names(dir: &std::path::Path) -> Vec<String> {
 /// is in use.
 #[allow(dead_code)]
 pub fn open_file_backed_replica_coordinator() -> (ReplicaCoordinator, tempfile::TempDir) {
+    ensure_isolated_config_dir();
     let dir = tempfile::tempdir().unwrap();
     let state = ReplicaCoordinator::open(dir.path().join("index.db")).unwrap();
     (state, dir)
