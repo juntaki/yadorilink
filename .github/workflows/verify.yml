@@ -42,24 +42,24 @@ jobs:
         if: always()
         run: |
           set -e
-          python3 scripts/check-architecture.py --self-test
-          python3 scripts/check-architecture.py
-          python3 scripts/check-block-commit-boundary.py
-          python3 scripts/check-block-deletion-boundary.py
-          python3 scripts/check-daemon-composition-root.py
-          python3 scripts/check-index-read-fail-closed.py
-          python3 scripts/check-link-enumeration-fail-closed.py
-          python3 scripts/check-link-group-uniqueness.py
-          python3 scripts/check-link-runtime-ownership.py
-          python3 scripts/check-maintenance-ownership.py
-          python3 scripts/check-materialization-journal.py
-          python3 scripts/check-mutation-boundary.py
-          python3 scripts/check-materialization-semantic-boundary.py
-          python3 scripts/check-materialization-semantic-boundary.py --self-test
-          python3 scripts/check-stored-blocklist-fail-closed.py
-          python3 scripts/check-pre-release-compatibility-debt.py
-          bash scripts/check_removed_features.sh --self-test
-          bash scripts/check_removed_features.sh
+          python3 .github/checks/check-architecture.py --self-test
+          python3 .github/checks/check-architecture.py
+          python3 .github/checks/check-block-commit-boundary.py
+          python3 .github/checks/check-block-deletion-boundary.py
+          python3 .github/checks/check-daemon-composition-root.py
+          python3 .github/checks/check-index-read-fail-closed.py
+          python3 .github/checks/check-link-enumeration-fail-closed.py
+          python3 .github/checks/check-link-group-uniqueness.py
+          python3 .github/checks/check-link-runtime-ownership.py
+          python3 .github/checks/check-maintenance-ownership.py
+          python3 .github/checks/check-materialization-journal.py
+          python3 .github/checks/check-mutation-boundary.py
+          python3 .github/checks/check-materialization-semantic-boundary.py
+          python3 .github/checks/check-materialization-semantic-boundary.py --self-test
+          python3 .github/checks/check-stored-blocklist-fail-closed.py
+          python3 .github/checks/check-pre-release-compatibility-debt.py
+          bash .github/checks/check_removed_features.sh --self-test
+          bash .github/checks/check_removed_features.sh
       - uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2.87.25
         if: always()
         with:

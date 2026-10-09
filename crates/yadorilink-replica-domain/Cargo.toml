@@ -8,7 +8,7 @@ license.workspace = true
 # the pure, synchronous domain model (identities, the signed canonical
 # Change, file/version records, conflict policy) with nothing beneath it
 # but the standard library and cryptography. The boundary is declared in
-# `.config/architecture.toml` and enforced by `scripts/check-architecture.py`.
+# `.config/architecture.toml` and enforced by `.github/checks/check-architecture.py`.
 [features]
 # Test-only constructors (`LocalAuthorKey::for_tests`) for other crates' tests.
 test-support = []

@@ -37,7 +37,7 @@ can be fixed by editing this manifest:
 
 Once both exist, `.github/workflows/release.yml`'s beta-release job has a
 "Record WinGet manifest inputs (no auto-submission)" step that prints the
-exact `scripts/ci/update-winget-manifest.sh` invocation (version +
+exact `platforms/windows/package/winget/update-winget-manifest.sh` invocation (version +
 installer sha256) to the workflow run summary, for a maintainer to run by
 hand. It deliberately does **not** run that script or commit the result
 itself, and does **not** open the winget-pkgs PR either — same

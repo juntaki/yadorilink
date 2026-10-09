@@ -444,7 +444,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -euo pipefail\n\"$SRCROOT/../../../scripts/generate-swift-bindings.sh\"\n";
+			shellScript = "set -euo pipefail\n\"$SRCROOT/../../../platforms/macos/generate-swift-bindings.sh\"\n";
 		};
 		8AB1644EDE03C79961BDC29F /* Build Rust FFI core (fileprovider-core) */ = {
 			isa = PBXShellScriptBuildPhase;

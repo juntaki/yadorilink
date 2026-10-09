@@ -8,7 +8,7 @@
 #  - shell-ext/macos/YadoriLinkFinderSync (the YadoriLink menu bar app,
 #  which also carries the FinderSync and File Provider extensions, and links
 #  the client core through crates/yadorilink-apple-ffi; the Xcode build runs
-#  scripts/generate-swift-bindings.sh to build it)
+#  platforms/macos/generate-swift-bindings.sh to build it)
 #  -> /Applications/YadoriLink.app
 #
 # The coordination service is deliberately NOT included — this is an
@@ -80,7 +80,7 @@ fi
 # The checked-in Swift binding must be what the current Rust code generates
 # (the Xcode build regenerates it, so a stale copy would otherwise ship
 # unreviewed), and the app's mirror types must still match it.
-"$REPO_ROOT/scripts/generate-swift-bindings.sh" --check
+"$REPO_ROOT/platforms/macos/generate-swift-bindings.sh" --check
 
 if [ "$RELEASE_BUILD" = "1" ] && [ -z "$APP_SIGN_IDENTITY" ]; then
     echo "YADORILINK_RELEASE_BUILD=1 requires YADORILINK_APP_SIGN_IDENTITY."
@@ -179,7 +179,7 @@ cp "$YADORILINK_DAEMON_BIN" "$STAGE_DIR/usr/local/bin/yadorilink-daemon"
 # with the CLI, daemon and app this package installs.
 # Source ref: the release workflow's tag/commit, else this checkout's commit.
 SOURCE_REF="${YADORILINK_SOURCE_REF:-$(git -C "$REPO_ROOT" rev-parse HEAD)}"
-"$REPO_ROOT/scripts/ci/write-source-notice.sh" "$SOURCE_REF" \
+"$REPO_ROOT/.github/release/write-source-notice.sh" "$SOURCE_REF" \
     "$STAGE_DIR/usr/local/share/doc/yadorilink"
 # The eframe status app (yadorilink-status-app) is not shipped on macOS:
 # YadoriLink.app is the menu bar app there.

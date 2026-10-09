@@ -16,7 +16,7 @@ crate-type = ["staticlib", "lib"]
 
 [[bin]]
 # Generates the Swift binding from the built library:
-# `scripts/generate-swift-bindings.sh` runs it.
+# `platforms/macos/generate-swift-bindings.sh` runs it.
 name = "uniffi-bindgen-swift"
 path = "src/bin/uniffi-bindgen-swift.rs"
 required-features = ["bindgen"]

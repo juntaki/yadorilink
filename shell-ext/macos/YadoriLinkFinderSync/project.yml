@@ -148,7 +148,7 @@ targets:
       - name: Build the Rust client core and its Swift binding
         script: |
           set -euo pipefail
-          "$SRCROOT/../../../scripts/generate-swift-bindings.sh"
+          "$SRCROOT/../../../platforms/macos/generate-swift-bindings.sh"
         basedOnDependencyAnalysis: false
 
   # Tests of the app's glue to the Rust client core: the generated mapping

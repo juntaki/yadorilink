@@ -49,7 +49,7 @@ sudo apt install yadorilink
   install instead of piping a script to a shell).
 - `README.md` — this file.
 
-`scripts/ci/build-apt-repo.sh` (not under this directory, alongside this
+`platforms/linux/package/apt/build-apt-repo.sh` (not under this directory, alongside this
 project's other CI-only release scripts) assembles the actual repository
 tree (`dists/`, `pool/`) from a set of already-built `.deb` files and
 signs it. See that script's own header comment for the exact layout it
@@ -65,11 +65,11 @@ the participants, date, device, and key identifier recorded -- a real ceremony w
 fold into an automated packaging change. Generating the production APT
 key is a maintainer action; this repository only ever consumes its public
 half (`installer/linux/apt/build-keyring-deb.sh`,
-`scripts/ci/build-apt-repo.sh`).
+`platforms/linux/package/apt/build-apt-repo.sh`).
 
 **What exists today, for real, verified in this environment:**
 
-- `scripts/ci/build-apt-repo.sh` end-to-end, including the GPG
+- `platforms/linux/package/apt/build-apt-repo.sh` end-to-end, including the GPG
   signing/verification step, tested against a **clearly-labeled
   development-only** key generated in an ephemeral `GNUPGHOME` (never
   committed, never used outside this local test) purely to prove the

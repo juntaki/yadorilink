@@ -3,7 +3,7 @@
 //! generated here (never a real release key):
 //!
 //!   artifact + `.sha256` sidecar (`generate-release-checksums.py`)
-//!   -> `scripts/ci/build-channel-manifest.sh` (drives
+//!   -> `.github/release/build-channel-manifest.sh` (drives
 //!      `generate-update-manifest.py` and the `yadorilink-sign-manifest` signer)
 //!   -> parse and verify with the client's own `verify_and_parse_with_keys`
 //!   -> `verify-update-manifest.py` with the explicit key and the artifacts
@@ -89,7 +89,7 @@ fn build_stand_in_artifact(dist: &Path) -> PathBuf {
     let bytes: Vec<u8> = (0..10_007u32).map(|i| (i % 251) as u8).collect();
     std::fs::write(&artifact, bytes).unwrap();
     let out = run(Command::new("python3")
-        .arg("scripts/ci/generate-release-checksums.py")
+        .arg(".github/release/generate-release-checksums.py")
         .arg("--sidecars")
         .arg(&artifact));
     assert!(out.status.success(), "{}", describe("generate-release-checksums.py", &out));
@@ -112,7 +112,7 @@ fn build_manifest_for(
     out_path: &Path,
 ) -> Output {
     run(Command::new("bash")
-        .arg("scripts/ci/build-channel-manifest.sh")
+        .arg(".github/release/build-channel-manifest.sh")
         .args(["--channel", channel])
         .args(["--version", version])
         .args(["--min-version", MIN_VERSION])
@@ -128,7 +128,10 @@ fn build_manifest_for(
 }
 
 fn verify_with_script(envelope: &Path, extra: &[&str]) -> Output {
-    run(Command::new("python3").arg("scripts/verify-update-manifest.py").arg(envelope).args(extra))
+    run(Command::new("python3")
+        .arg(".github/release/verify-update-manifest.py")
+        .arg(envelope)
+        .args(extra))
 }
 
 /// Signs `body` with the real signer, which refuses a body the client could

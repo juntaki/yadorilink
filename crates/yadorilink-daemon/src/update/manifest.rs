@@ -263,7 +263,7 @@ pub struct ReleaseEntry {
     pub mandatory: bool,
     pub artifact_url: String,
     /// Lowercase hex-encoded SHA-256, matching this repo's existing
-    /// `scripts/ci/generate-release-checksums.py` sidecar convention.
+    /// `.github/release/generate-release-checksums.py` sidecar convention.
     pub artifact_sha256: String,
     /// Signed (covered by the manifest signature exactly like every
     /// other field here) expected artifact size in bytes. Consulted by

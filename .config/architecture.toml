@@ -1,7 +1,7 @@
 # YadoriLink architecture manifest.
 #
 # This file is the single declarative statement of the workspace's intended
-# structure. `scripts/check-architecture.py` reads it, resolves the real
+# structure. `.github/checks/check-architecture.py` reads it, resolves the real
 # crate graph with `cargo metadata`, scans the sources named by each rule,
 # and fails CI on any divergence. There is one checker and one manifest: a
 # new boundary is a new entry here, never a new bespoke script.

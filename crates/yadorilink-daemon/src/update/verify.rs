@@ -8,7 +8,7 @@
 //! for this version); this module protects the artifact bytes
 //! themselves, using exactly the same checks this repo's release
 //! tooling already performs by hand
-//! (`scripts/ci/generate-release-checksums.py`'s SHA-256 sidecar
+//! (`.github/release/generate-release-checksums.py`'s SHA-256 sidecar
 //! convention, `installer/macos/verify-pkg.sh`'s `pkgutil`/`spctl`
 //! checks, `installer/windows/verify-installer.ps1`'s
 //! `Get-AuthenticodeSignature` check) — reused here as the fail-closed,
@@ -36,7 +36,7 @@ pub enum VerifyError {
 }
 
 /// Streams `path` through SHA-256 (matching
-/// `scripts/ci/generate-release-checksums.py`'s own `sha256_of` — read in
+/// `.github/release/generate-release-checksums.py`'s own `sha256_of` — read in
 /// fixed-size chunks rather than loading the whole artifact into memory)
 /// and compares against `expected_hex` (case-insensitive, matching that
 /// script's own comparison).

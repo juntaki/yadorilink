@@ -15,7 +15,7 @@ path's packaging actually lives.
 | Homebrew Cask | macOS | The same signed `.pkg`, via `brew install --cask` | `juntaki/homebrew-yadorilink` (separate repo) `Casks/yadorilink.rb` | Tap live; placeholder version/sha256 until the first real release |
 | Homebrew Formula | macOS + Linux | CLI + daemon only, built from source | `juntaki/homebrew-yadorilink` `Formula/yadorilink.rb` | Tap live; same placeholder caveat |
 | `.deb` (direct download / `dpkg -i`) | Linux (Debian/Ubuntu) | CLI + daemon + systemd `--user` unit | `installer/linux/` | Shipping (amd64 verified on real Linux + real apt; arm64 packaging exercised via QEMU, not yet on real hardware) |
-| APT repository | Linux (Debian/Ubuntu) | The same `.deb`, via `apt install` | `installer/linux/apt/`, `scripts/ci/build-apt-repo.sh`, served by `coordination-worker`'s `/apt` route | Tooling built and verified end-to-end against a dev key; production signing key not yet generated (see `installer/linux/apt/README.md`) |
+| APT repository | Linux (Debian/Ubuntu) | The same `.deb`, via `apt install` | `installer/linux/apt/`, `platforms/linux/package/apt/build-apt-repo.sh`, served by `coordination-worker`'s `/apt` route | Tooling built and verified end-to-end against a dev key; production signing key not yet generated (see `installer/linux/apt/README.md`) |
 | `.exe` (Inno Setup, direct download) | Windows | CLI + daemon + status app + shell integration, Authenticode-signed | `installer/windows/` | Build-health always; **signing not yet configured** (`WINDOWS_CODE_SIGN_PFX_*` secrets absent as of this writing) |
 | WinGet manifest | Windows | The same signed `.exe`, via `winget install` | `installer/windows/winget/` | Manifest built and schema-validated; **not submittable yet** — no release exists, and Windows signing isn't configured either (see `installer/windows/winget/README.md`) |
 | Docker image | linux/amd64, linux/arm64 | `yadorilink-daemon` only, headless | `installer/docker/`, published to `ghcr.io/juntaki/yadorilink-daemon` | amd64 built and run-verified; **arm64 build fixed a real wrong-architecture bug but the fix is not yet re-confirmed end to end** (disk-constrained build host — see `installer/docker/README.md`'s "Verification performed") |
@@ -54,7 +54,7 @@ real release:
    step) — gated on `HOMEBREW_TAP_DISPATCH_TOKEN`.
 4. Records the WinGet manifest's two real inputs (version, installer
    sha256) in the job summary — does **not** commit them or run
-   `scripts/ci/update-winget-manifest.sh` itself; see
+   `platforms/windows/package/winget/update-winget-manifest.sh` itself; see
    `installer/windows/winget/README.md`'s "Status" section for why that
    stays a manual, human-gated step, same as WinGet submission itself.
 
