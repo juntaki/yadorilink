@@ -714,7 +714,5 @@ fn response_of(
     ShellIpcMessage { payload: Some(Payload::ProviderApplyChangeResponse(message)) }
 }
 
-// TODO(checkpoint B): Windows ingest is not implemented, so every ingest is refused;
-// re-enable on Windows when the WindowsCfapi provider port lands.
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests;
