@@ -278,11 +278,17 @@ jobs:
         if: matrix.lane == 'workspace' && always()
         run: >-
           .github/checks/run-logged.sh cargo test --no-fail-fast --workspace --exclude yadorilink-daemon --exclude yadorilink-desktop-app
+          --exclude yadorilink-sync-substrate
           --
           --skip rotation_without_the_lock_destroys_the_grant
           --skip rotation_under_the_lock_keeps_the_grant_alive
           --skip rotation_child
           --skip a_process_stays_authenticated_across_the_five_minute_access_token_lifetime
+      - name: Sync substrate tests (single-threaded)
+        if: matrix.lane == 'workspace' && always()
+        # Own step, one test at a time, as on Linux: the relay tests bind real
+        # endpoints and share an in-process address book.
+        run: .github/checks/run-logged.sh cargo test --no-fail-fast -p yadorilink-sync-substrate --tests -- --test-threads=1
       - name: Daemon filesystem and runtime tests
         if: matrix.lane == 'daemon'
         run: >-
@@ -341,11 +347,17 @@ jobs:
         if: matrix.lane == 'workspace' && always()
         run: >-
           .github/checks/run-logged.sh cargo test --no-fail-fast --workspace --exclude yadorilink-daemon --exclude yadorilink-desktop-app
+          --exclude yadorilink-sync-substrate
           -- --test-threads=4
           --skip rotation_without_the_lock_destroys_the_grant
           --skip rotation_under_the_lock_keeps_the_grant_alive
           --skip rotation_child
           --skip a_process_stays_authenticated_across_the_five_minute_access_token_lifetime
+      - name: Sync substrate tests (single-threaded)
+        if: matrix.lane == 'workspace' && always()
+        # Own step, one test at a time, as on Linux: the relay tests bind real
+        # endpoints and share an in-process address book.
+        run: .github/checks/run-logged.sh cargo test --no-fail-fast -p yadorilink-sync-substrate --tests -- --test-threads=1
       - name: Daemon filesystem and runtime tests
         if: matrix.lane == 'daemon'
         run: >-

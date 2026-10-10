@@ -333,6 +333,9 @@ async fn an_imported_folder_settles_without_a_peer_and_stays_settled_across_a_re
         let path = device.root.path().join(format!("file{i:05}.bin"));
         std::fs::write(&path, format!("payload for file {i}").repeat(4)).unwrap();
     }
+    // Judged before any daemon or watcher exists: the probe writes a temporary
+    // file into the watched root, and a running watcher would index it.
+    let can_confirm = can_confirm_repeated_observation(device.root.path());
     let local_path = device.root.path().to_string_lossy().to_string();
 
     device
@@ -373,7 +376,7 @@ async fn an_imported_folder_settles_without_a_peer_and_stays_settled_across_a_re
     // generation counter and no fine birth clock -- cannot confirm that
     // for any regular file, so skip the closure half there rather than
     // assert something the volume cannot support.
-    if can_confirm_repeated_observation(device.root.path()) {
+    if can_confirm {
         wait_for_quiet(&poll_conn, "after import restart").await;
     } else {
         eprintln!(
@@ -405,7 +408,7 @@ async fn an_imported_folder_settles_without_a_peer_and_stays_settled_across_a_re
     // And it must stay settled, not re-open the same work on every boot.
     device = restart(device, &local_path, group_id).await;
     let poll_conn = rusqlite::Connection::open(&device.db_path).unwrap();
-    if can_confirm_repeated_observation(device.root.path()) {
+    if can_confirm {
         wait_for_quiet(&poll_conn, "after second restart").await;
     }
     assert_eq!(
