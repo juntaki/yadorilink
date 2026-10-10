@@ -119,7 +119,7 @@ impl Side {
         let witness = self
             .db
             .write_immediate::<_, SyncSqliteError>(|tx| {
-                crate::native_projection_binding::capture_native_witness(tx, &group(), spec.path())
+                crate::native_capture::capture_native_witness(tx, &group(), spec.path())
             })
             .unwrap();
         let witness = witnessed.then_some(witness);
@@ -310,7 +310,7 @@ impl Side {
                     delta,
                     &remote_key().verifying_key(),
                 )?;
-                // Admission arms the paths and records where a loser is placed.
+                // Admission arms the paths.
                 crate::native_desired_state::arm_projection_for_delta(tx, "g1", delta, false)
                     .map(|_| ())
             })
@@ -345,8 +345,6 @@ fn remote_put(seq: u64, prev: Option<DeltaHash>, path: &str, salt: u8) -> Native
             path: SyncPath(path.into()),
             removes: Vec::new(),
             put: Some(DeltaPut { version: remote_version(salt).version_hash }),
-            keeps: Vec::new(),
-            keep_put: false,
         }],
         signature: [0u8; 64],
     };
@@ -526,11 +524,6 @@ struct Pool {
     parent_of_existing: String,
     /// New paths under an existing file, which the new directory displaces.
     under_a_file: Vec<String>,
-    /// Names a conflict copy was placed at, read from the starting replica.
-    placed: Vec<String>,
-    /// Paths with no `files` row and no head that a kept copy, a stable-name binding or a
-    /// placement names, seeded by `seed_state`.
-    named: Vec<String>,
     /// Paths with no `files` row and no head that are held.
     held: Vec<String>,
 }
@@ -545,55 +538,7 @@ fn pool() -> Pool {
         remote: names("rem", 3),
         parent_of_existing: "nest".to_owned(),
         under_a_file: (0..3).map(|i| format!("anc/x{i}")).collect(),
-        placed: Vec::new(),
-        named: ["kept", "bound", "bound-stable", "placed", "origin", "copy", "sourced"]
-            .iter()
-            .map(|name| format!("named/{name}"))
-            .collect(),
         held: vec!["held/h0".to_owned(), "held/h1".to_owned()],
-    }
-}
-
-/// Names the `named` paths in the tables the new-path check reads other than `files` and the
-/// heads: a kept copy at `named/kept`, a binding with source `named/bound` and stable name
-/// `named/bound-stable`, and placements with physical name `named/placed` and `named/copy` and
-/// sources `named/origin` and `named/sourced`. None of them has a `files` row or a head.
-fn seed_named_paths(side: &Side) {
-    use crate::stable_projection_binding::{
-        native_bind, native_keep_heads_of_version, native_placement_put, NativePlacementRow,
-    };
-    side.db
-        .write_immediate::<_, SyncSqliteError>(|tx| {
-            native_keep_heads_of_version(tx, "g1", "named/kept", &[1; 32])?;
-            native_bind(
-                tx,
-                "g1",
-                &("named/bound".to_owned(), "device-b".to_owned(), [1u8; 16], 1),
-                "named/bound-stable",
-            )?;
-            for (physical, source) in
-                [("named/placed", "named/origin"), ("named/copy", "named/sourced")]
-            {
-                native_placement_put(
-                    tx,
-                    "g1",
-                    &NativePlacementRow {
-                        physical_path: physical.to_owned(),
-                        source_path: source.to_owned(),
-                        author: "device-b".to_owned(),
-                        incarnation: [1u8; 16],
-                        seq: 1,
-                        provenance: [2u8; 32],
-                        version: [3u8; 32],
-                        origin: "conflict_copy".to_owned(),
-                    },
-                )?;
-            }
-            Ok(())
-        })
-        .unwrap();
-    for path in ["held/h0", "held/h1"] {
-        side.hold(path);
     }
 }
 
@@ -629,18 +574,9 @@ fn seed_state(side: &Side, pool: &Pool, evidence: &Evidence, deltas: &[RemoteDel
     for remote in deltas {
         side.install_remote(&remote.delta, remote.salt);
     }
-    seed_named_paths(side);
-}
-
-fn placed_names(side: &Side) -> Vec<String> {
-    side.db
-        .write_immediate::<_, SyncSqliteError>(|tx| {
-            Ok(tx
-                .prepare("SELECT physical_path FROM native_physical_placement ORDER BY 1")?
-                .query_map([], |r| r.get(0))?
-                .collect::<Result<Vec<String>, _>>()?)
-        })
-        .unwrap()
+    for path in ["held/h0", "held/h1"] {
+        side.hold(path);
+    }
 }
 
 fn random_batch(rng: &mut Rng, pool: &Pool, salt: &mut i64) -> Vec<Spec> {
@@ -653,8 +589,6 @@ fn random_batch(rng: &mut Rng, pool: &Pool, salt: &mut i64) -> Vec<Spec> {
         .chain(&pool.scaffold)
         .chain(&pool.remote)
         .chain(&pool.under_a_file)
-        .chain(&pool.placed)
-        .chain(&pool.named)
         .collect();
     let len = 4 + rng.next(30) as usize;
     let mut batch: Vec<Spec> = (0..len)
@@ -686,8 +620,8 @@ fn random_batch(rng: &mut Rng, pool: &Pool, salt: &mut i64) -> Vec<Spec> {
 /// the identities that depend on how the edits were signed, as the one-delta-per-mutation commit.
 #[test]
 fn new_path_rows_mean_what_the_per_path_chain_means() {
-    let (mut interferences, mut placed_names_seen, mut named_batches) = (0usize, 0usize, 0usize);
-    let mut pool = pool();
+    let mut interferences = 0usize;
+    let pool = pool();
     let evidence = Evidence::new(7);
     for seed in 0..24u64 {
         let mut rng = Rng(seed + 1);
@@ -702,8 +636,6 @@ fn new_path_rows_mean_what_the_per_path_chain_means() {
         for side in [&subject, &per_path, &reference, &rows_only] {
             seed_state(side, &pool, &evidence, &deltas);
         }
-        pool.placed = placed_names(&subject);
-        placed_names_seen += pool.placed.len();
         let mut salt = 100i64;
         let mut interfered = std::collections::BTreeSet::new();
         for round in 0..3 {
@@ -714,9 +646,6 @@ fn new_path_rows_mean_what_the_per_path_chain_means() {
                 .filter(|path| pool.new.contains(path) && interfered.insert(path.clone()))
                 .map(|path| chain.put(&path, 240 + round as u8));
             interferences += usize::from(interference.is_some());
-            let names_one = batch
-                .iter()
-                .any(|spec| pool.named.iter().chain(&pool.held).any(|path| path == spec.path()));
             // The batch-level hold refusal is the grouped commit's: a batch with a held path
             // commits nothing there, while the one-delta-per-mutation reference has no such
             // refusal. The reference then skips the batch, and the sides must have refused it.
@@ -741,7 +670,6 @@ fn new_path_rows_mean_what_the_per_path_chain_means() {
                 })
                 .collect();
             assert!(!held_batch || outcomes[0].is_err(), "a held path was authored: {batch:?}");
-            named_batches += usize::from(names_one && outcomes[0].is_ok());
             assert_eq!(outcomes[0], outcomes[1], "seed {seed} round {round}: {batch:?}");
             assert_eq!(outcomes[0], outcomes[2], "seed {seed} round {round}: {batch:?}");
             assert_eq!(outcomes[0], outcomes[3], "seed {seed} round {round}: {batch:?}");
@@ -766,13 +694,11 @@ fn new_path_rows_mean_what_the_per_path_chain_means() {
         }
     }
     // The batches reached what they were built to: rows written finished, proofs batched, remote
-    // heads landing after capture, and placed names to put at.
+    // heads landing after capture.
     use crate::new_path_rows::tests_support::{PROOFS_BATCHED, ROWS_WRITTEN};
     let (rows, proofs) = (ROWS_WRITTEN.with(|n| n.get()), PROOFS_BATCHED.with(|n| n.get()));
     assert!(rows > 200 && proofs > 200, "{rows} rows and {proofs} proofs went the short way");
     assert!(interferences > 5, "{interferences} remote heads landed after capture");
-    assert!(placed_names_seen > 0, "no conflict copy was ever placed");
-    assert!(named_batches > 5, "{named_batches} batches committed a path a table names");
 }
 
 /// A group committed directly, with a held path and a path with a remote head in it, leaves what
@@ -886,62 +812,7 @@ fn a_path_anything_names_is_not_brand_new() {
     side.scaffold("scaffold");
     side.hold("held");
     side.install_remote(&remote_put(1, None, "headed", 9), 9);
-    side.db
-        .write_immediate::<_, SyncSqliteError>(|tx| {
-            tx.execute(
-                "INSERT INTO native_head_keep (group_id, path, author, incarnation, seq, provenance) \
-                 VALUES ('g1', 'kept', 'device-b', ?1, 5, ?2)",
-                (&[1u8; 16][..], &[1u8; 32][..]),
-            )?;
-            crate::stable_projection_binding::native_bind(
-                tx,
-                "g1",
-                &("bound".to_owned(), "device-b".to_owned(), [1u8; 16], 1),
-                "bound-stable",
-            )?;
-            crate::stable_projection_binding::native_bind(
-                tx,
-                "g1",
-                &("src".to_owned(), "device-b".to_owned(), [1u8; 16], 2),
-                "stable-only",
-            )?;
-            let placement = |physical: &str, source: &str| {
-                crate::stable_projection_binding::NativePlacementRow {
-                    physical_path: physical.to_owned(),
-                    source_path: source.to_owned(),
-                    author: "device-b".to_owned(),
-                    incarnation: [1u8; 16],
-                    seq: 1,
-                    provenance: [2u8; 32],
-                    version: [3u8; 32],
-                    origin: "conflict_copy".to_owned(),
-                }
-            };
-            crate::stable_projection_binding::native_placement_put(
-                tx,
-                "g1",
-                &placement("placed", "origin"),
-            )?;
-            crate::stable_projection_binding::native_placement_put(
-                tx,
-                "g1",
-                &placement("copy-name", "sourced"),
-            )?;
-            Ok(())
-        })
-        .unwrap();
-    let candidates = [
-        "row",
-        "scaffold",
-        "held",
-        "headed",
-        "kept",
-        "bound",
-        "stable-only",
-        "placed",
-        "sourced",
-        "free",
-    ];
+    let candidates = ["row", "scaffold", "held", "headed", "free"];
     let fresh = side
         .db
         .write_immediate::<_, SyncSqliteError>(|tx| {

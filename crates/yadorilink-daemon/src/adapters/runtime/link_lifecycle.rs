@@ -94,8 +94,7 @@ impl LinkRepositoryPort for DaemonLinkRepositoryAdapter {
                 crate::daemon_state::now_unix(),
                 provider
                     .map(|target| yadorilink_sync_sqlite::provider::ProviderLinkSpec {
-                        kind:
-                            yadorilink_replica_domain::session_state::ProviderKind::MacFileProvider,
+                        kind: target.kind,
                         display_name: target.display_name.clone(),
                         empty_owner: target.empty_owner,
                         on_demand: target.on_demand,

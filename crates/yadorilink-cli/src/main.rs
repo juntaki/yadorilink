@@ -5,7 +5,23 @@ use yadorilink_cli::commands;
 use yadorilink_cli::error::CliError;
 
 #[derive(Parser)]
-#[command(name = "yadorilink", version, about = "Peer-to-peer file sync")]
+#[command(
+    name = "yadorilink",
+    version,
+    about = "Peer-to-peer file sync",
+    after_help = "Exit codes:\n  \
+0   success\n  \
+1   command failed\n  \
+2   usage error (bad arguments)\n  \
+3   cannot reach the YadoriLink server\n  \
+4   daemon is not running\n  \
+5   peer connectivity error\n  \
+6   reporting needs the daemon\n  \
+7   account limit or rate limit hit\n  \
+8   operation may still be completing; the daemon will finish it\n  \
+9   credential store problem\n  \
+10  not logged in or sign-in rejected"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -20,7 +36,11 @@ enum Command {
         device: bool,
     },
     /// Sign out and revoke this computer's access. This cannot be undone.
-    Logout,
+    Logout {
+        /// Skip the confirmation prompt.
+        #[arg(short, long)]
+        yes: bool,
+    },
     /// Remove this computer's stored credentials without revoking its access on the server.
     ForgetLocalCredentials,
     /// Manage registered devices.
@@ -113,6 +133,9 @@ enum Command {
         /// use, or a release still pending).
         #[arg(long, value_name = "N")]
         pending_items: Option<u32>,
+        /// Also show internal ids and the raw reason codes.
+        #[arg(long, visible_alias = "details")]
+        verbose: bool,
     },
     /// Delete unused data blocks to free disk space.
     Gc {
@@ -169,7 +192,7 @@ enum Command {
         #[command(subcommand)]
         action: BackupAction,
     },
-    /// Check for updates and configure automatic updates.
+    /// Check for updates and configure update checks.
     Update {
         #[command(subcommand)]
         action: UpdateAction,
@@ -183,21 +206,22 @@ enum Command {
     },
 }
 
-/// Check for updates and configure automatic updates.
+/// Check for updates and configure update checks.
 #[derive(Subcommand)]
 enum UpdateAction {
     /// Show the current version, update channel and update status.
     Status,
     /// Check for an update now.
     Check,
-    /// Install an available update at the next safe moment.
-    Install,
-    /// Turn automatic update checks and installs on or off.
+    /// Show where to download the new version (updates are installed manually).
+    #[command(alias = "install")]
+    Download,
+    /// Turn automatic update checks on or off.
     Config {
         /// Automatic checks: `on` or `off`.
         #[arg(long)]
         checks: Option<String>,
-        /// Automatic install: `automatic` or `manual`.
+        /// Install mode: only `manual` is supported (updates are installed manually).
         #[arg(long)]
         install: Option<String>,
     },
@@ -421,6 +445,9 @@ enum DeviceAction {
         /// Remove even if this device holds the only complete copy of a folder group. This can permanently lose data.
         #[arg(long)]
         force: bool,
+        /// Skip the confirmation prompt.
+        #[arg(short, long)]
+        yes: bool,
     },
 }
 
@@ -492,10 +519,16 @@ enum ShareAction {
         /// Revoke even if the device holds the only complete copy of the group. This can permanently lose data.
         #[arg(long)]
         force: bool,
+        /// Skip the confirmation prompt.
+        #[arg(short, long)]
+        yes: bool,
     },
     /// Delete a folder group you own, for every member.
     Delete {
         group_name: String,
+        /// Skip the confirmation prompt.
+        #[arg(short, long)]
+        yes: bool,
         /// Required when the group has members from other accounts.
         #[arg(long)]
         acknowledge_cross_account_members: bool,
@@ -663,13 +696,13 @@ async fn run_provider_folder(action: ProviderFolderAction) -> Result<(), CliErro
 async fn run(command: Command) -> Result<(), CliError> {
     match command {
         Command::Login { device } => commands::auth::login(device).await,
-        Command::Logout => commands::auth::logout().await,
+        Command::Logout { yes } => commands::auth::logout(yes).await,
         Command::ForgetLocalCredentials => commands::auth::forget_local_credentials().await,
         Command::Device { action } => match action {
             DeviceAction::Register { name } => commands::device::register(name).await,
             DeviceAction::List => commands::device::list().await,
-            DeviceAction::Remove { device_id, force } => {
-                commands::device::remove(device_id, force).await
+            DeviceAction::Remove { device_id, force, yes } => {
+                commands::device::remove(device_id, force, yes).await
             }
         },
         Command::Recovery { action } => match action {
@@ -688,14 +721,15 @@ async fn run(command: Command) -> Result<(), CliError> {
             ShareAction::ChangeRole { group_name, device_id, role } => {
                 commands::share::change_role(group_name, device_id, role).await
             }
-            ShareAction::Revoke { group_name_or_edge, device_id, force } => match device_id {
+            ShareAction::Revoke { group_name_or_edge, device_id, force, yes } => match device_id {
                 Some(device_id) => {
-                    commands::share::revoke(group_name_or_edge, device_id, force).await
+                    commands::share::revoke(group_name_or_edge, device_id, force, yes).await
                 }
-                None => commands::share::revoke_edge(group_name_or_edge, force).await,
+                None => commands::share::revoke_edge(group_name_or_edge, force, yes).await,
             },
-            ShareAction::Delete { group_name, acknowledge_cross_account_members } => {
-                commands::share::delete_group(group_name, acknowledge_cross_account_members).await
+            ShareAction::Delete { group_name, acknowledge_cross_account_members, yes } => {
+                commands::share::delete_group(group_name, acknowledge_cross_account_members, yes)
+                    .await
             }
             ShareAction::List => commands::share::list_shares().await,
             ShareAction::Members { group_name } => commands::share::members(group_name).await,
@@ -764,10 +798,10 @@ async fn run(command: Command) -> Result<(), CliError> {
                 commands::daemon::metrics(enable, disable, addr, show)
             }
         },
-        Command::Status { watch, pending_items } => {
-            commands::status::status(watch).await?;
+        Command::Status { watch, pending_items, verbose } => {
+            commands::status::status(watch, verbose).await?;
             match pending_items {
-                Some(limit) => commands::status::pending_items(limit).await,
+                Some(limit) => commands::status::pending_items(limit, verbose).await,
                 None => Ok(()),
             }
         }
@@ -847,7 +881,7 @@ async fn run(command: Command) -> Result<(), CliError> {
         Command::Update { action } => match action {
             UpdateAction::Status => commands::update::status().await,
             UpdateAction::Check => commands::update::check().await,
-            UpdateAction::Install => commands::update::install().await,
+            UpdateAction::Download => commands::update::download().await,
             UpdateAction::Config { checks, install } => {
                 commands::update::config(checks, install).await
             }

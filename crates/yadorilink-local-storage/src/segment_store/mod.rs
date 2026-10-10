@@ -194,7 +194,7 @@ impl SegmentBlockStore {
         limits: GroupCommitLimits,
     ) -> Result<Self, StorageError> {
         let root = root.into();
-        std::fs::create_dir_all(&root)?;
+        crate::fs_ops::create_dir_all_durably(&root)?;
         ensure_segments_directory(&root)?;
         write_format_marker(&root)?;
 

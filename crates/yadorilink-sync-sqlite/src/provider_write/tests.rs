@@ -788,8 +788,14 @@ fn the_verification_finds_a_row_the_plan_does_not_hold() {
     fx.db
         .write_immediate::<_, SyncSqliteError>(|tx| {
             tx.execute(
+                "INSERT OR IGNORE INTO native_authoring_witness (group_id, identity, version) \
+                 VALUES (?1, zeroblob(58), zeroblob(32))",
+                [GROUP],
+            )?;
+            tx.execute(
                 "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json, deleted, \
-                 version_seq, state) VALUES (?1, 'stranger', 1, 1, '[]', 0, 7, 'current')",
+                 version_seq, state, native_authoring_identity) \
+                 VALUES (?1, 'stranger', 1, 1, '[]', 0, 7, 'current', zeroblob(58))",
                 [GROUP],
             )?;
             Ok(())
@@ -1036,8 +1042,14 @@ impl Fx {
         self.db
             .write_immediate::<_, SyncSqliteError>(|tx| {
                 tx.execute(
+                    "INSERT OR IGNORE INTO native_authoring_witness (group_id, identity, version) \
+                     VALUES (?1, zeroblob(58), zeroblob(32))",
+                    [GROUP],
+                )?;
+                tx.execute(
                     "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json, deleted, \
-                     version_seq, state) VALUES (?1, ?2, 0, 1, '[]', 0, 9, 'current')",
+                     version_seq, state, native_authoring_identity) \
+                     VALUES (?1, ?2, 0, 1, '[]', 0, 9, 'current', zeroblob(58))",
                     rusqlite::params![GROUP, path],
                 )?;
                 Ok(())
@@ -1186,8 +1198,14 @@ fn change_pages_split_by_events_without_skipping() {
         .write_immediate::<_, SyncSqliteError>(|tx| {
             for n in 0..5 {
                 tx.execute(
+                    "INSERT OR IGNORE INTO native_authoring_witness (group_id, identity, version) \
+                     VALUES (?1, zeroblob(58), zeroblob(32))",
+                    [GROUP],
+                )?;
+                tx.execute(
                     "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json, deleted, \
-                     version_seq, state) VALUES (?1, ?2, 0, 1, '[]', 0, 9, 'current')",
+                     version_seq, state, native_authoring_identity) \
+                     VALUES (?1, ?2, 0, 1, '[]', 0, 9, 'current', zeroblob(58))",
                     rusqlite::params![GROUP, format!("n{n}")],
                 )?;
             }
@@ -1359,71 +1377,7 @@ fn a_rebootstrap_carries_the_install_marker_only_for_a_completely_built_namespac
 
 // ---- retiring a displaced placement (M3) ----
 
-impl Fx {
-    /// Every row of every `native_*` table: the semantic state a delete or a change would touch.
-    fn native_rows(&self) -> i64 {
-        self.db
-            .read::<_, SyncSqliteError>(|conn| {
-                let tables: Vec<String> = conn
-                    .prepare(
-                        "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'native_%'",
-                    )?
-                    .query_map([], |r| r.get(0))?
-                    .collect::<Result<_, _>>()?;
-                let mut total = 0;
-                for table in tables {
-                    total += conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| {
-                        r.get::<_, i64>(0)
-                    })?;
-                }
-                Ok(total)
-            })
-            .unwrap()
-    }
-}
-
-/// When a head that held a conflict-copy name leaves the plan, the copy's row is retired by the
-/// projector, in the same batch, WITHOUT authoring anything: no head, no change, no tombstone
-/// for peers.
-#[test]
-fn a_placement_the_plan_no_longer_holds_is_retired_without_authoring_a_delete() {
-    let fx = Fx::new();
-    fx.create(None, "a", b"a");
-    fx.repo.project_batch(GROUP, 100).unwrap();
-    // The state a previous plan left: a conflict copy of `a` projected at `a.copy`.
-    fx.db
-        .write_immediate::<_, SyncSqliteError>(|tx| {
-            tx.execute(
-                "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json, deleted, \
-                 version_seq, state, native_authoring_identity) \
-                 VALUES (?1, 'a.copy', 0, 1, '[]', 0, 9, 'current', x'AA')",
-                [GROUP],
-            )?;
-            tx.execute(
-                "INSERT INTO provider_placements (group_id, physical_path, source_path, owner_identity) \
-                 VALUES (?1, 'a.copy', 'a', x'AA')",
-                [GROUP],
-            )?;
-            crate::projection_obligations::bump_projection_obligations_for_touched_paths(
-                tx,
-                GROUP,
-                &["a"],
-                1,
-            )?;
-            Ok(())
-        })
-        .unwrap();
-    assert_eq!(fx.live_paths(), ["a", "a.copy"]);
-    let native_before = fx.native_rows();
-
-    fx.repo.project_batch(GROUP, 100).unwrap();
-
-    assert_eq!(fx.live_paths(), ["a"], "the stale placement's row stayed live");
-    assert_eq!(fx.count("provider_placements"), 0);
-    assert_eq!(fx.native_rows(), native_before, "retiring a placement authored something");
-    // The source itself is untouched.
-    assert!(fx.row_version("a").is_some());
-}
+impl Fx {}
 
 /// A flat level of many names is projected in one pass over its plan, not one pass per name.
 #[test]
@@ -2059,39 +2013,6 @@ fn an_observed_revision_before_the_announcement_only_tightens_content_edits() {
     assert!(!stale_view(fx.run_raw(&rename)));
 }
 
-/// A placement is retired only while its row still shows the identity of the head that held it:
-/// a different head projected at that physical path since (a canonical row now) keeps its row
-/// when a later batch for the old source retires the stale placement record.
-#[test]
-fn a_stale_placement_never_retires_the_row_of_another_head() {
-    let fx = Fx::new();
-    fx.create(None, "a", b"a");
-    fx.repo.project_batch(GROUP, 100).unwrap();
-    // `a` once had a conflict copy at `x`; since then ANOTHER head's row lives at `x`.
-    fx.db
-        .write_immediate::<_, SyncSqliteError>(|tx| {
-            tx.execute(
-                "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json, deleted, \
-                 version_seq, state, native_authoring_identity) \
-                 VALUES (?1, 'x', 0, 1, '[]', 0, 9, 'current', x'BB')",
-                [GROUP],
-            )?;
-            tx.execute(
-                "INSERT INTO provider_placements (group_id, physical_path, source_path, owner_identity) \
-                 VALUES (?1, 'x', 'a', x'AA')",
-                [GROUP],
-            )?;
-            crate::projection_obligations::bump_projection_obligations_for_touched_paths(
-                tx, GROUP, &["a"], 1,
-            )?;
-            Ok(())
-        })
-        .unwrap();
-    fx.repo.project_batch(GROUP, 100).unwrap();
-    assert!(fx.live_paths().contains(&"x".to_string()), "another head's row was retired");
-    assert_eq!(fx.count("provider_placements"), 0, "the stale record stayed");
-}
-
 /// Working-set membership is separate from the history of what was published and handed: an item
 /// that leaves the working set keeps its published version and its ledger, and when it is shown
 /// again with a newer current version it is PENDING again, not freshly consistent.
@@ -2117,8 +2038,14 @@ fn leaving_the_working_set_never_erases_the_publication_history() {
                 [GROUP],
             )?;
             tx.execute(
+                "INSERT OR IGNORE INTO native_authoring_witness (group_id, identity, version) \
+                 VALUES (?1, zeroblob(58), zeroblob(32))",
+                [GROUP],
+            )?;
+            tx.execute(
                 "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json, deleted, \
-                 version_seq, state) VALUES (?1, 'f', 0, 5, '[]', 0, 50, 'current')",
+                 version_seq, state, native_authoring_identity) \
+                 VALUES (?1, 'f', 0, 5, '[]', 0, 50, 'current', zeroblob(58))",
                 [GROUP],
             )?;
             Ok(())
@@ -2162,9 +2089,17 @@ impl Fx {
                      AND state = 'current'",
                     [GROUP, path],
                 )?;
+                // A peer's row is vouched for by a verified identity: the group has native
+                // history, so an unauthored current row is refused.
+                tx.execute(
+                    "INSERT OR IGNORE INTO native_authoring_witness (group_id, identity, version) \
+                     VALUES (?1, zeroblob(58), zeroblob(32))",
+                    [GROUP],
+                )?;
                 tx.execute(
                     "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json, \
-                     deleted, version_seq, state) VALUES (?1, ?2, 0, 9, '[]', 0, ?3, 'current')",
+                     deleted, version_seq, state, native_authoring_identity) \
+                     VALUES (?1, ?2, 0, 9, '[]', 0, ?3, 'current', zeroblob(58))",
                     rusqlite::params![GROUP, path, seq],
                 )?;
                 let version = crate::provider::current_version(tx, GROUP, path)?
@@ -2182,8 +2117,9 @@ impl Fx {
             .write_immediate::<_, SyncSqliteError>(|tx| {
                 tx.execute(
                     "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json, \
-                     deleted, version_seq, state, unix_mode) \
-                     SELECT group_id, path, size, mtime_unix_nanos, blocks_json, 0, ?3, 'new', ?4 \
+                     deleted, version_seq, state, unix_mode, native_authoring_identity) \
+                     SELECT group_id, path, size, mtime_unix_nanos, blocks_json, 0, ?3, 'new', ?4, \
+                            native_authoring_identity \
                      FROM files WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
                     rusqlite::params![GROUP, path, seq, mode],
                 )?;
@@ -2972,7 +2908,12 @@ impl Fx {
         self.db
             .write_immediate::<_, SyncSqliteError>(|tx| {
                 tx.execute(
-                    "UPDATE files SET native_authoring_identity = x'00' \
+                    "INSERT OR IGNORE INTO native_authoring_witness (group_id, identity, version) \
+                     VALUES (?1, zeroblob(59), zeroblob(32))",
+                    [GROUP],
+                )?;
+                tx.execute(
+                    "UPDATE files SET native_authoring_identity = zeroblob(59) \
                      WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
                     [GROUP, path],
                 )?;

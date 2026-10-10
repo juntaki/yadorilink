@@ -111,26 +111,58 @@ fn load_corpus_seeds() -> Vec<u64> {
     let Ok(contents) = std::fs::read_to_string(corpus_path()) else {
         return Vec::new();
     };
+    parse_corpus(&contents)
+}
+
+/// Parses corpus text into seeds: comments, blank and malformed lines are
+/// ignored and repeated seeds are dropped keeping first-occurrence order, so a
+/// corpus with duplicates still replays each seed exactly once.
+fn parse_corpus(contents: &str) -> Vec<u64> {
+    let mut seen = std::collections::HashSet::new();
     contents
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .filter_map(|line| line.parse::<u64>().ok())
+        .filter(|seed| seen.insert(*seed))
         .collect()
 }
 
 /// Appends `seed` to the corpus file (creating it/its directory if
-/// needed), best-effort -- a failure to persist the seed must not itself
-/// panic out of a panic hook.
+/// needed) unless it is already present, best-effort -- a failure to persist
+/// the seed must not itself panic out of a panic hook. Only semantic failures
+/// are ever passed here (see `is_semantic_failure`).
 fn record_failing_seed(seed: u64) {
-    let path = corpus_path();
+    append_seed_if_absent(&corpus_path(), seed);
+}
+
+fn append_seed_if_absent(path: &std::path::Path, seed: u64) {
+    if let Ok(existing) = std::fs::read_to_string(path) {
+        if parse_corpus(&existing).contains(&seed) {
+            return;
+        }
+    }
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     use std::io::Write;
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(file, "{seed}");
     }
+}
+
+/// Panic-message prefix marking a failure of the property under test
+/// (convergence timeout or final divergence). Setup/resource failures
+/// (socket bind, DB open, ENOSPC, harness handshake timeouts) do not carry it
+/// and so are never persisted: for those the seed is not the repro condition.
+const SEMANTIC_FAILURE_PREFIX: &str = "[semantic] ";
+
+fn is_semantic_failure(payload: &(dyn std::any::Any + Send)) -> bool {
+    let msg = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied());
+    msg.is_some_and(|m| m.starts_with(SEMANTIC_FAILURE_PREFIX))
 }
 
 fn seed_from_env_or_random() -> u64 {
@@ -501,29 +533,13 @@ fn native_projection_report(devices: &[TestDevice], group_id: &str) -> String {
         summaries.push((frontier, heads));
     }
     for device in devices {
-        let (placements, kept): (Vec<String>, Vec<String>) = device
+        let contested = device
             .state
             .replica_coordinator
-            .database()
-            .write(|conn| {
-                let mut a = conn.prepare(
-                    "SELECT substr(physical_path, 1, 10) || '..' || substr(physical_path, -14) || ' src=' || source_path || ' ' || author || '#' || seq || ' ' || origin \
-                     FROM native_physical_placement WHERE group_id = ?1 ORDER BY physical_path",
-                )?;
-                let p = a.query_map([group_id], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
-                let mut b = conn.prepare(
-                    "SELECT path || ' ' || author || '#' || seq FROM native_head_keep WHERE group_id = ?1 ORDER BY 1",
-                )?;
-                let k = b.query_map([group_id], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
-                Ok::<_, yadorilink_sync_sqlite::SyncSqliteError>((p, k))
-            })
+            .file_index_repository()
+            .contested_path_count(group_id)
             .unwrap_or_default();
-        report.push_str(&format!(
-            "\nPLACEMENTS {} ({}): {placements:?}\nKEPT {}: {kept:?}",
-            device.device_id,
-            placements.len(),
-            device.device_id
-        ));
+        report.push_str(&format!("\nCONTESTED {}: {contested}", device.device_id));
     }
     for device in devices {
         let obligations: Vec<String> = device
@@ -907,7 +923,7 @@ async fn run_chaos(seed: u64) {
 
         if first_equal_elapsed.is_none() && now >= phase1_deadline {
             panic!(
-                "phase 1 (convergence) never reached agreement across all devices within \
+                "{SEMANTIC_FAILURE_PREFIX}phase 1 (convergence) never reached agreement across all devices within \
                  {phase1_timeout:?}:\n{}",
                 timeout_context(
                     &current,
@@ -923,7 +939,7 @@ async fn run_chaos(seed: u64) {
         }
         if now >= overall_deadline {
             panic!(
-                "phase 2 (stability) never held agreement for {PHASE2_STABILITY_TIMEOUT:?} \
+                "{SEMANTIC_FAILURE_PREFIX}phase 2 (stability) never held agreement for {PHASE2_STABILITY_TIMEOUT:?} \
                  straight within the overall {:?} budget:\n{}",
                 phase1_timeout + PHASE2_STABILITY_TIMEOUT,
                 timeout_context(
@@ -970,7 +986,7 @@ async fn run_chaos(seed: u64) {
             .collect();
         let index_dump = diff_diagnostics(&devices, &group_id, &final_snapshots);
         panic!(
-            "device-{i} diverged from device-0's final file set after {ROUNDS} random operations\n\
+            "{SEMANTIC_FAILURE_PREFIX}device-{i} diverged from device-0's final file set after {ROUNDS} random operations\n\
              only on device-0: {only_in_reference:?}\n\
              only on device-{i}: {only_in_other:?}\n\
              present on both but different content: {differing_content:?}\n\
@@ -991,7 +1007,9 @@ async fn run_chaos(seed: u64) {
 async fn run_chaos_recording_seed_on_failure(seed: u64) {
     let result = std::panic::AssertUnwindSafe(run_chaos(seed)).catch_unwind().await;
     if let Err(panic_payload) = result {
-        record_failing_seed(seed);
+        if is_semantic_failure(panic_payload.as_ref()) {
+            record_failing_seed(seed);
+        }
         std::panic::resume_unwind(panic_payload);
     }
 }
@@ -1028,4 +1046,32 @@ async fn replay_known_failing_seeds() {
         tracing::info!(seed, "replaying corpus seed");
         run_chaos_recording_seed_on_failure(seed).await;
     }
+}
+
+#[test]
+fn corpus_parse_dedupes_in_order_and_ignores_noise() {
+    assert_eq!(parse_corpus("# c\n3\n1\n\n3\nbad\n1\n2\n"), vec![3, 1, 2]);
+    assert_eq!(parse_corpus("1\n1\n2\n").len(), 2);
+}
+
+#[test]
+fn record_failing_seed_is_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sub/seeds.txt");
+    append_seed_if_absent(&path, 1);
+    append_seed_if_absent(&path, 1);
+    append_seed_if_absent(&path, 2);
+    append_seed_if_absent(&path, 1);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "1\n2\n");
+}
+
+#[test]
+fn only_semantic_failures_are_recordable() {
+    let semantic: Box<dyn std::any::Any + Send> =
+        Box::new(format!("{SEMANTIC_FAILURE_PREFIX}phase 1 never converged"));
+    let setup: Box<dyn std::any::Any + Send> = Box::new("bind failed: address in use".to_string());
+    let setup_str: Box<dyn std::any::Any + Send> = Box::new("No space left on device");
+    assert!(is_semantic_failure(semantic.as_ref()));
+    assert!(!is_semantic_failure(setup.as_ref()));
+    assert!(!is_semantic_failure(setup_str.as_ref()));
 }

@@ -64,15 +64,14 @@ pub fn record(
     current_basis(conn, group_id, path)
 }
 
-/// The basis of a path that holds exactly the heads with these `provenances` and has no
-/// placement recorded for it: what [`record`] reads for such a path. For a caller that holds the
-/// path's heads from the install that wrote them and knows no placement names the path.
+/// The basis of a path that holds exactly the heads with these `provenances`: what
+/// [`record`] reads for such a path. For a caller that holds the path's heads from the install
+/// that wrote them.
 pub(crate) fn of_unplaced_heads(provenances: &[[u8; 32]]) -> ReflectedHeads {
     ReflectedHeads::of(provenances, &[])
 }
 
-/// The basis the path has now. Read-only: recording a basis must not plan,
-/// because planning places entries.
+/// The basis the path has now. Read-only.
 fn current_basis(
     conn: &Connection,
     group_id: &str,
@@ -85,32 +84,7 @@ fn current_basis(
             .map(|head| head.payload.provenance.0)
             .collect())
     };
-    let mut own = provenances(path)?;
-    let mut identity = Vec::new();
-    // A physical name with no head of its own can stand for another path's
-    // head (a conflict copy or a relocated entry). The recorded placement says
-    // which exact head, and that head's source path is part of the basis: when
-    // any head of the source moves, what the name stands for may move with it.
-    if let Some(placement) =
-        crate::stable_projection_binding::native_placement_at(conn, group_id, path)?
-    {
-        own.extend(provenances(&placement.source_path)?);
-        let live = crate::native_store::native_heads_at(
-            conn,
-            &group,
-            &SyncPath(placement.source_path.clone()),
-        )?
-        .iter()
-        .any(|head| head.payload.provenance.0 == placement.provenance);
-        if live {
-            identity.extend_from_slice(&placement.provenance);
-            identity.extend_from_slice(&placement.seq.to_be_bytes());
-            identity.extend_from_slice(placement.author.as_bytes());
-            identity.push(0);
-            identity.extend_from_slice(placement.source_path.as_bytes());
-        }
-    }
-    Ok(ReflectedHeads::of(&own, &identity))
+    Ok(ReflectedHeads::of(&provenances(path)?, &[]))
 }
 
 /// Whether the path's basis is still exactly the reflected one.

@@ -137,8 +137,6 @@ fn pending_native_deltas_for_author_lists_installed_but_unpublished_deltas_only(
             put: Some(yadorilink_replica_domain::signed_delta::DeltaPut {
                 version: yadorilink_replica_domain::ids::VersionHash([1u8; 32]),
             }),
-            keeps: Vec::new(),
-            keep_put: false,
         }],
         signature: [0u8; 64],
     };

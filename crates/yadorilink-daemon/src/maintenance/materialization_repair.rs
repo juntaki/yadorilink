@@ -73,20 +73,6 @@ impl MaterializationRepairJob {
             }
         }
         let state = &self.state;
-        // The backstop for a structural `mkdir` whose writer died between
-        // its two phases while the daemon kept running; see
-        // `STALE_STRUCTURAL_INTENT_AGE` for the cutoff.
-        match state.replica_coordinator.drop_stale_structural_intents() {
-            Ok(dropped) if dropped.is_empty() => {}
-            Ok(dropped) => tracing::info!(
-                count = dropped.len(),
-                "materialization repair dropped stale structural-directory intents"
-            ),
-            Err(e) => tracing::warn!(
-                error = %e,
-                "materialization repair failed to drop stale structural-directory intents"
-            ),
-        }
         let groups: HashSet<String> = match state.replica_coordinator.link_repository().list_links()
         {
             // An orphaned link's coordination-side authorization is
@@ -103,20 +89,6 @@ impl MaterializationRepairJob {
             }
         };
         for group_id in groups {
-            // A planned entry with no row is owed a projection whether or not
-            // any peer is connected: a missed wake-up leaves no obligation to
-            // say so, and the engine only acts on obligations. Armed here so
-            // the ordinary engine pass projects it.
-            match state.replica_coordinator.arm_native_plan_gaps(&group_id) {
-                Ok(0) => {}
-                Ok(armed) => {
-                    tracing::info!(group_id, armed, "armed planned entries that had no row");
-                    state.replica_coordinator.notify_materialization_wake();
-                }
-                Err(error) => {
-                    tracing::warn!(group_id, %error, "could not arm planned entries with no row");
-                }
-            }
             let candidates = state.peers.sessions_for_group(&group_id);
             if candidates.is_empty() {
                 tracing::debug!(

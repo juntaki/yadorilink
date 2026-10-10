@@ -126,21 +126,6 @@ pub fn init_native_tables(conn: &Connection) -> Result<(), SyncSqliteError> {
             provenance    BLOB NOT NULL,
             PRIMARY KEY (group_id, path, author, incarnation, seq)
         );
-        -- Live heads a signed delta declared kept copies (`DeltaOp::keeps`,
-        -- `DeltaOp::keep_put`): a pure function of the deltas admitted, in any
-        -- order. A row exists only while its head is live with exactly this
-        -- provenance; whatever removes the head removes the row. A lone
-        -- surviving head whose version a kept head shares keeps its copy name;
-        -- content nobody declared takes the real name.
-        CREATE TABLE IF NOT EXISTS native_head_keep (
-            group_id    TEXT NOT NULL,
-            path        TEXT NOT NULL,
-            author      TEXT NOT NULL,
-            incarnation BLOB NOT NULL,
-            seq         INTEGER NOT NULL,
-            provenance  BLOB NOT NULL,
-            PRIMARY KEY (group_id, path, author, incarnation, seq)
-        );
 
         -- The deltas a `files` row's native identity was verified against when
         -- the row was written: the durable evidence that the identity named a
@@ -259,14 +244,13 @@ pub fn init_native_tables(conn: &Connection) -> Result<(), SyncSqliteError> {
         "#,
     )?;
     crate::native_closure::init_tables(conn)?;
+    crate::native_contest_candidates::init_tables(conn)?;
     crate::native_checkpoint_frontier::init_tables(conn)?;
     crate::native_history_floor::init_tables(conn)?;
     crate::native_rebootstrap::init_tables(conn)?;
     crate::native_rebootstrap_install::init_tables(conn)?;
     crate::native_rebootstrap_replay::init_tables(conn)?;
     crate::native_recovery_items::init_tables(conn)?;
-    // Recording a delta notes the bindings it removes the heads of.
-    crate::stable_projection_binding::init_stable_projection_binding_tables(conn)?;
     crate::native_summary_cache::init_tables(conn)?;
     crate::projection_obligations::init_projection_obligations_schema(conn)?;
     Ok(())
@@ -311,6 +295,22 @@ pub fn fetch_delta_body_by_hash(
     )
     .optional()
     .map_err(SyncSqliteError::from)
+}
+
+/// Every path that holds a live head of `version`, in path order.
+pub(crate) fn native_paths_with_version(
+    conn: &Connection,
+    group_id: &FolderGroupId,
+    version: &yadorilink_replica_domain::ids::VersionHash,
+) -> Result<Vec<String>, SyncSqliteError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT DISTINCT path FROM native_heads INDEXED BY idx_native_heads_version \
+         WHERE group_id = ?1 AND version = ?2 ORDER BY path",
+    )?;
+    let paths = stmt
+        .query_map(rusqlite::params![group_id.as_str(), &version.0[..]], |row| row.get(0))?
+        .collect::<Result<Vec<String>, _>>()?;
+    Ok(paths)
 }
 
 /// Reconstructs the group's `NativeState` from its persisted rows. Absent
@@ -410,28 +410,6 @@ fn live_head_from_row(
             provenance: DeltaHash(as_array32(&provenance)?),
         },
     })
-}
-
-/// The paths of `paths` that hold a native live head, in few statements.
-pub(crate) fn native_paths_with_heads(
-    conn: &Connection,
-    group_id: &FolderGroupId,
-    paths: &[&str],
-) -> Result<std::collections::BTreeSet<String>, SyncSqliteError> {
-    let mut held = std::collections::BTreeSet::new();
-    for chunk in paths.chunks(crate::store::PATHS_PER_QUERY) {
-        let marks = vec!["?"; chunk.len()].join(",");
-        let mut stmt = conn.prepare_cached(&format!(
-            "SELECT DISTINCT path FROM native_heads WHERE group_id = ?1 AND path IN ({marks})"
-        ))?;
-        let params = std::iter::once(group_id.as_str()).chain(chunk.iter().copied());
-        let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
-        while let Some(row) = rows.next()? {
-            count_head_rows_read(1);
-            held.insert(row.get::<_, String>(0)?);
-        }
-    }
-    Ok(held)
 }
 
 /// Whether anything strictly below `path` has a native live head --
@@ -810,11 +788,7 @@ fn seal_checkpoint_in(
         group_id.clone(),
         yadorilink_replica_domain::native_checkpoint::NamespaceRoot(namespace.0),
         yadorilink_replica_domain::native_checkpoint::AuthorStateRoot(author_state_root.0),
-    )
-    .with_projection_digest(crate::native_row_witness::carried_projection_digest(
-        tx,
-        group_id.as_str(),
-    )?);
+    );
     checkpoint.sign(sealer_key);
     Ok(checkpoint)
 }
@@ -1034,15 +1008,6 @@ fn install_touched_heads(
                     dot.author.incarnation.0.as_slice(),
                     dot.seq.get() as i64,
                 ))?;
-                // A keep names a live head: it goes with the head.
-                crate::stable_projection_binding::native_unkeep_head(
-                    conn,
-                    group_id.as_str(),
-                    path.as_str(),
-                    dot.author.device.as_str(),
-                    &dot.author.incarnation.0,
-                    dot.seq.get(),
-                )?;
                 count_head_rows_written(1);
             }
         }
@@ -1277,45 +1242,6 @@ pub(crate) fn record_installed_delta(
         &delta.to_wire_bytes(),
     )?;
     crate::native_recursive_operation::record_delta(conn, group_id.as_str(), delta)?;
-    apply_keeps(conn, group_id, delta)?;
-    Ok(())
-}
-
-/// Records the keeps `delta` declares, once its heads are installed: each
-/// named head that is live with exactly the named provenance is kept, and the
-/// head an op puts is kept when the op says so. A named head that is not live
-/// was retired by a delta this replica already admitted (admission holds a
-/// delta that names a head it has not observed), so there is nothing to keep,
-/// and a keep never revives or outlives its head.
-fn apply_keeps(
-    conn: &Connection,
-    group_id: &FolderGroupId,
-    delta: &NativeDelta,
-) -> Result<(), SyncSqliteError> {
-    for op in &delta.ops {
-        for keep in &op.keeps {
-            crate::stable_projection_binding::native_keep_head(
-                conn,
-                group_id.as_str(),
-                op.path.as_str(),
-                keep.dot.author.device.as_str(),
-                &keep.dot.author.incarnation.0,
-                keep.dot.seq.get(),
-                &keep.provenance.0,
-            )?;
-        }
-        if op.keep_put && op.put.is_some() {
-            crate::stable_projection_binding::native_keep_head(
-                conn,
-                group_id.as_str(),
-                op.path.as_str(),
-                delta.author.device.as_str(),
-                &delta.author.incarnation.0,
-                delta.seq.get(),
-                &delta.delta_hash().0,
-            )?;
-        }
-    }
     Ok(())
 }
 
@@ -1474,8 +1400,6 @@ pub fn install_state(
             count_head_rows_written(1);
         }
     }
-    // The keeps of a head this install dropped (or replaced) cannot stay.
-    crate::stable_projection_binding::native_prune_orphan_keeps(conn, group_id.as_str())?;
     Ok(())
 }
 
@@ -1956,8 +1880,6 @@ mod frontier_tests {
                 path: SyncPath(path.into()),
                 removes: vec![],
                 put: Some(DeltaPut { version: VersionHash([version; 32]) }),
-                keeps: Vec::new(),
-                keep_put: false,
             }],
             signature: [0u8; 64],
         };
@@ -2048,8 +1970,6 @@ mod frontier_tests {
                 path: SyncPath("x".into()),
                 removes: vec![HeadRef { dot: b_dot.clone(), provenance: wrong_header }],
                 put: Some(DeltaPut { version: VersionHash([2; 32]) }),
-                keeps: Vec::new(),
-                keep_put: false,
             }],
             signature: [0u8; 64],
         };
@@ -2296,8 +2216,6 @@ mod delta_body_tests {
                 path: SyncPath(path.into()),
                 removes: vec![],
                 put: Some(DeltaPut { version: VersionHash([version; 32]) }),
-                keeps: Vec::new(),
-                keep_put: false,
             }],
             signature: [0u8; 64],
         };
@@ -2341,8 +2259,6 @@ mod retirement_tests {
     fn conn() -> Connection {
         let c = Connection::open_in_memory().unwrap();
         init_native_tables(&c).unwrap();
-        // Sealing commits the projection facts too.
-        crate::stable_projection_binding::init_stable_projection_binding_tables(&c).unwrap();
         c
     }
 
@@ -2376,8 +2292,6 @@ mod retirement_tests {
                 path: SyncPath(path.into()),
                 removes: vec![],
                 put: Some(DeltaPut { version: VersionHash([version; 32]) }),
-                keeps: Vec::new(),
-                keep_put: false,
             }],
             signature: [0u8; 64],
         };

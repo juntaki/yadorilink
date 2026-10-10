@@ -59,8 +59,11 @@ def main() -> int:
         r"\bfs::remove_file\(": (1, "physical removal primitive"),
         r"\bfs::rename\(": (1, "atomic replace primitive"),
         r"fs::File::open\(path\)\?\.sync_all\(": (1, "Unix directory durability sync"),
-        r"\bCreateFileW\(": (1, "Windows directory handle open"),
-        r"\bFlushFileBuffers\(": (1, "Windows directory durability flush"),
+        # Windows documents no directory flush: namespace changes there are the
+        # write-through moves of `yadorilink_root_authority::durable_dir`, and
+        # this seam holds neither a directory handle nor a flush.
+        r"\bCreateFileW\(": (0, "Windows directory handle open (retired)"),
+        r"\bFlushFileBuffers\(": (0, "Windows directory durability flush (retired)"),
     }
     for pattern, (expected, label) in expected_counts.items():
         found = locations(pattern, seam)

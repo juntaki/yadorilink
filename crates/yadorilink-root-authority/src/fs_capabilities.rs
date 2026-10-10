@@ -81,10 +81,10 @@ pub struct FilesystemSafetyCapabilities {
     /// since plain `fsync` there does not flush the drive's write cache.
     pub durable_file_flush: Capability,
     /// A durable flush of a directory's own metadata (needed so a rename
-    /// or exchange within it survives a crash). Always `Unsupported` on
-    /// Windows by construction — see [`probe_durable_directory_flush`]'s
-    /// doc for why a successful Windows directory flush still doesn't
-    /// establish this.
+    /// or exchange within it survives a crash). On Windows this reports
+    /// whether `durable_dir::DurableNamespace` trusts the volume (a
+    /// write-through move, not a directory flush): `Unsupported` while the
+    /// Windows gate is closed.
     pub durable_directory_flush: Capability,
     /// Whether an EXTERNALLY supplied file's identity — a file the engine
     /// did not itself create, e.g. a source file already present in a sync
@@ -1050,28 +1050,19 @@ fn platform_durable_directory_flush(handle: &File) -> Capability {
 }
 
 #[cfg(windows)]
-fn probe_durable_directory_flush(_dir: &Path) -> Capability {
-    // But unlike the Unix `fsync(dirfd)` idiom this capability models — a
-    // documented, portable contract that a successful call makes a prior
-    // rename within that directory durable across a crash — Win32
-    // documents no such contract for `FlushFileBuffers` on a directory
-    // handle specifically. Community reports from other
-    // durability-sensitive engines (SQLite, LevelDB/RocksDB, LMDB)
-    // consistently note there is no reliable way to fsync a directory on
-    // Windows; those engines instead rely on NTFS's own always-on metadata
-    // journal (`$LogFile`) to make directory-entry changes crash-durable,
-    // a filesystem-internal guarantee that holds unconditionally rather
-    // than one this probe's methodology can ever observe through a
-    // syscall's return value the way `F_FULLFSYNC`'s success is trusted on
-    // macOS. A successful `FlushFileBuffers` call on a directory handle
-    // therefore proves nothing this module can stand behind, and there is
-    // no stronger alternative primitive to reach for the way macOS reaches
-    // past plain `fsync` to `F_FULLFSYNC`. That makes this the same shape
-    // as [`probe_range_clone`]'s Windows/macOS stub: a permanent, known
-    // absence of a *provable* guarantee, not an unattempted probe — so
-    // this reports `Unsupported` by construction rather than attempting
-    // the call and classifying its result.
-    Capability::Unsupported
+fn probe_durable_directory_flush(dir: &Path) -> Capability {
+    // Win32 documents no contract that flushing a directory handle makes
+    // directory entries durable, so this does not ask for one. What a
+    // namespace change on Windows relies on is the write-through move
+    // (`crate::durable_dir`); this reports whether `DurableNamespace::open`
+    // trusts the volume: `Unsupported` while the global gate is closed, and
+    // afterwards the per-volume probe's verdict.
+    use crate::durable_dir::{DurableNamespace, NsError, UnavailableReason};
+    match DurableNamespace::open(dir) {
+        Ok(_) => Capability::Supported,
+        Err(NsError::Unavailable(UnavailableReason::Unknown)) => Capability::Unknown,
+        Err(_) => Capability::Unsupported,
+    }
 }
 
 #[cfg(not(any(unix, windows)))]

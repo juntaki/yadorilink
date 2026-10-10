@@ -19,8 +19,6 @@ fn sample_delta_bytes() -> Vec<u8> {
             path: crate::ids::SyncPath("x".into()),
             removes: vec![],
             put: Some(DeltaPut { version: VersionHash([5u8; 32]) }),
-            keeps: Vec::new(),
-            keep_put: false,
         }],
         signature: [0u8; 64],
     };

@@ -24,7 +24,6 @@
 //!           str(group_id) str(author) u64(seq) prev[0|1 + 32] body_digest[32]
 //! body    = u32(|ops|) op*
 //! op      = str(path) u32(|removes|) headref* u8(put?) [version[32]]
-//!           u32(|keeps|) headref* u8(keep_put?)
 //! headref = str(author) u64(seq) provenance[32]
 //! wire    = NATIVE_DELTA_DOMAIN_TAG header signature[64] body
 //! ```
@@ -83,9 +82,6 @@ pub const NATIVE_DELTA_BODY_DOMAIN_TAG: &[u8; 8] = &native_domain_tag(b"YLNKndB"
 /// `limits.rs`'s own reasoning for its bounds).
 pub const MAX_REMOVES_PER_OP: usize = 64;
 
-/// The most heads one `DeltaOp` may declare as kept copies at its path.
-pub const MAX_KEEPS_PER_OP: usize = 64;
-
 /// A head named inside an op by its exact identity: the dot that created it and
 /// the header hash of the delta that did so (the head's provenance). The path is
 /// the naming op's path; [`HeadId`] is the same identity with the path spelled
@@ -113,18 +109,6 @@ pub struct DeltaOp {
     pub path: SyncPath,
     pub removes: Vec<HeadRef>,
     pub put: Option<DeltaPut>,
-    /// Heads at `path` the author's own view showed as conflict copies and
-    /// that this op leaves in place. Presentation history, signed with the op:
-    /// each names one exact head, so a replica that never saw the contest still
-    /// learns which heads keep their copy names when they become the only
-    /// survivor, and a later head with the same content is not covered.
-    /// Admission holds the delta until every named head's delta is observed.
-    pub keeps: Vec<HeadRef>,
-    /// The head this op itself puts is a kept copy too (a write made through a
-    /// copy). Valid only with a put; it names `(path, this delta's dot,
-    /// this delta's hash)`, which cannot be written as a [`HeadRef`] because
-    /// the hash is not known until the delta is signed.
-    pub keep_put: bool,
 }
 
 /// One signed native-causal-state mutation. `prev` is the author's own
@@ -177,13 +161,6 @@ impl NativeDelta {
                     buf.extend_from_slice(&put.version.0);
                 }
             }
-            put_u32(&mut buf, op.keeps.len() as u32);
-            for keep in &op.keeps {
-                keep.dot.author.encode_into(&mut buf);
-                put_u64(&mut buf, keep.dot.seq.get());
-                buf.extend_from_slice(&keep.provenance.0);
-            }
-            buf.push(u8::from(op.keep_put));
         }
         buf
     }
@@ -268,7 +245,7 @@ impl NativeDelta {
             .try_into()
             .map_err(|_| ChangeError::Encoding("signature must be 64 bytes".into()))?;
         let body_start = bytes.len() - r.remaining();
-        let ops = decode_ops(&mut r, &header.author, header.seq)?;
+        let ops = decode_ops(&mut r)?;
         r.expect_end()?;
 
         let mut hasher = Sha256::new();
@@ -371,11 +348,7 @@ fn decode_head_ref(r: &mut Reader<'_>, what: &str) -> Result<HeadRef, ChangeErro
     Ok(HeadRef { dot: Dot { author, seq }, provenance })
 }
 
-fn decode_ops(
-    r: &mut Reader<'_>,
-    own_author: &AuthorId,
-    own_seq: AuthorSeq,
-) -> Result<Vec<DeltaOp>, ChangeError> {
+fn decode_ops(r: &mut Reader<'_>) -> Result<Vec<DeltaOp>, ChangeError> {
     let op_count = r.bounded_count(4, MAX_OPS)?;
     if op_count == 0 {
         return Err(ChangeError::Malformed("delta carries no ops".into()));
@@ -408,40 +381,7 @@ fn decode_ops(
                 )))
             }
         };
-        let keeps_count = r.bounded_count(60, MAX_KEEPS_PER_OP)?;
-        let mut keeps = Vec::with_capacity(keeps_count);
-        for _ in 0..keeps_count {
-            let keep = decode_head_ref(r, "keep")?;
-            if keep.dot.author == *own_author && keep.dot.seq == own_seq {
-                return Err(ChangeError::Malformed(
-                    "a keep names the delta's own dot; the head an op puts is kept with the \
-                     own-put flag"
-                        .into(),
-                ));
-            }
-            if keeps.iter().any(|k: &HeadRef| k.dot == keep.dot) {
-                return Err(ChangeError::Malformed("an op keeps one head twice".into()));
-            }
-            if removes.iter().any(|removal| removal.dot == keep.dot) {
-                return Err(ChangeError::Malformed(
-                    "an op both keeps and removes the same head".into(),
-                ));
-            }
-            keeps.push(keep);
-        }
-        let keep_put = match r.u8()? {
-            0 => false,
-            1 => true,
-            other => {
-                return Err(ChangeError::Encoding(format!(
-                    "unknown own-put keep discriminant {other}"
-                )))
-            }
-        };
-        if keep_put && put.is_none() {
-            return Err(ChangeError::Malformed("an op keeps its own put but puts nothing".into()));
-        }
-        ops.push(DeltaOp { path, removes, put, keeps, keep_put });
+        ops.push(DeltaOp { path, removes, put });
     }
     Ok(ops)
 }
@@ -473,8 +413,6 @@ mod tests {
                     provenance: DeltaHash([1u8; 32]),
                 }],
                 put: Some(DeltaPut { version: VersionHash([5u8; 32]) }),
-                keeps: Vec::new(),
-                keep_put: false,
             }],
             signature: [0u8; 64],
         };
@@ -580,8 +518,8 @@ mod tests {
     fn delta_encoding_has_no_rank_field() {
         let mut delta = sample();
         delta.ops[0].removes.clear();
-        // ops count, path, removes count, put flag, version, keeps count, keep_put.
-        let expected = 4 + (4 + 1) + 4 + 1 + 32 + 4 + 1;
+        // ops count, path, removes count, put flag, version.
+        let expected = 4 + (4 + 1) + 4 + 1 + 32;
         assert_eq!(delta.body_encoding().len(), expected);
     }
 
@@ -596,11 +534,9 @@ mod tests {
     fn tampered_body_is_refused_before_signature_check() {
         let delta = sample();
         let mut bytes = delta.to_wire_bytes();
-        // Flip a byte inside `put.version` (the trailing bytes are the
-        // op's `keeps` count and own-put flag, which a tamper there would
-        // instead catch as a decode error, not a hash mismatch), so the count/shape prefixes all still parse and only the
-        // digest check catches the tamper.
-        let target = bytes.len() - 6;
+        // Flip the last byte of `put.version`, so the count/shape prefixes all
+        // still parse and only the digest check catches the tamper.
+        let target = bytes.len() - 1;
         bytes[target] ^= 0xff;
         let err = NativeDelta::from_wire_bytes(&bytes).unwrap_err();
         assert_eq!(err, ChangeError::HashMismatch);
@@ -625,104 +561,9 @@ mod tests {
         );
     }
 
-    fn head_ref(device: &str, seq: u64, header: u8) -> HeadRef {
-        HeadRef {
-            dot: Dot { author: author_id(device, 1), seq: AuthorSeq(seq) },
-            provenance: DeltaHash([header; 32]),
-        }
-    }
-
     fn resigned(mut delta: NativeDelta) -> NativeDelta {
         delta.sign(&signing_key());
         delta
-    }
-
-    #[test]
-    fn kept_heads_survive_a_wire_round_trip_and_are_signed() {
-        let mut delta = sample();
-        delta.ops[0].keeps = vec![head_ref("device-b", 3, 3), head_ref("device-c", 4, 4)];
-        let delta = resigned(delta);
-        let decoded = NativeDelta::from_wire_bytes(&delta.to_wire_bytes()).unwrap();
-        assert_eq!(decoded, delta);
-        let mut without = delta.clone();
-        without.ops[0].keeps.clear();
-        assert_ne!(
-            without.delta_hash(),
-            delta.delta_hash(),
-            "the declaration is covered by the delta's identity"
-        );
-        let mut other_header = delta.clone();
-        other_header.ops[0].keeps[0].provenance = DeltaHash([9u8; 32]);
-        assert_ne!(
-            resigned(other_header).delta_hash(),
-            delta.delta_hash(),
-            "a keep names the head's provenance, not only its dot"
-        );
-    }
-
-    #[test]
-    fn the_own_put_keep_flag_round_trips_and_is_signed() {
-        let mut delta = sample();
-        delta.ops[0].keep_put = true;
-        let delta = resigned(delta);
-        let decoded = NativeDelta::from_wire_bytes(&delta.to_wire_bytes()).unwrap();
-        assert!(decoded.ops[0].keep_put);
-        let mut without = delta.clone();
-        without.ops[0].keep_put = false;
-        assert_ne!(resigned(without).delta_hash(), delta.delta_hash());
-    }
-
-    #[test]
-    fn a_delta_declaring_more_kept_heads_than_the_bound_is_refused() {
-        let mut delta = sample();
-        delta.ops[0].keeps =
-            (0..=MAX_KEEPS_PER_OP as u64).map(|i| head_ref("device-b", 10 + i, 3)).collect();
-        let delta = resigned(delta);
-        assert!(NativeDelta::from_wire_bytes(&delta.to_wire_bytes()).is_err());
-    }
-
-    #[test]
-    fn a_keep_naming_one_head_twice_is_refused() {
-        let mut delta = sample();
-        delta.ops[0].keeps = vec![head_ref("device-b", 3, 3), head_ref("device-b", 3, 3)];
-        let delta = resigned(delta);
-        assert!(NativeDelta::from_wire_bytes(&delta.to_wire_bytes()).is_err());
-    }
-
-    #[test]
-    fn a_keep_naming_a_head_the_same_op_removes_is_refused() {
-        let mut delta = sample();
-        delta.ops[0].keeps = vec![head_ref("device-b", 1, 1)];
-        let delta = resigned(delta);
-        assert!(NativeDelta::from_wire_bytes(&delta.to_wire_bytes()).is_err());
-    }
-
-    #[test]
-    fn a_keep_naming_a_zero_seq_dot_is_refused() {
-        let mut delta = sample();
-        delta.ops[0].keeps = vec![head_ref("device-b", 0, 3)];
-        let delta = resigned(delta);
-        assert!(NativeDelta::from_wire_bytes(&delta.to_wire_bytes()).is_err());
-    }
-
-    #[test]
-    fn a_keep_naming_the_deltas_own_dot_is_refused() {
-        let mut delta = sample();
-        delta.ops[0].keeps = vec![HeadRef { dot: delta.dot(), provenance: DeltaHash([3u8; 32]) }];
-        let delta = resigned(delta);
-        assert!(
-            NativeDelta::from_wire_bytes(&delta.to_wire_bytes()).is_err(),
-            "the head an op puts is kept with `keep_put`, never by naming its own dot"
-        );
-    }
-
-    #[test]
-    fn the_own_put_keep_flag_without_a_put_is_refused() {
-        let mut delta = sample();
-        delta.ops[0].put = None;
-        delta.ops[0].keep_put = true;
-        let delta = resigned(delta);
-        assert!(NativeDelta::from_wire_bytes(&delta.to_wire_bytes()).is_err());
     }
 
     #[test]
@@ -760,10 +601,7 @@ mod tests {
     /// same ops now, and a delta whose header commits to it is refused.
     #[test]
     fn a_header_committing_to_a_digest_under_the_previous_body_tag_is_refused() {
-        let mut delta = sample();
-        delta.ops[0].keeps = vec![head_ref("device-b", 3, 3)];
-        delta.ops[0].keep_put = true;
-        let delta = resigned(delta);
+        let delta = resigned(sample());
         let mut previous = Sha256::new();
         previous.update(b"YLNKndB");
         previous.update([NATIVE_PROTOCOL_GENERATION - 1]);
@@ -779,28 +617,23 @@ mod tests {
         assert!(NativeDelta::from_wire_bytes(&stale).is_err());
     }
 
-    /// The canonical body of one fixed delta, byte for byte. A change to how keeps,
-    /// the own-put flag or any other field is encoded changes these bytes, which
+    /// The canonical body of one fixed delta, byte for byte. A change to how any field is encoded changes these bytes, which
     /// must come with a new generation tag.
     #[test]
     fn the_body_encoding_and_digest_are_pinned() {
-        let mut delta = sample();
-        delta.ops[0].keeps = vec![head_ref("device-b", 3, 3)];
-        delta.ops[0].keep_put = true;
+        let delta = sample();
         assert_eq!(
             hex::encode(delta.body_encoding()),
             concat!(
                 "00000001000000017800000001000000086465766963652d6201010101010101",
                 "0101010101010101010000000000000001010101010101010101010101010101",
                 "0101010101010101010101010101010101010505050505050505050505050505",
-                "0505050505050505050505050505050505050000000100000008646576696365",
-                "2d62010101010101010101010101010101010000000000000003030303030303",
-                "030303030303030303030303030303030303030303030303030301"
+                "050505050505050505050505050505050505"
             )
         );
         assert_eq!(
             hex::encode(delta.body_digest()),
-            "ec68aa0f0388cfb4d5c81c8defd8c705abe9e782fbcd8906dcf7be34268f4891"
+            "9a3e5b9be4a47869b19b0ac4e59c9b9db5d1c55ae00a3d619b5cd43e51b7ee43"
         );
     }
 

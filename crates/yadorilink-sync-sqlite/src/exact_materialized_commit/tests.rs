@@ -44,7 +44,7 @@ fn materialization_state(conn: &rusqlite::Connection, group_id: &str, path: &str
 fn intent_open(conn: &rusqlite::Connection, group_id: &str, path: &str) -> bool {
     let n: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM materialization_intents WHERE group_id = ?1 AND path = ?2",
+            "SELECT COUNT(*) FROM materialization_intents WHERE group_id = ?1 AND path = ?2 AND kind = 'write'",
             rusqlite::params![group_id, path],
             |r| r.get(0),
         )

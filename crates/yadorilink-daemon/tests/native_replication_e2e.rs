@@ -8,7 +8,7 @@ mod support;
 
 use native_e2e_support::*;
 use yadorilink_replica_domain::ids::FolderGroupId;
-use yadorilink_sync_sqlite::{native_projection_binding, native_replication, native_store};
+use yadorilink_sync_sqlite::{native_replication, native_store};
 
 const GROUP: &str = "native-e2e-group";
 
@@ -49,13 +49,6 @@ fn native_head_count(node: &TopologyNode, path: &str) -> usize {
     })
 }
 
-fn placement_of(
-    node: &TopologyNode,
-    path: &str,
-) -> Option<native_projection_binding::NativePhysicalIdentity> {
-    read(node, |conn| native_projection_binding::resolve_native_physical_path(conn, GROUP, path))
-}
-
 async fn native_converged(a: &TopologyNode, b: &TopologyNode, what: &str) {
     support::wait_until_with_context(
         || roots(a) == roots(b),
@@ -86,8 +79,11 @@ async fn a_remote_write_reaches_the_peers_native_state() {
     );
 }
 
+/// Two concurrent writes of one path: the author of the losing head moves it
+/// to its copy path, an ordinary entry on both devices, and the original path
+/// keeps one head.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_writes_leave_both_heads_and_a_placed_conflict_copy_on_both_devices() {
+async fn concurrent_writes_are_forked_into_an_ordinary_copy_on_both_devices() {
     setup();
     let (a, b) = two().await;
     write(&a, "c.txt", b"base");
@@ -105,48 +101,14 @@ async fn concurrent_writes_leave_both_heads_and_a_placed_conflict_copy_on_both_d
     let copy = conflict_copies(&tree).remove(0);
 
     native_converged(&a, &b, "native state converges").await;
-    // Placements are settled just after each delta is admitted.
-    support::wait_until_with_context(
-        || [&a, &b].iter().all(|node| placement_of(node, &copy).is_some()),
-        std::time::Duration::from_secs(30),
-        || format!("native places {copy} on both devices"),
-    )
-    .await;
-
     for node in [&a, &b] {
-        assert_eq!(
-            native_head_count(node, "c.txt"),
-            2,
-            "{}: both concurrent heads",
-            node.device_id
-        );
-        let placed = placement_of(node, &copy);
-        let placed = placed.unwrap_or_else(|| {
-            let dump = read(node, |conn| {
-                let placements = yadorilink_sync_sqlite::stable_projection_binding::native_placements(conn, GROUP)?;
-                let heads = native_store::native_heads_at(
-                    conn,
-                    &group(),
-                    &yadorilink_replica_domain::ids::SyncPath("c.txt".into()),
-                )?;
-                let rows: Option<(bool, i64)> = conn
-                    .query_row(
-                        "SELECT deleted, size FROM files WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
-                        [GROUP, copy.as_str()],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                    .ok();
-                Ok(format!("placements {placements:?}\nheads {heads:?}\nrow {rows:?}"))
-            });
-            panic!("{}: native resolves the conflict copy {copy}\n{dump}", node.device_id)
-        });
-        assert_eq!(placed.source_path.as_str(), "c.txt");
+        assert_eq!(native_head_count(node, "c.txt"), 1, "{}: the winner", node.device_id);
+        assert_eq!(native_head_count(node, &copy), 1, "{}: the forked copy", node.device_id);
     }
 }
 
 /// Deleting a conflict copy removes its content's heads and the copy on every
-/// device, whichever device wrote it: the delta names the source path, so the
-/// peers find the copy through the placement the source still has.
+/// device, whichever device wrote it: the copy is an ordinary entry.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn deleting_a_conflict_copy_removes_it_on_both_devices() {
     setup();
@@ -169,9 +131,10 @@ async fn deleting_a_conflict_copy_removes_it_on_both_devices() {
     converge_to(&[&a, &b], &[("c.txt", &kept)], "the copy is gone everywhere").await;
     native_converged(&a, &b, "native state converges").await;
     for node in [&a, &b] {
+        assert_eq!(native_head_count(node, "c.txt"), 1, "{}: the winner stays", node.device_id);
         assert_eq!(
-            native_head_count(node, "c.txt"),
-            1,
+            native_head_count(node, &copy),
+            0,
             "{}: the copy's head is gone",
             node.device_id
         );
@@ -251,4 +214,90 @@ async fn relinking_after_unlink_authors_local_differences_as_concurrent_changes(
         );
     }
     assert!(after.len() > versions_before.len(), "the new versions are recorded beside the old");
+}
+
+/// A device whose folder is edited and pruned while its daemon is stopped
+/// learns of those changes only at startup. Nothing may be lost: the deleted
+/// file must disappear on the peer too, the edited bytes must survive on both
+/// devices, and both must settle on one native state. An offline edit is an
+/// ordinary edit: the peer receives it at the same path and no
+/// conflicted copy appears on either device.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn edits_and_deletes_made_while_a_device_was_stopped_reach_its_peer_after_restart() {
+    use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
+
+    setup();
+    let (a, b) = two().await;
+    write(&a, "report.txt", b"version one");
+    write(&a, "gone.txt", b"to be deleted");
+    converge_to(
+        &[&a, &b],
+        &[("report.txt", b"version one"), ("gone.txt", b"to be deleted")],
+        "base",
+    )
+    .await;
+    native_converged(&a, &b, "the base is shared").await;
+    let roots_before = roots(&b);
+
+    // Stop A's watcher, then change the folder behind its back.
+    let a_path = a.root.path().to_string_lossy().to_string();
+    LinkRuntimeController::new(a.state.clone()).stop(&a_path).await;
+    let edited: &[u8] = b"version two, edited while the daemon was stopped";
+    write(&a, "report.txt", edited);
+    remove(&a, "gone.txt");
+
+    let a = restart(a, &[&b], GROUP).await;
+    let settled = converge_where(&[&a, &b], "the offline edit and delete reach the peer", |tree| {
+        !tree.contains_key("gone.txt") && tree.get("report.txt").map(Vec::as_slice) == Some(edited)
+    })
+    .await;
+    assert!(!settled.contains_key("gone.txt"), "the offline delete reaches the peer");
+    for node in [&a, &b] {
+        assert_eq!(
+            tree(node).get("report.txt").map(Vec::as_slice),
+            Some(edited),
+            "{}: the peer receives the plain edit",
+            node.device_id
+        );
+        assert!(
+            conflict_copies(&tree(node)).is_empty(),
+            "{}: an offline edit must not leave a conflicted copy: {:?}",
+            node.device_id,
+            conflict_copies(&tree(node))
+        );
+    }
+    native_converged(&a, &b, "native state follows").await;
+    assert_ne!(roots(&b), roots_before, "the peer's native state advanced past the base");
+}
+
+/// An offline edit that races a peer's edit of the same file is not special:
+/// both sides keep their bytes through the ordinary conflict path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_offline_edit_racing_a_peer_edit_keeps_both_versions_as_a_normal_conflict() {
+    use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
+
+    setup();
+    let (a, b) = two().await;
+    write(&a, "doc.txt", b"base");
+    converge_to(&[&a, &b], &[("doc.txt", b"base")], "base").await;
+    native_converged(&a, &b, "the base is shared").await;
+
+    let a_path = a.root.path().to_string_lossy().to_string();
+    LinkRuntimeController::new(a.state.clone()).stop(&a_path).await;
+    partition(&a, &b).await;
+    let offline: &[u8] = b"edited on A while its daemon was stopped";
+    let peer: &[u8] = b"edited on B meanwhile";
+    write(&a, "doc.txt", offline);
+    write(&b, "doc.txt", peer);
+    captured(&b, GROUP).await;
+
+    let a = restart(a, &[&b], GROUP).await;
+    let tree = converge_where(&[&a, &b], "both versions survive on both devices", |tree| {
+        conflict_copies(tree).len() == 1
+            && tree.values().any(|c| c.as_slice() == offline)
+            && tree.values().any(|c| c.as_slice() == peer)
+    })
+    .await;
+    assert_eq!(conflict_copies(&tree).len(), 1, "exactly one conflicted copy: {tree:?}");
+    native_converged(&a, &b, "native state follows").await;
 }

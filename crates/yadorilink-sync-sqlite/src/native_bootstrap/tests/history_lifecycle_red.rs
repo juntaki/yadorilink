@@ -49,13 +49,11 @@ pub(super) fn put_op(path: &str, v: u8, removes: Vec<HeadRef>) -> DeltaOp {
         path: SyncPath(path.into()),
         removes,
         put: Some(DeltaPut { version: version(v).version_hash }),
-        keeps: Vec::new(),
-        keep_put: false,
     }
 }
 
 pub(super) fn remove_op(path: &str, removes: Vec<HeadRef>) -> DeltaOp {
-    DeltaOp { path: SyncPath(path.into()), removes, put: None, keeps: Vec::new(), keep_put: false }
+    DeltaOp { path: SyncPath(path.into()), removes, put: None }
 }
 
 /// A delta signed by the test key of `who`'s device.

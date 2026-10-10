@@ -15,6 +15,14 @@
 #  2. `pkgutil --check-signature` — reports signed/unsigned status.
 #  3. `spctl -a -vvv -t install` — Gatekeeper's install-time verdict.
 #  4. `xcrun stapler validate` — whether a notarization ticket is stapled.
+#  5. Payload contents (YadoriLink.app present, no eframe status app).
+#  6. --release only: signatures of what ships. For the app, both
+#     extensions and every nested Mach-O (incl. usr/local/bin/*):
+#     `codesign --verify --strict --deep`, Authority = Developer ID
+#     Application, hardened runtime, secure timestamp, one common Team ID,
+#     no get-task-allow; app and extension entitlements must match the
+#     entitlement files in this repo; the pkg must be Developer ID Installer
+#     signed; Gatekeeper must accept the app.
 #
 # By default this only *reports* signature/notarization status without
 # failing on unsigned (matching this project's documented allowance for
@@ -142,6 +150,87 @@ else
     cat /tmp/verify-pkg-expand.$$ >&2
 fi
 rm -f /tmp/verify-pkg-expand.$$
+
+# --- 6. Payload signatures (release only) ---------------------------------
+# Expected entitlements live in the repo; the extensions must carry exactly
+# those security entitlements (Developer ID signing may add identifier keys).
+APP_DIR="$(dirname "$0")/../app"
+expected_ent_for() {
+    case "$1" in
+        *YadoriLinkFinderSync.appex) echo "$APP_DIR/YadoriLinkFinderSync/Extension/Extension.entitlements" ;;
+        *YadoriLinkFileProvider.appex) echo "$APP_DIR/YadoriLinkFileProvider/Extension/Extension.entitlements" ;;
+    esac
+}
+# plist keys at top level, one per line
+plist_keys() { plutil -p "$1" | sed -n 's/^  "\(.*\)" => .*/\1/p'; }
+plist_value() { # file key -> normalized value
+    plutil -extract "$(echo "$2" | sed 's/\./\\./g')" xml1 -o - "$1" 2>/dev/null
+}
+
+TEAM_IDS=""
+check_item() { # path
+    local item="$1" rel="${1#$EXPAND_DIR/expanded/}" info ent expected k
+    if ! codesign --verify --strict --deep "$item" >/dev/null 2>&1; then
+        fail "$rel: codesign --verify --strict --deep failed"
+        return
+    fi
+    info="$(codesign -dvvv "$item" 2>&1)"
+    echo "$info" | grep -q '^Authority=Developer ID Application' || fail "$rel: Authority is not Developer ID Application"
+    echo "$info" | grep -Eq 'flags=0x[0-9a-f]+\(.*runtime' || fail "$rel: hardened runtime flag missing"
+    echo "$info" | grep -q '^Timestamp=' || fail "$rel: no secure timestamp"
+    TEAM_IDS="$TEAM_IDS$(echo "$info" | sed -n 's/^TeamIdentifier=//p')
+"
+    ent="$(mktemp "${TMPDIR:-/tmp}/verify-pkg-ent.XXXXXX")"
+    codesign -d --entitlements :- "$item" >"$ent" 2>/dev/null
+    if [ -s "$ent" ] && plist_keys "$ent" | grep -qx 'com.apple.security.get-task-allow'; then
+        fail "$rel: has get-task-allow (debug build)"
+    fi
+    expected="$(expected_ent_for "$item")"
+    if [ -n "$expected" ]; then
+        if [ -z "$(plist_keys "$expected" 2>/dev/null)" ]; then
+            fail "$rel: expected entitlements file missing or unreadable: $expected"
+        elif [ ! -s "$ent" ]; then
+            fail "$rel: no entitlements embedded"
+        else
+            for k in $(plist_keys "$expected"); do
+                [ "$(plist_value "$expected" "$k")" = "$(plist_value "$ent" "$k")" ] || fail "$rel: entitlement $k differs from $expected"
+            done
+            for k in $(plist_keys "$ent" | grep '^com\.apple\.security\.'); do
+                plist_keys "$expected" | grep -qx "$k" || fail "$rel: unexpected entitlement $k"
+            done
+        fi
+    fi
+    rm -f "$ent"
+    echo "checked $rel"
+}
+
+if [ "$RELEASE_MODE" -eq 1 ]; then
+    log "payload signatures and entitlements (--release)"
+    ROOT="$EXPAND_DIR/expanded"
+    APP="$(find "$ROOT" -type d -path "*/Applications/YadoriLink.app" | head -1)"
+    if [ -z "$APP" ]; then
+        fail "cannot check payload signatures: YadoriLink.app not found"
+    else
+        for appex in YadoriLinkFinderSync YadoriLinkFileProvider; do
+            [ -d "$APP/Contents/PlugIns/$appex.appex" ] || fail "missing PlugIns/$appex.appex"
+        done
+        check_item "$APP"
+        for appex in "$APP"/Contents/PlugIns/*.appex; do [ -d "$appex" ] && check_item "$appex"; done
+        # Every other Mach-O: nested frameworks/dylibs/helpers and the CLI.
+        while IFS= read -r f; do
+            file "$f" | grep -q 'Mach-O' && check_item "$f"
+        done < <(find "$APP" "$ROOT" -path "*/usr/local/bin/*" -type f -print -o -path "$APP/*" -type f -print | sort -u)
+        if [ "$(echo "$TEAM_IDS" | sed '/^$/d' | sort -u | wc -l | tr -d ' ')" -gt 1 ]; then
+            fail "payload items have different Team IDs: $(echo "$TEAM_IDS" | sort -u | tr '\n' ' ')"
+        fi
+        if spctl -a -t exec -vv "$APP" 2>&1 | grep -q accepted; then
+            ok "spctl accepted YadoriLink.app"
+        else
+            fail "spctl did not accept YadoriLink.app"
+        fi
+    fi
+    echo "$PKGUTIL_OUT" | grep -q "Developer ID Installer" || fail "pkg is not signed by a Developer ID Installer certificate"
+fi
 
 echo
 if [ "$FAILURES" -gt 0 ]; then

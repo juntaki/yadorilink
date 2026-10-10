@@ -143,3 +143,94 @@ async fn a_local_edit_after_the_pre_write_commit_is_kept_and_publishes_nothing()
     assert_eq!(std::fs::read(h.path("edited.bin")).unwrap(), b"saved locally meanwhile");
     assert_published_nothing(&h, "edited.bin", "local edit");
 }
+
+fn on_disk(h: &Harness, name: &str) -> Option<Vec<u8>> {
+    std::fs::read(h.path(name)).ok()
+}
+
+/// A peer's change that arrives while the link's startup (initial scan and
+/// dirty-journal redrive) has not captured local state is deferred, not
+/// written: an offline local delete or edit is otherwise indistinguishable
+/// from an absent path. It applies once startup settles successfully.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_change_before_startup_has_captured_is_deferred_then_applied() {
+    let h = Harness::new(false);
+    let generation = h.state.startup_readiness().begin_group_startup(GROUP);
+    admit_received(&h, "early.bin", b"arrived before the scan finished").await;
+
+    project(&h, "early.bin").await;
+    assert!(on_disk(&h, "early.bin").is_none(), "deferred while startup is running");
+
+    h.state.startup_readiness().mark_group_ready(GROUP, generation);
+    project(&h, "early.bin").await;
+    assert_eq!(
+        std::fs::read(h.path("early.bin")).unwrap(),
+        b"arrived before the scan finished",
+        "applied after capture"
+    );
+}
+
+/// A failed startup defers peer apply without parking it, and the next
+/// startup attempt that succeeds releases it. Nothing waits on the gate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_startup_defers_without_blocking_and_a_later_success_releases() {
+    let h = Harness::new(false);
+    let failed = h.state.startup_readiness().begin_group_startup(GROUP);
+    h.state.startup_readiness().mark_group_failed(GROUP, failed, "scan failed");
+    admit_received(&h, "late.bin", b"deferred by a failed startup").await;
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), project(&h, "late.bin"))
+        .await
+        .expect("a failed gate must defer, not park");
+    assert!(on_disk(&h, "late.bin").is_none());
+
+    let retry = h.state.startup_readiness().begin_group_startup(GROUP);
+    h.state.startup_readiness().mark_group_ready(GROUP, retry);
+    project(&h, "late.bin").await;
+    assert!(on_disk(&h, "late.bin").is_some(), "released by the successful retry");
+}
+
+/// One group's startup never holds another, idle or ready, group back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn another_groups_running_startup_does_not_hold_a_ready_group() {
+    let h = Harness::new(false);
+    let _other = h.state.startup_readiness().begin_group_startup("some-other-group");
+    admit_received(&h, "ready.bin", b"unaffected").await;
+
+    project(&h, "ready.bin").await;
+    assert!(on_disk(&h, "ready.bin").is_some());
+}
+
+/// A user save landing after the daemon's write and before the proof
+/// observes the object must not be read as the daemon's own write: nothing
+/// is proven, the path is dirty, the user's bytes survive, and capture
+/// authors them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_user_edit_between_the_write_and_its_proof_is_captured_not_absorbed() {
+    let h = Harness::new(false);
+    admit_received(&h, "absorbed.bin", b"the peer's bytes").await;
+    *h.convergence.after_write_before_proof_hook.lock().unwrap() =
+        Some(Box::new(|out_path| std::fs::write(out_path, b"user edit right after").unwrap()));
+
+    project(&h, "absorbed.bin").await;
+
+    assert_eq!(std::fs::read(h.path("absorbed.bin")).unwrap(), b"user edit right after");
+    assert_eq!(proven_version(&h, "absorbed.bin"), None, "no proof for bytes that were replaced");
+    assert!(h.state.is_path_dirty(GROUP, "absorbed.bin").unwrap(), "the edit is journaled");
+
+    assert!(matches!(h.capture("absorbed.bin").await, LocalChangeOutcome::FileChanged(_)));
+    assert_eq!(std::fs::read(h.path("absorbed.bin")).unwrap(), b"user edit right after");
+}
+
+/// The untouched path still gets its proof, with no dirty churn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_untouched_write_is_still_proven_and_not_dirty() {
+    let h = Harness::new(false);
+    let version = admit_received(&h, "clean.bin", b"nobody touches this").await;
+
+    project(&h, "clean.bin").await;
+
+    assert_eq!(proven_version(&h, "clean.bin"), Some(version.version_hash));
+    assert!(!h.state.is_path_dirty(GROUP, "clean.bin").unwrap());
+    assert!(!h.state.has_materialization_intent(GROUP, "clean.bin").unwrap());
+}

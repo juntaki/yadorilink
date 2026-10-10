@@ -17,9 +17,6 @@ use yadorilink_replica_domain::native_checkpoint_seal::NativeCheckpointSealEvide
 use yadorilink_replica_domain::native_frontier::{AuthorState, NativeAuthorFrontierEntry};
 use yadorilink_replica_domain::native_protocol::native_domain_tag;
 use yadorilink_replica_domain::native_state::{DeltaHash, Dot};
-use yadorilink_replica_engine::native_snapshot::{
-    NativeBindingEntry, NativeKeptHead, NativeSnapshotState,
-};
 
 use crate::native_bootstrap::{
     BootstrapAuthorState, BootstrapDelta, BootstrapHead, NativeBootstrap,
@@ -48,8 +45,6 @@ const DELTA_MIN: usize = LEN_PREFIX + HASH_LEN + LEN_PREFIX + LEN_PREFIX + HASH_
 const AUTHOR_STATE_MIN: usize = AUTHOR_MIN + 1;
 const FILE_VERSION_MIN: usize = LEN_PREFIX;
 const CLOSURE_MIN: usize = LEN_PREFIX;
-const KEPT_HEAD_MIN: usize = LEN_PREFIX + LEN_PREFIX + INCARNATION_LEN + SEQ_LEN + HASH_LEN;
-const BINDING_MIN: usize = LEN_PREFIX + LEN_PREFIX + INCARNATION_LEN + SEQ_LEN + LEN_PREFIX;
 
 /// The flag of an author's state: open at an entry, closed at a cutoff entry, or
 /// closed before its first delta (no entry follows).
@@ -79,12 +74,8 @@ fn read_seq(r: &mut Reader<'_>) -> Result<AuthorSeq, ChangeError> {
     Ok(seq)
 }
 
-/// The bundle's canonical bytes. A bundle that carries index rows is not a
-/// wire bundle: the rows are the sender's own projection.
+/// The bundle's canonical bytes.
 pub fn encode_recovery_bundle(bundle: &NativeBootstrap) -> Result<Vec<u8>, ChangeError> {
-    if !bundle.native.row_witnesses.is_empty() {
-        return Err(ChangeError::Malformed("a recovery bundle carries no index rows".into()));
-    }
     let seal = bundle
         .seal
         .as_ref()
@@ -135,22 +126,6 @@ pub fn encode_recovery_bundle(bundle: &NativeBootstrap) -> Result<Vec<u8>, Chang
     put_u32(&mut out, bundle.file_versions.len() as u32);
     for version in &bundle.file_versions {
         put_len_bytes(&mut out, version);
-    }
-    put_u32(&mut out, bundle.native.kept_heads.len() as u32);
-    for kept in &bundle.native.kept_heads {
-        put_str(&mut out, &kept.source_path);
-        put_str(&mut out, &kept.author);
-        out.extend_from_slice(&kept.incarnation);
-        put_u64(&mut out, kept.seq);
-        out.extend_from_slice(&kept.provenance);
-    }
-    put_u32(&mut out, bundle.native.bindings.len() as u32);
-    for binding in &bundle.native.bindings {
-        put_str(&mut out, &binding.source_path);
-        put_str(&mut out, &binding.author);
-        out.extend_from_slice(&binding.incarnation);
-        put_u64(&mut out, binding.seq);
-        put_str(&mut out, &binding.stable_path);
     }
     Ok(out)
 }
@@ -240,28 +215,6 @@ pub fn decode_recovery_bundle(bytes: &[u8]) -> Result<NativeBootstrap, ChangeErr
     for _ in 0..count {
         file_versions.push(r.len_bytes()?);
     }
-    let count = r.bounded_count(KEPT_HEAD_MIN, MAX_ENTRIES)?;
-    let mut kept_heads = Vec::with_capacity(count);
-    for _ in 0..count {
-        kept_heads.push(NativeKeptHead {
-            source_path: r.string()?,
-            author: r.string()?,
-            incarnation: r.array16()?,
-            seq: r.u64()?,
-            provenance: r.array32()?,
-        });
-    }
-    let count = r.bounded_count(BINDING_MIN, MAX_ENTRIES)?;
-    let mut bindings = Vec::with_capacity(count);
-    for _ in 0..count {
-        bindings.push(NativeBindingEntry {
-            source_path: r.string()?,
-            author: r.string()?,
-            incarnation: r.array16()?,
-            seq: r.u64()?,
-            stable_path: r.string()?,
-        });
-    }
     r.expect_end()?;
     Ok(NativeBootstrap {
         checkpoint,
@@ -271,7 +224,6 @@ pub fn decode_recovery_bundle(bytes: &[u8]) -> Result<NativeBootstrap, ChangeErr
         authors,
         closures,
         file_versions,
-        native: NativeSnapshotState { row_witnesses: Vec::new(), kept_heads, bindings },
     })
 }
 
@@ -338,23 +290,6 @@ mod tests {
             ],
             closures: vec![closure_of_e()],
             file_versions: vec![vec![11; 9]],
-            native: NativeSnapshotState {
-                row_witnesses: Vec::new(),
-                kept_heads: vec![NativeKeptHead {
-                    source_path: "a/b".into(),
-                    author: "device-a".into(),
-                    incarnation: [3; 16],
-                    seq: 2,
-                    provenance: [12; 32],
-                }],
-                bindings: vec![NativeBindingEntry {
-                    source_path: "a/b".into(),
-                    author: "device-a".into(),
-                    incarnation: [3; 16],
-                    seq: 2,
-                    stable_path: "a/b (copy)".into(),
-                }],
-            },
         }
     }
 
@@ -408,8 +343,6 @@ mod tests {
         b.authors.clear();
         b.closures.clear();
         b.file_versions.clear();
-        b.native.kept_heads.clear();
-        b.native.bindings.clear();
         b
     }
 
@@ -446,26 +379,6 @@ mod tests {
         }
     }
 
-    fn smallest_kept() -> NativeKeptHead {
-        NativeKeptHead {
-            source_path: String::new(),
-            author: String::new(),
-            incarnation: [0; 16],
-            seq: 1,
-            provenance: [0; 32],
-        }
-    }
-
-    fn smallest_binding() -> NativeBindingEntry {
-        NativeBindingEntry {
-            source_path: String::new(),
-            author: String::new(),
-            incarnation: [0; 16],
-            seq: 1,
-            stable_path: String::new(),
-        }
-    }
-
     fn encoded_len(b: &NativeBootstrap) -> usize {
         encode_recovery_bundle(b).unwrap().len()
     }
@@ -482,15 +395,13 @@ mod tests {
         assert_eq!(grew(&|b| b.deltas.push(smallest_delta())), DELTA_MIN);
         assert_eq!(grew(&|b| b.authors.push(smallest_author_state())), AUTHOR_STATE_MIN);
         assert_eq!(grew(&|b| b.file_versions.push(Vec::new())), FILE_VERSION_MIN);
-        assert_eq!(grew(&|b| b.native.kept_heads.push(smallest_kept())), KEPT_HEAD_MIN);
-        assert_eq!(grew(&|b| b.native.bindings.push(smallest_binding())), BINDING_MIN);
     }
 
     #[test]
     fn a_bundle_of_only_the_smallest_entries_of_one_collection_round_trips() {
         // Each collection alone, so nothing larger follows it to make room for
         // an over-estimated minimum entry size.
-        let fills: [fn(&mut NativeBootstrap); 6] = [
+        let fills: [fn(&mut NativeBootstrap); 4] = [
             |b| b.heads.push(smallest_head()),
             |b| b.deltas.push(smallest_delta()),
             |b| {
@@ -500,8 +411,6 @@ mod tests {
                 b.authors.push(state);
             },
             |b| b.file_versions.push(Vec::new()),
-            |b| b.native.kept_heads.push(smallest_kept()),
-            |b| b.native.bindings.push(smallest_binding()),
         ];
         for (which, fill) in fills.iter().enumerate() {
             let mut b = empty_bundle();
@@ -640,7 +549,7 @@ mod tests {
         let bytes = encode_recovery_bundle(&b).unwrap();
         let without = encode_recovery_bundle(&empty_bundle()).unwrap();
         // The empty bundle holds a zero author count where this one holds the section.
-        let at = without.len() - 4 * 4 - 4;
+        let at = without.len() - 4 * 2 - 4;
         assert_eq!(&without[at..at + 4], &0u32.to_be_bytes());
         assert_eq!(&bytes[at..at + expected.len()], expected.as_slice());
         assert_eq!(decode_recovery_bundle(&bytes).unwrap(), b);
@@ -651,9 +560,9 @@ mod tests {
         let mut b = empty_bundle();
         b.authors = vec![smallest_author_state()];
         let mut bytes = encode_recovery_bundle(&b).unwrap();
-        // The flag is the last byte of the section, before the four empty counts
+        // The flag is the last byte of the section, before the two empty counts
         // that close the bundle.
-        let at = bytes.len() - 4 * 4 - 1;
+        let at = bytes.len() - 4 * 2 - 1;
         assert_eq!(bytes[at], STATE_CLOSED_EMPTY);
         bytes[at] = 9;
         assert!(decode_recovery_bundle(&bytes).is_err());

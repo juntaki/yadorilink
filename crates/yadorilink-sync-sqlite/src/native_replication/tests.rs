@@ -45,8 +45,6 @@ fn author_delta(c: &Connection, name: &str, path: &str, version_byte: u8) -> Nat
             path: SyncPath(path.into()),
             removes: Vec::new(),
             put: Some(DeltaPut { version: VersionHash([version_byte; 32]) }),
-            keeps: Vec::new(),
-            keep_put: false,
         }],
         signature: [0; 64],
     };
@@ -352,8 +350,6 @@ fn author_delta_naming(c: &Connection, name: &str, path: &str, version: VersionH
             path: SyncPath(path.into()),
             removes: Vec::new(),
             put: Some(DeltaPut { version }),
-            keeps: Vec::new(),
-            keep_put: false,
         }],
         signature: [0; 64],
     };

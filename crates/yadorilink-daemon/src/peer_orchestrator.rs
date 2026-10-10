@@ -484,6 +484,9 @@ fn record_group_policy_states(
     // nor marked stale. The failed groups are revoked from live sessions only
     // after that switch is visible.
     state.apply_policy_snapshot(states, stale_groups);
+    // What a fork pass may do depends on the verified policy (the fallback
+    // for an author that can no longer act): it looks at the contests again.
+    state.reconsider_contests_after_policy_change();
     // Under checkpoint-based admission, orphan promotion is
     // purely ancestry-based (no writer-freshness re-check -- authorization
     // was already fully verified, atomically with the Change itself, at
@@ -1134,7 +1137,12 @@ fn save_key_pins(path: PathBuf, pins: &HashMap<String, String>) -> Result<(), Da
         serde_json::to_writer_pretty(&mut file, pins)?;
         file.sync_all()?;
     }
-    std::fs::rename(&tmp_path, &path)?;
+    // Published by a durable move: a pinned key does not revert after a power loss.
+    yadorilink_root_authority::durable_dir::publish_durably(
+        &tmp_path,
+        &path,
+        yadorilink_root_authority::durable_dir::Replace::Yes,
+    )?;
     Ok(())
 }
 

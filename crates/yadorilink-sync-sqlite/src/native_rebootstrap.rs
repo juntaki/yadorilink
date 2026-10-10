@@ -1775,7 +1775,7 @@ pub fn begin_rebootstrap(
     let group = request.group;
     // Before anything is read, written or journaled: the barrier below cannot be
     // honoured on a platform that cannot flush a directory entry.
-    if !crate::native_rebootstrap_recovery::directory_durability_available() {
+    if !crate::native_rebootstrap_recovery::directory_durability_available(ctx.recovery_root) {
         return Err(BeginError::Blocked(BlockedReason::DurabilityUnsupported));
     }
     let (verified, stored) = verify_and_prepare_target(request.bundle, group, request.policy)
@@ -2024,9 +2024,8 @@ fn preserve(
             detail: "the manifest read back is not the one written".into(),
         }));
     }
-    // The files are durable; so must be every name that leads to them before the
-    // journal says so.
-    area.sync_chain().map_err(|e| block(area_failure(e)))?;
+    // Every file and directory of the area was published by a durable move, the
+    // manifest last, so the names that lead to them are on disk already.
     hook(Failpoint::AfterManifest).map_err(|_| BeginError::Crashed)?;
     set_preserved(conn, group, &manifest_sha256, ctx.now_unix)?;
     hook(Failpoint::AtPreserved).map_err(|_| BeginError::Crashed)?;

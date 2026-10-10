@@ -474,104 +474,6 @@ fn repair(
     .unwrap()
 }
 
-/// A source path whose conflict copy fails in the same attempt that writes
-/// the source. The copy is a name of the source's own obligation -- it has
-/// none of its own -- so the source's obligation must stay open until the
-/// copy is written too: closing it with the source would leave the copy
-/// missing with nothing left to retry it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_source_stays_owed_until_its_failed_conflict_copy_is_written() {
-    a_source_stays_owed_until_its_failed_conflict_copy_is_written_at(40, 41).await;
-}
-
-/// The same scenario at modification times that give the pair different version hashes. The
-/// higher hash holds the name, so these put the winner on each side of the pair (and on each
-/// side in the platform that used to fail): a retry of the failed copy must prove the copy
-/// whichever version it is a copy of, and must not be disturbed by the link's watcher
-/// meeting the unfinished copy write on disk.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_source_stays_owed_until_its_failed_conflict_copy_is_written_1000_1100() {
-    a_source_stays_owed_until_its_failed_conflict_copy_is_written_at(1000, 1100).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_source_stays_owed_until_its_failed_conflict_copy_is_written_4000_4100() {
-    a_source_stays_owed_until_its_failed_conflict_copy_is_written_at(4000, 4100).await;
-}
-
-async fn a_source_stays_owed_until_its_failed_conflict_copy_is_written_at(
-    ours_mtime: i64,
-    theirs_mtime: i64,
-) {
-    let (f, engine) = ready_fixture().await;
-    let name = "doc.txt";
-    let ours = content_of(ONE_BLOCK, 21);
-    let theirs = content_of(ONE_BLOCK, 23);
-    let ours_version = f.content_version(&ours, ours_mtime);
-    let theirs_version = f.content_version(&theirs, theirs_mtime);
-    // Two concurrent puts of the same path: one stands at the name, the
-    // other at a conflict copy beside it.
-    f.admit(name, &ours_version);
-    crate::test_support::remote_admission_fixture::admit_remote(
-        &f.state.replica_coordinator,
-        GROUP,
-        "device-other",
-        vec![crate::test_support::remote_admission_fixture::put(
-            name,
-            theirs_version.version_hash,
-            Vec::new(),
-        )],
-        std::slice::from_ref(&theirs_version),
-    );
-
-    // The first write of the attempt is the copy (copies go before own-name
-    // entries); a fence moved under it makes it fail and be retried.
-    let failed = Arc::new(std::sync::Mutex::new(None::<String>));
-    let (failed2, state) = (failed.clone(), f.state.clone());
-    let root = f.root.clone();
-    *f.state
-        .peers
-        .local_convergence("device-peer")
-        .unwrap()
-        .between_assemble_and_persist_hook
-        .lock()
-        .unwrap() = Some(Box::new(move |out_path| {
-        let rel = out_path.strip_prefix(&root).unwrap().to_string_lossy().into_owned();
-        state.replica_coordinator.dag_bump_mutation_fence(GROUP, &rel, "local_capture").unwrap();
-        *failed2.lock().unwrap() = Some(rel);
-    }));
-
-    tokio::time::timeout(
-        Duration::from_secs(20),
-        drive_obligations_once_for_test(&engine, 128, 256),
-    )
-    .await
-    .unwrap();
-    let copy = failed.lock().unwrap().clone().expect("the attempt wrote something");
-    assert!(
-        yadorilink_replica_domain::conflict::is_conflict_copy_of(&copy, name),
-        "the failed write is the conflict copy, not {copy}"
-    );
-    assert!(f.read(name).is_some(), "the source itself was written");
-    assert!(!proof_names_current_row(&f, &copy), "the copy is not proven");
-    assert!(
-        obligation(&f, name).is_some(),
-        "the source's obligation stays open while its conflict copy is unwritten"
-    );
-
-    drive_until(&f, &engine, "the copy is written and the source closes", |f| {
-        obligation(f, name).is_none()
-    })
-    .await;
-    assert!(proof_names_current_row(&f, &copy), "the copy is written before the source closes");
-    assert!(proof_names_current_row(&f, name));
-    let mut on_disk = [f.read(name).unwrap(), f.read(&copy).unwrap()];
-    on_disk.sort();
-    let mut expected = [ours.clone(), theirs.clone()];
-    expected.sort();
-    assert_eq!(on_disk, expected, "both versions are on disk, one at each name");
-}
-
 /// A file named like a conflict copy of another is an ordinary own-name entry
 /// of the pass. When its write fails, the entry it looks like a copy of must
 /// not close its obligation in the same pass: the claim is chosen after the
@@ -845,8 +747,8 @@ async fn a_crash_after_the_temp_fsyncs_of_a_window_is_rebuilt_from_the_blocks() 
         assert!(!any_proof_row(&f, name) && !hydrated(&f, name) && intent_open(&f, name));
         assert_eq!(obligation(&f, name).as_ref(), Some(claimed));
     }
-    let strays = yadorilink_filesystem_sync::stale_temp_files::cleanup_stale_temp_files(&f.root);
-    assert_eq!(strays.len(), 3, "one stray temp per file: {strays:?}");
+    let strays = f.state.replica_coordinator.remove_recorded_temp_files(GROUP, &f.root).unwrap();
+    assert_eq!(strays.len(), 3, "one recorded temp per file: {strays:?}");
 
     let report = repair(&f);
     assert_eq!(report.reconstructed.len(), 3, "rebuilt from the blocks: {report:?}");
@@ -1257,8 +1159,8 @@ async fn a_crash_after_the_open_before_any_byte(mode: u8) -> (Vec<String>, Vec<S
         assert!(obligation(&f, name).is_some(), "{name}: the obligation is still owed");
         crash_state.push(format!("{name} {:?}", rows_of(&f, name)));
     }
-    let strays = yadorilink_filesystem_sync::stale_temp_files::cleanup_stale_temp_files(&f.root);
-    assert_eq!(strays.len(), 3, "one stray temp per file: {strays:?}");
+    let strays = reopened.remove_recorded_temp_files(GROUP, &f.root).unwrap();
+    assert_eq!(strays.len(), 3, "one recorded temp per file: {strays:?}");
     let store = crate::adapters::block_store_ports::BlockStorePortsAdapter::new(
         f.state.block_store.clone(),
     );

@@ -34,10 +34,12 @@ use crate::error::StorageError;
 pub enum CommitPoint {
     /// Before any byte of the group is written.
     BeforeAppend,
-    /// A new segment file exists but its directory entry is not durable.
-    AfterSegmentCreateBeforeDirSync,
-    /// The new segment's directory entry is durable; no records written.
-    AfterSegmentDirSync,
+    /// A new segment file exists (staged under a reserved name where the
+    /// volume offers durable moves) but is not published under its name.
+    AfterSegmentStaged,
+    /// The new segment is published under its name and that is durable; no
+    /// records written.
+    AfterSegmentPublished,
     /// Part of the group's records reached the file. See
     /// [`FaultPlan::partial_append_bytes`].
     MidRecordAppend,
@@ -57,8 +59,8 @@ impl CommitPoint {
     /// Every boundary, for a test that sweeps the whole sequence.
     pub const ALL: [CommitPoint; 9] = [
         CommitPoint::BeforeAppend,
-        CommitPoint::AfterSegmentCreateBeforeDirSync,
-        CommitPoint::AfterSegmentDirSync,
+        CommitPoint::AfterSegmentStaged,
+        CommitPoint::AfterSegmentPublished,
         CommitPoint::MidRecordAppend,
         CommitPoint::AfterAppendBeforeFsync,
         CommitPoint::AfterFsyncBeforeIndex,

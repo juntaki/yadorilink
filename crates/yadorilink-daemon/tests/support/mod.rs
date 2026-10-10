@@ -1287,6 +1287,15 @@ fn install_bootstrap_policies(state: &DaemonState, group_ids: &[String], service
     state.authority.replace_group_policy_states(policies);
 }
 
+/// Marks `group`'s startup as finished on a test device that links the group
+/// without running the link runtime: peer apply waits for a Ready startup gate
+/// (`startup_admits_peer_apply`), and a device that never registers one defers it forever.
+#[allow(dead_code)]
+pub fn mark_group_started(state: &Arc<DaemonState>, group: &str) {
+    let generation = state.replica_coordinator.startup_readiness().begin_group_startup(group);
+    state.replica_coordinator.startup_readiness().mark_group_ready(group, generation);
+}
+
 /// Ensures `state` has a change-signing key (generating one if absent) and
 /// returns its verifying (public) key bytes — the value a peer pins so this
 /// device's DAG changes verify. Call this at device setup, before

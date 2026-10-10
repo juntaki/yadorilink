@@ -5,30 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-# Same shape as every other test-support feature in this workspace (e.g.
-# Deliberately does NOT forward to `yadorilink-replica-engine/test-support`
-# -- see `evict-custody-test-bypass` below. Bundling that forward into this
-# feature used to mean every consumer of `test-support` (including
-# `yadorilink-daemon`/`yadorilink-cli`, which need it only for the doubles
-# above) silently got the confirmed-custody deletion bypass too, defeating
-# their own tests' fails-closed-without-a-durable-lease assertions.
 test-support = []
-
-# Forwards to `yadorilink-replica-engine`'s own identically-named feature:
-# `materialization_eviction::evict_file`'s `cfg(any(test, feature =
-# "evict-custody-test-bypass"))` branch calls that crate's
-# `verify_reclaim_custody_for_test`, which is itself gated `cfg(any(test,
-# feature = "test-support"))` on that crate -- without this forward, a
-# consumer that enables only this feature would unify it into `true` for
-# the whole build graph while leaving `yadorilink-replica-engine`'s own
-# feature off, so the function this branch calls would not exist in that
-# build. A caller whose tests assert the opposite -- that an instantaneous
-# confirmation without a durable remote lease must NOT authorize deletion
-# (`yadorilink-daemon`'s
-# `eviction_without_remote_lease_never_reaches_physical_reclaim`) -- must
-# NOT enable it, or its tests silently stop exercising the real,
-# fails-closed `verify_reclaim_custody` path.
-evict-custody-test-bypass = ["yadorilink-replica-engine/test-support"]
 
 [dependencies]
 yadorilink-root-authority = { path = "../yadorilink-root-authority" }

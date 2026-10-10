@@ -149,12 +149,9 @@ fn path_still_names_live_unix_handle(expected: FileIdentity, current: FileIdenti
 fn verify_sidecar_identity(root: &Path, expected: FileIdentity) -> Result<(), RootAuthorityError> {
     let lock_path = root.join(SYNC_ROOT_LOCK_FILE_NAME);
     let current = FileIdentity::observe_path(&lock_path).map_err(|e| {
-        RootAuthorityError::Io(io::Error::new(
-            e.kind(),
-            format!(
-                "sync-root lock sidecar {} could not be re-observed: {e} -- this root's ownership can no longer be confirmed",
-                lock_path.display()
-            ),
+        RootAuthorityError::OwnershipLost(format!(
+            "sync-root lock sidecar {} could not be re-observed: {e} -- this root's ownership can no longer be confirmed",
+            lock_path.display()
         ))
     })?;
     // Cached, not the raw probe: this function is reached from
@@ -167,20 +164,20 @@ fn verify_sidecar_identity(root: &Path, expected: FileIdentity) -> Result<(), Ro
     match expected.compare(&current, granularity) {
         crate::fs_identity::IdentityComparison::SameObject => Ok(()),
         crate::fs_identity::IdentityComparison::DefinitelyDifferent => {
-            Err(RootAuthorityError::Io(io::Error::other(format!(
+            Err(RootAuthorityError::OwnershipLost(format!(
                 "sync-root lock sidecar {} no longer names the object this process locked",
                 lock_path.display()
-            ))))
+            )))
         }
         crate::fs_identity::IdentityComparison::Ambiguous(reason) => {
             #[cfg(unix)]
             if path_still_names_live_unix_handle(expected, current) {
                 return Ok(());
             }
-            Err(RootAuthorityError::Io(io::Error::other(format!(
+            Err(RootAuthorityError::OwnershipLost(format!(
                 "sync-root lock sidecar {} cannot be conclusively re-verified ({reason:?})",
                 lock_path.display()
-            ))))
+            )))
         }
     }
 }

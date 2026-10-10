@@ -62,6 +62,6 @@ pub(crate) use runtime_control::{
     DaemonLifecyclePort, GcCommandError, GcCommandOutcome, GcPort, LinkPauseResumePort,
 };
 #[allow(unused_imports)]
-pub(crate) use update::{InstallOutcome, UpdateCommandPort, UpdateConfigCommand, UpdatePolicyView};
+pub(crate) use update::{UpdateCommandPort, UpdateConfigCommand, UpdatePolicyView};
 #[allow(unused_imports)]
 pub(crate) use version_restore::VersionRestorePort;

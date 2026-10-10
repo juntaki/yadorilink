@@ -10,8 +10,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::content_ports::BlockContentStore;
 use crate::error::StorageError;
-use crate::fs_ops::{remove_path, rename_path};
+use crate::fs_ops::{durable_namespace_beside, remove_path, rename_path, LedgerNames};
 use yadorilink_replica_domain::file::BlockInfo;
+use yadorilink_root_authority::durable_dir::Replace;
 
 fn unique_tmp_path(path: &Path) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -19,6 +20,56 @@ fn unique_tmp_path(path: &Path) -> PathBuf {
     let mut name = OsString::from(path.file_name().unwrap_or_default());
     name.push(format!(".yadorilink-tmp.{}.{n}", std::process::id()));
     path.with_file_name(name)
+}
+
+/// Where a writer records, durably, the temp file it is about to create.
+///
+/// A temp file exists between its `create` and the `rename` that publishes it
+/// (or the `remove` that discards it). A crash in that span leaves it on disk,
+/// and the only honest way to find it again is for something durable to have
+/// named it first: [`Self::record`] runs BEFORE the file is created and must
+/// not return until the name is durable; [`Self::release`] runs AFTER the file
+/// has been renamed away or removed. A row left behind by a crash is what the
+/// recovery at the next start works from, so nothing ever has to guess from a
+/// file name that a stray file is ours.
+pub trait TempFileLedger: Send + Sync {
+    fn record(&self, tmp_path: &Path) -> Result<(), StorageError>;
+    /// Best effort: a row that outlives its file only names a path that no
+    /// longer exists, which recovery clears without touching anything.
+    fn release(&self, tmp_path: &Path);
+}
+
+/// For writers with no recovery to speak of (a one-shot copy outside any
+/// linked folder, tests).
+pub struct NoTempLedger;
+
+impl TempFileLedger for NoTempLedger {
+    fn record(&self, _tmp_path: &Path) -> Result<(), StorageError> {
+        Ok(())
+    }
+    fn release(&self, _tmp_path: &Path) {}
+}
+
+/// Removes a temp file that will not be published and releases its record,
+/// in that order: the record outlives the file, never the reverse. A removal
+/// that fails (other than the file already being gone) keeps the record, so
+/// the next link start retries it.
+pub fn discard_temp_file(tmp_path: &Path, ledger: &dyn TempFileLedger) {
+    match remove_path(tmp_path) {
+        Ok(()) => release_once_gone_is_durable(tmp_path, ledger),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ledger.release(tmp_path),
+        Err(_) => {}
+    }
+}
+
+/// Releases the record of a temp file that was just removed or renamed away,
+/// but only once its disappearance is durable: after a power failure the name
+/// could otherwise come back with no record left to find it by. A directory
+/// sync that fails keeps the record.
+fn release_once_gone_is_durable(tmp_path: &Path, ledger: &dyn TempFileLedger) {
+    if sync_parent_directory(tmp_path).is_ok() {
+        ledger.release(tmp_path);
+    }
 }
 
 /// Defense-in-depth: creates `out_path`'s parent directory (if needed) then
@@ -140,13 +191,24 @@ pub fn verify_write_target_within_canonical_root(
 ///    the identity observed on it;
 /// 3. [`Self::abandon`] when the `mkdir` found the name taken (`EEXIST`,
 ///    a user or another writer got there first) or failed: nothing is
-///    claimed for what is there.
+///    claimed for what is there;
+/// 4. [`Self::interrupted`] when the writer leaves with neither of those
+///    done (the ledger itself failed, or a panic is unwinding): the intent is
+///    resolved as recovery would resolve it, so a running process never leaves
+///    one pending.
 ///
 /// `rel_path` is the directory's path relative to the sync root, with `/`
 /// separators -- the same form every replicated path has. An
 /// implementation is bound to one group; it is the owner of the
 /// structural-origin ledger for that group's root.
 pub trait StructuralDirectoryLedger {
+    /// Where the Stage names of the directories this writer creates are
+    /// recorded, so a crash between the Stage directory and its publication
+    /// leaves a record to clean it by, never a name to guess from. A ledger
+    /// with no recovery to speak of keeps the default.
+    fn names(&self) -> &dyn TempFileLedger {
+        &NoTempLedger
+    }
     fn record_intent(&self, rel_path: &str) -> Result<(), StorageError>;
     fn complete(
         &self,
@@ -154,6 +216,7 @@ pub trait StructuralDirectoryLedger {
         identity: &yadorilink_root_authority::fs_identity::FileIdentity,
     ) -> Result<(), StorageError>;
     fn abandon(&self, rel_path: &str) -> Result<(), StorageError>;
+    fn interrupted(&self, rel_path: &str) -> Result<(), StorageError>;
 }
 
 /// What [`create_explicit_directory`] found or did at its path.
@@ -183,17 +246,8 @@ pub fn create_explicit_directory(
     ledger: &dyn StructuralDirectoryLedger,
 ) -> Result<ExplicitDirectoryCreation, StorageError> {
     verify_write_target_within_canonical_root(out_path, canonical_root, ledger)?;
-    match fs::create_dir(out_path) {
-        Ok(()) => {
-            if let Err(error) = sync_parent_directory(out_path) {
-                tracing::warn!(
-                    path = %out_path.display(),
-                    error = %error,
-                    "directory was created but its parent directory could not be synced"
-                );
-            }
-            Ok(ExplicitDirectoryCreation::Created)
-        }
+    match make_directory(out_path, ledger) {
+        Ok(()) => Ok(ExplicitDirectoryCreation::Created),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             match fs::symlink_metadata(out_path) {
                 Ok(meta) if meta.is_dir() => Ok(ExplicitDirectoryCreation::AlreadyDirectory),
@@ -209,6 +263,25 @@ pub fn create_explicit_directory(
         }
         Err(e) => Err(e.into()),
     }
+}
+
+/// One directory, created empty at `path`: a Stage directory published by a
+/// durable move where the volume offers it, so the name is on disk before the
+/// caller reports it, and a plain `mkdir` followed by a best-effort parent sync
+/// where it does not.
+fn make_directory(path: &Path, ledger: &dyn StructuralDirectoryLedger) -> std::io::Result<()> {
+    if let Some(ns) = durable_namespace_beside(path) {
+        return ns.create_dir(path, &LedgerNames(ledger.names())).map_err(std::io::Error::from);
+    }
+    fs::create_dir(path)?;
+    if let Err(error) = sync_parent_directory(path) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %error,
+            "directory was created but its parent directory could not be synced"
+        );
+    }
+    Ok(())
 }
 
 /// Creates every missing directory component of `target` (`out_path`'s
@@ -292,13 +365,45 @@ pub fn create_dir_all_never_through_a_symlink(
     Ok(())
 }
 
+/// A structural intent this writer has recorded and not yet settled. If the
+/// writer leaves while it is still armed -- a settling call that failed, or a
+/// panic unwinding past the `mkdir` -- the ledger resolves the intent, so
+/// nothing is left for a periodic sweep to guess about.
+struct OpenStructuralIntent<'a> {
+    ledger: &'a dyn StructuralDirectoryLedger,
+    rel_path: &'a str,
+    armed: bool,
+}
+
+impl OpenStructuralIntent<'_> {
+    /// Disarms on a settling call that succeeded; passes its result through.
+    fn settle(&mut self, settled: Result<(), StorageError>) -> Result<(), StorageError> {
+        if settled.is_ok() {
+            self.armed = false;
+        }
+        settled
+    }
+}
+
+impl Drop for OpenStructuralIntent<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            // Best effort, and never a second panic out of a drop: whatever
+            // this cannot resolve, startup and the next link start do.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = self.ledger.interrupted(self.rel_path);
+            }));
+        }
+    }
+}
+
 /// One structural `mkdir`, bracketed by `ledger`: the intent is durable
 /// before the syscall, the identity recorded after it. A name found taken
 /// (`EEXIST`: a user, or another writer, created it since the walk above
 /// looked) is abandoned without a claim, and is then accepted only if it
 /// is a real directory. Any other failure abandons the intent too, so a
-/// failed `mkdir` leaves nothing pending; a failure to abandon is left to
-/// recovery, which drops the intent.
+/// failed `mkdir` leaves nothing pending; a failure to abandon or complete
+/// resolves the intent through [`StructuralDirectoryLedger::interrupted`].
 ///
 /// The identity is observed by name right after the `mkdir`: neither macOS
 /// nor Linux has a `mkdir` that returns a descriptor of the directory it
@@ -311,13 +416,17 @@ pub fn create_dir_all_never_through_a_symlink(
 /// name and renaming it into place is no better: a plain directory rename
 /// replaces an empty directory already at the target, and a crash between
 /// the two leaves the privately named directory in the sync root.
+/// [`make_directory`] does it anyway where the volume offers durable moves: the
+/// move refuses an occupied target, and the Stage name is in the temp-file
+/// ledger before the directory exists, so a crash leaves a record to clean it by.
 fn create_structural_directory(
     dir: &Path,
     rel_path: &str,
     ledger: &dyn StructuralDirectoryLedger,
 ) -> Result<(), StorageError> {
     ledger.record_intent(rel_path)?;
-    match fs::create_dir(dir) {
+    let mut open = OpenStructuralIntent { ledger, rel_path, armed: true };
+    match make_directory(dir, ledger) {
         Ok(()) => {
             let identity =
                 match yadorilink_root_authority::fs_identity::FileIdentity::observe_path(dir) {
@@ -325,21 +434,21 @@ fn create_structural_directory(
                     Err(e) => {
                         // Created, but its identity cannot be read: nothing to
                         // bind the claim to, so none is made.
-                        let _ = ledger.abandon(rel_path);
+                        let _ = open.settle(ledger.abandon(rel_path));
                         return Err(e.into());
                     }
                 };
-            ledger.complete(rel_path, &identity)
+            open.settle(ledger.complete(rel_path, &identity))
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            ledger.abandon(rel_path)?;
+            open.settle(ledger.abandon(rel_path))?;
             match fs::symlink_metadata(dir) {
                 Ok(meta) if meta.is_dir() => Ok(()),
                 _ => Err(StorageError::PathEscapesRoot(dir.display().to_string())),
             }
         }
         Err(e) => {
-            let _ = ledger.abandon(rel_path);
+            let _ = open.settle(ledger.abandon(rel_path));
             Err(e.into())
         }
     }
@@ -552,8 +661,19 @@ pub fn reconstruct_file(
     blocks: &[BlockInfo],
     mtime_unix_nanos: i64,
 ) -> Result<(), StorageError> {
-    let tmp_path = reconstruct_file_to_temp(store, out_path, blocks, mtime_unix_nanos)?;
-    persist_reconstructed_file(&tmp_path, out_path)
+    reconstruct_file_in(store, out_path, blocks, mtime_unix_nanos, &NoTempLedger)
+}
+
+/// [`reconstruct_file`] with its temp file recorded in `ledger`.
+pub fn reconstruct_file_in(
+    store: &dyn BlockContentStore,
+    out_path: &Path,
+    blocks: &[BlockInfo],
+    mtime_unix_nanos: i64,
+    ledger: &dyn TempFileLedger,
+) -> Result<(), StorageError> {
+    let tmp_path = reconstruct_file_to_temp_in(store, out_path, blocks, mtime_unix_nanos, ledger)?;
+    persist_reconstructed_file_in(&tmp_path, out_path, ledger)
 }
 
 /// The "assemble" half of [`reconstruct_file`]: reads `blocks` from `store`
@@ -581,18 +701,33 @@ pub fn reconstruct_file_to_temp(
     blocks: &[BlockInfo],
     mtime_unix_nanos: i64,
 ) -> Result<PathBuf, StorageError> {
+    reconstruct_file_to_temp_in(store, out_path, blocks, mtime_unix_nanos, &NoTempLedger)
+}
+
+/// [`reconstruct_file_to_temp`] with the temp file recorded in `ledger`
+/// before it is created. The caller owns the record from here on: it ends
+/// in [`persist_reconstructed_file_in`] or [`discard_temp_file`].
+pub fn reconstruct_file_to_temp_in(
+    store: &dyn BlockContentStore,
+    out_path: &Path,
+    blocks: &[BlockInfo],
+    mtime_unix_nanos: i64,
+    ledger: &dyn TempFileLedger,
+) -> Result<PathBuf, StorageError> {
     require_parent_directory(out_path)?;
     let tmp_path = unique_tmp_path(out_path);
+    // The name is durable before the file exists.
+    ledger.record(&tmp_path)?;
     // Removes the temp file on every way out but success, a panic included.
-    struct RemoveUnlessKept(PathBuf, bool);
-    impl Drop for RemoveUnlessKept {
+    struct RemoveUnlessKept<'a>(PathBuf, bool, &'a dyn TempFileLedger);
+    impl Drop for RemoveUnlessKept<'_> {
         fn drop(&mut self) {
             if !self.1 {
-                let _ = remove_path(&self.0);
+                discard_temp_file(&self.0, self.2);
             }
         }
     }
-    let mut cleanup = RemoveUnlessKept(tmp_path.clone(), false);
+    let mut cleanup = RemoveUnlessKept(tmp_path.clone(), false, ledger);
     let assemble = || -> Result<(), StorageError> {
         // Straight-line and synchronous, so the guard covers exactly these
         // reads and nothing else.
@@ -640,6 +775,25 @@ pub fn reconstruct_file_to_temp(
 /// directory as it found it. `tmp_path` must not be reused after this
 /// returns, whether it succeeds or fails.
 pub fn persist_reconstructed_file(tmp_path: &Path, out_path: &Path) -> Result<(), StorageError> {
+    persist_reconstructed_file_in(tmp_path, out_path, &NoTempLedger)
+}
+
+/// [`persist_reconstructed_file`] for a temp file recorded in `ledger`: the
+/// record is released once the temp file is renamed away or removed.
+pub fn persist_reconstructed_file_in(
+    tmp_path: &Path,
+    out_path: &Path,
+    ledger: &dyn TempFileLedger,
+) -> Result<(), StorageError> {
+    if let Some(ns) = durable_namespace_beside(out_path) {
+        // The temp file is flushed; a durable move publishes it and removes the
+        // temp name, and the record is released once that name is gone.
+        let published = crate::io_diag::time(crate::io_diag::Op::Rename, 0, || {
+            ns.publish(tmp_path, out_path, Replace::Yes, &LedgerNames(ledger))
+        });
+        note_directory_sync_inside_the_move(out_path);
+        return published.map_err(|error| StorageError::Io(error.into()));
+    }
     let publish = || -> Result<(), StorageError> {
         crate::io_diag::time(crate::io_diag::Op::Rename, 0, || rename_path(tmp_path, out_path))?;
         tracing::debug!("phase T_recv_rename_done: temp-file-to-final-path rename complete");
@@ -655,15 +809,31 @@ pub fn persist_reconstructed_file(tmp_path: &Path, out_path: &Path) -> Result<()
         Ok(())
     };
     if let Err(e) = publish() {
-        let _ = remove_path(tmp_path);
+        discard_temp_file(tmp_path, ledger);
         return Err(e);
     }
+    ledger.release(tmp_path);
     Ok(())
+}
+
+/// The directory sync of a durable move on Unix happens inside it and is timed
+/// with the rename; the counters still say that one was issued.
+fn note_directory_sync_inside_the_move(out_path: &Path) {
+    #[cfg(unix)]
+    if let Some(parent) = out_path.parent() {
+        let parent = if parent.as_os_str().is_empty() { Path::new(".") } else { parent };
+        crate::io_diag::note_dir_fsync(parent);
+        crate::io_diag::time(crate::io_diag::Op::DirFsync, 0, || ());
+    }
+    #[cfg(not(unix))]
+    let _ = out_path;
 }
 
 #[cfg(unix)]
 fn sync_parent_directory(path: &Path) -> Result<(), StorageError> {
     if let Some(parent) = path.parent() {
+        // A bare file name has the current directory as its parent.
+        let parent = if parent.as_os_str().is_empty() { Path::new(".") } else { parent };
         crate::io_diag::note_dir_fsync(parent);
         crate::io_diag::time(crate::io_diag::Op::DirFsync, 0, || {
             fs::File::open(parent)?.sync_all()
@@ -672,12 +842,16 @@ fn sync_parent_directory(path: &Path) -> Result<(), StorageError> {
     Ok(())
 }
 
-// Windows does not support opening a directory for `sync_all` through the
-// portable `std::fs::File::open` API. The temp file itself is still flushed
-// before `rename`; a handle-based `FlushFileBuffers` directory implementation
-// belongs in the Windows storage backend rather than behind a misleading
-// portable wrapper here.
-#[cfg(not(unix))]
+// Windows has no documented directory flush to rely on, and none is issued:
+// what makes a Windows namespace change durable is the write-through move of
+// `durable_dir`, used wherever the volume offers it. This is the plain-rename
+// fallback's parent sync, and it is nothing there.
+#[cfg(windows)]
+fn sync_parent_directory(_path: &Path) -> Result<(), StorageError> {
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
 fn sync_parent_directory(_path: &Path) -> Result<(), StorageError> {
     Ok(())
 }
@@ -1470,14 +1644,49 @@ pub fn apply_xattrs(_path: &Path, _xattrs: &[(String, Vec<u8>)]) -> Result<(), S
 /// regular-file materialization already gives.
 #[cfg(unix)]
 pub fn materialize_symlink(out_path: &Path, target: &[u8]) -> Result<(), StorageError> {
+    materialize_symlink_in(out_path, target, &NoTempLedger)
+}
+
+/// [`materialize_symlink`] with its temp link recorded in `ledger`.
+#[cfg(unix)]
+pub fn materialize_symlink_in(
+    out_path: &Path,
+    target: &[u8],
+    ledger: &dyn TempFileLedger,
+) -> Result<(), StorageError> {
     require_parent_directory(out_path)?;
     let tmp_path = unique_tmp_path(out_path);
-    std::os::unix::fs::symlink(
+    ledger.record(&tmp_path)?;
+    if let Err(e) = std::os::unix::fs::symlink(
         yadorilink_root_authority::fs_identity::bytes_to_target(target),
         &tmp_path,
-    )?;
-    rename_path(&tmp_path, out_path)?;
-    Ok(())
+    ) {
+        // Not created by this call, so not this call's to remove.
+        ledger.release(&tmp_path);
+        return Err(e.into());
+    }
+    if let Some(ns) = durable_namespace_beside(out_path) {
+        // Published by a durable move: the link is not reported as present
+        // before its name is on disk.
+        return ns
+            .publish(&tmp_path, out_path, Replace::Yes, &LedgerNames(ledger))
+            .map_err(|error| StorageError::Io(error.into()));
+    }
+    match rename_path(&tmp_path, out_path) {
+        Ok(()) => {
+            // The same directory holds the new name and the gone temp name.
+            // The link is published only once that entry is durable: a failed
+            // flush is an error, not a link the caller may record as present
+            // (the temp record stays, to be cleaned by the ledger's sweep).
+            sync_parent_directory(out_path)?;
+            ledger.release(&tmp_path);
+            Ok(())
+        }
+        Err(e) => {
+            discard_temp_file(&tmp_path, ledger);
+            Err(e.into())
+        }
+    }
 }
 
 /// Windows per-link opt-in symlink materialization: the default Windows
@@ -1507,6 +1716,16 @@ pub fn materialize_symlink(out_path: &Path, target: &[u8]) -> Result<(), Storage
 /// unverified until run on real Windows.
 #[cfg(windows)]
 pub fn materialize_symlink_windows(out_path: &Path, target: &[u8]) -> Result<(), StorageError> {
+    materialize_symlink_windows_in(out_path, target, &NoTempLedger)
+}
+
+/// [`materialize_symlink_windows`] with its temp link recorded in `ledger`.
+#[cfg(windows)]
+pub fn materialize_symlink_windows_in(
+    out_path: &Path,
+    target: &[u8],
+    ledger: &dyn TempFileLedger,
+) -> Result<(), StorageError> {
     // `target` is `target_to_bytes`'s own little-endian UTF-16 output (see
     // `fs_identity::bytes_to_target`'s doc) for any target this crate itself
     // ever captured; a malformed byte string has nothing well-formed to
@@ -1522,6 +1741,7 @@ pub fn materialize_symlink_windows(out_path: &Path, target: &[u8]) -> Result<(),
     };
     require_parent_directory(out_path)?;
     let tmp_path = unique_tmp_path(out_path);
+    ledger.record(&tmp_path)?;
     let target_hint = out_path.parent().unwrap_or(out_path).join(&target);
     let is_dir = fs::metadata(&target_hint).map(|m| m.is_dir()).unwrap_or(false);
     let create_result = if is_dir {
@@ -1530,7 +1750,7 @@ pub fn materialize_symlink_windows(out_path: &Path, target: &[u8]) -> Result<(),
         std::os::windows::fs::symlink_file(&target, &tmp_path)
     };
     if let Err(e) = create_result {
-        let _ = remove_path(&tmp_path);
+        discard_temp_file(&tmp_path, ledger);
         return Err(StorageError::from(std::io::Error::new(
             e.kind(),
             format!(
@@ -1540,7 +1760,16 @@ pub fn materialize_symlink_windows(out_path: &Path, target: &[u8]) -> Result<(),
             ),
         )));
     }
-    rename_path(&tmp_path, out_path)?;
+    if let Some(ns) = durable_namespace_beside(out_path) {
+        return ns
+            .publish(&tmp_path, out_path, Replace::Yes, &LedgerNames(ledger))
+            .map_err(|error| StorageError::Io(error.into()));
+    }
+    if let Err(e) = rename_path(&tmp_path, out_path) {
+        discard_temp_file(&tmp_path, ledger);
+        return Err(e.into());
+    }
+    release_once_gone_is_durable(&tmp_path, ledger);
     Ok(())
 }
 

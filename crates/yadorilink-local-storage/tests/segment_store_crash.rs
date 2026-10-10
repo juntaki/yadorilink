@@ -105,7 +105,7 @@ fn victim_must_be_present(point: CommitPoint) -> bool {
 
 /// Whether reaching `point` requires the group to create a segment.
 fn needs_a_fresh_segment(point: CommitPoint) -> bool {
-    matches!(point, CommitPoint::AfterSegmentCreateBeforeDirSync | CommitPoint::AfterSegmentDirSync)
+    matches!(point, CommitPoint::AfterSegmentStaged | CommitPoint::AfterSegmentPublished)
 }
 
 fn crash_scenario(point: CommitPoint) {
@@ -617,4 +617,42 @@ fn an_empty_store_holds_no_segment_data() {
     assert!(!SegmentBlockStore::holds_segment_data(dir.path()).unwrap());
     drop(SegmentBlockStore::with_limits(dir.path(), limits()).unwrap());
     assert!(!SegmentBlockStore::holds_segment_data(dir.path()).unwrap());
+}
+
+#[test]
+fn a_segment_still_under_its_stage_name_is_removed_on_the_next_open_and_its_id_is_not_reused() {
+    let dir = tempfile::tempdir().unwrap();
+    let baseline = block("baseline", 300);
+    let committed_ids = {
+        let store = SegmentBlockStore::with_limits(dir.path(), limits()).unwrap();
+        store.put_durable_batch(std::slice::from_ref(&baseline)).unwrap();
+        store.seal_active_segment().unwrap();
+        let committed = testing::segment_ids_on_disk(dir.path()).unwrap();
+        store.arm_commit_fault_for_tests(FaultPlan::crash_at(CommitPoint::AfterSegmentStaged));
+        assert!(store.put(b"in a segment that is never published").is_err());
+        drop(store);
+        committed
+    };
+    let leftovers = |dir: &std::path::Path| -> Vec<String> {
+        std::fs::read_dir(dir.join("segments"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".yadorilink-v1-stage."))
+            .collect()
+    };
+    // Where the volume offers durable moves the segment is waiting under a reserved
+    // name; elsewhere it was created in place and the ordinary orphan rule applies.
+    let staged = leftovers(dir.path());
+
+    let store = SegmentBlockStore::with_limits(dir.path(), limits()).unwrap();
+
+    assert!(leftovers(dir.path()).is_empty(), "{staged:?} was left");
+    assert_eq!(testing::segment_ids_on_disk(dir.path()).unwrap(), committed_ids);
+    assert_eq!(store.get(baseline.hash()).unwrap(), baseline.bytes());
+    let after = store.put(b"written after recovery").unwrap();
+    assert_eq!(store.get(&after).unwrap(), b"written after recovery");
+    for id in store.segment_ids().unwrap() {
+        assert!(!staged.iter().any(|n| n.ends_with(&format!("seg-{id:016}"))), "id {id} reused");
+    }
+    assert_index_names_only_readable_blocks(&store);
 }

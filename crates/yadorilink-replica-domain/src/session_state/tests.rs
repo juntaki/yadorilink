@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use super::{EnrollmentKind, MaterializationPolicy, MaterializationState};
+use super::{EnrollmentKind, MaterializationPolicy, MaterializationState, ProviderKind};
 use crate::file::RecordKind;
 
 #[test]
@@ -30,4 +30,28 @@ fn unknown_materialization_policy_is_not_coerced() {
 #[should_panic(expected = "unknown persisted enrollment kind")]
 fn unknown_enrollment_kind_is_not_coerced() {
     let _ = EnrollmentKind::from_db_str("future-kind");
+}
+
+#[test]
+fn provider_kinds_persist_under_their_exact_names() {
+    for (kind, name) in [
+        (ProviderKind::None, "none"),
+        (ProviderKind::MacFileProvider, "mac_file_provider"),
+        (ProviderKind::WindowsCfapi, "windows_cfapi"),
+    ] {
+        assert_eq!(kind.as_db_str(), name);
+        assert_eq!(ProviderKind::from_db_str(name), kind);
+    }
+}
+
+#[test]
+fn the_host_platform_selects_its_own_provider_adapter() {
+    let expected = if cfg!(target_os = "macos") {
+        Some(ProviderKind::MacFileProvider)
+    } else if cfg!(windows) {
+        Some(ProviderKind::WindowsCfapi)
+    } else {
+        None
+    };
+    assert_eq!(ProviderKind::for_host_platform(), expected);
 }

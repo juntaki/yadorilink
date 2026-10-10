@@ -12,6 +12,8 @@ license.workspace = true
 # end.
 
 [dependencies]
+# The durable publish of the small private state files (`durable_dir::publish_durably`).
+yadorilink-root-authority = { path = "../yadorilink-root-authority" }
 yadorilink-ipc-proto = { path = "../yadorilink-ipc-proto" }
 yadorilink-local-storage = { path = "../yadorilink-local-storage" }
 # The device's Ed25519 signing key, generated and registered by

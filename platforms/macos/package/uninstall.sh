@@ -13,7 +13,7 @@
 # GUI launchd domain — see postinstall's comment on why root can't just
 # `launchctl load/unload` a per-user LaunchAgent directly):
 #
-#  sudo./uninstall.sh
+#  sudo /usr/local/share/yadorilink/uninstall.sh   (installed by the .pkg)
 #
 # What this does NOT remove (deliberately — this is uninstalling the
 # *application*, not the user's data):
@@ -131,7 +131,8 @@ if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ] && [ "$CONSOLE_USER" 
             safe_rm_user_dir "$USER_HOME" "$USER_HOME/Library/Application Support/yadorilink"
             safe_rm_user_dir "$USER_HOME" "$USER_HOME/Library/Group Containers/group.com.juntaki.yadorilink.shared"
             safe_rm_user_dir "$USER_HOME" "$USER_HOME/Library/Logs/yadorilink"
-            /usr/bin/sudo -u "$CONSOLE_USER" /usr/bin/security delete-generic-password -s yadorilink "$USER_HOME/Library/Keychains/login.keychain-db" >/dev/null 2>&1 || true
+            # Each call removes one item; repeat until none is left.
+            while /usr/bin/sudo -u "$CONSOLE_USER" /usr/bin/security delete-generic-password -s yadorilink "$USER_HOME/Library/Keychains/login.keychain-db" >/dev/null 2>&1; do :; done
         fi
     fi
 else
@@ -141,6 +142,8 @@ fi
 
 log "Removing /usr/local/bin/yadorilink and /usr/local/bin/yadorilink-daemon..."
 rm -f /usr/local/bin/yadorilink /usr/local/bin/yadorilink-daemon /usr/local/bin/yadorilink-status-app
+# The installed copy of this script (the shell keeps reading the open file).
+rm -rf /usr/local/share/yadorilink /usr/local/share/doc/yadorilink
 
 # The app's open-at-login registration (SMAppService) goes away with the
 # bundle; quit it first so nothing is left running from a deleted path.

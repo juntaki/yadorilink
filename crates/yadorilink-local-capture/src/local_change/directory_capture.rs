@@ -53,7 +53,7 @@ use super::path_policy::{
 };
 use super::record_builder::metadata_columns_for;
 use super::semantic_delete::Removal;
-use super::{now_unix_nanos, LocalChangeOutcome, LocalChangeProcessor};
+use super::{LocalChangeOutcome, LocalChangeProcessor};
 
 /// What capture does with a directory it finds on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -343,26 +343,6 @@ impl LocalChangeProcessor {
         else {
             return Ok(LocalChangeOutcome::None);
         };
-        // The leaf this directory replaced sat under a copy name the
-        // namespace placed another entry's File or Symlink at: removing it
-        // was deleting that entry, authored at the entry itself (see
-        // `LocalMutationStore::write_through_source`). The directory is
-        // then a new entry at the name it was made under.
-        if let Some(emitter) = self.change_emitter.as_deref() {
-            if let Some(source) = self.state.write_through_source(group_id, rel_path)? {
-                let native_witness = self.state.native_capture_witness(group_id, rel_path)?;
-                self.state.commit_write_through_deletion(
-                    group_id,
-                    rel_path,
-                    &source,
-                    Some(native_witness),
-                    &self.device_id,
-                    now_unix_nanos(),
-                    emitter,
-                    &self.begin_operation()?.permit(),
-                )?;
-            }
-        }
         let (record, op, version, meta) = directory_entry(rel_path, unix_mode);
         // The proof names the directory only if it is still the directory
         // the verdict was taken on, with the mode being authored.

@@ -7,6 +7,9 @@ license.workspace = true
 # See yadorilink-local-storage/Cargo.toml's identical section for why.
 [features]
 test-support = []
+# The raw measurement primitives (`MoveFileExW`, a directory flush) for the
+# durability evidence runs. Production code never enables it.
+evidence = []
 
 [dependencies]
 yadorilink-replica-domain = { path = "../yadorilink-replica-domain" }
@@ -34,7 +37,7 @@ tempfile = "3"
 # `read_root_marker_for_test`/`write_root_marker_for_test` (all
 # `#[cfg(any(test, feature = "test-support"))]`) need this self-referencing
 # dev-dependency to enable the feature half of that gate.
-yadorilink-root-authority = { path = ".", features = ["test-support"] }
+yadorilink-root-authority = { path = ".", features = ["test-support", "evidence"] }
 # This is a dev-only back-edge against `yadorilink-daemon`'s own normal
 # (non-dev) dependency on this crate -- the same shape
 # `yadorilink-local-capture`'s own dev-dependency on `yadorilink-daemon`
@@ -47,6 +50,13 @@ yadorilink-daemon = { path = "../yadorilink-daemon", features = ["test-support"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# `durable_dir`'s Windows write-through move and volume probe.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
 
 [lints]
 workspace = true

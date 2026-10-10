@@ -19,6 +19,8 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+use yadorilink_root_authority::durable_dir::{publish_durably, remove_file_durably, Replace};
+
 use super::{StoreError, StoreResult};
 
 fn io(path: &Path) -> impl Fn(std::io::Error) -> StoreError + '_ {
@@ -61,16 +63,13 @@ pub(super) fn write(path: &Path, contents: &str) -> StoreResult<()> {
         // pointing at an empty file while the old document is already gone.
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&temporary, path)?;
-        // The rename itself is not durable until the DIRECTORY ENTRY is: a
-        // power loss between the rename returning and the directory's own
-        // metadata reaching disk can leave the old name back in place on
-        // reboot. That matters specifically for a rotated refresh token --
+        // Published by a durable move: the new name is on disk when this
+        // returns. That matters specifically for a rotated refresh token --
         // `CredentialStore::rotate_refresh_token` reports success as soon as
         // this call returns, and the spent token it just replaced is dead at
         // the server, so a name that reverts here strands the store holding a
         // token the Authorization Server has already refused.
-        fsync_parent(parent)
+        publish_durably(&temporary, path, Replace::Yes)
     })();
 
     if result.is_err() {
@@ -80,11 +79,7 @@ pub(super) fn write(path: &Path, contents: &str) -> StoreResult<()> {
 }
 
 pub(super) fn clear(path: &Path) -> StoreResult<()> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(io(path)(e)),
-    }
+    remove_file_durably(path).map_err(io(path))
 }
 
 fn temporary_path(path: &Path) -> PathBuf {
@@ -108,22 +103,6 @@ fn owner_only(path: &Path) -> std::io::Result<std::fs::File> {
     // On Windows the file inherits the directory's ACL, and the config
     // directory is already under the user's profile. There is no mode to set.
     std::fs::OpenOptions::new().create_new(true).write(true).open(path)
-}
-
-/// Fsyncs the directory a rename just landed in, so the new name survives a
-/// crash between the rename returning and the directory entry reaching disk.
-///
-/// POSIX only: a directory cannot be opened for this on Windows, where
-/// `MoveFileEx`'s own durability story is different and this crate does not
-/// attempt to second-guess it.
-#[cfg(unix)]
-fn fsync_parent(parent: &Path) -> std::io::Result<()> {
-    std::fs::File::open(parent)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn fsync_parent(_parent: &Path) -> std::io::Result<()> {
-    Ok(())
 }
 
 #[cfg(unix)]

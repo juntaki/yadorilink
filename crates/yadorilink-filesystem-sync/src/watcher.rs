@@ -644,13 +644,19 @@ fn reconcile_new_directory_subtree(
     start: &Path,
     ignore_set: &EffectiveIgnoreSet,
 ) {
-    let walker =
-        walkdir::WalkDir::new(start).follow_links(false).into_iter().filter_entry(|entry| {
+    let walker = walkdir::WalkDir::new(start)
+        .follow_links(false)
+        .same_file_system(true)
+        .into_iter()
+        .filter_entry(|entry| {
             if entry.depth() == 0 {
                 return true;
             }
             if !entry.file_type().is_dir() {
                 return true;
+            }
+            if crate::device_boundary::is_foreign_device_dir(root, entry.path()) {
+                return false;
             }
             let Ok(relative_path) = entry.path().strip_prefix(root) else { return false };
             !ignore_set.is_ignored(relative_path, true)
@@ -913,13 +919,19 @@ fn record_non_ignored_directories(
         _ => return Ok(Vec::new()),
     }
 
-    let walker =
-        walkdir::WalkDir::new(start).follow_links(false).into_iter().filter_entry(|entry| {
+    let walker = walkdir::WalkDir::new(start)
+        .follow_links(false)
+        .same_file_system(true)
+        .into_iter()
+        .filter_entry(|entry| {
             if entry.depth() == 0 && entry.path() == root {
                 return true;
             }
             if !entry.file_type().is_dir() {
                 return true;
+            }
+            if crate::device_boundary::is_foreign_device_dir(root, entry.path()) {
+                return false;
             }
             let Ok(relative_path) = entry.path().strip_prefix(root) else { return false };
             // Same ordering as every other entry point: the reserved

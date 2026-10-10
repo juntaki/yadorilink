@@ -217,17 +217,29 @@ pub fn cfapi_placeholder_untouched(
 /// tombstoned, not permanently spared because *something* now answers to
 /// its name.
 pub(super) fn exact_leaf_exists_as_file_or_symlink(root: &Path, path: &str) -> bool {
+    try_exact_leaf_exists_as_file_or_symlink(root, path).unwrap_or(false)
+}
+
+/// [`exact_leaf_exists_as_file_or_symlink`], but a failed look (the parent
+/// cannot be listed, an entry cannot be read) is an error, not "absent".
+pub(super) fn try_exact_leaf_exists_as_file_or_symlink(
+    root: &Path,
+    path: &str,
+) -> std::io::Result<bool> {
     let full = root.join(path);
     let (Some(leaf), Some(parent)) =
         (full.file_name().map(|n| n.to_os_string()), full.parent().map(|p| p.to_path_buf()))
     else {
-        return false;
+        return Ok(false);
     };
-    let Ok(entries) = std::fs::read_dir(&parent) else { return false };
-    entries.filter_map(|e| e.ok()).any(|entry| {
-        entry.file_name() == leaf
-            && entry.file_type().is_ok_and(|ft| ft.is_file() || ft.is_symlink())
-    })
+    for entry in std::fs::read_dir(&parent)? {
+        let entry = entry?;
+        if entry.file_name() == leaf {
+            let file_type = entry.file_type()?;
+            return Ok(file_type.is_file() || file_type.is_symlink());
+        }
+    }
+    Ok(false)
 }
 
 /// Whether a real directory (lstat, never followed) answers to `path`'s

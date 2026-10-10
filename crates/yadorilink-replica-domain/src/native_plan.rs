@@ -10,7 +10,6 @@
 
 use crate::file::RecordKind;
 use crate::ids::{SyncPath, VersionHash};
-use crate::native_materialize::Placement;
 use crate::native_state::{Dot, LiveHead};
 
 use std::collections::BTreeMap;
@@ -59,20 +58,23 @@ pub enum NativePlannedNode {
     ExplicitDirectory {
         head: NativeLocatedHead,
     },
-    /// A File or Symlink at `physical_path` (the map key), standing for
-    /// `head`; `placement` says whether that is its own path or a copy name.
+    /// A File or Symlink at its own path (the map key), standing for `head`.
     Entry {
         head: NativeLocatedHead,
         kind: RecordKind,
-        placement: Placement,
     },
 }
 
-/// Every node of one directory level, keyed by physical path. A path with
-/// no key is absent.
+/// Every node of one directory level, keyed by path. A path with no key is
+/// absent, unless it is contested.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct NativeLevelPlan {
     pub nodes: BTreeMap<SyncPath, NativePlannedNode>,
+    /// Paths of the level that project `Pending`: two versions hold them, or
+    /// a file holds a path that has to be a directory, or a version record
+    /// has not arrived. Nothing is planned for them and nothing below them is
+    /// created or removed.
+    pub contested: std::collections::BTreeSet<SyncPath>,
 }
 
 /// What a `files` row displays, in NativeState's terms: the exact head it

@@ -160,6 +160,11 @@ public final class FolderDetailViewModel {
         return sentences.joined(separator: " ")
     }
 
+    /// Where a conflict copy lives on this Mac, for "Show in Finder".
+    public func conflictFilePath(_ row: ConflictRow) -> String {
+        (folder.localPath as NSString).appendingPathComponent(row.path)
+    }
+
     private func conflictRow(_ c: ConflictSummary) -> ConflictRow {
         var parts = [sizeOrFolder(c.size, c.kind)]
         if let modified = c.modifiedAt { parts.append(Format.relative(modified, now: now())) }

@@ -411,6 +411,13 @@ def check_forbidden_patterns(root: Path, manifest: dict) -> list[str]:
     return failures
 
 
+def mentions_symbol(line: str, symbol: str) -> bool:
+    """Whole-identifier match: `probe_direct` is not `probe_directory_durability`."""
+    left = r"(?<![A-Za-z0-9_])" if re.match(r"\w", symbol[0]) else ""
+    right = r"(?![A-Za-z0-9_])" if re.match(r"\w", symbol[-1]) else ""
+    return re.search(left + re.escape(symbol) + right, line) is not None
+
+
 def check_confined_symbols(root: Path, manifest: dict) -> list[str]:
     failures: list[str] = []
     for rule in manifest.get("confined_symbol", []):
@@ -438,7 +445,7 @@ def check_confined_symbols(root: Path, manifest: dict) -> list[str]:
             text = path.read_text(encoding="utf-8")
             for number, line in scannable_lines(text, exclude, path):
                 for symbol in rule["symbols"]:
-                    if symbol in line:
+                    if mentions_symbol(line, symbol):
                         failures.append(
                             f"[{rule['name']}] {relative(root, path)}:{number} "
                             f"references {symbol!r} outside its confinement"

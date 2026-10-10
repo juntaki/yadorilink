@@ -28,6 +28,13 @@ pub enum RootAuthorityError {
     #[error("{0}")]
     RootIdentityMismatch(String),
 
+    /// The sync-root lock sidecar is gone, replaced, or can no longer be
+    /// re-observed: this process can no longer prove it owns the root. Terminal
+    /// for the link -- never retried, never repaired by recreating the sidecar;
+    /// only a relink or a daemon restart acquires a fresh lock.
+    #[error("{0}")]
+    OwnershipLost(String),
+
     /// A group has more than one live link -- `root_identity`'s
     /// `ensure_single_root` gate refuses before any constructor touches
     /// disk or the index. }` after this crate's

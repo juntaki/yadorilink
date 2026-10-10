@@ -303,13 +303,7 @@ async fn ondemand_adoption_waits_for_the_block_deletion_gate_before_committing_a
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg_attr(
     windows,
-    ignore = "on Windows, real placeholder creation is deferred to \
-              cfapi-host.exe (see create_or_defer_placeholder), which is not \
-              present in this pure-Rust integration harness -- a placeholder \
-              path never appears on disk here, only its generation is persisted. \
-              This test's cross-platform logic is still exercised on macOS/Linux \
-              CI; Windows placeholder creation itself is covered by \
-              yadorilink-local-storage's own create_or_defer_placeholder tests."
+    ignore = "this test drives an in-place placeholder in a linked folder through the in-process harness; on Windows an on-demand folder is a Cloud Files provider folder served by yadorilink-cfapi-host, which this harness does not run. Windows coverage: platforms/windows/e2e scenarios 2, 3 and 7 read, hash-compare and update placeholders against the real cfapi-host"
 )]
 async fn hydrate_file_fetches_and_materializes_placeholder_content() {
     let device_a = Device::new("device-a").await;
@@ -576,13 +570,7 @@ async fn hydrate_file_without_any_connected_peer_fails_immediately() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg_attr(
     windows,
-    ignore = "on Windows, real placeholder creation is deferred to \
-              cfapi-host.exe (see create_or_defer_placeholder), which is not \
-              present in this pure-Rust integration harness -- a placeholder \
-              path never appears on disk here, only its generation is persisted. \
-              This test's cross-platform logic is still exercised on macOS/Linux \
-              CI; Windows placeholder creation itself is covered by \
-              yadorilink-local-storage's own create_or_defer_placeholder tests."
+    ignore = "this test drives an in-place placeholder in a linked folder through the in-process harness; on Windows an on-demand folder is a Cloud Files provider folder served by yadorilink-cfapi-host, which this harness does not run. Windows coverage: platforms/windows/e2e scenarios 8 and 9 evict and reopen a file against the real cfapi-host"
 )]
 async fn evict_then_rehydrate_round_trips_to_identical_content() {
     let device_a = Device::new("device-a").await;
@@ -719,13 +707,7 @@ async fn evict_then_rehydrate_round_trips_to_identical_content() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg_attr(
     windows,
-    ignore = "on Windows, real placeholder creation is deferred to \
-              cfapi-host.exe (see create_or_defer_placeholder), which is not \
-              present in this pure-Rust integration harness -- a placeholder \
-              path never appears on disk here, only its generation is persisted. \
-              This test's cross-platform logic is still exercised on macOS/Linux \
-              CI; Windows placeholder creation itself is covered by \
-              yadorilink-local-storage's own create_or_defer_placeholder tests."
+    ignore = "this test drives an in-place placeholder in a linked folder through the in-process harness; on Windows an on-demand folder is a Cloud Files provider folder served by yadorilink-cfapi-host, which this harness does not run. Windows coverage: platforms/windows/e2e runs two devices only, so the per-device property with a third device is not exercised on Windows"
 )]
 async fn three_devices_on_demand_hydration_is_per_device_not_group_wide() {
     let device_a = Device::new("device-a").await;
@@ -1850,13 +1832,7 @@ async fn hydration_rejects_a_corrupt_compressed_block_response() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg_attr(
     windows,
-    ignore = "on Windows, real placeholder creation is deferred to \
-              cfapi-host.exe (see create_or_defer_placeholder), which is not \
-              present in this pure-Rust integration harness -- a placeholder \
-              path never appears on disk here, only its generation is persisted. \
-              This test's cross-platform logic is still exercised on macOS/Linux \
-              CI; Windows placeholder creation itself is covered by \
-              yadorilink-local-storage's own create_or_defer_placeholder tests."
+    ignore = "this test drives an in-place placeholder in a linked folder through the in-process harness; on Windows an on-demand folder is a Cloud Files provider folder served by yadorilink-cfapi-host, which this harness does not run. Windows coverage: platforms/windows/e2e does not observe the fetch window, so this property is not exercised on Windows"
 )]
 async fn fetch_window_grows_under_real_traffic_and_shrinks_after_timeouts_then_recovers() {
     let device_a = Device::new("device-a").await;

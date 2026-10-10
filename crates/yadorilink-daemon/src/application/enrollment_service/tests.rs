@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use super::*;
+use yadorilink_replica_domain::session_state::ProviderKind;
 
 #[test]
 fn enrollment_outcome_keeps_operation_identity_for_recovery() {
@@ -440,7 +441,9 @@ fn service(
     coordination: Arc<FakeCoordination>,
     links: Arc<FakeLinkPort>,
 ) -> EnrollmentService {
+    // The adapter kind is pinned so these cases do not depend on the OS running them.
     EnrollmentService::new("device-a".to_string(), repository, coordination, links)
+        .with_provider_kind(Some(ProviderKind::MacFileProvider))
 }
 
 fn create_command() -> CreateAndLinkCommand {
@@ -1143,7 +1146,44 @@ async fn a_provider_creation_runs_the_journaled_saga_under_a_token_derived_opera
     assert_eq!(*key, PathBuf::from("provider://token-1"));
     let target = target.as_ref().expect("a provider target");
     assert_eq!(target.display_name, "Photos");
+    assert_eq!(target.kind, ProviderKind::MacFileProvider);
     assert!(target.empty_owner, "an owner-created group has nothing to install");
+}
+
+/// The link carries the adapter kind of the host, and a host with no provider adapter refuses a
+/// provider link before the journal opens or the coordination plane is called.
+#[tokio::test]
+async fn a_provider_link_follows_the_host_adapter_and_is_refused_without_one() {
+    let repository = Arc::new(FakeEnrollmentRepository::default());
+    let coordination = Arc::new(FakeCoordination::configured());
+    coordination
+        .prepare
+        .lock()
+        .unwrap()
+        .push_back(EnrollmentPrepareResult::Prepared { group_id: "group-1".to_string() });
+    coordination.activate.lock().unwrap().push_back(EnrollmentActivationResult::Activated);
+    let links = Arc::new(FakeLinkPort::default());
+    links.commit.lock().unwrap().push_back(Ok(LinkOutcome::Linked));
+    service(repository.clone(), coordination.clone(), links.clone())
+        .with_provider_kind(Some(ProviderKind::WindowsCfapi))
+        .create_and_link(provider_create_command("Photos", "token-win"))
+        .await
+        .expect("created");
+    assert_eq!(
+        links.requests.lock().unwrap()[0].2.as_ref().expect("a provider target").kind,
+        ProviderKind::WindowsCfapi
+    );
+
+    let repository = Arc::new(FakeEnrollmentRepository::default());
+    let coordination = Arc::new(FakeCoordination::configured());
+    let links = Arc::new(FakeLinkPort::default());
+    let refused = service(repository.clone(), coordination.clone(), links.clone())
+        .with_provider_kind(None)
+        .create_and_link(provider_create_command("Photos", "token-none"))
+        .await;
+    assert!(matches!(refused, Err(EnrollmentError::PreparationRejected { .. })), "{refused:?}");
+    assert!(repository.operations.lock().unwrap().is_empty(), "a journal row was opened");
+    assert!(links.requests.lock().unwrap().is_empty());
 }
 
 /// A retry of a completed creation answers with the existing folder and touches nothing (no

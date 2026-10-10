@@ -8,10 +8,9 @@
 # one manifest-production path (a single code path for manifest
 # production).
 #
-# The signed artifacts the manifest points at are the auto-update install
-# targets (macOS.pkg, Windows setup.exe) — matching the daemon client's
-# platform install handoffs (install_macos.rs / install_windows.rs). Linux is
-# checksum-only and not an auto-update target, so it is not listed.
+# The manifest drives update notifications only (v1 ships manual updates; the
+# daemon never downloads or installs). The artifacts it points at are the
+# macOS .pkg and Windows setup.exe. Linux is checksum-only and is not listed.
 #
 # Requires MANIFEST_SIGNING_KEY in the environment (the caller gates on it).
 

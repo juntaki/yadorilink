@@ -131,7 +131,7 @@ async fn status_reports_daemon_not_running_clearly() {
     let dir = tempfile::tempdir().unwrap();
     std::env::set_var("YADORILINK_CONTROL_SOCKET", dir.path().join("no-daemon-here.sock"));
 
-    let result = yadorilink_cli::commands::status::status(false).await;
+    let result = yadorilink_cli::commands::status::status(false, false).await;
     let err = result.expect_err("expected an error with no daemon listening");
     assert_eq!(err.exit_code(), yadorilink_cli::error::CliError::DaemonNotRunning.exit_code());
 }
@@ -154,7 +154,7 @@ async fn fresh_daemon_reports_healthy_over_the_real_socket() {
     // The CLI's own `status` rendering must also succeed against the same
     // daemon (this is the parity surface a desktop app's tray label and
     // `yadorilink status` both read).
-    yadorilink_cli::commands::status::status(false)
+    yadorilink_cli::commands::status::status(false, false)
         .await
         .expect("status command should succeed against a healthy daemon");
 }

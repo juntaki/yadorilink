@@ -459,6 +459,52 @@ async fn starting_a_watch_holds_the_sync_root_lock_until_stopped() {
         .expect("stopping the watch must release the sync-root lock so it can be re-acquired");
 }
 
+/// Losing the sync-root lock sidecar while the daemon runs is terminal for that link:
+/// the repair pass ends (no retry loop, nothing recreated), status says why, and only a
+/// relink brings it back.
+#[tokio::test]
+async fn a_deleted_lock_sidecar_ends_the_links_repair_pass_and_only_relink_restores_it() {
+    let state = test_state();
+    let root = tempfile::tempdir().unwrap();
+    let group = "group-1";
+    let path = root.path().to_string_lossy().into_owned();
+    std::fs::write(root.path().join("in-a.txt"), b"aaa").unwrap();
+    state.replica_coordinator.link_repository().add_link(&path, group).unwrap();
+    start_watch_and_await_scan(&state, root.path(), group).await;
+    let subscribers_running = state.replica_coordinator.held_path_subscribers();
+
+    let sidecar =
+        root.path().join(yadorilink_root_authority::sync_root_lock::SYNC_ROOT_LOCK_FILE_NAME);
+    std::fs::remove_file(&sidecar).unwrap();
+    state.replica_coordinator.notify_held_path();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !state.links.is_ownership_lost(&path) {
+        assert!(std::time::Instant::now() < deadline, "link never entered OwnershipLost");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    // The repair task has ended: it no longer listens for wakes, however many arrive.
+    for _ in 0..100 {
+        state.replica_coordinator.notify_held_path();
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(state.replica_coordinator.held_path_subscribers(), subscribers_running - 1);
+    // Disk-pressure bookkeeping neither overwrites nor clears the terminal mark.
+    state.mark_link_degraded(&path, "disk".into());
+    state.clear_link_degraded(&path);
+    assert!(state.links.is_ownership_lost(&path));
+    assert!(!state.links.mark_ownership_lost(&path, 0), "already terminal: no second transition");
+    assert!(!sidecar.exists(), "the sidecar is never recreated automatically");
+    assert!(state.links.degraded_due_snapshot(i64::MAX - 1).is_empty(), "never rechecked");
+    let info = state.links.degraded_info(&path).unwrap();
+    assert_eq!(info.reason, crate::link_registry::OWNERSHIP_LOST_REASON);
+
+    // Relink: stop, start again.
+    LinkRuntimeController::new(state.clone()).stop(&path).await;
+    start_watch_and_await_scan(&state, root.path(), group).await;
+    assert!(!state.links.is_ownership_lost(&path));
+    assert!(sidecar.exists());
+}
+
 /// HIGH-1 concurrent-stop regression: the control socket spawns one
 /// task per connection, so two overlapping `Unlink`s for the same path
 /// (a genuine, not hypothetical, shape) both call `stop`.

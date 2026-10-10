@@ -1735,7 +1735,6 @@ pub(crate) fn delete_provider_state(
     )?;
     if !remaining {
         tx.execute("DELETE FROM provider_dirs WHERE group_id = ?1", [group])?;
-        tx.execute("DELETE FROM provider_placements WHERE group_id = ?1", [group])?;
     }
     Ok(())
 }
@@ -1776,10 +1775,6 @@ pub fn declare_link_root_in_tx(
     }
     let root_id = mint_root_id();
     insert_root(tx, &root_id, group_id, spec.kind.as_db_str(), &spec.display_name)?;
-    // A provider root never goes through the link startup that records native authority, and rows
-    // arriving by replication would make the group "not fresh" afterwards: the first local write
-    // would be refused as state from before native authority. A provider link is native from the start.
-    crate::group_authority::adopt_native_if_fresh(tx, group_id)?;
     tx.execute(
         "UPDATE links SET creation_digest = ?2 WHERE group_id = ?1",
         rusqlite::params![group_id, spec.creation_digest],

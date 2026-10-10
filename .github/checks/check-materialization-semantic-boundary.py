@@ -323,7 +323,6 @@ ALLOWLIST: dict[str, dict[str, int]] = {
         "dag_snapshot_mutation_fence": 1,
         "set_held": 2,
         "set_held_with_key": 1,
-        "dag_publish_materialized_generation_if_fence_current": 1,
         "dag_complete_obligation_if_exact_proof_current": 1,
         "dag_complete_obligation_if_non_exact_proof_current": 1,
         "commit_internal_materialized_state_if_fence_current": 2,
@@ -496,14 +495,6 @@ ALLOWLIST: dict[str, dict[str, int]] = {
         "set_materialization_state_in_tx": 1,
         "retire_unproven_actual_state_in_tx": 1,
     },
-    # A snapshot install's reconciliation that keeps a directory where an
-    # installed entry belongs moves the entry to its copy name, releases
-    # the path's hold and records the directory as retained in one
-    # transaction: a crash between the two would leave the directory
-    # unrecorded with nothing held to bring the path back.
-    S + "held_path.rs": {
-        "record_retained_directory": 1,
-    },
     # A structural `mkdir` bumps the path's fence as it records its intent,
     # and the intent's completion refuses a fence that moved since; a
     # rename's rekey forgets the record at the old name.
@@ -570,7 +561,7 @@ ALLOWLIST: dict[str, dict[str, int]] = {
 #   O daemon/replica_coordinator/materialization_execution.rs       7
 #   O daemon/replica_coordinator/materialization_owner.rs           3
 #   O daemon/replica_coordinator/materialization_owner/hydration.rs 10
-#   O daemon/replica_coordinator/materialization_owner/lanes.rs    27
+#   O daemon/replica_coordinator/materialization_owner/lanes.rs    26
 #   O daemon/replica_coordinator/materialization_owner/repair.rs 14
 #   O daemon/replica_coordinator/materialization_owner/structural.rs 11
 #   O daemon/replica_coordinator/peer_replica_state.rs             17
@@ -579,13 +570,12 @@ ALLOWLIST: dict[str, dict[str, int]] = {
 #   R sync-sqlite/materialization_state.rs                          1
 #   R sync-sqlite/materialized_generation.rs                        2
 #   R sync-sqlite/restore_operation.rs                              4
-#   R sync-sqlite/held_path.rs                          1
 #   R sync-sqlite/store.rs                                         12
 #   R sync-sqlite/structural_origin.rs                              3
 #   ------------------------------------------------------------
-#   total 189 = lane 43 + owner 89 + repository 57 (the per-file rows above are
+#   total 187 = lane 43 + owner 88 + repository 56 (the per-file rows above are
 #   indicative; the pins in ALLOWLIST are authoritative)
-EXPECTED_ALLOWED = 189
+EXPECTED_ALLOWED = 187
 
 # The in-family row mutators outside `FORBIDDEN`. Each also writes
 # materialization-relevant columns (a peer row's version and authoring, the
@@ -1037,7 +1027,6 @@ def self_test() -> None:
         ("not(test)", False),
         ("any(test, madsim)", False),
         ("any(test, not(madsim))", False),
-        ('any(test, feature = "evict-custody-test-bypass")', False),
         ('feature = "test"', False),
         ("unix", False),
         ("all(not(test), unix)", False),

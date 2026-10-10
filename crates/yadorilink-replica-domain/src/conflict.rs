@@ -168,83 +168,6 @@ pub const MAX_COMPONENT_BYTES: usize = 255;
 /// [`conflict_copy_stem_was_truncated`] reports.
 pub const STEM_TRUNCATION_MARKER: &str = "~";
 
-/// Clamps `mtime_unix_nanos` so it is never trusted as more than
-/// `MAX_FUTURE_MTIME_SKEW_NANOS` beyond `now_unix_nanos`. A no-op for any
-/// ordinary (non-adversarial) mtime, which is always at or before "now".
-fn clamp_future_mtime(mtime_unix_nanos: i64, now_unix_nanos: i64) -> i64 {
-    mtime_unix_nanos.min(now_unix_nanos.saturating_add(MAX_FUTURE_MTIME_SKEW_NANOS))
-}
-
-/// Returns whether `(mtime_a, device_a)` is the *loser* against
-/// `(mtime_b, device_b)` — i.e. the older-effective-mtime copy, demoted to
-/// a conflict-marked filename. Shared by `resolve_conflict_names` (which
-/// needs a result every peer computes identically, regardless of which
-/// side of the conflict it's looking at) and
-/// `peer_session::resolve_and_apply_conflict` (which needs to know which
-/// side's *content*, not just which path name, is the winner) so the two
-/// decisions can never disagree with each other.
-///
-/// Both mtimes are bounded via `clamp_future_mtime` before comparison,
-/// so an extreme peer-supplied value can no longer win
-/// outright by an unbounded margin.
-///
-/// The tie-break (mtimes equal after clamping) is device id, not "prefer
-/// local": this function is deliberately symmetric/observer-independent —
-/// it has no notion of which side is "this device's own" copy. A literal
-/// "prefer local" tie-break would mean two different peers, each
-/// comparing the *same* conflicting pair from their own point of view,
-/// could independently pick *different* winners (each preferring itself)
-/// while computing the *same* merged version vector for the result —
-/// leaving the mesh with two devices permanently disagreeing about a
-/// path's content under a version vector that claims they're in sync, a
-/// correctness regression no security fix should introduce. Device id is
-/// a fixed identity established at pairing time, not something a peer can
-/// adaptively choose per-message to win ties, so keeping it as the
-/// tie-break closes the concrete exploit (an extreme mtime unilaterally
-/// winning) without sacrificing that determinism guarantee.
-pub fn a_is_loser(
-    mtime_a: i64,
-    device_a: &str,
-    mtime_b: i64,
-    device_b: &str,
-    now_unix_nanos: i64,
-) -> bool {
-    let eff_a = clamp_future_mtime(mtime_a, now_unix_nanos);
-    let eff_b = clamp_future_mtime(mtime_b, now_unix_nanos);
-    eff_a < eff_b || (eff_a == eff_b && device_a < device_b)
-}
-
-/// Given the two concurrently-edited file records' paths/mtimes/device
-/// ids/content hashes (plus wall-clock "now"), returns
-/// `(winner_path, loser_conflict_path)` — the loser being the
-/// older-effective-mtime copy (ties broken by device id, for determinism
-/// so all peers independently compute the same result; see `a_is_loser`'s
-/// doc comment for why). `hash_a`/`hash_b` (each a
-/// `combined_block_hash` of that side's `FileRecord::blocks`) follow the
-/// same observer-independence property as `mtime_a`/`device_a` and
-/// `mtime_b`/`device_b`: they're exactly as available and exactly as
-/// identical-on-both-sides, so selecting the loser's hash alongside its
-/// mtime/device introduces no new source of cross-peer disagreement.
-#[allow(clippy::too_many_arguments)]
-pub fn resolve_conflict_names(
-    path: &str,
-    mtime_a: i64,
-    device_a: &str,
-    hash_a: &[u8],
-    mtime_b: i64,
-    device_b: &str,
-    hash_b: &[u8],
-    now_unix_nanos: i64,
-) -> (String, String) {
-    let (loser_mtime, loser_device, loser_hash) =
-        if a_is_loser(mtime_a, device_a, mtime_b, device_b, now_unix_nanos) {
-            (clamp_future_mtime(mtime_a, now_unix_nanos), device_a, hash_a)
-        } else {
-            (clamp_future_mtime(mtime_b, now_unix_nanos), device_b, hash_b)
-        };
-    (path.to_string(), conflict_copy_path(path, loser_mtime, loser_device, loser_hash))
-}
-
 /// Builds `<name> (conflicted copy, <ISO-8601 timestamp>, <device>,
 /// <content hash>).<ext>`, where `<content hash>` is the FULL lowercase
 /// hex encoding of `content_hash` (typically a `combined_block_hash` of
@@ -348,7 +271,7 @@ pub fn native_copy_path(path: &str, label: &str, version_hash: &[u8; 32]) -> Str
 /// result is just the marker: the remaining fields are the ones that
 /// carry identity, so there is nothing further this may shorten, and an
 /// honest over-long name is better than a name that has lost the hash.
-fn truncate_stem_to_fit(stem: &str, fixed_bytes: usize) -> String {
+pub(crate) fn truncate_stem_to_fit(stem: &str, fixed_bytes: usize) -> String {
     if stem.len() + fixed_bytes <= MAX_COMPONENT_BYTES {
         return stem.to_string();
     }

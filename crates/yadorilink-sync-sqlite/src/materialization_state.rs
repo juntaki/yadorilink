@@ -278,10 +278,6 @@ impl MaterializationStateRepository {
     /// disk, and repair, not a blind reconstruct, is what then decides it.
     /// Both updates share one transaction; the count is every row moved
     /// out of `Hydrating`.
-    pub fn reset_stale_hydrating(&self) -> Result<usize, SyncSqliteError> {
-        self.database.write_immediate::<_, SyncSqliteError>(|tx| Self::reset_hydrating_in(tx))
-    }
-
     fn reset_hydrating_in(tx: &rusqlite::Connection) -> Result<usize, SyncSqliteError> {
         let restored = tx.execute(
             "UPDATE files SET materialization_state = ?1 \
@@ -290,6 +286,7 @@ impl MaterializationStateRepository {
                    AND NOT EXISTS ( \
                        SELECT 1 FROM materialization_intents i \
                         WHERE i.group_id = files.group_id AND i.path = files.path \
+                          AND i.kind = 'write' \
                    ) \
                    AND EXISTS ( \
                        SELECT 1 FROM path_materialized_generations g \
@@ -313,6 +310,7 @@ impl MaterializationStateRepository {
                        EXISTS ( \
                            SELECT 1 FROM materialization_intents i \
                             WHERE i.group_id = files.group_id AND i.path = files.path \
+                              AND i.kind = 'write' \
                        ) \
                        AND files.deleted = 0 \
                        AND ( \
@@ -340,7 +338,7 @@ impl MaterializationStateRepository {
     /// `Evicting` is set right before eviction writes the placeholder and is
     /// cleared to `Remote` only once that placeholder is committed
     /// (`materialization_eviction::evict_file`). A crash in that window
-    /// leaves the row `Evicting` forever: `reset_stale_hydrating`
+    /// leaves the row `Evicting` forever: `reset_hydrating_in`
     /// above touches only `Hydrating` rows, `repair_interrupted_materializations`
     /// skips every non-`Present` row, and nothing else reconciles it — so
     /// the file is permanently wedged (status even miscounts it as
@@ -370,10 +368,6 @@ impl MaterializationStateRepository {
     /// on-disk bytes (the zero-filled placeholder) do not match the indexed
     /// blocks, quarantine that placeholder as a divergent "user edit", and
     /// journal it as a new local path — fabricating a zero-filled conflict copy.
-    pub fn reset_stale_evicting(&self) -> Result<usize, SyncSqliteError> {
-        self.database.write::<_, SyncSqliteError>(|conn| Self::reset_evicting_in(conn))
-    }
-
     fn reset_evicting_in(conn: &rusqlite::Connection) -> Result<usize, SyncSqliteError> {
         Ok(conn.execute(
             "UPDATE files SET materialization_state = ?1 \

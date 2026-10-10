@@ -152,7 +152,7 @@ fn local_put(local: &Connection, path: &str, seed: u8) -> Result<(), SyncSqliteE
     let key = device_key(device_seed(author.device.as_str()));
     let signer = LocalAuthor { author, signing_key: &key, capture: None };
     let op = Op::Put { path: SyncPath(path.into()), version: version(seed).version_hash };
-    author_op(local, &group(), &signer, &op, &SyncPath(path.into())).map(|_| ())
+    author_op(local, &group(), &signer, &op).map(|_| ())
 }
 
 fn local_delete(local: &Connection, path: &str) -> Result<(), SyncSqliteError> {
@@ -160,7 +160,7 @@ fn local_delete(local: &Connection, path: &str) -> Result<(), SyncSqliteError> {
     let key = device_key(device_seed(author.device.as_str()));
     let signer = LocalAuthor { author, signing_key: &key, capture: None };
     let op = Op::Delete { path: SyncPath(path.into()) };
-    author_op(local, &group(), &signer, &op, &SyncPath(path.into())).map(|_| ())
+    author_op(local, &group(), &signer, &op).map(|_| ())
 }
 
 fn is_frozen<T: std::fmt::Debug>(outcome: Result<T, SyncSqliteError>) -> bool {
@@ -879,7 +879,6 @@ fn reasserted_delta_is_recomputed_from_installed_state() {
             if live { vec![rem(&o.a, 1, o.a1)] } else { Vec::new() },
             "the removal of A/1 stays only while A/1 is live in the installed state"
         );
-        assert!(delta.ops[0].keeps.is_empty() && !delta.ops[0].keep_put);
     }
 }
 

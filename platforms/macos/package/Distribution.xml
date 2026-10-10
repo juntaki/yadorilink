@@ -3,18 +3,13 @@
     <title>yadorilink</title>
     <organization>com.yadorilink</organization>
     <domains enable_localSystem="true" enable_currentUserHome="false" enable_anywhere="false"/>
-    <options customize="never" require-scripts="true" rootVolumeOnly="true"/>
-
-    <!--
-      Deliberately no notarization/Developer-ID signing of this outer
-      Distribution package, this pass of
-      the installer is unsigned/unnotarized. Gatekeeper will show an
-      "unidentified developer" warning when this .pkg is opened; that is
-      expected for unsigned local builds. The .app bundle payload embedded
-      inside this package *is* signed for real (see build-pkg.sh's comment on why: an
-      ad-hoc-signed FinderSync/File Provider extension is proven, in this
-      repo's own history, to not actually launch under App Sandbox).
-    -->
+    <options customize="never" require-scripts="true" rootVolumeOnly="true" hostArchitectures="arm64"/>
+    <!-- The app and every linked Rust library are arm64-only and need macOS 14. -->
+    <volume-check>
+        <allowed-os-versions>
+            <os-version min="14.0"/>
+        </allowed-os-versions>
+    </volume-check>
 
     <choices-outline>
         <line choice="default">

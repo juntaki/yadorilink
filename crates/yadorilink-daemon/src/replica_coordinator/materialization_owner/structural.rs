@@ -18,18 +18,6 @@ use yadorilink_sync_sqlite::SyncSqliteError;
 
 use super::super::ReplicaCoordinator;
 
-/// How old an unresolved structural intent must be before the periodic
-/// sweep resolves it. Between an intent and its completion the materializer
-/// runs one `mkdir`, one `lstat` and one write transaction; five minutes
-/// is far longer than that takes even behind a contended writer gate, so
-/// an intent this old belongs to a writer that died between the two
-/// phases (a crash, or a panic unwinding past the `mkdir`). Dropping a
-/// live intent by mistake is safe in any case: its completion then finds
-/// no pending intent, records the directory as of lost provenance, and it
-/// is `OriginUnknown` -- kept, never authored.
-pub(crate) const STALE_STRUCTURAL_INTENT_AGE: std::time::Duration =
-    std::time::Duration::from_secs(5 * 60);
-
 fn now_unix_nanos() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -100,22 +88,32 @@ impl ReplicaCoordinator {
     pub(crate) fn drop_interrupted_structural_intents_at_startup(
         &self,
     ) -> Result<Vec<(String, String)>, SyncSqliteError> {
-        self.resolve_unresolved_structural_intents(i64::MAX)
+        self.resolve_unresolved_structural_intents(None, None)
     }
 
-    /// Periodic backstop: resolves the structural intents older than
-    /// [`STALE_STRUCTURAL_INTENT_AGE`], for a writer that died between the
-    /// two phases while the daemon kept running -- and retries every intent
-    /// an earlier pass had to keep.
-    pub(crate) fn drop_stale_structural_intents(
+    /// Link start: the intents of `group_id` that startup had to keep because
+    /// its root could not be looked at then. Nothing of this link runs yet, so
+    /// none is in flight.
+    pub fn resolve_structural_intents_at_link_start(
         &self,
+        group_id: &str,
     ) -> Result<Vec<(String, String)>, SyncSqliteError> {
-        let cutoff = now_unix_nanos()
-            .saturating_sub(STALE_STRUCTURAL_INTENT_AGE.as_nanos().min(i64::MAX as u128) as i64);
-        self.resolve_unresolved_structural_intents(cutoff)
+        self.resolve_unresolved_structural_intents(Some(group_id), None)
     }
 
-    /// Drops each structural intent recorded before `cutoff` and, in the
+    /// A `mkdir` writer that is leaving without having completed or abandoned
+    /// its intent (an error it could not report to the ledger, or a panic
+    /// unwinding): resolves that one intent now, as recovery would.
+    pub fn resolve_interrupted_structural_intent(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<(), SyncSqliteError> {
+        self.resolve_unresolved_structural_intents(Some(group_id), Some(path)).map(|_| ())
+    }
+
+    /// Drops each structural intent (of `group_id`, and of `path` when given;
+    /// of every group when `None`) and, in the
     /// same transaction, records the directory now at its path -- which
     /// may be the one the interrupted `mkdir` created -- as of lost
     /// provenance, bound to its identity: capture then keeps it and
@@ -127,15 +125,17 @@ impl ReplicaCoordinator {
     /// path. One whose root cannot be looked at -- no live link for the
     /// group, a root not (yet) mounted, an observation that failed -- is
     /// kept: it still reads as a `mkdir` in flight, never as a user's
-    /// directory, and the periodic sweep resolves it once the root is
-    /// back.
+    /// directory, and the next link start of its group resolves it once the
+    /// root is back.
     fn resolve_unresolved_structural_intents(
         &self,
-        cutoff: i64,
+        group_id: Option<&str>,
+        path: Option<&str>,
     ) -> Result<Vec<(String, String)>, SyncSqliteError> {
-        let intents = self.sqlite().dag_list_unresolved_structural_intents(cutoff)?;
+        let intents = self.sqlite().dag_list_unresolved_structural_intents(group_id)?;
         let resolutions: Vec<_> = intents
             .into_iter()
+            .filter(|intent| path.is_none_or(|p| intent.path == p))
             .filter_map(|intent| {
                 let found = self.directory_an_interrupted_mkdir_may_have_made(&intent)?;
                 Some((intent, found))
@@ -210,34 +210,9 @@ impl ReplicaCoordinator {
         Ok(())
     }
 
-    /// Records that the reconciler left the entry of `path` at the copy name
-    /// `copy` for a reason only this device's disk knows, so native's
-    /// physical placement authority resolves the row there to that entry
-    /// until the row is replaced. Nothing is recorded when native shows no
-    /// head at `path` with the row's version.
-    pub(crate) fn record_reconciliation_hold(
-        &self,
-        group_id: &str,
-        copy: &str,
-        path: &str,
-    ) -> Result<(), SyncSqliteError> {
-        self.file_index_repository()
-            .record_native_reconciliation_hold(group_id, copy, path)
-            .map(|_| ())
-    }
-
     /// Raises an obligation for every planned entry with no live row.
     pub(crate) fn arm_native_plan_gaps(&self, group_id: &str) -> Result<usize, SyncSqliteError> {
         self.file_index_repository().arm_native_plan_gaps(group_id)
-    }
-
-    /// The copy and relocated names native still records for `path`.
-    pub(crate) fn native_placed_names_of(
-        &self,
-        group_id: &str,
-        path: &str,
-    ) -> Result<Vec<String>, SyncSqliteError> {
-        self.file_index_repository().native_placed_names_of(group_id, path)
     }
 
     /// Records that the directory at `path` stays on disk although its
@@ -392,20 +367,29 @@ impl ReplicaCoordinator {
         self.sqlite().native_desired_path_state(group_id, path)
     }
 
-    /// Records `group_id` as native-authorized when it has no indexed rows
-    /// yet (see [`yadorilink_sync_sqlite::group_authority`]); whether it is
-    /// native afterwards.
-    pub(crate) fn adopt_native_authority_if_fresh(
+    /// Whether `version` is a Present file at a path other than `path`.
+    pub(crate) fn version_present_elsewhere(
         &self,
         group_id: &str,
+        path: &str,
+        version: &yadorilink_replica_domain::ids::VersionHash,
     ) -> Result<bool, SyncSqliteError> {
-        self.database().write::<_, SyncSqliteError>(|conn| {
-            yadorilink_sync_sqlite::group_authority::adopt_native_if_fresh(conn, group_id)
-        })
+        self.file_index_repository().version_present_elsewhere(group_id, path, version)
+    }
+
+    /// The displacement guard for `path` about to show `planned`.
+    pub(crate) fn displacement_guard(
+        &self,
+        group_id: &str,
+        path: &str,
+        planned: Option<&yadorilink_replica_domain::ids::VersionHash>,
+    ) -> Result<yadorilink_sync_sqlite::displacement_guard::DisplacementGuard, SyncSqliteError>
+    {
+        self.file_index_repository().displacement_guard(group_id, path, planned)
     }
 
     /// One directory level of native's materialization plan: the exact live
-    /// head behind every node, copies and relocated entries included.
+    /// head behind every node.
     pub(crate) fn native_plan_level(
         &self,
         group_id: &str,
@@ -424,7 +408,7 @@ impl ReplicaCoordinator {
         self.file_index_repository().native_plan_node(group_id, path)
     }
 
-    /// The nodes of [`Self::native_plan_level`] that `names` are or stand for. A handful of
+    /// The nodes of [`Self::native_plan_level`] at `names`. A handful of
     /// names is read for themselves; past [`SCOPED_PLAN_NAME_LIMIT`] the whole level is
     /// planned once, which then costs less than naming each (the plan holds the requested nodes
     /// and others, which callers ignore).
@@ -441,7 +425,7 @@ impl ReplicaCoordinator {
         }
     }
 
-    /// The nodes of [`Self::native_plan_level`] that `names` are or stand for.
+    /// The nodes of [`Self::native_plan_level`] at `names`.
     pub(crate) fn native_plan_nodes(
         &self,
         group_id: &str,

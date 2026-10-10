@@ -259,7 +259,7 @@ async fn a_directory_whose_structural_provenance_was_lost_is_kept_and_not_author
     let root = canonical_root(&root_dir);
     adopt_root(&state, GROUP, &root);
     state.sqlite().dag_record_structural_intent(GROUP, "lost", 1).unwrap();
-    state.sqlite().dag_drop_unresolved_structural_intents(i64::MAX).unwrap();
+    state.sqlite().dag_drop_unresolved_structural_intents().unwrap();
     std::fs::create_dir(root.join("lost")).unwrap();
     let identity = FileIdentity::observe_path(&root.join("lost")).unwrap();
     // The mkdir's own completion finds its intent gone.

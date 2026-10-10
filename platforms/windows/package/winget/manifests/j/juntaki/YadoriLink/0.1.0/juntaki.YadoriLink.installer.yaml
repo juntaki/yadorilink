@@ -25,7 +25,7 @@ InstallerSwitches:
   # Both switches append /PACKAGEMANAGER=winget -- platforms/windows/package/yadorilink.iss's
   # GetPackageManagerParam reads this and records InstallSource=winget in
   # the registry (HKLM\Software\yadorilink) so
-  # install_windows::detect_package_manager_marker can tell the daemon's
+  # install_source::detect_package_manager_marker can tell the daemon's
   # built-in updater a WinGet-managed install exists and defer to
   # `winget upgrade` instead of running its own installer over it -- see
   # manager::dispatch_install in

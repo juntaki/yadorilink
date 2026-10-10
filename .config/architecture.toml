@@ -87,7 +87,6 @@ crates = [
   "yadorilink-replica-domain",
   "yadorilink-root-authority",
   "yadorilink-replica-engine",
-  "yadorilink-dcf-kernel",
   "yadorilink-namespace",
   "yadorilink-dcf-oracle",
 ]
@@ -211,15 +210,6 @@ deterministic conflict repair election. Pure policy over the domain model,
 so it can be reasoned about and tested without a runtime.
 """
 workspace_dependencies = ["yadorilink-replica-domain"]
-
-[crate."yadorilink-dcf-kernel"]
-reason = """
-Research asset: the transition, join and author-side rules of signed
-per-path bases, generic over the change type. Pure and dependency-free. No
-production crate depends on it; it is kept as the reference the native
-causal state was derived from.
-"""
-workspace_dependencies = []
 
 [crate."yadorilink-namespace"]
 reason = """

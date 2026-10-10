@@ -311,7 +311,7 @@ impl ReplicaCoordinator {
                     Some(record),
                     generation.as_ref(),
                 ) || self
-                    .dag_disk_is_untouched_proven_write(group_id, path, out_path)
+                    .disk_is_untouched_proven_write_at(group_id, path, out_path)
                     .unwrap_or(false)
                     || (yadorilink_local_storage::disk_bytes_match_indexed_blocks(
                         out_path,

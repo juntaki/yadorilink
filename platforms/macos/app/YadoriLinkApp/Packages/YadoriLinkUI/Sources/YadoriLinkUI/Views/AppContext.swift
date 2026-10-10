@@ -10,6 +10,7 @@ public enum WindowID {
     public static let onboarding = "onboarding"
     public static let addFolder = "add-folder"
     public static let invite = "invite"
+    public static let join = "join-invite"
 }
 
 public enum SidebarItem: String, CaseIterable, Identifiable, Hashable, Sendable {
@@ -53,6 +54,9 @@ public final class AppContext {
     public var folderPath: [String] = []
     public var shareTarget: ShareTarget?
     public var showsSignIn = false
+    /// An invite link received from the system (a clicked `yadorilink://` link),
+    /// waiting for the Join window to pick it up.
+    public var pendingInviteLink: String?
     @ObservationIgnored public let openURL: (URL) -> Void
 
     public init(app: AppModel, loginItem: LoginItemModel, openURL: @escaping (URL) -> Void = { NSWorkspace.shared.open($0) }) {
@@ -60,6 +64,9 @@ public final class AppContext {
         self.loginItem = loginItem
         self.openURL = openURL
     }
+
+    /// True when the app runs on the fake client: everything shown is made up.
+    public var isFixture: Bool { app.client is FakeYadoriLinkClient }
 
     public func showFolder(_ localPath: String) {
         sidebar = .folders
@@ -121,5 +128,19 @@ extension AppContext {
         let app = AppModel(client: FakeYadoriLinkClient(scenario: scenario))
         app.start()
         return AppContext(app: app, loginItem: LoginItemModel(service: loginItem), openURL: { _ in })
+    }
+}
+
+/// A small, always-visible mark that the data on screen is fixture data.
+struct FixtureBadge: View {
+    var body: some View {
+        Label("Fixture", systemImage: "testtube.2")
+            .font(.caption.weight(.semibold))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .foregroundStyle(.orange)
+            .background(.orange.opacity(0.15), in: Capsule())
+            .help("Fixture data: this is not your real YadoriLink state.")
+            .accessibilityLabel("Fixture data, not real")
     }
 }

@@ -166,10 +166,14 @@ impl ClientCore {
         Ok(dto::update_status(&status))
     }
 
+    /// Manual updates (v1): returns where to get the new version as
+    /// `StoreManaged { guidance }`. Nothing is installed by the daemon. The
+    /// name is kept so the generated Swift bindings stay stable.
+    ///
     /// # Errors
     /// Daemon failures.
     pub async fn install_update(&self) -> Result<UpdateInstallOutcome, DesktopError> {
-        Ok(dto::update_install_outcome(&ops::updates::install_update().await?))
+        Ok(dto::update_install_outcome(&ops::updates::download_guidance().await?))
     }
 
     /// Changes either setting; `None` leaves it as it is.

@@ -117,7 +117,7 @@ struct UpdatesSettingsView: View {
                         Text(model.headline).font(.headline)
                         Spacer()
                         if model.canInstall {
-                            Button("Install") { Task { await model.install() } }.disabled(model.isWorking)
+                            Button("Download the new version") { Task { await model.install() } }.disabled(model.isWorking)
                         } else {
                             Button("Check Now") { Task { await model.check() } }.disabled(model.isWorking)
                         }

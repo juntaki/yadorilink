@@ -46,7 +46,6 @@ use yadorilink_replica_domain::native_state::{DeltaHash, Dot, HeadPayload, Nativ
 use yadorilink_replica_domain::proof_carrying_delta::{
     verify_proof_carrying_delta, ProofCarryingDelta,
 };
-use yadorilink_replica_engine::native_snapshot::NativeSnapshotState;
 
 use crate::error::SyncSqliteError;
 
@@ -96,7 +95,6 @@ pub struct NativeBootstrap {
     /// cutoff, and refuses any other.
     pub closures: Vec<SignedAuthorClosure>,
     pub file_versions: Vec<Vec<u8>>,
-    pub native: NativeSnapshotState,
 }
 
 impl NativeBootstrap {
@@ -247,7 +245,6 @@ pub fn build_native_recovery_bundle(
             versions.insert(payload.version, version.canonical_encoding());
         }
     }
-    let native = crate::native_row_witness::carried_native_state(conn, group_id.as_str())?;
     Ok(NativeBootstrap {
         checkpoint,
         seal: None,
@@ -256,7 +253,6 @@ pub fn build_native_recovery_bundle(
         authors,
         closures,
         file_versions: versions.into_values().collect(),
-        native,
     })
 }
 
@@ -317,41 +313,6 @@ fn delta_evidence(
         author_signing_public_key,
         merkle_proof_encoded,
     })
-}
-
-/// A kept copy names a live head: every kept head of the bundle is one of the
-/// heads it carries, with the provenance the keep was recorded against.
-fn kept_heads_are_carried(payload: &NativeBootstrap) -> Result<(), String> {
-    type HeadKey<'a> = (&'a str, &'a str, [u8; 16], u64, [u8; 32]);
-    let carried: BTreeSet<HeadKey<'_>> = payload
-        .heads
-        .iter()
-        .map(|head| {
-            (
-                head.path.as_str(),
-                head.dot.author.device.as_str(),
-                head.dot.author.incarnation.0,
-                head.dot.seq.get(),
-                head.provenance.0,
-            )
-        })
-        .collect();
-    for kept in &payload.native.kept_heads {
-        let key = (
-            kept.source_path.as_str(),
-            kept.author.as_str(),
-            kept.incarnation,
-            kept.seq,
-            kept.provenance,
-        );
-        if !carried.contains(&key) {
-            return Err(format!(
-                "a kept copy of {:?} names a head the bundle does not carry",
-                kept.source_path
-            ));
-        }
-    }
-    Ok(())
 }
 
 /// Verifies `payload` for `group_id` and reconstructs what it installs.
@@ -517,41 +478,6 @@ pub fn verify_native_bootstrap(
         }
     }
 
-    payload
-        .native
-        .validate()
-        .map_err(|error| refuse(format!("the native snapshot state is malformed: {error}")))?;
-    // The names the projection facts carry steer what the receiver writes to
-    // disk, so each must be a path this replica would admit from a delta: the
-    // sealer's word covers which facts exist, not that a name may escape the
-    // folder or collide with reserved names.
-    for binding in &payload.native.bindings {
-        for name in [&binding.source_path, &binding.stable_path] {
-            if let Some(why) = projection_name_refusal(name) {
-                return Err(refuse(format!("a stable name {name:?} is not usable: {why}")));
-            }
-        }
-    }
-    for kept in &payload.native.kept_heads {
-        if let Some(why) = projection_name_refusal(&kept.source_path) {
-            return Err(refuse(format!(
-                "a kept head's path {:?} is not usable: {why}",
-                kept.source_path
-            )));
-        }
-    }
-    kept_heads_are_carried(&payload).map_err(refuse)?;
-    // The checkpoint commits the projection facts too: the roots above do not
-    // cover them, and they steer what the receiver writes to disk.
-    if payload.native.projection_digest() != payload.checkpoint.projection_digest {
-        return Err(refuse(
-            "the projection state is not the one the checkpoint's projection digest commits to"
-                .into(),
-        ));
-    }
-    if !payload.native.row_witnesses.is_empty() {
-        return Err(refuse("index rows are not carried, so no row evidence may be".into()));
-    }
     Ok(VerifiedNativeBootstrap {
         state,
         frontier,
@@ -633,6 +559,7 @@ mod tests {
     mod checkpoint_install;
     mod history_lifecycle_red;
     mod persisted_author_state_tamper;
+    mod rebootstrap_crash;
     mod rebootstrap_freeze;
     mod rebootstrap_install;
     mod rebootstrap_items;
@@ -923,8 +850,6 @@ mod tests {
                 path: SyncPath(path.into()),
                 removes: Vec::new(),
                 put: Some(DeltaPut { version: version(v).version_hash }),
-                keeps: Vec::new(),
-                keep_put: false,
             }],
             signature: [0; 64],
         }
@@ -955,8 +880,6 @@ mod tests {
                 provenance: a1_hash,
             }],
             put: None,
-            keeps: Vec::new(),
-            keep_put: false,
         });
         publish(&c, &a, &ka, a2);
         (c, a, b)
@@ -991,10 +914,6 @@ mod tests {
                 &crate::native_store::load_state(&source, &group()).unwrap()
             )
             .unwrap()
-        );
-        assert_eq!(
-            crate::group_authority::recorded_authority(&fresh, GROUP).unwrap().as_deref(),
-            Some("native")
         );
         assert!(!crate::native_store::stored_checkpoint_hashes(&fresh, &group()).is_empty());
 
@@ -1265,40 +1184,6 @@ mod tests {
         assert!(error.to_string().contains("no live head rests on"), "{error}");
     }
 
-    /// The names a bundle's projection facts carry are paths the receiver will
-    /// write; ones that escape the folder or sit in reserved names are refused
-    /// even when the sealer signed the facts.
-    #[test]
-    fn a_bundle_whose_stable_names_are_not_usable_paths_is_refused() {
-        let (source, _a, _b) = source();
-        for (name, usable) in [
-            ("x (conflicted copy of device-b)", true),
-            ("dir/sub/file.txt", true),
-            ("../escape", false),
-            ("/abs", false),
-            ("a//b", false),
-            ("a/./b", false),
-            ("", false),
-            ("a\\b", false),
-            ("CON", false),
-            ("x/.yadorilink-v1-probe.1", false),
-        ] {
-            let mut payload = built(&source);
-            payload.native.bindings =
-                vec![yadorilink_replica_engine::native_snapshot::NativeBindingEntry {
-                    source_path: "x".into(),
-                    author: "device-a".into(),
-                    incarnation: [1; 16],
-                    seq: 1,
-                    stable_path: name.to_owned(),
-                }];
-            payload.checkpoint.projection_digest = payload.native.projection_digest();
-            payload.checkpoint.sign(&sealer_key());
-            let result = verify_native_bootstrap(sealed(payload), &group(), &Policy);
-            assert_eq!(result.is_ok(), usable, "{name:?}: {:?}", result.err());
-        }
-    }
-
     fn forged_claim_of_b_at_100() -> NativeBootstrap {
         forged_bundle(vec![BootstrapAuthorState {
             author: author("device-b"),
@@ -1378,8 +1263,6 @@ mod tests {
                     provenance: a1_hash,
                 }],
                 put: None,
-                keeps: Vec::new(),
-                keep_put: false,
             }],
             ..put_delta(&a, 2, Some(a1_hash), "x", 1)
         };
@@ -1535,194 +1418,6 @@ mod tests {
 
     // --- the projection state ----------------------------------------------
 
-    /// A source whose heads conflict at `x` and where `d` is both a file and a
-    /// directory, so its resolver placed a conflict copy and relocated a winner
-    /// and bound the copy's stable name; its device also recorded a kept copy
-    /// and a reconciliation hold of its own.
-    fn source_with_projection() -> Connection {
-        let c = conn();
-        for seed in 1..=3 {
-            crate::dag_store::put_file_version(&c, GROUP, &version(seed)).unwrap();
-        }
-        let (a, b) = (author("device-a"), author("device-b"));
-        let (ka, kb) = (device_key(1), device_key(2));
-        let a1 = put_delta(&a, 1, None, "x", 1);
-        let b1 = put_delta(&b, 1, None, "x", 2);
-        let (a1_hash, b1_hash) = (signed_hash(a1.clone(), &ka), signed_hash(b1.clone(), &kb));
-        publish(&c, &a, &ka, a1);
-        publish(&c, &b, &kb, b1);
-        publish(&c, &a, &ka, put_delta(&a, 2, Some(a1_hash), "d", 3));
-        publish(&c, &b, &kb, put_delta(&b, 2, Some(b1_hash), "d/e", 3));
-        for path in ["x", "d", "d/e"] {
-            crate::native_projection_binding::ensure_native_placements_around(&c, GROUP, path)
-                .unwrap();
-        }
-        crate::stable_projection_binding::native_keep_heads_of_version(
-            &c,
-            GROUP,
-            "x",
-            &version(1).version_hash.0,
-        )
-        .unwrap();
-        crate::stable_projection_binding::native_placement_put(
-            &c,
-            GROUP,
-            &crate::stable_projection_binding::NativePlacementRow {
-                physical_path: "x (held)".into(),
-                source_path: "x".into(),
-                author: "device-a".into(),
-                incarnation: [1; 16],
-                seq: 1,
-                provenance: [7; 32],
-                version: version(1).version_hash.0,
-                origin: "reconciliation_hold".into(),
-            },
-        )
-        .unwrap();
-        c
-    }
-
-    /// The checkpoint commits the projection facts: a bundle altered after it
-    /// was sealed cannot add a kept copy or a name, nor change or drop one, to
-    /// steer what the receiver writes to disk.
-    #[test]
-    fn a_projection_fact_changed_after_sealing_is_refused() {
-        let good = built(&source_with_projection());
-        assert!(!good.native.kept_heads.is_empty());
-        assert!(!good.native.bindings.is_empty());
-        verify_native_bootstrap(good.clone(), &group(), &Policy)
-            .expect("the sealed bundle verifies");
-
-        // A carried head at "x" that the bundle does not keep.
-        fn other_head_at_x(
-            bundle: &NativeBootstrap,
-        ) -> yadorilink_replica_engine::native_snapshot::NativeKeptHead {
-            let head = bundle
-                .heads
-                .iter()
-                .find(|head| {
-                    head.path.as_str() == "x"
-                        && !bundle.native.kept_heads.iter().any(|kept| {
-                            kept.seq == head.dot.seq.get()
-                                && kept.author == head.dot.author.device.as_str()
-                        })
-                })
-                .expect("a second head at x");
-            yadorilink_replica_engine::native_snapshot::NativeKeptHead {
-                source_path: "x".into(),
-                author: head.dot.author.device.0.clone(),
-                incarnation: head.dot.author.incarnation.0,
-                seq: head.dot.seq.get(),
-                provenance: head.provenance.0,
-            }
-        }
-
-        type Mutation = Box<dyn Fn(&mut NativeBootstrap)>;
-        let mutations: Vec<(&str, Mutation)> = vec![
-            (
-                "an added kept head",
-                Box::new(|b| {
-                    let other = other_head_at_x(b);
-                    b.native.kept_heads.push(other)
-                }),
-            ),
-            (
-                "a retargeted kept head",
-                Box::new(|b| {
-                    let other = other_head_at_x(b);
-                    b.native.kept_heads[0] = other
-                }),
-            ),
-            ("a dropped kept head", Box::new(|b| b.native.kept_heads.clear())),
-            ("a renamed binding", Box::new(|b| b.native.bindings[0].stable_path = "other".into())),
-            (
-                "an added binding",
-                Box::new(|b| {
-                    let mut extra = b.native.bindings[0].clone();
-                    extra.seq += 1;
-                    extra.stable_path = "fake".into();
-                    b.native.bindings.push(extra)
-                }),
-            ),
-            ("a dropped binding", Box::new(|b| b.native.bindings.clear())),
-        ];
-        for (what, mutate) in mutations {
-            let mut forged = good.clone();
-            mutate(&mut forged);
-            let error = verify_native_bootstrap(forged, &group(), &Policy)
-                .err()
-                .unwrap_or_else(|| panic!("{what} was accepted"));
-            assert!(error.to_string().contains("projection"), "{what}: {error}");
-        }
-    }
-
-    /// A kept copy names a live head: a bundle whose kept head is not among the
-    /// heads it carries (or carries it with another provenance) is refused, even
-    /// when its projection digest was sealed over that very state.
-    #[test]
-    fn a_kept_head_the_bundle_does_not_carry_is_refused() {
-        let good = built(&source_with_projection());
-        for (what, mutate) in [
-            (
-                "an unknown head",
-                Box::new(|b: &mut NativeBootstrap| b.native.kept_heads[0].seq += 40)
-                    as Box<dyn Fn(&mut NativeBootstrap)>,
-            ),
-            (
-                "another provenance",
-                Box::new(|b: &mut NativeBootstrap| b.native.kept_heads[0].provenance = [0x66; 32]),
-            ),
-        ] {
-            let mut forged = good.clone();
-            mutate(&mut forged);
-            let error = verify_native_bootstrap(forged, &group(), &Policy)
-                .err()
-                .unwrap_or_else(|| panic!("{what} was accepted"));
-            assert!(error.to_string().contains("does not carry"), "{what}: {error}");
-        }
-    }
-
-    /// A reconciliation hold records a reason only the device that made it
-    /// knows, and a conflict copy or a relocated winner is what the heads
-    /// determine: none of them is carried. A receiver that was handed no
-    /// placement at all ends with exactly the placements and names the source's
-    /// resolver derived, and with none of the source's holds.
-    #[test]
-    fn a_receiver_derives_the_placements_and_is_never_handed_a_hold() {
-        let source = source_with_projection();
-        let dump = |conn: &Connection| {
-            let mut placements: Vec<_> =
-                crate::stable_projection_binding::native_placements(conn, GROUP)
-                    .unwrap()
-                    .into_iter()
-                    .filter(|row| row.origin != "reconciliation_hold")
-                    .map(|row| (row.physical_path, row.source_path, row.seq, row.origin))
-                    .collect();
-            placements.sort();
-            let bindings: Vec<_> = crate::stable_projection_binding::native_bindings(conn, GROUP)
-                .unwrap()
-                .into_iter()
-                .collect();
-            (placements, bindings)
-        };
-        let (placed, bound) = dump(&source);
-        let origins: Vec<&str> = placed.iter().map(|placement| placement.3.as_str()).collect();
-        assert!(origins.contains(&"conflict_copy") && origins.contains(&"tree_relocation"));
-        assert!(!bound.is_empty());
-
-        let fresh = conn();
-        try_join(&source, &fresh).unwrap();
-
-        assert_eq!(dump(&fresh), (placed, bound), "derived, not carried");
-        assert!(
-            crate::stable_projection_binding::native_placements(&fresh, GROUP)
-                .unwrap()
-                .iter()
-                .all(|row| row.origin != "reconciliation_hold"),
-            "the source's hold did not reach the receiver"
-        );
-    }
-
     // --- auxiliary native tables around a join -------------------------------
 
     fn roots_of(c: &Connection) -> ([u8; 32], [u8; 32]) {
@@ -1779,313 +1474,5 @@ mod tests {
             vec![expected_checkpoint.checkpoint_hash().0],
             "the join replaced the stale checkpoint with the sealer's"
         );
-    }
-
-    /// A replica with no native state can still hold projection facts left from
-    /// an earlier life of the group (a state that was wiped, a group that was
-    /// left and rejoined). They name heads that no longer exist, so none of them
-    /// may survive the install: afterwards the receiver's derived projection facts
-    /// are exactly what the bundle yields, the same as for a replica that never
-    /// held any. The install clears every native fact of the group, a
-    /// reconciliation hold included: the disk is read again once the group is
-    /// open.
-    #[test]
-    fn a_join_replaces_stale_projection_facts_of_a_replica_with_no_native_state() {
-        use crate::stable_projection_binding as spb;
-        let source = source_with_projection();
-        let dump = |conn: &Connection| {
-            let mut placements: Vec<_> = spb::native_placements(conn, GROUP)
-                .unwrap()
-                .into_iter()
-                .filter(|row| row.origin != "reconciliation_hold")
-                .map(|row| (row.physical_path, row.source_path, row.seq, row.origin))
-                .collect();
-            placements.sort();
-            let bindings: Vec<_> = spb::native_bindings(conn, GROUP).unwrap().into_iter().collect();
-            (placements, bindings, spb::native_kept_heads_of_group(conn, GROUP).unwrap())
-        };
-        let expected = dump(&{
-            let fresh = conn();
-            try_join(&source, &fresh).unwrap();
-            fresh
-        });
-
-        let stale = conn();
-        stale
-            .execute(
-                "INSERT INTO native_head_keep (group_id, path, author, incarnation, seq, provenance) \
-                 VALUES (?1, 'gone.txt', 'device-z', ?2, 4, ?3)",
-                (GROUP, [9u8; 16].as_slice(), [3u8; 32].as_slice()),
-            )
-            .unwrap();
-        spb::native_bind(
-            &stale,
-            GROUP,
-            &("gone.txt".to_string(), "device-z".into(), [9; 16], 4),
-            "gone (copy)",
-        )
-        .unwrap();
-        let row = |physical: &str, origin: &str| spb::NativePlacementRow {
-            physical_path: physical.into(),
-            source_path: "gone.txt".into(),
-            author: "device-z".into(),
-            incarnation: [9; 16],
-            seq: 4,
-            provenance: [3; 32],
-            version: [0x55; 32],
-            origin: origin.into(),
-        };
-        spb::native_placement_put(&stale, GROUP, &row("gone (copy)", "conflict_copy")).unwrap();
-        spb::native_placement_put(&stale, GROUP, &row("gone (held)", "reconciliation_hold"))
-            .unwrap();
-
-        try_join(&source, &stale).unwrap();
-
-        assert_eq!(dump(&stale), expected, "no stale fact survives the install");
-        assert!(
-            spb::native_placement_at(&stale, GROUP, "gone (held)").unwrap().is_none(),
-            "the install clears every native fact, a hold included"
-        );
-    }
-
-    /// What the kept-copy tests below share: a source replica whose history
-    /// ends with a kept loser, the deltas that follow the checkpoint, and the
-    /// authors' keys.
-    struct KeepWorld {
-        source: Connection,
-        keys: Vec<(AuthorId, SigningKey)>,
-        covered: Vec<NativeDelta>,
-        later: Vec<NativeDelta>,
-    }
-
-    fn keep_world() -> KeepWorld {
-        use yadorilink_replica_domain::signed_delta::HeadRef;
-        let c = conn();
-        for seed in 1..=4 {
-            crate::dag_store::put_file_version(&c, GROUP, &version(seed)).unwrap();
-        }
-        let who: Vec<(AuthorId, SigningKey)> = ["device-a", "device-b", "device-d", "device-e"]
-            .iter()
-            .enumerate()
-            .map(|(i, name)| (author(name), device_key(i as u8 + 1)))
-            .collect();
-        let sign_as = |index: usize, mut delta: NativeDelta| {
-            delta.sign(&who[index].1);
-            delta
-        };
-        let op = |path: &str| DeltaOp {
-            path: SyncPath(path.into()),
-            removes: Vec::new(),
-            put: None,
-            keeps: Vec::new(),
-            keep_put: false,
-        };
-        // a puts x (v1, the winner), b puts x concurrently (v2, the loser).
-        let a1 = sign_as(0, put_delta(&who[0].0, 1, None, "x", 1));
-        let b1 = sign_as(1, put_delta(&who[1].0, 1, None, "x", 2));
-        // a removes its own winner having seen the loser as a copy: it keeps b1.
-        let mut a2 = put_delta(&who[0].0, 2, Some(a1.delta_hash()), "x", 1);
-        a2.ops = vec![DeltaOp {
-            removes: vec![HeadRef { dot: a1.dot(), provenance: a1.delta_hash() }],
-            keeps: vec![HeadRef { dot: b1.dot(), provenance: b1.delta_hash() }],
-            ..op("x")
-        }];
-        let a2 = sign_as(0, a2);
-        // After the checkpoint: b retires its own kept head, d puts the same
-        // content again declaring nothing, e keeps the head b1 (concurrently
-        // with the retirement).
-        let mut b2 = put_delta(&who[1].0, 2, Some(b1.delta_hash()), "x", 1);
-        b2.ops = vec![DeltaOp {
-            removes: vec![HeadRef { dot: b1.dot(), provenance: b1.delta_hash() }],
-            ..op("x")
-        }];
-        let b2 = sign_as(1, b2);
-        let d1 = sign_as(2, put_delta(&who[2].0, 1, None, "x", 2));
-        let mut e1 = put_delta(&who[3].0, 1, None, "x", 1);
-        e1.ops = vec![DeltaOp {
-            keeps: vec![HeadRef { dot: b1.dot(), provenance: b1.delta_hash() }],
-            ..op("x")
-        }];
-        let e1 = sign_as(3, e1);
-        let covered = vec![a1, b1, a2];
-        for (index, delta) in covered.iter().enumerate() {
-            let who_index = if delta.author == who[0].0 { 0 } else { 1 };
-            publish(&c, &who[who_index].0, &who[who_index].1, delta.clone());
-            let _ = index;
-        }
-        crate::native_projection_binding::ensure_native_placements_around(&c, GROUP, "x").unwrap();
-        KeepWorld { source: c, keys: who, covered, later: vec![b2, d1, e1] }
-    }
-
-    fn projection_facts(c: &Connection) -> (Vec<String>, Vec<String>, Vec<String>) {
-        use crate::stable_projection_binding::{native_kept_heads_of_group, native_placements};
-        let heads = crate::native_store::native_heads_at(c, &group(), &SyncPath("x".into()))
-            .unwrap()
-            .iter()
-            .map(|h| {
-                format!(
-                    "{:?}#{} v{}",
-                    h.dot.author.device.0,
-                    h.dot.seq.get(),
-                    h.payload.version.0[0]
-                )
-            })
-            .collect::<Vec<_>>();
-        let kept = native_kept_heads_of_group(c, GROUP)
-            .unwrap()
-            .iter()
-            .map(|k| format!("{}#{}", k.author, k.seq))
-            .collect::<Vec<_>>();
-        let placements = native_placements(c, GROUP)
-            .unwrap()
-            .iter()
-            .map(|p| format!("{} v{} {}", p.physical_path, p.version[0], p.origin))
-            .collect::<Vec<_>>();
-        let sorted = |mut v: Vec<String>| {
-            v.sort();
-            v
-        };
-        (sorted(heads), sorted(kept), sorted(placements))
-    }
-
-    /// A kept head crosses a checkpoint: the bundle carries it, survives the
-    /// wire, verifies and joins, and the receiver shows the sender's kept copy.
-    #[test]
-    fn a_kept_head_survives_the_checkpoint_wire_and_join() {
-        let world = keep_world();
-        let sent = projection_facts(&world.source);
-        assert_eq!(sent.1, vec!["device-b#1".to_string()], "the loser is kept");
-        assert_eq!(sent.2.len(), 1, "and shown at its copy name: {:?}", sent.2);
-
-        let bundle = built(&world.source);
-        assert_eq!(bundle.native.kept_heads.len(), 1);
-        let bytes = crate::native_bootstrap_codec::encode_recovery_bundle(&bundle).unwrap();
-        let decoded = crate::native_bootstrap_codec::decode_recovery_bundle(&bytes).unwrap();
-        assert_eq!(decoded, bundle);
-
-        let fresh = conn();
-        join_bundle(decoded, &fresh).unwrap();
-        assert_eq!(projection_facts(&fresh), sent, "the joined replica shows the same kept copy");
-    }
-
-    /// A replica that joined from the checkpoint (no history below it) and one
-    /// that kept every delta end with the same heads, kept heads and placements
-    /// after the same later deltas arrive in different orders: a later keep of
-    /// a head the checkpoint's frontier already covers, a retirement of the
-    /// kept head, and the same content put again at a new dot.
-    #[test]
-    fn a_compacted_replica_and_one_with_full_history_agree_after_later_deltas() {
-        let world = keep_world();
-        let lookup = |who: &AuthorId| {
-            world.keys.iter().find(|(a, _)| a == who).map(|(_, k)| k.verifying_key())
-        };
-        let orders: [[usize; 3]; 6] =
-            [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
-        let mut results = std::collections::BTreeSet::new();
-        for (round, order) in orders.iter().enumerate() {
-            let uncompacted = conn();
-            // Same history, replayed in the order it was authored.
-            for index in 0..world.covered.len() {
-                let delta = &world.covered[index];
-                let who = if delta.author == world.keys[0].0 { 0 } else { 1 };
-                publish(&uncompacted, &world.keys[who].0, &world.keys[who].1, delta.clone());
-            }
-            for seed in 1..=4 {
-                crate::dag_store::put_file_version(&uncompacted, GROUP, &version(seed)).unwrap();
-            }
-            crate::native_projection_binding::ensure_native_placements_around(
-                &uncompacted,
-                GROUP,
-                "x",
-            )
-            .unwrap();
-            let compacted = conn();
-            join_bundle(built(&world.source), &compacted).unwrap();
-            let rotated: Vec<usize> = order.iter().rev().copied().collect();
-            for (replica, sequence) in [(&uncompacted, order.to_vec()), (&compacted, rotated)] {
-                for index in sequence {
-                    let outcome = crate::native_admission::admit_native_delta(
-                        replica,
-                        &group(),
-                        &world.later[index],
-                        &lookup,
-                    )
-                    .unwrap();
-                    assert!(
-                        matches!(
-                            outcome,
-                            NativeAdmission::Admitted { .. } | NativeAdmission::Held { .. }
-                        ),
-                        "round {round}: {outcome:?}"
-                    );
-                }
-            }
-            let (left, right) = (projection_facts(&uncompacted), projection_facts(&compacted));
-            assert_eq!(left, right, "round {round}: order {order:?}");
-            results.insert(left);
-        }
-        assert_eq!(results.len(), 1, "the final state does not depend on the order: {results:?}");
-        let (heads, kept, placements) = results.into_iter().next().unwrap();
-        assert!(kept.is_empty(), "the kept head was retired, and the keep with it: {kept:?}");
-        assert!(placements.is_empty(), "the re-put of the content took the real name");
-        assert_eq!(heads.len(), 1, "only the same content put again lives: {heads:?}");
-    }
-
-    /// A delivery at or below the checkpoint's frontier is ignored before any
-    /// install: replayed into the compacted replica (or one that kept the log),
-    /// including one whose keeps were edited, it changes nothing and cannot
-    /// bring a retired head or a keep back.
-    #[test]
-    fn replaying_covered_deltas_changes_nothing() {
-        let world = keep_world();
-        let lookup = |who: &AuthorId| {
-            world.keys.iter().find(|(a, _)| a == who).map(|(_, k)| k.verifying_key())
-        };
-        let compacted = conn();
-        join_bundle(built(&world.source), &compacted).unwrap();
-        // The head b1 is retired after the join; its keep goes with it.
-        let b2 = &world.later[0];
-        assert!(matches!(
-            crate::native_admission::admit_native_delta(&compacted, &group(), b2, &lookup).unwrap(),
-            NativeAdmission::Admitted { .. }
-        ));
-        let settled = projection_facts(&compacted);
-        assert!(settled.1.is_empty());
-
-        // An edited copy of a covered delta, signed by its author: same position,
-        // different keeps (the keep of b1 is dropped, a keep of a1 added).
-        let mut edited = world.covered[2].clone();
-        edited.ops[0].keeps = vec![yadorilink_replica_domain::signed_delta::HeadRef {
-            dot: world.covered[1].dot(),
-            provenance: world.covered[1].delta_hash(),
-        }];
-        edited.sign(&world.keys[0].1);
-        for replay in world.covered.iter().chain(std::iter::once(&edited)) {
-            let outcome =
-                crate::native_admission::admit_native_delta(&compacted, &group(), replay, &lookup)
-                    .unwrap();
-            assert!(
-                matches!(
-                    outcome,
-                    NativeAdmission::PriorHistoryTruncated { .. }
-                        | NativeAdmission::Duplicate
-                        | NativeAdmission::Equivocation(_)
-                ),
-                "a covered delta is not admitted again: {outcome:?}"
-            );
-            assert_eq!(projection_facts(&compacted), settled, "a replay changed the state");
-            // Below admission, the install itself refuses it too.
-            let refused = crate::native_store::install_verified_delta_inner(
-                &compacted,
-                &group(),
-                replay,
-                &lookup(&replay.author).unwrap(),
-            );
-            assert!(
-                refused.is_err(),
-                "a covered delta does not continue its author's chain: {refused:?}"
-            );
-            assert_eq!(projection_facts(&compacted), settled);
-        }
     }
 }

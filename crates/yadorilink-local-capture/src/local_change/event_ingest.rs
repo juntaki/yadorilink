@@ -19,13 +19,14 @@ use yadorilink_sync_sqlite::file_index::ImportedActualState;
 
 use super::disk_observation::{
     closed_disk_observation_if_unraced, error_means_absent, exact_leaf_exists_as_directory,
-    exact_leaf_exists_as_file_or_symlink,
+    try_exact_leaf_exists_as_file_or_symlink,
 };
 use super::flush::PendingBatchedCommit;
 use super::path_policy::{
     is_excluded_from_sync, path_to_wire_relative_string, skip_reason_for_inadmissible_wire_path,
 };
 use super::record_builder::{metadata_columns_for, record_of_row};
+use super::scan::CaptureAuthority;
 use super::semantic_delete::{Removal, SemanticDelete};
 use super::{now_unix_nanos, LocalChangeOutcome, LocalChangeProcessor};
 
@@ -64,7 +65,7 @@ impl LocalChangeProcessor {
     /// Whether a removal is a delete. A user's or a platform provider's
     /// [`SemanticDelete`] always is; an OBSERVED absence is only for a
     /// `Present` object (or a path with no row, which the branch below then
-    /// authors nothing for).
+    /// authors nothing for, bar a recursive delete's expansion).
     fn removal_is_a_delete(
         &self,
         group_id: &str,
@@ -210,6 +211,13 @@ impl LocalChangeProcessor {
         if is_ignore_file_relative_path(Path::new(&rel_path)) {
             return Ok(EventOutcome::Ready(LocalChangeOutcome::None));
         }
+        // Live events from a nested mount are not ours either (see
+        // `device_boundary`): neither a Put nor a Delete may be authored.
+        if yadorilink_filesystem_sync::device_boundary::path_crosses_device_boundary(
+            &root, &rel_path,
+        ) {
+            return Ok(EventOutcome::Ready(LocalChangeOutcome::None));
+        }
 
         // Whether a directory-only pattern (`build/`) covers the path. What
         // is on disk says, never following a symlink; a path that is gone
@@ -343,37 +351,16 @@ impl LocalChangeProcessor {
                 // Something answers to this name, but on a case- or
                 // normalization-insensitive volume (macOS, Windows) that
                 // is not proof it is THIS exact leaf: the lookup resolves
-                // to whatever sibling folds to the same name, which for a
-                // held collision is a DIFFERENT record's file. Treating
-                // that as evidence about this path is the same case-fold
-                // hazard `exact_leaf_exists_as_file_or_symlink` already
-                // exists to answer for the scan's own disk check, so this
-                // reuses it rather than adding a second mechanism.
-                //
-                // Confirmed on real APFS, not hypothetical: an event for
-                // "photo.jpg" whose only on-disk sibling is a held
-                // "Photo.jpg" was classified `CreatedOrModified` and then
-                // built its record from `Photo.jpg`'s metadata -- so this
-                // device authored and PROPAGATED a local change claiming
-                // "photo.jpg" held the other file's content and size.
-                //
-                // Reclassifying as `Removed` would be equally wrong in the
-                // other direction: this branch's delete path has no held
-                // guard, so it would tombstone the held row instead. With
-                // no evidence about the exact leaf, the only supportable
-                // answer is to draw no conclusion and leave the row alone;
-                // a later event, or the scan's own re-examination, still
-                // re-drives the path once the collision clears.
-                if exact_leaf_exists_as_file_or_symlink(&root, &rel_path) {
-                    FsChangeKind::CreatedOrModified
-                } else {
-                    tracing::debug!(
-                        group_id,
-                        path = %rel_path,
-                        "ignoring a local change event whose exact leaf does not exist; a \
-                         case-fold sibling answers to the name, and it is a different record"
-                    );
-                    return Ok(EventOutcome::Ready(LocalChangeOutcome::None));
+                // to whatever sibling folds to the same name, which may be
+                // a DIFFERENT record's file. The exact name being absent
+                // is an observed removal of THIS leaf (a case-only rename
+                // is exactly that); whether it is a delete is
+                // `removal_is_a_delete`'s call, which refuses a held row.
+                match try_exact_leaf_exists_as_file_or_symlink(&root, &rel_path) {
+                    Ok(true) => FsChangeKind::CreatedOrModified,
+                    Ok(false) => FsChangeKind::ObservedRemoval,
+                    // No evidence of absence: look again later.
+                    Err(_) => return Ok(EventOutcome::Ready(LocalChangeOutcome::RetryLater)),
                 }
             }
         };
@@ -387,6 +374,12 @@ impl LocalChangeProcessor {
                 // or says nothing at all, and is not a delete. Only an
                 // explicit delete by the user or a platform provider is.
                 if !self.removal_is_a_delete(group_id, semantic, &rel_path)? {
+                    return Ok(EventOutcome::Ready(LocalChangeOutcome::None));
+                }
+                // Nor is it one on a root that is no longer the volume the
+                // index was built from (an unmounted root leaves an empty
+                // directory behind).
+                if self.capture_authority(group_id, &root)? != CaptureAuthority::Confirmed {
                     return Ok(EventOutcome::Ready(LocalChangeOutcome::None));
                 }
                 // `mark_deleted` creates a brand-new tombstone row
@@ -478,13 +471,6 @@ impl LocalChangeProcessor {
                     ));
                 }
                 let observed = observed_at_unix_nanos.unwrap_or_else(now_unix_nanos);
-                // A copy name the namespace placed another entry's leaf
-                // under: the deletion is that entry's (see
-                // `LocalMutationStore::write_through_source`).
-                let write_through = match &self.change_emitter {
-                    Some(_) => self.state.write_through_source(group_id, &rel_path)?,
-                    None => None,
-                };
                 match &self.change_emitter {
                     Some(emitter) => {
                         // The simple, common delete case: an existing row,
@@ -507,11 +493,7 @@ impl LocalChangeProcessor {
                                 });
                             record.deleted = true;
                             record.mtime_unix_nanos = observed;
-                            let op = Op::Delete {
-                                path: SyncPath(
-                                    write_through.clone().unwrap_or_else(|| rel_path.clone()),
-                                ),
-                            };
+                            let op = Op::Delete { path: SyncPath(rel_path.clone()) };
                             batch.push(PendingBatchedCommit {
                                 rel_path: rel_path.clone(),
                                 event_path: event.path.clone(),
@@ -525,26 +507,6 @@ impl LocalChangeProcessor {
                                     },
                             });
                             return Ok(EventOutcome::Deferred);
-                        }
-                        if let Some(source) = write_through {
-                            // Absent evidence, as below: the path's own
-                            // lock is held and it was just seen gone.
-                            self.state.commit_write_through_deletion(
-                                group_id,
-                                &rel_path,
-                                &source,
-                                Some(native_witness_at_prepare),
-                                &self.device_id,
-                                observed,
-                                emitter,
-                                &self.begin_operation()?.permit(),
-                            )?;
-                            return Ok(EventOutcome::Ready(
-                                match self.state.get_file(group_id, &rel_path)? {
-                                    Some(record) => LocalChangeOutcome::FileChanged(record),
-                                    None => LocalChangeOutcome::None,
-                                },
-                            ));
                         }
                         // One `Delete` mutation, committed as one change:
                         // the same tombstone the batched branch above
@@ -725,23 +687,12 @@ impl LocalChangeProcessor {
                             } else {
                                 Vec::new()
                             };
-                            let (mut op, version) = self.content_op(
+                            let (op, version) = self.content_op(
                                 record,
                                 unix_mode.flatten(),
                                 symlink_target.clone(),
                                 xattrs.clone(),
                             );
-                            // A copy name the namespace placed another
-                            // entry's leaf under: the edit is that entry's
-                            // (see `LocalMutationStore::write_through_source`).
-                            // The row stays at the copy name.
-                            if let Some(source) =
-                                self.state.write_through_source(group_id, &rel_path)?
-                            {
-                                if let Op::Put { path, .. } = &mut op {
-                                    *path = SyncPath(source);
-                                }
-                            }
                             // The record kind / symlink target / out-of-root
                             // flag / exec bit are written in the SAME
                             // transaction as the emitted change (folded into

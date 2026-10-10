@@ -716,7 +716,7 @@ pub fn update_install_outcome(outcome: &UpdateInstallResponse) -> UpdateInstallO
     match outcome.outcome.as_str() {
         "installing" => UpdateInstallOutcome::Installing,
         "deferred" => UpdateInstallOutcome::Deferred,
-        "store_managed" => {
+        "manual_download" | "store_managed" => {
             UpdateInstallOutcome::StoreManaged { guidance: outcome.guidance.clone() }
         }
         other => UpdateInstallOutcome::Other { raw: other.to_owned() },

@@ -50,8 +50,7 @@ fn author_new(
     authority: Option<&CaptureAuthority>,
 ) -> Result<(), SyncSqliteError> {
     let key = device_key(2);
-    author_op(&w.b, &group(), &local(w, &key, authority), &put(path, seed), &SyncPath(path.into()))
-        .map(|_| ())
+    author_op(&w.b, &group(), &local(w, &key, authority), &put(path, seed)).map(|_| ())
 }
 
 fn authority_for(w: &Scenario, recovery_id: &str) -> CaptureAuthority {
@@ -209,14 +208,8 @@ fn the_capture_delta_and_its_consumption_commit_or_vanish_together() {
     {
         let tx = w.b.unchecked_transaction().unwrap();
         let key = device_key(2);
-        author_op(
-            &tx,
-            &group(),
-            &local(&w, &key, Some(&authority)),
-            &put("captured.txt", 5),
-            &SyncPath("captured.txt".into()),
-        )
-        .unwrap();
+        author_op(&tx, &group(), &local(&w, &key, Some(&authority)), &put("captured.txt", 5))
+            .unwrap();
         assert_eq!(capture_high_seq(&tx), Some(3), "visible inside the transaction");
         drop(tx);
     }
@@ -227,14 +220,8 @@ fn the_capture_delta_and_its_consumption_commit_or_vanish_together() {
     {
         let tx = w.b.unchecked_transaction().unwrap();
         let key = device_key(2);
-        author_op(
-            &tx,
-            &group(),
-            &local(&w, &key, Some(&authority)),
-            &put("captured.txt", 5),
-            &SyncPath("captured.txt".into()),
-        )
-        .unwrap();
+        author_op(&tx, &group(), &local(&w, &key, Some(&authority)), &put("captured.txt", 5))
+            .unwrap();
         tx.commit().unwrap();
     }
     assert_eq!(frontier_seq(&w.b, &w.b1), Some(3));

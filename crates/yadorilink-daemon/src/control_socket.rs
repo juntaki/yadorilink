@@ -44,8 +44,6 @@ use yadorilink_ipc_proto::daemonctl::{
     UnlinkResponse, VolumeFreeSpace,
 };
 use yadorilink_ipc_proto::framing::{read_message, write_message};
-#[cfg(windows)]
-use yadorilink_replica_domain::file::RecordKind;
 
 use crate::reporting_ipc;
 
@@ -218,6 +216,16 @@ pub mod windows_transport {
         }
     }
 }
+
+#[cfg(windows)]
+const PROVIDER_LOCAL_STATE_HINT: &str =
+    "this item is in a provider folder: the OS holds its local \
+     state. `attrib` shows the offline attribute for an item that is not downloaded; \
+     `yadorilink status` shows a folder's download progress";
+#[cfg(not(windows))]
+const PROVIDER_LOCAL_STATE_HINT: &str = "this item is in a File Provider folder: the OS holds its \
+     local state. `ls -lO <path>` shows `dataless` for an item that is not downloaded; \
+     `yadorilink status` shows a folder's download progress";
 
 #[allow(
     clippy::too_many_lines,
@@ -589,7 +597,21 @@ async fn handle_request(
                     Err(e) => RespPayload::Error(e.to_string()),
                 }
             }
-            None => RespPayload::Error("path is not under any linked folder".into()),
+            None => match context.queries.linked_path.resolve_provider(&r.absolute_path) {
+                // A file in a provider folder: the host drops the OS copy once a full replica
+                // is confirmed to hold the version.
+                Some((group_id, path)) => {
+                    match context.provider_evict.evict(&group_id, &path).await {
+                        Ok(outcome) => RespPayload::Evict(EvictResponse {
+                            dehydrated: outcome.dehydrated,
+                            blocks_reclaimed: outcome.blocks_reclaimed,
+                            bytes_reclaimed: outcome.bytes_reclaimed,
+                        }),
+                        Err(e) => RespPayload::Error(e.to_string()),
+                    }
+                }
+                None => RespPayload::Error("path is not under any linked folder".into()),
+            },
         },
 
         Some(ReqPayload::MaterializationStatus(r)) => {
@@ -598,12 +620,7 @@ async fn handle_request(
             if context.queries.linked_path.resolve(&r.absolute_path).is_none()
                 && context.queries.linked_path.resolve_provider(&r.absolute_path).is_some()
             {
-                RespPayload::Error(
-                    "this item is in a File Provider folder: the OS holds its local state. \
-                     `ls -lO <path>` shows `dataless` for an item that is not downloaded; \
-                     `yadorilink status` shows a folder's download progress"
-                        .into(),
-                )
+                RespPayload::Error(PROVIDER_LOCAL_STATE_HINT.into())
             } else {
                 match context.queries.linked_path.resolve(&r.absolute_path) {
                     Some((group_id, path)) => {
@@ -722,12 +739,11 @@ async fn handle_request(
                 context.queries.update_status.snapshot(),
             ))
         }
-        Some(ReqPayload::UpdateInstall(_)) => match context.application.update.install().await {
-            Ok(outcome) => {
-                RespPayload::UpdateInstall(crate::update_ipc::encode_install_response(outcome))
-            }
-            Err(e) => RespPayload::Error(e),
-        },
+        Some(ReqPayload::UpdateInstall(_)) => {
+            RespPayload::UpdateInstall(crate::update_ipc::encode_download_response(
+                context.application.update.download_guidance(),
+            ))
+        }
         Some(ReqPayload::UpdateConfig(r)) => {
             match context.application.update.config(crate::update_ipc::decode_config_request(r)) {
                 Ok(policy) => {
@@ -1269,16 +1285,14 @@ fn membership_error_to_proto(
 }
 
 /// Why a provider folder cannot be created now, `None` when it can (or the request is not for one).
-/// Provider folders are a macOS feature behind the provider-roots switch; refused before anything is written.
+/// A provider folder needs the operating system's provider adapter (the macOS File Provider or the
+/// Windows Cloud Files API); refused before anything is written.
 fn provider_refusal(display_name: &str) -> Option<String> {
     if display_name.is_empty() {
         return None;
     }
-    if !cfg!(target_os = "macos") {
+    if yadorilink_replica_domain::session_state::ProviderKind::for_host_platform().is_none() {
         return Some("provider folders are not supported on this platform".to_string());
-    }
-    if !crate::provider_gate::provider_roots_enabled() {
-        return Some("provider folders are not enabled in this build".to_string());
     }
     None
 }
@@ -1827,6 +1841,8 @@ pub(crate) fn encode_link_status(view: crate::queries::link_status::LinkStatusVi
         group_id: view.group_id,
         paused: view.paused,
         conflict_count: view.conflict_count,
+        conflicts_pending: view.conflicts_pending,
+        conflict_note: view.conflict_note,
         materialization_policy: view.materialization_policy,
         hydrated_count: view.hydrated_count,
         placeholder_count: view.placeholder_count,
@@ -1857,6 +1873,7 @@ pub(crate) fn encode_link_status(view: crate::queries::link_status::LinkStatusVi
         // involved so the remedy (unlink all but one) is actionable.
         ambiguous: view.ambiguous_local_paths.len() > 1,
         ambiguous_local_paths: view.ambiguous_local_paths,
+        capture_volume_changed: view.capture_volume_changed,
         local_storage_state: local_storage_state_to_proto(view.local_storage_state) as i32,
         fetch_availability: fetch_availability_to_proto(view.fetch_availability) as i32,
         full_replica_device_ids: view.full_replica_device_ids,
@@ -1937,13 +1954,18 @@ fn overall_status(response: &StatusResponse) -> (OverallState, Vec<String>) {
     let mut attention_reasons = Vec::new();
 
     for link in &response.links {
-        if link.degraded {
+        if link.degraded && link.degraded_reason == crate::link_registry::OWNERSHIP_LOST_REASON {
+            degraded_reasons.push(format!("ownership_lost:{}", link.group_id));
+        } else if link.degraded {
             degraded_reasons.push(format!("degraded:{}", link.group_id));
         }
         // A group linked at several folders syncs nothing at all, which is not
         // something a rollup may call healthy next to the `NOT SYNCING` detail.
         if link.ambiguous {
             degraded_reasons.push(format!("ambiguous:{}", link.group_id));
+        }
+        if link.capture_volume_changed {
+            attention_reasons.push(format!("volume_changed:{}", link.group_id));
         }
         match link.durability_status() {
             GroupDurabilityStatus::AtRisk => {
@@ -1968,6 +1990,9 @@ fn overall_status(response: &StatusResponse) -> (OverallState, Vec<String>) {
         }
         if link.conflict_count > 0 {
             attention_reasons.push(format!("conflict:{}", link.group_id));
+        }
+        if link.conflicts_pending > 0 {
+            attention_reasons.push(format!("conflict_pending:{}", link.group_id));
         }
         if link.held_file_count > 0 {
             attention_reasons.push(format!("held:{}", link.group_id));

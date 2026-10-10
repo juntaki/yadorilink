@@ -72,9 +72,8 @@
 use std::path::{Path, PathBuf};
 
 /// Lock file placed *inside* the block-store root. Ignored by the store itself:
-/// `SegmentBlockStore`'s usage scan only counts 64-character hash filenames and its
-/// stale-temp sweep only removes strict `.yadorilink-tmp.<pid>.<counter>`
-/// names, so this sidecar is never miscounted as a block nor swept away.
+/// `SegmentBlockStore`'s usage scan only counts 64-character hash filenames,
+/// so this sidecar is never miscounted as a block.
 const BLOCK_STORE_LOCK_FILE: &str = ".yadorilink-store.lock";
 
 /// Process-lifetime ownership of one mutable data resource. Holding the

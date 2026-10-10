@@ -390,6 +390,9 @@ impl ClientCore {
         let core = self.inner.clone();
         bridge(async move { core.cancel_invite(invite_id).await }).await
     }
+    pub fn parse_invite_link(&self, input: String) -> Result<String, DesktopError> {
+        self.inner.parse_invite_link(&input)
+    }
     pub async fn accept_invite(
         &self,
         code_or_url: String,

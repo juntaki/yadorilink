@@ -715,6 +715,112 @@ pub async fn revoke_resolved(
     }
 }
 
+/// What a FRESH read of this folder's access state says about the request a
+/// Deny was just clicked for.
+///
+/// The requests panel is read when the window opens and after this window's
+/// own actions, never on a timer, so a row can still name a request that was
+/// decided somewhere else -- from another device, or another session --
+/// minutes ago. For every other control in the panel that is harmless. For
+/// this one it is not: denying IS revoking (see the share window's
+/// deny action), so a Deny aimed at a request that has since been
+/// APPROVED would not turn a request down, it would remove a member whose
+/// access is live and working, and report it as a request being turned down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DenyPrecheck {
+    /// Still waiting on a decision. Denying turns it down, which is exactly
+    /// what the button says it does.
+    StillWaiting,
+    /// Not waiting any more, so the denial must not be sent at all.
+    NotWaiting(DenyRefusal),
+}
+
+/// Why a Deny was not carried out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DenyRefusal {
+    /// The request was approved already and this device now holds live
+    /// access to the folder. Taking that away is a removal, and a removal
+    /// belongs in the member list, behind the confirmation that names it as
+    /// one.
+    AlreadyAdmitted,
+    /// Neither waiting nor a member. All this listing establishes is that
+    /// the request is gone; it cannot say which of the several causes did
+    /// it -- turned down or approved-then-removed elsewhere, withdrawn by
+    /// the requester, or swept by the coordination plane when the invite it
+    /// came from expired. Either way there is nothing left to decide, and
+    /// the message this maps to names the possibilities rather than picking
+    /// one it cannot actually observe.
+    NoLongerListed,
+}
+
+/// Re-decides, from listings read immediately before the mutation would be
+/// sent, whether a Deny is still the thing the button claims it is.
+///
+/// `members` is already scoped to this folder group (it is the group's own
+/// member listing); `pending` is account-wide, so it is narrowed by group id
+/// here for the same reason `pending_rows` narrows it.
+///
+/// Membership is checked FIRST and wins outright. The two listings come from
+/// two separate reads, so a request approved in between them can appear in
+/// both, and the safe reading of "this is a live member" is the one that
+/// stops the removal rather than the one that sends it.
+pub fn deny_precheck(
+    pending: &[PendingApproval],
+    members: &[GroupMemberInfo],
+    group_id: &str,
+    device_id: &str,
+) -> DenyPrecheck {
+    if members.iter().any(|member| member.device_id == device_id) {
+        return DenyPrecheck::NotWaiting(DenyRefusal::AlreadyAdmitted);
+    }
+    let still_waiting = pending
+        .iter()
+        .any(|request| request.group_id == group_id && request.device_id == device_id);
+    if still_waiting {
+        DenyPrecheck::StillWaiting
+    } else {
+        DenyPrecheck::NotWaiting(DenyRefusal::NoLongerListed)
+    }
+}
+
+impl DenyRefusal {
+    /// Plain-language reason, for a front end with no wording of its own.
+    #[must_use]
+    pub fn reason(self) -> &'static str {
+        match self {
+            DenyRefusal::AlreadyAdmitted => {
+                "This device was already approved and now has access, so nothing was changed. \
+                 Removing it is a separate action: remove its access from the member list."
+            }
+            DenyRefusal::NoLongerListed => {
+                "This request is no longer waiting for approval (resolved, withdrawn, or \
+                 expired elsewhere). Nothing was changed."
+            }
+        }
+    }
+}
+
+/// How [`deny_checked`] ended.
+pub enum DenyAttempt {
+    /// The precheck stopped it; nothing was sent.
+    Refused(DenyRefusal),
+    Attempted(RevokeAttempt),
+}
+
+/// Denies a waiting request: re-reads the pending and member listings, and
+/// only when the request is still waiting sends the (never forced) revoke.
+/// An unreadable listing is an error and sends nothing.
+pub async fn deny_checked(group_id: String, device_id: String) -> Result<DenyAttempt, CoreError> {
+    let pending = pending_approvals().await?;
+    let members = list_members_resolved(&group_id).await?;
+    match deny_precheck(&pending, &members, &group_id, &device_id) {
+        DenyPrecheck::NotWaiting(refusal) => Ok(DenyAttempt::Refused(refusal)),
+        DenyPrecheck::StillWaiting => {
+            Ok(DenyAttempt::Attempted(try_revoke_resolved(group_id, device_id, false).await?))
+        }
+    }
+}
+
 /// Same as [`revoke_resolved`], for a caller holding the group's name.
 pub async fn revoke(
     group_name: &str,
@@ -1017,14 +1123,6 @@ pub async fn join_resolved_with_outcome(
     }
 }
 
-/// Accepts either the bare invite code or the full `yadorilink://invite/<code>`
-/// URL -- a scanned QR always decodes to the URL; a code typed by hand is the
-/// bare form.
-#[must_use]
-pub fn extract_invite_code(input: &str) -> &str {
-    input.strip_prefix("yadorilink://invite/").unwrap_or(input)
-}
-
 /// What redeeming an invite did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AcceptInviteOutcome {
@@ -1045,8 +1143,10 @@ pub async fn accept_invite(
     on_demand: bool,
     acknowledged: bool,
 ) -> Result<AcceptInviteOutcome, CoreError> {
+    let code = crate::wording::parse_invite_input(code_or_url)
+        .map_err(|e| CoreError::InvalidInput(e.to_string()))?;
     let response = control::send(ReqPayload::AcceptInviteCommand(AcceptInviteCommandRequest {
-        code: extract_invite_code(code_or_url).to_string(),
+        code: code.to_string(),
         local_path: absolute.to_string_lossy().to_string(),
         on_demand,
         acknowledge_risks: acknowledged,

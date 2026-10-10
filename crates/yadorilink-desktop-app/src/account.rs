@@ -479,7 +479,7 @@ async fn execute(effect: Effect) -> Event {
                 Err(e) => Event::ApproveFailed { group_id, device_id, msg: e.to_string() },
             }
         }
-        // `try_revoke_resolved`, not the CLI's name-resolving `deny` --
+        // `deny_checked` (prechecks the request is still waiting), not the CLI's name-resolving `deny` --
         // this row already carries `group_id`, so there is no name to
         // resolve, exactly `share_window.rs`'s own `Action::Deny` handling.
         // A `NotDurable` refusal is reported as a plain failure, same
@@ -489,10 +489,15 @@ async fn execute(effect: Effect) -> Event {
         // which belongs in the per-folder Share window that can offer its
         // override with the member's name in front of it.
         Effect::Deny { group_id, device_id, group_name: _ } => {
-            match share::try_revoke_resolved(group_id.clone(), device_id.clone(), false).await {
-                Ok(RevokeAttempt::Committed(_)) => Event::DenyDone { group_id, device_id },
-                Ok(RevokeAttempt::NotDurable { message, .. }) => {
-                    Event::DenyFailed { group_id, device_id, msg: message }
+            match share::deny_checked(group_id.clone(), device_id.clone()).await {
+                Ok(share::DenyAttempt::Attempted(RevokeAttempt::Committed(_))) => {
+                    Event::DenyDone { group_id, device_id }
+                }
+                Ok(share::DenyAttempt::Attempted(RevokeAttempt::NotDurable {
+                    message, ..
+                })) => Event::DenyFailed { group_id, device_id, msg: message },
+                Ok(share::DenyAttempt::Refused(refusal)) => {
+                    Event::DenyFailed { group_id, device_id, msg: refusal.reason().to_owned() }
                 }
                 Err(e) => Event::DenyFailed { group_id, device_id, msg: e.to_string() },
             }

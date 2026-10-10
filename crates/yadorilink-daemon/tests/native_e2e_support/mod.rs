@@ -227,7 +227,9 @@ pub async fn converge_where(
     support::wait_until_with_context(
         || {
             let first = tree(nodes[0]);
-            accept(&first) && nodes[1..].iter().all(|node| tree(node) == first)
+            accept(&first)
+                && nodes[1..].iter().all(|node| tree(node) == first)
+                && nodes.iter().all(|node| no_write_in_flight(node))
         },
         CONVERGE,
         || {
@@ -247,6 +249,20 @@ pub async fn converge_where(
     )
     .await;
     tree(nodes[0])
+}
+
+/// Whether `node` has no materialization write still open. The bytes of a
+/// peer's file are on disk before the write is committed, so a wait for the
+/// tree alone returns while the daemon is still finishing the write; a test
+/// that then edits the file races that commit (the edit lands between the
+/// bytes and the proof, and is read as the daemon's own write). The state
+/// commit, not the side effect, is what to wait for.
+fn no_write_in_flight(node: &TopologyNode) -> bool {
+    read(node, |conn| {
+        let open: i64 =
+            conn.query_row("SELECT COUNT(*) FROM materialization_intents", [], |row| row.get(0))?;
+        Ok(open == 0)
+    })
 }
 
 /// What a failed wait prints about one node's database: its native frontier and
@@ -542,8 +558,6 @@ pub fn admit_native_removal(
                     .map(|head| HeadRef { dot: head.dot, provenance: head.payload.provenance })
                     .collect(),
                 put: None,
-                keeps: Vec::new(),
-                keep_put: false,
             }
         })
         .collect::<Vec<_>>();
@@ -756,8 +770,6 @@ pub fn admit_native_put(
             path: yadorilink_replica_domain::ids::SyncPath(path.to_owned()),
             removes: Vec::new(),
             put: Some(DeltaPut { version: version.version_hash }),
-            keeps: Vec::new(),
-            keep_put: false,
         }],
     )
 }

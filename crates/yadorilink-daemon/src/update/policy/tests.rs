@@ -61,23 +61,6 @@ fn deserializing_a_partial_json_object_fills_in_safe_defaults() {
     assert_eq!(policy.state, UpdateState::Idle);
 }
 
-/// Crash-recovery precondition: an artifact path can be
-/// recorded without `downloaded_artifact_verified` ever being set,
-/// and that round-trips faithfully (the flag is never implicitly
-/// upgraded to `true` just because a path is present).
-#[test]
-fn unverified_downloaded_artifact_path_round_trips_as_unverified() {
-    let (_dir, store) = store();
-    let policy = store
-        .update(|p| {
-            p.downloaded_artifact_path = Some(PathBuf::from("/tmp/update.pkg"));
-            p.state = UpdateState::Downloaded;
-        })
-        .unwrap();
-    assert!(!policy.downloaded_artifact_verified);
-    assert_eq!(policy.downloaded_artifact_path, Some(PathBuf::from("/tmp/update.pkg")));
-}
-
 // Cohort-based
 // rollout maps a tester's stable cohort onto the manifest rollout
 // percentage, stably across releases; non-testers are unaffected.

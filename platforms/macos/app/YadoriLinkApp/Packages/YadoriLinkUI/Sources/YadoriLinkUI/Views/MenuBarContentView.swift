@@ -20,6 +20,7 @@ public struct MenuBarContentView: View {
                 Image(systemName: p.tone.symbol).foregroundStyle(p.tone.color).font(.title3)
                 Text(p.headline).font(.headline)
                 Spacer()
+                if context.isFixture { FixtureBadge() }
             }
 
             if p.showsStartAction {
@@ -84,6 +85,11 @@ public struct MenuBarContentView: View {
                 MenuRowButton("Open YadoriLink…", systemImage: "macwindow") { open(.home) }
                 MenuRowButton("Add Folder…", systemImage: "folder.badge.plus") {
                     openWindow(id: WindowID.addFolder)
+                    NSApp.activate()
+                    dismiss()
+                }
+                MenuRowButton("Join with Invite Link…", systemImage: "link.badge.plus") {
+                    openWindow(id: WindowID.join)
                     NSApp.activate()
                     dismiss()
                 }

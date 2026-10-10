@@ -462,18 +462,3 @@ async fn a_provider_group_never_reaches_peer_reconciliation_roots() {
     assert!(!std::path::Path::new("provider:").exists());
     assert!(!std::path::Path::new(locator).exists());
 }
-
-/// The provider-roots switch ships on (a compile-time guard: flipping the constant breaks the build of the tests).
-const _: () = assert!(PROVIDER_ROOTS_ENABLED);
-
-/// A provider root has no directory, so the directory-only maintenance passes have nothing to do
-/// for it. They used to fail with "corrupt local state: <group>" on every wake, forever.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn directory_maintenance_has_nothing_to_do_for_a_provider_root() {
-    use crate::local_convergence::types::RetirementAttempt;
-    let state = test_state();
-    declare(&state, "/provider/photos");
-    assert_eq!(state.replica_coordinator.directory_link_gate_for_group(GROUP).unwrap(), None);
-    let attempt = state.local_convergence().retire_conflict_copies_only(GROUP).await.unwrap();
-    assert!(matches!(attempt, RetirementAttempt::Settled { retired: 0 }), "{attempt:?}");
-}

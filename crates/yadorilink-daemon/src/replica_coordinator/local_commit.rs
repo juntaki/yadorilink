@@ -1,6 +1,6 @@
 //! The local capture port's authoring methods on the signed
 //! seams of the file index (`commit_local_mutations_batch`,
-//! `commit_recursive_operation`, `commit_write_through_deletion`),
+//! `commit_recursive_operation`),
 //! each authoring as the author the handle names. Every authoring refusal
 //! reaches the caller as [`SyncSqliteError::AuthoringRefused`]
 //! (`StaleAuthor` and `OwnAuthorAhead` rotate the incarnation). A write
@@ -160,32 +160,4 @@ pub fn commit_directory_rename(
         SignedEmissionContext { author: &author, permit },
     )?;
     Ok(())
-}
-
-/// `LocalMutationStore::commit_write_through_deletion`: `Delete(source)`
-/// for a copy row that still shows what `native_witness` recorded.
-// One argument per fact the deletion needs.
-#[allow(clippy::too_many_arguments)]
-pub fn commit_write_through_deletion(
-    files: &FileIndexRepository,
-    group_id: &str,
-    copy_path: &str,
-    source: &str,
-    native_witness: Option<yadorilink_replica_domain::native_state::NativeCaptureWitness>,
-    device_id: &str,
-    observed_at_unix_nanos: i64,
-    author: &LocalAuthorKey,
-    capture: Option<&CaptureAuthority>,
-    permit: &RootCommitPermit<'_>,
-) -> Result<(), SyncSqliteError> {
-    let author = local_author(author, capture);
-    files.commit_write_through_deletion(
-        group_id,
-        copy_path,
-        source,
-        native_witness,
-        device_id,
-        observed_at_unix_nanos,
-        SignedEmissionContext { author: &author, permit },
-    )
 }

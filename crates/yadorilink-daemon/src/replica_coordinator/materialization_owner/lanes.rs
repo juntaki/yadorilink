@@ -6,7 +6,6 @@
 //! preflight, and for most lanes the fence bump that follows it), stay in
 //! the lane.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use yadorilink_filesystem_sync::materialization_execution::MaterializationIntentKind;
@@ -393,10 +392,8 @@ impl ReplicaCoordinator {
             obligation_closed,
         );
         if obligation_closed {
-            // A copy this write just made durable can supersede another
-            // ephemeral conflict copy's justification, or be the sibling
-            // change that clears a held path's hazard.
-            self.retirement_wake().mark_dirty(group_id);
+            // A write just made durable can be the sibling change that
+            // clears a held path's hazard.
             self.hazard_recheck_wake().mark_dirty(group_id);
         }
         Ok(close)
@@ -565,7 +562,6 @@ impl ReplicaCoordinator {
             });
         }
         for group_id in woken {
-            self.retirement_wake().mark_dirty(group_id);
             self.hazard_recheck_wake().mark_dirty(group_id);
         }
         Ok(results)
@@ -1104,12 +1100,11 @@ impl ReplicaCoordinator {
         delete_intent_guard.clear()
     }
 
-    /// Settle half of a conflict-copy retirement's delete (a tombstone no
-    /// native delta authors), after the lane's removal: clear any hold (tx,
-    /// no permit), erase the local-only row under the caller's permit (tx),
-    /// then clear the intent (tx). Kept apart from
-    /// [`Self::settle_tombstone_delete`]: this is a retirement, not a fresh
-    /// mutation, and it asserts no tombstone fact.
+    /// Settle half of a displacement's delete (a tombstone no native delta
+    /// authors), after the lane's removal: clear any hold (tx, no permit),
+    /// erase the local-only row under the caller's permit (tx), then clear
+    /// the intent (tx). Kept apart from [`Self::settle_tombstone_delete`]:
+    /// this is not a fresh mutation, and it asserts no tombstone fact.
     pub(crate) fn settle_retired_copy_erase(
         &self,
         delete_intent_guard: LaneIntent<'_>,
@@ -1120,38 +1115,6 @@ impl ReplicaCoordinator {
         self.clear_held(group_id, path)?;
         self.erase_local_only_file(group_id, path, permit)?;
         delete_intent_guard.clear()
-    }
-
-    /// Settle of an event-driven conflict-copy retirement pass: publish an
-    /// actual-absence proof for every path the pass deleted, each in its
-    /// own fence-CAS transaction under the fence value that path's own
-    /// pre-delete bump produced, with `frontier_before` as the causal
-    /// basis. A lost CAS publishes nothing and is not reported; an error is
-    /// logged and never blocks another path's publication. Completes no
-    /// obligation, unlike the engine's publication.
-    pub(crate) fn publish_retired_copy_absence(
-        &self,
-        group_id: &str,
-        retired_generations: &BTreeMap<String, i64>,
-        permit: &RootCommitPermit<'_>,
-    ) {
-        for (path, expected_mutation_generation) in retired_generations {
-            if let Err(e) = self.dag_publish_materialized_generation_if_fence_current(
-                group_id,
-                path,
-                yadorilink_peer_session::ports::ExactActualState::Absent,
-                *expected_mutation_generation,
-                permit,
-            ) {
-                tracing::warn!(
-                    group_id,
-                    path = %path,
-                    error = %e,
-                    "failed to publish a retired conflict copy's actual-absence generation; \
-                     its obligation stays outstanding for a later pass"
-                );
-            }
-        }
     }
 
     /// The engine's completion of a claimed obligation against exact

@@ -16,7 +16,7 @@
 //! rather than reused -- calling the shared function is what makes that
 //! impossible here rather than merely unlikely.
 
-use yadorilink_client_core::ops::shares::{GroupMemberInfo, PendingApproval};
+use yadorilink_client_core::ops::shares::{DenyRefusal, GroupMemberInfo, PendingApproval};
 use yadorilink_client_core::wording::{
     member_relationship_label, member_storage_label, short_device_id,
 };
@@ -249,74 +249,6 @@ pub fn pending_rows(requests: &[PendingApproval], group_id: &str) -> Vec<Pending
 /// describe the same request differently.
 pub fn all_pending_rows(requests: &[PendingApproval]) -> Vec<PendingRow> {
     requests.iter().map(to_pending_row).collect()
-}
-
-/// What a FRESH read of this folder's access state says about the request a
-/// Deny was just clicked for.
-///
-/// The requests panel is read when the window opens and after this window's
-/// own actions, never on a timer, so a row can still name a request that was
-/// decided somewhere else -- from another device, or another session --
-/// minutes ago. For every other control in the panel that is harmless. For
-/// this one it is not: denying IS revoking (see `share_window`'s
-/// `Action::Deny`), so a Deny aimed at a request that has since been
-/// APPROVED would not turn a request down, it would remove a member whose
-/// access is live and working, and report it as a request being turned down.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DenyPrecheck {
-    /// Still waiting on a decision. Denying turns it down, which is exactly
-    /// what the button says it does.
-    StillWaiting,
-    /// Not waiting any more, so the denial must not be sent at all.
-    NotWaiting(DenyRefusal),
-}
-
-/// Why a Deny was not carried out.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DenyRefusal {
-    /// The request was approved already and this device now holds live
-    /// access to the folder. Taking that away is a removal, and a removal
-    /// belongs in the member list, behind the confirmation that names it as
-    /// one.
-    AlreadyAdmitted,
-    /// Neither waiting nor a member. All this listing establishes is that
-    /// the request is gone; it cannot say which of the several causes did
-    /// it -- turned down or approved-then-removed elsewhere, withdrawn by
-    /// the requester, or swept by the coordination plane when the invite it
-    /// came from expired. Either way there is nothing left to decide, and
-    /// the message this maps to names the possibilities rather than picking
-    /// one it cannot actually observe.
-    NoLongerListed,
-}
-
-/// Re-decides, from listings read immediately before the mutation would be
-/// sent, whether a Deny is still the thing the button claims it is.
-///
-/// `members` is already scoped to this folder group (it is the group's own
-/// member listing); `pending` is account-wide, so it is narrowed by group id
-/// here for the same reason `pending_rows` narrows it.
-///
-/// Membership is checked FIRST and wins outright. The two listings come from
-/// two separate reads, so a request approved in between them can appear in
-/// both, and the safe reading of "this is a live member" is the one that
-/// stops the removal rather than the one that sends it.
-pub fn deny_precheck(
-    pending: &[PendingApproval],
-    members: &[GroupMemberInfo],
-    group_id: &str,
-    device_id: &str,
-) -> DenyPrecheck {
-    if members.iter().any(|member| member.device_id == device_id) {
-        return DenyPrecheck::NotWaiting(DenyRefusal::AlreadyAdmitted);
-    }
-    let still_waiting = pending
-        .iter()
-        .any(|request| request.group_id == group_id && request.device_id == device_id);
-    if still_waiting {
-        DenyPrecheck::StillWaiting
-    } else {
-        DenyPrecheck::NotWaiting(DenyRefusal::NoLongerListed)
-    }
 }
 
 /// How a member is named in a confirmation and in an outcome message: the

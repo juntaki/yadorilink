@@ -236,8 +236,8 @@ impl super::LocalConvergenceExecutor {
         // function's doc comment. Also NOT the broader exclusion
         // predicate: a legacy `.yadorilink-tmp.`-marked path can be a
         // genuine user file (the marker is a substring match, and
-        // `materialization::cleanup_stale_temp_files` already refuses to
-        // delete exactly such a look-alike) or an already-admitted change
+        // recovery never deletes a file by its name,
+        // so such a look-alike is safe) or an already-admitted change
         // from before this module existed — either way it must still
         // materialize, matching admission's own choice of predicate. See
         // `reserved_namespace`'s "Two predicates, not one".

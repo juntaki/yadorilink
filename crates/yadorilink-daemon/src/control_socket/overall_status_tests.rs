@@ -253,3 +253,19 @@ fn an_ambiguous_link_makes_the_rollup_degraded() {
     assert_eq!(state, OverallState::Degraded);
     assert_eq!(reasons, vec!["ambiguous:group-1".to_string()]);
 }
+
+/// A link whose sync-root lock sidecar is gone reports the terminal `ownership_lost` reason.
+#[test]
+fn an_ownership_lost_link_reports_its_own_reason() {
+    let response = StatusResponse {
+        links: vec![LinkStatus {
+            degraded: true,
+            degraded_reason: crate::link_registry::OWNERSHIP_LOST_REASON.into(),
+            ..protected_link("group-1")
+        }],
+        ..Default::default()
+    };
+    let (state, reasons) = overall_status(&response);
+    assert_eq!(state, OverallState::Degraded);
+    assert_eq!(reasons, vec!["ownership_lost:group-1".to_string()]);
+}

@@ -585,6 +585,17 @@ public final class FakeYadoriLinkClient: YadoriLinkClient, @unchecked Sendable {
         lock.withLock { _invites.removeAll { $0.inviteId == inviteId } }
     }
 
+    public func parseInviteLink(_ input: String) throws -> String {
+        var code = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        if code.lowercased().hasPrefix("yadorilink://invite/") { code = String(code.dropFirst("yadorilink://invite/".count)) }
+        if code.hasSuffix("/") { code.removeLast() }
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
+        guard !code.isEmpty, code.count <= 64, code.unicodeScalars.allSatisfy({ allowed.contains($0) }) else {
+            throw DesktopError.invalidInput(message: "This does not look like a YadoriLink invite. Ask the sender for a new link.", field: "invite")
+        }
+        return code
+    }
+
     public func acceptInvite(codeOrUrl: String, localPath: String, mode: FolderMode, acknowledgeRisks: Bool) async throws -> AcceptInviteOutcome {
         try await enter(signedIn: true)
         return AcceptInviteOutcome(groupId: "g-invited", localPath: localPath, awaitingApproval: true)

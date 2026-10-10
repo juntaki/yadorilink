@@ -1150,6 +1150,151 @@ fn repair_does_not_recreate_a_symlink_its_interrupted_tombstone_delete_removed()
     assert_eq!(report.reconstructed, Vec::<String>::new());
 }
 
+/// A user's regular file created at a tombstoned symlink's path while the
+/// daemon was stopped (after the delete's intent opened, before its unlink)
+/// must survive startup repair; the deleted link is not resurrected over it.
+#[cfg(unix)]
+#[test]
+fn repair_leaves_a_user_file_at_a_symlink_path_under_an_open_delete_intent() {
+    const GROUP: &str = "group-tomb-link-user-file";
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = SegmentBlockStore::new(store_dir.path()).unwrap();
+    let state = ReplicaCoordinator::open_in_memory().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    adopt_root(&state, GROUP, root.path());
+    let permit = RootCommitPermit::for_tests();
+    let record = FileRecord {
+        path: "link.txt".to_string(),
+        size: 0,
+        mtime_unix_nanos: 0,
+        blocks: vec![],
+        deleted: false,
+    };
+    upsert_hydrated_file(&state, GROUP, &record, &permit);
+    state
+        .file_index_repository()
+        .set_record_kind(GROUP, "link.txt", RecordKind::Symlink, &permit)
+        .unwrap();
+    state
+        .file_index_repository()
+        .set_symlink_target(GROUP, "link.txt", Some(b"target.txt"))
+        .unwrap();
+    let (guard, _) = state.open_tombstone_delete(GROUP, "link.txt", &permit).unwrap();
+    drop(guard);
+    std::fs::write(root.path().join("link.txt"), b"user data").unwrap();
+
+    let report = repair_interrupted_materializations(
+        &state,
+        &store,
+        root.path(),
+        GROUP,
+        RepairMode::Startup,
+        &permit,
+    )
+    .unwrap();
+
+    assert_eq!(std::fs::read(root.path().join("link.txt")).unwrap(), b"user data");
+    assert_eq!(report.reconstructed, Vec::<String>::new());
+}
+
+/// A regular file at a symlink row's path under a write intent is likewise
+/// not the arm's to replace.
+#[cfg(unix)]
+#[test]
+fn repair_leaves_a_user_file_at_a_symlink_path_under_a_write_intent() {
+    const GROUP: &str = "group-write-link-user-file";
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = SegmentBlockStore::new(store_dir.path()).unwrap();
+    let state = ReplicaCoordinator::open_in_memory().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    adopt_root(&state, GROUP, root.path());
+    let permit = RootCommitPermit::for_tests();
+    let record = FileRecord {
+        path: "link.txt".to_string(),
+        size: 0,
+        mtime_unix_nanos: 0,
+        blocks: vec![],
+        deleted: false,
+    };
+    upsert_hydrated_file(&state, GROUP, &record, &permit);
+    state
+        .file_index_repository()
+        .set_record_kind(GROUP, "link.txt", RecordKind::Symlink, &permit)
+        .unwrap();
+    state
+        .file_index_repository()
+        .set_symlink_target(GROUP, "link.txt", Some(b"target.txt"))
+        .unwrap();
+    state
+        .materialization_intent_repository()
+        .begin_materialization_intent(GROUP, "link.txt", &[0; 32], &permit)
+        .unwrap();
+    std::fs::write(root.path().join("link.txt"), b"user data").unwrap();
+
+    repair_interrupted_materializations(
+        &state,
+        &store,
+        root.path(),
+        GROUP,
+        RepairMode::Startup,
+        &permit,
+    )
+    .unwrap();
+
+    assert_eq!(std::fs::read(root.path().join("link.txt")).unwrap(), b"user data");
+}
+
+/// An interrupted overwrite of an actual symlink (stale target, write
+/// intent open) is still completed.
+#[cfg(unix)]
+#[test]
+fn repair_still_completes_an_interrupted_symlink_overwrite() {
+    const GROUP: &str = "group-write-link-overwrite";
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = SegmentBlockStore::new(store_dir.path()).unwrap();
+    let state = ReplicaCoordinator::open_in_memory().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    adopt_root(&state, GROUP, root.path());
+    let permit = RootCommitPermit::for_tests();
+    let record = FileRecord {
+        path: "link.txt".to_string(),
+        size: 0,
+        mtime_unix_nanos: 0,
+        blocks: vec![],
+        deleted: false,
+    };
+    upsert_hydrated_file(&state, GROUP, &record, &permit);
+    state
+        .file_index_repository()
+        .set_record_kind(GROUP, "link.txt", RecordKind::Symlink, &permit)
+        .unwrap();
+    state
+        .file_index_repository()
+        .set_symlink_target(GROUP, "link.txt", Some(b"target.txt"))
+        .unwrap();
+    std::os::unix::fs::symlink("stale.txt", root.path().join("link.txt")).unwrap();
+    state
+        .materialization_intent_repository()
+        .begin_materialization_intent(GROUP, "link.txt", &[0; 32], &permit)
+        .unwrap();
+
+    let report = repair_interrupted_materializations(
+        &state,
+        &store,
+        root.path(),
+        GROUP,
+        RepairMode::Startup,
+        &permit,
+    )
+    .unwrap();
+
+    assert_eq!(report.reconstructed, vec!["link.txt"]);
+    assert_eq!(
+        std::fs::read_link(root.path().join("link.txt")).unwrap(),
+        std::path::Path::new("target.txt")
+    );
+}
+
 /// The generic defense-in-depth fix: a `Present` row that is missing
 /// on disk, has no open intent, but still has an OUTSTANDING projection
 /// obligation must not be classified as an offline deletion either --
@@ -1291,18 +1436,130 @@ fn live_repair_does_not_quarantine_a_present_divergent_file_with_no_open_intent(
     );
 }
 
-/// Regression pin: `RepairMode::Startup` keeps its original,
-/// conservative behavior for the exact same present-but-divergent,
-/// no-intent scenario `live_repair_does_not_quarantine_...` above
-/// covers for `Live` -- at startup, before any watcher/live-capture
-/// pipeline exists, this observation can only be an offline edit, so
-/// quarantining and healing from the index is correct.
+/// Startup decision table for a `Present` file row (an offline edit stays a plain local edit). With no
+/// materialization intent, nothing interrupted a write, so whatever disk holds
+/// is the user's: missing is an offline delete, matching bytes are clean, and
+/// different bytes stay in place for the dirty journal / initial scan to author
+/// as an ordinary local edit (never a conflicted copy at repair time). With an
+/// intent, disk bytes that the row can explain are crash recovery, and bytes it
+/// cannot explain keep the conservative quarantine.
 #[test]
-fn startup_repair_still_quarantines_a_present_divergent_file_with_no_open_intent() {
+fn startup_repair_decision_table_for_a_present_file() {
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Disk {
+        Missing,
+        Indexed,
+        Other,
+    }
+    // (name, disk, intent open)
+    let cases = [
+        ("no intent, missing", Disk::Missing, false),
+        ("no intent, bytes == indexed", Disk::Indexed, false),
+        ("no intent, bytes != indexed", Disk::Other, false),
+        ("intent, missing", Disk::Missing, true),
+        ("intent, bytes == indexed", Disk::Indexed, true),
+        ("intent, bytes != indexed", Disk::Other, true),
+    ];
+    for (name, disk, intent) in cases {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = SegmentBlockStore::new(store_dir.path()).unwrap();
+        let indexed: &[u8] = b"the synced, indexed content";
+        let other: &[u8] = b"an edit made while the daemon was stopped";
+        let hash = hex::decode(store.put(indexed).unwrap()).unwrap();
+        let state = ReplicaCoordinator::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        adopt_root(&state, "group-1", root.path());
+        let permit = RootCommitPermit::for_tests();
+        upsert_hydrated_file(
+            &state,
+            "group-1",
+            &record_with_blocks("doc.txt", indexed, hash),
+            &permit,
+        );
+        match disk {
+            Disk::Missing => {}
+            Disk::Indexed => std::fs::write(root.path().join("doc.txt"), indexed).unwrap(),
+            Disk::Other => std::fs::write(root.path().join("doc.txt"), other).unwrap(),
+        }
+        if intent {
+            state
+                .materialization_intent_repository()
+                .begin_materialization_intent("group-1", "doc.txt", &[0; 32], &permit)
+                .unwrap();
+        }
+
+        let report = repair_interrupted_materializations(
+            &state,
+            &store,
+            root.path(),
+            "group-1",
+            RepairMode::Startup,
+            &permit,
+        )
+        .unwrap();
+
+        let on_disk = std::fs::read(root.path().join("doc.txt")).ok();
+        let dirty = state.dirty_path_repository().list_dirty_paths("group-1").unwrap();
+        let dirty_doc = dirty.iter().any(|d| d.path == "doc.txt");
+        match (disk, intent) {
+            (Disk::Missing, false) => {
+                assert_eq!(report.offline_deleted, vec!["doc.txt".to_owned()], "{name}");
+                assert!(on_disk.is_none(), "{name}: an offline delete is not resurrected");
+                assert!(report.quarantined_dirty.is_empty(), "{name}");
+            }
+            (Disk::Indexed, false) => {
+                assert!(report.quarantined_dirty.is_empty(), "{name}");
+                assert!(!dirty_doc, "{name}: clean file is not dirty");
+                assert_eq!(on_disk.as_deref(), Some(indexed), "{name}");
+            }
+            (Disk::Other, false) => {
+                assert!(
+                    report.quarantined_dirty.is_empty(),
+                    "{name}: {:?}",
+                    report.quarantined_dirty
+                );
+                assert!(report.reconstructed.is_empty(), "{name}");
+                assert_eq!(on_disk.as_deref(), Some(other), "{name}: edit stays at the path");
+                assert!(dirty_doc, "{name}: edit is handed to the dirty journal: {dirty:?}");
+                let conflicted = std::fs::read_dir(root.path())
+                    .unwrap()
+                    .filter(|e| {
+                        e.as_ref().unwrap().file_name().to_string_lossy().contains("conflicted")
+                    })
+                    .count();
+                assert_eq!(conflicted, 0, "{name}: no conflicted copy is created");
+            }
+            (Disk::Missing, true) | (Disk::Indexed, true) => {
+                assert!(report.quarantined_dirty.is_empty(), "{name}");
+                assert_eq!(on_disk.as_deref(), Some(indexed), "{name}: crash recovery");
+            }
+            (Disk::Other, true) => {
+                assert_eq!(report.quarantined_dirty.len(), 1, "{name}");
+                assert_eq!(on_disk.as_deref(), Some(indexed), "{name}: canonical healed");
+                assert_eq!(
+                    std::fs::read(root.path().join(&report.quarantined_dirty[0].1)).unwrap(),
+                    other,
+                    "{name}: unexplained bytes are preserved in the quarantine copy"
+                );
+            }
+        }
+    }
+}
+
+/// The index row holds a peer's version while the local file differs from it
+/// (an offline edit). With no intent, startup repair does not pick a winner or
+/// move bytes: the edit stays at the path and goes to the dirty journal, and
+/// the peer's blocks stay in the store. What authoring then does is decided by
+/// the native witness, not here (an edit based on the row's version
+/// supersedes it; a peer head the edit did not observe is a conflict, see
+/// `an_offline_edit_racing_a_peer_edit_keeps_both_versions_as_a_normal_conflict`).
+#[test]
+fn startup_repair_leaves_an_offline_edit_in_place_when_the_row_already_holds_a_peer_version() {
     let store_dir = tempfile::tempdir().unwrap();
     let store = SegmentBlockStore::new(store_dir.path()).unwrap();
-    let indexed_content = b"the synced, indexed content";
-    let hash = hex::decode(store.put(indexed_content).unwrap()).unwrap();
+    let peer: &[u8] = b"the peer's concurrent version";
+    let local: &[u8] = b"my offline edit";
+    let peer_hash = hex::decode(store.put(peer).unwrap()).unwrap();
     let state = ReplicaCoordinator::open_in_memory().unwrap();
     let root = tempfile::tempdir().unwrap();
     adopt_root(&state, "group-1", root.path());
@@ -1310,11 +1567,10 @@ fn startup_repair_still_quarantines_a_present_divergent_file_with_no_open_intent
     upsert_hydrated_file(
         &state,
         "group-1",
-        &record_with_blocks("doc.txt", indexed_content, hash),
+        &record_with_blocks("doc.txt", peer, peer_hash.clone()),
         &permit,
     );
-    let offline_edit_content = b"an edit made while the daemon was stopped";
-    std::fs::write(root.path().join("doc.txt"), offline_edit_content).unwrap();
+    std::fs::write(root.path().join("doc.txt"), local).unwrap();
 
     let report = repair_interrupted_materializations(
         &state,
@@ -1326,19 +1582,107 @@ fn startup_repair_still_quarantines_a_present_divergent_file_with_no_open_intent
     )
     .unwrap();
 
-    assert_eq!(report.quarantined_dirty.len(), 1);
-    assert_eq!(report.quarantined_dirty[0].0, "doc.txt");
-    assert_eq!(
-        std::fs::read(root.path().join("doc.txt")).unwrap(),
-        indexed_content,
-        "startup mode must heal the canonical path back to the indexed content"
+    assert!(report.quarantined_dirty.is_empty() && report.reconstructed.is_empty());
+    assert_eq!(std::fs::read(root.path().join("doc.txt")).unwrap(), local);
+    assert!(store.present_blocks(&[hex::encode(&peer_hash)]).unwrap()[0], "peer bytes kept");
+    let dirty = state.dirty_path_repository().list_dirty_paths("group-1").unwrap();
+    assert!(dirty.iter().any(|d| d.path == "doc.txt"), "{dirty:?}");
+}
+
+/// Seeds a `Present` row holding `indexed`, with `doc.txt` on disk as `disk`.
+fn seed_present(
+    state: &ReplicaCoordinator,
+    store: &SegmentBlockStore,
+    root: &Path,
+    indexed: &[u8],
+    disk: Option<&[u8]>,
+) {
+    let hash = hex::decode(store.put(indexed).unwrap()).unwrap();
+    adopt_root(state, "group-1", root);
+    upsert_hydrated_file(
+        state,
+        "group-1",
+        &record_with_blocks("doc.txt", indexed, hash),
+        &RootCommitPermit::for_tests(),
     );
-    let quarantine_path = &report.quarantined_dirty[0].1;
-    assert_eq!(
-        std::fs::read(root.path().join(quarantine_path)).unwrap(),
-        offline_edit_content,
-        "the offline edit's own bytes must be preserved in the quarantine copy"
-    );
+    if let Some(disk) = disk {
+        std::fs::write(root.join("doc.txt"), disk).unwrap();
+    }
+}
+
+fn startup_repair(
+    state: &ReplicaCoordinator,
+    store: &SegmentBlockStore,
+    root: &Path,
+) -> yadorilink_filesystem_sync::materialization_repair::MaterializationRepairReport {
+    repair_interrupted_materializations(
+        state,
+        store,
+        root,
+        "group-1",
+        RepairMode::Startup,
+        &RootCommitPermit::for_tests(),
+    )
+    .unwrap()
+}
+
+fn is_dirty(state: &ReplicaCoordinator) -> bool {
+    state
+        .dirty_path_repository()
+        .list_dirty_paths("group-1")
+        .unwrap()
+        .iter()
+        .any(|d| d.path == "doc.txt")
+}
+
+/// A `Hydrating` row with an intent is an interrupted write: bytes the row
+/// cannot explain are quarantined and the version rebuilt, like `Present`.
+#[test]
+fn startup_repair_recovers_a_hydrating_row_with_an_intent() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = SegmentBlockStore::new(store_dir.path()).unwrap();
+    let state = ReplicaCoordinator::open_in_memory().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let permit = RootCommitPermit::for_tests();
+    let indexed: &[u8] = b"the row's content";
+    seed_present(&state, &store, root.path(), indexed, Some(b"stale partial bytes"));
+    state
+        .materialization_state_repository()
+        .set_materialization_state("group-1", "doc.txt", MaterializationState::Hydrating, &permit)
+        .unwrap();
+    state
+        .materialization_intent_repository()
+        .begin_materialization_intent("group-1", "doc.txt", &[0; 32], &permit)
+        .unwrap();
+
+    let report = startup_repair(&state, &store, root.path());
+
+    assert_eq!(report.quarantined_dirty.len(), 1, "{report:?}");
+    assert_eq!(std::fs::read(root.path().join("doc.txt")).unwrap(), indexed);
+}
+
+/// A present, divergent file under an unsettled projection obligation but no
+/// intent is still an ordinary offline edit: the obligation only defers a
+/// MISSING path, since a present file has no deletion to protect.
+#[test]
+fn startup_repair_journals_a_present_divergent_file_despite_an_unsettled_obligation() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = SegmentBlockStore::new(store_dir.path()).unwrap();
+    let state = ReplicaCoordinator::open_in_memory().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let edit: &[u8] = b"an offline edit";
+    seed_present(&state, &store, root.path(), b"the row's content", Some(edit));
+    state
+        .sqlite()
+        .dag_bump_projection_obligations_for_touched_paths("group-1", &["doc.txt"], 0)
+        .unwrap();
+    assert!(state.has_unsettled_projection_obligation("group-1", "doc.txt").unwrap());
+
+    let report = startup_repair(&state, &store, root.path());
+
+    assert!(report.quarantined_dirty.is_empty() && report.reconstructed.is_empty());
+    assert_eq!(std::fs::read(root.path().join("doc.txt")).unwrap(), edit);
+    assert!(is_dirty(&state));
 }
 
 /// `RepairMode::Live`'s missing-file counterpart: a `Present` record
@@ -3332,4 +3676,404 @@ fn a_repair_reconstruct_that_fails_after_its_rename_keeps_the_object_and_the_int
             .unwrap(),
         "the intent must stay open so the next pass retries the metadata"
     );
+}
+
+/// Proves `doc.txt` the way an interrupted write is finished (intent open,
+/// file missing, startup repair rebuilds it), leaving a `Present` row with a
+/// usable proof and no intent.
+fn settle_proven_present(state: &ReplicaCoordinator, store: &SegmentBlockStore, root: &Path) {
+    let content = b"the synced, indexed content";
+    seed_present(state, store, root, content, None);
+    state
+        .materialization_intent_repository()
+        .begin_materialization_intent(
+            "group-1",
+            "doc.txt",
+            &[0; 32],
+            &RootCommitPermit::for_tests(),
+        )
+        .unwrap();
+    let report = startup_repair(state, store, root);
+    assert_eq!(report.reconstructed, vec!["doc.txt"]);
+    assert!(MaterializationExecutionPort::has_usable_materialized_generation(
+        state, "group-1", "doc.txt"
+    )
+    .unwrap());
+}
+
+/// A settled row (`Present`, usable proof, no intent) owes the live sweep
+/// nothing, so it does not read the file: a divergence there is left to
+/// capture, and the sweep neither journals nor touches it.
+#[test]
+fn live_repair_does_not_read_a_settled_present_file() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = SegmentBlockStore::new(store_dir.path()).unwrap();
+    let state = ReplicaCoordinator::open_in_memory().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    settle_proven_present(&state, &store, root.path());
+    let edit: &[u8] = b"an edit the watcher has not delivered";
+    std::fs::write(root.path().join("doc.txt"), edit).unwrap();
+
+    let report = repair_interrupted_materializations(
+        &state,
+        &store,
+        root.path(),
+        "group-1",
+        RepairMode::Live,
+        &RootCommitPermit::for_tests(),
+    )
+    .unwrap();
+
+    assert!(report.is_empty(), "{report:?}");
+    assert!(!is_dirty(&state), "a settled row is not compared, so nothing is journaled");
+    assert_eq!(std::fs::read(root.path().join("doc.txt")).unwrap(), edit);
+}
+
+/// The startup pass is unchanged: the same settled row with different bytes
+/// is an offline edit and is journaled for the initial scan.
+#[test]
+fn startup_repair_still_compares_a_settled_present_file() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = SegmentBlockStore::new(store_dir.path()).unwrap();
+    let state = ReplicaCoordinator::open_in_memory().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    settle_proven_present(&state, &store, root.path());
+    let edit: &[u8] = b"an edit made while the daemon was stopped";
+    std::fs::write(root.path().join("doc.txt"), edit).unwrap();
+
+    startup_repair(&state, &store, root.path());
+
+    assert!(is_dirty(&state), "an offline edit is found at startup");
+    assert_eq!(std::fs::read(root.path().join("doc.txt")).unwrap(), edit);
+}
+
+/// A row with an intent open is unfinished work and is still examined live,
+/// proof or not.
+#[test]
+fn live_repair_still_examines_a_present_file_with_an_open_intent() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = SegmentBlockStore::new(store_dir.path()).unwrap();
+    let state = ReplicaCoordinator::open_in_memory().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    settle_proven_present(&state, &store, root.path());
+    state
+        .materialization_intent_repository()
+        .begin_materialization_intent(
+            "group-1",
+            "doc.txt",
+            &[0; 32],
+            &RootCommitPermit::for_tests(),
+        )
+        .unwrap();
+    std::fs::remove_file(root.path().join("doc.txt")).unwrap();
+
+    let report = repair_interrupted_materializations(
+        &state,
+        &store,
+        root.path(),
+        "group-1",
+        RepairMode::Live,
+        &RootCommitPermit::for_tests(),
+    )
+    .unwrap();
+
+    assert_eq!(report.reconstructed, vec!["doc.txt"]);
+}
+
+// Crash matrix of a temp file's life. A write records the temp file, creates
+// it, fills and syncs it, renames it over the target and releases the record.
+// Link start removes what the records name and nothing else.
+mod temp_file_crash_matrix {
+    use super::*;
+    use yadorilink_local_storage::{
+        persist_reconstructed_file_in, reconstruct_file_to_temp_in, TempFileLedger,
+    };
+
+    const G: &str = "group-tmp";
+
+    /// A ledger that records but whose release never happens: the process died
+    /// before it.
+    struct DiesBeforeRelease<'a>(&'a dyn TempFileLedger);
+    impl TempFileLedger for DiesBeforeRelease<'_> {
+        fn record(&self, tmp: &Path) -> Result<(), yadorilink_local_storage::StorageError> {
+            self.0.record(tmp)
+        }
+        fn release(&self, _tmp: &Path) {}
+    }
+
+    struct Fixture {
+        state: ReplicaCoordinator,
+        store: SegmentBlockStore,
+        _store_dir: tempfile::TempDir,
+        root: tempfile::TempDir,
+        blocks: Vec<BlockInfo>,
+    }
+
+    fn fixture() -> Fixture {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = SegmentBlockStore::new(store_dir.path()).unwrap();
+        let data = b"temp file crash matrix content";
+        let hash = hex::decode(store.put(data).unwrap()).unwrap();
+        Fixture {
+            state: ReplicaCoordinator::open_in_memory().unwrap(),
+            store,
+            _store_dir: store_dir,
+            root: tempfile::tempdir().unwrap(),
+            blocks: vec![BlockInfo { hash, offset: 0, size: data.len() as u32 }],
+        }
+    }
+
+    impl Fixture {
+        fn recorded(&self) -> Vec<String> {
+            self.state.temp_ledger(G).list().unwrap()
+        }
+        fn recover(&self) -> Vec<std::path::PathBuf> {
+            self.state.remove_recorded_temp_files(G, self.root.path()).unwrap()
+        }
+        fn names(&self) -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(self.root.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        }
+    }
+
+    /// Case 1: Crash after the name is recorded, before the file is created.
+    #[test]
+    fn crash_after_record_before_create() {
+        let f = fixture();
+        let tmp = f.root.path().join("a.yadorilink-tmp.1.1");
+        f.state.temp_ledger(G).record(&tmp).unwrap();
+        assert_eq!(f.recorded().len(), 1);
+        assert!(f.recover().is_empty(), "nothing was created, nothing to remove");
+        assert!(f.recorded().is_empty());
+    }
+
+    /// Case 2: Crash while the file is being filled (it exists, partly written).
+    #[test]
+    fn crash_mid_assembly() {
+        let f = fixture();
+        let tmp = f.root.path().join("a.yadorilink-tmp.1.2");
+        f.state.temp_ledger(G).record(&tmp).unwrap();
+        std::fs::write(&tmp, b"partial").unwrap();
+        assert_eq!(f.recover(), vec![tmp.clone()]);
+        assert!(f.names().is_empty() && f.recorded().is_empty());
+    }
+
+    /// Case 3: Crash after the temp file is complete and synced, before the rename.
+    #[test]
+    fn crash_after_assembly_before_rename() {
+        let f = fixture();
+        let out = f.root.path().join("a.bin");
+        let ledger = f.state.temp_ledger(G);
+        let tmp = reconstruct_file_to_temp_in(&f.store, &out, &f.blocks, 0, &ledger).unwrap();
+        assert!(tmp.exists() && f.recorded().len() == 1);
+        assert_eq!(f.recover(), vec![tmp]);
+        assert!(!out.exists(), "nothing was published");
+        assert!(f.names().is_empty() && f.recorded().is_empty());
+    }
+
+    /// Case 4: Crash after the rename, before the record is released: the published
+    /// file is untouched and only the stale record goes.
+    #[test]
+    fn crash_after_rename_before_release() {
+        let f = fixture();
+        let out = f.root.path().join("a.bin");
+        let ledger = f.state.temp_ledger(G);
+        let dying = DiesBeforeRelease(&ledger);
+        let tmp = reconstruct_file_to_temp_in(&f.store, &out, &f.blocks, 0, &dying).unwrap();
+        persist_reconstructed_file_in(&tmp, &out, &dying).unwrap();
+        assert_eq!(f.recorded().len(), 1, "the release never ran");
+        assert!(f.recover().is_empty(), "the temp file is gone: nothing to remove");
+        assert_eq!(f.names(), vec!["a.bin".to_string()]);
+        assert_eq!(std::fs::read(&out).unwrap(), b"temp file crash matrix content");
+        assert!(f.recorded().is_empty());
+    }
+
+    /// Case 5: No crash: a write that finishes leaves no record, and recovery has
+    /// nothing to do.
+    #[test]
+    fn a_finished_write_leaves_nothing_recorded() {
+        let f = fixture();
+        let out = f.root.path().join("a.bin");
+        let ledger = f.state.temp_ledger(G);
+        let tmp = reconstruct_file_to_temp_in(&f.store, &out, &f.blocks, 0, &ledger).unwrap();
+        persist_reconstructed_file_in(&tmp, &out, &ledger).unwrap();
+        assert!(f.recorded().is_empty());
+        assert!(f.recover().is_empty());
+        assert_eq!(f.names(), vec!["a.bin".to_string()]);
+    }
+
+    /// Case 6: A symlink's temp link, created and never renamed.
+    #[cfg(unix)]
+    #[test]
+    fn crash_with_a_temp_symlink() {
+        let f = fixture();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("target"), b"must survive").unwrap();
+        let tmp = f.root.path().join("l.yadorilink-tmp.1.6");
+        f.state.temp_ledger(G).record(&tmp).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("target"), &tmp).unwrap();
+        assert_eq!(f.recover(), vec![tmp]);
+        assert_eq!(std::fs::read(outside.path().join("target")).unwrap(), b"must survive");
+        assert!(f.names().is_empty());
+    }
+
+    /// The window the single per-path intent could not cover: a second write
+    /// of the same path replaces the intent while the first write's temp file
+    /// is still on disk. Both temp files are named by their own records.
+    #[test]
+    fn a_second_write_does_not_orphan_the_first_writes_temp_file() {
+        let f = fixture();
+        let out = f.root.path().join("a.bin");
+        let permit = RootCommitPermit::for_tests();
+        let ledger = f.state.temp_ledger(G);
+        let intents = f.state.materialization_intent_repository();
+        intents.begin_materialization_intent(G, "a.bin", &[1; 32], &permit).unwrap();
+        let first = reconstruct_file_to_temp_in(&f.store, &out, &f.blocks, 0, &ledger).unwrap();
+        intents.begin_materialization_intent(G, "a.bin", &[2; 32], &permit).unwrap();
+        let second = reconstruct_file_to_temp_in(&f.store, &out, &f.blocks, 0, &ledger).unwrap();
+        let mut removed = f.recover();
+        removed.sort();
+        let mut expected = vec![first, second];
+        expected.sort();
+        assert_eq!(removed, expected);
+        assert!(f.names().is_empty());
+    }
+
+    /// A directory component swapped for a symlink while stopped must not aim
+    /// the removal outside the root.
+    #[cfg(unix)]
+    #[test]
+    fn recovery_does_not_follow_a_symlinked_ancestor() {
+        let f = fixture();
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("x.yadorilink-tmp.1.3");
+        std::fs::write(&victim, b"outside the root").unwrap();
+        std::os::unix::fs::symlink(outside.path(), f.root.path().join("sub")).unwrap();
+        let recorded = f.root.path().join("sub/x.yadorilink-tmp.1.3");
+        f.state.temp_ledger(G).record(&recorded).unwrap();
+
+        assert!(f.recover().is_empty());
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"outside the root");
+    }
+
+    /// Recovery never decides from a name: an unrecorded file that looks
+    /// exactly like a temp file is a user's, and a recorded path that lies
+    /// outside the root is left alone. A recorded directory is removed only
+    /// when it is empty, by one non-recursive `rmdir`; with anything inside it
+    /// stays, and so does its record.
+    #[test]
+    fn recovery_removes_only_what_a_record_names() {
+        let f = fixture();
+        let lookalike = f.root.path().join("notes.yadorilink-tmp.12345.7");
+        std::fs::write(&lookalike, b"mine").unwrap();
+        let unrecorded_dir = f.root.path().join("e.yadorilink-tmp.1.8");
+        std::fs::create_dir(&unrecorded_dir).unwrap();
+        let empty = f.root.path().join("d.yadorilink-tmp.1.8");
+        std::fs::create_dir(&empty).unwrap();
+        let full = f.root.path().join("full.yadorilink-tmp.1.8");
+        std::fs::create_dir(&full).unwrap();
+        std::fs::write(full.join("child"), b"data").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let elsewhere = outside.path().join("x.yadorilink-tmp.1.9");
+        std::fs::write(&elsewhere, b"not under the root").unwrap();
+        let ledger = f.state.temp_ledger(G);
+        ledger.record(&empty).unwrap();
+        ledger.record(&full).unwrap();
+        ledger.record(&elsewhere).unwrap();
+
+        assert_eq!(f.recover(), vec![empty.clone()]);
+        assert_eq!(std::fs::read(&lookalike).unwrap(), b"mine");
+        assert!(unrecorded_dir.is_dir(), "an unrecorded directory is never touched");
+        assert!(!empty.exists());
+        assert_eq!(std::fs::read(full.join("child")).unwrap(), b"data");
+        assert!(elsewhere.exists());
+        assert_eq!(f.recorded(), vec![full.display().to_string()], "only the full one is kept");
+    }
+
+    /// A crash between a Stage directory and its publication leaves a recorded
+    /// empty directory beside the target and nothing at the target; recovery
+    /// removes exactly that.
+    #[test]
+    fn crash_between_a_stage_directory_and_its_publication() {
+        use yadorilink_root_authority::durable_dir::{
+            arm_failpoint, disarm_failpoint, NsFailpoint,
+        };
+        let f = fixture();
+        let target = f.root.path().join("d");
+        let canonical = std::fs::canonicalize(f.root.path()).unwrap();
+        let ledger =
+            yadorilink_filesystem_sync::materialization_execution::GroupStructuralLedger::new(
+                &f.state, G,
+            );
+        arm_failpoint(NsFailpoint::AfterStage);
+        let result = yadorilink_local_storage::create_explicit_directory(
+            &canonical.join("d"),
+            &canonical,
+            &ledger,
+        );
+        disarm_failpoint();
+        assert!(result.is_err());
+        assert!(!target.exists());
+        assert_eq!(f.names().len(), 1, "the Stage directory is beside the target");
+        assert_eq!(f.recorded().len(), 1, "and a record names it");
+
+        assert_eq!(f.recover().len(), 1);
+
+        assert!(f.names().is_empty() && f.recorded().is_empty());
+    }
+}
+
+mod structural_intents_without_an_age_sweep {
+    use super::*;
+
+    fn pending(state: &ReplicaCoordinator) -> Vec<(String, String)> {
+        state
+            .sqlite()
+            .dag_list_unresolved_structural_intents(None)
+            .unwrap()
+            .into_iter()
+            .map(|i| (i.group_id, i.path))
+            .collect()
+    }
+
+    /// An intent a dead process left stays until the group's link starts: no
+    /// clock decides, however old or young it is. Link start resolves only its
+    /// own group's, and records the directory found as of lost provenance.
+    #[test]
+    fn link_start_resolves_its_own_groups_intents_and_nothing_else() {
+        let state = ReplicaCoordinator::open_in_memory().unwrap();
+        let root_a = tempfile::tempdir().unwrap();
+        let root_b = tempfile::tempdir().unwrap();
+        adopt_root(&state, "ga", root_a.path());
+        adopt_root(&state, "gb", root_b.path());
+        std::fs::create_dir(root_a.path().join("d")).unwrap();
+        std::fs::create_dir(root_b.path().join("d")).unwrap();
+        state.record_structural_directory_intent("ga", "d").unwrap();
+        state.record_structural_directory_intent("gb", "d").unwrap();
+
+        let resolved = state.resolve_structural_intents_at_link_start("ga").unwrap();
+
+        assert_eq!(resolved, vec![("ga".to_string(), "d".to_string())]);
+        assert_eq!(pending(&state), vec![("gb".to_string(), "d".to_string())]);
+    }
+
+    /// A writer leaving with its intent unsettled resolves just that intent.
+    #[test]
+    fn an_interrupted_writer_resolves_only_its_own_intent() {
+        let state = ReplicaCoordinator::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        adopt_root(&state, "ga", root.path());
+        std::fs::create_dir(root.path().join("d")).unwrap();
+        state.record_structural_directory_intent("ga", "d").unwrap();
+        state.record_structural_directory_intent("ga", "e").unwrap();
+
+        state.resolve_interrupted_structural_intent("ga", "d").unwrap();
+
+        assert_eq!(pending(&state), vec![("ga".to_string(), "e".to_string())]);
+    }
 }

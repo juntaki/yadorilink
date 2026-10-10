@@ -14,6 +14,7 @@
 
 use std::time::Duration;
 
+use status_model::TrayAction;
 use tao::event::Event;
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
@@ -28,7 +29,22 @@ use yadorilink_ipc_proto::daemonctl::StatusResponse;
 /// Sent from the background polling thread to the event loop whenever a
 /// fresh (or newly-unreachable) status snapshot is available.
 enum UserEvent {
-    Status(Result<StatusResponse, ()>),
+    Status(Box<Result<StatusResponse, ()>>),
+    /// Outcome of a tray action, shown in the menu and tooltip (and, for a
+    /// failure, in a dialog with the details).
+    Notice(status_model::Notice),
+}
+
+/// How long an action outcome stays at the top of the menu.
+const NOTICE_TTL: Duration = Duration::from_secs(30);
+
+static PROXY: std::sync::OnceLock<tao::event_loop::EventLoopProxy<UserEvent>> =
+    std::sync::OnceLock::new();
+
+fn report(action: status_model::TrayAction, result: Result<(), String>) {
+    if let Some(proxy) = PROXY.get() {
+        let _ = proxy.send_event(UserEvent::Notice(status_model::action_notice(action, result)));
+    }
 }
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -103,6 +119,7 @@ fn main() {
 
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
+    let _ = PROXY.set(event_loop.create_proxy());
 
     // Background polling thread: its own small tokio runtime, entirely
     // separate from the tao event loop (which must stay on the main
@@ -115,7 +132,7 @@ fn main() {
         rt.block_on(async move {
             loop {
                 let status = fetch_status().await;
-                if proxy.send_event(UserEvent::Status(status)).is_err() {
+                if proxy.send_event(UserEvent::Status(Box::new(status))).is_err() {
                     // Event loop is gone (app quitting) — stop polling.
                     return;
                 }
@@ -124,22 +141,53 @@ fn main() {
         });
     });
 
-    let icon = placeholder_icon();
+    let icon = state_icon(status_model::TrayState::Attention);
     let tray_icon = TrayIconBuilder::new()
         .with_tooltip(status_model::DAEMON_UNREACHABLE_HEADLINE)
         .with_icon(icon)
-        .with_menu(Box::new(build_menu(None)))
+        .with_menu(Box::new(build_menu(None, None)))
         .build()
         .expect("failed to build tray icon");
 
     let menu_channel = MenuEvent::receiver();
     let tray_channel = TrayIconEvent::receiver();
 
+    let mut last_status: Option<StatusResponse> = None;
+    let mut notice: Option<(status_model::Notice, std::time::Instant)> = None;
+    let mut shown_state = status_model::TrayState::Attention;
+
     event_loop.run(move |event, _target, control_flow| {
         *control_flow = ControlFlow::Wait;
 
-        if let Event::UserEvent(UserEvent::Status(status)) = event {
-            apply_status(&tray_icon, status.ok());
+        match event {
+            Event::UserEvent(UserEvent::Status(status)) => {
+                last_status = (*status).ok();
+                if notice.as_ref().is_some_and(|(_, at)| at.elapsed() > NOTICE_TTL) {
+                    notice = None;
+                }
+                let state = status_model::tray_state(last_status.as_ref());
+                if state != shown_state {
+                    shown_state = state;
+                    let _ = tray_icon.set_icon(Some(state_icon(state)));
+                }
+                apply_status(&tray_icon, last_status.as_ref(), notice.as_ref().map(|n| &n.0));
+            }
+            Event::UserEvent(UserEvent::Notice(n)) => {
+                if n.is_error {
+                    let mut text = n.text.clone();
+                    if let Some(details) = &n.details {
+                        text.push_str(&format!("\n\nDetails: {details}"));
+                    }
+                    rfd::MessageDialog::new()
+                        .set_title("YadoriLink")
+                        .set_description(text)
+                        .set_buttons(rfd::MessageButtons::Ok)
+                        .show();
+                }
+                notice = Some((n, std::time::Instant::now()));
+                apply_status(&tray_icon, last_status.as_ref(), notice.as_ref().map(|n| &n.0));
+            }
+            _ => {}
         }
 
         // `tray-icon`/`muda` events arrive on their own global channels
@@ -265,20 +313,27 @@ async fn fetch_status() -> Result<StatusResponse, ()> {
     }
 }
 
-fn apply_status(tray_icon: &TrayIcon, status: Option<StatusResponse>) {
-    let headline = match &status {
+fn apply_status(
+    tray_icon: &TrayIcon,
+    status: Option<&StatusResponse>,
+    notice: Option<&status_model::Notice>,
+) {
+    let mut headline = match status {
         Some(status) => status_model::headline(status),
         None => status_model::DAEMON_UNREACHABLE_HEADLINE.to_string(),
     };
+    if let Some(notice) = notice {
+        headline = format!("{headline}\n{}", notice.text);
+    }
     let _ = tray_icon.set_tooltip(Some(&headline));
-    tray_icon.set_menu(Some(Box::new(build_menu(status.as_ref()))));
+    tray_icon.set_menu(Some(Box::new(build_menu(status, notice))));
 }
 
 /// Rebuilds the whole menu from the latest status snapshot — simpler and
 /// less error-prone than mutating individual native menu items in place,
 /// and cheap enough at a 2s poll interval (this is not
 /// a high-frequency UI).
-fn build_menu(status: Option<&StatusResponse>) -> Menu {
+fn build_menu(status: Option<&StatusResponse>, notice: Option<&status_model::Notice>) -> Menu {
     let menu = Menu::new();
 
     let headline_text = match status {
@@ -286,6 +341,9 @@ fn build_menu(status: Option<&StatusResponse>) -> Menu {
         None => status_model::DAEMON_UNREACHABLE_HEADLINE.to_string(),
     };
     let _ = menu.append(&MenuItem::new(headline_text, false, None));
+    if let Some(notice) = notice {
+        let _ = menu.append(&MenuItem::new(format!("  {}", notice.text), false, None));
+    }
     // The Home screen (folder list, devices, transfers, per-folder mode/
     // pause) -- the tray menu's own items below stay as fast per-folder
     // shortcuts, Home is where a fuller at-a-glance view + those same
@@ -403,8 +461,8 @@ fn build_menu(status: Option<&StatusResponse>) -> Menu {
         let _ = menu.append(&MenuItem::with_id("check_updates", "Check for Updates", true, None));
         if !status.update_available_version.is_empty() {
             let _ = menu.append(&MenuItem::with_id(
-                "install_update",
-                format!("Install Update ({})", status.update_available_version),
+                "download_update",
+                format!("Download Update ({})", status.update_available_version),
                 true,
                 None,
             ));
@@ -488,15 +546,17 @@ fn handle_menu_event(id: &str) {
         if result == rfd::MessageDialogResult::Ok {
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().expect("failed to start action runtime");
-                if let Err(e) = rt.block_on(actions::unlink(path)) {
+                let result = rt.block_on(actions::unlink(path)).map_err(|e| e.to_string());
+                if let Err(e) = &result {
                     tracing::warn!(error = %e, "unlink failed");
                 }
+                report(TrayAction::Unlink, result);
             });
         }
         return;
     }
     if let Some(preset) = actions::BandwidthPreset::from_menu_id(id) {
-        run_async(actions::set_bandwidth_limit(preset));
+        run_async(TrayAction::Bandwidth, actions::set_bandwidth_limit(preset));
         return;
     }
     match id {
@@ -504,10 +564,10 @@ fn handle_menu_event(id: &str) {
         "open_send" => spawn_window("send"),
         "open_settings" => spawn_window("settings"),
         "open_storage" => spawn_window("storage"),
-        "pause_all" => run_async(actions::pause_all()),
-        "resume_all" => run_async(actions::resume_all()),
-        "check_updates" => run_async(actions::check_for_updates()),
-        "install_update" => run_async(actions::install_update()),
+        "pause_all" => run_async(TrayAction::PauseAll, actions::pause_all()),
+        "resume_all" => run_async(TrayAction::ResumeAll, actions::resume_all()),
+        "check_updates" => run_async(TrayAction::CheckUpdates, actions::check_for_updates()),
+        "download_update" => run_async(TrayAction::DownloadUpdate, actions::download_update()),
         "export_diagnostics" => {
             std::thread::spawn(|| {
                 let rt = tokio::runtime::Runtime::new().expect("failed to start action runtime");
@@ -516,7 +576,7 @@ fn handle_menu_event(id: &str) {
                 }
             });
         }
-        "restart_daemon" => run_async(actions::restart_daemon()),
+        "restart_daemon" => run_async(TrayAction::RestartDaemon, actions::restart_daemon()),
         "start_daemon" => {
             std::thread::spawn(|| {
                 let rt = tokio::runtime::Runtime::new().expect("failed to start action runtime");
@@ -546,13 +606,17 @@ fn handle_menu_event(id: &str) {
         // failed sign-out deliberately keeps the credential (see
         // `actions::sign_out`). A warning log is the wrong place for that
         // outcome to end up and this is tracked as a UI gap: the user sees a
-        // menu that still says "Sign Out" and no explanation.
+        // menu that still says "Sign Out" and no explanation. The outcome is
+        // therefore reported back to the tray (menu line, tooltip, and a
+        // dialog with details on failure).
         "sign_out" => {
             std::thread::spawn(|| {
                 let rt = tokio::runtime::Runtime::new().expect("failed to start action runtime");
-                if let Err(e) = rt.block_on(actions::sign_out()) {
+                let result = rt.block_on(actions::sign_out()).map_err(|e| e.to_string());
+                if let Err(e) = &result {
                     tracing::warn!(error = %e, "sign out failed; credentials were kept");
                 }
+                report(TrayAction::SignOut, result);
             });
         }
         // All three first-run/setup entry
@@ -565,28 +629,24 @@ fn handle_menu_event(id: &str) {
     }
 }
 
-fn run_async<F>(fut: F)
+fn run_async<F>(action: TrayAction, fut: F)
 where
     F: std::future::Future<Output = Result<(), ipc_client::IpcError>> + Send + 'static,
 {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("failed to start action runtime");
-        if let Err(e) = rt.block_on(fut) {
+        let result = rt.block_on(fut).map_err(|e| e.to_string());
+        if let Err(e) = &result {
             tracing::warn!(error = %e, "tray action failed");
         }
+        report(action, result);
     });
 }
 
-/// A minimal 16x16 solid-color placeholder icon — no real icon asset is
-/// embedded here (a multi-resolution `.icns`/`.ico` belongs to
-/// packaging), just enough for
-/// `TrayIconBuilder::build` to succeed and for the tray to be visibly
-/// present.
-fn placeholder_icon() -> Icon {
+/// A 16x16 solid-colour icon tinted per tray state (no real icon asset is
+/// embedded; a multi-resolution `.icns`/`.ico` belongs to packaging).
+fn state_icon(state: status_model::TrayState) -> Icon {
     const SIZE: u32 = 16;
-    let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
-    for _ in 0..(SIZE * SIZE) {
-        rgba.extend_from_slice(&[0x2b, 0x6c, 0xb0, 0xff]); // opaque blue square
-    }
-    Icon::from_rgba(rgba, SIZE, SIZE).expect("placeholder icon dimensions are valid")
+    Icon::from_rgba(status_model::tray_icon_rgba(state, SIZE), SIZE, SIZE)
+        .expect("tray icon dimensions are valid")
 }

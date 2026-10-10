@@ -196,8 +196,6 @@ fn remote_delta(
             path: SyncPath(path.into()),
             removes,
             put: Some(DeltaPut { version: VersionHash([version; 32]) }),
-            keeps: Vec::new(),
-            keep_put: false,
         }],
         signature: [0u8; 64],
     };
@@ -232,23 +230,11 @@ fn served_roots_always_equal_the_roots_of_the_rows() {
                 0 | 1 => {
                     let version = VersionHash([rng.next(200) as u8 + 1; 32]);
                     let op = Op::Put { path: SyncPath(path.clone()), version };
-                    let _ = crate::native_authoring::author_op(
-                        &c,
-                        &group(),
-                        &local,
-                        &op,
-                        &SyncPath(path),
-                    );
+                    let _ = crate::native_authoring::author_op(&c, &group(), &local, &op);
                 }
                 2 => {
                     let op = Op::Delete { path: SyncPath(path.clone()) };
-                    let _ = crate::native_authoring::author_op(
-                        &c,
-                        &group(),
-                        &local,
-                        &op,
-                        &SyncPath(path),
-                    );
+                    let _ = crate::native_authoring::author_op(&c, &group(), &local, &op);
                 }
                 3 | 4 => {
                     let who = rng.next(2);
@@ -337,13 +323,7 @@ fn served_roots_always_equal_the_roots_of_the_rows() {
                     c.execute_batch("BEGIN").unwrap();
                     let version = VersionHash([250; 32]);
                     let op = Op::Put { path: SyncPath(path.clone()), version };
-                    let _ = crate::native_authoring::author_op(
-                        &c,
-                        &group(),
-                        &local,
-                        &op,
-                        &SyncPath(path),
-                    );
+                    let _ = crate::native_authoring::author_op(&c, &group(), &local, &op);
                     let inside = summary_roots(&c, &group()).unwrap();
                     assert_eq!(inside, fresh_roots(&c), "{label}: stale inside the transaction");
                     c.execute_batch("ROLLBACK").unwrap();

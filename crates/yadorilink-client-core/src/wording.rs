@@ -24,12 +24,73 @@ devices. Removing them, if you ever want to, is a separate manual step.";
 /// still read/type just the code portion after the last `/`.
 ///
 /// Every surface that shows an invite builds it here: accepting an invite
-/// (`ops::shares::extract_invite_code`) is defined against exactly this
+/// (`parse_invite_input`) is defined against exactly this
 /// shape, so a second, independently written formatter is a way for the two
 /// halves to drift apart.
 #[must_use]
 pub fn invite_url(code: &str) -> String {
     format!("yadorilink://invite/{code}")
+}
+
+/// Longest invite code accepted from a link or typed input; real codes are
+/// far shorter, so anything longer is a malformed or hostile link.
+pub const MAX_INVITE_CODE_LEN: usize = 64;
+
+const INVITE_URL_PREFIX: &str = "yadorilink://invite/";
+
+/// Why a pasted or clicked invite link was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InviteLinkError {
+    Empty,
+    TooLong,
+    Malformed,
+}
+
+impl std::fmt::Display for InviteLinkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Empty => "Paste the invite link or code you were sent.",
+            Self::TooLong => "This invite link is too long to be a real invite.",
+            Self::Malformed => {
+                "This does not look like a YadoriLink invite. Ask the sender for a new link."
+            }
+        })
+    }
+}
+
+impl std::error::Error for InviteLinkError {}
+
+/// The one parser for invites: accepts a `yadorilink://invite/<code>` link
+/// (scheme and host case-insensitive, one optional trailing `/`) or a bare
+/// code, and returns the validated code (ASCII letters, digits, `-`, `_`).
+///
+/// # Errors
+/// [`InviteLinkError`] for empty, oversized, or malformed input.
+pub fn parse_invite_input(input: &str) -> Result<&str, InviteLinkError> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err(InviteLinkError::Empty);
+    }
+    if input.len() > INVITE_URL_PREFIX.len() + MAX_INVITE_CODE_LEN + 1 {
+        return Err(InviteLinkError::TooLong);
+    }
+    let code = match input.get(..INVITE_URL_PREFIX.len()) {
+        Some(head) if head.eq_ignore_ascii_case(INVITE_URL_PREFIX) => {
+            let rest = &input[INVITE_URL_PREFIX.len()..];
+            rest.strip_suffix('/').unwrap_or(rest)
+        }
+        _ => input,
+    };
+    if code.is_empty() {
+        return Err(InviteLinkError::Malformed);
+    }
+    if code.len() > MAX_INVITE_CODE_LEN {
+        return Err(InviteLinkError::TooLong);
+    }
+    if !code.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return Err(InviteLinkError::Malformed);
+    }
+    Ok(code)
 }
 
 /// What an approval reports for each result the coordination plane can

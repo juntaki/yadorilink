@@ -117,6 +117,9 @@ pub const MAX_COMPONENT_BYTES: usize = 255;
 /// rules would accept it, because nothing ever re-evaluates a "settled"
 /// verdict.
 ///
+/// Bumped again for [`ArtefactKind::Discard`] for the same reason: a wire
+/// path shaped `.yadorilink-v1-discard.<id>` is now a reserved name.
+///
 /// Also bumped for [`ArtefactKind::Probe`]: adding a kind to
 /// [`ArtefactKind::ALL`] widens `parse_artefact_component`, which backs
 /// both the host and the wire predicates — a wire path shaped
@@ -128,7 +131,7 @@ pub const MAX_COMPONENT_BYTES: usize = 255;
 /// on the wire), so the practical effect is only that a peer can no longer
 /// name a file that shape — but the verdict for that shape changed, so the
 /// version must too.
-pub const RULES_VERSION: u32 = 4;
+pub const RULES_VERSION: u32 = 5;
 
 /// The versioned artefact kinds from the reserved namespace. Each maps to a
 /// literal ASCII prefix that appears in `.yadorilink-v1-<kind>.<id>` — see
@@ -160,15 +163,22 @@ pub enum ArtefactKind {
     /// `fs_capabilities::probe_artefact_name`'s doc for the concrete
     /// mechanism this closes).
     Probe,
+    /// An object the product has decided to remove, moved aside beside its
+    /// former path by a write-through move (the commit point of the removal)
+    /// and not yet physically deleted. Like [`ArtefactKind::Stage`] it is
+    /// owned only by a durable ledger row that names it; a name found without
+    /// such a row is never inferred to be ours and is left alone.
+    Discard,
 }
 
 impl ArtefactKind {
-    const ALL: [ArtefactKind; 5] = [
+    const ALL: [ArtefactKind; 6] = [
         ArtefactKind::Stage,
         ArtefactKind::Preimage,
         ArtefactKind::Backup,
         ArtefactKind::Retained,
         ArtefactKind::Probe,
+        ArtefactKind::Discard,
     ];
 
     /// The lowercase ASCII token that follows `.yadorilink-v1-` in a
@@ -180,6 +190,7 @@ impl ArtefactKind {
             ArtefactKind::Backup => "backup",
             ArtefactKind::Retained => "retained",
             ArtefactKind::Probe => "probe",
+            ArtefactKind::Discard => "discard",
         }
     }
 }
@@ -189,8 +200,8 @@ const V1_PREFIX: &str = ".yadorilink-v1-";
 
 /// The legacy temp-file marker `chunker::unique_tmp_path` (and
 /// `yadorilink-local-storage`'s equivalent) has always appended. It predates
-/// this module and keeps its own strict-suffix shape and its own GC matcher
-/// (`materialization::cleanup_stale_temp_files`) rather than being folded
+/// this module and keeps its own strict-suffix shape and is removed by name from the
+/// writers' durable temp-file records, not by pattern, rather than being folded
 /// into the versioned namespace — see [`ReservedComponent::Legacy`]'s doc
 /// comment for why.
 const LEGACY_MARKER: &str = ".yadorilink-tmp.";
@@ -207,8 +218,7 @@ pub enum ReservedComponent<'a> {
     /// this module recognizes it purely so it is excluded from indexing
     /// alongside the versioned kinds, but does not construct, parse or own
     /// it beyond that — `chunker::unique_tmp_path` still mints it and
-    /// `materialization::cleanup_stale_temp_files` still collects it with
-    /// its own, unchanged, strict-suffix matcher. A daemon upgrade must not
+    /// the recorded-temp-file recovery still removes it by its record. A daemon upgrade must not
     /// orphan an in-flight temp file from the previous version with no
     /// collector, so the legacy marker keeps working exactly as it always
     /// has; this variant only ever appears for **exclusion**, never for
@@ -306,9 +316,8 @@ pub fn parse_artefact_component(name: &str) -> Option<(ArtefactKind, &str)> {
 /// substring (matching the shape `unique_tmp_path` actually produces —
 /// `<original-name>.yadorilink-tmp.<pid>.<counter>`, where arbitrary user
 /// content precedes the marker within the same component), not that the
-/// whole component equal it. `materialization::is_own_stale_temp_file_name`
-/// additionally validates the `<pid>.<counter>` suffix shape for its own
-/// (stricter) deletion decision; this function only decides "exclude from
+/// whole component equal it. No deletion decision is made from the
+/// name; this function only decides "exclude from
 /// indexing," which must be at least as permissive as that stricter check
 /// so nothing importable slips through the gap between the two.
 fn contains_legacy_marker(name: &str) -> bool {
@@ -407,8 +416,8 @@ fn classify_normalized_component<'a>(
 /// dot/space normalization (see [`strip_windows_trailing_normalization`]):
 /// `notes.yadorilink-v1-stage.x` does not match, only a component that *is*
 /// the artefact name (modulo that trailing-character stripping). This
-/// mirrors the precedent in `materialization::cleanup_stale_temp_files`'s
-/// doc comment, which deliberately rejects treating a user file that merely
+/// mirrors the rule that recovery never deletes by name: it
+/// deliberately rejects treating a user file that merely
 /// *contains* `.yadorilink-tmp.` as one of its own temp files.
 pub fn classify_component(name: &OsStr) -> Option<ReservedComponent<'_>> {
     let name = name.to_str()?;

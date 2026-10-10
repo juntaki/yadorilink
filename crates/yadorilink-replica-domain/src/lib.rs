@@ -18,13 +18,11 @@ pub mod limits;
 pub mod local_op;
 pub mod native_checkpoint;
 pub mod native_checkpoint_seal;
+pub mod native_fork;
 pub mod native_frontier;
-#[cfg(any(test, feature = "test-support"))]
-pub mod native_keep_model;
-pub mod native_materialize;
 pub mod native_plan;
+pub mod native_project;
 pub mod native_protocol;
-pub mod native_resolver;
 pub mod native_state;
 pub mod proof_carrying_delta;
 pub mod protocol5;

@@ -240,8 +240,6 @@ mod tests {
             path: SyncPath(path.into()),
             removes: Vec::new(),
             put: Some(DeltaPut { version: VersionHash([byte; 32]) }),
-            keeps: Vec::new(),
-            keep_put: false,
         }
     }
 
@@ -263,8 +261,6 @@ mod tests {
             path: SyncPath(path.into()),
             removes: vec![HeadRef { dot: delta.dot(), provenance: delta.delta_hash() }],
             put: None,
-            keeps: Vec::new(),
-            keep_put: false,
         };
 
         install(&conn, removal(&first, "a"), part(0, 2));

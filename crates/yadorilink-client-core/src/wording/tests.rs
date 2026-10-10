@@ -245,3 +245,27 @@ fn sign_out_lines_are_pinned_verbatim() {
          independently confirmed the registration is revoked; its credentials were removed."
     );
 }
+
+#[test]
+fn parse_invite_input_accepts_links_and_bare_codes() {
+    assert_eq!(parse_invite_input("yadorilink://invite/K7QX-M2PA"), Ok("K7QX-M2PA"));
+    assert_eq!(parse_invite_input("  YadoriLink://Invite/abc_1/ \n"), Ok("abc_1"));
+    assert_eq!(parse_invite_input("abc123"), Ok("abc123"));
+    assert_eq!(parse_invite_input(&invite_url("0123456789abcdef")), Ok("0123456789abcdef"));
+}
+
+#[test]
+fn parse_invite_input_rejects_malformed_and_oversized_input() {
+    assert_eq!(parse_invite_input("  "), Err(InviteLinkError::Empty));
+    assert_eq!(parse_invite_input("yadorilink://invite/"), Err(InviteLinkError::Malformed));
+    assert_eq!(parse_invite_input("yadorilink://invite/a/b"), Err(InviteLinkError::Malformed));
+    assert_eq!(parse_invite_input("yadorilink://invite/a?x=1"), Err(InviteLinkError::Malformed));
+    assert_eq!(parse_invite_input("https://example.com/x"), Err(InviteLinkError::Malformed));
+    assert_eq!(parse_invite_input("a b"), Err(InviteLinkError::Malformed));
+    assert_eq!(parse_invite_input("é"), Err(InviteLinkError::Malformed));
+    let long = "a".repeat(MAX_INVITE_CODE_LEN + 1);
+    assert_eq!(parse_invite_input(&long), Err(InviteLinkError::TooLong));
+    assert_eq!(parse_invite_input(&invite_url(&long)), Err(InviteLinkError::TooLong));
+    assert_eq!(parse_invite_input(&"x".repeat(100_000)), Err(InviteLinkError::TooLong));
+    assert!(parse_invite_input(&"a".repeat(MAX_INVITE_CODE_LEN)).is_ok());
+}

@@ -16,11 +16,15 @@
 //!
 //! Hashes of blocks are computed by the daemon; the declared digest is checked, never trusted.
 
+#[cfg(unix)]
 use std::sync::Arc;
 
+#[cfg(unix)]
 use sha2::{Digest, Sha256};
+#[cfg(not(windows))]
 use yadorilink_local_storage::BlockContentStore;
 use yadorilink_replica_domain::file::BlockInfo;
+#[cfg(unix)]
 use yadorilink_replica_domain::limits::MAX_SYNCABLE_BLOCKS;
 
 /// Why a copy could not be ingested; each maps to one failure code of the wire.
@@ -59,7 +63,7 @@ pub(crate) fn valid_ingest_name(name: &str) -> bool {
         && name != ".."
 }
 
-fn storage_error(error: yadorilink_local_storage::StorageError) -> IngestError {
+pub(crate) fn storage_error(error: yadorilink_local_storage::StorageError) -> IngestError {
     use yadorilink_local_storage::StorageError;
     match &error {
         StorageError::DiskPressure { .. } => IngestError::LowDisk(error.to_string()),
@@ -75,7 +79,13 @@ fn libc_enospc() -> i32 {
     libc::ENOSPC
 }
 
-#[cfg(not(unix))]
+/// `ERROR_DISK_FULL`.
+#[cfg(windows)]
+fn libc_enospc() -> i32 {
+    112
+}
+
+#[cfg(not(any(unix, windows)))]
 fn libc_enospc() -> i32 {
     -1
 }
@@ -174,7 +184,10 @@ pub(crate) fn ingest(
     Ok(Ingested { blocks, size: read })
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(crate) use crate::provider_ingest_windows::ingest;
+
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn ingest(
     _ingest_dir: &std::path::Path,
     _name: &str,

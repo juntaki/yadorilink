@@ -15,28 +15,9 @@
 //! single-file `Op::Move` (the single-head rename: remove at the source, put
 //! at the destination).
 //!
-//! # Write-through conflict-copy edits/deletes
-//!
-//! A conflict copy is *never* a durable authored entity -- it is a
-//! losing head merely *displayed* at a copy-shaped name, recomputed fresh by
-//! materialization on every pass (the name embeds mtime/content hash, so it
-//! is not stable across edits). `write_through.rs` translates a user's
-//! edit/delete of that displayed name into an ordinary `Op::Put`/`Op::Delete`
-//! **at the source path**, naming only the specific loser it supersedes
-//! (`crate::write_through::write_through_source`). So the `Op` this module
-//! receives for a conflict-copy edit targets the *source* path, and the
-//! actual on-disk row path (passed separately, since `Op` alone cannot
-//! distinguish this from an ordinary edit) is the current display name of
-//! the copy.
-//!
-//! To translate this, this module resolves the winner at the source path
-//! (`resolve_winner`, the same decided tie-break as everywhere else) and
-//! treats whichever other live head exists there as "the loser being
-//! edited/deleted via its copy" -- `write_through_source` only ever fires
-//! when there is exactly one entry not authored at its own name, so exactly
-//! one non-winner candidate is the expected case. More than one cannot be
-//! disambiguated from the recorded history and is skipped, not guessed at,
-//! the same policy as any op this module cannot resolve.
+//! A conflict copy is an ordinary entry at its own path, authored like any
+//! other: the op a user's edit of it produces targets that path and
+//! supersedes exactly the heads of the content the capture showed there.
 
 use rusqlite::Connection;
 
@@ -72,19 +53,11 @@ pub struct AuthoredPuts {
         SyncPath,
         yadorilink_replica_domain::native_plan::NativeRowIdentity,
     >,
-    /// Heads put in follow-up deltas, by the path and content they landed.
-    follow_ups: std::collections::BTreeMap<
-        (SyncPath, VersionHash),
-        yadorilink_replica_domain::native_plan::NativeRowIdentity,
-    >,
     /// The live heads at every path an authored delta touched, as the installs left them: the
     /// state each install computed and wrote, so what the transaction holds at those paths now.
     installed: std::collections::BTreeMap<SyncPath, crate::native_store::PathHeadsMap>,
     /// The obligation each touched path holds as the arming of its last delta left it.
     armed: std::collections::BTreeMap<String, crate::projection_obligations::ArmedObligation>,
-    /// What authoring read for each row path before it wrote: the head the row is a copy of
-    /// (`None` for an ordinary path).
-    placed: std::collections::BTreeMap<SyncPath, Option<VersionHash>>,
 }
 
 impl AuthoredPuts {
@@ -94,17 +67,6 @@ impl AuthoredPuts {
         path: &SyncPath,
     ) -> Option<&yadorilink_replica_domain::native_plan::NativeRowIdentity> {
         self.puts.get(path)
-    }
-
-    /// The head the mutation put at `path` with content `version`: like
-    /// [`Self::put_at`], but also finding a head signed as a follow-up when
-    /// two mutations of one part put different content at the same path.
-    pub fn put_of(
-        &self,
-        path: &SyncPath,
-        version: &VersionHash,
-    ) -> Option<&yadorilink_replica_domain::native_plan::NativeRowIdentity> {
-        self.follow_ups.get(&(path.clone(), *version)).or_else(|| self.puts.get(path))
     }
 
     /// The live heads at `path` as the authoring left them, when a delta touched it.
@@ -123,37 +85,23 @@ impl AuthoredPuts {
         self.armed.get(path)
     }
 
-    /// What authoring found `row_path` to be a copy of before it wrote: `Some(None)` for an
-    /// ordinary path, `None` when it did not read the path.
-    pub(crate) fn placed_head_of(&self, row_path: &SyncPath) -> Option<Option<VersionHash>> {
-        self.placed.get(row_path).copied()
-    }
-
     /// Adds another part's puts.
     pub fn extend(&mut self, other: AuthoredPuts) {
         self.puts.extend(other.puts);
-        self.follow_ups.extend(other.follow_ups);
         self.installed.extend(other.installed);
         self.armed.extend(other.armed);
-        self.placed.extend(other.placed);
     }
 }
 
-/// Authors a delta for `op` as `author`, inside
-/// `tx`. `row_path` is the actual on-disk row the mutation acts on
-/// (`PreparedLocalMutation::record().path`) — equal to `op`'s own path for
-/// an ordinary edit, and the conflict copy's current display name when
-/// `write_through.rs` retargeted `op` to the source path (see the module
-/// doc's write-through section). See the module doc for scope and the atomicity
-/// contract.
+/// Authors a delta for `op` as `author`, inside `tx`. See the module doc for
+/// scope and the atomicity contract.
 pub fn author_op(
     tx: &Connection,
     group_id: &FolderGroupId,
     author: &LocalAuthor<'_>,
     op: &Op,
-    row_path: &SyncPath,
 ) -> Result<AuthoredPuts, SyncSqliteError> {
-    author_op_witnessed(tx, group_id, author, op, row_path, None)
+    author_op_witnessed(tx, group_id, author, op, None)
 }
 
 /// [`author_op`] for a mutation captured earlier under `witness`: the
@@ -164,27 +112,25 @@ pub fn author_op_witnessed(
     group_id: &FolderGroupId,
     author: &LocalAuthor<'_>,
     op: &Op,
-    row_path: &SyncPath,
     witness: Option<&NativeCaptureWitness>,
 ) -> Result<AuthoredPuts, SyncSqliteError> {
-    let shown = shown_versions(tx, group_id, std::slice::from_ref(op), &[witness])?.remove(0);
-    author_op_shown(tx, group_id, author, op, row_path, &shown)
+    let shown = shown_versions(tx, group_id, &author.author, std::slice::from_ref(op), &[witness])?
+        .remove(0);
+    author_op_shown(tx, group_id, author, op, &shown)
 }
 
-/// One mutation of a bulk capture: the op, the row it acts on, and the
-/// witness its capture recorded.
+/// One mutation of a bulk capture: the op and the witness its capture
+/// recorded.
 pub struct BulkOp<'a> {
     pub op: &'a Op,
-    pub row_path: &'a SyncPath,
     pub witness: Option<&'a NativeCaptureWitness>,
 }
 
 /// Every path whose rows or heads authoring `item` reads or edits.
 fn bulk_touched_paths<'a>(item: &'a BulkOp<'a>) -> Vec<&'a SyncPath> {
     let mut paths = op_paths(item.op);
-    paths.push(item.row_path);
     if let Some(witness) = item.witness {
-        paths.push(&witness.logical_source_path);
+        paths.push(&witness.path);
     }
     paths
 }
@@ -233,37 +179,22 @@ fn paths_related(touched: &std::collections::BTreeSet<&str>, path: &str) -> bool
     touched.range::<&str, _>(below.as_str()..).next().is_some_and(|next| next.starts_with(&below))
 }
 
-/// The bytes an op for `edit` is estimated to take on the wire, with the kept
-/// copies it may declare. Every head at the path the edit leaves in place may
-/// be declared kept (an op declares at most [`MAX_KEEPS_PER_OP`] of them), so
-/// those are counted without reading which of them the author's tree shows as
-/// copies: an over-estimate only cuts a run sooner. A removal or a keep names
-/// its head exactly (a length-prefixed device id, the incarnation, the sequence
-/// and the header hash), so its size depends on the device id's length: the op
-/// is charged for the longest names it could carry, never the first ones met.
-///
-/// [`MAX_KEEPS_PER_OP`]: yadorilink_replica_domain::signed_delta::MAX_KEEPS_PER_OP
-fn estimated_edit_bytes(state: &NativeState, edit: &PathEdit) -> usize {
-    use yadorilink_replica_domain::signed_delta::{MAX_KEEPS_PER_OP, MAX_REMOVES_PER_OP};
+/// The bytes an op for `edit` is estimated to take on the wire. A removal
+/// names its head exactly (a length-prefixed device id, the incarnation, the
+/// sequence and the header hash), so its size depends on the device id's
+/// length: the op is charged for the longest names it could carry, never the
+/// first ones met.
+fn estimated_edit_bytes(edit: &PathEdit) -> usize {
+    use yadorilink_replica_domain::signed_delta::MAX_REMOVES_PER_OP;
     /// What naming a head takes: 4 (length) + device id + 16 + 8 + 32.
     fn named_head_bytes(dot: &Dot) -> usize {
         60 + dot.author.device.0.len()
     }
-    fn largest(mut sizes: Vec<usize>, limit: usize) -> usize {
-        sizes.sort_unstable_by(|a, b| b.cmp(a));
-        sizes.into_iter().take(limit).sum()
-    }
-    let removes = largest(edit.observed.iter().map(named_head_bytes).collect(), MAX_REMOVES_PER_OP);
-    let kept = largest(
-        state
-            .heads_at(&edit.path)
-            .filter(|head| !edit.observed.contains(&head.dot))
-            .map(|head| named_head_bytes(&head.dot))
-            .collect(),
-        MAX_KEEPS_PER_OP,
-    );
-    // The path (length-prefixed), the counts, the put and the own-put flag.
-    edit.path.as_str().len() + 64 + removes + kept
+    let mut sizes: Vec<usize> = edit.observed.iter().map(named_head_bytes).collect();
+    sizes.sort_unstable_by(|a, b| b.cmp(a));
+    let removes: usize = sizes.into_iter().take(MAX_REMOVES_PER_OP).sum();
+    // The path (length-prefixed), the counts and the put.
+    edit.path.as_str().len() + 64 + removes
 }
 
 /// Authors one bulk capture run (see [`bulk_groups`]) as a single multi-op
@@ -284,16 +215,12 @@ pub fn author_bulk_group(
     let ops: Vec<Op> = items.iter().map(|item| item.op.clone()).collect();
     let witnesses: Vec<Option<&NativeCaptureWitness>> =
         items.iter().map(|item| item.witness).collect();
-    let shown = shown_versions(tx, group_id, &ops, &witnesses)?;
+    let shown = shown_versions(tx, group_id, &author.author, &ops, &witnesses)?;
     let state = native_store::load_heads_at_paths(tx, group_id, &paths_of_ops(&ops))?;
     let mut per_op: Vec<Vec<PathEdit>> = Vec::with_capacity(items.len());
     let mut authored = AuthoredPuts::default();
     for (item, shown) in items.iter().zip(&shown) {
-        let placed = placed_head(tx, group_id, item.row_path)?;
-        let edits = edits_for_op(&state, item.op, item.row_path, placed.as_ref(), shown)
-            .ok_or_else(|| unauthorable(item.op, item.row_path))?;
-        authored.placed.insert(item.row_path.clone(), placed);
-        per_op.push(edits);
+        per_op.push(edits_for_op(&state, item.op, shown));
     }
     let mut pack: Vec<PathEdit> = Vec::new();
     let mut pack_bytes = 0usize;
@@ -303,13 +230,13 @@ pub fn author_bulk_group(
             group_id,
             author,
             &state,
-            PartEdits { edits: std::mem::take(pack), follow_ups: Vec::new() },
+            std::mem::take(pack),
             None,
             native_store::load_heads_at_paths,
         )
     };
     for edits in per_op {
-        let bytes: usize = edits.iter().map(|edit| estimated_edit_bytes(&state, edit)).sum();
+        let bytes: usize = edits.iter().map(estimated_edit_bytes).sum();
         if !pack.is_empty()
             && (pack.len() + edits.len() > BULK_DELTA_MAX_OPS
                 || pack_bytes + bytes > BULK_DELTA_MAX_BYTES)
@@ -356,18 +283,9 @@ fn author_op_shown(
     group_id: &FolderGroupId,
     author: &LocalAuthor<'_>,
     op: &Op,
-    row_path: &SyncPath,
     shown: &Shown,
 ) -> Result<AuthoredPuts, SyncSqliteError> {
-    author_op_shown_reading(
-        tx,
-        group_id,
-        author,
-        op,
-        row_path,
-        shown,
-        native_store::load_heads_at_paths,
-    )
+    author_op_shown_reading(tx, group_id, author, op, shown, native_store::load_heads_at_paths)
 }
 
 fn author_op_shown_reading(
@@ -375,61 +293,24 @@ fn author_op_shown_reading(
     group_id: &FolderGroupId,
     author: &LocalAuthor<'_>,
     op: &Op,
-    row_path: &SyncPath,
     shown: &Shown,
     read_heads: ReadHeads,
 ) -> Result<AuthoredPuts, SyncSqliteError> {
     let state = read_heads(tx, group_id, &op_paths(op))?;
-    let placed = placed_head(tx, group_id, row_path)?;
-    let edits = edits_for_op(&state, op, row_path, placed.as_ref(), shown)
-        .ok_or_else(|| unauthorable(op, row_path))?;
-    author_and_install(
-        tx,
-        group_id,
-        author,
-        &state,
-        PartEdits { edits, follow_ups: Vec::new() },
-        None,
-        read_heads,
-    )
-}
-
-/// The refusal for an op native cannot author: writing the index row without
-/// the delta would leave this device showing a change no peer ever receives.
-fn unauthorable(op: &Op, row_path: &SyncPath) -> SyncSqliteError {
-    SyncSqliteError::InvalidInput(format!(
-        "{op:?} at the row {:?} cannot be authored natively (an unmodeled origin, or a write \
-         through a copy that has no placement)",
-        row_path.as_str()
-    ))
-}
-
-/// The content the index row at `row_path` displays, when that row is a copy
-/// of another path's entry (physical placement authority). Read before the
-/// mutation rewrites the row.
-fn placed_head(
-    tx: &Connection,
-    group_id: &FolderGroupId,
-    row_path: &SyncPath,
-) -> Result<Option<VersionHash>, SyncSqliteError> {
-    Ok(crate::native_projection_binding::resolve_native_physical_path(
-        tx,
-        group_id.as_str(),
-        row_path.as_str(),
-    )?
-    .map(|identity| identity.payload.version))
+    let edits = edits_for_op(&state, op, shown);
+    author_and_install(tx, group_id, author, &state, edits, None, read_heads)
 }
 
 /// [`author_recursive_part`] with each op's capture-time witness, in
-/// the same order as `ops_and_row_paths`.
+/// the same order as `ops`.
 pub fn author_recursive_part_witnessed(
     tx: &Connection,
     group_id: &FolderGroupId,
     author: &LocalAuthor<'_>,
-    ops_and_row_paths: &[(Op, SyncPath)],
+    ops: &[Op],
     witnesses: &[Option<&NativeCaptureWitness>],
 ) -> Result<AuthoredPuts, SyncSqliteError> {
-    author_recursive_part_tagged(tx, group_id, author, ops_and_row_paths, witnesses, None)
+    author_recursive_part_tagged(tx, group_id, author, ops, witnesses, None)
 }
 
 /// [`author_recursive_part_witnessed`] naming the operation the part
@@ -440,20 +321,19 @@ pub fn author_recursive_part_tagged(
     tx: &Connection,
     group_id: &FolderGroupId,
     author: &LocalAuthor<'_>,
-    ops_and_row_paths: &[(Op, SyncPath)],
+    ops: &[Op],
     witnesses: &[Option<&NativeCaptureWitness>],
     recursive_part: Option<yadorilink_replica_domain::signed_delta::RecursivePart>,
 ) -> Result<AuthoredPuts, SyncSqliteError> {
-    let ops: Vec<Op> = ops_and_row_paths.iter().map(|(op, _)| op.clone()).collect();
-    let shown = shown_versions(tx, group_id, &ops, witnesses)?;
-    author_part_shown(tx, group_id, author, ops_and_row_paths, &shown, recursive_part)
+    let shown = shown_versions(tx, group_id, &author.author, ops, witnesses)?;
+    author_part_shown(tx, group_id, author, ops, &shown, recursive_part)
 }
 
 fn author_part_shown(
     tx: &Connection,
     group_id: &FolderGroupId,
     author: &LocalAuthor<'_>,
-    ops_and_row_paths: &[(Op, SyncPath)],
+    ops: &[Op],
     shown: &[Shown],
     recursive_part: Option<yadorilink_replica_domain::signed_delta::RecursivePart>,
 ) -> Result<AuthoredPuts, SyncSqliteError> {
@@ -461,7 +341,7 @@ fn author_part_shown(
         tx,
         group_id,
         author,
-        ops_and_row_paths,
+        ops,
         shown,
         recursive_part,
         native_store::load_heads_at_paths,
@@ -472,94 +352,39 @@ fn author_part_shown_reading(
     tx: &Connection,
     group_id: &FolderGroupId,
     author: &LocalAuthor<'_>,
-    ops_and_row_paths: &[(Op, SyncPath)],
+    ops: &[Op],
     shown: &[Shown],
     recursive_part: Option<yadorilink_replica_domain::signed_delta::RecursivePart>,
     read_heads: ReadHeads,
 ) -> Result<AuthoredPuts, SyncSqliteError> {
-    if ops_and_row_paths.is_empty() {
+    if ops.is_empty() {
         return Ok(AuthoredPuts::default());
     }
-    let state =
-        read_heads(tx, group_id, &paths_of_ops(ops_and_row_paths.iter().map(|(op, _)| op)))?;
-    let PartEdits { edits, follow_ups } =
-        part_edits(tx, group_id, &state, ops_and_row_paths, shown)?;
-    author_and_install(
-        tx,
-        group_id,
-        author,
-        &state,
-        PartEdits { edits, follow_ups },
-        recursive_part,
-        read_heads,
-    )
+    let state = read_heads(tx, group_id, &paths_of_ops(ops))?;
+    let edits = part_edits(&state, ops, shown);
+    author_and_install(tx, group_id, author, &state, edits, recursive_part, read_heads)
 }
 
-/// The edits of one recursive part. A delta carries one op per path, so a
-/// second put at a path the part already puts (a conflict loser that moved
-/// with its directory, beside the winner) cannot ride in the same delta: it is
-/// signed in a follow-up delta of the same author.
-struct PartEdits {
-    edits: Vec<PathEdit>,
-    follow_ups: Vec<PathEdit>,
-}
-
-fn part_edits(
-    tx: &Connection,
-    group_id: &FolderGroupId,
-    state: &NativeState,
-    ops_and_row_paths: &[(Op, SyncPath)],
-    shown: &[Shown],
-) -> Result<PartEdits, SyncSqliteError> {
-    let mut edits = Vec::with_capacity(ops_and_row_paths.len());
-    // Puts of a copy that moved with its directory: a copy row with no
-    // placement yet, written at the destination by this very operation.
-    let mut moved_copies = Vec::new();
-    for ((op, row_path), shown) in ops_and_row_paths.iter().zip(shown) {
-        let placed = placed_head(tx, group_id, row_path)?;
-        if let Op::Put { path, version } = op {
-            if path != row_path && placed.is_none() {
-                moved_copies.push((path.clone(), *version));
-                continue;
-            }
-        }
-        match edits_for_op(state, op, row_path, placed.as_ref(), shown) {
-            Some(op_edits) => edits.extend(op_edits),
-            None => return Err(unauthorable(op, row_path)),
-        }
-    }
-    let mut put_paths: std::collections::BTreeSet<SyncPath> =
-        edits.iter().filter(|edit| edit.put.is_some()).map(|edit| edit.path.clone()).collect();
-    let mut follow_ups = Vec::new();
-    for (path, version) in moved_copies {
-        let edit = PathEdit {
-            path: path.clone(),
-            observed: Vec::new(),
-            put: Some(HeadPayload { version, provenance: DeltaHash::default() }),
-        };
-        if put_paths.insert(path) {
-            edits.push(edit);
-        } else {
-            follow_ups.push(edit);
-        }
-    }
-    Ok(PartEdits { edits, follow_ups })
+/// The edits of one recursive part, one per op in order.
+fn part_edits(state: &NativeState, ops: &[Op], shown: &[Shown]) -> Vec<PathEdit> {
+    ops.iter().zip(shown).flat_map(|(op, shown)| edits_for_op(state, op, shown)).collect()
 }
 
 /// How many deltas authoring this recursive part would sign: none when every
-/// op has nothing left to remove or put, otherwise its follow-up puts and its
-/// chain of removals. The operation's part count is the sum over its parts, so
+/// op has nothing left to remove or put, otherwise its chain of removals. The operation's part count is the sum over its parts, so
 /// an operation whose deltas all authored is complete.
 pub fn recursive_part_delta_count(
     tx: &Connection,
     group_id: &FolderGroupId,
-    ops_and_row_paths: &[(Op, SyncPath)],
+    own: &yadorilink_replica_domain::author::AuthorId,
+    ops: &[Op],
     witnesses: &[Option<&NativeCaptureWitness>],
 ) -> Result<u32, SyncSqliteError> {
     recursive_part_delta_count_reading(
         tx,
         group_id,
-        ops_and_row_paths,
+        own,
+        ops,
         witnesses,
         native_store::load_heads_at_paths,
     )
@@ -568,84 +393,31 @@ pub fn recursive_part_delta_count(
 fn recursive_part_delta_count_reading(
     tx: &Connection,
     group_id: &FolderGroupId,
-    ops_and_row_paths: &[(Op, SyncPath)],
+    own: &yadorilink_replica_domain::author::AuthorId,
+    ops: &[Op],
     witnesses: &[Option<&NativeCaptureWitness>],
     read_heads: ReadHeads,
 ) -> Result<u32, SyncSqliteError> {
-    let ops: Vec<Op> = ops_and_row_paths.iter().map(|(op, _)| op.clone()).collect();
-    let shown = shown_versions(tx, group_id, &ops, witnesses)?;
-    let state = read_heads(tx, group_id, &paths_of_ops(&ops))?;
-    let PartEdits { edits, follow_ups } =
-        part_edits(tx, group_id, &state, ops_and_row_paths, &shown)?;
+    let shown = shown_versions(tx, group_id, own, ops, witnesses)?;
+    let state = read_heads(tx, group_id, &paths_of_ops(ops))?;
+    let edits = part_edits(&state, ops, &shown);
     if edits.is_empty() {
         return Ok(0);
     }
-    let edits = merge_edits(edits)?;
-    Ok(plan_chain(tx, group_id, &state, edits, &follow_ups)?.steps.len() as u32)
+    Ok(chain_rounds(&merge_edits(edits)?) as u32)
 }
 
 /// The `PathEdit`s one op contributes, against a fixed pre-state `state`.
-/// `None` means "skip" — a write-through conflict-copy resolution this
-/// slice cannot disambiguate (see
-/// [`conflict_copy_edits`]).
-fn edits_for_op(
-    state: &NativeState,
-    op: &Op,
-    row_path: &SyncPath,
-    placed: Option<&VersionHash>,
-    shown: &Shown,
-) -> Option<Vec<PathEdit>> {
+fn edits_for_op(state: &NativeState, op: &Op, shown: &Shown) -> Vec<PathEdit> {
     match op {
-        Op::Put { path, version } if path == row_path => {
-            Some(vec![put_edit(state, path, *version, shown)])
-        }
-        Op::Put { path, version } => {
-            conflict_copy_edits(state, path, row_path, Some(*version), placed, shown)
-        }
+        Op::Put { path, version } => vec![put_edit(state, path, *version, shown)],
         // A delete of a version native no longer shows has nothing to remove:
         // that entry authors nothing, and the rest of its part still does.
-        Op::Delete { path } if path == row_path => {
-            Some(delete_edit(state, path, shown).into_iter().collect())
-        }
-        Op::Delete { path } => conflict_copy_edits(state, path, row_path, None, placed, shown),
-        Op::Move { from, to, version } => Some(
-            delete_edit(state, from, shown)
-                .into_iter()
-                .chain(std::iter::once(put_edit(state, to, *version, shown)))
-                .collect(),
-        ),
-    }
-}
-
-/// An edit or delete through a copy row
-/// removes exactly the head that row shows (its physical placement) at
-/// `source_path` and, for an edit, puts the new content at `source_path`, one
-/// atomic mutation. Returns `None` when the row is no placed copy (no
-/// placement: nothing to name, so nothing is guessed).
-fn conflict_copy_edits(
-    state: &NativeState,
-    source_path: &SyncPath,
-    _copy_path: &SyncPath,
-    new_content: Option<VersionHash>,
-    placed: Option<&VersionHash>,
-    shown: &Shown,
-) -> Option<Vec<PathEdit>> {
-    // The copy row shows one piece of content (its placement's version), and
-    // that content is what the operation supersedes: every head of it at
-    // `source_path` the writer's capture held, wherever native currently orders
-    // them, and the edited content lands at the logical source. No placement,
-    // no guess. The heads may already be gone from the live set: then there is
-    // nothing to remove, and an edit still lands its content beside whatever
-    // is live, superseding nothing it was not shown.
-    let placed = placed?;
-    let observed = heads_of_shown_class(state, source_path, placed, shown.class_at(source_path));
-    match new_content {
-        Some(version) => {
-            let payload = HeadPayload { version, provenance: DeltaHash::default() };
-            Some(vec![PathEdit { path: source_path.clone(), observed, put: Some(payload) }])
-        }
-        None if observed.is_empty() => Some(Vec::new()),
-        None => Some(vec![PathEdit { path: source_path.clone(), observed, put: None }]),
+        Op::Delete { path } => delete_edit(state, path, shown).into_iter().collect(),
+        Op::Move { from, to, version } => delete_edit(state, from, shown)
+            .into_iter()
+            .chain(std::iter::once(put_edit(state, to, *version, shown)))
+            .collect(),
     }
 }
 
@@ -675,6 +447,7 @@ impl Shown {
 fn shown_versions(
     tx: &Connection,
     group_id: &FolderGroupId,
+    own: &yadorilink_replica_domain::author::AuthorId,
     ops: &[Op],
     witnesses: &[Option<&NativeCaptureWitness>],
 ) -> Result<Vec<Shown>, SyncSqliteError> {
@@ -691,19 +464,30 @@ fn shown_versions(
                     .map(|row| row.version_hash()),
             );
         }
-        // The witness names the source path the op acts on (for a write
-        // through a copy row, the copy's source). What it recorded is what the
+        // The witness names the path the op acts on. What it recorded is what the
         // writer saw: the row is not read again, since it may have changed
         // since the capture.
         if let Some(Some(witness)) = witnesses.get(index) {
             if witness.shown_version.is_some() {
-                out.versions.insert(witness.logical_source_path.clone(), witness.shown_version);
-            }
-            if !witness.shown_class.is_empty() {
-                out.class = Some((
-                    witness.logical_source_path.clone(),
-                    witness.shown_class.iter().cloned().collect(),
-                ));
+                out.versions.insert(witness.path.clone(), witness.shown_version);
+                if !witness.shown_class.is_empty() {
+                    out.class =
+                        Some((witness.path.clone(), witness.shown_class.iter().cloned().collect()));
+                }
+            } else if let Some(Some(row_version)) = out.versions.get(&witness.path).copied() {
+                // Nothing vouches for the disk (a locally captured row whose
+                // proof the capture left out). The row's version may be only
+                // ahead of the disk through a remote write, and a remote write
+                // never puts an own head: the row stands in for the disk only
+                // when every live head of its version here is this author's.
+                let heads = native_store::native_heads_at(tx, group_id, &witness.path)?;
+                let all_own = heads
+                    .iter()
+                    .filter(|head| head.payload.version == row_version)
+                    .all(|head| head.dot.author == *own);
+                if !all_own {
+                    out.versions.insert(witness.path.clone(), None);
+                }
             }
         }
         all.push(out);
@@ -837,9 +621,9 @@ fn author_and_install(
     group_id: &FolderGroupId,
     author: &LocalAuthor<'_>,
     state: &NativeState,
-    PartEdits { edits, follow_ups }: PartEdits,
+    edits: Vec<PathEdit>,
     recursive_part: Option<yadorilink_replica_domain::signed_delta::RecursivePart>,
-    read_heads: ReadHeads,
+    _read_heads: ReadHeads,
 ) -> Result<AuthoredPuts, SyncSqliteError> {
     refuse_unless_current_author(tx, group_id.as_str(), &author.author)?;
     if edits.is_empty() {
@@ -870,14 +654,6 @@ fn author_and_install(
     };
     let mut prev = current.map(|entry| entry.tip);
 
-    // A second put at a path another edit of this mutation puts (a conflict
-    // loser that moved with its directory, beside the winner) cannot ride in the
-    // same delta, so it is signed in a delta of its own, observing nothing at
-    // the path, so it stays concurrent with the put it accompanies. These
-    // deltas come FIRST in the chain: the main deltas below remove the source
-    // heads, so a peer that has admitted only a prefix of the chain still holds
-    // every piece of content it held before, never fewer.
-    //
     // One op carries at most `MAX_REMOVES_PER_OP` removals, and one delta may
     // not name a path twice, so a class larger than that is removed by a chain
     // of this author's consecutive deltas, all signed and installed in this
@@ -887,98 +663,39 @@ fn author_and_install(
     // of the class is gone. When the mutation is part of a recursive operation
     // every delta of the chain is tagged with consecutive part indexes.
     let max_removes = yadorilink_replica_domain::signed_delta::MAX_REMOVES_PER_OP;
-    let max_keeps = yadorilink_replica_domain::signed_delta::MAX_KEEPS_PER_OP;
-    let ChainPlan { planned, rounds, steps } = plan_chain(tx, group_id, state, edits, &follow_ups)?;
-    let total = steps.len();
-    // The kept heads of the follow-up being signed, read before its put is
-    // installed and cut into chunks across its deltas.
-    let mut follow_up_keeps: Vec<HeadRef> = Vec::new();
-
+    let rounds = chain_rounds(&edits);
     let mut puts = std::collections::BTreeMap::new();
-    let mut moved = std::collections::BTreeMap::new();
     let mut installed = std::collections::BTreeMap::new();
     let mut obligations = std::collections::BTreeMap::new();
-    for (ordinal, step) in steps.iter().enumerate() {
-        let ops = if let ChainStep::FollowUp { index, chunk } = *step {
-            let edit = &follow_ups[index];
-            let Some(payload) = &edit.put else { continue };
-            let installed = read_heads(tx, group_id, &[&edit.path])?;
-            if chunk > 0 {
-                // Heads of the content beyond the first op's bound, kept by deltas
-                // that follow the one that put it.
-                vec![DeltaOp {
-                    path: edit.path.clone(),
-                    removes: Vec::new(),
-                    put: None,
-                    keeps: follow_up_keeps
-                        .chunks(max_keeps)
-                        .nth(chunk)
-                        .unwrap_or_default()
-                        .to_vec(),
-                    keep_put: false,
-                }]
-            } else {
-                if let Err(yadorilink_replica_domain::native_state::AuthorError::SelfHeadBound {
-                    path,
-                }) = installed.check_edits(&author.author, std::slice::from_ref(edit))
-                {
-                    return Err(SyncSqliteError::AuthoringRefused {
-                        refusal:
-                            yadorilink_replica_domain::author::AuthoringRefusal::OwnBucketOverCap {
-                                path,
-                                count: yadorilink_replica_domain::author::MAX_SELF_HEADS + 1,
-                            },
-                    });
-                }
-                // The author's own tree shows this content as a copy, and so every
-                // head it holds of the same content at this path.
-                follow_up_keeps = same_version_heads(&installed, &edit.path, payload.version);
-                check_follow_up_keeps(&steps, index, follow_up_keeps.len(), &edit.path)?;
-                vec![DeltaOp {
-                    path: edit.path.clone(),
-                    removes: Vec::new(),
-                    put: Some(DeltaPut { version: payload.version }),
-                    keeps: follow_up_keeps.chunks(max_keeps).next().unwrap_or_default().to_vec(),
-                    keep_put: true,
-                }]
+    for round in 0..rounds {
+        let last_round = round + 1 == rounds;
+        let mut ops = Vec::new();
+        for edit in &edits {
+            let removes: Vec<HeadRef> = edit
+                .observed
+                .chunks(max_removes)
+                .nth(round)
+                .unwrap_or_default()
+                .iter()
+                .map(|dot| HeadRef {
+                    dot: dot.clone(),
+                    provenance: provenance_of(state, &edit.path, dot),
+                })
+                .collect();
+            let put = edit
+                .put
+                .as_ref()
+                .filter(|_| last_round)
+                .map(|payload| DeltaPut { version: payload.version });
+            if removes.is_empty() && put.is_none() {
+                continue;
             }
-        } else {
-            let ChainStep::Round(round) = *step else { unreachable!("a follow-up step") };
-            let last_round = round + 1 == rounds;
-            let mut ops = Vec::new();
-            for (edit, keeps) in &planned {
-                let removes: Vec<HeadRef> = edit
-                    .observed
-                    .chunks(max_removes)
-                    .nth(round)
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|dot| HeadRef {
-                        dot: dot.clone(),
-                        provenance: provenance_of(state, &edit.path, dot),
-                    })
-                    .collect();
-                let put = edit
-                    .put
-                    .as_ref()
-                    .filter(|_| last_round)
-                    .map(|payload| DeltaPut { version: payload.version });
-                // Every kept head is named exactly once across the chain, at most
-                // `MAX_KEEPS_PER_OP` per op; the head an op puts is kept by its own flag.
-                let kept: Vec<HeadRef> =
-                    keeps.heads.chunks(max_keeps).nth(round).unwrap_or_default().to_vec();
-                if removes.is_empty() && put.is_none() && kept.is_empty() {
-                    continue;
-                }
-                let keep_put = keeps.keep_put && put.is_some();
-                ops.push(DeltaOp { path: edit.path.clone(), removes, put, keeps: kept, keep_put });
-            }
-            ops
-        };
+            ops.push(DeltaOp { path: edit.path.clone(), removes, put });
+        }
         let mut delta = NativeDelta {
             recursive_part: recursive_part.map(|part| {
                 yadorilink_replica_domain::signed_delta::RecursivePart {
-                    part_index: part.part_index + ordinal as u32,
+                    part_index: part.part_index + round as u32,
                     ..part
                 }
             }),
@@ -1006,31 +723,17 @@ fn author_and_install(
         installed.extend(installed_heads);
         obligations.extend(armed);
         let (dot, provenance) = (delta.dot(), delta.delta_hash());
-        if let ChainStep::FollowUp { index, chunk } = *step {
-            let edit = &follow_ups[index];
-            if let (0, Some(payload)) = (chunk, &edit.put) {
-                moved.insert(
-                    (edit.path.clone(), payload.version),
-                    yadorilink_replica_domain::native_plan::NativeRowIdentity {
-                        source_path: edit.path.clone(),
-                        dot,
-                        provenance,
-                    },
-                );
-            }
-        } else {
-            puts.extend(delta.ops.iter().filter(|op| op.put.is_some()).map(|op| {
-                (
-                    op.path.clone(),
-                    yadorilink_replica_domain::native_plan::NativeRowIdentity {
-                        source_path: op.path.clone(),
-                        dot: dot.clone(),
-                        provenance,
-                    },
-                )
-            }));
-        }
-        if ordinal + 1 < total {
+        puts.extend(delta.ops.iter().filter(|op| op.put.is_some()).map(|op| {
+            (
+                op.path.clone(),
+                yadorilink_replica_domain::native_plan::NativeRowIdentity {
+                    source_path: op.path.clone(),
+                    dot: dot.clone(),
+                    provenance,
+                },
+            )
+        }));
+        if !last_round {
             seq = seq.checked_next().ok_or_else(|| {
                 SyncSqliteError::InvalidInput(
                     "author has reached the highest storable sequence".into(),
@@ -1039,13 +742,154 @@ fn author_and_install(
             prev = Some(provenance);
         }
     }
-    Ok(AuthoredPuts {
-        puts,
-        follow_ups: moved,
-        installed,
-        armed: obligations,
-        ..AuthoredPuts::default()
-    })
+    Ok(AuthoredPuts { puts, installed, armed: obligations })
+}
+
+/// What [`author_forks`] signed and what it left for later.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ForkAuthored {
+    /// Deltas signed and installed.
+    pub deltas: usize,
+    /// Paths that wait for a version record to arrive.
+    pub waiting_for_records: usize,
+    /// Paths whose fork cannot be made; they stay contested.
+    pub refused: usize,
+}
+
+/// Signs, as `author`, the deltas by which the losing heads of `owner` move to
+/// their copy paths ([`yadorilink_replica_domain::native_fork::plan_forks`]),
+/// each installed after the previous in this transaction. With `owner` the
+/// author itself this is its own fork; for another owner the caller has
+/// checked `fallback_may_fork`.
+fn author_forks(
+    tx: &Connection,
+    group_id: &FolderGroupId,
+    author: &LocalAuthor<'_>,
+    owner: &yadorilink_replica_domain::author::AuthorId,
+    limits: yadorilink_replica_domain::native_fork::ForkLimits,
+    state: &NativeState,
+) -> Result<ForkAuthored, SyncSqliteError> {
+    refuse_unless_current_author(tx, group_id.as_str(), &author.author)?;
+    let mut kinds = std::collections::HashMap::new();
+    for heads in state.heads.values() {
+        for payload in heads.values() {
+            if let std::collections::hash_map::Entry::Vacant(slot) = kinds.entry(payload.version) {
+                let kind =
+                    crate::dag_store::get_file_version(tx, group_id.as_str(), &payload.version)?
+                        .map(|version| version.meta.record_kind);
+                slot.insert(kind);
+            }
+        }
+    }
+    let plan = yadorilink_replica_domain::native_fork::plan_forks(
+        state,
+        owner,
+        &author.author,
+        |version| kinds.get(version).copied().flatten(),
+        limits,
+    )
+    .map_err(|error| SyncSqliteError::InvalidInput(error.to_string()))?;
+    let mut out = ForkAuthored {
+        deltas: 0,
+        waiting_for_records: plan.waiting_for_records.len(),
+        refused: plan.refused.len(),
+    };
+    if plan.deltas.is_empty() {
+        return Ok(out);
+    }
+    let current = native_store::frontier_entry_get(tx, group_id, &author.author)?;
+    let mut seq = match &current {
+        None => AuthorSeq::FIRST,
+        Some(entry) => entry.seq.checked_next().ok_or_else(|| {
+            SyncSqliteError::InvalidInput("author has reached the highest storable sequence".into())
+        })?,
+    };
+    let mut prev = current.map(|entry| entry.tip);
+    for planned in plan.deltas {
+        let ops = planned
+            .ops
+            .into_iter()
+            .map(|op| DeltaOp { path: op.path, removes: op.removes, put: op.put })
+            .collect();
+        let mut delta = NativeDelta {
+            recursive_part: None,
+            group_id: group_id.clone(),
+            author: author.author.clone(),
+            seq,
+            prev,
+            ops,
+            signature: [0u8; 64],
+        };
+        delta.sign(author.signing_key);
+        native_store::install_authored_delta(
+            tx,
+            group_id,
+            &delta,
+            &author.signing_key.verifying_key(),
+            native_store::Admission::of(author.capture),
+        )?;
+        crate::native_desired_state::arm_projection_for_delta(tx, group_id.as_str(), &delta, true)?;
+        out.deltas += 1;
+        prev = Some(delta.delta_hash());
+        seq = seq.checked_next().ok_or_else(|| {
+            SyncSqliteError::InvalidInput("author has reached the highest storable sequence".into())
+        })?;
+    }
+    Ok(out)
+}
+
+/// [`author_forks`] for every author with a head in the group that `eligible`
+/// admits (told whether the author is closed): the author itself always, any
+/// other only under the fallback rule the caller applies. One write, owners in
+/// author order.
+pub fn author_all_forks(
+    tx: &Connection,
+    group_id: &FolderGroupId,
+    author: &LocalAuthor<'_>,
+    eligible: &dyn Fn(&yadorilink_replica_domain::author::AuthorId, bool) -> bool,
+) -> Result<ForkAuthored, SyncSqliteError> {
+    // Nothing new is contested since the last pass looked: nothing to read.
+    if !crate::native_contest_candidates::has_unattempted(tx, group_id.as_str())? {
+        return Ok(ForkAuthored::default());
+    }
+    let limits = yadorilink_replica_domain::native_fork::ForkLimits {
+        max_ops_per_delta: BULK_DELTA_MAX_OPS,
+        max_bytes_per_delta: BULK_DELTA_MAX_BYTES,
+    };
+    let mut total = ForkAuthored::default();
+    // A fork can put a head where a larger version already stands, which is a
+    // contest of its own at the copy path: plan again from the new state until
+    // a round authors nothing, so what it created is not marked looked-at.
+    for _round in 0..16 {
+        let mut state = native_store::load_state(tx, group_id)?;
+        let owners: std::collections::BTreeSet<_> = state
+            .heads
+            .values()
+            .flat_map(|heads| heads.keys().map(|dot| dot.author.clone()))
+            .collect();
+        let mut round = ForkAuthored::default();
+        for owner in owners {
+            let own = owner == author.author;
+            if !own && !eligible(&owner, native_store::is_closed(tx, group_id, &owner)?) {
+                continue;
+            }
+            let done = author_forks(tx, group_id, author, &owner, limits, &state)?;
+            if done.deltas > 0 {
+                state = native_store::load_state(tx, group_id)?;
+            }
+            round.deltas += done.deltas;
+            round.waiting_for_records += done.waiting_for_records;
+            round.refused += done.refused;
+        }
+        total.deltas += round.deltas;
+        total.waiting_for_records = round.waiting_for_records;
+        total.refused = round.refused;
+        if round.deltas == 0 {
+            break;
+        }
+    }
+    crate::native_contest_candidates::finish_attempt(tx, group_id.as_str())?;
+    Ok(total)
 }
 
 /// The number of consecutive deltas the removals of `edits` need: one per
@@ -1053,142 +897,6 @@ fn author_and_install(
 fn chain_rounds(edits: &[PathEdit]) -> usize {
     let max_removes = yadorilink_replica_domain::signed_delta::MAX_REMOVES_PER_OP;
     edits.iter().map(|edit| edit.observed.len().div_ceil(max_removes)).max().unwrap_or(0).max(1)
-}
-
-/// One delta of a mutation's chain.
-#[derive(Clone, Copy, Debug)]
-enum ChainStep {
-    /// The `chunk`th delta of follow-up `index`: the first puts the content, any
-    /// further one keeps the heads of it the first op could not name.
-    FollowUp { index: usize, chunk: usize },
-    /// The `round`th delta of the main chain.
-    Round(usize),
-}
-
-/// Refuses a follow-up whose kept heads outgrew the deltas planned for them,
-/// which would leave some unnamed.
-fn check_follow_up_keeps(
-    steps: &[ChainStep],
-    index: usize,
-    kept: usize,
-    path: &SyncPath,
-) -> Result<(), SyncSqliteError> {
-    let planned = steps
-        .iter()
-        .filter(|step| matches!(step, ChainStep::FollowUp { index: i, .. } if *i == index))
-        .count();
-    if kept.div_ceil(yadorilink_replica_domain::signed_delta::MAX_KEEPS_PER_OP) > planned {
-        return Err(SyncSqliteError::InvalidInput(format!(
-            "the heads of {:?} grew while its copies were being kept",
-            path.as_str()
-        )));
-    }
-    Ok(())
-}
-
-/// The deltas a mutation is signed as, and the kept copies each edit declares.
-struct ChainPlan {
-    planned: Vec<(PathEdit, DeclaredKeeps)>,
-    rounds: usize,
-    steps: Vec<ChainStep>,
-}
-
-/// Plans the chain of deltas for `edits` and `follow_ups` against `state`: one
-/// main round per `MAX_REMOVES_PER_OP` removals or `MAX_KEEPS_PER_OP` kept
-/// heads of the largest edit, and a follow-up's own deltas for the heads of its
-/// content beyond one op's bound. Nothing is refused or cut short.
-fn plan_chain(
-    tx: &Connection,
-    group_id: &FolderGroupId,
-    state: &NativeState,
-    edits: Vec<PathEdit>,
-    follow_ups: &[PathEdit],
-) -> Result<ChainPlan, SyncSqliteError> {
-    let max_keeps = yadorilink_replica_domain::signed_delta::MAX_KEEPS_PER_OP;
-    let mut rounds = chain_rounds(&edits);
-    let mut planned = Vec::with_capacity(edits.len());
-    for edit in edits {
-        let keeps = declared_keeps(tx, group_id, state, &edit)?;
-        rounds = rounds.max(keeps.heads.len().div_ceil(max_keeps));
-        planned.push((edit, keeps));
-    }
-    let mut steps = Vec::new();
-    for (index, edit) in follow_ups.iter().enumerate() {
-        let Some(payload) = &edit.put else { continue };
-        let kept = same_version_heads(state, &edit.path, payload.version).len();
-        for chunk in 0..kept.div_ceil(max_keeps).max(1) {
-            steps.push(ChainStep::FollowUp { index, chunk });
-        }
-    }
-    steps.extend((0..rounds).map(ChainStep::Round));
-    Ok(ChainPlan { planned, rounds, steps })
-}
-
-/// The kept-copy declaration one edit signs.
-#[derive(Debug, Default)]
-struct DeclaredKeeps {
-    /// Exact heads at the edit's path the author's tree shows as conflict
-    /// copies and the edit leaves in place.
-    heads: Vec<HeadRef>,
-    /// The edit was made through a copy: the head it puts is a kept copy too.
-    keep_put: bool,
-}
-
-/// The live heads at `path` in `state` with `version`, as exact references.
-fn same_version_heads(state: &NativeState, path: &SyncPath, version: VersionHash) -> Vec<HeadRef> {
-    state
-        .heads_at(path)
-        .filter(|head| head.payload.version == version)
-        .map(|head| HeadRef { dot: head.dot.clone(), provenance: head.payload.provenance })
-        .collect()
-}
-
-/// What this author's own tree shows as conflict copies at `edit`'s path and
-/// the edit leaves in place, plus whether an edit made through such a copy
-/// puts a kept copy: the copies the author's user could see. The delta signs
-/// each kept head exactly (`DeltaOp::keeps`, `DeltaOp::keep_put`), the whole
-/// same-version cohort the author holds, so a replica that never saw the
-/// contest still keeps them at their copy names while they live. A head put
-/// later with the same content is not covered: its author declares it or it
-/// is not kept.
-fn declared_keeps(
-    tx: &Connection,
-    group_id: &FolderGroupId,
-    state: &NativeState,
-    edit: &PathEdit,
-) -> Result<DeclaredKeeps, SyncSqliteError> {
-    let copies = crate::native_projection_binding::shown_copy_versions(
-        tx,
-        group_id.as_str(),
-        edit.path.as_str(),
-    )?;
-    if copies.is_empty() {
-        return Ok(DeclaredKeeps::default());
-    }
-    let mut versions = std::collections::BTreeSet::new();
-    let mut through_a_copy = false;
-    for head in state.heads_at(&edit.path) {
-        if !copies.contains(&head.payload.version) {
-            continue;
-        }
-        if edit.observed.contains(&head.dot) {
-            through_a_copy = true;
-        } else {
-            versions.insert(head.payload.version);
-        }
-    }
-    let keep_put = through_a_copy && edit.put.is_some();
-    if let (true, Some(put)) = (keep_put, &edit.put) {
-        versions.insert(put.version);
-    }
-    let heads: Vec<HeadRef> = state
-        .heads_at(&edit.path)
-        .filter(|head| {
-            versions.contains(&head.payload.version) && !edit.observed.contains(&head.dot)
-        })
-        .map(|head| HeadRef { dot: head.dot.clone(), provenance: head.payload.provenance })
-        .collect();
-    Ok(DeclaredKeeps { heads, keep_put })
 }
 
 fn provenance_of(state: &NativeState, path: &SyncPath, dot: &Dot) -> DeltaHash {
@@ -1208,36 +916,6 @@ mod tests {
         let c = Connection::open_in_memory().unwrap();
         crate::replica_tables::init(&c).unwrap();
         c
-    }
-
-    /// Records that the row at `copy_path` shows the head of `source` whose
-    /// version is `[version; 32]` (what the reconciler does when it writes a
-    /// copy).
-    fn place_copy(c: &Connection, copy_path: &SyncPath, source: &str, version: u8) {
-        place_copy_of(c, copy_path, source, VersionHash([version; 32]));
-    }
-
-    fn place_copy_of(c: &Connection, copy_path: &SyncPath, source: &str, version: VersionHash) {
-        let state = native_store::load_state(c, &group()).unwrap();
-        let head = state
-            .heads_at(&SyncPath(source.into()))
-            .find(|h| h.payload.version == version)
-            .expect("the copy's head is live");
-        crate::stable_projection_binding::native_placement_put(
-            c,
-            "g1",
-            &crate::stable_projection_binding::NativePlacementRow {
-                physical_path: copy_path.as_str().to_owned(),
-                source_path: source.to_owned(),
-                author: head.dot.author.device.0.clone(),
-                incarnation: head.dot.author.incarnation.0,
-                seq: head.dot.seq.get(),
-                provenance: head.payload.provenance.0,
-                version: head.payload.version.0,
-                origin: "conflict_copy".to_owned(),
-            },
-        )
-        .unwrap();
     }
 
     fn group() -> FolderGroupId {
@@ -1296,17 +974,10 @@ mod tests {
         c: &Connection,
         local: &LocalAuthor<'_>,
         op: &Op,
-        row_path: &SyncPath,
+        _row_path: &SyncPath,
     ) -> Result<(), SyncSqliteError> {
-        author_op_shown(
-            c,
-            &group(),
-            local,
-            op,
-            row_path,
-            &seeing_winner(c, std::slice::from_ref(op))[0],
-        )
-        .map(|_| ())
+        author_op_shown(c, &group(), local, op, &seeing_winner(c, std::slice::from_ref(op))[0])
+            .map(|_| ())
     }
 
     fn author_local_part(
@@ -1315,7 +986,7 @@ mod tests {
         part: &[(Op, SyncPath)],
     ) -> Result<(), SyncSqliteError> {
         let ops: Vec<Op> = part.iter().map(|(op, _)| op.clone()).collect();
-        author_part_shown(c, &group(), local, part, &seeing_winner(c, &ops), None).map(|_| ())
+        author_part_shown(c, &group(), local, &ops, &seeing_winner(c, &ops), None).map(|_| ())
     }
 
     fn shown_of(path: &SyncPath, version: VersionHash) -> Shown {
@@ -1375,11 +1046,11 @@ mod tests {
         let blind = Shown { versions: [(x.clone(), None)].into(), class: None };
 
         for version in [1u8, 2] {
-            author_op_shown(&c, &group(), &local, &direct_put("x", version), &x, &blind).unwrap();
+            author_op_shown(&c, &group(), &local, &direct_put("x", version), &blind).unwrap();
         }
         let before = native_store::load_frontier(&c, &group()).unwrap();
         let refused =
-            author_op_shown(&c, &group(), &local, &direct_put("x", 3), &x, &blind).unwrap_err();
+            author_op_shown(&c, &group(), &local, &direct_put("x", 3), &blind).unwrap_err();
 
         assert!(
             matches!(
@@ -1478,8 +1149,6 @@ mod tests {
                 path: path.clone(),
                 removes: vec![],
                 put: Some(DeltaPut { version }),
-                keeps: Vec::new(),
-                keep_put: false,
             }],
             signature: [0u8; 64],
         };
@@ -1491,276 +1160,6 @@ mod tests {
             &local.signing_key.verifying_key(),
         )
         .unwrap();
-    }
-
-    /// Via write-through: a concurrent write leaves two live
-    /// heads at "x"; editing the loser's on-disk copy name arrives here as
-    /// `Op::Put(path="x", ...)` with `row_path` set to the copy's display
-    /// name, distinct from "x". Must remove only the loser at "x" and put
-    /// the new content at the copy's own path -- the winner untouched.
-    #[test]
-    fn write_through_edit_of_a_conflict_copy_resolves_the_loser_only() {
-        let c = conn();
-        let (owned_a, key_a) = author();
-        let (owned_b, key_b) = author_b();
-        let a = owned_a.as_local(&key_a);
-        let b = owned_b.as_local(&key_b);
-
-        // Two concurrent writes at "x", neither observing the other.
-        concurrent_create(&c, &a, &SyncPath("x".into()), 1);
-        concurrent_create(&c, &b, &SyncPath("x".into()), 2);
-
-        let copy_path = SyncPath("x (conflicted copy, b)".into());
-        place_copy(&c, &copy_path, "x", 2);
-        // b edits its own loser's on-disk copy: write-through retargets the
-        // op to the source path "x", naming only the head the copy shows.
-        author_local_op(&c, &b, &direct_put("x", 3), &copy_path).unwrap();
-
-        let state = native_store::load_state(&c, &group()).unwrap();
-        let mut versions: Vec<_> =
-            state.heads_at(&SyncPath("x".into())).map(|h| h.payload.version).collect();
-        versions.sort();
-        assert_eq!(
-            versions,
-            vec![VersionHash([1u8; 32]), VersionHash([3u8; 32])],
-            "the winner stays and the edit lands at the real name; the shown loser is gone"
-        );
-        assert_eq!(state.heads_at(&copy_path).count(), 0, "a copy is not a path of its own");
-    }
-
-    /// Via write-through: deleting a conflict copy removes only
-    /// the loser at the real name; nothing is put anywhere.
-    #[test]
-    fn write_through_delete_of_a_conflict_copy_removes_only_the_loser() {
-        let c = conn();
-        let (owned_a, key_a) = author();
-        let (owned_b, key_b) = author_b();
-        let a = owned_a.as_local(&key_a);
-        let b = owned_b.as_local(&key_b);
-
-        concurrent_create(&c, &a, &SyncPath("x".into()), 1);
-        concurrent_create(&c, &b, &SyncPath("x".into()), 2);
-
-        let copy_path = SyncPath("x (conflicted copy, b)".into());
-        place_copy(&c, &copy_path, "x", 2);
-        author_local_op(&c, &b, &Op::Delete { path: SyncPath("x".into()) }, &copy_path).unwrap();
-
-        let state = native_store::load_state(&c, &group()).unwrap();
-        let x_heads: Vec<_> = state.heads_at(&SyncPath("x".into())).collect();
-        assert_eq!(x_heads.len(), 1, "the winner must survive the loser's copy being deleted");
-        assert_eq!(x_heads[0].payload.version, VersionHash([1u8; 32]));
-        assert_eq!(state.heads_at(&copy_path).count(), 0, "nothing should exist at the copy path");
-    }
-
-    /// With several losers live, the copy row's placement names exactly one
-    /// of them; the operation removes that head and no other.
-    #[test]
-    fn a_placed_copy_among_several_losers_removes_exactly_its_head() {
-        let c = conn();
-        let (owned_a, key_a) = author();
-        let a = owned_a.as_local(&key_a);
-        let (owned_b, key_b) = author_b();
-        let b = owned_b.as_local(&key_b);
-        let (owned_c, key_c) = {
-            let signing_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
-            let author = AuthorId {
-                device: DeviceId("device-c".into()),
-                incarnation: IncarnationId([1u8; 16]),
-            };
-            (LocalAuthorOwned { author }, signing_key)
-        };
-        let c_author = owned_c.as_local(&key_c);
-
-        concurrent_create(&c, &a, &SyncPath("x".into()), 1);
-        concurrent_create(&c, &b, &SyncPath("x".into()), 2);
-        concurrent_create(&c, &c_author, &SyncPath("x".into()), 3);
-        let copy_path = SyncPath("x (conflicted copy, b)".into());
-        place_copy(&c, &copy_path, "x", 2);
-
-        author_local_op(&c, &b, &Op::Delete { path: SyncPath("x".into()) }, &copy_path).unwrap();
-
-        let state = native_store::load_state(&c, &group()).unwrap();
-        let mut versions: Vec<_> =
-            state.heads_at(&SyncPath("x".into())).map(|h| h.payload.version).collect();
-        versions.sort();
-        assert_eq!(versions, vec![VersionHash([1u8; 32]), VersionHash([3u8; 32])]);
-    }
-
-    /// Two edits through the same copy row in a row: the second supersedes
-    /// the head the first authored (the placement follows the row), so no
-    /// stale edit stays live beside it.
-    #[test]
-    fn a_second_edit_through_a_copy_supersedes_the_first_edit() {
-        let c = conn();
-        let (owned_a, key_a) = author();
-        let a = owned_a.as_local(&key_a);
-        let (owned_b, key_b) = author_b();
-        let b = owned_b.as_local(&key_b);
-        concurrent_create(&c, &a, &SyncPath("x".into()), 1);
-        concurrent_create(&c, &b, &SyncPath("x".into()), 2);
-        let copy_path = SyncPath("x (conflicted copy, b)".into());
-        place_copy(&c, &copy_path, "x", 2);
-
-        author_local_op(&c, &b, &direct_put("x", 3), &copy_path).unwrap();
-        crate::native_projection_binding::follow_write_through_edit(
-            &c,
-            "g1",
-            copy_path.as_str(),
-            &b.author,
-            &VersionHash([3u8; 32]),
-        )
-        .unwrap();
-        author_local_op(&c, &b, &direct_put("x", 4), &copy_path).unwrap();
-
-        let state = native_store::load_state(&c, &group()).unwrap();
-        let mut versions: Vec<_> =
-            state.heads_at(&SyncPath("x".into())).map(|h| h.payload.version).collect();
-        versions.sort();
-        assert_eq!(versions, vec![VersionHash([1u8; 32]), VersionHash([4u8; 32])]);
-    }
-
-    /// The delta an author signed last, as decoded from the body it stored.
-    fn last_delta(c: &Connection, author: &AuthorId) -> NativeDelta {
-        let entry = native_store::frontier_entry_get(c, &group(), author).unwrap().unwrap();
-        let body = native_store::fetch_delta_body(c, &group(), author, entry.seq).unwrap().unwrap();
-        NativeDelta::from_wire_bytes(&body).unwrap()
-    }
-
-    /// Removing the winner while the loser is shown as a copy declares the
-    /// loser kept, so a replica that never saw the contest keeps its name.
-    #[test]
-    fn removing_the_winner_declares_the_shown_copy_kept() {
-        let c = conn();
-        let (owned_a, key_a) = author();
-        let a = owned_a.as_local(&key_a);
-        let (owned_b, key_b) = author_b();
-        let b = owned_b.as_local(&key_b);
-        concurrent_create(&c, &a, &SyncPath("x".into()), 1);
-        concurrent_create(&c, &b, &SyncPath("x".into()), 2);
-        place_copy(&c, &SyncPath("x (conflicted copy, b)".into()), "x", 2);
-
-        let state = native_store::load_state(&c, &group()).unwrap();
-        let winner = state
-            .heads_at(&SyncPath("x".into()))
-            .find(|head| head.payload.version == VersionHash([1u8; 32]))
-            .unwrap();
-        let edit = PathEdit { path: SyncPath("x".into()), observed: vec![winner.dot], put: None };
-        let keeps = declared_keeps(&c, &group(), &state, &edit).unwrap();
-        let loser = state
-            .heads_at(&SyncPath("x".into()))
-            .find(|head| head.payload.version == VersionHash([2u8; 32]))
-            .unwrap();
-        assert_eq!(
-            keeps.heads,
-            vec![HeadRef { dot: loser.dot.clone(), provenance: loser.payload.provenance }],
-            "the exact head shown as a copy is kept, not its version"
-        );
-        assert!(!keeps.keep_put);
-
-        // A path with no copy shown declares nothing.
-        let other = PathEdit { path: SyncPath("y".into()), observed: Vec::new(), put: None };
-        let none = declared_keeps(&c, &group(), &state, &other).unwrap();
-        assert!(none.heads.is_empty() && !none.keep_put);
-    }
-
-    /// More copies than one op can declare are planned as a chain of ops, never
-    /// refused or cut short: every head is declared exactly once.
-    #[test]
-    fn more_shown_copies_than_an_op_can_keep_are_declared_across_a_chain() {
-        let c = conn();
-        let (owned_a, key_a) = author();
-        let a = owned_a.as_local(&key_a);
-        concurrent_create(&c, &a, &SyncPath("x".into()), 1);
-        let many = yadorilink_replica_domain::signed_delta::MAX_KEEPS_PER_OP + 1;
-        let mut state = native_store::load_state(&c, &group()).unwrap();
-        for i in 0..many {
-            let author_id = AuthorId {
-                device: DeviceId(format!("device-{i}")),
-                incarnation: IncarnationId([1u8; 16]),
-            };
-            let mut version = [0u8; 32];
-            version[..8].copy_from_slice(&(i as u64 + 10).to_le_bytes());
-            state
-                .put(
-                    &author_id,
-                    SyncPath("x".into()),
-                    &[],
-                    HeadPayload {
-                        version: VersionHash(version),
-                        provenance: DeltaHash([i as u8; 32]),
-                    },
-                )
-                .unwrap();
-        }
-        native_store::install_state(&c, &group(), &state).unwrap();
-        for (i, head) in state
-            .heads_at(&SyncPath("x".into()))
-            .filter(|head| head.payload.version != VersionHash([1u8; 32]))
-            .enumerate()
-        {
-            crate::stable_projection_binding::native_placement_put(
-                &c,
-                "g1",
-                &crate::stable_projection_binding::NativePlacementRow {
-                    physical_path: format!("x (copy {i})"),
-                    source_path: "x".to_owned(),
-                    author: head.dot.author.device.0.clone(),
-                    incarnation: head.dot.author.incarnation.0,
-                    seq: head.dot.seq.get(),
-                    provenance: head.payload.provenance.0,
-                    version: head.payload.version.0,
-                    origin: "conflict_copy".to_owned(),
-                },
-            )
-            .unwrap();
-        }
-        let winner = state
-            .heads_at(&SyncPath("x".into()))
-            .find(|head| head.payload.version == VersionHash([1u8; 32]))
-            .unwrap();
-        let edit = PathEdit { path: SyncPath("x".into()), observed: vec![winner.dot], put: None };
-        let keeps = declared_keeps(&c, &group(), &state, &edit).unwrap();
-        assert_eq!(keeps.heads.len(), many, "every shown copy is declared");
-        let plan = plan_chain(&c, &group(), &state, vec![edit], &[]).unwrap();
-        assert_eq!(plan.rounds, 2, "the declaration needs two ops");
-    }
-
-    /// A follow-up put whose content is held by more heads than one op can name is
-    /// planned as the put and further deltas that keep the rest.
-    #[test]
-    fn a_follow_up_of_content_held_by_many_heads_is_planned_as_a_chain() {
-        let c = conn();
-        let many = yadorilink_replica_domain::signed_delta::MAX_KEEPS_PER_OP * 2 + 1;
-        let mut state = native_store::load_state(&c, &group()).unwrap();
-        for i in 0..many {
-            let author_id = AuthorId {
-                device: DeviceId(format!("device-{i}")),
-                incarnation: IncarnationId([1u8; 16]),
-            };
-            let payload = HeadPayload {
-                version: VersionHash([5u8; 32]),
-                provenance: DeltaHash([i as u8; 32]),
-            };
-            state.put(&author_id, SyncPath("x".into()), &[], payload).unwrap();
-        }
-        let follow_up = PathEdit {
-            path: SyncPath("x".into()),
-            observed: Vec::new(),
-            put: Some(HeadPayload {
-                version: VersionHash([5u8; 32]),
-                provenance: DeltaHash::default(),
-            }),
-        };
-        let plan = plan_chain(&c, &group(), &state, Vec::new(), &[follow_up]).unwrap();
-        let chunks: Vec<usize> = plan
-            .steps
-            .iter()
-            .filter_map(|step| match step {
-                ChainStep::FollowUp { chunk, .. } => Some(*chunk),
-                ChainStep::Round(_) => None,
-            })
-            .collect();
-        assert_eq!(chunks, vec![0, 1, 2], "every head of the content is named by a delta");
     }
 
     /// The longest device id the replication layer accepts.
@@ -1790,16 +1189,15 @@ mod tests {
 
     /// The estimate that cuts a bulk run is never under the canonical encoding of
     /// the op it stands for, whatever the lengths of the device ids the removals
-    /// and the kept heads name, however many there are, and whichever of the
-    /// heads an op declares: the estimate is checked against the largest op
-    /// that can be signed from the heads at the path.
+    /// name and however many there are: the estimate is checked against the
+    /// largest op that can be signed from the heads at the path.
     #[test]
     fn the_estimate_of_an_edit_is_never_under_its_encoded_op() {
-        use yadorilink_replica_domain::native_keep_model::Rng;
-        use yadorilink_replica_domain::signed_delta::{MAX_KEEPS_PER_OP, MAX_REMOVES_PER_OP};
+        use crate::native_store_reference::support::Rng;
+        use yadorilink_replica_domain::signed_delta::MAX_REMOVES_PER_OP;
         let mut rng = Rng(21);
         for round in 0..200 {
-            let heads = rng.below(2 * (MAX_KEEPS_PER_OP + MAX_REMOVES_PER_OP) + 1);
+            let heads = rng.below(2 * MAX_REMOVES_PER_OP + 1);
             let path = SyncPath("p".repeat(1 + rng.below(4000)));
             let mut state = NativeState::default();
             let mut dots = Vec::new();
@@ -1827,34 +1225,23 @@ mod tests {
             let edit =
                 PathEdit { path: path.clone(), observed: observed.clone(), put: put.clone() };
 
-            let removes_of = |dots: &[Dot]| -> Vec<HeadRef> {
-                let mut sorted: Vec<&Dot> = dots.iter().collect();
-                sorted.sort_by_key(|dot| std::cmp::Reverse(dot.author.device.0.len()));
-                sorted
-                    .into_iter()
-                    .take(MAX_REMOVES_PER_OP)
-                    .map(|dot| HeadRef {
-                        dot: dot.clone(),
-                        provenance: provenance_of(&state, &path, dot),
-                    })
-                    .collect()
-            };
-            let mut unobserved: Vec<HeadRef> = state
-                .heads_at(&path)
-                .filter(|head| !observed.contains(&head.dot))
-                .map(|head| HeadRef { dot: head.dot.clone(), provenance: head.payload.provenance })
+            let mut sorted: Vec<&Dot> = observed.iter().collect();
+            sorted.sort_by_key(|dot| std::cmp::Reverse(dot.author.device.0.len()));
+            let removes: Vec<HeadRef> = sorted
+                .into_iter()
+                .take(MAX_REMOVES_PER_OP)
+                .map(|dot| HeadRef {
+                    dot: dot.clone(),
+                    provenance: provenance_of(&state, &path, dot),
+                })
                 .collect();
-            unobserved.sort_by_key(|k| std::cmp::Reverse(k.dot.author.device.0.len()));
-            unobserved.truncate(MAX_KEEPS_PER_OP);
             let op = DeltaOp {
                 path: path.clone(),
-                removes: removes_of(&observed),
+                removes,
                 put: put.map(|payload| DeltaPut { version: payload.version }),
-                keeps: unobserved,
-                keep_put: edit.put.is_some(),
             };
             let encoded = encoded_op_bytes(op);
-            let estimated = estimated_edit_bytes(&state, &edit);
+            let estimated = estimated_edit_bytes(&edit);
             assert!(
                 estimated >= encoded,
                 "round {round}: estimated {estimated} < encoded {encoded}"
@@ -1862,57 +1249,37 @@ mod tests {
         }
     }
 
-    /// A bulk run at long paths, each op superseding a full class
-    /// of heads and declaring a full cohort kept, with the longest device ids, is
-    /// signed as deltas that each sum to no more than their estimate and fit one
-    /// replication item: nothing authored can fail to be delivered.
+    /// A bulk run at long paths, each op superseding a full class of heads, with
+    /// the longest device ids, is signed as deltas that each sum to no more than
+    /// their estimate and fit one replication item: nothing authored can fail
+    /// to be delivered.
     #[test]
     fn a_worst_case_bulk_run_is_signed_within_the_estimate_and_the_item_budget() {
-        use yadorilink_replica_domain::signed_delta::{MAX_KEEPS_PER_OP, MAX_REMOVES_PER_OP};
+        use yadorilink_replica_domain::signed_delta::MAX_REMOVES_PER_OP;
         let c = conn();
         let (owned, key) = author();
         let local = owned.as_local(&key);
-        // Enough ops of full cohorts to need several deltas; the bound on ops per
+        // Enough ops of full classes to need several deltas; the bound on ops per
         // delta is covered by the property above and the bulk tests.
         let paths: Vec<SyncPath> =
             (0..128).map(|i| SyncPath(format!("{}/{i:04}", "d".repeat(3000)))).collect();
-        let (old, copy) = (VersionHash([1u8; 32]), VersionHash([2u8; 32]));
+        let old = VersionHash([1u8; 32]);
         let mut state = native_store::load_state(&c, &group()).unwrap();
         let mut classes = Vec::new();
         for path in &paths {
             let mut class = Vec::new();
-            for i in 0..MAX_REMOVES_PER_OP + MAX_KEEPS_PER_OP {
-                let version = if i < MAX_REMOVES_PER_OP { old } else { copy };
-                let payload = HeadPayload { version, provenance: DeltaHash([i as u8; 32]) };
-                let dot = state
-                    .put(&author_named(i + 1, MAX_DEVICE_ID_BYTES), path.clone(), &[], payload)
-                    .unwrap();
-                if i < MAX_REMOVES_PER_OP {
-                    class.push(dot);
-                }
+            for i in 0..MAX_REMOVES_PER_OP {
+                let payload = HeadPayload { version: old, provenance: DeltaHash([i as u8; 32]) };
+                class.push(
+                    state
+                        .put(&author_named(i + 1, MAX_DEVICE_ID_BYTES), path.clone(), &[], payload)
+                        .unwrap(),
+                );
             }
             class.sort();
             classes.push(class);
         }
         native_store::install_state(&c, &group(), &state).unwrap();
-        for path in &paths {
-            let head = state.heads_at(path).find(|head| head.payload.version == copy).unwrap();
-            crate::stable_projection_binding::native_placement_put(
-                &c,
-                "g1",
-                &crate::stable_projection_binding::NativePlacementRow {
-                    physical_path: format!("{} (copy)", path.as_str()),
-                    source_path: path.as_str().to_owned(),
-                    author: head.dot.author.device.0.clone(),
-                    incarnation: head.dot.author.incarnation.0,
-                    seq: head.dot.seq.get(),
-                    provenance: head.payload.provenance.0,
-                    version: head.payload.version.0,
-                    origin: "conflict_copy".to_owned(),
-                },
-            )
-            .unwrap();
-        }
         let ops: Vec<Op> = paths
             .iter()
             .map(|path| Op::Put { path: path.clone(), version: VersionHash([3u8; 32]) })
@@ -1921,24 +1288,21 @@ mod tests {
             .iter()
             .zip(&classes)
             .map(|(path, class)| NativeCaptureWitness {
-                physical_path: path.clone(),
-                logical_source_path: path.clone(),
-                shown_head: None,
+                path: path.clone(),
                 shown_class: class.clone(),
                 shown_version: Some(old),
+                row_version: Some(old),
             })
             .collect();
         let items: Vec<BulkOp<'_>> = ops
             .iter()
-            .zip(&paths)
             .zip(&witnesses)
-            .map(|((op, row_path), witness)| BulkOp { op, row_path, witness: Some(witness) })
+            .map(|(op, witness)| BulkOp { op, witness: Some(witness) })
             .collect();
         author_bulk_group(&c, &group(), &local, &items).unwrap();
 
         let signed = native_store::load_frontier(&c, &group()).unwrap()[&owned.author].seq.get();
         assert!(signed >= 2, "a run this size is cut into several deltas: {signed}");
-        let mut keeps_named = 0usize;
         for seq in 1..=signed {
             let body = native_store::fetch_delta_body(&c, &group(), &owned.author, AuthorSeq(seq))
                 .unwrap()
@@ -1951,56 +1315,13 @@ mod tests {
                 .map(|op| {
                     let observed = op.removes.iter().map(|r| r.dot.clone()).collect();
                     let edit = PathEdit { path: op.path.clone(), observed, put: None };
-                    estimated_edit_bytes(&state, &edit)
+                    estimated_edit_bytes(&edit)
                 })
                 .sum();
             let header = NativeDelta { ops: Vec::new(), ..delta.clone() }.to_wire_bytes().len();
             let encoded_ops = body.len() - header;
             assert!(estimated >= encoded_ops, "delta {seq}: estimated {estimated} < {encoded_ops}");
-            keeps_named += delta.ops.iter().map(|op| op.keeps.len()).sum::<usize>();
         }
-        assert_eq!(keeps_named, paths.len() * MAX_KEEPS_PER_OP, "every cohort is declared kept");
-    }
-
-    /// An edit made through a copy declares the content it puts kept: the
-    /// author's tree keeps showing it at the copy's name.
-    #[test]
-    fn an_edit_through_a_copy_declares_its_new_content_kept() {
-        let c = conn();
-        let (owned_a, key_a) = author();
-        let a = owned_a.as_local(&key_a);
-        let (owned_b, key_b) = author_b();
-        let b = owned_b.as_local(&key_b);
-        concurrent_create(&c, &a, &SyncPath("x".into()), 1);
-        concurrent_create(&c, &b, &SyncPath("x".into()), 2);
-        let copy_path = SyncPath("x (conflicted copy, b)".into());
-        place_copy(&c, &copy_path, "x", 2);
-
-        author_local_op(&c, &b, &direct_put("x", 3), &copy_path).unwrap();
-
-        let delta = last_delta(&c, &b.author);
-        assert!(delta.ops[0].keep_put, "the head the edit puts is a kept copy");
-        assert!(delta.ops[0].keeps.is_empty());
-    }
-
-    /// A copy row with no placement names nothing: the operation is refused,
-    /// never guessed at and never written without its delta.
-    #[test]
-    fn a_copy_row_without_a_placement_is_refused_not_guessed_at() {
-        let c = conn();
-        let (owned_a, key_a) = author();
-        let a = owned_a.as_local(&key_a);
-        let (owned_b, key_b) = author_b();
-        let b = owned_b.as_local(&key_b);
-        concurrent_create(&c, &a, &SyncPath("x".into()), 1);
-        concurrent_create(&c, &b, &SyncPath("x".into()), 2);
-        let before = native_store::load_state(&c, &group()).unwrap();
-
-        let copy_path = SyncPath("x (conflicted copy, b)".into());
-        let refused = author_local_op(&c, &b, &direct_put("x", 4), &copy_path).unwrap_err();
-
-        assert!(refused.to_string().contains("cannot be authored natively"), "{refused}");
-        assert_eq!(before, native_store::load_state(&c, &group()).unwrap());
     }
 
     fn delete_op(path: &str) -> Op {
@@ -2155,7 +1476,7 @@ mod tests {
         author_local_op(&c, &b, &direct_put("x", 9), &x).unwrap();
 
         let shown = shown_of(&x, VersionHash([1u8; 32]));
-        author_op_shown(&c, &group(), &a, &direct_put("x", 3), &x, &shown).unwrap();
+        author_op_shown(&c, &group(), &a, &direct_put("x", 3), &shown).unwrap();
 
         let state = native_store::load_state(&c, &group()).unwrap();
         let versions: std::collections::BTreeSet<VersionHash> =
@@ -2180,7 +1501,7 @@ mod tests {
         concurrent_create(&c, &b, &x, 2); // unseen, the winner
 
         let shown = shown_of(&x, VersionHash([1u8; 32]));
-        author_op_shown(&c, &group(), &a, &direct_put("x", 3), &x, &shown).unwrap();
+        author_op_shown(&c, &group(), &a, &direct_put("x", 3), &shown).unwrap();
 
         let state = native_store::load_state(&c, &group()).unwrap();
         let versions: std::collections::BTreeSet<VersionHash> =
@@ -2205,7 +1526,7 @@ mod tests {
         let before = native_store::load_frontier(&c, &group()).unwrap();
 
         let shown = shown_of(&x, VersionHash([1u8; 32]));
-        author_op_shown(&c, &group(), &a, &Op::Delete { path: x.clone() }, &x, &shown).unwrap();
+        author_op_shown(&c, &group(), &a, &Op::Delete { path: x.clone() }, &shown).unwrap();
 
         assert_eq!(native_store::load_frontier(&c, &group()).unwrap(), before);
         let state = native_store::load_state(&c, &group()).unwrap();
@@ -2236,70 +1557,30 @@ mod tests {
             .collect()
     }
 
-    fn witness_of_class(copy: &SyncPath, source: &str, class: &[Dot]) -> NativeCaptureWitness {
-        NativeCaptureWitness {
-            physical_path: copy.clone(),
-            logical_source_path: SyncPath(source.into()),
-            shown_head: None,
-            shown_class: class.to_vec(),
-            shown_version: Some(VersionHash([2u8; 32])),
-        }
-    }
-
-    /// Two devices hold the same content (v2) at `x` beside a winner (v1) and
-    /// a copy row shows it once.
-    fn a_copy_of_content_held_by_two_heads(c: &Connection) -> SyncPath {
-        let (oa, ka) = author();
-        let (ob, kb) = author_b();
-        let (oc, kc) = author_c();
-        let x = SyncPath("x".into());
-        concurrent_create(c, &oa.as_local(&ka), &x, 1);
-        concurrent_create(c, &ob.as_local(&kb), &x, 2);
-        concurrent_create(c, &oc.as_local(&kc), &x, 2);
-        let copy = SyncPath("x (copy)".into());
-        place_copy(c, &copy, "x", 2);
-        copy
-    }
-
-    /// Deleting the copy row deletes the content it shows: every head of it
-    /// the writer's capture held, so it does not come back as a new copy.
-    #[test]
-    fn deleting_a_copy_removes_every_head_of_the_content_it_showed() {
-        let c = conn();
-        let copy = a_copy_of_content_held_by_two_heads(&c);
-        let (oa, ka) = author();
-        let class = [dot_of_device(&c, "x", "device-b"), dot_of_device(&c, "x", "device-c")];
-        let witness = witness_of_class(&copy, "x", &class);
-
-        author_op_witnessed(
-            &c,
-            &group(),
-            &oa.as_local(&ka),
-            &Op::Delete { path: SyncPath("x".into()) },
-            &copy,
-            Some(&witness),
-        )
-        .unwrap();
-
-        assert_eq!(versions_at(&c, "x"), [VersionHash([1u8; 32])].into_iter().collect());
-    }
-
     /// A head of the same content that arrived after the capture was never
     /// seen by the writer: it survives the delete.
     #[test]
     fn a_head_of_the_same_content_that_arrived_after_the_capture_survives() {
         let c = conn();
-        let copy = a_copy_of_content_held_by_two_heads(&c);
         let (oa, ka) = author();
+        let (ob, kb) = author_b();
+        let (oc, kc) = author_c();
+        let x = SyncPath("x".into());
+        concurrent_create(&c, &ob.as_local(&kb), &x, 2);
+        concurrent_create(&c, &oc.as_local(&kc), &x, 2);
         let captured_only_b = [dot_of_device(&c, "x", "device-b")];
-        let witness = witness_of_class(&copy, "x", &captured_only_b);
+        let witness = NativeCaptureWitness {
+            path: x.clone(),
+            shown_class: captured_only_b.to_vec(),
+            shown_version: Some(VersionHash([2u8; 32])),
+            row_version: Some(VersionHash([2u8; 32])),
+        };
 
         author_op_witnessed(
             &c,
             &group(),
             &oa.as_local(&ka),
             &Op::Delete { path: SyncPath("x".into()) },
-            &copy,
             Some(&witness),
         )
         .unwrap();
@@ -2320,32 +1601,6 @@ mod tests {
         assert!(versions_at(&c, "x").contains(&VersionHash([2u8; 32])));
     }
 
-    /// Editing the copy row supersedes the whole class too; the new content
-    /// lands at the source.
-    #[test]
-    fn editing_a_copy_supersedes_every_head_of_the_content_it_showed() {
-        let c = conn();
-        let copy = a_copy_of_content_held_by_two_heads(&c);
-        let (oa, ka) = author();
-        let class = [dot_of_device(&c, "x", "device-b"), dot_of_device(&c, "x", "device-c")];
-        let witness = witness_of_class(&copy, "x", &class);
-
-        author_op_witnessed(
-            &c,
-            &group(),
-            &oa.as_local(&ka),
-            &direct_put("x", 9),
-            &copy,
-            Some(&witness),
-        )
-        .unwrap();
-
-        assert_eq!(
-            versions_at(&c, "x"),
-            [VersionHash([1u8; 32]), VersionHash([9u8; 32])].into_iter().collect()
-        );
-    }
-
     /// An ordinary edit of content two heads hold leaves no copy of the old
     /// content behind.
     #[test]
@@ -2358,7 +1613,7 @@ mod tests {
         concurrent_create(&c, &ob.as_local(&kb), &x, 1);
         let shown = shown_of(&x, VersionHash([1u8; 32]));
 
-        author_op_shown(&c, &group(), &oa.as_local(&ka), &direct_put("x", 3), &x, &shown).unwrap();
+        author_op_shown(&c, &group(), &oa.as_local(&ka), &direct_put("x", 3), &shown).unwrap();
 
         assert_eq!(versions_at(&c, "x"), [VersionHash([3u8; 32])].into_iter().collect());
     }
@@ -2375,16 +1630,20 @@ mod tests {
         concurrent_create(&c, &oa.as_local(&ka), &x, 1);
         concurrent_create(&c, &ob.as_local(&kb), &x, 2);
         let seen_v1 = NativeCaptureWitness {
-            physical_path: x.clone(),
-            logical_source_path: x.clone(),
-            shown_head: None,
+            path: x.clone(),
             shown_class: vec![dot_of_device(&c, "x", "device-a")],
             shown_version: Some(VersionHash([1u8; 32])),
+            row_version: Some(VersionHash([1u8; 32])),
         };
         // The index row at x has meanwhile been replaced by content 2's.
-        let shown =
-            shown_versions(&c, &group(), &[Op::Delete { path: x.clone() }], &[Some(&seen_v1)])
-                .unwrap();
+        let shown = shown_versions(
+            &c,
+            &group(),
+            &author().0.author,
+            &[Op::Delete { path: x.clone() }],
+            &[Some(&seen_v1)],
+        )
+        .unwrap();
         assert_eq!(shown[0].versions.get(&x), Some(&Some(VersionHash([1u8; 32]))));
     }
 
@@ -2420,15 +1679,8 @@ mod tests {
         native_store::install_state(&peer, &group(), &state).unwrap();
         let shown = shown_of(&x, VersionHash([1u8; 32]));
 
-        author_op_shown(
-            &c,
-            &group(),
-            &oa.as_local(&ka),
-            &Op::Delete { path: x.clone() },
-            &x,
-            &shown,
-        )
-        .unwrap();
+        author_op_shown(&c, &group(), &oa.as_local(&ka), &Op::Delete { path: x.clone() }, &shown)
+            .unwrap();
 
         assert_eq!(native_store::load_state(&c, &group()).unwrap().heads_at(&x).count(), 0);
 
@@ -2490,7 +1742,7 @@ mod tests {
             &c,
             &group(),
             &oa.as_local(&ka),
-            &[(Op::Delete { path: x.clone() }, x.clone())],
+            &[Op::Delete { path: x.clone() }],
             &[shown_of(&x, VersionHash([1u8; 32]))],
             Some(RecursivePart { operation_id, part_index: 0, part_count: 2 }),
         )
@@ -2536,289 +1788,17 @@ mod tests {
         }
     }
 
-    /// Two ops of one recursive part can act on the same source path with
-    /// different rows -- the winner's and a folded copy's -- and each removes
-    /// the content ITS row showed.
-    #[test]
-    fn two_ops_of_a_part_on_one_source_path_each_remove_what_their_own_row_showed() {
-        let c = conn();
-        let (oa, ka) = author();
-        let (ob, kb) = author_b();
-        let x = SyncPath("x".into());
-        concurrent_create(&c, &oa.as_local(&ka), &x, 1); // the winner's row shows v1
-        concurrent_create(&c, &ob.as_local(&kb), &x, 2); // a folded copy row shows v2
-        let copy = SyncPath("x (copy)".into());
-        place_copy(&c, &copy, "x", 2);
-        let winner_seen = NativeCaptureWitness {
-            physical_path: x.clone(),
-            logical_source_path: x.clone(),
-            shown_head: None,
-            shown_class: vec![dot_of_device(&c, "x", "device-a")],
-            shown_version: Some(VersionHash([1u8; 32])),
-        };
-        let copy_seen = witness_of_class(&copy, "x", &[dot_of_device(&c, "x", "device-b")]);
-        let part = vec![
-            (Op::Delete { path: x.clone() }, x.clone()),
-            (Op::Delete { path: x.clone() }, copy.clone()),
-        ];
-
-        author_recursive_part_witnessed(
-            &c,
-            &group(),
-            &oa.as_local(&ka),
-            &part,
-            &[Some(&winner_seen), Some(&copy_seen)],
-        )
-        .unwrap();
-
-        assert!(
-            versions_at(&c, "x").is_empty(),
-            "both rows' content is gone: {:?}",
-            versions_at(&c, "x")
-        );
-    }
-
-    fn file_version(mtime: i64) -> yadorilink_replica_domain::file::FileVersion {
-        use yadorilink_replica_domain::file::{FileMeta, FileVersion, RecordKind};
-        FileVersion::new(
-            Vec::new(),
-            0,
-            FileMeta {
-                mtime_unix_nanos: mtime,
-                unix_mode: Some(0o644),
-                symlink_target: None,
-                record_kind: RecordKind::File,
-                xattrs: Vec::new(),
-            },
-        )
-    }
-
-    /// `p/f` holds a winner by device-a and a loser by device-b, the loser
-    /// shown at a copy name. Returns the part a `mv p q` captures after
-    /// write-through: both deletes at `p/f`, then both puts at `q/f`, the
-    /// loser's from the row at its (moved) copy name.
-    struct MovedContest {
-        winner: VersionHash,
-        loser: VersionHash,
-        moved_copy: SyncPath,
-        part: Vec<(Op, SyncPath)>,
-        witnesses: Vec<Option<NativeCaptureWitness>>,
-    }
-
-    fn contested_directory(c: &Connection) -> MovedContest {
-        let (oa, ka) = author();
-        let (ob, kb) = author_b();
-        // Concurrent heads are ordered by version hash: the larger one wins.
-        let (mut winner, mut loser) = (file_version(1), file_version(2));
-        if winner.version_hash < loser.version_hash {
-            std::mem::swap(&mut winner, &mut loser);
-        }
-        for version in [&winner, &loser] {
-            crate::dag_store::put_file_version(c, "g1", version).unwrap();
-        }
-        let (winner, loser) = (winner.version_hash, loser.version_hash);
-        let from = SyncPath("p/f".into());
-        concurrent_create_version(c, &oa.as_local(&ka), &from, winner);
-        concurrent_create_version(c, &ob.as_local(&kb), &from, loser);
-        let old_copy = SyncPath("p/f (copy)".into());
-        place_copy_of(c, &old_copy, "p/f", loser);
-        let witness = |physical: &SyncPath, device: &str, version: VersionHash| {
-            Some(NativeCaptureWitness {
-                physical_path: physical.clone(),
-                logical_source_path: from.clone(),
-                shown_head: None,
-                shown_class: vec![dot_of_device(c, "p/f", device)],
-                shown_version: Some(version),
-            })
-        };
-        let to = SyncPath("q/f".into());
-        let moved_copy = SyncPath("q/f (copy)".into());
-        MovedContest {
-            winner,
-            loser,
-            part: vec![
-                (Op::Delete { path: from.clone() }, from.clone()),
-                (Op::Delete { path: from.clone() }, old_copy.clone()),
-                (Op::Put { path: to.clone(), version: winner }, to.clone()),
-                (Op::Put { path: to, version: loser }, moved_copy.clone()),
-            ],
-            witnesses: vec![
-                witness(&from, "device-a", winner),
-                witness(&old_copy, "device-b", loser),
-                None,
-                None,
-            ],
-            moved_copy,
-        }
-    }
-
-    fn author_contested_move(
-        c: &Connection,
-        contest: &MovedContest,
-    ) -> Result<AuthoredPuts, SyncSqliteError> {
-        let (oa, ka) = author();
-        let witnesses: Vec<Option<&NativeCaptureWitness>> =
-            contest.witnesses.iter().map(Option::as_ref).collect();
-        author_recursive_part_witnessed(c, &group(), &oa.as_local(&ka), &contest.part, &witnesses)
-    }
-
-    /// Spec R7: a directory move carries both heads of a contested path. The
-    /// loser is not an entry of its own at its copy name: it is a second head
-    /// at the destination, concurrent with the winner, whose copy name is
-    /// derived anew at `q`, and editing that copy edits the loser.
-    #[test]
-    fn a_directory_move_keeps_the_conflict_loser_competing_at_the_destination() {
-        use yadorilink_replica_domain::native_state::resolve_winner;
-        let c = conn();
-        let contest = contested_directory(&c);
-
-        let authored = author_contested_move(&c, &contest).unwrap();
-
-        let state = native_store::load_state(&c, &group()).unwrap();
-        assert_eq!(state.heads_at(&SyncPath("p/f".into())).count(), 0, "the source is vacated");
-        assert_eq!(
-            state.heads_at(&contest.moved_copy).count(),
-            0,
-            "a copy name is never a path of its own"
-        );
-        let to = SyncPath("q/f".into());
-        let heads: Vec<_> = state.heads_at(&to).collect();
-        assert_eq!(
-            heads.iter().map(|h| h.payload.version).collect::<std::collections::BTreeSet<_>>(),
-            [contest.winner, contest.loser].into(),
-            "winner and loser both compete at q/f"
-        );
-        assert_eq!(
-            resolve_winner(heads.iter()).map(|h| h.payload.version),
-            Some(contest.winner),
-            "the move does not change who wins"
-        );
-        let (won, lost) = (
-            authored.put_of(&to, &contest.winner).expect("the winner's head"),
-            authored.put_of(&to, &contest.loser).expect("the loser's head"),
-        );
-        assert_ne!(won.dot, lost.dot, "each row shows its own head");
-
-        // The copy's name at `q` is derived from the heads there.
-        let level =
-            crate::native_desired_state::native_desired_level_projection(&c, "g1", "q").unwrap();
-        let copies: Vec<_> = level
-            .nodes()
-            .iter()
-            .filter_map(|(path, node)| match node {
-                yadorilink_replica_engine::namespace::PhysicalNode::Entry(entry)
-                    if entry.placement
-                        == yadorilink_replica_engine::namespace::Placement::ConflictCopy =>
-                {
-                    Some((path.clone(), entry.version_hash, entry.source.clone()))
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(copies.len(), 1, "{copies:?}");
-        assert_eq!((copies[0].1, copies[0].2.as_str()), (contest.loser.0, "q/f"));
-
-        // Editing that copy is an edit of the loser: the winner stays.
-        let (oa, ka) = author();
-        let copy_path = SyncPath(copies[0].0.clone());
-        place_copy_of(&c, &copy_path, "q/f", contest.loser);
-        let edited = Op::Put { path: to.clone(), version: VersionHash([9u8; 32]) };
-        author_local_op(&c, &oa.as_local(&ka), &edited, &copy_path).unwrap();
-        assert_eq!(
-            versions_at(&c, "q/f"),
-            [contest.winner, VersionHash([9u8; 32])].into(),
-            "the edit supersedes the loser only"
-        );
-        assert_eq!(versions_at(&c, copy_path.as_str()).len(), 0);
-    }
-
-    /// A peer admitting the move's deltas one by one never holds less than it
-    /// did: the loser's destination put comes first, so with only that delta
-    /// admitted the loser is still live and the operation is incomplete; the
-    /// move itself comes last, and only then is the operation complete.
-    #[test]
-    fn a_peer_admitting_a_directory_move_never_loses_the_loser_in_any_prefix() {
-        use yadorilink_replica_domain::recursive_operation::{
-            RecursiveOperationId, RecursiveOperationRef,
-        };
-        use yadorilink_replica_domain::signed_delta::RecursivePart;
-        let c = conn();
-        let contest = contested_directory(&c);
-        let peer = conn();
-        {
-            let (oa, ka) = author();
-            let (ob, kb) = author_b();
-            let from = SyncPath("p/f".into());
-            concurrent_create_version(&peer, &oa.as_local(&ka), &from, contest.winner);
-            concurrent_create_version(&peer, &ob.as_local(&kb), &from, contest.loser);
-        }
-        let operation_id = RecursiveOperationId([7u8; 16]);
-        let (oa, ka) = author();
-        let witnesses: Vec<Option<&NativeCaptureWitness>> =
-            contest.witnesses.iter().map(Option::as_ref).collect();
-        author_recursive_part_tagged(
-            &c,
-            &group(),
-            &oa.as_local(&ka),
-            &contest.part,
-            &witnesses,
-            Some(RecursivePart { operation_id, part_index: 0, part_count: 2 }),
-        )
-        .unwrap();
-
-        let tip = native_store::frontier_entry_get(&c, &group(), &oa.author).unwrap().unwrap();
-        assert_eq!(tip.seq, AuthorSeq(3), "a create, the loser's put, and the move");
-        let operation = RecursiveOperationRef { author: oa.author.device.clone(), operation_id };
-        let admit = |n: u64| {
-            let body = native_store::fetch_delta_body(&c, &group(), &oa.author, AuthorSeq(n))
-                .unwrap()
-                .expect("the delta body is stored");
-            let delta = NativeDelta::from_wire_bytes(&body).expect("a peer decodes it");
-            native_store::install_verified_delta(&peer, &group(), &delta, &ka.verifying_key())
-                .unwrap();
-        };
-
-        admit(2);
-        assert_eq!(
-            versions_at(&peer, "p/f"),
-            [contest.winner, contest.loser].into(),
-            "the source heads are still there"
-        );
-        assert_eq!(versions_at(&peer, "q/f"), [contest.loser].into(), "the loser is live");
-        assert!(matches!(
-            crate::native_recursive_operation::completeness(&peer, "g1", &operation).unwrap(),
-            crate::native_recursive_operation::NativeOperationCompleteness::Partial { .. }
-        ));
-        admit(3);
-        assert_eq!(versions_at(&peer, "p/f").len(), 0, "the old path is removed");
-        assert_eq!(versions_at(&peer, "q/f"), [contest.winner, contest.loser].into());
-        assert_eq!(
-            native_store::load_state(&peer, &group()).unwrap(),
-            native_store::load_state(&c, &group()).unwrap(),
-            "both replicas agree"
-        );
-        assert_eq!(
-            crate::native_recursive_operation::completeness(&peer, "g1", &operation).unwrap(),
-            crate::native_recursive_operation::NativeOperationCompleteness::Complete
-        );
-    }
-
     /// A replica admitting the same deltas reaches the author's own frontier entry.
     #[test]
     fn a_remote_admission_reaches_the_same_frontier_entry_as_the_author() {
         let c = conn();
-        let contest = contested_directory(&c);
         let peer = conn();
-        {
-            let (oa, ka) = author();
-            let (ob, kb) = author_b();
-            let from = SyncPath("p/f".into());
-            concurrent_create_version(&peer, &oa.as_local(&ka), &from, contest.winner);
-            concurrent_create_version(&peer, &ob.as_local(&kb), &from, contest.loser);
-        }
-        author_contested_move(&c, &contest).unwrap();
         let (oa, ka) = author();
-        for n in [2, 3] {
+        let local = oa.as_local(&ka);
+        let x = SyncPath("x".into());
+        author_local_op(&c, &local, &direct_put("x", 1), &x).unwrap();
+        author_local_op(&c, &local, &direct_put("x", 2), &x).unwrap();
+        for n in [1, 2] {
             let body = native_store::fetch_delta_body(&c, &group(), &oa.author, AuthorSeq(n))
                 .unwrap()
                 .unwrap();
@@ -2851,52 +1831,6 @@ mod tests {
         assert_eq!(merged[0].put.as_ref().map(|p| p.version), Some(VersionHash([1u8; 32])));
     }
 
-    /// An ambiguous or unmodeled op anywhere in a part refuses the *whole*
-    /// part, not just that entry: a part is one atomic delta.
-    #[test]
-    fn one_unresolvable_op_in_a_part_refuses_the_whole_part() {
-        let c = conn();
-        let (owned, key) = author();
-        let local = owned.as_local(&key);
-        author_local_op(&c, &local, &direct_put("dir/a", 1), &SyncPath("dir/a".into())).unwrap();
-        let before = native_store::load_state(&c, &group()).unwrap();
-
-        let part = vec![
-            (delete_op("dir/a"), SyncPath("dir/a".into())),
-            // A delete through a row that shows no placed copy names no head
-            // to remove, so this op is unresolvable.
-            (delete_op("dir/b"), SyncPath("dir/b (copy)".into())),
-        ];
-        let refused = author_local_part(&c, &local, &part).unwrap_err();
-        assert!(refused.to_string().contains("cannot be authored natively"), "{refused}");
-
-        let after = native_store::load_state(&c, &group()).unwrap();
-        assert_eq!(before, after, "one unresolvable op must leave the whole part left unauthored");
-    }
-
-    /// A local create can be the transition that first makes a path
-    /// contested (another device's head it never saw stays live beside it):
-    /// the loser's name is recorded with it, not left to a later comparison.
-    #[test]
-    fn a_local_create_that_first_contests_a_path_records_the_losers_name() {
-        let c = conn();
-        let (owned_a, key_a) = author();
-        let a = owned_a.as_local(&key_a);
-        let (owned_b, key_b) = author_b();
-        let b = owned_b.as_local(&key_b);
-        // b's head is live here but this device's create never observed it.
-        concurrent_create(&c, &b, &SyncPath("x".into()), 2);
-        assert!(crate::stable_projection_binding::native_placements(&c, "g1").unwrap().is_empty());
-
-        let x = SyncPath("x".into());
-        let shown_nothing = Shown { versions: [(x.clone(), None)].into(), class: None };
-        author_op_shown(&c, &group(), &a, &direct_put("x", 1), &x, &shown_nothing).unwrap();
-
-        let state = native_store::load_state(&c, &group()).unwrap();
-        assert_eq!(state.heads_at(&x).count(), 2, "both heads are live");
-        let placements = crate::stable_projection_binding::native_placements(&c, "g1").unwrap();
-        assert_eq!(placements.len(), 1, "the loser has a copy name: {placements:?}");
-    }
     /// The whole-group read authoring used before it read only the paths it
     /// edits: the reference the differential tests below hold it to.
     fn read_whole_group(
@@ -2949,8 +1883,6 @@ mod tests {
                 path: path.clone(),
                 removes: removals,
                 put: version.map(|version| DeltaPut { version }),
-                keeps: Vec::new(),
-                keep_put: false,
             }],
             signature: [0u8; 64],
         };
@@ -3027,7 +1959,6 @@ mod tests {
     #[derive(Default)]
     struct StepTally {
         authored: usize,
-        copies_placed: usize,
         chained: usize,
     }
 
@@ -3046,24 +1977,6 @@ mod tests {
         assert_eq!(verdicts[0], verdicts[1], "{label}: remote");
     }
 
-    fn place_copy_step(rng: &mut RngRef, a: &Connection, b: &Connection) -> usize {
-        let state = native_store::load_state(a, &group()).unwrap();
-        let heads: Vec<(SyncPath, VersionHash)> = state
-            .heads
-            .iter()
-            .flat_map(|(path, heads)| heads.values().map(move |p| (path.clone(), p.version)))
-            .collect();
-        if heads.is_empty() {
-            return 0;
-        }
-        let (source, version) = heads[rng.below(heads.len())].clone();
-        let copy = SyncPath(format!("{} (copy {})", source.as_str(), rng.below(3)));
-        for c in [a, b] {
-            place_copy_of(c, &copy, source.as_str(), version);
-        }
-        1
-    }
-
     fn single_op_step(
         rng: &mut RngRef,
         a: &Connection,
@@ -3071,42 +1984,14 @@ mod tests {
         local: &LocalAuthor<'_>,
         label: &str,
     ) -> usize {
-        let mut op = random_op(rng);
-        // A write through a placed copy names the source, and the row is the copy.
-        let mut row_path = op_paths(&op)[0].clone();
-        let placements = crate::stable_projection_binding::native_placements(a, "g1").unwrap();
-        if rng.below(10) < 4 && !placements.is_empty() {
-            let placement = &placements[rng.below(placements.len())];
-            row_path = SyncPath(placement.physical_path.clone());
-            let source = SyncPath(placement.source_path.clone());
-            op = match rng.below(2) {
-                0 => Op::Delete { path: source },
-                _ => Op::Put { path: source, version: VersionHash([1 + rng.below(4) as u8; 32]) },
-            };
-        }
+        let op = random_op(rng);
         let shown = random_shown(rng, a, std::slice::from_ref(&op));
-        let incremental = author_op_shown(a, &group(), local, &op, &row_path, &shown[0]);
-        let reference = author_op_shown_reading(
-            b,
-            &group(),
-            local,
-            &op,
-            &row_path,
-            &shown[0],
-            read_whole_group,
-        );
+        let incremental = author_op_shown(a, &group(), local, &op, &shown[0]);
+        let reference =
+            author_op_shown_reading(b, &group(), local, &op, &shown[0], read_whole_group);
         let (got, want) = (result_text(incremental), result_text(reference));
-        assert_eq!(got, want, "{label}: {op:?} at {row_path:?}");
+        assert_eq!(got, want, "{label}: {op:?}");
         usize::from(got.starts_with("ok"))
-    }
-
-    fn part_row(rng: &mut RngRef, op: &Op) -> SyncPath {
-        if rng.below(10) < 3 {
-            // A copy that moved with its directory: a row with no placement.
-            SyncPath(format!("moved/{}", op_paths(op)[0].as_str()))
-        } else {
-            op_paths(op)[0].clone()
-        }
     }
 
     /// Returns `(authored, chained)`.
@@ -3118,19 +2003,25 @@ mod tests {
         label: &str,
     ) -> (usize, usize) {
         let ops: Vec<Op> = (0..1 + rng.below(4)).map(|_| random_op(rng)).collect();
-        let part: Vec<(Op, SyncPath)> =
-            ops.iter().map(|op| (op.clone(), part_row(rng, op))).collect();
+        let part = ops.clone();
         let shown = random_shown(rng, a, &ops);
         let before = native_store::load_frontier(a, &group()).unwrap();
         let count_new = recursive_part_delta_count_reading(
             a,
             &group(),
+            &local.author,
             &part,
             &[],
             native_store::load_heads_at_paths,
         );
-        let count_old =
-            recursive_part_delta_count_reading(b, &group(), &part, &[], read_whole_group);
+        let count_old = recursive_part_delta_count_reading(
+            b,
+            &group(),
+            &local.author,
+            &part,
+            &[],
+            read_whole_group,
+        );
         assert_eq!(
             count_new.as_ref().map_err(|e| e.to_string()),
             count_old.as_ref().map_err(|e| e.to_string()),
@@ -3166,8 +2057,7 @@ mod tests {
                 let label = format!("seed {seed} step {step}");
                 match rng.below(100) {
                     0..=39 => remote_step(&mut rng, &a, &b, &label),
-                    40..=49 => tally.copies_placed += place_copy_step(&mut rng, &a, &b),
-                    50..=79 => tally.authored += single_op_step(&mut rng, &a, &b, &local, &label),
+                    40..=79 => tally.authored += single_op_step(&mut rng, &a, &b, &local, &label),
                     _ => {
                         let (authored, chained) = part_step(&mut rng, &a, &b, &local, &label);
                         tally.authored += authored;
@@ -3178,8 +2068,6 @@ mod tests {
             }
         }
         assert!(tally.authored > 1500, "only {} authored steps", tally.authored);
-        assert!(tally.copies_placed > 100, "only {} placed copies", tally.copies_placed);
-        assert!(tally.chained > 20, "only {} chained-delta steps", tally.chained);
     }
 
     /// A class of more than one op's removal cap of same-version heads is
@@ -3213,8 +2101,6 @@ mod tests {
                         path: x.clone(),
                         removes: vec![],
                         put: Some(DeltaPut { version }),
-                        keeps: Vec::new(),
-                        keep_put: false,
                     }],
                     signature: [0u8; 64],
                 };
@@ -3225,13 +2111,12 @@ mod tests {
                 }
             }
             let shown = Shown { versions: [(x.clone(), Some(version))].into(), class: None };
-            let got = result_text(author_op_shown(&a, &group(), &local, &op, &x, &shown));
+            let got = result_text(author_op_shown(&a, &group(), &local, &op, &shown));
             let want = result_text(author_op_shown_reading(
                 &b,
                 &group(),
                 &local,
                 &op,
-                &x,
                 &shown,
                 read_whole_group,
             ));
@@ -3245,5 +2130,121 @@ mod tests {
                 cap + 6
             );
         }
+    }
+
+    /// 2000 contested paths are forked by one author in a chain; no prefix of
+    /// the chain, admitted by a peer, ever leaves a version without a home: a
+    /// removal and the put that keeps its version are always one delta.
+    #[test]
+    fn fork_of_2000_paths_never_leaves_a_removal_without_its_put() {
+        use yadorilink_replica_domain::file::{FileMeta, FileVersion, RecordKind};
+        let (owned, key) = author();
+        let local = owned.as_local(&key);
+        let (ob, _kb) = author_b();
+        let paths: Vec<String> = (0..2000).map(|i| format!("d/f{i:04}")).collect();
+        let versions: Vec<FileVersion> = (1..=2)
+            .map(|seed| {
+                FileVersion::new(
+                    Vec::new(),
+                    0,
+                    FileMeta {
+                        mtime_unix_nanos: seed,
+                        unix_mode: Some(0o644),
+                        symlink_target: None,
+                        record_kind: RecordKind::File,
+                        xattrs: Vec::new(),
+                    },
+                )
+            })
+            .collect();
+        let (a, b) = (conn(), conn());
+        let mut state = NativeState::new();
+        for (i, path) in paths.iter().enumerate() {
+            for (who, version) in [(&owned.author, &versions[0]), (&ob.author, &versions[1])] {
+                state
+                    .put(
+                        who,
+                        SyncPath(path.clone()),
+                        &[],
+                        HeadPayload {
+                            version: version.version_hash,
+                            provenance: DeltaHash(
+                                [version.meta.mtime_unix_nanos as u8 ^ i as u8; 32],
+                            ),
+                        },
+                    )
+                    .unwrap();
+            }
+        }
+        for c in [&a, &b] {
+            native_store::install_state(c, &group(), &state).unwrap();
+            for version in &versions {
+                crate::dag_store::put_file_version(c, "g1", version).unwrap();
+            }
+        }
+        let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+        crate::native_contest_candidates::note(&a, "g1", &refs).unwrap();
+        assert_eq!(crate::native_contest_candidates::count(&a, "g1").unwrap(), 2000);
+
+        let done = author_all_forks(&a, &group(), &local, &|_, _| false).unwrap();
+
+        assert!(done.deltas >= 1, "{done:?}");
+        let forked =
+            crate::native_store::load_frontier(&a, &group()).unwrap()[&owned.author].seq.get();
+        let before = native_store::load_state(&b, &group()).unwrap();
+        let versions_of =
+            |state: &NativeState| -> std::collections::BTreeSet<(String, VersionHash)> {
+                state
+                    .heads
+                    .iter()
+                    .flat_map(|(path, heads)| {
+                        heads.values().map(move |p| (path.as_str().to_owned(), p.version))
+                    })
+                    .collect()
+            };
+        let originally: std::collections::BTreeSet<VersionHash> =
+            versions.iter().map(|v| v.version_hash).collect();
+        let _ = &before;
+        let mut seen_at: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeSet<VersionHash>,
+        > = std::collections::BTreeMap::new();
+        for (path, version) in versions_of(&before) {
+            seen_at.entry(path).or_default().insert(version);
+        }
+        for seq in 1..=forked {
+            let body = native_store::fetch_delta_body(&a, &group(), &owned.author, AuthorSeq(seq))
+                .unwrap()
+                .unwrap();
+            let delta = NativeDelta::from_wire_bytes(&body).unwrap();
+            native_store::install_verified_delta(&b, &group(), &delta, &key.verifying_key())
+                .unwrap();
+            // Every version that was live anywhere is still live somewhere.
+            let live: std::collections::BTreeSet<VersionHash> =
+                versions_of(&native_store::load_state(&b, &group()).unwrap())
+                    .into_iter()
+                    .map(|(_, version)| version)
+                    .collect();
+            assert!(originally.is_subset(&live), "delta {seq} dropped a version");
+            // And per path: a version removed at a path is put at its copy in
+            // the same delta, so the pair (path, version) either stays or has
+            // moved whole.
+            for op in &delta.ops {
+                if !op.removes.is_empty() {
+                    assert!(
+                        delta.ops.iter().any(|other| other.put.is_some() && other.path != op.path),
+                        "a removal at {:?} without the put of its copy in delta {seq}",
+                        op.path
+                    );
+                }
+            }
+        }
+        // After the whole chain both replicas agree and nothing is contested.
+        assert_eq!(
+            native_store::load_state(&a, &group()).unwrap(),
+            native_store::load_state(&b, &group()).unwrap()
+        );
+        crate::native_contest_candidates::finish_attempt(&a, "g1").unwrap();
+        assert_eq!(crate::native_contest_candidates::count(&a, "g1").unwrap(), 0);
     }
 }

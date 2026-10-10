@@ -369,6 +369,11 @@ jobs:
         if: matrix.lane == 'shell'
         working-directory: platforms/windows/shell
         run: cargo build --release
+      - name: Shell extension tests
+        if: matrix.lane == 'shell'
+        # The crate is its own workspace, so the manifest is named from the root
+        # where the log is collected.
+        run: .github/checks/run-logged.sh cargo test --release --no-fail-fast --manifest-path platforms/windows/shell/Cargo.toml
       - name: Test report
         if: always()
         run: python3 .github/checks/summarize-test-log.py test-output.log

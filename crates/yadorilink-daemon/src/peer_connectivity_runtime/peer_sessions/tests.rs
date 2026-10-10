@@ -44,10 +44,20 @@ struct Pair {
 /// Two devices that pin each other, each with a running driver. When
 /// `introduce` is false neither knows where the other answers.
 async fn pair(introduce: bool) -> Pair {
+    pair_with(introduce, |_, _| {}).await
+}
+
+/// [`pair`], with `setup` run on both devices after they pin each other and
+/// before either driver starts, so no session can exist while it runs.
+async fn pair_with(
+    introduce: bool,
+    setup: impl FnOnce(&Arc<DaemonState>, &Arc<DaemonState>),
+) -> Pair {
     let (alice, alice_dir) = device(ALICE, 11);
     let (bob, bob_dir) = device(BOB, 22);
     pin(&alice, BOB, 22);
     pin(&bob, ALICE, 11);
+    setup(&alice, &bob);
     let alice_stack = Arc::new(
         SyncStack::spawn(alice.clone(), NetworkConfig::direct_only())
             .await
@@ -239,4 +249,176 @@ async fn a_quiet_authorized_peer_stays_connected_and_available_while_its_keeper_
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// Issue 79: custody confirmation runs when the peer session opens, not at
+/// the next 90 s sweep (no sweep task exists in this fixture), and fetch
+/// availability follows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn opening_a_peer_session_triggers_custody_confirmation_promptly() {
+    let pair = pair(true).await;
+    assert!(within(STEP, || pair.alice.peers.has_session(BOB)).await, "precondition");
+    assert!(
+        within(STEP, || pair.alice.durability().has_ever_been_custody_swept(GROUP)).await,
+        "a session opening must run a custody confirmation without waiting for the sweep"
+    );
+    assert!(
+        within(STEP, || pair.alice.fetch_available_via_confirmed_peer(GROUP)).await,
+        "fetch availability flips as soon as the refresh publishes"
+    );
+}
+
+/// A burst of session events leaves at most one pending refresh per group.
+#[tokio::test(flavor = "current_thread")]
+async fn a_burst_of_session_events_coalesces_to_one_refresh_per_group() {
+    let (alice, _dir) = device(ALICE, 11);
+    let groups = vec![GROUP.to_string()];
+    assert_eq!(alice.request_custody_refresh(&groups), 1);
+    for _ in 0..10 {
+        assert_eq!(alice.request_custody_refresh(&groups), 0, "already pending");
+    }
+    // Let the single task start; a later event schedules a fresh one.
+    while !alice.durability().has_ever_been_custody_swept(GROUP) {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(alice.request_custody_refresh(&groups), 1);
+}
+
+// Issue 79 integration: a real, content-bearing group and a real peer that
+// answers the custody question. The 90 s sweep task does not exist in this
+// fixture and no clock is advanced, so anything that becomes available did so
+// because the session opening ran the refresh.
+
+const FILE: &str = "only.bin";
+
+fn record(path: &str, size: u64) -> yadorilink_replica_domain::file::FileRecord {
+    use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
+    FileRecord {
+        path: path.to_string(),
+        size,
+        mtime_unix_nanos: 0,
+        blocks: vec![BlockInfo { hash: vec![7; 32], offset: 0, size: size as u32 }],
+        deleted: false,
+    }
+}
+
+/// Alice (the asker, an on-demand view: row indexed, bytes not fetched) and
+/// Bob (holds the file) index the same version; Bob's copy is hydrated.
+fn seed_shared_file(
+    alice: &Arc<DaemonState>,
+    bob: &Arc<DaemonState>,
+) -> (tempfile::TempDir, tempfile::TempDir) {
+    use yadorilink_root_authority::root_commit::RootCommitPermit;
+    let alice_root = tempfile::tempdir().unwrap();
+    let bob_root = tempfile::tempdir().unwrap();
+    let alice_path = crate::test_support::sync_stack_fixture::link_folder(alice, alice_root.path());
+    let bob_path = crate::test_support::sync_stack_fixture::link_folder(bob, bob_root.path());
+    let permit = RootCommitPermit::for_tests();
+    let rec = record(FILE, 5);
+    alice.replica_coordinator.file_index_repository().upsert_file(GROUP, &rec, &permit).unwrap();
+    bob.replica_coordinator.file_index_repository().upsert_file(GROUP, &rec, &permit).unwrap();
+    let on_disk = bob_path.join(FILE);
+    std::fs::write(&on_disk, b"hello").unwrap();
+    crate::test_support::seed_prior_cycle_proof(
+        &bob.replica_coordinator,
+        GROUP,
+        FILE,
+        &on_disk,
+        &permit,
+    );
+    let _ = alice_path;
+    (alice_root, bob_root)
+}
+
+fn fetch_availability(state: &Arc<DaemonState>) -> crate::queries::link_status::FetchAvailability {
+    use crate::adapters::query::link_status::DaemonLinkStatusReader;
+    use crate::queries::link_status::LinkStatusReadPort;
+    let views = DaemonLinkStatusReader::new(state.clone()).list_links().unwrap();
+    views.iter().find(|v| v.group_id == GROUP).expect("the linked group").fetch_availability
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_full_replica_writer_peer_makes_content_fetchable_as_soon_as_its_session_opens() {
+    let mut roots = None;
+    let pair = pair_with(true, |alice, bob| {
+        roots = Some(seed_shared_file(alice, bob));
+        alice.authority.set_peer_group_full_replica(BOB, GROUP, true);
+        bob.authority.set_peer_group_full_replica(ALICE, GROUP, true);
+    })
+    .await;
+    let started = std::time::Instant::now();
+    assert!(
+        within(Duration::from_secs(10), || pair.alice.fetch_available_via_confirmed_peer(GROUP))
+            .await,
+        "custody confirmation must run when the session opens, not at the 90 s sweep"
+    );
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(
+        fetch_availability(&pair.alice),
+        crate::queries::link_status::FetchAvailability::AvailableNow,
+        "the status a user sees clears 'cannot fetch now'"
+    );
+    drop(roots);
+}
+
+/// The pinned regression: a peer that is authorized and connected but not a
+/// full replica cannot make content fetchable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_that_is_not_a_full_replica_never_makes_content_fetchable() {
+    let mut roots = None;
+    let pair = pair_with(true, |alice, bob| {
+        roots = Some(seed_shared_file(alice, bob));
+    })
+    .await;
+    assert!(within(STEP, || pair.alice.peers.has_session(BOB)).await, "precondition");
+    assert!(
+        within(STEP, || pair.alice.durability().has_ever_been_custody_swept(GROUP)).await,
+        "the session event still ran a refresh (a negative one)"
+    );
+    assert!(!pair.alice.fetch_available_via_confirmed_peer(GROUP));
+    assert_eq!(
+        fetch_availability(&pair.alice),
+        crate::queries::link_status::FetchAvailability::UnavailableNow
+    );
+    drop(roots);
+}
+
+/// Restart: the new process has no confirmation and no session. 'Cannot fetch
+/// now' must clear within seconds of the session coming back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cannot_fetch_now_clears_within_seconds_of_the_session_returning_after_a_restart() {
+    let mut roots = None;
+    let pair = pair_with(true, |alice, bob| {
+        roots = Some(seed_shared_file(alice, bob));
+        alice.authority.set_peer_group_full_replica(BOB, GROUP, true);
+        bob.authority.set_peer_group_full_replica(ALICE, GROUP, true);
+    })
+    .await;
+    assert!(
+        within(Duration::from_secs(10), || pair.alice.fetch_available_via_confirmed_peer(GROUP))
+            .await,
+        "precondition"
+    );
+
+    // Alice "restarts": her confirmation is gone and her session with Bob
+    // has to be built again.
+    let old = pair.alice.peers.session(BOB).expect("session");
+    pair.alice.durability().clear_custody_confirmation(GROUP);
+    assert!(pair.alice.peers.remove_if_current(BOB, &old));
+    let alice_stack = pair.alice.peer_session_driver().unwrap().stack().clone();
+    alice_stack.link_to(BOB).await.expect("the live link").close();
+    assert_eq!(
+        fetch_availability(&pair.alice),
+        crate::queries::link_status::FetchAvailability::UnavailableNow,
+        "right after the restart, content cannot be fetched"
+    );
+    assert!(
+        within(Duration::from_secs(15), || {
+            fetch_availability(&pair.alice)
+                == crate::queries::link_status::FetchAvailability::AvailableNow
+        })
+        .await,
+        "'cannot fetch now' must clear without waiting for the 90 s sweep"
+    );
+    drop(roots);
 }

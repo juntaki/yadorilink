@@ -1087,10 +1087,10 @@ impl ReplicaCoordinator {
         Ok(self.sqlite().dag_usable_proof_names_current_version(group_id, path)?)
     }
 
-    /// `SqliteSyncStore::dag_disk_is_untouched_proven_write`
+    /// `SqliteSyncStore::disk_is_untouched_proven_write_at`
     /// for a path under this group's live root. Fail-closed: a group with no
     /// live link, or any error, is `false`.
-    pub fn dag_disk_is_untouched_proven_write(
+    pub fn disk_is_untouched_proven_write_at(
         &self,
         group_id: &str,
         path: &str,
@@ -1108,7 +1108,7 @@ impl ReplicaCoordinator {
             LinkGate::NoLiveLink => return Ok(false),
         };
         self.sqlite()
-            .dag_disk_is_untouched_proven_write(
+            .disk_is_untouched_proven_write_at(
                 group_id,
                 path,
                 out_path,

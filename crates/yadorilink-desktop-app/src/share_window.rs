@@ -40,7 +40,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use yadorilink_client_core::ops::shares::{GroupMemberInfo, PendingApproval, RevokeAttempt};
+use yadorilink_client_core::ops::shares::{
+    DenyAttempt, DenyRefusal, GroupMemberInfo, PendingApproval, RevokeAttempt,
+};
 use yadorilink_ipc_proto::daemonctl::{
     MintedInviteInfo, ReplicaMembershipCommandOutcome, StatusResponse,
 };
@@ -48,11 +50,11 @@ use yadorilink_ipc_proto::daemonctl::{
 use crate::onboarding::executor::EventSink;
 use crate::share_access::{
     access_unreadable_banner, approval_gated_invite_note, assignable_role,
-    confirmation_device_label, deny_done_line, deny_not_carried_out_line, deny_precheck,
-    member_rows, no_pending_requests_line, pending_rows, revoke_confirm_prompt, revoke_done_line,
-    revoke_override_prompt, role_change_done_line, DenyPrecheck, DenyRefusal, MemberRow,
-    PendingRow, MEMBERS_HEADING, NO_MEMBERS, ONLY_THE_OWNER_CAN_MANAGE_ACCESS,
-    PENDING_REQUESTS_HEADING, REMOVE_ACCESS_BUTTON, REVOKE_OVERRIDE_BUTTON,
+    confirmation_device_label, deny_done_line, deny_not_carried_out_line, member_rows,
+    no_pending_requests_line, pending_rows, revoke_confirm_prompt, revoke_done_line,
+    revoke_override_prompt, role_change_done_line, MemberRow, PendingRow, MEMBERS_HEADING,
+    NO_MEMBERS, ONLY_THE_OWNER_CAN_MANAGE_ACCESS, PENDING_REQUESTS_HEADING, REMOVE_ACCESS_BUTTON,
+    REVOKE_OVERRIDE_BUTTON,
 };
 use crate::share_invite::{
     expires_in_label, group_id_for_path, mailto_url, qr_modules, role_display_label, ExpiryPreset,
@@ -392,22 +394,12 @@ async fn run_action(group_id: String, action: Action) -> Result<ActionOutcome, S
         // holds data, and that is a REMOVAL, which belongs in the members
         // list where the confirmation names it as one.
         Action::Deny { device_id, .. } => {
-            let pending = share::pending_approvals().await.map_err(|e| e.to_string())?;
-            let members =
-                share::list_members_resolved(&group_id).await.map_err(|e| e.to_string())?;
-            match deny_precheck(&pending, &members, &group_id, &device_id) {
-                DenyPrecheck::NotWaiting(refusal) => Ok(ActionOutcome::DenyNotCarriedOut(refusal)),
-                DenyPrecheck::StillWaiting => {
-                    match share::try_revoke_resolved(group_id, device_id, false)
-                        .await
-                        .map_err(|e| e.to_string())?
-                    {
-                        RevokeAttempt::Committed(outcome) => {
-                            Ok(ActionOutcome::Denied(Box::new(outcome)))
-                        }
-                        RevokeAttempt::NotDurable { message, .. } => Err(message),
-                    }
+            match share::deny_checked(group_id, device_id).await.map_err(|e| e.to_string())? {
+                DenyAttempt::Refused(refusal) => Ok(ActionOutcome::DenyNotCarriedOut(refusal)),
+                DenyAttempt::Attempted(RevokeAttempt::Committed(outcome)) => {
+                    Ok(ActionOutcome::Denied(Box::new(outcome)))
                 }
+                DenyAttempt::Attempted(RevokeAttempt::NotDurable { message, .. }) => Err(message),
             }
         }
         Action::Revoke { device_id, forced, .. } => {

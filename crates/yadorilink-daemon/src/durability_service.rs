@@ -465,6 +465,10 @@ pub struct DurabilityService {
     /// DurabilityConfirmationJob`, same shape/reason as `DaemonState`'s
     /// `materialization_repair_sweep_interval`.
     custody_confirmation_sweep_interval: Mutex<Duration>,
+    /// Groups with an event-triggered custody refresh scheduled but not yet
+    /// started. Coalesces a burst of peer-session events into at most one
+    /// pending refresh per group.
+    pending_custody_refresh: Mutex<std::collections::HashSet<String>>,
     /// group_id -> that group's custody-confirmation cache entry (the most
     /// recent whole-group peer-confirmed custody evidence, if any, plus an
     /// epoch counter) -- populated by `DurabilityConfirmationJob`'s
@@ -520,11 +524,27 @@ impl DurabilityService {
             custody_confirmation_sweep_interval: Mutex::new(
                 default_custody_confirmation_sweep_interval(),
             ),
+            pending_custody_refresh: Mutex::new(std::collections::HashSet::new()),
             custody_confirmation_cache: Mutex::new(HashMap::new()),
             root_set_summary_memo: Mutex::new(HashMap::new()),
             latch_load_failed,
             scope_unknown: AtomicBool::new(scope_unknown),
         }
+    }
+
+    /// Marks `group_id` as having a custody refresh pending. True only for
+    /// the caller that must schedule it; false when one is already pending.
+    pub(crate) fn mark_custody_refresh_pending(&self, group_id: &str) -> bool {
+        self.pending_custody_refresh
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(group_id.to_string())
+    }
+
+    /// Clears the pending mark as the refresh starts, so an event arriving
+    /// while it runs schedules a follow-up rather than being lost.
+    pub(crate) fn clear_custody_refresh_pending(&self, group_id: &str) {
+        self.pending_custody_refresh.lock().unwrap_or_else(|p| p.into_inner()).remove(group_id);
     }
 
     /// Whether the persisted latch table failed to load at startup -- see

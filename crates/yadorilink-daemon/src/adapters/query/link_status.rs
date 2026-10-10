@@ -45,6 +45,10 @@ impl LinkStatusReadPort for DaemonLinkStatusReader {
                 .file_index_repository()
                 .list_live_conflict_copies(&link.group_id)?
                 .len() as u64;
+            let conflicts_pending = state
+                .replica_coordinator
+                .file_index_repository()
+                .contested_path_count(&link.group_id)?;
             let materialization = state
                 .replica_coordinator
                 .materialization_state_repository()
@@ -174,6 +178,22 @@ impl LinkStatusReadPort for DaemonLinkStatusReader {
                     );
                     Vec::new()
                 });
+            let capture_volume_changed = matches!(
+                &link.location,
+                yadorilink_replica_domain::session_state::LinkLocation::Folder(_)
+            ) && state
+                .replica_coordinator
+                .link_repository()
+                .capture_volume_identity_for_path(link.key())
+                .ok()
+                .flatten()
+                .is_some_and(|stored| {
+                    yadorilink_filesystem_sync::device_boundary::root_volume_identity(
+                        std::path::Path::new(link.key()),
+                    )
+                    .as_deref()
+                        != Some(stored.as_str())
+                });
             let provider = match &link.location {
                 yadorilink_replica_domain::session_state::LinkLocation::Provider {
                     root_id,
@@ -196,6 +216,17 @@ impl LinkStatusReadPort for DaemonLinkStatusReader {
                 group_id: link.group_id.clone(),
                 paused: link.paused,
                 conflict_count,
+                conflict_note: if (conflict_count > 0 || conflicts_pending > 0)
+                    && !yadorilink_sync_sqlite::displacement_guard::destructive_step_durable(
+                        std::path::Path::new(link.key()),
+                    )
+                {
+                    "Conflict resolved semantically; local filesystem update is waiting for Windows durability validation."
+                        .to_string()
+                } else {
+                    String::new()
+                },
+                conflicts_pending,
                 materialization_policy: link.materialization_policy.as_db_str().to_string(),
                 hydrated_count: materialization.hydrated,
                 placeholder_count: materialization.placeholder,
@@ -215,6 +246,7 @@ impl LinkStatusReadPort for DaemonLinkStatusReader {
                 local_storage_state,
                 fetch_availability,
                 ambiguous_local_paths,
+                capture_volume_changed,
                 full_replica_device_ids: state
                     .authority
                     .full_replica_devices_for_group(&link.group_id),

@@ -494,27 +494,20 @@ impl SqliteSyncStore {
     /// [`crate::structural_origin::drop_unresolved_structural_intents`].
     pub fn dag_drop_unresolved_structural_intents(
         &self,
-        recorded_before_unix_nanos: i64,
     ) -> Result<Vec<(String, String)>, SyncSqliteError> {
         self.database.write::<_, SyncSqliteError>(|conn| {
-            crate::structural_origin::drop_unresolved_structural_intents(
-                conn,
-                recorded_before_unix_nanos,
-            )
+            crate::structural_origin::drop_unresolved_structural_intents(conn)
         })
     }
 
-    /// The structural intents recorded before `recorded_before_unix_nanos`
+    /// The structural intents of `group_id` (all groups when `None`)
     /// -- [`crate::structural_origin::list_unresolved_structural_intents`].
     pub fn dag_list_unresolved_structural_intents(
         &self,
-        recorded_before_unix_nanos: i64,
+        group_id: Option<&str>,
     ) -> Result<Vec<crate::structural_origin::UnresolvedStructuralIntent>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            crate::structural_origin::list_unresolved_structural_intents(
-                conn,
-                recorded_before_unix_nanos,
-            )
+            crate::structural_origin::list_unresolved_structural_intents(conn, group_id)
         })
     }
 
@@ -717,7 +710,7 @@ impl SqliteSyncStore {
     /// Fail-closed: no usable proof, a proof of anything but a regular file,
     /// a changed identity or metadata token, or any error observing the path
     /// is `false`.
-    pub fn dag_disk_is_untouched_proven_write(
+    pub fn disk_is_untouched_proven_write_at(
         &self,
         group_id: &str,
         path: &str,
@@ -800,17 +793,6 @@ impl SqliteSyncStore {
     ) -> Result<crate::desired_state::DesiredPathState, SyncSqliteError> {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
             crate::native_desired_state::native_desired_path_state(tx, group_id, path)
-        })
-    }
-
-    /// [`Self::dag_desired_level_projection`] from native state.
-    pub fn native_desired_level_projection(
-        &self,
-        group_id: &str,
-        parent: &str,
-    ) -> Result<yadorilink_replica_engine::namespace::NamespaceProjection, SyncSqliteError> {
-        self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            crate::native_desired_state::native_desired_level_projection(tx, group_id, parent)
         })
     }
 

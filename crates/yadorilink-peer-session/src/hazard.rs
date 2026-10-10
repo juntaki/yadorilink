@@ -713,22 +713,31 @@ fn probe_normalization_insensitive_filesystem(canonical_dir: &Path) -> std::io::
 /// entry may be this exact path: not absent.
 ///
 /// An entry "may be" a component when its name is byte-identical to it,
-/// or canonically equivalent to it under Unicode normalization while
-/// still differing in case. The second arm is because a directory does
-/// not always record a name as it was created: HFS+ decomposes every name
-/// it stores, so an entry created as a composed `Caf\u{e9}.jpg` is listed
-/// decomposed, and a byte comparison would call it absent. Whether an
-/// equivalent-but-not-identical entry is this name's stored form or a
-/// distinct normalization sibling (APFS keeps both spellings as created)
-/// cannot be told from the listing, so it counts as present: the failure
-/// direction is a retry, never a claimed absence. Case is still compared
-/// exactly, because no filesystem rewrites a name's case when storing it.
+/// or -- only when `normalization_insensitive` (the volume's own probe
+/// result, see [`is_normalization_insensitive_filesystem`]) -- canonically
+/// equivalent to it under Unicode normalization while still differing in
+/// case. The second arm is because such a directory does not always record
+/// a name as it was created: HFS+ decomposes every name it stores, so an
+/// entry created as a composed `Caf\u{e9}.jpg` is listed decomposed, and a
+/// byte comparison would call it absent. Whether an equivalent-but-not-
+/// identical entry is this name's stored form or a distinct sibling cannot
+/// be told from the listing on such a volume, so it counts as present: the
+/// failure direction is a retry, never a claimed absence. On a
+/// normalization-sensitive volume (APFS keeps both spellings as created) an
+/// equivalent spelling is a distinct file, so it is not this name and must
+/// not keep a redelivered tombstone retrying forever. Case is compared
+/// exactly either way, because no filesystem rewrites a name's case when
+/// storing it.
 ///
 /// Anything the listing cannot answer -- an unreadable directory, an
 /// unreadable entry, a component that is not a directory -- is not an
 /// observed absence.
-pub fn observably_absent_by_exact_name(root: &Path, path: &str) -> bool {
-    exact_name_absent_with(root, path, |dir| {
+pub fn observably_absent_by_exact_name(
+    root: &Path,
+    path: &str,
+    normalization_insensitive: bool,
+) -> bool {
+    exact_name_absent_with(root, path, normalization_insensitive, |dir| {
         std::fs::read_dir(dir).map(|entries| entries.map(|entry| entry.map(|e| e.file_name())))
     })
 }
@@ -736,7 +745,12 @@ pub fn observably_absent_by_exact_name(root: &Path, path: &str) -> bool {
 /// [`observably_absent_by_exact_name`] over an injected directory lister,
 /// so its fail-closed arms can be driven without a filesystem that fails
 /// on cue.
-fn exact_name_absent_with<L, I>(root: &Path, path: &str, mut list: L) -> bool
+fn exact_name_absent_with<L, I>(
+    root: &Path,
+    path: &str,
+    normalization_insensitive: bool,
+    mut list: L,
+) -> bool
 where
     L: FnMut(&Path) -> std::io::Result<I>,
     I: Iterator<Item = std::io::Result<std::ffi::OsString>>,
@@ -751,7 +765,7 @@ where
             let Ok(entry) = entry else {
                 return false;
             };
-            if entry_may_be_named(&entry, component) {
+            if entry_may_be_named(&entry, component, normalization_insensitive) {
                 matched = true;
                 break;
             }
@@ -766,10 +780,17 @@ where
 
 /// See [`observably_absent_by_exact_name`] for why canonical equivalence
 /// counts and case-folding does not.
-fn entry_may_be_named(entry: &std::ffi::OsStr, component: &str) -> bool {
+fn entry_may_be_named(
+    entry: &std::ffi::OsStr,
+    component: &str,
+    normalization_insensitive: bool,
+) -> bool {
     use unicode_normalization::UnicodeNormalization;
     if entry.as_encoded_bytes() == component.as_bytes() {
         return true;
+    }
+    if !normalization_insensitive {
+        return false;
     }
     match entry.to_str() {
         Some(entry) => entry.nfd().eq(component.nfd()),

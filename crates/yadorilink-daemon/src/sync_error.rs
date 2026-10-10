@@ -206,6 +206,11 @@ pub enum SyncError {
     )]
     DiskPressure { path: String, volume: String, available_bytes: u64, headroom_bytes: u64 },
 
+    /// The sync-root lock sidecar is gone or replaced; terminal for the link
+    /// (see `RootAuthorityError::OwnershipLost`).
+    #[error("{0}")]
+    OwnershipLost(String),
+
     /// This local database's stamped
     /// `PRAGMA user_version` is newer than the schema version this binary
     /// supports — it was opened (and migrated) by a newer build. Refusing
@@ -312,6 +317,7 @@ impl SyncError {
             SyncError::NotFound(_) => "not_found",
             SyncError::InvalidInput(_) => "invalid_input",
             SyncError::AmbiguousLink { .. } => "config",
+            SyncError::OwnershipLost(_) => "config",
             SyncError::CorruptState(_) => "storage",
             SyncError::HydrationFailed(_) => "peer_unreachable",
             SyncError::VersionContentUnavailable(_) => "peer_unreachable",
@@ -502,6 +508,9 @@ impl From<yadorilink_root_authority::RootAuthorityError> for SyncError {
             yadorilink_root_authority::RootAuthorityError::RootIdentityMismatch(msg) => {
                 SyncError::InvalidInput(msg)
             }
+            yadorilink_root_authority::RootAuthorityError::OwnershipLost(msg) => {
+                SyncError::OwnershipLost(msg)
+            }
             // Lossless: `yadorilink-local-capture`'s own tests match on
             // `SyncError::AmbiguousLink { .. }` after a round trip through
             // `RootVerificationStatePort`'s `SyncState`/`ReplicaCoordinator`
@@ -534,6 +543,7 @@ impl From<SyncError> for yadorilink_root_authority::RootAuthorityError {
                 E::AmbiguousLink { group_id, local_paths }
             }
             SyncError::ReservedNamespaceCollision(msg) => E::ReservedNamespaceCollision(msg),
+            SyncError::OwnershipLost(msg) => E::OwnershipLost(msg),
             other => E::CorruptState(other.to_string()),
         }
     }
@@ -566,6 +576,9 @@ impl From<SyncError>
                 E::DiskPressure { path, volume, available_bytes, headroom_bytes }
             }
             SyncError::PolicyUnavailable => E::PolicyUnavailable,
+            SyncError::OwnershipLost(msg) => {
+                E::RootAuthority(yadorilink_root_authority::RootAuthorityError::OwnershipLost(msg))
+            }
             other => E::CorruptState(other.to_string()),
         }
     }

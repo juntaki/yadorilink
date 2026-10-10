@@ -74,7 +74,7 @@ impl Side {
         let witness = self
             .db
             .write_immediate::<_, SyncSqliteError>(|tx| {
-                crate::native_projection_binding::capture_native_witness(tx, &group(), spec.path())
+                crate::native_capture::capture_native_witness(tx, &group(), spec.path())
             })
             .unwrap();
         let witness = witnessed.then_some(witness);
@@ -318,8 +318,6 @@ impl Remote {
                 path: SyncPath(path.into()),
                 removes: Vec::new(),
                 put: Some(DeltaPut { version }),
-                keeps: Vec::new(),
-                keep_put: false,
             }],
             signature: [0u8; 64],
         };
@@ -462,12 +460,8 @@ fn a_peer_admitting_a_prefix_of_the_runs_sees_a_consistent_state() {
     grouped.commit_grouped(&batch).unwrap();
     // The runs the commit cut, from the mutations it was handed.
     let mutations = grouped.prepare_all(&batch);
-    let rows: Vec<SyncPath> = mutations.iter().map(|m| SyncPath(m.record().path.clone())).collect();
-    let items: Vec<BulkOp<'_>> = mutations
-        .iter()
-        .zip(&rows)
-        .map(|(m, row_path)| BulkOp { op: m.op(), row_path, witness: None })
-        .collect();
+    let items: Vec<BulkOp<'_>> =
+        mutations.iter().map(|m| BulkOp { op: m.op(), witness: None }).collect();
     let runs = bulk_groups(&items);
     assert_eq!(
         runs,
@@ -585,99 +579,6 @@ fn long_paths_split_a_run_by_bytes() {
     assert_eq!(native_store::load_state(&peer, &group()).unwrap(), side.state());
 }
 
-/// An op that keeps many conflict copies takes bytes for each keep: a run of
-/// such ops is cut by the bytes it will sign, so every delta stays within the
-/// per-delta budget and a peer still ends in the author's state.
-#[test]
-fn ops_that_keep_many_copies_split_a_run_by_bytes() {
-    const PATHS: usize = 300;
-    const COPIES: usize = 40;
-    let side = Side::new();
-    let peer_delta = |name: &str, version: u8| {
-        let author = author_id(name);
-        let key = SigningKey::from_bytes(&[name.bytes().last().unwrap_or(9); 32]);
-        let mut delta = NativeDelta {
-            recursive_part: None,
-            group_id: group(),
-            author: author.clone(),
-            seq: AuthorSeq(1),
-            prev: None,
-            ops: (0..PATHS)
-                .map(|i| DeltaOp {
-                    path: SyncPath(format!("d/f-{i:04}")),
-                    removes: Vec::new(),
-                    put: Some(DeltaPut { version: VersionHash([version; 32]) }),
-                    keeps: Vec::new(),
-                    keep_put: false,
-                })
-                .collect(),
-            signature: [0u8; 64],
-        };
-        delta.sign(&key);
-        (delta, key)
-    };
-    let mut installed = Vec::new();
-    let (winner, key) = peer_delta("winner", 200);
-    side.db
-        .write_immediate::<_, SyncSqliteError>(|tx| {
-            native_store::install_verified_delta(tx, &group(), &winner, &key.verifying_key())
-                .map(|_| ())
-        })
-        .unwrap();
-    installed.push(winner);
-    for k in 0..COPIES {
-        let (delta, key) = peer_delta(&format!("copier-{k:03}"), 100);
-        side.db
-            .write_immediate::<_, SyncSqliteError>(|tx| {
-                native_store::install_verified_delta(tx, &group(), &delta, &key.verifying_key())
-                    .map(|_| ())
-            })
-            .unwrap();
-        installed.push(delta);
-    }
-    // The author's tree shows the version-100 cohort as a copy at every path.
-    let first = &installed[1];
-    side.db
-        .write_immediate::<_, SyncSqliteError>(|tx| {
-            for i in 0..PATHS {
-                crate::stable_projection_binding::native_placement_put(
-                    tx,
-                    "g1",
-                    &crate::stable_projection_binding::NativePlacementRow {
-                        physical_path: format!("d/f-{i:04} (copy)"),
-                        source_path: format!("d/f-{i:04}"),
-                        author: first.author.device.0.clone(),
-                        incarnation: first.author.incarnation.0,
-                        seq: first.seq.get(),
-                        provenance: first.delta_hash().0,
-                        version: [100; 32],
-                        origin: "conflict_copy".to_owned(),
-                    },
-                )?;
-            }
-            Ok(())
-        })
-        .unwrap();
-
-    let specs: Vec<Spec> =
-        (0..PATHS).map(|i| Spec::Put { path: format!("d/f-{i:04}"), salt: i as i64 + 1 }).collect();
-    side.commit_grouped(&specs).unwrap();
-
-    let tip = side.local_tip();
-    let mut keeps = 0;
-    for seq in 1..=tip {
-        let delta = side.local_delta(seq);
-        keeps += delta.ops.iter().map(|op| op.keeps.len()).sum::<usize>();
-        let bytes = delta.to_wire_bytes().len();
-        assert!(
-            bytes <= crate::native_authoring::BULK_DELTA_MAX_BYTES,
-            "delta {seq} is {bytes} bytes"
-        );
-    }
-    assert!(keeps >= PATHS * COPIES / 2, "the ops carry their keeps: {keeps}");
-    assert!(tip > 1, "{tip}");
-}
-
 fn mutation_at(path: &str, op: Op) -> PreparedLocalMutation {
     PreparedLocalMutation::Delete {
         record: FileRecord {
@@ -703,13 +604,8 @@ fn runs_split_where_paths_interact() {
     };
     let runs = |cases: Vec<(&str, Op)>| {
         let mutations: Vec<_> = cases.into_iter().map(|(row, op)| mutation_at(row, op)).collect();
-        let rows: Vec<SyncPath> =
-            mutations.iter().map(|m| SyncPath(m.record().path.clone())).collect();
-        let items: Vec<BulkOp<'_>> = mutations
-            .iter()
-            .zip(&rows)
-            .map(|(m, row_path)| BulkOp { op: m.op(), row_path, witness: None })
-            .collect();
+        let items: Vec<BulkOp<'_>> =
+            mutations.iter().map(|m| BulkOp { op: m.op(), witness: None }).collect();
         bulk_groups(&items)
     };
     assert_eq!(runs(vec![("a", put("a")), ("b", put("b")), ("c", put("c"))]), vec![0..3]);
@@ -719,8 +615,6 @@ fn runs_split_where_paths_interact() {
     assert_eq!(runs(vec![("d/x", put("d/x")), ("dd", put("dd"))]), vec![0..2]);
     // A move touches both its ends.
     assert_eq!(runs(vec![("t", mv("f", "t")), ("f", put("f")), ("z", put("z"))]), vec![0..1, 1..3]);
-    // A write through a copy touches the copy row and the source.
-    assert_eq!(runs(vec![("a (copy)", put("a")), ("a", put("a"))]), vec![0..1, 1..2]);
 }
 
 /// No run is longer than one delta carries.
@@ -733,12 +627,8 @@ fn runs_are_capped_at_the_delta_op_bound() {
             mutation_at(&p, op)
         })
         .collect();
-    let rows: Vec<SyncPath> = mutations.iter().map(|m| SyncPath(m.record().path.clone())).collect();
-    let items: Vec<BulkOp<'_>> = mutations
-        .iter()
-        .zip(&rows)
-        .map(|(m, row_path)| BulkOp { op: m.op(), row_path, witness: None })
-        .collect();
+    let items: Vec<BulkOp<'_>> =
+        mutations.iter().map(|m| BulkOp { op: m.op(), witness: None }).collect();
     let lens: Vec<usize> = bulk_groups(&items).iter().map(|r| r.len()).collect();
     assert_eq!(lens, vec![BULK_DELTA_MAX_OPS, BULK_DELTA_MAX_OPS, 1]);
 }

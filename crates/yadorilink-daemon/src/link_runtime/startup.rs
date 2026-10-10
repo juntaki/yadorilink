@@ -77,18 +77,11 @@ pub(crate) fn open_group_author(
                 deps.device_id
             ))
         })?;
-    // Native is the only authority: a group with no history yet is recorded as
-    // native, and one that already holds indexed rows without a
-    // native record is refused rather than projected under rules it was never
-    // authored under (there is no migration; recreate the database).
-    if !deps.replica_coordinator.adopt_native_authority_if_fresh(group_id)? {
-        return Err(SyncError::CorruptState(format!(
-            "group {group_id} holds state from before native authority and cannot be started; \
-             recreate this device's database to use it"
-        )));
-    }
     // What the plan names but the index does not hold is owed a projection, and
     // nothing persisted says so if the obligation was lost with the last run.
+    // This is the one place the plan is compared with the index: every change
+    // to the plan arms its paths in the same transaction, so within a run an
+    // unmet entry always has its obligation, and no periodic pass looks again.
     if let Err(error) = deps.replica_coordinator.arm_native_plan_gaps(group_id) {
         tracing::warn!(group_id, %error, "could not arm planned entries that have no row");
     }

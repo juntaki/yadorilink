@@ -20,7 +20,7 @@ use rusqlite::Connection;
 use yadorilink_replica_domain::file::{FileVersion, RecordKind};
 use yadorilink_replica_domain::ids::VersionHash;
 use yadorilink_replica_domain::native_plan::NativeRowIdentity;
-use yadorilink_replica_domain::native_state::{LiveHead, PathMaterialization};
+use yadorilink_replica_domain::native_state::LiveHead;
 use yadorilink_root_authority::fs_identity::FileIdentity;
 
 use crate::error::SyncSqliteError;
@@ -176,22 +176,19 @@ pub(crate) fn publish_and_settle(
 
     let mut closes = Vec::with_capacity(proofs.len());
     for proof in proofs {
-        // A resolution carrying conflict copies is not satisfied by this path alone.
-        if let PathMaterialization::Present { conflict_copies, .. } =
-            yadorilink_replica_domain::native_state::resolve_path(proof.heads.iter().cloned())
-        {
-            if !conflict_copies.is_empty() {
-                continue;
-            }
-        }
         let kinds: HashMap<VersionHash, RecordKind> =
             HashMap::from([(proof.version.version_hash, proof.version.meta.record_kind)]);
-        let desired = crate::native_desired_state::desired_path_state_of_unplaced_heads(
+        let desired = match crate::native_desired_state::desired_path_state_of_unplaced_heads(
             proof.path,
             proof.heads.clone(),
             &kinds,
-        )?;
-        // Its relocated entry is owed at a copy name no obligation names.
+        ) {
+            Ok(desired) => desired,
+            // Contested: nothing is owed yet.
+            Err(SyncSqliteError::NotFound(_)) => continue,
+            Err(error) => return Err(error),
+        };
+        // The directory the path has to be is the engine's to place.
         if let crate::desired_state::DesiredPathState::StructuralDirectory = desired {
             continue;
         }
@@ -239,19 +236,6 @@ fn cross_check_against_the_database(
             );
             ancestor = parent;
         }
-        assert!(
-            crate::stable_projection_binding::native_placement_at(tx, group_id, proof.path)?
-                .is_none()
-                && crate::stable_projection_binding::native_placements_for_source(
-                    tx, group_id, proof.path
-                )?
-                .is_empty()
-                && !crate::stable_projection_binding::native_has_kept_head(
-                    tx, group_id, proof.path
-                )?,
-            "{} is named by a placement or a kept copy",
-            proof.path
-        );
         let recorded = crate::materialization_basis::record(tx, group_id, proof.path)?;
         assert_eq!(recorded, proof.basis(), "the basis of {} is not the one read", proof.path);
         let kind = crate::dag_store::get_file_version(tx, group_id, &proof.version.version_hash)?

@@ -82,7 +82,6 @@ fn authoring_cost(n: usize) -> Cost {
             &group(),
             &local,
             &Op::Put { path: path.clone(), version },
-            &path,
         )
         .unwrap();
     }
@@ -115,8 +114,6 @@ fn remote_install_cost(n: usize) -> Cost {
                 path: SyncPath(format!("dir/file-{i:06}")),
                 removes: Vec::new(),
                 put: Some(DeltaPut { version: VersionHash([(i % 251) as u8 + 1; 32]) }),
-                keeps: Vec::new(),
-                keep_put: false,
             }],
             signature: [0u8; 64],
         };
@@ -156,8 +153,6 @@ fn remote_admission_cost(n: usize) -> Cost {
                 path: SyncPath(format!("dir/file-{i:06}")),
                 removes: Vec::new(),
                 put: Some(DeltaPut { version: VersionHash([(i % 251) as u8 + 1; 32]) }),
-                keeps: Vec::new(),
-                keep_put: false,
             }],
             signature: [0u8; 64],
         };

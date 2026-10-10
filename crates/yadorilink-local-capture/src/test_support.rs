@@ -265,6 +265,21 @@ impl LocalMutationStore for TestReplica {
         self.materialization_state_repository().list_materialization_states(group_id)
     }
 
+    fn capture_volume_identity(
+        &self,
+        group_id: &str,
+    ) -> Result<Option<Option<String>>, SyncSqliteError> {
+        self.link_repository().capture_volume_identity_for_group(group_id)
+    }
+
+    fn adopt_capture_volume_identity(
+        &self,
+        group_id: &str,
+        identity: &str,
+    ) -> Result<(), SyncSqliteError> {
+        self.link_repository().set_capture_volume_identity_for_group(group_id, identity)
+    }
+
     fn get_materialization_state(
         &self,
         group_id: &str,
@@ -412,7 +427,7 @@ impl LocalMutationStore for TestReplica {
         sync_root: &std::path::Path,
         out_path: &std::path::Path,
     ) -> Result<bool, SyncSqliteError> {
-        self.sqlite().dag_disk_is_untouched_proven_write(
+        self.sqlite().disk_is_untouched_proven_write_at(
             group_id,
             path,
             out_path,
@@ -546,14 +561,6 @@ impl LocalMutationStore for TestReplica {
         self.file_index_repository().has_live_descendant_row(group_id, path)
     }
 
-    fn write_through_source(
-        &self,
-        group_id: &str,
-        path: &str,
-    ) -> Result<Option<String>, SyncSqliteError> {
-        self.file_index_repository().write_through_source(group_id, path)
-    }
-
     fn follow_renamed_structural_directory(
         &self,
         group_id: &str,
@@ -606,31 +613,6 @@ impl LocalMutationStore for TestReplica {
             path,
             device_id,
             observed_at_unix_nanos,
-            permit,
-        )
-    }
-
-    fn commit_write_through_deletion(
-        &self,
-        group_id: &str,
-        copy_path: &str,
-        source: &str,
-        native_witness: Option<yadorilink_replica_domain::native_state::NativeCaptureWitness>,
-        device_id: &str,
-        observed_at_unix_nanos: i64,
-        emitter: &LocalAuthorKey,
-        permit: &RootCommitPermit<'_>,
-    ) -> Result<(), SyncSqliteError> {
-        local_commit::commit_write_through_deletion(
-            self.file_index_repository(),
-            group_id,
-            copy_path,
-            source,
-            native_witness,
-            device_id,
-            observed_at_unix_nanos,
-            &*self.author(emitter)?,
-            None,
             permit,
         )
     }

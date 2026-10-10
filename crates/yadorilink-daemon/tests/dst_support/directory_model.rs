@@ -332,11 +332,11 @@ mod tests {
         check_disk_against_projection, check_projection, check_projection_purity, disk_tree,
         sha256_hex, ExpectedLeaf, NamespaceViolation,
     };
-    use super::super::op_applier::apply_op;
-    use super::*;
-    use yadorilink_replica_engine::namespace::{
+    use super::super::namespace_oracle::{
         project, DirectoryNode, PhysicalNode, PlacedEntry, Placement,
     };
+    use super::super::op_applier::apply_op;
+    use super::*;
 
     fn w(path: &str, content_id: u64) -> Op {
         Op::Write { path: path.into(), content_id }
@@ -489,7 +489,7 @@ mod tests {
         assert_eq!(tree.get("a/x"), Some(&file_at(2, "a/x", Placement::AtPath)));
         let beside: Vec<&PhysicalNode> =
             tree.iter().filter(|(p, _)| p.starts_with("a (")).map(|(_, n)| n).collect();
-        assert_eq!(beside, vec![&file_at(1, "a", Placement::Relocated)], "{tree:#?}");
+        assert_eq!(beside, vec![&file_at(1, "a", Placement::ConflictCopy)], "{tree:#?}");
     }
 
     /// Two devices `mkdir` the same path: one explicit directory, no copy.

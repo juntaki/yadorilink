@@ -174,8 +174,9 @@ fn run_scenario(seed: u64) -> Result<(), String> {
     // own "Recover any file left permanently stuck `Evicting`" section).
     let reset_count = state
         .materialization_state_repository()
-        .reset_stale_evicting()
-        .map_err(|e| format!("seed {seed}: reset_stale_evicting failed: {e}"))?;
+        .reset_stale_transients(&[], &[])
+        .map_err(|e| format!("seed {seed}: reset_stale_transients failed: {e}"))?
+        .1;
     if reset_count != 1 {
         return Err(format!("seed {seed}: expected exactly 1 row reset, got {reset_count}"));
     }

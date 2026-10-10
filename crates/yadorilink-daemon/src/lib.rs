@@ -11,6 +11,7 @@ pub mod change_auth;
 pub mod change_policy;
 pub mod checkpoint_source;
 pub mod connection_trace;
+pub mod contest_fork;
 pub mod control_context;
 pub mod control_socket;
 pub mod convergence;
@@ -31,6 +32,8 @@ pub mod hydration_single_flight;
 pub mod link_registry;
 pub mod link_runtime;
 pub mod local_convergence;
+pub mod log_roll;
+pub mod log_throttle;
 pub mod machine_fingerprint;
 pub(crate) mod maintenance;
 pub mod maintenance_coordinator;
@@ -74,14 +77,16 @@ pub mod route;
 pub mod runtime_telemetry;
 pub mod sync_adapter;
 pub mod sync_runtime;
-pub mod write_lease;
 // Exclusive OS locks on the block-store root and sync-state database.
 pub(crate) mod provider_eager;
+pub(crate) mod provider_evict;
 pub(crate) mod provider_evidence;
 pub(crate) mod provider_gate;
 pub(crate) mod provider_handoff;
 pub(crate) mod provider_host_link;
 pub(crate) mod provider_ingest;
+#[cfg(windows)]
+pub(crate) mod provider_ingest_windows;
 pub(crate) mod provider_prefetch;
 pub(crate) mod provider_projector;
 pub(crate) mod provider_publication;
@@ -105,4 +110,7 @@ pub mod transfer_progress;
 pub mod update;
 pub mod update_ipc;
 #[cfg(windows)]
+pub(crate) mod windows_fs_security;
+#[cfg(windows)]
 pub mod windows_pipe_security;
+pub(crate) mod windows_sync_roots;

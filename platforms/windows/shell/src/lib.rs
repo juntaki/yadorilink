@@ -19,10 +19,16 @@ pub mod cfapi;
 // dehydration -- `pub` for the same reason as `cfapi`/`ipc_client`, so the
 // `yadorilink-cfapi-host` binary target can drive it.
 pub mod dehydrate_server;
+pub mod dir_watch;
+pub mod host_paths;
 pub mod ipc_client;
 mod overlay;
-mod windows_pipe_security;
+pub mod provider_authoring;
+pub mod provider_client;
+pub mod provider_namespace;
+pub mod provider_session;
 mod registration;
+mod windows_pipe_security;
 
 use windows::core::{IUnknown, Interface, Result, GUID, HRESULT};
 use windows::Win32::Foundation::{BOOL, CLASS_E_CLASSNOTAVAILABLE, E_NOINTERFACE, S_FALSE, S_OK};

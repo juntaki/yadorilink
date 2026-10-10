@@ -148,17 +148,11 @@ impl From<yadorilink_fapi_client::Error> for CoreError {
     }
 }
 
-/// A missing or refusing control socket means the daemon is not running;
-/// every other I/O failure keeps its own message.
+/// Daemon-connect failures are mapped to [`CoreError::DaemonNotRunning`] where the socket is
+/// opened; any other I/O failure (a missing file, say) keeps its own message.
 impl From<std::io::Error> for CoreError {
     fn from(e: std::io::Error) -> Self {
-        if e.kind() == std::io::ErrorKind::NotFound
-            || e.kind() == std::io::ErrorKind::ConnectionRefused
-        {
-            CoreError::DaemonNotRunning
-        } else {
-            CoreError::Io(e.to_string())
-        }
+        CoreError::Io(e.to_string())
     }
 }
 

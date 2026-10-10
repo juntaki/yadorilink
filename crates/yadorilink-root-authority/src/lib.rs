@@ -17,6 +17,7 @@
 //! -- see [`root_commit`]'s own module doc.
 
 pub mod canonical_fold;
+pub mod durable_dir;
 pub mod error;
 pub mod fs_capabilities;
 pub mod fs_identity;

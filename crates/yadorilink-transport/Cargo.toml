@@ -6,6 +6,8 @@ license.workspace = true
 
 # See yadorilink-local-storage/Cargo.toml's identical section for why.
 [dependencies]
+# The durable publish of the device key file (`durable_dir::publish_durably`).
+yadorilink-root-authority = { path = "../yadorilink-root-authority" }
 yadorilink-ipc-proto.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

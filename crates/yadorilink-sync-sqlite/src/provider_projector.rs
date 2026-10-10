@@ -115,11 +115,10 @@ pub fn project_batch_in_tx(
     Ok(pending.len())
 }
 
-/// Writes the rows the plan gives for `source` (the path itself or the copy names standing for
-/// it), retires the placements it held before that the plan no longer holds, and tombstones the
-/// row at `source` when the plan holds nothing there any more.
+/// Writes the row the plan gives for `source`, and tombstones the row at `source` when the plan
+/// holds nothing there any more.
 ///
-/// A retirement is PROJECTION, never a semantic delete: it writes only the group's own rows
+/// A tombstone here is PROJECTION, never a semantic delete: it writes only the group's own rows
 /// (the same way any projected row is written) and authors no change and no tombstone head for
 /// peers.
 fn project_path(
@@ -130,7 +129,6 @@ fn project_path(
     structural: bool,
 ) -> Result<(), SyncSqliteError> {
     let mut holds_source_path = false;
-    let mut now_held: HashSet<&str> = HashSet::new();
     for (physical, node) in nodes {
         let (NativePlannedNode::Entry { head, .. } | NativePlannedNode::ExplicitDirectory { head }) =
             node
@@ -139,59 +137,8 @@ fn project_path(
         };
         if physical.as_str() == source {
             holds_source_path = true;
-            // The path is its own source's again: no displaced placement may claim it.
-            tx.execute(
-                "DELETE FROM provider_placements WHERE group_id = ?1 AND physical_path = ?2",
-                rusqlite::params![group_id, physical.as_str()],
-            )?;
-        } else {
-            // A displaced placement (a conflict copy, a relocation): remembered with the
-            // identity of the head that holds it, so a later plan that no longer holds it can
-            // retire its row, and only while that row still shows THAT head.
-            tx.execute(
-                "INSERT OR REPLACE INTO provider_placements \
-                 (group_id, physical_path, source_path, owner_identity) VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![
-                    group_id,
-                    physical.as_str(),
-                    source,
-                    NativeRowIdentity::of(head).to_bytes()
-                ],
-            )?;
         }
-        now_held.insert(physical.as_str());
         write_row(tx, group_id, physical.as_str(), head)?;
-    }
-    let previous: Vec<(String, Vec<u8>)> = {
-        let mut stmt = tx.prepare_cached(
-            "SELECT physical_path, owner_identity FROM provider_placements \
-             WHERE group_id = ?1 AND source_path = ?2",
-        )?;
-        let rows = stmt
-            .query_map(rusqlite::params![group_id, source], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<Result<_, _>>()?;
-        rows
-    };
-    for (physical, owner) in previous {
-        if !now_held.contains(physical.as_str()) {
-            // Another head may own the physical path by now: only a row that still shows the
-            // identity of the placement being retired is retired.
-            let shown: Option<Option<Vec<u8>>> = tx
-                .query_row(
-                    "SELECT native_authoring_identity FROM files \
-                     WHERE group_id = ?1 AND path = ?2 AND state = 'current' AND deleted = 0",
-                    rusqlite::params![group_id, physical],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if shown.is_none_or(|identity| identity.as_deref() == Some(owner.as_slice())) {
-                tombstone_if_live(tx, group_id, &physical)?;
-            }
-            tx.execute(
-                "DELETE FROM provider_placements WHERE group_id = ?1 AND physical_path = ?2",
-                rusqlite::params![group_id, physical],
-            )?;
-        }
     }
     if !holds_source_path {
         let was_row = tombstone_if_live(tx, group_id, source)?;

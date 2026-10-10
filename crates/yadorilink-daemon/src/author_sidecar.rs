@@ -77,8 +77,8 @@ pub fn read_sidecar(db_path: &Path) -> io::Result<Option<InstanceSidecar>> {
 }
 
 /// Durably replaces the sidecar beside `db_path` with `sidecar`: temp file,
-/// fsync, rename, directory fsync. Returns only once the new sidecar is
-/// durable.
+/// fsync, then a durable move over the old one. Returns only once the new
+/// sidecar is durable.
 pub fn write_sidecar(db_path: &Path, sidecar: &InstanceSidecar) -> io::Result<()> {
     let temp = temp_path(db_path);
     let written = (|| {
@@ -86,29 +86,16 @@ pub fn write_sidecar(db_path: &Path, sidecar: &InstanceSidecar) -> io::Result<()
         file.write_all(&encode(sidecar))?;
         file.sync_all()?;
         drop(file);
-        fs::rename(&temp, sidecar_path(db_path))
+        yadorilink_root_authority::durable_dir::publish_durably(
+            &temp,
+            &sidecar_path(db_path),
+            yadorilink_root_authority::durable_dir::Replace::Yes,
+        )
     })();
     if written.is_err() {
         let _ = fs::remove_file(&temp);
     }
-    written?;
-    sync_parent_directory(db_path)
-}
-
-#[cfg(unix)]
-fn sync_parent_directory(path: &Path) -> io::Result<()> {
-    match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => fs::File::open(parent)?.sync_all(),
-        _ => fs::File::open(".")?.sync_all(),
-    }
-}
-
-// Windows cannot open a directory for `sync_all` through `std::fs`; the temp
-// file itself is flushed before the rename (as in
-// `yadorilink-local-storage`'s materialization write).
-#[cfg(not(unix))]
-fn sync_parent_directory(_path: &Path) -> io::Result<()> {
-    Ok(())
+    written
 }
 
 #[cfg(test)]

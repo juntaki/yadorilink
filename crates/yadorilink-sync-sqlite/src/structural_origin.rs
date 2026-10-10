@@ -97,16 +97,11 @@ pub fn init_structural_origin_schema(conn: &Connection) -> Result<(), SyncSqlite
     conn.execute_batch(
         r#"
         -- A directory this device is about to create for descendants, not
-        -- yet bound to an identity. `mutation_generation` is the path's
-        -- mutation fence as the intent bumped it; completion is refused
-        -- once anything else has moved the fence since.
-        CREATE TABLE IF NOT EXISTS structural_directory_intents (
-            group_id             TEXT NOT NULL,
-            path                 TEXT NOT NULL,
-            mutation_generation  INTEGER NOT NULL,
-            intent_at_unix_nanos INTEGER NOT NULL,
-            PRIMARY KEY (group_id, path)
-        );
+        -- yet bound to an identity, is a `structural_mkdir` row of
+        -- `materialization_intents` (see that table). Its
+        -- `mutation_generation` is the path's mutation fence as the intent
+        -- bumped it; completion is refused once anything else has moved the
+        -- fence.
 
         -- A directory this device created (or kept) only to hold
         -- descendants, bound to its filesystem identity. `object_address`
@@ -283,12 +278,13 @@ pub fn record_structural_intent(
     let mutation_generation =
         bump_mutation_fence(conn, group_id, path, "structural-mkdir", now_unix_nanos)?;
     conn.prepare_cached(
-        "INSERT INTO structural_directory_intents
-            (group_id, path, mutation_generation, intent_at_unix_nanos)
-         VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT (group_id, path) DO UPDATE SET
+        "INSERT INTO materialization_intents
+            (group_id, path, kind, target_version_hash, created_at_unix_nanos,
+             mutation_generation)
+         VALUES (?1, ?2, 'structural_mkdir', x'', ?4, ?3)
+         ON CONFLICT (group_id, path, kind) DO UPDATE SET
             mutation_generation = excluded.mutation_generation,
-            intent_at_unix_nanos = excluded.intent_at_unix_nanos",
+            created_at_unix_nanos = excluded.created_at_unix_nanos",
     )?
     .execute(rusqlite::params![group_id, path, mutation_generation, now_unix_nanos])?;
     Ok(StructuralIntent { mutation_generation })
@@ -339,16 +335,11 @@ pub fn abandon_structural_intent(
     delete_intent(conn, group_id, path)
 }
 
-/// Drops every structural intent recorded before
-/// `recorded_before_unix_nanos`, across all groups, and returns the
+/// Drops every structural intent, across all groups, and returns the
 /// `(group_id, path)` pairs dropped -- recording nothing in their place.
 /// Recovery does not use it: a directory an interrupted `mkdir` made would
 /// then read as a user's. It resolves each intent with
 /// [`drop_structural_intent_recording_lost_provenance`] instead.
-///
-/// At startup nothing is in flight, so every intent is an interrupted one:
-/// pass `i64::MAX`. A periodic sweep passes a cutoff old enough that no
-/// live `mkdir` can still be between its two phases.
 ///
 /// Dropped, never completed: whether the directory now at the path is the
 /// one the interrupted `mkdir` created cannot be proven from disk, and an
@@ -356,15 +347,13 @@ pub fn abandon_structural_intent(
 /// directory is left as it is and becomes `OriginUnknown`.
 pub fn drop_unresolved_structural_intents(
     conn: &Connection,
-    recorded_before_unix_nanos: i64,
 ) -> Result<Vec<(String, String)>, SyncSqliteError> {
     let mut stmt = conn.prepare_cached(
-        "DELETE FROM structural_directory_intents WHERE intent_at_unix_nanos < ?1
+        "DELETE FROM materialization_intents WHERE kind = 'structural_mkdir'
          RETURNING group_id, path",
     )?;
-    let rows = stmt.query_map([recorded_before_unix_nanos], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
+    let rows =
+        stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
     let mut dropped: Vec<(String, String)> = rows.collect::<Result<_, _>>()?;
     dropped.sort();
     Ok(dropped)
@@ -382,19 +371,20 @@ pub struct UnresolvedStructuralIntent {
     pub mutation_generation: i64,
 }
 
-/// Every structural intent recorded before `recorded_before_unix_nanos`,
-/// across all groups, ordered by group and path. Reads only: recovery
+/// Every structural intent of `group_id` (of every group when `None`),
+/// ordered by group and path. Reads only: recovery
 /// observes what is at each path, then resolves each intent with
 /// [`drop_structural_intent_recording_lost_provenance`].
 pub fn list_unresolved_structural_intents(
     conn: &Connection,
-    recorded_before_unix_nanos: i64,
+    group_id: Option<&str>,
 ) -> Result<Vec<UnresolvedStructuralIntent>, SyncSqliteError> {
     let mut stmt = conn.prepare_cached(
-        "SELECT group_id, path, mutation_generation FROM structural_directory_intents
-         WHERE intent_at_unix_nanos < ?1 ORDER BY group_id, path",
+        "SELECT group_id, path, mutation_generation FROM materialization_intents
+         WHERE kind = 'structural_mkdir' AND (?1 IS NULL OR group_id = ?1)
+         ORDER BY group_id, path",
     )?;
-    let rows = stmt.query_map([recorded_before_unix_nanos], |row| {
+    let rows = stmt.query_map([group_id], |row| {
         Ok(UnresolvedStructuralIntent {
             group_id: row.get(0)?,
             path: row.get(1)?,
@@ -422,8 +412,9 @@ pub fn drop_structural_intent_recording_lost_provenance(
 ) -> Result<bool, SyncSqliteError> {
     let dropped = conn
         .prepare_cached(
-            "DELETE FROM structural_directory_intents
-             WHERE group_id = ?1 AND path = ?2 AND mutation_generation = ?3",
+            "DELETE FROM materialization_intents
+             WHERE group_id = ?1 AND path = ?2 AND kind = 'structural_mkdir'
+               AND mutation_generation = ?3",
         )?
         .execute(rusqlite::params![intent.group_id, intent.path, intent.mutation_generation])?
         > 0;
@@ -746,8 +737,8 @@ fn pending_intent_generation(
 ) -> Result<Option<i64>, SyncSqliteError> {
     Ok(conn
         .prepare_cached(
-            "SELECT mutation_generation FROM structural_directory_intents
-             WHERE group_id = ?1 AND path = ?2",
+            "SELECT mutation_generation FROM materialization_intents
+             WHERE group_id = ?1 AND path = ?2 AND kind = 'structural_mkdir'",
         )?
         .query_row(rusqlite::params![group_id, path], |row| row.get(0))
         .optional()?)
@@ -756,7 +747,8 @@ fn pending_intent_generation(
 fn delete_intent(conn: &Connection, group_id: &str, path: &str) -> Result<bool, SyncSqliteError> {
     let removed = conn
         .prepare_cached(
-            "DELETE FROM structural_directory_intents WHERE group_id = ?1 AND path = ?2",
+            "DELETE FROM materialization_intents
+             WHERE group_id = ?1 AND path = ?2 AND kind = 'structural_mkdir'",
         )?
         .execute(rusqlite::params![group_id, path])?;
     Ok(removed > 0)

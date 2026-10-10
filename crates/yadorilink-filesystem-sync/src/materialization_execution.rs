@@ -294,11 +294,12 @@ impl From<yadorilink_local_storage::StorageError> for MaterializationExecutionEr
 pub struct GroupStructuralLedger<'a> {
     port: &'a dyn MaterializationExecutionPort,
     group_id: &'a str,
+    names: GroupTempLedger<'a>,
 }
 
 impl<'a> GroupStructuralLedger<'a> {
     pub fn new(port: &'a dyn MaterializationExecutionPort, group_id: &'a str) -> Self {
-        Self { port, group_id }
+        Self { port, group_id, names: GroupTempLedger::new(port, group_id) }
     }
 }
 
@@ -309,6 +310,10 @@ fn ledger_error(error: MaterializationExecutionError) -> yadorilink_local_storag
 }
 
 impl yadorilink_local_storage::StructuralDirectoryLedger for GroupStructuralLedger<'_> {
+    fn names(&self) -> &dyn yadorilink_local_storage::TempFileLedger {
+        &self.names
+    }
+
     fn record_intent(&self, rel_path: &str) -> Result<(), yadorilink_local_storage::StorageError> {
         self.port.record_structural_directory_intent(self.group_id, rel_path).map_err(ledger_error)
     }
@@ -326,9 +331,56 @@ impl yadorilink_local_storage::StructuralDirectoryLedger for GroupStructuralLedg
     fn abandon(&self, rel_path: &str) -> Result<(), yadorilink_local_storage::StorageError> {
         self.port.abandon_structural_directory_intent(self.group_id, rel_path).map_err(ledger_error)
     }
+
+    fn interrupted(&self, rel_path: &str) -> Result<(), yadorilink_local_storage::StorageError> {
+        self.port
+            .resolve_interrupted_structural_intent(self.group_id, rel_path)
+            .map_err(ledger_error)
+    }
+}
+
+/// The temp-file ledger of one group, over the port: a writer in
+/// `yadorilink-local-storage` records the temp file it will create through it.
+pub struct GroupTempLedger<'a> {
+    port: &'a dyn MaterializationExecutionPort,
+    group_id: &'a str,
+}
+
+impl<'a> GroupTempLedger<'a> {
+    pub fn new(port: &'a dyn MaterializationExecutionPort, group_id: &'a str) -> Self {
+        Self { port, group_id }
+    }
+}
+
+impl yadorilink_local_storage::TempFileLedger for GroupTempLedger<'_> {
+    fn record(
+        &self,
+        tmp_path: &std::path::Path,
+    ) -> Result<(), yadorilink_local_storage::StorageError> {
+        self.port.record_temp_file(self.group_id, tmp_path).map_err(|error| {
+            yadorilink_local_storage::StorageError::Io(std::io::Error::other(format!(
+                "temp file ledger: {error}"
+            )))
+        })
+    }
+
+    fn release(&self, tmp_path: &std::path::Path) {
+        self.port.release_temp_file(self.group_id, tmp_path);
+    }
 }
 
 pub trait MaterializationExecutionPort: Send + Sync {
+    /// Durably records the temp file a writer is about to create (see
+    /// `yadorilink_local_storage::TempFileLedger`).
+    fn record_temp_file(
+        &self,
+        group_id: &str,
+        tmp_path: &Path,
+    ) -> Result<(), MaterializationExecutionError>;
+
+    /// Forgets a recorded temp file once it is renamed away or removed.
+    fn release_temp_file(&self, group_id: &str, tmp_path: &Path);
+
     fn get_file(
         &self,
         group_id: &str,
@@ -578,23 +630,6 @@ pub trait MaterializationExecutionPort: Send + Sync {
         generation: i64,
     ) -> Result<bool, MaterializationExecutionError>;
 
-    /// Moves the installed File or Symlink row held at `path` to the copy
-    /// name the namespace projection gives it beside a directory, holds the
-    /// copy name for the next reconciliation to place, records the
-    /// directory at `path` as retained for its untracked content (see
-    /// [`Self::retain_directory_with_untracked_content`] for `removable`),
-    /// and releases `path`'s hold -- all in one transaction, and only while
-    /// that hold is at `generation`. Returns the copy name, or `None` when
-    /// nothing moved (and nothing was recorded). See
-    /// `yadorilink_sync_sqlite::held_path`.
-    fn relocate_held_entry_beside_directory(
-        &self,
-        group_id: &str,
-        path: &str,
-        generation: i64,
-        removable: Option<&yadorilink_root_authority::fs_identity::FileIdentity>,
-    ) -> Result<Option<String>, MaterializationExecutionError>;
-
     /// Phase 1 of a structural `mkdir` of `path` (a directory this device
     /// is about to create only to hold a descendant): records the intent
     /// and moves the path's mutation fence, durably, before the syscall.
@@ -621,6 +656,14 @@ pub trait MaterializationExecutionPort: Send + Sync {
     /// (`EEXIST`, or any failure): drops the pending intent, claiming
     /// nothing.
     fn abandon_structural_directory_intent(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<(), MaterializationExecutionError>;
+
+    /// A `mkdir` writer leaving with its intent unsettled: resolves that one
+    /// intent as startup recovery would.
+    fn resolve_interrupted_structural_intent(
         &self,
         group_id: &str,
         path: &str,

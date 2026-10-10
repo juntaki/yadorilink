@@ -27,6 +27,13 @@ use yadorilink_root_authority::root_identity::VerifiedRoot;
 fn adopt_root(state: &ReplicaCoordinator, group: &str, root: &std::path::Path) {
     let _ = state.link_repository().add_link(&root.to_string_lossy(), group);
     VerifiedRoot::open(root, group, state).unwrap();
+    state
+        .link_repository()
+        .set_capture_volume_identity_for_group(
+            group,
+            &yadorilink_filesystem_sync::device_boundary::root_volume_identity(root).unwrap(),
+        )
+        .unwrap();
 }
 
 fn record_with_blocks(path: &str, content: &[u8], hash: Vec<u8>) -> FileRecord {

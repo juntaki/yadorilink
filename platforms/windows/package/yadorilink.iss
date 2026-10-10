@@ -51,6 +51,9 @@
   #define HasYadoriLinkSignTool
 #endif
 
+; TODO(#76): register the yadorilink:// URL scheme here once the WinUI app can act on the URL.
+; Registering it earlier would start a second tray app per click (no single-instance guard).
+
 [Setup]
 ; Fixed AppId so re-running the installer / Add-Remove-Programs upgrade
 ; detection is stable across versions.
@@ -184,7 +187,7 @@ end;
 // the normal silent-install flags; this scans for that switch (Inno Setup
 // has no built-in support for arbitrary custom /switches, only ParamStr)
 // and, if present, records it so the running daemon's
-// `install_windows::detect_package_manager_marker` can defer self-update
+// `install_source::detect_package_manager_marker` can defer self-update
 // to `winget upgrade` instead of running its own installer over an
 // install WinGet believes it owns.
 function GetPackageManagerParam: String;
@@ -222,7 +225,7 @@ begin
       // as. {#MyAppName}'s AppId-scoped uninstall key already lives under
       // HKLM for the same reason; this is a small, separate key
       // (`Software\yadorilink`) rather than reusing that uninstall entry
-      // so `install_windows::detect_package_manager_marker` doesn't need
+      // so `install_source::detect_package_manager_marker` doesn't need
       // to know Inno Setup's uninstall-key layout.
       RegWriteStringValue(HKLM, 'Software\yadorilink', 'InstallSource', PackageManager);
     end;

@@ -159,6 +159,8 @@ impl From<yadorilink_root_authority::RootAuthorityError> for SyncSqliteError {
             // No dedicated variant -- `CorruptState` is the closest existing shape (a
             // fail-closed condition the caller cannot repair by retrying).
             E::RootIdentityMismatch(msg) => SyncSqliteError::CorruptState(msg),
+            // Kept an `Io`, as a lost sidecar always was here: callers re-verify the permit.
+            E::OwnershipLost(msg) => SyncSqliteError::Io(std::io::Error::other(msg)),
             // Lossless, not flattened to a message string: `link.rs` gives
             // `AmbiguousLink` a real sync-sqlite call site with the same "callers match on the
             // structured variant, not the message" requirement

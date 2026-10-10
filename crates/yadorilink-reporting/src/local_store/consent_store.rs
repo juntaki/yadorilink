@@ -71,17 +71,31 @@ impl ConsentStore {
     }
 
     /// Writes `state` to disk, creating the reporting directory if needed.
-    /// Writes to a temp file and renames over the target so a crash
-    /// mid-write can't leave a half-written, unparseable consent file
-    /// behind (`load` would otherwise treat that as a hard error).
+    /// Writes to a temp file, flushes it and publishes it over the target by a
+    /// durable move, so a crash mid-write can't leave a half-written,
+    /// unparseable consent file behind (`load` would otherwise treat that as a
+    /// hard error), and a withdrawn consent can't come back after a power loss.
     pub fn save(&self, state: &ConsentState) -> ReportingResult<()> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_string_pretty(state)?;
         let tmp_path = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp_path, json)?;
-        std::fs::rename(&tmp_path, &self.path)?;
+        let flushed = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&tmp_path)?;
+            file.write_all(json.as_bytes())?;
+            file.sync_all()
+        })();
+        if let Err(error) = flushed {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(error.into());
+        }
+        yadorilink_root_authority::durable_dir::publish_durably(
+            &tmp_path,
+            &self.path,
+            yadorilink_root_authority::durable_dir::Replace::Yes,
+        )?;
         Ok(())
     }
 

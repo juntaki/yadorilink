@@ -426,6 +426,9 @@ async fn an_unreadable_proof_is_never_current_content() {
     assert!(!remote.object_present && !remote.current_content_present);
 }
 
+// macOS locations only; a Windows provider folder is found through the host's record of its sync roots
+// (`windows_sync_roots`).
+#[cfg(not(windows))]
 #[tokio::test]
 async fn a_file_provider_location_resolves_by_display_name_not_by_path() {
     use yadorilink_replica_domain::session_state::ProviderKind;

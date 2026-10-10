@@ -1,0 +1,446 @@
+//! Resolving a contested path: the author of a losing head renames it.
+//!
+//! A conflict is resolved by an ordinary delta. The author of a head that
+//! loses its path removes that head and puts the same version at a copy path
+//! derived from the path and the version alone ([`copy_path`]). Nothing about
+//! the delta is special: it is exactly what the author would have signed had
+//! the user renamed the file, and admission applies no extra rule to it.
+//!
+//! This module computes those deltas as pure data from the replicated
+//! [`NativeState`]. It never signs, reads a disk or looks at occupancy.
+//!
+//! # Rules
+//!
+//! * Only the author of a head moves it ([`plan_own_forks`]); a Writer moves
+//!   another author's head only when that author can never act
+//!   ([`fallback_may_fork`]), and then removes only that author's heads.
+//! * A head loses when [`crate::native_project::loses`] says so: it is
+//!   file-like and the path has to be a directory, or a version of larger
+//!   [`crate::native_state::win_key`] holds the path. Directory heads are
+//!   never copied.
+//! * Every delta is self-contained: it puts every version it removes, so no
+//!   admitted prefix of a plan can leave a head removed without its copy.
+//! * An author holds at most [`MAX_SELF_HEADS`] heads at a path. A put into a
+//!   full bucket supersedes only a head of the same version; a bucket full of
+//!   other versions is resolved first (its heads are forks of their own) or
+//!   the plan is refused. A distinct version is never dropped.
+//! * A copy path that is occupied is an ordinary contest at that path and is
+//!   handled by the next round of planning, not by choosing another name.
+
+use std::collections::BTreeSet;
+
+use crate::author::{AuthorId, MAX_SELF_HEADS};
+use crate::conflict::{truncate_stem_to_fit, MAX_COMPONENT_BYTES};
+use crate::file::RecordKind;
+use crate::ids::{DeltaHash, SyncPath, VersionHash};
+use crate::limits::MAX_PATH_BYTES;
+use crate::native_project::loses;
+use crate::native_state::{HeadPayload, LiveHead, NativeState, RemoteOp};
+use crate::signed_delta::{DeltaPut, HeadRef};
+
+/// How many leading bytes of the copy id a copy name shows: 128 bits, 32 hex
+/// characters.
+pub const COPY_ID_BYTES: usize = 16;
+
+/// Domain separator of the copy id preimage.
+const COPY_ID_DOMAIN: &[u8] = b"ylnk-copy-2";
+
+/// The name of the copy of `version` that lost the path `path`:
+/// `name (conflicted copy, <id>).ext`, where
+/// `id = hex(SHA-256("ylnk-copy-2" || u32be(len(path)) || path || version)[..16])`.
+///
+/// A pure function of the full source path (including any copy marker it
+/// already carries: a copy of a copy is a different path and so a different
+/// id) and the full version hash. No occupancy, salt, clock, device or
+/// arrival order is an input, so every replica derives the same name. Only the
+/// stem is shortened, on a character boundary, to keep the component within
+/// [`MAX_COMPONENT_BYTES`]; the id covers the untruncated path.
+pub fn copy_path(path: &str, version: &VersionHash) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(COPY_ID_DOMAIN);
+    hasher.update((path.len() as u32).to_be_bytes());
+    hasher.update(path.as_bytes());
+    hasher.update(version.0);
+    let digest = hasher.finalize();
+    let id = hex::encode(&digest[..COPY_ID_BYTES]);
+
+    let (dir, filename) = match path.rsplit_once('/') {
+        Some((dir, name)) => (format!("{dir}/"), name),
+        None => (String::new(), path),
+    };
+    let suffix = format!(" (conflicted copy, {id})");
+    let (stem, ext) = match filename.rsplit_once('.') {
+        // An extension too long to leave room for the suffix is not kept as
+        // one: the whole file name is the stem, so the component stays
+        // within the limit whatever the source looked like.
+        Some((stem, ext))
+            if !stem.is_empty() && suffix.len() + 1 + ext.len() < MAX_COMPONENT_BYTES / 2 =>
+        {
+            (stem, Some(ext))
+        }
+        _ => (filename, None),
+    };
+    let ext_bytes = ext.map_or(0, |ext| 1 + ext.len());
+    let stem = truncate_stem_to_fit(stem, suffix.len() + ext_bytes);
+    match ext {
+        Some(ext) => format!("{dir}{stem}{suffix}.{ext}"),
+        None => format!("{dir}{stem}{suffix}"),
+    }
+}
+
+/// One path of a fork delta, in the shape of an ordinary delta op.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ForkOp {
+    pub path: SyncPath,
+    pub removes: Vec<HeadRef>,
+    pub put: Option<DeltaPut>,
+}
+
+/// The ops of one delta the author signs.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ForkDelta {
+    pub ops: Vec<ForkOp>,
+}
+
+/// An ordered chain of deltas of one author, each applied after the previous.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct ForkPlan {
+    pub deltas: Vec<ForkDelta>,
+    /// Paths with an own head that cannot be judged yet because the record of
+    /// some head's version is missing. They are forked once it arrives.
+    pub waiting_for_records: Vec<SyncPath>,
+    /// Paths whose fork cannot be made (the copy path is too long, or the
+    /// signer's bucket at it is full of other versions). They stay contested;
+    /// they do not stop the forks of other paths.
+    pub refused: Vec<(SyncPath, ForkError)>,
+}
+
+/// The shape bound of one planned delta.
+#[derive(Clone, Copy, Debug)]
+pub struct ForkLimits {
+    /// The most ops one delta of the chain may carry. At least
+    /// [`MIN_OPS_PER_DELTA`].
+    pub max_ops_per_delta: usize,
+    /// The most bytes (estimated, never under the encoded size) the ops of one
+    /// delta may take, so that a delta always fits one replication item. A
+    /// group of one remove plus put is never split, so one group over the
+    /// budget travels alone.
+    pub max_bytes_per_delta: usize,
+}
+
+/// The bytes an op takes on the wire, estimated from above: the path
+/// (length-prefixed), the counts, each removal naming a head (device id,
+/// incarnation, sequence, provenance) and the put.
+fn fork_op_bytes(op: &ForkOp) -> usize {
+    op.path.as_str().len()
+        + 64
+        + op.removes.iter().map(|removal| 60 + removal.dot.author.device.0.len()).sum::<usize>()
+}
+
+/// One path's fork needs an op for the path itself and one per distinct
+/// losing version of the author, at most [`MAX_SELF_HEADS`].
+pub const MIN_OPS_PER_DELTA: usize = 1 + MAX_SELF_HEADS;
+
+/// Why a plan could not be made.
+#[derive(Clone, PartialEq, Eq, Debug, thiserror::Error)]
+pub enum ForkError {
+    #[error("a fork delta needs room for at least {MIN_OPS_PER_DELTA} ops")]
+    OpBudgetTooSmall,
+    #[error("two losing heads would be copied to {path:?}")]
+    DestinationCollision { path: SyncPath },
+    #[error("the author's heads at {path:?} cannot take another version without dropping one")]
+    BucketFull { path: SyncPath },
+    #[error("copy destinations form a cycle at {path:?}")]
+    Cycle { path: SyncPath },
+    #[error("the copy path of {path:?} would exceed the path length limit")]
+    DestinationTooLong { path: SyncPath },
+    #[error("the author's sequence is exhausted")]
+    SeqExhausted,
+}
+
+struct Group {
+    source: SyncPath,
+    removes: Vec<HeadRef>,
+    puts: Vec<(SyncPath, VersionHash)>,
+}
+
+/// The deltas by which `author` moves each of its own losing heads to the
+/// copy path of its version.
+///
+/// A function of `state`, `author` and the record kinds only. Applying the
+/// plan and planning again yields the contests that remain (an occupied copy
+/// path, for one), never the same heads twice.
+pub fn plan_own_forks(
+    state: &NativeState,
+    author: &AuthorId,
+    kind_of: impl Fn(&VersionHash) -> Option<RecordKind>,
+    limits: ForkLimits,
+) -> Result<ForkPlan, ForkError> {
+    plan_forks(state, author, author, kind_of, limits)
+}
+
+/// Whether a Writer other than the owner of a losing head may move it.
+///
+/// Only when the owner can never act: its author state is `Closed`, or its
+/// device is not a writer at the policy point the caller verified. The
+/// answer is a function of those two facts alone: no clock, heartbeat,
+/// reachability or disk input exists.
+///
+/// Replicas may hold different verified policy points, so they may disagree
+/// (a replica that has not seen a revocation says no; after a revocation
+/// followed by a re-grant a lagging replica can say yes where an advanced one
+/// says no). That is harmless by construction rather than by agreement: what
+/// a fallback signs is an ordinary delta that every replica admits as a
+/// writer's delta, and concurrent forks of one head converge to one visible
+/// copy without losing a version.
+pub fn fallback_may_fork(owner_closed: bool, owner_is_writer_at_policy_point: bool) -> bool {
+    owner_closed || !owner_is_writer_at_policy_point
+}
+
+/// The deltas by which `signer` moves the losing heads of `owner`: the
+/// removals name only `owner`'s heads and the puts land in `signer`'s own
+/// bucket at the copy paths. With `owner == signer` this is the author
+/// forking its own heads ([`plan_own_forks`]); with another signer it is the
+/// fallback of [`fallback_may_fork`], and the caller must have checked that.
+pub fn plan_forks(
+    state: &NativeState,
+    owner: &AuthorId,
+    signer: &AuthorId,
+    kind_of: impl Fn(&VersionHash) -> Option<RecordKind>,
+    limits: ForkLimits,
+) -> Result<ForkPlan, ForkError> {
+    if limits.max_ops_per_delta < MIN_OPS_PER_DELTA {
+        return Err(ForkError::OpBudgetTooSmall);
+    }
+    let mut plan = ForkPlan::default();
+    let mut groups: Vec<Group> = Vec::new();
+
+    for (path, heads) in &state.heads {
+        if !heads.keys().any(|dot| dot.author == *owner) {
+            continue;
+        }
+        let has_descendant = state
+            .heads
+            .range(SyncPath(format!("{}/", path.as_str()))..)
+            .next()
+            .is_some_and(|(key, _)| key.as_str().starts_with(&format!("{}/", path.as_str())));
+        let mut removes = Vec::new();
+        let mut versions: BTreeSet<VersionHash> = BTreeSet::new();
+        let mut judged = true;
+        for (dot, payload) in heads {
+            if dot.author != *owner {
+                continue;
+            }
+            let head = LiveHead { dot: dot.clone(), payload: payload.clone() };
+            match loses(&head, &kind_of, heads, has_descendant) {
+                None => {
+                    judged = false;
+                    break;
+                }
+                Some(true) => {
+                    removes.push(HeadRef { dot: dot.clone(), provenance: payload.provenance });
+                    versions.insert(payload.version);
+                }
+                Some(false) => {}
+            }
+        }
+        if !judged {
+            plan.waiting_for_records.push(path.clone());
+            continue;
+        }
+        if removes.is_empty() {
+            continue;
+        }
+        let puts: Vec<(SyncPath, VersionHash)> = versions
+            .into_iter()
+            .map(|version| (SyncPath(copy_path(path.as_str(), &version)), version))
+            .collect::<Vec<_>>();
+        if let Some((destination, _)) = puts.iter().find(|(d, _)| d.as_str().len() > MAX_PATH_BYTES)
+        {
+            plan.refused
+                .push((path.clone(), ForkError::DestinationTooLong { path: destination.clone() }));
+            continue;
+        }
+        groups.push(Group { source: path.clone(), removes, puts });
+    }
+
+    let mut destinations: BTreeSet<&SyncPath> = BTreeSet::new();
+    for group in &groups {
+        for (destination, _) in &group.puts {
+            if !destinations.insert(destination) {
+                return Err(ForkError::DestinationCollision { path: destination.clone() });
+            }
+        }
+    }
+
+    let ordered = order_groups(groups)?;
+
+    // Emit the chain against a simulation of the author's own state.
+    let mut sim = state.clone();
+    let mut current: Vec<ForkOp> = Vec::new();
+    let mut touched: BTreeSet<SyncPath> = BTreeSet::new();
+    let mut current_bytes = 0usize;
+    for group in &ordered {
+        loop {
+            let ops = match group_ops(&sim, signer, group) {
+                Ok(ops) => ops,
+                // The bucket may be full only until the delta being built is
+                // applied (it moves heads out of that path).
+                Err(ForkError::BucketFull { .. }) if !current.is_empty() => {
+                    flush(&mut sim, signer, &mut current, &mut touched, &mut plan)?;
+                    current_bytes = 0;
+                    continue;
+                }
+                Err(error @ ForkError::BucketFull { .. }) => {
+                    plan.refused.push((group.source.clone(), error));
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+            let overlaps = ops.iter().any(|op| touched.contains(&op.path));
+            let bytes: usize = ops.iter().map(fork_op_bytes).sum();
+            let too_big = current.len() + ops.len() > limits.max_ops_per_delta
+                || current_bytes + bytes > limits.max_bytes_per_delta;
+            if (overlaps || too_big) && !current.is_empty() {
+                flush(&mut sim, signer, &mut current, &mut touched, &mut plan)?;
+                current_bytes = 0;
+                continue;
+            }
+            current_bytes += bytes;
+            for op in ops {
+                touched.insert(op.path.clone());
+                current.push(op);
+            }
+            break;
+        }
+    }
+    if !current.is_empty() {
+        flush(&mut sim, signer, &mut current, &mut touched, &mut plan)?;
+    }
+    Ok(plan)
+}
+
+/// Orders groups so that a group whose source is another group's destination
+/// goes before that group.
+fn order_groups(groups: Vec<Group>) -> Result<Vec<Group>, ForkError> {
+    // `before[g]` are the groups that have to go before `g`: those whose
+    // source is one of its destinations.
+    let by_source: std::collections::BTreeMap<&SyncPath, usize> =
+        groups.iter().enumerate().map(|(i, g)| (&g.source, i)).collect();
+    let before: Vec<Vec<usize>> = groups
+        .iter()
+        .map(|g| g.puts.iter().filter_map(|(d, _)| by_source.get(d).copied()).collect())
+        .collect();
+    // 0 unvisited, 1 on the stack, 2 done.
+    let mut mark = vec![0u8; groups.len()];
+    let mut order = Vec::with_capacity(groups.len());
+    for start in 0..groups.len() {
+        let mut stack = vec![(start, 0usize)];
+        while let Some((node, next)) = stack.pop() {
+            if next == 0 {
+                match mark[node] {
+                    2 => continue,
+                    1 => return Err(ForkError::Cycle { path: groups[node].source.clone() }),
+                    _ => mark[node] = 1,
+                }
+            }
+            if let Some(&dep) = before[node].get(next) {
+                stack.push((node, next + 1));
+                if mark[dep] == 1 {
+                    return Err(ForkError::Cycle { path: groups[dep].source.clone() });
+                }
+                if mark[dep] == 0 {
+                    stack.push((dep, 0));
+                }
+            } else {
+                mark[node] = 2;
+                order.push(node);
+            }
+        }
+    }
+    let mut slots: Vec<Option<Group>> = groups.into_iter().map(Some).collect();
+    Ok(order.into_iter().map(|i| slots[i].take().expect("each group once")).collect())
+}
+
+fn group_ops(
+    sim: &NativeState,
+    author: &AuthorId,
+    group: &Group,
+) -> Result<Vec<ForkOp>, ForkError> {
+    let mut ops =
+        vec![ForkOp { path: group.source.clone(), removes: group.removes.clone(), put: None }];
+    for (destination, version) in &group.puts {
+        let own: Vec<(&crate::native_state::Dot, &HeadPayload)> = sim
+            .heads
+            .get(destination)
+            .into_iter()
+            .flat_map(|heads| heads.iter())
+            .filter(|(dot, _)| dot.author == *author)
+            .collect();
+        let mut removes = Vec::new();
+        if own.len() + 1 > MAX_SELF_HEADS {
+            // Supersede only heads of the very version being put: the copy
+            // stays represented, nothing distinct is dropped.
+            let need = own.len() + 1 - MAX_SELF_HEADS;
+            let same: Vec<_> =
+                own.iter().filter(|(_, payload)| payload.version == *version).collect();
+            if same.len() < need {
+                return Err(ForkError::BucketFull { path: destination.clone() });
+            }
+            for (dot, payload) in same.into_iter().take(need) {
+                removes.push(HeadRef { dot: (*dot).clone(), provenance: payload.provenance });
+            }
+        }
+        ops.push(ForkOp {
+            path: destination.clone(),
+            removes,
+            put: Some(DeltaPut { version: *version }),
+        });
+    }
+    Ok(ops)
+}
+
+fn flush(
+    sim: &mut NativeState,
+    author: &AuthorId,
+    current: &mut Vec<ForkOp>,
+    touched: &mut BTreeSet<SyncPath>,
+    plan: &mut ForkPlan,
+) -> Result<(), ForkError> {
+    let ops = std::mem::take(current);
+    touched.clear();
+    let seq = sim.next_dot(author).map_err(|_| ForkError::SeqExhausted)?.seq;
+    let mut provenance = [0u8; 32];
+    provenance[..8].copy_from_slice(&seq.0.to_be_bytes());
+    let remote: Vec<RemoteOp> = ops
+        .iter()
+        .map(|op| RemoteOp {
+            path: op.path.clone(),
+            removes: op.removes.clone(),
+            put: op
+                .put
+                .as_ref()
+                .map(|put| HeadPayload { version: put.version, provenance: DeltaHash(provenance) }),
+        })
+        .collect();
+    sim.receive_verified(author, seq, &remote).map_err(|_| ForkError::SeqExhausted)?;
+    if let Err(violation) = sim.check_invariants() {
+        use crate::native_state::InvariantViolation;
+        return Err(match violation {
+            InvariantViolation::SelfHeadBound { path, .. } => ForkError::BucketFull { path },
+            _ => ForkError::SeqExhausted,
+        });
+    }
+    plan.deltas.push(ForkDelta { ops });
+    Ok(())
+}
+
+/// Every distinct version live anywhere in `state`.
+pub fn live_versions(state: &NativeState) -> BTreeSet<VersionHash> {
+    state.heads.values().flat_map(|heads| heads.values().map(|p| p.version)).collect()
+}
+
+#[cfg(test)]
+mod tests;

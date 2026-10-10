@@ -11,7 +11,50 @@
 use std::fs;
 use std::path::Path;
 
+use yadorilink_root_authority::durable_dir::{DurableNamespace, NameLedger, NsError};
+
 use crate::error::StorageError;
+use crate::materialize_write::TempFileLedger;
+
+/// The handle for durable namespace changes beside `path`, or `None` where the
+/// volume does not offer them (Windows while its gate is closed, a file system
+/// the probe rejects). Callers then keep the plain rename they always had, with
+/// no durability claim beyond it.
+pub(crate) fn durable_namespace_beside(path: &Path) -> Option<DurableNamespace> {
+    // The writers' own tests run the durable shapes on every platform, Windows
+    // included, where the gate is closed; the gate and the probe are tested
+    // where they live.
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        let _ = path;
+        Some(DurableNamespace::unchecked_for_tests())
+    }
+    #[cfg(not(any(test, feature = "test-support")))]
+    durable_namespace_checked(path)
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+fn durable_namespace_checked(path: &Path) -> Option<DurableNamespace> {
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    DurableNamespace::open(dir).ok()
+}
+
+/// A [`TempFileLedger`] as the [`NameLedger`] a durable operation records its
+/// Stage and Discard names in.
+pub(crate) struct LedgerNames<'a>(pub &'a dyn TempFileLedger);
+
+impl NameLedger for LedgerNames<'_> {
+    fn record(&self, path: &Path) -> std::io::Result<()> {
+        self.0.record(path).map_err(|error| match error {
+            StorageError::Io(error) => error,
+            other => std::io::Error::other(other.to_string()),
+        })
+    }
+
+    fn release(&self, path: &Path) {
+        self.0.release(path);
+    }
+}
 
 /// Single crate-wide boundary for removing a filesystem object. Block-store
 /// segment retirement and materialization cleanup both pass through here so
@@ -21,7 +64,7 @@ pub(crate) fn remove_path(path: &Path) -> std::io::Result<()> {
 }
 
 /// What [`remove_empty_dir`] found at its path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EmptyDirectoryRemoval {
     /// The directory was empty and is gone.
     Removed,
@@ -32,16 +75,30 @@ pub enum EmptyDirectoryRemoval {
     /// Something other than a directory is at the path (a symlink to a
     /// directory included). Nothing was removed.
     NotADirectory,
+    /// The directory gained a child while it was being moved aside to be
+    /// removed, and something else took its name before it could be put back.
+    /// Nothing was deleted: the directory and its child stand under the reserved
+    /// name at this path, and the user has to be told.
+    Stranded(std::path::PathBuf),
 }
 
 /// Removes the directory at `path` only if it is empty: one non-recursive
-/// `rmdir`. The only way this crate removes a directory. There is no
+/// removal. The only way this crate removes a directory. There is no
 /// recursive counterpart on purpose: a directory's contents are removed
 /// entry by entry by whoever knows each one (a replicated delete), and
 /// anything left is something this device does not know about -- a
 /// user's untracked file, an ignored `.git`, an OS's `.DS_Store` -- which
 /// is never deleted on anyone's behalf.
 pub fn remove_empty_dir(path: &Path) -> Result<EmptyDirectoryRemoval, StorageError> {
+    remove_empty_dir_in(path, &crate::materialize_write::NoTempLedger)
+}
+
+/// [`remove_empty_dir`] with the Discard name a durable removal may need
+/// recorded in `ledger` first.
+pub fn remove_empty_dir_in(
+    path: &Path,
+    ledger: &dyn TempFileLedger,
+) -> Result<EmptyDirectoryRemoval, StorageError> {
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.is_dir() => {}
         Ok(_) => return Ok(EmptyDirectoryRemoval::NotADirectory),
@@ -49,6 +106,9 @@ pub fn remove_empty_dir(path: &Path) -> Result<EmptyDirectoryRemoval, StorageErr
             return Ok(EmptyDirectoryRemoval::Absent)
         }
         Err(e) => return Err(e.into()),
+    }
+    if let Some(ns) = durable_namespace_beside(path) {
+        return durable_remove_empty_dir(&ns, path, ledger);
     }
     match fs::remove_dir(path) {
         Ok(()) => {
@@ -76,6 +136,51 @@ pub fn remove_empty_dir(path: &Path) -> Result<EmptyDirectoryRemoval, StorageErr
     }
 }
 
+fn durable_remove_empty_dir(
+    ns: &DurableNamespace,
+    path: &Path,
+    ledger: &dyn TempFileLedger,
+) -> Result<EmptyDirectoryRemoval, StorageError> {
+    use yadorilink_root_authority::durable_dir::{DiscardOutcome, RetainReason};
+    match ns.remove_empty_dir(path, &LedgerNames(ledger)) {
+        Ok(DiscardOutcome::Removed) => Ok(EmptyDirectoryRemoval::Removed),
+        // Moved aside, which is the removal; the record stays and the next start
+        // finishes it.
+        Ok(DiscardOutcome::Retained { reason: RetainReason::RemovalFailed, .. }) => {
+            Ok(EmptyDirectoryRemoval::Removed)
+        }
+        // A child appeared meanwhile: put back, untouched.
+        Ok(DiscardOutcome::Restored) => Ok(EmptyDirectoryRemoval::NotEmpty),
+        Ok(DiscardOutcome::Retained { path: aside, reason: RetainReason::OriginalOccupied }) => {
+            tracing::error!(
+                path = %path.display(),
+                aside = %aside.display(),
+                "a directory gained a child while it was being removed and something else now \
+                 stands at its name; it was not put back and nothing was deleted: it stays \
+                 under a reserved name beside it and needs the user's attention"
+            );
+            Ok(EmptyDirectoryRemoval::Stranded(aside))
+        }
+        // Gone, but the sync that makes it durable failed: the visible state has
+        // changed and the caller advances its index state to match; a
+        // resurrected empty directory costs nothing.
+        Err(NsError::NotDurable(error)) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "directory was removed but its parent directory could not be synced"
+            );
+            Ok(EmptyDirectoryRemoval::Removed)
+        }
+        Err(NsError::NotEmpty) => Ok(EmptyDirectoryRemoval::NotEmpty),
+        Err(NsError::NotFound) => Ok(EmptyDirectoryRemoval::Absent),
+        Err(NsError::Io(e)) if e.kind() == std::io::ErrorKind::NotADirectory => {
+            Ok(EmptyDirectoryRemoval::NotADirectory)
+        }
+        Err(error) => Err(StorageError::Io(error.into())),
+    }
+}
+
 /// Single crate-wide boundary for atomically replacing a filesystem path.
 /// Callers remain responsible for their operation-specific durability and
 /// containment checks.
@@ -93,39 +198,67 @@ pub(crate) fn sync_directory(path: &Path) -> Result<(), StorageError> {
     Ok(())
 }
 
+// Windows documents no directory flush, and none is issued: what makes a
+// Windows namespace change durable is the write-through move of `durable_dir`.
+// The syncs that remain after an unlink are for the non-critical removals
+// (a retired or orphan segment), whose resurrection the store already handles.
 #[cfg(windows)]
-pub(crate) fn sync_directory(path: &Path) -> Result<(), StorageError> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_WRITE, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FlushFileBuffers, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-    };
-
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    // SAFETY: `wide` is NUL-terminated and remains alive for the call. The
-    // returned handle is checked and closed on every successful-open path.
-    let handle = unsafe {
-        CreateFileW(
-            wide.as_ptr(),
-            GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS,
-            std::ptr::null_mut(),
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(StorageError::Io(std::io::Error::last_os_error()));
-    }
-    // SAFETY: `handle` is a valid directory handle returned by CreateFileW.
-    let flushed = unsafe { FlushFileBuffers(handle) };
-    let flush_error = (flushed == 0).then(std::io::Error::last_os_error);
-    // SAFETY: this function owns the valid handle and closes it exactly once.
-    unsafe { CloseHandle(handle) };
-    if let Some(error) = flush_error {
-        return Err(StorageError::Io(error));
-    }
+pub(crate) fn sync_directory(_path: &Path) -> Result<(), StorageError> {
     Ok(())
+}
+
+/// Removes the file or link at `path` and returns once the removal is durable:
+/// the caller records the path as absent next. A path that is already gone is
+/// fine. `ledger` names the Discard name where the volume's durable shape needs
+/// one (Windows); a volume without durable moves keeps a plain unlink followed
+/// by a sync of the parent where the platform has one.
+pub fn remove_durably(path: &Path, ledger: &dyn TempFileLedger) -> Result<(), StorageError> {
+    if let Some(ns) = durable_namespace_beside(path) {
+        return match ns.remove_file(path, &LedgerNames(ledger)) {
+            Ok(_) | Err(NsError::NotFound) => Ok(()),
+            Err(error) => Err(StorageError::Io(error.into())),
+        };
+    }
+    match remove_path(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    match crate::materialize_write::sync_parent_dir(path) {
+        // The directory is gone too: nothing is left in it to make durable.
+        Err(StorageError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+/// Moves `from` to `to` without replacing anything at `to` (`AlreadyExists`
+/// otherwise) and returns once the move is durable: a durable move where the
+/// volume offers one, otherwise the no-replace rename followed by a sync of
+/// `to`'s directory where the platform has one.
+pub fn move_no_replace_durably(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(ns) = durable_namespace_beside(to) {
+        return ns
+            .durable_move(from, to, yadorilink_root_authority::durable_dir::Replace::No)
+            .map_err(std::io::Error::from);
+    }
+    yadorilink_root_authority::durable_dir::move_durably(
+        from,
+        to,
+        yadorilink_root_authority::durable_dir::Replace::No,
+    )
+}
+
+/// Creates `path` and every missing ancestor, each as its own published
+/// directory where the volume offers durable moves (the first ancestor that
+/// exists is trusted as it is), otherwise with a plain `create_dir_all`.
+pub(crate) fn create_dir_all_durably(path: &Path) -> Result<(), StorageError> {
+    let existing = path.ancestors().find(|dir| dir.is_dir());
+    let ns = existing.and_then(|dir| durable_namespace_beside(&dir.join("x")));
+    match ns {
+        Some(ns) => ns
+            .create_dir_all(path, &yadorilink_root_authority::durable_dir::NoLedger)
+            .map_err(|error| StorageError::Io(error.into())),
+        None => fs::create_dir_all(path).map_err(StorageError::from),
+    }
 }

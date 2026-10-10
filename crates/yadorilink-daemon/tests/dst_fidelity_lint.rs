@@ -28,7 +28,6 @@ use std::path::PathBuf;
 /// half-migrated tree is never falsely failed.
 const MIGRATED_FILES: &[&str] = &[
     // Added as each migration lands.
-    "dst_directory_chaos.rs",
     // `dst_intermittent_catchup_chaos.rs` was listed here for its
     // partition->FaultPlan swap and self-healing sweep hook, with an approved
     // exception for its fine-grained per-op mtime `stamp` fork. It was deleted

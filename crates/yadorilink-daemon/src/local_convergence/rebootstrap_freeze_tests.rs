@@ -175,10 +175,10 @@ async fn an_upstream_delete_is_deferred_until_the_freeze_ends() {
     assert!(!exists(&h, "d/p") && !exists(&h, "d/q"), "the deferred deletes never ran");
 }
 
-/// Two concurrent heads at a path: neither the winner at the path nor the copy of
-/// the loser is placed under the freeze; after it both are.
+/// Two concurrent heads at a path: nothing is placed under the freeze and the
+/// loser's head is not moved; after it the fork is authored and both are placed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn conflict_copies_are_not_placed_until_the_freeze_ends() {
+async fn contested_heads_are_not_forked_or_placed_until_the_freeze_ends() {
     let h = Harness::new(true);
     let a = a_version_held_here(&h, "scratch-a.bin", b"written by one peer").await;
     let b = a_version_held_here(&h, "scratch-b.bin", b"written by the other peer").await;
@@ -194,12 +194,20 @@ async fn conflict_copies_are_not_placed_until_the_freeze_ends() {
         std::fs::read_dir(h.path("d")).map_or(0, |entries| entries.filter_map(|e| e.ok()).count())
     };
     assert_eq!(placed(&h), 0, "something was placed under the freeze");
+    assert!(h.try_fork_contests().is_err(), "a fork was authored under the freeze");
 
     unfreeze(&h);
     for _ in 0..4 {
         reconcile(&h, &["d/p"]).await;
     }
-    assert_eq!(placed(&h), 2, "after the freeze the winner and the copy are placed");
+    assert_eq!(placed(&h), 0, "a contested path is placed only once it is forked");
+    h.fork_own_contests();
+    let paths = h.head_paths();
+    for _ in 0..4 {
+        let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+        reconcile(&h, &paths).await;
+    }
+    assert_eq!(placed(&h), 2, "after the fork the winner and the copy are placed");
 }
 
 // --- local capture --------------------------------------------------------------------------------

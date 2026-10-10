@@ -37,7 +37,6 @@
 use std::sync::Arc;
 
 use rusqlite::{params, Connection, OptionalExtension};
-use yadorilink_replica_domain::file::RecordKind;
 pub use yadorilink_replica_domain::session_state::HeldPath;
 use yadorilink_sqlite_runtime::SyncDatabase;
 
@@ -65,134 +64,6 @@ const HELD_SQL: &str = "EXISTS (SELECT 1 FROM held_paths h \
 
 pub(crate) fn held_sql(group: &str, path: &str) -> String {
     HELD_SQL.replace("{group}", group).replace("{path}", path)
-}
-
-/// Moves the live File or Symlink row at `path` to the copy name the
-/// namespace projection gives it when a directory holds its name, holds
-/// the copy name for the reconciliation pass to place, records the
-/// directory at `path` as retained for its untracked content (`removable`:
-/// the identity of a directory this device made there, which may go once
-/// it is empty; `None` keeps it for good), and releases `path`'s hold --
-/// all only while that hold is still at `generation`. Returns the copy
-/// name, or `None` when the hold moved (an install renewed it) or `path`
-/// has no live File or Symlink row to move; nothing is written then.
-///
-/// One transaction, because nothing brings `path` back once its hold is
-/// released: a directory left unrecorded there would read to capture as
-/// one the user made, and be authored over the installed entry.
-///
-/// For the reconciliation pass, when a directory it may not remove (the
-/// user's, or one holding content this device does not replicate) sits
-/// where an installed entry belongs: the live projection keeps the entry at
-/// its copy name beside that directory, and so does this. Left at `path`,
-/// the row would name a file where the disk has a directory, which the
-/// offline-delete scan reads as that file's deletion.
-pub(crate) fn relocate_held_entry_beside_directory_in_tx(
-    conn: &Connection,
-    group_id: &str,
-    path: &str,
-    generation: i64,
-    removable: Option<&yadorilink_root_authority::fs_identity::FileIdentity>,
-    now_unix_nanos: i64,
-) -> Result<Option<String>, SyncSqliteError> {
-    let held_at: Option<i64> = conn
-        .query_row(
-            "SELECT generation FROM held_paths WHERE group_id = ?1 AND path = ?2",
-            params![group_id, path],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if held_at != Some(generation) {
-        return Ok(None);
-    }
-    let Some(row) = crate::store::read_canonical_current_row(conn, group_id, path)? else {
-        return Ok(None);
-    };
-    if row.snapshot.deleted
-        || !matches!(row.snapshot.record_kind, RecordKind::File | RecordKind::Symlink)
-    {
-        return Ok(None);
-    }
-    // The copy name is the one the live reconciler gives the same head: the
-    // first free numbered name of its source path. A row whose head native
-    // does not name is not relocated -- its source path is unknown.
-    let Some(identity) = crate::file_index::row_authoring_in_tx(conn, group_id, path)? else {
-        return Ok(None);
-    };
-    let group = yadorilink_replica_domain::ids::FolderGroupId(group_id.to_owned());
-    let version = row.version_hash().0;
-    let mut attempt = 1u32;
-    let to = loop {
-        let candidate = yadorilink_replica_domain::native_resolver::numbered_copy_name(
-            identity.source_path.as_str(),
-            version,
-            attempt,
-        );
-        let live_row = crate::store::read_canonical_current_row(conn, group_id, &candidate)?
-            .is_some_and(|row| !row.snapshot.deleted);
-        let has_heads = !crate::native_store::native_heads_at(
-            conn,
-            &group,
-            &yadorilink_replica_domain::ids::SyncPath(candidate.clone()),
-        )?
-        .is_empty();
-        if !live_row && !has_heads {
-            break candidate;
-        }
-        attempt += 1;
-    };
-    move_current_rows(conn, group_id, &[(path.to_owned(), to.clone())])?;
-    hold_in_tx(conn, group_id, &to, now_unix_nanos)?;
-    crate::native_projection_binding::record_native_reconciliation_hold(
-        conn,
-        group_id,
-        &to,
-        identity.source_path.as_str(),
-    )?;
-    crate::structural_origin::record_retained_directory(
-        conn,
-        group_id,
-        path,
-        crate::structural_origin::RETAINED_UNTRACKED_CONTENT,
-        removable,
-        now_unix_nanos,
-    )?;
-    conn.execute(
-        "DELETE FROM held_paths WHERE group_id = ?1 AND path = ?2 AND generation = ?3",
-        params![group_id, path, generation],
-    )?;
-    Ok(Some(to))
-}
-
-/// Moves each `(from, to)` current row to `to`. The copy name has no live
-/// row (the projection gave it out), but it may have history, a tombstone
-/// included: the moved row becomes its current row, after all of it.
-pub(crate) fn move_current_rows(
-    conn: &Connection,
-    group_id: &str,
-    moves: &[(String, String)],
-) -> Result<(), SyncSqliteError> {
-    for (from, to) in moves {
-        conn.execute(
-            "UPDATE files SET state = 'superseded' \
-             WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
-            params![group_id, to],
-        )?;
-        let next_seq: i64 = conn.query_row(
-            "SELECT COALESCE(MAX(version_seq), 0) + 1 FROM files \
-             WHERE group_id = ?1 AND path = ?2",
-            params![group_id, to],
-            |r| r.get(0),
-        )?;
-        let (case_key, canonical_key) = crate::file_index::name_fold_keys(to);
-        conn.execute(
-            "UPDATE files SET path = ?3, version_seq = ?4, case_fold_key = ?5, \
-                    canonical_fold_key = ?6 \
-             WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
-            params![group_id, from, to, next_seq, case_key, canonical_key],
-        )?;
-    }
-    Ok(())
 }
 
 /// Whether any live current row of `group_id` lies strictly below `path`:
@@ -388,27 +259,6 @@ impl HeldPathRepository {
     pub fn group_frozen(&self, group_id: &str) -> Result<bool, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             crate::native_rebootstrap::group_frozen(conn, group_id)
-        })
-    }
-
-    /// See [`relocate_held_entry_beside_directory_in_tx`].
-    pub fn relocate_held_entry_beside_directory(
-        &self,
-        group_id: &str,
-        path: &str,
-        generation: i64,
-        removable: Option<&yadorilink_root_authority::fs_identity::FileIdentity>,
-        now_unix_nanos: i64,
-    ) -> Result<Option<String>, SyncSqliteError> {
-        self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            relocate_held_entry_beside_directory_in_tx(
-                tx,
-                group_id,
-                path,
-                generation,
-                removable,
-                now_unix_nanos,
-            )
         })
     }
 

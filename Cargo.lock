@@ -9155,6 +9155,7 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "hex",
+ "libc",
  "qrcode",
  "reqwest 0.12.28",
  "serde",
@@ -9199,6 +9200,7 @@ dependencies = [
  "yadorilink-local-storage",
  "yadorilink-product-view",
  "yadorilink-reporting",
+ "yadorilink-root-authority",
  "yadorilink-transport",
 ]
 
@@ -9264,10 +9266,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "yadorilink-dcf-kernel"
-version = "0.1.0"
-
-[[package]]
 name = "yadorilink-dcf-oracle"
 version = "0.1.0"
 
@@ -9323,6 +9321,7 @@ dependencies = [
  "uuid",
  "wiremock",
  "yadorilink-fapi-client",
+ "yadorilink-root-authority",
 ]
 
 [[package]]
@@ -9442,6 +9441,8 @@ dependencies = [
  "libc",
  "rand 0.10.2",
  "rusqlite",
+ "serde",
+ "serde_json",
  "sha2",
  "tempfile",
  "thiserror 2.0.20",
@@ -9543,6 +9544,7 @@ dependencies = [
  "tracing",
  "uuid",
  "wiremock",
+ "yadorilink-root-authority",
 ]
 
 [[package]]
@@ -9562,6 +9564,7 @@ dependencies = [
  "tokio",
  "tracing",
  "unicode-normalization",
+ "windows-sys 0.59.0",
  "yadorilink-daemon",
  "yadorilink-replica-domain",
  "yadorilink-root-authority",
@@ -9602,6 +9605,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "yadorilink-root-authority",
 ]
 
 [[package]]
@@ -9642,13 +9646,13 @@ dependencies = [
  "thiserror 2.0.20",
  "tracing",
  "windows-sys 0.59.0",
- "yadorilink-daemon",
  "yadorilink-local-storage",
  "yadorilink-namespace",
  "yadorilink-replica-domain",
  "yadorilink-replica-engine",
  "yadorilink-root-authority",
  "yadorilink-sqlite-runtime",
+ "yadorilink-sync-sqlite",
 ]
 
 [[package]]
@@ -9697,6 +9701,7 @@ dependencies = [
  "turmoil",
  "windows-sys 0.59.0",
  "yadorilink-ipc-proto",
+ "yadorilink-root-authority",
  "zeroize",
 ]
 

@@ -93,21 +93,24 @@ async fn a_tombstone_adopted_from_a_peer_leaves_recoverable_trash() {
     // for content device-a itself authored — the case where losing the bytes
     // outright would be least recoverable.
     std::fs::remove_file(device_b.path(PATH)).unwrap();
+    // The tombstone commit is the sync point: adoption removes the file first and only then
+    // records the tombstone (so a file that could not be removed is never marked deleted).
+    // Waiting for the file to vanish would race the index write.
     wait_until_with_context(
-        || !device_a.path(PATH).exists(),
+        || {
+            device_a
+                .state
+                .replica_coordinator
+                .file_index_repository()
+                .get_file(GROUP, PATH)
+                .unwrap()
+                .is_some_and(|record| record.deleted)
+        },
         Duration::from_secs(60),
-        || "the peer's delete never reached the authoring device".into(),
+        || "the peer's tombstone never reached the authoring device".into(),
     )
     .await;
-
-    let current = device_a
-        .state
-        .replica_coordinator
-        .file_index_repository()
-        .get_file(GROUP, PATH)
-        .unwrap()
-        .expect("the path must still be indexed, as a tombstone");
-    assert!(current.deleted, "the authoring device must have adopted the peer's tombstone");
+    assert!(!device_a.path(PATH).exists(), "a tombstoned file must be absent from disk");
 
     let trashed =
         device_a.state.replica_coordinator.file_index_repository().list_trashed(GROUP).unwrap();

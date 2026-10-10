@@ -62,6 +62,14 @@ fn status_app_path() -> Option<std::path::PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
+/// Opens the status app's Home window (`--window home`; a bare launch would
+/// start a second tray instead). Fails soft like the rest of this handler.
+fn open_status_window() {
+    if let Some(exe) = status_app_path() {
+        let _ = std::process::Command::new(exe).args(["--window", "home"]).spawn();
+    }
+}
+
 fn query_context_menu_result(command_count: u32) -> Result<()> {
     if command_count == 0 {
         Ok(())
@@ -190,10 +198,13 @@ impl IContextMenu_Impl for ContextMenuHandler_Impl {
                 // to Explorer (shell-integration spec's "App is
                 // unavailable" scenario), matching the fire-and-forget
                 // discipline just below for the daemon-IPC actions.
-                if let Some(exe) = status_app_path() {
-                    let _ = std::process::Command::new(exe).arg(&path).spawn();
-                }
+                open_status_window();
                 return Ok(());
+            }
+            if cmd_offset == Command::ViewStatus as u32 {
+                // "View sync status" opens the status window; the daemon
+                // round trip below only validates the path.
+                open_status_window();
             }
             if let Some((_, _, action)) = COMMANDS.iter().find(|(c, _, _)| *c as u32 == cmd_offset)
             {

@@ -56,7 +56,7 @@ pub(crate) fn parent_of(path: &str) -> &str {
 pub(crate) enum DirectoryVerdict {
     Clear,
     Retry,
-    Kept { reason: &'static str },
+    Kept,
 }
 
 impl super::LocalConvergenceExecutor {
@@ -72,15 +72,13 @@ impl super::LocalConvergenceExecutor {
     /// Makes `path` the directory its live descendants need, when it has no
     /// explicit entry of its own: keeps a directory already there, creates
     /// one (recorded as structural) when nothing is, and moves a File or
-    /// Symlink out of the way -- only once `leaf_is_placed_elsewhere` says
-    /// its content already stands at its copy name.
+    /// Symlink out of the way (see [`Self::displace_leaf_for_directory`]).
     pub(crate) async fn settle_structural_container(
         &self,
         group_id: &str,
         path: &str,
-        leaf_is_placed_elsewhere: bool,
     ) -> Result<MaterializeResult, PeerSessionError> {
-        if !self.displace_leaf_for_directory(group_id, path, leaf_is_placed_elsewhere).await? {
+        if !self.displace_leaf_for_directory(group_id, path).await? {
             return Ok(MaterializeResult::RetryRequired);
         }
         let path_lock = self.state.path_lock(group_id, path);
@@ -157,18 +155,17 @@ impl super::LocalConvergenceExecutor {
     /// directory. `true` when nothing but a directory (or nothing at all)
     /// is left there.
     ///
-    /// The leaf goes only when `leaf_is_placed_elsewhere` (its content
-    /// stands at its copy name), when disk still holds exactly what its
-    /// index row says (an edit nobody captured is captured first, and the
-    /// path retried), and under the path lock with the fence bumped and a
-    /// delete intent open. Its index row is removed, not tombstoned: the
-    /// entry is not deleted, it lives on at its copy name, and a row that
+    /// The leaf goes only when disk still holds exactly what its index row
+    /// says (an edit nobody captured is captured first, and the path
+    /// retried), and under the path lock with the fence bumped and a delete
+    /// intent open. The caller has already checked the displacement guard:
+    /// the content, if it lives on elsewhere, is on disk there. Its index row
+    /// is removed, not tombstoned: the entry is not deleted, and a row that
     /// claimed it at `path` would read to capture as a file gone missing.
     pub(crate) async fn displace_leaf_for_directory(
         &self,
         group_id: &str,
         path: &str,
-        leaf_is_placed_elsewhere: bool,
     ) -> Result<bool, PeerSessionError> {
         let out_path = self.local_file_path(group_id, path)?;
         let leaf_on_disk = std::fs::symlink_metadata(&out_path).is_ok_and(|meta| !meta.is_dir());
@@ -182,9 +179,6 @@ impl super::LocalConvergenceExecutor {
             // captured, which it never removes.
             return Ok(false);
         }
-        if !leaf_is_placed_elsewhere {
-            return Ok(false);
-        }
         if self.flush_local_changes_before_reconcile(group_id, path).await
             == PendingLocalFlushOutcome::RetryRequired
         {
@@ -192,8 +186,10 @@ impl super::LocalConvergenceExecutor {
         }
         let path_lock = self.state.path_lock(group_id, path);
         let _guard = crate::receive_diag::lock_path(&path_lock).await;
-        if leaf_on_disk {
-            if self.disk_holds_uncaptured_local_bytes(group_id, path, &out_path, None)? {
+        // Looked at again under the lock: what stood here before the flush
+        // and lock awaits may have been replaced since.
+        if std::fs::symlink_metadata(&out_path).is_ok_and(|meta| !meta.is_dir()) {
+            if self.removal_would_destroy_unrecorded_state(group_id, path, &out_path)? {
                 tracing::info!(
                     group_id,
                     path,
@@ -204,25 +200,26 @@ impl super::LocalConvergenceExecutor {
             }
             self.verify_delete_target(group_id, &out_path)?;
         }
+        // Under the lock, with the content that is there now: what this path
+        // gives up lives on elsewhere and is on disk there (and the platform can
+        // make that durable), or the path waits.
+        if !self.displacement_allowed(group_id, path, None)? {
+            return Ok(false);
+        }
         let authority = self.root_lease_for(group_id)?;
         let authority_op = authority.begin_operation()?;
         let permit = authority_op.permit();
         let (intent, _mutation_generation) =
             self.state.open_tombstone_delete(group_id, path, &permit)?;
-        match std::fs::symlink_metadata(&out_path) {
-            Ok(meta) if !meta.is_dir() => match std::fs::remove_file(&out_path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(PeerSessionError::from(e)),
-            },
-            _ => {}
+        if !std::fs::symlink_metadata(&out_path).is_ok_and(|meta| meta.is_dir()) {
+            // Durable before the row is erased; a leaf already gone only needs
+            // its absence made durable.
+            yadorilink_local_storage::remove_durably(&out_path, &self.state.temp_ledger(group_id))?;
         }
+        #[cfg(test)]
+        super::removal_ordering_probe::fire(&out_path);
         self.state.settle_retired_copy_erase(intent, group_id, path, &permit)?;
-        tracing::debug!(
-            group_id,
-            path,
-            "moved a file out of a name its live descendants need; it lives on at its copy name"
-        );
+        tracing::debug!(group_id, path, "moved a file out of a name its live descendants need");
         Ok(true)
     }
 
@@ -282,9 +279,10 @@ impl super::LocalConvergenceExecutor {
             group_id,
             path,
             "a directory this device may not remove holds the name an entry needs; the entry \
-             stays at its copy name"
+             waits"
         );
-        Ok(DirectoryVerdict::Kept { reason })
+        let _ = reason;
+        Ok(DirectoryVerdict::Kept)
     }
 
     /// Whether anything under the directory at `path` (`out_path`) is an
@@ -367,18 +365,25 @@ impl super::LocalConvergenceExecutor {
         self.verify_delete_target(group_id, &out_path)?;
         let mutation_generation =
             self.state.begin_directory_removal(group_id, path, "structural_directory_rmdir")?;
-        Ok(match yadorilink_local_storage::remove_empty_dir(&out_path)? {
-            EmptyDirectoryRemoval::Removed | EmptyDirectoryRemoval::Absent => {
-                self.state.forget_removed_directory(group_id, path).map_err(sqlite_error)?;
-                tracing::debug!(
+        Ok(
+            match yadorilink_local_storage::remove_empty_dir_in(
+                &out_path,
+                &self.state.temp_ledger(group_id),
+            )? {
+                EmptyDirectoryRemoval::Removed | EmptyDirectoryRemoval::Absent => {
+                    self.state.forget_removed_directory(group_id, path).map_err(sqlite_error)?;
+                    tracing::debug!(
                     group_id,
                     path,
                     "removed a directory this device created only for descendants that are gone"
                 );
-                Some(SettlementEvidence::ExactAbsent { mutation_generation })
-            }
-            EmptyDirectoryRemoval::NotEmpty | EmptyDirectoryRemoval::NotADirectory => None,
-        })
+                    Some(SettlementEvidence::ExactAbsent { mutation_generation })
+                }
+                EmptyDirectoryRemoval::NotEmpty
+                | EmptyDirectoryRemoval::NotADirectory
+                | EmptyDirectoryRemoval::Stranded(_) => None,
+            },
+        )
     }
 
     /// Nothing is at `path` (`out_path`), yet a structural directory is
@@ -426,13 +431,20 @@ impl super::LocalConvergenceExecutor {
         let out_path = self.local_file_path(group_id, path)?;
         self.verify_delete_target(group_id, &out_path)?;
         self.state.begin_directory_removal(group_id, path, "superseded_directory_rmdir")?;
-        Ok(match yadorilink_local_storage::remove_empty_dir(&out_path)? {
-            EmptyDirectoryRemoval::Removed | EmptyDirectoryRemoval::Absent => {
-                self.state.forget_removed_directory(group_id, path).map_err(sqlite_error)?;
-                true
-            }
-            EmptyDirectoryRemoval::NotEmpty | EmptyDirectoryRemoval::NotADirectory => false,
-        })
+        Ok(
+            match yadorilink_local_storage::remove_empty_dir_in(
+                &out_path,
+                &self.state.temp_ledger(group_id),
+            )? {
+                EmptyDirectoryRemoval::Removed | EmptyDirectoryRemoval::Absent => {
+                    self.state.forget_removed_directory(group_id, path).map_err(sqlite_error)?;
+                    true
+                }
+                EmptyDirectoryRemoval::NotEmpty
+                | EmptyDirectoryRemoval::NotADirectory
+                | EmptyDirectoryRemoval::Stranded(_) => false,
+            },
+        )
     }
 
     fn origin_status(
@@ -503,13 +515,6 @@ impl super::LocalConvergenceExecutor {
         let Ok(target) = std::fs::symlink_metadata(out_path) else { return Ok(None) };
         Ok(entry_answering_under_another_name(parent, name, &target)?)
     }
-}
-
-/// Whether a settlement leaves the entry's content at its name on disk:
-/// the exact object, or the placeholder an on-demand folder materializes
-/// in its place.
-pub(super) fn content_on_disk(evidence: &SettlementEvidence) -> bool {
-    matches!(evidence, SettlementEvidence::ExactObject { .. } | SettlementEvidence::PolicyRemote)
 }
 
 /// The name of the entry of `parent` that is the object `target` describes

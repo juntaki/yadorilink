@@ -806,8 +806,6 @@ fn author_unit(
                     })
                     .collect(),
                 put: op.put.map(|version| DeltaPut { version }),
-                keeps: Vec::new(),
-                keep_put: false,
             })
             .collect();
         let recursive_part = step.recursive.map(|part| {

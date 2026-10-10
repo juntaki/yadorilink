@@ -31,6 +31,11 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Release tag matches shipped versions
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: bash .github/release/check-release-version.sh "$GITHUB_REF_NAME"
+
       - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
@@ -654,7 +659,7 @@ jobs:
       - name: Build release binaries
         run: cargo build --workspace --release
 
-      - name: Package macOS binary archive
+      - name: Package macOS binary archive (CI-internal, never released)
         run: |
           set -euo pipefail
           version="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
@@ -788,46 +793,17 @@ jobs:
           YADORILINK_NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
         run: ./platforms/macos/package/build-pkg.sh
 
-      - name: Package binary archive from the trust-root-enforced build
+      - name: Verify the .pkg binaries embed the release trust root
         env:
           YADORILINK_RELEASE_MANIFEST_PUBLIC_KEY_HEX: ${{ vars.RELEASE_MANIFEST_PUBLIC_KEY_HEX }}
         run: |
           set -euo pipefail
-          # build-pkg.sh (previous step, YADORILINK_RELEASE_BUILD=1) just
-          # rebuilt the workspace with the `enforce-release-trust-root`
-          # feature into target/release. This archive must ship those
-          # binaries, not the ones from the unsigned build-health job --
-          # an ordinary build's daemon still pins the forgeable development
-          # update-manifest trust root, so a real user running
-          # yadorilink-daemon straight from this archive (never through the
-          # .pkg) needs the same enforced binary the .pkg bundles.
-          version="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
-          arch="$(uname -m)"
-          mkdir -p release/macos/bin
-          cp target/release/yadorilink \
-             target/release/yadorilink-daemon \
-             target/release/yadorilink-status-app \
-             release/macos/bin/
-          # Cheap positive confirmation this binary was genuinely built
-          # with the enforced, real trust root: this build's actual
-          # configured public key hex must be present in the binary. NOT
-          # the inverse (checking the placeholder's absence) -- the
-          # placeholder hex also appears unconditionally in a runtime
-          # error-message string this same binary carries regardless of
-          # which key is compiled in, so its mere absence proves nothing.
-          # This is a backstop against a misconfigured build, not the
-          # primary mechanism -- see manifest.rs's own compile-time gate
-          # for that.
-          if ! grep -a -q "$YADORILINK_RELEASE_MANIFEST_PUBLIC_KEY_HEX" release/macos/bin/yadorilink-daemon; then
+          # The .pkg is the only official macOS artifact; no raw binary
+          # archive is built or published for it.
+          if ! grep -a -q "$YADORILINK_RELEASE_MANIFEST_PUBLIC_KEY_HEX" target/release/yadorilink-daemon; then
             echo "yadorilink-daemon does not contain the configured update-manifest trust root -- it was not built with enforce-release-trust-root and the real key" >&2
             exit 1
           fi
-          bash .github/release/write-source-notice.sh "$YADORILINK_SOURCE_REF" release/macos
-          tar -C release/macos -czf "release/macos/yadorilink-${version}-macos-${arch}-binaries.tar.gz" bin LICENSE SOURCE.txt
-          rm -rf release/macos/bin
-          python3 .github/release/generate-release-checksums.py \
-            --sidecars \
-            "release/macos/yadorilink-${version}-macos-${arch}-binaries.tar.gz"
 
       - name: Collect and verify the signed .pkg
         run: |
@@ -849,8 +825,7 @@ jobs:
           cp "$pkg" "$pkg.sha256" release/macos/
           python3 .github/release/generate-release-checksums.py \
             --out release/macos/SHA256SUMS \
-            "release/macos/yadorilink-${version}.pkg" \
-            release/macos/yadorilink-*-macos-*-binaries.tar.gz
+            "release/macos/yadorilink-${version}.pkg"
 
       - name: Tear down signing material
         if: always()
@@ -898,12 +873,8 @@ jobs:
           mkdir -p dist
           find release-assets/yadorilink-linux-artifacts -maxdepth 1 -type f ! -name 'SHA256SUMS' -exec cp {} dist/ \;
           find release-assets/yadorilink-windows-artifacts -maxdepth 1 -type f ! -name 'SHA256SUMS' -exec cp {} dist/ \;
-          # macos-artifacts (not macos-build-health) is now the sole source
-          # of the published macOS binary archive: it is rebuilt with the
-          # enforce-release-trust-root feature, matching the .pkg it ships
-          # alongside. macos-build-health's tar.gz stays CI-internal
-          # (that job's own README.txt already documents this), never
-          # copied into a real release.
+          # The signed .pkg is the only official macOS artifact. No raw macOS
+          # tar.gz is released; macos-build-health's tar.gz is CI-internal.
           find release-assets/yadorilink-macos-artifacts -maxdepth 1 -type f ! -name 'SHA256SUMS' -exec cp {} dist/ \;
           cp release-assets/yadorilink-linux-artifacts/SHA256SUMS dist/SHA256SUMS-linux
           cp release-assets/yadorilink-windows-artifacts/SHA256SUMS dist/SHA256SUMS-windows
@@ -911,12 +882,10 @@ jobs:
           cp dist/yadorilink-*-linux-x86_64-binaries.tar.gz dist/yadorilink-linux-x86_64.tar.gz
           cp dist/yadorilink_*_amd64.deb dist/yadorilink-linux-amd64.deb
           cp dist/yadorilink-*-windows-x86_64-binaries.zip dist/yadorilink-windows-x86_64.zip
-          cp dist/yadorilink-*-macos-*-binaries.tar.gz dist/yadorilink-macos.tar.gz
           sidecar_targets=(
             dist/yadorilink-linux-x86_64.tar.gz
             dist/yadorilink-linux-amd64.deb
             dist/yadorilink-windows-x86_64.zip
-            dist/yadorilink-macos.tar.gz
           )
           # Exactly one of these exists: the signed installer when Windows
           # code-signing secrets were configured, otherwise the explicitly
@@ -990,6 +959,10 @@ jobs:
           # keep serving this stale, now-inaccurate file forever. Safe to run
           # every time: a no-op once the asset is already gone.
           gh release delete-asset nightly README.txt --yes || true
+          # Same for the raw macOS tar.gz, no longer an official asset.
+          gh release view nightly --json assets --jq '.assets[].name' \
+            | grep -E '^yadorilink(-.*-macos-.*-binaries|-macos)\.tar\.gz(\.sha256)?$' \
+            | while read -r asset; do gh release delete-asset nightly "$asset" --yes; done || true
 
           gh release upload nightly dist/* --clobber
 
@@ -1146,19 +1119,16 @@ jobs:
           mkdir -p dist
           find release-assets/yadorilink-linux-artifacts -maxdepth 1 -type f ! -name 'SHA256SUMS' -exec cp {} dist/ \;
           find release-assets/yadorilink-windows-artifacts -maxdepth 1 -type f ! -name 'SHA256SUMS' -exec cp {} dist/ \;
-          # macos-artifacts (not macos-build-health) is the sole source of
-          # the published macOS binary archive -- see the matching comment
-          # in the nightly-release job's Flatten step.
+          # No raw macOS tar.gz is released; the .pkg is the only macOS
+          # artifact (see the nightly-release job's Flatten step).
           find release-assets/yadorilink-macos-artifacts -maxdepth 1 -type f ! -name 'SHA256SUMS' -exec cp {} dist/ \;
           cp dist/yadorilink-*-linux-x86_64-binaries.tar.gz dist/yadorilink-linux-x86_64.tar.gz
           cp dist/yadorilink_*_amd64.deb dist/yadorilink-linux-amd64.deb
           cp dist/yadorilink-*-windows-x86_64-binaries.zip dist/yadorilink-windows-x86_64.zip
-          cp dist/yadorilink-*-macos-*-binaries.tar.gz dist/yadorilink-macos.tar.gz
           sidecar_targets=(
             dist/yadorilink-linux-x86_64.tar.gz
             dist/yadorilink-linux-amd64.deb
             dist/yadorilink-windows-x86_64.zip
-            dist/yadorilink-macos.tar.gz
           )
           # Exactly one of these exists: the signed installer when Windows
           # code-signing secrets were configured, otherwise the explicitly

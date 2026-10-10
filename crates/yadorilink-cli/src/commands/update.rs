@@ -1,4 +1,4 @@
-//! `yadorilink update status|check|install|config` — mirrors
+//! `yadorilink update status|check|download|config` — mirrors
 //! `commands::limits`'s exact shape (a thin wrapper per subcommand over
 //! `yadorilink_client_core::ops::updates`, printing the daemon's response).
 
@@ -33,9 +33,7 @@ fn print_status(status: &UpdateStatusResponse) {
         if !status.holdback_reason.is_empty() {
             println!("held back: {}", status.holdback_reason);
         }
-        if status.waiting_for_safe_point {
-            println!("waiting for a safe point to install");
-        }
+        println!("download the new version: run `yadorilink update download`");
     }
     if !status.last_error_category.is_empty() {
         println!(
@@ -48,11 +46,7 @@ fn print_status(status: &UpdateStatusResponse) {
             }
         );
     }
-    println!(
-        "automatic checks: {}  automatic install: {}",
-        if status.automatic_checks_enabled { "on" } else { "off" },
-        status.automatic_install_mode
-    );
+    println!("automatic checks: {}", if status.automatic_checks_enabled { "on" } else { "off" });
 }
 
 /// `yadorilink update status` (spec "Show update status").
@@ -77,19 +71,16 @@ pub async fn check() -> Result<(), CliError> {
     Ok(())
 }
 
-/// `yadorilink update install` (spec "Manual install request").
-pub async fn install() -> Result<(), CliError> {
-    let resp = updates::install_update().await?;
-    match resp.outcome.as_str() {
-        "installing" => println!("installing update..."),
-        "deferred" => println!("update install deferred until the daemon reaches a safe point"),
-        "store_managed" => println!("{}", resp.guidance),
-        other => println!("install outcome: {other}"),
-    }
+/// `yadorilink update download`: v1 ships manual updates, so this prints
+/// where to get the new version (the official download page, or the
+/// package-manager command for a package-managed install).
+pub async fn download() -> Result<(), CliError> {
+    let resp = updates::download_guidance().await?;
+    println!("{}", resp.guidance);
     Ok(())
 }
 
-/// `yadorilink update config --checks <on|off> --install <automatic|manual>`
+/// `yadorilink update config --checks <on|off> --install <manual>`
 /// (spec "Configure automatic updates").
 pub async fn config(checks: Option<String>, install: Option<String>) -> Result<(), CliError> {
     let automatic_checks_enabled = match checks.as_deref() {
@@ -101,17 +92,13 @@ pub async fn config(checks: Option<String>, install: Option<String>) -> Result<(
         None => None,
     };
     if let Some(mode) = install.as_deref() {
-        if mode != "automatic" && mode != "manual" {
+        if mode != "manual" {
             return Err(CliError::Other(format!(
-                "--install must be 'automatic' or 'manual', got {mode:?}"
+                "--install must be 'manual' (updates are installed manually), got {mode:?}"
             )));
         }
     }
     let config = updates::set_update_config(automatic_checks_enabled, install).await?;
-    println!(
-        "automatic checks: {}  automatic install: {}",
-        if config.automatic_checks_enabled { "on" } else { "off" },
-        config.automatic_install_mode
-    );
+    println!("automatic checks: {}", if config.automatic_checks_enabled { "on" } else { "off" });
     Ok(())
 }

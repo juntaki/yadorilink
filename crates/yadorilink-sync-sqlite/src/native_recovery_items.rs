@@ -33,7 +33,8 @@ use crate::native_bootstrap::VerifiedNativeBootstrap;
 use crate::native_rebootstrap::BlockedReason;
 use crate::native_rebootstrap_recovery::{
     create_dirs_durably, ensure_private_dir_durably, group_dir_name, lstat_no_link, read_regular,
-    refuse_synced_location, sha256, sync_dir, write_durable, AreaError, ManifestRemoteOnly,
+    refuse_synced_location, remove_private_tree, sha256, write_durable, AreaError,
+    ManifestRemoteOnly,
 };
 
 pub(crate) fn init_tables(conn: &Connection) -> Result<(), SyncSqliteError> {
@@ -243,10 +244,7 @@ fn item_dir(items_root: &Path, group: &FolderGroupId, item_id: &str) -> PathBuf 
 
 fn remove_dir(dir: &Path) -> Result<(), AreaError> {
     if lstat_no_link(dir)?.is_some() {
-        fs::remove_dir_all(dir)?;
-        if let Some(parent) = dir.parent() {
-            sync_dir(parent)?;
-        }
+        remove_private_tree(dir)?;
     }
     Ok(())
 }
@@ -340,12 +338,6 @@ pub(crate) fn write_item_files(
     }
     if body.content == ItemContent::Complete {
         write_durable(&dir, CONTENT_FILE, &body.bytes)?;
-    }
-    let mut level = Some(dir.as_path());
-    for _ in 0..3 {
-        let Some(path) = level else { break };
-        sync_dir(path)?;
-        level = path.parent();
     }
     Ok(())
 }
@@ -720,7 +712,6 @@ pub fn complete_unavailable_item(
     }
     let dir = item_dir(items_root, group, &item.item_id);
     write_durable(&dir, CONTENT_FILE, bytes).map_err(|e| corrupt(e.to_string()))?;
-    sync_dir(&dir).map_err(|e| corrupt(e.to_string()))?;
     let retained = serde_json::to_string(&hex_block_hashes(&record))
         .map_err(|e| CompleteError::Store(corrupt(e.to_string())))?;
     conn.execute(
@@ -817,7 +808,12 @@ pub fn restore_recovery_item(
         .map_err(SyncSqliteError::from)?;
     crate::dag_store::put_file_version(&tx, group.as_str(), &record)?;
     let op = Op::Put { path: item.path.clone(), version: item.version };
-    let authored = crate::native_authoring::author_op(&tx, group, author, &op, &item.path)?;
+    // The restore saw nothing at the path: it lands beside whatever is live there
+    // and supersedes none of it (only this device's own heads, if the row shows
+    // one), so a newer version a peer wrote is never replaced without a conflict.
+    let witness = crate::native_capture::absent_native_witness(item.path.as_str());
+    let authored =
+        crate::native_authoring::author_op_witnessed(&tx, group, author, &op, Some(&witness))?;
     tx.commit().map_err(SyncSqliteError::from)?;
     Ok(authored)
 }

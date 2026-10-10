@@ -643,8 +643,20 @@ async fn an_offline_folder_delete_withholds_a_path_a_peer_head_replaced_meanwhil
     // The row stays: the owed projection decides what the path becomes.
     assert!(live_kind(&state, "r/x").is_some());
     // The removal never saw the peer's head: it is still native's head there.
-    let now = state.file_index_repository().native_capture_witness(GROUP, "r/x").unwrap();
-    assert_eq!(now.shown_head.map(|head| head.payload.version), Some(peer_version));
+    let heads = state
+        .database()
+        .read(|conn| {
+            yadorilink_sync_sqlite::native_store::native_heads_at(
+                conn,
+                &yadorilink_replica_domain::ids::FolderGroupId(GROUP.to_owned()),
+                &yadorilink_replica_domain::ids::SyncPath("r/x".to_owned()),
+            )
+        })
+        .unwrap();
+    assert_eq!(
+        heads.iter().map(|head| head.payload.version).collect::<Vec<_>>(),
+        vec![peer_version]
+    );
     let parts = parts(&state);
     assert_one_complete_operation(
         &state,

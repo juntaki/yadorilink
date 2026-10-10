@@ -240,8 +240,6 @@ impl Drop for BackstopPass {
 
 pub struct DaemonState {
     pub device_id: String,
-    /// Observation only; see `retirement_backstop_ticks`.
-    retirement_backstop_ticks: std::sync::atomic::AtomicU64,
     /// Links whose disk-reconcile backstop pass is still running, by local
     /// path. A later sweep leaves such a link alone instead of stacking a
     /// second whole-folder pass on the first.
@@ -613,34 +611,13 @@ impl BlockWriteActivityProvider for DaemonState {
 /// `link_runtime::dependencies::LinkRuntimeHostPort`'s own doc for why
 /// each of these three specifically can't just be a plain field there.
 impl crate::link_runtime::dependencies::LinkRuntimeHostPort for DaemonState {
-    fn note_capture_settled(&self, group_id: &str) {
-        // `local_dirty_paths: present -> absent` is one state transition with
-        // TWO correctness consumers, and both treat a dirty path as a veto
-        // they must re-evaluate once it clears:
-        //
-        //   admission   a staged Change touching a dirty path is
-        //               `CaptureBarrierOpen` and stays staged.
-        //   retirement  an ephemeral conflict copy on a dirty path is skipped
-        //               by `is_path_dirty` -- with a bare `continue` that
-        //               never sets `retry_required`, so the pass can still
-        //               report `Settled` and its generation is completed.
-        //
-        // Waking only one of them leaves the other holding a decision it
-        // made under uncertainty that has since resolved, with nothing left
-        // to revisit it. For retirement that means a conflict copy which is
-        // now safe to remove is never removed -- and a copy present on some
-        // devices and absent on others is precisely the divergence the
-        // retirement mechanism exists to converge.
-        //
-        // Not routed through `note_local_commit_for_group`: that runs only
-        // when a commit produced records, and `announce_local_change` returns
-        // at `records.is_empty()` before reaching it. A flush that settles a
-        // barrier while authoring nothing is exactly the missed case.
-        // Two independent consumers of one transition, so neither may be
-        // gated on the other's machinery. Retirement is local and always
-        // available; admission needs the peer session driver. Ordering
-        // retirement first means a device without a driver still retires.
-        self.replica_coordinator.retirement_wake().mark_dirty(group_id);
+    fn note_capture_settled(&self, _group_id: &str) {
+        // `local_dirty_paths: present -> absent` is a veto clearing for
+        // admission (a staged Change touching a dirty path is
+        // `CaptureBarrierOpen` and stays staged), and a flush that settles a
+        // barrier while authoring nothing never reaches
+        // `note_local_commit_for_group`. Admission is driven by the peer
+        // session driver's own wakes, so nothing is owed here.
     }
 
     fn on_local_native_commit<'a>(
@@ -878,8 +855,7 @@ impl DaemonState {
     /// Construction only -- builds `self` and wires its internal
     /// closures (local-change-auth/repair-election providers), but starts
     /// no background task and performs no other side effect beyond that
-    /// wiring and `update_manager.recover_on_startup()`'s own startup
-    /// recovery I/O. The caller owns starting `MaintenanceCoordinator` on
+    /// wiring. The caller owns starting `MaintenanceCoordinator` on
     /// the returned state (see [`Self::new`] for the common case, or
     /// `app::run` for production's own explicit sequencing).
     #[allow(
@@ -944,7 +920,6 @@ impl DaemonState {
             offline_authorization::OfflineAuthorizationCache::new(replica_coordinator.clone());
         let state = Arc::new(Self {
             device_id,
-            retirement_backstop_ticks: std::sync::atomic::AtomicU64::new(0),
             backstop_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             replica_coordinator,
             block_store,
@@ -1025,12 +1000,6 @@ impl DaemonState {
             #[cfg(test)]
             membership_recovery_sweep_disabled_for_test: std::sync::atomic::AtomicBool::new(false),
         });
-        // Recover from any update artifact
-        // left unverified, or an install left mid-handoff, by a previous
-        // run that crashed/was killed/lost power — before the periodic
-        // scheduler (spawned below) or any control-socket update request
-        // can observe (and potentially act on) stale state.
-        state.update_manager.recover_on_startup();
         {
             let weak_state = Arc::downgrade(&state);
             let local_policy_head_provider: Arc<
@@ -1141,6 +1110,11 @@ impl DaemonState {
         self.links.mark_degraded(local_path, reason, now_unix(), |backoff_attempt| {
             supervise::BackoffConfig::DEGRADED_LINK_RECHECK.next(backoff_attempt).as_secs() as i64
         });
+    }
+
+    /// Terminal OwnershipLost for `local_path`; true on the first transition only.
+    pub fn mark_link_ownership_lost(&self, local_path: &str) -> bool {
+        self.links.mark_ownership_lost(local_path, now_unix())
     }
 
     /// Clears `local_path`'s Degraded state, if any — a no-op if it wasn't
@@ -2175,6 +2149,29 @@ impl DaemonState {
             file_index: self.replica_coordinator.file_index_repository(),
         };
         crate::background_custody::run_cycle(&components, group_id).await
+    }
+
+    /// Event-driven trigger for [`Self::refresh_custody_confirmation`]: a peer
+    /// just became usable, so confirm custody now instead of waiting for the
+    /// periodic sweep (which stays as the lost-wake backstop). Never blocks;
+    /// at most one refresh is pending per group, so a burst of sessions
+    /// coalesces. Returns how many refresh tasks this call scheduled.
+    /// Must be called inside a Tokio runtime.
+    pub(crate) fn request_custody_refresh(self: &Arc<Self>, groups: &[String]) -> usize {
+        let mut scheduled = 0;
+        for group in groups {
+            if !self.durability.mark_custody_refresh_pending(group) {
+                continue;
+            }
+            scheduled += 1;
+            let state = self.clone();
+            let group = group.clone();
+            tokio::spawn(async move {
+                state.durability.clear_custody_refresh_pending(&group);
+                let _ = state.refresh_custody_confirmation(&group).await;
+            });
+        }
+        scheduled
     }
 
     /// Positively confirms
@@ -3522,6 +3519,7 @@ impl DaemonState {
         // Deliberately BEFORE the wake, not after: the wake lets the
         // peer session driver start pushing, and a peer can only be sent
         // a delta that is already Published.
+        self.fork_contested_heads(group_id);
         self.flush_pending_native_checkpoint_for_group(group_id).await;
         self.note_local_commit_for_group(group_id).await;
     }
@@ -3692,40 +3690,7 @@ impl DaemonState {
         if !self.peers.all_sessions().iter().any(|(_, session)| session.shares_group(group_id)) {
             return;
         }
-        // A locally-authored commit advanced this device's own frontier the
-        // same way an admitted remote Change does -- retirement needs to know
-        // either way.
-        self.replica_coordinator.retirement_wake().mark_dirty(group_id);
         self.replica_coordinator.hazard_recheck_wake().mark_dirty(group_id);
-    }
-
-    /// The peer-free half of convergence for this device.
-    ///
-    /// Everything it does is decided from this device's own durable state, so
-    /// there is nothing per-peer or per-group to bind: roots are resolved live
-    /// from the link table on every call, exactly as a session's are.
-    ///
-    /// This is what a caller with no peer uses. It replaces manufacturing a
-    /// session over an inert channel to borrow local behaviour from — a
-    /// construction that also ran the netmap authenticator and could
-    /// quarantine another session's authorization, which is why callers went
-    /// out of their way to avoid it.
-    ///
-    /// Built per call rather than cached, deliberately. The executor holds
-    /// this state as its root-commit authority and its pending-change flush,
-    /// so caching it here would make `DaemonState` own something that owns
-    /// `DaemonState` — a cycle nothing breaks, which would keep a daemon and
-    /// everything it holds alive forever, in tests most visibly. Construction
-    /// is a few `Arc` clones; the only thing not carried across calls is the
-    /// canonical-root cache, which stays warm for the pass that uses it,
-    /// which is where it matters.
-    /// How many times the retirement backstop has ticked in this process.
-    ///
-    /// A real-time test that waits past the backstop interval needs to know
-    /// the tick it waited for happened; a long enough sleep is an assumption,
-    /// not evidence. Nothing in production reads this.
-    pub fn retirement_backstop_ticks(&self) -> u64 {
-        self.retirement_backstop_ticks.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Claims `local_path`'s disk-reconcile backstop pass; `None` when one is
@@ -3737,10 +3702,6 @@ impl DaemonState {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(local_path.to_string());
         claimed.then(|| BackstopPass { state: self.clone(), local_path: local_path.to_string() })
-    }
-
-    pub(crate) fn note_retirement_backstop_tick(&self) {
-        self.retirement_backstop_ticks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn local_convergence(

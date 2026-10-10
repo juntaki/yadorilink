@@ -55,7 +55,6 @@ fn author_restore(
             &yadorilink_replica_domain::ids::FolderGroupId(group_id.to_owned()),
             author,
             &op,
-            path,
         )?;
         native = authored.put_at(path).cloned();
         // Witnessed now, while the head is live: the row commits after the

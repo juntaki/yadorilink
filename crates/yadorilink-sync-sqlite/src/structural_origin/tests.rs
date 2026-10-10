@@ -74,7 +74,7 @@ fn structural_intent_without_identity_is_dropped_on_recovery() {
     record_structural_intent(&conn, "other", "c", 10).unwrap();
     // The process dies here, after mkdir, before the identity is recorded.
 
-    let dropped = drop_unresolved_structural_intents(&conn, i64::MAX).unwrap();
+    let dropped = drop_unresolved_structural_intents(&conn).unwrap();
     assert_eq!(
         dropped,
         vec![(GROUP.to_string(), "a/b".to_string()), ("other".to_string(), "c".to_string())]
@@ -94,15 +94,41 @@ fn structural_intent_without_identity_is_dropped_on_recovery() {
 }
 
 #[test]
-fn a_periodic_sweep_leaves_a_recent_intent_in_flight() {
+fn listing_can_be_limited_to_one_group() {
     let conn = open();
-    record_structural_intent(&conn, GROUP, "old", 10).unwrap();
-    record_structural_intent(&conn, GROUP, "fresh", 100).unwrap();
-    assert_eq!(
-        drop_unresolved_structural_intents(&conn, 50).unwrap(),
-        vec![(GROUP.to_string(), "old".to_string())]
-    );
-    assert_eq!(status(&conn, "fresh", None), StructuralOriginStatus::IntentPending);
+    record_structural_intent(&conn, GROUP, "a", 10).unwrap();
+    record_structural_intent(&conn, "other", "b", 10).unwrap();
+    let only: Vec<_> = list_unresolved_structural_intents(&conn, Some(GROUP))
+        .unwrap()
+        .into_iter()
+        .map(|intent| intent.path)
+        .collect();
+    assert_eq!(only, ["a"]);
+}
+
+/// A structural intent and a write intent are different obligations that
+/// may sit on one path together; neither reads as the other.
+#[test]
+fn a_structural_intent_is_not_a_write_intent() {
+    let conn = open();
+    record_structural_intent(&conn, GROUP, "d", 10).unwrap();
+    let writes: i64 = conn
+        .query_row("SELECT COUNT(*) FROM materialization_intents WHERE kind = 'write'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(writes, 0);
+    conn.execute(
+        "INSERT INTO materialization_intents (group_id, path, target_version_hash, \
+         created_at_unix_nanos) VALUES (?1, 'd', x'01', 0)",
+        [GROUP],
+    )
+    .unwrap();
+    assert_eq!(list_unresolved_structural_intents(&conn, None).unwrap().len(), 1);
+    assert!(abandon_structural_intent(&conn, GROUP, "d").unwrap());
+    let left: i64 =
+        conn.query_row("SELECT COUNT(*) FROM materialization_intents", [], |r| r.get(0)).unwrap();
+    assert_eq!(left, 1, "abandoning the mkdir leaves the write intent");
 }
 
 #[test]
@@ -397,7 +423,7 @@ fn rekeying_a_renamed_directory_carries_its_nested_origins() {
 fn a_completion_that_finds_its_intent_gone_records_lost_provenance() {
     let conn = open();
     record_structural_intent(&conn, GROUP, "a", 10).unwrap();
-    drop_unresolved_structural_intents(&conn, i64::MAX).unwrap();
+    drop_unresolved_structural_intents(&conn).unwrap();
     let made = dir_identity(100, 1);
 
     assert_eq!(
@@ -468,7 +494,7 @@ fn recovery_drops_an_intent_only_together_with_the_lost_provenance_it_leaves() {
     record_structural_intent(&conn, GROUP, "made", 10).unwrap();
     record_structural_intent(&conn, GROUP, "nothing", 10).unwrap();
     record_structural_intent(&conn, GROUP, "again", 10).unwrap();
-    let listed = list_unresolved_structural_intents(&conn, i64::MAX).unwrap();
+    let listed = list_unresolved_structural_intents(&conn, None).unwrap();
     assert_eq!(
         listed.iter().map(|intent| intent.path.as_str()).collect::<Vec<_>>(),
         ["again", "made", "nothing"]

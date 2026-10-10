@@ -71,7 +71,7 @@ fn assert_every_row_carries_its_path_folds(db: &SyncDatabase) {
     }
 }
 
-/// A new path, a new version of it, both metadata scaffolds and a relocation
+/// A new path, a new version of it and both metadata scaffolds
 /// each write the keys of the path they leave current, with the shared
 /// functions: not an empty default, and not a lowercase.
 #[test]
@@ -87,15 +87,6 @@ fn every_writer_that_sets_a_path_stores_its_folds() {
         ensure_bootstrap_row_for_metadata_in_tx(&tx, GROUP, "Tx/Caf\u{e9}.txt")?;
         tx.commit()?;
         Ok(())
-    })
-    .unwrap();
-    repo.upsert_file(GROUP, &record("Old/Name.txt", 1), &permit).unwrap();
-    db.write::<_, SyncSqliteError>(|conn| {
-        crate::held_path::move_current_rows(
-            conn,
-            GROUP,
-            &[("Old/Name.txt".to_string(), "Moved/Cop\u{130}.TXT".to_string())],
-        )
     })
     .unwrap();
     assert_every_row_carries_its_path_folds(&db);

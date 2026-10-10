@@ -687,6 +687,8 @@ public protocol ClientCoreProtocol: AnyObject, Sendable {
      */
     func newLoginSession(options: LoginOptions)  -> LoginSession
     
+    func parseInviteLink(input: String) throws  -> String
+    
     func pauseAll() async throws 
     
     func pauseFolder(localPath: String) async throws 
@@ -1425,6 +1427,16 @@ open func newLoginSession(options: LoginOptions) -> LoginSession  {
     uniffi_yadorilink_apple_ffi_fn_method_clientcore_new_login_session(
             self.uniffiCloneHandle(),
         FfiConverterTypeLoginOptions_lower(options),uniffiCallStatus
+    )
+})
+}
+    
+open func parseInviteLink(input: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeDesktopError_lift) {
+        uniffiCallStatus in
+    uniffi_yadorilink_apple_ffi_fn_method_clientcore_parse_invite_link(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(input),uniffiCallStatus
     )
 })
 }
@@ -2908,6 +2920,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_yadorilink_apple_ffi_checksum_method_clientcore_new_login_session() != 47763) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_yadorilink_apple_ffi_checksum_method_clientcore_parse_invite_link() != 39740) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_yadorilink_apple_ffi_checksum_method_clientcore_pause_all() != 50745) {

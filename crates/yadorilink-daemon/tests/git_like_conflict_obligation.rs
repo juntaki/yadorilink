@@ -345,11 +345,6 @@ fn diagnostic_dump(expected: &Snapshot, devices: &[&TestDevice], group_id: &str)
                         ));
                     }
                 }
-                for row in yadorilink_sync_sqlite::stable_projection_binding::native_placements(
-                    conn, group_id,
-                )? {
-                    text.push_str(&format!("  placement {row:?}\n"));
-                }
                 let mut stmt = conn.prepare(
                     "SELECT path, deleted, hex(native_authoring_identity) FROM files \
                  WHERE group_id = ?1 AND state = 'current' ORDER BY path",

@@ -2965,8 +2965,7 @@ mod exact_version_hash_tests {
     /// not the broader exclusion predicate `path_has_reserved_component` —
     /// the legacy marker is a substring match precisely because arbitrary
     /// user content can precede it, and
-    /// `materialization::cleanup_stale_temp_files` already refuses to
-    /// delete exactly such a look-alike. Pointing `materialize`'s check
+    /// recovery never deletes a file by its name. Pointing `materialize`'s check
     /// back at the exclusion predicate makes this test fail.
     #[tokio::test]
     async fn materialize_still_writes_a_legacy_marker_look_alike_user_file() {

@@ -8,24 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeviceConfig {
-    pub device_id: String,
-    pub coordination_addr: String,
-    /// Base64-encoded public half of the registered Ed25519 change-signing
-    /// key -- this device's one real key.
-    pub signing_public_key: String,
-    /// Exact development config shape. Pre-release builds intentionally do not
-    /// migrate older `device.json` revisions; a mismatch must be recreated by
-    /// registering the device with the current build.
-    pub config_version: u32,
-}
-
-/// Current pre-release `device.json` shape. This is an exact-match marker, not
-/// a migration boundary: older development shapes are intentionally rejected.
-pub const CONFIG_VERSION: u32 = 3;
+pub use yadorilink_local_storage::device_config::{DeviceConfig, CONFIG_VERSION};
 
 pub fn config_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("YADORILINK_CONFIG_DIR") {
@@ -100,8 +83,8 @@ enum WriteStep {
 /// crash must leave either the previous document or the complete new one.
 ///
 /// A sibling temporary file (owner-only from creation) is written and
-/// fsynced, renamed over the target, and the parent directory is fsynced so
-/// the rename itself is durable.
+/// fsynced, and published over the target by a durable move, so the new name
+/// is on disk when this returns.
 fn write_config_file(path: &Path, contents: &str) -> std::io::Result<()> {
     write_config_file_with(path, contents, &mut |_| Ok(()))
 }
@@ -126,9 +109,13 @@ fn write_config_file_with(
         file.sync_all()?;
         drop(file);
         after(WriteStep::TempSynced)?;
-        std::fs::rename(&temporary, path)?;
-        after(WriteStep::Renamed)?;
-        sync_parent_directory(path)
+        // A durable publish: the new name is on disk when this returns.
+        yadorilink_root_authority::durable_dir::publish_durably(
+            &temporary,
+            path,
+            yadorilink_root_authority::durable_dir::Replace::Yes,
+        )?;
+        after(WriteStep::Renamed)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
@@ -149,17 +136,6 @@ fn create_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
 #[cfg(not(unix))]
 fn create_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new().create_new(true).write(true).open(path)
-}
-
-#[cfg(unix)]
-fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    std::fs::File::open(parent)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
-    Ok(())
 }
 
 /// `YADORILINK_CONFIG_DIR` is process-global and Rust runs tests concurrently.

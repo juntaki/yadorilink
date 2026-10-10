@@ -36,13 +36,17 @@ fn an_unknown_command_error_code_reads_as_unspecified_and_an_empty_operation_as_
 }
 
 #[test]
-fn a_missing_or_refusing_socket_is_daemon_not_running_and_other_io_keeps_its_message() {
-    for kind in [std::io::ErrorKind::NotFound, std::io::ErrorKind::ConnectionRefused] {
-        let error = CoreError::from(std::io::Error::new(kind, "x"));
-        assert!(matches!(error, CoreError::DaemonNotRunning), "{kind:?}");
+fn a_raw_io_error_keeps_its_own_message_only_the_connect_site_means_daemon_not_running() {
+    // `From<io::Error>` never guesses "daemon not running": the daemon-connect call site
+    // (daemon/control.rs) maps its own connect failures to `DaemonNotRunning`.
+    for kind in [
+        std::io::ErrorKind::NotFound,
+        std::io::ErrorKind::ConnectionRefused,
+        std::io::ErrorKind::BrokenPipe,
+    ] {
+        let error = CoreError::from(std::io::Error::new(kind, "gone"));
+        assert!(matches!(&error, CoreError::Io(m) if m == "gone"), "{kind:?}: {error:?}");
     }
-    let error = CoreError::from(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pipe gone"));
-    assert!(matches!(&error, CoreError::Io(m) if m == "pipe gone"), "{error:?}");
 }
 
 fn command(code: ApplicationErrorCode) -> CoreError {

@@ -529,13 +529,12 @@ fn a_rotation_closure_before_the_first_delta_refuses_the_first_delta() {
 }
 
 /// Storing the closure is invisible to the summary roots, the cache token that
-/// keys them and the digest of the projection facts a bundle carries.
+/// keys them.
 #[test]
 fn a_rotation_closure_is_outside_every_root_digest_and_token() {
     let (c, _a, b) = source();
     let roots = roots_of(&c);
     let token = crate::native_summary_cache::state_token(&c, &group()).unwrap();
-    let digest = crate::native_row_witness::carried_projection_digest(&c, GROUP).unwrap();
     let bundle = built(&c);
 
     rotation_closure_at(&c, &group(), &b, Some(AuthorSeq(1)));
@@ -543,7 +542,6 @@ fn a_rotation_closure_is_outside_every_root_digest_and_token() {
 
     assert_eq!(roots_of(&c), roots);
     assert_eq!(crate::native_summary_cache::state_token(&c, &group()).unwrap(), token);
-    assert_eq!(crate::native_row_witness::carried_projection_digest(&c, GROUP).unwrap(), digest);
     let after = built(&c);
     assert_eq!(after.checkpoint, bundle.checkpoint);
     assert_eq!(after.authors, bundle.authors);
@@ -1141,8 +1139,6 @@ fn a_delayed_old_incarnation_delta_cannot_resurrect_a_file_at_a_third_replica() 
             provenance: put.delta_hash(),
         }],
         put: None,
-        keeps: Vec::new(),
-        keep_put: false,
     });
     remove.sign(&key);
     let mut delayed = put_delta(&b1, 3, Some(remove.delta_hash()), "f", 3);

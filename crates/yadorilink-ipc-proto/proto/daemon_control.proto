@@ -162,6 +162,18 @@ message LinkStatus {
   // identity key, never something to open, reveal or restore into. Its name and root are here.
   string provider_root_id = 35;
   string provider_display_name = 36;
+  // Paths whose replicated state is contested right now: the conflict is
+  // being resolved by moving the losing version to its copy name, and the
+  // path keeps what the disk has until then. Windows additionally waits
+  // for durability validation before the local file is updated.
+  uint64 conflicts_pending = 37;
+  // Set when this platform cannot yet make a file update durable and a conflict is present:
+  // the conflict is resolved, the local file update waits.
+  string conflict_note = 38;
+  // The folder is no longer on the volume its index was built from (for
+  // example an unmounted disk left an empty mountpoint). Deletions under it
+  // are withheld rather than synced. Additive; `false` when unchanged.
+  bool capture_volume_changed = 39;
 }
 
 // See `LinkStatus.local_storage_state`'s own doc comment.
@@ -1404,10 +1416,9 @@ message LimitsShowResponse {
 }
 
 // CLI <-> daemon surface for
-// signed-update discovery/verification/install orchestration (the
-// "Daemon-Orchestrated Checks, Installer-Owned Replacement" — the daemon
-// owns manifest checks, download, and verification; these messages let
-// the CLI trigger a manual check/install and read status, mirroring the
+// signed-update discovery (v1 ships manual updates: the daemon owns
+// manifest checks only; these messages let
+// the CLI trigger a manual check, read status and get download guidance, mirroring the
 // `Reporting*`/`Limits*` request-response pairs above). `channel` and
 // `install_source` are plain strings (not proto enums), matching this
 // file's existing convention for string-typed enums elsewhere
@@ -1440,7 +1451,7 @@ message UpdateStatusResponse {
   string last_error_category = 11;
   string last_error_message = 12;
   bool automatic_checks_enabled = 13;
-  // "automatic" | "manual".
+  // Always "manual" in v1.
   string automatic_install_mode = 14;
 }
 
@@ -1455,18 +1466,15 @@ message UpdateCheckResponse {
   UpdateStatusResponse status = 1;
 }
 
-// `yadorilink update install` requests installation of a
-// verified, applicable update. Fails with a clear error (surfaced via
-// `DaemonControlResponse.error`) if no verified update is available yet;
-// otherwise either installs immediately (if at a safe point) or reports
-// that installation is deferred until one, or reports the platform's
-// manual-handoff requirement (e.g. Microsoft-Store-managed installs).
+// `yadorilink update download` (wire name kept as `UpdateInstall`).
+// v1 ships manual updates: the daemon never downloads or installs. The
+// response says where to get the new version.
 message UpdateInstallRequest {}
 message UpdateInstallResponse {
-  // "installing" | "deferred" | "store_managed" | "manual_handoff_required".
+  // Always "manual_download".
   string outcome = 1;
-  // Non-empty only for "manual_handoff_required" — platform-specific
-  // guidance text (e.g. pointing at the Microsoft Store update flow).
+  // The download page URL, or the package-manager command for a
+  // package-managed install.
   string guidance = 2;
 }
 

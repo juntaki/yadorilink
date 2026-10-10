@@ -363,3 +363,33 @@ async fn the_serial_removal_lane_re_resolves_under_the_path_lock() {
         "a file whose path has a current head is never unlinked"
     );
 }
+
+/// The deletion is made durable (parent directory fsync) BEFORE the index
+/// records the path as absent: at the moment the parent flush is requested the
+/// row must still be live, and the file already unlinked.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removal_is_durable_before_the_index_records_absence() {
+    let h = Harness::new(true);
+    let seen = captured(&h, "notes.txt", b"the version the remover saw").await;
+    let mut remote = Remote::new();
+    remote.admit(&h, vec![delete("notes.txt", vec![seen])]).await;
+
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let (state, observed, path) = (h.state.clone(), observed.clone(), h.path("notes.txt"));
+        super::removal_ordering_probe::arm(h.path("notes.txt"), move || {
+            let live = state.get_file(GROUP, "notes.txt").unwrap().is_some_and(|row| !row.deleted);
+            observed.lock().unwrap().push((live, std::fs::symlink_metadata(&path).is_err()));
+        });
+    }
+
+    assert!(reconcile(&h, &["notes.txt"]).await.is_settled("notes.txt"));
+
+    assert_eq!(
+        *observed.lock().unwrap(),
+        vec![(true, true)],
+        "the parent flush must run once, after the unlink and while the index still has the row"
+    );
+    assert!(h.state.get_file(GROUP, "notes.txt").unwrap().is_none_or(|row| row.deleted));
+}

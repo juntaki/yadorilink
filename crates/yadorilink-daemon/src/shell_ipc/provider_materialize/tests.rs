@@ -504,8 +504,10 @@ async fn an_unconsumed_handoff_file_is_swept_after_its_lifetime() {
 
 /// A restart removes what a crashed run left: every staging file and the stale handoff files,
 /// while a fresh handoff file (a response that just went out) is kept.
-// TODO(checkpoint B): the handoff sweep is macOS/Unix-specific (handoff time is the Unix ctime).
-// Windows does not use this handoff; decide the Windows expectation in checkpoint B.
+// Unix only: the age of a handoff file is its status-change time (ctime), which the rename into
+// `handoff/` sets and user space cannot move. Windows has no such time, so a Windows daemon keeps
+// no handoff file across a restart at all; `a_windows_restart_removes_every_leftover` states that
+// expectation.
 #[cfg(unix)]
 #[test]
 fn a_restart_sweeps_leftovers_of_a_crashed_run() {
@@ -736,8 +738,8 @@ async fn a_directory_sync_failure_after_the_rename_leaves_no_handoff_file() {
 /// The startup sweep ages a handoff file by when it entered `handoff/`, never by the replicated
 /// modification time it carries: an old mtime on a fresh file and a future mtime on a stale one
 /// are both judged by the handoff time.
-// TODO(checkpoint B): the handoff sweep is macOS/Unix-specific (handoff time is the Unix ctime).
-// Windows does not use this handoff; decide the Windows expectation in checkpoint B.
+// Unix only, for the same reason as `a_restart_sweeps_leftovers_of_a_crashed_run`: the handoff
+// time is the Unix ctime; on Windows nothing ages and every leftover is removed at start.
 #[cfg(unix)]
 #[test]
 fn the_startup_sweep_ignores_the_replicated_mtime() {
@@ -1022,4 +1024,25 @@ async fn the_response_pairs_the_bytes_with_the_hash_and_generation_of_the_handof
         })
         .unwrap();
     assert_eq!(response.content_version[32..], (generation as u64).to_be_bytes());
+}
+
+/// Windows: the handoff time cannot be read from the file system, so an entry that a crashed run
+/// left in `handoff/` or `staging/` is removed at the next start whatever its age or modification
+/// time. A response that just went out is not at risk: the host takes its file before any restart
+/// matters, and the live sweep (by name, after the lifetime) is unchanged.
+#[cfg(windows)]
+#[test]
+fn a_windows_restart_removes_every_leftover() {
+    let dir = tempfile::tempdir().unwrap();
+    for sub in ["staging", "handoff"] {
+        std::fs::create_dir_all(dir.path().join(sub)).unwrap();
+    }
+    std::fs::write(dir.path().join("staging/half.partial"), b"half").unwrap();
+    std::fs::write(dir.path().join("handoff/fresh"), b"new").unwrap();
+    std::fs::write(dir.path().join("handoff/older"), b"old").unwrap();
+    let root = HandoffRoot::open_with_lifetime(dir.path(), Duration::from_secs(1)).unwrap();
+    assert!(!dir.path().join("staging/half.partial").exists());
+    assert!(!dir.path().join("handoff/fresh").exists());
+    assert!(!dir.path().join("handoff/older").exists());
+    drop(root);
 }

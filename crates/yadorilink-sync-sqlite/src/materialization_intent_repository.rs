@@ -38,7 +38,7 @@ fn keep_replaced_target(
         "INSERT OR IGNORE INTO materialization_replaced_targets \
          (group_id, path, target_version_hash) \
          SELECT group_id, path, target_version_hash FROM materialization_intents \
-          WHERE group_id = ?1 AND path = ?2 AND target_version_hash != ?3",
+          WHERE group_id = ?1 AND path = ?2 AND kind = 'write' AND target_version_hash != ?3",
         rusqlite::params![group_id, path, target],
     )?;
     Ok(())
@@ -60,7 +60,7 @@ fn delete_intent(
         rusqlite::params![group_id, path],
     )?;
     conn.execute(
-        "DELETE FROM materialization_intents WHERE group_id = ?1 AND path = ?2",
+        "DELETE FROM materialization_intents WHERE group_id = ?1 AND path = ?2 AND kind = 'write'",
         rusqlite::params![group_id, path],
     )?;
     Ok(())
@@ -96,7 +96,7 @@ impl MaterializationIntentRepository {
                 "INSERT INTO materialization_intents \
                  (group_id, path, target_version_hash, created_at_unix_nanos) \
                  VALUES (?1, ?2, ?3, ?4) \
-                 ON CONFLICT(group_id, path) DO UPDATE SET \
+                 ON CONFLICT(group_id, path, kind) DO UPDATE SET \
                   target_version_hash = excluded.target_version_hash, \
                   created_at_unix_nanos = excluded.created_at_unix_nanos",
                 rusqlite::params![group_id, path, target_version_hash, now],
@@ -136,7 +136,7 @@ impl MaterializationIntentRepository {
             "INSERT INTO materialization_intents \
              (group_id, path, target_version_hash, created_at_unix_nanos) \
              VALUES (?1, ?2, ?3, ?4) \
-             ON CONFLICT(group_id, path) DO UPDATE SET \
+             ON CONFLICT(group_id, path, kind) DO UPDATE SET \
               target_version_hash = excluded.target_version_hash, \
               created_at_unix_nanos = excluded.created_at_unix_nanos",
             rusqlite::params![group_id, path, target_version_hash, now],
@@ -165,7 +165,8 @@ impl MaterializationIntentRepository {
     ) -> Result<bool, SyncSqliteError> {
         let count: i64 = self.database.read::<_, SyncSqliteError>(|conn| {
             Ok(conn.query_row(
-                "SELECT COUNT(*) FROM materialization_intents WHERE group_id = ?1 AND path = ?2",
+                "SELECT COUNT(*) FROM materialization_intents WHERE group_id = ?1 AND path = ?2 \
+                     AND kind = 'write'",
                 rusqlite::params![group_id, path],
                 |r| r.get(0),
             )?)
@@ -191,7 +192,7 @@ impl MaterializationIntentRepository {
             Ok(conn
                 .query_row(
                     "SELECT target_version_hash FROM materialization_intents \
-                     WHERE group_id = ?1 AND path = ?2",
+                     WHERE group_id = ?1 AND path = ?2 AND kind = 'write'",
                     rusqlite::params![group_id, path],
                     |r| r.get::<_, Vec<u8>>(0),
                 )
@@ -211,8 +212,9 @@ impl MaterializationIntentRepository {
         group_id: &str,
     ) -> Result<std::collections::HashSet<String>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            let mut stmt =
-                conn.prepare("SELECT path FROM materialization_intents WHERE group_id = ?1")?;
+            let mut stmt = conn.prepare(
+                "SELECT path FROM materialization_intents WHERE group_id = ?1 AND kind = 'write'",
+            )?;
             let rows = stmt.query_map([group_id], |r| r.get::<_, String>(0))?;
             let mut paths = std::collections::HashSet::new();
             for row in rows {
@@ -220,5 +222,141 @@ impl MaterializationIntentRepository {
             }
             Ok(paths)
         })
+    }
+}
+
+/// Releases not yet written. A released record only names a file that is
+/// gone, which recovery clears without touching anything, so the delete does
+/// not have to be durable before the writer moves on: it is carried by the next
+/// record's transaction instead of costing a write of its own. One queue is
+/// shared by every ledger of a database.
+#[derive(Default)]
+pub struct TempReleaseQueue(std::sync::Mutex<Vec<(String, String)>>);
+
+/// Past this many unwritten releases the next release writes them itself.
+const MAX_QUEUED_RELEASES: usize = 256;
+
+/// The durable record of temp files writers are about to create:
+/// `materialization_tmp_files`. See that table's schema comment. The
+/// repository is a [`yadorilink_local_storage::TempFileLedger`] bound to one
+/// group, so a writer in `yadorilink-local-storage` records through it without
+/// knowing about the database.
+#[derive(Clone)]
+pub struct MaterializationTempLedger {
+    database: Arc<SyncDatabase>,
+    group_id: String,
+    releases: Arc<TempReleaseQueue>,
+}
+
+impl MaterializationTempLedger {
+    pub fn new(
+        database: Arc<SyncDatabase>,
+        group_id: &str,
+        releases: Arc<TempReleaseQueue>,
+    ) -> Self {
+        Self { database, group_id: group_id.to_string(), releases }
+    }
+
+    fn take_queued(&self) -> Vec<(String, String)> {
+        std::mem::take(&mut *self.releases.0.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    fn requeue(&self, mut released: Vec<(String, String)>) {
+        let mut queue = self.releases.0.lock().unwrap_or_else(|p| p.into_inner());
+        released.append(&mut queue);
+        *queue = released;
+    }
+
+    fn delete_released(
+        conn: &rusqlite::Connection,
+        released: &[(String, String)],
+    ) -> Result<(), SyncSqliteError> {
+        for (group_id, tmp_path) in released {
+            conn.execute(
+                "DELETE FROM materialization_tmp_files WHERE group_id = ?1 AND tmp_path = ?2",
+                rusqlite::params![group_id, tmp_path],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Every temp file recorded for `group_id`, as the absolute paths the
+    /// writers recorded, after the queued releases are written.
+    pub fn list(&self) -> Result<Vec<String>, SyncSqliteError> {
+        let released = self.take_queued();
+        if !released.is_empty() {
+            self.database
+                .write::<_, SyncSqliteError>(|conn| Self::delete_released(conn, &released))
+                .inspect_err(|_| self.requeue(released.clone()))?;
+        }
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT tmp_path FROM materialization_tmp_files WHERE group_id = ?1 \
+                 ORDER BY tmp_path",
+            )?;
+            let rows = stmt.query_map([&self.group_id], |r| r.get::<_, String>(0))?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+    }
+
+    /// Forgets a recorded temp file (recovery, after the file is gone).
+    pub fn forget(&self, tmp_path: &str) -> Result<(), SyncSqliteError> {
+        self.database.write::<_, SyncSqliteError>(|conn| {
+            Self::delete_released(conn, &[(self.group_id.clone(), tmp_path.to_string())])
+        })
+    }
+}
+
+fn utf8_tmp_path(
+    tmp_path: &std::path::Path,
+) -> Result<&str, yadorilink_local_storage::StorageError> {
+    tmp_path.to_str().ok_or_else(|| {
+        yadorilink_local_storage::StorageError::Io(std::io::Error::other(
+            "a temp file path that is not UTF-8 cannot be recorded",
+        ))
+    })
+}
+
+impl yadorilink_local_storage::TempFileLedger for MaterializationTempLedger {
+    fn record(
+        &self,
+        tmp_path: &std::path::Path,
+    ) -> Result<(), yadorilink_local_storage::StorageError> {
+        let tmp_path = utf8_tmp_path(tmp_path)?;
+        let released = self.take_queued();
+        let written = self.database.write::<_, SyncSqliteError>(|conn| {
+            Self::delete_released(conn, &released)?;
+            conn.execute(
+                "INSERT OR IGNORE INTO materialization_tmp_files (group_id, tmp_path) \
+                 VALUES (?1, ?2)",
+                rusqlite::params![self.group_id, tmp_path],
+            )?;
+            Ok(())
+        });
+        written.map_err(|e| {
+            self.requeue(released);
+            yadorilink_local_storage::StorageError::Io(std::io::Error::other(format!(
+                "temp file ledger: {e}"
+            )))
+        })
+    }
+
+    fn release(&self, tmp_path: &std::path::Path) {
+        let Some(tmp_path) = tmp_path.to_str() else { return };
+        let full = {
+            let mut queue = self.releases.0.lock().unwrap_or_else(|p| p.into_inner());
+            queue.push((self.group_id.clone(), tmp_path.to_string()));
+            queue.len() >= MAX_QUEUED_RELEASES
+        };
+        if full {
+            let released = self.take_queued();
+            if let Err(error) = self
+                .database
+                .write::<_, SyncSqliteError>(|conn| Self::delete_released(conn, &released))
+            {
+                self.requeue(released);
+                tracing::warn!(%error, "could not write queued temp file releases; recovery clears them");
+            }
+        }
     }
 }

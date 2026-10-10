@@ -133,23 +133,79 @@ pub async fn conflicts_list() -> Result<(), CliError> {
     for file in &conflicts {
         println!("{}", conflicted_file_line(file));
     }
+    println!("{CONFLICT_RESOLVE_HINT}");
     Ok(())
 }
+
+/// The one place the `conflicts` wording lives, so it can be unified with
+/// the other UIs later.
+const CONFLICT_RESOLVE_HINT: &str = "Both versions were kept. To resolve, open the copies, keep \
+     the content you want in the original file, then delete the other copy.";
 
 fn conflicted_file_line(f: &ConflictedFileInfo) -> String {
     let line = if f.kind() == EntryKind::Directory {
         format!("{}/{}/  directory", f.local_path, f.path)
     } else {
-        format!("{}/{}  size={}  mtime={}", f.local_path, f.path, f.size, f.mtime_unix_nanos)
+        format!(
+            "{}/{}  size={}  modified={}",
+            f.local_path,
+            f.path,
+            f.size,
+            format_local_time(f.mtime_unix_nanos)
+        )
     };
     // A concurrent edit is what every copy used to mean, so only the other
     // reason is spelled out.
-    let line = if f.reason() == ConflictReason::FolderAtPath {
+    if f.reason() == ConflictReason::FolderAtPath {
         format!("{line}  reason=folder_at_path")
     } else {
         line
-    };
-    line
+    }
+}
+
+/// `YYYY-MM-DD HH:MM:SS` in this machine's local time.
+fn format_local_time(unix_nanos: i64) -> String {
+    let secs = unix_nanos.div_euclid(1_000_000_000);
+    format_with_offset(secs, local_utc_offset_secs(secs))
+}
+
+fn format_with_offset(unix_secs: i64, offset_secs: i64) -> String {
+    let t = unix_secs + offset_secs;
+    let (days, rem) = (t.div_euclid(86_400), t.rem_euclid(86_400));
+    // Civil-from-days (Howard Hinnant).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
+#[cfg(unix)]
+fn local_utc_offset_secs(unix_secs: i64) -> i64 {
+    let t = unix_secs as libc::time_t;
+    // SAFETY: `tm` is plain data and `localtime_r` only writes to it.
+    unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&t, &mut tm).is_null() {
+            return 0;
+        }
+        tm.tm_gmtoff as i64
+    }
+}
+
+#[cfg(not(unix))]
+fn local_utc_offset_secs(_unix_secs: i64) -> i64 {
+    0
 }
 
 /// `yadorilink trash restore <path>` — recovers a deleted file's

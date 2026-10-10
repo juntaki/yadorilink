@@ -999,11 +999,10 @@ fn clean_xattrs(xattrs: Vec<(String, Vec<u8>)>) -> Vec<(String, Vec<u8>)> {
 
 fn witness(path: &str, shown: Option<VersionHash>) -> NativeCaptureWitness {
     NativeCaptureWitness {
-        physical_path: SyncPath(path.to_owned()),
-        logical_source_path: SyncPath(path.to_owned()),
-        shown_head: None,
+        path: SyncPath(path.to_owned()),
         shown_class: Vec::new(),
         shown_version: shown,
+        row_version: shown,
     }
 }
 

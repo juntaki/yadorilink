@@ -20,6 +20,10 @@ public struct MainWindowView: View {
             .navigationSplitViewColumnWidth(min: 170, ideal: 190)
         } detail: {
             VStack(spacing: 0) {
+                if context.isFixture {
+                    HStack { FixtureBadge(); Spacer() }
+                        .padding([.horizontal, .top], 16)
+                }
                 if let banner = context.app.banner {
                     AppBannerView(banner, isWorking: context.app.isStartingDaemon) { context.perform(banner) }
                         .padding([.horizontal, .top], 16)

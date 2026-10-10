@@ -533,14 +533,8 @@ mod tests {
         };
         let path = SyncPath(path.to_owned());
         let op = Op::Put { path: path.clone(), version: VersionHash([1; 32]) };
-        author_op(
-            conn,
-            &yadorilink_replica_domain::ids::FolderGroupId("g".to_owned()),
-            &local,
-            &op,
-            &path,
-        )
-        .map(drop)
+        author_op(conn, &yadorilink_replica_domain::ids::FolderGroupId("g".to_owned()), &local, &op)
+            .map(drop)
     }
 
     fn assert_stale(result: Result<(), SyncSqliteError>, retired: &LocalAuthorKey) {

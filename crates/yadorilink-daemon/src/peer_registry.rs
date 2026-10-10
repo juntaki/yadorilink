@@ -106,16 +106,27 @@ pub struct PeerRegistry {
     /// Marked each time a session leaves the registry, so a caller waiting
     /// for a slot to free up can wait for that instead of polling.
     removals: tokio::sync::watch::Sender<()>,
+    /// Marked each time a session joins the registry, so an inbound stream
+    /// that beat its session here can wait for it instead of being dropped.
+    registrations: tokio::sync::watch::Sender<()>,
 }
 
 impl PeerRegistry {
     pub(crate) fn new() -> Self {
-        Self { sessions: Mutex::new(HashMap::new()), removals: tokio::sync::watch::channel(()).0 }
+        Self {
+            sessions: Mutex::new(HashMap::new()),
+            removals: tokio::sync::watch::channel(()).0,
+            registrations: tokio::sync::watch::channel(()).0,
+        }
     }
 
     /// Wakes after any session is removed from here from now on. Subscribe
     /// before looking at the registry, so a removal between the look and
     /// the wait is not missed.
+    pub(crate) fn subscribe_to_registrations(&self) -> tokio::sync::watch::Receiver<()> {
+        self.registrations.subscribe()
+    }
+
     pub(crate) fn subscribe_to_removals(&self) -> tokio::sync::watch::Receiver<()> {
         self.removals.subscribe()
     }
@@ -174,9 +185,12 @@ impl PeerRegistry {
         session: Arc<PeerSyncSession>,
         convergence: Arc<crate::local_convergence::LocalConvergenceExecutor>,
     ) -> Option<Arc<PeerSyncSession>> {
-        self.lock_sessions()
+        let previous = self
+            .lock_sessions()
             .insert(device_id, PeerRuntime { session, convergence })
-            .map(|previous| previous.session)
+            .map(|previous| previous.session);
+        self.registrations.send_replace(());
+        previous
     }
 
     /// Installs `session` for `device_id` only if no session is registered
@@ -187,13 +201,17 @@ impl PeerRegistry {
         session: Arc<PeerSyncSession>,
         convergence: Arc<crate::local_convergence::LocalConvergenceExecutor>,
     ) -> bool {
-        match self.lock_sessions().entry(device_id.to_string()) {
+        let installed = match self.lock_sessions().entry(device_id.to_string()) {
             std::collections::hash_map::Entry::Occupied(_) => false,
             std::collections::hash_map::Entry::Vacant(slot) => {
                 slot.insert(PeerRuntime { session, convergence });
                 true
             }
+        };
+        if installed {
+            self.registrations.send_replace(());
         }
+        installed
     }
 
     /// `device_id`'s convergence executor, if a session is registered.

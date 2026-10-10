@@ -93,7 +93,15 @@ impl LocalChangeProcessor {
             .collect();
         for entry in walkdir::WalkDir::new(canonical_root.join(item))
             .follow_links(false)
+            .same_file_system(true)
             .into_iter()
+            .filter_entry(|entry| {
+                !(entry.file_type().is_dir()
+                    && yadorilink_filesystem_sync::device_boundary::is_foreign_device_dir(
+                        &canonical_root,
+                        entry.path(),
+                    ))
+            })
             .filter_map(Result::ok)
             .filter(|entry| !entry.file_type().is_dir())
         {

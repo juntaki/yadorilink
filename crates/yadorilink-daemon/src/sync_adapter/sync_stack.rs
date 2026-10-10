@@ -148,7 +148,7 @@ impl SyncStack {
             let stack = stack.clone();
             Box::pin(async move {
                 let Some(stack) = stack.upgrade() else { return };
-                let Some(session) = stack.session_for(&peer) else {
+                let Some(session) = stack.session_for_or_await(&peer, lane).await else {
                     tracing::debug!(?lane, "no session for this peer; closing the stream");
                     return;
                 };
@@ -191,6 +191,37 @@ impl SyncStack {
             blocks: transports.clone(),
             service: transports.clone(),
         }
+    }
+
+    /// [`Self::session_for`], except that a service request which beat its
+    /// session to this side waits for the session to be registered. The
+    /// asker opens its session first and asks at once (custody confirmation
+    /// runs when a session opens), so without the wait the answer would be a
+    /// closed stream and the asker would have nothing to retry on until its
+    /// periodic sweep. Woken by registration, not polled; the cap only stops
+    /// a peer that never gets a session from parking streams.
+    async fn session_for_or_await(
+        &self,
+        peer: &PeerId,
+        lane: Lane,
+    ) -> Option<Arc<yadorilink_peer_session::peer_session::PeerSyncSession>> {
+        let mut registrations = self.state.peers.subscribe_to_registrations();
+        if let Some(session) = self.session_for(peer) {
+            return Some(session);
+        }
+        if lane != Lane::Service {
+            return None;
+        }
+        let waited = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                registrations.changed().await.ok()?;
+                if let Some(session) = self.session_for(peer) {
+                    return Some(session);
+                }
+            }
+        })
+        .await;
+        waited.ok().flatten()
     }
 
     /// The live session for this endpoint identity, if the netmap still

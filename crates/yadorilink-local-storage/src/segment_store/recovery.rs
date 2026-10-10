@@ -36,7 +36,8 @@ use crate::fs_ops::{remove_path, sync_directory};
 use crate::segment_store::format::SEGMENT_HEADER_LEN;
 use crate::segment_store::index::{BlockIndex, SegmentState};
 use crate::segment_store::segment::{
-    segment_id_from_file_name, segment_path, SegmentWriter, SEGMENTS_DIR,
+    segment_id_from_file_name, segment_id_from_stage_name, segment_path, SegmentWriter,
+    SEGMENTS_DIR,
 };
 
 /// What opening the store had to repair, for the log line and for tests
@@ -157,6 +158,17 @@ pub(crate) fn recover(root: &Path, index: &BlockIndex) -> Result<RecoveredStore,
             report.removed_orphan_segments.push(segment_id);
         }
     }
+    // A segment a crash left under its Stage name, before it was published: no
+    // committed transaction mentions its id, so nothing refers to it.
+    for stage in staged_segment_files(root)? {
+        if known.contains(&stage.0) {
+            continue;
+        }
+        if remove_path(&stage.1).is_ok() {
+            deleted_any_file = true;
+            highest_id = highest_id.max(stage.0);
+        }
+    }
     if deleted_any_file {
         // Make the unlinks themselves durable, so a crash right here does
         // not resurrect a file this open already accounted as gone.
@@ -199,6 +211,26 @@ pub(crate) fn recover(root: &Path, index: &BlockIndex) -> Result<RecoveredStore,
     }
 
     Ok(RecoveredStore { report, next_segment_id })
+}
+
+/// Every segment file waiting under its Stage name, with the segment id it was
+/// made for.
+fn staged_segment_files(root: &Path) -> Result<Vec<(u64, std::path::PathBuf)>, StorageError> {
+    let dir = root.join(SEGMENTS_DIR);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(StorageError::Io(e)),
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
+        if let Some(id) = segment_id_from_stage_name(&name) {
+            out.push((id, entry.path()));
+        }
+    }
+    Ok(out)
 }
 
 /// Every `segments/NNNNNNNNNNNNNNNN.seg` and its length. Entries that do

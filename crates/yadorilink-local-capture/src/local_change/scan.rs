@@ -35,6 +35,55 @@ use super::record_builder::{indexed_mode_and_xattrs, metadata_columns_for, Symli
 use super::scan_test_hooks;
 use super::{now_unix_nanos, LocalChangeOutcome, LocalChangeProcessor};
 
+/// Whether the file's bytes still match `existing`'s indexed blocks. An
+/// unreadable file is not current: the capture that follows reads it again
+/// and reports the failure through [`unreadable_file`].
+fn indexed_bytes_match(
+    path: &Path,
+    existing: &FileRecord,
+    size: u64,
+) -> Result<bool, yadorilink_local_storage::StorageError> {
+    match disk_bytes_match_indexed_blocks_off_worker(path, &existing.blocks, size) {
+        Err(yadorilink_local_storage::StorageError::Io(_)) => Ok(false),
+        other => other,
+    }
+}
+
+/// One unreadable source file must not abort the whole scan: its path joins
+/// the failed prefixes, so no deletion is inferred under it, and the error
+/// is logged. Any other error (block store, database, out of space) is returned
+/// and still aborts.
+fn unreadable_file(
+    group_id: &str,
+    rel_path: &str,
+    error: LocalCaptureError,
+    failed_prefixes: &mut Vec<String>,
+) -> Result<(), LocalCaptureError> {
+    use yadorilink_sync_sqlite::SyncSqliteError;
+    let LocalCaptureError::SyncCore(SyncSqliteError::Io(error)) = error else {
+        return Err(error);
+    };
+    // Out-of-space and quota failures come from our own staging and stores, never from reading
+    // the user's file, so they still abort the scan.
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::StorageFull
+            | std::io::ErrorKind::QuotaExceeded
+            | std::io::ErrorKind::OutOfMemory
+    ) {
+        return Err(LocalCaptureError::SyncCore(SyncSqliteError::Io(error)));
+    }
+    tracing::warn!(
+        group_id,
+        path = %rel_path,
+        error = %error,
+        "could not read a file during the scan; it is skipped and deletions under it are \
+         suppressed until it can be read"
+    );
+    failed_prefixes.push(rel_path.to_owned());
+    Ok(())
+}
+
 /// True when `rel_path` (a root-relative index path, `/`-separated) sits
 /// under any of the `failed_prefixes` a partial scan collected — the
 /// root-relative directories the walk could not read. Matching is on whole
@@ -371,9 +420,10 @@ impl ReconcileSnapshot {
         &self,
         path: &str,
     ) -> yadorilink_replica_domain::native_state::NativeCaptureWitness {
-        self.native_witness_by_path.get(path).cloned().unwrap_or_else(|| {
-            yadorilink_sync_sqlite::native_projection_binding::absent_native_witness(path)
-        })
+        self.native_witness_by_path
+            .get(path)
+            .cloned()
+            .unwrap_or_else(|| yadorilink_sync_sqlite::native_capture::absent_native_witness(path))
     }
 
     fn is_directory(&self, path: &str) -> bool {
@@ -446,6 +496,21 @@ pub(crate) enum ReconcileMode {
     /// tombstoning an already-known path can (the hazard `watcher.rs`'s
     /// module doc documents as "found unsafe").
     AddOnly,
+}
+
+/// Whether the link root is still the volume the index was built from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum CaptureAuthority {
+    /// The persisted identity equals the root's current one (or the group has
+    /// no link row to record one on): absence on disk is delete evidence.
+    Confirmed,
+    /// A link created by an older build, with no identity recorded yet. The
+    /// current identity is adopted by the first safe full scan, which authors
+    /// no deletes; nothing is inferred about earlier history.
+    Unrecorded(String),
+    /// The root is on another volume than the one recorded, or its volume
+    /// cannot be observed. Nothing under it may be tombstoned.
+    Refused,
 }
 
 impl ReconcileMode {
@@ -841,6 +906,24 @@ impl LocalChangeProcessor {
         Ok(true)
     }
 
+    /// See [`CaptureAuthority`]. Never updates a recorded identity: following a
+    /// changed volume would legitimise the empty mountpoint it leaves behind.
+    pub(super) fn capture_authority(
+        &self,
+        group_id: &str,
+        root: &Path,
+    ) -> Result<CaptureAuthority, LocalCaptureError> {
+        let Some(stored) = self.state.capture_volume_identity(group_id)? else {
+            return Ok(CaptureAuthority::Confirmed);
+        };
+        let current = yadorilink_filesystem_sync::device_boundary::root_volume_identity(root);
+        Ok(match (stored, current) {
+            (Some(stored), Some(current)) if stored == current => CaptureAuthority::Confirmed,
+            (None, Some(current)) => CaptureAuthority::Unrecorded(current),
+            _ => CaptureAuthority::Refused,
+        })
+    }
+
     /// The single choke point every disk reconcile passes through, and the
     /// reason it takes a [`VerifiedRoot`] rather than a `&Path`.
     ///
@@ -916,6 +999,14 @@ impl LocalChangeProcessor {
         // more than it was during the walk itself, which would have
         // skipped it the same way.
         if exact_leaf_exists_as_file_or_symlink(root, path) {
+            return Ok(false);
+        }
+        // Under (or at) a directory now on another device: the walk does not
+        // cross it, so absence here is not delete evidence.
+        if yadorilink_filesystem_sync::device_boundary::path_crosses_device_boundary(root, path) {
+            return Ok(false);
+        }
+        if self.capture_authority(group_id, root)? != CaptureAuthority::Confirmed {
             return Ok(false);
         }
         // Absence is delete evidence only for a `Present` object (see
@@ -1128,8 +1219,34 @@ impl LocalChangeProcessor {
         // on which repair succeeds. Fail-closed: never emit a delete when a
         // crash cannot be told from a delete. See
         // `scan_existing_files_with_ignore_gated`.
-        if mode.emits_tombstones() && walk.scan_complete {
-            self.prepare_offline_tombstones(group_id, root, ignore_set, &snapshot, &mut walk)?;
+        if mode.is_full() && walk.scan_complete {
+            // Absence is delete evidence only on the volume the index was
+            // built from (see `CaptureAuthority`). Adoption of a first
+            // identity needs a scan that read the whole tree, whether or not
+            // this scan may emit deletes, and emits none itself.
+            match self.capture_authority(group_id, root)? {
+                CaptureAuthority::Confirmed => {
+                    if mode.emits_tombstones() {
+                        self.prepare_offline_tombstones(
+                            group_id, root, ignore_set, &snapshot, &mut walk,
+                        )?;
+                    }
+                }
+                CaptureAuthority::Unrecorded(current) => {
+                    if walk.failed_prefixes.is_empty() {
+                        self.state.adopt_capture_volume_identity(group_id, &current)?;
+                    }
+                }
+                CaptureAuthority::Refused => {
+                    if mode.emits_tombstones() {
+                        tracing::warn!(
+                            group_id,
+                            "the sync root is not on the volume its index was built from; \
+                             no deletions are authored under it"
+                        );
+                    }
+                }
+            }
         }
 
         // A paused item's changes -- edits and offline deletions alike --
@@ -1146,17 +1263,6 @@ impl LocalChangeProcessor {
                 }
             }
             walk.prepared = kept;
-        }
-
-        // A copy name the namespace placed another entry's leaf under is
-        // not an entry of its own: its edit or deletion is authored at
-        // that entry, superseding only the head the copy holds (see
-        // `LocalMutationStore::write_through_source`). A chunk here is one
-        // change over the rows' own paths and cannot carry that, so such a
-        // path is journaled dirty instead and authored by the flush route
-        // when the journal is re-driven.
-        if can_author_history {
-            self.journal_write_throughs(group_id, &mut walk.prepared)?;
         }
 
         let prepared = walk.prepared;
@@ -1196,38 +1302,6 @@ impl LocalChangeProcessor {
         } else {
             self.commit_prepared_index_only(group_id, root, &prepared, &mut trace)
         }
-    }
-
-    /// Takes every mutation of a copy name that writes through to another
-    /// entry out of `prepared`, journaling its path dirty for the flush
-    /// route to author.
-    fn journal_write_throughs(
-        &self,
-        group_id: &str,
-        prepared: &mut Vec<PreparedMutation>,
-    ) -> Result<(), LocalCaptureError> {
-        let mut kept = Vec::with_capacity(prepared.len());
-        for mutation in prepared.drain(..) {
-            let record = mutation.record();
-            if self.state.write_through_source(group_id, &record.path)?.is_none() {
-                kept.push(mutation);
-                continue;
-            }
-            let kind = if record.deleted {
-                FsChangeKind::ObservedRemoval
-            } else {
-                FsChangeKind::CreatedOrModified
-            };
-            self.state.record_dirty_path(
-                group_id,
-                &record.path,
-                dirty_kind_str(kind),
-                now_unix_nanos(),
-                &self.begin_operation()?.permit(),
-            )?;
-        }
-        *prepared = kept;
-        Ok(())
     }
 
     /// Reads the whole-index snapshot a pass judges disk against. Every
@@ -1336,10 +1410,28 @@ impl LocalChangeProcessor {
         // `follow_links(false)` — a walkdir quirk that doesn't apply here
         // since `root` is always canonicalized above, but is guarded
         // there defensively regardless).
-        let walker =
-            walkdir::WalkDir::new(root).follow_links(false).into_iter().filter_entry(|entry| {
+        let walker = walkdir::WalkDir::new(root)
+            .follow_links(false)
+            .same_file_system(true)
+            .into_iter()
+            .filter_entry(|entry| {
                 if entry.depth() == 0 {
                     return true;
+                }
+                // Never index across a device (mount) boundary; see
+                // `device_boundary`. Unmounting must not read as deletion.
+                if entry.file_type().is_dir()
+                    && yadorilink_filesystem_sync::device_boundary::is_foreign_device_dir(
+                        root,
+                        entry.path(),
+                    )
+                {
+                    // The walk prunes the whole subtree, so this fires once per scan.
+                    tracing::warn!(
+                        path = %entry.path().display(),
+                        "skipping directory on another device (mount, btrfs subvolume or ZFS dataset); its contents are not synced"
+                    );
+                    return false;
                 }
                 let Ok(rel_path) = entry.path().strip_prefix(root) else { return false };
                 !is_excluded_from_sync(rel_path, entry.file_type().is_dir(), ignore_set)
@@ -1527,11 +1619,7 @@ impl LocalChangeProcessor {
                         && existing.size == metadata.len()
                         && metadata_mtime_matches(metadata, existing.mtime_unix_nanos)
                         && (!file_type.is_file()
-                            || disk_bytes_match_indexed_blocks_off_worker(
-                                path,
-                                &existing.blocks,
-                                metadata.len(),
-                            )?)
+                            || indexed_bytes_match(path, existing, metadata.len())?)
                 }
                 _ => false,
             };
@@ -1629,16 +1717,23 @@ impl LocalChangeProcessor {
 
             let materialization_state = materialization_by_path.get(&rel_path).copied();
             let placeholder_generation = placeholder_generation_by_path.get(&rel_path).cloned();
-            let (outcome, classification, unix_mode) = self.build_record_for_created_or_modified(
-                group_id,
-                root,
-                rel_path.clone(),
-                path,
-                existing,
-                materialization_state,
-                placeholder_generation,
-                Some(&mut staging),
-            )?;
+            let (outcome, classification, unix_mode) = match self
+                .build_record_for_created_or_modified(
+                    group_id,
+                    root,
+                    rel_path.clone(),
+                    path,
+                    existing,
+                    materialization_state,
+                    placeholder_generation,
+                    Some(&mut staging),
+                ) {
+                Ok(built) => built,
+                Err(error) => {
+                    unreadable_file(group_id, &rel_path, error, &mut failed_prefixes)?;
+                    continue;
+                }
+            };
             if outcome == LocalChangeOutcome::RetryLater {
                 // Changed while it was read: nothing to prepare from this
                 // pass. It is already in `seen_paths`, so it is never read
