@@ -303,7 +303,14 @@ mod ladder_tests {
         let _scope = completion.enter();
         mark_running_current();
         drop(_scope);
-        std::thread::sleep(Duration::from_millis(100));
+        // The next warning after the phase mark reports it; wait for that warning rather than
+        // for a fixed time, which a loaded machine can overrun.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !warnings.lock().unwrap().last().unwrap().contains("running the commit")
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(warnings.lock().unwrap().last().unwrap().contains("running the commit"));
         drop(completion);
         thread.join().unwrap();
