@@ -162,7 +162,9 @@ async fn an_existing_device_takes_no_sealed_state_while_its_peers_can_still_repl
     captured(&b, GROUP).await;
     let before = native_state(&b, GROUP);
     let group = FolderGroupId(GROUP.to_owned());
-    let bundle = DaemonRecovery::new(shared(&a))
+    // A private seal log: the running driver may already have sealed this group for the peer,
+    // and the device-wide cooldown would then answer this explicit request `Overloaded`.
+    let bundle = DaemonRecovery::with_private_seal_log_for_test(shared(&a))
         .serve(&group)
         .await
         .expect("the up-to-date device can seal its state");
@@ -445,7 +447,10 @@ async fn rebootstrap_refused_and_state_intact(server: &TopologyNode, node: &Topo
     }
     let (state_before, files_before) = (native_state(node, GROUP), tree(node));
     let group = FolderGroupId(GROUP.to_owned());
-    let bundle = DaemonRecovery::new(shared(server))
+    // A private seal log, not the device-wide one: the driver may already have sealed this group
+    // for the peer (where the refusal then follows), and the shared cooldown would answer this
+    // explicit request `Overloaded` depending on timing.
+    let bundle = DaemonRecovery::with_private_seal_log_for_test(shared(server))
         .serve(&group)
         .await
         .expect("the up-to-date peer can seal its state");
